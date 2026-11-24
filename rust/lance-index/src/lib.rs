@@ -27,6 +27,37 @@ pub mod vector;
 
 pub use crate::traits::*;
 
+/// Declares a [`lance_core::dispatch!`] whose candidates depend on the target
+/// architecture. Each architecture's kernels come first, best first, followed
+/// by the portable kernel; an architecture without a list gets only the
+/// portable kernel, so callers need no `cfg` of their own.
+macro_rules! arch_dispatch {
+    ($(
+        $vis:vis static $name:ident: Dispatch<$kernel_type:ty> =
+            x86_64[$($x86:expr),* $(,)?]
+            $(, aarch64[$($aarch64:expr),* $(,)?])?
+            , portable $portable:expr;
+    )*) => {$(
+        lance_core::dispatch! {
+            $vis static $name: Dispatch<$kernel_type> = {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    &[$($x86,)* $portable]
+                }
+                #[cfg(target_arch = "aarch64")]
+                {
+                    &[$($($aarch64,)*)? $portable]
+                }
+                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+                {
+                    &[$portable]
+                }
+            };
+        }
+    )*};
+}
+pub(crate) use arch_dispatch;
+
 // Re-export core traits from lance-index-core
 pub use lance_index_core::{Index, IndexParams, IndexType};
 
@@ -57,19 +88,19 @@ pub const MIN_PARTITION_SIZE_PERCENT: usize = 25;
 
 pub mod pb {
     #![allow(clippy::use_self)]
-    include!(concat!(env!("OUT_DIR"), "/lance.index.pb.rs"));
+    include!("pb/lance.index.pb.rs");
 }
 
 pub mod pbold {
     #![allow(clippy::use_self)]
-    include!(concat!(env!("OUT_DIR"), "/lance.table.rs"));
+    include!("pb/lance.table.rs");
 }
 
 /// Protobuf headers for serialized index cache entries (FTS posting lists,
 /// scalar indices, and IVF vector partitions).
 pub mod cache_pb {
     #![allow(clippy::use_self)]
-    include!(concat!(env!("OUT_DIR"), "/lance.index.cache.rs"));
+    include!("pb/lance.index.cache.rs");
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -105,7 +136,11 @@ mod tests {
 
     #[test]
     fn test_max_vector_version_tracks_highest_supported() {
-        assert_eq!(IndexType::max_vector_version(), IVF_RQ_INDEX_VERSION);
+        assert!(IndexType::IvfHnswRq.version() as u32 > IVF_RQ_INDEX_VERSION);
+        assert_eq!(
+            IndexType::max_vector_version(),
+            IndexType::IvfHnswRq.version() as u32
+        );
     }
 
     #[test]

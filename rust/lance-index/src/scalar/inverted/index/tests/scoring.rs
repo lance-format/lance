@@ -772,7 +772,6 @@ async fn search_test_impact_partition(
             Operator::Or,
             scorer.as_ref(),
             &NoOpMetricsCollector,
-            false,
         )
         .await
         .unwrap();
@@ -926,7 +925,6 @@ async fn assert_no_impact_bulk_conjunction_preserves_winner(with_phrase: bool) {
                 Operator::And,
                 scorer.as_ref(),
                 &NoOpMetricsCollector,
-                false,
             )
             .await
             .unwrap();

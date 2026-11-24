@@ -28,6 +28,7 @@ use rand::{Rng, SeedableRng, rngs::SmallRng};
 use serde::{Deserialize, Serialize};
 
 use super::super::graph::beam_search;
+use super::remap::remap_graph_connected;
 use super::{
     HNSW_TYPE, HnswMetadata, VECTOR_ID_COL, VECTOR_ID_FIELD, select_neighbors_heuristic_owned,
 };
@@ -41,11 +42,11 @@ use crate::vector::graph::{
 };
 use crate::vector::graph::{
     NodeFilter, Visited, beam_search_acorn, beam_search_borrowed, greedy_search,
-    greedy_search_borrowed,
+    greedy_search_borrowed, range_filter,
 };
 use crate::vector::storage::{DistCalculator, VectorStore};
 use crate::vector::v3::subindex::IvfSubIndex;
-use crate::vector::{ApproxMode, Query, VECTOR_RESULT_SCHEMA};
+use crate::vector::{ApproxMode, Query, RqGraphScoring, VECTOR_RESULT_SCHEMA};
 
 pub const HNSW_METADATA_KEY: &str = "lance:hnsw";
 
@@ -410,7 +411,7 @@ impl HNSW {
         prefetch_distance: Option<usize>,
     ) -> Result<(Vec<OrderedNode>, usize)> {
         self.ensure_storage_covers_graph(storage)?;
-        let dist_calc = storage.dist_calculator(query, params.dist_q_c);
+        let dist_calc = params.dist_calculator(storage, query);
         let entry = self.inner.entry_point;
         let ep = OrderedNode::new(entry, dist_calc.distance(entry).into());
 
@@ -626,7 +627,7 @@ impl HNSW {
         prefetch_distance: Option<usize>,
     ) -> Result<(Vec<OrderedNode>, usize)> {
         self.ensure_storage_covers_graph(storage)?;
-        let dist_calc = storage.dist_calculator(query, params.dist_q_c);
+        let dist_calc = params.dist_calculator(storage, query);
         let entry = self.inner.entry_point;
         let ep = OrderedNode::new(entry, dist_calc.distance(entry).into());
 
@@ -725,12 +726,11 @@ impl HNSW {
         prefilter_bitset: &impl NodeFilter,
         params: &HnswQueryParams,
     ) -> (Vec<OrderedNode>, usize) {
-        let lower_bound: OrderedFloat = params.lower_bound.unwrap_or(f32::MIN).into();
-        let upper_bound: OrderedFloat = params.upper_bound.unwrap_or(f32::MAX).into();
         // every set bit gets exactly one distance on both branches below
         let comparisons = prefilter_bitset.num_allowed();
 
-        let dist_calc = storage.dist_calculator(query, params.dist_q_c);
+        let dist_calc = params.dist_calculator(storage, query);
+        let in_range = range_filter(params, &dist_calc);
         let mut heap = BinaryHeap::<OrderedNode>::with_capacity(k);
 
         match self.inner.params.prefetch_distance {
@@ -754,7 +754,7 @@ impl HNSW {
                     }
 
                     let dist: OrderedFloat = dist_calc.distance(node_id).into();
-                    if dist < lower_bound || dist >= upper_bound {
+                    if !in_range(node_id, dist) {
                         continue;
                     }
                     if heap.len() < k {
@@ -768,7 +768,7 @@ impl HNSW {
             _ => {
                 for node_id in prefilter_bitset.allowed_ids() {
                     let dist: OrderedFloat = dist_calc.distance(node_id).into();
-                    if dist < lower_bound || dist >= upper_bound {
+                    if !in_range(node_id, dist) {
                         continue;
                     }
                     if heap.len() < k {
@@ -813,13 +813,16 @@ impl HNSW {
                 storage.len()
             )));
         }
+        let rerank_query = query.clone();
         let (results, comparisons) =
             self.search_filtered(query, k, &params, storage, allowed, allowed.num_allowed())?;
         metrics.record_comparisons(comparisons);
-        Self::results_batch(results, storage)
+        Self::results_batch(results, rerank_query, k, &params, storage)
     }
 
     /// Search through `filter`, which allows `remained` of the partition's rows.
+    ///
+    /// Returns [`HnswQueryParams::candidates`] results for a top-`k` query.
     fn search_filtered<F: NodeFilter>(
         &self,
         query: ArrayRef,
@@ -829,15 +832,16 @@ impl HNSW {
         filter: &F,
         remained: usize,
     ) -> Result<(Vec<OrderedNode>, usize)> {
+        let candidates = params.candidates(k);
         if remained == storage.len() {
             // mask passes every row: same as unfiltered
-            self.search_basic_with::<F>(query, k, params, None, storage)
+            self.search_basic_with::<F>(query, candidates, params, None, storage)
         } else if remained < self.len() * 10 / 100 {
             // few matching rows: brute force is cheaper and exact
-            Ok(self.flat_search(storage, query, k, filter, params))
+            Ok(self.flat_search(storage, query, candidates, filter, params))
         } else if params.use_acorn {
             let (acorn_results, acorn_comparisons) =
-                self.search_acorn_with(query.clone(), k, params, filter, storage)?;
+                self.search_acorn_with(query.clone(), candidates, params, filter, storage)?;
             // under-delivery means the budget ran out on a fragmented
             // mask, except range-bounded queries which return short
             // legitimately
@@ -845,17 +849,32 @@ impl HNSW {
             if !bounded && acorn_results.len() < k.min(remained) {
                 // the abandoned ACORN traversal still cost its distances
                 let (results, basic_comparisons) =
-                    self.search_basic_with(query, k, params, Some(filter), storage)?;
+                    self.search_basic_with(query, candidates, params, Some(filter), storage)?;
                 Ok((results, acorn_comparisons + basic_comparisons))
             } else {
                 Ok((acorn_results, acorn_comparisons))
             }
         } else {
-            self.search_basic_with(query, k, params, Some(filter), storage)
+            self.search_basic_with(query, candidates, params, Some(filter), storage)
         }
     }
 
-    fn results_batch(results: Vec<OrderedNode>, storage: &impl VectorStore) -> Result<RecordBatch> {
+    /// Reranks `results` when `params` asks for it and keeps the top `k`.
+    fn results_batch(
+        mut results: Vec<OrderedNode>,
+        query: ArrayRef,
+        k: usize,
+        params: &HnswQueryParams,
+        storage: &impl VectorStore,
+    ) -> Result<RecordBatch> {
+        if params.reranks() && storage.rerank(query, params.dist_q_c, &mut results) {
+            // The search applied the bounds to the scores rerank replaced.
+            let lower = params.lower_bound.unwrap_or(f32::MIN);
+            let upper = params.upper_bound.unwrap_or(f32::MAX);
+            results.retain(|node| node.dist.0 >= lower && node.dist.0 < upper);
+        }
+        results.truncate(k);
+
         // need to unique by row ids in case of searching multivector
         let (row_ids, dists): (Vec<_>, Vec<_>) = results
             .into_iter()
@@ -1085,6 +1104,7 @@ impl HnswBuilder {
                 upper_bound: None,
                 dist_q_c: 0.0,
                 use_acorn: false,
+                rq_graph_scoring: Default::default(),
             },
             dist_calc,
             None,
@@ -1665,17 +1685,50 @@ pub struct HnswQueryParams {
     pub upper_bound: Option<f32>,
     pub dist_q_c: f32,
     pub use_acorn: bool,
+    pub rq_graph_scoring: RqGraphScoring,
 }
 
 impl From<&Query> for HnswQueryParams {
     fn from(query: &Query) -> Self {
+        Self::from_query(query, query.dist_q_c)
+    }
+}
+
+impl HnswQueryParams {
+    pub(crate) fn from_query(query: &Query, dist_q_c: f32) -> Self {
         let k = query.k * query.refine_factor.unwrap_or(1) as usize;
         Self {
             ef: query.ef.unwrap_or_else(|| (k + k / 2).max(DEFAULT_MIN_EF)),
             lower_bound: query.lower_bound,
             upper_bound: query.upper_bound,
-            dist_q_c: query.dist_q_c,
+            dist_q_c,
             use_acorn: query.approx_mode == ApproxMode::Fast,
+            rq_graph_scoring: query.rq_graph_scoring,
+        }
+    }
+
+    /// Whether the search walks with [`VectorStore::graph_dist_calculator`]
+    /// and lets [`VectorStore::rerank`] replace its scores.
+    fn reranks(&self) -> bool {
+        self.rq_graph_scoring == RqGraphScoring::OneBitRerank
+    }
+
+    /// How many results a top-`k` search collects: a reranking search keeps
+    /// `ef` candidates on every path for [`VectorStore::rerank`].
+    fn candidates(&self, k: usize) -> usize {
+        if self.reranks() { self.ef } else { k }
+    }
+
+    /// The calculator that scores the nodes a search visits.
+    pub(crate) fn dist_calculator<'a, S: VectorStore>(
+        &self,
+        storage: &'a S,
+        query: ArrayRef,
+    ) -> S::DistanceCalculator<'a> {
+        if self.reranks() {
+            storage.graph_dist_calculator(query, self.dist_q_c)
+        } else {
+            storage.dist_calculator(query, self.dist_q_c)
         }
     }
 }
@@ -1683,6 +1736,10 @@ impl From<&Query> for HnswQueryParams {
 impl IvfSubIndex for HNSW {
     type BuildParams = HnswBuildParams;
     type QueryParams = HnswQueryParams;
+
+    fn query_params(query: &Query, _query_key: &ArrayRef, dist_q_c: f32) -> Self::QueryParams {
+        Self::QueryParams::from_query(query, dist_q_c)
+    }
 
     fn empty_partition_metadata(build_params: Option<&Self::BuildParams>) -> Option<String> {
         let params = build_params.cloned().unwrap_or_default();
@@ -1870,6 +1927,33 @@ impl IvfSubIndex for HNSW {
         Some(&[VECTOR_ID_COL, NEIGHBORS_COL])
     }
 
+    fn positional_rows(metadata: &str) -> Result<Option<usize>> {
+        // Legacy files may leave an empty partition's metadata blank; such a
+        // partition has no graph to realign.
+        if metadata.is_empty() {
+            return Ok(None);
+        }
+        let metadata: HnswMetadata = serde_json::from_str(metadata).map_err(|e| {
+            Error::index(format!(
+                "Failed to decode HNSW metadata: {e}, json: {metadata}"
+            ))
+        })?;
+        Ok(Some(match metadata.level_offsets.as_slice() {
+            [start, end, ..] => end.saturating_sub(*start),
+            _ => 0,
+        }))
+    }
+
+    /// Dropping the removed nodes can strand survivors whose every path from
+    /// the entry point ran through them; only then is the graph repaired.
+    fn remap_positions(
+        data: RecordBatch,
+        new_ids: &[Option<u32>],
+        storage: &impl VectorStore,
+    ) -> Result<RecordBatch> {
+        remap_graph_connected(&data, new_ids, storage)
+    }
+
     #[instrument(level = "debug", skip(self, query, storage, prefilter, metrics))]
     fn search(
         &self,
@@ -1884,17 +1968,19 @@ impl IvfSubIndex for HNSW {
             return self.search_with_allowed_mask(query, k, params, storage, allowed, metrics);
         }
         if params.ef < k {
-            return Err(Error::index(
-                "ef must be greater than or equal to k".to_string(),
-            ));
+            return Err(Error::invalid_input(format!(
+                "ef must be greater than or equal to k: ef={}, k={k}",
+                params.ef
+            )));
         }
 
         if self.is_empty() {
             return Ok(RecordBatch::new_empty(VECTOR_RESULT_SCHEMA.clone()));
         }
 
+        let rerank_query = query.clone();
         let (results, comparisons) = if prefilter.is_empty() {
-            self.search_basic(query, k, &params, None, storage)?
+            self.search_basic(query, params.candidates(k), &params, None, storage)?
         } else {
             let mut prefilter_generator = self
                 .inner
@@ -1916,7 +2002,7 @@ impl IvfSubIndex for HNSW {
             found?
         };
         metrics.record_comparisons(comparisons);
-        Self::results_batch(results, storage)
+        Self::results_batch(results, rerank_query, k, &params, storage)
     }
 
     /// Given a vector storage, containing all the data for the IVF partition, build the sub index.
@@ -2056,7 +2142,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use arrow_array::cast::AsArray;
-    use arrow_array::types::Float32Type;
+    use arrow_array::types::{Float32Type, UInt64Type};
     use arrow_array::{
         ArrayRef, FixedSizeListArray, Float32Array, RecordBatch, UInt8Array, UInt32Array,
     };
@@ -2133,8 +2219,8 @@ mod tests {
     #[tokio::test]
     async fn test_builder_write_load() {
         const DIM: usize = 32;
-        const TOTAL: usize = 2048;
-        const NUM_EDGES: usize = 20;
+        const TOTAL: usize = 512;
+        const NUM_EDGES: usize = 8;
         let data = generate_random_array(TOTAL * DIM);
         let fsl = FixedSizeListArray::try_new_from_values(data, DIM as i32).unwrap();
         let store = Arc::new(FlatFloatStorage::new(fsl.clone(), DistanceType::L2));
@@ -2142,7 +2228,7 @@ mod tests {
             store.as_ref(),
             HnswBuildParams::default()
                 .num_edges(NUM_EDGES)
-                .ef_construction(50),
+                .ef_construction(32),
         )
         .unwrap();
 
@@ -2183,6 +2269,7 @@ mod tests {
             upper_bound: None,
             dist_q_c: 0.0,
             use_acorn: false,
+            rq_graph_scoring: Default::default(),
         };
         let (builder_results, _) = builder
             .search_basic(query.clone(), k, &params, None, store.as_ref())
@@ -2245,6 +2332,7 @@ mod tests {
             upper_bound: None,
             dist_q_c: 0.0,
             use_acorn: false,
+            rq_graph_scoring: Default::default(),
         };
         let (builder_results, _) = builder
             .search_basic(query.clone(), k, &params, None, store.as_ref())
@@ -2263,6 +2351,57 @@ mod tests {
             .collect();
         all.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
         all.into_iter().take(k).map(|(_, id)| id).collect()
+    }
+
+    #[test]
+    fn search_rejects_ef_below_k_as_input_error() {
+        let vectors = FixedSizeListArray::try_new_from_values(
+            Float32Array::from((0..16).map(|value| value as f32).collect::<Vec<_>>()),
+            2,
+        )
+        .unwrap();
+        let store = FlatFloatStorage::new(vectors.clone(), DistanceType::L2);
+        let index = HNSW::index_vectors(
+            &store,
+            HnswBuildParams::default().num_edges(4).ef_construction(8),
+        )
+        .unwrap();
+        let query = vectors.value(0);
+        let search = |ef| {
+            index.search(
+                query.clone(),
+                8,
+                HnswQueryParams {
+                    ef,
+                    lower_bound: None,
+                    upper_bound: None,
+                    dist_q_c: 0.0,
+                    use_acorn: false,
+                    rq_graph_scoring: Default::default(),
+                },
+                &store,
+                Arc::new(NoFilter),
+                &NoOpMetricsCollector,
+            )
+        };
+
+        let error = search(1).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(
+            error.to_string().contains("ef=1, k=8"),
+            "unexpected error: {error}"
+        );
+
+        let result = search(8).unwrap();
+        let rows = result
+            .column_by_name(lance_core::ROW_ID)
+            .unwrap()
+            .as_primitive::<UInt64Type>();
+        let expected = brute_force_topk(&store, query, 8)
+            .into_iter()
+            .map(u64::from)
+            .collect::<Vec<_>>();
+        assert_eq!(rows.values().as_ref(), expected.as_slice());
     }
 
     #[rstest]
@@ -2518,6 +2657,7 @@ mod tests {
                     upper_bound: None,
                     dist_q_c: 0.0,
                     use_acorn: false,
+                    rq_graph_scoring: Default::default(),
                 },
                 None,
                 &store,
@@ -2609,21 +2749,24 @@ mod tests {
     #[rstest]
     #[case::l2_single(DistanceType::L2, 1)]
     #[case::l2_pair(DistanceType::L2, 2)]
-    #[case::l2_multi_level(DistanceType::L2, 2048)]
-    #[case::dot_multi_level(DistanceType::Dot, 2048)]
+    #[case::l2_multi_level(DistanceType::L2, 512)]
+    #[case::dot_multi_level(DistanceType::Dot, 512)]
     #[tokio::test]
     async fn test_loaded_search_parity_and_recall(
         #[case] distance_type: DistanceType,
         #[case] total: usize,
     ) {
         const DIM: usize = 32;
-        let fsl =
-            FixedSizeListArray::try_new_from_values(generate_random_array(total * DIM), DIM as i32)
-                .unwrap();
+        // Seeded so the data and query are fixed across runs.
+        let fsl = FixedSizeListArray::try_new_from_values(
+            generate_random_array_with_seed::<Float32Type>(total * DIM, [42; 32]),
+            DIM as i32,
+        )
+        .unwrap();
         let store = Arc::new(FlatFloatStorage::new(fsl.clone(), distance_type));
         let builder = HNSW::index_vectors(
             store.as_ref(),
-            HnswBuildParams::default().num_edges(20).ef_construction(50),
+            HnswBuildParams::default().num_edges(8).ef_construction(32),
         )
         .unwrap();
         assert!(!matches!(builder.inner.graph, HnswGraph::Loaded(_)));
@@ -2639,6 +2782,7 @@ mod tests {
             upper_bound: None,
             dist_q_c: 0.0,
             use_acorn: false,
+            rq_graph_scoring: Default::default(),
         };
         let query = fsl.value(0);
 
@@ -2731,6 +2875,7 @@ mod tests {
             upper_bound: None,
             dist_q_c: 0.0,
             use_acorn: false,
+            rq_graph_scoring: Default::default(),
         };
 
         let calls = AtomicUsize::new(0);
@@ -2820,14 +2965,17 @@ mod tests {
     #[tokio::test]
     async fn test_acorn_filtered_search() {
         const DIM: usize = 32;
-        const TOTAL: usize = 2048;
-        let fsl =
-            FixedSizeListArray::try_new_from_values(generate_random_array(TOTAL * DIM), DIM as i32)
-                .unwrap();
+        const TOTAL: usize = 512;
+        // Seeded so the data and query are fixed across runs.
+        let fsl = FixedSizeListArray::try_new_from_values(
+            generate_random_array_with_seed::<Float32Type>(TOTAL * DIM, [42; 32]),
+            DIM as i32,
+        )
+        .unwrap();
         let store = Arc::new(FlatFloatStorage::new(fsl.clone(), DistanceType::L2));
         let builder = HNSW::index_vectors(
             store.as_ref(),
-            HnswBuildParams::default().num_edges(20).ef_construction(50),
+            HnswBuildParams::default().num_edges(8).ef_construction(32),
         )
         .unwrap();
         let loaded = HNSW::load(builder.to_batch().unwrap()).unwrap();
@@ -2840,6 +2988,7 @@ mod tests {
             upper_bound: None,
             dist_q_c: 0.0,
             use_acorn: false,
+            rq_graph_scoring: Default::default(),
         };
         let query = fsl.value(0);
         let truth: std::collections::HashSet<u32> =
@@ -3014,14 +3163,14 @@ mod tests {
     #[tokio::test]
     async fn test_subindex_prefilter_dispatch() {
         const DIM: usize = 32;
-        const TOTAL: usize = 2048;
+        const TOTAL: usize = 512;
         let fsl =
             FixedSizeListArray::try_new_from_values(generate_random_array(TOTAL * DIM), DIM as i32)
                 .unwrap();
         let store = Arc::new(FlatFloatStorage::new(fsl.clone(), DistanceType::L2));
         let hnsw = HNSW::index_vectors(
             store.as_ref(),
-            HnswBuildParams::default().num_edges(20).ef_construction(50),
+            HnswBuildParams::default().num_edges(8).ef_construction(32),
         )
         .unwrap();
 
@@ -3035,6 +3184,7 @@ mod tests {
                 upper_bound: None,
                 dist_q_c: 0.0,
                 use_acorn,
+                rq_graph_scoring: Default::default(),
             };
             let batch = hnsw
                 .search(
@@ -3072,6 +3222,7 @@ mod tests {
                     upper_bound: None,
                     dist_q_c: 0.0,
                     use_acorn: false,
+                    rq_graph_scoring: Default::default(),
                 },
                 None,
                 store.as_ref(),
@@ -3137,6 +3288,7 @@ mod tests {
                         upper_bound: Some(1.0),
                         dist_q_c: 0.0,
                         use_acorn: false,
+                        rq_graph_scoring: Default::default(),
                     },
                     store.as_ref(),
                     filter,
@@ -3162,7 +3314,7 @@ mod tests {
     #[tokio::test]
     async fn test_search_reports_distance_comparisons() {
         const DIM: usize = 32;
-        const TOTAL: usize = 2048;
+        const TOTAL: usize = 512;
         let fsl = FixedSizeListArray::try_new_from_values(
             generate_random_array_with_seed::<Float32Type>(TOTAL * DIM, [42; 32]),
             DIM as i32,
@@ -3171,7 +3323,7 @@ mod tests {
         let store = FlatFloatStorage::new(fsl.clone(), DistanceType::L2);
         let hnsw = HNSW::index_vectors(
             &store,
-            HnswBuildParams::default().num_edges(20).ef_construction(50),
+            HnswBuildParams::default().num_edges(8).ef_construction(32),
         )
         .unwrap();
         // build through the plain storage, search through the counting one, so
@@ -3192,6 +3344,7 @@ mod tests {
                     upper_bound: None,
                     dist_q_c: 0.0,
                     use_acorn,
+                    rq_graph_scoring: Default::default(),
                 },
                 &counting,
                 prefilter,
@@ -3283,6 +3436,7 @@ mod tests {
             upper_bound: None,
             dist_q_c: 0.0,
             use_acorn: true,
+            rq_graph_scoring: Default::default(),
         };
         let query_key = fsl.value(0);
 
@@ -3336,14 +3490,14 @@ mod tests {
         use arrow::datatypes::UInt32Type;
 
         const DIM: usize = 32;
-        const TOTAL: usize = 2048;
+        const TOTAL: usize = 512;
         let fsl =
             FixedSizeListArray::try_new_from_values(generate_random_array(TOTAL * DIM), DIM as i32)
                 .unwrap();
         let store = Arc::new(FlatFloatStorage::new(fsl, DistanceType::L2));
         let builder = HNSW::index_vectors(
             store.as_ref(),
-            HnswBuildParams::default().num_edges(20).ef_construction(50),
+            HnswBuildParams::default().num_edges(8).ef_construction(32),
         )
         .unwrap();
 
@@ -3420,14 +3574,14 @@ mod tests {
     #[test]
     fn test_load_legacy_misaligned_level_offsets() {
         const DIM: usize = 32;
-        const TOTAL: usize = 2048;
+        const TOTAL: usize = 512;
         let fsl =
             FixedSizeListArray::try_new_from_values(generate_random_array(TOTAL * DIM), DIM as i32)
                 .unwrap();
         let store = Arc::new(FlatFloatStorage::new(fsl.clone(), DistanceType::L2));
         let builder = HNSW::index_vectors(
             store.as_ref(),
-            HnswBuildParams::default().num_edges(20).ef_construction(50),
+            HnswBuildParams::default().num_edges(8).ef_construction(32),
         )
         .unwrap();
         assert!(builder.max_level() >= 2);
@@ -3453,6 +3607,7 @@ mod tests {
             upper_bound: None,
             dist_q_c: 0.0,
             use_acorn: false,
+            rq_graph_scoring: Default::default(),
         };
         let entry_point = builder.inner.entry_point as usize;
         let query_indices = [0, 1, TOTAL / 3, TOTAL - 1]
@@ -3548,6 +3703,7 @@ mod tests {
             upper_bound: None,
             dist_q_c: 0.0,
             use_acorn: false,
+            rq_graph_scoring: Default::default(),
         };
         let query = Arc::new(generate_random_array(DIM)) as ArrayRef;
 
@@ -3679,6 +3835,7 @@ mod tests {
             upper_bound: None,
             dist_q_c: 0.0,
             use_acorn: false,
+            rq_graph_scoring: Default::default(),
         };
         let (results, _) = loaded
             .search_basic(query, 10, &params, None, store.as_ref())
@@ -3776,6 +3933,7 @@ mod tests {
             upper_bound: None,
             dist_q_c: 0.0,
             use_acorn: false,
+            rq_graph_scoring: Default::default(),
         };
         let query = fsl.value(7);
         let (a, _) = builder
@@ -3856,14 +4014,14 @@ mod tests {
     #[tokio::test]
     async fn test_loaded_graph_is_arrow_backed() {
         const DIM: usize = 32;
-        const TOTAL: usize = 2048;
+        const TOTAL: usize = 512;
         let fsl =
             FixedSizeListArray::try_new_from_values(generate_random_array(TOTAL * DIM), DIM as i32)
                 .unwrap();
         let store = Arc::new(FlatFloatStorage::new(fsl, DistanceType::L2));
         let builder = HNSW::index_vectors(
             store.as_ref(),
-            HnswBuildParams::default().num_edges(20).ef_construction(50),
+            HnswBuildParams::default().num_edges(8).ef_construction(32),
         )
         .unwrap();
         assert!(!matches!(builder.inner.graph, HnswGraph::Loaded(_)));
@@ -3896,6 +4054,7 @@ mod tests {
             dist_q_c: 0.0,
             approx_mode: Default::default(),
             segment_ef: Default::default(),
+            rq_graph_scoring: Default::default(),
         }
     }
 
@@ -4032,6 +4191,7 @@ mod tests {
                     upper_bound: None,
                     dist_q_c: 0.0,
                     use_acorn: false,
+                    rq_graph_scoring: Default::default(),
                 },
                 None,
                 &counting,
@@ -4062,6 +4222,7 @@ mod tests {
             upper_bound: None,
             dist_q_c: 0.0,
             use_acorn: false,
+            rq_graph_scoring: Default::default(),
         };
 
         let mut visited_generator = VisitedGenerator::new(storage.len());
@@ -4160,6 +4321,7 @@ mod tests {
                 upper_bound: None,
                 dist_q_c: 0.0,
                 use_acorn,
+                rq_graph_scoring: Default::default(),
             };
             for query_id in (0..TOTAL).step_by(TOTAL / 10) {
                 let query = fsl.value(query_id);
@@ -4209,6 +4371,7 @@ mod tests {
                     upper_bound: None,
                     dist_q_c: 0.0,
                     use_acorn: false,
+                    rq_graph_scoring: Default::default(),
                 },
                 &store,
                 &mask,

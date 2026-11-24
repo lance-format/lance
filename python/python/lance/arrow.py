@@ -252,7 +252,9 @@ class ImageURIArray(ImageArray):
         Examples
         --------
         >>> import os
-        >>> uris = [os.path.join(os.path.dirname(__file__), "../tests/images/1.png")]
+        >>> from PIL import Image
+        >>> Image.new("RGBA", (1, 1), (42, 42, 42, 255)).save("1.png")
+        >>> uris = [os.path.abspath("1.png")]
         >>> uri_array = ImageURIArray.from_uris(uris)
         >>> uri_array.read_uris()
         <lance.arrow.EncodedImageArray object at 0x...>
@@ -352,7 +354,9 @@ class EncodedImageArray(ImageArray):
         Examples
         --------
         >>> import os
-        >>> uris = [os.path.join(os.path.dirname(__file__), "../tests/images/1.png")]
+        >>> from PIL import Image
+        >>> Image.new("RGBA", (1, 1), (42, 42, 42, 255)).save("1.png")
+        >>> uris = [os.path.abspath("1.png")]
         >>> encoded_image_array = ImageURIArray.from_uris(uris).read_uris()
         >>> encoded_image_array.to_tensor()
         <lance.arrow.FixedShapeImageTensorArray object at 0x...>
@@ -425,7 +429,9 @@ class FixedShapeImageTensorArray(ImageArray):
         --------
 
         >>> import os
-        >>> uris = [os.path.join(os.path.dirname(__file__), "../tests/images/1.png")]
+        >>> from PIL import Image
+        >>> Image.new("RGBA", (1, 1), (42, 42, 42, 255)).save("1.png")
+        >>> uris = [os.path.abspath("1.png")]
         >>> tensor_image_array = ImageURIArray.from_uris(uris).read_uris().to_tensor()
         >>> tensor_image_array.to_numpy()
         array([[[[ 42,  42,  42, 255]]]], dtype=uint8)
@@ -574,9 +580,21 @@ def cast(
                 "Only support casting fixed size list to fixed size list "
                 f"with the same size, got: {arr.type} to {target_type}"
             )
-        values = cast(arr.values, list_type.value_type)
-        return pa.FixedSizeListArray.from_arrays(
-            values=values, list_size=list_type.list_size
+        # ``arr.values`` ignores the array's offset and length, so slice it.
+        list_size = list_type.list_size
+        values = arr.values.slice(arr.offset * list_size, len(arr) * list_size)
+        values = cast(values, list_type.value_type)
+        if arr.null_count == 0:
+            return pa.FixedSizeListArray.from_arrays(values=values, list_size=list_size)
+        # ``from_arrays(mask=...)`` needs PyArrow 15; build from buffers so the
+        # validity bitmap is kept on every supported PyArrow version.
+        validity = arr.is_valid().buffers()[1]
+        return pa.Array.from_buffers(
+            pa.list_(values.type, list_size),
+            len(arr),
+            [validity],
+            null_count=arr.null_count,
+            children=[values],
         )
 
     # Fallback to normal cast.

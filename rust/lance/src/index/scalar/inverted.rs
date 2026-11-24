@@ -36,6 +36,7 @@ use crate::{
     Dataset, Error, Result,
     dataset::index::LanceIndexStoreExt,
     index::{DatasetIndexExt, scalar::fetch_index_details},
+    session::caches::InvertedIndexParamsKey,
 };
 
 #[derive(Debug, Clone)]
@@ -822,10 +823,14 @@ pub(crate) fn transform_fts_document_stream(
             .column_by_name(&resolved.root_column)
             .or_else(|| batch.column_by_name(VALUE_COLUMN_NAME))
             .expect("FTS document input schema was validated");
-        let documents = resolved
+        let mut documents = resolved
             .documents_from_array(source, batch.num_rows())
             .map_err(DataFusionError::from)?;
         let input_row_ids = batch[ROW_ID].as_primitive::<arrow_array::types::UInt64Type>();
+        // The row-ID validity bitmap can carry the scan's selection vector.
+        if input_row_ids.null_count() > 0 {
+            documents.retain(|document| input_row_ids.is_valid(document.row_index));
+        }
         let texts =
             StringArray::from_iter_values(documents.iter().map(|document| document.text.as_str()));
         let row_ids = UInt64Array::from_iter_values(
@@ -1033,7 +1038,7 @@ pub(crate) async fn merge_segments(
                 segment.uuid
             ))
         })?;
-        if segment.fields != segments[0].fields {
+        if !segment.declares_same_fields(&segments[0]) {
             return Err(Error::invalid_input(format!(
                 "FTS index {} has inconsistent fields across segments",
                 segments[0].name
@@ -1124,9 +1129,8 @@ pub async fn load_segments(
         return Ok(None);
     }
 
-    let expected_fields = indices[0].fields.clone();
     for meta in &indices {
-        if meta.fields != expected_fields {
+        if !meta.declares_same_fields(&indices[0]) {
             return Err(Error::invalid_input(format!(
                 "FTS index {} has inconsistent fields across segments",
                 index_meta.name
@@ -1231,18 +1235,133 @@ fn inverted_index_details_semantically_equal(
     left == right
 }
 
-/// Read one segment's [`InvertedIndexParams`]
+/// Read one segment's [`InvertedIndexParams`], caching decoded values in the
+/// dataset's metadata cache by immutable segment UUID without populating the
+/// index partition cache.
 pub async fn load_segment_params(
     dataset: &Dataset,
     segment: &IndexMetadata,
 ) -> Result<InvertedIndexParams> {
-    let store = LanceIndexStore::from_dataset_for_existing(dataset, segment).await?;
-    InvertedIndex::load_params(&store).await
+    let params = dataset
+        .metadata_cache
+        .get_or_insert_with_key(
+            InvertedIndexParamsKey {
+                uuid: &segment.uuid,
+            },
+            || async {
+                let store = LanceIndexStore::from_dataset_for_existing(dataset, segment).await?;
+                InvertedIndex::load_params(&store).await
+            },
+        )
+        .await?;
+    Ok(params.as_ref().clone())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow_array::RecordBatchIterator;
+    use lance_io::object_store::ObjectStoreRegistry;
+
+    use crate::dataset::WriteParams;
+    use crate::session::Session;
+
+    #[rstest::rstest]
+    #[case::disabled(0)]
+    #[case::oversized(1024)]
+    #[case::enabled(1024 * 1024)]
+    #[tokio::test]
+    async fn segment_params_cache_respects_budget_and_index_replacement(
+        #[case] cache_bytes: usize,
+    ) {
+        let batch =
+            arrow_array::record_batch!(("text", Utf8, [r#"{"title":"alpha beta"}"#])).unwrap();
+        let session = Arc::new(Session::new(
+            1024 * 1024,
+            cache_bytes,
+            Arc::new(ObjectStoreRegistry::default()),
+        ));
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
+            "memory://",
+            Some(WriteParams {
+                session: Some(session),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let json_params = InvertedIndexParams::default()
+            .lance_tokenizer("json".into())
+            .custom_stop_words(Some(vec!["x".repeat(2048)]));
+        dataset
+            .create_index(
+                &["text"],
+                lance_index::IndexType::Inverted,
+                None,
+                &json_params,
+                true,
+            )
+            .await
+            .unwrap();
+        let old_segment = dataset.load_indices().await.unwrap()[0].clone();
+        let old_snapshot = dataset.clone();
+        dataset.index_cache.clear().await;
+        dataset.metadata_cache.clear().await;
+        let index_entries_before = dataset.index_cache_entry_count().await;
+
+        let before = dataset.object_store.io_stats_snapshot().read_iops;
+        let first = load_segment_params(&dataset, &old_segment).await.unwrap();
+        let after_first = dataset.object_store.io_stats_snapshot().read_iops;
+        assert!(after_first > before);
+        assert!(first.same_tokenization(&json_params));
+        assert_eq!(
+            dataset.index_cache_entry_count().await,
+            index_entries_before,
+            "load_segment_params must not populate the index cache"
+        );
+        let repeated = load_segment_params(&dataset, &old_segment).await.unwrap();
+        assert_eq!(first, repeated);
+        let after_repeat = dataset.object_store.io_stats_snapshot().read_iops;
+        if cache_bytes <= 1024 {
+            assert!(after_repeat > after_first);
+        } else {
+            assert_eq!(after_repeat, after_first);
+        }
+
+        dataset.metadata_cache.clear().await;
+        let before_reload = dataset.object_store.io_stats_snapshot().read_iops;
+        assert_eq!(
+            load_segment_params(&dataset, &old_segment).await.unwrap(),
+            first
+        );
+        assert!(dataset.object_store.io_stats_snapshot().read_iops > before_reload);
+
+        // Replacing the index changes its tokenizer but must not invalidate the
+        // immutable old snapshot or reuse its cached parameters for the new one.
+        let text_params = InvertedIndexParams::default().lance_tokenizer("text".into());
+        dataset
+            .create_index(
+                &["text"],
+                lance_index::IndexType::Inverted,
+                None,
+                &text_params,
+                true,
+            )
+            .await
+            .unwrap();
+        let new_segment = dataset.load_indices().await.unwrap()[0].clone();
+        assert_ne!(old_segment.uuid, new_segment.uuid);
+        let replacement = load_segment_params(&dataset, &new_segment).await.unwrap();
+        assert!(replacement.same_tokenization(&text_params));
+        assert!(!replacement.same_tokenization(&first));
+        assert_eq!(
+            load_segment_params(&old_snapshot, &old_segment)
+                .await
+                .unwrap(),
+            first
+        );
+    }
 
     /// A covered FTS index (`fields=[tags, id]`, `id` carried) must still be
     /// recognized by `indexed_fts_document_granularities`: matching on

@@ -11,18 +11,35 @@ import "index.proto";
 
 /* Query-time approximation mode for vector search.
  *
- * This currently only affects RQ-quantized vector indexes, such as IVF_RQ.
- * Other index types ignore this setting.
+ * This currently affects RQ-quantized vector indexes (such as IVF_RQ) and
+ * HNSW sub-index searches that exclude rows (for example through a prefilter
+ * or deletions), where Fast enables the ACORN traversal. Other index types
+ * ignore this setting.
  */
 enum VectorApproxMode {
   // Use all RQ bits for query-time scoring with u8-quantized lookup tables.
   Normal = 0;
-  // Use only one RQ bit for query-time scoring, even for multi-bit indexes.
+  /* Use only one RQ bit for query-time scoring, even for multi-bit indexes.
+   * On HNSW sub-indexes, also enable the ACORN traversal for searches that
+   * exclude rows.
+   */
   Fast = 1;
   /* Use all RQ bits for query-time scoring with u16-quantized lookup tables
    * to reduce estimator quantization error.
    */
   Accurate = 2;
+}
+
+/* How an HNSW search over RQ codes (IVF_HNSW_RQ) scores the nodes it visits.
+ * Other index types ignore this setting.
+ */
+enum VectorRqGraphScoring {
+  // Score every visited node with the full multi-bit RQ estimator.
+  MultiBit = 0;
+  /* Walk the graph with the 1-bit sign codes, then rescore the ef finalists
+   * with the full multi-bit codes.
+   */
+  OneBitRerank = 1;
 }
 
 /* The covering ("included") index columns a query needs materialized, as dataset
@@ -82,8 +99,10 @@ message VectorQueryProto {
   bool use_index = 11;
   optional float dist_q_c = 12;
   optional int32 query_parallelism = 13;
-  /* Query-time approximation mode. Currently only affects RQ-quantized vector
-   * indexes, such as IVF_RQ. Other index types ignore this setting.
+  /* Query-time approximation mode. Currently affects RQ-quantized vector
+   * indexes (such as IVF_RQ) and HNSW sub-index searches that exclude rows
+   * (for example through a prefilter or deletions), where Fast enables the
+   * ACORN traversal. Other index types ignore this setting.
    */
   VectorApproxMode approx_mode = 14;
   /* Which covering columns the index must materialize for this query. Absent means
@@ -98,10 +117,14 @@ message VectorQueryProto {
    * subject to caller bounds. Later candidate-count expansion is unchanged.
    */
   optional double search_effort = 16;
+  /* How an IVF_HNSW_RQ graph search scores visited nodes. Other index types
+   * ignore this setting.
+   */
+  VectorRqGraphScoring rq_graph_scoring = 17;
   /* Beam width of the delta segments. Absent, as from a producer that predates
    * the field, means the executor's default policy.
    */
-  SegmentEfProto segment_ef = 17;
+  SegmentEfProto segment_ef = 18;
 }
 
 /* Serializable form of ANNIvfSubIndexExec — the IVF sub-index search node.

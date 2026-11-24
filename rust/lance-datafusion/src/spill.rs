@@ -2,9 +2,13 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::{
-    io::{BufReader, BufWriter, Write},
+    io::{self, BufReader, BufWriter, Read, Write},
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, Instant},
 };
 
 use arrow::ipc::{reader::StreamReader, writer::StreamWriter};
@@ -12,13 +16,110 @@ use arrow_array::RecordBatch;
 use arrow_schema::{ArrowError, Schema, SchemaRef};
 use datafusion::{
     catalog::{TableProvider, streaming::StreamingTable},
-    execution::{SendableRecordBatchStream, SpillFile, TaskContext, disk_manager::DiskManager},
-    physical_plan::{stream::RecordBatchStreamAdapter, streaming::PartitionStream},
+    execution::{
+        SendableRecordBatchStream, SpillFile, TaskContext, disk_manager::DiskManager,
+        runtime_env::RuntimeEnv,
+    },
+    physical_plan::{
+        SpillManager,
+        metrics::{ExecutionPlanMetricsSet, SpillMetrics},
+        stream::RecordBatchStreamAdapter,
+        streaming::PartitionStream,
+    },
 };
 use datafusion_common::DataFusionError;
 use futures::StreamExt;
 use lance_arrow::memory::MemoryAccumulator;
 use lance_core::error::LanceOptionExt;
+use tracing::Instrument;
+
+/// Traffic from a single Arrow replay spill, excluding in-memory batch replay.
+///
+/// Bytes include IPC headers, body, and footer. Reads count each consumption,
+/// including buffered read-ahead. Physical file/quota lifetime remains managed
+/// by the job's DataFusion disk manager and is not counted again here.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ReplaySpillUsage {
+    /// Files opened for writing; zero when the source remained in memory.
+    pub spill_count: u64,
+    /// Bytes accepted by successful underlying write calls.
+    pub bytes_written: u64,
+    /// Bytes returned by underlying file reads, including repeated replay.
+    pub bytes_read: u64,
+    /// Cumulative underlying write time, excluding blocking-pool queue wait.
+    pub write_duration: Duration,
+    /// Cumulative underlying read time, excluding blocking-pool queue wait.
+    pub read_duration: Duration,
+}
+
+/// Explicit replay traffic scope, independent of any session-wide disk manager.
+#[derive(Debug, Default)]
+pub struct ReplaySpillMetrics {
+    spill_count: AtomicU64,
+    bytes_written: AtomicU64,
+    bytes_read: AtomicU64,
+    write_time_ns: AtomicU64,
+    read_time_ns: AtomicU64,
+}
+
+impl ReplaySpillMetrics {
+    /// Snapshot observed traffic. Fields can advance concurrently and are not atomic as a group.
+    pub fn snapshot(&self) -> ReplaySpillUsage {
+        ReplaySpillUsage {
+            spill_count: self.spill_count.load(Ordering::Relaxed),
+            bytes_written: self.bytes_written.load(Ordering::Relaxed),
+            bytes_read: self.bytes_read.load(Ordering::Relaxed),
+            write_duration: Duration::from_nanos(self.write_time_ns.load(Ordering::Relaxed)),
+            read_duration: Duration::from_nanos(self.read_time_ns.load(Ordering::Relaxed)),
+        }
+    }
+}
+
+struct ReplayWriter {
+    inner: Box<dyn Write + Send>,
+    metrics: Arc<ReplaySpillMetrics>,
+}
+
+impl Write for ReplayWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let start = Instant::now();
+        let result = self.inner.write(bytes);
+        self.metrics
+            .write_time_ns
+            .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        if let Ok(count) = result {
+            self.metrics
+                .bytes_written
+                .fetch_add(count as u64, Ordering::Relaxed);
+        }
+        result
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+struct ReplayReader {
+    inner: std::fs::File,
+    metrics: Arc<ReplaySpillMetrics>,
+}
+
+impl Read for ReplayReader {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        let start = Instant::now();
+        let result = self.inner.read(bytes);
+        self.metrics
+            .read_time_ns
+            .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        if let Ok(count) = result {
+            self.metrics
+                .bytes_read
+                .fetch_add(count as u64, Ordering::Relaxed);
+        }
+        result
+    }
+}
 
 /// Start a spill of Arrow data to a file that can be read later multiple times.
 ///
@@ -44,6 +145,7 @@ pub fn create_replay_spill(
     schema: Arc<Schema>,
     memory_limit: usize,
 ) -> (SpillSender, SpillReceiver) {
+    let metrics = Arc::new(ReplaySpillMetrics::default());
     let initial_status = WriteStatus::default();
     let (status_sender, status_receiver) = tokio::sync::watch::channel(initial_status);
     let sender = SpillSender {
@@ -53,15 +155,154 @@ pub fn create_replay_spill(
         schema: schema.clone(),
         state: SpillState::default(),
         status_sender,
+        metrics: metrics.clone(),
     };
 
     let receiver = SpillReceiver {
         status_receiver,
         path,
         schema,
+        metrics,
     };
 
     (sender, receiver)
+}
+
+enum MaterializedStreamStorage {
+    Memory(Arc<[RecordBatch]>),
+    Spill {
+        manager: SpillManager,
+        file: Arc<dyn SpillFile>,
+    },
+}
+
+/// A fully materialized stream that can be replayed sequentially.
+///
+/// The materialized batches remain in memory when they fit within the configured limit. Larger
+/// inputs are stored in a DataFusion-managed spill file, so temporary-disk accounting and cleanup
+/// follow the runtime's resource limits.
+pub struct MaterializedStream {
+    schema: SchemaRef,
+    storage: MaterializedStreamStorage,
+}
+
+impl MaterializedStream {
+    /// Opens a new stream over the materialized batches.
+    ///
+    /// Multiple streams may be opened, but callers should consume them sequentially to avoid
+    /// multiplying decoded-batch memory and disk IO.
+    pub fn read(&self) -> Result<SendableRecordBatchStream, DataFusionError> {
+        match &self.storage {
+            MaterializedStreamStorage::Memory(batches) => {
+                let batches = batches.to_vec();
+                Ok(Box::pin(RecordBatchStreamAdapter::new(
+                    self.schema.clone(),
+                    futures::stream::iter(batches.into_iter().map(Ok)),
+                )))
+            }
+            MaterializedStreamStorage::Spill { manager, file } => {
+                manager.read_spill_as_stream_unbuffered(file.clone(), None)
+            }
+        }
+    }
+}
+
+/// Fully materializes a stream into replayable memory or managed spill storage.
+///
+/// Up to `memory_limit` bytes are retained in memory. Larger inputs are written once to a
+/// DataFusion-managed spill file and can subsequently be replayed without evaluating the source
+/// again. The returned metrics describe the materialization write, not later reads.
+///
+/// # Examples
+///
+/// ```
+/// # use std::sync::Arc;
+/// # use arrow_array::RecordBatch;
+/// # use arrow_schema::Schema;
+/// # use datafusion::execution::{SendableRecordBatchStream, runtime_env::RuntimeEnvBuilder};
+/// # use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+/// # use datafusion_common::DataFusionError;
+/// # use lance_datafusion::spill::materialize_replayable_stream;
+/// # async fn example() -> Result<(), DataFusionError> {
+/// let schema = Arc::new(Schema::empty());
+/// let source: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+///     schema,
+///     futures::stream::empty::<Result<RecordBatch, DataFusionError>>(),
+/// ));
+/// let runtime = RuntimeEnvBuilder::new().build_arc()?;
+/// let (materialized, _metrics) =
+///     materialize_replayable_stream(source, runtime, 1024, "example").await?;
+///
+/// let first_read = materialized.read()?;
+/// drop(first_read);
+/// let second_read = materialized.read()?;
+/// drop(second_read);
+/// # Ok(())
+/// # }
+/// ```
+pub async fn materialize_replayable_stream(
+    mut source: SendableRecordBatchStream,
+    runtime: Arc<RuntimeEnv>,
+    memory_limit: usize,
+    request_description: &str,
+) -> Result<(MaterializedStream, ExecutionPlanMetricsSet), DataFusionError> {
+    let schema = source.schema();
+    let metrics = ExecutionPlanMetricsSet::new();
+    let spill_metrics = SpillMetrics::new(&metrics, 0);
+    let spill_manager = SpillManager::new(runtime, spill_metrics, schema.clone())
+        .with_batch_read_buffer_capacity(1);
+    let mut buffered_batches = Vec::new();
+    let mut buffered_memory = MemoryAccumulator::default();
+    let mut spill_file = spill_manager.create_in_progress_file(request_description)?;
+    let mut is_spilled = false;
+
+    while let Some(batch) = source.next().await {
+        let batch = batch?;
+        if is_spilled {
+            spill_file.append_batch(&batch)?;
+            continue;
+        }
+
+        buffered_memory.record_batch(&batch);
+        buffered_batches.push(batch);
+        if buffered_memory.total() > memory_limit {
+            for buffered_batch in buffered_batches.drain(..) {
+                spill_file.append_batch(&buffered_batch)?;
+            }
+            is_spilled = true;
+        }
+    }
+
+    let storage = if is_spilled {
+        match spill_file.finish()? {
+            Some(file) => MaterializedStreamStorage::Spill {
+                manager: spill_manager,
+                file,
+            },
+            None => MaterializedStreamStorage::Memory(Arc::new([])),
+        }
+    } else {
+        MaterializedStreamStorage::Memory(buffered_batches.into())
+    };
+    Ok((MaterializedStream { schema, storage }, metrics))
+}
+
+/// Fully materializes a stream before replaying it.
+///
+/// Unlike [`spilling_table_provider_with_job_disk_manager`], this function does not allow replay
+/// to begin while the source is still running. It is intended as a pipeline barrier between
+/// operators whose non-spillable reservations cannot safely coexist in one memory pool. Up to
+/// `memory_limit` bytes are retained in memory; larger inputs use a DataFusion-managed spill file.
+pub async fn materialize_stream(
+    source: SendableRecordBatchStream,
+    runtime: Arc<RuntimeEnv>,
+    memory_limit: usize,
+    request_description: &str,
+) -> Result<(SendableRecordBatchStream, ExecutionPlanMetricsSet), DataFusionError> {
+    let (materialized, metrics) =
+        materialize_replayable_stream(source, runtime, memory_limit, request_description).await?;
+    let stream = materialized.read()?;
+    Ok((stream, metrics))
 }
 
 /// Wrap a one-shot stream in a replayable provider using a job-local disk manager.
@@ -113,9 +354,30 @@ pub fn create_replay_spill(
 /// # }
 /// ```
 pub async fn spilling_table_provider_with_job_disk_manager(
+    source: SendableRecordBatchStream,
+    memory_limit: usize,
+    disk_manager: Arc<DiskManager>,
+) -> Result<Arc<dyn TableProvider>, DataFusionError> {
+    spilling_table_provider_with_metrics(
+        source,
+        memory_limit,
+        disk_manager,
+        Arc::new(ReplaySpillMetrics::default()),
+    )
+    .await
+}
+
+/// Build a replay provider with explicit operation-owned traffic accounting.
+///
+/// Shares the quota and lifecycle semantics of
+/// [`spilling_table_provider_with_job_disk_manager`]. Retain `metrics` to observe
+/// repeated scans and I/O completing after cancellation. Use a fresh handle per
+/// operation; no process-global snapshot subtraction is involved.
+pub async fn spilling_table_provider_with_metrics(
     mut source: SendableRecordBatchStream,
     memory_limit: usize,
     disk_manager: Arc<DiskManager>,
+    metrics: Arc<ReplaySpillMetrics>,
 ) -> Result<Arc<dyn TableProvider>, DataFusionError> {
     let schema = source.schema();
     let spill_file = disk_manager.create_tmp_file("writing replay spill")?;
@@ -127,40 +389,45 @@ pub async fn spilling_table_provider_with_job_disk_manager(
             )
         })?
         .to_owned();
-    let (mut sender, receiver) = create_replay_spill(spill_path, schema.clone(), memory_limit);
+    let (mut sender, mut receiver) = create_replay_spill(spill_path, schema.clone(), memory_limit);
+    sender.metrics = metrics.clone();
+    receiver.metrics = metrics;
     sender.managed_spill = Some(spill_file.clone());
 
     // Drain the one-shot source into the spill once, in the background. The spill
     // tees to memory/disk so the first reader can consume batches as they arrive
     // while later readers replay the complete source.
-    let drain_handle = tokio::task::spawn(async move {
-        let mut errored = false;
-        while let Some(res) = source.next().await {
-            match res {
-                Ok(batch) => {
-                    if let Err(e) = sender.write(batch).await {
+    let drain_handle = lance_core::utils::tokio::spawn(
+        async move {
+            let mut errored = false;
+            while let Some(res) = source.next().await {
+                match res {
+                    Ok(batch) => {
+                        if let Err(e) = sender.write(batch).await {
+                            sender.send_error(e);
+                            errored = true;
+                            break;
+                        }
+                    }
+                    Err(e) => {
                         sender.send_error(e);
                         errored = true;
                         break;
                     }
                 }
-                Err(e) => {
-                    sender.send_error(e);
-                    errored = true;
-                    break;
-                }
             }
+            // Release upstream execution state before readers can observe completion.
+            drop(source);
+            // Only finish on a clean drain. Calling finish() after an error would
+            // overwrite the original (replayable) error with a generic one, losing
+            // the source error's type (e.g. an external error from user code).
+            if !errored && let Err(err) = sender.finish().await {
+                sender.send_error(err);
+            }
+            sender
         }
-        // Release upstream execution state before readers can observe completion.
-        drop(source);
-        // Only finish on a clean drain. Calling finish() after an error would
-        // overwrite the original (replayable) error with a generic one, losing
-        // the source error's type (e.g. an external error from user code).
-        if !errored && let Err(err) = sender.finish().await {
-            sender.send_error(err);
-        }
-        sender
-    });
+        .in_current_span(),
+    );
 
     let partition = Arc::new(SpillPartition {
         schema: schema.clone(),
@@ -172,11 +439,11 @@ pub async fn spilling_table_provider_with_job_disk_manager(
 }
 
 struct AbortOnDropHandle<T> {
-    handle: tokio::task::JoinHandle<T>,
+    handle: lance_core::utils::tokio::JoinHandle<T>,
 }
 
 impl<T> AbortOnDropHandle<T> {
-    fn new(handle: tokio::task::JoinHandle<T>) -> Self {
+    fn new(handle: lance_core::utils::tokio::JoinHandle<T>) -> Self {
         Self { handle }
     }
 }
@@ -237,9 +504,14 @@ pub struct SpillReceiver {
     status_receiver: tokio::sync::watch::Receiver<WriteStatus>,
     path: PathBuf,
     schema: Arc<Schema>,
+    metrics: Arc<ReplaySpillMetrics>,
 }
 
 impl SpillReceiver {
+    /// Retain replay traffic accounting independently of sender/reader lifetimes.
+    pub fn metrics(&self) -> Arc<ReplaySpillMetrics> {
+        self.metrics.clone()
+    }
     /// Returns a stream of batches from the spill. The stream will emit
     /// batches as they are written to the spill. If the spill has already
     /// been finished, the stream will emit all batches in the spill.
@@ -249,7 +521,7 @@ impl SpillReceiver {
     /// If the spill has been dropped, an error will be returned.
     pub fn read(&self) -> SendableRecordBatchStream {
         let rx = self.status_receiver.clone();
-        let reader = SpillReader::new(rx, self.path.clone());
+        let reader = SpillReader::new(rx, self.path.clone(), self.metrics.clone());
 
         let stream = futures::stream::try_unfold(reader, move |mut reader| async move {
             match reader.read().await {
@@ -267,6 +539,7 @@ struct SpillReader {
     pub batches_read: usize,
     receiver: tokio::sync::watch::Receiver<WriteStatus>,
     state: SpillReaderState,
+    metrics: Arc<ReplaySpillMetrics>,
 }
 
 enum SpillReaderState {
@@ -275,11 +548,16 @@ enum SpillReaderState {
 }
 
 impl SpillReader {
-    fn new(receiver: tokio::sync::watch::Receiver<WriteStatus>, spill_path: PathBuf) -> Self {
+    fn new(
+        receiver: tokio::sync::watch::Receiver<WriteStatus>,
+        spill_path: PathBuf,
+        metrics: Arc<ReplaySpillMetrics>,
+    ) -> Self {
         Self {
             batches_read: 0,
             receiver,
             state: SpillReaderState::Buffered { spill_path },
+            metrics,
         }
     }
 
@@ -312,7 +590,7 @@ impl SpillReader {
 
     async fn get_reader(&mut self) -> Result<&AsyncStreamReader, ArrowError> {
         if let SpillReaderState::Buffered { spill_path } = &self.state {
-            let reader = AsyncStreamReader::open(spill_path.clone()).await?;
+            let reader = AsyncStreamReader::open(spill_path.clone(), self.metrics.clone()).await?;
             // Skip batches we've already read before the writer started spilling.
             // The read batches were spilled to the file for the benefit of
             // future readers, as the spill is replay-able.
@@ -362,6 +640,7 @@ pub struct SpillSender {
     path: PathBuf,
     state: SpillState,
     status_sender: tokio::sync::watch::Sender<WriteStatus>,
+    metrics: Arc<ReplaySpillMetrics>,
 }
 
 enum SpillState {
@@ -536,6 +815,7 @@ impl SpillSender {
                         self.path.clone(),
                         self.schema.clone(),
                         self.managed_spill.clone(),
+                        self.metrics.clone(),
                     )
                     .await?;
                     let batches_written = batches.len();
@@ -645,6 +925,7 @@ impl AsyncStreamWriter {
         path: PathBuf,
         schema: Arc<Schema>,
         managed_spill: Option<Arc<dyn SpillFile>>,
+        metrics: Arc<ReplaySpillMetrics>,
     ) -> Result<Self, ArrowError> {
         let writer = tokio::task::spawn_blocking(move || {
             let writer: Box<dyn Write + Send> = if let Some(spill) = managed_spill {
@@ -656,7 +937,14 @@ impl AsyncStreamWriter {
             } else {
                 Box::new(std::fs::File::create(&path).map_err(ArrowError::from)?)
             };
-            TrackedStreamWriter::try_new(writer, &schema)
+            metrics.spill_count.fetch_add(1, Ordering::Relaxed);
+            TrackedStreamWriter::try_new(
+                Box::new(ReplayWriter {
+                    inner: writer,
+                    metrics,
+                }),
+                &schema,
+            )
         })
         .await
         .unwrap()?;
@@ -714,14 +1002,17 @@ impl TrackedStreamWriter {
 }
 
 struct AsyncStreamReader {
-    reader: Arc<Mutex<StreamReader<BufReader<std::fs::File>>>>,
+    reader: Arc<Mutex<StreamReader<BufReader<ReplayReader>>>>,
 }
 
 impl AsyncStreamReader {
-    pub async fn open(path: PathBuf) -> Result<Self, ArrowError> {
+    pub async fn open(path: PathBuf, metrics: Arc<ReplaySpillMetrics>) -> Result<Self, ArrowError> {
         let reader = tokio::task::spawn_blocking(move || {
             let file = std::fs::File::open(&path).map_err(ArrowError::from)?;
-            let reader = BufReader::new(file);
+            let reader = BufReader::new(ReplayReader {
+                inner: file,
+                metrics,
+            });
             StreamReader::try_new(reader, None)
         })
         .await
@@ -744,10 +1035,12 @@ impl AsyncStreamReader {
 
 #[cfg(test)]
 mod tests {
-    use arrow_array::Int32Array;
+    use arrow_array::{Int32Array, record_batch};
     use arrow_schema::{DataType, Field};
+    use datafusion::execution::{disk_manager::DiskManagerBuilder, runtime_env::RuntimeEnvBuilder};
     use futures::{StreamExt, TryStreamExt, poll};
     use lance_core::utils::tempfile::{TempStdFile, TempStdPath};
+    use rstest::rstest;
     use tokio::sync::{Barrier, oneshot};
 
     use super::*;
@@ -761,6 +1054,146 @@ mod tests {
                 let _ = sender.send(());
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_materialize_stream_to_managed_spill() {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+        let batches = vec![
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+            )
+            .unwrap(),
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int32Array::from(vec![4, 5, 6]))],
+            )
+            .unwrap(),
+        ];
+        let source = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            futures::stream::iter(batches.clone().into_iter().map(Ok)),
+        ));
+        let runtime = RuntimeEnvBuilder::new()
+            .with_disk_manager_builder(DiskManagerBuilder::default())
+            .build_arc()
+            .unwrap();
+
+        let (stream, metrics) =
+            materialize_stream(source, runtime.clone(), 0, "test materialization")
+                .await
+                .unwrap();
+        let progress = runtime.disk_manager.spilling_progress();
+        assert_eq!(progress.active_files_count, 1);
+        assert!(progress.current_bytes > 0);
+        assert_eq!(
+            metrics
+                .clone_inner()
+                .iter()
+                .filter_map(|metric| match metric.value() {
+                    datafusion::physical_plan::metrics::MetricValue::SpillCount(value) => {
+                        Some(value.value())
+                    }
+                    _ => None,
+                })
+                .sum::<usize>(),
+            1
+        );
+
+        let replayed = stream.try_collect::<Vec<_>>().await.unwrap();
+        assert_eq!(replayed, batches);
+        let progress = runtime.disk_manager.spilling_progress();
+        assert_eq!(progress.active_files_count, 0);
+        assert_eq!(progress.current_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn test_materialize_stream_in_memory() {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+        let source = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            futures::stream::iter(vec![Ok(batch.clone())]),
+        ));
+        let runtime = RuntimeEnvBuilder::new()
+            .with_disk_manager_builder(DiskManagerBuilder::default())
+            .build_arc()
+            .unwrap();
+
+        let (stream, metrics) =
+            materialize_stream(source, runtime.clone(), 1024, "test materialization")
+                .await
+                .unwrap();
+        assert_eq!(
+            runtime.disk_manager.spilling_progress().active_files_count,
+            0
+        );
+        assert_eq!(
+            metrics
+                .clone_inner()
+                .iter()
+                .filter_map(|metric| match metric.value() {
+                    datafusion::physical_plan::metrics::MetricValue::SpillCount(value) => {
+                        Some(value.value())
+                    }
+                    _ => None,
+                })
+                .sum::<usize>(),
+            0
+        );
+        assert_eq!(stream.try_collect::<Vec<_>>().await.unwrap(), vec![batch]);
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_materialize_stream_shared_slices(#[values(false, true)] distinct: bool) {
+        let batch = record_batch!(("a", Int32, (0..128).collect::<Vec<_>>())).unwrap();
+        let memory_limit = batch["a"].to_data().buffers()[0].capacity();
+        let mut batches = (0..128)
+            .step_by(32)
+            .map(|offset| batch.slice(offset, 32))
+            .collect::<Vec<_>>();
+        if distinct {
+            batches.push(record_batch!(("a", Int32, (0..128).collect::<Vec<_>>())).unwrap());
+        }
+        let source = Box::pin(RecordBatchStreamAdapter::new(
+            batch.schema(),
+            futures::stream::iter(batches.clone().into_iter().map(Ok)),
+        ));
+        let runtime = RuntimeEnvBuilder::new()
+            .with_disk_manager_builder(DiskManagerBuilder::default())
+            .build_arc()
+            .unwrap();
+
+        let (materialized, _) =
+            materialize_replayable_stream(source, runtime.clone(), memory_limit, "shared slices")
+                .await
+                .unwrap();
+        assert_eq!(
+            matches!(
+                materialized.storage,
+                MaterializedStreamStorage::Spill { .. }
+            ),
+            distinct
+        );
+        assert_eq!(
+            runtime.disk_manager.spilling_progress().active_files_count,
+            usize::from(distinct)
+        );
+        assert_eq!(
+            materialized
+                .read()
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap(),
+            batches
+        );
     }
 
     #[tokio::test]
@@ -782,6 +1215,8 @@ mod tests {
         // Create a stream
         let path = TempStdFile::default();
         let (mut spill, receiver) = create_replay_spill(path.to_owned(), schema.clone(), 0);
+        let metrics = receiver.metrics();
+        assert_eq!(metrics.snapshot(), ReplaySpillUsage::default());
 
         // We can open a reader prior to writing any data. No batches will be ready.
         let mut stream_before = receiver.read();
@@ -837,6 +1272,14 @@ mod tests {
         let stream_after_batches = stream_after.try_collect::<Vec<_>>().await.unwrap();
         assert_eq!(&stream_after_batches, &batches);
 
+        let usage = metrics.snapshot();
+        assert_eq!(usage.spill_count, 1);
+        assert_eq!(usage.bytes_written, std::fs::metadata(&path).unwrap().len());
+        assert!(
+            usage.bytes_read > usage.bytes_written,
+            "each replay must count its own reads: {usage:?}"
+        );
+
         std::fs::remove_file(path).unwrap();
     }
 
@@ -847,6 +1290,7 @@ mod tests {
         let path = TempStdFile::default();
         let (mut spill, receiver) =
             create_replay_spill(path.as_ref().to_owned(), schema.clone(), 0);
+        let metrics = receiver.metrics();
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
@@ -900,6 +1344,13 @@ mod tests {
             DataFusionError::Execution(message) if message.contains("🥱")
         ));
 
+        let usage = metrics.snapshot();
+        assert_eq!(usage.spill_count, 1);
+        assert!(usage.bytes_written > 0);
+        assert!(usage.bytes_read > 0);
+        assert!(usage.write_duration > Duration::ZERO);
+        assert!(usage.read_duration > Duration::ZERO);
+
         std::fs::remove_file(path).unwrap();
     }
 
@@ -909,6 +1360,7 @@ mod tests {
         let path = TempStdPath::default();
         let memory_limit = 1024 * 1024; // 1 MiB
         let (mut spill, receiver) = create_replay_spill(path.clone(), schema.clone(), memory_limit);
+        let metrics = receiver.metrics();
 
         // 0.5 MB batch
         let batch = RecordBatch::try_new(
@@ -929,6 +1381,7 @@ mod tests {
             .expect("Expected a batch")
             .expect("Expected no error");
         assert_eq!(&stream_batch, &batch);
+        assert_eq!(metrics.snapshot(), ReplaySpillUsage::default());
 
         assert!(!std::fs::exists(&path).unwrap());
     }

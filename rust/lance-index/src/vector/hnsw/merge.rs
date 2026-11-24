@@ -554,6 +554,7 @@ impl HNSW {
                                     upper_bound: None,
                                     dist_q_c: 0.0,
                                     use_acorn: false,
+                                    rq_graph_scoring: Default::default(),
                                 },
                                 &dist_calc,
                                 None,
@@ -752,6 +753,7 @@ mod tests {
             upper_bound: None,
             dist_q_c: 0.0,
             use_acorn: false,
+            rq_graph_scoring: Default::default(),
         };
         let (results, _) = hnsw
             .search_basic(query, k, &query_params, None, store)

@@ -17,14 +17,16 @@ use lance_core::{
     cache::{CacheKey, CacheKeySchema, KeyBuilder, LanceCache},
     utils::deletion::DeletionVector,
 };
+use lance_index::scalar::inverted::InvertedIndexParams;
 use lance_select::RowAddrMask;
 use lance_table::{
     format::{
         DataFile, DeletionFile, DeletionFileType, Manifest, RowDatasetVersionSequence, RowIdMeta,
     },
-    rowids::{RowIdIndex, RowIdSequence},
+    rowids::RowIdSequence,
 };
 use object_store::path::Path;
+use uuid::Uuid;
 
 use crate::dataset::transaction::Transaction;
 
@@ -130,20 +132,25 @@ pub struct DeletionFileKey<'a> {
 impl CacheKey for DeletionFileKey<'_> {
     type ValueType = DeletionVector;
     fn key(&self) -> Cow<'_, str> {
-        Cow::Owned(format!(
+        let mut key = format!(
             "deletion/{}/{}/{}/{}",
             self.fragment_id,
             self.deletion_file.read_version,
             self.deletion_file.id,
             self.deletion_file.file_type.suffix()
-        ))
+        );
+        if let Some(path) = &self.deletion_file.path {
+            key.push('/');
+            key.push_str(path);
+        }
+        Cow::Owned(key)
     }
     fn type_name() -> &'static str {
         "DeletionVector"
     }
 
     fn schema() -> CacheKeySchema {
-        CacheKeySchema::new("lance.dataset.deletion-file-key", 1)
+        CacheKeySchema::new("lance.dataset.deletion-file-key", 2)
     }
 
     fn write_key(&self, builder: &mut KeyBuilder) {
@@ -157,6 +164,13 @@ impl CacheKey for DeletionFileKey<'_> {
         if let Some(base_id) = self.deletion_file.base_id {
             builder.write_some();
             builder.write_u32(base_id);
+        } else {
+            builder.write_none();
+        }
+        // An explicit path identifies the file along with the fields above.
+        if let Some(path) = &self.deletion_file.path {
+            builder.write_some();
+            builder.write_str(path);
         } else {
             builder.write_none();
         }
@@ -210,52 +224,6 @@ impl CacheKey for RowAddrMaskKey<'_> {
             builder.write_u64(restrict_hash);
         } else {
             builder.write_none();
-        }
-    }
-}
-
-#[derive(Debug)]
-pub struct RowIdIndexKey<'a> {
-    pub version: u64,
-    /// Whether the index knows the deleted rows (it then maps them to `None`).
-    /// An index built without deletion vectors reads no deletion file.
-    pub with_deletions: bool,
-    /// A dataset dropped and recreated at the same URI restarts its version
-    /// history at 1, so a long-lived session's cache can otherwise return the
-    /// previous incarnation's index for a version number the new incarnation
-    /// now also holds. The e-tag disambiguates generations the same way
-    /// [`ManifestKey::e_tag`] does. Callers without one must not share the
-    /// cached index at all (see `get_row_id_index`).
-    pub e_tag: Option<&'a str>,
-}
-
-impl CacheKey for RowIdIndexKey<'_> {
-    type ValueType = RowIdIndex;
-    fn key(&self) -> Cow<'_, str> {
-        Cow::Owned(format!(
-            "row_id_index/{}/{}/{}",
-            self.version,
-            self.with_deletions,
-            self.e_tag.unwrap_or("")
-        ))
-    }
-    fn type_name() -> &'static str {
-        "RowIdIndex"
-    }
-
-    fn schema() -> CacheKeySchema {
-        CacheKeySchema::new("lance.dataset.row-id-index-key", 1)
-    }
-
-    fn write_key(&self, builder: &mut KeyBuilder) {
-        builder.write_u64(self.version);
-        builder.write_u64(self.with_deletions as u64);
-        match self.e_tag {
-            Some(e_tag) => {
-                builder.write_some();
-                builder.write_str(e_tag);
-            }
-            None => builder.write_none(),
         }
     }
 }
@@ -363,6 +331,34 @@ impl CacheKey for RowVersionSequenceKey<'_> {
     }
 }
 
+/// Complete persisted inverted-index tokenizer parameters, independent of row
+/// remapping. Stored in the metadata cache so parameter checks never populate
+/// the index partition cache.
+#[derive(Debug)]
+pub struct InvertedIndexParamsKey<'a> {
+    pub uuid: &'a Uuid,
+}
+
+impl CacheKey for InvertedIndexParamsKey<'_> {
+    type ValueType = InvertedIndexParams;
+
+    fn key(&self) -> Cow<'_, str> {
+        Cow::Owned(format!("inverted_params/{}", self.uuid))
+    }
+
+    fn type_name() -> &'static str {
+        "InvertedIndexParams"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.dataset.inverted-params-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_fixed_bytes(self.uuid.as_bytes());
+    }
+}
+
 impl DSMetadataCache {
     /// Create a file-specific metadata cache with the given prefix.
     /// This is used by file readers and other components that need file-level caching.
@@ -388,6 +384,8 @@ mod tests {
             file_type: DeletionFileType::Bitmap,
             num_deleted_rows: Some(1),
             base_id: None,
+            path: None,
+            inline: None,
         };
         cache
             .insert_with_key(
@@ -408,6 +406,43 @@ mod tests {
                 .get_with_key(&DeletionFileKey {
                     fragment_id: 2,
                     deletion_file: &deletion_file_on_other_base,
+                })
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn deletion_file_key_separates_explicit_paths() {
+        let cache = LanceCache::with_capacity(4096);
+        let deletion_file = DeletionFile {
+            read_version: 3,
+            id: 4,
+            file_type: DeletionFileType::Bitmap,
+            num_deleted_rows: Some(1),
+            base_id: None,
+            path: Some("_deletions/a.bin".to_string()),
+            inline: None,
+        };
+        cache
+            .insert_with_key(
+                &DeletionFileKey {
+                    fragment_id: 2,
+                    deletion_file: &deletion_file,
+                },
+                Arc::new(DeletionVector::NoDeletions),
+            )
+            .await;
+
+        let other_path = DeletionFile {
+            path: Some("_deletions/b.bin".to_string()),
+            ..deletion_file.clone()
+        };
+        assert!(
+            cache
+                .get_with_key(&DeletionFileKey {
+                    fragment_id: 2,
+                    deletion_file: &other_path,
                 })
                 .await
                 .is_none()
@@ -437,31 +472,6 @@ mod tests {
                     fragment_id: 0,
                     row_id_meta: &second_generation,
                     lineage_file: None,
-                })
-                .await
-                .is_none()
-        );
-    }
-
-    #[tokio::test]
-    async fn row_id_index_key_separates_manifest_generations() {
-        let cache = LanceCache::with_capacity(4096);
-        let key = RowIdIndexKey {
-            version: 5,
-            with_deletions: true,
-            e_tag: Some("first-etag"),
-        };
-        cache
-            .insert_with_key(&key, Arc::new(RowIdIndex::new(&[]).unwrap()))
-            .await;
-        assert!(cache.get_with_key(&key).await.is_some());
-
-        assert!(
-            cache
-                .get_with_key(&RowIdIndexKey {
-                    version: 5,
-                    with_deletions: true,
-                    e_tag: Some("second-etag"),
                 })
                 .await
                 .is_none()

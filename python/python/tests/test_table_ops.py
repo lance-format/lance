@@ -252,3 +252,31 @@ def test_incompatible_transaction_raises_non_retryable(tmp_path: str):
 
     assert isinstance(exc_info.value, OSError)
     assert exc_info.value.retryable is False
+
+
+@pytest.mark.parametrize("data_change", [True, False])
+def test_data_replacement_data_change_round_trips(tmp_path: str, data_change: bool):
+    """`data_change` survives commit and read_transaction, and only a replacement
+    that changes values withdraws index coverage of the replaced column."""
+    table = pa.Table.from_pydict({"a": range(100)})
+    ds = lance.write_dataset(table, tmp_path)
+    ds.add_columns({"b": "a + 1"})
+    ds.create_scalar_index("b", "BTREE")
+
+    # The same values of b, written to a new file.
+    new_data_file = make_data_file(ds, [1], pa.table({"b": range(1, 101)}))
+    ds = lance.LanceDataset.commit(
+        ds.uri,
+        lance.LanceOperation.DataReplacement(
+            [lance.LanceOperation.DataReplacementGroup(0, new_data_file)],
+            data_change=data_change,
+        ),
+        read_version=ds.version,
+    )
+
+    operation = ds.read_transaction(ds.version).operation
+    assert isinstance(operation, lance.LanceOperation.DataReplacement)
+    assert operation.data_change is data_change
+    [segment] = ds.describe_indices()[0].segments
+    assert list(segment.fragment_ids) == ([] if data_change else [0])
+    assert ds.to_table() == pa.table({"a": range(100), "b": range(1, 101)})

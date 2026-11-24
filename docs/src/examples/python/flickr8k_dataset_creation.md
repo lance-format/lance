@@ -6,7 +6,7 @@ In this brief example we will be going over how you can take a Multi-modal datas
 The dataset of choice here is [Flickr8k dataset](https://github.com/goodwillyoga/Flickr8k_dataset). Flickr8k is a benchmark collection for sentence-based image description and search, consisting of 8,000 images that are each paired with five different captions which provide clear descriptions of the salient entities and events. 
 The images were chosen from six different Flickr groups, and tend not to contain any well-known people or locations, but were manually selected to depict a variety of scenes and situations.
 
-We will be creating an Image-caption pair dataset for Multi-modal model training by using the above mentioned Flickr8k dataset, saving it in form of a Lance dataset with image file names, all captions for every image (order preserved) and the image itself (in binary format).
+We will be creating an Image-caption pair dataset for Multi-modal model training by using the above mentioned Flickr8k dataset, saving it in form of a Lance dataset with image file names, all captions for every image (order preserved) and the image bytes stored in a Lance [Blob v2 column](../../guide/blob.md).
 
 ## Imports and Setup
 
@@ -23,6 +23,7 @@ import cv2
 import random
 
 import lance
+from lance import blob_array, blob_field
 import pyarrow as pa
 
 import matplotlib.pyplot as plt
@@ -65,11 +66,21 @@ for img_id in tqdm(image_ids):
 
 ## Converting to a Lance Dataset
 
-Now that our captions list is in a proper format, we will write a `process()` function that will take the said captions as argument and yield a Pyarrow record batch consisting of the `image_id`, `image` and `captions`.
-The image in this record batch will be in binary format and all the captions for an image will be in a list with their ordering preserved.
+Now that our captions list is in a proper format, we will define the table schema using `blob_field("image")` for the raw image bytes and write a `process()` function that accumulates rows into batches of `batch_size` images before yielding a PyArrow `RecordBatch`.
 
 ```python
-def process(captions):
+schema = pa.schema([
+    pa.field("image_id", pa.string()),
+    blob_field("image"),
+    pa.field("captions", pa.list_(pa.string(), -1)),
+])
+```
+
+We are including the `image_id` (which is the original image name) so it can be easier to reference and debug in the future.
+
+```python
+def process(captions, batch_size=256):
+    image_ids, images, caption_lists = [], [], []
     for img_id, img_captions in tqdm(captions):
         try:
             with open(os.path.join(image_folder, img_id), 'rb') as im:
@@ -79,33 +90,42 @@ def process(captions):
             print(f"img_id '{img_id}' not found in the folder, skipping.")
             continue
         
-        img_id = pa.array([img_id], type=pa.string())
-        img = pa.array([binary_im], type=pa.binary())
-        capt = pa.array([img_captions], pa.list_(pa.string(), -1))
-        
+        image_ids.append(img_id)
+        images.append(binary_im)
+        caption_lists.append(img_captions)
+
+        if len(image_ids) == batch_size:
+            yield pa.RecordBatch.from_arrays(
+                [
+                    pa.array(image_ids, type=pa.string()),
+                    blob_array(images),
+                    pa.array(caption_lists, pa.list_(pa.string(), -1)),
+                ],
+                schema=schema,
+            )
+            image_ids, images, caption_lists = [], [], []
+
+    if image_ids:
         yield pa.RecordBatch.from_arrays(
-            [img_id, img, capt], 
-            ["image_id", "image", "captions"]
+            [
+                pa.array(image_ids, type=pa.string()),
+                blob_array(images),
+                pa.array(caption_lists, pa.list_(pa.string(), -1)),
+            ],
+            schema=schema,
         )
 ```
 
-Let's also define the same schema to tell Pyarrow the type of data it should be expecting in the table.
-
-```python
-schema = pa.schema([
-    pa.field("image_id", pa.string()),
-    pa.field("image", pa.binary()),
-    pa.field("captions", pa.list_(pa.string(), -1)),
-])
-```
-
-We are including the `image_id` (which is the original image name) so it can be easier to reference and debug in the future.
-
-Finally, we define a reader to iteratively read those record batches and then write them to a lance dataset on the disk.
+Finally, we define a reader to iteratively read those record batches and write them to a Lance dataset on disk using `data_storage_version="2.2"` for Blob v2 support.
 
 ```python
 reader = pa.RecordBatchReader.from_batches(schema, process(captions))
-lance.write_dataset(reader, "flickr8k.lance", schema)
+lance.write_dataset(
+    reader,
+    "flickr8k.lance",
+    schema=schema,
+    data_storage_version="2.2",
+)
 ```
 
 And that's basically it! If you want to execute this in a notebook form, you can check out this example in our deeplearning-recipes repository [here](https://github.com/lancedb/lance-deeplearning-recipes/tree/main/examples/flickr8k-dataset).

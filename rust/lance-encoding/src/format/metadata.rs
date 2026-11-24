@@ -10,8 +10,8 @@ use prost::Message;
 pub use super::pb23::{
     Alp, AxisDelta, BufferCompression, ByteStreamSplit, CompressionScheme, CompressiveEncoding,
     Constant, Delta, Dictionary, FixedSizeList, Flat, Fsst, General, InlineBitpacking,
-    OutOfLineBitpacking, PackedStruct, Range, RepDefLayer, Rle, Variable, VariablePackedStruct,
-    compressive_encoding, variable_packed_struct,
+    OutOfLineBitpacking, PackedStruct, Pcodec, Range, RepDefLayer, Rle, Variable,
+    VariablePackedStruct, compressive_encoding, variable_packed_struct,
 };
 
 /// A structural engine's execution description, independent of its wire envelope.

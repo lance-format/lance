@@ -401,6 +401,9 @@ impl BitPacker for BitPacker4x {
     }
 
     fn compress(&self, decompressed: &[u32], compressed: &mut [u8], num_bits: u8) -> usize {
+        // SAFETY: `self.0` is `SSE3` or `NEON` only if its constructor detected that feature at
+        // runtime. The kernels check `num_bits` and each slice's length before touching the slice,
+        // and all their loads and stores are unaligned.
         unsafe {
             match self.0 {
                 #[cfg(target_arch = "x86_64")]
@@ -425,6 +428,9 @@ impl BitPacker for BitPacker4x {
         compressed: &mut [u8],
         num_bits: u8,
     ) -> usize {
+        // SAFETY: `self.0` is `SSE3` or `NEON` only if its constructor detected that feature at
+        // runtime. The kernels check `num_bits` and each slice's length before touching the slice,
+        // and all their loads and stores are unaligned.
         unsafe {
             match self.0 {
                 #[cfg(target_arch = "x86_64")]
@@ -458,6 +464,9 @@ impl BitPacker for BitPacker4x {
         compressed: &mut [u8],
         num_bits: u8,
     ) -> usize {
+        // SAFETY: `self.0` is `SSE3` or `NEON` only if its constructor detected that feature at
+        // runtime. The kernels check `num_bits` and each slice's length before touching the slice,
+        // and all their loads and stores are unaligned.
         unsafe {
             match self.0 {
                 #[cfg(target_arch = "x86_64")]
@@ -485,6 +494,9 @@ impl BitPacker for BitPacker4x {
     }
 
     fn decompress(&self, compressed: &[u8], decompressed: &mut [u32], num_bits: u8) -> usize {
+        // SAFETY: `self.0` is `SSE3` or `NEON` only if its constructor detected that feature at
+        // runtime. The kernels check `num_bits` and each slice's length before touching the slice,
+        // and all their loads and stores are unaligned.
         unsafe {
             match self.0 {
                 #[cfg(target_arch = "x86_64")]
@@ -509,6 +521,9 @@ impl BitPacker for BitPacker4x {
         decompressed: &mut [u32],
         num_bits: u8,
     ) -> usize {
+        // SAFETY: `self.0` is `SSE3` or `NEON` only if its constructor detected that feature at
+        // runtime. The kernels check `num_bits` and each slice's length before touching the slice,
+        // and all their loads and stores are unaligned.
         unsafe {
             match self.0 {
                 #[cfg(target_arch = "x86_64")]
@@ -542,6 +557,9 @@ impl BitPacker for BitPacker4x {
         decompressed: &mut [u32],
         num_bits: u8,
     ) -> usize {
+        // SAFETY: `self.0` is `SSE3` or `NEON` only if its constructor detected that feature at
+        // runtime. The kernels check `num_bits` and each slice's length before touching the slice,
+        // and all their loads and stores are unaligned.
         unsafe {
             match self.0 {
                 #[cfg(target_arch = "x86_64")]
@@ -569,6 +587,8 @@ impl BitPacker for BitPacker4x {
     }
 
     fn num_bits(&self, decompressed: &[u32]) -> u8 {
+        // SAFETY: `self.0` is `SSE3` or `NEON` only if its constructor detected that feature at
+        // runtime. The kernel checks the slice length before its unaligned loads.
         unsafe {
             match self.0 {
                 #[cfg(target_arch = "x86_64")]
@@ -581,6 +601,8 @@ impl BitPacker for BitPacker4x {
     }
 
     fn num_bits_sorted(&self, initial: u32, decompressed: &[u32]) -> u8 {
+        // SAFETY: `self.0` is `SSE3` or `NEON` only if its constructor detected that feature at
+        // runtime. The kernel checks the slice length before its unaligned loads.
         unsafe {
             match self.0 {
                 #[cfg(target_arch = "x86_64")]
@@ -599,6 +621,8 @@ impl BitPacker for BitPacker4x {
     }
 
     fn num_bits_strictly_sorted(&self, initial: Option<u32>, decompressed: &[u32]) -> u8 {
+        // SAFETY: `self.0` is `SSE3` or `NEON` only if its constructor detected that feature at
+        // runtime. The kernel checks the slice length before its unaligned loads.
         unsafe {
             match self.0 {
                 #[cfg(target_arch = "x86_64")]
@@ -614,74 +638,6 @@ impl BitPacker for BitPacker4x {
                 }
             }
         }
-    }
-}
-
-#[cfg(any(
-    target_arch = "x86_64",
-    all(target_arch = "aarch64", target_endian = "little")
-))]
-#[cfg(any())]
-mod tests {
-    use super::BLOCK_LEN;
-    use super::scalar;
-    use crate::bitpacker_internal::Available;
-    use crate::tests::test_util_compatible;
-    use crate::{BitPacker, BitPacker4x};
-
-    #[cfg(target_arch = "x86_64")]
-    #[test]
-    fn test_compatible_sse3() {
-        use super::sse3;
-        if sse3::UnsafeBitPackerImpl::available() {
-            test_util_compatible::<scalar::UnsafeBitPackerImpl, sse3::UnsafeBitPackerImpl>(
-                BLOCK_LEN,
-            );
-        }
-    }
-
-    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
-    #[test]
-    fn test_compatible_neon() {
-        use super::neon;
-        if neon::UnsafeBitPackerImpl::available() {
-            test_util_compatible::<scalar::UnsafeBitPackerImpl, neon::UnsafeBitPackerImpl>(
-                BLOCK_LEN,
-            );
-        }
-    }
-
-    #[test]
-    fn test_delta_bit_width_32() {
-        let values = vec![i32::max_value() as u32 + 1; BitPacker4x::BLOCK_LEN];
-        let bit_packer = BitPacker4x::new();
-        let bit_width = bit_packer.num_bits_sorted(0, &values);
-        assert_eq!(bit_width, 32);
-
-        let mut block = vec![0u8; BitPacker4x::compressed_block_size(bit_width)];
-        bit_packer.compress_sorted(0, &values, &mut block, bit_width);
-
-        let mut decoded_values = vec![0x10101010; BitPacker4x::BLOCK_LEN];
-        bit_packer.decompress_sorted(0, &block, &mut decoded_values, bit_width);
-
-        assert_eq!(values, decoded_values);
-    }
-
-    #[test]
-    fn test_bit_width_32() {
-        let mut values = vec![i32::max_value() as u32 + 1; BitPacker4x::BLOCK_LEN];
-        values[0] = 0;
-        let bit_packer = BitPacker4x::new();
-        let bit_width = bit_packer.num_bits(&values);
-        assert_eq!(bit_width, 32);
-
-        let mut block = vec![0u8; BitPacker4x::compressed_block_size(bit_width)];
-        bit_packer.compress(&values, &mut block, bit_width);
-
-        let mut decoded_values = vec![0x10101010; BitPacker4x::BLOCK_LEN];
-        bit_packer.decompress(&block, &mut decoded_values, bit_width);
-
-        assert_eq!(values, decoded_values);
     }
 }
 

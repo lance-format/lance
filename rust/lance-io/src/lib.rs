@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
+
+#![warn(clippy::undocumented_unsafe_blocks)]
+
 use std::{
     ops::{Range, RangeFrom, RangeFull, RangeTo},
     sync::Arc,

@@ -41,10 +41,11 @@ use lance_linalg::distance::DistanceType;
 use super::super::builder::VectorQuery;
 use super::newest_pk_positions;
 use super::vector::DISTANCE_COLUMN;
+use crate::dataset::mem_wal::index::IndexStore;
 use crate::dataset::mem_wal::index::{SearchContext, evaluate_index_filter};
+use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
 use crate::dataset::mem_wal::memtable::scanner::exec::{scan_record_batch, take_projected_columns};
 use crate::dataset::mem_wal::scanner::exec::resolve_pk_indices;
-use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
 
 /// Distance metric used when [`VectorQuery::distance_type`] is `None`. The
 /// indexed path defers to the index's own metric, but with no index there is
@@ -621,8 +622,13 @@ impl ExecutionPlan for MemTableBruteForceVectorExec {
     }
 
     fn partition_statistics(&self, _partition: Option<usize>) -> DataFusionResult<Arc<Statistics>> {
+        let visible_rows = self
+            .batch_store
+            .max_visible_row(self.readable_count)
+            .map_or(0, |row| row as usize + 1);
         Ok(Arc::new(Statistics {
-            num_rows: Precision::Exact(self.query.k),
+            // Visibility and filtering may leave fewer than k results.
+            num_rows: Precision::Inexact(self.query.k.min(visible_rows)),
             total_byte_size: Precision::Absent,
             column_statistics: Statistics::unknown_column(&self.schema()),
         }))

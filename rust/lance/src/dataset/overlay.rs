@@ -34,13 +34,16 @@
 //! deleted row is simply dropped along with the row. This matches the spec with no
 //! special casing.
 
+mod selection;
 pub mod writer;
+pub use selection::{OverlayBatchSelection, OverlayReadSelection};
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use arrow_array::{Array, ArrayRef, RecordBatch, StructArray};
 use arrow_buffer::{NullBuffer, NullBufferBuilder};
+use arrow_schema::Fields;
 use arrow_select::interleave::interleave;
 use futures::StreamExt;
 use lance_core::datatypes::{Field, Schema};
@@ -125,8 +128,9 @@ fn contiguous_frag_start(offsets_in_frag: &[u32]) -> Option<u32> {
 /// scan batch past the last cell this overlay touches) is skipped cheaply without
 /// inspecting individual bits.
 ///
-/// Within the batch a coverage's cells appear in ascending order, so their
-/// `offset_in_overlay` values are consecutive: the first in-batch cell sits at
+/// Borrow a bounded coverage iterator instead of allocating a batch bitmap and
+/// an intersection bitmap for every overlay. Its cells appear in ascending order,
+/// so their `offset_in_overlay` values are consecutive: the first in-batch cell sits at
 /// `offset_in_overlay = <cells this coverage has before the batch>` (a single
 /// `rank` lookup), and each following cell is one more. Coverages are applied
 /// newest-first, and the first overlay to claim a row wins.
@@ -136,15 +140,14 @@ fn route_contiguous(
     coverages_newest_first: &[&RoaringBitmap],
 ) -> OverlayRouting {
     let mut offsets_in_overlay: Vec<Vec<u32>> = vec![Vec::new(); coverages_newest_first.len()];
-    // Indexed by offset_in_batch: which (overlay, fetch position) supplies the row.
-    let mut routed: Vec<Option<(usize, usize)>> = vec![None; len];
+    // Source zero is an unclaimed base row. Update the final interleave routing
+    // directly so a second row-sized table does not overlap its allocation.
+    let mut indices: Vec<(usize, usize)> = (0..len).map(|row| (0, row)).collect();
+    let mut any_overlay = false;
     let range_end = (frag_start as u64 + len as u64).min(u32::MAX as u64) as u32;
-    let mut batch_range = RoaringBitmap::new();
-    batch_range.insert_range(frag_start..range_end);
-
     for (k, coverage) in coverages_newest_first.iter().enumerate() {
-        let covered_in_batch = *coverage & &batch_range;
-        if covered_in_batch.is_empty() {
+        let mut covered_in_batch = coverage.range(frag_start..range_end).peekable();
+        if covered_in_batch.peek().is_none() {
             continue;
         }
         // offset_in_overlay of this coverage's first in-batch cell = the number of
@@ -154,27 +157,15 @@ fn route_contiguous(
         } else {
             coverage.rank(frag_start - 1) as u32
         };
-        for (nth_in_batch, offset_in_frag) in covered_in_batch.iter().enumerate() {
+        for (nth_in_batch, offset_in_frag) in covered_in_batch.enumerate() {
             let offset_in_batch = (offset_in_frag - frag_start) as usize;
-            if routed[offset_in_batch].is_none() {
-                routed[offset_in_batch] = Some((k, offsets_in_overlay[k].len()));
+            if indices[offset_in_batch].0 == 0 {
+                indices[offset_in_batch] = (k + 1, offsets_in_overlay[k].len());
                 offsets_in_overlay[k].push(first_offset_in_overlay + nth_in_batch as u32);
+                any_overlay = true;
             }
         }
     }
-
-    let mut any_overlay = false;
-    let indices = routed
-        .into_iter()
-        .enumerate()
-        .map(|(offset_in_batch, routed)| match routed {
-            None => (0, offset_in_batch),
-            Some((k, fetch_pos)) => {
-                any_overlay = true;
-                (k + 1, fetch_pos)
-            }
-        })
-        .collect();
 
     OverlayRouting {
         indices,
@@ -613,6 +604,14 @@ fn descend_by_ids(array: &ArrayRef, field: &Field, ancestor_ids: &[i32]) -> Resu
 /// Rebuild `array` with the array at `ancestor_ids` replaced by `new_atomic_field`, cloning
 /// the struct spine along the path and preserving each struct's null buffer and other
 /// children. With an empty path this is just `new_atomic_field` (whole-column replacement).
+///
+/// Each rebuilt level's null buffer is extended to mask its non-nullable children's
+/// nulls: the child just spliced in may be null on rows the base struct considered
+/// valid (an overlay's struct null is pushed into the children it stages), and arrow
+/// rejects a struct whose non-nullable child holds an unmasked null. Masking only
+/// adds nulls on rows where such a child is null, so the overlay-resolved validity
+/// applied afterwards by [`apply_struct_validities`] still decides the final
+/// per-row validity.
 fn splice_by_ids(
     array: &ArrayRef,
     field: &Field,
@@ -649,9 +648,29 @@ fn splice_by_ids(
         rest,
         new_atomic_field,
     )?;
+    let nulls = mask_non_nullable_children(&fields, &children, nulls);
     Ok(Arc::new(StructArray::try_new_with_length(
         fields, children, nulls, len,
     )?))
+}
+
+/// Extend a struct's own nulls to also mask every non-nullable child's nulls, so
+/// the rebuilt struct is valid Arrow even while some children still carry base
+/// values whose nulls reflect the base struct validity rather than the merged one.
+fn mask_non_nullable_children(
+    fields: &Fields,
+    children: &[ArrayRef],
+    nulls: Option<NullBuffer>,
+) -> Option<NullBuffer> {
+    let mut nulls = nulls;
+    for (field, child) in fields.iter().zip(children) {
+        if !field.is_nullable()
+            && let Some(child_nulls) = child.nulls()
+        {
+            nulls = NullBuffer::union(nulls.as_ref(), Some(child_nulls));
+        }
+    }
+    nulls
 }
 
 /// Replace only the validity of the struct at `ancestor_ids`, preserving its
@@ -759,7 +778,13 @@ fn apply_struct_validities(
     columns: &mut [ArrayRef],
     struct_validities: StructValidityMap,
 ) -> Result<()> {
-    for candidates in struct_validities.into_values() {
+    // Restore deeper structs first. Rebuilding a struct makes arrow check that every
+    // required child has no null the parent does not mask, and a nested struct still
+    // carrying its base validity can fail that check until its own candidate is
+    // applied, so an ancestor must be rebuilt only after its descendants are final.
+    let mut candidates = struct_validities.into_values().collect::<Vec<_>>();
+    candidates.sort_by_key(|candidates| std::cmp::Reverse(candidates.ancestor_ids.len()));
+    for candidates in candidates {
         let Some(idx) = schema.index_of(&candidates.top_field.name).ok() else {
             continue;
         };
@@ -805,7 +830,7 @@ fn apply_struct_validities(
 /// Open the overlay readers a specific read needs and return the per-field plans to
 /// merge, pruned to that read.
 ///
-/// `offsets_in_frag` are the rows the read will return. An overlay whose coverage is
+/// `selection` describes the read without expanding range rows. An overlay whose coverage is
 /// disjoint from those rows contributes nothing, so it is dropped and its file is
 /// never opened — a `take` that misses an overlay's cells pays no IO for it. Each
 /// surviving file is opened once, concurrently, projected to the covered fields; the
@@ -813,18 +838,16 @@ fn apply_struct_validities(
 /// only the values it needs).
 pub async fn resolve_overlays(
     planner: &OverlayReadPlanner,
-    offsets_in_frag: &[u32],
+    selection: &OverlayReadSelection,
     fragment: &FileFragment,
     read_config: &FragReadConfig,
 ) -> Result<Vec<LoadedAtomicField>> {
-    let read_offsets = read_offsets_bitmap(offsets_in_frag);
-
     // A file is opened only if some atomic field it covers has cells among the requested rows.
     // This is the row-selection pruning: overlays outside the read are skipped.
     let mut file_needed = vec![false; planner.files.len()];
     for atomic_field in &planner.atomic_fields {
         for overlay in &atomic_field.overlays_newest_first {
-            if !overlay.coverage.is_disjoint(&read_offsets) {
+            if selection.intersects(&overlay.coverage) {
                 file_needed[overlay.file] = true;
             }
         }
@@ -881,29 +904,14 @@ pub async fn resolve_overlays(
     Ok(plans)
 }
 
-/// The set of `offset_in_frag` a read will return, as a bitmap for cheap
-/// intersection against overlay coverages. Contiguous scans build a single range;
-/// arbitrary `take` offsets (small batches) are inserted individually.
-fn read_offsets_bitmap(offsets_in_frag: &[u32]) -> RoaringBitmap {
-    let mut bitmap = RoaringBitmap::new();
-    match contiguous_frag_start(offsets_in_frag) {
-        Some(start) => {
-            let end = (start as u64 + offsets_in_frag.len() as u64).min(u32::MAX as u64) as u32;
-            bitmap.insert_range(start..end);
-        }
-        None => bitmap.extend(offsets_in_frag.iter().copied()),
-    }
-    bitmap
-}
-
 /// Resolve overlays for one base batch: route each relevant atomic field against the
-/// batch's `offsets_in_frag`, fetch only the overlay values the batch needs
+/// batch's compact physical selection, fetch only the overlay values the batch needs
 /// (concurrently with the base read), and collect projected struct validity. For a
 /// projected value, assemble the merged atomic field and splice it into its output
 /// column. Atomic fields with no covered rows, and columns with no plan, pass through.
 pub async fn merge_overlay_batch(
     base: ReadBatchFut,
-    offsets_in_frag: &[u32],
+    selection: &OverlayBatchSelection,
     plans: &[LoadedAtomicField],
 ) -> Result<RecordBatch> {
     let atomic_field_work = futures::future::try_join_all(plans.iter().map(|plan| async move {
@@ -912,7 +920,12 @@ pub async fn merge_overlay_batch(
             .iter()
             .map(|overlay| overlay.coverage.as_ref())
             .collect();
-        let routing = route_overlays(offsets_in_frag, &coverages);
+        let routing = match selection {
+            OverlayBatchSelection::Range(range) => {
+                route_contiguous(range.start, (range.end - range.start) as usize, &coverages)
+            }
+            OverlayBatchSelection::Indices(indices) => route_overlays(indices.values(), &coverages),
+        };
         if !routing.any_overlay {
             return Ok::<_, Error>((plan, None));
         }
@@ -976,6 +989,9 @@ pub async fn merge_overlay_batch(
 
     // Child values resolve independently, but a struct cell has one shared
     // validity, selected from the newest overlay contributing any descendant.
+    // The splices above mask each rebuilt level's non-nullable children, which
+    // may over-null rows the base considered valid; this resolves the final
+    // per-row validity from the overlays' own struct validity.
     apply_struct_validities(schema.as_ref(), &mut columns, struct_validities)?;
     Ok(RecordBatch::try_new(schema, columns)?)
 }
@@ -1176,8 +1192,11 @@ mod tests {
         assert!(assemble_overlay_column(&base, &routing, &fetched).is_err());
     }
 
-    #[test]
-    fn test_contiguous_fast_path_matches_general() {
+    #[rstest::rstest]
+    #[case::low(0)]
+    #[case::container_boundary(65_520)]
+    #[case::fragment_end(u32::MAX - 128)]
+    fn test_contiguous_fast_path_matches_general(#[case] origin: u32) {
         // The contiguous fast path must produce byte-for-byte identical routing to
         // the general offset-major path for any contiguous batch. Fuzz a range of
         // fragment starts, lengths, overlay counts, and coverage densities —
@@ -1190,8 +1209,8 @@ mod tests {
             (state >> 33) as u32
         };
         for _ in 0..500 {
-            let frag_start = next() % 64;
-            let len = (next() % 48 + 1) as usize;
+            let frag_start = origin + next() % 64;
+            let len = (next() % 49) as usize;
             let num_overlays = (next() % 5) as usize;
             let coverages: Vec<RoaringBitmap> = (0..num_overlays)
                 .map(|_| {
@@ -1216,6 +1235,39 @@ mod tests {
                 "offsets_in_overlay differ"
             );
             assert_eq!(fast.any_overlay, general.any_overlay, "any_overlay differs");
+        }
+    }
+
+    #[rstest::rstest]
+    #[case::dense_container(8192)]
+    #[case::container_boundary(65_520)]
+    #[case::last_container(u32::MAX - 8192)]
+    fn test_contiguous_routing_with_dense_and_sparse_coverage(
+        #[case] origin: u32,
+        #[values(false, true)] optimize_runs: bool,
+    ) {
+        let lower = origin - 4096;
+        let upper = origin + 4096;
+        let mut coverages = vec![
+            (lower..upper).step_by(97).collect::<RoaringBitmap>(),
+            (lower + 11..upper - 13).collect(),
+            (lower..upper).collect(),
+        ];
+        if optimize_runs {
+            for coverage in &mut coverages {
+                coverage.optimize();
+            }
+        }
+        let refs = coverages.iter().collect::<Vec<_>>();
+        // Empty, clipped and whole-container selections exercise borrowed iterator
+        // boundaries; the independent offset-major path checks rank and precedence.
+        for range in [origin..origin, origin..origin + 129, lower..upper] {
+            let offsets = range.clone().collect::<Vec<_>>();
+            let fast = route_contiguous(range.start, offsets.len(), &refs);
+            let general = route_arbitrary(&offsets, &refs);
+            assert_eq!(fast.indices, general.indices);
+            assert_eq!(fast.offsets_in_overlay, general.offsets_in_overlay);
+            assert_eq!(fast.any_overlay, general.any_overlay);
         }
     }
 

@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::num::NonZero;
 use std::sync::Arc;
 
+use bytes::Bytes;
 use lance_core::Error;
 use lance_core::deepsize::DeepSizeOf;
 use lance_file::version::ConcreteFileVersion;
@@ -18,6 +19,7 @@ use super::row_ids::{
     RowIdMeta,
 };
 use crate::format::pb;
+use crate::io::deletion::DELETIONS_DIR;
 
 use crate::rowids::version::{
     RowDatasetVersionMeta, created_at_version_meta_to_pb, last_updated_at_version_meta_to_pb,
@@ -257,6 +259,17 @@ impl DataFile {
                 .collect(),
             metadata: full_schema.metadata.clone(),
         }
+    }
+
+    /// The ids of the fields this file answers for in a `DataReplacement`:
+    /// those of [`Self::schema`], which adds a nested parent with no column
+    /// of its own, and every id in [`Self::fields`].
+    pub fn covered_field_ids(&self, full_schema: &Schema) -> HashSet<i32> {
+        self.schema(full_schema)
+            .field_ids()
+            .into_iter()
+            .chain(self.fields.iter().copied())
+            .collect()
     }
 
     fn uses_v1_data_file_encoding(&self) -> bool {
@@ -504,7 +517,7 @@ impl DeletionFileType {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, DeepSizeOf)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, DeepSizeOf)]
 pub struct DeletionFile {
     pub read_version: u64,
     pub id: u64,
@@ -512,6 +525,121 @@ pub struct DeletionFile {
     /// Number of deleted rows in this file. If None, this is unknown.
     pub num_deleted_rows: Option<usize>,
     pub base_id: Option<u32>,
+    /// Path under `_deletions/`, relative to the dataset root selected by `base_id`.
+    /// When `None`, the path is derived via [`deletion_file_path`](crate::io::deletion::deletion_file_path).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// The serialized Roaring bitmap of deleted row offsets, when the deletion
+    /// vector is stored in the manifest rather than in a file. `Bytes`, so the
+    /// many clones of a fragment share it instead of copying it.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "inline_deletion_bytes"
+    )]
+    pub inline: Option<Bytes>,
+}
+
+impl<'de> Deserialize<'de> for DeletionFile {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct DeletionFileHelper {
+            read_version: u64,
+            id: u64,
+            file_type: DeletionFileType,
+            num_deleted_rows: Option<usize>,
+            base_id: Option<u32>,
+            #[serde(default)]
+            path: Option<String>,
+            #[serde(default, with = "inline_deletion_bytes")]
+            inline: Option<Bytes>,
+        }
+
+        let helper = DeletionFileHelper::deserialize(deserializer)?;
+        let deletion_file = Self {
+            read_version: helper.read_version,
+            id: helper.id,
+            file_type: helper.file_type,
+            num_deleted_rows: helper.num_deleted_rows,
+            base_id: helper.base_id,
+            path: helper.path,
+            inline: helper.inline,
+        };
+        deletion_file
+            .check_location()
+            .map_err(serde::de::Error::custom)?;
+        Ok(deletion_file)
+    }
+}
+
+/// `Option<Bytes>` as serde sees a byte sequence, without the `serde` feature of `bytes`.
+mod inline_deletion_bytes {
+    use super::*;
+
+    pub fn serialize<S: Serializer>(
+        value: &Option<Bytes>,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        match value {
+            Some(bytes) => serializer.serialize_some(&bytes[..]),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Option<Bytes>, D::Error> {
+        Option::<Vec<u8>>::deserialize(deserializer).map(|bytes| bytes.map(Bytes::from))
+    }
+}
+
+impl DeletionFile {
+    /// Whether the deletion vector lives in the manifest, so no file exists for it.
+    pub fn is_inline(&self) -> bool {
+        self.inline.is_some()
+    }
+
+    pub fn validate_location(&self) -> Result<()> {
+        self.check_location().map_err(Error::invalid_input)
+    }
+
+    fn check_location(&self) -> std::result::Result<(), String> {
+        if self.path.is_some() && self.inline.is_some() {
+            return Err("a deletion file cannot set both path and inline".to_string());
+        }
+        if let Some(path) = &self.path {
+            check_deletion_path(path, &self.file_type)?;
+        }
+        Ok(())
+    }
+}
+
+/// Validates that `path` is a normalized relative object path under `_deletions/`
+/// (no leading/trailing `/`, `.`, `..`, or empty segments) and ends with `.{file_type.suffix()}`.
+fn check_deletion_path(
+    path: &str,
+    file_type: &DeletionFileType,
+) -> std::result::Result<(), String> {
+    if path.is_empty() {
+        return Err("deletion file path is empty".to_string());
+    }
+    if !path.starts_with(&format!("{DELETIONS_DIR}/")) {
+        return Err(format!(
+            "deletion file path {path:?} must be under {DELETIONS_DIR}/"
+        ));
+    }
+    let suffix = file_type.suffix();
+    if !path.ends_with(&format!(".{suffix}")) {
+        return Err(format!(
+            "deletion file path {path:?} must end with .{suffix}"
+        ));
+    }
+    match Path::parse(path) {
+        Ok(parsed) if parsed.as_ref() == path => Ok(()),
+        _ => Err(format!(
+            "deletion file path {path:?} is not a relative object path"
+        )),
+    }
 }
 
 impl TryFrom<pb::DeletionFile> for DeletionFile {
@@ -532,13 +660,37 @@ impl TryFrom<pb::DeletionFile> for DeletionFile {
         } else {
             Some(value.num_deleted_rows as usize)
         };
-        Ok(Self {
+        let deletion_file = Self {
             read_version: value.read_version,
             id: value.id,
             file_type,
             num_deleted_rows,
             base_id: value.base_id,
-        })
+            path: value.path,
+            inline: value.inline,
+        };
+        deletion_file
+            .check_location()
+            .map_err(|message| Error::corrupt_file_named("table metadata", message))?;
+        Ok(deletion_file)
+    }
+}
+
+impl From<&DeletionFile> for pb::DeletionFile {
+    fn from(value: &DeletionFile) -> Self {
+        let file_type = match value.file_type {
+            DeletionFileType::Array => pb::deletion_file::DeletionFileType::ArrowArray,
+            DeletionFileType::Bitmap => pb::deletion_file::DeletionFileType::Bitmap,
+        };
+        Self {
+            read_version: value.read_version,
+            id: value.id,
+            file_type: file_type.into(),
+            num_deleted_rows: value.num_deleted_rows.unwrap_or_default() as u64,
+            base_id: value.base_id,
+            path: value.path.clone(),
+            inline: value.inline.clone(),
+        }
     }
 }
 
@@ -844,6 +996,135 @@ impl Fragment {
             .push(DataFile::new_legacy(path, schema, None, None));
     }
 
+    /// Swap `new_files` into this fragment, applied in order: what a
+    /// `DataReplacement` commit does to the data files of a fragment.
+    ///
+    /// A new file replaces an existing file holding exactly its fields with the
+    /// same file version numbers, or is appended when the fragment has no data
+    /// for its fields, or, when the fragment holds all of them, is appended
+    /// after they are tombstoned where they live. A V1 file cannot tombstone a
+    /// field, so a field one holds takes only an exact match. In the
+    /// tombstoning case, every file then left with no field of `schema` and
+    /// none of the fragment's spilled row lineage is dropped. Pure: no IO,
+    /// only `files` changes. A new file that changes nothing is an error.
+    pub fn replace_files(&self, schema: &Schema, new_files: &[DataFile]) -> Result<Self> {
+        new_files
+            .iter()
+            .try_fold(self.clone(), |fragment, new_file| {
+                fragment.replace_file(schema, new_file)
+            })
+    }
+
+    fn replace_file(&self, schema: &Schema, new_file: &DataFile) -> Result<Self> {
+        let mut new_frag = self.clone();
+
+        // Physical mappings differ across V2 encodings (a nested
+        // parent may have no column of its own). Choosing the arm and
+        // tombstoning use the logical field coverage; the exact-match swap
+        // compares `fields` as written.
+        let replacement_ids = new_file.covered_field_ids(schema);
+
+        // TODO(rmeng): check new file and fragment are the same length
+
+        let mut columns_covered = HashSet::new();
+        // Set when an existing file covers exactly the replaced
+        // fields, so the whole file swaps rather than part of it.
+        let mut replaced_in_place = false;
+        for file in &mut new_frag.files {
+            if file.fields == new_file.fields
+                && file.file_major_version == new_file.file_major_version
+                && file.file_minor_version == new_file.file_minor_version
+            {
+                // assign the new file path / size / metadata size / base to the fragment
+                file.path = new_file.path.clone();
+                file.file_size_bytes = new_file.file_size_bytes.clone();
+                file.file_metadata_size_bytes = new_file.file_metadata_size_bytes;
+                file.base_id = new_file.base_id;
+                replaced_in_place = true;
+            }
+            columns_covered.extend(file.covered_field_ids(schema));
+        }
+        // Reject a file whose version does not decode before any
+        // arm publishes it.
+        new_file.file_version()?;
+
+        // SPECIAL CASE: if the column(s) being replaced are not covered by the fragment
+        // Then it means it's a all-NULL column that is being replaced with real data
+        // just append it to this fragment. Push the DataFile as
+        // given so every field (including base_id) is preserved.
+        if columns_covered.is_disjoint(&replacement_ids) {
+            new_frag.files.push(new_file.clone());
+        } else if !replaced_in_place
+            && replacement_ids.is_subset(&columns_covered)
+            && new_frag.files.iter().all(|file| {
+                file.file_version()
+                    .is_ok_and(|version| version != ConcreteFileVersion::V1)
+                    || file
+                        .fields
+                        .iter()
+                        .all(|field| !replacement_ids.contains(field))
+            })
+        {
+            // Tombstone the replaced fields where they live and
+            // append the new file to answer for them, the idiom
+            // `update_columns` uses. Compaction decides that layout,
+            // so the fields may sit in one wider file or span
+            // several.
+            //
+            // Legacy V1 is excluded: its reader derives the page table
+            // offset from the first field in the metadata, so
+            // tombstoning one field leaves its siblings decoding from
+            // the wrong pages. A field a V1 file covers keeps
+            // exact-match replacement.
+            for file in &mut new_frag.files {
+                // Same reason as the guard above.
+                if file.file_version()? == ConcreteFileVersion::V1 {
+                    continue;
+                }
+                file.fields = file
+                    .fields
+                    .iter()
+                    .map(|field| {
+                        if replacement_ids.contains(field) {
+                            TOMBSTONE_FIELD_ID
+                        } else {
+                            *field
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .into();
+            }
+            // Every data file must share at least one field with
+            // the dataset schema: a file kept alive only by
+            // tombstones or by ids the schema no longer defines is
+            // unreachable to readers and uncollectable by cleanup.
+            // The exception is a file carrying one of the fragment's
+            // spilled row lineage sequences: their reserved ids are
+            // never in the schema, the file holds their only copy,
+            // and the replaced user columns in it are dead space
+            // until compaction.
+            let live_ids = schema
+                .fields_pre_order()
+                .map(|field| field.id)
+                .collect::<HashSet<i32>>();
+            let spilled = new_frag.spilled_row_lineage_field_ids();
+            new_frag.files.retain(|file| {
+                file.fields
+                    .iter()
+                    .any(|f| live_ids.contains(f) || spilled.contains(f))
+            });
+            new_frag.files.push(new_file.clone());
+        }
+
+        // Nothing changed in the current fragment, which is not expected -- error out
+        if &new_frag == self {
+            return Err(Error::invalid_input(
+                "Expected to modify the fragment but no changes were made. This means the new data files does not align with any exiting datafiles. Please check if the schema of the new data files matches the schema of the old data files including the file major and minor versions",
+            ));
+        }
+        Ok(new_frag)
+    }
+
     // Helper method to infer the Lance version from a set of fragments
     //
     // Returns None if there are no data files
@@ -919,19 +1200,7 @@ impl TryFrom<pb::DataFragment> for Fragment {
 
 impl From<&Fragment> for pb::DataFragment {
     fn from(f: &Fragment) -> Self {
-        let deletion_file = f.deletion_file.as_ref().map(|f| {
-            let file_type = match f.file_type {
-                DeletionFileType::Array => pb::deletion_file::DeletionFileType::ArrowArray,
-                DeletionFileType::Bitmap => pb::deletion_file::DeletionFileType::Bitmap,
-            };
-            pb::DeletionFile {
-                read_version: f.read_version,
-                id: f.id,
-                file_type: file_type.into(),
-                num_deleted_rows: f.num_deleted_rows.unwrap_or_default() as u64,
-                base_id: f.base_id,
-            }
-        });
+        let deletion_file = f.deletion_file.as_ref().map(pb::DeletionFile::from);
 
         let row_id_sequence = f.row_id_meta.as_ref().map(|m| match m {
             RowIdMeta::Inline(data) => {
@@ -963,6 +1232,7 @@ impl From<&Fragment> for pb::DataFragment {
 mod tests {
     use super::*;
     use crate::format::overlay::OverlayCoverage;
+    use crate::io::deletion::relative_deletion_file_path;
     use arrow_schema::{
         DataType, Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema,
     };
@@ -1107,6 +1377,8 @@ mod tests {
             file_type: DeletionFileType::Array,
             num_deleted_rows: Some(10),
             base_id: None,
+            path: None,
+            inline: None,
         });
 
         let proto = pb::DataFragment::from(&fragment);
@@ -1288,6 +1560,8 @@ mod tests {
             file_type: DeletionFileType::Array,
             num_deleted_rows: Some(10),
             base_id: None,
+            path: None,
+            inline: None,
         });
 
         let json = serde_json::to_string(&fragment).unwrap();
@@ -1318,6 +1592,165 @@ mod tests {
             .remove("file_metadata_size_bytes");
         let frag3: Fragment = serde_json::from_value(value).unwrap();
         assert_eq!(frag3.files[0].file_metadata_size_bytes, None);
+    }
+
+    #[test]
+    fn test_deletion_file_derived_path() {
+        let deletion_file = DeletionFile {
+            read_version: 3,
+            id: 77,
+            file_type: DeletionFileType::Array,
+            num_deleted_rows: Some(1),
+            base_id: None,
+            path: None,
+            inline: None,
+        };
+        let mut fragment = Fragment::new(9);
+        fragment.deletion_file = Some(deletion_file.clone());
+
+        let proto = pb::DataFragment::from(&fragment);
+        assert!(proto.deletion_file.as_ref().unwrap().path.is_none());
+        assert_eq!(Fragment::try_from(proto).unwrap(), fragment);
+        assert_eq!(
+            relative_deletion_file_path(9, &deletion_file),
+            "_deletions/9-3-77.arrow"
+        );
+
+        let json = serde_json::to_value(&deletion_file).unwrap();
+        assert!(json.get("path").is_none());
+        assert_eq!(
+            serde_json::from_value::<DeletionFile>(json).unwrap(),
+            deletion_file
+        );
+    }
+
+    #[test]
+    fn test_deletion_file_path_round_trips() {
+        let deletion_file = DeletionFile {
+            read_version: 123,
+            id: 456,
+            file_type: DeletionFileType::Bitmap,
+            num_deleted_rows: Some(10),
+            base_id: Some(3),
+            path: Some("_deletions/ab/0b2f8a3c-6d4e-4f10-9a7b-1c2d3e4f5a6b.bin".to_string()),
+            inline: None,
+        };
+        let mut fragment = Fragment::new(42);
+        fragment.deletion_file = Some(deletion_file.clone());
+
+        let proto = pb::DataFragment::from(&fragment);
+        assert_eq!(
+            proto.deletion_file.as_ref().unwrap().path.as_deref(),
+            Some("_deletions/ab/0b2f8a3c-6d4e-4f10-9a7b-1c2d3e4f5a6b.bin")
+        );
+        assert_eq!(Fragment::try_from(proto.clone()).unwrap(), fragment);
+        assert_eq!(
+            DataFileFieldInterner::default()
+                .intern_fragment(proto)
+                .unwrap(),
+            fragment
+        );
+        let filename = relative_deletion_file_path(42, &deletion_file);
+        assert_eq!(
+            filename,
+            "_deletions/ab/0b2f8a3c-6d4e-4f10-9a7b-1c2d3e4f5a6b.bin"
+        );
+        assert_eq!(filename, relative_deletion_file_path(99, &deletion_file));
+
+        let json = serde_json::to_value(&deletion_file).unwrap();
+        assert_eq!(
+            serde_json::from_value::<DeletionFile>(json).unwrap(),
+            deletion_file
+        );
+    }
+
+    #[test]
+    fn test_deletion_file_rejects_bad_path_and_inline_conflict() {
+        let bad_paths = [
+            "",
+            "/_deletions/file.bin",
+            "_deletions/file.bin/",
+            "_deletions/..",
+            "_deletions/../file.bin",
+            "_deletions/a/../b.bin",
+            "_deletions/.",
+            "_deletions/a/./b.bin",
+            "_deletions/a//b.bin",
+            "_deletions/file.lance",
+            "_deletions/file.arrow",
+            "ab/file.bin",
+            "_indices/file.bin",
+        ];
+        for path in bad_paths {
+            let deletion_file = DeletionFile {
+                read_version: 1,
+                id: 2,
+                file_type: DeletionFileType::Bitmap,
+                num_deleted_rows: Some(1),
+                base_id: None,
+                path: Some(path.to_string()),
+                inline: None,
+            };
+            let err = deletion_file.validate_location().unwrap_err();
+            assert!(matches!(err, Error::InvalidInput { .. }), "{path}: {err:?}");
+
+            let proto = pb::DeletionFile {
+                read_version: 1,
+                id: 2,
+                file_type: pb::deletion_file::DeletionFileType::Bitmap as i32,
+                num_deleted_rows: 1,
+                base_id: None,
+                path: Some(path.to_string()),
+                inline: None,
+            };
+            let err = DeletionFile::try_from(proto).unwrap_err();
+            assert!(matches!(err, Error::CorruptFile { .. }), "{path}: {err:?}");
+            if path.is_empty() {
+                assert!(err.to_string().contains("empty"), "{err}");
+            } else {
+                assert!(err.to_string().contains(path), "{path}: {err}");
+            }
+
+            let json = serde_json::json!({
+                "read_version": 1,
+                "id": 2,
+                "file_type": "bitmap",
+                "num_deleted_rows": 1,
+                "base_id": null,
+                "path": path,
+            });
+            let err = serde_json::from_value::<DeletionFile>(json).unwrap_err();
+            if path.is_empty() {
+                assert!(err.to_string().contains("empty"), "{err}");
+            } else {
+                assert!(err.to_string().contains(path), "{path}: {err}");
+            }
+        }
+
+        let proto = pb::DeletionFile {
+            read_version: 1,
+            id: 2,
+            file_type: pb::deletion_file::DeletionFileType::Bitmap as i32,
+            num_deleted_rows: 1,
+            base_id: None,
+            path: Some("_deletions/file.bin".to_string()),
+            inline: Some(bytes::Bytes::from_static(&[1, 2, 3])),
+        };
+        let err = DeletionFile::try_from(proto).unwrap_err();
+        assert!(matches!(err, Error::CorruptFile { .. }), "{err:?}");
+        assert!(err.to_string().contains("both path and inline"), "{err}");
+
+        let json = serde_json::json!({
+            "read_version": 1,
+            "id": 2,
+            "file_type": "bitmap",
+            "num_deleted_rows": 1,
+            "base_id": null,
+            "path": "_deletions/file.bin",
+            "inline": [1, 2, 3],
+        });
+        let err = serde_json::from_value::<DeletionFile>(json).unwrap_err();
+        assert!(err.to_string().contains("both path and inline"), "{err}");
     }
 
     #[test]

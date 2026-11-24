@@ -229,9 +229,18 @@ object's resolved dataset. A set `base_id` matches `BasePath.id` in this Version
 Manifest's `base_paths`. The same inheritance rule applies to deletion files, overlays,
 and other fragment-owned files. A null `base_id` in a buffered mutation
 inherits the resolved dataset of the structure containing that mutation.
+A deletion file's `path`, when set, resolves under the dataset this rule
+selects, as in a Version Manifest.
 
 Counts in a leaf are known. `physical_rows` of 0 is zero rows. A deletion file
 must carry `num_deleted_rows`, which must not exceed `physical_rows`.
+
+A `DeletionFile` with `inline` set stores its deletion vector in the metadata
+itself, as a serialized Roaring bitmap of deleted row offsets, whatever
+`file_type` says; no file exists under `_deletions/` for it. Readers must
+decode `inline` when present and must not look for the file. Writers set
+`FLAG_INLINE_DELETIONS` (`2^19`) in both `reader_feature_flags` and
+`writer_feature_flags` of any snapshot that carries one.
 
 After decoding a leaf, readers must verify the following fields against its
 parent `FragmentTreeChild`:

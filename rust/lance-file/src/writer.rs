@@ -41,8 +41,9 @@ pub struct FileWriteSummary {
 pub struct FileWriterOptions {
     /// How many bytes to use for buffering column data.
     ///
-    /// The budget is divided evenly across columns. The default is 8 MiB per
-    /// column.
+    /// This is an aggregate budget divided evenly across the cache-owning field
+    /// encoders, including encoders nested inside structs, lists, and maps.
+    /// The default is 8 MiB per cache owner.
     pub data_cache_bytes: Option<u64>,
     /// A best-effort maximum encoded page size.
     pub max_page_bytes: Option<u64>,
@@ -188,6 +189,16 @@ impl FileWriter {
         }
     }
 
+    /// Mark the next batch as ending the current file page.
+    pub fn prepare_for_flush(&mut self) {
+        match self {
+            Self::V2_0(writer) => writer.prepare_for_flush(),
+            Self::V2_1(writer) => writer.prepare_for_flush(),
+            Self::V2_2(writer) => writer.prepare_for_flush(),
+            Self::V2_3(writer) => writer.prepare_for_flush(),
+        }
+    }
+
     /// Write one top-level column.
     pub async fn write_column(&mut self, column_index: usize, array: ArrayRef) -> Result<()> {
         match self {
@@ -301,4 +312,4 @@ impl FileWriter {
 
 #[cfg(test)]
 #[path = "writer_tests.rs"]
-mod writer_tests;
+pub(crate) mod writer_tests;

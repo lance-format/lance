@@ -5,7 +5,7 @@
 
 use crate::remapping::{RowAddrTranslator, materialize_remap};
 use arrow_array::{ArrayRef, BooleanArray, RecordBatch, UInt32Array, UInt64Array};
-use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use arrow_schema::{DataType, Field, Schema, SchemaRef, SortOptions};
 use async_trait::async_trait;
 use bytes::Bytes;
 use datafusion_common::scalar::ScalarValue;
@@ -13,7 +13,9 @@ use datafusion_execution::SendableRecordBatchStream;
 use datafusion_expr::Expr;
 use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
+use lance_core::cache::WeakLanceCache;
 use lance_core::deepsize::DeepSizeOf;
+use lance_core::utils::address::RowAddress;
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{Error, ROW_ADDR, ROW_ID, Result};
@@ -175,9 +177,68 @@ pub trait IndexWriter: Send {
     ) -> Result<IndexFile>;
 }
 
+/// Prepared byte-range access to one binary value in an immutable index file.
+#[async_trait]
+pub trait IndexBinaryReader: std::fmt::Debug + Send + Sync {
+    /// The exact payload length, available without reading the payload.
+    fn len(&self) -> u64;
+
+    /// Whether the value has no payload bytes.
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Read value-relative ranges in input order, including overlaps/empties.
+    /// Returned buffers may share I/O backing; visible lengths are not retained
+    /// allocation bounds. Preparation metadata is reused between calls.
+    async fn read_slices(&self, slices: &[std::ops::Range<u64>]) -> Result<Vec<Bytes>>;
+}
+
 /// Trait for reading an index (or parts of an index) from storage
 #[async_trait]
 pub trait IndexReader: Send + Sync {
+    /// Return this immutable file's optional, bounded metadata cache namespace.
+    ///
+    /// Auxiliary metadata can use this tier independently of index payload
+    /// eviction. The weak handle must not retain a request's I/O scope. Readers
+    /// without a separate metadata tier return `None`; callers keep their normal
+    /// fallback. A disabled cache is still a supported tier, without retention.
+    ///
+    /// ```
+    /// # use lance_index_core::scalar::IndexReader;
+    /// # fn example(reader: &dyn IndexReader) {
+    /// if let Some(file_metadata) = reader.metadata_cache() {
+    ///     // Reuse the existing file namespace for immutable metadata loaders.
+    ///     # drop(file_metadata);
+    /// }
+    /// # }
+    /// ```
+    fn metadata_cache(&self) -> Option<WeakLanceCache> {
+        None
+    }
+
+    /// Optionally prepare byte reads for one binary value without reading its payload.
+    ///
+    /// `row` is relative to the named column. `None` requests ordinary decoding;
+    /// the default does not issue I/O. Handles retain the current I/O scope and
+    /// must not be cached across requests with different statistics/priority.
+    ///
+    /// ```
+    /// # use lance_index_core::scalar::IndexReader;
+    /// # async fn example(reader: &dyn IndexReader) -> lance_core::Result<()> {
+    /// if let Some(value) = reader.try_prepare_binary_value("positions", 0).await? {
+    ///     let _tail = value.read_slices(&[value.len().saturating_sub(8)..value.len()]).await?;
+    /// }
+    /// # Ok(()) }
+    /// ```
+    async fn try_prepare_binary_value(
+        &self,
+        _column: &str,
+        _row: u64,
+    ) -> Result<Option<Arc<dyn IndexBinaryReader>>> {
+        Ok(None)
+    }
+
     /// Read the n-th record batch from the file
     async fn read_record_batch(&self, n: u64, batch_size: u64) -> Result<RecordBatch>;
     /// Read several record batches, returning one batch per entry of
@@ -382,6 +443,25 @@ pub trait IndexStore: std::fmt::Debug + Send + Sync + DeepSizeOf {
     /// that silently gets no bound cannot tell.
     fn with_io_buffer_size(&self, bytes: u64) -> Arc<dyn IndexStore>;
 
+    /// Return a scope whose index writers use at most `bytes` of configured
+    /// column buffering per file. A single Arrow row and encoding scratch may
+    /// exceed that buffer, so callers must separately bound their batches.
+    /// Unsupported stores return an error rather than silently ignoring a cap.
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use lance_core::Result;
+    /// use lance_index_core::scalar::IndexStore;
+    /// fn bounded_writers(store: &dyn IndexStore) -> Result<Arc<dyn IndexStore>> {
+    ///     store.with_write_buffer_size(8 << 20)
+    /// }
+    /// ```
+    fn with_write_buffer_size(&self, bytes: u64) -> Result<Arc<dyn IndexStore>> {
+        Err(Error::not_supported(format!(
+            "index store does not support a writer buffer of {bytes} bytes"
+        )))
+    }
+
     /// Copy a range of batches from an index file from this store to another
     ///
     /// This is often useful when remapping or updating
@@ -434,6 +514,16 @@ pub trait AnyQuery: std::fmt::Debug + Any + Send + Sync {
     fn to_expr(&self, col: String) -> Expr;
     /// Compare this query to another query
     fn dyn_eq(&self, other: &dyn AnyQuery) -> bool;
+    /// Whether every index answering this query reports the rows where the
+    /// predicate is SQL NULL in the `nulls` set of its [`SearchResult`].
+    ///
+    /// Reporting those rows as FALSE instead keeps the result exact under
+    /// `WHERE`, which drops NULL and FALSE rows alike, but `NOT` would turn them
+    /// into TRUE. The planner only pushes `NOT` down to queries that return
+    /// `true` here.
+    fn reports_null_rows(&self) -> bool {
+        true
+    }
 }
 
 impl PartialEq for dyn AnyQuery {
@@ -577,6 +667,13 @@ pub enum OldIndexDataFilter {
         to_keep: RoaringBitmap,
         to_remove: RoaringBitmap,
     },
+    /// Keep addresses in retained fragments except for deletion-marked positions.
+    /// The exclusion set stores only deleted offsets, not a mapping for every live row.
+    RowAddresses {
+        to_keep: RoaringBitmap,
+        to_remove: RoaringBitmap,
+        deleted_rows: RowAddrTreeMap,
+    },
     /// Keep old rows whose identifier is in this exact allow-list, used for id-domain
     /// indexes when stable row id is enabled.
     RowIds(RowAddrTreeMap),
@@ -594,6 +691,19 @@ impl OldIndexDataFilter {
                 .iter()
                 .map(|id| id.map(|id| valid_row_ids.contains(id)))
                 .collect(),
+            Self::RowAddresses {
+                to_keep,
+                deleted_rows,
+                ..
+            } => row_ids
+                .iter()
+                .map(|address| {
+                    address.map(|address| {
+                        to_keep.contains(RowAddress::from(address).fragment_id())
+                            && !deleted_rows.contains(address)
+                    })
+                })
+                .collect(),
         }
     }
 
@@ -605,6 +715,14 @@ impl OldIndexDataFilter {
         match self {
             Self::Fragments { to_keep, .. } => rows.retain_fragments(to_keep.iter()),
             Self::RowIds(valid_row_ids) => *rows &= valid_row_ids,
+            Self::RowAddresses {
+                to_keep,
+                deleted_rows,
+                ..
+            } => {
+                rows.retain_fragments(to_keep.iter());
+                *rows -= deleted_rows;
+            }
         }
     }
 }
@@ -726,6 +844,12 @@ pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
         self.search(query, metrics).await
     }
 
+    /// This index as an [`OrderedScalarIndex`], or `None` when it cannot
+    /// stream rows in key order.
+    fn as_ordered(&self) -> Option<&dyn OrderedScalarIndex> {
+        None
+    }
+
     /// Find the rows whose indexed value equals each of `keys`.
     ///
     /// Streams one row per match in batches with [`lookup_schema`]: the
@@ -733,7 +857,7 @@ pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
     /// rows yields one match per row, a key matching nothing yields none, and
     /// matches come in no particular order. A key matches exactly the rows
     /// `search` returns for an equality query on it, so for floats `-0.0`
-    /// and `0.0` are distinct and NaN matches NaN. A null key never matches,
+    /// and `0.0` compare equal and NaN matches NaN. A null key never matches,
     /// not even a null indexed value. `keys` must have the index's value type.
     ///
     /// Like [`Self::search`], the rows may include deleted rows, so callers
@@ -759,8 +883,20 @@ pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
         false
     }
 
-    /// Returns true if the remap operation is supported
-    fn can_remap(&self) -> bool;
+    /// Returns true if the remap operation is supported.
+    ///
+    /// Deprecated: new index implementations should report remap support from
+    /// persisted metadata through their scalar index plugin, so callers can
+    /// decide without opening the index. This instance-level check remains for
+    /// existing implementations; returning `false` keeps the index on the
+    /// safe fallback path during maintenance. The default is `true` because an
+    /// index that does not override this method may still be remappable.
+    #[deprecated(
+        note = "report remap support from persisted metadata through the scalar index plugin instead"
+    )]
+    fn can_remap(&self) -> bool {
+        true
+    }
 
     /// Remap the row ids, creating a new remapped version of this index in `dest_store`
     ///
@@ -856,6 +992,51 @@ pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
     fn value_range(&self) -> Option<(ScalarValue, ScalarValue)> {
         None
     }
+}
+
+/// A [`ScalarIndex`] that streams rows in key order, reached through
+/// [`ScalarIndex::as_ordered`].
+pub trait OrderedScalarIndex: ScalarIndex {
+    /// Stream the rows that satisfy `query` in the key order of `options`, or
+    /// every row, null keys included, when `query` is `None`.
+    ///
+    /// Each batch has two columns: the key, then the row identifier that
+    /// [`ScalarIndex::search`] returns, named `_rowaddr` when
+    /// [`ScalarIndex::results_are_row_addresses`] is true and `_rowid`
+    /// otherwise. A query yields only the rows where it is true, so null keys
+    /// appear only for `IS NULL` and for a range unbounded at both ends, which
+    /// is true for every row. The order of rows with equal keys is up to the
+    /// index.
+    ///
+    /// The stream is complete and exact: it yields every matching row once.
+    /// It has no limit, so a consumer that stops reading early owns that
+    /// truncation and must not report what it read as the full answer.
+    /// Dropping the stream stops further index reads.
+    ///
+    /// An index that finds its files out of key order returns
+    /// [`Error::NotSupported`].
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use arrow_schema::SortOptions;
+    /// # use futures::StreamExt;
+    /// # use lance_index_core::metrics::NoOpMetricsCollector;
+    /// # use lance_index_core::scalar::ScalarIndex;
+    /// # async fn test(index: &dyn ScalarIndex) -> lance_core::Result<()> {
+    /// if let Some(index) = index.as_ordered() {
+    ///     let options = SortOptions { descending: true, nulls_first: false };
+    ///     let mut stream = index.search_ordered(None, options, Arc::new(NoOpMetricsCollector))?;
+    ///     let largest_keys = stream.next().await;
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn search_ordered(
+        &self,
+        query: Option<&dyn AnyQuery>,
+        options: SortOptions,
+        metrics: Arc<dyn MetricsCollector>,
+    ) -> Result<SendableRecordBatchStream>;
 }
 
 /// Abstraction over any type that can remap row IDs during index loading.

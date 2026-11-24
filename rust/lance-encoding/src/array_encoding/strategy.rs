@@ -10,7 +10,7 @@ use arrow_buffer::{BooleanBuffer, NullBuffer};
 use arrow_data::ArrayData;
 use arrow_schema::DataType;
 use hyperloglogplus::{HyperLogLog, HyperLogLogPlus};
-use lance_arrow::BLOB_META_KEY;
+use lance_arrow::{BLOB_META_KEY, DataTypeExt};
 
 use crate::{
     array_encoding::{
@@ -26,6 +26,7 @@ use crate::{
             packed_struct::PackedStructEncoder,
         },
     },
+    compression::validate_packed_struct_children,
     constants::{
         COMPRESSION_LEVEL_META_KEY, COMPRESSION_META_KEY, PACKED_STRUCT_LEGACY_META_KEY,
         PACKED_STRUCT_META_KEY,
@@ -134,6 +135,14 @@ impl ArrayFieldEncodingStrategy {
     }
 
     fn is_primitive_type(data_type: &DataType) -> bool {
+        if let DataType::FixedSizeList(item, _) = data_type {
+            // The 2.0 reader cannot decode a fixed-size list of variable-width items.
+            return match item.data_type() {
+                nested @ DataType::FixedSizeList(..) => Self::is_primitive_type(nested),
+                DataType::Dictionary(..) => false,
+                item => !item.is_binary_like(),
+            };
+        }
         matches!(
             data_type,
             DataType::Boolean
@@ -159,7 +168,6 @@ impl ArrayFieldEncodingStrategy {
                 | DataType::UInt64
                 | DataType::UInt8
                 | DataType::FixedSizeBinary(_)
-                | DataType::FixedSizeList(_, _)
                 | DataType::Binary
                 | DataType::LargeBinary
                 | DataType::Utf8
@@ -550,6 +558,7 @@ impl ArrayFieldEncodingStrategy {
                         .map(|v| str_is_truthy(v))
                         .unwrap_or(field_metadata.contains_key(PACKED_STRUCT_META_KEY))
                     {
+                        validate_packed_struct_children(field)?;
                         Ok(Box::new(PrimitiveFieldEncoder::try_new(
                             options,
                             self.array_encoding_strategy.clone(),

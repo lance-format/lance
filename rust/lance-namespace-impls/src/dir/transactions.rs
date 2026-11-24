@@ -8,8 +8,8 @@ use lance::dataset::transaction::{Operation, Transaction};
 use lance_core::Result;
 use lance_namespace::error::NamespaceError;
 use lance_namespace::models::DescribeTransactionResponse;
+use object_store::Error as ObjectStoreError;
 use object_store::path::Path;
-use object_store::{Error as ObjectStoreError, ObjectStoreExt};
 
 use super::DirectoryNamespace;
 
@@ -220,7 +220,7 @@ impl DirectoryNamespace {
         txn_uuid: &str,
     ) -> Result<Option<TransactionAlteration>> {
         let path = self.transaction_alteration_path(table_uri, txn_uuid)?;
-        match self.object_store.inner.get(&path).await {
+        match self.object_store.read_object(&path).await {
             Ok(get_result) => {
                 let bytes = get_result.bytes().await.map_err(|e| {
                     lance_core::Error::from(NamespaceError::Internal {
@@ -266,8 +266,7 @@ impl DirectoryNamespace {
             })
         })?;
         self.object_store
-            .inner
-            .put(&path, bytes.into())
+            .put_payload(&path, bytes.into())
             .await
             .map_err(|e| {
                 lance_core::Error::from(NamespaceError::Internal {

@@ -292,6 +292,47 @@ async fn test_from_properties_defaults() {
     assert!(!builder.inline_optimization_enabled);
 }
 
+/// Present-but-unparsable typed properties must be rejected instead of
+/// silently falling back to the knob's default value.
+#[rstest]
+#[case::manifest_enabled("manifest_enabled", "tru")]
+#[case::dir_listing_enabled("dir_listing_enabled", "tru")]
+#[case::inline_optimization_enabled("inline_optimization_enabled", "tru")]
+#[case::table_version_tracking_enabled("table_version_tracking_enabled", "tru")]
+#[case::dir_listing_to_manifest_migration_enabled(
+    "dir_listing_to_manifest_migration_enabled",
+    "tru"
+)]
+#[case::vend_input_storage_options("vend_input_storage_options", "tru")]
+#[case::ops_metrics_enabled("ops_metrics_enabled", "tru")]
+#[case::commit_retries("commit_retries", "ten")]
+#[case::vend_input_storage_options_refresh_interval_millis(
+    "vend_input_storage_options_refresh_interval_millis",
+    "1.5"
+)]
+fn test_from_properties_rejects_unparsable_typed_values(#[case] key: &str, #[case] value: &str) {
+    let temp_dir = TempStdDir::default();
+
+    let mut properties = HashMap::new();
+    properties.insert("root".to_string(), temp_dir.to_str().unwrap().to_string());
+    properties.insert(key.to_string(), value.to_string());
+
+    let err = DirectoryNamespaceBuilder::from_properties(properties, None)
+        .expect_err("present-but-unparsable typed property should be rejected");
+    let code = match &err {
+        Error::Namespace { source, .. } => {
+            source.downcast_ref::<NamespaceError>().map(|e| e.code())
+        }
+        _ => None,
+    };
+    assert_eq!(code, Some(ErrorCode::InvalidInput), "{err}");
+    let message = err.to_string();
+    assert!(
+        message.contains(&format!("'{key}'")) && message.contains(&format!("'{value}'")),
+        "error should name the property and the offending value: {message}"
+    );
+}
+
 #[test]
 fn test_builder_disables_inline_optimization_by_default() {
     let builder = DirectoryNamespaceBuilder::new("memory://");
@@ -935,8 +976,11 @@ async fn test_isolation_between_namespaces() {
     assert!(namespace.table_exists(exists_req).await.is_ok());
 }
 
+#[rstest]
+#[case::plain(["table1", "table2", "table3"])]
+#[case::dollar(["a$b", "a$b$c", "a$$b"])]
 #[tokio::test]
-async fn test_migrate_directory_tables() {
+async fn test_migrate_directory_tables(#[case] table_names: [&str; 3]) {
     let temp_dir = TempStdDir::default();
     let temp_path = temp_dir.to_str().unwrap();
 
@@ -948,15 +992,23 @@ async fn test_migrate_directory_tables() {
         .await
         .unwrap();
 
-    // Create some tables
-    let schema = create_test_schema();
-    let ipc_data = create_test_ipc_data(&schema);
+    let ipc_data = create_non_empty_test_ipc_data();
+    let mut locations = Vec::with_capacity(table_names.len());
 
-    for i in 1..=3 {
+    for table_name in table_names {
         let mut create_req = CreateTableRequest::new();
-        create_req.id = Some(vec![format!("table{}", i)]);
-        dir_only_ns
+        create_req.id = Some(vec![table_name.to_string()]);
+        let response = dir_only_ns
             .create_table(create_req, bytes::Bytes::from(ipc_data.clone()))
+            .await
+            .unwrap();
+        locations.push(Url::from_file_path(response.location.unwrap()).unwrap());
+
+        let mut insert_req = InsertIntoTableRequest::new();
+        insert_req.id = Some(vec![table_name.to_string()]);
+        insert_req.mode = Some("append".to_string());
+        dir_only_ns
+            .insert_into_table(insert_req, bytes::Bytes::from(ipc_data.clone()))
             .await
             .unwrap();
     }
@@ -1009,9 +1061,29 @@ async fn test_migrate_directory_tables() {
     list_req.id = Some(vec![]);
     let tables = manifest_only_ns.list_tables(list_req).await.unwrap().tables;
     assert_eq!(tables.len(), 3);
-    assert!(tables.contains(&"table1".to_string()));
-    assert!(tables.contains(&"table2".to_string()));
-    assert!(tables.contains(&"table3".to_string()));
+    for (table_name, location) in table_names.into_iter().zip(locations) {
+        assert!(tables.contains(&table_name.to_string()));
+        let mut describe_req = DescribeTableRequest::new();
+        describe_req.id = Some(vec![table_name.to_string()]);
+        let response = manifest_only_ns.describe_table(describe_req).await.unwrap();
+        let migrated_location = response.location.unwrap();
+        assert_eq!(uri_to_url(&migrated_location).unwrap(), location);
+        let dataset = Dataset::open(&migrated_location).await.unwrap();
+        assert_eq!(dataset.get_fragments().len(), 2);
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 4);
+
+        if table_name.contains('$') {
+            let mut exists_req = TableExistsRequest::new();
+            exists_req.id = Some(table_name.split('$').map(str::to_string).collect());
+            let error = manifest_only_ns.table_exists(exists_req).await.unwrap_err();
+            assert!(matches!(
+                error,
+                lance_core::Error::Namespace { ref source, .. }
+                    if matches!(source.downcast_ref(), Some(NamespaceError::TableNotFound { .. }))
+            ));
+            assert!(error.to_string().contains("Table not found"));
+        }
+    }
 }
 
 #[tokio::test]

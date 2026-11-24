@@ -4,8 +4,10 @@ import math
 import os
 import time
 import uuid
+import weakref
 
 import lance
+import numpy as np
 import pyarrow as pa
 import pytest
 from lance.mem_wal import (
@@ -57,11 +59,19 @@ def _append_only_table(ids, prefix: str) -> pa.Table:
     )
 
 
-def _write_sstable(base_path: str, shard_id: str, gen_folder: str, data: pa.Table):
+def _mem_wal_dir(ds: lance.LanceDataset) -> str:
+    """The storage directory of ``ds``'s MemWAL: ``_{dir_id}_mem_wal``."""
+    dir_id = ds.mem_wal_index_details()["dir_id"]
+    return os.path.join(ds.uri, f"_{dir_id}_mem_wal")
+
+
+def _write_sstable(
+    ds: lance.LanceDataset, shard_id: str, gen_folder: str, data: pa.Table
+):
     """Write an SSTable Lance dataset at the expected sub-path.
 
     The collector resolves SSTable paths as:
-        {base_dataset_path}/_mem_wal/{shard_id}/{gen_folder}
+        {base_dataset_path}/_{dir_id}_mem_wal/{shard_id}/{gen_folder}
 
     Production flush also writes a primary-key dedup sidecar (`_pk_index/`) that
     the LSM scanner opens to dedup across generations; stage it here too so the
@@ -69,7 +79,7 @@ def _write_sstable(base_path: str, shard_id: str, gen_folder: str, data: pa.Tabl
     """
     from lance.lance import _write_pk_sidecar
 
-    gen_path = os.path.join(base_path, "_mem_wal", shard_id, gen_folder)
+    gen_path = os.path.join(_mem_wal_dir(ds), shard_id, gen_folder)
     lance.write_dataset(data, gen_path, schema=_LOOKUP_SCHEMA)
     _write_pk_sidecar(gen_path, data, ["id"])
 
@@ -81,12 +91,23 @@ def test_mark_sstables_as_compacted(tmp_path):
         _lookup_table([1, 2, 3], "base"), ds_path, schema=_LOOKUP_SCHEMA
     )
     dataset.initialize_mem_wal()
+    dir_id = dataset.mem_wal_index_details()["dir_id"]
+    assert dir_id
+
+    # Progress for any MemWAL but the table's own is refused.
+    with pytest.raises(OSError, match="Stale MemWAL"):
+        (
+            dataset.merge_insert("id")
+            .when_matched_update_all()
+            .mark_sstables_as_compacted([CompactedSsTable(shard_id, 1)], "stale")
+            .execute(_lookup_table([2], "stale"))
+        )
 
     (
         dataset.merge_insert("id")
         .when_matched_update_all()
         .when_not_matched_insert_all()
-        .mark_sstables_as_compacted([CompactedSsTable(shard_id, 1)])
+        .mark_sstables_as_compacted([CompactedSsTable(shard_id, 1)], dir_id)
         .execute(_lookup_table([2, 4], "compacted"))
     )
 
@@ -115,7 +136,7 @@ def test_point_lookup_with_memtables(tmp_path):
     base_ds.initialize_mem_wal()
 
     # --- SSTable: overwrites id=2 ---
-    _write_sstable(ds_path, shard_id, "gen_1", _lookup_table([2], "gen1"))
+    _write_sstable(base_ds, shard_id, "gen_1", _lookup_table([2], "gen1"))
 
     # --- ShardSnapshot describing the SSTable state ---
     snap = ShardSnapshot(shard_id).with_sstable(1, "gen_1").with_current_generation(2)
@@ -185,7 +206,7 @@ def test_lsm_scanner_with_memtables(tmp_path):
     )
     base_ds.initialize_mem_wal()
 
-    _write_sstable(ds_path, shard_id, "gen_1", _lookup_table([2], "gen1"))
+    _write_sstable(base_ds, shard_id, "gen_1", _lookup_table([2], "gen1"))
 
     snap = ShardSnapshot(shard_id).with_sstable(1, "gen_1").with_current_generation(2)
 
@@ -314,6 +335,252 @@ def test_shard_writer_delete_binding_masks_base_row(tmp_path):
     assert rows[4] == "writer_4"
 
 
+@pytest.mark.parametrize("operation", ["put", "delete"])
+@pytest.mark.parametrize("max_bytes", [1, 2 * 128 * 1024 + 16 * 1024])
+def test_shard_writer_reader_byte_limit(tmp_path, operation, max_bytes):
+    ds = lance.write_dataset(_lookup_table([0], "base"), tmp_path / "base")
+    ds.initialize_mem_wal()
+    batch_bytes = 128 * 1024
+    generated = 0
+    baseline = pa.total_allocated_bytes()
+    peak_bytes = 0
+
+    def batches():
+        nonlocal generated, peak_bytes
+        for i in range(20):
+            # Fresh Arrow allocations make retention observable without relying
+            # on RSS or allocating a large fixture. Delete must bound ignored
+            # non-key columns too.
+            batch = pa.record_batch(
+                [pa.array([i], pa.int64()), pa.array(["x" * batch_bytes])],
+                schema=_LOOKUP_SCHEMA,
+            )
+            generated += 1
+            peak_bytes = max(peak_bytes, pa.total_allocated_bytes() - baseline)
+            yield batch
+
+    reader = pa.RecordBatchReader.from_batches(_LOOKUP_SCHEMA, batches())
+    with ds.mem_wal_writer(str(uuid.uuid4())) as writer:
+        with pytest.raises(OSError, match=f"exceeds max_bytes={max_bytes}"):
+            getattr(writer, operation)(reader, max_bytes=max_bytes)
+        assert generated == (1 if max_bytes == 1 else 3)
+        assert peak_bytes <= max_bytes + 2 * batch_bytes + 4096
+        assert writer.stats()["put_count"] == 0
+        assert writer.lsm_scanner().to_table() == _lookup_table([0], "base")
+
+
+@pytest.mark.parametrize("operation", ["put", "delete"])
+@pytest.mark.parametrize("slice_kind", ["array", "buffer", "dictionary", "nested"])
+def test_shard_writer_reader_retained_parent_limit(tmp_path, operation, slice_kind):
+    max_bytes = 64 * 1024
+    dictionary_type = pa.dictionary(pa.int8(), pa.string())
+    name_type = {
+        "array": pa.string(),
+        "buffer": pa.string(),
+        "dictionary": dictionary_type,
+        "nested": pa.struct([("value", dictionary_type)]),
+    }[slice_kind]
+    schema = pa.schema([_LOOKUP_SCHEMA.field("id"), pa.field("name", name_type)])
+    base_name = {"value": "base"} if slice_kind == "nested" else "base"
+    base = pa.table({"id": [0], "name": [base_name]}, schema=schema)
+    ds = lance.write_dataset(base, tmp_path / "base")
+    ds.initialize_mem_wal()
+    parent_bytes = 128 * 1024
+    generated = 0
+    baseline = pa.total_allocated_bytes()
+    peak_bytes = 0
+
+    def batches():
+        nonlocal generated, peak_bytes
+        for i in range(12):
+            if slice_kind == "buffer":
+                parent = pa.allocate_buffer(parent_bytes)
+                memoryview(parent).cast("B")[:5] = b"small"
+                names = pa.Array.from_buffers(
+                    pa.string(),
+                    1,
+                    [
+                        None,
+                        pa.array([0, 5], pa.int32()).buffers()[1],
+                        parent.slice(0, 5),
+                    ],
+                )
+                del parent
+            else:
+                names = pa.array(["small", "x" * parent_bytes]).slice(0, 1)
+                if slice_kind in ("dictionary", "nested"):
+                    names = pa.DictionaryArray.from_arrays(
+                        pa.array([0], pa.int8()), names
+                    )
+                if slice_kind == "nested":
+                    names = pa.StructArray.from_arrays([names], names=["value"])
+            batch = pa.record_batch([pa.array([i + 1], pa.int64()), names], schema)
+            generated += 1
+            peak_bytes = max(peak_bytes, pa.total_allocated_bytes() - baseline)
+            yield batch
+        raise ValueError("reader exhausted")
+
+    reader = pa.RecordBatchReader.from_batches(schema, batches())
+    with ds.mem_wal_writer(str(uuid.uuid4())) as writer:
+        with pytest.raises(ValueError, match="reader exhausted"):
+            getattr(writer, operation)(reader, max_bytes=max_bytes)
+        # The owned copies must release the complete parents of tiny slices.
+        # Allow overlap between the producer's previous and incoming batches.
+        assert peak_bytes <= max_bytes + 2 * parent_bytes + 4096
+        assert generated == 12
+        assert writer.stats()["put_count"] == 0
+
+
+@pytest.mark.parametrize("operation", ["put", "delete"])
+@pytest.mark.parametrize(
+    "layout", ["key", "primitive", "validity", "dictionary", "nested"]
+)
+@pytest.mark.parametrize("reader_error", [False, True])
+def test_shard_writer_reader_foreign_owners(tmp_path, operation, layout, reader_error):
+    name_type = {
+        "key": pa.string(),
+        "primitive": pa.int64(),
+        "validity": pa.int64(),
+        "dictionary": pa.dictionary(pa.int8(), pa.int64()),
+        "nested": pa.struct([("value", pa.dictionary(pa.int8(), pa.int64()))]),
+    }[layout]
+    schema = pa.schema([_LOOKUP_SCHEMA.field("id"), pa.field("name", name_type)])
+    base_name = "base" if layout == "key" else {"value": 0} if layout == "nested" else 0
+    base = pa.table({"id": [0], "name": [base_name]}, schema=schema)
+    ds = lance.write_dataset(base, tmp_path / "base")
+    ds.initialize_mem_wal()
+    owner_bytes = 128 * 1024
+    owners = []
+    expected = base.to_pylist()
+    peak_bytes = 0
+
+    def batches():
+        nonlocal peak_bytes
+        for i in range(12):
+            parent = np.arange(owner_bytes // 8, dtype=np.int64)
+            owners.append(weakref.ref(parent))
+            # A nonzero view offset also checks that copying preserves values.
+            values = pa.array(parent[1:4])
+            ids = pa.array([3 * i + 1, 3 * i + 2, 3 * i + 3], pa.int64())
+            if layout == "key":
+                parent[1:4] = [3 * i + 1, 3 * i + 2, 3 * i + 3]
+                ids, values = values, pa.array(["small"] * 3)
+            elif layout == "validity":
+                parent = np.full(owner_bytes, 0b00000101, dtype=np.uint8)
+                owners.append(weakref.ref(parent))
+                values = pa.Array.from_buffers(
+                    pa.int64(), 3, [pa.py_buffer(parent[:1]), values.buffers()[1]]
+                )
+            elif layout in ("dictionary", "nested"):
+                values = pa.DictionaryArray.from_arrays(
+                    pa.array([1, 0, 2], pa.int8()), values
+                )
+                if layout == "nested":
+                    values = pa.StructArray.from_arrays([values], names=["value"])
+            batch = pa.record_batch([ids, values], schema=schema)
+            del parent
+            expected.extend(batch.to_pylist())
+            # Weak references observe foreign allocations without retaining them.
+            peak_bytes = max(
+                peak_bytes,
+                sum(
+                    owner.nbytes
+                    for ref in owners
+                    for owner in [ref()]
+                    if owner is not None
+                ),
+            )
+            yield batch
+        if reader_error:
+            raise ValueError("reader failed")
+
+    reader = pa.RecordBatchReader.from_batches(schema, batches())
+    with ds.mem_wal_writer(str(uuid.uuid4())) as writer:
+        if reader_error:
+            with pytest.raises(ValueError, match="reader failed"):
+                getattr(writer, operation)(reader, max_bytes=64 * 1024)
+            assert writer.stats()["put_count"] == 0
+        else:
+            getattr(writer, operation)(reader, max_bytes=64 * 1024)
+        # Allow previous/incoming producer overlap, including validity owners.
+        incoming_bytes = owner_bytes * (2 if layout == "validity" else 1)
+        assert peak_bytes <= 64 * 1024 + 2 * incoming_bytes + 4096
+        assert all(ref() is None for ref in owners)
+        actual = writer.lsm_scanner().to_table().to_pylist()
+        expected = (
+            expected if operation == "put" and not reader_error else base.to_pylist()
+        )
+        assert sorted(actual, key=lambda row: row["id"]) == expected
+
+
+@pytest.mark.parametrize("operation", ["put", "delete"])
+def test_shard_writer_reader_row_limit(tmp_path, operation):
+    ds = lance.write_dataset(_lookup_table([0], "base"), tmp_path / "base")
+    ds.initialize_mem_wal()
+    generated = 0
+
+    def batches():
+        nonlocal generated
+        for i in range(10):
+            generated += 1
+            yield _lookup_table([i], "input").to_batches()[0]
+
+    reader = pa.RecordBatchReader.from_batches(_LOOKUP_SCHEMA, batches())
+    with ds.mem_wal_writer(str(uuid.uuid4()), max_memtable_rows=2) as writer:
+        with pytest.raises(OSError, match="exceeds max_memtable_rows=2"):
+            getattr(writer, operation)(reader)
+        assert generated == 3
+        assert writer.stats()["put_count"] == 0
+
+
+@pytest.mark.parametrize("operation", ["put", "delete"])
+@pytest.mark.parametrize("reader_error", [None, ValueError, KeyboardInterrupt])
+def test_shard_writer_reader_atomicity(tmp_path, operation, reader_error):
+    ds = lance.write_dataset(_lookup_table([0, 1], "base"), tmp_path / "base")
+    ds.initialize_mem_wal()
+
+    def batches():
+        yield _lookup_table([0], "input").to_batches()[0]
+        if reader_error is not None:
+            raise reader_error("reader failed")
+        yield _lookup_table([1], "input").to_batches()[0]
+
+    reader = pa.RecordBatchReader.from_batches(_LOOKUP_SCHEMA, batches())
+    with ds.mem_wal_writer(str(uuid.uuid4())) as writer:
+        if reader_error is not None:
+            with pytest.raises(reader_error, match="reader failed"):
+                getattr(writer, operation)(reader, max_bytes=1024 * 1024)
+            expected = _lookup_table([0, 1], "base")
+            assert writer.stats()["put_count"] == 0
+        else:
+            getattr(writer, operation)(reader, max_bytes=1024 * 1024)
+            expected = (
+                _lookup_table([0, 1], "input")
+                if operation == "put"
+                else _lookup_table([], "base")
+            )
+            assert writer.stats()["put_count"] == 1
+        assert writer.lsm_scanner().to_table().sort_by("id") == expected
+
+
+@pytest.mark.parametrize("operation", ["put", "delete"])
+def test_shard_writer_reader_validation_before_consumption(tmp_path, operation):
+    ds = lance.write_dataset(_lookup_table([0], "base"), tmp_path / "base")
+    ds.initialize_mem_wal()
+
+    def batches():
+        raise AssertionError("reader should not be consumed")
+        yield
+
+    reader = pa.RecordBatchReader.from_batches(_LOOKUP_SCHEMA, batches())
+    writer = ds.mem_wal_writer(str(uuid.uuid4()))
+    with pytest.raises(OSError, match="max_bytes must be positive"):
+        getattr(writer, operation)(reader, max_bytes=0)
+    writer.close()
+    with pytest.raises(OSError, match="already closed"):
+        getattr(writer, operation)(reader)
+
+
 _VDIM = 4  # matches Rust test fixture dimension
 
 
@@ -379,6 +646,60 @@ def test_lsm_vector_search_filter_binding(tmp_path):
         )
 
 
+def test_lsm_vector_search_planner_inner_product_alias(tmp_path):
+    ds = lance.write_dataset(
+        _vector_search_table(range(64)),
+        str(tmp_path / "vec"),
+        schema=_vector_search_schema(),
+    )
+    ds.create_index(
+        "vector",
+        index_type="IVF_PQ",
+        name="vector_idx",
+        num_partitions=2,
+        num_sub_vectors=2,
+        metric="dot",
+    )
+    ds.initialize_mem_wal(maintained_indexes=["vector_idx"])
+
+    query = pa.array([6.0, 6.1, 6.2, 6.3], type=pa.float32())
+    dot_result = (
+        LsmVectorSearchPlanner(ds, [], "vector", distance_type="dot")
+        .plan_search(query, k=5, nprobes=2, columns=["id"])
+        .to_table()
+    )
+    alias_result = (
+        LsmVectorSearchPlanner(ds, [], "vector", distance_type="INNER_PRODUCT")
+        .plan_search(query, k=5, nprobes=2, columns=["id"])
+        .to_table()
+    )
+    assert dot_result.num_rows > 0
+    assert alias_result.equals(dot_result)
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            "Unknown distance_type 'manhattan'. "
+            "Valid values: 'l2', 'cosine', 'dot', 'hamming'"
+        ),
+    ):
+        LsmVectorSearchPlanner(ds, [], "vector", distance_type="manhattan")
+
+    # The alias is scoped to MemWAL; regular nearest keeps the Rust parser's
+    # contract and rejects it.
+    with pytest.raises(
+        ValueError, match="Metric type 'inner_product' is not supported"
+    ):
+        ds.scanner(
+            nearest={
+                "column": "vector",
+                "q": query.to_pylist(),
+                "k": 5,
+                "metric": "INNER_PRODUCT",
+            }
+        )
+
+
 VECTOR_DIM = 32
 ROWS_PER_BATCH = 50
 NUM_WRITE_ROUNDS = 3
@@ -422,7 +743,8 @@ def test_shard_writer_e2e_correctness(tmp_path):
     """
     End-to-end correctness test for ShardWriter covering:
     - Multi-round writes that trigger WAL and MemTable flushes
-    - File-system layout verification (_mem_wal/<shard_id>/wal/ and manifest/)
+    - File-system layout verification (_{dir_id}_mem_wal/<shard_id>/wal/ and
+      manifest/)
     - SSTable data readable via LsmScanner
     - New writer created after close can write and scan correctly
 
@@ -475,7 +797,7 @@ def test_shard_writer_e2e_correctness(tmp_path):
     assert closed_memtable_stats["frozen_bytes"] == 0
 
     # === File-system layout ===
-    mem_wal_dir = os.path.join(ds_path, "_mem_wal", shard_id)
+    mem_wal_dir = os.path.join(_mem_wal_dir(ds), shard_id)
     assert os.path.isdir(mem_wal_dir), f"MemWAL directory missing: {mem_wal_dir}"
 
     wal_dir = os.path.join(mem_wal_dir, "wal")

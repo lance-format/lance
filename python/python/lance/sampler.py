@@ -63,15 +63,27 @@ def _efficient_sample(
     batch_size : int
         The batch size to use when loading the data.
     max_takes : int
-        The maximum number of takes to perform. This is used to limit the number of
-        random reads. Large enough value can give a good random sample without
-        having to issue too many random reads.
+        The target number of strata to sample from. A large enough value can give
+        a good random sample. Reads within each output batch are coalesced into
+        takes of at most 8192 rows.
 
     Returns
     -------
     Generator of a RecordBatch.
     """
-    buf: list[pa.RecordBatch] = []
+    indices: list[int] = []
+
+    def load_batch() -> pa.RecordBatch:
+        buf: list[pa.RecordBatch] = []
+        for start in range(0, len(indices), 8192):
+            buf.extend(
+                dataset.take(
+                    indices[start : start + 8192], columns=columns
+                ).to_batches()
+            )
+        indices.clear()
+        return pa.Table.from_batches(buf).combine_chunks().to_batches()[0]
+
     total_records = len(dataset)
     assert total_records > n
     chunk_size = math.ceil(total_records / max_takes)
@@ -87,28 +99,19 @@ def _efficient_sample(
 
         if local_sample_size < local_size:
             # Add more randomness within each chunk, if there is room.
-            offset = i + np.random.randint(0, local_size - local_sample_size)
+            offset = i + np.random.randint(
+                0, local_size - local_sample_size + 1, dtype=np.int64
+            )
         else:
             offset = i
 
-        buf.extend(
-            dataset.take(
-                list(range(offset, offset + local_sample_size)),
-                columns=columns,
-            ).to_batches()
-        )
+        indices.extend(range(offset, offset + local_sample_size))
         if idx % 50 == 0:
             LOGGER.info("Sampled at offset=%s, len=%s", offset, local_sample_size)
-        if sum(len(b) for b in buf) >= batch_size:
-            tbl = pa.Table.from_batches(buf)
-            buf.clear()
-            tbl = tbl.combine_chunks()
-            yield tbl.to_batches()[0]
-            del tbl
-    if buf:
-        tbl = pa.Table.from_batches(buf).combine_chunks()
-        yield tbl.to_batches()[0]
-        del tbl
+        if len(indices) >= batch_size:
+            yield load_batch()
+    if indices:
+        yield load_batch()
 
 
 def _filtered_efficient_sample(
@@ -119,6 +122,9 @@ def _filtered_efficient_sample(
     target_takes: int,
     filter: str,
 ) -> Generator[pa.RecordBatch, None, None]:
+    if n == 0:
+        return
+
     total_records = len(dataset)
     shard_size = math.ceil(n / target_takes)
     num_shards = math.ceil(total_records / shard_size)
@@ -128,7 +134,7 @@ def _filtered_efficient_sample(
 
     tables = []
     remaining_rows = n
-    remaining_in_batch = min(batch_size, n)
+    buffered_rows = 0
     for shard in shards:
         start = shard * shard_size
         end = min(start + shard_size, total_records)
@@ -147,20 +153,24 @@ def _filtered_efficient_sample(
                 table = table.slice(0, remaining_rows)
             tables.append(table)
             remaining_rows -= table.num_rows
-            remaining_in_batch = remaining_in_batch - table.num_rows
-            if remaining_in_batch <= 0:
+            buffered_rows += table.num_rows
+            if buffered_rows >= batch_size:
                 combined = pa.concat_tables(tables).combine_chunks()
-                batch = combined.slice(0, batch_size).to_batches()[0]
-                yield batch
-                remaining_in_batch = min(batch_size, remaining_rows)
-                if len(combined) > batch_size:
-                    leftover = combined.slice(batch_size)
-                    tables = [leftover]
-                    remaining_in_batch -= len(leftover)
-                else:
-                    tables = []
+                full_batch_rows = buffered_rows // batch_size * batch_size
+                yield from combined.slice(0, full_batch_rows).to_batches(
+                    max_chunksize=batch_size
+                )
+                buffered_rows -= full_batch_rows
+                tables = [combined.slice(full_batch_rows)] if buffered_rows else []
             if remaining_rows <= 0:
                 break
+
+    if buffered_rows:
+        yield from (
+            pa.concat_tables(tables)
+            .combine_chunks()
+            .to_batches(max_chunksize=batch_size)
+        )
 
 
 def maybe_sample(
@@ -184,10 +194,11 @@ def maybe_sample(
     batch_size : int, optional
         The batch size to use when loading the data, by default 10240.
     max_takes : int, optional
-        The maximum number of takes to perform, by default 2048.
-        This is employed to minimize the number of random reads necessary for sampling.
-        A sufficiently large value can provide an effective random sample without
-        the need for excessive random reads.
+        The target number of sampling strata, by default 2048. A sufficiently
+        large value can provide an effective random sample. For unfiltered
+        stratified sampling, reads within each output batch are coalesced into
+        takes of at most 8192 rows;
+        this parameter does not impose a hard limit on the number of take calls.
     filt : str, optional
         The filter to apply to the dataset, by default None.  If a filter is provided,
         then we will first load all row ids in memory and then batch through the ids
@@ -197,7 +208,17 @@ def maybe_sample(
     -------
     Generator[pa.RecordBatch]
         A generator that yields [RecordBatch] of data.
+
+    Notes
+    -----
+    Unfiltered sampling uses NumPy's global random state. The bounded-memory
+    selection algorithm and corrected stratum window bounds change exact sampled
+    rows and random-state advancement for a given seed compared with earlier
+    implementations.
     """
+    if n < 0:
+        raise ValueError(f"n must be non-negative, got {n}")
+
     if isinstance(dataset, (str, Path)):
         dataset = lance.dataset(dataset)
 
@@ -216,7 +237,15 @@ def maybe_sample(
     elif n > max_takes:
         yield from _efficient_sample(dataset, n, columns, batch_size, max_takes)
     else:
-        choices = np.random.choice(len(dataset), n, replace=False)
+        # Floyd's algorithm samples without allocating a population-sized permutation.
+        selected = set()
+        choices = []
+        for upper in range(len(dataset) - n, len(dataset)):
+            candidate = int(np.random.randint(0, upper + 1, dtype=np.int64))
+            index = upper if candidate in selected else candidate
+            selected.add(index)
+            choices.append(index)
+        np.random.shuffle(choices)
         idx = 0
         while idx < len(choices):
             end = min(idx + batch_size, len(choices))
@@ -447,7 +476,11 @@ class ShardedBatchSampler(Sampler):
             filter=filter,
             scan_in_order=True,
         ).to_batches():
-            batch = batch.slice(rows_to_skip, batch.num_rows - rows_to_skip)
+            if rows_to_skip >= batch.num_rows:
+                # This batch ends before this rank's next row.
+                rows_to_skip -= batch.num_rows
+                continue
+            batch = batch.slice(rows_to_skip)
             # Take every Nth row
             indices = list(range(0, batch.num_rows, self._world_size))
             rows_to_skip = (
@@ -476,10 +509,13 @@ class ShardedBatchSampler(Sampler):
                     accumulated_batches.append(big_batch)
         # deliver any batches left over, they will be <= batch
         # size but that is ok because we are done
-        last_batch = (
-            pa.Table.from_batches(accumulated_batches).combine_chunks().to_batches()[0]
-        )
-        yield last_batch
+        if accumulated_batches:
+            last_batch = (
+                pa.Table.from_batches(accumulated_batches)
+                .combine_chunks()
+                .to_batches()[0]
+            )
+            yield last_batch
 
     def _sample_filtered(
         self,
@@ -583,13 +619,15 @@ class ShardedFixedBatchSampler(ShardedBatchSampler):
     Features:
     - Requires `total_num_rows` and `batch_size` to be specified.
     - Each rank receives consecutive, non-overlapping index ranges.
+    - Length reports this rank's batch count, including partial batches and
+      zero batches for ranks beyond the dataset.
     - Optionally randomizes the order of batches per epoch if `randomize=True`.
     - Suitable for integration with PyTorch DataLoader or similar frameworks.
 
     Example (total_num_rows=1000, world_size=4, batch_size=100):
-    - Rank 0: [0-99], [100-199], [200-299]
-    - Rank 1: [250-349], [350-449], [450-549]
-    - Rank 2: [500-599], [600-699], [700-799]
+    - Rank 0: [0-99], [100-199], [200-249]
+    - Rank 1: [250-349], [350-449], [450-499]
+    - Rank 2: [500-599], [600-699], [700-749]
     - Rank 3: [750-849], [850-949], [950-999]
 
     Parameters
@@ -600,12 +638,15 @@ class ShardedFixedBatchSampler(ShardedBatchSampler):
         The total number of processes in the distributed cluster.
     randomize : bool, default False
         Whether to randomize the order of batches for each epoch.
+        Sequential iteration retains only the current batch. Randomized iteration
+        also retains one start offset per batch.
     seed : int, default 0
         Random seed for reproducibility when randomize is enabled.
     batch_size : int, default 0
-        The number of rows per batch.
+        The number of rows per batch. Must be positive for nonempty datasets.
     total_num_rows : int, default 0
-        The total number of rows in the dataset.
+        The non-negative total number of rows in the dataset. Empty datasets
+        yield no batches, including with the default batch size of zero.
     """
 
     def __init__(
@@ -617,40 +658,56 @@ class ShardedFixedBatchSampler(ShardedBatchSampler):
         batch_size: int = 0,
         total_num_rows: int = 0,
     ):
+        if world_size <= 0:
+            raise ValueError(f"world_size must be positive, got {world_size}")
+        if not 0 <= rank < world_size:
+            raise ValueError(
+                f"rank must satisfy 0 <= rank < world_size ({world_size}), got {rank}"
+            )
+        if total_num_rows < 0:
+            raise ValueError(
+                f"total_num_rows must be non-negative, got {total_num_rows}"
+            )
+        if batch_size < 0 or (batch_size == 0 and total_num_rows > 0):
+            raise ValueError(
+                "batch_size must be non-negative for empty datasets and positive "
+                f"otherwise, got batch_size={batch_size}, "
+                f"total_num_rows={total_num_rows}"
+            )
         super().__init__(rank, world_size, randomize, seed)
         self._total_num_rows = total_num_rows
         self._batch_size = batch_size
+        per_rank = (total_num_rows + world_size - 1) // world_size
+        self._start = min(rank * per_rank, total_num_rows)
+        self._end = min(self._start + per_rank, total_num_rows)
         self._len = self._compute_length()
 
     # The sampler here is mainly implemented with the hope that
     # the data of batch_size are all adjacent, so we don't want
     # to use filter to break this adjacent feature.
     def _compute_length(self):
-        if self._batch_size == 0 and self._total_num_rows == 0:
+        num_rows = self._end - self._start
+        if num_rows == 0:
             return 0
-        per_rank = math.ceil(self._total_num_rows / self._world_size)
-        return math.ceil(per_rank / self._batch_size)
+        return (num_rows + self._batch_size - 1) // self._batch_size
 
     def __len__(self):
         return self._len
 
     def __iter__(self) -> Generator[List[int], None, None]:
-        per_rank = math.ceil(self._total_num_rows / self._world_size)
-        start = self._rank * per_rank
-        end = min(start + per_rank, self._total_num_rows)
+        start, end = self._start, self._end
 
-        batches = []
-        current = start
-        while current < end:
-            batch_end = min(current + self._batch_size, end)
-            batches.append(list(range(current, batch_end)))
-            current = batch_end
+        batch_starts: Union[range, List[int]] = (
+            range(start, end, self._batch_size) if start < end else range(0)
+        )
 
         if self._randomize:
+            batch_starts = list(batch_starts)
             random.seed(self._seed + self._epoch)
-            random.shuffle(batches)
+            random.shuffle(batch_starts)
 
-        yield from batches
+        for current in batch_starts:
+            yield list(range(current, min(current + self._batch_size, end)))
 
     @staticmethod
     def from_torch(

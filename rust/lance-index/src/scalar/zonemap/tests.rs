@@ -10,13 +10,16 @@ use crate::scalar::registry::VALUE_COLUMN_NAME;
 use crate::scalar::{IndexStore, zonemap::ROWS_PER_ZONE_DEFAULT};
 use std::sync::Arc;
 
+use crate::progress::NoopIndexBuildProgress;
 use crate::scalar::registry::ScalarIndexPlugin;
 use crate::scalar::zoned::ZoneBound;
 use crate::scalar::zonemap::{
     CarriedSeed, MergeableSeed, ZoneMapIndexPlugin, ZoneMapIndexVersion, ZoneMapStatistics,
     make_zone_map_index_details,
 };
-use arrow::datatypes::{ArrowPrimitiveType, Decimal128Type, Float32Type, Float64Type, Int64Type};
+use arrow::datatypes::{
+    ArrowPrimitiveType, Decimal128Type, Float32Type, Float64Type, Int32Type, Int64Type,
+};
 use arrow_array::{
     Array, Float64Array, PrimitiveArray, RecordBatch, UInt32Array, UInt64Array, record_batch,
 };
@@ -129,6 +132,7 @@ where
         stream,
         test_store.as_ref(),
         Some(ZoneMapIndexBuilderParams::new(2)),
+        &NoopIndexBuildProgress,
     )
     .await
     .unwrap();
@@ -364,6 +368,26 @@ async fn test_remapped_legacy_nan_marker_zone_keeps_bounded_range_candidate() {
     source_mut.null_rows = None;
     let new_row = 3_u64 << 32;
     source_mut.fri = Some(Arc::new(TestRemapper::new([(0, new_row)])));
+
+    let raw_zones = source.zones_as_batch().unwrap();
+    let column_u64 = |name| {
+        raw_zones
+            .column_by_name(name)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap()
+    };
+    assert_eq!(column_u64("fragment_id").value(0), 0);
+    assert_eq!(column_u64("zone_start").value(0), 0);
+    assert_eq!(column_u64("zone_length").value(0), 2);
+    let negative_nan_count = raw_zones
+        .column_by_name("negative_nan_count")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<UInt32Array>()
+        .unwrap();
+    assert!(negative_nan_count.is_null(0));
 
     let remapped = remap_zone(
         &source.zones[0],
@@ -630,9 +654,14 @@ async fn test_empty_zonemap_index() {
         stream::once(std::future::ready(Ok(data))),
     ));
 
-    ZoneMapIndexPlugin::train_zonemap_index(data_stream, test_store.as_ref(), None)
-        .await
-        .unwrap();
+    ZoneMapIndexPlugin::train_zonemap_index(
+        data_stream,
+        test_store.as_ref(),
+        None,
+        &NoopIndexBuildProgress,
+    )
+    .await
+    .unwrap();
 
     log::debug!("Successfully wrote the index file");
 
@@ -680,6 +709,7 @@ async fn test_null_zonemap_index() {
         stream,
         test_store.as_ref(),
         Some(ZoneMapIndexBuilderParams::new(5000)),
+        &NoopIndexBuildProgress,
     )
     .await
     .unwrap();
@@ -816,7 +846,7 @@ async fn test_zonemap_null_handling_in_queries() {
     let stream = Box::pin(RecordBatchStreamAdapter::new(schema, stream));
 
     // Train and write the zonemap index
-    ZoneMapIndexPlugin::train_zonemap_index(stream, store.as_ref(), None)
+    ZoneMapIndexPlugin::train_zonemap_index(stream, store.as_ref(), None, &NoopIndexBuildProgress)
         .await
         .unwrap();
 
@@ -919,6 +949,7 @@ async fn test_nan_zonemap_index() {
         data_stream,
         test_store.as_ref(),
         Some(ZoneMapIndexBuilderParams::new(100)),
+        &NoopIndexBuildProgress,
     )
     .await
     .unwrap();
@@ -1134,6 +1165,7 @@ async fn test_basic_zonemap_index() {
         data_stream,
         test_store.as_ref(),
         Some(ZoneMapIndexBuilderParams::new(100)),
+        &NoopIndexBuildProgress,
     )
     .await
     .unwrap();
@@ -1343,6 +1375,7 @@ async fn test_complex_zonemap_index() {
         data_stream,
         test_store.as_ref(),
         Some(ZoneMapIndexBuilderParams::default()),
+        &NoopIndexBuildProgress,
     )
     .await
     .unwrap();
@@ -1512,6 +1545,7 @@ async fn test_multiple_fragments_zonemap() {
             data_stream,
             test_store.as_ref(),
             Some(ZoneMapIndexBuilderParams::new(5000)),
+            &NoopIndexBuildProgress,
         )
         .await
         .unwrap();
@@ -1731,6 +1765,7 @@ async fn test_multiple_fragments_zonemap() {
             data_stream,
             test_store.as_ref(),
             Some(ZoneMapIndexBuilderParams::default()),
+            &NoopIndexBuildProgress,
         )
         .await
         .unwrap();
@@ -1815,6 +1850,7 @@ async fn test_multiple_fragments_zonemap() {
             data_stream,
             test_store.as_ref(),
             Some(ZoneMapIndexBuilderParams::new(ROWS_PER_ZONE_DEFAULT * 3)),
+            &NoopIndexBuildProgress,
         )
         .await
         .unwrap();
@@ -2203,6 +2239,67 @@ async fn test_like_prefix_large_utf8() {
     let mut expected = RowAddrTreeMap::new();
     expected.insert_range((1u64 << 32)..((1u64 << 32) + 100));
 
+    assert_eq!(result, SearchResult::at_most(expected));
+}
+
+/// Zones trained on a dictionary column have no extrema, so a prefix query
+/// keeps every zone with a non-null value instead of pruning them all.
+#[tokio::test]
+async fn test_like_prefix_dictionary_zones_without_extrema() {
+    let tmpdir = TempObjDir::default();
+    let test_store = local_store(&tmpdir);
+    let values: arrow_array::DictionaryArray<Int32Type> = vec![
+        Some("p012"),
+        Some("p013"),
+        None,
+        None,
+        Some("p099"),
+        Some("x"),
+    ]
+    .into_iter()
+    .collect();
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        VALUE_COLUMN_NAME,
+        values.data_type().clone(),
+        true,
+    )]));
+    let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(values)]).unwrap();
+    let stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+        schema,
+        stream::iter([Ok(batch)]),
+    ));
+    ZoneMapIndexPlugin::train_zonemap_index(
+        add_row_addr(stream),
+        test_store.as_ref(),
+        Some(ZoneMapIndexBuilderParams::new(2)),
+        &NoopIndexBuildProgress,
+    )
+    .await
+    .unwrap();
+    let index = ZoneMapIndex::load(
+        test_store,
+        None,
+        &LanceCache::no_cache(),
+        false,
+        ZoneMapIndexVersion::V1,
+    )
+    .await
+    .unwrap();
+    assert!(
+        index
+            .zones
+            .iter()
+            .all(|zone| zone.min.is_null() && zone.max.is_null()),
+        "dictionary zones are expected to store no extrema"
+    );
+
+    let query = SargableQuery::LikePrefix(ScalarValue::Utf8(Some("p01".to_string())));
+    let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+
+    // The all-null middle zone holds no value the prefix could match
+    let mut expected = RowAddrTreeMap::new();
+    expected.insert_range(0..2);
+    expected.insert_range(4..6);
     assert_eq!(result, SearchResult::at_most(expected));
 }
 
@@ -3757,6 +3854,7 @@ async fn train_and_load_fsl(rows: Vec<Vec<Option<f32>>>, list_size: i32) -> Arc<
         stream,
         test_store.as_ref(),
         Some(ZoneMapIndexBuilderParams::new(4)),
+        &NoopIndexBuildProgress,
     )
     .await
     .unwrap();
@@ -3877,6 +3975,7 @@ async fn test_fsl_zonemap_null_list() {
         stream,
         test_store.as_ref(),
         Some(ZoneMapIndexBuilderParams::new(4)),
+        &NoopIndexBuildProgress,
     )
     .await
     .unwrap();
@@ -3994,6 +4093,7 @@ async fn test_fsl_zonemap_all_null_zone() {
         stream,
         test_store.as_ref(),
         Some(ZoneMapIndexBuilderParams::new(4)),
+        &NoopIndexBuildProgress,
     )
     .await
     .unwrap();
@@ -4062,6 +4162,7 @@ async fn test_struct_zonemap_null_tracking() {
         stream,
         test_store.as_ref(),
         Some(ZoneMapIndexBuilderParams::new(10)),
+        &NoopIndexBuildProgress,
     )
     .await
     .unwrap();
@@ -4141,6 +4242,7 @@ async fn test_list_zonemap_null_tracking() {
         stream,
         test_store.as_ref(),
         Some(ZoneMapIndexBuilderParams::new(10)),
+        &NoopIndexBuildProgress,
     )
     .await
     .unwrap();
@@ -4395,6 +4497,7 @@ async fn test_list_zonemap_training_ignores_child_nulls() {
         stream,
         test_store.as_ref(),
         Some(ZoneMapIndexBuilderParams::new(10)),
+        &NoopIndexBuildProgress,
     )
     .await
     .unwrap();
@@ -5561,6 +5664,7 @@ async fn train_float_index_in(
         add_row_addr(stream),
         store.as_ref(),
         Some(ZoneMapIndexBuilderParams::new(rows_per_zone)),
+        &NoopIndexBuildProgress,
     )
     .await
     .unwrap();

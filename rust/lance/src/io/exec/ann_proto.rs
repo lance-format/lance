@@ -17,7 +17,7 @@ use arrow_schema::{Field, Schema as ArrowSchema};
 use lance_core::{Error, Result};
 use lance_index::pb as index_pb;
 use lance_index::vector::segment_ef::{SegmentEfParams, SegmentEfPolicy};
-use lance_index::vector::{ApproxMode, DEFAULT_QUERY_PARALLELISM, Query};
+use lance_index::vector::{ApproxMode, DEFAULT_QUERY_PARALLELISM, Query, RqGraphScoring};
 use lance_linalg::distance::DistanceType;
 use lance_table::format::IndexMetadata;
 use lance_table::format::pb as table_pb;
@@ -97,6 +97,23 @@ fn approx_mode_from_proto(value: i32) -> ApproxMode {
     }
 }
 
+fn rq_graph_scoring_to_proto(scoring: RqGraphScoring) -> pb::VectorRqGraphScoring {
+    match scoring {
+        RqGraphScoring::MultiBit => pb::VectorRqGraphScoring::MultiBit,
+        RqGraphScoring::OneBitRerank => pb::VectorRqGraphScoring::OneBitRerank,
+    }
+}
+
+fn rq_graph_scoring_from_proto(value: i32) -> Result<RqGraphScoring> {
+    match pb::VectorRqGraphScoring::try_from(value) {
+        Ok(pb::VectorRqGraphScoring::MultiBit) => Ok(RqGraphScoring::MultiBit),
+        Ok(pb::VectorRqGraphScoring::OneBitRerank) => Ok(RqGraphScoring::OneBitRerank),
+        Err(_) => Err(Error::internal(format!(
+            "Invalid VectorRqGraphScoring value: {value}"
+        ))),
+    }
+}
+
 pub fn query_to_proto(query: &Query) -> Result<pb::VectorQueryProto> {
     query.validate_search_effort()?;
     let query_vector_arrow_ipc = query_vector_to_ipc_bytes(query.key.as_ref())?;
@@ -121,6 +138,7 @@ pub fn query_to_proto(query: &Query) -> Result<pb::VectorQueryProto> {
         dist_q_c: Some(query.dist_q_c),
         query_parallelism: Some(query.query_parallelism),
         approx_mode: approx_mode_to_proto(query.approx_mode) as i32,
+        rq_graph_scoring: rq_graph_scoring_to_proto(query.rq_graph_scoring) as i32,
         // No planner narrows the covering projection yet, so this is always absent:
         // "materialize every covering column declared". See `CoveringProjection`.
         covering_projection: None,
@@ -204,6 +222,7 @@ pub fn query_from_proto(proto: pb::VectorQueryProto) -> Result<Query> {
         dist_q_c: proto.dist_q_c.unwrap_or(0.0),
         approx_mode: approx_mode_from_proto(proto.approx_mode),
         segment_ef: segment_ef_from_proto(proto.segment_ef)?,
+        rq_graph_scoring: rq_graph_scoring_from_proto(proto.rq_graph_scoring)?,
     };
     query.validate_search_effort()?;
     Ok(query)
@@ -414,6 +433,7 @@ mod tests {
             dist_q_c: 0.42,
             approx_mode: ApproxMode::Accurate,
             segment_ef: Default::default(),
+            rq_graph_scoring: RqGraphScoring::OneBitRerank,
         };
 
         let proto = query_to_proto(&query).unwrap();
@@ -434,6 +454,7 @@ mod tests {
         assert_eq!(query.query_parallelism, back.query_parallelism);
         assert_eq!(query.dist_q_c, back.dist_q_c);
         assert_eq!(query.approx_mode, back.approx_mode);
+        assert_eq!(query.rq_graph_scoring, back.rq_graph_scoring);
         assert_eq!(query.key.len(), back.key.len());
         assert_eq!(query.key.data_type(), back.key.data_type());
     }
@@ -500,6 +521,7 @@ mod tests {
             dist_q_c: 0.0,
             approx_mode: ApproxMode::Normal,
             segment_ef: Default::default(),
+            rq_graph_scoring: Default::default(),
         };
 
         let proto = query_to_proto(&query).unwrap();
@@ -507,7 +529,13 @@ mod tests {
         assert!(back.metric_type.is_none());
         assert!(!back.use_index);
         assert_eq!(back.approx_mode, ApproxMode::Normal);
+        assert_eq!(back.rq_graph_scoring, RqGraphScoring::MultiBit);
         assert_eq!(back.search_effort, 0.5);
+
+        let mut proto = query_to_proto(&query).unwrap();
+        proto.rq_graph_scoring = i32::MAX;
+        let error = query_from_proto(proto).unwrap_err();
+        assert!(error.to_string().contains("VectorRqGraphScoring"));
 
         for effort in [-0.1, 1.1, f64::NAN, f64::INFINITY] {
             let mut proto = query_to_proto(&query).unwrap();
@@ -595,6 +623,7 @@ mod tests {
             dist_q_c: 0.0,
             approx_mode: ApproxMode::Normal,
             segment_ef: Default::default(),
+            rq_graph_scoring: Default::default(),
         };
 
         let exec = ANNIvfPartitionExec::try_new(
@@ -645,6 +674,7 @@ mod tests {
             dist_q_c: 0.0,
             approx_mode: ApproxMode::Normal,
             segment_ef: Default::default(),
+            rq_graph_scoring: Default::default(),
         };
 
         // Use a TestMemoryExec as a mock input child (provides the KNN_PARTITION_SCHEMA)
@@ -711,6 +741,7 @@ mod tests {
             dist_q_c: 0.0,
             approx_mode: ApproxMode::Normal,
             segment_ef: Default::default(),
+            rq_graph_scoring: Default::default(),
         };
         let input: Arc<dyn datafusion::physical_plan::ExecutionPlan> =
             TestMemoryExec::try_new_exec(
@@ -774,12 +805,24 @@ mod tests {
     #[tokio::test]
     async fn test_sub_index_proto_roundtrip_scalar_index_query() {
         let (dataset, _dir) = make_indexed_dataset().await;
-        let scalar_schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
-            "result",
-            arrow_schema::DataType::Binary,
-            true,
-        )]));
-        let prefilter_plan = make_dummy_prefilter_plan(scalar_schema.clone());
+        let format = lance_select::result::IndexExprResultWireFormat::ThreeVariant;
+        let prefilter_plan: Arc<dyn datafusion::physical_plan::ExecutionPlan> =
+            Arc::new(super::super::prefilter_union::PrefilterUnionExec::new(
+                dataset.clone(),
+                make_dummy_prefilter_plan(format.schema().clone()),
+                None,
+                dataset
+                    .fragments()
+                    .iter()
+                    .map(|fragment| fragment.id as u32)
+                    .collect(),
+                dataset
+                    .fragments()
+                    .iter()
+                    .map(|fragment| fragment.id as u32)
+                    .collect(),
+                format,
+            ));
         let exec = build_sub_index_exec(
             &dataset,
             PreFilterSource::ScalarIndexQuery(prefilter_plan.clone()),
@@ -803,7 +846,7 @@ mod tests {
             proto,
             Some(dataset.clone()),
             input,
-            Some(make_dummy_prefilter_plan(scalar_schema)),
+            Some(prefilter_plan.clone()),
         )
         .await
         .unwrap();
@@ -811,6 +854,9 @@ mod tests {
             back.prefilter_source(),
             PreFilterSource::ScalarIndexQuery(_)
         ));
+        if let PreFilterSource::ScalarIndexQuery(child) = back.prefilter_source() {
+            assert!(Arc::ptr_eq(child, &prefilter_plan));
+        }
     }
 
     #[tokio::test]

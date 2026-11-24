@@ -29,7 +29,8 @@ use lance_io::object_store::{LanceNamespaceStorageOptionsProvider, StorageOption
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::blocking_dataset::extract_namespace_info;
+use crate::blocking_dataset::clone_dataset;
+use crate::blocking_dataset::conversions::extract_namespace_info;
 use crate::error::{Error, Result};
 use crate::ffi::JNIEnvExt;
 use crate::session::session_from_handle;
@@ -78,7 +79,7 @@ fn inner_count_rows_native(
     jdataset: JObject,
     fragment_id: jlong,
 ) -> Result<usize> {
-    let dataset = unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }?;
+    let dataset = clone_dataset(env, &jdataset)?;
     let Some(fragment) = dataset.inner.get_fragment(fragment_id as usize) else {
         return Err(Error::input_error(format!(
             "Fragment not found: {fragment_id}"
@@ -761,8 +762,7 @@ const DATA_FILE_CLASS: &str = "org/lance/fragment/DataFile";
 const DATA_FILE_CONSTRUCTOR_SIG: &str =
     "(Ljava/lang/String;[I[IIILjava/lang/Long;Ljava/lang/Integer;)V";
 const DELETE_FILE_CLASS: &str = "org/lance/fragment/DeletionFile";
-const DELETE_FILE_CONSTRUCTOR_SIG: &str =
-    "(JJLjava/lang/Long;Lorg/lance/fragment/DeletionFileType;Ljava/lang/Integer;)V";
+const DELETE_FILE_CONSTRUCTOR_SIG: &str = "(JJLjava/lang/Long;Lorg/lance/fragment/DeletionFileType;Ljava/lang/Integer;[BLjava/lang/String;)V";
 const DELETE_FILE_TYPE_CLASS: &str = "org/lance/fragment/DeletionFileType";
 const FRAGMENT_METADATA_CLASS: &str = "org/lance/FragmentMetadata";
 const FRAGMENT_METADATA_CONSTRUCTOR_SIG: &str = "(ILjava/util/List;Ljava/lang/Long;Lorg/lance/fragment/DeletionFile;Lorg/lance/fragment/RowIdMeta;Lorg/lance/fragment/VersionMeta;Lorg/lance/fragment/VersionMeta;Ljava/util/List;Ljava/lang/Long;Ljava/util/Map;)V";
@@ -861,6 +861,14 @@ impl IntoJava for &DeletionFile {
         };
         let file_type = self.file_type.into_java(env)?;
         let base_id = convert_to_java_integer(env, self.base_id)?;
+        let inline = match &self.inline {
+            Some(bytes) => env.byte_array_from_slice(bytes)?.into(),
+            None => JObject::null(),
+        };
+        let path = match &self.path {
+            Some(path) => JObject::from(env.new_string(path)?),
+            None => JObject::null(),
+        };
         Ok(env.new_object(
             DELETE_FILE_CLASS,
             DELETE_FILE_CONSTRUCTOR_SIG,
@@ -870,6 +878,8 @@ impl IntoJava for &DeletionFile {
                 JValueGen::Object(&num_deleted_rows),
                 JValueGen::Object(&file_type),
                 JValueGen::Object(&base_id),
+                JValueGen::Object(&inline),
+                JValueGen::Object(&path),
             ],
         )?)
     }
@@ -1094,13 +1104,24 @@ impl FromJObjectWithEnv<DeletionFile> for JObject<'_> {
             .l()?
             .extract_object(env)?;
         let base_id = get_base_id(env, self)?;
-        Ok(DeletionFile {
+        let inline = env.call_method(self, "getInline", "()[B", &[])?.l()?;
+        let inline = if inline.is_null() {
+            None
+        } else {
+            Some(env.convert_byte_array(JByteArray::from(inline))?.into())
+        };
+        let path = env.get_optional_string_from_method(self, "getPath")?;
+        let deletion_file = DeletionFile {
             read_version,
             id,
             num_deleted_rows,
             file_type,
             base_id,
-        })
+            path,
+            inline,
+        };
+        deletion_file.validate_location()?;
+        Ok(deletion_file)
     }
 }
 
