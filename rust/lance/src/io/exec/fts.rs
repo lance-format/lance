@@ -931,9 +931,11 @@ mod tests {
                     ));
                 }
                 if let Some(m) = plan.downcast_ref::<FlatMatchQueryExec>() {
-                    assert!(m.with_limit(10).has_shared_scorer());
+                    let widened_flat = m.with_limit(10);
+                    assert!(widened_flat.has_shared_scorer());
+                    assert_eq!(widened_flat.params().limit, Some(10));
                     return Ok(Transformed::yes(
-                        Arc::new(m.with_limit(10)) as Arc<dyn ExecutionPlan>
+                        Arc::new(widened_flat) as Arc<dyn ExecutionPlan>
                     ));
                 }
                 Ok(Transformed::no(plan))

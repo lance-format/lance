@@ -954,8 +954,9 @@ impl FlatMatchQueryExec {
         self.preset_segments.as_deref()
     }
 
-    /// Re-cut this scorer at `limit`, keeping its input, candidate filter and
-    /// scorers. See [`super::MatchQueryExec::with_limit`].
+    /// Record `limit` in this node's params, keeping its input, candidate filter
+    /// and scorers. Flat matching still emits every match, since a later row may
+    /// score higher; the enclosing relevance `SortExec.fetch` makes the top-k cut.
     pub fn with_limit(&self, limit: usize) -> Self {
         let mut params = self.params.clone();
         params.limit = Some(limit);
