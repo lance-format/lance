@@ -8,6 +8,60 @@ use crate::session::index_caches::{
 };
 
 #[rstest]
+#[case::before_codebook_tensor("0.10.18")]
+#[case::legacy_file("0.16.1")]
+#[case::before_transposed("0.18.2")]
+#[case::empty_index_details("0.24.1")]
+#[tokio::test]
+async fn test_read_legacy_hnsw_pq(#[case] version: &str) {
+    let test_dir = copy_test_data_to_tmp(&format!("legacy_hnsw_pq/{version}")).unwrap();
+    let dataset = Dataset::open(&test_dir.path_str()).await.unwrap();
+    assert_eq!(dataset.get_fragments().len(), 2);
+
+    let indices = dataset.load_indices().await.unwrap();
+    assert_eq!(indices.len(), 1, "the legacy index must remain usable");
+
+    for id in [0, 256] {
+        let vector = dataset
+            .scan()
+            .filter(&format!("id = {id}"))
+            .unwrap()
+            .project(&["vector"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let query = vector["vector"].as_fixed_size_list().value(0);
+        let mut scanner = dataset.scan();
+        scanner
+            .project(&["id"])
+            .unwrap()
+            .nearest("vector", query.as_ref(), 10)
+            .unwrap()
+            .minimum_nprobes(2)
+            .ef(128)
+            .refine(10);
+        let plan = scanner.explain_plan(false).await.unwrap();
+        assert!(plan.contains("ANNIvfPartition"), "{version}: {plan}");
+        let result = scanner.try_into_batch().await.unwrap();
+        let ids = result["id"].as_primitive::<Int32Type>();
+        assert_eq!(ids.len(), 10);
+        assert!(ids.values().contains(&id));
+
+        scanner.use_index(false);
+        let expected = scanner.try_into_batch().await.unwrap();
+        let expected_ids = expected["id"].as_primitive::<Int32Type>();
+        let recall = ids
+            .values()
+            .iter()
+            .filter(|id| expected_ids.values().contains(id))
+            .count() as f32
+            / 10.0;
+        assert!(recall >= 0.5, "{version}: recall = {recall}");
+    }
+}
+
+#[rstest]
 #[case::v1("v3.0.1/fts_v1", INVERTED_INDEX_VERSION_V1)]
 #[case::v2("v4.0.1/fts_v2", INVERTED_INDEX_VERSION_V2)]
 #[tokio::test]

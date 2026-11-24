@@ -66,6 +66,8 @@ pub const PQ_METADATA_KEY: &str = "lance:pq";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProductQuantizationMetadata {
     pub codebook_position: usize,
+    // Named num_bits before 0.25.
+    #[serde(alias = "num_bits")]
     pub nbits: u32,
     pub num_sub_vectors: usize,
     pub dimension: usize,
@@ -76,7 +78,11 @@ pub struct ProductQuantizationMetadata {
     // empty for v1 format
     // used for v3 format
     // deprecated in later version
+    // Absent before 0.12; the codebook is stored at codebook_position.
+    #[serde(default)]
     pub codebook_tensor: Vec<u8>,
+    // Absent before 0.19.2, when PQ codes were not transposed.
+    #[serde(default)]
     pub transposed: bool,
 }
 
@@ -154,8 +160,9 @@ impl QuantizerMetadata for ProductQuantizationMetadata {
             .map_err(|_| Error::index(format!("Failed to parse PQ metadata: {}", metadata)))?;
 
         debug_assert!(metadata.codebook.is_none());
-        debug_assert!(metadata.codebook_tensor.is_empty());
 
+        // Some legacy writers also embedded a copy in codebook_tensor.
+        // The v1 reader always uses the codebook at codebook_position.
         let codebook_tensor: pb::Tensor =
             read_message(reader.object_reader.as_ref(), metadata.codebook_position).await?;
         metadata.codebook = Some(FixedSizeListArray::try_from(&codebook_tensor)?);
@@ -1797,6 +1804,46 @@ mod tests {
     const DIM: usize = 32;
     const TOTAL: usize = 512;
     const NUM_SUB_VECTORS: usize = 16;
+
+    #[rstest]
+    #[case::before_0_12("num_bits", None, None)]
+    #[case::before_0_19_2("num_bits", Some(vec![1, 2, 3]), None)]
+    #[case::before_0_25("num_bits", Some(vec![1, 2, 3]), Some(true))]
+    #[case::current("nbits", Some(vec![]), Some(true))]
+    fn test_pq_metadata_compatibility(
+        #[case] bits_key: &str,
+        #[case] codebook_tensor: Option<Vec<u8>>,
+        #[case] transposed: Option<bool>,
+    ) {
+        let mut json = serde_json::json!({
+            "codebook_position": 123,
+            bits_key: 8,
+            "num_sub_vectors": 2,
+            "dimension": 8,
+        });
+        if let Some(tensor) = &codebook_tensor {
+            json["codebook_tensor"] = serde_json::json!(tensor);
+        }
+        if let Some(transposed) = transposed {
+            json["transposed"] = serde_json::json!(transposed);
+        }
+
+        let metadata: ProductQuantizationMetadata = serde_json::from_value(json).unwrap();
+        assert_eq!(metadata.codebook_position, 123);
+        assert_eq!(metadata.nbits, 8);
+        assert_eq!(metadata.num_sub_vectors, 2);
+        assert_eq!(metadata.dimension, 8);
+        assert!(metadata.codebook.is_none());
+        assert_eq!(
+            metadata.codebook_tensor,
+            codebook_tensor.unwrap_or_default()
+        );
+        assert_eq!(metadata.transposed, transposed.unwrap_or_default());
+
+        let serialized = serde_json::to_value(&metadata).unwrap();
+        assert_eq!(serialized["nbits"], 8);
+        assert!(serialized.get("num_bits").is_none());
+    }
 
     async fn create_pq_storage() -> ProductQuantizationStorage {
         create_pq_storage_with_distance(DistanceType::Dot).await
