@@ -557,6 +557,10 @@ impl PreFilter for DatasetPreFilter {
             && self.overlay_block.is_none()
     }
 
+    fn deletions_only(&self) -> bool {
+        self.only_deletions()
+    }
+
     /// Get the row id mask for this prefilter
     fn mask(&self) -> Arc<RowAddrMask> {
         self.final_mask

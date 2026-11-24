@@ -461,6 +461,29 @@ impl IvfSubIndex for FlatIndex {
         // Filtering, distance evaluation and heap updates are fused in fast-scan paths.
         let distance_timer = IndexTimer::new(metrics, IndexTiming::DistanceTopK);
 
+        if !prefilter.is_empty() && prefilter.deletions_only() {
+            // A blocked row can only displace a row that every row left in the
+            // heap also beats, so a heap holding no blocked row is exact.
+            // Otherwise this partition is rescanned through the mask.
+            let before = res.clone();
+            dist_calc.accumulate_topk_with_scratch(
+                k,
+                params.lower_bound,
+                params.upper_bound,
+                |id| storage.row_id(id),
+                res,
+                &mut scratch.distances,
+                &mut scratch.u16,
+                &mut scratch.u8,
+                &mut scratch.u32,
+            );
+            let mask = prefilter.mask();
+            if res.iter().all(|candidate| mask.selected(candidate.id)) {
+                return Ok(());
+            }
+            *res = before;
+        }
+
         match prefilter.is_empty() {
             true => {
                 dist_calc.accumulate_topk_with_scratch(
@@ -716,6 +739,7 @@ mod tests {
     use async_trait::async_trait;
     use lance_arrow::FixedSizeListArrayExt;
     use lance_select::{RowAddrMask, RowAddrTreeMap};
+    use rstest::rstest;
 
     use crate::metrics::NoOpMetricsCollector;
     use crate::prefilter::NoFilter;
@@ -731,6 +755,7 @@ mod tests {
 
     struct MaskPreFilter {
         mask: Arc<RowAddrMask>,
+        deletions_only: bool,
     }
 
     #[async_trait]
@@ -745,6 +770,10 @@ mod tests {
 
         fn mask(&self) -> Arc<RowAddrMask> {
             self.mask.clone()
+        }
+
+        fn deletions_only(&self) -> bool {
+            self.deletions_only
         }
 
         fn filter_row_ids<'a>(&self, row_ids: Box<dyn Iterator<Item = &'a u64> + 'a>) -> Vec<u64> {
@@ -837,6 +866,7 @@ mod tests {
             mask: Arc::new(RowAddrMask::from_allowed(RowAddrTreeMap::from_iter([
                 0_u64, 3, 4,
             ]))),
+            deletions_only: false,
         });
         let search_results = batch_results(
             index
@@ -869,6 +899,51 @@ mod tests {
             search_results.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
             vec![0, 3]
         );
+    }
+
+    /// Scanning past a deletions-only mask returns what the masked scan
+    /// returns, whether the deleted row misses the top k, lands in it, or the
+    /// heap already holds a row from an earlier partition.
+    #[rstest]
+    #[case::deleted_row_outside_top_k(4, vec![], vec![1, 2])]
+    #[case::deleted_row_in_top_k(2, vec![], vec![0, 1])]
+    #[case::heap_from_earlier_partition(2, vec![(100, 0.5)], vec![1, 100])]
+    fn test_accumulate_topk_past_deletions(
+        #[case] deleted: u64,
+        #[case] carried: Vec<(u64, f32)>,
+        #[case] expected: Vec<u64>,
+    ) {
+        let index = FlatIndex::default();
+        let storage = test_storage();
+        let topk = |deletions_only| {
+            let mut heap = BinaryHeap::from_iter(carried.iter().map(|(id, dist)| OrderedNode {
+                id: *id,
+                dist: OrderedFloat(*dist),
+            }));
+            let filter = Arc::new(MaskPreFilter {
+                mask: Arc::new(RowAddrMask::from_block(RowAddrTreeMap::from_iter([
+                    deleted,
+                ]))),
+                deletions_only,
+            });
+            index
+                .accumulate_topk(
+                    query(),
+                    2,
+                    FlatQueryParams::default(),
+                    &storage,
+                    filter,
+                    &mut heap,
+                    &NoOpMetricsCollector,
+                )
+                .unwrap();
+            heap_results(heap)
+        };
+
+        let past_deletions = topk(true);
+        assert_eq!(past_deletions, topk(false));
+        let row_ids = past_deletions.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+        assert_eq!(row_ids, expected);
     }
 
     #[test]
