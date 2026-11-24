@@ -3,9 +3,9 @@
 Open Lance table snapshots and read fragments with projections, row IDs,
 deletions, and overlays. Point takes select rows by offset, stable ID, or
 physical address. The runtime can return lazy blob handles or plan payload
-reads. It also resolves refs and version history, and commits transactions
-over prewritten fragments. Enable the Cargo feature for the cloud backend
-you use.
+reads. Stream Arrow batches into `InsertBuilder` to create, append to, or
+overwrite a table. Publish prewritten fragments and staged deletions or
+overlays with `CommitBuilder`. Enable the Cargo feature for your cloud backend.
 
 ```rust,no_run
 use lance_table_runtime::{FragReadConfig, Table};
@@ -51,5 +51,24 @@ use lance_table_runtime::{CommitBuilder, Table};
 async fn append(table: Table, fragments: Vec<Fragment>) -> lance_core::Result<Table> {
     let transaction = Transaction::new(table.version_id(), Operation::Append { fragments }, None);
     CommitBuilder::new(Arc::new(table)).execute(transaction).await
+}
+```
+
+```rust,no_run
+use lance_table_runtime::{InsertBuilder, Table, WriteMode, WriteParams};
+
+async fn append_batches(
+    table: &Table,
+    data: impl arrow_array::RecordBatchReader + Send + 'static,
+) -> lance_core::Result<Table> {
+    let params = WriteParams {
+        mode: WriteMode::Append,
+        max_rows_per_file: 100_000,
+        ..Default::default()
+    };
+    InsertBuilder::new(table)
+        .with_params(&params)
+        .execute_stream(data)
+        .await
 }
 ```

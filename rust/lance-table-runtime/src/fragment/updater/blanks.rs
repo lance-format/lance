@@ -6,14 +6,15 @@
 
 use std::{collections::HashMap, sync::Arc};
 
-use arrow::array::{MutableArrayData, make_array};
 use arrow_array::cast::AsArray;
+use arrow_array::make_array;
 use arrow_array::{
     Array, ArrayRef, BinaryArray, BinaryViewArray, FixedSizeListArray, GenericListArray,
     LargeBinaryArray, LargeStringArray, MapArray, OffsetSizeTrait, RecordBatch, StringArray,
     StringViewArray, StructArray, UInt32Array, new_empty_array, new_null_array,
 };
 use arrow_buffer::{NullBuffer, NullBufferBuilder, OffsetBuffer};
+use arrow_data::transform::MutableArrayData;
 use arrow_schema::{ArrowError, DataType, Field as ArrowField};
 use arrow_select::dictionary::garbage_collect_any_dictionary;
 use arrow_select::interleave::interleave;
@@ -795,7 +796,7 @@ fn apply_blank_plan(
             if contains_map(array.data_type()) {
                 copy_rows_unvalidated(array, take_indices)
             } else {
-                arrow::compute::take(array.as_ref(), take_indices, None)
+                arrow_select::take::take(array.as_ref(), take_indices, None)
             }
         }
         BlankPlan::Interleave(filler) => interleave(

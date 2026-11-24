@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Resolution of data overlay files on read.
+//! Writing sparse data overlays and resolving them on read.
 //!
 //! An overlay supplies replacement values for some `(row, field)` cells without
 //! rewriting the base data. Resolving a read means, for each row we return,
@@ -35,7 +35,10 @@
 //! special casing.
 
 mod selection;
+mod writer;
+
 pub use selection::{OverlayBatchSelection, OverlayReadSelection};
+pub use writer::{OverlayWriter, WriteOverlayError};
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;

@@ -10,7 +10,8 @@ use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use object_store::path::PathPart;
 use serde::{Deserialize, Serialize};
 
-use super::{DataFileTarget, Dataset};
+use super::DataFileTarget;
+use crate::Table;
 
 // Opening a Blob-bearing part also decodes its descriptors. Bound that work
 // independently of the store's potentially much larger request concurrency.
@@ -24,7 +25,7 @@ const MAX_CONCURRENT_PART_OPENS: usize = 8;
 /// commit or [`DataFileTarget::cleanup`] when abandoning the target.
 ///
 /// ```
-/// # use lance::dataset::DataFilePart;
+/// # use lance_table_runtime::write::DataFilePart;
 /// # fn checkpoint(part: &DataFilePart) -> Result<(), serde_json::Error> {
 /// let bytes = serde_json::to_vec(part)?;
 /// let restored: DataFilePart = serde_json::from_slice(&bytes)?;
@@ -54,7 +55,7 @@ impl DataFilePart {
     }
 
     pub(super) async fn open_all(
-        dataset: &Dataset,
+        dataset: &Table,
         target: &DataFileTarget,
         parts: &[Self],
     ) -> Result<Vec<OpenedDataFilePart>> {
@@ -104,7 +105,7 @@ impl DataFilePart {
             }
         }
         let store = dataset.object_store(target.base_id).await?;
-        let dir = target.parts_dir(&dataset.data_file_dir_for_base(target.base_id)?);
+        let dir = target.parts_dir(&dataset.view().data_file_dir_for_base(target.base_id)?);
         let scheduler = ScanScheduler::new(store.clone(), SchedulerConfig::max_bandwidth(&store));
         let concurrency = store.io_parallelism().min(MAX_CONCURRENT_PART_OPENS);
         // Owned inputs avoid a higher-ranked borrowed iterator closure in the

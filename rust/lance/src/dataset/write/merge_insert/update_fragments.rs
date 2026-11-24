@@ -7,7 +7,7 @@ use super::{MergeInsertJob, PatchedFragments};
 use crate::dataset::rowids::load_spilled_row_lineage;
 use crate::dataset::utils::SchemaAdapter;
 use crate::dataset::write::cleanup_data_fragments;
-use crate::dataset::write::seeds::SeedCollector;
+use crate::dataset::write::seeds::collect_write_seeds;
 use crate::dataset::write::{
     TargetBaseInfo, WriteParams, write_fragments_internal, write_fragments_internal_impl,
 };
@@ -374,13 +374,8 @@ impl MergeInsertJob {
                     // Exact, deletion-free coverage can be written directly because the
                     // batches are sorted by row address.
 
-                    let mut seeds = SeedCollector::for_write(
-                        write_version,
-                        Some(&dataset),
-                        &write_schema,
-                        true,
-                    )
-                    .await?;
+                    let mut seeds =
+                        collect_write_seeds(write_version, &dataset, &write_schema).await?;
                     let mut writer =
                         versions::open_update_writer(write_version, &dataset, &write_schema, false)
                             .await?;
