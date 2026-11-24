@@ -57,6 +57,36 @@ pub trait IvfSubIndex: Send + Sync + Debug + DeepSizeOf {
         None
     }
 
+    /// The number of storage rows a partition's sub-index addresses by
+    /// position, decoded from the partition's serialized sub-index
+    /// `metadata`, or `None` if the sub-index does not address storage rows
+    /// by position.
+    ///
+    /// A row-ID remapping drops deleted rows from the partition storage as it
+    /// loads, shifting every later position, so a positional sub-index must be
+    /// realigned with [`Self::remap_positions`] whenever the loaded storage
+    /// dropped rows. The count may be smaller than the stored rows: the
+    /// sub-index then covers only a prefix of them.
+    fn positional_rows(_metadata: &str) -> Result<Option<usize>> {
+        Ok(None)
+    }
+
+    /// Realign a serialized sub-index with storage that dropped rows as it
+    /// loaded.
+    ///
+    /// `data` is read with every column of [`Self::schema`].
+    /// `new_ids[position]` is the position the stored row at `position` takes
+    /// in the loaded `storage`, or `None` if the storage dropped it; surviving
+    /// rows keep their relative order. Sub-indices without positional
+    /// addressing return `data` unchanged.
+    fn remap_positions(
+        data: RecordBatch,
+        _new_ids: &[Option<u32>],
+        _storage: &impl VectorStore,
+    ) -> Result<RecordBatch> {
+        Ok(data)
+    }
+
     /// Build the sub-index query params for one IVF partition.
     ///
     /// `query_key` is the partition-processed key and `dist_q_c` is the
