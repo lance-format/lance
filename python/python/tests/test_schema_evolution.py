@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
+import json
 import os
 import uuid
+from decimal import Decimal
 from pathlib import Path
 
 import lance
@@ -227,6 +229,144 @@ def test_add_columns_from_file(tmp_path):
     assert expected == dataset.to_table()
 
 
+@pytest.mark.parametrize("cache_kind", ["fragment", "batch"])
+@pytest.mark.parametrize(
+    "change",
+    [
+        "unchanged",
+        "delete",
+        "update",
+        "schema",
+        "projection",
+        "batch_size",
+        "output_schema",
+        "dataset",
+        "branch_recreated",
+        "branch_unchanged",
+        "missing_context",
+        "malformed_context",
+    ],
+)
+@pytest.mark.parametrize("stable_row_ids", [False, True])
+def test_checkpoint_resume(tmp_path, monkeypatch, cache_kind, change, stable_row_ids):
+    table = pa.table({"id": range(30), "value": [None, 1, 2] * 10})
+    dataset = lance.write_dataset(
+        table,
+        tmp_path / "data",
+        max_rows_per_file=10,
+        data_storage_version="2.2",
+        enable_stable_row_ids=stable_row_ids,
+    )
+    if change in ("branch_recreated", "branch_unchanged"):
+        original = dataset
+        dataset = original.create_branch("checkpoint")
+    metadata_key = b"lance:udf_checkpoint_context"
+    output_schema = pa.schema(
+        [pa.field("double", pa.int64())],
+        metadata={metadata_key: b"user value", b"b": b"2", b"a": b"1"},
+    )
+    fail_at = 20 if cache_kind == "fragment" else 4
+    checkpoint = tmp_path / "checkpoint.sqlite"
+
+    @lance.batch_udf(output_schema=output_schema, checkpoint_file=checkpoint)
+    def interrupted(batch):
+        if batch["id"][0].as_py() >= fail_at:
+            raise RuntimeError("injected UDF failure")
+        return pa.record_batch([pc.multiply(batch["value"], 2)], schema=output_schema)
+
+    with pytest.raises(Exception, match="injected UDF failure"):
+        dataset.add_columns(interrupted, read_columns=["id", "value"], batch_size=2)
+
+    read_columns = ["id", "value"]
+    batch_size = 2
+    if change == "delete":
+        dataset.delete("id < 3")
+    elif change == "update":
+        dataset.update({"value": "100"}, where="id = 5")
+    elif change == "schema":
+        dataset.add_columns({"z": "CAST(NULL AS BIGINT)"})
+    elif change == "projection":
+        read_columns.reverse()
+    elif change == "batch_size":
+        batch_size = 3
+    elif change == "output_schema":
+        output_schema = pa.schema([pa.field("another_column", pa.int64())])
+    elif change == "dataset":
+        dataset = lance.write_dataset(
+            table,
+            tmp_path / "other",
+            max_rows_per_file=10,
+            data_storage_version="2.2",
+            enable_stable_row_ids=stable_row_ids,
+        )
+    elif change == "branch_recreated":
+        original.branches.delete("checkpoint")
+        dataset = original.create_branch("checkpoint")
+    elif change in ("missing_context", "malformed_context"):
+        # Model an older checkpoint or a store that did not preserve metadata.
+        if cache_kind == "fragment":
+            get_fragment = udf_module.BatchUDFCheckpoint.get_fragment
+
+            def read_fragment(store, fragment_id):
+                cached = get_fragment(store, fragment_id)
+                if cached is None:
+                    return None
+                fragment = json.loads(cached)
+                metadata = fragment.setdefault("metadata", {})
+                metadata.pop(metadata_key.decode(), None)
+                if change == "malformed_context":
+                    metadata[metadata_key.decode()] = "invalid context"
+                return json.dumps(fragment)
+
+            monkeypatch.setattr(
+                udf_module.BatchUDFCheckpoint, "get_fragment", read_fragment
+            )
+        else:
+            get_batch = udf_module.BatchUDFCheckpoint.get_batch
+
+            def read_batch(store, info):
+                cached = get_batch(store, info)
+                if cached is None:
+                    return None
+                metadata = dict(cached.schema.metadata or {})
+                metadata.pop(metadata_key, None)
+                if change == "malformed_context":
+                    metadata[metadata_key] = b"invalid context"
+                return cached.replace_schema_metadata(metadata)
+
+            monkeypatch.setattr(udf_module.BatchUDFCheckpoint, "get_batch", read_batch)
+
+    before = dataset.to_table()
+    version = dataset.version
+    calls = []
+
+    @lance.batch_udf(output_schema=output_schema, checkpoint_file=checkpoint)
+    def resumed(batch):
+        calls.append(batch["id"][0].as_py())
+        return pa.record_batch([pc.multiply(batch["value"], 2)], schema=output_schema)
+
+    if change in ("unchanged", "branch_unchanged"):
+        dataset.add_columns(resumed, read_columns=read_columns, batch_size=batch_size)
+        assert dataset.to_table() == table.append_column(
+            "double", pc.multiply(table["value"], 2)
+        )
+        assert min(calls) == fail_at
+        assert all(
+            not fragment.metadata.metadata for fragment in dataset.get_fragments()
+        )
+        for fragment in dataset.get_fragments():
+            column_file = fragment.metadata.files[-1].path
+            reader = LanceFileReader(str(Path(dataset.uri) / "data" / column_file))
+            assert reader.metadata().schema.metadata[metadata_key] == b"user value"
+    else:
+        with pytest.raises(OSError, match="UDF checkpoint.*incompatible"):
+            dataset.add_columns(
+                resumed, read_columns=read_columns, batch_size=batch_size
+            )
+        assert dataset.version == version
+        assert dataset.to_table() == before
+
+
 def test_add_columns_udf_caching(tmp_path):
     tab = pa.table(
         {
@@ -414,6 +554,68 @@ def test_alter_columns(tmp_path: Path):
         dataset.alter_columns({"path": "x"})
 
 
+@pytest.mark.parametrize(
+    ("values", "data_type"),
+    [
+        pytest.param(pa.array([1.5, 1e300]), pa.float32(), id="float_overflow"),
+        pytest.param(
+            pa.array([1_000_000_001_500_000_000], pa.timestamp("ns")),
+            pa.timestamp("s"),
+            id="timestamp_unit",
+        ),
+        pytest.param(
+            pa.array([1_000_000_001_500_000_000], pa.timestamp("ns")),
+            pa.date32(),
+            id="timestamp_to_date",
+        ),
+        pytest.param(
+            pa.array([Decimal("1.25"), Decimal("2.50")], pa.decimal128(10, 2)),
+            pa.decimal128(10, 0),
+            id="decimal_scale",
+        ),
+    ],
+)
+def test_alter_columns_rejects_lossy_cast(tmp_path: Path, values, data_type):
+    dataset = lance.write_dataset(pa.table({"x": values}), tmp_path)
+
+    with pytest.raises(OSError, match="cannot be represented in the new type"):
+        dataset.alter_columns({"path": "x", "data_type": data_type})
+
+    dataset = lance.dataset(tmp_path)
+    assert dataset.version == 1
+    assert dataset.to_table()["x"].combine_chunks() == values
+
+
+@pytest.mark.parametrize(
+    ("values", "data_type"),
+    [
+        pytest.param(pa.array([1.5, 0.1, None]), pa.float32(), id="float_precision"),
+        pytest.param(
+            pa.array([1_000_000_001_000_000_000, None], pa.timestamp("ns")),
+            pa.timestamp("s"),
+            id="whole_seconds",
+        ),
+        pytest.param(
+            pa.array([86_400_000_000_000], pa.timestamp("ns")),
+            pa.date32(),
+            id="midnight_to_date",
+        ),
+        pytest.param(
+            pa.array([Decimal("1.00"), None], pa.decimal128(10, 2)),
+            pa.decimal128(10, 0),
+            id="whole_decimal",
+        ),
+    ],
+)
+def test_alter_columns_representable_downcast(tmp_path: Path, values, data_type):
+    dataset = lance.write_dataset(pa.table({"x": values}), tmp_path)
+
+    dataset.alter_columns({"path": "x", "data_type": data_type})
+
+    expected = values.cast(data_type, safe=False)
+    assert dataset.to_table()["x"].combine_chunks() == expected
+
+
 def test_merge_columns(tmp_path: Path):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
     base_dir = tmp_path / "test"
@@ -442,6 +644,57 @@ def test_merge_columns(tmp_path: Path):
             "c": pa.array(range(0, 200, 2), pa.int64()),
         }
     )
+
+
+def test_merge_columns_cleanup_after_outer_commit_failure(tmp_path: Path):
+    base_dir = tmp_path / "test"
+    dataset = lance.write_dataset(
+        pa.table({"a": range(100)}), base_dir, max_rows_per_file=25
+    )
+    read_version = dataset.version
+    fragments = dataset.get_fragments()
+    assert len(fragments) == 4
+
+    def data_files() -> set[Path]:
+        return {
+            path.relative_to(base_dir)
+            for path in (base_dir / "data").rglob("*")
+            if path.is_file()
+        }
+
+    def dataset_files() -> set[Path]:
+        return {
+            path.relative_to(base_dir) for path in base_dir.rglob("*") if path.is_file()
+        }
+
+    files_before_staging = data_files()
+    staged_fragment, staged_schema, cleanup = fragments[0].merge_columns(
+        {"staged": "a * 2"}, return_cleanup=True
+    )
+    staged_files = data_files() - files_before_staging
+    assert staged_files
+
+    # Preserve every fragment in the outer Merge while replacing the one that
+    # carries the staged column data.
+    merged_fragments = [staged_fragment]
+    merged_fragments.extend(fragment.metadata for fragment in fragments[1:])
+
+    # A concurrent Delete updates the same fragment without changing field ids,
+    # so the staged Merge based on read_version conflicts before it can land.
+    dataset.delete("a = 0")
+    files_before_cleanup = data_files()
+    dataset_files_before_cleanup = dataset_files()
+    with pytest.raises(Exception, match="conflict"):
+        lance.LanceDataset.commit(
+            base_dir,
+            lance.LanceOperation.Merge(merged_fragments, staged_schema),
+            read_version=read_version,
+        )
+
+    cleanup.cleanup()
+    assert data_files() == files_before_cleanup - staged_files
+    assert dataset_files() == dataset_files_before_cleanup - staged_files
+    assert files_before_staging <= data_files()
 
 
 def test_merge_columns_from_reader(tmp_path: Path):

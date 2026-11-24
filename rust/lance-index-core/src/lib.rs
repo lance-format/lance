@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::convert::TryFrom;
 
 pub mod metrics;
+pub mod remapping;
 pub mod scalar;
 
 /// Generic methods common across all types of secondary indices
@@ -42,6 +43,13 @@ pub trait Index: Send + Sync + DeepSizeOf {
 }
 
 /// Index Type
+///
+/// Do not add further entries to this enum except as a last resort.  We are attempting
+/// to move away from using hard-coded enums to represent index types and instead use
+/// index plugins.
+///
+/// For example, if you need to decide if some index needs capability X then add a
+/// has_capability_x method to one of the index plugin traits.
 #[derive(Debug, PartialEq, Eq, Copy, Hash, Clone, DeepSizeOf, Serialize, Deserialize)]
 pub enum IndexType {
     // Preserve 0-100 for simple indices.
@@ -69,6 +77,8 @@ pub enum IndexType {
 
     Fm = 11, // FM-Index
 
+    MinHashLsh = 12, // MinHash LSH (near-duplicate detection)
+
     // 100+ and up for vector index.
     /// Flat vector index.
     Vector = 100, // Legacy vector index, alias to IvfPq
@@ -79,6 +89,7 @@ pub enum IndexType {
     IvfHnswPq = 105,
     IvfHnswFlat = 106,
     IvfRq = 107,
+    IvfHnswRq = 108,
 }
 
 impl std::fmt::Display for IndexType {
@@ -95,6 +106,7 @@ impl std::fmt::Display for IndexType {
             Self::BloomFilter => write!(f, "BloomFilter"),
             Self::RTree => write!(f, "RTree"),
             Self::Fm => write!(f, "Fm"),
+            Self::MinHashLsh => write!(f, "MinHashLsh"),
             Self::Vector | Self::IvfPq => write!(f, "IVF_PQ"),
             Self::IvfFlat => write!(f, "IVF_FLAT"),
             Self::IvfSq => write!(f, "IVF_SQ"),
@@ -102,6 +114,7 @@ impl std::fmt::Display for IndexType {
             Self::IvfHnswPq => write!(f, "IVF_HNSW_PQ"),
             Self::IvfHnswFlat => write!(f, "IVF_HNSW_FLAT"),
             Self::IvfRq => write!(f, "IVF_RQ"),
+            Self::IvfHnswRq => write!(f, "IVF_HNSW_RQ"),
         }
     }
 }
@@ -123,6 +136,7 @@ impl TryFrom<i32> for IndexType {
             v if v == Self::BloomFilter as i32 => Ok(Self::BloomFilter),
             v if v == Self::RTree as i32 => Ok(Self::RTree),
             v if v == Self::Fm as i32 => Ok(Self::Fm),
+            v if v == Self::MinHashLsh as i32 => Ok(Self::MinHashLsh),
             v if v == Self::Vector as i32 => Ok(Self::Vector),
             v if v == Self::IvfFlat as i32 => Ok(Self::IvfFlat),
             v if v == Self::IvfSq as i32 => Ok(Self::IvfSq),
@@ -131,6 +145,7 @@ impl TryFrom<i32> for IndexType {
             v if v == Self::IvfHnswPq as i32 => Ok(Self::IvfHnswPq),
             v if v == Self::IvfHnswFlat as i32 => Ok(Self::IvfHnswFlat),
             v if v == Self::IvfRq as i32 => Ok(Self::IvfRq),
+            v if v == Self::IvfHnswRq as i32 => Ok(Self::IvfHnswRq),
             _ => Err(Error::invalid_input_source(
                 format!("the input value {} is not a valid IndexType", value).into(),
             )),
@@ -152,6 +167,7 @@ impl TryFrom<&str> for IndexType {
             "BloomFilter" | "BLOOMFILTER" | "BLOOM_FILTER" => Ok(Self::BloomFilter),
             "RTree" | "RTREE" | "R_TREE" => Ok(Self::RTree),
             "Fm" | "FM" => Ok(Self::Fm),
+            "MinHashLsh" | "MINHASHLSH" | "MINHASH_LSH" => Ok(Self::MinHashLsh),
             "Vector" | "VECTOR" => Ok(Self::Vector),
             "IVF_FLAT" => Ok(Self::IvfFlat),
             "IVF_SQ" => Ok(Self::IvfSq),
@@ -160,6 +176,7 @@ impl TryFrom<&str> for IndexType {
             "IVF_HNSW_FLAT" => Ok(Self::IvfHnswFlat),
             "IVF_HNSW_SQ" => Ok(Self::IvfHnswSq),
             "IVF_HNSW_PQ" => Ok(Self::IvfHnswPq),
+            "IVF_HNSW_RQ" => Ok(Self::IvfHnswRq),
             "FragmentReuse" => Ok(Self::FragmentReuse),
             "MemWal" => Ok(Self::MemWal),
             _ => Err(Error::invalid_input(format!(
@@ -183,7 +200,8 @@ impl IndexType {
                 | Self::ZoneMap
                 | Self::BloomFilter
                 | Self::RTree
-                | Self::Fm,
+                | Self::Fm
+                | Self::MinHashLsh,
         )
     }
 
@@ -198,6 +216,7 @@ impl IndexType {
                 | Self::IvfFlat
                 | Self::IvfSq
                 | Self::IvfRq
+                | Self::IvfHnswRq
         )
     }
 
@@ -224,6 +243,7 @@ impl IndexType {
             Self::BloomFilter => 0,
             Self::RTree => 0,
             Self::Fm => 0,
+            Self::MinHashLsh => 0,
 
             // IMPORTANT: if any vector index subtype needs a format bump that is
             // not backward compatible, its new version must be set to
@@ -239,6 +259,9 @@ impl IndexType {
             | Self::IvfHnswPq
             | Self::IvfHnswFlat => 1,
             Self::IvfRq => 2,
+            // Released readers accept vector versions up to 2 and cannot tell
+            // subtypes apart, so 3 makes them skip IVF_HNSW_RQ.
+            Self::IvfHnswRq => 3,
         }
     }
 
@@ -258,6 +281,7 @@ impl IndexType {
             Self::IvfHnswFlat => 1 << 20,
             Self::IvfHnswSq => 1 << 20,
             Self::IvfHnswPq => 1 << 20,
+            Self::IvfHnswRq => 1 << 20,
             _ => 8192,
         }
     }
@@ -273,6 +297,7 @@ impl IndexType {
             Self::IvfHnswPq,
             Self::IvfHnswFlat,
             Self::IvfRq,
+            Self::IvfHnswRq,
         ]
         .into_iter()
         .map(|index_type| index_type.version() as u32)
@@ -292,6 +317,7 @@ impl IndexType {
             Self::BloomFilter => url.ends_with("BloomFilterIndexDetails"),
             Self::RTree => url.ends_with("RTreeIndexDetails"),
             Self::Fm => url.ends_with("FMIndexDetails"),
+            Self::MinHashLsh => url.ends_with("MinHashLshIndexDetails"),
             Self::FragmentReuse => url.ends_with("FragmentReuseIndexDetails"),
             Self::MemWal => url.ends_with("MemWalIndexDetails"),
             Self::Vector
@@ -301,7 +327,8 @@ impl IndexType {
             | Self::IvfHnswSq
             | Self::IvfHnswPq
             | Self::IvfHnswFlat
-            | Self::IvfRq => url.ends_with("VectorIndexDetails"),
+            | Self::IvfRq
+            | Self::IvfHnswRq => url.ends_with("VectorIndexDetails"),
         }
     }
 }

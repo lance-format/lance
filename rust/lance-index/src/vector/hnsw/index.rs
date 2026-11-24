@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use crate::scalar::RowAddrTranslator;
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 use std::{
     any::Any,
@@ -10,8 +11,8 @@ use std::{
 
 use arrow_array::{Float32Array, RecordBatch, UInt32Array};
 use async_trait::async_trait;
-use datafusion::execution::SendableRecordBatchStream;
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion_execution::SendableRecordBatchStream;
+use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
 use lance_arrow::RecordBatchExt;
 use lance_core::ROW_ID;
 use lance_core::deepsize::DeepSizeOf;
@@ -307,6 +308,13 @@ impl<Q: Quantization + Send + Sync + 'static> VectorIndex for HNSWIndex<Q> {
     }
 
     async fn remap(&mut self, _mapping: &RowAddrRemap) -> Result<()> {
+        Err(Error::index(
+            "Remapping HNSW in this way not supported".to_string(),
+        ))
+    }
+
+    async fn remap_streaming(&mut self, _translator: &RowAddrTranslator) -> Result<()> {
+        // No mapping to materialize for an index that cannot be remapped.
         Err(Error::index(
             "Remapping HNSW in this way not supported".to_string(),
         ))

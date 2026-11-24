@@ -28,6 +28,7 @@ import org.apache.arrow.vector.types.pojo.Schema;
 import java.nio.ByteBuffer;
 import java.util.List;
 import java.util.Optional;
+import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
@@ -68,6 +69,8 @@ public class AsyncScanner implements AutoCloseable {
           createAsyncScanner(
               dataset,
               options.getFragmentIds(),
+              options.getFragmentSlices(),
+              options.getIndexSegments(),
               options.getColumns(),
               options.getSubstraitFilter(),
               options.getFilter(),
@@ -87,6 +90,7 @@ public class AsyncScanner implements AutoCloseable {
               options.getLateMaterialization(),
               options.getColumnOrderings(),
               options.isUseScalarIndex(),
+              options.getIgnoredScalarIndices(),
               options.isFastSearch(),
               options.getSubstraitAggregate(),
               options.isIncludeDeletedRows(),
@@ -100,6 +104,8 @@ public class AsyncScanner implements AutoCloseable {
   static native AsyncScanner createAsyncScanner(
       Dataset dataset,
       Optional<List<Integer>> fragmentIds,
+      Optional<List<FragmentSlice>> fragmentSlices,
+      Optional<List<UUID>> indexSegments,
       Optional<List<String>> columns,
       Optional<ByteBuffer> substraitFilter,
       Optional<String> filter,
@@ -119,6 +125,7 @@ public class AsyncScanner implements AutoCloseable {
       Optional<MaterializationStyle> lateMaterialization,
       Optional<List<ColumnOrdering>> columnOrderings,
       boolean useScalarIndex,
+      Optional<List<String>> ignoredScalarIndices,
       boolean fastSearch,
       Optional<ByteBuffer> substraitAggregate,
       boolean includeDeletedRows,

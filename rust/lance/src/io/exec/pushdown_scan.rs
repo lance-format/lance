@@ -9,10 +9,12 @@ use arrow_array::types::{Int64Type, UInt64Type};
 use arrow_array::{Array, BooleanArray, Int64Array, PrimitiveArray, RecordBatch, UInt32Array};
 use arrow_schema::{DataType, Schema as ArrowSchema, SchemaRef};
 use arrow_select::filter::filter_record_batch;
+use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::logical_expr::col;
 use datafusion::logical_expr::interval_arithmetic::{Interval, NullableInterval};
 use datafusion::optimizer::simplify_expressions::{ExprSimplifier, SimplifyContext};
+use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::{ColumnarValue, PlanProperties};
@@ -42,7 +44,6 @@ use crate::{
     dataset::{
         ROW_ID,
         fragment::{FileFragment, V1FragmentReader},
-        versions,
     },
     datatypes::Schema,
 };
@@ -166,6 +167,13 @@ impl ExecutionPlan for LancePushdownScanExec {
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![]
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> datafusion::error::Result<TreeNodeRecursion>,
+    ) -> datafusion::error::Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
     }
 
     fn with_new_children(
@@ -303,8 +311,9 @@ impl FragmentScanner {
         if let Some(file_reader_options) = config.file_reader_options.clone() {
             frag_config = frag_config.with_file_reader_options(file_reader_options);
         }
-        let mut reader =
-            versions::open_v1_fragment_reader(&fragment, dataset.schema(), &frag_config).await?;
+        let mut reader = fragment
+            .open_v1_fragment_reader(dataset.schema(), &frag_config)
+            .await?;
         if config.make_deletions_null {
             reader.with_make_deletions_null();
         }
@@ -327,6 +336,11 @@ impl FragmentScanner {
         let batch_readahead = self.config.batch_readahead;
         let simplified_predicates = self.simplified_predicates()?;
         let ordered_output = self.config.ordered_output;
+        let batch_size_bytes = self
+            .config
+            .file_reader_options
+            .as_ref()
+            .and_then(|o| o.batch_size_bytes);
 
         let scanner = Arc::new(self);
 
@@ -342,12 +356,14 @@ impl FragmentScanner {
             })
             .map(move |(batch_id, predicate)| {
                 let scanner_ref = scanner.clone();
-                tokio::task::spawn(async move { scanner_ref.read_batch(batch_id, predicate).await })
-                    .map(|res| match res {
-                        Ok(Ok(batch)) => Ok(batch),
-                        Ok(Err(err)) => Err(err),
-                        Err(join_err) => Err(DataFusionError::ExecutionJoin(Box::new(join_err))),
-                    })
+                lance_core::utils::tokio::spawn(async move {
+                    scanner_ref.read_batch(batch_id, predicate).await
+                })
+                .map(|res| match res {
+                    Ok(Ok(batch)) => Ok(batch),
+                    Ok(Err(err)) => Err(err),
+                    Err(join_err) => Err(DataFusionError::ExecutionJoin(Box::new(join_err))),
+                })
             });
 
         let stream = if ordered_output {
@@ -362,6 +378,21 @@ impl FragmentScanner {
                 .buffer_unordered(batch_readahead)
                 .try_filter_map(|res| futures::future::ready(Ok(res)))
                 .boxed()
+        };
+
+        let stream = if let Some(budget) = batch_size_bytes {
+            stream
+                .and_then(move |batch| {
+                    futures::future::ready(
+                        crate::dataset::blob::split_batch_by_bytes(batch, (budget * 2) as usize)
+                            .map_err(DataFusionError::from),
+                    )
+                })
+                .map_ok(|batches| futures::stream::iter(batches.into_iter().map(Ok)))
+                .try_flatten()
+                .boxed()
+        } else {
+            stream
         };
 
         Ok(stream)
@@ -731,7 +762,6 @@ mod test {
     use crate::dataset::WriteParams;
     use crate::io::exec::{LanceScanConfig, LanceScanExec};
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
-    use lance_datafusion::logical_expr::ExprExt;
 
     use super::*;
 
@@ -1154,9 +1184,9 @@ mod test {
         let projection = Arc::new(dataset.schema().clone().project_by_ids(&[2, 4], true));
 
         let predicate = col("x")
-            .field_newstyle("a")
+            .field("a")
             .lt(lit(8))
-            .and(col("y").field_newstyle("b").gt(lit(3)));
+            .and(col("y").field("b").gt(lit(3)));
 
         let exec = LancePushdownScanExec::try_new(
             dataset.clone(),
@@ -1394,7 +1424,7 @@ mod test {
         let dataset = Arc::new(test_dataset().await);
 
         let predicate = col("struct")
-            .field_newstyle("int")
+            .field("int")
             .gt(lit(4))
             .and(col(Column::from_name("str")).is_not_null());
 

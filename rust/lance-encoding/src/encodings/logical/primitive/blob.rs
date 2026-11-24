@@ -21,7 +21,10 @@ use crate::{
     buffer::LanceBuffer,
     data::{BlockInfo, DataBlock, VariableWidthBlock},
     decoder::{DecodePageTask, DecodedPage, StructuralPageDecoder},
-    encodings::logical::primitive::{CachedPageData, PageLoadTask, StructuralPageScheduler},
+    encodings::logical::primitive::{
+        CachedPageData, PageCacheView, PageInitialization, PageInitializationBuffers, PageLoadTask,
+        StructuralPageScheduler,
+    },
     repdef::{DefinitionInterpretation, RepDefUnraveler},
 };
 
@@ -34,6 +37,7 @@ pub const TARGET_SHARD_SIZE: u64 = 32 * 1024 * 1024;
 
 #[derive(Debug)]
 pub(super) struct BlobDescriptionPageScheduler {
+    pub(super) structural_projection: Option<super::structure::StructuralProjection>,
     inner_scheduler: Box<dyn StructuralPageScheduler>,
     def_meaning: Arc<[DefinitionInterpretation]>,
 }
@@ -46,34 +50,50 @@ impl BlobDescriptionPageScheduler {
         Self {
             inner_scheduler,
             def_meaning,
+            structural_projection: None,
         }
     }
 
     fn wrap_decoder_fut(
         decoder_fut: BoxFuture<'static, Result<Box<dyn StructuralPageDecoder>>>,
         def_meaning: Arc<[DefinitionInterpretation]>,
+        structural_projection: Option<super::structure::StructuralProjection>,
     ) -> BoxFuture<'static, Result<Box<dyn StructuralPageDecoder>>> {
         async move {
             let decoder = decoder_fut.await?;
-            Ok(
-                Box::new(BlobDescriptionPageDecoder::new(decoder, def_meaning))
-                    as Box<dyn StructuralPageDecoder>,
-            )
+            Ok(Box::new(BlobDescriptionPageDecoder {
+                inner: decoder,
+                def_meaning,
+                structural_projection,
+            }) as Box<dyn StructuralPageDecoder>)
         }
         .boxed()
     }
 }
 
 impl StructuralPageScheduler for BlobDescriptionPageScheduler {
-    fn initialize<'a>(
-        &'a mut self,
-        io: &Arc<dyn EncodingsIo>,
-    ) -> BoxFuture<'a, Result<Arc<dyn CachedPageData>>> {
-        self.inner_scheduler.initialize(io)
+    fn needs_initialization(&self) -> bool {
+        self.inner_scheduler.needs_initialization()
     }
 
-    fn load(&mut self, data: &Arc<dyn CachedPageData>) {
-        self.inner_scheduler.load(data);
+    fn init_layout(&self) -> Result<PageInitialization> {
+        self.inner_scheduler.init_layout()
+    }
+
+    fn init_from_buffers<'a>(
+        &'a mut self,
+        buffers: PageInitializationBuffers,
+        io: &Arc<dyn EncodingsIo>,
+    ) -> BoxFuture<'a, Result<Arc<dyn CachedPageData>>> {
+        self.inner_scheduler.init_from_buffers(buffers, io)
+    }
+
+    fn try_load(&mut self, data: &Arc<dyn CachedPageData>) -> Result<()> {
+        self.inner_scheduler.try_load(data)
+    }
+
+    fn cache_view(&self) -> PageCacheView {
+        PageCacheView::BlobDescriptor
     }
 
     fn schedule_ranges(
@@ -85,7 +105,11 @@ impl StructuralPageScheduler for BlobDescriptionPageScheduler {
         Ok(tasks
             .into_iter()
             .map(|task| PageLoadTask {
-                decoder_fut: Self::wrap_decoder_fut(task.decoder_fut, self.def_meaning.clone()),
+                decoder_fut: Self::wrap_decoder_fut(
+                    task.decoder_fut,
+                    self.def_meaning.clone(),
+                    self.structural_projection.clone(),
+                ),
                 num_rows: task.num_rows,
             })
             .collect())
@@ -94,25 +118,18 @@ impl StructuralPageScheduler for BlobDescriptionPageScheduler {
 
 #[derive(Debug)]
 struct BlobDescriptionPageDecoder {
+    structural_projection: Option<super::structure::StructuralProjection>,
     inner: Box<dyn StructuralPageDecoder>,
     def_meaning: Arc<[DefinitionInterpretation]>,
 }
 
-impl BlobDescriptionPageDecoder {
-    fn new(
-        inner: Box<dyn StructuralPageDecoder>,
-        def_meaning: Arc<[DefinitionInterpretation]>,
-    ) -> Self {
-        Self { inner, def_meaning }
-    }
-}
-
 impl StructuralPageDecoder for BlobDescriptionPageDecoder {
     fn drain(&mut self, num_rows: u64) -> Result<Box<dyn DecodePageTask>> {
-        Ok(Box::new(BlobDescriptionDecodePageTask::new(
-            self.inner.drain(num_rows)?,
-            self.def_meaning.clone(),
-        )))
+        Ok(Box::new(BlobDescriptionDecodePageTask {
+            inner: self.inner.drain(num_rows)?,
+            def_meaning: self.def_meaning.clone(),
+            structural_projection: self.structural_projection.clone(),
+        }))
     }
 
     fn num_rows(&self) -> u64 {
@@ -122,14 +139,9 @@ impl StructuralPageDecoder for BlobDescriptionPageDecoder {
 
 #[derive(Debug)]
 struct BlobDescriptionDecodePageTask {
+    structural_projection: Option<super::structure::StructuralProjection>,
     inner: Box<dyn DecodePageTask>,
     def_meaning: Arc<[DefinitionInterpretation]>,
-}
-
-impl BlobDescriptionDecodePageTask {
-    fn new(inner: Box<dyn DecodePageTask>, def_meaning: Arc<[DefinitionInterpretation]>) -> Self {
-        Self { inner, def_meaning }
-    }
 }
 
 impl DecodePageTask for BlobDescriptionDecodePageTask {
@@ -192,7 +204,11 @@ impl DecodePageTask for BlobDescriptionDecodePageTask {
             RepDefUnraveler::new(rep, def, self.def_meaning.clone(), positions.len() as u64);
 
         Ok(DecodedPage {
-            data: decoded.data,
+            data: if let Some(projection) = &self.structural_projection {
+                projection.placeholder_values(num_values)?
+            } else {
+                decoded.data
+            },
             repdef,
         })
     }
@@ -201,14 +217,12 @@ impl DecodePageTask for BlobDescriptionDecodePageTask {
 struct BlobCacheableState {
     positions: Arc<UInt64Array>,
     sizes: Arc<UInt64Array>,
-    inner_state: Arc<dyn CachedPageData>,
 }
 
 impl DeepSizeOf for BlobCacheableState {
     fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         (self.positions.as_ref() as &dyn arrow_array::Array).deep_size_of_children(context)
             + (self.sizes.as_ref() as &dyn arrow_array::Array).deep_size_of_children(context)
-            + self.inner_state.deep_size_of_children(context)
     }
 }
 
@@ -220,6 +234,7 @@ impl CachedPageData for BlobCacheableState {
 
 #[derive(Debug)]
 pub(super) struct BlobPageScheduler {
+    pub(super) omit_values: bool,
     inner_scheduler: Box<dyn StructuralPageScheduler>,
     row_number: u64,
     num_rows: u64,
@@ -238,6 +253,7 @@ impl BlobPageScheduler {
         Self {
             inner_scheduler,
             row_number,
+            omit_values: false,
             num_rows,
             def_meaning,
             positions: None,
@@ -277,14 +293,20 @@ impl BlobPageScheduler {
 }
 
 impl StructuralPageScheduler for BlobPageScheduler {
-    fn initialize<'a>(
+    fn init_layout(&self) -> Result<PageInitialization> {
+        self.inner_scheduler.init_layout()
+    }
+
+    fn init_from_buffers<'a>(
         &'a mut self,
+        buffers: PageInitializationBuffers,
         io: &Arc<dyn EncodingsIo>,
     ) -> BoxFuture<'a, Result<Arc<dyn CachedPageData>>> {
         let io = io.clone();
         let num_rows = self.num_rows;
         async move {
-            let cached = self.inner_scheduler.initialize(&io).await?;
+            let cached = self.inner_scheduler.init_from_buffers(buffers, &io).await?;
+            self.inner_scheduler.try_load(&cached)?;
             let mut desc_decoders = self.inner_scheduler.schedule_ranges(&[0..num_rows], &io)?;
             if desc_decoders.len() != 1 {
                 // This can't happen yet today so being a little lazy but if it did happen we just
@@ -317,27 +339,27 @@ impl StructuralPageScheduler for BlobPageScheduler {
                     .unwrap()
                     .clone(),
             );
-            self.positions = Some(positions.clone());
-            self.sizes = Some(sizes.clone());
-            let state = Arc::new(BlobCacheableState {
-                inner_state: cached,
-                positions,
-                sizes,
-            });
+            let state = Arc::new(BlobCacheableState { positions, sizes });
             Ok(state as Arc<dyn CachedPageData>)
         }
         .boxed()
     }
 
-    fn load(&mut self, data: &Arc<dyn CachedPageData>) {
+    fn try_load(&mut self, data: &Arc<dyn CachedPageData>) -> Result<()> {
         let blob_state = data
             .clone()
             .as_arc_any()
             .downcast::<BlobCacheableState>()
-            .unwrap();
+            .map_err(|_| {
+                Error::invalid_input_source("Cached blob page data has an unexpected type".into())
+            })?;
         self.positions = Some(blob_state.positions.clone());
         self.sizes = Some(blob_state.sizes.clone());
-        self.inner_scheduler.load(&blob_state.inner_state);
+        Ok(())
+    }
+
+    fn cache_view(&self) -> PageCacheView {
+        PageCacheView::BlobPayload
     }
 
     fn schedule_ranges(
@@ -376,6 +398,10 @@ impl StructuralPageScheduler for BlobPageScheduler {
                         // result in the load task.
                         blob.set_bytes(Bytes::new());
                     }
+                    loaded_blobs.push(blob);
+                } else if self.omit_values {
+                    let mut blob = LoadedBlob::new(0, 0);
+                    blob.set_bytes(Bytes::new());
                     loaded_blobs.push(blob);
                 } else {
                     loaded_blobs.push(LoadedBlob::new(0, 0));

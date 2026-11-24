@@ -10,8 +10,10 @@
 
 use crate::format::key_existence::KeyExistenceFilter;
 use crate::format::pb;
+use crate::format::pb_actions;
 use crate::format::{BasePath, Fragment, IndexFile, IndexMetadata, overlay::DataOverlayFile};
 use crate::system_index::mem_wal::CompactedSsTable;
+use crate::transaction::action::CompositeOperation;
 use crate::transaction::{
     DataOverlayGroup, DataReplacementGroup, Operation, RewriteGroup, RewrittenIndex, Transaction,
     UpdateMap, UpdateMapEntry, UpdateMode, UpdatedFragmentOffsets, translate_config_updates,
@@ -22,6 +24,7 @@ use lance_core::{Error, Result};
 use lance_file::datatypes::Fields;
 use roaring::RoaringBitmap;
 use std::collections::HashMap;
+use std::num::NonZero;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -188,11 +191,11 @@ impl TryFrom<pb::Transaction> for Transaction {
             })) => Operation::CreateIndex {
                 new_indices: new_indices
                     .into_iter()
-                    .map(IndexMetadata::try_from)
+                    .map(IndexMetadata::from_transaction_proto)
                     .collect::<Result<_>>()?,
                 removed_indices: removed_indices
                     .into_iter()
-                    .map(IndexMetadata::try_from)
+                    .map(IndexMetadata::from_transaction_proto)
                     .collect::<Result<_>>()?,
             },
             Some(pb::transaction::Operation::Merge(pb::transaction::Merge {
@@ -225,6 +228,7 @@ impl TryFrom<pb::Transaction> for Transaction {
                 inserted_rows,
                 updated_fragment_offsets,
                 updated_fragment_offset_bitmaps,
+                mem_wal_dir_id,
             })) => Operation::Update {
                 removed_fragment_ids,
                 updated_fragments: updated_fragments
@@ -240,6 +244,7 @@ impl TryFrom<pb::Transaction> for Transaction {
                     .into_iter()
                     .map(|m| CompactedSsTable::try_from(m).unwrap())
                     .collect(),
+                mem_wal_dir_id,
                 fields_for_preserving_frag_bitmap,
                 update_mode: match update_mode {
                     0 => Some(UpdateMode::RewriteRows),
@@ -373,20 +378,28 @@ impl TryFrom<pb::Transaction> for Transaction {
                 }
             }
             Some(pb::transaction::Operation::DataReplacement(
-                pb::transaction::DataReplacement { replacements },
+                pb::transaction::DataReplacement {
+                    replacements,
+                    data_change,
+                },
             )) => Operation::DataReplacement {
                 replacements: replacements
                     .into_iter()
                     .map(DataReplacementGroup::try_from)
                     .collect::<Result<Vec<_>>>()?,
+                data_change: data_change.unwrap_or(true),
             },
             Some(pb::transaction::Operation::UpdateMemWalState(
-                pb::transaction::UpdateMemWalState { compacted_sstables },
+                pb::transaction::UpdateMemWalState {
+                    compacted_sstables,
+                    dir_id,
+                },
             )) => Operation::UpdateMemWalState {
                 compacted_sstables: compacted_sstables
                     .into_iter()
                     .map(CompactedSsTable::try_from)
                     .collect::<Result<_>>()?,
+                dir_id,
             },
             Some(pb::transaction::Operation::UpdateBases(pb::transaction::UpdateBases {
                 new_bases,
@@ -401,11 +414,17 @@ impl TryFrom<pb::Transaction> for Transaction {
                     .map(DataOverlayGroup::try_from)
                     .collect::<Result<Vec<_>>>()?,
             },
-            None => {
-                return Err(Error::internal(
-                    "Transaction message did not contain an operation".to_string(),
-                ));
+            Some(pb::transaction::Operation::CompositeOperation(composite_operation)) => {
+                // Action-based transactions (Transaction V2, discussion #5960).
+                // Parsing is fail-closed: an action this build does not implement is an error, never a skipped element.
+                // load_and_sort_new_transactions collects concurrent transactions
+                // with try_collect, so such a transaction aborts the commit rather
+                // than being silently treated as a no-op. Do NOT make this lenient.
+                Operation::CompositeOperation(CompositeOperation::try_from(composite_operation)?)
             }
+            // prost drops unrecognized oneof fields, so an operation from a
+            // newer writer is indistinguishable from a missing one.
+            None => Operation::Unknown {},
         };
         Ok(Self {
             read_version: message.read_version,
@@ -462,6 +481,7 @@ impl TryFrom<&pb::transaction::rewrite::RewrittenIndex> for RewrittenIndex {
                         .map(|f| IndexFile {
                             path: f.path.clone(),
                             size_bytes: f.size_bytes,
+                            file_metadata_size_bytes: NonZero::new(f.file_metadata_size_bytes),
                         })
                         .collect(),
                 )
@@ -489,8 +509,10 @@ impl TryFrom<pb::transaction::rewrite::RewriteGroup> for RewriteGroup {
     }
 }
 
-impl From<&Transaction> for pb::Transaction {
-    fn from(value: &Transaction) -> Self {
+impl TryFrom<&Transaction> for pb::Transaction {
+    type Error = Error;
+
+    fn try_from(value: &Transaction) -> Result<Self> {
         let operation = match &value.operation {
             Operation::Append { fragments } => {
                 pb::transaction::Operation::Append(pb::transaction::Append {
@@ -571,11 +593,14 @@ impl From<&Transaction> for pb::Transaction {
                 new_indices,
                 removed_indices,
             } => pb::transaction::Operation::CreateIndex(pb::transaction::CreateIndex {
-                new_indices: new_indices.iter().map(pb::IndexMetadata::from).collect(),
+                new_indices: new_indices
+                    .iter()
+                    .map(IndexMetadata::to_transaction_proto)
+                    .collect::<Result<_>>()?,
                 removed_indices: removed_indices
                     .iter()
-                    .map(pb::IndexMetadata::from)
-                    .collect(),
+                    .map(IndexMetadata::to_transaction_proto)
+                    .collect::<Result<_>>()?,
             }),
             Operation::Merge {
                 fragments,
@@ -596,6 +621,7 @@ impl From<&Transaction> for pb::Transaction {
                 new_fragments,
                 fields_modified,
                 compacted_sstables,
+                mem_wal_dir_id,
                 fields_for_preserving_frag_bitmap,
                 update_mode,
                 inserted_rows_filter,
@@ -612,6 +638,7 @@ impl From<&Transaction> for pb::Transaction {
                     .iter()
                     .map(pb::CompactedSsTable::from)
                     .collect(),
+                mem_wal_dir_id: mem_wal_dir_id.clone(),
                 fields_for_preserving_frag_bitmap: fields_for_preserving_frag_bitmap.clone(),
                 update_mode: update_mode
                     .as_ref()
@@ -652,19 +679,17 @@ impl From<&Transaction> for pb::Transaction {
                 schema_metadata_updates,
                 field_metadata_updates,
             } => pb::transaction::Operation::UpdateConfig(pb::transaction::UpdateConfig {
-                config_updates: config_updates
-                    .as_ref()
-                    .map(pb::transaction::UpdateMap::from),
+                config_updates: config_updates.as_ref().map(pb_actions::UpdateMap::from),
                 table_metadata_updates: table_metadata_updates
                     .as_ref()
-                    .map(pb::transaction::UpdateMap::from),
+                    .map(pb_actions::UpdateMap::from),
                 schema_metadata_updates: schema_metadata_updates
                     .as_ref()
-                    .map(pb::transaction::UpdateMap::from),
+                    .map(pb_actions::UpdateMap::from),
                 field_metadata_updates: field_metadata_updates
                     .iter()
                     .map(|(field_id, update_map)| {
-                        (*field_id, pb::transaction::UpdateMap::from(update_map))
+                        (*field_id, pb_actions::UpdateMap::from(update_map))
                     })
                     .collect(),
                 // Leave old fields empty - we only write new-style fields
@@ -673,14 +698,18 @@ impl From<&Transaction> for pb::Transaction {
                 schema_metadata: Default::default(),
                 field_metadata: Default::default(),
             }),
-            Operation::DataReplacement { replacements } => {
-                pb::transaction::Operation::DataReplacement(pb::transaction::DataReplacement {
-                    replacements: replacements
-                        .iter()
-                        .map(pb::transaction::DataReplacementGroup::from)
-                        .collect(),
-                })
-            }
+            Operation::DataReplacement {
+                replacements,
+                data_change,
+            } => pb::transaction::Operation::DataReplacement(pb::transaction::DataReplacement {
+                replacements: replacements
+                    .iter()
+                    .map(pb::transaction::DataReplacementGroup::from)
+                    .collect(),
+                // Written only when false, so a transaction file from a data
+                // changing replacement stays byte-identical to an older writer's.
+                data_change: (!data_change).then_some(false),
+            }),
             Operation::DataOverlay { groups } => {
                 pb::transaction::Operation::DataOverlay(pb::transaction::DataOverlay {
                     groups: groups
@@ -689,12 +718,16 @@ impl From<&Transaction> for pb::Transaction {
                         .collect(),
                 })
             }
-            Operation::UpdateMemWalState { compacted_sstables } => {
+            Operation::UpdateMemWalState {
+                compacted_sstables,
+                dir_id,
+            } => {
                 pb::transaction::Operation::UpdateMemWalState(pb::transaction::UpdateMemWalState {
                     compacted_sstables: compacted_sstables
                         .iter()
                         .map(pb::CompactedSsTable::from)
                         .collect::<Vec<_>>(),
+                    dir_id: dir_id.clone(),
                 })
             }
             Operation::UpdateBases { new_bases } => {
@@ -706,6 +739,18 @@ impl From<&Transaction> for pb::Transaction {
                         .collect::<Vec<pb::BasePath>>(),
                 })
             }
+            Operation::Unknown { .. } => {
+                return Err(Error::not_supported(format!(
+                    "Transaction {} has an operation written by a newer version of Lance \
+                     and cannot be re-encoded by this version",
+                    value.uuid
+                )));
+            }
+            Operation::CompositeOperation(composite_operation) => {
+                pb::transaction::Operation::CompositeOperation(
+                    pb_actions::CompositeOperation::from(composite_operation),
+                )
+            }
         };
 
         let transaction_properties = value
@@ -713,13 +758,13 @@ impl From<&Transaction> for pb::Transaction {
             .as_ref()
             .map(|arc| arc.as_ref().clone())
             .unwrap_or_default();
-        Self {
+        Ok(Self {
             read_version: value.read_version,
             uuid: value.uuid.clone(),
             operation: Some(operation),
             tag: value.tag.clone().unwrap_or("".to_string()),
             transaction_properties,
-        }
+        })
     }
 }
 
@@ -739,6 +784,9 @@ impl From<&RewrittenIndex> for pb::transaction::rewrite::RewrittenIndex {
                         .map(|f| pb::IndexFile {
                             path: f.path.clone(),
                             size_bytes: f.size_bytes,
+                            file_metadata_size_bytes: f
+                                .file_metadata_size_bytes
+                                .map_or(0, NonZero::get),
                         })
                         .collect()
                 })
@@ -764,13 +812,13 @@ impl From<&RewriteGroup> for pb::transaction::rewrite::RewriteGroup {
     }
 }
 
-impl From<&UpdateMap> for pb::transaction::UpdateMap {
+impl From<&UpdateMap> for pb_actions::UpdateMap {
     fn from(update_map: &UpdateMap) -> Self {
         Self {
             update_entries: update_map
                 .update_entries
                 .iter()
-                .map(|entry| pb::transaction::UpdateMapEntry {
+                .map(|entry| pb_actions::UpdateMapEntry {
                     key: entry.key.clone(),
                     value: entry.value.clone(),
                 })
@@ -780,8 +828,8 @@ impl From<&UpdateMap> for pb::transaction::UpdateMap {
     }
 }
 
-impl From<&pb::transaction::UpdateMap> for UpdateMap {
-    fn from(pb_update_map: &pb::transaction::UpdateMap) -> Self {
+impl From<&pb_actions::UpdateMap> for UpdateMap {
+    fn from(pb_update_map: &pb_actions::UpdateMap) -> Self {
         Self {
             update_entries: pb_update_map
                 .update_entries
@@ -796,20 +844,180 @@ impl From<&pb::transaction::UpdateMap> for UpdateMap {
     }
 }
 
-impl From<&Transaction> for crate::format::Transaction {
-    fn from(value: &Transaction) -> Self {
-        let pb_transaction: pb::Transaction = value.into();
-        Self {
-            inner: pb_transaction,
-        }
+impl TryFrom<&Transaction> for crate::format::Transaction {
+    type Error = Error;
+
+    fn try_from(value: &Transaction) -> Result<Self> {
+        Ok(Self {
+            inner: pb::Transaction::try_from(value)?,
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::feature_flags::CoveringContract;
     use crate::format::DataFile;
     use crate::format::overlay::OverlayCoverage;
+    use crate::transaction::action::{
+        Action, AddDataFile, AddFragment, FieldRef, Ref, RemoveFragment, UserStep,
+    };
+    use crate::transaction::operation::RewriteGroup;
+    use crate::transaction::test_support::sample_index_metadata;
+    use lance_file::version::ConcreteFileVersion;
+    use prost::Message;
+    use rstest::rstest;
+
+    #[rstest::rstest]
+    #[case::suffix(CoveringContract::Suffix, vec![7, 11], vec![11], vec![7])]
+    #[case::keys_only(CoveringContract::Independent, vec![7], vec![11], vec![7])]
+    #[case::carries_its_key(CoveringContract::Independent, vec![7], vec![7, 11], vec![7])]
+    #[case::tail_shaped(CoveringContract::Independent, vec![7, 11], vec![11], vec![7, 11])]
+    fn test_create_index_entries_roundtrip_in_the_suffix_layout(
+        #[case] contract: CoveringContract,
+        #[case] stored_fields: Vec<i32>,
+        #[case] covering_fields: Vec<i32>,
+        #[case] keys: Vec<i32>,
+    ) {
+        let mut stored = pb::IndexMetadata::from(&sample_index_metadata("covered"));
+        stored.fields = stored_fields;
+        stored.covering_fields = covering_fields.clone();
+        let entry = IndexMetadata::from_manifest_proto(stored, contract).unwrap();
+        let transaction = Transaction::new(
+            1,
+            Operation::CreateIndex {
+                new_indices: vec![entry.clone()],
+                removed_indices: vec![entry],
+            },
+            None,
+        );
+
+        let message = pb::Transaction::try_from(&transaction).unwrap();
+        let Some(pb::transaction::Operation::CreateIndex(written)) = &message.operation else {
+            panic!("expected CreateIndex, got {:?}", message.operation);
+        };
+        let suffix_layout = [keys.as_slice(), &covering_fields].concat();
+        for entry in written.new_indices.iter().chain(&written.removed_indices) {
+            assert_eq!(entry.fields, suffix_layout);
+            IndexMetadata::from_manifest_proto(entry.clone(), CoveringContract::Suffix).unwrap();
+        }
+
+        let Operation::CreateIndex {
+            new_indices,
+            removed_indices,
+        } = Transaction::try_from(message).unwrap().operation
+        else {
+            panic!("expected CreateIndex");
+        };
+        for entry in new_indices.iter().chain(&removed_indices) {
+            assert_eq!(entry.keyed_fields(), keys);
+            assert_eq!(entry.covering_fields, covering_fields);
+        }
+    }
+
+    /// Appending the carried fields to an entry with no keys would write one
+    /// that reads back keyed on its carried field.
+    #[test]
+    fn test_create_index_entry_without_keys_is_not_encoded() {
+        let entry = IndexMetadata {
+            fields: vec![],
+            covering_fields: vec![11],
+            ..sample_index_metadata("covered")
+        };
+        let transaction = Transaction::new(
+            1,
+            Operation::CreateIndex {
+                new_indices: vec![entry],
+                removed_indices: vec![],
+            },
+            None,
+        );
+
+        let error = pb::Transaction::try_from(&transaction).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("at least one field must remain indexed"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// A transaction file holds only the suffix layout, so decoding one refuses
+    /// an entry that only a manifest under the independent contract may store.
+    #[rstest::rstest]
+    #[case::keys_only(vec![7], vec![11], "covering fields [11] but [11] are not among its fields [7]")]
+    #[case::no_key(vec![11], vec![11], "covering fields [11] but its fields are [11]; at least one field must remain indexed")]
+    #[case::carried_field_not_last(vec![7, 11], vec![7], "covering fields [7] which are not the trailing entries of [7, 11]")]
+    fn test_create_index_entry_outside_the_suffix_layout_is_refused(
+        #[case] fields: Vec<i32>,
+        #[case] covering_fields: Vec<i32>,
+        #[case] expected_error: &str,
+    ) {
+        let mut entry = pb::IndexMetadata::from(&sample_index_metadata("covered"));
+        entry.fields = fields.clone();
+        entry.covering_fields = covering_fields;
+        let manifest_entry =
+            IndexMetadata::from_manifest_proto(entry.clone(), CoveringContract::Independent)
+                .unwrap();
+        assert_eq!(manifest_entry.keyed_fields(), fields);
+
+        for create_index in [
+            pb::transaction::CreateIndex {
+                new_indices: vec![entry.clone()],
+                removed_indices: vec![],
+            },
+            pb::transaction::CreateIndex {
+                new_indices: vec![],
+                removed_indices: vec![entry],
+            },
+        ] {
+            let error = Transaction::try_from(pb::Transaction {
+                read_version: 1,
+                uuid: "test".to_string(),
+                operation: Some(pb::transaction::Operation::CreateIndex(create_index)),
+                ..Default::default()
+            })
+            .unwrap_err();
+            assert!(
+                matches!(error, Error::InvalidInput { .. }),
+                "expected InvalidInput, got {error:?}"
+            );
+            assert!(
+                error.to_string().contains(expected_error),
+                "unexpected error: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_rewrite_frag_reuse_update_stays_in_memory() {
+        // The fragment reuse update never enters the transaction file:
+        // other writers' conflict decisions only need the fragment sets in
+        // `groups`.
+        let entry = crate::transaction::test_support::sample_index_metadata(
+            crate::system_index::frag_reuse::FRAG_REUSE_INDEX_NAME,
+        );
+        let transaction = Transaction::new(
+            1,
+            Operation::Rewrite {
+                groups: vec![],
+                rewritten_indices: vec![],
+                frag_reuse_index: Some(entry),
+            },
+            None,
+        );
+        let decoded =
+            Transaction::try_from(pb::Transaction::try_from(&transaction).unwrap()).unwrap();
+        match decoded.operation {
+            Operation::Rewrite {
+                frag_reuse_index, ..
+            } => {
+                assert!(frag_reuse_index.is_none());
+            }
+            other => panic!("expected Rewrite, got {other:?}"),
+        }
+    }
 
     #[test]
     fn test_data_overlay_operation_roundtrips() {
@@ -853,5 +1061,248 @@ mod tests {
             }
             other => panic!("expected DataOverlay, got {other:?}"),
         }
+    }
+
+    /// `data_change` survives the round trip, and a transaction written
+    /// before the field existed reads back as a data change.
+    #[rstest::rstest]
+    #[case::moved(false)]
+    #[case::changed(true)]
+    fn test_data_replacement_data_change_roundtrips(#[case] data_change: bool) {
+        let transaction = Transaction::new(
+            1,
+            Operation::DataReplacement {
+                replacements: vec![DataReplacementGroup(
+                    0,
+                    DataFile::new_legacy_from_fields("new.lance", vec![3], None),
+                )],
+                data_change,
+            },
+            None,
+        );
+        let mut message = pb::Transaction::try_from(&transaction).unwrap();
+        let decoded = Transaction::try_from(message.clone()).unwrap();
+        assert!(matches!(
+            decoded.operation,
+            Operation::DataReplacement { data_change: d, .. } if d == data_change
+        ));
+
+        if let Some(pb::transaction::Operation::DataReplacement(replacement)) =
+            message.operation.as_mut()
+        {
+            assert_eq!(replacement.data_change, (!data_change).then_some(false));
+            replacement.data_change = None;
+        }
+        let legacy = Transaction::try_from(message).unwrap();
+        assert!(matches!(
+            legacy.operation,
+            Operation::DataReplacement {
+                data_change: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_rewritten_index_roundtrips() {
+        let rewritten_index = RewrittenIndex {
+            old_id: Uuid::new_v4(),
+            new_id: Uuid::new_v4(),
+            new_index_details: prost_types::Any::default(),
+            new_index_version: 1,
+            new_index_files: Some(vec![
+                IndexFile {
+                    path: "index.idx".to_string(),
+                    size_bytes: 4_096,
+                    file_metadata_size_bytes: NonZero::new(256),
+                },
+                IndexFile {
+                    path: "auxiliary.idx".to_string(),
+                    size_bytes: 1_024,
+                    file_metadata_size_bytes: None,
+                },
+            ]),
+        };
+
+        let message = pb::transaction::rewrite::RewrittenIndex::from(&rewritten_index);
+        assert_eq!(RewrittenIndex::try_from(&message).unwrap(), rewritten_index);
+    }
+
+    #[test]
+    fn test_composite_operation_round_trips_through_transaction() {
+        let uuid = Uuid::new_v4().to_string();
+        let transaction = Transaction {
+            read_version: 4,
+            uuid: uuid.clone(),
+            operation: Operation::CompositeOperation(CompositeOperation::new(vec![UserStep::new(
+                "append batch",
+                vec![Action::AddFragment(AddFragment {
+                    id: Ref::Local(0),
+                    physical_rows: 1,
+                    row_id_meta: None,
+                    last_updated_at_version_meta: None,
+                    created_at_version_meta: None,
+                    data_change: true,
+                })],
+            )])),
+            tag: None,
+            transaction_properties: None,
+        };
+
+        let message = pb::Transaction::try_from(&transaction).unwrap();
+        // The identity lives on the envelope alone. The operation carries the
+        // steps, and their descriptions are what keeps history readable.
+        assert_eq!(message.uuid, uuid);
+        assert_eq!(message.read_version, 4);
+        match &message.operation {
+            Some(pb::transaction::Operation::CompositeOperation(composite_operation)) => {
+                let descriptions: Vec<&str> = composite_operation
+                    .steps
+                    .iter()
+                    .map(|step| step.description.as_str())
+                    .collect();
+                assert_eq!(descriptions, ["append batch"]);
+            }
+            other => panic!("expected CompositeOperation, got {other:?}"),
+        }
+
+        assert_eq!(Transaction::try_from(message).unwrap(), transaction);
+    }
+
+    #[test]
+    fn test_unrecognized_action_fails_closed_on_load() {
+        // An action a newer Lance wrote decodes to no known variant, because
+        // protobuf drops the field this build does not know. Loading it must
+        // fail rather than parse leniently: load_and_sort_new_transactions
+        // collects concurrent transactions with try_collect, so this aborts an
+        // in-flight commit instead of letting it proceed against a change it
+        // cannot see.
+        let message = pb::Transaction {
+            read_version: 1,
+            uuid: Uuid::new_v4().to_string(),
+            operation: Some(pb::transaction::Operation::CompositeOperation(
+                pb_actions::CompositeOperation {
+                    steps: vec![pb_actions::UserStep {
+                        description: "something from the future".to_string(),
+                        actions: vec![pb_actions::Action { action: None }],
+                    }],
+                },
+            )),
+            ..Default::default()
+        };
+
+        let err = Transaction::try_from(message).unwrap_err();
+        assert!(
+            matches!(err, Error::NotSupported { .. }),
+            "expected NotSupported, got: {err:?}"
+        );
+    }
+
+    const WIDE_COLUMNS: i32 = 200;
+
+    fn wide_data_file(index: usize, fields: Vec<i32>) -> DataFile {
+        DataFile::new(
+            format!("data/{:032x}.lance", index),
+            fields,
+            (0..WIDE_COLUMNS).collect(),
+            ConcreteFileVersion::V2_0,
+            std::num::NonZero::new(64 << 20),
+            None,
+        )
+    }
+
+    fn wide_fragment(id: u64) -> Fragment {
+        let mut fragment = Fragment::new(id);
+        fragment.physical_rows = Some(1_000_000);
+        fragment.files = vec![wide_data_file(id as usize, (0..WIDE_COLUMNS).collect())];
+        fragment
+    }
+
+    /// The composite spelling of minting `count` wide fragments: `file.fields`
+    /// empty and `field_ids` the file's only field list.
+    fn mint_wide_fragments(count: usize, data_change: bool) -> Vec<Action> {
+        (0..count)
+            .flat_map(|index| {
+                let token = index as u32;
+                [
+                    Action::AddFragment(AddFragment {
+                        id: Ref::Local(token),
+                        physical_rows: 1_000_000,
+                        row_id_meta: None,
+                        last_updated_at_version_meta: None,
+                        created_at_version_meta: None,
+                        data_change,
+                    }),
+                    Action::AddDataFile(AddDataFile {
+                        fragment: Ref::Local(token),
+                        file: wide_data_file(index, Vec::new()),
+                        field_ids: (0..WIDE_COLUMNS).map(FieldRef::Committed).collect(),
+                        data_change,
+                        base: None,
+                    }),
+                ]
+            })
+            .collect()
+    }
+
+    fn encoded_len(operation: Operation) -> usize {
+        let transaction = Transaction::new(1, operation, None);
+        pb::Transaction::try_from(&transaction)
+            .unwrap()
+            .encoded_len()
+    }
+
+    fn composite(actions: Vec<Action>) -> Operation {
+        Operation::CompositeOperation(CompositeOperation::new(vec![UserStep::new(
+            "step", actions,
+        )]))
+    }
+
+    /// A wide table makes the per-column cost of an action set visible: 100
+    /// fragments of 200 columns each, appended, and compacted 10 to 1.
+    ///
+    /// Each bound is what the format costs today plus ~10%, so it only catches
+    /// growth. What remains of the append's overhead is `field_ids`: a
+    /// `FieldRef` per column costs a few bytes more than a packed `int32`.
+    #[rstest]
+    #[case::append(
+        Operation::Append { fragments: (0..100).map(wide_fragment).collect() },
+        composite(mint_wide_fragments(100, true)),
+        2.3,
+    )]
+    #[case::compaction(
+        Operation::Rewrite {
+            groups: vec![RewriteGroup {
+                old_fragments: (0..100).map(wide_fragment).collect(),
+                new_fragments: (100..110).map(wide_fragment).collect(),
+            }],
+            rewritten_indices: vec![],
+            frag_reuse_index: None,
+        },
+        composite(
+            (0..100)
+                .map(|id| {
+                    Action::RemoveFragment(RemoveFragment {
+                        fragment: Ref::Committed(id),
+                        data_change: false,
+                    })
+                })
+                .chain(mint_wide_fragments(10, false))
+                .collect(),
+        ),
+        0.23,
+    )]
+    fn test_a_wide_action_set_stays_within_a_bound_of_the_legacy_size(
+        #[case] legacy: Operation,
+        #[case] actions: Operation,
+        #[case] max_ratio: f64,
+    ) {
+        let legacy = encoded_len(legacy);
+        let actions = encoded_len(actions);
+        assert!(
+            actions as f64 <= legacy as f64 * max_ratio,
+            "the action set encodes to {actions} bytes, more than {max_ratio}x the legacy \
+             operation's {legacy}"
+        );
     }
 }

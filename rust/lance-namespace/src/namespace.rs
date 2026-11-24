@@ -12,10 +12,12 @@ use lance_namespace_reqwest_client::models::{
     AlterTableAlterColumnsResponse, AlterTableBackfillColumnsRequest,
     AlterTableBackfillColumnsResponse, AlterTableDropColumnsRequest, AlterTableDropColumnsResponse,
     AlterTransactionRequest, AlterTransactionResponse, AnalyzeTableQueryPlanRequest,
-    BatchDeleteTableVersionsRequest, BatchDeleteTableVersionsResponse, CountTableRowsRequest,
-    CreateMaterializedViewRequest, CreateMaterializedViewResponse, CreateNamespaceRequest,
-    CreateNamespaceResponse, CreateTableBranchRequest, CreateTableBranchResponse,
-    CreateTableIndexRequest, CreateTableIndexResponse, CreateTableRequest, CreateTableResponse,
+    BatchCommitTablesRequest, BatchCommitTablesResponse, BatchCreateTableVersionsRequest,
+    BatchCreateTableVersionsResponse, BatchDeleteTableVersionsRequest,
+    BatchDeleteTableVersionsResponse, CountTableRowsRequest, CreateMaterializedViewRequest,
+    CreateMaterializedViewResponse, CreateNamespaceRequest, CreateNamespaceResponse,
+    CreateTableBranchRequest, CreateTableBranchResponse, CreateTableIndexRequest,
+    CreateTableIndexResponse, CreateTableRequest, CreateTableResponse,
     CreateTableScalarIndexResponse, CreateTableTagRequest, CreateTableTagResponse,
     CreateTableVersionRequest, CreateTableVersionResponse, DeclareTableRequest,
     DeclareTableResponse, DeleteFromTableRequest, DeleteFromTableResponse,
@@ -35,9 +37,10 @@ use lance_namespace_reqwest_client::models::{
     MergeInsertIntoTableRequest, MergeInsertIntoTableResponse, NamespaceExistsRequest,
     QueryTableRequest, RefreshMaterializedViewRequest, RefreshMaterializedViewResponse,
     RegisterTableRequest, RegisterTableResponse, RenameTableRequest, RenameTableResponse,
-    RestoreTableRequest, RestoreTableResponse, TableExistsRequest, UpdateTableRequest,
-    UpdateTableResponse, UpdateTableSchemaMetadataRequest, UpdateTableSchemaMetadataResponse,
-    UpdateTableTagRequest, UpdateTableTagResponse,
+    RestoreTableRequest, RestoreTableResponse, TableExistsRequest, UpdateFieldMetadataRequest,
+    UpdateFieldMetadataResponse, UpdateTableRequest, UpdateTableResponse,
+    UpdateTableSchemaMetadataRequest, UpdateTableSchemaMetadataResponse, UpdateTableTagRequest,
+    UpdateTableTagResponse,
 };
 
 /// Base trait for Lance Namespace implementations.
@@ -176,7 +179,7 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
         Err(Error::not_supported("declare_table not implemented"))
     }
 
-    /// Insert data into a table.
+    /// Insert data into a table, returning the inserted row count and commit version.
     async fn insert_into_table(
         &self,
         _request: InsertIntoTableRequest,
@@ -362,6 +365,26 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
         ))
     }
 
+    /// Create version entries for one or more tables atomically: either every
+    /// entry is created, or none is.
+    async fn batch_create_table_versions(
+        &self,
+        _request: BatchCreateTableVersionsRequest,
+    ) -> Result<BatchCreateTableVersionsResponse> {
+        Err(Error::not_supported(
+            "batch_create_table_versions not implemented",
+        ))
+    }
+
+    /// Commit operations on one or more tables atomically: either every
+    /// operation is applied, or none is.
+    async fn batch_commit_tables(
+        &self,
+        _request: BatchCommitTablesRequest,
+    ) -> Result<BatchCommitTablesResponse> {
+        Err(Error::not_supported("batch_commit_tables not implemented"))
+    }
+
     /// Update table schema metadata.
     async fn update_table_schema_metadata(
         &self,
@@ -369,6 +392,16 @@ pub trait LanceNamespace: Send + Sync + std::fmt::Debug {
     ) -> Result<UpdateTableSchemaMetadataResponse> {
         Err(Error::not_supported(
             "update_table_schema_metadata not implemented",
+        ))
+    }
+
+    /// Update the metadata of fields in a table's schema.
+    async fn update_field_metadata(
+        &self,
+        _request: UpdateFieldMetadataRequest,
+    ) -> Result<UpdateFieldMetadataResponse> {
+        Err(Error::not_supported(
+            "update_field_metadata not implemented",
         ))
     }
 

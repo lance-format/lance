@@ -7,6 +7,7 @@
 
 #[cfg(feature = "substrait")]
 pub mod ann_proto;
+pub(crate) mod column_width;
 pub mod count_from_mask;
 pub mod count_pushdown;
 mod filter;
@@ -15,7 +16,10 @@ pub mod filtered_read;
 pub mod filtered_read_proto;
 pub mod fts;
 pub(crate) mod knn;
+pub mod minhash;
 mod optimizer;
+pub mod ordered_index_scan;
+mod prefilter_union;
 mod projection;
 mod pushdown_scan;
 pub(crate) mod row_addr_mask;
@@ -24,16 +28,22 @@ pub mod scalar_index;
 mod scan;
 #[cfg(feature = "substrait")]
 pub mod table_identifier;
-mod take;
+pub(crate) mod take;
 #[cfg(test)]
 pub mod testing;
+pub mod topk_late_materialization;
 pub mod utils;
 
 pub use filter::LanceFilterExec;
-pub use knn::{ANNIvfPartitionExec, ANNIvfSubIndexExec, KNNVectorDistanceExec};
+pub use knn::{
+    ANNIvfBatchExec, ANNIvfPartitionExec, ANNIvfSubIndexExec, KNNVectorDistanceExec,
+    MultivectorScoringExec, QUERY_INDEX_COL,
+};
 pub use lance_datafusion::planner::Planner;
 pub use lance_index::scalar::expression::FilterPlan;
+pub use minhash::{FlatMinHashExec, MinHashSearchExec};
 pub use optimizer::get_physical_optimizer;
+pub use prefilter_union::PrefilterUnionExec;
 pub use projection::project;
 pub use pushdown_scan::{LancePushdownScanExec, ScanConfig};
 pub use row_addr_mask::RowAddrMaskFilterExec;

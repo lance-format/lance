@@ -6,9 +6,19 @@ name: Format spec vote gate
 # the persisted format protos or `docs/src/format/**`; execution-only wire
 # schemas are excluded. This gate reads that label and blocks merging until the
 # PR has 3 binding +1 votes from PMC members (PR approvals, excluding the
-# author), has no outstanding veto (a PMC "Request changes" review), and the
-# 72-hour voting period has elapsed. That period starts once the PR is labeled
-# and ready for review, and pauses over weekends.
+# author) with at least one of them on the head commit, has no outstanding veto
+# (a PMC "Request changes" review), and the 72-hour voting period has elapsed.
+# That period starts once the PR is labeled and ready for review, and pauses
+# over weekends. Approvals carry over across pushes; the member who approves the
+# head commit is vouching that nothing substantive changed since the others
+# voted.
+#
+# That carry-over depends on a branch-protection setting the gate cannot read
+# with its token: turning on "Dismiss stale pull request approvals when new
+# commits are pushed" makes GitHub report the earlier approvals as DISMISSED,
+# which this gate does not count. The gate then quietly reverts to requiring all
+# 3 approvals on the head commit — it fails closed, but anyone wondering why
+# should look there first.
 #
 # The gate publishes its verdict as the `format-spec-vote` commit status on the
 # PR head. To make it a merge blocker, an org admin must add `format-spec-vote`

@@ -18,6 +18,8 @@ import org.lance.index.IndexParams;
 import org.lance.index.IndexType;
 import org.lance.index.scalar.ScalarIndexParams;
 import org.lance.ipc.AsyncScanner;
+import org.lance.ipc.FragmentSlice;
+import org.lance.ipc.FullTextQuery;
 import org.lance.ipc.MaterializationStyle;
 import org.lance.ipc.ScanOptions;
 
@@ -40,12 +42,14 @@ import java.net.URL;
 import java.net.URLClassLoader;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
@@ -238,6 +242,56 @@ public class AsyncScannerTest {
             assertEquals(5, countRows(reader));
             reader.close();
           }
+
+          // Without an index query, fast search falls back to both fragments. A dropped
+          // ignore list in the async JNI path would incorrectly return only five rows.
+          ScanOptions ignoredOptions =
+              new ScanOptions.Builder()
+                  .filter("id < 5")
+                  .fastSearch(true)
+                  .ignoredScalarIndices(Collections.singletonList("id_btree_index"))
+                  .build();
+          try (AsyncScanner scanner = AsyncScanner.create(appended, ignoredOptions, allocator);
+              ArrowReader reader = scanner.scanBatchesAsync().get(10, TimeUnit.SECONDS)) {
+            assertEquals(10, countRows(reader));
+          }
+        }
+      }
+    }
+  }
+
+  @Test
+  void testAsyncScanRespectsFragmentSlice(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("async_scanner_fragment_slice").toString();
+    WriteParams writeParams =
+        new WriteParams.Builder()
+            .withDataStorageVersion(LanceConstants.FILE_FORMAT_VERSION_STABLE)
+            .build();
+    try (BufferAllocator allocator = new RootAllocator()) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createDatasetWithWriteParams(writeParams).close();
+      List<FragmentMetadata> metadata = testDataset.createNewFragment(10, writeParams);
+      try (Dataset dataset =
+          Dataset.commit(
+              allocator, datasetPath, new FragmentOperation.Append(metadata), Optional.of(1L))) {
+        int fragmentId = dataset.getFragments().get(0).getId();
+        ScanOptions options =
+            new ScanOptions.Builder()
+                .fragmentSlices(Collections.singletonList(new FragmentSlice(fragmentId, 3, 4)))
+                .columns(Collections.singletonList("id"))
+                .build();
+        try (AsyncScanner scanner = AsyncScanner.create(dataset, options, allocator);
+            ArrowReader reader = scanner.scanBatchesAsync().get(10, TimeUnit.SECONDS)) {
+          List<Integer> ids = new ArrayList<>();
+          VectorSchemaRoot root = reader.getVectorSchemaRoot();
+          while (reader.loadNextBatch()) {
+            IntVector vector = (IntVector) root.getVector("id");
+            for (int i = 0; i < root.getRowCount(); i++) {
+              ids.add(vector.get(i));
+            }
+          }
+          assertEquals(Arrays.asList(3, 4, 5, 6), ids);
         }
       }
     }
@@ -723,5 +777,44 @@ public class AsyncScannerTest {
             + stdout
             + "\n--- stderr ---\n"
             + stderr);
+  }
+
+  @Test
+  void testRepeatedNativeErrorsThenSuccess(@TempDir Path tempDir) throws Exception {
+    try (BufferAllocator allocator = new RootAllocator()) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(
+              allocator, tempDir.resolve("dispatcher_errors").toString());
+      testDataset.createEmptyDataset().close();
+      try (Dataset dataset = testDataset.write(1, 4)) {
+        ScanOptions invalid =
+            new ScanOptions.Builder()
+                .fullTextQuery(FullTextQuery.match("word", "missing_column"))
+                .build();
+        try (AsyncScanner scanner = AsyncScanner.create(dataset, invalid, allocator)) {
+          for (int i = 0; i < 64; i++) {
+            ExecutionException failure =
+                assertThrows(
+                    ExecutionException.class,
+                    () -> scanner.scanBatchesAsync().get(10, TimeUnit.SECONDS));
+            Throwable error = failure.getCause();
+            assertTrue(error instanceof LanceException);
+            while (error.getCause() != null) {
+              error = error.getCause();
+            }
+            assertTrue(error.getMessage().contains("missing_column"));
+          }
+        }
+        try (AsyncScanner scanner =
+                AsyncScanner.create(dataset, new ScanOptions.Builder().build(), allocator);
+            ArrowReader reader = scanner.scanBatchesAsync().get(10, TimeUnit.SECONDS)) {
+          int rows = 0;
+          while (reader.loadNextBatch()) {
+            rows += reader.getVectorSchemaRoot().getRowCount();
+          }
+          assertEquals(4, rows);
+        }
+      }
+    }
   }
 }

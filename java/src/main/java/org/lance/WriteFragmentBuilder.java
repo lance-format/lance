@@ -13,6 +13,7 @@
  */
 package org.lance;
 
+import org.lance.file.FileWriteOptions;
 import org.lance.namespace.LanceNamespace;
 import org.lance.schema.LanceSchema;
 
@@ -232,6 +233,18 @@ public class WriteFragmentBuilder {
   public WriteFragmentBuilder maxBytesPerFile(long maxBytesPerFile) {
     ensureWriteParamsBuilder();
     this.writeParamsBuilder.withMaxBytesPerFile(maxBytesPerFile);
+    return this;
+  }
+
+  /**
+   * Set options for configuring the current-format file writer.
+   *
+   * @param fileWriteOptions file writer options
+   * @return this builder
+   */
+  public WriteFragmentBuilder fileWriteOptions(FileWriteOptions fileWriteOptions) {
+    ensureWriteParamsBuilder();
+    this.writeParamsBuilder.withFileWriteOptions(fileWriteOptions);
     return this;
   }
 

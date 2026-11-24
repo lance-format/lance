@@ -2,34 +2,98 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use lance_core::utils::row_addr_remap::RowAddrRemap;
+use lance_index_core::remapping::RowAddrTranslator;
 use std::collections::BTreeSet;
-use std::{ops::Bound, sync::Arc};
+use std::{
+    ops::Bound,
+    sync::{Arc, Mutex, OnceLock},
+};
 
 use arrow_array::Array;
 use arrow_array::{
-    ArrayRef, BooleanArray, RecordBatch, UInt64Array, cast::AsArray, types::UInt64Type,
+    ArrayRef, BooleanArray, RecordBatch, UInt32Array, UInt64Array, cast::AsArray, types::UInt64Type,
 };
+use arrow_ord::{ord::make_comparator, sort::sort_to_indices};
+use arrow_schema::SortOptions;
 
 use datafusion_common::DFSchema;
 use datafusion_expr::execution_props::ExecutionProps;
+use datafusion_expr::physical_planning_context::PhysicalPlanningContext;
 use datafusion_physical_expr::{PhysicalExpr, create_physical_expr};
 use lance_arrow::RecordBatchExt;
-use lance_core::Result;
 use lance_core::cache::{CacheCodecImpl, CacheEntryReader, CacheEntryWriter};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::address::RowAddress;
+use lance_core::{Error, Result};
 use lance_select::{NullableRowAddrSet, RowAddrTreeMap, RowSetOps};
 use roaring::RoaringBitmap;
 use tracing::instrument;
 
 use datafusion_common::ScalarValue;
 
+use super::lookup::U64Lookup;
 use crate::metrics::MetricsCollector;
 use crate::scalar::btree::{BTREE_VALUES_COLUMN, OrderableScalarValue};
 use crate::scalar::{AnyQuery, SargableQuery};
 
 const VALUES_COL_IDX: usize = 0;
 const IDS_COL_IDX: usize = 1;
+
+/// The rows of one page that matched a query, before they are assembled into
+/// a [`NullableRowAddrSet`].
+///
+/// A btree search touches many pages, and each page's rows are scattered
+/// across many fragments (a page holds rows sorted by *value*). Building a
+/// `RowAddrTreeMap` per page and unioning them is O(pages x fragments) tiny
+/// bitmaps; instead every page hands back its matched ids as plain arrays and
+/// the caller assembles the final set once, e.g. with
+/// [`RowAddrTreeMap::from_sorted_runs`].
+///
+/// Both arrays are sorted ascending because the page itself is sorted by row
+/// id (see [`FlatIndex::try_new`]) and every array here is a filtered view of
+/// the page's id column. `nulls` is empty unless the caller asked to track
+/// nulls. A row id may appear in both (e.g. [`FlatIndex::all_matches`]), in
+/// which case it is NULL — the same "null trumps true" rule as
+/// [`NullableRowAddrSet::new`].
+#[derive(Debug, Clone)]
+pub struct PageMatches {
+    selected: UInt64Array,
+    nulls: UInt64Array,
+}
+
+impl PageMatches {
+    fn new(selected: UInt64Array, nulls: UInt64Array) -> Self {
+        Self { selected, nulls }
+    }
+
+    pub fn empty() -> Self {
+        Self::new(empty_ids(), empty_ids())
+    }
+
+    /// Row ids for which the predicate was TRUE, sorted ascending.
+    pub fn selected(&self) -> &[u64] {
+        self.selected.values()
+    }
+
+    /// Row ids for which the predicate was NULL, sorted ascending.
+    pub fn nulls(&self) -> &[u64] {
+        self.nulls.values()
+    }
+
+    /// Build the set for this page alone. For many pages, assemble once from
+    /// [`Self::selected`] / [`Self::nulls`] across all of them instead.
+    pub fn into_row_addr_set(self) -> Result<NullableRowAddrSet> {
+        Ok(NullableRowAddrSet::new(
+            RowAddrTreeMap::from_sorted_iter(self.selected().iter().copied())?,
+            RowAddrTreeMap::from_sorted_iter(self.nulls().iter().copied())?,
+        ))
+    }
+}
+
+fn empty_ids() -> UInt64Array {
+    UInt64Array::from(Vec::<u64>::new())
+}
+
 /// A flat index is just a batch of value/row-id pairs
 ///
 /// The batch always has two columns.  The first column "values" contains
@@ -38,55 +102,144 @@ const IDS_COL_IDX: usize = 1;
 /// Evaluating a query requires O(N) time where N is the # of rows
 #[derive(Debug)]
 pub struct FlatIndex {
+    /// Sorted by row id, so filtered id columns remain sorted for bitmap assembly.
     data: Arc<RecordBatch>,
-    all_addrs_map: RowAddrTreeMap,
-    null_addrs_map: RowAddrTreeMap,
+    /// Reuse the address-sort permutation until lookup needs value order.
+    /// Ordinary filters never pay for constructing a second ordering.
+    lookup_order: Mutex<LookupOrder>,
+    lookup_u64: OnceLock<Option<Arc<U64Lookup>>>,
     df_schema: DFSchema,
+}
+
+#[derive(Debug)]
+enum LookupOrder {
+    /// Maps address-sorted positions to positions in the original input page.
+    Source(UInt32Array),
+    /// Cached IPC only contains address-sorted data, without its input order.
+    Unsorted,
+    /// Positions of non-null values in ascending value order.
+    Values(UInt32Array),
 }
 
 impl DeepSizeOf for FlatIndex {
     fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
+        // `df_schema` is a two-field schema derived from `data`; its footprint
+        // is a few hundred bytes and not worth a separate accounting.
+        // Charge for the eventual lookup permutation even before it exists,
+        // so lazy initialization cannot grow an already-accounted cache entry.
+        let lookup_extra = if self.values().as_primitive_opt::<UInt64Type>().is_some() {
+            U64Lookup::extra_size(self.data.num_rows())
+        } else {
+            0
+        };
         self.data.get_array_memory_size()
+            + self.data.num_rows() * std::mem::size_of::<u32>()
+            + lookup_extra
     }
 }
 
 impl FlatIndex {
     #[instrument(name = "FlatIndex::try_new", level = "debug", skip_all)]
     pub fn try_new(data: RecordBatch) -> Result<Self> {
-        // Sort by row id to make bitmap construction more efficient
-        let data = data.sort_by_column(IDS_COL_IDX, None)?;
-
-        let has_nulls = data.column(VALUES_COL_IDX).null_count() > 0;
-        let all_addrs_map = RowAddrTreeMap::from_sorted_iter(
-            data.column(IDS_COL_IDX)
-                .as_primitive::<UInt64Type>()
-                .values()
-                .iter()
-                .copied(),
-        )?;
-
-        let null_addrs_map = if has_nulls {
-            Self::get_null_addrs(&data)?
-        } else {
-            RowAddrTreeMap::default()
-        };
-
+        // Sort by row id so every filtered view of the id column is itself
+        // sorted, which is what makes bitmap construction cheap downstream.
+        let row_order = sort_to_indices(data.column(IDS_COL_IDX), None, None)?;
+        let data = data.take(&row_order)?;
         let df_schema = DFSchema::try_from(data.schema())?;
 
         Ok(Self {
             data: Arc::new(data),
-            all_addrs_map,
-            null_addrs_map,
+            lookup_order: Mutex::new(LookupOrder::Source(row_order)),
+            lookup_u64: OnceLock::new(),
             df_schema,
         })
     }
 
-    fn ids(&self) -> &ArrayRef {
-        self.data.column(IDS_COL_IDX)
+    pub(crate) fn ids(&self) -> &UInt64Array {
+        self.data.column(IDS_COL_IDX).as_primitive::<UInt64Type>()
     }
 
-    fn values(&self) -> &ArrayRef {
+    pub(crate) fn values(&self) -> &ArrayRef {
         self.data.column(VALUES_COL_IDX)
+    }
+
+    pub(crate) fn value_order(&self) -> Result<UInt32Array> {
+        let mut order = self
+            .lookup_order
+            .lock()
+            .map_err(|_| Error::internal("BTree lookup order lock poisoned"))?;
+        if let LookupOrder::Values(order) = &*order {
+            return Ok(order.clone());
+        }
+        let values = self.values();
+        let value_order = if values.len() == values.logical_null_count() {
+            UInt32Array::from(Vec::<u32>::new())
+        } else if let LookupOrder::Source(row_order) = &*order {
+            let mut positions = vec![0; row_order.len()];
+            for (position, &source) in row_order.values().iter().enumerate() {
+                positions[source as usize] = position as u32;
+            }
+            positions.retain(|&position| values.is_valid(position as usize));
+            let compare = make_comparator(values, values, SortOptions::default())?;
+            // Current writers persist value order. Remapped or older pages
+            // may not, so validate it before using the inverse permutation.
+            if !positions
+                .windows(2)
+                .all(|pair| !compare(pair[0] as usize, pair[1] as usize).is_gt())
+            {
+                positions.sort_unstable_by(|&a, &b| compare(a as usize, b as usize));
+            }
+            UInt32Array::from(positions)
+        } else {
+            let order = sort_to_indices(values, None, None)?;
+            order.slice(values.null_count(), values.len() - values.null_count())
+        };
+        *order = LookupOrder::Values(value_order.clone());
+        Ok(value_order)
+    }
+
+    pub(super) fn lookup_u64(&self) -> Result<Option<&Arc<U64Lookup>>> {
+        let Some(values) = self.values().as_primitive_opt::<UInt64Type>() else {
+            return Ok(None);
+        };
+        if let Some(lookup) = self.lookup_u64.get() {
+            return Ok(lookup.as_ref());
+        }
+        let order = self.value_order()?;
+        Ok(self
+            .lookup_u64
+            .get_or_init(|| U64Lookup::try_new(values, self.ids(), order).map(Arc::new))
+            .as_ref())
+    }
+
+    fn has_nulls(&self) -> bool {
+        self.values().null_count() > 0
+    }
+
+    /// The id column restricted to the rows where `mask` is true.
+    fn filter_ids(&self, mask: &BooleanArray) -> Result<UInt64Array> {
+        let filtered = arrow_select::filter::filter(self.ids(), mask)?;
+        Ok(filtered
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .expect("Result of arrow_select::filter::filter did not match input type")
+            .clone())
+    }
+
+    /// Row ids whose value is NULL.
+    fn null_ids(&self) -> Result<UInt64Array> {
+        if !self.has_nulls() {
+            return Ok(empty_ids());
+        }
+        self.filter_ids(&arrow::compute::is_null(self.values())?)
+    }
+
+    /// Row ids whose value is not NULL.
+    fn non_null_ids(&self) -> Result<UInt64Array> {
+        if !self.has_nulls() {
+            return Ok(self.ids().clone());
+        }
+        self.filter_ids(&arrow::compute::is_not_null(self.values())?)
     }
 
     /// Which of `needles` are present in this page.
@@ -108,7 +261,12 @@ impl FlatIndex {
         }
         let query = SargableQuery::IsIn(needles.iter().map(|v| v.0.clone()).collect());
         let expr = query.to_expr(BTREE_VALUES_COLUMN.to_string());
-        let expr = create_physical_expr(&expr, &self.df_schema, &ExecutionProps::default())?;
+        let expr = create_physical_expr(
+            &expr,
+            &self.df_schema,
+            &ExecutionProps::default(),
+            &PhysicalPlanningContext::default(),
+        )?;
         let predicate = expr.evaluate(&self.data)?;
         let predicate = predicate.into_array(self.data.num_rows())?;
         let predicate = predicate
@@ -125,21 +283,45 @@ impl FlatIndex {
             .collect()
     }
 
-    pub fn all(&self) -> NullableRowAddrSet {
+    /// Every row as TRUE, with the NULL rows also reported as NULL.
+    pub fn all_matches(&self) -> Result<PageMatches> {
         // Some rows will be in both sets but that is ok, null trumps true
-        NullableRowAddrSet::new(self.all_addrs_map.clone(), self.null_addrs_map.clone())
+        Ok(PageMatches::new(self.ids().clone(), self.null_ids()?))
     }
 
-    pub fn all_ignore_nulls(&self) -> NullableRowAddrSet {
-        NullableRowAddrSet::new(self.all_addrs_map.clone(), Default::default())
+    /// Every row as TRUE, NULL rows included, without reporting any NULLs.
+    pub fn all_ignore_nulls_matches(&self) -> PageMatches {
+        PageMatches::new(self.ids().clone(), empty_ids())
+    }
+
+    /// Every non-null row as TRUE without preserving NULL rows.
+    pub fn all_non_null_matches(&self) -> Result<PageMatches> {
+        Ok(PageMatches::new(self.non_null_ids()?, empty_ids()))
+    }
+
+    pub fn all(&self) -> Result<NullableRowAddrSet> {
+        self.all_matches()?.into_row_addr_set()
+    }
+
+    pub fn all_ignore_nulls(&self) -> Result<NullableRowAddrSet> {
+        self.all_ignore_nulls_matches().into_row_addr_set()
     }
 
     /// Return every non-null row as TRUE without preserving NULL rows.
-    pub fn all_non_null(&self) -> NullableRowAddrSet {
-        NullableRowAddrSet::new(
-            self.all_addrs_map.clone() - &self.null_addrs_map,
-            Default::default(),
-        )
+    pub fn all_non_null(&self) -> Result<NullableRowAddrSet> {
+        self.all_non_null_matches()?.into_row_addr_set()
+    }
+
+    /// [`Self::remap_batch`] through a [`RowAddrTranslator`]: the page's
+    /// addresses are translated first, so a batch translator performs one
+    /// bounded translation per page.
+    pub async fn remap_batch_with(
+        batch: RecordBatch,
+        translator: &RowAddrTranslator,
+    ) -> Result<RecordBatch> {
+        let row_ids = batch.column(IDS_COL_IDX).as_primitive::<UInt64Type>();
+        let resolved = translator.resolve(row_ids.values().iter().copied()).await?;
+        Self::remap_batch(batch, &resolved)
     }
 
     pub fn remap_batch(batch: RecordBatch, mapping: &RowAddrRemap) -> Result<RecordBatch> {
@@ -171,26 +353,30 @@ impl FlatIndex {
         )?)
     }
 
-    fn get_null_addrs(sorted_batch: &RecordBatch) -> Result<RowAddrTreeMap> {
-        let null_mask = arrow::compute::is_null(sorted_batch.column(VALUES_COL_IDX))?;
-        let null_ids = arrow_select::filter::filter(sorted_batch.column(IDS_COL_IDX), &null_mask)?;
-        let null_ids = null_ids
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .expect("Result of arrow_select::filter::filter did not match input type");
-        RowAddrTreeMap::from_sorted_iter(null_ids.values().iter().copied())
-    }
-
-    pub fn search(
+    /// Evaluate `query` against this page, returning the matched row ids.
+    ///
+    /// This is the per-page primitive; [`Self::search`] wraps it into a
+    /// [`NullableRowAddrSet`] for callers that only look at one page.
+    pub fn search_matches(
         &self,
         query: &dyn AnyQuery,
         track_nulls: bool,
         metrics: &dyn MetricsCollector,
-    ) -> Result<NullableRowAddrSet> {
+    ) -> Result<PageMatches> {
         metrics.record_comparisons(self.data.num_rows());
         let query = query.as_any().downcast_ref::<SargableQuery>().unwrap();
         // Since we have all the values in memory we can use basic arrow-rs compute
         // functions to satisfy scalar queries.
+
+        // Comparing anything with NULL yields NULL, so a NULL operand turns
+        // every row of the page into NULL (or nothing, if nulls are not tracked).
+        let everything_is_null = |this: &Self| {
+            if track_nulls {
+                PageMatches::new(empty_ids(), this.ids().clone())
+            } else {
+                PageMatches::empty()
+            }
+        };
 
         // Shortcuts for simple cases where we can re-use computed values
         match query {
@@ -198,45 +384,27 @@ impl FlatIndex {
             SargableQuery::Equals(value) => {
                 if value.is_null() {
                     // if we have x = NULL then the correct SQL behavior is to return all NULLs
-                    return Ok(if track_nulls {
-                        NullableRowAddrSet::new(Default::default(), self.all_addrs_map.clone())
-                    } else {
-                        NullableRowAddrSet::empty()
-                    });
+                    return Ok(everything_is_null(self));
                 }
             }
-            // x IS NULL we can use pre-computed nulls
+            // x IS NULL is a filter on the values' validity, no predicate needed
             SargableQuery::IsNull() => {
-                return Ok(NullableRowAddrSet::new(
-                    self.null_addrs_map.clone(),
-                    Default::default(),
-                ));
+                return Ok(PageMatches::new(self.null_ids()?, empty_ids()));
             }
             // x < NULL or x > NULL means all rows are NULL
             SargableQuery::Range(lower_bound, upper_bound) => match (lower_bound, upper_bound) {
                 (Bound::Unbounded, Bound::Unbounded) => {
-                    return Ok(NullableRowAddrSet::new(
-                        self.all_addrs_map.clone(),
-                        Default::default(),
-                    ));
+                    return Ok(self.all_ignore_nulls_matches());
                 }
                 (Bound::Unbounded, Bound::Included(upper) | Bound::Excluded(upper)) => {
                     if upper.is_null() {
-                        return Ok(if track_nulls {
-                            NullableRowAddrSet::new(Default::default(), self.all_addrs_map.clone())
-                        } else {
-                            NullableRowAddrSet::empty()
-                        });
+                        return Ok(everything_is_null(self));
                     }
                 }
                 (Bound::Included(lower) | Bound::Excluded(lower), Bound::Unbounded)
                     if lower.is_null() =>
                 {
-                    return Ok(if track_nulls {
-                        NullableRowAddrSet::new(Default::default(), self.all_addrs_map.clone())
-                    } else {
-                        NullableRowAddrSet::empty()
-                    });
+                    return Ok(everything_is_null(self));
                 }
                 _ => {}
             },
@@ -245,28 +413,50 @@ impl FlatIndex {
 
         // No shortcut possible, need to actually evaluate the query
         let expr = query.to_expr(BTREE_VALUES_COLUMN.to_string());
-        let expr = create_physical_expr(&expr, &self.df_schema, &ExecutionProps::default())?;
+        let expr = create_physical_expr(
+            &expr,
+            &self.df_schema,
+            &ExecutionProps::default(),
+            &PhysicalPlanningContext::default(),
+        )?;
         self.eval_expr(&expr, track_nulls)
+    }
+
+    pub fn search(
+        &self,
+        query: &dyn AnyQuery,
+        track_nulls: bool,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<NullableRowAddrSet> {
+        self.search_matches(query, track_nulls, metrics)?
+            .into_row_addr_set()
     }
 
     /// Evaluate a predicate compiled once by the caller. Lets a large IsIn that
     /// spans many pages build the physical expr a single time instead of
     /// rebuilding the whole IN-list per page (the dominant cost of a big lookup).
+    pub fn search_prebuilt_matches(
+        &self,
+        expr: &Arc<dyn PhysicalExpr>,
+        track_nulls: bool,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<PageMatches> {
+        metrics.record_comparisons(self.data.num_rows());
+        self.eval_expr(expr, track_nulls)
+    }
+
+    /// [`Self::search_prebuilt_matches`] wrapped into a [`NullableRowAddrSet`].
     pub fn search_prebuilt(
         &self,
         expr: &Arc<dyn PhysicalExpr>,
         track_nulls: bool,
         metrics: &dyn MetricsCollector,
     ) -> Result<NullableRowAddrSet> {
-        metrics.record_comparisons(self.data.num_rows());
-        self.eval_expr(expr, track_nulls)
+        self.search_prebuilt_matches(expr, track_nulls, metrics)?
+            .into_row_addr_set()
     }
 
-    fn eval_expr(
-        &self,
-        expr: &Arc<dyn PhysicalExpr>,
-        track_nulls: bool,
-    ) -> Result<NullableRowAddrSet> {
+    fn eval_expr(&self, expr: &Arc<dyn PhysicalExpr>, track_nulls: bool) -> Result<PageMatches> {
         let predicate = expr.evaluate(&self.data)?;
         let predicate = predicate.into_array(self.data.num_rows())?;
         let predicate = predicate
@@ -274,34 +464,27 @@ impl FlatIndex {
             .downcast_ref::<BooleanArray>()
             .expect("Predicate should return boolean array");
 
-        let matching_ids = arrow_select::filter::filter(self.ids(), predicate)?;
-        let matching_ids = matching_ids
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .expect("Result of arrow_select::filter::filter did not match input type");
-        let selected = RowAddrTreeMap::from_sorted_iter(matching_ids.values().iter().copied())?;
+        let selected = self.filter_ids(predicate)?;
 
         if !track_nulls {
-            return Ok(NullableRowAddrSet::new(selected, Default::default()));
+            return Ok(PageMatches::new(selected, empty_ids()));
         }
 
-        let nulls = arrow::compute::is_null(&predicate)?;
-        let null_row_ids = arrow_select::filter::filter(self.ids(), &nulls)?;
-        let null_row_ids = null_row_ids
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .expect("Result of arrow_select::filter::filter did not match input type");
-        let null_row_ids = RowAddrTreeMap::from_sorted_iter(null_row_ids.values().iter().copied())?;
+        let nulls = if predicate.null_count() == 0 {
+            empty_ids()
+        } else {
+            self.filter_ids(&arrow::compute::is_null(&predicate)?)?
+        };
 
-        Ok(NullableRowAddrSet::new(selected, null_row_ids))
+        Ok(PageMatches::new(selected, nulls))
     }
 
     pub fn calculate_included_frags(&self) -> Result<RoaringBitmap> {
         let mut frag_ids = self
             .ids()
-            .as_primitive::<UInt64Type>()
+            .values()
             .iter()
-            .map(|row_id| RowAddress::from(row_id.unwrap()).fragment_id())
+            .map(|row_id| RowAddress::from(*row_id).fragment_id())
             .collect::<Vec<_>>();
         frag_ids.sort();
         frag_ids.dedup();
@@ -311,23 +494,15 @@ impl FlatIndex {
 
 impl CacheCodecImpl for FlatIndex {
     const TYPE_ID: &'static str = "lance.scalar.FlatIndex";
-    const CURRENT_VERSION: u32 = 1;
+    /// v2 is the data batch alone. Entries written with the earlier layout
+    /// (two roaring blobs ahead of the batch) fail to decode and are treated as
+    /// cache misses, so the page is simply re-read from the index file.
+    const CURRENT_VERSION: u32 = 2;
 
     fn serialize(&self, w: &mut CacheEntryWriter<'_>) -> Result<()> {
-        // Format:
-        // RAW_BLOB  : all_addrs_map (roaring tree map)
-        // RAW_BLOB  : null_addrs_map (roaring tree map)
+        // Format (v2):
         // ARROW_IPC : data batch
-        let mut all_addrs_bytes = Vec::with_capacity(self.all_addrs_map.serialized_size());
-        self.all_addrs_map.serialize_into(&mut all_addrs_bytes)?;
-        w.write_raw(&all_addrs_bytes)?;
-
-        let mut null_addrs_bytes = Vec::with_capacity(self.null_addrs_map.serialized_size());
-        self.null_addrs_map.serialize_into(&mut null_addrs_bytes)?;
-        w.write_raw(&null_addrs_bytes)?;
-
         w.write_ipc(self.data.as_ref())?;
-
         Ok(())
     }
 
@@ -335,20 +510,14 @@ impl CacheCodecImpl for FlatIndex {
     where
         Self: Sized,
     {
-        let all_addrs_bytes = r.read_raw()?;
-        let all_addrs_map = RowAddrTreeMap::deserialize_from(all_addrs_bytes.as_ref())?;
-
-        let null_addrs_bytes = r.read_raw()?;
-        let null_addrs_map = RowAddrTreeMap::deserialize_from(null_addrs_bytes.as_ref())?;
-
         let batch = r.read_ipc()?;
-
+        // Cached data is already address-sorted. Keep its IPC buffers shared
+        // and defer rebuilding the lookup permutation until it is requested.
         let df_schema = DFSchema::try_from(batch.schema())?;
-
         Ok(Self {
             data: Arc::new(batch),
-            all_addrs_map,
-            null_addrs_map,
+            lookup_order: Mutex::new(LookupOrder::Unsorted),
+            lookup_u64: OnceLock::new(),
             df_schema,
         })
     }
@@ -362,7 +531,7 @@ mod tests {
     };
 
     use super::*;
-    use arrow_array::{record_batch, types::Int32Type};
+    use arrow_array::{NullArray, record_batch, types::Int32Type};
     use datafusion_common::ScalarValue;
     use lance_core::utils::row_addr_remap::GroupInput;
     use lance_datagen::{RowCount, array, gen_batch};
@@ -401,8 +570,83 @@ mod tests {
         let restored = FlatIndex::deserialize(&mut reader).unwrap();
 
         assert_eq!(restored.data, index.data);
-        assert_eq!(restored.all_addrs_map, index.all_addrs_map);
-        assert_eq!(restored.null_addrs_map, index.null_addrs_map);
+        assert_eq!(restored.all().unwrap(), index.all().unwrap());
+        let ordered_values = |index: &FlatIndex| {
+            let charged_size = index.deep_size_of();
+            let order = index.value_order().unwrap();
+            assert_eq!(index.deep_size_of(), charged_size);
+            assert_eq!(index.value_order().unwrap(), order);
+            arrow_select::take::take(index.values(), &order, None).unwrap()
+        };
+        assert_eq!(
+            ordered_values(&restored).to_data(),
+            ordered_values(index).to_data()
+        );
+    }
+
+    /// The per-page primitives hand back sorted, filtered views of the id
+    /// column; `all_matches` keeps NULL rows in `selected` (null trumps true),
+    /// the other two drop or keep them as their names say.
+    #[test]
+    fn test_page_matches_views() {
+        // ids are deliberately unsorted on input; try_new sorts by id.
+        let batch = record_batch!(
+            (
+                BTREE_VALUES_COLUMN,
+                Int32,
+                [Some(3), None, Some(1), None, Some(2)]
+            ),
+            (BTREE_IDS_COLUMN, UInt64, [40, 10, 30, 50, 20])
+        )
+        .unwrap();
+        let index = FlatIndex::try_new(batch).unwrap();
+
+        let all = index.all_matches().unwrap();
+        assert_eq!(all.selected(), &[10, 20, 30, 40, 50]);
+        assert_eq!(all.nulls(), &[10, 50]);
+        assert_eq!(
+            all.into_row_addr_set().unwrap(),
+            NullableRowAddrSet::new(
+                RowAddrTreeMap::from_iter([10, 20, 30, 40, 50]),
+                RowAddrTreeMap::from_iter([10, 50])
+            )
+        );
+
+        let ignore = index.all_ignore_nulls_matches();
+        assert_eq!(ignore.selected(), &[10, 20, 30, 40, 50]);
+        assert!(ignore.nulls().is_empty());
+
+        let non_null = index.all_non_null_matches().unwrap();
+        assert_eq!(non_null.selected(), &[20, 30, 40]);
+        assert!(non_null.nulls().is_empty());
+
+        // Predicate path, with and without null tracking.
+        let query = SargableQuery::Range(Bound::Included(ScalarValue::from(2)), Bound::Unbounded);
+        let tracked = index
+            .search_matches(&query, true, &NoOpMetricsCollector)
+            .unwrap();
+        assert_eq!(tracked.selected(), &[20, 40]);
+        assert_eq!(tracked.nulls(), &[10, 50]);
+        let untracked = index
+            .search_matches(&query, false, &NoOpMetricsCollector)
+            .unwrap();
+        assert_eq!(untracked.selected(), &[20, 40]);
+        assert!(untracked.nulls().is_empty());
+
+        // A page without nulls answers the null shortcuts without scanning.
+        let no_nulls = example_index();
+        assert!(no_nulls.all_matches().unwrap().nulls().is_empty());
+        assert_eq!(
+            no_nulls.all_non_null_matches().unwrap().selected(),
+            no_nulls.all_ignore_nulls_matches().selected()
+        );
+        assert!(
+            no_nulls
+                .search_matches(&SargableQuery::IsNull(), true, &NoOpMetricsCollector)
+                .unwrap()
+                .selected()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -418,14 +662,103 @@ mod tests {
         .unwrap();
         assert_roundtrips(&FlatIndex::try_new(batch).unwrap());
 
+        let nulls = RecordBatch::try_from_iter_with_nullable([
+            (
+                BTREE_VALUES_COLUMN,
+                Arc::new(NullArray::new(3)) as ArrayRef,
+                true,
+            ),
+            (
+                BTREE_IDS_COLUMN,
+                Arc::new(UInt64Array::from(vec![2, 0, 1])) as ArrayRef,
+                false,
+            ),
+        ])
+        .unwrap();
+        assert_roundtrips(&FlatIndex::try_new(nulls).unwrap());
+
         // Empty index
         let empty = RecordBatch::new_empty(example_index().data.schema());
         assert_roundtrips(&FlatIndex::try_new(empty).unwrap());
     }
 
+    #[rstest]
+    #[case::range(vec![Some(103), Some(100), Some(102), Some(101)], Some(vec![73, 70, 72, 71]), true)]
+    #[case::dense(vec![Some(103), Some(100), Some(102), Some(101)], Some(vec![15, 0, 8, 20]), true)]
+    #[case::sparse_word_boundaries((0..130).filter(|key| key % 3 != 1).map(Some).collect(), None, true)]
+    #[case::nullable(vec![Some(102), None, Some(100), Some(101)], None, true)]
+    #[case::high_keys((u64::MAX-7..=u64::MAX).rev().map(Some).collect(), None, true)]
+    #[case::duplicate_and_hole(vec![Some(10), Some(11), Some(11), Some(13)], None, false)]
+    #[case::huge_span(vec![Some(0), Some(u64::MAX)], None, false)]
+    #[case::all_null(vec![None, None], None, false)]
+    #[case::empty(vec![], None, false)]
+    fn test_u64_mapping_preserves_pairs_and_cache(
+        #[case] values: Vec<Option<u64>>,
+        #[case] addresses: Option<Vec<u64>>,
+        #[case] specialized: bool,
+    ) {
+        let addresses =
+            addresses.unwrap_or_else(|| (0..values.len()).rev().map(|i| (i * 2) as u64).collect());
+        let batch = record_batch!(
+            (BTREE_VALUES_COLUMN, UInt64, values.clone()),
+            (BTREE_IDS_COLUMN, UInt64, addresses.clone())
+        )
+        .unwrap();
+        let index = FlatIndex::try_new(batch).unwrap();
+        let mut bytes = Vec::new();
+        index
+            .serialize(&mut CacheEntryWriter::new(&mut bytes))
+            .unwrap();
+        let bytes = bytes::Bytes::from(bytes);
+        let restored = FlatIndex::deserialize(&mut CacheEntryReader::new(
+            &bytes,
+            0,
+            FlatIndex::CURRENT_VERSION,
+        ))
+        .unwrap();
+        let mut queries = values.clone();
+        queries.extend([
+            Some(0),
+            Some(12),
+            Some(63),
+            Some(64),
+            Some(65),
+            Some(127),
+            Some(128),
+            Some(u64::MAX),
+            None,
+        ]);
+        let mut expected = Vec::new();
+        for (key_index, key) in queries.iter().enumerate() {
+            if let Some(key) = key {
+                for (value, address) in values.iter().zip(&addresses) {
+                    if value == &Some(*key) {
+                        expected.push((key_index as u32, *address));
+                    }
+                }
+            }
+        }
+        expected.sort_unstable();
+        for page in [&index, &restored] {
+            let charged = page.deep_size_of();
+            assert_eq!(page.lookup_u64().unwrap().is_some(), specialized);
+            let keys = crate::scalar::btree::LookupKeys::try_new(Arc::new(UInt64Array::from(
+                queries.clone(),
+            )))
+            .unwrap();
+            let mut actual = keys
+                .match_page(page, None, &NoOpMetricsCollector)
+                .unwrap()
+                .collect::<Vec<_>>();
+            actual.sort_unstable();
+            assert_eq!(actual, expected);
+            assert_eq!(page.deep_size_of(), charged);
+        }
+    }
+
     /// The data batch must decode zero-copy through the full envelope-bearing
-    /// [`CacheCodec`], even though the two roaring blobs and the envelope push
-    /// the IPC section to a non-aligned starting offset.
+    /// [`CacheCodec`], even though the envelope pushes the IPC section to a
+    /// non-aligned starting offset.
     #[test]
     fn test_flat_index_data_is_zero_copy() {
         use lance_core::cache::CacheCodec;
@@ -689,7 +1022,7 @@ mod tests {
             }
         }
 
-        assert!(index.all().true_rows().is_empty());
+        assert!(index.all().unwrap().true_rows().is_empty());
         assert_eq!(
             index.calculate_included_frags().unwrap(),
             RoaringBitmap::new()

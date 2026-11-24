@@ -24,6 +24,9 @@
 //!   --threads 64
 //! ```
 
+// serde_json's `json_internal!` recurses once per nesting level of the config
+// literals below, which exceeds the default limit of 128. Async future depth
+// is not the reason; see issue #8416.
 #![recursion_limit = "256"]
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 

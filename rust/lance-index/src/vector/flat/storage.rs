@@ -413,6 +413,7 @@ where
     T: ArrowPrimitiveType,
     T::Native: L2 + Cosine + Dot,
 {
+    #[allow(deprecated)] // The DistCalculator interface is infallible.
     fn new(
         vectors: &'a FixedSizeListArray,
         query: ArrayRef,
@@ -440,6 +441,7 @@ where
         }
     }
 
+    #[allow(deprecated)] // The DistCalculator interface is infallible.
     fn new_from_id(
         vectors: &'a FixedSizeListArray,
         id: u32,

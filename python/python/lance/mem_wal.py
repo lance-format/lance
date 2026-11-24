@@ -34,7 +34,8 @@ from .lance import (
 from .types import _coerce_reader
 
 if TYPE_CHECKING:
-    import lance
+    from .dataset import LanceDataset
+    from .schema import LanceSchema
 
 __all__ = [
     "ShardingField",
@@ -94,7 +95,7 @@ class ShardingSpec:
 def evaluate_sharding_spec(
     batch: pa.RecordBatch,
     spec: Union[ShardingSpec, Mapping[str, object]],
-    schema: "lance.schema.LanceSchema",
+    schema: "LanceSchema",
 ) -> pa.RecordBatch:
     """Evaluate a MemWAL sharding spec against one PyArrow RecordBatch.
 
@@ -203,8 +204,21 @@ class ShardWriter:
         """UUID string for this writer's shard."""
         return self._raw.shard_id
 
-    def put(self, data, *, schema: Optional[pa.Schema] = None) -> None:
+    def put(
+        self,
+        data,
+        *,
+        schema: Optional[pa.Schema] = None,
+        max_bytes: int = 256 * 1024 * 1024,
+    ) -> None:
         """Write data to the MemWAL.
+
+        Input is buffered for one atomic write. Reading stops at the first batch
+        that exceeds ``max_bytes`` or the writer's ``max_memtable_rows`` cap.
+        Limit errors, reader errors, and interrupts during input buffering write
+        nothing. A WAL error or interrupt after submission may leave the write
+        applied; this method does not split input into partial writes.
+        Exceptions raised by Python readers propagate to the caller.
 
         Parameters
         ----------
@@ -214,19 +228,41 @@ class ShardWriter:
             DataFrame, etc.
         schema : pa.Schema, optional
             Schema hint, needed when *data* is a generator.
+        max_bytes : int, default 268435456 (256 MiB)
+            Positive byte budget for owned Arrow array memory and batch
+            structures. Each batch is copied, including nested and dictionary
+            buffers, to release foreign owners such as NumPy views. The reader
+            must produce a batch before it can be copied and checked, so peak
+            input memory can exceed this budget by one incoming batch and its
+            owned copy. A single oversized copy is rejected without splitting
+            it. This budget excludes the writer's WAL, memtables, and indices.
 
         Raises
         ------
         IOError
-            On WAL flush failure.
-        RuntimeError
-            If the writer has already been closed.
+            If an input limit is exceeded, WAL flush fails, or the writer has
+            already been closed.
+
+        Examples
+        --------
+        ::
+
+            with dataset.mem_wal_writer(shard_id) as writer:
+                writer.put(reader, max_bytes=64 * 1024 * 1024)
         """
         reader = _coerce_reader(data, schema)
-        self._raw.put(reader)
+        self._raw.put(reader, max_bytes=max_bytes)
 
-    def delete(self, keys, *, schema: Optional[pa.Schema] = None) -> None:
+    def delete(
+        self,
+        keys,
+        *,
+        schema: Optional[pa.Schema] = None,
+        max_bytes: int = 256 * 1024 * 1024,
+    ) -> None:
         """Delete rows by primary key from the MemWAL.
+
+        Uses the same atomic input buffering and failure semantics as :meth:`put`.
 
         Parameters
         ----------
@@ -236,14 +272,18 @@ class ShardWriter:
             the Rust core delete path.
         schema : pa.Schema, optional
             Schema hint, needed when *keys* is a generator.
+        max_bytes : int, default 268435456 (256 MiB)
+            Positive input byte budget, measured as in :meth:`put`, including
+            any non-key columns supplied by the reader. Reading stops on the
+            first batch exceeding this budget or ``max_memtable_rows``; nothing
+            is deleted. A single oversized batch is rejected. Peak input memory
+            can exceed the budget by one incoming batch and its owned copy.
 
         Raises
         ------
         IOError
-            If delete validation fails, WAL flush fails, or the writer has
-            already been closed. Delete validation is centralized in Rust and
-            includes checks for primary-key metadata and tombstone-compatible
-            nullable non-key columns.
+            If an input limit is exceeded, delete validation or WAL flush fails,
+            or the writer has already been closed.
 
         Examples
         --------
@@ -253,7 +293,7 @@ class ShardWriter:
                 writer.delete(pa.table({"id": [42]}))
         """
         reader = _coerce_reader(keys, schema)
-        self._raw.delete(reader)
+        self._raw.delete(reader, max_bytes=max_bytes)
 
     def close(self) -> None:
         """Flush and close the writer.
@@ -290,11 +330,11 @@ class ShardWriter:
     def lsm_scanner(
         self, shard_snapshots: Optional[List[ShardSnapshot]] = None
     ) -> "LsmScanner":
-        """Create an LSM scanner that includes the active MemTable.
+        """Create an LSM scanner that includes this writer's in-memory MemTables.
 
-        This scanner covers the base table, the given SSTables,
-        and the current active MemTable — providing strong read-your-writes
-        consistency.
+        This scanner covers the base table, the given SSTables, the current
+        active MemTable, and every frozen MemTable still awaiting flush —
+        providing strong read-your-writes consistency.
 
         Parameters
         ----------
@@ -341,7 +381,7 @@ class LsmScanner:
 
     @staticmethod
     def from_snapshots(
-        dataset: "lance.LanceDataset",
+        dataset: "LanceDataset",
         shard_snapshots: List[ShardSnapshot],
     ) -> "LsmScanner":
         """Create a scanner from dataset and shard snapshots.
@@ -393,6 +433,16 @@ class LsmScanner:
     def to_batches(self) -> List[pa.RecordBatch]:
         """Execute the scan and return a list of :class:`~pyarrow.RecordBatch`."""
         return list(self._raw.to_batches())
+
+    def to_reader(self) -> pa.RecordBatchReader:
+        """Execute the scan and return a streaming reader.
+
+        Batches are produced as the reader is consumed, so the result is never
+        held in memory all at once. Prefer this over `to_batches` and
+        `to_table` when the result may not fit in memory. JSON columns are
+        returned as Arrow JSON, the same as `Dataset.to_table`.
+        """
+        return self._raw.to_reader()
 
     def to_table(self) -> pa.Table:
         """Execute the scan and return a :class:`~pyarrow.Table`."""
@@ -469,7 +519,7 @@ class LsmPointLookupPlanner:
 
     def __init__(
         self,
-        dataset: "lance.LanceDataset",
+        dataset: "LanceDataset",
         shard_snapshots: List[ShardSnapshot],
         pk_columns: Optional[List[str]] = None,
     ) -> None:
@@ -538,7 +588,7 @@ class LsmVectorSearchPlanner:
 
     def __init__(
         self,
-        dataset: "lance.LanceDataset",
+        dataset: "LanceDataset",
         shard_snapshots: List[ShardSnapshot],
         vector_column: str,
         pk_columns: Optional[List[str]] = None,
@@ -582,10 +632,9 @@ class LsmVectorSearchPlanner:
             Columns to project.  Returns all columns + ``_distance`` if
             omitted.
         refine_base_table : bool, optional
-            When true, the base-table arm re-ranks its candidates with exact
-            distances.  Useful when the base index is approximate (e.g.
-            IVF-PQ).  Memtable arms use exact HNSW and are unaffected.
-            Auto-enabled whenever stale filtering is on (see ``overfetch_factor``).
+            When true, the base-table and SSTable arms re-rank their candidates
+            with exact distances. Auto-enabled when a newer generation blocks
+            the base table.
         overfetch_factor : float, optional
             Over-fetch multiple for sources with rows superseded by newer
             generations. Must be at least ``1.0``. At ``1.0`` each affected

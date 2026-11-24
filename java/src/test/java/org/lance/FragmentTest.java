@@ -13,6 +13,7 @@
  */
 package org.lance;
 
+import org.lance.file.FileWriteOptions;
 import org.lance.fragment.DeletionFile;
 import org.lance.fragment.DeletionFileType;
 import org.lance.fragment.FragmentMergeResult;
@@ -23,23 +24,34 @@ import org.lance.operation.Project;
 import org.lance.operation.Update;
 import org.lance.schema.LanceField;
 
+import org.apache.arrow.c.ArrowArrayStream;
+import org.apache.arrow.c.Data;
 import org.apache.arrow.memory.RootAllocator;
+import org.apache.arrow.vector.BigIntVector;
 import org.apache.arrow.vector.IntVector;
 import org.apache.arrow.vector.UInt8Vector;
 import org.apache.arrow.vector.VarCharVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.ipc.ArrowReader;
+import org.apache.arrow.vector.ipc.ArrowStreamReader;
+import org.apache.arrow.vector.ipc.ArrowStreamWriter;
+import org.apache.arrow.vector.types.pojo.ArrowType;
+import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.Schema;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
@@ -61,11 +73,159 @@ public class FragmentTest {
     DeletionFile bitmap = new DeletionFile(7, 11, 2L, DeletionFileType.BITMAP, null);
     DeletionFile array = new DeletionFile(7, 11, 2L, DeletionFileType.ARRAY, null);
     DeletionFile highBitId = new DeletionFile(-1L, 11, 2L, DeletionFileType.BITMAP, null);
+    byte[] inlineBytes = new byte[] {1, 2, 3};
+    DeletionFile inline = new DeletionFile(7, 11, 2L, DeletionFileType.BITMAP, null, inlineBytes);
 
     assertEquals("_deletions/5-11-7.bin", bitmap.getRelativePath(5));
     assertEquals("_deletions/5-11-7.arrow", array.getRelativePath(5));
     assertEquals("_deletions/5-11-18446744073709551615.bin", highBitId.getRelativePath(5));
+    assertArrayEquals(inlineBytes, inline.getInline());
+    assertNull(inline.getRelativePath(5));
     assertThrows(IllegalArgumentException.class, () -> bitmap.getRelativePath(-1));
+
+    String explicitPath = "_deletions/0b2f8a3c-6d4e-4f10-9a7b-1c2d3e4f5a6b.bin";
+    DeletionFile explicit =
+        new DeletionFile(7, 11, 2L, DeletionFileType.BITMAP, null, null, explicitPath);
+    assertEquals(explicitPath, explicit.getRelativePath(5));
+    assertEquals(explicitPath, explicit.getRelativePath(99));
+    assertEquals(Optional.of(explicitPath), explicit.getPath());
+    assertEquals(Optional.empty(), bitmap.getPath());
+    assertThrows(
+        IllegalArgumentException.class,
+        () ->
+            new DeletionFile(7, 11, 2L, DeletionFileType.BITMAP, null, inlineBytes, explicitPath));
+  }
+
+  @Test
+  void testExplicitDeletionPathRoundTrip(@TempDir Path tempDir) throws Exception {
+    Path datasetDir = tempDir.resolve("explicit_deletion_round_trip");
+    String datasetPath = datasetDir.toString();
+    String explicitRelPath = "_deletions/0b2f8a3c-6d4e-4f10-9a7b-1c2d3e4f5a6b.arrow";
+
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      try (Dataset dataset = testDataset.write(1, 5)) {
+        dataset.delete("id = 1");
+        assertEquals(4, dataset.countRows());
+
+        FragmentMetadata derivedMeta = dataset.getFragments().get(0).metadata();
+        DeletionFile derivedDel = derivedMeta.getDeletionFile();
+        assertNotNull(derivedDel);
+        assertEquals(Optional.empty(), derivedDel.getPath());
+        String derivedRelPath = derivedDel.getRelativePath(derivedMeta.getId());
+        assertNotNull(derivedRelPath);
+
+        Files.move(datasetDir.resolve(derivedRelPath), datasetDir.resolve(explicitRelPath));
+
+        DeletionFile explicitDel =
+            new DeletionFile(
+                derivedDel.getId(),
+                derivedDel.getReadVersion(),
+                derivedDel.getNumDeletedRows(),
+                derivedDel.getFileType(),
+                derivedDel.getBaseId().orElse(null),
+                null,
+                explicitRelPath);
+        FragmentMetadata withExplicit =
+            new FragmentMetadata(
+                derivedMeta.getId(),
+                derivedMeta.getFiles(),
+                derivedMeta.getPhysicalRows(),
+                explicitDel,
+                derivedMeta.getRowIdMeta(),
+                derivedMeta.getCreatedAtVersionMeta(),
+                derivedMeta.getLastUpdatedAtVersionMeta(),
+                derivedMeta.getReferencedLanceFiles(),
+                derivedMeta.getClusteringId(),
+                derivedMeta.getMetadata());
+
+        Update setExplicit =
+            Update.builder()
+                .updatedFragments(Collections.singletonList(withExplicit))
+                .updateMode(Optional.of(Update.UpdateMode.RewriteRows))
+                .build();
+        try (Transaction tx1 =
+                new Transaction.Builder()
+                    .readVersion(dataset.version())
+                    .operation(setExplicit)
+                    .build();
+            Dataset v3 = new CommitBuilder(dataset).execute(tx1)) {
+          FragmentMetadata v3Meta = v3.getFragments().get(0).metadata();
+          DeletionFile v3Del = v3Meta.getDeletionFile();
+          assertNotNull(v3Del);
+          assertEquals(Optional.of(explicitRelPath), v3Del.getPath());
+          assertEquals(explicitRelPath, v3Del.getRelativePath(v3Meta.getId()));
+          assertEquals(explicitRelPath, v3Del.getRelativePath(99));
+
+          Update roundTrip =
+              Update.builder()
+                  .updatedFragments(Collections.singletonList(v3Meta))
+                  .updateMode(Optional.of(Update.UpdateMode.RewriteRows))
+                  .build();
+          try (Transaction tx2 =
+                  new Transaction.Builder().readVersion(v3.version()).operation(roundTrip).build();
+              Dataset v4 = new CommitBuilder(v3).execute(tx2)) {
+            FragmentMetadata v4Meta = v4.getFragments().get(0).metadata();
+            assertEquals(Optional.of(explicitRelPath), v4Meta.getDeletionFile().getPath());
+            assertEquals(4, v4.countRows());
+            assertEquals(0, v4.countRows("id = 1"));
+          }
+        }
+      }
+    }
+
+    try (Dataset reopened = Dataset.open(datasetPath)) {
+      FragmentMetadata reopenedMeta = reopened.getFragments().get(0).metadata();
+      assertEquals(Optional.of(explicitRelPath), reopenedMeta.getDeletionFile().getPath());
+      assertEquals(4, reopened.countRows());
+      assertEquals(0, reopened.countRows("id = 1"));
+    }
+  }
+
+  @Test
+  void testInlineDeletionFileRoundTrip(@TempDir Path tempDir) {
+    String datasetPath = tempDir.resolve("inline_deletion_round_trip").toString();
+    byte[] expectedInline;
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      try (Dataset dataset = testDataset.write(1, 5)) {
+        dataset.updateConfig(Map.of("lance.deletions.inline_max_bytes", "4096"));
+        dataset.delete("id = 1");
+        assertEquals(4, dataset.countRows());
+
+        FragmentMetadata original = dataset.getFragments().get(0).metadata();
+        DeletionFile deletionFile = original.getDeletionFile();
+        assertNotNull(deletionFile);
+        assertNull(deletionFile.getRelativePath(original.getId()));
+        expectedInline = deletionFile.getInline();
+        assertNotNull(expectedInline);
+        assertTrue(expectedInline.length > 0);
+
+        Update update =
+            Update.builder()
+                .updatedFragments(Collections.singletonList(original))
+                .updateMode(Optional.of(Update.UpdateMode.RewriteRows))
+                .build();
+        try (Transaction transaction =
+                new Transaction.Builder().readVersion(dataset.version()).operation(update).build();
+            Dataset committed = new CommitBuilder(dataset).execute(transaction)) {
+          assertArrayEquals(
+              expectedInline,
+              committed.getFragments().get(0).metadata().getDeletionFile().getInline());
+        }
+      }
+    }
+
+    try (Dataset reopened = Dataset.open(datasetPath)) {
+      assertEquals(4, reopened.countRows());
+      assertEquals(0, reopened.countRows("id = 1"));
+      assertArrayEquals(
+          expectedInline, reopened.getFragments().get(0).metadata().getDeletionFile().getInline());
+    }
   }
 
   @Test
@@ -76,6 +236,24 @@ public class FragmentTest {
           new TestUtils.SimpleTestDataset(allocator, datasetPath);
       testDataset.createEmptyDataset().close();
       testDataset.createNewFragment(20);
+    }
+  }
+
+  @Test
+  void testFragmentWriteRejectsZeroMaxPageBytes(@TempDir Path tempDir) {
+    String datasetPath = tempDir.resolve("zero_max_page_bytes").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      WriteParams params =
+          new WriteParams.Builder()
+              .withFileWriteOptions(FileWriteOptions.builder().maxPageBytes(0).build())
+              .build();
+
+      IllegalArgumentException error =
+          assertThrows(
+              IllegalArgumentException.class, () -> testDataset.createNewFragment(3, params));
+      assertTrue(error.getMessage().contains("max_page_bytes must be greater than 0, got 0"));
     }
   }
 
@@ -546,6 +724,37 @@ public class FragmentTest {
   }
 
   @Test
+  void testColumnLayoutStatistics(@TempDir Path tempDir) {
+    String datasetPath = tempDir.resolve("column_layout_statistics").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      FragmentMetadata frag1 = testDataset.createNewFragment(10);
+      FragmentMetadata frag2 = testDataset.createNewFragment(5);
+      FragmentOperation.Append appendOp = new FragmentOperation.Append(Arrays.asList(frag1, frag2));
+      try (Dataset dataset = Dataset.commit(allocator, datasetPath, appendOp, Optional.of(1L))) {
+        ColumnLayoutStatistics stats = dataset.getColumnLayoutStatistics();
+        assertEquals(2, stats.size());
+        assertArrayEquals(
+            dataset.getFragments().stream().mapToLong(f -> f.getId()).toArray(),
+            stats.getFragmentIds());
+        assertArrayEquals(new int[] {1, 1}, stats.getLiveFileCounts());
+        assertArrayEquals(new int[] {2}, stats.getFieldsPerFile()[0]);
+        assertTrue(stats.getFileSizes()[0][0] > 0);
+        assertArrayEquals(new double[] {0.0, 0.0}, stats.getDeadSlotRatios());
+        assertArrayEquals(new int[] {0, 0}, stats.getOverlayCounts());
+
+        // Dropping a column leaves its id in the file that held it.
+        dataset.dropColumns(Collections.singletonList("name"));
+        ColumnLayoutStatistics dropped = dataset.getColumnLayoutStatistics();
+        assertArrayEquals(new int[] {1}, dropped.getFieldsPerFile()[1]);
+        assertArrayEquals(new double[] {0.5, 0.5}, dropped.getDeadSlotRatios());
+      }
+    }
+  }
+
+  @Test
   void testFragmentStatisticsPreservesLegacyMissingRowCount() {
     String historicalPath =
         Path.of("..", "test_data", "v0.7.5", "with_deletions")
@@ -607,5 +816,108 @@ public class FragmentTest {
         executor.shutdownNow();
       }
     }
+  }
+
+  @Test
+  void testAddColumnsByReader(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("testAddColumnsByReader").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.MergeColumnTestDataset testDataset =
+          new TestUtils.MergeColumnTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+
+      int rowCount = 21;
+      FragmentMetadata fragmentMeta = testDataset.createNewFragment(rowCount);
+      FragmentOperation.Append appendOp = new FragmentOperation.Append(Arrays.asList(fragmentMeta));
+      try (Dataset dataset = Dataset.commit(allocator, datasetPath, appendOp, Optional.of(1L))) {
+        Fragment fragment = dataset.getFragments().get(0);
+
+        // The stream carries only the new column, one value per fragment row in row order;
+        // several small batches exercise the positional zip across batch boundaries. A read
+        // batch size of 5 against stream batches of 8 forces stream batches to be sliced at
+        // non-zero offsets, which the nulls in the stream must survive.
+        FragmentMergeResult result;
+        try (ArrowStreamReader reader = newColumnStream(allocator, rowCount, 8);
+            ArrowArrayStream stream = ArrowArrayStream.allocateNew(allocator)) {
+          Data.exportArrayStream(allocator, reader, stream);
+          result = fragment.addColumns(stream, Optional.of(5L));
+        }
+
+        try (Transaction transaction =
+            new Transaction.Builder()
+                .readVersion(dataset.version())
+                .operation(
+                    Merge.builder()
+                        .fragments(Collections.singletonList(result.getFragmentMetadata()))
+                        .schema(result.getSchema().asArrowSchema())
+                        .build())
+                .build()) {
+          try (Dataset newDs = new CommitBuilder(dataset).execute(transaction)) {
+            try (LanceScanner scanner = newDs.getFragments().get(0).newScan();
+                ArrowReader batches = scanner.scanBatches()) {
+              int row = 0;
+              while (batches.loadNextBatch()) {
+                VectorSchemaRoot root = batches.getVectorSchemaRoot();
+                BigIntVector val = (BigIntVector) root.getVector("val");
+                for (int i = 0; i < root.getRowCount(); i++, row++) {
+                  if (row % 3 == 0) {
+                    assertTrue(val.isNull(i), "row " + row + " should be null");
+                  } else {
+                    assertEquals(row * 2L, val.get(i));
+                  }
+                }
+              }
+              assertEquals(rowCount, row);
+            }
+          }
+        }
+
+        // The stream must cover every live row exactly once: one row short or one row long
+        // must fail instead of silently misaligning values.
+        assertAddColumnsRejected(allocator, fragment, rowCount - 1, Optional.empty());
+        assertAddColumnsRejected(allocator, fragment, rowCount + 1, Optional.empty());
+        // The batch size must fit a u32.
+        assertAddColumnsRejected(allocator, fragment, rowCount, Optional.of(-1L));
+      }
+    }
+  }
+
+  private static void assertAddColumnsRejected(
+      RootAllocator allocator, Fragment fragment, int rows, Optional<Long> batchSize)
+      throws IOException {
+    try (ArrowStreamReader reader = newColumnStream(allocator, rows, 8);
+        ArrowArrayStream stream = ArrowArrayStream.allocateNew(allocator)) {
+      Data.exportArrayStream(allocator, reader, stream);
+      assertThrows(IllegalArgumentException.class, () -> fragment.addColumns(stream, batchSize));
+    }
+  }
+
+  private static ArrowStreamReader newColumnStream(RootAllocator allocator, int rows, int batchSize)
+      throws IOException {
+    Schema schema =
+        new Schema(
+            Collections.singletonList(Field.nullable("val", new ArrowType.Int(64, true))), null);
+    ByteArrayOutputStream out = new ByteArrayOutputStream();
+    try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator);
+        ArrowStreamWriter writer = new ArrowStreamWriter(root, null, out)) {
+      writer.start();
+      for (int start = 0; start < rows; start += batchSize) {
+        int batchRows = Math.min(batchSize, rows - start);
+        root.allocateNew();
+        BigIntVector val = (BigIntVector) root.getVector("val");
+        for (int i = 0; i < batchRows; i++) {
+          // Every third row is null to check nulls line up with their rows.
+          if ((start + i) % 3 == 0) {
+            val.setNull(i);
+          } else {
+            val.setSafe(i, (start + i) * 2L);
+          }
+        }
+        root.setRowCount(batchRows);
+        writer.writeBatch();
+      }
+      writer.end();
+    }
+    return new ArrowStreamReader(new ByteArrayInputStream(out.toByteArray()), allocator);
   }
 }

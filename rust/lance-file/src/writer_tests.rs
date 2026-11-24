@@ -1,28 +1,94 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+/// A failed page must not drop another encoder's still-owned work. The
+/// second future stands in for an already-dispatched encoder join handle.
+pub async fn assert_page_encoder_failure_drains<F, Fut>(write: F)
+where
+    F: FnOnce(futures::stream::FuturesOrdered<lance_encoding::encoder::EncodeTask>) -> Fut,
+    Fut: std::future::Future<Output = lance_core::Result<()>>,
+{
+    let started = std::sync::Arc::new(tokio::sync::Notify::new());
+    let failed = std::sync::Arc::new(tokio::sync::Notify::new());
+    let release = std::sync::Arc::new(tokio::sync::Notify::new());
+    let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut tasks = futures::stream::FuturesOrdered::new();
+    let start_wait = started.clone();
+    let first_failed = failed.clone();
+    tasks.push_back(Box::pin(async move {
+        start_wait.notified().await;
+        first_failed.notify_one();
+        Err(lance_core::Error::execution("first page encoder failed"))
+    }) as lance_encoding::encoder::EncodeTask);
+    let finish = finished.clone();
+    let continue_work = release.clone();
+    tasks.push_back(Box::pin(async move {
+        started.notify_one();
+        continue_work.notified().await;
+        finish.store(true, std::sync::atomic::Ordering::SeqCst);
+        Err(lance_core::Error::execution("later page encoder failed"))
+    }) as lance_encoding::encoder::EncodeTask);
+    let operation = write(tasks);
+    tokio::pin!(operation);
+    tokio::select! {
+        biased;
+        result = &mut operation => panic!("writer returned before the remaining encoder drained: {result:?}"),
+        _ = failed.notified() => {},
+    }
+    assert!(!finished.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(matches!(
+        futures::poll!(&mut operation),
+        std::task::Poll::Pending
+    ));
+    release.notify_one();
+    let error = operation.await.unwrap_err();
+    assert!(matches!(error, lance_core::Error::Execution { .. }));
+    assert!(error.to_string().contains("first page encoder failed"));
+    assert!(finished.load(std::sync::atomic::Ordering::SeqCst));
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::ptr::NonNull;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     use crate::reader::{FileReader, FileReaderOptions, ReaderProjection, describe_encoding};
     use crate::testing::FsFixture;
     use crate::version::ConcreteFileVersion;
     use crate::versions;
-    use crate::writer::{ENV_LANCE_FILE_WRITER_MAX_PAGE_BYTES, FileWriter, FileWriterOptions};
-    use arrow_array::builder::{Float32Builder, Int32Builder};
-    use arrow_array::types::Float64Type;
-    use arrow_array::{
-        Array, ArrayRef, Int32Array, RecordBatch, RecordBatchReader, StringArray, UInt64Array,
+    use crate::writer::{
+        ENV_LANCE_FILE_WRITER_MAX_PAGE_BYTES, FieldTypeMismatch, FileWriter, FileWriterOptions,
     };
-    use arrow_schema::{DataType, Field, Field as ArrowField, Schema, Schema as ArrowSchema};
+    use arrow_array::builder::{Float32Builder, Int32Builder, StringDictionaryBuilder};
+    use arrow_array::types::{Float16Type, Float64Type, Int32Type};
+    use arrow_array::{
+        Array, ArrayRef, ArrowPrimitiveType, FixedSizeListArray, Float16Array, Float32Array,
+        Int32Array, LargeBinaryArray, ListArray, RecordBatch, RecordBatchReader, StringArray,
+        StructArray, UInt64Array,
+    };
+    use arrow_buffer::{Buffer, NullBuffer, OffsetBuffer, ScalarBuffer};
+    use arrow_schema::{
+        DataType, Field, Field as ArrowField, Fields as ArrowFields, Schema, Schema as ArrowSchema,
+    };
+    use futures::TryStreamExt;
+    use lance_arrow::ARROW_EXT_NAME_KEY;
+    use lance_arrow::json::{ARROW_JSON_EXT_NAME, JSON_EXT_NAME, JsonArray, json_field};
     use lance_core::cache::LanceCache;
     use lance_core::datatypes::Schema as LanceSchema;
     use lance_core::utils::tempfile::TempObjFile;
     use lance_datagen::{BatchCount, RowCount, array, gen_batch};
     use lance_encoding::compression_config::{CompressionFieldParams, CompressionParams};
+    use lance_encoding::constants::{
+        PACKED_STRUCT_META_KEY, STRUCTURAL_ENCODING_META_KEY, STRUCTURAL_ENCODING_SPARSE,
+    };
     use lance_encoding::decoder::DecoderPlugins;
+    use lance_encoding::encoder::{
+        BatchEncoder, ColumnIndexSequence, EncodingOptions, FieldEncodingContext, OutOfLineBuffers,
+        encode_batch,
+    };
+    use lance_encoding::repdef::RepDefBuilder;
     use lance_io::object_store::ObjectStore;
     use lance_io::traits::Writer;
     use lance_io::utils::CachedFileSize;
@@ -45,6 +111,101 @@ mod tests {
     ) -> lance_core::Result<FileWriter> {
         versions::v2_1::create_writer_with_compression(object_writer, schema, options, compression)
             .map(Into::into)
+    }
+
+    fn create_v2_3_writer_with_compression(
+        object_writer: Box<dyn Writer>,
+        schema: LanceSchema,
+        options: FileWriterOptions,
+        compression: CompressionParams,
+    ) -> lance_core::Result<FileWriter> {
+        versions::v2_3::create_writer_with_compression(object_writer, schema, options, compression)
+            .map(Into::into)
+    }
+
+    #[tokio::test]
+    async fn test_v2_3_alp_rd_single_dictionary_default_compression() {
+        // A slow linear drift whose pages collapse to a one-entry ALP-RD
+        // dictionary writes an empty index stream (index_bits == 0). The files
+        // must still read back end-to-end through the default Compress-All path;
+        // this is the integration-level companion to the ALP-RD unit test.
+        use futures::TryStreamExt;
+        use lance_encoding::decoder::FilterExpression;
+        use lance_io::ReadBatchParams;
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "data",
+            DataType::Float64,
+            false,
+        )]));
+        let lance_schema = LanceSchema::try_from(arrow_schema.as_ref()).unwrap();
+        let n = 65536usize;
+        use rand::rngs::SmallRng;
+        use rand::{Rng, SeedableRng};
+        let mut rng = SmallRng::seed_from_u64(0x05ee_da1b_2026_1023);
+        let mut gauss = || {
+            let u1: f64 = rng.random_range(1e-12..1.0);
+            let u2: f64 = rng.random();
+            (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
+        };
+        let vals: Vec<f64> = (0..n)
+            .map(|i| 1_000_000.0 + i as f64 * 0.1 + gauss() * 0.01)
+            .collect();
+        let expected_sum: f64 = vals.iter().sum();
+
+        let path = TempObjFile::default();
+        let object_store = ObjectStore::local();
+        let mut writer = create_v2_3_writer_with_compression(
+            object_store.create(&path).await.unwrap(),
+            lance_schema,
+            FileWriterOptions::default(),
+            CompressionParams::new(),
+        )
+        .unwrap();
+        let arr = Arc::new(arrow_array::Float64Array::from(vals));
+        let batch = RecordBatch::try_new(arrow_schema, vec![arr]).unwrap();
+        writer.write_batch(&batch).await.unwrap();
+        writer.finish().await.unwrap();
+
+        let fs = FsFixture::default();
+        let file_scheduler = fs
+            .scheduler
+            .open_file(&path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let file_reader = FileReader::try_open(
+            file_scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &LanceCache::no_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+        let stream = file_reader
+            .read_stream(
+                ReadBatchParams::RangeFull,
+                1024,
+                16,
+                FilterExpression::no_filter(),
+            )
+            .await
+            .unwrap();
+        let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+        let total: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
+        assert_eq!(total, n as u64);
+        let read_sum: f64 = batches
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<arrow_array::Float64Array>()
+                    .unwrap()
+                    .iter()
+                    .flatten()
+            })
+            .sum();
+        assert_eq!(read_sum, expected_sum);
     }
 
     fn reader_projection_from_column_names(
@@ -83,6 +244,192 @@ mod tests {
         file_writer.add_schema_metadata("foo", "bar");
         file_writer.finish().await.unwrap();
         // Tests asserting the contents of the written file are in reader.rs
+    }
+
+    #[tokio::test]
+    async fn test_sliced_batches_preserve_page_accumulation() {
+        let expected =
+            arrow_array::record_batch!(("id", UInt64, (0..1024).collect::<Vec<u64>>())).unwrap();
+        let mut page_counts = Vec::with_capacity(2);
+        for sliced in [false, true] {
+            let batches = (0..1024).step_by(32).map(|offset| {
+                if sliced {
+                    Ok(expected.slice(offset, 32))
+                } else {
+                    arrow_array::record_batch!((
+                        "id",
+                        UInt64,
+                        (offset as u64..offset as u64 + 32).collect::<Vec<_>>()
+                    ))
+                }
+            });
+            let input = arrow_array::RecordBatchIterator::new(batches, expected.schema());
+            let fs = FsFixture::default();
+            crate::testing::write_lance_file(
+                input,
+                &fs,
+                ConcreteFileVersion::V2_1,
+                FileWriterOptions {
+                    data_cache_bytes: Some(4096),
+                    ..Default::default()
+                },
+            )
+            .await;
+            let scheduler = fs
+                .scheduler
+                .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+                .await
+                .unwrap();
+            let reader = FileReader::try_open(
+                scheduler,
+                None,
+                Arc::<DecoderPlugins>::default(),
+                &LanceCache::no_cache(),
+                FileReaderOptions::default(),
+            )
+            .await
+            .unwrap();
+            page_counts.push(reader.metadata().column_metadatas[0].pages.len());
+            let output = crate::testing::read_lance_file(
+                &fs,
+                Arc::<DecoderPlugins>::default(),
+                lance_encoding::decoder::FilterExpression::no_filter(),
+            )
+            .await;
+            let actual = arrow_select::concat::concat_batches(&expected.schema(), &output).unwrap();
+            assert_eq!(actual, expected);
+        }
+        assert!(page_counts[0] < 32);
+        assert_eq!(page_counts[0], page_counts[1]);
+    }
+
+    #[tokio::test]
+    async fn test_write_batch_snapshots_foreign_values() {
+        let owner = Arc::new((0..4096).map(AtomicU64::new).collect::<Vec<_>>());
+        // SAFETY: `owner` holds 4096 initialized `AtomicU64`s, which have u64's size and
+        // bit validity, so the pointer is valid for 4096 * 8 bytes, and the clone passed
+        // as the allocation keeps them alive. The test stores into them only after
+        // checking that no `Buffer` over them is left.
+        let buffer = unsafe {
+            Buffer::from_custom_allocation(
+                NonNull::new(owner.as_ptr() as *mut u8).unwrap(),
+                4096 * 8,
+                owner.clone(),
+            )
+        };
+        let input = UInt64Array::new(ScalarBuffer::new(buffer, 0, 4096), None).slice(17, 32);
+        let batch = RecordBatch::try_from_iter([("id", Arc::new(input) as ArrayRef)]).unwrap();
+        let fs = FsFixture::default();
+        let sink = fs.object_store.create(&fs.tmp_path).await.unwrap();
+        let schema = LanceSchema::try_from(batch.schema().as_ref()).unwrap();
+        let mut writer = versions::create_writer(
+            ConcreteFileVersion::V2_1,
+            sink,
+            schema,
+            FileWriterOptions {
+                data_cache_bytes: Some(4096),
+                keep_original_array: Some(false),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        writer.write_batch(&batch).await.unwrap();
+        drop(batch);
+        assert_eq!(
+            Arc::strong_count(&owner),
+            1,
+            "the writer kept the foreign buffer"
+        );
+        owner[17].store(999, Ordering::Relaxed);
+        writer.add_schema_metadata("foo", "bar");
+        writer.finish().await.unwrap();
+
+        let output = crate::testing::read_lance_file(
+            &fs,
+            Arc::<DecoderPlugins>::default(),
+            lance_encoding::decoder::FilterExpression::no_filter(),
+        )
+        .await;
+        let values = output[0]
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        assert_eq!(values.value(0), 17);
+    }
+
+    #[tokio::test]
+    async fn test_spare_batch_capacity_preserves_page_accumulation() {
+        async fn page_count(capacity: usize) -> usize {
+            let batches = (0..32)
+                .map(|batch_index| {
+                    let mut values = Vec::with_capacity(capacity);
+                    values.extend(batch_index * 32..batch_index * 32 + 32);
+                    RecordBatch::try_from_iter([(
+                        "id",
+                        Arc::new(UInt64Array::from(values)) as ArrayRef,
+                    )])
+                    .unwrap()
+                })
+                .collect::<Vec<_>>();
+            let schema = batches[0].schema();
+            let fs = FsFixture::default();
+            crate::testing::write_lance_file(
+                arrow_array::RecordBatchIterator::new(batches.into_iter().map(Ok), schema),
+                &fs,
+                ConcreteFileVersion::V2_1,
+                FileWriterOptions {
+                    data_cache_bytes: Some(4096),
+                    ..Default::default()
+                },
+            )
+            .await;
+            let scheduler = fs
+                .scheduler
+                .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+                .await
+                .unwrap();
+            let reader = FileReader::try_open(
+                scheduler,
+                None,
+                Arc::<DecoderPlugins>::default(),
+                &LanceCache::no_cache(),
+                FileReaderOptions::default(),
+            )
+            .await
+            .unwrap();
+            reader.metadata().column_metadatas[0].pages.len()
+        }
+
+        let compact_capacity = page_count(32).await;
+        assert_eq!(compact_capacity, page_count(64).await);
+        assert!(compact_capacity < 32);
+    }
+
+    #[rstest]
+    #[case::v2_1(ConcreteFileVersion::V2_1)]
+    #[case::v2_2(ConcreteFileVersion::V2_2)]
+    #[case::v2_3(ConcreteFileVersion::V2_3)]
+    #[tokio::test]
+    async fn test_negative_dictionary_values_with_runt_tail(#[case] version: ConcreteFileVersion) {
+        let values: Vec<i64> = (0..9216_u64)
+            .map(|i| ((i.wrapping_mul(2_654_435_761) >> 7) % 1600) as i64 - 800)
+            .collect();
+        let batch = arrow_array::record_batch!(("f0", Int64, values)).unwrap();
+        let reader = arrow_array::RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+        let fs = FsFixture::default();
+
+        crate::testing::write_lance_file(reader, &fs, version, FileWriterOptions::default()).await;
+        let read = crate::testing::read_lance_file(
+            &fs,
+            Arc::new(DecoderPlugins::default()),
+            lance_encoding::decoder::FilterExpression::no_filter(),
+        )
+        .await;
+        let read = arrow_select::concat::concat_batches(&read[0].schema(), &read).unwrap();
+        assert_eq!(read, batch);
     }
 
     #[tokio::test]
@@ -513,6 +860,59 @@ mod tests {
         }
     }
 
+    #[rstest]
+    #[case::v2_2(ConcreteFileVersion::V2_2, false)]
+    #[case::v2_3_dense(ConcreteFileVersion::V2_3, false)]
+    #[case::v2_3_sparse(ConcreteFileVersion::V2_3, true)]
+    #[tokio::test]
+    async fn test_read_fixed_size_list_struct_with_scalar(
+        #[case] version: ConcreteFileVersion,
+        #[case] sparse: bool,
+    ) {
+        use lance_encoding::constants::{STRUCTURAL_ENCODING_META_KEY, STRUCTURAL_ENCODING_SPARSE};
+
+        let metadata = if sparse {
+            HashMap::from([(
+                STRUCTURAL_ENCODING_META_KEY.to_string(),
+                STRUCTURAL_ENCODING_SPARSE.to_string(),
+            )])
+        } else {
+            HashMap::new()
+        };
+        let values = Arc::new(StructArray::from(vec![(
+            Arc::new(Field::new("x", DataType::Int32, true)),
+            Arc::new(Int32Array::from(vec![10, 20])) as ArrayRef,
+        )]));
+        let points = FixedSizeListArray::new(
+            Arc::new(Field::new("item", values.data_type().clone(), true)),
+            2,
+            values,
+            None,
+        );
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                Field::new("id", DataType::Int64, true),
+                Field::new("points", points.data_type().clone(), true).with_metadata(metadata),
+            ])),
+            vec![
+                Arc::new(arrow_array::Int64Array::from(vec![1])) as ArrayRef,
+                Arc::new(points) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let data = arrow_array::RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+        let fs = FsFixture::default();
+
+        crate::testing::write_lance_file(data, &fs, version, FileWriterOptions::default()).await;
+        let batches = crate::testing::read_lance_file(
+            &fs,
+            Arc::<DecoderPlugins>::default(),
+            lance_encoding::decoder::FilterExpression::no_filter(),
+        )
+        .await;
+        assert_eq!(batches, vec![batch]);
+    }
+
     /// `write_column` rejects invalid inputs at the API boundary with
     /// descriptive errors: a writer without an explicit schema, an
     /// out-of-bounds field index, and a null written into a non-nullable field.
@@ -569,6 +969,1088 @@ mod tests {
             err.contains("non-null"),
             "expected nullability error, got: {err}"
         );
+    }
+
+    fn field_type_mismatch(error: lance_core::Error) -> FieldTypeMismatch {
+        match error {
+            lance_core::Error::InvalidInput { source, .. } => source
+                .downcast_ref::<FieldTypeMismatch>()
+                .unwrap_or_else(|| panic!("expected a field type mismatch, got: {source}"))
+                .clone(),
+            other => panic!("expected an invalid input error, got: {other}"),
+        }
+    }
+
+    /// Arrow JSON text that skipped conversion to Lance JSONB is rejected
+    /// before anything is encoded, naming the offending field.
+    #[rstest]
+    #[case::top_level(false)]
+    #[case::nested_in_struct(true)]
+    #[tokio::test]
+    async fn test_writer_rejects_unconverted_arrow_json(
+        #[case] nested: bool,
+        #[values(
+            ConcreteFileVersion::V2_0,
+            ConcreteFileVersion::V2_1,
+            ConcreteFileVersion::V2_2,
+            ConcreteFileVersion::V2_3
+        )]
+        version: ConcreteFileVersion,
+    ) {
+        let arrow_json =
+            ArrowField::new("j", DataType::Utf8, true).with_metadata(HashMap::from([(
+                ARROW_EXT_NAME_KEY.to_string(),
+                ARROW_JSON_EXT_NAME.to_string(),
+            )]));
+        let text: ArrayRef = Arc::new(StringArray::from(vec![r#"{"a":1}"#]));
+        let in_struct = |field: ArrowField| {
+            if nested {
+                ArrowField::new("s", DataType::Struct(vec![field].into()), true)
+            } else {
+                field
+            }
+        };
+        let jsonb: ArrayRef = Arc::new(JsonArray::try_from(text.clone()).unwrap().into_inner());
+        let batch_of = |field: ArrowField, values: ArrayRef| {
+            let field = in_struct(field);
+            let values: ArrayRef = match field.data_type() {
+                DataType::Struct(fields) => {
+                    Arc::new(StructArray::new(fields.clone(), vec![values], None))
+                }
+                _ => values,
+            };
+            RecordBatch::try_new(Arc::new(ArrowSchema::new(vec![field])), vec![values]).unwrap()
+        };
+        let converted = batch_of(json_field("j", true), jsonb);
+        let batch = batch_of(arrow_json, text);
+        let file_schema = LanceSchema::try_from(converted.schema().as_ref()).unwrap();
+
+        let fs = FsFixture::default();
+        let mut writer = create_writer(
+            fs.object_store.create(&fs.tmp_path).await.unwrap(),
+            file_schema,
+            version,
+            FileWriterOptions::default(),
+        )
+        .unwrap();
+        // A batch with an accepted schema must not let a later, different
+        // schema through.
+        writer.write_batch(&converted).await.unwrap();
+        let mismatch = field_type_mismatch(writer.write_batch(&batch).await.unwrap_err());
+        assert_eq!(mismatch.field_path, if nested { "s.j" } else { "j" });
+        assert_eq!(mismatch.expected.data_type(), &DataType::LargeBinary);
+        assert_eq!(mismatch.expected.extension_type_name(), Some(JSON_EXT_NAME));
+        assert_eq!(mismatch.actual.data_type(), &DataType::Utf8);
+        assert_eq!(
+            mismatch.actual.extension_type_name(),
+            Some(ARROW_JSON_EXT_NAME)
+        );
+        // The rejected batch reached no encoder.
+        assert_eq!(writer.finish().await.unwrap().num_rows, 1);
+    }
+
+    #[rstest]
+    #[case::mismatched_first(true)]
+    #[case::mismatched_unused(false)]
+    #[tokio::test]
+    async fn test_writer_checks_first_duplicate_column_type(
+        #[case] mismatched_first: bool,
+        #[values(
+            ConcreteFileVersion::V2_0,
+            ConcreteFileVersion::V2_1,
+            ConcreteFileVersion::V2_2,
+            ConcreteFileVersion::V2_3
+        )]
+        version: ConcreteFileVersion,
+    ) {
+        let expected =
+            arrow_array::record_batch!(("b", Int32, [7, 8]), ("a", Int32, [11, 12])).unwrap();
+        let schema = LanceSchema::try_from(expected.schema().as_ref()).unwrap();
+        let values: ArrayRef = Arc::new(Int32Array::from(vec![11, 12]));
+        let strings: ArrayRef = Arc::new(StringArray::from(vec!["first", "second"]));
+        let (first, second) = if mismatched_first {
+            (strings, values)
+        } else {
+            (values, strings)
+        };
+        let duplicate = RecordBatch::try_from_iter(vec![
+            ("a", first),
+            ("a", second),
+            ("b", expected["b"].clone()),
+        ])
+        .unwrap();
+        let fs = FsFixture::default();
+        let mut writer = create_writer(
+            fs.object_store.create(&fs.tmp_path).await.unwrap(),
+            schema,
+            version,
+            FileWriterOptions::default(),
+        )
+        .unwrap();
+        for _ in 0..2 {
+            if mismatched_first {
+                let mismatch =
+                    field_type_mismatch(writer.write_batch(&duplicate).await.unwrap_err());
+                assert_eq!(mismatch.field_path, "a");
+                assert!(mismatch.to_string().contains("field `a` does not match"));
+                assert_eq!(mismatch.expected.data_type(), &DataType::Int32);
+                assert_eq!(mismatch.actual.data_type(), &DataType::Utf8);
+                writer.write_batch(&expected).await.unwrap();
+            } else {
+                writer.write_batch(&duplicate).await.unwrap();
+            }
+        }
+        assert_eq!(writer.finish().await.unwrap().num_rows, 4);
+        let scheduler = fs
+            .scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let reader = FileReader::try_open(
+            scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &LanceCache::no_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+        let batches: Vec<RecordBatch> = reader
+            .read_stream(
+                lance_io::ReadBatchParams::RangeFull,
+                2,
+                1,
+                lance_encoding::decoder::FilterExpression::no_filter(),
+            )
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let actual = arrow_select::concat::concat_batches(&expected.schema(), &batches).unwrap();
+        let expected =
+            arrow_select::concat::concat_batches(&expected.schema(), &[expected.clone(), expected])
+                .unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_write_column_rejects_mismatched_type(
+        #[values(
+            ConcreteFileVersion::V2_0,
+            ConcreteFileVersion::V2_1,
+            ConcreteFileVersion::V2_2,
+            ConcreteFileVersion::V2_3
+        )]
+        version: ConcreteFileVersion,
+    ) {
+        let file_schema =
+            LanceSchema::try_from(&ArrowSchema::new(vec![json_field("j", true)])).unwrap();
+        let fs = FsFixture::default();
+        let mut writer = create_writer(
+            fs.object_store.create(&fs.tmp_path).await.unwrap(),
+            file_schema,
+            version,
+            FileWriterOptions::default(),
+        )
+        .unwrap();
+        let text: ArrayRef = Arc::new(StringArray::from(vec![r#"{"a":1}"#]));
+        let mismatch = field_type_mismatch(writer.write_column(0, text).await.unwrap_err());
+        assert_eq!(mismatch.field_path, "j");
+        assert_eq!(mismatch.expected.data_type(), &DataType::LargeBinary);
+        // A bare array carries no extension of its own.
+        assert_eq!(mismatch.actual.data_type(), &DataType::Utf8);
+        assert_eq!(mismatch.actual.extension_type_name(), None);
+    }
+
+    /// The value encoder stores each fixed-size list as one fixed-width value, so
+    /// writing a list of strings or binaries fails with an error, not a panic.
+    #[rstest]
+    #[case::utf8(DataType::Utf8, false)]
+    #[case::large_binary(DataType::LargeBinary, false)]
+    #[case::nested_utf8(DataType::Utf8, true)]
+    #[tokio::test]
+    async fn test_writer_rejects_fixed_size_list_of_variable_width_items(
+        #[case] item_type: DataType,
+        #[case] nested: bool,
+        #[values(false, true)] null_lists: bool,
+        // Lists of 200-byte items are too wide for mini-block pages and use full zip.
+        #[values(2, 200)] item_len: usize,
+        // 2.3 sparse pages choose their compressors without the dense page path.
+        #[values(
+            (ConcreteFileVersion::V2_0, None),
+            (ConcreteFileVersion::V2_1, None),
+            (ConcreteFileVersion::V2_2, None),
+            (ConcreteFileVersion::V2_3, None),
+            (ConcreteFileVersion::V2_3, Some(STRUCTURAL_ENCODING_SPARSE))
+        )]
+        target: (ConcreteFileVersion, Option<&str>),
+    ) {
+        let (version, structural_encoding) = target;
+        let items = (0..8).map(|i| format!("{i:0>item_len$}"));
+        let values: ArrayRef = match item_type {
+            DataType::Utf8 => Arc::new(StringArray::from_iter_values(items)),
+            DataType::LargeBinary => Arc::new(LargeBinaryArray::from_iter_values(items)),
+            _ => unreachable!(),
+        };
+        let item_field = Arc::new(ArrowField::new("item", item_type, true));
+        // A null list makes the encoder write definition levels.
+        let nulls = null_lists.then(|| NullBuffer::from(vec![true, false, true, true]));
+        let mut tags: ArrayRef = Arc::new(FixedSizeListArray::new(item_field, 2, values, nulls));
+        if nested {
+            let item_field = Arc::new(ArrowField::new("item", tags.data_type().clone(), true));
+            tags = Arc::new(FixedSizeListArray::new(item_field, 2, tags, None));
+        }
+        let metadata = structural_encoding.map(|encoding| {
+            (
+                STRUCTURAL_ENCODING_META_KEY.to_string(),
+                encoding.to_string(),
+            )
+        });
+        let tags_field = ArrowField::new("tags", tags.data_type().clone(), true)
+            .with_metadata(metadata.into_iter().collect());
+        let schema = Arc::new(ArrowSchema::new(vec![tags_field]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![tags]).unwrap();
+        let fs = FsFixture::default();
+        let result = async {
+            let mut writer = create_writer(
+                fs.object_store.create(&fs.tmp_path).await?,
+                LanceSchema::try_from(schema.as_ref())?,
+                version,
+                FileWriterOptions::default(),
+            )?;
+            writer.write_batch(&batch).await?;
+            writer.finish().await
+        }
+        .await;
+        let error = result.expect_err("a fixed-size list of variable-width items was written");
+        assert!(
+            matches!(error, lance_core::Error::NotSupported { .. }),
+            "{error}"
+        );
+        assert!(error.to_string().contains("FixedSizeList"), "{error}");
+    }
+
+    /// A row with more rep/def levels than one mini-block chunk holds is checked
+    /// for full-zip support before any compressor is chosen.
+    #[rstest]
+    #[tokio::test]
+    async fn test_writer_rejects_large_row_of_fixed_size_lists_of_strings(
+        // 2.3 writes such a row as a sparse page, which has no such limit.
+        #[values(ConcreteFileVersion::V2_1, ConcreteFileVersion::V2_2)]
+        version: ConcreteFileVersion,
+    ) {
+        let item_field = Arc::new(ArrowField::new("item", DataType::Utf8, true));
+        let items = Arc::new(StringArray::from(vec!["a", "b"]));
+        let tags = FixedSizeListArray::new(item_field, 2, items, None);
+        // One row of 70,000 lists, all empty but the first, has a level for each
+        // list but a single value.
+        let num_lists = 70_000;
+        let offsets = std::iter::once(0).chain(std::iter::repeat_n(1, num_lists));
+        let list_field = Arc::new(ArrowField::new("item", tags.data_type().clone(), true));
+        let lists = ListArray::new(
+            list_field,
+            OffsetBuffer::new(ScalarBuffer::from_iter(offsets)),
+            Arc::new(tags),
+            None,
+        );
+        let row_field = Arc::new(ArrowField::new("item", lists.data_type().clone(), true));
+        let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0, num_lists as i32]));
+        let row: ArrayRef = Arc::new(ListArray::new(row_field, offsets, Arc::new(lists), None));
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "tags",
+            row.data_type().clone(),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![row]).unwrap();
+        let fs = FsFixture::default();
+        let result = async {
+            let mut writer = create_writer(
+                fs.object_store.create(&fs.tmp_path).await?,
+                LanceSchema::try_from(schema.as_ref())?,
+                version,
+                FileWriterOptions::default(),
+            )?;
+            writer.write_batch(&batch).await?;
+            writer.finish().await
+        }
+        .await;
+        let error = result.expect_err("a fixed-size list of variable-width items was written");
+        assert!(
+            matches!(error, lance_core::Error::InvalidInput { .. }),
+            "{error}"
+        );
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_writer_rejects_fixed_size_list_of_dictionary_strings(
+        #[values(
+            ConcreteFileVersion::V2_0,
+            ConcreteFileVersion::V2_1,
+            ConcreteFileVersion::V2_2,
+            ConcreteFileVersion::V2_3
+        )]
+        version: ConcreteFileVersion,
+    ) {
+        let mut builder = StringDictionaryBuilder::<Int32Type>::new();
+        for i in 0..8 {
+            builder.append_value(format!("item-{i}"));
+        }
+        let values: ArrayRef = Arc::new(builder.finish());
+        let item_field = Arc::new(ArrowField::new("item", values.data_type().clone(), true));
+        let tags = FixedSizeListArray::new(item_field, 2, values, None);
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "tags",
+            tags.data_type().clone(),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(tags)]).unwrap();
+        let fs = FsFixture::default();
+        let result = async {
+            let mut writer = create_writer(
+                fs.object_store.create(&fs.tmp_path).await?,
+                LanceSchema::try_from(schema.as_ref())?,
+                version,
+                FileWriterOptions::default(),
+            )?;
+            writer.write_batch(&batch).await?;
+            writer.finish().await
+        }
+        .await;
+        let error = result.expect_err("fixed-size list of dictionary strings was written");
+        assert!(
+            matches!(error, lance_core::Error::NotSupported { .. }),
+            "{error}"
+        );
+        assert!(error.to_string().contains("FixedSizeList"), "{error}");
+    }
+
+    fn packed_metadata() -> HashMap<String, String> {
+        HashMap::from([(PACKED_STRUCT_META_KEY.to_owned(), "true".to_owned())])
+    }
+
+    /// A packed `{a: Int32, <name>: child}` struct of three rows.
+    fn packed_struct_with_child(name: &str, child: ArrayRef) -> StructArray {
+        let fields = ArrowFields::from(vec![
+            ArrowField::new("a", DataType::Int32, true),
+            ArrowField::new(name, child.data_type().clone(), true),
+        ]);
+        StructArray::new(
+            fields,
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3])), child],
+            None,
+        )
+    }
+
+    fn int32_lists() -> ListArray {
+        ListArray::from_iter_primitive::<Int32Type, _, _>(vec![
+            Some(vec![Some(1)]),
+            Some(vec![]),
+            Some(vec![Some(2), Some(3)]),
+        ])
+    }
+
+    async fn write_single_column(
+        fs: &FsFixture,
+        field: ArrowField,
+        column: ArrayRef,
+        version: ConcreteFileVersion,
+    ) -> lance_core::Result<()> {
+        let schema = Arc::new(ArrowSchema::new(vec![field]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![column]).unwrap();
+        let mut writer = create_writer(
+            fs.object_store.create(&fs.tmp_path).await?,
+            LanceSchema::try_from(schema.as_ref())?,
+            version,
+            FileWriterOptions::default(),
+        )?;
+        writer.write_batch(&batch).await?;
+        writer.finish().await?;
+        Ok(())
+    }
+
+    /// Packed structs are encoded as one primitive column, so a list-like
+    /// child, even inside a nested struct, is rejected with an error naming the
+    /// child instead of panicking while the column is converted to a data block.
+    #[rstest]
+    #[case::list("l", "List", false)]
+    #[case::large_list("l", "LargeList", false)]
+    #[case::map("m", "Map", false)]
+    #[case::nested_struct("inner.l", "List", false)]
+    #[case::packed_struct_in_list("l", "List", true)]
+    #[tokio::test]
+    async fn test_writer_rejects_packed_struct_with_list_child(
+        #[case] child_path: &str,
+        #[case] child_type: &str,
+        #[case] in_list: bool,
+        #[values(
+            ConcreteFileVersion::V2_0,
+            ConcreteFileVersion::V2_1,
+            ConcreteFileVersion::V2_2,
+            ConcreteFileVersion::V2_3
+        )]
+        version: ConcreteFileVersion,
+    ) {
+        use arrow_array::LargeListArray;
+        use arrow_array::builder::MapBuilder;
+
+        let child: ArrayRef = match (child_path, child_type) {
+            (_, "LargeList") => Arc::new(LargeListArray::from_iter_primitive::<Int32Type, _, _>(
+                vec![Some(vec![Some(1)]), Some(vec![]), Some(vec![Some(2)])],
+            )),
+            (_, "Map") => {
+                let mut builder = MapBuilder::new(None, Int32Builder::new(), Int32Builder::new());
+                for i in 0..3 {
+                    builder.keys().append_value(i);
+                    builder.values().append_value(i * 10);
+                    builder.append(true).unwrap();
+                }
+                Arc::new(builder.finish())
+            }
+            ("inner.l", _) => {
+                let lists: ArrayRef = Arc::new(int32_lists());
+                Arc::new(StructArray::new(
+                    ArrowFields::from(vec![
+                        ArrowField::new("b", DataType::Int32, true),
+                        ArrowField::new("l", lists.data_type().clone(), true),
+                    ]),
+                    vec![Arc::new(Int32Array::from(vec![4, 5, 6])), lists],
+                    None,
+                ))
+            }
+            _ => Arc::new(int32_lists()),
+        };
+        let top_name = child_path.split('.').next().unwrap();
+        let packed = packed_struct_with_child(top_name, child);
+        let packed_name = if in_list { "item" } else { "s" };
+        let packed_field = ArrowField::new(packed_name, packed.data_type().clone(), true)
+            .with_metadata(packed_metadata());
+        let (field, column): (ArrowField, ArrayRef) = if in_list {
+            let list = ListArray::new(
+                Arc::new(packed_field),
+                OffsetBuffer::new(ScalarBuffer::from(vec![0, 1, 3])),
+                Arc::new(packed),
+                None,
+            );
+            (
+                ArrowField::new("s", list.data_type().clone(), true),
+                Arc::new(list),
+            )
+        } else {
+            (packed_field, Arc::new(packed))
+        };
+
+        let fs = FsFixture::default();
+        let error = write_single_column(&fs, field, column, version)
+            .await
+            .expect_err("a packed struct with a list-like child was written");
+        assert!(
+            matches!(error, lance_core::Error::NotSupported { .. }),
+            "{error}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains(&format!("Packed struct field '{packed_name}'")),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!("child '{child_path}' of type {child_type}(")),
+            "{message}"
+        );
+    }
+
+    /// Packed structs whose children are values still round-trip: fixed-width
+    /// children on every version and variable-width children from 2.2 on.
+    #[rstest]
+    #[case::fixed_v2_0(ConcreteFileVersion::V2_0, false)]
+    #[case::fixed_v2_1(ConcreteFileVersion::V2_1, false)]
+    #[case::fixed_v2_2(ConcreteFileVersion::V2_2, false)]
+    #[case::fixed_v2_3(ConcreteFileVersion::V2_3, false)]
+    #[case::variable_v2_2(ConcreteFileVersion::V2_2, true)]
+    #[case::variable_v2_3(ConcreteFileVersion::V2_3, true)]
+    #[tokio::test]
+    async fn test_packed_struct_with_value_children_round_trips(
+        #[case] version: ConcreteFileVersion,
+        #[case] variable: bool,
+    ) {
+        let child: ArrayRef = if variable {
+            Arc::new(StringArray::from(vec!["x", "", "yz"]))
+        } else {
+            Arc::new(arrow_array::Float64Array::from(vec![0.5, 1.5, 2.5]))
+        };
+        let packed = packed_struct_with_child("c", child);
+        let field =
+            ArrowField::new("s", packed.data_type().clone(), true).with_metadata(packed_metadata());
+        let schema = Arc::new(ArrowSchema::new(vec![field]));
+        let expected = RecordBatch::try_new(schema.clone(), vec![Arc::new(packed)]).unwrap();
+
+        let fs = FsFixture::default();
+        crate::testing::write_lance_file(
+            arrow_array::RecordBatchIterator::new(vec![Ok(expected.clone())], schema.clone()),
+            &fs,
+            version,
+            FileWriterOptions::default(),
+        )
+        .await;
+        let output = crate::testing::read_lance_file(
+            &fs,
+            Arc::<DecoderPlugins>::default(),
+            lance_encoding::decoder::FilterExpression::no_filter(),
+        )
+        .await;
+        let actual = arrow_select::concat::concat_batches(&schema, &output).unwrap();
+        assert_eq!(actual.column(0), expected.column(0));
+    }
+
+    fn struct_array(fields: ArrowFields, nulls: Option<NullBuffer>) -> StructArray {
+        StructArray::new(
+            fields,
+            vec![
+                Arc::new(Int32Array::from(vec![10, 99, 30])),
+                Arc::new(Int32Array::from(vec![11, 98, 31])),
+            ],
+            nulls,
+        )
+    }
+
+    /// Writer preflight uses the same name-selected arrays as encoding, so a
+    /// rejected reordered batch cannot leave earlier field encoders mutated.
+    #[tokio::test]
+    async fn test_v2_0_writer_atomically_rejects_reordered_null_structs() {
+        let struct_fields: ArrowFields = vec![
+            ArrowField::new("a", DataType::Int32, true),
+            ArrowField::new("b", DataType::Int32, true),
+        ]
+        .into();
+        let struct_field = ArrowField::new("s", DataType::Struct(struct_fields.clone()), true);
+        let writer_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, true),
+            struct_field.clone(),
+        ]));
+        let batch_schema = Arc::new(ArrowSchema::new(vec![
+            struct_field,
+            ArrowField::new("id", DataType::Int32, true),
+        ]));
+        let null_structs = struct_array(
+            struct_fields.clone(),
+            Some(NullBuffer::from(vec![true, false, true])),
+        );
+        let invalid_batch = RecordBatch::try_new(
+            batch_schema.clone(),
+            vec![
+                Arc::new(null_structs),
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+            ],
+        )
+        .unwrap();
+        let lance_schema = LanceSchema::try_from(writer_schema.as_ref()).unwrap();
+
+        let fs = FsFixture::default();
+        let mut writer = create_writer(
+            fs.object_store.create(&fs.tmp_path).await.unwrap(),
+            lance_schema.clone(),
+            ConcreteFileVersion::V2_0,
+            FileWriterOptions::default(),
+        )
+        .unwrap();
+        let error = writer.write_batch(&invalid_batch).await.unwrap_err();
+
+        assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
+        let message = error.to_string();
+        assert!(message.contains("struct validity"), "{message}");
+        assert!(message.contains("2.0"), "{message}");
+        assert!(message.contains("1 null value"), "{message}");
+
+        let valid_batch = RecordBatch::try_new(
+            batch_schema,
+            vec![
+                Arc::new(struct_array(struct_fields, None)),
+                Arc::new(Int32Array::from(vec![4, 5, 6])),
+            ],
+        )
+        .unwrap();
+        writer.write_batch(&valid_batch).await.unwrap();
+        writer.finish().await.unwrap();
+
+        let file_scheduler = fs
+            .scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let reader = FileReader::try_open(
+            file_scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &LanceCache::no_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            read_int32_column(
+                &reader,
+                &lance_schema,
+                ConcreteFileVersion::V2_0,
+                "id",
+                lance_io::ReadBatchParams::RangeFull,
+            )
+            .await,
+            vec![Some(4), Some(5), Some(6)]
+        );
+    }
+
+    /// The 2.1+ preflight must pair each field with the array encoding will select for
+    /// it. Pairing `batch.columns()` positionally against the schema misreads a batch
+    /// whose column order differs: it rejects a legal null in the nullable field while
+    /// naming the non-nullable one, and lets a null through in the non-nullable field.
+    #[rstest]
+    #[case::null_in_nullable_field(true, true)]
+    #[case::null_in_non_nullable_field(false, false)]
+    #[tokio::test]
+    async fn test_structural_writer_verifies_name_selected_nullability(
+        #[values(
+            ConcreteFileVersion::V2_1,
+            ConcreteFileVersion::V2_2,
+            ConcreteFileVersion::V2_3
+        )]
+        version: ConcreteFileVersion,
+        #[case] null_in_nullable: bool,
+        #[case] should_succeed: bool,
+    ) {
+        // The schema declares "a" non-nullable; the batch puts "b" first, so a
+        // positional pairing would check "a" against "b"'s array. The batch's
+        // columns are both nullable (what `record_batch!` builds); the writer's
+        // schema is the contract being checked.
+        let writer_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, false),
+            ArrowField::new("b", DataType::Int32, true),
+        ]));
+        let with_null: Vec<Option<i32>> = vec![Some(1), None, Some(3)];
+        let without_null: Vec<Option<i32>> = vec![Some(4), Some(5), Some(6)];
+        let (b, a) = if null_in_nullable {
+            (with_null, without_null)
+        } else {
+            (without_null, with_null)
+        };
+        let batch = arrow_array::record_batch!(("b", Int32, b), ("a", Int32, a)).unwrap();
+
+        let fs = FsFixture::default();
+        let mut writer = create_writer(
+            fs.object_store.create(&fs.tmp_path).await.unwrap(),
+            LanceSchema::try_from(writer_schema.as_ref()).unwrap(),
+            version,
+            FileWriterOptions::default(),
+        )
+        .unwrap();
+
+        let result = writer.write_batch(&batch).await;
+        if should_succeed {
+            result.expect("a null in the nullable field must be accepted");
+            writer.finish().await.unwrap();
+        } else {
+            let error = result.unwrap_err();
+            assert!(
+                matches!(error, lance_core::Error::InvalidInput { .. }),
+                "expected InvalidInput, got: {error}"
+            );
+            assert!(
+                error
+                    .to_string()
+                    .contains("field `a` contained null values"),
+                "expected the error to name field `a`, got: {error}"
+            );
+        }
+    }
+
+    /// With two batch columns named `a`, encoding selects the first via
+    /// `column_by_name`, so the nullability preflight must check that same first
+    /// column. Non-nullable `a` sits at schema index 1, where a positional pairing
+    /// would line it up with the second `a` (which carries a null) and wrongly
+    /// reject; name selection validates the first `a` that is actually written.
+    /// Guards against a future positional fast path reintroducing the mismatch.
+    #[rstest]
+    #[tokio::test]
+    async fn test_structural_writer_checks_first_duplicate_column_nullability(
+        #[values(
+            ConcreteFileVersion::V2_1,
+            ConcreteFileVersion::V2_2,
+            ConcreteFileVersion::V2_3
+        )]
+        version: ConcreteFileVersion,
+    ) {
+        let writer_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("z", DataType::Int32, true),
+            ArrowField::new("a", DataType::Int32, false),
+        ]));
+        let lance_schema = LanceSchema::try_from(writer_schema.as_ref()).unwrap();
+        // Two columns named "a": the first is what `column_by_name` (and the
+        // encoder) selects and is null-free; the second carries a null and must
+        // be ignored by the name-selected check.
+        let first_a: Vec<Option<i32>> = vec![Some(1), Some(2), Some(3)];
+        let second_a: Vec<Option<i32>> = vec![Some(4), None, Some(6)];
+        let z: Vec<Option<i32>> = vec![Some(7), Some(8), Some(9)];
+        let batch = arrow_array::record_batch!(
+            ("a", Int32, first_a),
+            ("a", Int32, second_a),
+            ("z", Int32, z)
+        )
+        .unwrap();
+
+        let fs = FsFixture::default();
+        let mut writer = create_writer(
+            fs.object_store.create(&fs.tmp_path).await.unwrap(),
+            lance_schema.clone(),
+            version,
+            FileWriterOptions::default(),
+        )
+        .unwrap();
+
+        writer
+            .write_batch(&batch)
+            .await
+            .expect("the first \"a\" is null-free, so the name-selected check accepts it");
+        writer.finish().await.unwrap();
+
+        // Read `a` back: the encoder must have written the first `a` (null-free),
+        // not the second. A positional fast path on the encoding side would write
+        // the second `a` and its null, passing the preflight but only failing here.
+        let file_scheduler = fs
+            .scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let reader = FileReader::try_open(
+            file_scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &LanceCache::no_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            read_int32_column(
+                &reader,
+                &lance_schema,
+                version,
+                "a",
+                lance_io::ReadBatchParams::RangeFull,
+            )
+            .await,
+            vec![Some(1), Some(2), Some(3)]
+        );
+    }
+
+    /// A batch missing a column the schema names is rejected when arrays are
+    /// selected by name, not written short. The type preflight leaves a missing
+    /// column for this step (`check_batch` skips absent columns), so the error
+    /// has to come from the name selection itself.
+    #[rstest]
+    #[tokio::test]
+    async fn test_structural_writer_rejects_batch_missing_column(
+        #[values(
+            ConcreteFileVersion::V2_1,
+            ConcreteFileVersion::V2_2,
+            ConcreteFileVersion::V2_3
+        )]
+        version: ConcreteFileVersion,
+    ) {
+        // The schema names "a" and "b", both nullable so only the absence of a
+        // column can fail the write; the batch carries only "a".
+        let writer_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("a", DataType::Int32, true),
+            ArrowField::new("b", DataType::Int32, true),
+        ]));
+        let a: Vec<Option<i32>> = vec![Some(1), Some(2), Some(3)];
+        let batch = arrow_array::record_batch!(("a", Int32, a)).unwrap();
+
+        let fs = FsFixture::default();
+        let mut writer = create_writer(
+            fs.object_store.create(&fs.tmp_path).await.unwrap(),
+            LanceSchema::try_from(writer_schema.as_ref()).unwrap(),
+            version,
+            FileWriterOptions::default(),
+        )
+        .unwrap();
+
+        let error = writer.write_batch(&batch).await.unwrap_err();
+        assert!(
+            matches!(error, lance_core::Error::InvalidInput { .. }),
+            "expected InvalidInput, got: {error}"
+        );
+        assert!(
+            error.to_string().contains("missing the column `b`"),
+            "expected the error to name the missing column `b`, got: {error}"
+        );
+    }
+
+    /// V2.0 null-struct validation applies only to list values that are logically
+    /// encoded, excluding unselected backing values and values under null lists.
+    #[rstest]
+    #[case::non_empty_slice(1, 1, false, true)]
+    #[case::empty_slice(1, 0, false, true)]
+    #[case::garbage_under_null_list(0, 2, true, true)]
+    #[case::selected_null_struct(0, 1, false, false)]
+    #[tokio::test]
+    async fn test_v2_0_writer_validates_logical_list_structs(
+        #[case] offset: usize,
+        #[case] len: usize,
+        #[case] has_null_list: bool,
+        #[case] should_succeed: bool,
+    ) {
+        let struct_fields: ArrowFields = vec![
+            ArrowField::new("a", DataType::Int32, true),
+            ArrowField::new("b", DataType::Int32, true),
+        ]
+        .into();
+        let struct_values = struct_array(
+            struct_fields.clone(),
+            Some(NullBuffer::from(vec![false, true, true])),
+        );
+        let item_field = Arc::new(ArrowField::new(
+            "item",
+            DataType::Struct(struct_fields),
+            true,
+        ));
+        let list_nulls = has_null_list.then(|| NullBuffer::from(vec![false, true, true]));
+        let list = ListArray::new(
+            item_field,
+            OffsetBuffer::new(ScalarBuffer::from(vec![0_i32, 1, 2, 3])),
+            Arc::new(struct_values),
+            list_nulls,
+        );
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "items",
+            list.data_type().clone(),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(list.slice(offset, len))],
+        )
+        .unwrap();
+        let lance_schema = LanceSchema::try_from(arrow_schema.as_ref()).unwrap();
+
+        let fs = FsFixture::default();
+        let mut writer = create_writer(
+            fs.object_store.create(&fs.tmp_path).await.unwrap(),
+            lance_schema,
+            ConcreteFileVersion::V2_0,
+            FileWriterOptions::default(),
+        )
+        .unwrap();
+
+        let result = writer.write_batch(&batch).await;
+        if !should_succeed {
+            let error = result.unwrap_err();
+            assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
+            assert!(error.to_string().contains("struct validity"));
+            return;
+        }
+        result.unwrap();
+        writer.finish().await.unwrap();
+    }
+
+    /// Fixed-size-list child slots under null parent rows are not logically
+    /// encoded, while null structs under valid parent rows remain invalid.
+    #[rstest]
+    #[case::masked_child_null(true, false, true)]
+    #[case::masked_non_nullable_child_null(true, true, true)]
+    #[case::selected_child_null(false, false, false)]
+    #[tokio::test]
+    async fn test_v2_0_writer_validates_logical_fixed_size_list_structs(
+        #[case] mask_child_null: bool,
+        #[case] has_non_nullable_child_null: bool,
+        #[case] should_succeed: bool,
+    ) {
+        let struct_fields: ArrowFields = vec![
+            ArrowField::new("a", DataType::Int32, !has_non_nullable_child_null),
+            ArrowField::new("b", DataType::Int32, true),
+        ]
+        .into();
+        let struct_values = if has_non_nullable_child_null {
+            StructArray::new(
+                struct_fields.clone(),
+                vec![
+                    Arc::new(Int32Array::from(vec![None, Some(99), Some(30)])),
+                    Arc::new(Int32Array::from(vec![11, 98, 31])),
+                ],
+                Some(NullBuffer::from(vec![false, true, true])),
+            )
+        } else {
+            struct_array(
+                struct_fields.clone(),
+                Some(NullBuffer::from(vec![false, true, true])),
+            )
+        };
+        let item_field = Arc::new(ArrowField::new(
+            "item",
+            DataType::Struct(struct_fields),
+            true,
+        ));
+        let parent_nulls = mask_child_null.then(|| NullBuffer::from(vec![false, true, true]));
+        let list = FixedSizeListArray::new(item_field, 1, Arc::new(struct_values), parent_nulls);
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("items", list.data_type().clone(), true),
+        ]));
+        let batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3])), Arc::new(list)],
+        )
+        .unwrap();
+        let lance_schema = LanceSchema::try_from(arrow_schema.as_ref()).unwrap();
+
+        let fs = FsFixture::default();
+        let mut writer = create_writer(
+            fs.object_store.create(&fs.tmp_path).await.unwrap(),
+            lance_schema,
+            ConcreteFileVersion::V2_0,
+            FileWriterOptions::default(),
+        )
+        .unwrap();
+
+        let result = writer.write_batch(&batch).await;
+        if !should_succeed {
+            let error = result.unwrap_err();
+            assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
+            assert!(error.to_string().contains("struct validity"));
+            return;
+        }
+        result.unwrap();
+        writer.finish().await.unwrap();
+    }
+
+    /// The public in-memory v2.0 encoder must enforce the invariant for both
+    /// ordinary multi-column structs and packed structs.
+    #[rstest]
+    #[case::ordinary(false)]
+    #[case::packed(true)]
+    #[tokio::test]
+    async fn test_v2_0_encoding_strategy_rejects_null_structs(#[case] is_packed: bool) {
+        let struct_fields: ArrowFields = vec![
+            ArrowField::new("a", DataType::Int32, true),
+            ArrowField::new("b", DataType::Int32, true),
+        ]
+        .into();
+        let mut struct_field = ArrowField::new("s", DataType::Struct(struct_fields.clone()), true);
+        if is_packed {
+            struct_field = struct_field.with_metadata(HashMap::from([(
+                PACKED_STRUCT_META_KEY.to_owned(),
+                "true".to_owned(),
+            )]));
+        }
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![struct_field]));
+        let batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(struct_array(
+                struct_fields,
+                Some(NullBuffer::from(vec![true, false, true])),
+            ))],
+        )
+        .unwrap();
+        let lance_schema = Arc::new(LanceSchema::try_from(arrow_schema.as_ref()).unwrap());
+        let strategy = versions::v2_0::encoding_strategy();
+
+        let mut batch_encoder = BatchEncoder::try_new(
+            lance_schema.as_ref(),
+            strategy.as_ref(),
+            &EncodingOptions::default(),
+        )
+        .unwrap();
+        let mut external_buffers = OutOfLineBuffers::new(0, 64);
+        let direct_result = batch_encoder.field_encoders[0].maybe_encode(
+            batch.column(0).clone(),
+            &mut external_buffers,
+            RepDefBuilder::default(),
+            0,
+            batch.num_rows() as u64,
+        );
+        let Err(direct_error) = direct_result else {
+            panic!("public BatchEncoder bypassed v2.0 validation");
+        };
+        assert!(matches!(
+            direct_error,
+            lance_core::Error::InvalidInput { .. }
+        ));
+        assert!(direct_error.to_string().contains("struct validity"));
+
+        let options = EncodingOptions::default();
+        let field = &lance_schema.fields[0];
+        let context = FieldEncodingContext {
+            strategy: strategy.as_ref(),
+            options: &options,
+            root_field_metadata: &field.metadata,
+        };
+        let mut column_index = ColumnIndexSequence::default();
+        let mut factory_encoder = strategy
+            .create_field_encoder(field, &mut column_index, &context)
+            .unwrap();
+        let factory_result = factory_encoder.maybe_encode(
+            batch.column(0).clone(),
+            &mut OutOfLineBuffers::new(0, 64),
+            RepDefBuilder::default(),
+            0,
+            batch.num_rows() as u64,
+        );
+        let Err(factory_error) = factory_result else {
+            panic!("public create_field_encoder bypassed v2.0 validation");
+        };
+        assert!(matches!(
+            factory_error,
+            lance_core::Error::InvalidInput { .. }
+        ));
+        assert!(factory_error.to_string().contains("struct validity"));
+
+        let error = encode_batch(
+            &batch,
+            lance_schema,
+            strategy.as_ref(),
+            &EncodingOptions::default(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
+        let message = error.to_string();
+        assert!(message.contains("struct validity"), "{message}");
+        assert!(message.contains("2.0"), "{message}");
+        assert!(message.contains("1 null value"), "{message}");
+    }
+
+    #[test]
+    fn test_v2_0_primitive_fsl_preparation_reuses_array() {
+        let item_field = Arc::new(ArrowField::new("item", DataType::Float32, true));
+        let array: ArrayRef = Arc::new(FixedSizeListArray::new(
+            item_field.clone(),
+            2,
+            Arc::new(Float32Array::from(vec![0.0; 6])),
+            Some(NullBuffer::from(vec![true, false, true])),
+        ));
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new(
+            "vector",
+            DataType::FixedSizeList(item_field, 2),
+            true,
+        )]);
+        let lance_schema = LanceSchema::try_from(&arrow_schema).unwrap();
+        let strategy = versions::v2_0::encoding_strategy();
+        let options = EncodingOptions::default();
+        let field = &lance_schema.fields[0];
+        let context = FieldEncodingContext {
+            strategy: strategy.as_ref(),
+            options: &options,
+            root_field_metadata: &field.metadata,
+        };
+        let mut column_index = ColumnIndexSequence::default();
+        let mut encoder = strategy
+            .create_field_encoder(field, &mut column_index, &context)
+            .unwrap();
+
+        let prepared = encoder.prepare_array(array.clone()).unwrap();
+
+        assert!(Arc::ptr_eq(&prepared, &array));
     }
 
     /// The blocking read path applies the same projection-length validation as
@@ -785,8 +2267,120 @@ mod tests {
         assert_eq!(total_page_num, 8)
     }
 
+    fn assert_zero_max_page_bytes_error(error: lance_core::Error) {
+        assert!(
+            matches!(error, lance_core::Error::InvalidInput { .. }),
+            "unexpected error: {error:?}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("max_page_bytes must be greater than 0, got 0")
+        );
+    }
+
+    #[rstest]
+    #[case::schema_writer(false)]
+    #[case::lazy_writer(true)]
+    #[tokio::test]
+    async fn test_zero_max_page_bytes_rejected(#[case] lazy: bool) {
+        let path = TempObjFile::default();
+        let object_store = ObjectStore::local();
+        let object_writer = object_store.create(&path).await.unwrap();
+        let options = FileWriterOptions {
+            max_page_bytes: Some(0),
+            ..Default::default()
+        };
+
+        let error = if lazy {
+            let mut writer =
+                versions::create_lazy_writer(ConcreteFileVersion::V2_0, object_writer, options)
+                    .unwrap();
+            let batch = arrow_array::record_batch!(("data", UInt64, [1])).unwrap();
+            writer.write_batch(&batch).await.unwrap_err()
+        } else {
+            let schema = LanceSchema::try_from(&Schema::new(vec![Field::new(
+                "data",
+                DataType::UInt64,
+                false,
+            )]))
+            .unwrap();
+            versions::create_writer(ConcreteFileVersion::V2_0, object_writer, schema, options)
+                .err()
+                .expect("zero max_page_bytes should fail")
+        };
+
+        assert_zero_max_page_bytes_error(error);
+    }
+
+    #[tokio::test]
+    async fn test_v2_0_writer_rejects_zero_max_page_bytes() {
+        let path = TempObjFile::default();
+        let object_store = ObjectStore::local();
+        let object_writer = object_store.create(&path).await.unwrap();
+        let schema = LanceSchema::try_from(&Schema::new(vec![Field::new(
+            "data",
+            DataType::UInt64,
+            false,
+        )]))
+        .unwrap();
+        let options = FileWriterOptions {
+            max_page_bytes: Some(0),
+            ..Default::default()
+        };
+
+        let error = versions::v2_0::create_writer(object_writer, schema, options)
+            .err()
+            .expect("zero max_page_bytes should fail");
+        assert_zero_max_page_bytes_error(error);
+    }
+
+    #[tokio::test]
+    async fn test_v2_1_lazy_writer_rejects_zero_max_page_bytes() {
+        let path = TempObjFile::default();
+        let object_store = ObjectStore::local();
+        let object_writer = object_store.create(&path).await.unwrap();
+        let options = FileWriterOptions {
+            max_page_bytes: Some(0),
+            ..Default::default()
+        };
+        let batch = arrow_array::record_batch!(("data", UInt64, [1])).unwrap();
+
+        let mut writer = versions::v2_1::create_lazy_writer(object_writer, options);
+        let error = writer.write_batch(&batch).await.unwrap_err();
+        assert_zero_max_page_bytes_error(error);
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn test_max_page_bytes_env_var() {
+        // `set_var` is unsound while other test threads may read the environment,
+        // so instead the test re-runs itself in a child process that starts with
+        // the variable set. libtest names the thread after the running test, so
+        // the child's filter cannot drift from this test's name.
+        const CHILD_ENV: &str = "LANCE_TEST_MAX_PAGE_BYTES_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    std::thread::current().name().unwrap(),
+                    "--nocapture",
+                ])
+                .env(CHILD_ENV, "1")
+                // 2MiB
+                .env(ENV_LANCE_FILE_WRITER_MAX_PAGE_BYTES, "2097152")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success(),
+                "child test failed: {stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            // libtest also exits 0 when the filter matches no test.
+            assert!(stdout.contains("test result: ok. 1 passed;"), "{stdout}");
+            return;
+        }
+
         let arrow_field = Field::new("data", DataType::UInt64, false);
         let arrow_schema = Schema::new(vec![arrow_field]);
         let lance_schema = LanceSchema::try_from(&arrow_schema).unwrap();
@@ -796,11 +2390,6 @@ mod tests {
         let batch =
             RecordBatch::try_new(arrow_schema.clone().into(), vec![Arc::new(array)]).unwrap();
 
-        // 2MiB
-        unsafe {
-            std::env::set_var(ENV_LANCE_FILE_WRITER_MAX_PAGE_BYTES, "2097152");
-        }
-
         let options = FileWriterOptions {
             max_page_bytes: None, // enforce env
             ..Default::default()
@@ -808,10 +2397,11 @@ mod tests {
 
         let path = TempObjFile::default();
         let object_store = ObjectStore::local();
+        // Only the 2.0 encoder splits pages by `max_page_bytes`.
         let mut writer = create_writer(
             object_store.create(&path).await.unwrap(),
             lance_schema.clone(),
-            ConcreteFileVersion::V2_1,
+            ConcreteFileVersion::V2_0,
             options,
         )
         .unwrap();
@@ -836,6 +2426,8 @@ mod tests {
         .unwrap();
 
         for col_metadata in file_reader.metadata().column_metadatas.iter() {
+            // Without the variable, the 4MB of values stay in one page.
+            assert_eq!(col_metadata.pages.len(), 2);
             for page in col_metadata.pages.iter() {
                 let total_size: u64 = page.buffer_sizes.iter().sum();
                 assert!(
@@ -844,10 +2436,6 @@ mod tests {
                     total_size
                 );
             }
-        }
-
-        unsafe {
-            std::env::set_var(ENV_LANCE_FILE_WRITER_MAX_PAGE_BYTES, "");
         }
     }
 
@@ -922,6 +2510,8 @@ mod tests {
                 compression: None,        // Will use default compression if any
                 compression_level: None,
                 bss: Some(lance_encoding::compression_config::BssMode::Off), // Explicitly disable BSS to ensure RLE is used
+                alp: None,
+                axis_delta: None,
                 minichunk_size: None,
             },
         );
@@ -1198,6 +2788,244 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_v2_3_default_alp_auto_gate() {
+        // With no ALP metadata, the v2.3 writer defaults to AlpMode::Auto: finite
+        // decimal floats pass the entropy gate, high-entropy floats stay flat.
+        use futures::TryStreamExt;
+        use lance_encoding::decoder::FilterExpression;
+        use lance_io::ReadBatchParams;
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("prices", DataType::Float64, false),
+            ArrowField::new("random", DataType::Float64, false),
+        ]));
+        let lance_schema = LanceSchema::try_from(arrow_schema.as_ref()).unwrap();
+
+        let n = 8192usize;
+        let prices = arrow_array::Float64Array::from_iter_values(
+            (0..n).map(|i| ((i * 73) % 10000) as f64 / 100.0),
+        );
+        // Reuse a fixed LCG so the test is deterministic across platforms. The
+        // [-1e12, 1e12) range matches the high-entropy fixture used by the
+        // `should_use_alp` unit test: near-uniform bytes in every position.
+        let mut state = 0x05ee_da1b_2026_1023_u64;
+        let random = arrow_array::Float64Array::from_iter_values((0..n).map(|_| {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 11) as f64 * (2e12 / (1u64 << 53) as f64)) - 1e12
+        }));
+        let batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(prices), Arc::new(random)],
+        )
+        .unwrap();
+
+        let path = TempObjFile::default();
+        let object_store = ObjectStore::local();
+        let mut writer = create_v2_3_writer_with_compression(
+            object_store.create(&path).await.unwrap(),
+            lance_schema.clone(),
+            FileWriterOptions::default(),
+            CompressionParams::new(),
+        )
+        .unwrap();
+        writer.write_batch(&batch).await.unwrap();
+        writer.finish().await.unwrap();
+
+        let fs = FsFixture::default();
+        let file_scheduler = fs
+            .scheduler
+            .open_file(&path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let file_reader = FileReader::try_open(
+            file_scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &LanceCache::no_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        let column_metadatas = &file_reader.metadata().column_metadatas;
+        let prices_encoding = describe_encoding(&column_metadatas[0].pages[0]);
+        let random_encoding = describe_encoding(&column_metadatas[1].pages[0]);
+        assert!(
+            prices_encoding.contains("Alp"),
+            "prices column should use ALP via the Auto gate, got: {prices_encoding}"
+        );
+        assert!(
+            !random_encoding.contains("Alp"),
+            "random column should stay flat under the Auto gate, got: {random_encoding}"
+        );
+
+        // Both columns must round-trip bitwise; this also exercises the reader.
+        let projection = reader_projection_from_column_names(
+            ConcreteFileVersion::V2_3,
+            &lance_schema,
+            &["prices", "random"],
+        )
+        .unwrap();
+        let batches: Vec<RecordBatch> = file_reader
+            .read_stream_projected(
+                ReadBatchParams::RangeFull,
+                1024,
+                16,
+                projection,
+                FilterExpression::no_filter(),
+            )
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let got_prices: Vec<u64> = batches
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<arrow_array::Float64Array>()
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .map(|v| v.to_bits())
+            })
+            .collect();
+        assert_eq!(
+            got_prices,
+            (0..n)
+                .map(|i| (((i * 73) % 10000) as f64 / 100.0).to_bits())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_field_metadata_alp_round_trip() {
+        use futures::TryStreamExt;
+        use lance_encoding::constants::ALP_META_KEY;
+        use lance_encoding::decoder::FilterExpression;
+        use lance_io::ReadBatchParams;
+
+        let mut metadata = HashMap::new();
+        metadata.insert(ALP_META_KEY.to_string(), "on".to_string());
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("price", DataType::Float32, false).with_metadata(metadata.clone()),
+            ArrowField::new("sensor", DataType::Float64, false).with_metadata(metadata),
+        ]));
+        let lance_schema = LanceSchema::try_from(arrow_schema.as_ref()).unwrap();
+
+        let n = 8192usize;
+        let prices =
+            Float32Array::from_iter_values((0..n).map(|i| ((i * 73) % 10000) as f32 / 100.0));
+        let sensors = arrow_array::Float64Array::from_iter_values(
+            (0..n).map(|i| ((i * 73) % 10000) as f64 / 100.0),
+        );
+        let batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(prices), Arc::new(sensors)],
+        )
+        .unwrap();
+
+        let path = TempObjFile::default();
+        let object_store = ObjectStore::local();
+        let mut writer = create_v2_3_writer_with_compression(
+            object_store.create(&path).await.unwrap(),
+            lance_schema.clone(),
+            FileWriterOptions::default(),
+            CompressionParams::new(),
+        )
+        .unwrap();
+        writer.write_batch(&batch).await.unwrap();
+        writer.finish().await.unwrap();
+
+        let fs = FsFixture::default();
+        let file_scheduler = fs
+            .scheduler
+            .open_file(&path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let file_reader = FileReader::try_open(
+            file_scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &LanceCache::no_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        // Both float columns should have been written with the ALP codec.
+        let column_metadatas = &file_reader.metadata().column_metadatas;
+        for (i, column) in ["price", "sensor"].iter().enumerate() {
+            let encoding = describe_encoding(&column_metadatas[i].pages[0]);
+            assert!(
+                encoding.contains("Alp"),
+                "column {column} should use ALP encoding, got: {encoding}"
+            );
+        }
+
+        // Full pipeline round-trip must be bitwise identical.
+        let projection = reader_projection_from_column_names(
+            ConcreteFileVersion::V2_3,
+            &lance_schema,
+            &["price", "sensor"],
+        )
+        .unwrap();
+        let batches: Vec<RecordBatch> = file_reader
+            .read_stream_projected(
+                ReadBatchParams::RangeFull,
+                1024,
+                16,
+                projection,
+                FilterExpression::no_filter(),
+            )
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let got_prices: Vec<u32> = batches
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<Float32Array>()
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .map(|v| v.to_bits())
+            })
+            .collect();
+        let got_sensors: Vec<u64> = batches
+            .iter()
+            .flat_map(|b| {
+                b.column(1)
+                    .as_any()
+                    .downcast_ref::<arrow_array::Float64Array>()
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .map(|v| v.to_bits())
+            })
+            .collect();
+        assert_eq!(
+            got_prices,
+            (0..n)
+                .map(|i| (((i * 73) % 10000) as f32 / 100.0).to_bits())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            got_sensors,
+            (0..n)
+                .map(|i| (((i * 73) % 10000) as f64 / 100.0).to_bits())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
     async fn test_large_page_split_on_read() {
         use arrow_array::Array;
         use futures::TryStreamExt;
@@ -1378,5 +3206,361 @@ mod tests {
             write_and_read_batches(&batches, Some((spill_store, spill_path.as_ref().clone())))
                 .await;
         assert_eq!(baseline, spilled);
+    }
+
+    /// A smooth trajectory with a constant dimension, a NaN payload and a signed
+    /// zero, so the round trip checks float bits rather than float equality.
+    /// With `num_levels`, every value is instead one of that many levels.
+    fn pcodec_trajectory(num_rows: usize, dimension: usize, num_levels: Option<usize>) -> Vec<f64> {
+        let mut values: Vec<f64> = (0..num_rows * dimension)
+            .map(|i| {
+                let (row, item) = (i / dimension, i % dimension);
+                match item {
+                    _ if num_levels.is_some() => (i % num_levels.unwrap()) as f64,
+                    0 if dimension > 1 => 1.0,
+                    _ => (row as f64 * 0.01 * (item + 1) as f64).sin() * 100.0 + item as f64,
+                }
+            })
+            .collect();
+        values[dimension + 1] = f64::from_bits(0x7ff8_dead_beef_0001);
+        values[2 * dimension + 1] = -0.0;
+        values
+    }
+
+    /// Writes `array` as the 2.3 column "signal" and opens it again.
+    async fn write_v2_3_signal(
+        array: &ArrayRef,
+        metadata: HashMap<String, String>,
+        params: CompressionParams,
+    ) -> lance_core::Result<(FileReader, LanceSchema)> {
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("signal", array.data_type().clone(), array.null_count() > 0)
+                .with_metadata(metadata),
+        ]));
+        let lance_schema = LanceSchema::try_from(arrow_schema.as_ref()).unwrap();
+        let batch = RecordBatch::try_new(arrow_schema, vec![array.clone()]).unwrap();
+
+        let path = TempObjFile::default();
+        let object_store = ObjectStore::local();
+        let mut writer = create_v2_3_writer_with_compression(
+            object_store.create(&path).await.unwrap(),
+            lance_schema.clone(),
+            FileWriterOptions::default(),
+            params,
+        )
+        .unwrap();
+        writer.write_batch(&batch).await?;
+        writer.finish().await?;
+
+        let fs = FsFixture::default();
+        let file_scheduler = fs
+            .scheduler
+            .open_file(&path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let file_reader = FileReader::try_open(
+            file_scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &LanceCache::no_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+        Ok((file_reader, lance_schema))
+    }
+
+    async fn read_v2_3_signal(
+        file_reader: &FileReader,
+        lance_schema: &LanceSchema,
+        params: lance_io::ReadBatchParams,
+    ) -> ArrayRef {
+        use futures::TryStreamExt;
+        use lance_encoding::decoder::FilterExpression;
+
+        let projection = reader_projection_from_column_names(
+            ConcreteFileVersion::V2_3,
+            lance_schema,
+            &["signal"],
+        )
+        .unwrap();
+        let batches: Vec<RecordBatch> = file_reader
+            .read_stream_projected(params, 1024, 16, projection, FilterExpression::no_filter())
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let columns: Vec<&dyn Array> = batches.iter().map(|b| b.column(0).as_ref()).collect();
+        arrow_select::concat::concat(&columns).unwrap()
+    }
+
+    fn pcodec_metadata() -> HashMap<String, String> {
+        HashMap::from([(
+            lance_encoding::constants::COMPRESSION_META_KEY.to_string(),
+            "pcodec".to_string(),
+        )])
+    }
+
+    fn page_encodings(file_reader: &FileReader) -> Vec<String> {
+        file_reader.metadata().column_metadatas[0]
+            .pages
+            .iter()
+            .map(describe_encoding)
+            .collect()
+    }
+
+    #[rstest]
+    #[case::narrow_f16(DataType::Float16, vec![6], None, 5000)]
+    #[case::narrow_f32(DataType::Float32, vec![3], None, 5000)]
+    #[case::nested_f64(DataType::Float64, vec![4, 4], None, 5000)]
+    #[case::wide_f64(DataType::Float64, vec![64], None, 5000)]
+    // Rows wider than half a chunk still need two rows per non-final chunk.
+    #[case::very_wide_f64(DataType::Float64, vec![4096], None, 7)]
+    #[case::scalar_f64(DataType::Float64, vec![], None, 5000)]
+    // Few distinct values would otherwise be dictionary encoded.
+    #[case::few_levels_f64(DataType::Float64, vec![], Some(4), 5000)]
+    #[case::few_levels_vector_f64(DataType::Float64, vec![8], Some(4), 5000)]
+    #[tokio::test]
+    async fn test_v2_3_pcodec_round_trip(
+        #[case] item_type: DataType,
+        #[case] dims: Vec<i32>,
+        #[case] num_levels: Option<usize>,
+        #[case] num_rows: usize,
+    ) {
+        use lance_io::ReadBatchParams;
+
+        let dimension = dims.iter().product::<i32>() as usize;
+        let values = pcodec_trajectory(num_rows, dimension, num_levels);
+        let mut array: ArrayRef = match item_type {
+            DataType::Float16 => {
+                Arc::new(Float16Array::from_iter_values(values.iter().map(|v| {
+                    <Float16Type as ArrowPrimitiveType>::Native::from_f64(*v)
+                })))
+            }
+            DataType::Float32 => Arc::new(Float32Array::from_iter_values(
+                values.iter().map(|v| *v as f32),
+            )),
+            _ => Arc::new(arrow_array::Float64Array::from(values)),
+        };
+        for dim in dims.iter().rev() {
+            let item = Arc::new(ArrowField::new("item", array.data_type().clone(), true));
+            array = Arc::new(FixedSizeListArray::new(item, *dim, array, None));
+        }
+        let (file_reader, lance_schema) =
+            write_v2_3_signal(&array, pcodec_metadata(), CompressionParams::new())
+                .await
+                .unwrap();
+        for encoding in page_encodings(&file_reader) {
+            assert!(
+                encoding.contains("Pcodec"),
+                "expected pcodec, got: {encoding}"
+            );
+        }
+
+        // Arrow compares primitive values bytewise, so equality is bit-exact.
+        let full = read_v2_3_signal(&file_reader, &lance_schema, ReadBatchParams::RangeFull).await;
+        assert_eq!(full.to_data(), array.to_data());
+        let last_row = num_rows as u32 - 1;
+        for row in [0, 1, 2, 1023, 1024, last_row]
+            .into_iter()
+            .filter(|r| *r <= last_row)
+        {
+            let taken = read_v2_3_signal(
+                &file_reader,
+                &lance_schema,
+                ReadBatchParams::Indices(arrow_array::UInt32Array::from(vec![row])),
+            )
+            .await;
+            assert_eq!(taken.to_data(), array.slice(row as usize, 1).to_data());
+        }
+    }
+
+    /// A `FixedSizeList<Float64, dimension>` trajectory with optional null
+    /// items and null rows.
+    fn pcodec_vectors(
+        num_rows: usize,
+        dimension: i32,
+        item_validity: Option<NullBuffer>,
+        row_validity: Option<NullBuffer>,
+    ) -> ArrayRef {
+        let values = pcodec_trajectory(num_rows, dimension as usize, None);
+        let items = arrow_array::Float64Array::new(values.into(), item_validity);
+        let item = Arc::new(ArrowField::new("item", DataType::Float64, true));
+        Arc::new(FixedSizeListArray::new(
+            item,
+            dimension,
+            Arc::new(items),
+            row_validity,
+        ))
+    }
+
+    #[rstest]
+    // pcodec cannot hold null items, so wide rows fall back to full zip
+    // instead of failing in a raw mini-block.
+    #[case::wide_null_items(
+        pcodec_vectors(64, 1024, Some(NullBuffer::from_iter((0..64 * 1024).map(|i| i != 5))), None),
+        false
+    )]
+    // Mostly-null wide rows would otherwise be stored sparse and uncompressed.
+    #[case::mostly_null_wide_rows(
+        pcodec_vectors(5000, 64, None, Some(NullBuffer::from_iter((0..5000).map(|i| i % 4 == 0)))),
+        true
+    )]
+    #[tokio::test]
+    async fn test_v2_3_pcodec_routing(#[case] array: ArrayRef, #[case] expect_pcodec: bool) {
+        let (file_reader, lance_schema) =
+            write_v2_3_signal(&array, pcodec_metadata(), CompressionParams::new())
+                .await
+                .unwrap();
+        for encoding in page_encodings(&file_reader) {
+            assert_eq!(encoding.contains("Pcodec"), expect_pcodec, "{encoding}");
+        }
+        let full = read_v2_3_signal(
+            &file_reader,
+            &lance_schema,
+            lance_io::ReadBatchParams::RangeFull,
+        )
+        .await;
+        assert_eq!(full.to_data(), array.to_data());
+    }
+
+    #[tokio::test]
+    async fn test_v2_3_pcodec_rejects_full_zip() {
+        let array = pcodec_vectors(16, 16, None, None);
+        let mut metadata = pcodec_metadata();
+        metadata.insert(
+            STRUCTURAL_ENCODING_META_KEY.to_string(),
+            "fullzip".to_string(),
+        );
+        let err = write_v2_3_signal(&array, metadata, CompressionParams::new())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, lance_core::Error::InvalidInput { .. }),
+            "{err}"
+        );
+        assert!(
+            err.to_string()
+                .contains("Field 'signal' requests pcodec compression"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_v2_3_pcodec_params_keep_dictionary_buffers_writable() {
+        // Configured through CompressionParams, pcodec does not disable the
+        // dictionary, whose indices and values must keep their own compression.
+        let array: ArrayRef = Arc::new(arrow_array::Float64Array::from(pcodec_trajectory(
+            5000,
+            1,
+            Some(4),
+        )));
+        let mut params = CompressionParams::new();
+        params.columns.insert(
+            "signal".to_string(),
+            CompressionFieldParams {
+                compression: Some("pcodec".to_string()),
+                ..Default::default()
+            },
+        );
+        let (file_reader, lance_schema) = write_v2_3_signal(&array, HashMap::new(), params)
+            .await
+            .unwrap();
+        let read = read_v2_3_signal(
+            &file_reader,
+            &lance_schema,
+            lance_io::ReadBatchParams::RangeFull,
+        )
+        .await;
+        assert_eq!(read.to_data(), array.to_data());
+    }
+    #[rstest]
+    #[case::mixed(false)]
+    #[case::all_null(true)]
+    #[tokio::test]
+    async fn test_write_fixed_size_list_masked_struct_nulls(
+        #[case] all_null: bool,
+        #[values(ConcreteFileVersion::V2_2, ConcreteFileVersion::V2_3)]
+        version: ConcreteFileVersion,
+        #[values(false, true)] sliced: bool,
+        #[values(false, true)] column_write: bool,
+    ) {
+        let valid = if all_null {
+            vec![false; 4]
+        } else {
+            vec![true, false, true, false]
+        };
+        let child_valid: Vec<bool> = valid.iter().flat_map(|valid| [*valid; 2]).collect();
+        let values = Int32Array::from(
+            child_valid
+                .iter()
+                .enumerate()
+                .map(|(i, valid)| valid.then_some(i as i32))
+                .collect::<Vec<_>>(),
+        );
+        let entries = Arc::new(StructArray::new(
+            vec![ArrowField::new("value", DataType::Int32, false)].into(),
+            vec![Arc::new(values)],
+            Some(NullBuffer::from(child_valid)),
+        ));
+        let lists = FixedSizeListArray::try_new(
+            Arc::new(ArrowField::new("item", entries.data_type().clone(), false)),
+            2,
+            entries,
+            Some(NullBuffer::from(valid)),
+        )
+        .unwrap();
+        let lists = if sliced { lists.slice(1, 2) } else { lists };
+        let batch =
+            RecordBatch::try_from_iter(vec![("lists", Arc::new(lists) as ArrayRef)]).unwrap();
+        let fs = FsFixture::default();
+        let mut writer = create_writer(
+            fs.object_store.create(&fs.tmp_path).await.unwrap(),
+            LanceSchema::try_from(batch.schema().as_ref()).unwrap(),
+            version,
+            FileWriterOptions::default(),
+        )
+        .unwrap();
+        if column_write {
+            writer
+                .write_column(0, batch["lists"].clone())
+                .await
+                .unwrap();
+        } else {
+            writer.write_batch(&batch).await.unwrap();
+        }
+        assert_eq!(
+            writer.finish().await.unwrap().num_rows,
+            batch.num_rows() as u64
+        );
+        let scheduler = fs
+            .scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let reader = FileReader::try_open(
+            scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &LanceCache::no_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+        let batches: Vec<RecordBatch> = reader
+            .read_stream(
+                lance_io::ReadBatchParams::RangeFull,
+                2,
+                1,
+                lance_encoding::decoder::FilterExpression::no_filter(),
+            )
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let actual = arrow_select::concat::concat_batches(&batch.schema(), &batches).unwrap();
+        assert_eq!(actual, batch);
     }
 }

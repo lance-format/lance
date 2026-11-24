@@ -9,7 +9,8 @@ use arrow_schema::SchemaRef;
 use uuid::Uuid;
 
 use crate::dataset::Dataset;
-use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
+use crate::dataset::mem_wal::index::IndexStore;
+use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
 
 /// A watermark marking how far into one shard's fresh tier a prior scan
 /// observed, so membership can be evaluated as of that point (see
@@ -176,6 +177,10 @@ pub enum LsmDataSource {
         shard_id: Uuid,
         /// Generation number.
         generation: LsmGeneration,
+        /// Visible batch count, read once when the source is collected. Every
+        /// part of a query reads the memtable up to this count, so the
+        /// cross-generation block lists and the memtable scan see the same rows.
+        visible_batch_count: usize,
     },
 }
 

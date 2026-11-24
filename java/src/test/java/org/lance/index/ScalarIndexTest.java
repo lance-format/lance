@@ -13,14 +13,22 @@
  */
 package org.lance.index;
 
+import org.lance.CommitBuilder;
 import org.lance.Dataset;
 import org.lance.Fragment;
 import org.lance.LockManager;
 import org.lance.TestUtils;
+import org.lance.Transaction;
 import org.lance.WriteParams;
+import org.lance.index.scalar.FmIndexParams;
+import org.lance.index.scalar.InvertedIndexParams;
+import org.lance.index.scalar.MinHashLshIndexParams;
 import org.lance.index.scalar.ScalarIndexParams;
 import org.lance.ipc.LanceScanner;
 import org.lance.ipc.ScanOptions;
+import org.lance.operation.CreateIndex;
+import org.lance.update.UpdateParams;
+import org.lance.util.JsonUtils;
 
 import org.apache.arrow.c.ArrowArrayStream;
 import org.apache.arrow.c.Data;
@@ -49,10 +57,13 @@ import org.junit.jupiter.params.provider.EnumSource;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -63,6 +74,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -614,8 +626,14 @@ public class ScalarIndexTest {
       testDatasetB.createEmptyDataset().close();
       datasetA = testDatasetA.write(1, 20);
       datasetB = testDatasetB.write(1, 20);
-      optionsA = createInvertedSegmentOptions(datasetA.getFragments().get(0).getId());
-      optionsB = createInvertedSegmentOptions(datasetB.getFragments().get(0).getId());
+      // Committed builds, since only they hold the per-Dataset build lock.
+      optionsA =
+          IndexOptions.builder(
+                  Collections.singletonList("name"),
+                  IndexType.INVERTED,
+                  createInvertedIndexParams())
+              .build();
+      optionsB = optionsA;
     }
 
     private void runCreates(IndexBuildProgress progressA, IndexBuildProgress progressB)
@@ -763,6 +781,443 @@ public class ScalarIndexTest {
   }
 
   @Test
+  @SuppressWarnings("unchecked")
+  public void testCreateMinHashLshIndexSegments(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("minhash_segments").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      testDataset.write(1, 10).close();
+      try (Dataset dataset = testDataset.write(2, 10)) {
+        ScalarIndexParams minhashParams =
+            MinHashLshIndexParams.builder()
+                .numHashes(64)
+                .numBands(16)
+                .shingleSize(2)
+                .tokenizer(
+                    InvertedIndexParams.builder().baseTokenizer("whitespace").withPosition(true))
+                .build();
+        // Only tokenizer settings are taken from the FTS builder.
+        Map<String, Object> tokenizerJson =
+            (Map<String, Object>)
+                JsonUtils.fromJson(minhashParams.getJsonParams().get()).get("tokenizer");
+        assertFalse(tokenizerJson.containsKey("with_position"));
+
+        IndexParams indexParams = IndexParams.builder().setScalarIndexParams(minhashParams).build();
+        List<Index> segments = new ArrayList<>();
+        for (Fragment fragment : dataset.getFragments()) {
+          segments.add(
+              dataset.createIndex(
+                  IndexOptions.builder(
+                          Collections.singletonList("name"), IndexType.MINHASH_LSH, indexParams)
+                      .withIndexName("name_minhash")
+                      .withFragmentIds(Collections.singletonList(fragment.getId()))
+                      .build()));
+        }
+        Index merged = dataset.mergeExistingIndexSegments(segments);
+        List<Index> committed =
+            dataset.commitExistingIndexSegments(
+                "name_minhash", "name", Collections.singletonList(merged));
+        assertEquals(IndexType.MINHASH_LSH, segments.get(0).indexType());
+        assertEquals(IndexType.MINHASH_LSH, committed.get(0).indexType());
+
+        // The parameters and the tokenizer reach the Rust index.
+        Map<String, Object> stats =
+            ((List<Map<String, Object>>) dataset.getIndexStatistics("name_minhash").get("indices"))
+                .get(0);
+        assertEquals(64, ((Number) stats.get("num_hashes")).intValue());
+        assertEquals(20, ((Number) stats.get("num_docs")).intValue());
+        String detailsJson = dataset.describeIndices().get(0).getDetailsJson();
+        assertEquals(
+            "whitespace",
+            ((Map<String, Object>) JsonUtils.fromJson(detailsJson).get("tokenizer"))
+                .get("base_tokenizer"));
+      }
+    }
+  }
+
+  @Test
+  public void testCreateFmIndex(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("fm_index").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      testDataset.write(1, 10).close();
+      // The second fragment holds two NULL names and "P0" through "P5".
+      try (Dataset written = testDataset.writeSortByDataset(2);
+          Dataset dataset =
+              written
+                  .update(
+                      new UpdateParams(Collections.singletonMap("name", "'Person\0007'"))
+                          .withWhere("name = 'Person 0'"))
+                  .getDataset()) {
+        IndexParams indexParams =
+            IndexParams.builder()
+                .setScalarIndexParams(FmIndexParams.builder().numSegments(2).build())
+                .build();
+        dataset.createIndex(
+            IndexOptions.builder(Collections.singletonList("name"), IndexType.FM, indexParams)
+                .withIndexName("name_fm")
+                .build());
+
+        List<Index> segments = dataset.describeIndices().get(0).getSegments();
+        assertEquals(2, segments.size());
+        assertEquals(IndexType.FM, segments.get(0).indexType());
+        // Both the original "Person 7" and the NUL-containing name contain '7'.
+        assertEquals(
+            2, dataset.countIndexedRows("name_fm", "contains(name, '7')", Optional.empty()));
+        // Every non-NULL name contains 'P'; the two NULL rows do not match.
+        assertEquals(
+            18, dataset.countIndexedRows("name_fm", "contains(name, 'P')", Optional.empty()));
+
+        String spacedFilter = "contains(name, 'Person 7')";
+        assertEquals(1, dataset.countRows(spacedFilter));
+        // The normalized NUL is an FM candidate, but source rechecking excludes it.
+        assertEquals(1, dataset.countIndexedRows("name_fm", spacedFilter, Optional.empty()));
+        // NUL patterns still cannot produce a sound FM candidate set.
+        IllegalArgumentException error =
+            Assertions.assertThrows(
+                IllegalArgumentException.class,
+                () ->
+                    dataset.countIndexedRows(
+                        "name_fm", "contains(name, 'Person\0')", Optional.empty()));
+        assertTrue(
+            error.getMessage().contains("Filter cannot be planned using scalar index 'name_fm'"));
+        assertEquals(1, dataset.countRows("contains(name, 'Person\0')"));
+      }
+    }
+  }
+
+  @Test
+  public void testCreateFmIndexDefaultsToOneSegment(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("fm_index_default").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      testDataset.write(1, 10).close();
+      try (Dataset dataset = testDataset.write(2, 10)) {
+        IndexParams indexParams =
+            IndexParams.builder().setScalarIndexParams(FmIndexParams.builder().build()).build();
+        dataset.createIndex(
+            IndexOptions.builder(Collections.singletonList("name"), IndexType.FM, indexParams)
+                .withIndexName("name_fm")
+                .build());
+
+        assertEquals(1, dataset.describeIndices().get(0).getSegments().size());
+        assertEquals(
+            2, dataset.countIndexedRows("name_fm", "contains(name, '7')", Optional.empty()));
+        String spacedFilter = "contains(name, 'Person 7')";
+        assertEquals(2, dataset.countRows(spacedFilter));
+        assertEquals(2, dataset.countIndexedRows("name_fm", spacedFilter, Optional.empty()));
+      }
+    }
+  }
+
+  @Test
+  public void testCountIndexedRowsSelectsPhysicalSegments(@TempDir Path tempDir) throws Exception {
+    assertPhysicalSegmentSelection(tempDir.resolve("segments"), false);
+  }
+
+  @Test
+  public void testCountIndexedRowsStableRowIdsExcludeDeletions(@TempDir Path tempDir)
+      throws Exception {
+    assertPhysicalSegmentSelection(tempDir.resolve("stable-segments"), true);
+  }
+
+  @Test
+  public void testCountIndexedRowsDoesNotOpenUnselectedSegment(@TempDir Path tempDir)
+      throws Exception {
+    String filter = "name >= 'Person 0'";
+    Path datasetPath = tempDir.resolve("unopened");
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      UUID segmentA;
+      UUID segmentB;
+      String indexName;
+      try (NamedSegments segments = createNamedSegments(allocator, datasetPath, false, 10, 4)) {
+        segmentA = segments.segmentA.uuid();
+        segmentB = segments.segmentB.uuid();
+        indexName = segments.indexName;
+      }
+      // Reopen after deleting B so a session cache cannot satisfy the query.
+      deleteIndexSegment(datasetPath, segmentB);
+      try (Dataset dataset = Dataset.open(datasetPath.toString(), allocator)) {
+        assertEquals(
+            10,
+            dataset.countIndexedRows(
+                indexName, filter, Collections.singletonList(segmentA), Optional.empty()));
+        Exception missingSegment =
+            Assertions.assertThrows(
+                Exception.class,
+                () ->
+                    dataset.countIndexedRows(
+                        indexName, filter, Collections.singletonList(segmentB), Optional.empty()));
+        assertTrue(
+            missingSegment.getMessage() != null && !missingSegment.getMessage().isEmpty(),
+            "opening the deleted segment should fail, got: " + missingSegment);
+      }
+    }
+  }
+
+  private void assertPhysicalSegmentSelection(Path datasetPath, boolean stableRowIds)
+      throws Exception {
+    String filter = "name >= 'Person 0'";
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE);
+        NamedSegments segments = createNamedSegments(allocator, datasetPath, stableRowIds, 10, 4)) {
+      Dataset dataset = segments.dataset;
+      List<UUID> segmentA = Collections.singletonList(segments.segmentA.uuid());
+      List<UUID> segmentB = Collections.singletonList(segments.segmentB.uuid());
+      List<UUID> both = Arrays.asList(segments.segmentB.uuid(), segments.segmentA.uuid());
+      int fragmentA = fragmentId(segments.segmentA);
+      int fragmentB = fragmentId(segments.segmentB);
+
+      assertEquals(
+          10, dataset.countIndexedRows(segments.indexName, filter, segmentA, Optional.empty()));
+      assertEquals(
+          4, dataset.countIndexedRows(segments.indexName, filter, segmentB, Optional.empty()));
+      assertEquals(
+          14, dataset.countIndexedRows(segments.indexName, filter, both, Optional.empty()));
+      assertEquals(14, dataset.countIndexedRows(segments.indexName, filter, Optional.empty()));
+      assertEquals(
+          14,
+          dataset.countIndexedRows(
+              segments.indexName, filter, both, Optional.of(Arrays.asList(fragmentB, fragmentA))));
+      assertEquals(
+          10,
+          dataset.countIndexedRows(
+              segments.indexName, filter, Optional.of(Collections.singletonList(fragmentA))));
+
+      Exception unindexedFilter =
+          Assertions.assertThrows(
+              IllegalArgumentException.class,
+              () -> dataset.countIndexedRows(segments.indexName, "id = 0", Optional.empty()));
+      assertTrue(
+          unindexedFilter.getMessage().contains(segments.indexName), unindexedFilter.getMessage());
+      assertTrue(
+          unindexedFilter.getMessage().contains("cannot be planned"), unindexedFilter.getMessage());
+
+      Exception coverageMismatch =
+          Assertions.assertThrows(
+              IllegalArgumentException.class,
+              () ->
+                  dataset.countIndexedRows(
+                      segments.indexName,
+                      filter,
+                      segmentA,
+                      Optional.of(Collections.singletonList(fragmentB))));
+      assertTrue(
+          coverageMismatch.getMessage().contains("do not match selected segment coverage"),
+          coverageMismatch.getMessage());
+      assertTrue(
+          coverageMismatch.getMessage().contains(Integer.toString(fragmentA)),
+          coverageMismatch.getMessage());
+      assertTrue(
+          coverageMismatch.getMessage().contains(Integer.toString(fragmentB)),
+          coverageMismatch.getMessage());
+
+      Exception unknownFragment =
+          Assertions.assertThrows(
+              IllegalArgumentException.class,
+              () ->
+                  dataset.countIndexedRows(
+                      segments.indexName,
+                      filter,
+                      segmentA,
+                      Optional.of(Collections.singletonList(99))));
+      assertTrue(
+          unknownFragment.getMessage().contains("unknown fragment IDs"),
+          unknownFragment.getMessage());
+
+      Exception duplicateFragments =
+          Assertions.assertThrows(
+              IllegalArgumentException.class,
+              () ->
+                  dataset.countIndexedRows(
+                      segments.indexName,
+                      filter,
+                      segmentA,
+                      Optional.of(Arrays.asList(fragmentA, fragmentA))));
+      assertTrue(
+          duplicateFragments.getMessage().contains("duplicate fragment IDs"),
+          duplicateFragments.getMessage());
+
+      Exception unknownSegment =
+          Assertions.assertThrows(
+              IllegalArgumentException.class,
+              () ->
+                  dataset.countIndexedRows(
+                      segments.indexName,
+                      filter,
+                      Collections.singletonList(UUID.randomUUID()),
+                      Optional.empty()));
+      assertTrue(
+          unknownSegment.getMessage().contains("does not exist"), unknownSegment.getMessage());
+
+      Index otherIndex =
+          dataset.createIndex(
+              IndexOptions.builder(
+                      Collections.singletonList("id"), IndexType.BTREE, btreeIndexParams())
+                  .withIndexName("other_index")
+                  .build());
+      Exception wrongIndex =
+          Assertions.assertThrows(
+              IllegalArgumentException.class,
+              () ->
+                  dataset.countIndexedRows(
+                      segments.indexName,
+                      filter,
+                      Collections.singletonList(otherIndex.uuid()),
+                      Optional.empty()));
+      assertTrue(wrongIndex.getMessage().contains("other_index"), wrongIndex.getMessage());
+      assertTrue(wrongIndex.getMessage().contains(segments.indexName), wrongIndex.getMessage());
+
+      Exception duplicateSegments =
+          Assertions.assertThrows(
+              IllegalArgumentException.class,
+              () ->
+                  dataset.countIndexedRows(
+                      segments.indexName,
+                      filter,
+                      Arrays.asList(segments.segmentA.uuid(), segments.segmentA.uuid()),
+                      Optional.empty()));
+      assertTrue(
+          duplicateSegments.getMessage().contains("duplicate UUIDs"),
+          duplicateSegments.getMessage());
+      Assertions.assertThrows(
+          IllegalArgumentException.class,
+          () ->
+              dataset.countIndexedRows(
+                  segments.indexName, filter, Collections.emptyList(), Optional.empty()));
+
+      dataset.delete("name = 'Person 0'");
+      assertEquals(
+          9, dataset.countIndexedRows(segments.indexName, filter, segmentA, Optional.empty()));
+      assertEquals(
+          3, dataset.countIndexedRows(segments.indexName, filter, segmentB, Optional.empty()));
+      assertEquals(
+          12, dataset.countIndexedRows(segments.indexName, filter, both, Optional.empty()));
+      assertEquals(12, dataset.countRows(filter));
+    }
+  }
+
+  private NamedSegments createNamedSegments(
+      BufferAllocator allocator, Path datasetPath, boolean stableRowIds, int rowsA, int rowsB)
+      throws Exception {
+    TestUtils.SimpleTestDataset testDataset =
+        new TestUtils.SimpleTestDataset(allocator, datasetPath.toString());
+    WriteParams.Builder createParams = new WriteParams.Builder();
+    if (stableRowIds) {
+      createParams.withEnableStableRowIds(true);
+    }
+    testDataset.createDatasetWithWriteParams(createParams.build()).close();
+    testDataset.write(1, rowsA).close();
+    Dataset dataset = testDataset.write(2, rowsB);
+    List<Fragment> fragments = dataset.getFragments();
+    assertEquals(2, fragments.size());
+    Fragment fragmentA = null;
+    Fragment fragmentB = null;
+    for (Fragment fragment : fragments) {
+      long physicalRows = fragment.metadata().getPhysicalRows();
+      if (physicalRows == rowsA) {
+        fragmentA = fragment;
+      } else if (physicalRows == rowsB) {
+        fragmentB = fragment;
+      }
+    }
+    assertNotNull(fragmentA);
+    assertNotNull(fragmentB);
+
+    String indexName = "name_idx";
+    List<Index> committed =
+        commitBtreeSegments(dataset, indexName, "name", Arrays.asList(fragmentA, fragmentB));
+    return new NamedSegments(
+        dataset,
+        indexName,
+        indexCovering(committed, fragmentA.getId()),
+        indexCovering(committed, fragmentB.getId()));
+  }
+
+  private static IndexParams btreeIndexParams() {
+    return IndexParams.builder()
+        .setScalarIndexParams(ScalarIndexParams.create("btree", "{\"zone_size\": 2048}"))
+        .build();
+  }
+
+  private static List<Index> commitBtreeSegments(
+      Dataset dataset, String indexName, String column, List<Fragment> fragments) {
+    List<Index> segments = new ArrayList<>();
+    for (Fragment fragment : fragments) {
+      segments.add(
+          dataset.createIndex(
+              IndexOptions.builder(
+                      Collections.singletonList(column), IndexType.BTREE, btreeIndexParams())
+                  .withIndexName(indexName)
+                  .withFragmentIds(Collections.singletonList(fragment.getId()))
+                  .build()));
+    }
+    List<Index> committed = dataset.commitExistingIndexSegments(indexName, column, segments);
+    assertEquals(fragments.size(), committed.size());
+    return committed;
+  }
+
+  private static Index indexCovering(List<Index> indexes, int fragmentId) {
+    for (Index index : indexes) {
+      if (index.fragments().orElse(Collections.emptyList()).contains(fragmentId)) {
+        return index;
+      }
+    }
+    throw new AssertionError("no committed segment covers fragment " + fragmentId);
+  }
+
+  private static int fragmentId(Index segment) {
+    List<Integer> fragments =
+        segment
+            .fragments()
+            .orElseThrow(
+                () ->
+                    new AssertionError("segment " + segment.uuid() + " has no fragment coverage"));
+    assertEquals(1, fragments.size(), "expected one fragment in " + segment.uuid());
+    return fragments.get(0);
+  }
+
+  private static void deleteIndexSegment(Path datasetPath, UUID uuid) throws IOException {
+    Path indexDir = datasetPath.resolve("_indices").resolve(uuid.toString());
+    assertTrue(Files.isDirectory(indexDir), "expected index directory " + indexDir);
+    try (Stream<Path> walk = Files.walk(indexDir)) {
+      walk.sorted(Comparator.reverseOrder())
+          .forEach(
+              path -> {
+                try {
+                  Files.delete(path);
+                } catch (IOException e) {
+                  throw new UncheckedIOException(e);
+                }
+              });
+    }
+  }
+
+  private static final class NamedSegments implements AutoCloseable {
+    private final Dataset dataset;
+    private final String indexName;
+    private final Index segmentA;
+    private final Index segmentB;
+
+    private NamedSegments(Dataset dataset, String indexName, Index segmentA, Index segmentB) {
+      this.dataset = dataset;
+      this.indexName = indexName;
+      this.segmentA = segmentA;
+      this.segmentB = segmentB;
+    }
+
+    @Override
+    public void close() {
+      dataset.close();
+    }
+  }
+
+  @Test
   public void testRangedBTreeIndex(@TempDir Path tempDir) throws Exception {
     String datasetPath = tempDir.resolve("ranged_btree_map").toString();
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
@@ -781,13 +1236,13 @@ public class ScalarIndexTest {
                   dataset.newScan(
                       new ScanOptions.Builder()
                           .fragmentIds(Collections.singletonList(fragment.getId()))
-                          .withRowId(true)
+                          .withRowAddress(true)
                           .columns(Collections.singletonList("id"))
                           .build());
               ArrowReader arrowReader = scanner.scanBatches(); ) {
             while (arrowReader.loadNextBatch()) {
               VectorSchemaRoot root = arrowReader.getVectorSchemaRoot();
-              UInt8Vector rowIdVec = (UInt8Vector) root.getVector("_rowid");
+              UInt8Vector rowIdVec = (UInt8Vector) root.getVector("_rowaddr");
               IntVector idVec = (IntVector) root.getVector("id");
               for (int i = 0; i < root.getRowCount(); i++) {
                 data.add(new long[] {idVec.get(i), rowIdVec.get(i)});
@@ -821,12 +1276,12 @@ public class ScalarIndexTest {
         new Schema(
             Arrays.asList(
                 Field.nullable("value", new ArrowType.Int(32, true)),
-                Field.nullable("_rowid", new ArrowType.Int(64, false))),
+                Field.nullable("_rowaddr", new ArrowType.Int(64, false))),
             null);
     try (VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
       root.allocateNew();
       IntVector idVec = (IntVector) root.getVector("value");
-      UInt8Vector rowIdVec = (UInt8Vector) root.getVector("_rowid");
+      UInt8Vector rowIdVec = (UInt8Vector) root.getVector("_rowaddr");
       for (int i = 0; i < preprocessedData.size(); i++) {
         long[] dataPair = preprocessedData.get(i);
         idVec.setSafe(i, (int) dataPair[0]);
@@ -1132,7 +1587,7 @@ public class ScalarIndexTest {
   }
 
   @Test
-  @Timeout(value = 5, unit = TimeUnit.SECONDS)
+  @Timeout(value = 10, unit = TimeUnit.SECONDS)
   public void testCreateInvertedIndexAllowsConcurrentCreate(@TempDir Path tempDir)
       throws Exception {
     String datasetPath = tempDir.resolve("inverted_concurrent_create").toString();
@@ -1162,8 +1617,9 @@ public class ScalarIndexTest {
         Thread concurrentCreate =
             new Thread(() -> concurrentResult.set(dataset.createIndex(segmentOptions)));
         concurrentCreate.start();
-        concurrentCreate.join(100);
-        assertTrue(concurrentCreate.isAlive(), "Concurrent create should wait for active create");
+        concurrentCreate.join(3000);
+        assertFalse(
+            concurrentCreate.isAlive(), "Uncommitted create should not wait for active create");
 
         progress.release.countDown();
         outerCreate.join(5000);
@@ -1933,6 +2389,147 @@ public class ScalarIndexTest {
         assertTrue(
             dataset.listIndexes().contains("rtree_geometry_index"),
             "Expected 'rtree_geometry_index' in: " + dataset.listIndexes());
+      }
+    }
+  }
+
+  @Test
+  public void testGetIndexesInfersTypeWhenIndexDetailsAbsent(@TempDir Path tempDir)
+      throws Exception {
+    String datasetPath = tempDir.resolve("index_type_without_details").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      try (Dataset dataset = testDataset.write(1, 10)) {
+        dataset.createIndex(
+            Collections.singletonList("id"),
+            IndexType.BTREE,
+            Optional.of("id_btree_idx"),
+            IndexParams.builder().setScalarIndexParams(ScalarIndexParams.create("btree")).build(),
+            false);
+        dataset.createIndex(
+            Collections.singletonList("id"),
+            IndexType.BITMAP,
+            Optional.of("id_bitmap_idx"),
+            IndexParams.builder().setScalarIndexParams(ScalarIndexParams.create("bitmap")).build(),
+            false);
+        dataset.createIndex(
+            Collections.singletonList("id"),
+            IndexType.ZONEMAP,
+            Optional.of("id_zonemap_idx"),
+            IndexParams.builder().setScalarIndexParams(ScalarIndexParams.create("zonemap")).build(),
+            false);
+        dataset.createIndex(
+            Collections.singletonList("name"),
+            IndexType.INVERTED,
+            Optional.of("name_inverted_idx"),
+            createInvertedIndexParams(),
+            false);
+
+        List<Index> originalIndices = dataset.getIndexes();
+        assertEquals(4, originalIndices.size());
+
+        List<Index> strippedIndices = new ArrayList<>();
+        for (Index original : originalIndices) {
+          strippedIndices.add(
+              Index.builder()
+                  .uuid(original.uuid())
+                  .fields(original.fields())
+                  .coveringFields(original.coveringFields())
+                  .name(original.name())
+                  .datasetVersion(original.datasetVersion())
+                  .fragments(original.fragments().orElse(null))
+                  .indexVersion(0)
+                  .createdAt(original.createdAt().orElse(null))
+                  .baseId(original.baseId().orElse(null))
+                  .build());
+        }
+
+        try (Transaction tx =
+            new Transaction.Builder()
+                .readVersion(dataset.version())
+                .operation(
+                    CreateIndex.builder()
+                        .withNewIndices(strippedIndices)
+                        .withRemovedIndices(originalIndices)
+                        .build())
+                .build()) {
+          try (Dataset committed = new CommitBuilder(dataset).execute(tx)) {
+            Map<String, Index> byName =
+                committed.getIndexes().stream()
+                    .collect(java.util.stream.Collectors.toMap(Index::name, idx -> idx));
+            assertEquals(4, byName.size());
+
+            for (Index idx : byName.values()) {
+              assertTrue(
+                  idx.indexDetails().isEmpty(),
+                  "Expected indexDetails to remain empty for " + idx.name());
+            }
+
+            assertEquals(IndexType.BTREE, byName.get("id_btree_idx").indexType());
+            assertEquals(IndexType.BITMAP, byName.get("id_bitmap_idx").indexType());
+            assertEquals(IndexType.ZONEMAP, byName.get("id_zonemap_idx").indexType());
+            assertEquals(IndexType.INVERTED, byName.get("name_inverted_idx").indexType());
+
+            for (IndexDescription desc : committed.describeIndices()) {
+              Index segment = desc.getMetadata().get(0);
+              assertEquals(byName.get(desc.getName()).indexType(), segment.indexType());
+            }
+          }
+        }
+      }
+    }
+  }
+
+  @ParameterizedTest
+  @EnumSource(
+      value = IndexType.class,
+      names = {"FM", "MINHASH_LSH"})
+  public void testMissingDetailsRetainsRecognizableType(IndexType type, @TempDir Path dir)
+      throws Exception {
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset fixture =
+          new TestUtils.SimpleTestDataset(allocator, dir.resolve("data").toString());
+      fixture.createEmptyDataset().close();
+      try (Dataset dataset = fixture.write(1, 10)) {
+        ScalarIndexParams params =
+            type == IndexType.FM
+                ? FmIndexParams.builder().build()
+                : MinHashLshIndexParams.builder().build();
+        dataset.createIndex(
+            Collections.singletonList("name"),
+            type,
+            Optional.of("text_idx"),
+            IndexParams.builder().setScalarIndexParams(params).build(),
+            false);
+        List<Index> original = dataset.getIndexes();
+        Index old = original.get(0);
+        assertEquals(type, old.indexType());
+        Index stripped =
+            Index.builder()
+                .uuid(old.uuid())
+                .fields(old.fields())
+                .name(old.name())
+                .datasetVersion(old.datasetVersion())
+                .fragments(old.fragments().orElse(null))
+                .files(old.getFiles().orElse(null))
+                .indexVersion(0)
+                .build();
+        try (Transaction tx =
+                new Transaction.Builder()
+                    .readVersion(dataset.version())
+                    .operation(
+                        CreateIndex.builder()
+                            .withNewIndices(Collections.singletonList(stripped))
+                            .withRemovedIndices(original)
+                            .build())
+                    .build();
+            Dataset committed = new CommitBuilder(dataset).execute(tx)) {
+          Index actual = committed.getIndexes().get(0);
+          assertTrue(actual.indexDetails().isEmpty());
+          assertEquals(type, actual.indexType());
+        }
       }
     }
   }

@@ -161,15 +161,7 @@ public final class DataOverlay implements Operation {
 
     @Override
     public int hashCode() {
-      int dataFileHash =
-          Objects.hash(
-              dataFile.getPath(),
-              dataFile.getFileMajorVersion(),
-              dataFile.getFileMinorVersion(),
-              dataFile.getFileSizeBytes());
-      dataFileHash = 31 * dataFileHash + Arrays.hashCode(dataFile.getFields());
-      dataFileHash = 31 * dataFileHash + Arrays.hashCode(dataFile.getColumnIndices());
-      return Objects.hash(dataFileHash, coverage, committedVersion);
+      return Objects.hash(dataFile, coverage, committedVersion);
     }
   }
 

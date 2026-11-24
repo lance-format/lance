@@ -1,8 +1,38 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+//! Split a filter into scalar index searches and a refine expression.
+//!
+//! [`apply_scalar_indices`] routes a filter in two steps.
+//!
+//! 1. Planners. The filter's top-level AND is split into conjuncts, and each
+//!    [`ScalarIndexPlanner`] from [`IndexInformationProvider::planners`] is
+//!    offered all of them. The plan that consumes the most conjuncts wins. A tie
+//!    goes to the index name that sorts first.
+//! 2. Per-column parsers. The conjuncts the winning plan leaves, or the whole
+//!    filter when no planner returns a plan, go to the per-column visitor. It
+//!    asks each column's [`MultiQueryParser`] for searches. What no parser
+//!    answers becomes the refine expression, which the scan evaluates on rows.
+//!
+//! The result ANDs the winning plan's search with the searches from step 2.
+//! A conjunct that an index evaluates on its own key columns counts as
+//! consumed, even when the index cannot seek on it. A filter whose root is an
+//! OR or NOT over more than one column skips step 1, so the per-column visitor
+//! can combine two column indices. A nested field such as `s.x` counts as its
+//! own column. An OR or NOT root over at most one column reaches the planners
+//! as one conjunct. Inside an AND, an OR or NOT conjunct reaches the planners
+//! whole.
+//!
+//! The rule reads the filter that [`apply_scalar_indices`] receives, which
+//! [`create_filter_plan`] passes through unchanged. The dataset scanner
+//! optimizes the filter with `Planner::optimize_expr` before calling
+//! [`create_filter_plan`], so the root can differ from the one the user wrote.
+//! For example, the optimizer turns `NOT (a = 1 AND b = 2)` into an OR over two
+//! columns, which skips step 1, and it turns `a IN (1, 2)` into `a = 1 OR a = 2`,
+//! which reaches the planners. Aliases around the root do not change the rule.
+
 use std::{
-    cmp::Ordering,
+    cmp::{Ordering, Reverse},
     collections::{HashMap, HashSet, hash_map::Entry},
     ops::Bound,
     sync::Arc,
@@ -15,6 +45,7 @@ use datafusion_common::ScalarValue;
 use datafusion_expr::{
     Between, BinaryExpr, Expr, Operator, ReturnFieldArgs, ScalarUDF,
     expr::{InList, Like, ScalarFunction},
+    utils::{conjunction, split_conjunction},
 };
 use tokio::try_join;
 
@@ -22,15 +53,19 @@ use super::{
     AnyQuery, BloomFilterQuery, LabelListQuery, MetricsCollector, SargableQuery, ScalarIndex,
     SearchOptions, SearchResult, TextQuery, TokenQuery, label_list::validate_label_list_data_type,
 };
-#[cfg(feature = "geo")]
-use super::{GeoQuery, RelationQuery};
+use crate::scalar::inverted::InvertedIndexParams;
+use crate::scalar::inverted::query::try_collect_query_tokens;
 use lance_core::{Error, Result};
-use lance_datafusion::{expr::safe_coerce_scalar, planner::Planner};
-use lance_select::{IndexExprResult, NullableIndexExprResult, NullableRowAddrMask};
+use lance_datafusion_exec::expr::{column_names_in_expr, safe_coerce_scalar};
+use lance_select::{IndexExprResult, MaskDomain, NullableIndexExprResult, NullableRowAddrMask};
 use roaring::RoaringBitmap;
 use tracing::instrument;
 
 const MAX_DEPTH: usize = 500;
+
+/// Most index searches that `a = b` / `a != b` between two predicates may
+/// expand to; see [`visit_predicate_equality`].
+const MAX_PREDICATE_EQUALITY_SEARCHES: usize = 64;
 
 /// An indexed expression consists of a scalar index query with a post-scan filter
 ///
@@ -52,14 +87,14 @@ const MAX_DEPTH: usize = 500;
 /// "z" column then we must fallback to an IndexedExpression with no scalar_query and
 /// only a refine.
 ///
-/// Two IndexedExpressions can be AND'd together.  Each part is AND'd together.
-/// Two IndexedExpressions cannot be OR'd together unless both are scalar_query only
-///   or both are refine only
-/// An IndexedExpression cannot be negated if it has both a refine and a scalar_query
+/// Two IndexedExpressions can be AND'd together. Each part is AND'd together.
+/// Two IndexedExpressions can be OR'd when both have a scalar query. If either side
+/// has a refine, the original OR expression refines the union of the index results.
+/// An IndexedExpression cannot be negated if it has both a refine and a scalar_query.
 ///
 /// When an operation cannot be performed we fallback to the original expression-only
 /// representation
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct IndexedExpression {
     /// The portion of the query that can be satisfied by scalar indices
     pub scalar_query: Option<ScalarIndexExpr>,
@@ -142,7 +177,7 @@ pub trait ScalarQueryParser: std::fmt::Debug + Send + Sync {
     /// is "x = 7" and we have a scalar index on "x" then we apply the index to the "x" column reference.
     ///
     /// However, some indexes are designed to run on projections of the indexed column.  For example,
-    /// if a query is "json_extract(json, '$.name') = 'books'" and we have a JSON index on the "json" column
+    /// if a query is "json_get_string(json, 'name') = 'books'" and we have a JSON index on the "json" column
     /// then we apply the index to the projection of the "json" column.
     ///
     /// This function is used to test if a potential column reference is a reference the index handles.
@@ -162,6 +197,123 @@ pub trait ScalarQueryParser: std::fmt::Debug + Send + Sync {
             _ => None,
         }
     }
+}
+
+/// A [`ScalarIndexPlanner`]'s claim on some conjuncts of a filter.
+#[derive(Debug)]
+pub struct ScalarIndexPlan<'a> {
+    /// The search to run. Set `column` to the index's first key column, which
+    /// keys its fragment coverage. The query's `to_expr` must express the
+    /// consumed conjuncts, because a recheck evaluates it on rows. Set
+    /// `needs_recheck` when the index can return [`SearchResult::AtMost`] or
+    /// [`SearchResult::AtLeast`], because some scans decide whether to recheck
+    /// rows before the search runs.
+    pub search: ScalarIndexSearch,
+    /// The conjuncts that `search` answers, borrowed from the slice passed to
+    /// [`ScalarIndexPlanner::plan`]. Every other conjunct goes on to the
+    /// per-column parsers and then to row evaluation.
+    pub consumed: Vec<&'a Expr>,
+}
+
+/// Plans a conjunctive filter across the key columns of one index.
+///
+/// [`apply_scalar_indices`] offers the conjuncts of each filter to every planner
+/// before the per-column parsers, and runs the plan that consumes the most. The
+/// module docs give the full rule.
+///
+/// The example builds on [`plan_tuple_predicate`]. Its query carries the key
+/// residual, which the index evaluates on the keys it reads. So the planner
+/// consumes the key residual too, and the search returns
+/// [`SearchResult::Exact`]. The row residual stays unconsumed.
+///
+/// [`plan_tuple_predicate`]: crate::scalar::tuple::planner::plan_tuple_predicate
+///
+/// ```
+/// use std::any::Any;
+/// use std::sync::Arc;
+///
+/// use arrow_schema::{DataType, Field, Fields};
+/// use datafusion_expr::{Expr, col, lit, utils::conjunction};
+/// use lance_index::scalar::AnyQuery;
+/// use lance_index::scalar::expression::{ScalarIndexPlan, ScalarIndexPlanner, ScalarIndexSearch};
+/// use lance_index::scalar::tuple::TupleQuery;
+/// use lance_index::scalar::tuple::planner::plan_tuple_predicate;
+///
+/// #[derive(Debug, PartialEq)]
+/// struct KeyQuery {
+///     tuples: TupleQuery,
+///     key_residual: Vec<Expr>,
+/// }
+///
+/// impl AnyQuery for KeyQuery {
+///     fn as_any(&self) -> &dyn Any {
+///         self
+///     }
+///
+///     fn format(&self, col: &str) -> String {
+///         self.to_expr(col.to_string()).to_string()
+///     }
+///
+///     fn to_expr(&self, col: String) -> Expr {
+///         let tuples = self.tuples.to_expr(col);
+///         conjunction(std::iter::once(tuples).chain(self.key_residual.iter().cloned())).unwrap()
+///     }
+///
+///     fn dyn_eq(&self, other: &dyn AnyQuery) -> bool {
+///         other.as_any().downcast_ref::<Self>() == Some(self)
+///     }
+/// }
+///
+/// #[derive(Debug)]
+/// struct TuplePlanner {
+///     keys: Fields,
+/// }
+///
+/// impl ScalarIndexPlanner for TuplePlanner {
+///     fn plan<'a>(&self, conjuncts: &'a [Expr]) -> Option<ScalarIndexPlan<'a>> {
+///         let tuple = plan_tuple_predicate(conjuncts, &self.keys)?;
+///         let query = KeyQuery {
+///             tuples: tuple.query,
+///             key_residual: tuple.key_residual.iter().map(|&term| term.clone()).collect(),
+///         };
+///         Some(ScalarIndexPlan {
+///             search: ScalarIndexSearch {
+///                 column: self.keys[0].name().clone(),
+///                 index_name: "tenant_ts_idx".to_string(),
+///                 index_type: "Tuple".to_string(),
+///                 query: Arc::new(query),
+///                 needs_recheck: false,
+///                 fragment_bitmap: None,
+///             },
+///             consumed: [tuple.consumed, tuple.key_residual].concat(),
+///         })
+///     }
+/// }
+///
+/// let planner = TuplePlanner {
+///     keys: Fields::from(vec![
+///         Field::new("tenant", DataType::Int32, true),
+///         Field::new("ts", DataType::Int64, true),
+///     ]),
+/// };
+/// let conjuncts = [
+///     col("tenant").eq(lit(1)),
+///     col("ts").gt(lit(10_i64)),
+///     (col("ts") % lit(7_i64)).eq(lit(0_i64)),
+///     col("status").eq(lit("a")),
+/// ];
+/// let plan = planner.plan(&conjuncts).expect("tenant binds the first key");
+/// assert_eq!(plan.consumed, vec![&conjuncts[0], &conjuncts[1], &conjuncts[2]]);
+/// assert_eq!(
+///     plan.search.query.to_expr("tenant".to_string()).to_string(),
+///     "tenant = Int32(1) AND ts > Int64(10) AND ts % Int64(7) = Int64(0)"
+/// );
+/// ```
+pub trait ScalarIndexPlanner: std::fmt::Debug + Send + Sync {
+    /// Plan `conjuncts`, the terms of a filter's top-level AND.
+    ///
+    /// Returns None when the index answers none of them.
+    fn plan<'a>(&self, conjuncts: &'a [Expr]) -> Option<ScalarIndexPlan<'a>>;
 }
 
 /// A generic parser that wraps multiple scalar query parsers
@@ -185,16 +337,111 @@ impl MultiQueryParser {
         self.parsers.push(other);
     }
 
-    /// Pick the first underlying parser whose `is_valid_reference` accepts `expr`.
+    /// Collect every underlying parser whose `is_valid_reference` accepts `expr`.
+    ///
+    /// Reference validation ("does this index handle this column / JSON path?")
+    /// and capability matching ("can this index serve this query shape?") are
+    /// two distinct decisions.  `is_valid_reference` only sees the column
+    /// reference, not the operator, so it cannot answer the second question.
+    /// Committing to the first accepting parser here would, for example, route
+    /// `x > 7` to a bloom filter (which only serves equality) even though a
+    /// btree on the same column could accelerate the range.
+    ///
+    /// We therefore keep *all* parsers that accept the reference and defer the
+    /// capability decision to the `visit_*` calls on the returned
+    /// [`MultiQueryParserView`], which try each candidate in registration order.
+    ///
+    /// All parsers that accept the same reference describe the same underlying
+    /// value, so they agree on its data type; we report the first one.
     pub fn select(
         &self,
         expr: &Expr,
         data_type: &DataType,
-    ) -> Option<(&dyn ScalarQueryParser, DataType)> {
-        self.parsers.iter().find_map(|p| {
-            p.is_valid_reference(expr, data_type)
-                .map(|dt| (p.as_ref(), dt))
-        })
+    ) -> Option<(MultiQueryParserView<'_>, DataType)> {
+        let mut parsers = Vec::new();
+        let mut reference_type = None;
+        for parser in &self.parsers {
+            if let Some(dt) = parser.is_valid_reference(expr, data_type) {
+                reference_type.get_or_insert(dt);
+                parsers.push(parser.as_ref());
+            }
+        }
+        reference_type.map(|dt| (MultiQueryParserView { parsers }, dt))
+    }
+}
+
+/// A borrowed view over the subset of a [`MultiQueryParser`]'s parsers whose
+/// `is_valid_reference` accepted a particular column reference.
+///
+/// It behaves exactly like the parent [`MultiQueryParser`] — every `visit_*`
+/// method fans out to its parsers with the same "first match wins" semantics —
+/// but operates on a borrowed subset rather than owning the parsers.  Selecting
+/// the reference-valid subset up front, then deferring the capability decision
+/// to the `visit_*` calls, lets a column carrying several indexes (e.g. a bloom
+/// filter that only serves equality alongside a btree that serves ranges) pick
+/// the right index per query instead of being locked to whichever parser was
+/// registered first.
+#[derive(Debug)]
+pub struct MultiQueryParserView<'a> {
+    parsers: Vec<&'a dyn ScalarQueryParser>,
+}
+
+impl ScalarQueryParser for MultiQueryParserView<'_> {
+    fn visit_between(
+        &self,
+        column: &str,
+        low: &Bound<ScalarValue>,
+        high: &Bound<ScalarValue>,
+    ) -> Option<IndexedExpression> {
+        self.parsers
+            .iter()
+            .find_map(|parser| parser.visit_between(column, low, high))
+    }
+    fn visit_in_list(&self, column: &str, in_list: &[ScalarValue]) -> Option<IndexedExpression> {
+        self.parsers
+            .iter()
+            .find_map(|parser| parser.visit_in_list(column, in_list))
+    }
+    fn visit_is_bool(&self, column: &str, value: bool) -> Option<IndexedExpression> {
+        self.parsers
+            .iter()
+            .find_map(|parser| parser.visit_is_bool(column, value))
+    }
+    fn visit_is_null(&self, column: &str) -> Option<IndexedExpression> {
+        self.parsers
+            .iter()
+            .find_map(|parser| parser.visit_is_null(column))
+    }
+    fn visit_comparison(
+        &self,
+        column: &str,
+        value: &ScalarValue,
+        op: &Operator,
+    ) -> Option<IndexedExpression> {
+        self.parsers
+            .iter()
+            .find_map(|parser| parser.visit_comparison(column, value, op))
+    }
+    fn visit_scalar_function(
+        &self,
+        column: &str,
+        data_type: &DataType,
+        func: &ScalarUDF,
+        args: &[Expr],
+    ) -> Option<IndexedExpression> {
+        self.parsers
+            .iter()
+            .find_map(|parser| parser.visit_scalar_function(column, data_type, func, args))
+    }
+    fn visit_like(
+        &self,
+        column: &str,
+        like: &Like,
+        pattern: &ScalarValue,
+    ) -> Option<IndexedExpression> {
+        self.parsers
+            .iter()
+            .find_map(|parser| parser.visit_like(column, like, pattern))
     }
 }
 
@@ -522,7 +769,8 @@ impl ScalarQueryParser for SargableQueryParser {
 /// - `prefix` is the leading literal portion before any wildcards
 /// - `needs_refine` is true if the pattern has wildcards beyond a simple trailing `%`
 ///
-/// Returns `None` if the pattern starts with a wildcard (no leading literal).
+/// Returns `None` if the pattern starts with a wildcard (no leading literal), has
+/// no unescaped wildcard, or uses an escape character other than backslash.
 ///
 /// Examples:
 /// - "foo%" -> Some(("foo", false)) - pure prefix, no recheck needed
@@ -531,106 +779,54 @@ impl ScalarQueryParser for SargableQueryParser {
 /// - "foo\%bar%" with escape '\' -> Some(("foo%bar", false)) - escaped %, pure prefix
 /// - "%foo" -> None - starts with wildcard, cannot prune
 /// - "foo" -> None - no wildcard at all, use equality instead
+/// - "a\b%" -> Some(("ab", false)) - an escape consumes any character
 fn extract_like_leading_prefix(pattern: &str, escape_char: Option<char>) -> Option<(String, bool)> {
+    // DataFusion's starts_with simplification escapes special characters with backslash
+    // but doesn't set escape_char, so backslash is the default escape. It is also the
+    // only escape the executor defines: DataFusion's physical planner rejects any other
+    // ESCAPE character, so decline here rather than answer a query the executor
+    // refuses (an index query would replace the predicate and skip that rejection).
+    // Pattern: starts_with(col, 'test_ns$') -> col LIKE 'test\_ns$%' (escape_char: None)
+    let esc = match escape_char {
+        None | Some('\\') => '\\',
+        Some(_) => return None,
+    };
+
     let chars: Vec<char> = pattern.chars().collect();
     let len = chars.len();
 
-    if len == 0 {
-        return None;
-    }
-
-    // DataFusion's starts_with simplification escapes special characters with backslash
-    // but doesn't set escape_char. Use backslash as default escape character.
-    // Pattern: starts_with(col, 'test_ns$') -> col LIKE 'test\_ns$%' (escape_char: None)
-    // See: https://github.com/apache/datafusion/issues/XXXX
-    let effective_escape_char = escape_char.or(Some('\\'));
-
-    // Helper to check if a character at position i is escaped
-    let is_escaped = |i: usize| -> bool {
-        if let Some(esc) = effective_escape_char {
-            if i > 0 && chars[i - 1] == esc {
-                // Check if the escape char itself is escaped
-                if i >= 2 && chars[i - 2] == esc {
-                    false // Escape was escaped, so this char is NOT escaped
-                } else {
-                    true // This char is escaped
-                }
-            } else {
-                false
-            }
-        } else {
-            // No escape character defined - nothing can be escaped
-            false
-        }
-    };
-
-    // Pattern must contain at least one unescaped wildcard
-    let has_wildcard = chars.iter().enumerate().any(|(i, &c)| {
-        if c != '%' && c != '_' {
-            return false;
-        }
-        !is_escaped(i)
-    });
-
-    if !has_wildcard {
-        return None; // No wildcards, should use equality
-    }
-
-    // Check if pattern starts with an unescaped wildcard
-    if chars[0] == '%' || chars[0] == '_' {
-        return None; // Starts with wildcard, cannot prune
-    }
-
-    // Extract the leading literal prefix (everything before first unescaped wildcard)
+    // Single left-to-right pass. An escape consumes whatever follows it, matching
+    // arrow's LIKE kernel ("\x" matches a literal x for any x), so wildcard detection
+    // and prefix extraction must share this tokenization: judging a wildcard by its
+    // neighbours alone misreads runs of escapes such as "\\\%".
     let mut prefix = String::new();
     let mut i = 0;
-    let mut found_wildcard = false;
-
+    let mut first_wildcard = None;
     while i < len {
         let c = chars[i];
-
-        // Check for escape character (using effective escape char which may be inferred)
-        if let Some(esc) = effective_escape_char
-            && c == esc
-            && i + 1 < len
-        {
-            let next = chars[i + 1];
-            if next == '%' || next == '_' || next == esc {
-                // Escaped character - add the literal character
-                prefix.push(next);
-                i += 2;
-                continue;
-            }
+        if c == esc && i + 1 < len {
+            prefix.push(chars[i + 1]);
+            i += 2;
+            continue;
         }
-
-        // Check for unescaped wildcard
         if c == '%' || c == '_' {
-            found_wildcard = true;
+            first_wildcard = Some(i);
             break;
         }
-
         prefix.push(c);
         i += 1;
     }
 
+    // No unescaped wildcard: the pattern is an exact literal, use equality instead.
+    let wildcard_at = first_wildcard?;
+    // Starts with a wildcard: nothing to prune on.
     if prefix.is_empty() {
         return None;
     }
 
-    // Check if pattern is just a simple prefix (ends with single % and nothing after)
-    let needs_refine = if found_wildcard && i < len {
-        // Check if we're at a % wildcard
-        if chars[i] == '%' && i + 1 == len {
-            // Pattern is "prefix%" - pure prefix match, no refine needed
-            false
-        } else {
-            // Pattern has more after first wildcard, or has _ wildcard
-            true
-        }
-    } else {
-        // No wildcard found (shouldn't happen due to earlier check)
-        false
-    };
+    // "prefix%" is a pure prefix match; anything after the first wildcard, or a `_`
+    // wildcard, needs the original predicate re-applied.
+    let needs_refine = !(chars[wildcard_at] == '%' && wildcard_at + 1 == len);
 
     Some((prefix, needs_refine))
 }
@@ -826,6 +1022,11 @@ impl ScalarQueryParser for LabelListQueryParser {
         for idx in 0..list_values.len() {
             scalars.push(ScalarValue::try_from_array(list_values.as_ref(), idx).ok()?);
         }
+        // Coercing the literal to the column's item type turns an item that does not
+        // fit into NULL, which the index would match against NULL items.
+        if scalars.iter().any(ScalarValue::is_null) {
+            return None;
+        }
         if func.name() == "array_has_all" {
             let query = LabelListQuery::HasAllLabels(scalars);
             Some(IndexedExpression::index_query(
@@ -848,6 +1049,17 @@ impl ScalarQueryParser for LabelListQueryParser {
     }
 }
 
+/// How an index can answer a particular substring pattern.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ContainsQuerySupport {
+    /// The index returns exact matches for this pattern.
+    Exact,
+    /// The index returns candidates that must be rechecked against source values.
+    NeedsRecheck,
+    /// The index cannot produce a sound candidate set for this pattern.
+    Unsupported,
+}
+
 /// A parser for indices that handle string `contains` queries, and -- when
 /// `supports_regex` is set -- `regexp_like` / `regexp_match` queries.
 #[derive(Debug, Clone)]
@@ -860,6 +1072,7 @@ pub struct TextQueryParser {
     /// say anything useful about.  Shorter patterns bypass the index entirely so
     /// they are answered by a full scan.  Use 0 for indices with no such limit.
     min_contains_chars: usize,
+    contains_query_support: Option<fn(&str) -> ContainsQuerySupport>,
 }
 
 impl TextQueryParser {
@@ -876,7 +1089,17 @@ impl TextQueryParser {
             needs_recheck,
             supports_regex,
             min_contains_chars,
+            contains_query_support: None,
         }
+    }
+
+    /// Override exactness or bypass the index according to its representation of a pattern.
+    pub(crate) fn with_contains_query_support(
+        mut self,
+        support: fn(&str) -> ContainsQuerySupport,
+    ) -> Self {
+        self.contains_query_support = Some(support);
+        self
     }
 }
 
@@ -931,14 +1154,24 @@ impl ScalarQueryParser for TextQueryParser {
             return None;
         };
 
+        let mut needs_recheck = self.needs_recheck;
         let query = match func.name() {
             "contains" if args.len() == 2 => {
-                // A pattern shorter than the index's token width produces no
-                // tokens, so the index can only answer "recheck everything".
-                // Leave it to a full scan instead.  The count is in characters
-                // because tokenizers split on characters, not bytes.
-                if pattern.chars().count() < self.min_contains_chars {
+                // Every non-null string contains the empty pattern, so no index
+                // can narrow it down.  A pattern shorter than the index's token
+                // width produces no tokens, so the index can only answer
+                // "recheck everything".  Leave both to a full scan instead.  The
+                // count is in characters because tokenizers split on characters,
+                // not bytes.
+                if pattern.is_empty() || pattern.chars().count() < self.min_contains_chars {
                     return None;
+                }
+                if let Some(support) = self.contains_query_support {
+                    match support(&pattern) {
+                        ContainsQuerySupport::Exact => {}
+                        ContainsQuerySupport::NeedsRecheck => needs_recheck = true,
+                        ContainsQuerySupport::Unsupported => return None,
+                    }
                 }
                 TextQuery::StringContains(pattern)
             }
@@ -963,7 +1196,7 @@ impl ScalarQueryParser for TextQueryParser {
             self.index_name.clone(),
             self.index_type.clone(),
             Arc::new(query),
-            self.needs_recheck,
+            needs_recheck,
         ))
     }
 
@@ -976,9 +1209,8 @@ impl ScalarQueryParser for TextQueryParser {
         // Infix LIKE is accelerated only by the ngram index (via its regex
         // machinery). A plain-literal `regexp_like(col, 'foo')` is rewritten to
         // `col LIKE '%foo%'` before it reaches the index, so this is the path
-        // that accelerates those. ILIKE is skipped because its case folding does
-        // not match the index's normalization.
-        if !self.supports_regex || like.case_insensitive {
+        // that accelerates those.
+        if !self.supports_regex {
             return None;
         }
         let pattern_str = match pattern {
@@ -988,7 +1220,10 @@ impl ScalarQueryParser for TextQueryParser {
         // Translate the LIKE pattern into a loose regex used only for candidate
         // generation; the original LIKE stays as the recheck filter, so the
         // regex only needs to be a sound superset.
-        let regex = like_to_regex(pattern_str, like.escape_char)?;
+        let mut regex = like_to_regex(pattern_str, like.escape_char)?;
+        if like.case_insensitive {
+            regex.insert_str(0, "(?i)");
+        }
         if !crate::scalar::ngram::regex_can_use_index(&regex) {
             return None;
         }
@@ -1058,7 +1293,8 @@ fn like_to_regex(pattern: &str, escape: Option<char>) -> Option<String> {
 /// predicate to a full recheck rather than risk changing its semantics.
 fn apply_regex_flags(pattern: &str, flags_expr: &Expr) -> Option<String> {
     let (Expr::Literal(ScalarValue::Utf8(Some(flags)), _)
-    | Expr::Literal(ScalarValue::LargeUtf8(Some(flags)), _)) = flags_expr
+    | Expr::Literal(ScalarValue::LargeUtf8(Some(flags)), _)
+    | Expr::Literal(ScalarValue::Utf8View(Some(flags)), _)) = flags_expr
     else {
         return None;
     };
@@ -1084,6 +1320,7 @@ fn apply_regex_flags(pattern: &str, flags_expr: &Expr) -> Option<String> {
 pub struct FtsQueryParser {
     index_name: String,
     index_type: String,
+    tokenizer_params: Option<InvertedIndexParams>,
 }
 
 impl FtsQueryParser {
@@ -1091,7 +1328,26 @@ impl FtsQueryParser {
         Self {
             index_name: name,
             index_type,
+            tokenizer_params: None,
         }
+    }
+
+    /// The tokenizer settings of the index. A query the index tokenizer reduces
+    /// to no tokens, such as one made only of stop words, is left to the scan,
+    /// since the index cannot narrow the rows it matches.
+    pub fn with_tokenizer_params(mut self, params: InvertedIndexParams) -> Self {
+        self.tokenizer_params = Some(params);
+        self
+    }
+
+    fn has_index_tokens(&self, query: &str) -> bool {
+        let Some(params) = &self.tokenizer_params else {
+            return true;
+        };
+        params
+            .build()
+            .and_then(|mut tokenizer| try_collect_query_tokens(query, &mut tokenizer))
+            .is_ok_and(|tokens| !tokens.is_empty())
     }
 }
 
@@ -1139,131 +1395,18 @@ impl ScalarQueryParser for FtsQueryParser {
         let scalar = maybe_scalar(&args[1], data_type)?;
         if let ScalarValue::Utf8(Some(scalar_str)) = scalar
             && func.name() == "contains_tokens"
+            && self.has_index_tokens(&scalar_str)
         {
             let query = TokenQuery::TokensContains(scalar_str);
-            return Some(IndexedExpression::index_query(
+            // The index tokenizer can lowercase, fold and drop stop words, so
+            // its rows are candidates the scan still has to check.
+            return Some(IndexedExpression::index_query_with_recheck(
                 column.to_string(),
                 self.index_name.clone(),
                 self.index_type.clone(),
                 Arc::new(query),
+                true,
             ));
-        }
-        None
-    }
-}
-
-/// A parser for geo indices that handles spatial queries
-#[cfg(feature = "geo")]
-#[derive(Debug, Clone)]
-pub struct GeoQueryParser {
-    index_name: String,
-    index_type: String,
-}
-
-#[cfg(feature = "geo")]
-impl GeoQueryParser {
-    pub fn new(index_name: String, index_type: String) -> Self {
-        Self {
-            index_name,
-            index_type,
-        }
-    }
-}
-
-#[cfg(feature = "geo")]
-impl ScalarQueryParser for GeoQueryParser {
-    fn visit_between(
-        &self,
-        _: &str,
-        _: &Bound<ScalarValue>,
-        _: &Bound<ScalarValue>,
-    ) -> Option<IndexedExpression> {
-        None
-    }
-
-    fn visit_in_list(&self, _: &str, _: &[ScalarValue]) -> Option<IndexedExpression> {
-        None
-    }
-
-    fn visit_is_bool(&self, _: &str, _: bool) -> Option<IndexedExpression> {
-        None
-    }
-
-    fn visit_is_null(&self, column: &str) -> Option<IndexedExpression> {
-        Some(IndexedExpression::index_query_with_recheck(
-            column.to_string(),
-            self.index_name.clone(),
-            self.index_type.clone(),
-            Arc::new(GeoQuery::IsNull),
-            true,
-        ))
-    }
-
-    fn visit_comparison(
-        &self,
-        _: &str,
-        _: &ScalarValue,
-        _: &Operator,
-    ) -> Option<IndexedExpression> {
-        None
-    }
-
-    fn visit_scalar_function(
-        &self,
-        column: &str,
-        _data_type: &DataType,
-        func: &ScalarUDF,
-        args: &[Expr],
-    ) -> Option<IndexedExpression> {
-        if (func.name() == "st_intersects"
-            || func.name() == "st_contains"
-            || func.name() == "st_within"
-            || func.name() == "st_touches"
-            || func.name() == "st_crosses"
-            || func.name() == "st_overlaps"
-            || func.name() == "st_covers"
-            || func.name() == "st_coveredby")
-            && args.len() == 2
-        {
-            let left_arg = &args[0];
-            let right_arg = &args[1];
-            return match (left_arg, right_arg) {
-                (Expr::Literal(left_value, metadata), Expr::Column(_)) => {
-                    let mut field = Field::new("_geo", left_value.data_type(), false);
-                    if let Some(metadata) = metadata {
-                        field = field.with_metadata(metadata.to_hashmap());
-                    }
-                    let query = GeoQuery::IntersectQuery(RelationQuery {
-                        value: left_value.clone(),
-                        field,
-                    });
-                    Some(IndexedExpression::index_query_with_recheck(
-                        column.to_string(),
-                        self.index_name.clone(),
-                        self.index_type.clone(),
-                        Arc::new(query),
-                        true,
-                    ))
-                }
-                (Expr::Column(_), Expr::Literal(right_value, metadata)) => {
-                    let mut field = Field::new("_geo", right_value.data_type(), false);
-                    if let Some(metadata) = metadata {
-                        field = field.with_metadata(metadata.to_hashmap());
-                    }
-                    let query = GeoQuery::IntersectQuery(RelationQuery {
-                        value: right_value.clone(),
-                        field,
-                    });
-                    Some(IndexedExpression::index_query_with_recheck(
-                        column.to_string(),
-                        self.index_name.clone(),
-                        self.index_type.clone(),
-                        Arc::new(query),
-                        true,
-                    ))
-                }
-                _ => None,
-            };
         }
         None
     }
@@ -1299,7 +1442,25 @@ impl IndexedExpression {
     }
 
     /// Create an expression that is only an index query with explicit needs_recheck
-    fn index_query_with_recheck(
+    ///
+    /// Set `needs_recheck` when the results of the index are inexact and have to be
+    /// filtered again. A [`ScalarQueryParser`] outside this crate builds its answer here.
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use lance_index::scalar::AnyQuery;
+    /// # use lance_index::scalar::expression::IndexedExpression;
+    /// # fn parse(query: Arc<dyn AnyQuery>) -> IndexedExpression {
+    /// IndexedExpression::index_query_with_recheck(
+    ///     "column".to_string(),
+    ///     "column_idx".to_string(),
+    ///     "MyIndex".to_string(),
+    ///     query,
+    ///     true,
+    /// )
+    /// # }
+    /// ```
+    pub fn index_query_with_recheck(
         column: String,
         index_name: String,
         index_type: String,
@@ -1371,13 +1532,18 @@ impl IndexedExpression {
         }
     }
 
-    /// Try and perform a logical OR of two indexed expressions
+    /// Try and perform a logical OR of two indexed expressions, where `expr` is the
+    /// original OR expression
     ///
-    /// This is a bit tricky because something like:
+    /// The refine expressions cannot be OR'd on their own because something like:
     ///   (color == 'blue' AND size < 20) OR (color == 'green' AND size < 50)
     /// is not equivalent to:
     ///   (color == 'blue' OR color == 'green') AND (size < 20 OR size < 50)
-    fn maybe_or(self, other: Self) -> Option<Self> {
+    ///
+    /// Every row matching a side is in the result of that side's index query, so the OR
+    /// of the two index queries still finds every matching row. If either side has a
+    /// refine then the rows found are refined with the original expression.
+    fn maybe_or(self, other: Self, expr: &BinaryExpr) -> Option<Self> {
         // If either expression is missing a scalar_query then we need to load all rows from
         // the database and so we short-circuit and return None
         let scalar_query = self.scalar_query?;
@@ -1386,28 +1552,8 @@ impl IndexedExpression {
             Box::new(scalar_query),
             Box::new(other_scalar_query),
         ));
-
-        let refine_expr = match (self.refine_expr, other.refine_expr) {
-            // TODO
-            //
-            // To handle these cases we need a way of going back from a scalar expression query to a logical DF expression (perhaps
-            // we can store the expression that led to the creation of the query)
-            //
-            // For example, imagine we have something like "(color == 'blue' AND size < 20) OR (color == 'green' AND size < 50)"
-            //
-            // We can do an indexed load of all rows matching "color == 'blue' OR color == 'green'" but then we need to
-            // refine that load with the full original expression which, at the moment, we no longer have.
-            (Some(_), Some(_)) => {
-                return None;
-            }
-            (Some(_), None) => {
-                return None;
-            }
-            (None, Some(_)) => {
-                return None;
-            }
-            (None, None) => None,
-        };
+        let refine_expr = (self.refine_expr.is_some() || other.refine_expr.is_some())
+            .then(|| Expr::BinaryExpr(expr.clone()));
         Some(Self {
             scalar_query,
             refine_expr,
@@ -1441,18 +1587,20 @@ pub trait ScalarIndexLoader: Send + Sync {
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<dyn ScalarIndex>>;
 
-    /// Translate an address-domain index result into the row-id domain
+    /// Translate a row-id-domain index result into the row-address domain
     ///
-    /// Address-domain indices (see [`ScalarIndex::results_are_row_addresses`])
-    /// report matches as physical row addresses. The default returns `result`
-    /// unchanged, which is correct when addresses and row ids coincide (no
-    /// stable row ids). A dataset with stable row ids overrides this to remap
-    /// addresses to stable row ids via its per-fragment row-id sequences.
-    async fn row_addr_result_to_row_ids(
+    /// Row-id-domain indices (see [`ScalarIndex::results_are_row_addresses`])
+    /// report matches as stable row ids rather than physical row addresses.
+    /// The default returns `result` just retagged, which is correct when
+    /// addresses and row ids coincide (no stable row ids). A dataset with
+    /// stable row ids overrides this to remap row ids to physical row
+    /// addresses via its row-id index (an id -> address lookup, cheap and
+    /// batched).
+    async fn row_id_result_to_row_addrs(
         &self,
         result: NullableIndexExprResult,
     ) -> Result<NullableIndexExprResult> {
-        Ok(result)
+        Ok(result.with_domain(MaskDomain::RowAddress))
     }
 }
 
@@ -1913,8 +2061,8 @@ impl std::fmt::Display for ScalarIndexExpr {
     }
 }
 
-fn search_result_to_nullable(result: SearchResult) -> NullableIndexExprResult {
-    match result {
+fn search_result_to_nullable(result: SearchResult, domain: MaskDomain) -> NullableIndexExprResult {
+    let result = match result {
         SearchResult::Exact(mask) => {
             NullableIndexExprResult::exact(NullableRowAddrMask::AllowList(mask))
         }
@@ -1924,6 +2072,29 @@ fn search_result_to_nullable(result: SearchResult) -> NullableIndexExprResult {
         SearchResult::AtLeast(mask) => {
             NullableIndexExprResult::at_least(NullableRowAddrMask::AllowList(mask))
         }
+    };
+    result.with_domain(domain)
+}
+
+/// Reconcile mismatched mask domains before combining two results with
+/// `And`/`Or`.
+///
+/// Converts whichever side is row-id-domain into row-address domain (via
+/// [`ScalarIndexLoader::row_id_result_to_row_addrs`]). Same-domain pairs
+/// (the common case) pass through untouched.
+async fn reconcile_domains(
+    index_loader: &dyn ScalarIndexLoader,
+    lhs: NullableIndexExprResult,
+    rhs: NullableIndexExprResult,
+) -> Result<(NullableIndexExprResult, NullableIndexExprResult)> {
+    match (lhs.domain, rhs.domain) {
+        (MaskDomain::RowId, MaskDomain::RowAddress) => {
+            Ok((index_loader.row_id_result_to_row_addrs(lhs).await?, rhs))
+        }
+        (MaskDomain::RowAddress, MaskDomain::RowId) => {
+            Ok((lhs, index_loader.row_id_result_to_row_addrs(rhs).await?))
+        }
+        _ => Ok((lhs, rhs)),
     }
 }
 
@@ -1963,12 +2134,16 @@ impl ScalarIndexExpr {
                 let lhs_result = lhs.evaluate_with_options(index_loader, metrics, track_nulls);
                 let rhs_result = rhs.evaluate_with_options(index_loader, metrics, track_nulls);
                 let (lhs_result, rhs_result) = try_join!(lhs_result, rhs_result)?;
+                let (lhs_result, rhs_result) =
+                    reconcile_domains(index_loader, lhs_result, rhs_result).await?;
                 Ok(lhs_result & rhs_result)
             }
             Self::Or(lhs, rhs) => {
                 let lhs_result = lhs.evaluate_with_options(index_loader, metrics, track_nulls);
                 let rhs_result = rhs.evaluate_with_options(index_loader, metrics, track_nulls);
                 let (lhs_result, rhs_result) = try_join!(lhs_result, rhs_result)?;
+                let (lhs_result, rhs_result) =
+                    reconcile_domains(index_loader, lhs_result, rhs_result).await?;
                 Ok(lhs_result | rhs_result)
             }
             Self::Query(search) => {
@@ -1982,15 +2157,16 @@ impl ScalarIndexExpr {
                         metrics,
                     )
                     .await?;
-                let result = search_result_to_nullable(search_result);
-                if index.results_are_row_addresses() {
-                    // Translate address-domain results to the row-id domain
-                    // before combining or scanning; otherwise stable-row-id
-                    // datasets silently drop matches (issue #7434).
-                    index_loader.row_addr_result_to_row_ids(result).await
+                // Leave address-domain results as-is and tag row-id-domain
+                // results accordingly; domain reconciliation (if this leaf
+                // ends up combined with a mismatched-domain sibling) happens
+                // in the `And`/`Or` arms above, not here.
+                let domain = if index.results_are_row_addresses() {
+                    MaskDomain::RowAddress
                 } else {
-                    Ok(result)
-                }
+                    MaskDomain::RowId
+                };
+                Ok(search_result_to_nullable(search_result, domain))
             }
         }
     }
@@ -2029,6 +2205,26 @@ impl ScalarIndexExpr {
             Self::Not(inner) => inner.needs_recheck(),
             Self::And(lhs, rhs) | Self::Or(lhs, rhs) => lhs.needs_recheck() || rhs.needs_recheck(),
             Self::Query(search) => search.needs_recheck,
+        }
+    }
+
+    /// Whether every search in the expression reports rows where its predicate
+    /// is NULL, see [`AnyQuery::reports_null_rows`].
+    pub fn reports_null_rows(&self) -> bool {
+        match self {
+            Self::Not(inner) => inner.reports_null_rows(),
+            Self::And(lhs, rhs) | Self::Or(lhs, rhs) => {
+                lhs.reports_null_rows() && rhs.reports_null_rows()
+            }
+            Self::Query(search) => search.query.reports_null_rows(),
+        }
+    }
+
+    fn search_count(&self) -> usize {
+        match self {
+            Self::Not(inner) => inner.search_count(),
+            Self::And(lhs, rhs) | Self::Or(lhs, rhs) => lhs.search_count() + rhs.search_count(),
+            Self::Query(_) => 1,
         }
     }
 }
@@ -2086,16 +2282,56 @@ fn extract_nested_column_path(expr: &Expr) -> Option<String> {
     Some(lance_core::datatypes::format_field_path(&field_refs))
 }
 
+/// Whether `data_type` is one of Arrow's three plain string encodings.
+///
+/// The three carry the same values with the same ordering, so a cast between them
+/// preserves equality, ordering and nullness.  That is what makes it sound both to
+/// look through such a cast on a column reference and to renormalize a literal from
+/// one variant to another.
+fn is_plain_string(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+    )
+}
+
+/// Whether `from` is a list whose integer items convert to `to`'s item type without
+/// changing any value.
+///
+/// DataFusion coerces `array_has` and friends to the union item type of the column
+/// and the literal, and the literal list is typed from its first value as Int64.
+/// So a narrower integer list column reaches the planner as `CAST(col AS List(Int64))`.
+fn is_lossless_integer_list_cast(from: &DataType, to: &DataType) -> bool {
+    let (from, to) = match (from, to) {
+        (DataType::List(from), DataType::List(to))
+        | (DataType::LargeList(from), DataType::LargeList(to)) => {
+            (from.data_type(), to.data_type())
+        }
+        _ => return false,
+    };
+    let (Some(from_width), Some(to_width)) = (from.primitive_width(), to.primitive_width()) else {
+        return false;
+    };
+    match (from.is_signed_integer(), from.is_unsigned_integer()) {
+        (true, _) => to.is_signed_integer() && from_width <= to_width,
+        (_, true) => {
+            (to.is_unsigned_integer() && from_width <= to_width)
+                || (to.is_signed_integer() && from_width < to_width)
+        }
+        _ => false,
+    }
+}
+
 // Extract a column from the expression, if it is a column, and we have an index for that column, or None
 //
 // There's two ways to get a column.  First, the obvious way, is a
 // simple column reference (e.g. x = 7).  Second, a more complex way,
-// is some kind of projection into a column (e.g. json_extract(json, '$.name')).
+// is some kind of projection into a column (e.g. json_get_string(json, '$.name')).
 // Third way is nested field access (e.g. get_field(metadata, "status.code"))
 fn maybe_indexed_column<'b>(
     expr: &Expr,
     index_info: &'b dyn IndexInformationProvider,
-) -> Option<(String, DataType, &'b dyn ScalarQueryParser)> {
+) -> Option<(String, DataType, MultiQueryParserView<'b>)> {
     // First try to extract the full nested column path for get_field expressions
     if let Some(nested_path) = extract_nested_column_path(expr)
         && let Some((data_type, multi)) = index_info.get_index(&nested_path)
@@ -2120,6 +2356,21 @@ fn maybe_indexed_column<'b>(
             let (data_type, multi) = index_info.get_index(col)?;
             let (parser, data_type) = multi.select(expr, data_type)?;
             Some((col.to_string(), data_type, parser))
+        }
+        // DataFusion's LIKE coercion promotes both operands to a common string type
+        // and casts the column to it, and no later pass unwraps that cast the way
+        // `unwrap_cast_in_comparison` does for a comparison.  Looking through it is
+        // what keeps a LIKE whose pattern is a wider string variant on the index
+        // instead of a full scan; restricting it to casts that stay within the string
+        // types is what keeps the index answer equal to the original predicate, which
+        // matters because an exact answer skips the recheck.  The same holds for a
+        // list cast that only widens integer items, which is how a LABEL_LIST column
+        // narrower than int64 reaches `array_has`.
+        Expr::Cast(cast) => {
+            let (column, data_type, parser) = maybe_indexed_column(&cast.expr, index_info)?;
+            ((is_plain_string(&data_type) && is_plain_string(cast.field.data_type()))
+                || is_lossless_integer_list_cast(&data_type, cast.field.data_type()))
+            .then_some((column, data_type, parser))
         }
         _ => None,
     }
@@ -2379,7 +2630,7 @@ fn visit_or(
     let left = visit_node(&expr.left, index_info, depth + 1)?;
     let right = visit_node(&expr.right, index_info, depth + 1)?;
     Ok(match (left, right) {
-        (Some(left), Some(right)) => left.maybe_or(right),
+        (Some(left), Some(right)) => left.maybe_or(right, expr),
         // If one side can use an index and the other side cannot then
         // we must abandon the entire thing.  For example, consider the
         // query "color == 'blue' or size > 10" where color is indexed but
@@ -2391,21 +2642,193 @@ fn visit_or(
     })
 }
 
+/// `left = right` or `left != right` between two predicates, as
+/// `(left AND right) OR (NOT left AND NOT right)` or
+/// `(left AND NOT right) OR (NOT left AND right)`.
+///
+/// The result is NULL if either `left` or `right` are null, provided that
+/// each side reports its NULL rows.
+///
+/// Each side appears twice, so nested comparisons double the plan per level;
+/// past [`MAX_PREDICATE_EQUALITY_SEARCHES`] the comparison is left to the scan.
+fn visit_predicate_equality(
+    expr: &BinaryExpr,
+    index_info: &dyn IndexInformationProvider,
+    depth: usize,
+) -> Result<Option<IndexedExpression>> {
+    let (Some(left), Some(right)) = (
+        visit_node(&expr.left, index_info, depth + 1)?,
+        visit_node(&expr.right, index_info, depth + 1)?,
+    ) else {
+        return Ok(None);
+    };
+    let (Some(left_query), Some(right_query)) = (&left.scalar_query, &right.scalar_query) else {
+        return Ok(None);
+    };
+    let searches = 2 * (left_query.search_count() + right_query.search_count());
+    if searches > MAX_PREDICATE_EQUALITY_SEARCHES
+        || !left_query.reports_null_rows()
+        || !right_query.reports_null_rows()
+    {
+        return Ok(None);
+    }
+    let (Some(not_left), Some(not_right)) = (left.clone().maybe_not(), right.clone().maybe_not())
+    else {
+        return Ok(None);
+    };
+    Ok(if expr.op == Operator::Eq {
+        left.and(right).maybe_or(not_left.and(not_right), expr)
+    } else {
+        left.and(not_right).maybe_or(not_left.and(right), expr)
+    })
+}
+
+/// Returns the plain column whose NULL values make `predicate` evaluate to NULL.
+///
+/// Supports a Boolean column, comparisons, `BETWEEN`, or `IN` against non-NULL
+/// literals, and `NOT`/`AND`/`OR` combinations that all refer to the same column.
+/// Computed expressions, such as JSON accessors, are excluded because they can
+/// be NULL even when the underlying column is not.
+fn null_where_column_is<'a>(
+    predicate: &'a Expr,
+    index_info: &dyn IndexInformationProvider,
+) -> Option<&'a Expr> {
+    let against_literals = |column: &'a Expr, literals: &[&Expr]| {
+        if !matches!(column, Expr::Column(_)) {
+            return None;
+        }
+        let (_, column_type, _) = maybe_indexed_column(column, index_info)?;
+        literals
+            .iter()
+            .all(|literal| maybe_scalar(literal, &column_type).is_some_and(|v| !v.is_null()))
+            .then_some(column)
+    };
+    match predicate {
+        Expr::Column(_) => Some(predicate),
+        Expr::Not(inner) => null_where_column_is(inner, index_info),
+        Expr::BinaryExpr(BinaryExpr {
+            left,
+            op: Operator::And | Operator::Or,
+            right,
+        }) => {
+            let column = null_where_column_is(left, index_info)?;
+            (null_where_column_is(right, index_info)? == column).then_some(column)
+        }
+        Expr::BinaryExpr(BinaryExpr {
+            left,
+            op:
+                Operator::Eq
+                | Operator::NotEq
+                | Operator::Lt
+                | Operator::LtEq
+                | Operator::Gt
+                | Operator::GtEq,
+            right,
+        }) => against_literals(left, &[right]),
+        Expr::Between(between) => against_literals(&between.expr, &[&between.low, &between.high]),
+        Expr::InList(in_list) => {
+            against_literals(&in_list.expr, &in_list.list.iter().collect::<Vec<_>>())
+        }
+        _ => None,
+    }
+}
+
+/// `predicate IS TRUE`, or `predicate IS FALSE` when `value` is false, for a
+/// predicate that is NULL exactly where one indexed column is, such as a
+/// Boolean column or a comparison against a non-null literal.
+///
+/// That makes `IS TRUE` the predicate with the column's NULL rows excluded,
+/// which is what tells the two apart once negated: `NOT (x = 1)` drops NULL
+/// rows, `NOT ((x = 1) IS TRUE)` keeps them.
+fn visit_is_truth_value(
+    predicate: &Expr,
+    value: bool,
+    index_info: &dyn IndexInformationProvider,
+    depth: usize,
+) -> Result<Option<IndexedExpression>> {
+    let Some(column) = null_where_column_is(predicate, index_info) else {
+        return Ok(None);
+    };
+    let Some((column, _, query_parser)) = maybe_indexed_column(column, index_info) else {
+        return Ok(None);
+    };
+    let matches = match predicate {
+        Expr::Column(_) => visit_is_bool(predicate, index_info, value),
+        _ if value => visit_node(predicate, index_info, depth + 1)?,
+        _ => visit_node(predicate, index_info, depth + 1)?.and_then(IndexedExpression::maybe_not),
+    };
+    let Some(matches) = matches else {
+        return Ok(None);
+    };
+    let not_null = query_parser
+        .visit_is_null(&column)
+        .and_then(IndexedExpression::maybe_not);
+    Ok(Some(match not_null {
+        Some(not_null) => matches.and(not_null),
+        // Without an exact search for NULL rows the index can only narrow the
+        // rows down, and the predicate is rechecked on them.
+        None if value => matches.refine(predicate.clone().is_true()),
+        None => matches.refine(predicate.clone().is_false()),
+    }))
+}
+
+/// `column IS [NOT] DISTINCT FROM literal`, as `column IS [NOT] NULL` for a NULL
+/// literal and as `(column = literal) IS [NOT] TRUE` otherwise.
+fn visit_distinct_from(
+    expr: &BinaryExpr,
+    index_info: &dyn IndexInformationProvider,
+    depth: usize,
+) -> Result<Option<IndexedExpression>> {
+    let is_distinct = expr.op == Operator::IsDistinctFrom;
+    if matches!(expr.right.as_ref(), Expr::Literal(value, _) if value.is_null()) {
+        return Ok(visit_is_null(&expr.left, index_info, is_distinct));
+    }
+    let equals = (*expr.left).clone().eq((*expr.right).clone());
+    let is_true = visit_is_truth_value(&equals, true, index_info, depth)?;
+    Ok(if is_distinct {
+        is_true.and_then(IndexedExpression::maybe_not)
+    } else {
+        is_true
+    })
+}
+
 fn visit_binary_expr(
     expr: &BinaryExpr,
     index_info: &dyn IndexInformationProvider,
     depth: usize,
 ) -> Result<Option<IndexedExpression>> {
     match &expr.op {
-        Operator::Lt | Operator::LtEq | Operator::Gt | Operator::GtEq | Operator::Eq => {
+        Operator::Lt | Operator::LtEq | Operator::Gt | Operator::GtEq => {
             Ok(visit_comparison(expr, index_info))
         }
-        // visit_comparison will maybe create an Eq query which we negate
-        Operator::NotEq => Ok(visit_comparison(expr, index_info).and_then(|node| node.maybe_not())),
+        Operator::Eq | Operator::NotEq => match visit_comparison(expr, index_info) {
+            Some(node) if expr.op == Operator::Eq => Ok(Some(node)),
+            // visit_comparison creates an Eq query which we negate
+            Some(node) => Ok(node.maybe_not()),
+            None => visit_predicate_equality(expr, index_info, depth),
+        },
+        Operator::IsDistinctFrom | Operator::IsNotDistinctFrom => {
+            visit_distinct_from(expr, index_info, depth)
+        }
         Operator::And => visit_and(expr, index_info, depth),
         Operator::Or => visit_or(expr, index_info, depth),
+        Operator::RegexMatch | Operator::RegexIMatch => Ok(visit_regex_match(expr, index_info)),
         _ => Ok(None),
     }
+}
+
+/// `col ~ 'pat'` is `regexp_like(col, 'pat')`; `~*` adds the `i` flag.
+fn visit_regex_match(
+    expr: &BinaryExpr,
+    index_info: &dyn IndexInformationProvider,
+) -> Option<IndexedExpression> {
+    let (column, data_type, query_parser) = maybe_indexed_column(&expr.left, index_info)?;
+    let mut args = vec![expr.left.as_ref().clone(), expr.right.as_ref().clone()];
+    if expr.op == Operator::RegexIMatch {
+        args.push(Expr::Literal(ScalarValue::Utf8(Some("i".into())), None));
+    }
+    let regexp_like = datafusion_functions::regex::regexp_like();
+    query_parser.visit_scalar_function(&column, &data_type, &regexp_like, &args)
 }
 
 fn visit_scalar_fn(
@@ -2423,12 +2846,23 @@ fn visit_like_expr(
     like: &Like,
     index_info: &dyn IndexInformationProvider,
 ) -> Option<IndexedExpression> {
-    let (column, _, query_parser) = maybe_indexed_column(&like.expr, index_info)?;
+    let (column, col_type, query_parser) = maybe_indexed_column(&like.expr, index_info)?;
 
     // Extract the pattern as a ScalarValue
-    let pattern = match like.pattern.as_ref() {
-        Expr::Literal(scalar, _) => scalar.clone(),
-        _ => return None,
+    let Expr::Literal(pattern, _) = like.pattern.as_ref() else {
+        return None;
+    };
+
+    // Every other visitor coerces its operand to the indexed column's type through
+    // `maybe_scalar`; LIKE has to as well.  Once the column-side coercion cast is
+    // looked through, the pattern can be a wider string variant than the indexed
+    // data, and a parser that takes its bound's type from the pattern would emit a
+    // bound the index cannot compare against.  A non-string reference (a dictionary
+    // column, which the LIKE coercion leaves uncast) keeps its pattern verbatim.
+    let pattern = if is_plain_string(&col_type) {
+        safe_coerce_scalar(pattern, &col_type)?
+    } else {
+        pattern.clone()
     };
 
     query_parser.visit_like(&column, like, &pattern)
@@ -2450,8 +2884,12 @@ fn visit_node(
         Expr::Alias(alias) => visit_node(alias.expr.as_ref(), index_info, depth),
         Expr::Column(_) => Ok(visit_column(expr, index_info)),
         Expr::InList(in_list) => Ok(visit_in_list(in_list, index_info)),
-        Expr::IsFalse(expr) => Ok(visit_is_bool(expr.as_ref(), index_info, false)),
-        Expr::IsTrue(expr) => Ok(visit_is_bool(expr.as_ref(), index_info, true)),
+        Expr::IsFalse(expr) => visit_is_truth_value(expr, false, index_info, depth),
+        Expr::IsTrue(expr) => visit_is_truth_value(expr, true, index_info, depth),
+        Expr::IsNotFalse(expr) => Ok(visit_is_truth_value(expr, false, index_info, depth)?
+            .and_then(IndexedExpression::maybe_not)),
+        Expr::IsNotTrue(expr) => Ok(visit_is_truth_value(expr, true, index_info, depth)?
+            .and_then(IndexedExpression::maybe_not)),
         Expr::IsNull(expr) => Ok(visit_is_null(expr.as_ref(), index_info, false)),
         Expr::IsNotNull(expr) => {
             // `regexp_match(col, pat)` returns a list and is coerced to
@@ -2495,20 +2933,118 @@ pub trait IndexInformationProvider {
     fn fragment_bitmap(&self, _column: &str, _index_name: &str) -> Option<RoaringBitmap> {
         None
     }
+
+    /// Planners for indices keyed on more than one column. The default has none.
+    fn planners(&self) -> &[Box<dyn ScalarIndexPlanner>] {
+        &[]
+    }
 }
 
 /// Attempt to split a filter expression into a search of scalar indexes and an
 ///   optional post-search refinement query
+///
+/// The module docs describe how planners and per-column parsers share a filter.
+///
+/// # Errors
+///
+/// Returns [`Error::Internal`] when a planner returns a plan whose consumed
+/// conjuncts are empty, repeated, or not among the conjuncts it was offered.
 pub fn apply_scalar_indices(
     expr: Expr,
     index_info: &dyn IndexInformationProvider,
 ) -> Result<IndexedExpression> {
-    let mut result =
-        visit_node(&expr, index_info, 0)?.unwrap_or(IndexedExpression::refine_only(expr));
+    let mut result = match apply_index_planners(&expr, index_info)? {
+        Some(planned) => planned,
+        None => visit_node(&expr, index_info, 0)?.unwrap_or(IndexedExpression::refine_only(expr)),
+    };
     if let Some(query) = result.scalar_query.as_mut() {
         populate_fragment_bitmaps(query, index_info);
     }
     Ok(result)
+}
+
+fn apply_index_planners(
+    expr: &Expr,
+    index_info: &dyn IndexInformationProvider,
+) -> Result<Option<IndexedExpression>> {
+    let planners = index_info.planners();
+    let mut root = expr;
+    while let Expr::Alias(alias) = root {
+        root = alias.expr.as_ref();
+    }
+    let root_is_or_not = matches!(
+        root,
+        Expr::Not(_)
+            | Expr::BinaryExpr(BinaryExpr {
+                op: Operator::Or,
+                ..
+            })
+    );
+    if planners.is_empty() || (root_is_or_not && column_names_in_expr(root).len() > 1) {
+        return Ok(None);
+    }
+    let conjuncts = split_conjunction(root)
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut best: Option<(usize, ScalarIndexSearch, Vec<bool>)> = None;
+    for planner in planners {
+        let Some(plan) = planner.plan(&conjuncts) else {
+            continue;
+        };
+        let consumed = consumed_mask(&conjuncts, &plan)?;
+        let count = plan.consumed.len();
+        let search = plan.search;
+        let wins = best.as_ref().is_none_or(|(best_count, best_search, _)| {
+            (count, Reverse(&search.index_name)) > (*best_count, Reverse(&best_search.index_name))
+        });
+        if wins {
+            best = Some((count, search, consumed));
+        }
+    }
+    let Some((_, search, consumed)) = best else {
+        return Ok(None);
+    };
+    let planned = IndexedExpression {
+        scalar_query: Some(ScalarIndexExpr::Query(search)),
+        refine_expr: None,
+    };
+    let rest = conjunction(
+        conjuncts
+            .into_iter()
+            .zip(consumed)
+            .filter_map(|(conjunct, consumed)| (!consumed).then_some(conjunct)),
+    );
+    let Some(rest) = rest else {
+        return Ok(Some(planned));
+    };
+    let rest = visit_node(&rest, index_info, 0)?.unwrap_or(IndexedExpression::refine_only(rest));
+    Ok(Some(planned.and(rest)))
+}
+
+fn consumed_mask(conjuncts: &[Expr], plan: &ScalarIndexPlan) -> Result<Vec<bool>> {
+    let index_name = &plan.search.index_name;
+    if plan.consumed.is_empty() {
+        return Err(Error::internal(format!(
+            "Scalar index planner for '{index_name}' returned a plan that consumes no conjuncts"
+        )));
+    }
+    let mut consumed = vec![false; conjuncts.len()];
+    for conjunct in &plan.consumed {
+        match conjuncts
+            .iter()
+            .position(|offered| std::ptr::eq(offered, *conjunct))
+        {
+            Some(position) if !consumed[position] => consumed[position] = true,
+            _ => {
+                return Err(Error::internal(format!(
+                    "Scalar index planner for '{index_name}' consumed `{conjunct}`, which is not a distinct member of the {} conjuncts it was offered",
+                    conjuncts.len()
+                )));
+            }
+        }
+    }
+    Ok(consumed)
 }
 
 /// Walk a [`ScalarIndexExpr`] and fill in `fragment_bitmap` on each leaf from
@@ -2565,14 +3101,14 @@ impl FilterPlan {
     pub fn all_columns(&self) -> Vec<String> {
         self.full_expr
             .as_ref()
-            .map(Planner::column_names_in_expr)
+            .map(column_names_in_expr)
             .unwrap_or_default()
     }
 
     pub fn refine_columns(&self) -> Vec<String> {
         self.refine_expr
             .as_ref()
-            .map(Planner::column_names_in_expr)
+            .map(column_names_in_expr)
             .unwrap_or_default()
     }
 
@@ -2601,49 +3137,39 @@ impl FilterPlan {
     }
 }
 
-pub trait PlannerIndexExt {
-    /// Determine how to apply a provided filter
-    ///
-    /// We parse the filter into a logical expression.  We then
-    /// split the logical expression into a portion that can be
-    /// satisfied by an index search (of one or more indices) and
-    /// a refine portion that must be applied after the index search
-    fn create_filter_plan(
-        &self,
-        filter: Expr,
-        index_info: &dyn IndexInformationProvider,
-        use_scalar_index: bool,
-    ) -> Result<FilterPlan>;
-}
-
-impl PlannerIndexExt for Planner {
-    fn create_filter_plan(
-        &self,
-        filter: Expr,
-        index_info: &dyn IndexInformationProvider,
-        use_scalar_index: bool,
-    ) -> Result<FilterPlan> {
-        let logical_expr = self.optimize_expr(filter)?;
-        if use_scalar_index {
-            let indexed_expr = apply_scalar_indices(logical_expr.clone(), index_info)?;
-            let mut skip_recheck = false;
-            if let Some(scalar_query) = indexed_expr.scalar_query.as_ref() {
-                skip_recheck = !scalar_query.needs_recheck();
-            }
-            Ok(FilterPlan {
-                index_query: indexed_expr.scalar_query,
-                refine_expr: indexed_expr.refine_expr,
-                full_expr: Some(logical_expr),
-                skip_recheck,
-            })
-        } else {
-            Ok(FilterPlan {
-                index_query: None,
-                skip_recheck: true,
-                refine_expr: Some(logical_expr.clone()),
-                full_expr: Some(logical_expr),
-            })
+/// Determine how to apply a provided filter
+///
+/// The filter is split into a portion that can be satisfied by an index
+/// search (of one or more indices) and a refine portion that must be applied
+/// after the index search.
+///
+/// `filter` should already be optimized (e.g. by `Planner::optimize_expr` in
+/// `lance-datafusion`), since index matching relies on the simplified and
+/// type-coerced form of the expression.
+pub fn create_filter_plan(
+    filter: Expr,
+    index_info: &dyn IndexInformationProvider,
+    use_scalar_index: bool,
+) -> Result<FilterPlan> {
+    if use_scalar_index {
+        let indexed_expr = apply_scalar_indices(filter.clone(), index_info)?;
+        let mut skip_recheck = false;
+        if let Some(scalar_query) = indexed_expr.scalar_query.as_ref() {
+            skip_recheck = !scalar_query.needs_recheck();
         }
+        Ok(FilterPlan {
+            index_query: indexed_expr.scalar_query,
+            refine_expr: indexed_expr.refine_expr,
+            full_expr: Some(filter),
+            skip_recheck,
+        })
+    } else {
+        Ok(FilterPlan {
+            index_query: None,
+            skip_recheck: true,
+            refine_expr: Some(filter.clone()),
+            full_expr: Some(filter),
+        })
     }
 }
 
@@ -2656,18 +3182,29 @@ mod tests {
     use chrono::Utc;
     use datafusion_common::{Column, DFSchema};
     use datafusion_expr::simplify::SimplifyContext;
+    use lance_core::deepsize::DeepSizeOf;
     use lance_datafusion::exec::{LanceExecutionOptions, get_session_context};
+    use lance_datafusion::planner::Planner;
     use lance_select::result::IndexExprResultWireFormat;
+    use lance_select::{NullableRowAddrSet, RowAddrTreeMap};
     use roaring::RoaringBitmap;
     use rstest::rstest;
 
+    use crate::{Index, IndexType};
+
     use crate::scalar::json::{JsonQuery, JsonQueryParser};
+    use crate::scalar::registry::ScalarIndexPlugin;
+    use datafusion_expr::{col, lit};
 
     use super::*;
 
     struct ColInfo {
         data_type: DataType,
         parser: Box<MultiQueryParser>,
+    }
+
+    fn f16_scalar(value: f32) -> ScalarValue {
+        ScalarValue::Float16(Some(half::f16::from_f32(value)))
     }
 
     impl ColInfo {
@@ -2797,6 +3334,32 @@ mod tests {
         )
     }
 
+    /// `on_sale = value AND NOT on_sale IS NULL`, negated when `negated`.
+    fn check_is_truth_value(
+        index_info: &dyn IndexInformationProvider,
+        expr: &str,
+        value: bool,
+        negated: bool,
+    ) {
+        let query = |query| {
+            IndexedExpression::index_query(
+                "on_sale".to_string(),
+                "on_sale_idx".to_string(),
+                "BTree".to_string(),
+                Arc::new(query),
+            )
+        };
+        let not_null = query(SargableQuery::IsNull()).maybe_not().unwrap();
+        let is_value =
+            query(SargableQuery::Equals(ScalarValue::Boolean(Some(value)))).and(not_null);
+        let expected = if negated {
+            is_value.maybe_not().unwrap()
+        } else {
+            is_value
+        };
+        check(index_info, expr, Some(expected), false)
+    }
+
     fn check_simple_negated(
         index_info: &dyn IndexInformationProvider,
         expr: &str,
@@ -2886,6 +3449,136 @@ mod tests {
         );
     }
 
+    fn label_list_index_info(label_type: &DataType) -> MockIndexInfoProvider {
+        MockIndexInfoProvider::new(vec![(
+            "labels",
+            ColInfo::new(
+                label_type.clone(),
+                Box::new(LabelListQueryParser::new(
+                    "labels_idx".to_string(),
+                    "LabelList".to_string(),
+                )),
+            ),
+        )])
+    }
+
+    fn plan_label_list_filter(label_type: DataType, filter: &str) -> FilterPlan {
+        let index_info = label_list_index_info(&label_type);
+        let planner = Planner::new(Arc::new(Schema::new(vec![Field::new(
+            "labels", label_type, true,
+        )])));
+        let expr = planner.parse_filter(filter).unwrap();
+        create_filter_plan(planner.optimize_expr(expr).unwrap(), &index_info, true).unwrap()
+    }
+
+    // DataFusion types the literal list as Int64 and casts a narrower integer column
+    // to match, so the parser only sees the column through a `Cast`.
+    #[rstest]
+    #[case::int8(DataType::Int8, ScalarValue::Int8(Some(5)), ScalarValue::Int8(Some(7)))]
+    #[case::int32(
+        DataType::Int32,
+        ScalarValue::Int32(Some(5)),
+        ScalarValue::Int32(Some(7))
+    )]
+    #[case::uint8(
+        DataType::UInt8,
+        ScalarValue::UInt8(Some(5)),
+        ScalarValue::UInt8(Some(7))
+    )]
+    #[case::uint32(
+        DataType::UInt32,
+        ScalarValue::UInt32(Some(5)),
+        ScalarValue::UInt32(Some(7))
+    )]
+    fn test_label_list_integer_items_narrower_than_int64(
+        #[case] item_type: DataType,
+        #[case] first: ScalarValue,
+        #[case] second: ScalarValue,
+        #[values(false, true)] large: bool,
+    ) {
+        let item = Arc::new(Field::new("item", item_type, true));
+        let label_type = if large {
+            DataType::LargeList(item)
+        } else {
+            DataType::List(item)
+        };
+        let expected_any = LabelListQuery::HasAnyLabel(vec![first.clone(), second.clone()]);
+        let expected_all = LabelListQuery::HasAllLabels(vec![first.clone(), second]);
+        for (filter, expected) in [
+            (
+                "array_has(labels, 5)",
+                LabelListQuery::HasAnyLabel(vec![first]),
+            ),
+            ("array_has_any(labels, [5, 7])", expected_any),
+            ("array_has_all(labels, [5, 7])", expected_all),
+        ] {
+            let plan = plan_label_list_filter(label_type.clone(), filter);
+            let Some(ScalarIndexExpr::Query(search)) = plan.index_query.as_ref() else {
+                panic!("{filter} did not use the index: {:?}", plan.index_query);
+            };
+            assert_eq!(search.index_name, "labels_idx");
+            assert_eq!(
+                search.query.as_any().downcast_ref::<LabelListQuery>(),
+                Some(&expected),
+                "{filter}"
+            );
+        }
+    }
+
+    // A literal outside the item type's range cannot be answered by the index:
+    // coercing it to the item type would turn it into NULL, and the index would
+    // match rows with NULL items instead of nothing.
+    #[rstest]
+    #[case::int32_array_has("array_has(labels, 3000000000)")]
+    #[case::int32_array_has_any("array_has_any(labels, [1, 3000000000])")]
+    #[case::int32_array_has_all("array_has_all(labels, [1, 3000000000])")]
+    fn test_label_list_integer_literal_out_of_item_range(#[case] filter: &str) {
+        let label_type = DataType::List(Arc::new(Field::new("item", DataType::Int32, true)));
+        let plan = plan_label_list_filter(label_type, filter);
+
+        assert!(plan.index_query.is_none(), "{filter}");
+        assert!(plan.refine_expr.is_some());
+    }
+
+    #[test]
+    fn test_label_list_lossless_integer_cast() {
+        let list = |item_type| DataType::List(Arc::new(Field::new("item", item_type, true)));
+        let large = |item_type| DataType::LargeList(Arc::new(Field::new("item", item_type, true)));
+        assert!(is_lossless_integer_list_cast(
+            &list(DataType::Int32),
+            &list(DataType::Int64)
+        ));
+        assert!(is_lossless_integer_list_cast(
+            &large(DataType::UInt32),
+            &large(DataType::Int64)
+        ));
+        assert!(is_lossless_integer_list_cast(
+            &list(DataType::UInt8),
+            &list(DataType::UInt64)
+        ));
+        // These change values or the type of the items.
+        assert!(!is_lossless_integer_list_cast(
+            &list(DataType::Int64),
+            &list(DataType::Int32)
+        ));
+        assert!(!is_lossless_integer_list_cast(
+            &list(DataType::UInt64),
+            &list(DataType::Int64)
+        ));
+        assert!(!is_lossless_integer_list_cast(
+            &list(DataType::Int32),
+            &list(DataType::UInt64)
+        ));
+        assert!(!is_lossless_integer_list_cast(
+            &list(DataType::Int32),
+            &list(DataType::Float64)
+        ));
+        assert!(!is_lossless_integer_list_cast(
+            &list(DataType::Int32),
+            &large(DataType::Int64)
+        ));
+    }
+
     #[test]
     fn test_nested_column_index() {
         let column = "user_profile.basic.age";
@@ -2914,9 +3607,8 @@ mod tests {
         let filter = planner
             .parse_filter("user_profile.basic.age > 900")
             .unwrap();
-        let plan = planner
-            .create_filter_plan(filter, &index_info, true)
-            .unwrap();
+        let plan =
+            create_filter_plan(planner.optimize_expr(filter).unwrap(), &index_info, true).unwrap();
         let expected = IndexedExpression::index_query(
             column.to_string(),
             format!("{column}_idx"),
@@ -2929,6 +3621,79 @@ mod tests {
 
         assert_eq!(plan.index_query, expected.scalar_query);
         assert!(plan.refine_expr.is_none());
+    }
+
+    /// A `Float16` column must reach its scalar index like any other numeric
+    /// column. This is the second, quieter face of the coercion gap: `maybe_scalar`
+    /// runs `safe_coerce_scalar` on a literal the planner has *already* coerced,
+    /// so without a `ScalarValue::Float16` source arm the whole predicate silently
+    /// becomes a refine filter. The rows stay correct, which is why only the plan
+    /// catches it.
+    ///
+    /// This drives `Planner::parse_filter` rather than `check_with_schema` on
+    /// purpose. `check_with_schema` builds the expression with
+    /// `create_logical_expr`, which does no type coercion, so the literal would
+    /// still be `Float64` here and would exercise the `Float64` to `Float16`
+    /// target arm instead. Production coerces first, in `resolve_value`, and only
+    /// this order needs the source arm.
+    #[rstest]
+    #[case("temp = 1.0", SargableQuery::Equals(f16_scalar(1.0)))]
+    #[case("temp = 1", SargableQuery::Equals(f16_scalar(1.0)))]
+    #[case(
+        "temp < 1.0",
+        SargableQuery::Range(
+            Bound::Included(f16_scalar(f32::NEG_INFINITY)),
+            Bound::Excluded(f16_scalar(1.0))
+        )
+    )]
+    // A two-sided bound needs neither negative-NaN range, so it stays one range.
+    #[case(
+        "temp BETWEEN 1.0 AND 2.5",
+        SargableQuery::Range(Bound::Included(f16_scalar(1.0)), Bound::Included(f16_scalar(2.5)))
+    )]
+    #[case(
+        "temp > 0.0 AND temp < 2.5",
+        SargableQuery::Range(Bound::Excluded(f16_scalar(0.0)), Bound::Excluded(f16_scalar(2.5)))
+    )]
+    #[case(
+        // Four elements so DataFusion's `ShortenInListSimplifier` leaves the list
+        // alone; at three or fewer over a bare column it becomes an `OR` chain and
+        // stops exercising `maybe_scalar_list`.
+        "temp IN (1.0, 2.5, 3.0, 4.0)",
+        SargableQuery::IsIn(vec![
+            f16_scalar(1.0),
+            f16_scalar(2.5),
+            f16_scalar(3.0),
+            f16_scalar(4.0),
+        ])
+    )]
+    fn test_float16_column_reaches_its_index(#[case] expr: &str, #[case] expected: SargableQuery) {
+        let index_info = MockIndexInfoProvider::new(vec![(
+            "temp",
+            ColInfo::new(
+                DataType::Float16,
+                Box::new(SargableQueryParser::new(
+                    "temp_idx".to_string(),
+                    "BTree".to_string(),
+                    false,
+                )),
+            ),
+        )]);
+        let schema = Schema::new(vec![Field::new("temp", DataType::Float16, true)]);
+
+        let planner = Planner::new(Arc::new(schema));
+        let filter = planner.parse_filter(expr).unwrap();
+        let plan =
+            create_filter_plan(planner.optimize_expr(filter).unwrap(), &index_info, true).unwrap();
+        let wanted = IndexedExpression::index_query(
+            "temp".to_string(),
+            "temp_idx".to_string(),
+            "BTree".to_string(),
+            Arc::new(expected),
+        );
+
+        assert_eq!(plan.index_query, wanted.scalar_query, "predicate: {expr}");
+        assert!(plan.refine_expr.is_none(), "predicate: {expr}");
     }
 
     #[test]
@@ -2983,7 +3748,7 @@ mod tests {
                 ColInfo::new(
                     DataType::LargeBinary,
                     Box::new(JsonQueryParser::new(
-                        "$.name".to_string(),
+                        "name".to_string(),
                         Box::new(SargableQueryParser::new(
                             "json_idx".to_string(),
                             "BTree".to_string(),
@@ -2994,17 +3759,31 @@ mod tests {
             ),
         ]);
 
+        // The typed accessors decode the path value, matching the representation
+        // the index was trained on, so they route.
         check_simple(
             &index_info,
-            "json_extract(json, '$.name') = 'foo'",
+            "json_get_string(json, 'name') = 'foo'",
             "json",
             JsonQuery::new(
                 Arc::new(SargableQuery::Equals(ScalarValue::Utf8(Some(
                     "foo".to_string(),
                 )))),
-                "$.name".to_string(),
+                "name".to_string(),
             ),
         );
+        // `json_extract` evaluates to serialized JSON text, which does not match the
+        // decoded keys in the index, so it must not route.
+        // https://github.com/lance-format/lance/issues/8806
+        check_no_index(&index_info, "json_extract(json, 'name') = 'foo'");
+        check_no_index(&index_info, "json_extract(json, 'name') = '\"foo\"'");
+        check_no_index(&index_info, "json_extract(json, 'name') < 'foo'");
+        // Root-prefixed and nested JSONPath expressions do not have the same
+        // semantics as the typed accessors' literal key argument.
+        check_no_index(&index_info, "json_get_string(json, '$.name') = 'foo'");
+        check_no_index(&index_info, "json_get_string(json, 'name.first') = 'foo'");
+        // A typed accessor on a path the index was not built for still declines.
+        check_no_index(&index_info, "json_get_string(json, 'other') = 'foo'");
 
         check_no_index(&index_info, "size BETWEEN 5 AND 10");
         // Cast case.  We will cast 5 (an int64) to Int16 and then coerce to UInt32
@@ -3081,30 +3860,24 @@ mod tests {
                 Bound::Excluded(ScalarValue::UInt32(Some(10))),
             ),
         );
-        check_simple(
-            &index_info,
-            "on_sale IS TRUE",
-            "on_sale",
-            SargableQuery::Equals(ScalarValue::Boolean(Some(true))),
-        );
+        check_is_truth_value(&index_info, "on_sale IS TRUE", true, false);
         check_simple(
             &index_info,
             "on_sale",
             "on_sale",
             SargableQuery::Equals(ScalarValue::Boolean(Some(true))),
         );
+        // NULL rows are not TRUE, so they are in the negation of `IS TRUE`.
+        check_is_truth_value(&index_info, "on_sale IS NOT TRUE", true, true);
+        check_is_truth_value(&index_info, "NOT (on_sale IS TRUE)", true, true);
+        check_is_truth_value(&index_info, "on_sale IS NOT FALSE", false, true);
         check_simple_negated(
             &index_info,
             "NOT on_sale",
             "on_sale",
             SargableQuery::Equals(ScalarValue::Boolean(Some(true))),
         );
-        check_simple(
-            &index_info,
-            "on_sale IS FALSE",
-            "on_sale",
-            SargableQuery::Equals(ScalarValue::Boolean(Some(false))),
-        );
+        check_is_truth_value(&index_info, "on_sale IS FALSE", false, false);
         check_simple_negated(
             &index_info,
             "aisle NOT BETWEEN 5 AND 10",
@@ -3181,18 +3954,8 @@ mod tests {
                 ScalarValue::UInt32(Some(9)),
             ]),
         );
-        check_simple(
-            &index_info,
-            "on_sale is false",
-            "on_sale",
-            SargableQuery::Equals(ScalarValue::Boolean(Some(false))),
-        );
-        check_simple(
-            &index_info,
-            "on_sale is true",
-            "on_sale",
-            SargableQuery::Equals(ScalarValue::Boolean(Some(true))),
-        );
+        check_is_truth_value(&index_info, "on_sale is false", false, false);
+        check_is_truth_value(&index_info, "on_sale is true", true, false);
         check_simple(
             &index_info,
             "aisle < 10",
@@ -3301,18 +4064,81 @@ mod tests {
             &index_info,
             "(aisle = 10 OR color = 'blue') AND size > 30",
             Some(IndexedExpression {
-                scalar_query: Some(ScalarIndexExpr::Or(left, right)),
+                scalar_query: Some(ScalarIndexExpr::Or(left.clone(), right.clone())),
                 refine_expr: Some(refine),
             }),
             false,
         );
-        // Examples of things that are not yet supported but should be supportable someday
-
-        // OR'd group of refined index searches (see IndexedExpression::or for details)
-        check_no_index(
+        // OR'd group of refined index searches: the OR of the index searches finds every
+        // row either side could match and the original OR refines them
+        let col = |name: &str| Expr::Column(Column::new_unqualified(name));
+        let aisle_refined = col("aisle")
+            .eq(datafusion_expr::lit(10_i64))
+            .and(col("size").gt(datafusion_expr::lit(30_i64)));
+        let color_refined = col("color")
+            .eq(datafusion_expr::lit("blue"))
+            .and(col("size").gt(datafusion_expr::lit(20_i64)));
+        let or_query = ScalarIndexExpr::Or(left, right.clone());
+        check(
+            &index_info,
+            "(aisle = 10 AND size > 30) OR color = 'blue'",
+            Some(IndexedExpression {
+                scalar_query: Some(or_query.clone()),
+                refine_expr: Some(
+                    aisle_refined
+                        .clone()
+                        .or(col("color").eq(datafusion_expr::lit("blue"))),
+                ),
+            }),
+            false,
+        );
+        check(
             &index_info,
             "(aisle = 10 AND size > 30) OR (color = 'blue' AND size > 20)",
+            Some(IndexedExpression {
+                scalar_query: Some(or_query.clone()),
+                refine_expr: Some(aisle_refined.clone().or(color_refined.clone())),
+            }),
+            false,
         );
+        // Nested in an AND, the original OR is AND'd with the other refine
+        check(
+            &index_info,
+            "((aisle = 10 AND size > 30) OR (color = 'blue' AND size > 20)) AND size < 50",
+            Some(IndexedExpression {
+                scalar_query: Some(or_query.clone()),
+                refine_expr: Some(
+                    aisle_refined
+                        .clone()
+                        .or(color_refined.clone())
+                        .and(col("size").lt(datafusion_expr::lit(50_i64))),
+                ),
+            }),
+            false,
+        );
+        // Nested in an OR, the outermost OR is the refine
+        check(
+            &index_info,
+            "((aisle = 10 AND size > 30) OR color = 'blue') OR (color = 'blue' AND size > 20)",
+            Some(IndexedExpression {
+                scalar_query: Some(ScalarIndexExpr::Or(Box::new(or_query), right)),
+                refine_expr: Some(
+                    aisle_refined
+                        .or(col("color").eq(datafusion_expr::lit("blue")))
+                        .or(color_refined),
+                ),
+            }),
+            false,
+        );
+        // An index search with a refine cannot be negated, so NOT gives up on the index
+        check_no_index(
+            &index_info,
+            "NOT ((aisle = 10 AND size > 30) OR color = 'blue')",
+        );
+        // A side with no index search still makes the OR a full scan
+        check_no_index(&index_info, "(aisle = 10 AND size > 30) OR size < 5");
+
+        // Examples of things that are not yet supported but should be supportable someday
 
         // Non-normalized arithmetic (can use expression simplification)
         check_no_index(&index_info, "aisle + 3 < 10");
@@ -3471,6 +4297,346 @@ mod tests {
         assert!(matches!(negated.upper, NullableRowAddrMask::BlockList(_)));
     }
 
+    // --- domain-aware evaluation -------------------------------------
+
+    /// Minimal [`ScalarIndex`] for testing domain-aware `And`/`Or`
+    /// combination in `evaluate_with_options`, without needing a real
+    /// `Dataset`. Always answers with `matches` (ignoring the query itself)
+    /// tagged `domain`.
+    #[derive(Debug, DeepSizeOf)]
+    struct MockScalarIndex {
+        domain: MaskDomain,
+        matches: RowAddrTreeMap,
+    }
+
+    #[async_trait::async_trait]
+    impl Index for MockScalarIndex {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn as_index(self: Arc<Self>) -> Arc<dyn Index> {
+            self
+        }
+
+        fn statistics(&self) -> Result<serde_json::Value> {
+            Ok(serde_json::json!({}))
+        }
+
+        async fn prewarm(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn index_type(&self) -> IndexType {
+            IndexType::Scalar
+        }
+
+        async fn calculate_included_frags(&self) -> Result<RoaringBitmap> {
+            Ok(RoaringBitmap::new())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ScalarIndex for MockScalarIndex {
+        async fn search(
+            &self,
+            _query: &dyn AnyQuery,
+            _metrics: &dyn MetricsCollector,
+        ) -> Result<SearchResult> {
+            Ok(SearchResult::exact(self.matches.clone()))
+        }
+
+        fn results_are_row_addresses(&self) -> bool {
+            matches!(self.domain, MaskDomain::RowAddress)
+        }
+
+        async fn remap(
+            &self,
+            _mapping: &lance_core::utils::row_addr_remap::RowAddrRemap,
+            _dest_store: &dyn crate::scalar::IndexStore,
+        ) -> Result<crate::scalar::CreatedIndex> {
+            unimplemented!("not exercised by domain-reconciliation tests")
+        }
+
+        async fn update(
+            &self,
+            _new_data: datafusion_physical_plan::SendableRecordBatchStream,
+            _dest_store: &dyn crate::scalar::IndexStore,
+            _old_data_filter: Option<crate::scalar::OldIndexDataFilter>,
+        ) -> Result<crate::scalar::CreatedIndex> {
+            unimplemented!("not exercised by domain-reconciliation tests")
+        }
+
+        fn update_criteria(&self) -> crate::scalar::UpdateCriteria {
+            unimplemented!("not exercised by domain-reconciliation tests")
+        }
+
+        fn derive_index_params(&self) -> Result<crate::scalar::ScalarIndexParams> {
+            unimplemented!("not exercised by domain-reconciliation tests")
+        }
+    }
+
+    /// Shifts every element of `map` by `offset` — a deterministic stand-in
+    /// for a `RowIdIndex` id->address lookup, distinguishable from the input
+    /// in test assertions.
+    fn shift_treemap(map: &RowAddrTreeMap, offset: u64) -> RowAddrTreeMap {
+        RowAddrTreeMap::from_iter(
+            map.row_addrs()
+                .expect("test masks are always finite")
+                .map(|addr| u64::from(addr) + offset),
+        )
+    }
+
+    fn shift_mask(mask: NullableRowAddrMask, offset: u64) -> NullableRowAddrMask {
+        let (ctor, set): (fn(NullableRowAddrSet) -> NullableRowAddrMask, _) = match mask {
+            NullableRowAddrMask::AllowList(set) => {
+                (NullableRowAddrMask::AllowList as fn(_) -> _, set)
+            }
+            NullableRowAddrMask::BlockList(set) => {
+                (NullableRowAddrMask::BlockList as fn(_) -> _, set)
+            }
+        };
+        let (selected, nulls) = set.into_parts();
+        ctor(NullableRowAddrSet::new(
+            shift_treemap(&selected, offset),
+            shift_treemap(&nulls, offset),
+        ))
+    }
+
+    const TEST_ADDR_OFFSET: u64 = 1_000_000;
+
+    /// `ScalarIndexLoader` backed by [`MockScalarIndex`]es, with a
+    /// call-counting `row_id_result_to_row_addrs` so tests can assert
+    /// exactly when (and how often) domain conversion happens.
+    struct MockLoader {
+        indexes: HashMap<&'static str, Arc<MockScalarIndex>>,
+        conversions: std::sync::atomic::AtomicUsize,
+    }
+
+    impl MockLoader {
+        fn new(indexes: Vec<(&'static str, MockScalarIndex)>) -> Self {
+            Self {
+                indexes: indexes
+                    .into_iter()
+                    .map(|(name, idx)| (name, Arc::new(idx)))
+                    .collect(),
+                conversions: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn conversion_count(&self) -> usize {
+            self.conversions.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ScalarIndexLoader for MockLoader {
+        async fn load_index(
+            &self,
+            _column: &str,
+            index_name: &str,
+            _metrics: &dyn MetricsCollector,
+        ) -> Result<Arc<dyn ScalarIndex>> {
+            Ok(self.indexes[index_name].clone() as Arc<dyn ScalarIndex>)
+        }
+
+        async fn row_id_result_to_row_addrs(
+            &self,
+            result: NullableIndexExprResult,
+        ) -> Result<NullableIndexExprResult> {
+            self.conversions
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            result
+                .try_map(|mask| {
+                    std::future::ready(Ok::<_, Error>(shift_mask(mask, TEST_ADDR_OFFSET)))
+                })
+                .await
+                .map(|r| r.with_domain(MaskDomain::RowAddress))
+        }
+    }
+
+    fn mock_query(column: &str, index_name: &str) -> ScalarIndexExpr {
+        ScalarIndexExpr::Query(ScalarIndexSearch {
+            column: column.to_string(),
+            index_name: index_name.to_string(),
+            index_type: "Mock".to_string(),
+            query: Arc::new(SargableQuery::Equals(ScalarValue::UInt32(Some(0)))),
+            needs_recheck: false,
+            fragment_bitmap: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn test_and_of_two_address_domain_leaves_never_converts() {
+        let loader = MockLoader::new(vec![
+            (
+                "a",
+                MockScalarIndex {
+                    domain: MaskDomain::RowAddress,
+                    matches: RowAddrTreeMap::from_iter(&[1, 2, 3]),
+                },
+            ),
+            (
+                "b",
+                MockScalarIndex {
+                    domain: MaskDomain::RowAddress,
+                    matches: RowAddrTreeMap::from_iter(&[2, 3, 4]),
+                },
+            ),
+        ]);
+        let expr = ScalarIndexExpr::And(
+            Box::new(mock_query("a", "a")),
+            Box::new(mock_query("b", "b")),
+        );
+        let result = expr
+            .evaluate_nullable(&loader, &crate::metrics::NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert_eq!(loader.conversion_count(), 0);
+        assert_eq!(result.domain, MaskDomain::RowAddress);
+        assert_eq!(
+            result.lower,
+            NullableRowAddrMask::AllowList(NullableRowAddrSet::new(
+                RowAddrTreeMap::from_iter(&[2, 3]),
+                RowAddrTreeMap::new(),
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_and_of_two_row_id_domain_leaves_never_converts() {
+        let loader = MockLoader::new(vec![
+            (
+                "a",
+                MockScalarIndex {
+                    domain: MaskDomain::RowId,
+                    matches: RowAddrTreeMap::from_iter(&[1, 2, 3]),
+                },
+            ),
+            (
+                "b",
+                MockScalarIndex {
+                    domain: MaskDomain::RowId,
+                    matches: RowAddrTreeMap::from_iter(&[2, 3, 4]),
+                },
+            ),
+        ]);
+        let expr = ScalarIndexExpr::And(
+            Box::new(mock_query("a", "a")),
+            Box::new(mock_query("b", "b")),
+        );
+        let result = expr
+            .evaluate_nullable(&loader, &crate::metrics::NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert_eq!(loader.conversion_count(), 0);
+        assert_eq!(result.domain, MaskDomain::RowId);
+    }
+
+    #[tokio::test]
+    async fn test_and_of_mixed_domain_leaves_converts_row_id_side_once() {
+        let loader = MockLoader::new(vec![
+            (
+                "addr",
+                MockScalarIndex {
+                    domain: MaskDomain::RowAddress,
+                    // Straddles both sides of the shift: {1,2,3} would be the
+                    // intersection if the sides were combined *before*
+                    // conversion, and the two shifted entries are what the
+                    // row-id side lands on once it is converted.
+                    matches: RowAddrTreeMap::from_iter(&[
+                        1,
+                        2,
+                        3,
+                        2 + TEST_ADDR_OFFSET,
+                        3 + TEST_ADDR_OFFSET,
+                    ]),
+                },
+            ),
+            (
+                "id",
+                MockScalarIndex {
+                    domain: MaskDomain::RowId,
+                    matches: RowAddrTreeMap::from_iter(&[2, 3, 4]),
+                },
+            ),
+        ]);
+        let expr = ScalarIndexExpr::And(
+            Box::new(mock_query("addr", "addr")),
+            Box::new(mock_query("id", "id")),
+        );
+        let result = expr
+            .evaluate_nullable(&loader, &crate::metrics::NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert_eq!(loader.conversion_count(), 1);
+        assert_eq!(result.domain, MaskDomain::RowAddress);
+        // The row-id side ({2,3,4}) is shifted by TEST_ADDR_OFFSET before the
+        // intersection, so the answer is the shifted pair the address side
+        // also holds. Combining before converting would instead give {2,3}.
+        assert_eq!(
+            result.lower,
+            NullableRowAddrMask::AllowList(NullableRowAddrSet::new(
+                RowAddrTreeMap::from_iter(&[2 + TEST_ADDR_OFFSET, 3 + TEST_ADDR_OFFSET]),
+                RowAddrTreeMap::new(),
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_not_preserves_domain_through_mixed_subtree() {
+        let loader = MockLoader::new(vec![(
+            "id",
+            MockScalarIndex {
+                domain: MaskDomain::RowId,
+                matches: RowAddrTreeMap::from_iter(&[1, 2, 3]),
+            },
+        )]);
+        let expr = ScalarIndexExpr::Not(Box::new(mock_query("id", "id")));
+        let result = expr
+            .evaluate_nullable(&loader, &crate::metrics::NoOpMetricsCollector)
+            .await
+            .unwrap();
+        // A lone leaf with no And/Or never triggers reconciliation.
+        assert_eq!(loader.conversion_count(), 0);
+        assert_eq!(result.domain, MaskDomain::RowId);
+    }
+
+    #[tokio::test]
+    async fn test_or_of_mixed_domain_block_list_leaf_converts_row_id_side() {
+        // NOT(AtMost) produces an AtLeast result whose upper bound is a
+        // BlockList — exercise that a row-id-domain BlockList converts
+        // correctly (forward id->address lookup of just the listed ids,
+        // not the full universe).
+        let loader = MockLoader::new(vec![
+            (
+                "addr",
+                MockScalarIndex {
+                    domain: MaskDomain::RowAddress,
+                    matches: RowAddrTreeMap::from_iter(&[10]),
+                },
+            ),
+            (
+                "id",
+                MockScalarIndex {
+                    domain: MaskDomain::RowId,
+                    matches: RowAddrTreeMap::from_iter(&[1, 2, 3]),
+                },
+            ),
+        ]);
+        let expr = ScalarIndexExpr::Or(
+            Box::new(mock_query("addr", "addr")),
+            Box::new(ScalarIndexExpr::Not(Box::new(mock_query("id", "id")))),
+        );
+        let result = expr
+            .evaluate_nullable(&loader, &crate::metrics::NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert_eq!(loader.conversion_count(), 1);
+        assert_eq!(result.domain, MaskDomain::RowAddress);
+        assert!(matches!(result.upper, NullableRowAddrMask::BlockList(_)));
+    }
+
     #[test]
     fn test_like_to_regex() {
         // `%` -> `.*`, `_` -> `.`, with a literal run of at least three chars.
@@ -3582,10 +4748,32 @@ mod tests {
         // With backslash as default escape (for DataFusion starts_with compatibility):
         // "foo\%" means escaped %, no wildcard -> None (should use equality)
         assert_eq!(extract_like_leading_prefix(r"foo\%", None), None);
-        // "foo\bar%" - \b is not a valid escape sequence, so \ and b are literals, % is wildcard
+        // "foo\bar%" - the escape consumes whatever follows it, so \b is a literal
+        // 'b' (arrow's LIKE kernel matches "\x" against "x" for any x), and the
+        // prefix must be "foobar" or the index would select rows starting with
+        // "foo\bar" and miss the correct ones.
         assert_eq!(
             extract_like_leading_prefix(r"foo\bar%", None),
-            Some(("foo\\bar".to_string(), false))
+            Some(("foobar".to_string(), false))
+        );
+        assert_eq!(
+            extract_like_leading_prefix(r"foo\bar%", Some('\\')),
+            Some(("foobar".to_string(), false))
+        );
+
+        // Only backslash escapes are defined by the executor (DataFusion rejects any
+        // other ESCAPE character at physical planning); declining keeps the index
+        // from answering a query the executor would refuse.
+        assert_eq!(extract_like_leading_prefix(r"a!b%", Some('!')), None);
+
+        // Wildcard detection must use the same escape-pair tokenization as prefix
+        // extraction: three backslashes then % is the exact literal "\%" (no
+        // wildcard), while a trailing % after it is a prefix on "\%".
+        assert_eq!(extract_like_leading_prefix(r"\\\%", Some('\\')), None);
+        assert_eq!(extract_like_leading_prefix(r"\\\%", None), None);
+        assert_eq!(
+            extract_like_leading_prefix(r"\\\%%", None),
+            Some(("\\%".to_string(), false))
         );
 
         // Empty pattern
@@ -3644,6 +4832,44 @@ mod tests {
         } else {
             panic!("Expected Query variant");
         }
+
+        // Escape followed by an ordinary character: LIKE 'a\b%' means "starts with
+        // ab" under arrow's LIKE semantics, so the index prefix must be "ab" (and
+        // needs no refine). A prefix of "a\b" would select disjoint rows with no
+        // recheck to catch it.
+        let expr = state
+            .create_logical_expr("color LIKE 'a\\b%'", &df_schema)
+            .unwrap();
+        let result = apply_scalar_indices(expr, &index_info).unwrap();
+        assert!(
+            result.refine_expr.is_none(),
+            "Escaped literal prefix should not need refine_expr"
+        );
+        if let Some(ScalarIndexExpr::Query(search)) = &result.scalar_query {
+            let query = search.query.as_any().downcast_ref::<SargableQuery>();
+            match query.unwrap() {
+                SargableQuery::LikePrefix(prefix) => {
+                    assert_eq!(prefix, &ScalarValue::Utf8(Some("ab".to_string())));
+                }
+                _ => panic!("Expected LikePrefix query"),
+            }
+        } else {
+            panic!("Expected Query variant");
+        }
+
+        // A non-backslash ESCAPE is accepted by the SQL layer but rejected by
+        // DataFusion's physical planner; the index must decline rather than answer
+        // a query the executor refuses (it would otherwise replace the predicate
+        // entirely and skip the planner's rejection).
+        let expr = state
+            .create_logical_expr("color LIKE 'a!b%' ESCAPE '!'", &df_schema)
+            .unwrap();
+        let result = apply_scalar_indices(expr, &index_info).unwrap();
+        assert!(
+            result.scalar_query.is_none(),
+            "non-backslash escape must not be accelerated, got {:?}",
+            result.scalar_query
+        );
 
         // Complex pattern: LIKE 'foo%bar%' -> LikePrefix("foo"), with refine_expr
         let expr = state
@@ -3935,6 +5161,250 @@ mod tests {
         assert_like_prefix(&indexed, &ScalarValue::Utf8(Some("foo".to_string())), false);
     }
 
+    /// Run a filter through the real planner so the assertion covers DataFusion's
+    /// type coercion instead of a hand-shaped expression.
+    fn plan_filter(
+        schema: Schema,
+        expr: Expr,
+        index_info: &dyn IndexInformationProvider,
+    ) -> FilterPlan {
+        let planner = Planner::new(Arc::new(schema));
+        create_filter_plan(planner.optimize_expr(expr).unwrap(), index_info, true).unwrap()
+    }
+
+    fn like_expr(pattern: ScalarValue) -> Expr {
+        Expr::Like(Like::new(
+            false,
+            Box::new(Expr::Column(Column::new_unqualified("color"))),
+            Box::new(Expr::Literal(pattern, None)),
+            None,
+            false,
+        ))
+    }
+
+    fn ngram_index_info() -> MockIndexInfoProvider {
+        MockIndexInfoProvider::new(vec![(
+            "color",
+            ColInfo::new(
+                DataType::Utf8,
+                Box::new(TextQueryParser::new(
+                    "color_idx".to_string(),
+                    "NGram".to_string(),
+                    true,
+                    true,
+                    3,
+                )),
+            ),
+        )])
+    }
+
+    #[rstest]
+    #[case::nul("left\0right", ContainsQuerySupport::Unsupported)]
+    #[case::nul_and_space("left\0 right", ContainsQuerySupport::Unsupported)]
+    #[case::space("left right", ContainsQuerySupport::NeedsRecheck)]
+    #[case::space_only(" ", ContainsQuerySupport::NeedsRecheck)]
+    #[case::safe("left_right", ContainsQuerySupport::Exact)]
+    fn test_fm_contains_eligibility(#[case] pattern: &str, #[case] support: ContainsQuerySupport) {
+        let fm_parser = crate::scalar::fmindex::FMIndexPlugin
+            .new_query_parser("color_idx".to_string(), &prost_types::Any::default())
+            .unwrap();
+        let index_info =
+            MockIndexInfoProvider::new(vec![("color", ColInfo::new(DataType::Utf8, fm_parser))]);
+        let expr = datafusion::functions::string::expr_fn::contains(col("color"), lit(pattern));
+        let schema = Schema::new(vec![Field::new("color", DataType::Utf8, true)]);
+        let plan = plan_filter(schema.clone(), expr.clone(), &index_info);
+        let is_supported = support != ContainsQuerySupport::Unsupported;
+        assert_eq!(plan.index_query.is_some(), is_supported);
+        if let Some(query) = plan.index_query.as_ref() {
+            assert_eq!(
+                query.needs_recheck(),
+                support == ContainsQuerySupport::NeedsRecheck
+            );
+            assert_eq!(plan.skip_recheck, support == ContainsQuerySupport::Exact);
+        }
+        let negated = plan_filter(schema.clone(), !expr.clone(), &index_info);
+        if support != ContainsQuerySupport::Exact {
+            assert!(negated.index_query.is_none());
+            assert!(negated.refine_expr.is_some());
+            let safe = datafusion::functions::string::expr_fn::contains(col("color"), lit("right"));
+            let combined = plan_filter(schema.clone(), expr.clone().and(safe.clone()), &index_info);
+            assert!(combined.index_query.is_some());
+            assert_eq!(combined.refine_expr.is_some(), !is_supported);
+            assert_eq!(combined.skip_recheck, !is_supported);
+            let combined = plan_filter(schema.clone(), expr.clone().or(safe), &index_info);
+            assert_eq!(combined.index_query.is_some(), is_supported);
+            assert_eq!(combined.refine_expr.is_some(), !is_supported);
+            assert!(!combined.skip_recheck);
+        }
+        // NGRAM retains its existing eligibility for both normalized bytes.
+        let ngram_plan = plan_filter(schema, expr, &ngram_index_info());
+        assert_eq!(
+            ngram_plan.index_query.is_some(),
+            pattern.chars().count() >= 3
+        );
+    }
+
+    fn expect_query<Q: AnyQuery>(plan: &FilterPlan) -> &Q {
+        let Some(ScalarIndexExpr::Query(search)) = plan.index_query.as_ref() else {
+            panic!("expected a scalar index query, got {:?}", plan.index_query);
+        };
+        assert_eq!(search.column, "color");
+        assert_eq!(search.index_name, "color_idx");
+        search
+            .query
+            .as_any()
+            .downcast_ref::<Q>()
+            .expect("unexpected query type")
+    }
+
+    // A `LIKE` whose pattern literal is a wider string variant than the indexed
+    // column makes DataFusion's `like_coercion` promote *both* operands, which wraps
+    // the column in a `Cast`.  Unlike a comparison, no later pass unwraps that cast,
+    // so index discovery has to look through it or the predicate silently falls back
+    // to a full scan.
+    #[rstest]
+    #[case::utf8_view(ScalarValue::Utf8View(Some("%foobar%".to_string())))]
+    #[case::large_utf8(ScalarValue::LargeUtf8(Some("%foobar%".to_string())))]
+    #[case::utf8(ScalarValue::Utf8(Some("%foobar%".to_string())))]
+    fn test_planner_ngram_like_string_variants(#[case] pattern: ScalarValue) {
+        let index_info = ngram_index_info();
+        let plan = plan_filter(
+            Schema::new(vec![Field::new("color", DataType::Utf8, true)]),
+            like_expr(pattern),
+            &index_info,
+        );
+
+        assert_eq!(
+            expect_query::<TextQuery>(&plan),
+            &TextQuery::Regex(".*foobar.*".to_string())
+        );
+        assert!(plan.refine_expr.is_some());
+        assert!(!plan.skip_recheck);
+    }
+
+    // The emitted bound must carry the *indexed* column's string variant, not the
+    // pattern's: a `LargeUtf8` bound against `Utf8` page statistics compares as
+    // `None` in the zone map (pruning every zone) and fails the BTree's physical
+    // `LIKE`, which asserts both sides share a type.
+    #[rstest]
+    #[case::utf8_col_utf8_pattern(DataType::Utf8, ScalarValue::Utf8(Some("foo%".to_string())), ScalarValue::Utf8(Some("foo".to_string())))]
+    #[case::utf8_col_view_pattern(DataType::Utf8, ScalarValue::Utf8View(Some("foo%".to_string())), ScalarValue::Utf8(Some("foo".to_string())))]
+    #[case::utf8_col_large_pattern(DataType::Utf8, ScalarValue::LargeUtf8(Some("foo%".to_string())), ScalarValue::Utf8(Some("foo".to_string())))]
+    #[case::large_col_large_pattern(DataType::LargeUtf8, ScalarValue::LargeUtf8(Some("foo%".to_string())), ScalarValue::LargeUtf8(Some("foo".to_string())))]
+    #[case::large_col_view_pattern(DataType::LargeUtf8, ScalarValue::Utf8View(Some("foo%".to_string())), ScalarValue::LargeUtf8(Some("foo".to_string())))]
+    #[case::large_col_utf8_pattern(DataType::LargeUtf8, ScalarValue::Utf8(Some("foo%".to_string())), ScalarValue::LargeUtf8(Some("foo".to_string())))]
+    fn test_planner_like_prefix_normalizes_to_index_type(
+        #[case] column_type: DataType,
+        #[case] pattern: ScalarValue,
+        #[case] expected_prefix: ScalarValue,
+    ) {
+        let index_info = MockIndexInfoProvider::new(vec![(
+            "color",
+            ColInfo::new(
+                column_type.clone(),
+                Box::new(SargableQueryParser::new(
+                    "color_idx".to_string(),
+                    "BTree".to_string(),
+                    false,
+                )),
+            ),
+        )]);
+        let plan = plan_filter(
+            Schema::new(vec![Field::new("color", column_type, true)]),
+            like_expr(pattern),
+            &index_info,
+        );
+
+        assert_eq!(
+            expect_query::<SargableQuery>(&plan),
+            &SargableQuery::LikePrefix(expected_prefix)
+        );
+        assert!(plan.refine_expr.is_none());
+        assert!(plan.skip_recheck);
+    }
+
+    // `regexp_like`'s per-argument coercible signature never unifies its arguments,
+    // so the flags literal reaches the parser with whatever string variant the
+    // caller built and the column is left uncast.  The flag is `s` rather than `i`
+    // because a case-insensitive pattern yields no usable trigram.
+    #[rstest]
+    #[case::utf8(ScalarValue::Utf8(Some("s".to_string())))]
+    #[case::large_utf8(ScalarValue::LargeUtf8(Some("s".to_string())))]
+    #[case::utf8_view(ScalarValue::Utf8View(Some("s".to_string())))]
+    fn test_planner_regexp_flags_string_variants(#[case] flags: ScalarValue) {
+        let schema = Schema::new(vec![Field::new("color", DataType::Utf8, true)]);
+        let df_schema: DFSchema = schema.clone().try_into().unwrap();
+        let ctx = get_session_context(&LanceExecutionOptions::default());
+        let Expr::ScalarFunction(mut regexp_like) = ctx
+            .state()
+            .create_logical_expr("regexp_like(color, 'foobar', 's')", &df_schema)
+            .unwrap()
+        else {
+            panic!("expected regexp_like to parse as a scalar function");
+        };
+        regexp_like.args[2] = Expr::Literal(flags, None);
+
+        let index_info = ngram_index_info();
+        let plan = plan_filter(schema, Expr::ScalarFunction(regexp_like), &index_info);
+
+        assert_eq!(
+            expect_query::<TextQuery>(&plan),
+            &TextQuery::Regex("(?s)foobar".to_string())
+        );
+    }
+
+    // Looking through a cast is only sound while it stays inside the string types,
+    // which share a value domain and an ordering.  A cast that crosses out of them
+    // changes what the predicate means, so the index must not answer it.
+    #[test]
+    fn test_planner_rejects_cast_out_of_string_types() {
+        let index_info = MockIndexInfoProvider::new(vec![(
+            "color",
+            ColInfo::new(
+                DataType::Utf8,
+                Box::new(SargableQueryParser::new(
+                    "color_idx".to_string(),
+                    "BTree".to_string(),
+                    false,
+                )),
+            ),
+        )]);
+        let schema = Schema::new(vec![Field::new("color", DataType::Utf8, true)]);
+        let planner = Planner::new(Arc::new(schema));
+        let expr = planner
+            .parse_filter("cast(color as bigint) is null")
+            .unwrap();
+        let plan =
+            create_filter_plan(planner.optimize_expr(expr).unwrap(), &index_info, true).unwrap();
+
+        assert!(plan.index_query.is_none());
+        assert_eq!(plan.refine_expr, plan.full_expr);
+    }
+
+    // The same guard from the other side: the cast target is a string type but the
+    // indexed values are not, so the index's ordering is not the string ordering.
+    #[test]
+    fn test_planner_rejects_cast_from_non_string_column() {
+        let index_info = MockIndexInfoProvider::new(vec![(
+            "color",
+            ColInfo::new(
+                DataType::LargeBinary,
+                Box::new(SargableQueryParser::new(
+                    "color_idx".to_string(),
+                    "BTree".to_string(),
+                    false,
+                )),
+            ),
+        )]);
+        let plan = plan_filter(
+            Schema::new(vec![Field::new("color", DataType::LargeBinary, true)]),
+            like_expr(ScalarValue::Utf8(Some("foo%".to_string()))),
+            &index_info,
+        );
+
+        assert!(plan.index_query.is_none());
+    }
+
     #[test]
     fn test_sargable_query_parser_without_like_prefix() {
         // Bitmap indexes configure the parser with `without_like_prefix`: a bitmap index
@@ -4159,9 +5629,9 @@ mod tests {
     #[test]
     fn test_multi_json_indices_route_by_path() {
         // Build a MultiQueryParser containing two JSON sub-parsers: one for
-        // path "$.a" and one for path "$.b".
+        // path "a" and one for path "b".
         let mut multi = MultiQueryParser::single(Box::new(JsonQueryParser::new(
-            "$.a".to_string(),
+            "a".to_string(),
             Box::new(SargableQueryParser::new(
                 "json_a_idx".to_string(),
                 "Json".to_string(),
@@ -4169,7 +5639,7 @@ mod tests {
             )),
         )));
         multi.add(Box::new(JsonQueryParser::new(
-            "$.b".to_string(),
+            "b".to_string(),
             Box::new(SargableQueryParser::new(
                 "json_b_idx".to_string(),
                 "Json".to_string(),
@@ -4191,12 +5661,12 @@ mod tests {
                 Arc::new(SargableQuery::Equals(ScalarValue::Utf8(Some(
                     "foo".to_string(),
                 )))),
-                "$.b".to_string(),
+                "b".to_string(),
             )),
         );
         check(
             &index_info,
-            "json_extract(json, '$.b') = 'foo'",
+            "json_get_string(json, 'b') = 'foo'",
             Some(expected_b),
             false,
         );
@@ -4210,18 +5680,78 @@ mod tests {
                 Arc::new(SargableQuery::Equals(ScalarValue::Utf8(Some(
                     "foo".to_string(),
                 )))),
-                "$.a".to_string(),
+                "a".to_string(),
             )),
         );
         check(
             &index_info,
-            "json_extract(json, '$.a') = 'foo'",
+            "json_get_string(json, 'a') = 'foo'",
             Some(expected_a),
             false,
         );
 
         // Query against an unindexed path must not bind to either index.
-        check_no_index(&index_info, "json_extract(json, '$.c') = 'foo'");
+        check_no_index(&index_info, "json_get_string(json, 'c') = 'foo'");
+    }
+
+    /// Regression test for https://github.com/lance-format/lance/issues/7091.
+    ///
+    /// When a column carries both a bloom filter (equality only) and a btree
+    /// (ranges) index, parser selection must not commit to a single index based
+    /// on the column reference alone.  With the bloom filter registered first,
+    /// a range query like `size > 7` would otherwise be intercepted by the
+    /// bloom parser (which returns `None` for ranges) and fall back to a full
+    /// scan, even though the btree can serve it.
+    #[test]
+    fn test_multi_index_defers_to_operator_capability() {
+        // Register the bloom filter *first* so the pre-fix "first valid
+        // reference wins" behavior would route every query to it.
+        let mut multi = MultiQueryParser::single(Box::new(BloomFilterQueryParser::new(
+            "size_bloom_idx".to_string(),
+            "BloomFilter".to_string(),
+            false,
+        )));
+        multi.add(Box::new(SargableQueryParser::new(
+            "size_btree_idx".to_string(),
+            "BTree".to_string(),
+            false,
+        )));
+
+        let index_info = MockIndexInfoProvider::new(vec![(
+            "size",
+            ColInfo::with_multi(DataType::Float32, Box::new(multi)),
+        )]);
+
+        // `size > 7`: bloom can't serve ranges, so the btree must pick it up.
+        check(
+            &index_info,
+            "size > 7",
+            Some(IndexedExpression::index_query(
+                "size".to_string(),
+                "size_btree_idx".to_string(),
+                "BTree".to_string(),
+                Arc::new(SargableQuery::Range(
+                    Bound::Excluded(ScalarValue::Float32(Some(7.0))),
+                    Bound::Unbounded,
+                )),
+            )),
+            false,
+        );
+
+        // `size = 7`: the bloom filter is registered first and serves equality,
+        // so it still wins for the query shape it supports.
+        check(
+            &index_info,
+            "size = 7",
+            Some(IndexedExpression::index_query_with_recheck(
+                "size".to_string(),
+                "size_bloom_idx".to_string(),
+                "BloomFilter".to_string(),
+                Arc::new(BloomFilterQuery::Equals(ScalarValue::Float32(Some(7.0)))),
+                false,
+            )),
+            false,
+        );
     }
 
     #[test]
@@ -5012,6 +6542,114 @@ mod tests {
         }));
     }
 
+    #[rstest]
+    #[case::not_distinct(
+        "x IS NOT DISTINCT FROM 3",
+        "AND([x = 3]@x_idx(BTree),NOT([x IS NULL]@x_idx(BTree)))"
+    )]
+    #[case::distinct(
+        "x IS DISTINCT FROM 3",
+        "NOT(AND([x = 3]@x_idx(BTree),NOT([x IS NULL]@x_idx(BTree))))"
+    )]
+    #[case::not_distinct_null("x IS NOT DISTINCT FROM NULL", "[x IS NULL]@x_idx(BTree)")]
+    #[case::distinct_null("x IS DISTINCT FROM NULL", "NOT([x IS NULL]@x_idx(BTree))")]
+    #[case::in_list_is_true(
+        "(x IN (1, 2)) IS TRUE",
+        "AND([x IN [1,2]]@x_idx(BTree),NOT([x IS NULL]@x_idx(BTree)))"
+    )]
+    #[case::is_not_true(
+        "(x = 1) IS NOT TRUE",
+        "NOT(AND([x = 1]@x_idx(BTree),NOT([x IS NULL]@x_idx(BTree))))"
+    )]
+    #[case::or_chain(
+        "(x = 1 OR NOT x BETWEEN 3 AND 5) IS NOT TRUE",
+        "NOT(AND(OR([x = 1]@x_idx(BTree),NOT([x >= 3 && x <= 5]@x_idx(BTree))),NOT([x IS NULL]@x_idx(BTree))))"
+    )]
+    #[case::is_false(
+        "(x = 1) IS FALSE",
+        "AND(NOT([x = 1]@x_idx(BTree)),NOT([x IS NULL]@x_idx(BTree)))"
+    )]
+    #[case::is_not_false(
+        "(x < 1) IS NOT FALSE",
+        "NOT(AND(NOT([x < 1]@x_idx(BTree)),NOT([x IS NULL]@x_idx(BTree))))"
+    )]
+    #[case::xor(
+        "(x > 2) != (y < 6)",
+        "OR(AND([x > 2]@x_idx(BTree),NOT([y < 6]@y_idx(BTree))),AND(NOT([x > 2]@x_idx(BTree)),[y < 6]@y_idx(BTree)))"
+    )]
+    #[case::equivalent(
+        "(x > 2) = (y < 6)",
+        "OR(AND([x > 2]@x_idx(BTree),[y < 6]@y_idx(BTree)),AND(NOT([x > 2]@x_idx(BTree)),NOT([y < 6]@y_idx(BTree))))"
+    )]
+    fn test_predicate_truth_and_equality_use_index(#[case] filter: &str, #[case] expected: &str) {
+        let indexed = parse_int64_filter(filter, &int64_index_info("BTree", false));
+        assert_eq!(indexed.refine_expr, None, "{filter}");
+        assert_eq!(
+            indexed.scalar_query.unwrap().to_string(),
+            expected,
+            "{filter}"
+        );
+    }
+
+    #[rstest]
+    // `x IN (1, NULL)` is NULL for every row but 1, not just the NULL ones.
+    #[case::null_in_list("(x IN (1, NULL)) IS TRUE")]
+    #[case::null_literal("(x = CAST(NULL AS BIGINT)) IS NOT TRUE")]
+    #[case::computed("(x + 1 = 2) IS TRUE")]
+    #[case::two_columns("(x = 1 OR y = 2) IS NOT TRUE")]
+    #[case::computed_side("(x > 2) != (x + y > 3)")]
+    #[case::recheck_xor("(x > 2) != (y < 6)")]
+    #[case::recheck_distinct("x IS DISTINCT FROM 3")]
+    fn test_predicate_truth_and_equality_decline(#[case] filter: &str) {
+        // The last two only decline because the index needs a recheck, which
+        // cannot be negated.
+        let needs_recheck = filter.contains("!=") || filter.contains("DISTINCT");
+        let indexed = parse_int64_filter(filter, &int64_index_info("BTree", needs_recheck));
+        assert_eq!(indexed.scalar_query, None, "{filter}");
+    }
+
+    /// Each side of a predicate equality appears twice in its plan, so a chain
+    /// of them grows exponentially until the budget declines it.
+    #[rstest]
+    #[case::one(2, Some(4))]
+    #[case::three(4, Some(22))]
+    #[case::four(5, Some(46))]
+    #[case::five(6, None)]
+    #[case::seventeen(18, None)]
+    fn test_nested_predicate_equality_is_bounded(
+        #[case] comparisons: usize,
+        #[case] expected_searches: Option<usize>,
+    ) {
+        let filter = (1..comparisons).fold("x > 0".to_string(), |lhs, rhs| {
+            format!("({lhs}) = (x > {rhs})")
+        });
+        let indexed = parse_int64_filter(&filter, &int64_index_info("BTree", false));
+        let searches = indexed
+            .scalar_query
+            .as_ref()
+            .map(ScalarIndexExpr::search_count);
+        assert_eq!(searches, expected_searches, "{filter}");
+    }
+
+    /// An index whose NULL search needs a recheck still narrows `IS TRUE` down,
+    /// and rechecks the predicate on what it finds.
+    #[rstest]
+    #[case::is_true("(x = 3) IS TRUE", "[x = 3]@x_idx(ZoneMap)")]
+    #[case::not_distinct("x IS NOT DISTINCT FROM 3", "[x = 3]@x_idx(ZoneMap)")]
+    fn test_is_truth_value_rechecks_without_exact_null_search(
+        #[case] filter: &str,
+        #[case] expected: &str,
+    ) {
+        let indexed = parse_int64_filter(filter, &int64_index_info("ZoneMap", true));
+        assert_eq!(
+            indexed.scalar_query.unwrap().to_string(),
+            expected,
+            "{filter}"
+        );
+        let refine = indexed.refine_expr.unwrap();
+        assert!(matches!(refine, Expr::IsTrue(_)), "{filter}: {refine}");
+    }
+
     #[test]
     fn test_optimize_parser_handles_in_list_null_semantics() {
         let index_info = int64_index_info("BTree", false);
@@ -5691,5 +7329,489 @@ mod tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod planner_tests {
+    use std::any::Any;
+
+    use arrow_schema::{Fields, Schema};
+    use datafusion_expr::{col, lit};
+    use lance_core::deepsize::{Context, DeepSizeOf};
+    use lance_core::utils::row_addr_remap::RowAddrRemap;
+    use lance_datafusion::planner::Planner;
+    use lance_select::{RowAddrMask, RowAddrTreeMap};
+    use rstest::rstest;
+
+    use super::*;
+    use crate::metrics::NoOpMetricsCollector;
+    use crate::scalar::{CreatedIndex, IndexStore, ScalarIndexParams, UpdateCriteria};
+    use crate::{Index, IndexType};
+
+    /// Consumes every conjunct that reads only its key columns.
+    #[derive(Debug)]
+    struct KeyPlanner {
+        index_name: &'static str,
+        keys: &'static [&'static str],
+        needs_recheck: bool,
+    }
+
+    fn key_planner(index_name: &'static str, keys: &'static [&'static str]) -> KeyPlanner {
+        KeyPlanner {
+            index_name,
+            keys,
+            needs_recheck: false,
+        }
+    }
+
+    impl ScalarIndexPlanner for KeyPlanner {
+        fn plan<'a>(&self, conjuncts: &'a [Expr]) -> Option<ScalarIndexPlan<'a>> {
+            let consumed = conjuncts
+                .iter()
+                .filter(|conjunct| {
+                    let columns = conjunct.column_refs();
+                    !columns.is_empty()
+                        && columns
+                            .iter()
+                            .all(|column| self.keys.contains(&column.name.as_str()))
+                })
+                .collect::<Vec<_>>();
+            let filter = conjunction(consumed.iter().map(|conjunct| (*conjunct).clone()))?;
+            Some(ScalarIndexPlan {
+                search: ScalarIndexSearch {
+                    column: self.keys[0].to_string(),
+                    index_name: self.index_name.to_string(),
+                    index_type: "Keys".to_string(),
+                    query: Arc::new(KeyQuery(filter)),
+                    needs_recheck: self.needs_recheck,
+                    fragment_bitmap: None,
+                },
+                consumed,
+            })
+        }
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct KeyQuery(Expr);
+
+    impl AnyQuery for KeyQuery {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn format(&self, _col: &str) -> String {
+            self.0.to_string()
+        }
+
+        fn to_expr(&self, _col: String) -> Expr {
+            self.0.clone()
+        }
+
+        fn dyn_eq(&self, other: &dyn AnyQuery) -> bool {
+            other.as_any().downcast_ref::<Self>() == Some(self)
+        }
+    }
+
+    struct Indices {
+        btrees: HashMap<String, (DataType, MultiQueryParser)>,
+        planners: Vec<Box<dyn ScalarIndexPlanner>>,
+    }
+
+    impl Indices {
+        fn new(btree_columns: &[&str], planners: Vec<Box<dyn ScalarIndexPlanner>>) -> Self {
+            let btrees = btree_columns
+                .iter()
+                .map(|column| {
+                    let parser = SargableQueryParser::new(
+                        format!("{column}_idx"),
+                        "BTree".to_string(),
+                        false,
+                    );
+                    (
+                        column.to_string(),
+                        (DataType::Int32, MultiQueryParser::single(Box::new(parser))),
+                    )
+                })
+                .collect();
+            Self { btrees, planners }
+        }
+    }
+
+    impl IndexInformationProvider for Indices {
+        fn get_index(&self, col: &str) -> Option<(&DataType, &MultiQueryParser)> {
+            self.btrees
+                .get(col)
+                .map(|(data_type, parser)| (data_type, parser))
+        }
+
+        fn planners(&self) -> &[Box<dyn ScalarIndexPlanner>] {
+            &self.planners
+        }
+    }
+
+    fn plan(indices: &Indices, filter: &str) -> Result<FilterPlan> {
+        let mut fields = ["a", "b", "c", "d"]
+            .map(|name| Field::new(name, DataType::Int32, true))
+            .to_vec();
+        fields.push(Field::new("flag", DataType::Boolean, true));
+        let planner = Planner::new(Arc::new(Schema::new(fields)));
+        create_filter_plan(
+            planner.optimize_expr(planner.parse_filter(filter)?)?,
+            indices,
+            true,
+        )
+    }
+
+    fn render(plan: &FilterPlan) -> (Option<String>, Option<String>) {
+        (
+            plan.index_query.as_ref().map(ToString::to_string),
+            plan.refine_expr.as_ref().map(ToString::to_string),
+        )
+    }
+
+    const AB: &[&str] = &["a", "b"];
+    const AB_QUERY: &str = "[a = Int32(1) AND b > Int32(5)]@ab_idx(Keys)";
+
+    #[rstest]
+    #[case::full_consumption(
+        vec![key_planner("ab_idx", AB)],
+        &[],
+        "a = 1 AND b > 5",
+        AB_QUERY,
+        None
+    )]
+    #[case::partial_consumption(
+        vec![key_planner("ab_idx", AB)],
+        &["c"],
+        "a = 1 AND b > 5 AND c = 3",
+        "AND([a = Int32(1) AND b > Int32(5)]@ab_idx(Keys),[c = 3]@c_idx(BTree))",
+        None
+    )]
+    #[case::more_consumed_conjuncts_win(
+        vec![key_planner("ab_idx", AB), key_planner("abc_idx", &["a", "b", "c"])],
+        &[],
+        "a = 1 AND b > 5 AND c = 3",
+        "[a = Int32(1) AND b > Int32(5) AND c = Int32(3)]@abc_idx(Keys)",
+        None
+    )]
+    #[case::tie_goes_to_first_name(
+        vec![key_planner("zz_idx", AB), key_planner("ab_idx", AB)],
+        &[],
+        "a = 1 AND b > 5",
+        AB_QUERY,
+        None
+    )]
+    #[case::tie_ignores_registration_order(
+        vec![key_planner("ab_idx", AB), key_planner("zz_idx", AB)],
+        &[],
+        "a = 1 AND b > 5",
+        AB_QUERY,
+        None
+    )]
+    #[case::planner_beats_column_index_on_its_key(
+        vec![key_planner("ab_idx", AB)],
+        &["a", "b"],
+        "a = 1 AND b > 5",
+        AB_QUERY,
+        None
+    )]
+    #[case::query_carries_key_residual(
+        vec![key_planner("ab_idx", AB)],
+        &["b"],
+        "a = 1 AND b <> 7",
+        "[a = Int32(1) AND b != Int32(7)]@ab_idx(Keys)",
+        None
+    )]
+    #[case::leftover_conjunct_goes_to_rows(
+        vec![key_planner("ab_idx", AB)],
+        &[],
+        "a = 1 AND b > 5 AND d < 7",
+        AB_QUERY,
+        Some("d < Int32(7)")
+    )]
+    #[case::declined_filter_keeps_column_path(
+        vec![key_planner("ab_idx", AB)],
+        &["c"],
+        "c = 3",
+        "[c = 3]@c_idx(BTree)",
+        None
+    )]
+    #[case::or_root_keeps_column_path(
+        vec![key_planner("ab_idx", AB)],
+        &["a", "b"],
+        "a = 1 OR b = 2",
+        "OR([a = 1]@a_idx(BTree),[b = 2]@b_idx(BTree))",
+        None
+    )]
+    #[case::two_value_in_list_reaches_planners(
+        vec![key_planner("ab_idx", AB)],
+        &[],
+        "a IN (1, 2)",
+        "[a = Int32(1) OR a = Int32(2)]@ab_idx(Keys)",
+        None
+    )]
+    #[case::three_value_in_list_reaches_planners(
+        vec![key_planner("ab_idx", AB)],
+        &[],
+        "a IN (1, 2, 3)",
+        "[a = Int32(1) OR a = Int32(2) OR a = Int32(3)]@ab_idx(Keys)",
+        None
+    )]
+    #[case::not_of_boolean_key_reaches_planners(
+        vec![key_planner("flag_idx", &["flag"])],
+        &[],
+        "NOT flag",
+        "[NOT flag]@flag_idx(Keys)",
+        None
+    )]
+    #[case::declined_one_column_or_keeps_column_path(
+        vec![key_planner("ab_idx", AB)],
+        &["c"],
+        "c IN (1, 2)",
+        "OR([c = 1]@c_idx(BTree),[c = 2]@c_idx(BTree))",
+        None
+    )]
+    fn routes_conjuncts_to_planners(
+        #[case] planners: Vec<KeyPlanner>,
+        #[case] btree_columns: &[&str],
+        #[case] filter: &str,
+        #[case] index_query: &str,
+        #[case] refine: Option<&str>,
+    ) {
+        let planners = planners
+            .into_iter()
+            .map(|planner| Box::new(planner) as Box<dyn ScalarIndexPlanner>)
+            .collect();
+        let plan = plan(&Indices::new(btree_columns, planners), filter).unwrap();
+        assert_eq!(
+            render(&plan),
+            (
+                Some(index_query.to_string()),
+                refine.map(ToString::to_string)
+            )
+        );
+    }
+
+    // The filter planner's simplifier pushes NOT below comparisons and ANDs, so
+    // build the roots directly, as callers of apply_scalar_indices may.
+    #[rstest]
+    #[case::or_over_two_columns(
+        col("a").eq(lit(1)).or(col("b").eq(lit(2))),
+        "OR([a = 1]@a_idx(BTree),[b = 2]@b_idx(BTree))"
+    )]
+    #[case::or_over_one_column(
+        col("a").eq(lit(1)).or(col("a").eq(lit(2))),
+        "[a = Int32(1) OR a = Int32(2)]@ab_idx(Keys)"
+    )]
+    #[case::not_over_two_columns(
+        Expr::Not(Box::new(col("a").is_null().and(col("b").is_null()))),
+        "NOT(AND([a IS NULL]@a_idx(BTree),[b IS NULL]@b_idx(BTree)))"
+    )]
+    #[case::not_over_one_column(
+        Expr::Not(Box::new(col("a").is_null())),
+        "[NOT a IS NULL]@ab_idx(Keys)"
+    )]
+    #[case::and(col("a").eq(lit(1)).and(col("b").gt(lit(5))), AB_QUERY)]
+    fn aliased_roots_route_like_bare_roots(
+        #[case] root: Expr,
+        #[case] index_query: &str,
+        #[values(0, 1, 2)] aliases: usize,
+    ) {
+        let indices = Indices::new(AB, vec![Box::new(key_planner("ab_idx", AB))]);
+        let filter = (0..aliases).fold(root, |expr, depth| expr.alias(format!("alias_{depth}")));
+        let planned = apply_scalar_indices(filter, &indices).unwrap();
+        assert_eq!(
+            planned.scalar_query.as_ref().map(ToString::to_string),
+            Some(index_query.to_string())
+        );
+        assert_eq!(planned.refine_expr, None);
+    }
+
+    #[test]
+    fn nested_fields_count_as_separate_columns() {
+        let indices = Indices::new(
+            &["s.x", "s.y"],
+            vec![Box::new(key_planner("s_idx", &["s"]))],
+        );
+        let fields = Fields::from(
+            ["x", "y"]
+                .map(|name| Field::new(name, DataType::Int32, true))
+                .to_vec(),
+        );
+        let schema = Schema::new(vec![Field::new("s", DataType::Struct(fields), true)]);
+        let planner = Planner::new(Arc::new(schema));
+        let filter = planner.parse_filter("s.x = 1 OR s.y = 2").unwrap();
+        let plan =
+            create_filter_plan(planner.optimize_expr(filter).unwrap(), &indices, true).unwrap();
+        assert_eq!(
+            render(&plan),
+            (
+                Some("OR([s.x = 1]@s.x_idx(BTree),[s.y = 2]@s.y_idx(BTree))".to_string()),
+                None
+            )
+        );
+    }
+
+    #[derive(Debug)]
+    struct FixedIndex(fn() -> SearchResult);
+
+    impl DeepSizeOf for FixedIndex {
+        fn deep_size_of_children(&self, _context: &mut Context) -> usize {
+            0
+        }
+    }
+
+    #[async_trait]
+    impl Index for FixedIndex {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+        fn as_index(self: Arc<Self>) -> Arc<dyn Index> {
+            self
+        }
+        fn statistics(&self) -> Result<serde_json::Value> {
+            Ok(serde_json::Value::Null)
+        }
+        async fn prewarm(&self) -> Result<()> {
+            Ok(())
+        }
+        fn index_type(&self) -> IndexType {
+            IndexType::Scalar
+        }
+        async fn calculate_included_frags(&self) -> Result<RoaringBitmap> {
+            Ok(RoaringBitmap::new())
+        }
+    }
+
+    #[async_trait]
+    impl ScalarIndex for FixedIndex {
+        async fn search(&self, _: &dyn AnyQuery, _: &dyn MetricsCollector) -> Result<SearchResult> {
+            Ok((self.0)())
+        }
+        fn can_remap(&self) -> bool {
+            false
+        }
+        async fn remap(&self, _: &RowAddrRemap, _: &dyn IndexStore) -> Result<CreatedIndex> {
+            unimplemented!()
+        }
+        async fn update(
+            &self,
+            _: datafusion::execution::SendableRecordBatchStream,
+            _: &dyn IndexStore,
+            _: Option<crate::scalar::OldIndexDataFilter>,
+        ) -> Result<CreatedIndex> {
+            unimplemented!()
+        }
+        fn update_criteria(&self) -> UpdateCriteria {
+            unimplemented!()
+        }
+        fn derive_index_params(&self) -> Result<ScalarIndexParams> {
+            unimplemented!()
+        }
+    }
+
+    #[async_trait]
+    impl ScalarIndexLoader for FixedIndex {
+        async fn load_index(
+            &self,
+            _column: &str,
+            _index_name: &str,
+            _metrics: &dyn MetricsCollector,
+        ) -> Result<Arc<dyn ScalarIndex>> {
+            Ok(Arc::new(Self(self.0)))
+        }
+    }
+
+    fn rows_1_2() -> RowAddrTreeMap {
+        RowAddrTreeMap::from_iter([1, 2])
+    }
+
+    #[rstest]
+    #[case::exact(|| SearchResult::exact(rows_1_2()), false)]
+    #[case::at_most(|| SearchResult::at_most(rows_1_2()), true)]
+    #[case::at_least(|| SearchResult::at_least(rows_1_2()), true)]
+    #[tokio::test]
+    async fn inexact_planner_results_request_recheck(
+        #[case] result: fn() -> SearchResult,
+        #[case] needs_recheck: bool,
+    ) {
+        let planner = KeyPlanner {
+            needs_recheck,
+            ..key_planner("ab_idx", AB)
+        };
+        let indices = Indices::new(&[], vec![Box::new(planner)]);
+        let plan = plan(&indices, "a = 1 AND b > 5").unwrap();
+        assert_eq!(render(&plan), (Some(AB_QUERY.to_string()), None));
+        assert_eq!(plan.skip_recheck, !needs_recheck);
+
+        let evaluated = plan
+            .index_query
+            .unwrap()
+            .evaluate(&FixedIndex(result), &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let rows = RowAddrMask::from_allowed(rows_1_2());
+        let (lower, upper) = match result() {
+            SearchResult::Exact(_) => (rows.clone(), rows),
+            SearchResult::AtMost(_) => (RowAddrMask::allow_nothing(), rows),
+            SearchResult::AtLeast(_) => (rows, RowAddrMask::all_rows()),
+        };
+        assert_eq!((evaluated.lower, evaluated.upper), (lower, upper));
+    }
+
+    #[derive(Debug)]
+    enum Forgery {
+        NoConjuncts,
+        RepeatedConjunct,
+        SubExpression,
+    }
+
+    impl ScalarIndexPlanner for Forgery {
+        fn plan<'a>(&self, conjuncts: &'a [Expr]) -> Option<ScalarIndexPlan<'a>> {
+            let consumed = match self {
+                Self::NoConjuncts => vec![],
+                Self::RepeatedConjunct => vec![&conjuncts[0], &conjuncts[0]],
+                Self::SubExpression => match &conjuncts[0] {
+                    Expr::BinaryExpr(binary) => vec![binary.left.as_ref()],
+                    other => panic!("expected a comparison, got {other}"),
+                },
+            };
+            Some(ScalarIndexPlan {
+                search: ScalarIndexSearch {
+                    column: "a".to_string(),
+                    index_name: "forged_idx".to_string(),
+                    index_type: "Keys".to_string(),
+                    query: Arc::new(KeyQuery(conjuncts[0].clone())),
+                    needs_recheck: false,
+                    fragment_bitmap: None,
+                },
+                consumed,
+            })
+        }
+    }
+
+    #[rstest]
+    #[case::no_conjuncts(Forgery::NoConjuncts, "consumes no conjuncts")]
+    #[case::repeated_conjunct(
+        Forgery::RepeatedConjunct,
+        "not a distinct member of the 2 conjuncts it was offered"
+    )]
+    #[case::sub_expression(
+        Forgery::SubExpression,
+        "not a distinct member of the 2 conjuncts it was offered"
+    )]
+    fn rejects_plans_that_misreport_consumed_conjuncts(
+        #[case] forgery: Forgery,
+        #[case] reason: &str,
+    ) {
+        let indices = Indices::new(&[], vec![Box::new(forgery)]);
+        let error = plan(&indices, "a = 1 AND b > 5").unwrap_err();
+        assert!(matches!(error, Error::Internal { .. }), "{error}");
+        let message = error.to_string();
+        assert!(
+            message.contains("'forged_idx'") && message.contains(reason),
+            "{message}"
+        );
     }
 }

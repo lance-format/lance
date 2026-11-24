@@ -15,7 +15,6 @@ package org.lance.memwal;
 
 import com.google.common.base.Preconditions;
 
-import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
 
@@ -28,17 +27,22 @@ import java.util.Optional;
  * org.lance.Dataset#memWalWriter}.
  */
 public class InitializeMemWalParams {
-  private List<String> maintainedIndexes = Collections.emptyList();
+  private Optional<List<String>> maintainedIndexes = Optional.empty();
   private Optional<String> bucketColumn = Optional.empty();
   private Optional<Integer> numBuckets = Optional.empty();
   private Optional<String> identityColumn = Optional.empty();
   private boolean unsharded = false;
   private Optional<ShardWriterConfig> writerConfigDefaults = Optional.empty();
 
-  /** Names of the indexes to maintain through the MemWAL. Must already exist on the dataset. */
+  /**
+   * Names of the indexes to maintain through the MemWAL. Must already exist on the dataset, and an
+   * empty list maintains none.
+   *
+   * <p>Left unset, the MemWAL maintains every index the table has, including ones created later.
+   */
   public InitializeMemWalParams withMaintainedIndexes(List<String> maintainedIndexes) {
     Preconditions.checkNotNull(maintainedIndexes, "maintainedIndexes must not be null");
-    this.maintainedIndexes = maintainedIndexes;
+    this.maintainedIndexes = Optional.of(maintainedIndexes);
     return this;
   }
 
@@ -70,7 +74,8 @@ public class InitializeMemWalParams {
     return this;
   }
 
-  public List<String> maintainedIndexes() {
+  /** Empty when every index the table has is maintained. */
+  public Optional<List<String>> maintainedIndexes() {
     return maintainedIndexes;
   }
 

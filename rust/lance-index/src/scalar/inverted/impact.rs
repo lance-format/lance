@@ -20,24 +20,31 @@ const SMALL_FRONTIER_FREQ_LIMIT: usize = 256;
 /// reports whether a one-byte norm delta follows. The norm itself is the
 /// quantized `u8` document-length code; the common `norm_delta == 1` case needs
 /// no norm byte.
+///
+/// Clones share one immutable allocation: every query takes its own view of
+/// each posting list it reads, so a clone must not copy the Arrow array or the
+/// derived state.
 #[derive(Debug, Clone)]
-pub struct ImpactSkipData {
+pub struct ImpactSkipData(Arc<ImpactSkipDataInner>);
+
+#[derive(Debug)]
+struct ImpactSkipDataInner {
     entries: LargeBinaryArray,
     level0_len: usize,
     // Last doc id covered by each entry (level0 entries then level1 entries),
     // decoded once at construction. Level1 markers are fully validated because
     // WAND may use them to skip a group; u32::MAX marks malformed entries.
-    entry_doc_up_tos: Arc<[u32]>,
+    entry_doc_up_tos: Box<[u32]>,
     // The most recently baked bounds with a stable scorer key. Each query holds
     // its own Arc in ImpactScoreCache, so replacing this slot for another scorer
     // cannot change bounds already in use. Scorers without a key never enter the
     // shared slot. Malformed entries bake to INFINITY so pruning stays safe.
-    last_keyed_bounds: Arc<Mutex<LastKeyedImpactBounds>>,
+    last_keyed_bounds: Mutex<LastKeyedImpactBounds>,
 }
 
 impl PartialEq for ImpactSkipData {
     fn eq(&self, other: &Self) -> bool {
-        self.entries == other.entries && self.level0_len == other.level0_len
+        self.0.entries == other.0.entries && self.0.level0_len == other.0.level0_len
     }
 }
 
@@ -125,17 +132,17 @@ impl ImpactSkipData {
                 };
                 doc_up_to.unwrap_or(u32::MAX)
             })
-            .collect::<Arc<[u32]>>();
-        Ok(Self {
+            .collect::<Box<[u32]>>();
+        Ok(Self(Arc::new(ImpactSkipDataInner {
             entries,
             level0_len,
             entry_doc_up_tos,
-            last_keyed_bounds: Arc::new(Mutex::new(None)),
-        })
+            last_keyed_bounds: Mutex::new(None),
+        })))
     }
 
     fn keyed_bounds_guard(&self) -> MutexGuard<'_, LastKeyedImpactBounds> {
-        match self.last_keyed_bounds.lock() {
+        match self.0.last_keyed_bounds.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         }
@@ -173,12 +180,12 @@ impl ImpactSkipData {
     }
 
     fn compute_bounds<S: Scorer + ?Sized>(&self, scorer: &S) -> ImpactBounds {
-        let per_entry = (0..self.entries.len())
+        let per_entry = (0..self.0.entries.len())
             .map(|entry_idx| {
-                if self.entries.is_null(entry_idx) {
+                if self.0.entries.is_null(entry_idx) {
                     return f32::INFINITY;
                 }
-                let bytes = self.entries.value(entry_idx);
+                let bytes = self.0.entries.value(entry_idx);
                 let mut max_doc_weight = 0.0_f32;
                 match for_each_entry_pair(bytes, |freq, doc_len| {
                     max_doc_weight = max_doc_weight.max(scorer.doc_weight(freq, doc_len));
@@ -190,8 +197,8 @@ impl ImpactSkipData {
             .collect::<Box<[f32]>>();
         // The level1 entries cover every block, so their max is the list-wide
         // max doc weight; zero-entry lists fall back to the empty level0 slab.
-        let global = if per_entry.len() > self.level0_len {
-            per_entry[self.level0_len..]
+        let global = if per_entry.len() > self.0.level0_len {
+            per_entry[self.0.level0_len..]
                 .iter()
                 .copied()
                 .fold(0.0_f32, f32::max)
@@ -219,49 +226,51 @@ impl ImpactSkipData {
         scorer: &S,
         cache: &'a mut ImpactScoreCache,
     ) -> &'a [f32] {
-        &cache.bounds(self, scorer).per_entry[..self.level0_len]
+        &cache.bounds(self, scorer).per_entry[..self.0.level0_len]
     }
 
     pub fn entries(&self) -> &LargeBinaryArray {
-        &self.entries
+        &self.0.entries
     }
 
-    /// Conservative heap charge for query-independent derived state and one
-    /// shared keyed-bound slab, whether or not that slab has been initialized
-    /// yet. The Arrow impact entries are owned by the enclosing batch and are
-    /// deliberately excluded so packed-group cache accounting counts them once.
+    /// Conservative heap charge for the shared allocation, its query-independent
+    /// derived state, and one shared keyed-bound slab, whether or not that slab
+    /// has been initialized yet. The Arrow impact entries' buffers are owned by
+    /// the enclosing batch and are deliberately excluded so packed-group cache
+    /// accounting counts them once.
     pub(crate) fn derived_cache_bytes(&self) -> usize {
-        Self::derived_cache_bytes_for_entries(self.entries.len())
+        Self::derived_cache_bytes_for_entries(self.0.entries.len())
     }
 
     pub(crate) fn derived_cache_bytes_for_entries(entry_count: usize) -> usize {
-        entry_count * size_of::<u32>()
-            + size_of::<Mutex<LastKeyedImpactBounds>>()
+        // The Arc header holds the strong and weak counts.
+        2 * size_of::<usize>()
+            + size_of::<ImpactSkipDataInner>()
+            + entry_count * size_of::<u32>()
             + size_of::<ImpactBounds>()
             + entry_count * size_of::<f32>()
     }
 
     #[cfg(test)]
     pub(crate) fn shares_derived_state_with(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.entry_doc_up_tos, &other.entry_doc_up_tos)
-            && Arc::ptr_eq(&self.last_keyed_bounds, &other.last_keyed_bounds)
+        Arc::ptr_eq(&self.0, &other.0)
     }
 
     #[cfg(test)]
     pub fn level0_len(&self) -> usize {
-        self.level0_len
+        self.0.level0_len
     }
 
     #[cfg(test)]
     pub fn level1_len(&self) -> usize {
-        level1_len(self.level0_len)
+        level1_len(self.0.level0_len)
     }
 
     pub(crate) fn level1_doc_up_to(&self, group_idx: usize) -> Option<u32> {
-        if group_idx >= level1_len(self.level0_len) {
+        if group_idx >= level1_len(self.0.level0_len) {
             return None;
         }
-        match self.entry_doc_up_tos[self.level0_len + group_idx] {
+        match self.0.entry_doc_up_tos[self.0.level0_len + group_idx] {
             u32::MAX => None,
             doc_up_to => Some(doc_up_to),
         }
@@ -270,10 +279,10 @@ impl ImpactSkipData {
     /// Last doc id covered by the level0 entry of `block_idx`, or `None` when
     /// the entry is missing or malformed.
     pub(crate) fn level0_doc_up_to(&self, block_idx: usize) -> Option<u32> {
-        if block_idx >= self.level0_len {
+        if block_idx >= self.0.level0_len {
             return None;
         }
-        match self.entry_doc_up_tos[block_idx] {
+        match self.0.entry_doc_up_tos[block_idx] {
             u32::MAX => None,
             doc_up_to => Some(doc_up_to),
         }
@@ -286,7 +295,7 @@ impl ImpactSkipData {
         scorer: &S,
         cache: &mut ImpactScoreCache,
     ) -> f32 {
-        if block_idx >= self.level0_len {
+        if block_idx >= self.0.level0_len {
             return 0.0;
         }
         cache.entry_score(self, block_idx, query_weight, scorer)
@@ -301,10 +310,10 @@ impl ImpactSkipData {
         scorer: &S,
         cache: &mut ImpactScoreCache,
     ) -> f32 {
-        if group_idx >= level1_len(self.level0_len) {
+        if group_idx >= level1_len(self.0.level0_len) {
             return 0.0;
         }
-        cache.entry_score(self, self.level0_len + group_idx, query_weight, scorer)
+        cache.entry_score(self, self.0.level0_len + group_idx, query_weight, scorer)
     }
 
     #[cfg(test)]
@@ -323,13 +332,13 @@ impl ImpactSkipData {
         let mut max_score = 0.0_f32;
         let mut entries_scanned = 0usize;
 
-        while block_idx < self.level0_len {
+        while block_idx < self.0.level0_len {
             let group_idx = block_idx / IMPACT_LEVEL1_BLOCKS;
             let group_start = group_idx * IMPACT_LEVEL1_BLOCKS;
-            let group_end = ((group_idx + 1) * IMPACT_LEVEL1_BLOCKS).min(self.level0_len);
+            let group_end = ((group_idx + 1) * IMPACT_LEVEL1_BLOCKS).min(self.0.level0_len);
             if block_idx == group_start {
-                let level1_entry_idx = self.level0_len + group_idx;
-                match self.entry_doc_up_tos[level1_entry_idx] {
+                let level1_entry_idx = self.0.level0_len + group_idx;
+                match self.0.entry_doc_up_tos[level1_entry_idx] {
                     u32::MAX => {
                         return ImpactScore {
                             score: f32::INFINITY,
@@ -353,7 +362,7 @@ impl ImpactSkipData {
 
             max_score = max_score.max(cache.entry_score(self, block_idx, query_weight, scorer));
             entries_scanned += 1;
-            match self.entry_doc_up_tos[block_idx] {
+            match self.0.entry_doc_up_tos[block_idx] {
                 u32::MAX => {
                     return ImpactScore {
                         score: f32::INFINITY,

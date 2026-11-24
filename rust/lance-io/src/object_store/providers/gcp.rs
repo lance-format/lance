@@ -25,10 +25,16 @@ use crate::object_store::{
     DEFAULT_CLOUD_BLOCK_SIZE, DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE, ObjectStore,
     ObjectStoreParams, ObjectStoreProvider, StorageOptions, StorageOptionsAccessor,
     dynamic_credentials::build_dynamic_credential_provider,
-    throttle::{AimdThrottleConfig, AimdThrottleState, cloud_http_connector, with_throttling},
+    throttle::{
+        AimdThrottleState, Transport, cloud_http_connector, reject_http_connector_for_opendal,
+        shared_throttle_state, with_throttling,
+    },
 };
 use lance_core::error::{Error, Result};
 use lance_core::utils::parse::str_is_truthy;
+
+use super::opendal::finish_opendal_operator;
+
 #[derive(Default, Debug)]
 pub struct GcsStoreProvider;
 
@@ -228,6 +234,7 @@ impl GcsStoreProvider {
 
         let operator = Operator::from_iter::<Gcs>(config_map)
             .map_err(|e| Error::invalid_input(format!("Failed to create GCS operator: {:?}", e)))?;
+        let operator = finish_opendal_operator(operator, storage_options.client_max_retries());
 
         Ok(Arc::new(OpendalStore::new(operator)) as Arc<dyn OSObjectStore>)
     }
@@ -238,6 +245,7 @@ impl GcsStoreProvider {
         storage_options: &StorageOptions,
         accessor: Option<Arc<StorageOptionsAccessor>>,
         throttle_state: Option<&AimdThrottleState>,
+        transport: Transport,
         // Concrete rather than `dyn`, so the caller keeps the handle a paginated listing
         // needs: `PaginatedListStore` is a separate trait from `ObjectStore`.
     ) -> Result<Arc<GoogleCloudStorage>> {
@@ -280,7 +288,11 @@ impl GcsStoreProvider {
 
         let store_prefix =
             self.calculate_object_store_prefix(base_path, Some(&storage_options.0))?;
-        builder = builder.with_http_connector(cloud_http_connector(throttle_state, store_prefix));
+        builder = builder.with_http_connector(cloud_http_connector(
+            throttle_state,
+            crate::object_store::metrics_base(&store_prefix, base_path),
+            transport,
+        ));
 
         Ok(Arc::new(builder.build()?))
     }
@@ -303,14 +315,13 @@ impl ObjectStoreProvider for GcsStoreProvider {
 
         let accessor = params.get_accessor();
 
-        let throttle_config = AimdThrottleConfig::from_storage_options(params.storage_options())?;
-        let throttle_state = if throttle_config.is_disabled() {
-            None
-        } else {
-            Some(AimdThrottleState::new(throttle_config)?)
-        };
+        // Keyed like the registry cache so per-dataset stores share the bucket's budget.
+        let store_prefix =
+            self.calculate_object_store_prefix(&base_path, params.storage_options())?;
+        let throttle_state = shared_throttle_state(&store_prefix, params, Default::default())?;
 
         let (inner, paginated_lister) = if use_opendal {
+            reject_http_connector_for_opendal(params)?;
             // OpenDAL GCS intentionally uses static/environment-backed configuration only.
             // Namespace-vended dynamic credentials are supported on the native object_store path.
             // Listed in full: no paginated lister covers OpenDAL yet.
@@ -326,6 +337,7 @@ impl ObjectStoreProvider for GcsStoreProvider {
                     &storage_options,
                     accessor,
                     throttle_state.as_ref(),
+                    Transport::new(params.http_connector.as_ref()),
                 )
                 .await?;
             (
@@ -338,7 +350,11 @@ impl ObjectStoreProvider for GcsStoreProvider {
 
         Ok(ObjectStore {
             inner,
+            external_blob_inner: None,
+            direct_local_io: false,
+            _external_blob_origin: None,
             local_dir_operations: None,
+            local_fsync: false,
             scheme: String::from("gs"),
             block_size,
             max_iop_size: *DEFAULT_MAX_IOP_SIZE,
@@ -346,6 +362,7 @@ impl ObjectStoreProvider for GcsStoreProvider {
             list_is_lexically_ordered: true,
             io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
             download_retry_count,
+            scheduler_error_mode: Default::default(),
             io_tracker: Default::default(),
             store_prefix: self
                 .calculate_object_store_prefix(&base_path, params.storage_options())?,
@@ -355,36 +372,46 @@ impl ObjectStoreProvider for GcsStoreProvider {
 }
 
 impl StorageOptions {
-    /// Add values from the environment to storage options
+    /// Add values from the environment without overriding explicit options,
+    /// including aliases, case variants, and empty-string values.
     pub fn with_env_gcs(&mut self) {
+        self.merge_env_options(std::env::vars_os(), |key| {
+            GoogleConfigKey::from_str(key)
+                .ok()
+                .map(|key| key.as_ref().to_string())
+        });
+        // Check for GOOGLE_STORAGE_TOKEN until GoogleConfigKey supports storage token.
+        let token_key = "google_storage_token";
         for (os_key, os_value) in std::env::vars_os() {
-            if let (Some(key), Some(value)) = (os_key.to_str(), os_value.to_str()) {
-                let lowercase_key = key.to_ascii_lowercase();
-                let token_key = "google_storage_token";
-
-                if let Ok(config_key) = GoogleConfigKey::from_str(&lowercase_key) {
-                    if !self.0.contains_key(config_key.as_ref()) {
-                        self.0
-                            .insert(config_key.as_ref().to_string(), value.to_string());
-                    }
-                }
-                // Check for GOOGLE_STORAGE_TOKEN until GoogleConfigKey supports storage token
-                else if lowercase_key == token_key && !self.0.contains_key(token_key) {
-                    self.0.insert(token_key.to_string(), value.to_string());
-                }
+            if let (Some(key), Some(value)) = (os_key.to_str(), os_value.to_str())
+                && key.eq_ignore_ascii_case(token_key)
+                && !self.0.contains_key(token_key)
+            {
+                self.0.insert(token_key.to_string(), value.to_string());
             }
         }
     }
 
-    /// Subset of options relevant for gcs storage
+    /// Return options recognized by [`GoogleConfigKey`], ignoring unknown keys.
+    ///
+    /// When aliases conflict, the exact canonical name (such as
+    /// `google_service_account`) wins, followed by case variants of that name.
+    /// Remaining ties use the lexicographically smallest original key. Empty
+    /// values are preserved.
+    ///
+    /// ```
+    /// use std::collections::HashMap;
+    /// use lance_io::object_store::StorageOptions;
+    /// use object_store::gcp::GoogleConfigKey;
+    ///
+    /// let options = StorageOptions(HashMap::from([
+    ///     ("service_account".into(), "alias.json".into()),
+    ///     ("google_service_account".into(), "canonical.json".into()),
+    /// ]));
+    /// assert_eq!(options.as_gcs_options()[&GoogleConfigKey::ServiceAccount], "canonical.json");
+    /// ```
     pub fn as_gcs_options(&self) -> HashMap<GoogleConfigKey, String> {
-        self.0
-            .iter()
-            .filter_map(|(key, value)| {
-                let gcs_key = GoogleConfigKey::from_str(&key.to_ascii_lowercase()).ok()?;
-                Some((gcs_key, value.clone()))
-            })
-            .collect()
+        self.as_cloud_options()
     }
 }
 
@@ -393,13 +420,47 @@ mod tests {
     use super::*;
     use std::{collections::HashMap, fs, sync::Arc};
 
+    use crate::object_store::test_utils::RecordingConnector;
     use crate::object_store::test_utils::StaticMockStorageOptionsProvider;
     use crate::object_store::{ObjectStoreParams, StorageOptionsAccessor};
+    use object_store::client::{HttpError, HttpErrorKind};
     use tempfile::TempDir;
+    use tokio::io::{AsyncBufReadExt, BufReader};
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
         matchers::{method, path},
     };
+
+    #[rstest::rstest]
+    #[case::canonical("google_service_account", "service_account")]
+    #[case::canonical_over_case_variant("google_service_account", "GOOGLE_SERVICE_ACCOUNT")]
+    #[case::canonical_case_tie("GOOGLE_SERVICE_ACCOUNT", "Google_Service_Account")]
+    #[case::case_variant_over_alias("GOOGLE_SERVICE_ACCOUNT", "service_account_path")]
+    #[case::lexical_alias("service_account", "service_account_path")]
+    #[case::case_alias("SERVICE_ACCOUNT", "service_account")]
+    fn test_storage_options_alias_precedence(
+        #[case] preferred_key: &str,
+        #[case] conflicting_key: &str,
+        #[values("preferred", "")] preferred_value: &str,
+        #[values(false, true)] is_reversed: bool,
+    ) {
+        // Exercise fresh hash seeds as well as both insertion orders.
+        for _ in 0..16 {
+            let mut entries = [
+                (preferred_key.to_string(), preferred_value.to_string()),
+                (conflicting_key.to_string(), "conflicting".to_string()),
+                ("lance_custom_option".to_string(), "ignored".to_string()),
+            ];
+            if is_reversed {
+                entries.reverse();
+            }
+            let options = StorageOptions(HashMap::from(entries));
+            assert_eq!(
+                options.as_gcs_options(),
+                HashMap::from([(GoogleConfigKey::ServiceAccount, preferred_value.to_string())])
+            );
+        }
+    }
 
     fn external_account_storage_options(
         temp_dir: &TempDir,
@@ -431,16 +492,6 @@ mod tests {
             ),
             ("allow_http".to_string(), "true".to_string()),
         ])
-    }
-
-    #[test]
-    fn test_gcs_store_path() {
-        let provider = GcsStoreProvider;
-
-        let url = Url::parse("gs://bucket/path/to/file").unwrap();
-        let path = provider.extract_path(&url).unwrap();
-        let expected_path = object_store::path::Path::from("path/to/file");
-        assert_eq!(path, expected_path);
     }
 
     #[tokio::test]
@@ -542,26 +593,21 @@ mod tests {
         assert!(!requests[0].headers.contains_key("authorization"));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_external_account_respects_client_timeout() {
-        let mock_server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/token"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_delay(Duration::from_secs(1))
-                    .set_body_json(serde_json::json!({
-                        "access_token": "federated-token",
-                        "expires_in": 3600
-                    })),
-            )
-            .expect(1)
-            .mount(&mock_server)
-            .await;
-
+        // Keep virtual time stationary while real file and socket I/O completes.
+        // Dropping the sender also releases the blocking task if an assertion panics.
+        let (release_clock, clock_inhibited) = std::sync::mpsc::channel::<()>();
+        let clock_guard = tokio::task::spawn_blocking(move || {
+            let _ = clock_inhibited.recv_timeout(Duration::from_secs(10));
+        });
+        let start = tokio::time::Instant::now();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let temp_dir = tempfile::tempdir().unwrap();
-        let mut storage_options =
-            external_account_storage_options(&temp_dir, format!("{}/token", mock_server.uri()));
+        let mut storage_options = external_account_storage_options(
+            &temp_dir,
+            format!("http://{}/token", listener.local_addr().unwrap()),
+        );
         storage_options.insert("timeout".to_string(), "50ms".to_string());
         let storage_options = StorageOptions::new(storage_options);
         let client_options = gcs_client_options(&storage_options).unwrap();
@@ -571,14 +617,45 @@ mod tests {
         )
         .expect("external account credential provider should build")
         .expect("external account credentials should select the reqsign provider");
+        let mut request = tokio::spawn(async move { credential_provider.get_credential().await });
 
-        let credential_result = tokio::time::timeout(
-            Duration::from_millis(200),
-            credential_provider.get_credential(),
-        )
-        .await
-        .expect("configured client timeout should bound the credential exchange");
-        let error = credential_result.expect_err("the delayed token exchange should time out");
+        // Hold the connection open without responding, so only the client timeout
+        // can end the exchange. The endpoint uses the same runtime as the client.
+        let accept_request = async {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut socket = BufReader::new(socket);
+            let mut request_line = String::new();
+            socket.read_line(&mut request_line).await.unwrap();
+            assert_eq!(request_line, "POST /token HTTP/1.1\r\n");
+            socket
+        };
+        let _connection = tokio::select! {
+            result = &mut request => panic!("credential request ended before reaching the endpoint: {result:?}"),
+            connection = tokio::time::timeout(Duration::from_secs(1), accept_request) => {
+                connection.expect("credential request should reach the endpoint")
+            }
+        };
+        assert_eq!(start.elapsed(), Duration::ZERO);
+
+        let observe_timeout = async {
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            assert!(
+                !request.is_finished(),
+                "credential request timed out too early"
+            );
+            tokio::time::timeout(Duration::from_millis(20), &mut request)
+                .await
+                .expect("configured 50ms client timeout should end the request")
+                .unwrap()
+        };
+        tokio::pin!(observe_timeout);
+        // Register the observation timer before allowing virtual time to advance.
+        assert!(futures::poll!(&mut observe_timeout).is_pending());
+        drop(release_clock);
+        let error = observe_timeout
+            .await
+            .expect_err("the unanswered token exchange should time out");
+        clock_guard.await.unwrap();
         assert!(matches!(&error, object_store::Error::Generic { .. }));
         assert!(
             error
@@ -586,6 +663,44 @@ mod tests {
                 .contains("failed to send Google workload identity HTTP request"),
             "unexpected error: {error}"
         );
-        mock_server.verify().await;
+        let mut cause: &(dyn std::error::Error + 'static) = &error;
+        let http_error = loop {
+            if let Some(http_error) = cause.downcast_ref::<HttpError>() {
+                break http_error;
+            }
+            cause = cause
+                .source()
+                .expect("HTTP timeout source should be preserved");
+        };
+        assert_eq!(http_error.kind(), HttpErrorKind::Timeout);
+    }
+
+    #[tokio::test]
+    async fn test_gcs_store_opens_its_clients_with_the_given_http_connector() {
+        let connector = Arc::new(RecordingConnector::default());
+        let params = ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                HashMap::from([("google_skip_signature".to_string(), "true".to_string())]),
+            ))),
+            http_connector: Some(connector.clone()),
+            ..Default::default()
+        };
+
+        let url = Url::parse("gs://bucket/path").unwrap();
+        let store = GcsStoreProvider.new_store(url, &params).await.unwrap();
+        let found = object_store::ObjectStoreExt::get(
+            store.inner.as_ref(),
+            &object_store::path::Path::from("path/file"),
+        )
+        .await;
+
+        assert!(
+            matches!(found, Err(object_store::Error::NotFound { .. })),
+            "{found:?}"
+        );
+        assert!(connector.connects.load(std::sync::atomic::Ordering::SeqCst) >= 1);
+        let requests = connector.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1, "{requests:?}");
+        assert!(requests[0].ends_with("/bucket/path%2Ffile"), "{requests:?}");
     }
 }

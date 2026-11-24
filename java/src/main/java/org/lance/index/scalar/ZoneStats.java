@@ -20,7 +20,13 @@ import java.io.Serializable;
  *
  * <p>Each zone covers a contiguous range of row offsets within a single fragment. The min/max
  * values are represented as {@link Comparable} objects (Long, Double, String, etc.) matching the
- * column's data type.
+ * column's data type. Columns whose type has no such representation yield no {@code ZoneStats} at
+ * all, so a null min or max always means the zone has no comparable value: every value is null or,
+ * for a floating-point column, every non-null value is NaN.
+ *
+ * <p>String min/max values follow Arrow's UTF-8 byte ordering, which is not the same as {@link
+ * String#compareTo(String)}: that method compares UTF-16 code units and orders some supplementary
+ * characters differently.
  *
  * <p>A zone never spans fragment boundaries: if a fragment has more rows than the zone size,
  * multiple zones are created within that fragment.
@@ -37,6 +43,7 @@ public class ZoneStats implements Serializable {
   private final Comparable<?> min;
   private final Comparable<?> max;
   private final long nullCount;
+  private final long nanCount;
 
   /**
    * Constructs a new ZoneStats instance.
@@ -45,9 +52,10 @@ public class ZoneStats implements Serializable {
    * @param zoneStart the starting row offset within the fragment
    * @param zoneLength the span of row offsets (last_offset - first_offset + 1); may differ from
    *     physical row count if rows have been deleted
-   * @param min the minimum value in the zone, or null if all values are null
-   * @param max the maximum value in the zone, or null if all values are null
+   * @param min the minimum value in the zone, or null if the zone has no comparable value
+   * @param max the maximum value in the zone, or null if the zone has no comparable value
    * @param nullCount the number of null values in the zone
+   * @param nanCount the number of NaN values in the zone; see {@link #getNanCount()}
    */
   public ZoneStats(
       int fragmentId,
@@ -55,13 +63,26 @@ public class ZoneStats implements Serializable {
       long zoneLength,
       Comparable<?> min,
       Comparable<?> max,
-      long nullCount) {
+      long nullCount,
+      long nanCount) {
     this.fragmentId = fragmentId;
     this.zoneStart = zoneStart;
     this.zoneLength = zoneLength;
     this.min = min;
     this.max = max;
     this.nullCount = nullCount;
+    this.nanCount = nanCount;
+  }
+
+  /** Constructs a zone with no NaN values; see {@link #getNanCount()}. */
+  public ZoneStats(
+      int fragmentId,
+      long zoneStart,
+      long zoneLength,
+      Comparable<?> min,
+      Comparable<?> max,
+      long nullCount) {
+    this(fragmentId, zoneStart, zoneLength, min, max, nullCount, 0);
   }
 
   /** Returns the fragment ID this zone belongs to. */
@@ -87,7 +108,9 @@ public class ZoneStats implements Serializable {
   /**
    * Returns the minimum value in the zone.
    *
-   * @return the min value, or null if all values in the zone are null
+   * @return the min value, or null if the zone has no comparable value: every value is null, or
+   *     every non-null value is NaN; {@link #getNullCount()} and {@link #getNanCount()} tell the
+   *     two apart
    */
   public Comparable<?> getMin() {
     return min;
@@ -96,7 +119,9 @@ public class ZoneStats implements Serializable {
   /**
    * Returns the maximum value in the zone.
    *
-   * @return the max value, or null if all values in the zone are null
+   * @return the max value, or null if the zone has no comparable value: every value is null, or
+   *     every non-null value is NaN; {@link #getNullCount()} and {@link #getNanCount()} tell the
+   *     two apart
    */
   public Comparable<?> getMax() {
     return max;
@@ -107,10 +132,24 @@ public class ZoneStats implements Serializable {
     return nullCount;
   }
 
+  /**
+   * Returns the number of NaN values in the zone. Always 0 for non-floating-point columns.
+   *
+   * <p>Indexes written at zone map version 1 or later keep NaN out of {@link #getMin()} and {@link
+   * #getMax()}, so this count is the only trace of a NaN in the zone. A predicate that orders NaN
+   * relative to other values (Spark, for example, treats NaN as greater than any other value) must
+   * keep a zone with a positive NaN count regardless of its bounds. Older indexes also mark such a
+   * zone with a NaN max.
+   */
+  public long getNanCount() {
+    return nanCount;
+  }
+
   @Override
   public String toString() {
     return String.format(
-        "ZoneStats{fragmentId=%d, zoneStart=%d, zoneLength=%d," + " min=%s, max=%s, nullCount=%d}",
-        fragmentId, zoneStart, zoneLength, min, max, nullCount);
+        "ZoneStats{fragmentId=%d, zoneStart=%d, zoneLength=%d,"
+            + " min=%s, max=%s, nullCount=%d, nanCount=%d}",
+        fragmentId, zoneStart, zoneLength, min, max, nullCount, nanCount);
   }
 }

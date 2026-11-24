@@ -1,6 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+// The streaming IVF training stack (see index::vector::ivf), awaited whole by
+// its training tests, has a future type that nests past the default limit of
+// 128. `recursion_limit` is a crate-level inner attribute, so it necessarily
+// applies to every build of this crate, not only the test build that currently
+// exercises that future. benches/streaming_ivf_training.rs raises the limit for
+// the same stack.
+#![recursion_limit = "256"]
+// `redundant_clone` analyzes MIR for every function and costs ~35s on the test
+// build of this crate, which is the critical path of a workspace clippy run.
+// The non-test build still runs it, so library code stays covered.
+#![cfg_attr(test, allow(clippy::redundant_clone))]
+
 //! Lance Columnar Data Format
 //!
 //! Lance columnar data format is an alternative to Parquet. It provides 100x faster for random access,
@@ -72,7 +84,7 @@
 use arrow_schema::DataType;
 use dataset::builder::DatasetBuilder;
 pub use lance_core::datatypes;
-pub use lance_core::{Error, Result, cache};
+pub use lance_core::{Error, Result, cache, memory};
 use std::sync::LazyLock;
 
 pub mod arrow;
@@ -89,13 +101,21 @@ pub mod utils;
 
 pub mod pb {
     #![allow(clippy::use_self)]
-    include!(concat!(env!("OUT_DIR"), "/lance.pb.rs"));
+    include!("pb/lance.pb.rs");
+}
+
+/// Protobuf transport used by cache diagnostics language bindings.
+///
+/// These messages are runtime API payloads and are not part of the persisted
+/// Lance file format.
+pub mod cache_diagnostics_pb {
+    include!("pb/lance.cache.rs");
 }
 
 pub use blob::{
     BlobArrayBuilder, BlobDescriptor, BlobDescriptorArrayBuilder, BlobDescriptorColumn,
-    BlobFieldOptions, BlobRange, DedicatedBlobWriter, PackedBlobWriter, blob_field,
-    blob_field_with_options,
+    BlobFieldOptions, BlobRange, DedicatedBlobWriter, ManagedBlobWriter, PackedBlobWriter,
+    blob_field, blob_field_with_options,
 };
 pub use dataset::Dataset;
 use lance_index::vector::DIST_COL;

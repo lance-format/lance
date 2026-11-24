@@ -198,7 +198,7 @@ impl<T: DeepSizeOf> DeepSizeOf for Option<T> {
     }
 }
 
-impl<K: DeepSizeOf, V: DeepSizeOf> DeepSizeOf for HashMap<K, V> {
+impl<K: DeepSizeOf, V: DeepSizeOf, S> DeepSizeOf for HashMap<K, V, S> {
     fn deep_size_of_children(&self, context: &mut Context) -> usize {
         // Each bucket holds a key-value pair plus hash metadata (~1 byte control per bucket).
         // Robin hood / Swiss table capacity is always a power of 2.
@@ -463,5 +463,44 @@ mod tests {
         let size = val.deep_size_of();
         // Must be at least the stack size + heap allocations for label + values
         assert!(size >= std::mem::size_of::<Outer>() + 5 + 3 * std::mem::size_of::<u32>());
+    }
+
+    #[test]
+    fn test_derive_empty_enum_compiles() {
+        use lance_derive::DeepSizeOf;
+
+        // A zero-variant enum has no constructible value, so this only checks
+        // that the derived impl type-checks.
+        #[derive(DeepSizeOf)]
+        enum EmptyEnum {}
+
+        fn assert_deep_size_of<T: DeepSizeOf>() {}
+        assert_deep_size_of::<EmptyEnum>();
+    }
+
+    #[test]
+    fn test_derive_enum_fields_do_not_shadow_macro_locals() {
+        use lance_derive::DeepSizeOf;
+
+        // `__context` used to collide with the macro's context parameter, and
+        // `__lance_field_0` guards the renamed internal bindings.
+        #[derive(DeepSizeOf)]
+        enum ShadowEnum {
+            Named { __context: u32 },
+            Tuple(String, Vec<u32>),
+            Prefixed { __lance_field_0: String },
+        }
+
+        let mut context = Context::new();
+        let named = ShadowEnum::Named { __context: 7 };
+        assert_eq!(named.deep_size_of_children(&mut context), 0);
+
+        let tuple = ShadowEnum::Tuple(String::from("hello"), vec![1, 2, 3]);
+        assert!(tuple.deep_size_of_children(&mut context) >= 5);
+
+        let prefixed = ShadowEnum::Prefixed {
+            __lance_field_0: String::from("abc"),
+        };
+        assert!(prefixed.deep_size_of_children(&mut context) >= 3);
     }
 }

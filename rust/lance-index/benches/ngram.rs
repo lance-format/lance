@@ -8,16 +8,17 @@ use arrow_array::{RecordBatch, UInt64Array};
 use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
 use futures::stream;
 use itertools::Itertools;
-use lance_core::ROW_ID;
+use lance_core::ROW_ADDR;
 use lance_core::cache::LanceCache;
 use lance_datagen::{RowCount, array};
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::pbold;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::ngram::{NGramIndexBuilder, NGramIndexBuilderOptions, NGramIndexPlugin};
+use lance_index::scalar::registry::VALUE_COLUMN_NAME;
 use lance_index::scalar::{TextQuery, registry::ScalarIndexPlugin};
 use lance_io::object_store::ObjectStore;
 #[cfg(target_os = "linux")]
@@ -53,8 +54,8 @@ fn bench_ngram(c: &mut Criterion) {
         .unwrap();
     let batch = RecordBatch::try_new(
         arrow_schema::Schema::new(vec![
-            arrow_schema::Field::new("doc", arrow_schema::DataType::Utf8, false),
-            arrow_schema::Field::new(ROW_ID, arrow_schema::DataType::UInt64, false),
+            arrow_schema::Field::new(VALUE_COLUMN_NAME, arrow_schema::DataType::Utf8, false),
+            arrow_schema::Field::new(ROW_ADDR, arrow_schema::DataType::UInt64, false),
         ])
         .into(),
         vec![doc_col, row_id_col],
@@ -93,7 +94,7 @@ fn bench_ngram(c: &mut Criterion) {
         .measurement_time(Duration::from_secs(10));
     let details = prost_types::Any::from_msg(&pbold::NGramIndexDetails::default()).unwrap();
     let index = rt
-        .block_on(NGramIndexPlugin.load_index(store, &details, None, &LanceCache::no_cache()))
+        .block_on(NGramIndexPlugin.load_index(store, &details, 0, None, &LanceCache::no_cache()))
         .unwrap();
     group.bench_function(format!("ngram_search({TOTAL})").as_str(), |b| {
         b.to_async(&rt).iter(|| async {

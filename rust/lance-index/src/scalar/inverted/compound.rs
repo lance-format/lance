@@ -25,7 +25,8 @@ use super::{
     index::{DocSet, InvertedPartition},
     prepare_bm25_query,
     query::{
-        FtsQuery, FtsSearchParams, MatchQuery, Operator, PhraseQuery, Tokens, collect_query_tokens,
+        FtsQuery, FtsSearchParams, MatchQuery, Operator, PhraseQuery, Tokens,
+        try_collect_query_tokens,
     },
     scorer::MemBM25Scorer,
     tokenizer::document_tokenizer::TextTokenizer,
@@ -686,6 +687,7 @@ impl CompoundScorerPlan {
                     .map(|query| Self::from_query(query, num_leaves))
                     .collect::<Result<Vec<_>>>()?,
             }),
+            FtsQuery::CombinedFields(_) => Err(combined_fields_unsupported()),
         }
     }
 
@@ -3769,8 +3771,154 @@ pub(super) fn collect_leaf_queries(query: &FtsQuery, leaves: &mut Vec<LeafQuery>
                 collect_leaf_queries(child, leaves)?;
             }
         }
+        FtsQuery::CombinedFields(_) => return Err(combined_fields_unsupported()),
     }
     Ok(())
+}
+
+/// A `combined_fields` node reaching the compound scorer is a planner bug.
+///
+/// Every leaf here draws its postings from one column's index and scores them
+/// with a `MemBM25Scorer`, whereas BM25F blends `tf'`/`dl'`/`docFreq'` across
+/// several columns before scoring. The planner keeps such trees out via
+/// `supports_compound_scorer`, so this is an explicit error.
+fn combined_fields_unsupported() -> Error {
+    Error::not_supported(
+        "the compound FTS scorer cannot score a combined_fields (BM25F) node: its statistics \
+         are blended across columns and do not fit the single-index leaf protocol",
+    )
+}
+
+/// A prepared scoring leaf retaining its Match or Phrase semantics.
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub enum PreparedFtsQueryLeaf {
+    /// Term matching with the globally selected fuzzy vocabulary.
+    Match(PreparedBm25Query),
+    /// Phrase matching with the original token positions.
+    Phrase(PreparedBm25Query),
+}
+
+/// Prepared query leaves and their shared corpus-wide BM25 scorer.
+///
+/// Leaf order follows [`collect_leaf_queries`], so callers can preserve the
+/// identity and Match term groups or Phrase token positions of every scoring
+/// leaf when moving statistics between distributed executors.
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct PreparedFtsGlobalStatistics {
+    scorer: Arc<MemBM25Scorer>,
+    query_leaves: Vec<PreparedFtsQueryLeaf>,
+}
+
+impl PreparedFtsGlobalStatistics {
+    /// BM25 statistics covering every term referenced by `query_leaves`.
+    #[doc(hidden)]
+    pub fn scorer(&self) -> &Arc<MemBM25Scorer> {
+        &self.scorer
+    }
+
+    /// Canonically ordered prepared Match and Phrase leaves.
+    #[doc(hidden)]
+    pub fn query_leaves(&self) -> &[PreparedFtsQueryLeaf] {
+        &self.query_leaves
+    }
+}
+
+/// Prepare every scoring leaf and one corpus-wide BM25 scorer for a
+/// one-column FTS query.
+///
+/// Compound queries can contain multiple leaves with different fuzzy and
+/// phrase parameters. This helper applies each leaf's effective parameters,
+/// collects fuzzy expansions across every supplied segment, and retains each
+/// leaf's final vocabulary with its Match term groups or Phrase token
+/// positions alongside a scorer whose term table is complete for every leaf.
+///
+/// ```no_run
+/// # use std::sync::Arc;
+/// # use lance_core::Result;
+/// # use lance_index::scalar::inverted::{
+/// #     InvertedIndex, prepare_fts_global_statistics,
+/// #     query::{FtsQuery, FtsSearchParams},
+/// # };
+/// # async fn example(
+/// #     indices: &[Arc<InvertedIndex>],
+/// #     query: &FtsQuery,
+/// #     params: &FtsSearchParams,
+/// # ) -> Result<()> {
+/// let statistics = prepare_fts_global_statistics(indices, query, params, None).await?;
+/// assert!(statistics.scorer().num_docs() > 0);
+/// assert!(!statistics.query_leaves().is_empty());
+/// # Ok(())
+/// # }
+/// ```
+pub async fn prepare_fts_global_statistics(
+    indices: &[Arc<InvertedIndex>],
+    query: &FtsQuery,
+    params: &FtsSearchParams,
+    metrics: Option<&dyn MetricsCollector>,
+) -> Result<PreparedFtsGlobalStatistics> {
+    let first_index = indices
+        .first()
+        .ok_or_else(|| Error::invalid_input("FTS index requires at least one segment"))?;
+    let mut leaf_queries = Vec::new();
+    collect_leaf_queries(query, &mut leaf_queries)?;
+    if leaf_queries.is_empty() {
+        return Err(Error::invalid_input(
+            "FTS query must contain at least one scoring leaf",
+        ));
+    }
+
+    let mut combined: Option<MemBM25Scorer> = None;
+    let mut query_leaves = Vec::with_capacity(leaf_queries.len());
+    for leaf in leaf_queries {
+        let effective_params = leaf.effective_params(params);
+        let tokens = tokenize_leaf(first_index, &leaf, &effective_params)?;
+        let prepared =
+            prepare_bm25_query(indices, tokens, &effective_params, metrics, None).await?;
+        let leaf_scorer = prepared.scorer().as_ref().clone();
+        match &mut combined {
+            None => combined = Some(leaf_scorer),
+            Some(combined) => {
+                if combined.total_tokens != leaf_scorer.total_tokens
+                    || combined.num_docs != leaf_scorer.num_docs
+                {
+                    return Err(Error::internal(
+                        "FTS query leaves produced inconsistent corpus statistics",
+                    ));
+                }
+                for (term, document_frequency) in leaf_scorer.token_docs {
+                    match combined.token_docs.entry(term) {
+                        std::collections::hash_map::Entry::Vacant(entry) => {
+                            entry.insert(document_frequency);
+                        }
+                        std::collections::hash_map::Entry::Occupied(entry)
+                            if *entry.get() != document_frequency =>
+                        {
+                            return Err(Error::internal(format!(
+                                "FTS term '{}' produced inconsistent document frequencies {} and {}",
+                                entry.key(),
+                                entry.get(),
+                                document_frequency
+                            )));
+                        }
+                        std::collections::hash_map::Entry::Occupied(_) => {}
+                    }
+                }
+            }
+        }
+        query_leaves.push(match leaf {
+            LeafQuery::Match(_) => PreparedFtsQueryLeaf::Match(prepared),
+            LeafQuery::Phrase(_) => PreparedFtsQueryLeaf::Phrase(prepared),
+        });
+    }
+
+    let scorer =
+        combined.ok_or_else(|| Error::internal("FTS global scorer was not initialized"))?;
+    Ok(PreparedFtsGlobalStatistics {
+        scorer: Arc::new(scorer),
+        query_leaves,
+    })
 }
 
 struct PreparedLeaf {
@@ -3783,7 +3931,7 @@ pub(super) fn tokenize_leaf(
     index: &InvertedIndex,
     leaf: &LeafQuery,
     params: &FtsSearchParams,
-) -> Tokens {
+) -> Result<Tokens> {
     // Keep the legacy explicit-fuzzy rewrite independent of index analysis.
     // AUTO fuzziness still expands later, but its source terms must first use
     // the same normalization and filtering as the indexed vocabulary.
@@ -3798,7 +3946,7 @@ pub(super) fn tokenize_leaf(
     } else {
         index.tokenizer()
     };
-    collect_query_tokens(leaf.terms(), &mut tokenizer)
+    try_collect_query_tokens(leaf.terms(), &mut tokenizer)
 }
 
 async fn prepare_compound_query(
@@ -3807,7 +3955,7 @@ async fn prepare_compound_query(
     params: &FtsSearchParams,
     metrics: &dyn MetricsCollector,
     base_scorer: Option<Arc<MemBM25Scorer>>,
-    prepared_match: Option<Arc<PreparedBm25Query>>,
+    prepared_leaves: Option<&[Arc<PreparedBm25Query>]>,
 ) -> Result<(CompoundScorerPlan, Vec<PreparedLeaf>)> {
     let first_index = indices
         .first()
@@ -3823,27 +3971,33 @@ async fn prepare_compound_query(
         )));
     }
 
-    let mut leaves = Vec::with_capacity(leaf_queries.len());
-    if prepared_match.is_some() && leaf_queries.len() != 1 {
-        return Err(Error::internal(
-            "prepared Match replay requires exactly one compound FTS leaf",
-        ));
+    if let Some(prepared_leaves) = prepared_leaves
+        && prepared_leaves.len() != leaf_queries.len()
+    {
+        return Err(Error::invalid_input(format!(
+            "prepared compound FTS leaves count ({}) does not match query leaf count ({})",
+            prepared_leaves.len(),
+            leaf_queries.len()
+        )));
     }
-    for leaf in leaf_queries {
+    let mut leaves = Vec::with_capacity(leaf_queries.len());
+    for (leaf_idx, leaf) in leaf_queries.into_iter().enumerate() {
         let effective_params = leaf.effective_params(params);
-        let tokens = tokenize_leaf(first_index, &leaf, &effective_params);
-        let prepared = match &prepared_match {
-            Some(prepared) => prepared.clone(),
-            None => Arc::new(
-                prepare_bm25_query(
-                    indices,
-                    tokens,
-                    &effective_params,
-                    Some(metrics),
-                    base_scorer.clone(),
+        let prepared = match prepared_leaves {
+            Some(prepared_leaves) => prepared_leaves[leaf_idx].clone(),
+            None => {
+                let tokens = tokenize_leaf(first_index, &leaf, &effective_params)?;
+                Arc::new(
+                    prepare_bm25_query(
+                        indices,
+                        tokens,
+                        &effective_params,
+                        Some(metrics),
+                        base_scorer.clone(),
+                    )
+                    .await?,
                 )
-                .await?,
-            ),
+            }
         };
         leaves.push(PreparedLeaf {
             query: prepared,
@@ -3909,7 +4063,6 @@ async fn load_compound_partition(
                         operator,
                         scorer.as_ref(),
                         metrics.as_ref(),
-                        true,
                     )
                     .await?
                     .postings
@@ -4292,15 +4445,13 @@ pub async fn compound_search_prepared_match(
             "prepared Match replay requires a root Match query",
         ));
     }
-    compound_search_impl(
+    compound_search_prepared_leaves(
         indices,
         query,
         params,
         prefilter,
         metrics,
-        None,
-        None,
-        Some(prepared_match),
+        std::slice::from_ref(&prepared_match),
     )
     .await
 }
@@ -4322,6 +4473,53 @@ pub async fn compound_search_prepared_match_with_score_floor(
             "prepared Match replay requires a root Match query",
         ));
     }
+    compound_search_prepared_leaves_with_score_floor(
+        indices,
+        query,
+        params,
+        prefilter,
+        metrics,
+        std::slice::from_ref(&prepared_match),
+        score_floor,
+    )
+    .await
+}
+
+/// Execute a compound FTS query using one canonical prepared vocabulary/scorer
+/// pair per leaf in DFS traversal order (supporting multi-leaf fuzzy compounds
+/// over segment subsets).
+pub async fn compound_search_prepared_leaves(
+    indices: &[Arc<InvertedIndex>],
+    query: &FtsQuery,
+    params: &FtsSearchParams,
+    prefilter: Arc<dyn PreFilter>,
+    metrics: Arc<dyn MetricsCollector>,
+    prepared_leaves: &[Arc<PreparedBm25Query>],
+) -> Result<(Vec<u64>, Vec<f32>)> {
+    compound_search_impl(
+        indices,
+        query,
+        params,
+        prefilter,
+        metrics,
+        None,
+        None,
+        Some(prepared_leaves),
+    )
+    .await
+}
+
+/// Like [`compound_search_prepared_leaves`] with an inclusive initial score floor.
+#[doc(hidden)]
+pub async fn compound_search_prepared_leaves_with_score_floor(
+    indices: &[Arc<InvertedIndex>],
+    query: &FtsQuery,
+    params: &FtsSearchParams,
+    prefilter: Arc<dyn PreFilter>,
+    metrics: Arc<dyn MetricsCollector>,
+    prepared_leaves: &[Arc<PreparedBm25Query>],
+    score_floor: f32,
+) -> Result<(Vec<u64>, Vec<f32>)> {
     compound_search_impl(
         indices,
         query,
@@ -4330,7 +4528,7 @@ pub async fn compound_search_prepared_match_with_score_floor(
         metrics,
         None,
         Some(score_floor),
-        Some(prepared_match),
+        Some(prepared_leaves),
     )
     .await
 }
@@ -4347,7 +4545,7 @@ async fn compound_search_impl(
     metrics: Arc<dyn MetricsCollector>,
     base_scorer: Option<Arc<MemBM25Scorer>>,
     initial_score_floor: Option<f32>,
-    prepared_match: Option<Arc<PreparedBm25Query>>,
+    prepared_leaves: Option<&[Arc<PreparedBm25Query>]>,
 ) -> Result<(Vec<u64>, Vec<f32>)> {
     let limit = params.limit.unwrap_or(usize::MAX);
     if limit == 0 {
@@ -4359,7 +4557,7 @@ async fn compound_search_impl(
         params,
         metrics.as_ref(),
         base_scorer,
-        prepared_match,
+        prepared_leaves,
     )
     .await?;
     prefilter.wait_for_ready().await?;
@@ -4371,6 +4569,7 @@ async fn compound_search_impl(
     let mut collector = TopKCollector::with_competitive_score(limit, competitive_score);
 
     for (segment_ordinal, index) in indices.iter().enumerate() {
+        let mask = index.restrict_mask(mask.clone());
         let loads =
             index
                 .partitions

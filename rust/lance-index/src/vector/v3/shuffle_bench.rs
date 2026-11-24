@@ -40,6 +40,8 @@ pub async fn open_two_file_shuffle_fixture(
         manifest.num_flush_groups,
         manifest.partition_counts.clone(),
         manifest.total_loss,
+        // The fixture directory is checked in, not a scratch dir this reader owns.
+        None,
     )
     .await
 }

@@ -18,6 +18,7 @@ Do not use this skill for:
 
 - Contributing to Lance itself (repo development, internal architecture)
 - File format internals beyond what is required to use the API correctly
+- Checking the health of a table or maintaining it (compaction, index optimization, cleanup of old versions): use the `lance-table-maintenance` skill
 
 ## Installation (quick)
 

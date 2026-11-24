@@ -84,10 +84,10 @@ impl<W: Writer + ?Sized> WriteExt for W {
     async fn write_protobuf(&mut self, msg: &impl Message) -> Result<usize> {
         let offset = self.tell().await?;
 
-        let len = msg.encoded_len();
+        let buf = msg.encode_to_vec();
 
-        self.write_u32_le(len as u32).await?;
-        self.write_all(&msg.encode_to_vec()).await?;
+        self.write_u32_le(buf.len() as u32).await?;
+        self.write_all(&buf).await?;
 
         Ok(offset)
     }

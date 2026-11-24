@@ -50,6 +50,69 @@ use arrow::array::ArrayData;
 use arrow_array::RecordBatch;
 use arrow_buffer::Buffer;
 use arrow_schema::DataType;
+use tokio::sync::Mutex as AsyncMutex;
+
+use crate::dataset::blob::BlobPreprocessor;
+use crate::dataset::mem_wal::MemTableDataTarget;
+
+#[derive(Default)]
+pub(crate) struct BlobPreprocessorState {
+    preprocessor: Option<BlobPreprocessor>,
+    failure: Option<String>,
+}
+
+impl BlobPreprocessorState {
+    const CANCELLED_OPERATION: &'static str =
+        "shared Blob v2 pack operation was cancelled before completion";
+
+    pub(crate) fn get_or_insert_with(
+        &mut self,
+        create: impl FnOnce() -> crate::Result<BlobPreprocessor>,
+    ) -> crate::Result<&mut BlobPreprocessor> {
+        if let Some(failure) = &self.failure {
+            return Err(crate::Error::writer_poisoned(format!(
+                "Blob v2 pack is terminally failed: {failure}"
+            )));
+        }
+        if self.preprocessor.is_none() {
+            self.preprocessor = Some(create()?);
+        }
+        Ok(self
+            .preprocessor
+            .as_mut()
+            .expect("Blob preprocessor initialized"))
+    }
+
+    pub(crate) fn fail(&mut self, error: &crate::Error) {
+        if let Some(preprocessor) = self.preprocessor.as_mut() {
+            preprocessor.abort();
+        }
+        self.failure = Some(error.to_string());
+    }
+
+    /// Mark a shared-pack mutation as incomplete until its future returns.
+    ///
+    /// The marker deliberately precedes the first await. If the caller drops
+    /// the future, the mutex guard is released while this terminal state stays
+    /// behind, so a later WAL flush cannot mistake the abandoned pack for a
+    /// successfully finalized one.
+    pub(crate) fn begin_operation(&mut self) -> crate::Result<&mut BlobPreprocessor> {
+        if let Some(failure) = &self.failure {
+            return Err(crate::Error::writer_poisoned(format!(
+                "Blob v2 pack is terminally failed: {failure}"
+            )));
+        }
+        self.failure = Some(Self::CANCELLED_OPERATION.to_string());
+        Ok(self
+            .preprocessor
+            .as_mut()
+            .expect("Blob preprocessor initialized before shared operation"))
+    }
+
+    pub(crate) fn complete_operation(&mut self) {
+        self.failure = None;
+    }
+}
 
 /// A batch stored in the lock-free store.
 #[derive(Clone)]
@@ -221,6 +284,18 @@ pub struct BatchStore {
     /// lets a writer-global cursor (the WAL durability count) be mapped onto a
     /// particular store.
     global_offset: usize,
+
+    /// Final generation/data-file identity for batches in this store.
+    target: Option<MemTableDataTarget>,
+
+    /// The memtable generation these batches belong to. Recorded in each WAL
+    /// entry so replay keeps the writer's generation boundaries, even if the
+    /// shard is reopened with a different size limit.
+    generation: u64,
+
+    /// Generation-scoped Blob v2 writer. Durable puts reuse its current pack;
+    /// the WAL path finishes it before persisting any descriptors that reference it.
+    blob_preprocessor: AsyncMutex<BlobPreprocessorState>,
 }
 
 // SAFETY: Safe to share across threads because:
@@ -228,6 +303,7 @@ pub struct BatchStore {
 // - Readers only access committed slots (index < committed_len)
 // - Atomic operations provide proper synchronization
 // - Slots are never modified after being written
+// - Blob preprocessing is serialized by its async mutex
 unsafe impl Sync for BatchStore {}
 unsafe impl Send for BatchStore {}
 
@@ -260,6 +336,15 @@ impl BatchStore {
     /// batch sequence. Used by `freeze_memtable` for every memtable after the
     /// first; the first starts at 0.
     pub fn with_capacity_at(capacity: usize, global_offset: usize) -> Self {
+        Self::with_capacity_at_target(capacity, global_offset, None, 0)
+    }
+
+    pub(crate) fn with_capacity_at_target(
+        capacity: usize,
+        global_offset: usize,
+        target: Option<MemTableDataTarget>,
+        generation: u64,
+    ) -> Self {
         assert!(capacity > 0, "capacity must be > 0");
 
         // Allocate uninitialized storage
@@ -278,7 +363,15 @@ impl BatchStore {
             retained_bytes: AtomicUsize::new(0),
             retained_buffers: Mutex::new(HashSet::new()),
             global_offset,
+            target,
+            generation,
+            blob_preprocessor: AsyncMutex::new(BlobPreprocessorState::default()),
         }
+    }
+
+    /// The memtable generation these batches belong to.
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     /// Calculate recommended capacity from memtable size configuration.
@@ -570,6 +663,44 @@ impl BatchStore {
     #[inline]
     pub fn global_offset(&self) -> usize {
         self.global_offset
+    }
+
+    pub(crate) fn target(&self) -> Option<&MemTableDataTarget> {
+        self.target.as_ref()
+    }
+
+    pub(crate) fn blob_preprocessor(&self) -> &AsyncMutex<BlobPreprocessorState> {
+        &self.blob_preprocessor
+    }
+
+    pub(crate) async fn fail_blob_pack(&self, error: &crate::Error) {
+        self.blob_preprocessor.lock().await.fail(error);
+    }
+
+    /// Finish the generation's current packed sidecar before its descriptors are
+    /// made durable in the WAL. The preprocessor remains reusable so later puts
+    /// can start a new pack under the same generation target.
+    pub(crate) async fn finish_blob_pack(&self) -> crate::Result<()> {
+        let mut state = self.blob_preprocessor.lock().await;
+        if let Some(failure) = &state.failure {
+            return Err(crate::Error::writer_poisoned(format!(
+                "cannot finalize terminally failed Blob v2 pack: {failure}"
+            )));
+        }
+        if state.preprocessor.is_none() {
+            return Ok(());
+        }
+        let result = state.begin_operation()?.finish().await;
+        match result {
+            Ok(()) => state.complete_operation(),
+            Err(error) => {
+                state.fail(&error);
+                return Err(crate::Error::writer_poisoned(format!(
+                    "failed to finalize Blob v2 pack: {error}"
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// The local exclusive end of this store covered by a writer-global cursor.

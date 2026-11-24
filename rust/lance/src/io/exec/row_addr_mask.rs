@@ -18,8 +18,10 @@ use arrow::datatypes::UInt64Type;
 use arrow_array::cast::AsArray;
 use arrow_array::{BooleanArray, RecordBatch};
 use async_trait::async_trait;
+use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::error::DataFusionError;
 use datafusion::execution::TaskContext;
+use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
@@ -49,10 +51,10 @@ impl MaskAndLoader {
 
 #[async_trait]
 impl FilterLoader for MaskAndLoader {
-    async fn load(self: Box<Self>) -> Result<RowAddrMask> {
+    async fn load(self: Box<Self>) -> Result<Arc<RowAddrMask>> {
         match self.inner {
-            Some(inner) => Ok(Arc::unwrap_or_clone(self.mask) & inner.load().await?),
-            None => Ok(Arc::unwrap_or_clone(self.mask)),
+            Some(inner) => Ok(Arc::new(self.mask.intersect_ref(&*inner.load().await?))),
+            None => Ok(self.mask),
         }
     }
 }
@@ -106,6 +108,13 @@ impl ExecutionPlan for RowAddrMaskFilterExec {
         vec![true]
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+    ) -> DataFusionResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         mut children: Vec<Arc<dyn ExecutionPlan>>,
@@ -136,7 +145,7 @@ impl ExecutionPlan for RowAddrMaskFilterExec {
 
 /// Keep rows whose `_rowid` is selected by the mask (the mask is keyed in the
 /// same `_rowid` space). Null ids are dropped; they cannot be in any allow set.
-fn apply_mask(mask: &RowAddrMask, batch: RecordBatch) -> DataFusionResult<RecordBatch> {
+pub(super) fn apply_mask(mask: &RowAddrMask, batch: RecordBatch) -> DataFusionResult<RecordBatch> {
     let row_id_column = batch.column_by_name(ROW_ID).ok_or_else(|| {
         DataFusionError::Internal(format!(
             "RowAddrMaskFilterExec input missing {ROW_ID} column"
@@ -255,8 +264,8 @@ mod tests {
 
     #[async_trait]
     impl FilterLoader for FixedLoader {
-        async fn load(self: Box<Self>) -> Result<RowAddrMask> {
-            Ok(self.0)
+        async fn load(self: Box<Self>) -> Result<Arc<RowAddrMask>> {
+            Ok(Arc::new(self.0))
         }
     }
 

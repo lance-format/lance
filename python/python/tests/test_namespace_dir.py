@@ -7,16 +7,21 @@ Tests for DirectoryNamespace implementation.
 This module tests the DirectoryNamespace class which provides a directory-based
 namespace implementation for organizing Lance tables and nested namespaces.
 
-These tests mirror the Rust tests in rust/lance-namespace-impls/src/dir.rs
+These tests mirror the Rust tests in rust/lance-namespace-impls/src/dir/tests/
 
 Additionally, tests are parameterized to run with both the native DirectoryNamespace
 and a CustomNamespace wrapper to verify Python-Rust binding works correctly for
 custom namespace implementations.
 """
 
+import posixpath
+import shutil
+import subprocess
 import sys
 import tempfile
 import uuid
+from collections import UserDict
+from datetime import timedelta
 from threading import Lock
 from typing import Dict, Optional
 
@@ -26,6 +31,8 @@ import pyarrow as pa
 import pytest
 from lance.namespace import LanceNamespace
 from lance_namespace import (
+    BatchDeleteTableVersionsRequest,
+    BatchDeleteTableVersionsResponse,
     CountTableRowsRequest,
     CountTableRowsResponse,
     CreateNamespaceRequest,
@@ -84,7 +91,9 @@ from lance_namespace.errors import (
     TableBranchAlreadyExistsError,
     TableBranchNotFoundError,
     TableNotFoundError,
+    ThrottlingError,
 )
+from lance_namespace_urllib3_client import VersionRange
 
 
 class CustomNamespace(LanceNamespace):
@@ -164,6 +173,11 @@ class CustomNamespace(LanceNamespace):
         self, request: CreateTableVersionRequest
     ) -> CreateTableVersionResponse:
         return self._inner.create_table_version(request)
+
+    def batch_delete_table_versions(
+        self, request: BatchDeleteTableVersionsRequest
+    ) -> BatchDeleteTableVersionsResponse:
+        return self._inner.batch_delete_table_versions(request)
 
     def create_table_branch(
         self, request: CreateTableBranchRequest
@@ -690,6 +704,16 @@ class TestPythonNamespaceErrorMapping:
         ns = _RaisingNamespace(TableBranchNotFoundError("no such branch"))
         with pytest.raises(TableBranchNotFoundError, match="no such branch"):
             lance.dataset(namespace_client=ns, table_id=["t"])
+
+    def test_throttling_retry_after_survives_callback_round_trip(self):
+        exc = ThrottlingError("slow down")
+        exc.retry_after = timedelta(seconds=7)
+        ns = _RaisingNamespace(exc)
+
+        with pytest.raises(ThrottlingError) as exc_info:
+            lance.dataset(namespace_client=ns, table_id=["t"])
+
+        assert exc_info.value.retry_after == timedelta(seconds=7)
 
     def test_foreign_code_attribute_not_trusted(self):
         # The foreign exception must surface as itself, not be reinterpreted
@@ -1469,6 +1493,8 @@ class TestDataManipulation:
         )
         response = temp_ns_client.insert_into_table(insert_req, new_ipc_data)
         assert response is not None
+        assert response.num_inserted_rows == 2
+        assert response.version == 2
 
         # Verify row count increased
         count_req = CountTableRowsRequest(id=["workspace", "test_table"])
@@ -1555,9 +1581,78 @@ class TestTableVersions:
         describe_req = DescribeTableVersionRequest(
             id=["workspace", "test_table"], version=1
         )
-        response = temp_ns_client.describe_table_version(describe_req.model_dump())
-        assert response is not None
-        assert response.get("version") is not None
+        response = temp_ns_client.describe_table_version(describe_req)
+        assert isinstance(response, DescribeTableVersionResponse)
+        assert response.version.version == 1
+
+    @pytest.mark.parametrize("namespace_impl", ["dir", "custom", "rest"])
+    @pytest.mark.parametrize("request_kind", ["dict", "mapping", "model"])
+    def test_create_and_batch_delete_table_versions(
+        self, tmp_path, request, namespace_impl, request_kind
+    ):
+        """Every supported request form returns the response model."""
+        use_request_model = request_kind == "model"
+        mapping_type = UserDict if request_kind == "mapping" else dict
+        if namespace_impl == "rest":
+            adapter = lance.namespace.RestAdapter(
+                "dir", {"root": str(tmp_path)}, port=0
+            )
+            adapter.start()
+            request.addfinalizer(adapter.stop)
+            ns_client = connect("rest", {"uri": f"http://127.0.0.1:{adapter.port}"})
+        else:
+            ns_client = _wrap_if_custom(
+                connect("dir", {"root": str(tmp_path)}), namespace_impl == "custom"
+            )
+        ns_client.create_namespace(CreateNamespaceRequest(id=["workspace"]))
+        table_id = ["workspace", "test_table"]
+        ipc_data = table_to_ipc_bytes(create_test_data())
+        ns_client.create_table(CreateTableRequest(id=table_id), ipc_data)
+
+        describe_req = DescribeTableVersionRequest(id=table_id, version=1)
+        described = ns_client.describe_table_version(
+            describe_req
+            if use_request_model
+            else mapping_type(describe_req.model_dump())
+        )
+        assert isinstance(described, DescribeTableVersionResponse)
+        assert described.version.version == 1
+        manifest_path = described.version.manifest_path
+        assert described.model_dump()["version"]["manifest_path"] == manifest_path
+
+        # Stage a copy of the v1 manifest, as a writer would, and publish it as v2.
+        manifest_name = posixpath.basename(manifest_path)
+        (local_v1,) = [
+            path
+            for path in tmp_path.glob(f"*/_versions/{manifest_name}")
+            if path.parent.parent.name != "__manifest"
+        ]
+        shutil.copy(local_v1, local_v1.with_name("staging.manifest"))
+        staging_path = posixpath.join(
+            posixpath.dirname(manifest_path), "staging.manifest"
+        )
+        create_req = CreateTableVersionRequest(
+            id=table_id, version=2, manifest_path=staging_path
+        )
+        created = ns_client.create_table_version(
+            create_req if use_request_model else mapping_type(create_req.model_dump())
+        )
+        assert isinstance(created, CreateTableVersionResponse)
+        assert created.version.version == 2
+        assert created.model_dump()["version"]["version"] == 2
+
+        delete_req = BatchDeleteTableVersionsRequest(
+            id=table_id, ranges=[VersionRange(start_version=1, end_version=2)]
+        )
+        deleted = ns_client.batch_delete_table_versions(
+            delete_req if use_request_model else mapping_type(delete_req.model_dump())
+        )
+        assert isinstance(deleted, BatchDeleteTableVersionsResponse)
+        assert deleted.deleted_count == 1
+        assert deleted.model_dump()["deleted_count"] == 1
+
+        listed = ns_client.list_table_versions(ListTableVersionsRequest(id=table_id))
+        assert [v.version for v in listed.versions] == [2]
 
     def test_multiple_versions_via_insert(self, temp_ns_client):
         """Test that inserts create new versions."""
@@ -1696,3 +1791,16 @@ class TestIndexOperations:
         assert len(list_response.indexes) == 1
         assert list_response.indexes[0].index_name == "vector_idx"
         assert list_response.indexes[0].columns == ["vector"]
+
+
+def test_import_lance_does_not_load_namespace_client():
+    # The generated REST client is expensive to import and only needed when a
+    # namespace is actually used, so `import lance` must not pull it in.
+    code = (
+        "import sys, lance; "
+        "assert 'lance_namespace' not in sys.modules, sorted(sys.modules); "
+        "assert 'lance.namespace' not in sys.modules; "
+        "lance.LanceNamespace; lance.DescribeTableRequest; "
+        "assert 'lance_namespace' in sys.modules"
+    )
+    subprocess.run([sys.executable, "-c", code], check=True)

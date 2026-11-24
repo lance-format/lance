@@ -96,6 +96,7 @@ fn main() {
         upper_bound: None,
         dist_q_c: 0.0,
         use_acorn: false,
+        rq_graph_scoring: Default::default(),
     };
     let params_hi = HnswQueryParams {
         ef: EF_HI,
@@ -111,7 +112,7 @@ fn main() {
             let query = fsl.value(query_id as usize);
             let truth = ground_truth(&storage, query.clone(), &all_mask);
             let t = Instant::now();
-            let nodes = hnsw
+            let (nodes, _) = hnsw
                 .search_basic(query.clone(), K, &params, None, storage.as_ref())
                 .unwrap();
             control.latency_us.push(t.elapsed().as_secs_f64() * 1e6);
@@ -187,7 +188,7 @@ fn main() {
                         bitset.insert(id);
                     }
                     let t = Instant::now();
-                    let nodes = hnsw
+                    let (nodes, _) = hnsw
                         .search_basic(query.clone(), K, &params, Some(bitset), storage.as_ref())
                         .unwrap();
                     basic.latency_us.push(t.elapsed().as_secs_f64() * 1e6);
@@ -202,7 +203,7 @@ fn main() {
                         bitset.insert(id);
                     }
                     let t = Instant::now();
-                    let nodes = hnsw
+                    let (nodes, _) = hnsw
                         .search_basic(query.clone(), K, &params_hi, Some(bitset), storage.as_ref())
                         .unwrap();
                     basic_hi.latency_us.push(t.elapsed().as_secs_f64() * 1e6);
@@ -217,7 +218,7 @@ fn main() {
                         bitset.insert(id);
                     }
                     let t = Instant::now();
-                    let nodes = hnsw
+                    let (nodes, _) = hnsw
                         .search_acorn(query.clone(), K, &params, &bitset, storage.as_ref())
                         .unwrap();
                     acorn.latency_us.push(t.elapsed().as_secs_f64() * 1e6);

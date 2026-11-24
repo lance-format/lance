@@ -8,6 +8,29 @@ folder contains a `datagen.py` script that generates one or more lance datasets.
 
 ## List of datasets
 
+* `v14.0.2/stable_row_id_*.lance`: Seven datasets written by Lance 14.0.2 with
+  stable row IDs enabled. They cover a contiguous `Range`, sparse
+  `RangeWithHoles`, dense `RangeWithBitmap`, `SortedArray` with both 16-bit and
+  32-bit offsets, an unsorted `Array` from a reverse-order merge, and inline
+  row version sequences with multiple update versions. `expected.json` records
+  the exact `_rowid`, `_row_created_at_version`, and
+  `_row_last_updated_at_version` values plus the `next_row_id` high-water mark
+  of the writer. `datagen.py` regenerates the datasets and expected values with
+  pylance 14.0.2.
+
+* `v14.0.2/blob_v2_raw_reader/blob_v2_raw.lance`: A raw v2.2 file written by
+  the Lance 14.0.2 `LanceFileWriter` with two top-level Blob v2 columns and one
+  nested Blob v2 column. It contains an ordinary `id` column, inline payloads,
+  nulls, and empty values. The writer stores each Blob's descriptor children as
+  anonymous root fields, so the fixture reproduces the released raw-reader
+  failure. `datagen.py` regenerates it with pylance 14.0.2 and asserts that the
+  released reader still rejects the footer.
+
+* `v6.0.1/wrapped_bitpacked_levels.lance`: Synthetic nullable half-float lists
+  with a dense prefix and a long null run. The legacy writer wraps a mini-block
+  structural count at 65,536; its out-of-line bitpacked buffers retain all levels.
+  `test_data/v6.0.1/datagen.py`, run with pylance 6.0.1, regenerates it.
+
 * `v0.7.5/with_deletions`: This is a simple table created with deletions. It is
   written in a version of Lance that did not record the `Fragment.physical_rows`
   or `DeletionFile.num_deleted_rows`, so these values are not present in the
@@ -43,3 +66,17 @@ folder contains a `datagen.py` script that generates one or more lance datasets.
 * `v8.0.0/decimal_zonemap`: This dataset has a Decimal128 ZoneMap whose non-null
   values have null min/max statistics because Decimal extrema were not computed
   by Lance 8.0.0.
+* `v8.0.0/blobs/v2.0.lance` and `v8.0.0/blobs/v2.1.lance`: Legacy Blob
+  columns containing a payload, null, and empty bytes. These fixtures cover
+  reading released files alongside newly appended Blob v2 files.
+* `v10.0.0/null_slot_v2_0.lance` and `v10.0.0/disjoint_v2_1.lance`: Int8
+  dictionary columns whose pages store 32-bit indices. Lance 10.0.0 widened
+  them for the null slot it appended past the last Int8 key, and for two
+  chunks whose dictionaries did not fit Int8 together.
+* `v4.0.1/merge_insert_padded_control_words.lance` and
+  `v11.0.0/fullzip_padded_control_words.lance`: full-zip pages whose layout
+  records no control-word bits but which hold a zero byte before each value.
+  Lance 4.0.1 wrote them for a binary column updated by a merge_insert of some
+  columns (#6338); Lance 11.0.0 still wrote them for `FixedSizeList<Struct>`
+  columns, binary and fixed-width, in a file whose slice of the list validity
+  bitmap had no nulls.

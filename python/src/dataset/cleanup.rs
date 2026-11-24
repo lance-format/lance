@@ -23,10 +23,47 @@ pub struct CleanupStats {
     pub transaction_files_removed: u64,
     pub index_files_removed: u64,
     pub deletion_files_removed: u64,
+    /// Files that could not be deleted; not counted as removed.
+    pub failed_deletes: u64,
 }
 
 #[pymethods]
 impl CleanupStats {
+    fn __repr__(&self) -> String {
+        format!("{self:?}")
+    }
+}
+
+/// Result of expiring versions. Manifests only; no data files are touched.
+#[pyclass(get_all, skip_from_py_object)]
+#[derive(Clone, Debug)]
+pub struct ExpireVersionsStats {
+    pub versions_removed: u64,
+    pub versions_retained: u64,
+    pub bytes_removed: u64,
+    /// Manifests that could not be deleted; not counted as removed.
+    pub failed_deletes: u64,
+}
+
+#[pymethods]
+impl ExpireVersionsStats {
+    fn __repr__(&self) -> String {
+        format!("{self:?}")
+    }
+}
+
+/// What `expire_versions` would remove, without removing it.
+#[pyclass(get_all, skip_from_py_object)]
+#[derive(Clone, Debug)]
+pub struct ExpireVersionsPlan {
+    pub versions: Vec<u64>,
+    pub stats: ExpireVersionsStats,
+    /// Tagged versions the policy would have expired but will keep.
+    pub tagged_but_kept: Vec<u64>,
+}
+
+#[pymethods]
+impl ExpireVersionsPlan {
     fn __repr__(&self) -> String {
         format!("{self:?}")
     }

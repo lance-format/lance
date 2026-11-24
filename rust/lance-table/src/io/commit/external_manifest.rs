@@ -57,6 +57,7 @@ pub async fn finalize_staged<S: ExternalManifestStore + ?Sized>(
         naming_scheme,
         e_tag: final_e_tag,
         identity: None,
+        last_modified: None,
     };
 
     // Step 3: Update the external index to the final path.
@@ -179,6 +180,7 @@ pub trait ExternalManifestStore: std::fmt::Debug + Send + Sync {
             naming_scheme,
             e_tag: None,
             identity: None,
+            last_modified: None,
         })
     }
 
@@ -207,6 +209,7 @@ pub trait ExternalManifestStore: std::fmt::Debug + Send + Sync {
                     naming_scheme,
                     e_tag: None,
                     identity: None,
+                    last_modified: None,
                 })
             })
             .transpose()
@@ -580,6 +583,7 @@ impl ExternalManifestCommitHandler {
                     naming_scheme,
                     e_tag: _,
                     identity,
+                    ..
                 } = location;
 
                 let size = match expected_size {
@@ -609,6 +613,7 @@ impl ExternalManifestCommitHandler {
                     naming_scheme,
                     e_tag,
                     identity,
+                    last_modified: None,
                 })
             }
             Err(ObjectStoreError::NotFound { .. }) => {
@@ -656,6 +661,7 @@ impl ExternalManifestCommitHandler {
             naming_scheme,
             e_tag: final_e_tag,
             identity: None,
+            last_modified: None,
         };
 
         // Step 2: point the external index at the final location without an
@@ -731,6 +737,24 @@ impl CommitHandler for ExternalManifestCommitHandler {
         }
     }
 
+    async fn is_manifest_path_authoritative(
+        &self,
+        base_path: &Path,
+        version: u64,
+        path: &Path,
+        _object_store: &dyn OSObjectStore,
+    ) -> Result<bool> {
+        match self
+            .external_manifest_store
+            .get_manifest_location(base_path.as_ref(), version)
+            .await
+        {
+            Ok(location) => Ok(location.path == *path),
+            Err(error) if error.is_not_found() => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
     async fn resolve_latest_location(
         &self,
         base_path: &Path,
@@ -763,12 +787,13 @@ impl CommitHandler for ExternalManifestCommitHandler {
                     naming_scheme,
                     e_tag: _,
                     identity,
+                    ..
                 } = location;
 
                 let size = if let Some(size) = size {
                     size
                 } else {
-                    match object_store.inner.head(&path).await {
+                    match object_store.stat(&path).await {
                         Ok(meta) => meta.size,
                         Err(ObjectStoreError::NotFound { .. }) => {
                             // there may be other threads that have finished executing finalize_manifest.
@@ -847,6 +872,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
                             naming_scheme,
                             e_tag,
                             identity: None,
+                            last_modified: None,
                         });
                     }
                     Err(ObjectStoreError::NotFound { .. }) => {
@@ -1086,6 +1112,7 @@ impl CommitHandler for ExternalManifestCommitHandler {
                     naming_scheme,
                     e_tag: write_res.e_tag,
                     identity: Some(identity),
+                    last_modified: None,
                 })
             }
             Ok(Reservation::PredecessorChanged) => {
@@ -1269,6 +1296,7 @@ mod tests {
                 size: Some(stored.size),
                 e_tag: stored.e_tag,
                 identity: None,
+                last_modified: None,
             })
         }
 
@@ -1367,14 +1395,13 @@ mod tests {
         let final_path = ManifestNamingScheme::V2.manifest_path(&base_path, 1);
 
         object_store
-            .inner
-            .put(
+            .put_payload(
                 &final_path,
                 object_store::PutPayload::from_static(b"manifest"),
             )
             .await
             .unwrap();
-        let final_meta = object_store.inner.head(&final_path).await.unwrap();
+        let final_meta = object_store.stat(&final_path).await.unwrap();
 
         external_store
             .put_if_not_exists(
@@ -1407,14 +1434,13 @@ mod tests {
         let final_path = ManifestNamingScheme::V2.manifest_path(&base_path, 1);
 
         object_store
-            .inner
-            .put(
+            .put_payload(
                 &final_path,
                 object_store::PutPayload::from_static(b"manifest"),
             )
             .await
             .unwrap();
-        let final_meta = object_store.inner.head(&final_path).await.unwrap();
+        let final_meta = object_store.stat(&final_path).await.unwrap();
         external_store
             .put_if_not_exists(
                 base_path.as_ref(),
@@ -1457,7 +1483,7 @@ mod tests {
             )
             .await
             .expect("the default store should finalize the selected manifest");
-        let original = object_store.inner.head(&committed.path).await.unwrap();
+        let original = object_store.stat(&committed.path).await.unwrap();
         assert_eq!(committed.e_tag, original.e_tag);
 
         let indexed = external_store
@@ -1467,15 +1493,14 @@ mod tests {
         assert_eq!(indexed.e_tag, None);
 
         object_store
-            .inner
-            .put(
+            .put_payload(
                 &committed.path,
                 object_store::PutPayload::from(vec![0_u8; original.size as usize]),
             )
             .await
             .unwrap();
 
-        let replacement = object_store.inner.head(&committed.path).await.unwrap();
+        let replacement = object_store.stat(&committed.path).await.unwrap();
         assert_ne!(replacement.e_tag, original.e_tag);
 
         let resolved = handler
@@ -1499,11 +1524,10 @@ mod tests {
         let manifest_bytes = Bytes::from_static(b"immutable manifest bytes");
 
         object_store
-            .inner
-            .put(&staging_path, manifest_bytes.clone().into())
+            .put_payload(&staging_path, manifest_bytes.clone().into())
             .await
             .unwrap();
-        let staging_meta = object_store.inner.head(&staging_path).await.unwrap();
+        let staging_meta = object_store.stat(&staging_path).await.unwrap();
         external_store
             .put_if_not_exists(
                 base_path.as_ref(),
@@ -1519,7 +1543,7 @@ mod tests {
             .resolve_version_location(&base_path, version, object_store.inner.as_ref())
             .await
             .expect("a reader should finalize the selected staging manifest");
-        let final_meta = object_store.inner.head(&final_path).await.unwrap();
+        let final_meta = object_store.stat(&final_path).await.unwrap();
         assert_eq!(finalized.e_tag, final_meta.e_tag);
 
         let indexed = external_store
@@ -1541,14 +1565,13 @@ mod tests {
         let final_path = ManifestNamingScheme::V2.manifest_path(&base_path, version);
 
         object_store
-            .inner
-            .put(
+            .put_payload(
                 &final_path,
                 object_store::PutPayload::from_static(b"manifest"),
             )
             .await
             .unwrap();
-        let final_meta = object_store.inner.head(&final_path).await.unwrap();
+        let final_meta = object_store.stat(&final_path).await.unwrap();
 
         let resolved = handler
             .resolve_version_location(&base_path, version, object_store.inner.as_ref())
@@ -1574,14 +1597,13 @@ mod tests {
         let final_path = ManifestNamingScheme::V2.manifest_path(&base_path, 1);
 
         object_store
-            .inner
-            .put(
+            .put_payload(
                 &final_path,
                 object_store::PutPayload::from_static(b"manifest"),
             )
             .await
             .unwrap();
-        let final_meta = object_store.inner.head(&final_path).await.unwrap();
+        let final_meta = object_store.stat(&final_path).await.unwrap();
         external_store
             .put_if_not_exists(
                 base_path.as_ref(),
@@ -1631,8 +1653,7 @@ mod tests {
             "the caller must retain the canonical generation even when index repair fails"
         );
         object_store
-            .inner
-            .head(&final_path)
+            .stat(&final_path)
             .await
             .expect("the canonical manifest is the durable commit point");
 
@@ -1642,8 +1663,7 @@ mod tests {
             .unwrap();
         assert_ne!(pending.path, final_path);
         object_store
-            .inner
-            .head(&pending.path)
+            .stat(&pending.path)
             .await
             .expect("staging must remain until the external index is repaired");
 
@@ -1667,8 +1687,7 @@ mod tests {
             "the repaired index must not retain a physical object generation"
         );
         let staging_error = object_store
-            .inner
-            .head(&pending.path)
+            .stat(&pending.path)
             .await
             .expect_err("repair should garbage-collect the retained staging object");
         assert!(matches!(staging_error, ObjectStoreError::NotFound { .. }));
@@ -1688,11 +1707,10 @@ mod tests {
         let manifest_bytes = Bytes::from_static(b"immutable manifest bytes");
 
         object_store
-            .inner
-            .put(&staging_path, manifest_bytes.clone().into())
+            .put_payload(&staging_path, manifest_bytes.clone().into())
             .await
             .unwrap();
-        let staging_meta = object_store.inner.head(&staging_path).await.unwrap();
+        let staging_meta = object_store.stat(&staging_path).await.unwrap();
 
         let writer_store = object_store.inner.clone();
         let writer_external_store = external_store.clone();
@@ -1720,7 +1738,7 @@ mod tests {
         .await
         .expect("the direct finalizer should pause after COPY");
 
-        let first_generation = object_store.inner.head(&final_path).await.unwrap();
+        let first_generation = object_store.stat(&final_path).await.unwrap();
         let reservation = external_store
             .get_manifest_location(base_path.as_ref(), version)
             .await
@@ -1742,10 +1760,9 @@ mod tests {
 
         external_store.release_first_final_publish.notify_one();
         let writer_location = writer.await.unwrap().unwrap();
-        let final_meta = object_store.inner.head(&final_path).await.unwrap();
+        let final_meta = object_store.stat(&final_path).await.unwrap();
         let final_bytes = object_store
-            .inner
-            .get(&final_path)
+            .read_object(&final_path)
             .await
             .unwrap()
             .bytes()
@@ -1802,7 +1819,7 @@ mod tests {
         assert!(matches!(commit_error, CommitError::CommitConflict));
 
         let staging_path = Path::from(external_store.get("dataset", 1).await.unwrap());
-        object_store.inner.head(&staging_path).await.unwrap();
+        object_store.stat(&staging_path).await.unwrap();
 
         let resolved = handler
             .resolve_version_location(&base_path, 1, object_store.inner.as_ref())
@@ -1812,7 +1829,7 @@ mod tests {
             resolved.path,
             ManifestNamingScheme::V2.manifest_path(&base_path, 1)
         );
-        object_store.inner.head(&resolved.path).await.unwrap();
+        object_store.stat(&resolved.path).await.unwrap();
     }
 
     #[tokio::test]
@@ -1840,7 +1857,7 @@ mod tests {
             .await
             .expect("the generic workflow should commit the canonical manifest");
         assert_eq!(committed.path, final_path);
-        let final_meta = object_store.inner.head(&final_path).await.unwrap();
+        let final_meta = object_store.stat(&final_path).await.unwrap();
         assert_eq!(
             committed.e_tag, final_meta.e_tag,
             "the freshly committed Dataset needs the observed generation for cache separation"
@@ -1864,11 +1881,10 @@ mod tests {
         let final_path = Path::from("dataset/_versions/1.manifest");
         let manifest_bytes = Bytes::from_static(b"immutable manifest bytes");
         object_store
-            .inner
-            .put(&final_path, manifest_bytes.clone().into())
+            .put_payload(&final_path, manifest_bytes.clone().into())
             .await
             .unwrap();
-        let final_meta = object_store.inner.head(&final_path).await.unwrap();
+        let final_meta = object_store.stat(&final_path).await.unwrap();
 
         let recovered_e_tag = copy_or_verify_final_manifest(
             object_store.inner.as_ref(),
@@ -1909,8 +1925,7 @@ mod tests {
         let staging_path = Path::from("dataset/_versions/1.manifest-missing");
         let final_path = Path::from("dataset/_versions/1.manifest");
         object_store
-            .inner
-            .put(&final_path, Bytes::from_static(b"wrong size").into())
+            .put_payload(&final_path, Bytes::from_static(b"wrong size").into())
             .await
             .unwrap();
 
@@ -1994,14 +2009,12 @@ mod tests {
             .expect("the failure must be injected at copy(staging, canonical)");
         assert_eq!(recorded_location.path, staging_path);
         object_store
-            .inner
-            .head(&staging_path)
+            .stat(&staging_path)
             .await
             .expect("the winning staging manifest must be retained");
 
         let canonical_error = object_store
-            .inner
-            .head(&canonical_path)
+            .stat(&canonical_path)
             .await
             .expect_err("copy failed before creating the canonical manifest");
         assert!(
@@ -2022,14 +2035,12 @@ mod tests {
             .expect("the external store must publish the canonical location");
         assert_eq!(finalized_location.path, canonical_path);
         object_store
-            .inner
-            .head(&canonical_path)
+            .stat(&canonical_path)
             .await
             .expect("the canonical manifest must exist after finalization");
 
         let staging_error = object_store
-            .inner
-            .head(&staging_path)
+            .stat(&staging_path)
             .await
             .expect_err("successful finalization must clean up the staging manifest");
         assert!(
@@ -2114,6 +2125,7 @@ mod tests {
                 size: Some(row.1),
                 e_tag: None,
                 identity: Some(row.2),
+                last_modified: None,
             })
         }
 
@@ -2311,8 +2323,7 @@ mod tests {
 
     async fn versions_dir_files(object_store: &ObjectStore, base_path: &Path) -> Vec<String> {
         let mut files: Vec<String> = object_store
-            .inner
-            .list(Some(&base_path.clone().join(VERSIONS_DIR)))
+            .list_objects(Some(&base_path.clone().join(VERSIONS_DIR)))
             .map_ok(|meta| meta.location.filename().unwrap().to_string())
             .try_collect()
             .await

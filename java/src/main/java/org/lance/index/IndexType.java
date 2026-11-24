@@ -25,6 +25,8 @@ public enum IndexType {
   ZONEMAP(8),
   BLOOM_FILTER(9),
   RTREE(10),
+  FM(11),
+  MINHASH_LSH(12),
   VECTOR(100),
   IVF_FLAT(101),
   IVF_SQ(102),
@@ -32,7 +34,8 @@ public enum IndexType {
   IVF_HNSW_SQ(104),
   IVF_HNSW_PQ(105),
   IVF_HNSW_FLAT(106),
-  IVF_RQ(107);
+  IVF_RQ(107),
+  IVF_HNSW_RQ(108);
 
   private final int value;
 

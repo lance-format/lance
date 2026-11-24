@@ -9,6 +9,11 @@ updates:
       - "/python"
       - "/java/lance-jni"
     versioning-strategy: lockfile-only
+    # Matches the 48h floor enforced by ci/check_dependency_age.py, so grouped
+    # bumps do not land a version that CI will then reject. Cooldown does not
+    # apply to security updates, which we still want as fast as possible.
+    cooldown:
+      default-days: 2
     schedule:
       interval: "weekly"
       day: "wednesday"
@@ -35,6 +40,28 @@ updates:
         patterns:
           - "*"
       uv-security:
+        applies-to: security-updates
+        patterns:
+          - "*"
+
+  # Docs snippets — the exact versions the quickstart examples are tested
+  # against. The pins themselves are bumped (not just the lockfile) so the
+  # docs track current releases. The lance-spark bundle coordinate in
+  # docs/snippets/quickstart/spark* is not a Python dependency and is bumped by
+  # hand; a PySpark minor bump fails CI until that coordinate is updated too.
+  - package-ecosystem: "uv"
+    directory: "/docs/snippets"
+    versioning-strategy: increase
+    cooldown:
+      default-days: 2
+    schedule:
+      interval: "monthly"
+    groups:
+      docs-snippets:
+        applies-to: version-updates
+        patterns:
+          - "*"
+      docs-snippets-security:
         applies-to: security-updates
         patterns:
           - "*"

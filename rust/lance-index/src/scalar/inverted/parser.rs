@@ -3,7 +3,8 @@
 
 use super::DocumentGranularity;
 use super::query::{
-    BooleanQuery, BoostQuery, FtsQuery, MatchQuery, MultiMatchQuery, Occur, Operator, PhraseQuery,
+    BooleanQuery, BoostQuery, CombinedFieldsQuery, FtsQuery, MatchQuery, MultiMatchQuery, Occur,
+    Operator, PhraseQuery,
 };
 use lance_core::{Error, Result};
 use serde_json::Value;
@@ -26,23 +27,30 @@ impl JsonParser for MatchQuery {
             .map(|v| v as f32)
             .unwrap_or(Self::default_boost());
         let fuzziness = match &value["fuzziness"] {
-            Value::Number(num) if num.is_u64() => Some(num.as_u64().unwrap() as u32),
-            Value::String(s) if s.as_str() == "auto" => None,
-            Value::Null => None,
-            _ => Some(0),
+            Value::String(s) if s.eq_ignore_ascii_case("auto") => None,
+            Value::String(s) => {
+                return Err(Error::invalid_input(format!(
+                    "fuzziness must be a non-negative integer or \"auto\", got \"{s}\""
+                )));
+            }
+            other => parse_bounded_u64(other, "fuzziness", u32::MAX as u64)?.map(|v| v as u32),
         };
-        let max_expansions = value["max_expansions"]
-            .as_u64()
-            .map(|v| v as usize)
-            .unwrap_or(Self::default_max_expansions());
+        let max_expansions = parse_bounded_u64(
+            &value["max_expansions"],
+            "max_expansions",
+            usize::MAX as u64,
+        )?
+        .map(|v| v as usize)
+        .unwrap_or(Self::default_max_expansions());
         let operator = value["operator"]
             .as_str()
-            .map(|s| s.try_into().unwrap_or(Operator::default()))
+            .map(Operator::try_from)
+            .transpose()?
             .unwrap_or_default();
-        let prefix_length = value["prefix_length"]
-            .as_u64()
-            .map(|v| v as u32)
-            .unwrap_or(0);
+        let prefix_length =
+            parse_bounded_u64(&value["prefix_length"], "prefix_length", u32::MAX as u64)?
+                .map(|v| v as u32)
+                .unwrap_or(0);
         let document_granularity = parse_document_granularity(value)?;
 
         Ok(Self {
@@ -65,7 +73,9 @@ impl JsonParser for PhraseQuery {
             .as_str()
             .ok_or_else(|| Error::invalid_input("missing terms in phrase query"))?
             .to_string();
-        let slop = value["slop"].as_u64().map(|v| v as u32).unwrap_or(0);
+        let slop = parse_bounded_u64(&value["slop"], "slop", u32::MAX as u64)?
+            .map(|v| v as u32)
+            .unwrap_or(0);
         let document_granularity = parse_document_granularity(value)?;
 
         Ok(Self {
@@ -87,6 +97,28 @@ fn parse_document_granularity(value: &Value) -> Result<Option<DocumentGranularit
                     "invalid document_granularity in FTS query: {error}"
                 ))
             }),
+    }
+}
+
+/// Parses an optional non-negative integer field bounded by `max`, rejecting
+/// present-but-invalid values (negative numbers, numbers written as floats
+/// such as `1.0`, non-numbers, or values above `max`) instead of silently
+/// coercing them to a default.
+/// Absent keys and explicit nulls map to `None` so callers keep their defaults.
+fn parse_bounded_u64(value: &Value, field: &str, max: u64) -> Result<Option<u64>> {
+    let invalid = |repr: &dyn std::fmt::Display| {
+        Error::invalid_input(format!(
+            "{field} must be a non-negative integer no greater than {max}, got {repr}"
+        ))
+    };
+    match value {
+        Value::Null => Ok(None),
+        Value::Number(num) => match num.as_u64() {
+            Some(raw) if raw <= max => Ok(Some(raw)),
+            Some(raw) => Err(invalid(&raw)),
+            None => Err(invalid(num)),
+        },
+        other => Err(invalid(other)),
     }
 }
 
@@ -125,6 +157,54 @@ impl JsonParser for MultiMatchQuery {
         Ok(Self {
             match_queries: query,
         })
+    }
+}
+
+impl JsonParser for CombinedFieldsQuery {
+    fn from_json(value: &Value) -> Result<Self> {
+        let terms = value["query"]
+            .as_str()
+            .ok_or_else(|| Error::invalid_input("missing query in combined_fields query"))?
+            .to_string();
+        let columns = value["columns"]
+            .as_array()
+            .ok_or_else(|| Error::invalid_input("missing columns in combined_fields query"))?
+            .iter()
+            .map(|v| {
+                v.as_str().map(String::from).ok_or_else(|| {
+                    Error::invalid_input(
+                        "columns must be an array of strings in combined_fields query",
+                    )
+                })
+            })
+            .collect::<Result<Vec<String>>>()?;
+
+        let query = Self::try_new(terms, columns)?;
+
+        let query = match value.get("boost") {
+            Some(Value::Array(boosts)) => {
+                let boosts = boosts
+                    .iter()
+                    .map(|v| {
+                        v.as_f64().map(|f| f as f32).ok_or_else(|| {
+                            Error::invalid_input(
+                                "boost must be an array of numbers in combined_fields query",
+                            )
+                        })
+                    })
+                    .collect::<Result<Vec<f32>>>()?;
+                query.try_with_boosts(boosts)?
+            }
+            _ => query,
+        };
+
+        let operator = value["operator"]
+            .as_str()
+            .map(Operator::try_from)
+            .transpose()?
+            .unwrap_or_default();
+
+        Ok(query.with_operator(operator))
     }
 }
 
@@ -171,6 +251,9 @@ fn from_json_value(value: &Value) -> Result<FtsQuery> {
         "phrase" => Ok(FtsQuery::Phrase(PhraseQuery::from_json(query_val)?)),
         "boost" => Ok(FtsQuery::Boost(BoostQuery::from_json(query_val)?)),
         "multi_match" => Ok(FtsQuery::MultiMatch(MultiMatchQuery::from_json(query_val)?)),
+        "combined_fields" => Ok(FtsQuery::CombinedFields(CombinedFieldsQuery::from_json(
+            query_val,
+        )?)),
         "boolean" => Ok(FtsQuery::Boolean(BooleanQuery::from_json(query_val)?)),
         _ => Err(Error::invalid_input(format!(
             "unknown fts query type: {}",
@@ -216,6 +299,94 @@ mod tests {
             document_granularity: None,
         });
         assert_eq!(fts_query, expected_query);
+    }
+
+    #[test]
+    fn test_from_json_match_invalid_fuzziness_rejected() {
+        // Present-but-invalid fuzziness must be rejected instead of silently
+        // coercing to exact match (Some(0)) or truncating modulo 2^32.
+        for fuzziness in ["4294967296", "\"fuzzy\"", "\"1\"", "1.5", "-1", "true"] {
+            let json = format!(
+                r#"{{ "match": {{ "column": "text", "terms": "hello", "fuzziness": {fuzziness} }} }}"#
+            );
+            let error = from_json(&json).unwrap_err();
+            assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+            assert!(
+                error.to_string().contains("fuzziness"),
+                "fuzziness={fuzziness}: {error}"
+            );
+        }
+
+        // "auto", in any case like the operator, keeps its "determine
+        // automatically" meaning.
+        for auto in ["auto", "AUTO"] {
+            let json = format!(
+                r#"{{ "match": {{ "column": "text", "terms": "hello", "fuzziness": "{auto}" }} }}"#
+            );
+            let FtsQuery::Match(query) = from_json(&json).unwrap() else {
+                panic!("expected match query");
+            };
+            assert_eq!(query.fuzziness, None);
+        }
+    }
+
+    #[test]
+    fn test_from_json_invalid_integer_fields_rejected() {
+        for (field, value) in [
+            ("max_expansions", "10.0"),
+            ("max_expansions", "-1"),
+            ("max_expansions", "\"10\""),
+            ("prefix_length", "4294967296"),
+            ("prefix_length", "2.0"),
+            ("slop", "1.0"),
+            ("slop", "4294967297"),
+        ] {
+            let query = if field == "slop" { "phrase" } else { "match" };
+            let json = format!(
+                r#"{{ "{query}": {{ "column": "text", "terms": "hello", "{field}": {value} }} }}"#
+            );
+            let error = from_json(&json).unwrap_err();
+            assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+            assert!(
+                error.to_string().contains(field) && error.to_string().contains(value),
+                "{field}={value}: {error}"
+            );
+        }
+
+        // An explicit null keeps the default.
+        let json = r#"{ "match": { "column": "text", "terms": "hello", "max_expansions": null, "prefix_length": null } }"#;
+        let FtsQuery::Match(query) = from_json(json).unwrap() else {
+            panic!("expected match query");
+        };
+        assert_eq!(query.max_expansions, MatchQuery::default_max_expansions());
+        assert_eq!(query.prefix_length, 0);
+    }
+
+    #[test]
+    fn test_from_json_match_invalid_operator_rejected() {
+        // An operator string other than and/or must error, exactly as the
+        // combined_fields parser does, instead of silently running as Or.
+        let json =
+            r#"{ "match": { "column": "text", "terms": "hello world", "operator": "bogus" } }"#;
+        let error = from_json(json).unwrap_err();
+        assert!(
+            error.to_string().contains("Invalid operator: bogus"),
+            "{error}"
+        );
+
+        // multi_match sub-queries are parsed by MatchQuery::from_json as well.
+        let json = r#"{
+            "multi_match": {
+                "match_queries": [
+                    { "column": "title", "terms": "hello", "operator": "bogus" }
+                ]
+            }
+        }"#;
+        let error = from_json(json).unwrap_err();
+        assert!(
+            error.to_string().contains("Invalid operator: bogus"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -343,5 +514,55 @@ mod tests {
             (Occur::Should, should_query),
         ]));
         assert_eq!(fts_query, expected_query);
+    }
+
+    #[test]
+    fn test_from_json_combined_fields() {
+        let json = r#"
+        {
+            "combined_fields": {
+                "query": "hello world",
+                "columns": ["title", "body"],
+                "boost": [2.0, 1.0],
+                "operator": "and"
+            }
+        }"#;
+        let fts_query = from_json(json).unwrap();
+        let expected = CombinedFieldsQuery::try_new(
+            "hello world".to_string(),
+            vec!["title".to_string(), "body".to_string()],
+        )
+        .unwrap()
+        .try_with_boosts(vec![2.0, 1.0])
+        .unwrap()
+        .with_operator(Operator::And);
+        assert_eq!(fts_query, FtsQuery::CombinedFields(expected));
+    }
+
+    #[test]
+    fn test_from_json_combined_fields_defaults_and_validation() {
+        // boost + operator omitted: weights default to 1.0, operator to Or.
+        let json = r#"{ "combined_fields": { "query": "hi", "columns": ["a", "b"] } }"#;
+        let FtsQuery::CombinedFields(query) = from_json(json).unwrap() else {
+            panic!("expected combined_fields query");
+        };
+        assert_eq!(
+            query.weighted_columns().collect::<Vec<_>>(),
+            vec![("a", 1.0), ("b", 1.0)]
+        );
+        assert_eq!(query.operator(), Operator::Or);
+
+        // A weight below 1 is rejected.
+        let json = r#"{ "combined_fields": { "query": "hi", "columns": ["a", "b"], "boost": [0.5, 1.0] } }"#;
+        assert!(from_json(json).is_err());
+
+        // So is a weight above the upper bound that keeps the blended length
+        // finite.
+        let json = r#"{ "combined_fields": { "query": "hi", "columns": ["a", "b"], "boost": [1.0, 1e30] } }"#;
+        assert!(from_json(json).is_err());
+
+        // Empty columns are rejected.
+        let json = r#"{ "combined_fields": { "query": "hi", "columns": [] } }"#;
+        assert!(from_json(json).is_err());
     }
 }

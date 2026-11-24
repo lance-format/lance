@@ -15,21 +15,138 @@ package org.lance;
 
 import org.lance.cleanup.CleanupExplanation;
 import org.lance.cleanup.CleanupPolicy;
+import org.lance.cleanup.CleanupRule;
 import org.lance.cleanup.RemovalStats;
 
 import org.apache.arrow.memory.RootAllocator;
 import org.junit.jupiter.api.Assertions;
+import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.io.IOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.PosixFilePermission;
 import java.time.Duration;
+import java.util.EnumSet;
 import java.util.List;
+import java.util.Set;
+import java.util.stream.Collectors;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class CleanupTest {
+  @Test
+  public void testCleanupRetentionPolicy(@TempDir Path tempDir) {
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset fixture =
+          new TestUtils.SimpleTestDataset(allocator, tempDir.toString());
+      fixture.createEmptyDataset().close();
+      fixture.write(1, 10).close();
+      fixture.write(2, 10).close();
+      try (Dataset dataset = fixture.write(3, 10)) {
+        assertEquals(
+            0L, dataset.cleanup(new CleanupPolicy()).explain().getStats().getOldVersions());
+        CleanupOperation cleanup =
+            dataset.cleanup(
+                new CleanupPolicy(
+                    List.of(
+                        CleanupRule.keepOne(Duration.ofHours(1), Duration.ofDays(2)),
+                        CleanupRule.keepOne(Duration.ofDays(1), Duration.ofDays(7)),
+                        CleanupRule.removeAll(Duration.ofDays(30)))));
+        assertEquals(0L, cleanup.explain().getStats().getOldVersions());
+        assertEquals(0L, cleanup.execute().getOldVersions());
+        CleanupOperation expire =
+            dataset.cleanup(new CleanupPolicy(List.of(CleanupRule.removeAll(Duration.ZERO))));
+        assertEquals(3L, expire.explain().getStats().getOldVersions());
+        assertEquals(4, dataset.listVersions().size());
+        assertEquals(3L, expire.execute().getOldVersions());
+        assertEquals(1, dataset.listVersions().size());
+        assertEquals(0L, expire.execute().getOldVersions());
+        for (List<CleanupRule> invalid :
+            List.of(
+                List.<CleanupRule>of(),
+                List.of(
+                    CleanupRule.keepOne(Duration.ofHours(1), Duration.ofDays(2)),
+                    CleanupRule.keepOne(Duration.ofDays(1), Duration.ofDays(2))),
+                List.of(
+                    CleanupRule.removeAll(Duration.ofDays(30)),
+                    CleanupRule.keepOne(Duration.ofHours(1), Duration.ofDays(2))))) {
+          CleanupOperation bad = dataset.cleanup(new CleanupPolicy(invalid));
+          Assertions.assertThrows(RuntimeException.class, bad::explain);
+          Assertions.assertThrows(RuntimeException.class, bad::execute);
+        }
+      }
+    }
+  }
+
+  @Test
+  public void testCleanupKeepOnePer(@TempDir Path tempDir) {
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset fixture =
+          new TestUtils.SimpleTestDataset(allocator, tempDir.resolve("thinning").toString());
+      fixture.createEmptyDataset().close();
+      fixture.write(1, 10).close();
+      fixture.write(2, 10).close();
+      try (Dataset dataset = fixture.write(3, 10)) {
+        CleanupOperation recent =
+            dataset
+                .cleanup(CleanupPolicy.builder().build())
+                .withKeepOne(Duration.ofDays(1), Duration.ofDays(2));
+        assertEquals(0L, recent.explain().getStats().getOldVersions());
+        CleanupPolicy policy =
+            CleanupPolicy.builder()
+                .withBeforeTimestampMillis(
+                    System.currentTimeMillis() - Duration.ofDays(7).toMillis())
+                .build();
+        CleanupOperation cleanup =
+            dataset.cleanup(policy).withKeepOne(Duration.ofDays(365L * 10_000), Duration.ofDays(2));
+        assertEquals(0L, cleanup.explain().getStats().getOldVersions());
+        assertEquals(4, dataset.listVersions().size());
+        assertEquals(0L, cleanup.execute().getOldVersions());
+        assertEquals(
+            List.of(1L, 2L, 3L, 4L),
+            dataset.listVersions().stream().map(Version::getId).collect(Collectors.toList()));
+        CleanupOperation expireAll =
+            dataset
+                .cleanup(
+                    CleanupPolicy.builder()
+                        .withBeforeTimestampMillis(System.currentTimeMillis() + 1000)
+                        .build())
+                .withKeepOne(Duration.ofDays(1), Duration.ofDays(2));
+        assertEquals(3L, expireAll.explain().getStats().getOldVersions());
+        assertEquals(3L, expireAll.execute().getOldVersions());
+        assertEquals(1, dataset.listVersions().size());
+        Assertions.assertThrows(
+            IllegalArgumentException.class,
+            () -> dataset.cleanup(policy).withKeepOne(Duration.ZERO, Duration.ofDays(2)));
+        Assertions.assertThrows(
+            IllegalArgumentException.class,
+            () -> dataset.cleanup(policy).withKeepOne(Duration.ofNanos(1), Duration.ofDays(2)));
+      }
+    }
+  }
+
+  @Test
+  public void testCleanupThinningRequiresTwoDays(@TempDir Path tempDir) {
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset fixture =
+          new TestUtils.SimpleTestDataset(allocator, tempDir.resolve("unsupported").toString());
+      try (Dataset dataset = fixture.createEmptyDataset()) {
+        CleanupOperation cleanup =
+            dataset
+                .cleanup(CleanupPolicy.builder().build())
+                .withKeepOne(Duration.ofDays(1), Duration.ofDays(1));
+        RuntimeException error = Assertions.assertThrows(RuntimeException.class, cleanup::explain);
+        assertTrue(error.getMessage().contains("older_than must be at least 2 days"));
+        Assertions.assertThrows(RuntimeException.class, cleanup::execute);
+        assertEquals(1, dataset.listVersions().size());
+      }
+    }
+  }
+
   @Test
   public void testCleanupBeforeVersion(@TempDir Path tempDir) {
     String datasetPath = tempDir.resolve("test_dataset_for_cleanup").toString();
@@ -43,6 +160,13 @@ public class CleanupTest {
       testDataset.write(2, 10).close();
 
       try (Dataset dataset = testDataset.write(3, 10)) {
+        Assertions.assertThrows(
+            IllegalArgumentException.class,
+            () ->
+                dataset
+                    .cleanup(CleanupPolicy.builder().build())
+                    .withDeleteConcurrency(-1L)
+                    .execute());
         RemovalStats stats =
             dataset.cleanupWithPolicy(CleanupPolicy.builder().withBeforeVersion(3L).build());
         assertEquals(2L, stats.getOldVersions());
@@ -93,7 +217,8 @@ public class CleanupTest {
 
       try (Dataset dataset = testDataset.write(3, 10)) {
         CleanupPolicy policy = CleanupPolicy.builder().withBeforeVersion(3L).build();
-        CleanupOperation cleanup = dataset.cleanup(policy);
+        CleanupOperation cleanup =
+            dataset.cleanup(policy).withDeleteConcurrency(0L).withDeleteRateLimit(0L);
         CleanupExplanation explanation = cleanup.explain();
 
         assertEquals(2L, explanation.getStats().getOldVersions());
@@ -106,7 +231,7 @@ public class CleanupTest {
         List<Version> versions = dataset.listVersions();
         assertEquals(4, versions.size());
 
-        RemovalStats stats = cleanup.execute();
+        RemovalStats stats = cleanup.withDeleteConcurrency(2L).withDeleteRateLimit(100L).execute();
         assertEquals(explanation.getStats().getOldVersions(), stats.getOldVersions());
       }
     }
@@ -227,11 +352,15 @@ public class CleanupTest {
             versions.get(versions.size() - 1).getDataTime().toInstant().toEpochMilli() + 1;
         long start = System.nanoTime();
         RemovalStats stats =
-            dataset.cleanupWithPolicy(
-                CleanupPolicy.builder()
-                    .withBeforeTimestampMillis(beforeTimestampMillis)
-                    .withDeleteRateLimit(1L)
-                    .build());
+            dataset
+                .cleanup(
+                    CleanupPolicy.builder()
+                        .withBeforeTimestampMillis(beforeTimestampMillis)
+                        .withDeleteRateLimit(100L)
+                        .build())
+                .withDeleteConcurrency(2L)
+                .withDeleteRateLimit(1L)
+                .execute();
         long elapsed = System.nanoTime() - start;
 
         assertEquals(3L, stats.getOldVersions());
@@ -239,5 +368,75 @@ public class CleanupTest {
         assertTrue(elapsed >= Duration.ofSeconds(2).toNanos());
       }
     }
+  }
+
+  @Test
+  public void testFailedDeletesReachesJavaAcrossJni(@TempDir Path tempDir) throws Exception {
+    // Best-effort deletion makes failedDeletes the only programmatic signal that cleanup
+    // returned normally without removing everything it identified. Asserting it is zero on
+    // a successful run would prove nothing: the six-argument constructor defaults it to
+    // zero, so a JNI projection that dropped the field would still pass. The value has to
+    // be non-zero, which means a delete has to genuinely fail.
+    //
+    // Removing a file needs write permission on its parent, so making _transactions
+    // read-only fails exactly those deletes while the manifest deletes still succeed.
+    String datasetPath = tempDir.resolve("test_dataset_for_failed_deletes").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+
+      testDataset.createEmptyDataset().close();
+      testDataset.write(1, 10).close();
+      testDataset.write(2, 10).close();
+
+      Path transactions = Path.of(datasetPath, "_transactions");
+      assertTrue(Files.isDirectory(transactions), "expected a _transactions directory");
+      Set<PosixFilePermission> original = Files.getPosixFilePermissions(transactions);
+
+      // Every write lands a transaction file, so the directory stays writable until the
+      // last version is committed and only then becomes read-only.
+      try (Dataset dataset = testDataset.write(3, 10)) {
+        Files.setPosixFilePermissions(
+            transactions,
+            EnumSet.of(PosixFilePermission.OWNER_READ, PosixFilePermission.OWNER_EXECUTE));
+        try {
+          // Root ignores these bits, so confirm deletion is really blocked before relying
+          // on it; otherwise this asserts nothing and should skip rather than fail.
+          Path probe = transactions.resolve("permission-probe");
+          boolean blocked;
+          try {
+            Files.createFile(probe);
+            Files.deleteIfExists(probe);
+            blocked = false;
+          } catch (IOException expected) {
+            blocked = true;
+          }
+          Assumptions.assumeTrue(blocked, "filesystem permissions do not block deletion here");
+
+          RemovalStats stats =
+              dataset.cleanupWithPolicy(CleanupPolicy.builder().withBeforeVersion(3L).build());
+
+          // The call returns normally rather than throwing, and reports what it could not
+          // remove. Both halves matter: the old behaviour discarded the whole sweep.
+          assertTrue(
+              stats.getFailedDeletes() > 0,
+              "expected the blocked transaction deletes to be counted, got "
+                  + stats.getFailedDeletes());
+          assertTrue(stats.getOldVersions() > 0, "the sweep must continue past a failed delete");
+        } finally {
+          Files.setPosixFilePermissions(transactions, original);
+        }
+      }
+    }
+  }
+
+  @Test
+  public void testRemovalStatsCarriesFailedDeletes() {
+    RemovalStats stats = new RemovalStats(1L, 2L, 3L, 4L, 5L, 6L, 7L);
+    assertEquals(7L, stats.getFailedDeletes());
+
+    // The pre-existing six-argument constructor stays source compatible and defaults to
+    // zero, so callers that predate best-effort deletion keep compiling.
+    assertEquals(0L, new RemovalStats(1L, 2L, 3L, 4L, 5L, 6L).getFailedDeletes());
   }
 }

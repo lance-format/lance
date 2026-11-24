@@ -2,49 +2,56 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use crate::Result;
-use arrow_array::{ArrayRef, RecordBatch, UInt64Array};
+use arrow_array::{ArrayRef, RecordBatch, RecordBatchIterator, RecordBatchReader, UInt64Array};
 use arrow_schema::{
     DataType, Field as ArrowField, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
 };
-use datafusion::error::Result as DFResult;
-use datafusion::physical_plan::SendableRecordBatchStream;
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::physical_plan::SendableRecordBatchStream as DataFusionRecordBatchStream;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter as DataFusionStreamAdapter;
 use futures::StreamExt;
 use lance_arrow::json::{
     arrow_json_to_lance_json, convert_json_columns, convert_lance_json_to_arrow,
     has_arrow_json_fields, has_json_fields, lance_json_to_arrow_json,
 };
-use lance_core::ROW_ID;
+use lance_core::{Error, ROW_CREATED_AT_VERSION, ROW_ID};
+use lance_io::stream::{RecordBatchStreamAdapter, SendableRecordBatchStream};
+use lance_table::format::{RowDatasetVersionRun, RowDatasetVersionSequence};
+use lance_table::rowids::segment::U64Segment;
 use lance_table::rowids::{RowIdIndex, RowIdSequence};
 use roaring::RoaringTreemap;
 use std::borrow::Cow;
 use std::sync::Arc;
 use std::sync::mpsc::Receiver;
 
+fn u64_values<'a>(batch: &'a RecordBatch, column: usize, what: &str) -> &'a [u64] {
+    let array = batch.column(column);
+    array
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap_or_else(|| panic!("{what} had an unexpected type: {}", array.data_type()))
+        .values()
+}
+
 fn extract_row_ids(
     row_ids: &mut CapturedRowIds,
     batch: RecordBatch,
     row_id_idx: usize,
-    non_row_id_projection: &[usize],
-) -> DFResult<RecordBatch> {
-    let row_ids_arr = batch.column(row_id_idx);
-    let row_ids_itr = row_ids_arr
-        .as_any()
-        .downcast_ref::<UInt64Array>()
-        .unwrap_or_else(|| {
-            panic!(
-                "Row ids had an unexpected type: {}",
-                row_ids_arr.data_type()
-            )
-        })
-        .values();
-    row_ids.capture(row_ids_itr)?;
-    Ok(batch.project(non_row_id_projection)?)
+    created_at_idx: Option<usize>,
+    data_projection: &[usize],
+) -> Result<RecordBatch> {
+    row_ids.capture(u64_values(&batch, row_id_idx, "Row ids"))?;
+    if let Some(created_at_idx) = created_at_idx {
+        row_ids.capture_created_at(u64_values(&batch, created_at_idx, "Created-at versions"));
+    }
+    Ok(batch.project(data_projection)?)
 }
 
 /// Given a stream that includes a row id column, return a stream that will
 /// capture the row id. At completion of the stream, the captured row ids can
 /// be received from the returned receiver.
+///
+/// A `_row_created_at_version` column, if the stream carries one, is captured
+/// alongside the row ids and removed from the output the same way.
 pub fn make_rowid_capture_stream(
     mut target: SendableRecordBatchStream,
     stable_row_ids: bool,
@@ -57,14 +64,24 @@ pub fn make_rowid_capture_stream(
     let (row_id_idx, _) = schema
         .column_with_name(ROW_ID)
         .expect("Received a batch without row ids");
-    let non_row_ids_cols = (0..schema.fields.len())
-        .filter(|col| *col != row_id_idx)
+    let created_at_idx = schema
+        .column_with_name(ROW_CREATED_AT_VERSION)
+        .map(|(idx, _)| idx);
+    // Started here, rather than on the first batch, so a stream that carries
+    // the column but no rows still reports an empty capture.
+    if created_at_idx.is_some()
+        && let CapturedRowIds::SequenceStyle { created_at, .. } = &mut row_ids
+    {
+        *created_at = Some(RowDatasetVersionSequence::new());
+    }
+    let data_cols = (0..schema.fields.len())
+        .filter(|col| *col != row_id_idx && Some(*col) != created_at_idx)
         .collect::<Vec<_>>();
-    let output_schema = Arc::new(schema.project(&non_row_ids_cols)?);
+    let output_schema = Arc::new(schema.project(&data_cols)?);
 
     let stream = futures::stream::poll_fn(move |cx| match target.poll_next_unpin(cx) {
         std::task::Poll::Ready(Some(Ok(batch))) => {
-            let res = extract_row_ids(&mut row_ids, batch, row_id_idx, &non_row_ids_cols);
+            let res = extract_row_ids(&mut row_ids, batch, row_id_idx, created_at_idx, &data_cols);
             std::task::Poll::Ready(Some(res))
         }
         std::task::Poll::Ready(Some(Err(err))) => std::task::Poll::Ready(Some(Err(err))),
@@ -84,43 +101,99 @@ pub fn make_rowid_capture_stream(
 #[derive(Debug)]
 pub enum CapturedRowIds {
     AddressStyle(RoaringTreemap),
-    SequenceStyle(RowIdSequence),
+    SequenceStyle {
+        row_ids: RowIdSequence,
+        /// The created-at versions of the captured rows, in capture order,
+        /// when the stream carried them; `None` when it did not.
+        created_at: Option<RowDatasetVersionSequence>,
+    },
 }
 
 impl CapturedRowIds {
     pub fn new(stable_row_ids: bool) -> Self {
         if stable_row_ids {
-            Self::SequenceStyle(RowIdSequence::new())
+            Self::SequenceStyle {
+                row_ids: RowIdSequence::new(),
+                created_at: None,
+            }
         } else {
             Self::AddressStyle(RoaringTreemap::new())
         }
     }
 
-    pub fn capture(&mut self, row_ids: &[u64]) -> DFResult<()> {
+    pub fn capture(&mut self, row_ids: &[u64]) -> Result<()> {
         match self {
             Self::AddressStyle(ids) => {
                 // Assume they are sorted
                 ids.append(row_ids.iter().cloned())
-                    .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+                    .map_err(|e| Error::execution(e.to_string()))?;
             }
-            Self::SequenceStyle(sequence) => {
+            Self::SequenceStyle {
+                row_ids: sequence, ..
+            } => {
                 sequence.extend(row_ids.into());
             }
         }
         Ok(())
     }
 
+    /// Record the created-at versions of the rows just passed to [`Self::capture`].
+    pub fn capture_created_at(&mut self, versions: &[u64]) {
+        let Self::SequenceStyle {
+            created_at: Some(sequence),
+            ..
+        } = self
+        else {
+            return;
+        };
+        // Run-length encoded as they arrive, and a run that carries on from
+        // the previous batch is extended rather than restarted: a run per
+        // batch would bloat the inline metadata of a large rewrite.
+        for run in versions.chunk_by(|a, b| a == b) {
+            let (version, rows) = (run[0], run.len() as u64);
+            let start = match sequence.runs.last_mut() {
+                Some(RowDatasetVersionRun {
+                    span: U64Segment::Range(span),
+                    version: last_version,
+                }) => {
+                    if *last_version == version {
+                        span.end += rows;
+                        continue;
+                    }
+                    span.end
+                }
+                // Every run pushed below spans a range, so this is the first.
+                _ => 0,
+            };
+            sequence.runs.push(RowDatasetVersionRun {
+                span: U64Segment::Range(start..start + rows),
+                version,
+            });
+        }
+    }
+
     pub fn row_id_sequence(&self) -> Option<&RowIdSequence> {
         match self {
-            Self::SequenceStyle(sequence) => Some(sequence),
+            Self::SequenceStyle { row_ids, .. } => Some(row_ids),
             _ => None,
+        }
+    }
+
+    /// The captured rows' created-at versions, in capture order, when the
+    /// stream carried them.
+    pub fn created_at_sequence(&self) -> Option<&RowDatasetVersionSequence> {
+        match self {
+            Self::SequenceStyle { created_at, .. } => created_at.as_ref(),
+            Self::AddressStyle(_) => None,
         }
     }
 
     pub fn row_addrs(&self, index: Option<&RowIdIndex>) -> Result<Cow<'_, RoaringTreemap>> {
         match self {
             Self::AddressStyle(addrs) => Ok(Cow::Borrowed(addrs)),
-            Self::SequenceStyle(sequence) => {
+            Self::SequenceStyle {
+                row_ids: sequence, ..
+            } => {
                 let mut treemap = RoaringTreemap::new();
                 let Some(index) = index else {
                     panic!("RowIdIndex required for sequence style row ids")
@@ -145,22 +218,35 @@ impl Default for CapturedRowIds {
     }
 }
 
-/// Returns the physical field for a view type, or `None` if no conversion is needed.
+/// Returns the physical field when it contains view arrays, including nested ones.
 fn physical_field(field: &ArrowField) -> Option<ArrowField> {
-    match field.data_type() {
-        DataType::Utf8View => Some(
-            ArrowField::new(field.name(), DataType::Utf8, field.is_nullable())
-                .with_metadata(field.metadata().clone()),
-        ),
-        DataType::BinaryView => Some(
-            ArrowField::new(field.name(), DataType::Binary, field.is_nullable())
-                .with_metadata(field.metadata().clone()),
-        ),
-        _ => None,
-    }
+    let data_type = match field.data_type() {
+        DataType::Utf8View => DataType::Utf8,
+        DataType::BinaryView => DataType::Binary,
+        DataType::Struct(fields) => {
+            let mut physical_fields = None;
+            for (index, child) in fields.iter().enumerate() {
+                if let Some(physical) = physical_field(child) {
+                    physical_fields.get_or_insert_with(|| fields.to_vec())[index] =
+                        Arc::new(physical);
+                }
+            }
+            DataType::Struct(physical_fields?.into())
+        }
+        DataType::List(child) => DataType::List(Arc::new(physical_field(child)?)),
+        DataType::LargeList(child) => DataType::LargeList(Arc::new(physical_field(child)?)),
+        DataType::FixedSizeList(child, size) => {
+            DataType::FixedSizeList(Arc::new(physical_field(child)?), *size)
+        }
+        DataType::Map(entries, sorted) => {
+            DataType::Map(Arc::new(physical_field(entries)?), *sorted)
+        }
+        _ => return None,
+    };
+    Some(field.clone().with_data_type(data_type))
 }
 
-/// Cast `Utf8View`/`BinaryView` columns in a batch to their classic offset equivalents.
+/// Cast view arrays to offset arrays, preserving nested fields and extension metadata.
 fn downcast_view_columns(
     batch: &RecordBatch,
 ) -> std::result::Result<RecordBatch, arrow_schema::ArrowError> {
@@ -196,7 +282,14 @@ fn downcast_view_columns(
     )
 }
 
-/// Adapter around the existing JSON and view-type conversion utilities.
+/// Converts between the Arrow representations callers use and the ones Lance
+/// stores: Arrow JSON text ↔ Lance JSONB, and view arrays → offset
+/// arrays.
+///
+/// Dataset writes convert once, in the data file writer
+/// ([`V2WriterAdapter`](super::write::V2WriterAdapter)). The physical methods
+/// are otherwise only for combining caller data with values read back from
+/// storage before that point.
 #[derive(Debug, Clone)]
 pub struct SchemaAdapter {
     logical_schema: ArrowSchemaRef,
@@ -230,52 +323,50 @@ impl SchemaAdapter {
         }
     }
 
-    /// Convert a logical stream into a physical stream.
-    pub fn to_physical_stream(
-        &self,
-        stream: SendableRecordBatchStream,
-    ) -> SendableRecordBatchStream {
-        if !self.requires_physical_conversion() {
-            return stream;
-        }
-
-        let arrow_schema = stream.schema();
-        let mut new_fields = Vec::with_capacity(arrow_schema.fields().len());
-        for field in arrow_schema.fields() {
-            if has_arrow_json_fields(field) {
-                new_fields.push(Arc::new(arrow_json_to_lance_json(field)));
-            } else if let Some(phys) = physical_field(field) {
-                new_fields.push(Arc::new(phys));
+    /// Build the physical Arrow schema for `logical_schema`: Arrow JSON fields
+    /// become Lance JSON fields and view types are downcast to their classic
+    /// offset equivalents. Fields needing no conversion are left unchanged.
+    fn physical_schema(logical_schema: &ArrowSchemaRef) -> ArrowSchemaRef {
+        let mut new_fields = Vec::with_capacity(logical_schema.fields().len());
+        for field in logical_schema.fields() {
+            let field = if has_arrow_json_fields(field) {
+                Arc::new(arrow_json_to_lance_json(field))
             } else {
-                new_fields.push(Arc::clone(field));
-            }
+                Arc::clone(field)
+            };
+            new_fields.push(physical_field(&field).map(Arc::new).unwrap_or(field));
         }
-        let converted_schema = Arc::new(ArrowSchema::new_with_metadata(
+        Arc::new(ArrowSchema::new_with_metadata(
             new_fields,
-            arrow_schema.metadata().clone(),
-        ));
-
-        let converted_stream = stream.map(move |batch_result| {
-            batch_result.and_then(|batch| {
-                let batch = convert_json_columns(&batch).map_err(|e| {
-                    datafusion::error::DataFusionError::ArrowError(Box::new(e), None)
-                })?;
-                downcast_view_columns(&batch)
-                    .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
-            })
-        });
-
-        Box::pin(RecordBatchStreamAdapter::new(
-            converted_schema,
-            converted_stream,
+            logical_schema.metadata().clone(),
         ))
+    }
+
+    /// Wrap a synchronous [`RecordBatchReader`] so each batch is converted from
+    /// its logical form to the physical form Lance stores on disk (Arrow JSON →
+    /// Lance JSON, view types → offset types). Returns the reader unchanged when
+    /// no field needs conversion.
+    pub fn to_physical_reader(
+        &self,
+        reader: Box<dyn RecordBatchReader + Send>,
+    ) -> Box<dyn RecordBatchReader + Send> {
+        if !self.requires_physical_conversion() {
+            return reader;
+        }
+        let schema = Self::physical_schema(&reader.schema());
+        let converted = reader.map(|batch| {
+            let batch = batch?;
+            let batch = convert_json_columns(&batch)?;
+            downcast_view_columns(&batch)
+        });
+        Box::new(RecordBatchIterator::new(converted, schema))
     }
 
     /// Convert a physical stream into a logical stream.
     pub fn to_logical_stream(
         &self,
-        stream: SendableRecordBatchStream,
-    ) -> SendableRecordBatchStream {
+        stream: DataFusionRecordBatchStream,
+    ) -> DataFusionRecordBatchStream {
         if !Self::requires_logical_conversion(&stream.schema()) {
             return stream;
         }
@@ -307,9 +398,89 @@ impl SchemaAdapter {
             })
         });
 
-        Box::pin(RecordBatchStreamAdapter::new(
+        Box::pin(DataFusionStreamAdapter::new(
             converted_schema,
             converted_stream,
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_array::{Array, StringArray, StringViewArray, StructArray};
+    use lance_arrow::ARROW_EXT_NAME_KEY;
+    use lance_arrow::json::ARROW_JSON_EXT_NAME;
+
+    #[test]
+    fn nested_views_and_json_reader_schema_matches_batches() {
+        let fields = vec![
+            Arc::new(ArrowField::new("name", DataType::Utf8View, true)),
+            Arc::new(
+                ArrowField::new("document", DataType::Utf8, true).with_metadata(
+                    [(
+                        ARROW_EXT_NAME_KEY.to_string(),
+                        ARROW_JSON_EXT_NAME.to_string(),
+                    )]
+                    .into(),
+                ),
+            ),
+        ];
+        let values = StructArray::new(
+            fields.into(),
+            vec![
+                Arc::new(StringViewArray::from(vec![
+                    Some("a sufficiently long view"),
+                    None,
+                ])),
+                Arc::new(StringArray::from(vec![Some(r#"{"a":1}"#), None])),
+            ],
+            None,
+        );
+        let field = ArrowField::new("data", values.data_type().clone(), true)
+            .with_metadata([("custom".into(), "preserved".into())].into());
+        let schema = Arc::new(ArrowSchema::new(vec![field]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(values)]).unwrap();
+        let adapter = SchemaAdapter::new(schema.clone());
+        assert!(adapter.requires_physical_conversion());
+        let mut reader = adapter.to_physical_reader(Box::new(RecordBatchIterator::new(
+            [Ok(batch.clone())],
+            schema,
+        )));
+        let converted = reader.next().unwrap().unwrap();
+        assert_eq!(converted.schema(), reader.schema());
+        assert_eq!(converted, adapter.to_physical_batch(batch).unwrap());
+        let DataType::Struct(fields) = converted.schema().field(0).data_type().clone() else {
+            panic!("expected a struct");
+        };
+        assert_eq!(fields[0].data_type(), &DataType::Utf8);
+        assert_eq!(fields[1].data_type(), &DataType::LargeBinary);
+        assert_eq!(
+            converted.schema().field(0).metadata()["custom"],
+            "preserved"
+        );
+        assert!(!SchemaAdapter::new(converted.schema()).requires_physical_conversion());
+    }
+
+    #[test]
+    fn capture_created_at_extends_a_run_across_batches() {
+        let mut captured = CapturedRowIds::SequenceStyle {
+            row_ids: RowIdSequence::new(),
+            created_at: Some(RowDatasetVersionSequence::new()),
+        };
+        captured.capture_created_at(&[1, 1, 2]);
+        captured.capture_created_at(&[]);
+        captured.capture_created_at(&[2, 3]);
+        // One run per version, the one split by the batch boundary included,
+        // with spans absolute over the whole capture.
+        assert_eq!(
+            captured.created_at_sequence(),
+            Some(&RowDatasetVersionSequence::from_versions(&[1, 1, 2, 2, 3]))
+        );
+
+        // A stream that did not carry the column captures nothing.
+        let mut not_carried = CapturedRowIds::new(true);
+        not_carried.capture_created_at(&[1, 2]);
+        assert_eq!(not_carried.created_at_sequence(), None);
     }
 }

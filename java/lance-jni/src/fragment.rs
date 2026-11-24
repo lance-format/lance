@@ -5,7 +5,7 @@ use arrow::array::{RecordBatch, RecordBatchIterator, StructArray};
 use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema, from_ffi_and_data_type};
 use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
 use arrow_schema::{DataType, Schema as ArrowSchema};
-use jni::objects::{JByteArray, JIntArray, JValue, JValueGen};
+use jni::objects::{JByteArray, JIntArray, JMap, JValue, JValueGen};
 use jni::{
     JNIEnv,
     objects::{JClass, JLongArray, JObject, JString},
@@ -21,6 +21,7 @@ use std::iter::once;
 
 use roaring::RoaringBitmap;
 
+use lance::dataset::NewColumnTransform;
 use lance::dataset::fragment::write::FragmentCreateBuilder;
 use lance::io::ObjectStoreParams;
 use lance_datafusion::utils::StreamingWriteSource;
@@ -28,12 +29,13 @@ use lance_io::object_store::{LanceNamespaceStorageOptionsProvider, StorageOption
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::blocking_dataset::extract_namespace_info;
+use crate::blocking_dataset::clone_dataset;
+use crate::blocking_dataset::conversions::extract_namespace_info;
 use crate::error::{Error, Result};
 use crate::ffi::JNIEnvExt;
 use crate::session::session_from_handle;
 use crate::traits::{FromJObjectWithEnv, IntoJava, JLance, export_vec, import_vec};
-use crate::utils::extract_storage_options;
+use crate::utils::{extract_storage_options, to_java_map, to_rust_map};
 use crate::{
     block_on,
     blocking_dataset::{BlockingDataset, NATIVE_DATASET},
@@ -77,7 +79,7 @@ fn inner_count_rows_native(
     jdataset: JObject,
     fragment_id: jlong,
 ) -> Result<usize> {
-    let dataset = unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }?;
+    let dataset = clone_dataset(env, &jdataset)?;
     let Some(fragment) = dataset.inner.get_fragment(fragment_id as usize) else {
         return Err(Error::input_error(format!(
             "Fragment not found: {fragment_id}"
@@ -111,6 +113,7 @@ pub extern "system" fn Java_org_lance_Fragment_createWithFfiArray<'local>(
     table_id_obj: JObject,                      // List<String> (can be null)
     allow_external_blob_outside_bases: JObject, // Optional<Boolean>
     blob_pack_file_size_threshold: JObject,     // Optional<Long>
+    file_write_options: JObject,                // FileWriteOptions
     schema_addr: jlong,
     session_handle: jlong, // Session handle, 0 means no session
 ) -> JObject<'local> {
@@ -135,6 +138,7 @@ pub extern "system" fn Java_org_lance_Fragment_createWithFfiArray<'local>(
             table_id_obj,
             allow_external_blob_outside_bases,
             blob_pack_file_size_threshold,
+            file_write_options,
             schema_addr,
             session_handle,
         ),
@@ -162,6 +166,7 @@ fn inner_create_with_ffi_array<'local>(
     table_id_obj: JObject,                      // List<String> (can be null)
     allow_external_blob_outside_bases: JObject, // Optional<Boolean>
     blob_pack_file_size_threshold: JObject,     // Optional<Long>
+    file_write_options: JObject,                // FileWriteOptions
     schema_addr: jlong,
     session_handle: jlong, // Session handle, 0 means no session
 ) -> Result<JObject<'local>> {
@@ -195,6 +200,7 @@ fn inner_create_with_ffi_array<'local>(
         table_id_obj,
         allow_external_blob_outside_bases,
         blob_pack_file_size_threshold,
+        file_write_options,
         schema_addr,
         session_handle,
         reader,
@@ -221,6 +227,7 @@ pub extern "system" fn Java_org_lance_Fragment_createWithFfiStream<'a>(
     table_id_obj: JObject,                      // List<String> (can be null)
     allow_external_blob_outside_bases: JObject, // Optional<Boolean>
     blob_pack_file_size_threshold: JObject,     // Optional<Long>
+    file_write_options: JObject,                // FileWriteOptions
     schema_addr: jlong,
     session_handle: jlong, // Session handle, 0 means no session
 ) -> JObject<'a> {
@@ -244,6 +251,7 @@ pub extern "system" fn Java_org_lance_Fragment_createWithFfiStream<'a>(
             table_id_obj,
             allow_external_blob_outside_bases,
             blob_pack_file_size_threshold,
+            file_write_options,
             schema_addr,
             session_handle,
         ),
@@ -270,6 +278,7 @@ fn inner_create_with_ffi_stream<'local>(
     table_id_obj: JObject,                      // List<String> (can be null)
     allow_external_blob_outside_bases: JObject, // Optional<Boolean>
     blob_pack_file_size_threshold: JObject,     // Optional<Long>
+    file_write_options: JObject,                // FileWriteOptions
     schema_addr: jlong,
     session_handle: jlong, // Session handle, 0 means no session
 ) -> Result<JObject<'local>> {
@@ -293,6 +302,7 @@ fn inner_create_with_ffi_stream<'local>(
         table_id_obj,
         allow_external_blob_outside_bases,
         blob_pack_file_size_threshold,
+        file_write_options,
         schema_addr,
         session_handle,
         reader,
@@ -317,6 +327,7 @@ fn create_fragment<'a>(
     table_id_obj: JObject,                      // List<String> (can be null)
     allow_external_blob_outside_bases: JObject, // Optional<Boolean>
     blob_pack_file_size_threshold: JObject,     // Optional<Long>
+    file_write_options: JObject,                // FileWriteOptions
     schema_addr: jlong,
     session_handle: jlong, // Session handle, 0 means no session
     source: impl StreamingWriteSource,
@@ -338,6 +349,7 @@ fn create_fragment<'a>(
         &target_bases,
         &allow_external_blob_outside_bases,
         &blob_pack_file_size_threshold,
+        &file_write_options,
     )?;
 
     write_params.session = session_from_handle(session_handle);
@@ -471,13 +483,10 @@ fn inner_merge_column<'local>(
     left_on: JString,
     right_on: JString,
 ) -> Result<JObject<'local>> {
-    let (fragment_opt, max_field_id) = {
+    let fragment_opt = {
         let dataset =
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }?;
-        (
-            dataset.inner.get_fragment(fragment_id as usize),
-            dataset.inner.manifest().max_field_id(),
-        )
+        dataset.inner.get_fragment(fragment_id as usize)
     };
     let mut fragment = match fragment_opt {
         Some(fragment) => fragment,
@@ -494,7 +503,7 @@ fn inner_merge_column<'local>(
     let right_on_str: String = right_on.extract(env)?;
 
     let (new_frag, new_schema) =
-        block_on(fragment.merge_columns(reader, &left_on_str, &right_on_str, max_field_id))?;
+        block_on(fragment.merge_columns(reader, &left_on_str, &right_on_str))?;
     let result = FragmentMergeResult {
         fragment: new_frag,
         schema: new_schema,
@@ -683,15 +692,80 @@ fn inner_encode_row_ids(env: &mut JNIEnv, row_ids: &JLongArray) -> Result<String
     Ok(json)
 }
 
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_Fragment_nativeAddColumnsByReader<'a>(
+    mut env: JNIEnv<'a>,
+    _obj: JObject,
+    jdataset: JObject,              // Java DataSet
+    fragment_id: jlong,             // FragmentID
+    arrow_array_stream_addr: jlong, // memoryAddress of ArrowStream
+    batch_size: JObject,            // Optional<Long>
+) -> JObject<'a> {
+    ok_or_throw_with_return!(
+        env,
+        inner_add_columns_by_reader(
+            &mut env,
+            jdataset,
+            fragment_id,
+            arrow_array_stream_addr,
+            batch_size
+        ),
+        JObject::null()
+    )
+}
+
+fn inner_add_columns_by_reader<'local>(
+    env: &mut JNIEnv<'local>,
+    jdataset: JObject,
+    fragment_id: jlong,
+    arrow_array_stream_addr: jlong,
+    batch_size: JObject,
+) -> Result<JObject<'local>> {
+    let fragment_opt = {
+        let dataset =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(jdataset, NATIVE_DATASET) }?;
+        dataset.inner.get_fragment(fragment_id as usize)
+    };
+    let fragment = match fragment_opt {
+        Some(fragment) => fragment,
+        None => {
+            return Err(Error::input_error(format!(
+                "Fragment not found: {fragment_id}"
+            )));
+        }
+    };
+
+    let stream_ptr = arrow_array_stream_addr as *mut FFI_ArrowArrayStream;
+    let reader = unsafe { ArrowArrayStreamReader::from_raw(stream_ptr) }?;
+    let batch_size = match env.get_long_opt(&batch_size)? {
+        Some(value) => Some(
+            value
+                .try_into()
+                .map_err(|_| Error::input_error(format!("Invalid batch size: {value}")))?,
+        ),
+        None => None,
+    };
+
+    let (new_frag, new_schema) = block_on(fragment.add_columns(
+        NewColumnTransform::Reader(Box::new(reader)),
+        None,
+        batch_size,
+    ))?;
+    let result = FragmentMergeResult {
+        fragment: new_frag,
+        schema: new_schema,
+    };
+    result.into_java(env)
+}
+
 const DATA_FILE_CLASS: &str = "org/lance/fragment/DataFile";
 const DATA_FILE_CONSTRUCTOR_SIG: &str =
     "(Ljava/lang/String;[I[IIILjava/lang/Long;Ljava/lang/Integer;)V";
 const DELETE_FILE_CLASS: &str = "org/lance/fragment/DeletionFile";
-const DELETE_FILE_CONSTRUCTOR_SIG: &str =
-    "(JJLjava/lang/Long;Lorg/lance/fragment/DeletionFileType;Ljava/lang/Integer;)V";
+const DELETE_FILE_CONSTRUCTOR_SIG: &str = "(JJLjava/lang/Long;Lorg/lance/fragment/DeletionFileType;Ljava/lang/Integer;[BLjava/lang/String;)V";
 const DELETE_FILE_TYPE_CLASS: &str = "org/lance/fragment/DeletionFileType";
 const FRAGMENT_METADATA_CLASS: &str = "org/lance/FragmentMetadata";
-const FRAGMENT_METADATA_CONSTRUCTOR_SIG: &str = "(ILjava/util/List;Ljava/lang/Long;Lorg/lance/fragment/DeletionFile;Lorg/lance/fragment/RowIdMeta;Lorg/lance/fragment/VersionMeta;Lorg/lance/fragment/VersionMeta;Ljava/util/List;)V";
+const FRAGMENT_METADATA_CONSTRUCTOR_SIG: &str = "(ILjava/util/List;Ljava/lang/Long;Lorg/lance/fragment/DeletionFile;Lorg/lance/fragment/RowIdMeta;Lorg/lance/fragment/VersionMeta;Lorg/lance/fragment/VersionMeta;Ljava/util/List;Ljava/lang/Long;Ljava/util/Map;)V";
 const ROW_ID_META_CLASS: &str = "org/lance/fragment/RowIdMeta";
 const ROW_ID_META_CONSTRUCTOR_SIG: &str = "(Ljava/lang/String;)V";
 const VERSION_META_CLASS: &str = "org/lance/fragment/VersionMeta";
@@ -787,6 +861,14 @@ impl IntoJava for &DeletionFile {
         };
         let file_type = self.file_type.into_java(env)?;
         let base_id = convert_to_java_integer(env, self.base_id)?;
+        let inline = match &self.inline {
+            Some(bytes) => env.byte_array_from_slice(bytes)?.into(),
+            None => JObject::null(),
+        };
+        let path = match &self.path {
+            Some(path) => JObject::from(env.new_string(path)?),
+            None => JObject::null(),
+        };
         Ok(env.new_object(
             DELETE_FILE_CLASS,
             DELETE_FILE_CONSTRUCTOR_SIG,
@@ -796,6 +878,8 @@ impl IntoJava for &DeletionFile {
                 JValueGen::Object(&num_deleted_rows),
                 JValueGen::Object(&file_type),
                 JValueGen::Object(&base_id),
+                JValueGen::Object(&inline),
+                JValueGen::Object(&path),
             ],
         )?)
     }
@@ -851,6 +935,15 @@ impl IntoJava for &Fragment {
             Some(m) => m.into_java(env)?,
             None => JObject::null(),
         };
+        // A u32 id fits a Java long losslessly; `int` would fold the upper
+        // half of the range into negative values.
+        let clustering_id = match self.clustering_id {
+            Some(id) => {
+                env.new_object("java/lang/Long", "(J)V", &[JValueGen::Long(i64::from(id))])?
+            }
+            None => JObject::null(),
+        };
+        let metadata = to_java_map(env, &self.metadata)?;
 
         env.new_object(
             FRAGMENT_METADATA_CLASS,
@@ -864,6 +957,8 @@ impl IntoJava for &Fragment {
                 JValueGen::Object(&created_at),
                 JValueGen::Object(&last_updated_at),
                 JValueGen::Object(&referenced_data_files),
+                JValueGen::Object(&clustering_id),
+                JValueGen::Object(&metadata),
             ],
         )
         .map_err(|e| {
@@ -947,8 +1042,47 @@ impl FromJObjectWithEnv<Fragment> for JObject<'_> {
             // Overlays are not exposed to Java yet, and the reverse conversion
             // does not export them, so this round-trip is overlay-free.
             overlays: vec![],
+            clustering_id: extract_clustering_id(env, self, "getClusteringId")?,
+            metadata: extract_metadata_map(env, self, "getMetadata")?,
         })
     }
+}
+
+/// Read a nullable `java.lang.Long` clustering id and check it fits the
+/// unsigned 32-bit id range of the format.
+pub(crate) fn extract_clustering_id(
+    env: &mut JNIEnv<'_>,
+    obj: &JObject<'_>,
+    method: &str,
+) -> Result<Option<u32>> {
+    let boxed = env
+        .call_method(obj, method, "()Ljava/lang/Long;", &[])?
+        .l()?;
+    if boxed.is_null() {
+        return Ok(None);
+    }
+    let value = env.call_method(&boxed, "longValue", "()J", &[])?.j()?;
+    u32::try_from(value).map(Some).map_err(|_| {
+        Error::input_error(format!(
+            "clustering id {value} is outside the unsigned 32-bit range"
+        ))
+    })
+}
+
+/// Read a non-null `java.util.Map<String, String>` of generic object metadata.
+pub(crate) fn extract_metadata_map(
+    env: &mut JNIEnv<'_>,
+    obj: &JObject<'_>,
+    method: &str,
+) -> Result<HashMap<String, String>> {
+    let map = env
+        .call_method(obj, method, "()Ljava/util/Map;", &[])?
+        .l()?;
+    if map.is_null() {
+        return Ok(HashMap::new());
+    }
+    let jmap = JMap::from_env(env, &map)?;
+    to_rust_map(env, &jmap)
 }
 
 impl FromJObjectWithEnv<DeletionFile> for JObject<'_> {
@@ -970,13 +1104,24 @@ impl FromJObjectWithEnv<DeletionFile> for JObject<'_> {
             .l()?
             .extract_object(env)?;
         let base_id = get_base_id(env, self)?;
-        Ok(DeletionFile {
+        let inline = env.call_method(self, "getInline", "()[B", &[])?.l()?;
+        let inline = if inline.is_null() {
+            None
+        } else {
+            Some(env.convert_byte_array(JByteArray::from(inline))?.into())
+        };
+        let path = env.get_optional_string_from_method(self, "getPath")?;
+        let deletion_file = DeletionFile {
             read_version,
             id,
             num_deleted_rows,
             file_type,
             base_id,
-        })
+            path,
+            inline,
+        };
+        deletion_file.validate_location()?;
+        Ok(deletion_file)
     }
 }
 
@@ -1027,6 +1172,7 @@ impl FromJObjectWithEnv<DataFile> for JObject<'_> {
             file_major_version,
             file_minor_version,
             file_size_bytes,
+            file_metadata_size_bytes: None,
             base_id,
         })
     }

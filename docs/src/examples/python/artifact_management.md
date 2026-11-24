@@ -38,30 +38,36 @@ As we covered earlier, the weights table will have three columns - one for stori
 
 ## Saving and Versioning Models
 
-First we will focus on the model saving part. Let's start by writing a utility function that will take a model's state dict, goes over each weight, flatten it and then return the weight name, flattened weight and weight's original shape in a pyarrow `RecordBatch`.
+First we will focus on the model saving part. Let's start by writing a utility function that iterates through the model's `state_dict`, flattens each weight tensor, and yields PyArrow `RecordBatch` objects in batches of parameters rather than creating a single-row batch per tensor.
 
 ```python
-def _save_model_writer(state_dict):
-    """Yields a RecordBatch for each parameter in the model state dict"""
+def _save_model_writer(state_dict, batch_size=64):
+    """Yields batched RecordBatches of parameters from the model state dict"""
+    names, values, shapes = [], [], []
     for param_name, param in state_dict.items():
-        param_shape = list(param.size())
-        param_value = param.flatten().tolist()
+        names.append(param_name)
+        values.append(param.detach().cpu().flatten().tolist())
+        shapes.append(list(param.size()))
+
+        if len(names) == batch_size:
+            yield pa.RecordBatch.from_arrays(
+                [
+                    pa.array(names, pa.string()),
+                    pa.array(values, pa.list_(pa.float64(), -1)),
+                    pa.array(shapes, pa.list_(pa.int64(), -1)),
+                ],
+                schema=GLOBAL_SCHEMA,
+            )
+            names, values, shapes = [], [], []
+
+    if names:
         yield pa.RecordBatch.from_arrays(
             [
-                pa.array(
-                    [param_name],
-                    pa.string(),
-                ),
-                pa.array(
-                    [param_value],
-                    pa.list_(pa.float64(), -1),
-                ),
-                pa.array(
-                    [param_shape],
-                    pa.list_(pa.int64(), -1),
-                ),
+                pa.array(names, pa.string()),
+                pa.array(values, pa.list_(pa.float64(), -1)),
+                pa.array(shapes, pa.list_(pa.int64(), -1)),
             ],
-            ["name", "value", "shape"],
+            schema=GLOBAL_SCHEMA,
         )
 ```
 
@@ -134,11 +140,11 @@ def _load_state_dict(file_name: str, version: int = 1, map_location=None) -> Ord
         OrderedDict: Model state dict
     """
     ds = lance.dataset(file_name, version=version)
-    weights = ds.take([x for x in range(ds.count_rows())]).to_pylist()
     state_dict = OrderedDict()
 
-    for weight in weights:
-        state_dict[weight["name"]] = _load_weight(weight).to(map_location)
+    for batch in ds.to_batches():
+        for weight in batch.to_pylist():
+            state_dict[weight["name"]] = _load_weight(weight).to(map_location)
 
     return state_dict
 ```

@@ -157,6 +157,8 @@ public final class InvertedIndexParams {
     /**
      * Configure whether to store token positions in the index.
      *
+     * <p>This option is not supported with the {@code "ngram"} tokenizer when creating a new index.
+     *
      * @param withPosition whether to store term positions
      * @return this builder
      */
@@ -452,6 +454,33 @@ public final class InvertedIndexParams {
             (!"code".equals(analyzer) && !"code".equals(baseTokenizer)) || formatVersion == 3,
             "code analyzer and baseTokenizer 'code' require formatVersion 3");
       }
+      Map<String, Object> params = tokenizerParams();
+      if (withPosition != null) {
+        params.put("with_position", withPosition);
+      }
+      if (blockSize != null) {
+        params.put("block_size", blockSize);
+      }
+      if (memoryLimit != null) {
+        params.put("memory_limit", memoryLimit);
+      }
+      if (numWorkers != null) {
+        params.put("num_workers", numWorkers);
+      }
+      if (formatVersion != null) {
+        params.put("format_version", formatVersion);
+      }
+      params.put("document_granularity", documentGranularity.toRustString());
+
+      String json = JsonUtils.toJson(params);
+      return ScalarIndexParams.create(INDEX_TYPE, json);
+    }
+
+    /**
+     * The settings that decide how text is split into tokens, keyed as in the Rust parameters. Also
+     * used by {@link MinHashLshIndexParams}, which tokenizes text the same way.
+     */
+    Map<String, Object> tokenizerParams() {
       Map<String, Object> params = new HashMap<>();
       if (analyzer != null) {
         params.put("analyzer", analyzer);
@@ -464,9 +493,6 @@ public final class InvertedIndexParams {
       }
       if (language != null) {
         params.put("language", language);
-      }
-      if (withPosition != null) {
-        params.put("with_position", withPosition);
       }
       params.put("max_token_length", maxTokenLength);
       if (lowerCase != null) {
@@ -498,9 +524,6 @@ public final class InvertedIndexParams {
       if (prefixOnly != null) {
         params.put("prefix_only", prefixOnly);
       }
-      if (blockSize != null) {
-        params.put("block_size", blockSize);
-      }
       if (splitIdentifiers != null) {
         params.put("split_identifiers", splitIdentifiers);
       }
@@ -513,19 +536,7 @@ public final class InvertedIndexParams {
       if (indexOperators != null) {
         params.put("index_operators", indexOperators);
       }
-      if (memoryLimit != null) {
-        params.put("memory_limit", memoryLimit);
-      }
-      if (numWorkers != null) {
-        params.put("num_workers", numWorkers);
-      }
-      if (formatVersion != null) {
-        params.put("format_version", formatVersion);
-      }
-      params.put("document_granularity", documentGranularity.toRustString());
-
-      String json = JsonUtils.toJson(params);
-      return ScalarIndexParams.create(INDEX_TYPE, json);
+      return params;
     }
   }
 }

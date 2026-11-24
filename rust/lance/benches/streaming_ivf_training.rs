@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+// The streaming IVF training path still nests async frames past the default
+// recursion limit of 128 when the Linux io_uring reader types are in the
+// obligation graph (the failure does not reproduce on non-Linux hosts). Every
+// other bench now fits the default; see issue #8416.
 #![recursion_limit = "256"]
 
 use std::sync::Arc;
@@ -82,28 +86,30 @@ fn bench_streaming_ivf_training(c: &mut Criterion) {
     params.streaming_sample_rate = Some(STREAMING_SAMPLE_RATE);
     params.max_iters = MAX_ITERS;
 
-    c.bench_function(
-        &format!(
-            "streaming_ivf_training_{}d_{}p_sample_{}_stream_{}",
-            DIM, NUM_PARTITIONS, SAMPLE_RATE, STREAMING_SAMPLE_RATE
-        ),
-        |b| {
-            b.to_async(&rt).iter(|| async {
-                let ivf_model = build_ivf_model(
-                    &dataset,
-                    "vector",
-                    DIM,
-                    MetricType::L2,
-                    &params,
-                    None,
-                    noop_progress(),
-                )
-                .await
-                .unwrap();
-                black_box(ivf_model.num_partitions());
-            });
-        },
-    );
+    for metric_type in [MetricType::L2, MetricType::Dot] {
+        c.bench_function(
+            &format!(
+                "streaming_ivf_training_{}_{}d_{}p_sample_{}_stream_{}",
+                metric_type, DIM, NUM_PARTITIONS, SAMPLE_RATE, STREAMING_SAMPLE_RATE
+            ),
+            |b| {
+                b.to_async(&rt).iter(|| async {
+                    let ivf_model = build_ivf_model(
+                        &dataset,
+                        "vector",
+                        DIM,
+                        metric_type,
+                        &params,
+                        None,
+                        noop_progress(),
+                    )
+                    .await
+                    .unwrap();
+                    black_box(ivf_model.num_partitions());
+                });
+            },
+        );
+    }
 }
 
 criterion_group!(

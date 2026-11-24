@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+mod condition;
 mod delete;
 mod in_place;
 mod write;
@@ -13,12 +14,27 @@ use futures::StreamExt;
 use lance_table::format::Fragment;
 use roaring::RoaringTreemap;
 
+pub use condition::MergeConditionExec;
 pub use delete::DeleteOnlyMergeInsertExec;
 pub use in_place::InPlaceMergeInsertExec;
 pub use write::FullSchemaMergeInsertExec;
 
 use super::MergeStats;
 use crate::Dataset;
+use crate::dataset::WhenMatched;
+
+/// `when_matched` for a write node's plan display; an `UpdateIf` gated by
+/// `MergeConditionExec` names that node rather than a predicate it does not evaluate.
+pub(super) fn when_matched_label(when_matched: &WhenMatched, update_if_deferred: bool) -> String {
+    match when_matched {
+        WhenMatched::UpdateIf(_) | WhenMatched::UpdateIfExpr(_) if update_if_deferred => {
+            "UpdateIf(MergeCondition)".to_string()
+        }
+        WhenMatched::UpdateIf(condition) => format!("UpdateIf({condition})"),
+        WhenMatched::UpdateIfExpr(expr) => format!("UpdateIf({})", expr.human_display()),
+        other => format!("{other:?}"),
+    }
+}
 
 pub(super) struct MergeInsertMetrics {
     pub num_inserted_rows: Count,
@@ -86,7 +102,7 @@ pub(super) async fn apply_deletions(
                 if let Some(bitmap) = bitmaps_ref.get(&(fragment_id as u32)) {
                     match fragment.extend_deletions(*bitmap).await {
                         Ok(Some(new_fragment)) => {
-                            Ok(FragmentChange::Modified(Box::new(new_fragment.metadata)))
+                            Ok(FragmentChange::Modified(Box::new(new_fragment.into())))
                         }
                         Ok(None) => Ok(FragmentChange::Removed(fragment_id as u64)),
                         Err(e) => Err(e),
@@ -96,7 +112,7 @@ pub(super) async fn apply_deletions(
                 }
             }
         })
-        .buffer_unordered(dataset.object_store.io_parallelism());
+        .buffer_unordered(dataset.table_state.object_store.io_parallelism());
 
     while let Some(res) = stream.next().await.transpose()? {
         match res {

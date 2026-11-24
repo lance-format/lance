@@ -22,6 +22,7 @@ import org.lance.fragment.DataFile;
 import org.lance.ipc.LanceScanner;
 import org.lance.schema.LanceField;
 import org.lance.schema.LanceSchema;
+import org.lance.schema.SqlExpressions;
 
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.IntVector;
@@ -44,6 +45,7 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 
 public class MergeTest extends OperationTestBase {
 
@@ -354,6 +356,46 @@ public class MergeTest extends OperationTestBase {
           if (addressRoot != null) {
             addressRoot.close();
           }
+        }
+      }
+    }
+  }
+
+  @Test
+  void testLegacyMergeInheritsNonContiguousFieldIds(@TempDir Path tempDir) throws Exception {
+    Path source =
+        Path.of("..", "test_data", "v0.10.5", "corrupt_schema").toAbsolutePath().normalize();
+    Path datasetPath = tempDir.resolve("legacy");
+    copyDirectory(source, datasetPath);
+
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE);
+        Dataset legacy = Dataset.open(datasetPath.toString(), allocator)) {
+      legacy.dropColumns(Collections.singletonList("y"));
+      long baseVersion = legacy.version();
+      legacy.addColumns(
+          new SqlExpressions.Builder().withExpression("z", "x + 1").build(), Optional.empty());
+
+      Merge generated;
+      try (Transaction transaction = legacy.readTransaction().orElseThrow()) {
+        generated = (Merge) transaction.operation();
+      }
+
+      try (Dataset restored = legacy.checkoutVersion(baseVersion)) {
+        restored.restore();
+        try (Transaction transaction =
+                new Transaction.Builder()
+                    .readVersion(restored.version())
+                    .operation(
+                        Merge.builder()
+                            .fragments(generated.fragments())
+                            .schema(generated.schema())
+                            .build())
+                    .build();
+            Dataset merged = new CommitBuilder(restored).execute(transaction)) {
+          Assertions.assertEquals(0, findField(merged.getLanceSchema().fields(), "x").getId());
+          Assertions.assertEquals(4, findField(merged.getLanceSchema().fields(), "b").getId());
+          Assertions.assertEquals(5, findField(merged.getLanceSchema().fields(), "c").getId());
+          Assertions.assertEquals(6, findField(merged.getLanceSchema().fields(), "z").getId());
         }
       }
     }

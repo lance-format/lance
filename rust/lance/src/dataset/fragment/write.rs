@@ -2,30 +2,28 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use arrow_schema::Schema as ArrowSchema;
-use datafusion::execution::SendableRecordBatchStream;
-use futures::{StreamExt, TryStreamExt};
+use futures::StreamExt;
 use lance_core::Error;
 use lance_core::datatypes::Schema;
-use lance_datafusion::chunker::{break_stream, chunk_stream};
-use lance_datafusion::utils::StreamingWriteSource;
+use lance_datafusion::utils::{StreamingWriteSource, from_datafusion_stream};
 #[cfg(test)]
 use lance_file::version::LanceFileVersion;
-use lance_file::version::stable_file_version;
+use lance_file::version::{ConcreteFileVersion, stable_file_version};
 use lance_file::versions::v1::writer::FileWriter as V1FileWriter;
-use lance_file::writer::FileWriter;
 use lance_io::object_store::ObjectStore;
-use lance_io::traits::Writer;
-use lance_io::utils::CachedFileSize;
+use lance_io::stream::SendableRecordBatchStream;
+use lance_io::stream::chunker::{break_stream, chunk_stream};
 use lance_table::format::{DataFile, Fragment};
 use lance_table::io::manifest::ManifestDescribing;
 use std::borrow::Cow;
-use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::Result;
 use crate::dataset::builder::DatasetBuilder;
-use crate::dataset::utils::SchemaAdapter;
-use crate::dataset::write::validate_and_resolve_target_bases_with_primary;
+use crate::dataset::write::{
+    WriterOptions, blob_v2_external_base_resolver, promote_legacy_blob_schema,
+    validate_and_resolve_target_bases_with_primary,
+};
 use crate::dataset::{DATA_DIR, Dataset, ReadParams, WriteMode, WriteParams};
 
 /// Generates a filename optimized for S3 throughput using a UUID-based approach.
@@ -66,6 +64,17 @@ pub(crate) fn generate_random_filename() -> String {
     }
 
     out
+}
+
+/// Store blob v1 input as Blob v2 from file version 2.2 on, as `Dataset::write`
+/// does, so the commit that promotes the column never meets legacy pages in a
+/// 2.2 file. Below 2.2 the legacy layout is the only one.
+fn promote_legacy_blobs(version: ConcreteFileVersion, schema: Schema) -> Result<Schema> {
+    if crate::dataset::versions::writes_blob_v2(version) {
+        promote_legacy_blob_schema(&schema)
+    } else {
+        Ok(schema)
+    }
 }
 
 /// Builder for writing a new fragment.
@@ -110,17 +119,13 @@ impl<'a> FragmentCreateBuilder<'a> {
         id: Option<u64>,
     ) -> Result<Fragment> {
         let (stream, schema) = self.get_stream_and_schema(Box::new(source)).await?;
-        // Convert Arrow JSON columns (`arrow.json`, stored as Utf8) into Lance JSON
-        // (`lance.json`, stored as JSONB-encoded LargeBinary) before writing. The
-        // multi-fragment and dataset write paths perform this through
-        // `versions::write_fragments_direct`;
-        // the single-fragment create path must do the same or the raw UTF-8 string bytes
-        // would be written into a column whose schema declares JSONB, corrupting reads.
-        let stream = SchemaAdapter::new(stream.schema()).to_physical_stream(stream);
         let version = self
             .write_params
             .map(|params| params.storage_version_or_default())
             .unwrap_or_else(stable_file_version);
+        if let Some(params) = self.write_params {
+            crate::dataset::versions::validate_row_limits(version, params)?;
+        }
         crate::dataset::versions::write_fragment(
             version,
             self,
@@ -140,20 +145,18 @@ impl<'a> FragmentCreateBuilder<'a> {
         self.write_fragments_v2_impl(stream, schema).await
     }
 
-    pub(crate) async fn write_current_impl<F>(
+    pub(crate) async fn write_current_impl(
         &self,
-        create_writer: F,
+        version: ConcreteFileVersion,
         stream: SendableRecordBatchStream,
         schema: Schema,
         id: u64,
-    ) -> Result<Fragment>
-    where
-        F: FnOnce(Box<dyn Writer>, Schema, String) -> Result<(FileWriter, DataFile)>,
-    {
+    ) -> Result<Fragment> {
         let params = self.write_params.map(Cow::Borrowed).unwrap_or_default();
         let progress = params.progress.as_ref();
 
         Self::validate_schema(&schema, stream.schema().as_ref())?;
+        let schema = promote_legacy_blobs(version, schema)?;
 
         let (object_store, base_path) = ObjectStore::from_uri_and_params(
             params.store_registry(),
@@ -161,49 +164,44 @@ impl<'a> FragmentCreateBuilder<'a> {
             &params.store_params.clone().unwrap_or_default(),
         )
         .await?;
-        let data_file_key = generate_random_filename();
-        let filename = format!("{}.lance", data_file_key);
+        // The dataset's writer, not a raw file writer: it carries the version's
+        // write policies, such as preparing Blob v2 columns for the encoders.
+        let external_base_resolver = if crate::dataset::versions::writes_blob_v2(version) {
+            blob_v2_external_base_resolver(None, &params, &schema).await?
+        } else {
+            None
+        };
+        let mut writer = crate::dataset::versions::open_writer(
+            version,
+            &object_store,
+            &schema,
+            &base_path,
+            WriterOptions::from_params(&params, external_base_resolver),
+        )
+        .await?;
         let mut fragment = Fragment::new(id);
-        let full_path = base_path.clone().join(DATA_DIR).join(filename.clone());
-        let obj_writer = object_store.create(&full_path).await?;
-        let (mut writer, data_file) = create_writer(obj_writer, schema, filename)?;
-        fragment.files.push(data_file);
+        let (filename, _) = writer.data_file_path();
+        fragment
+            .files
+            .push(DataFile::new_unstarted(filename.to_string(), version));
 
         progress.begin(&fragment).await?;
 
         let break_limit = (128 * 1024).min(params.max_rows_per_file);
 
-        let mut broken_stream = break_stream(stream, break_limit)
-            .map_ok(|batch| vec![batch])
-            .boxed();
-        while let Some(batched_chunk) = broken_stream.next().await {
-            let batch_chunk = batched_chunk?;
-            writer.write_batches(batch_chunk.iter()).await?;
+        let mut broken_stream = break_stream(stream, break_limit);
+        while let Some(batch) = broken_stream.next().await {
+            writer.write(&[batch?]).await?;
         }
 
-        let write_summary = writer.finish().await?;
-        fragment.physical_rows = Some(write_summary.num_rows as usize);
+        let (num_rows, data_file) = writer.finish().await?;
+        fragment.physical_rows = Some(num_rows as usize);
 
         if matches!(fragment.physical_rows, Some(0)) {
             return Err(Error::invalid_input("Input data was empty."));
         }
 
-        let field_ids: Arc<[i32]> = writer
-            .field_id_to_column_indices()
-            .iter()
-            .map(|(field_id, _)| *field_id as i32)
-            .collect::<Vec<_>>()
-            .into();
-        let column_indices: Arc<[i32]> = writer
-            .field_id_to_column_indices()
-            .iter()
-            .map(|(_, column_index)| *column_index as i32)
-            .collect::<Vec<_>>()
-            .into();
-
-        fragment.files[0].fields = field_ids;
-        fragment.files[0].column_indices = column_indices;
-        fragment.files[0].file_size_bytes = CachedFileSize::new(write_summary.size_bytes);
+        fragment.files[0] = data_file;
 
         progress.complete(&fragment).await?;
 
@@ -219,6 +217,7 @@ impl<'a> FragmentCreateBuilder<'a> {
         Self::validate_schema(&schema, stream.schema().as_ref())?;
 
         let version = params.storage_version_or_default();
+        let schema = promote_legacy_blobs(version, schema)?;
         let needs_existing_dataset = params.target_base_names_or_paths.is_some()
             || params.target_bases.is_some()
             || params.target_all_bases.is_some()
@@ -258,7 +257,11 @@ impl<'a> FragmentCreateBuilder<'a> {
             stream,
             params,
             target_bases_info,
-            Vec::new(),
+            crate::dataset::write::seeds::SeedCollector::disabled(),
+            None,
+            None,
+            None,
+            false,
             None,
         )
         .await
@@ -315,14 +318,18 @@ impl<'a> FragmentCreateBuilder<'a> {
         &self,
         source: impl StreamingWriteSource,
     ) -> Result<(SendableRecordBatchStream, Schema)> {
-        if let Some(schema) = self.schema {
-            return Ok((source.into_stream(), schema.clone()));
-        } else if matches!(self.write_params.map(|p| p.mode), Some(WriteMode::Append))
-            && let Some(schema) = self.existing_dataset_schema().await?
-        {
-            return Ok((source.into_stream(), schema));
-        }
-        source.into_stream_and_schema().await
+        let schema = if let Some(schema) = self.schema {
+            Some(schema.clone())
+        } else if matches!(self.write_params.map(|p| p.mode), Some(WriteMode::Append)) {
+            self.existing_dataset_schema().await?
+        } else {
+            None
+        };
+        let (stream, schema) = match schema {
+            Some(schema) => (source.into_stream(), schema),
+            None => source.into_stream_and_schema().await?,
+        };
+        Ok((from_datafusion_stream(stream), schema))
     }
 
     async fn existing_dataset_schema(&self) -> Result<Option<Schema>> {
@@ -386,7 +393,9 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::dataset::InsertBuilder;
+    use crate::dataset::fragment::FileFragment;
+    use crate::dataset::transaction::{Operation, Transaction};
+    use crate::dataset::{CommitBuilder, InsertBuilder};
 
     fn test_data() -> Box<dyn RecordBatchReader + Send> {
         let schema = Arc::new(ArrowSchema::new(vec![
@@ -401,6 +410,36 @@ mod tests {
             ],
         );
         Box::new(RecordBatchIterator::new(vec![batch], schema))
+    }
+
+    /// A dataset whose only registered base has the sparse id 2.
+    async fn dataset_with_sparse_existing_base(
+        primary: &TempStrDir,
+        existing: &TempStrDir,
+    ) -> Dataset {
+        InsertBuilder::new(primary.as_str())
+            .with_params(&WriteParams {
+                mode: WriteMode::Create,
+                initial_bases: Some(vec![BasePath::new(
+                    2,
+                    existing.to_string(),
+                    Some("existing".to_string()),
+                    false,
+                )]),
+                ..Default::default()
+            })
+            .execute_stream(test_data())
+            .await
+            .unwrap()
+    }
+
+    fn assert_data_file_in(base: &TempStrDir, data_file: &DataFile) {
+        let path = std::path::Path::new(base.as_str()).join(data_file.path.as_str());
+        assert!(
+            path.exists(),
+            "data file was not written to the expected base: {}",
+            path.display()
+        );
     }
 
     #[tokio::test]
@@ -470,6 +509,100 @@ mod tests {
         assert_eq!(fragment.files[0].fields.as_ref(), &[0, 1]);
     }
 
+    /// Blob v1 input written at 2.2 is stored as Blob v2, as `Dataset::write`
+    /// does, so the commit that promotes the column never meets legacy pages
+    /// in a 2.2 file.
+    #[rstest]
+    #[case::single_fragment(false)]
+    #[case::multiple_fragments(true)]
+    #[tokio::test]
+    async fn test_legacy_blob_input_is_promoted_at_v2_2(#[case] multi: bool) {
+        use arrow_array::{LargeBinaryArray, UInt32Array};
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::UInt32, false),
+            ArrowField::new("blob", DataType::LargeBinary, true).with_metadata(
+                std::collections::HashMap::from([(
+                    lance_arrow::BLOB_META_KEY.to_string(),
+                    "true".to_string(),
+                )]),
+            ),
+        ]));
+        let reader = |ids: Vec<u32>, blobs: Vec<Option<&[u8]>>| {
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(UInt32Array::from(ids)),
+                    Arc::new(LargeBinaryArray::from(blobs)),
+                ],
+            )
+            .unwrap();
+            Box::new(RecordBatchIterator::new([Ok(batch)], schema.clone()))
+                as Box<dyn RecordBatchReader + Send>
+        };
+        let test_dir = TempStrDir::default();
+        let dataset = Dataset::write(
+            reader(vec![0, 1], vec![Some(b"legacy".as_slice()), None]),
+            &test_dir,
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_1),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let params = WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        };
+        let builder = FragmentCreateBuilder::new(&test_dir).write_params(&params);
+        let source = reader(vec![2, 3], vec![Some(b"fragment".as_slice()), Some(b"")]);
+        let fragments = if multi {
+            builder.write_fragments(source).await.unwrap()
+        } else {
+            vec![builder.write(source, Some(1)).await.unwrap()]
+        };
+        let data_file = &fragments[0].files[0];
+        assert_eq!(data_file.file_version().unwrap(), ConcreteFileVersion::V2_2);
+        let file_schema = crate::utils::test::data_file_schema(&dataset, &data_file.path).await;
+        // The footer keeps the writer's view: a Blob v2 descriptor struct, where
+        // the legacy layout keeps the large_binary input type.
+        assert!(
+            matches!(
+                file_schema.field("blob").unwrap().data_type(),
+                DataType::Struct(_)
+            ),
+            "{file_schema:?}"
+        );
+
+        let read_version = dataset.manifest.version;
+        let dataset = CommitBuilder::new(Arc::new(dataset))
+            .execute(Transaction::new(
+                read_version,
+                Operation::Append { fragments },
+                None,
+            ))
+            .await
+            .unwrap();
+        let dataset = Arc::new(dataset);
+        assert!(dataset.schema().field("blob").unwrap().is_blob_v2());
+        let blobs = dataset
+            .take_blobs_by_indices(&[0, 1, 2, 3], "blob")
+            .await
+            .unwrap();
+        assert_eq!(
+            blobs[0].as_ref().unwrap().read().await.unwrap().as_ref(),
+            b"legacy"
+        );
+        assert!(blobs[1].is_none());
+        assert_eq!(
+            blobs[2].as_ref().unwrap().read().await.unwrap().as_ref(),
+            b"fragment"
+        );
+        assert_eq!(blobs[3].as_ref().unwrap().size(), 0);
+    }
+
     #[tokio::test]
     async fn test_fragment_write_with_schema() {
         // Uses provided schema. Field ids are correct in fragment metadata.
@@ -492,6 +625,35 @@ mod tests {
         assert_eq!(fragment.files.len(), 1);
         assert_eq!(fragment.files[0].fields.as_ref(), &[3, 1]);
         assert_eq!(fragment.files[0].column_indices.as_ref(), &[0, 1]);
+    }
+
+    #[tokio::test]
+    async fn test_fragment_commit_rejects_system_column() {
+        let tmp_dir = TempStrDir::default();
+        let batch = record_batch!(("_rowid", UInt64, [1])).unwrap();
+        let arrow_schema = batch.schema();
+        let schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
+        let fragment = FragmentCreateBuilder::new(&tmp_dir)
+            .write(RecordBatchIterator::new([Ok(batch)], arrow_schema), None)
+            .await
+            .unwrap();
+
+        let transaction = Transaction::new(
+            0,
+            Operation::Overwrite {
+                schema,
+                fragments: vec![fragment],
+                config_upsert_values: None,
+                initial_bases: None,
+            },
+            None,
+        );
+        let error = CommitBuilder::new(tmp_dir.as_str())
+            .execute(transaction)
+            .await
+            .unwrap_err();
+        assert!(matches!(&error, Error::InvalidInput { .. }), "{error}");
+        assert!(error.to_string().contains("reserved name"), "{error}");
     }
 
     #[tokio::test]
@@ -652,7 +814,7 @@ mod tests {
             ..Default::default()
         }
         .with_target_base_names_or_paths(vec!["base2".to_string()]);
-        let fragments = FragmentCreateBuilder::new(dataset.uri.as_str())
+        let fragments = FragmentCreateBuilder::new(dataset.table_state.uri.as_str())
             .write_params(&append_params)
             .write_fragments(test_data())
             .await
@@ -684,7 +846,7 @@ mod tests {
             ..Default::default()
         }
         .with_target_all_bases(false);
-        let fragments = FragmentCreateBuilder::new(dataset.uri.as_str())
+        let fragments = FragmentCreateBuilder::new(dataset.table_state.uri.as_str())
             .write_params(&append_params)
             .write_fragments(test_data())
             .await
@@ -698,13 +860,100 @@ mod tests {
             ..Default::default()
         }
         .with_target_all_bases(true);
-        let fragments = FragmentCreateBuilder::new(dataset.uri.as_str())
+        let fragments = FragmentCreateBuilder::new(dataset.table_state.uri.as_str())
             .write_params(&append_params)
             .write_fragments(test_data())
             .await
             .unwrap();
         assert_eq!(fragments.len(), 1);
         assert_eq!(fragments[0].files[0].base_id, None);
+    }
+
+    #[rstest]
+    #[case::v1(LanceFileVersion::Legacy)]
+    #[case::v2(LanceFileVersion::V2_2)]
+    #[tokio::test]
+    async fn test_create_fragments_preserves_sparse_base_ids_for_numeric_target(
+        #[case] data_storage_version: LanceFileVersion,
+    ) {
+        let primary = TempStrDir::default();
+        let existing = TempStrDir::default();
+        let base_a = TempStrDir::default();
+        let base_b = TempStrDir::default();
+        let dataset = dataset_with_sparse_existing_base(&primary, &existing).await;
+
+        let params = WriteParams {
+            mode: WriteMode::Create,
+            data_storage_version: Some(data_storage_version),
+            max_rows_per_file: 1,
+            max_rows_per_group: 1,
+            initial_bases: Some(vec![
+                BasePath::new(0, base_a.to_string(), Some("base-a".to_string()), false),
+                BasePath::new(0, base_b.to_string(), Some("base-b".to_string()), false),
+            ]),
+            target_bases: Some(vec![3]),
+            ..Default::default()
+        };
+        let fragments = FileFragment::create_fragments(
+            dataset.table_state.uri.as_str(),
+            test_data(),
+            Some(params),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(fragments.len(), 3);
+        for fragment in &fragments {
+            let data_file = &fragment.files[0];
+            // Existing base 2 makes the first automatic base 3, not a lower
+            // free id. Numeric target 3 must therefore stay bound to base A.
+            assert_eq!(data_file.base_id, Some(3));
+            assert_data_file_in(&base_a, data_file);
+        }
+    }
+
+    #[rstest]
+    #[case::v1(LanceFileVersion::Legacy)]
+    #[case::v2(LanceFileVersion::V2_2)]
+    #[tokio::test]
+    async fn test_create_fragments_all_bases_starts_with_sparse_existing_base(
+        #[case] data_storage_version: LanceFileVersion,
+    ) {
+        let primary = TempStrDir::default();
+        let existing = TempStrDir::default();
+        let base_a = TempStrDir::default();
+        let base_b = TempStrDir::default();
+        let dataset = dataset_with_sparse_existing_base(&primary, &existing).await;
+
+        let params = WriteParams {
+            mode: WriteMode::Create,
+            data_storage_version: Some(data_storage_version),
+            max_rows_per_file: 1,
+            max_rows_per_group: 1,
+            initial_bases: Some(vec![
+                BasePath::new(0, base_a.to_string(), Some("base-a".to_string()), false),
+                BasePath::new(0, base_b.to_string(), Some("base-b".to_string()), false),
+            ]),
+            target_all_bases: Some(false),
+            ..Default::default()
+        };
+        let fragments = FileFragment::create_fragments(
+            dataset.table_state.uri.as_str(),
+            test_data(),
+            Some(params),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(fragments.len(), 3);
+        let expected = [(Some(2), &existing), (Some(3), &base_a), (Some(4), &base_b)];
+        for (fragment, (expected_base_id, base)) in fragments.iter().zip(expected) {
+            let data_file = &fragment.files[0];
+            // Rotation starts at the existing base and keeps the automatic
+            // bases in allocation order after it.
+            assert_eq!(data_file.base_id, expected_base_id);
+            assert_data_file_in(base, data_file);
+        }
     }
 
     #[rstest]
@@ -769,6 +1018,40 @@ mod tests {
             assert_eq!(f.file_major_version, major_version);
             assert_eq!(f.file_minor_version, minor_version);
         })
+    }
+
+    /// A zero row limit used to panic on V2. On V1 a zero group size wrote
+    /// nothing, and a zero file limit was ignored by `write`.
+    #[rstest]
+    #[case::v2_rows_per_file(LanceFileVersion::Stable, 0, 1024, "max_rows_per_file")]
+    #[case::v1_rows_per_file(LanceFileVersion::Legacy, 0, 1024, "max_rows_per_file")]
+    #[case::v1_rows_per_group(LanceFileVersion::Legacy, 1024, 0, "max_rows_per_group")]
+    #[tokio::test]
+    async fn test_fragment_write_rejects_zero_row_limits(
+        #[case] file_version: LanceFileVersion,
+        #[case] max_rows_per_file: usize,
+        #[case] max_rows_per_group: usize,
+        #[case] param: &str,
+    ) {
+        let tmp_dir = TempStrDir::default();
+        let params = WriteParams {
+            data_storage_version: Some(file_version),
+            max_rows_per_file,
+            max_rows_per_group,
+            ..Default::default()
+        };
+        let builder = FragmentCreateBuilder::new(&tmp_dir).write_params(&params);
+        let errors = [
+            builder.write(test_data(), None).await.unwrap_err(),
+            builder.write_fragments(test_data()).await.unwrap_err(),
+        ];
+        for err in errors {
+            assert!(
+                matches!(&err, Error::InvalidInput { source, .. }
+                if source.to_string().contains(&format!("{param} must be greater than zero"))),
+                "{err:?}"
+            );
+        }
     }
 
     #[test]

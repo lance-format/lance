@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
+from __future__ import annotations
+
 import ctypes
 import io
 from dataclasses import dataclass
-from typing import IO, Any, Iterator, Optional, Union
+from typing import IO, Any, Iterator, List, Optional, Sequence, Tuple, Union
 
 import pyarrow as pa
 
@@ -21,8 +23,13 @@ from .lance import (
     LanceBlobFile,
 )
 from .lance import (
+    ManagedBlobWriter as ManagedBlobWriter,
+)
+from .lance import (
     PackedBlobWriter as PackedBlobWriter,
 )
+from .lance import read_blob_file_ranges as _read_blob_file_ranges
+from .lance import read_blob_files as _read_blob_files
 
 _BLOB_INLINE_SIZE_THRESHOLD_META_KEY = b"lance-encoding:blob-inline-size-threshold"
 _BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY = (
@@ -32,6 +39,8 @@ _BLOB_PACK_FILE_SIZE_THRESHOLD_META_KEY = (
     b"lance-encoding:blob-pack-file-size-threshold"
 )
 _MAX_RUST_USIZE = ctypes.c_size_t(-1).value
+# Default sequential read-ahead size in bytes.
+DEFAULT_BLOB_BUFFER_SIZE = 512 * 1024
 
 
 @dataclass(frozen=True)
@@ -385,58 +394,239 @@ class BlobColumn:
         return BlobIterator(iter(self.blob_column))
 
 
-class BlobFile(io.RawIOBase):
-    """Represents a blob in a Lance dataset as a file-like object."""
+def _lance_blob_file(blob_file: Optional[BlobFile]) -> Optional[LanceBlobFile]:
+    if blob_file is None:
+        return None
+    if not isinstance(blob_file, BlobFile):
+        raise TypeError(
+            f"Expected a lance.BlobFile or None, got {type(blob_file).__name__}"
+        )
+    return blob_file.inner
 
-    def __init__(self, inner: LanceBlobFile):
-        """
-        Internal only:  To obtain a BlobFile use
-        :py:meth:`lance.dataset.Dataset.take_blobs`.
-        """
+
+def read_blob_files(
+    blob_files: Sequence[Optional[BlobFile]],
+    *,
+    io_buffer_size: Optional[int] = None,
+    io_parallelism: Optional[int] = None,
+    preserve_order: Optional[bool] = None,
+) -> List[Tuple[int, Optional[bytes]]]:
+    """
+    Read whole blobs through :py:class:`lance.BlobFile` handles you already hold.
+
+    Row-based reads resolve descriptors on every call. Handles returned by
+    :py:meth:`lance.LanceDataset.take_blobs` already hold those descriptors.
+    When reading the same blobs repeatedly, take them once and pass them here:
+    each call then issues only the payload requests, planned, coalesced
+    across handles that share a backing file, and executed in Rust.
+
+    Every handle produces one result. Pass ``None`` for a null blob to get
+    ``None`` back.
+    Handles retain their resolved source and range across later dataset commits.
+    Referenced payload files must remain retained. External objects follow their
+    storage provider's consistency semantics. Reading does not move a handle's
+    cursor. A handle that is already closed when the read stream is created
+    raises ``ValueError``; closing it afterwards does not cancel reads that
+    were already planned. Empty and all-``None`` inputs issue no storage
+    requests.
+
+    Parameters
+    ----------
+    blob_files : Sequence[Optional[BlobFile]]
+        Handles returned by ``take_blobs``, or ``None`` for null blobs.
+    io_buffer_size : int, optional
+        Positive byte budget for planned physical reads. Defaults to the first
+        non-null handle's object store. One oversized request runs alone.
+    io_parallelism : int, optional
+        Maximum concurrent physical read plans. Must be positive.
+        Defaults to the first non-null handle's object store.
+    preserve_order : bool, optional
+        If True (the default), results follow the order of ``blob_files``.
+        If False, ``request_index`` still identifies every result.
+
+    Examples
+    --------
+    .. code-block:: python
+
+        handles = dataset.take_blobs("images", indices=[0, 1, 2])
+        payloads = [data for _, data in lance.read_blob_files(handles)]
+
+    Returns
+    -------
+    results : List[Tuple[int, Optional[bytes]]]
+        One ``(request_index, data)`` pair per handle, where
+        ``request_index`` is the handle's position in ``blob_files``. Valid
+        empty blobs return ``b""``.
+    """
+    return _read_blob_files(
+        [_lance_blob_file(blob_file) for blob_file in blob_files],
+        io_buffer_size=io_buffer_size,
+        io_parallelism=io_parallelism,
+        preserve_order=preserve_order,
+    )
+
+
+def read_blob_file_ranges(
+    requests: Sequence[Tuple[Optional[BlobFile], int, int]],
+    *,
+    io_buffer_size: Optional[int] = None,
+    io_parallelism: Optional[int] = None,
+    preserve_order: Optional[bool] = None,
+) -> List[Tuple[int, Optional[bytes]]]:
+    """
+    Read blob-local byte ranges through :py:class:`lance.BlobFile` handles
+    you already hold.
+
+    Like :py:func:`read_blob_files`, this skips descriptor reads.
+    Each request is a ``(blob_file, offset, length)`` tuple. Repeat a handle
+    to read several ranges from one blob; ranges on the same backing file
+    are coalesced across handles.
+
+    Every request produces one result. A request whose handle is ``None``
+    returns ``None``, and its range is not checked against a blob size.
+    Empty ranges on a handle return ``b""`` without payload I/O. For every
+    request, offset plus length must fit in an unsigned 64-bit integer, and
+    a range on a handle must not extend beyond the blob's size. Handles are
+    read as described in :py:func:`read_blob_files`.
+
+    Parameters
+    ----------
+    requests : Sequence[Tuple[Optional[BlobFile], int, int]]
+        Complete ``(blob_file, offset, length)`` requests.
+    io_buffer_size : int, optional
+        Positive byte budget for planned physical reads. Defaults to the first
+        non-null handle's object store. One oversized request runs alone.
+    io_parallelism : int, optional
+        Maximum concurrent physical read plans. Must be positive.
+        Defaults to the first non-null handle's object store.
+    preserve_order : bool, optional
+        If True (the default), results follow request order. If False,
+        ``request_index`` still identifies every result.
+
+    Examples
+    --------
+    Read a shard index from the end of a blob, then two chunks from it:
+
+    .. code-block:: python
+
+        (shard,) = dataset.take_blobs("shards", indices=[7])
+        [(_, index)] = lance.read_blob_file_ranges(
+            [(shard, shard.size() - 1024, 1024)]
+        )
+        chunks = lance.read_blob_file_ranges(
+            [(shard, 0, 4096), (shard, 4096, 4096)]
+        )
+
+    Returns
+    -------
+    results : List[Tuple[int, Optional[bytes]]]
+        One ``(request_index, data)`` pair per request. The Python list
+        retains all returned payload bytes in memory.
+    """
+    return _read_blob_file_ranges(
+        [
+            (_lance_blob_file(blob_file), offset, length)
+            for blob_file, offset, length in requests
+        ],
+        io_buffer_size=io_buffer_size,
+        io_parallelism=io_parallelism,
+        preserve_order=preserve_order,
+    )
+
+
+class BlobFile(io.BufferedIOBase):
+    """Represents a blob in a Lance dataset as a file-like object.
+
+    ``read_range`` and ``read_ranges`` do not use the sequential buffer and
+    do not change the sequential cursor.
+
+    Obtain a handle from :py:meth:`lance.LanceDataset.take_blobs`.
+    """
+
+    def __init__(
+        self,
+        inner: LanceBlobFile,
+        buffer_size: int = DEFAULT_BLOB_BUFFER_SIZE,
+    ):
+        super().__init__()
         self.inner = inner
+        self.inner.set_buffer_size(_validate_buffer_size(buffer_size))
+        self._raw = _RawBlobFile(inner)
 
-    ## Note: most methods undocumented since they are defined by
-    ## the base class.
     def close(self) -> None:
-        self.inner.close()
+        self._raw.close()
 
     @property
     def closed(self) -> bool:
-        return self.inner.is_closed()
+        return self._raw.closed
 
     def readable(self) -> bool:
         return True
 
     def seek(self, offset: int, whence: int = io.SEEK_SET) -> int:
-        if whence == io.SEEK_SET:
-            self.inner.seek(offset)
-        elif whence == io.SEEK_CUR:
-            self.inner.seek(self.inner.tell() + offset)
-        elif whence == io.SEEK_END:
-            self.inner.seek(self.inner.size() + offset)
-        else:
-            raise ValueError(f"Invalid whence: {whence}")
-
-        return self.inner.tell()
+        return self._raw.seek(offset, whence)
 
     def seekable(self) -> bool:
         return True
 
     def tell(self) -> int:
-        return self.inner.tell()
+        return self._raw.tell()
 
     def size(self) -> int:
         """
         Returns the size of the blob in bytes.
         """
-        return self.inner.size()
+        return self._raw.size()
+
+    def read(self, size: int = -1) -> bytes:
+        if self.closed:
+            raise ValueError("read of closed file")
+        if size is None or size < 0:
+            return self._raw.readall()
+        if size == 0:
+            return b""
+        buf = bytearray(size)
+        n = self.readinto(buf)
+        if n == size:
+            return bytes(buf)
+        return bytes(buf[:n])
+
+    def read1(self, size: int = -1) -> bytes:
+        if self.closed:
+            raise ValueError("read of closed file")
+        if size is None or size < 0:
+            size = io.DEFAULT_BUFFER_SIZE
+        return self._raw.read(size)
 
     def readall(self) -> bytes:
-        return self.inner.readall()
+        if self.closed:
+            raise ValueError("read of closed file")
+        return self._raw.readall()
+
+    def readinto(self, b) -> int:
+        if isinstance(b, bytearray):
+            if self.closed:
+                raise ValueError("readinto of closed file")
+            if not b:
+                return 0
+            n = self._raw.readinto(b)
+            if n == 0 or n == len(b):
+                return n
+            return n + self._refill_readinto(memoryview(b)[n:])
+
+        view = memoryview(b).cast("B")
+        if view.readonly:
+            raise TypeError(
+                "readinto() argument must be read-write bytes-like object, "
+                f"not {type(b).__name__}"
+            )
+        if self.closed:
+            raise ValueError("readinto of closed file")
+        return self._refill_readinto(view)
 
     def read_range(self, offset: int, length: int) -> bytes:
         """Read a blob-local byte range without changing the current cursor."""
-        return self.inner.read_range(offset, length)
+        return self._raw.read_range(offset, length)
 
     def read_ranges(self, ranges: list[tuple[int, int]]) -> list[bytes]:
         """
@@ -458,10 +648,83 @@ class BlobFile(io.RawIOBase):
         data : List[bytes]
             One payload per requested range, in input order.
         """
-        return self.inner.read_ranges(ranges)
-
-    def readinto(self, b: bytearray) -> int:
-        return self.inner.read_into(b)
+        return self._raw.read_ranges(ranges)
 
     def __repr__(self) -> str:
         return f"<BlobFile size={self.size()}>"
+
+    def _refill_readinto(self, view) -> int:
+        filled = 0
+        while filled < len(view):
+            n = self._raw.readinto(view[filled:])
+            if n == 0:
+                break
+            filled += n
+        return filled
+
+
+class _RawBlobFile(io.RawIOBase):
+    """One inner ``read_up_to`` per ``read`` / ``readinto``."""
+
+    def __init__(self, inner: LanceBlobFile):
+        self.inner = inner
+
+    def close(self) -> None:
+        self.inner.close()
+
+    @property
+    def closed(self) -> bool:
+        return self.inner.is_closed()
+
+    def readable(self) -> bool:
+        return True
+
+    def seek(self, offset: int, whence: int = io.SEEK_SET) -> int:
+        if whence == io.SEEK_SET:
+            position = offset
+        elif whence == io.SEEK_CUR:
+            position = self.inner.tell() + offset
+        elif whence == io.SEEK_END:
+            position = self.inner.size() + offset
+        else:
+            raise ValueError(f"Invalid whence: {whence}")
+        if position < 0:
+            raise ValueError(f"negative seek value {position}")
+        self.inner.seek(position)
+        return self.inner.tell()
+
+    def seekable(self) -> bool:
+        return True
+
+    def tell(self) -> int:
+        return self.inner.tell()
+
+    def size(self) -> int:
+        return self.inner.size()
+
+    def readall(self) -> bytes:
+        return self.inner.readall()
+
+    def read_range(self, offset: int, length: int) -> bytes:
+        return self.inner.read_range(offset, length)
+
+    def read_ranges(self, ranges: list[tuple[int, int]]) -> list[bytes]:
+        return self.inner.read_ranges(ranges)
+
+    def readinto(self, b) -> int:
+        # The Rust binding requires bytearray.
+        if isinstance(b, bytearray):
+            return self.inner.read_into(b)
+        view = memoryview(b).cast("B")
+        buffer = bytearray(len(view))
+        bytes_read = self.inner.read_into(buffer)
+        view[:bytes_read] = buffer[:bytes_read]
+        return bytes_read
+
+
+def _validate_buffer_size(buffer_size: int) -> int:
+    if isinstance(buffer_size, bool) or not isinstance(buffer_size, int):
+        raise TypeError(f"buffer_size must be an int, got {type(buffer_size).__name__}")
+    if buffer_size < 0:
+        raise ValueError("buffer_size must be non-negative")
+    return buffer_size
