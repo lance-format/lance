@@ -51,8 +51,6 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Field as ArrowField, Schema, Schema as ArrowSchema};
 use arrow_select::concat::concat_batches;
 use async_trait::async_trait;
-use datafusion::physical_plan::SendableRecordBatchStream;
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use lance_arrow::{BLOB_META_KEY, FixedSizeListArrayExt};
 use lance_core::Error;
 use lance_core::ROW_ID;

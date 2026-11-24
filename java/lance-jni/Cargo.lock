@@ -4093,6 +4093,7 @@ dependencies = [
  "half",
  "lance-arrow",
  "lance-core",
+ "lance-io",
  "lance-jsonb",
  "log",
  "pin-project",

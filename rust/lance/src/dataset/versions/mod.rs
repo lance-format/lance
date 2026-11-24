@@ -14,7 +14,6 @@ use std::{
 
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use datafusion::catalog::Session;
-use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
 use futures::{StreamExt, TryStreamExt};
@@ -23,15 +22,16 @@ use lance_core::{
     Error, Result,
     datatypes::{Field, Projection, Schema, SchemaCompareOptions},
 };
-use lance_datafusion::chunker::{
-    break_stream, break_stream_with_sizes, chunk_stream, chunk_stream_with_sizes,
-};
 use lance_file::{
     version::ConcreteFileVersion,
     versions as file_versions,
     writer::{FileWriter, FileWriterOptions},
 };
 use lance_io::object_store::ObjectStore;
+use lance_io::stream::SendableRecordBatchStream;
+use lance_io::stream::chunker::{
+    break_stream, break_stream_with_sizes, chunk_stream, chunk_stream_with_sizes,
+};
 use lance_io::traits::Writer as ObjectWriter;
 use lance_table::feature_flags::FLAG_MIXED_DATA_FILE_VERSIONS;
 use lance_table::format::{DataFile, DataStorageFormat, Fragment, Manifest};
