@@ -21,7 +21,6 @@ use super::planning::{
 };
 use super::remapping::{self, IndexRemapperOptions};
 use crate::Dataset;
-use crate::dataset::fragment::FileFragment;
 use crate::dataset::transaction::{
     Operation, RewriteGroup, RewrittenIndex, Transaction, TransactionBuilder,
 };
@@ -29,7 +28,6 @@ use crate::index::frag_reuse::build_new_frag_reuse_index;
 use crate::index::frag_reuse_with_stable_row_ids::ensure_frag_reuse_recording_allowed;
 use crate::index::loading::load_all_indices;
 use crate::io::commit::{CommitTransactionOptions, commit_transaction};
-use crate::io::deletion::read_dataset_deletion_file;
 use lance_core::utils::row_addr_remap::{GroupInput, RowAddrRemap};
 use lance_core::{Error, Result};
 use lance_index::frag_reuse::{FRAG_REUSE_INDEX_NAME, FragReuseGroup};
@@ -642,25 +640,9 @@ pub async fn normalize_source_fragments(
     dataset: &Dataset,
     fragments: &[Fragment],
 ) -> Result<Vec<Fragment>> {
-    let mut normalized = Vec::with_capacity(fragments.len());
-    for fragment in fragments {
-        let mut fragment = fragment.clone();
-        if fragment.physical_rows.is_none() {
-            let file_fragment = FileFragment::new(Arc::new(dataset.clone()), fragment.clone());
-            fragment.physical_rows = Some(file_fragment.physical_rows().await?);
-        }
-        if fragment
-            .deletion_file
-            .as_ref()
-            .is_some_and(|deletion| deletion.num_deleted_rows.is_none())
-        {
-            let deletion_file = fragment.deletion_file.as_ref().unwrap();
-            let count = read_dataset_deletion_file(dataset, fragment.id, deletion_file)
-                .await?
-                .len();
-            fragment.deletion_file.as_mut().unwrap().num_deleted_rows = Some(count);
-        }
-        normalized.push(fragment);
-    }
-    Ok(normalized)
+    lance_table_runtime::frag_reuse::normalize_source_fragments(
+        &dataset.table_view().to_table(),
+        fragments,
+    )
+    .await
 }

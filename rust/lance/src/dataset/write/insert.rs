@@ -188,7 +188,7 @@ impl<'a> InsertBuilder<'a> {
             commit_builder = commit_builder.with_inherited_field_ids();
         }
 
-        commit_builder.execute(transaction).await
+        Box::pin(commit_builder.execute(transaction)).await
     }
 
     async fn write_uncommitted_impl(
@@ -232,7 +232,7 @@ impl<'a> InsertBuilder<'a> {
         stream: SendableRecordBatchStream,
         schema: Schema,
     ) -> Result<(Transaction, WriteContext<'_>)> {
-        let mut context = self.resolve_context().await?;
+        let mut context = Box::pin(self.resolve_context()).await?;
 
         info!(
             target: TRACE_DATASET_EVENTS,

@@ -15,10 +15,7 @@ use arrow_schema::{DataType as ArrowDataType, Field as ArrowField};
 use bytes::Bytes;
 use futures::FutureExt;
 use futures::future::BoxFuture;
-use lance_arrow::{
-    BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY, BLOB_INLINE_SIZE_THRESHOLD_META_KEY,
-    BLOB_PACK_FILE_SIZE_THRESHOLD_META_KEY, FieldExt, list::ListArrayExt, r#struct::StructArrayExt,
-};
+use lance_arrow::{FieldExt, list::ListArrayExt, r#struct::StructArrayExt};
 use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
 use object_store::path::Path;
 
@@ -33,14 +30,19 @@ use crate::blob::{
     validate_prepared_blob_array,
 };
 use crate::dataset::write::ExternalBlobMode;
-use lance_core::datatypes::{BlobKind, BlobV2Layout, Schema};
+use lance_core::datatypes::{BlobKind, BlobV2Layout};
 use lance_core::{Error, Result};
 use lance_io::traits::Reader;
 use lance_table::feature_flags::MANAGED_BLOBS_META_KEY;
 
-pub(super) const INLINE_MAX: usize = 64 * 1024; // 64KB inline cutoff
-const DEDICATED_THRESHOLD: usize = 4 * 1024 * 1024; // 4MB dedicated cutoff
-const PACK_FILE_MAX_SIZE: usize = 1024 * 1024 * 1024; // 1GiB per .pack sidecar
+#[cfg(test)]
+use lance_table_runtime::blob::thresholds::DEDICATED_THRESHOLD;
+pub(super) use lance_table_runtime::blob::thresholds::INLINE_MAX;
+pub(in crate::dataset) use lance_table_runtime::blob::thresholds::{
+    blob_dedicated_threshold_from_metadata, blob_inline_threshold_from_metadata,
+    blob_pack_file_threshold_from_metadata,
+};
+
 // Some Reader implementations buffer a whole requested range.
 const BLOB_SOURCE_MAX_REQUEST_SIZE: usize = 8 * 1024 * 1024;
 
@@ -95,79 +97,6 @@ fn new_managed_payload(
         created_payloads.record(object_store, &path);
     }
     (location, path)
-}
-
-pub(in crate::dataset) fn blob_inline_threshold_from_metadata(
-    metadata: &HashMap<String, String>,
-    field_name: &str,
-) -> Result<usize> {
-    blob_threshold_from_metadata(
-        metadata,
-        field_name,
-        BLOB_INLINE_SIZE_THRESHOLD_META_KEY,
-        INLINE_MAX,
-        true,
-    )
-}
-
-pub(in crate::dataset) fn blob_dedicated_threshold_from_metadata(
-    metadata: &HashMap<String, String>,
-    field_name: &str,
-) -> Result<usize> {
-    blob_threshold_from_metadata(
-        metadata,
-        field_name,
-        BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY,
-        DEDICATED_THRESHOLD,
-        false,
-    )
-}
-
-pub(in crate::dataset) fn blob_pack_file_threshold_from_metadata(
-    metadata: &HashMap<String, String>,
-    field_name: &str,
-) -> Result<usize> {
-    blob_threshold_from_metadata(
-        metadata,
-        field_name,
-        BLOB_PACK_FILE_SIZE_THRESHOLD_META_KEY,
-        PACK_FILE_MAX_SIZE,
-        false,
-    )
-}
-
-fn blob_threshold_from_metadata(
-    metadata: &HashMap<String, String>,
-    field_name: &str,
-    key: &str,
-    default_value: usize,
-    allow_zero: bool,
-) -> Result<usize> {
-    let Some(value) = metadata.get(key) else {
-        return Ok(default_value);
-    };
-    let threshold = value.parse::<usize>().map_err(|_| {
-        Error::invalid_input(format!(
-            "Invalid blob threshold metadata {key}={value:?} for field '{field_name}'; \
-             expected a non-negative integer that fits in usize"
-        ))
-    })?;
-    if !allow_zero && threshold == 0 {
-        return Err(Error::invalid_input(format!(
-            "Invalid blob threshold metadata {key}={value:?} for field '{field_name}'; \
-             expected a positive integer"
-        )));
-    }
-    Ok(threshold)
-}
-
-pub(in crate::dataset) fn validate_blob_threshold_metadata(schema: &Schema) -> Result<()> {
-    for field in schema.fields_pre_order().filter(|field| field.is_blob_v2()) {
-        blob_inline_threshold_from_metadata(&field.metadata, &field.name)?;
-        blob_dedicated_threshold_from_metadata(&field.metadata, &field.name)?;
-        blob_pack_file_threshold_from_metadata(&field.metadata, &field.name)?;
-    }
-    Ok(())
 }
 
 enum BlobPackAddress {

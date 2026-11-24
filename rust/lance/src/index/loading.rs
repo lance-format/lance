@@ -47,8 +47,7 @@ use lance_io::utils::{
     CachedFileSize, read_last_block, read_message, read_message_from_buf, read_metadata_offset,
     read_version,
 };
-use lance_table::format::{Fragment, IndexMetadata, SelfDescribingFileReader};
-use lance_table::io::manifest::read_manifest_indexes;
+use lance_table::format::{Fragment, IndexMetadata, Manifest, SelfDescribingFileReader};
 use roaring::RoaringBitmap;
 use tracing::{info, instrument};
 use uuid::Uuid;
@@ -66,13 +65,10 @@ use crate::index::segment::{
 use crate::index::vector;
 use crate::index::vector::{
     LogicalVectorIndex,
-    details::{infer_missing_vector_details, needs_vector_details_inference},
     ivf::v2::{IVFIndex, IvfOpenContext, IvfStateEntryBox, aux_file_key},
     utils::get_vector_type,
 };
-use crate::session::index_caches::{
-    DerivedIndexListingKey, FragReuseIndexKey, IndexMetadataKey, write_index_identity,
-};
+use crate::session::index_caches::{FragReuseIndexKey, write_index_identity};
 use crate::{Dataset, Error, Result};
 
 // Cache keys for different index types
@@ -311,7 +307,7 @@ pub(crate) async fn open_index_proto(reader: &dyn Reader) -> Result<pb::Index> {
 /// runs on every call, and `load_indices` sits on the query-planning path and on
 /// merge_insert's per-batch path. Warning there would cost an operator one line
 /// per hidden index per query for as long as the dataset carries one.
-pub(crate) fn warn_about_unsupported_indices(indices: &[IndexMetadata]) {
+pub(crate) fn warn_about_unsupported_indices(manifest: &Manifest, indices: &[IndexMetadata]) {
     for idx in indices {
         if !index_type_is_known(idx) {
             let type_url = idx
@@ -339,6 +335,7 @@ pub(crate) fn warn_about_unsupported_indices(indices: &[IndexMetadata]) {
             );
         }
     }
+    warn_about_indices_hidden_by_frag_reuse(manifest, indices);
 }
 
 /// Every index the manifest names, including any this build has no reader for.
@@ -353,113 +350,9 @@ pub(crate) fn warn_about_unsupported_indices(indices: &[IndexMetadata]) {
 /// reservation, replace and removal selection, explicit drop - answers that
 /// second question too: a name it cannot see is a name it will hand out twice.
 pub(crate) async fn load_all_indices(dataset: &Dataset) -> Result<Arc<Vec<IndexMetadata>>> {
-    let metadata_key = IndexMetadataKey {
-        version: dataset.manifest.version,
-        store_identity: &dataset.table_state.object_store.store_prefix,
-        e_tag: dataset.table_state.manifest_location.e_tag.as_deref(),
-    };
-    let mut indices = dataset
-        .index_cache
-        .get_or_insert_with_key(metadata_key, || async {
-            let loaded = read_manifest_indexes(
-                &dataset.table_state.object_store,
-                &dataset.table_state.manifest_location,
-                &dataset.manifest,
-            )
-            .await?;
-            warn_about_unsupported_indices(&loaded);
-            warn_about_indices_hidden_by_frag_reuse(&dataset.manifest, &loaded);
-            Ok(loaded)
-        })
-        .await?;
-
-    // Infer details for legacy vector indices (once per index name, concurrently).
-    // This may run on indices that were opportunistically cached during Dataset::open
-    // before the full Dataset was available for inference.
-    {
-        let schema = dataset.schema();
-        if indices
-            .iter()
-            .any(|idx| needs_vector_details_inference(idx, schema))
-        {
-            let mut updated = indices.as_ref().clone();
-            infer_missing_vector_details(dataset, &mut updated).await;
-            if updated != *indices {
-                indices = Arc::new(updated);
-                dataset
-                    .index_cache
-                    .insert_with_key(&metadata_key, indices.clone())
-                    .await;
-            }
-        }
-    }
-
-    // Legacy FRI index version 0 is handled below by directly remapping fragment coverage.
-    // For version 1 and above, load_indices handles version checks and filters index
-    // segments for query use; keep their metadata unchanged here.
-    if indices
-        .iter()
-        .any(lance_table::system_index::frag_reuse::metadata::is_tagged)
-    {
-        if indices
-            .iter()
-            .filter(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
-            .count()
-            != 1
-        {
-            return Err(Error::corrupt_file_named(
-                "FRI metadata",
-                "tagged history requires a single FRI entry",
-            ));
-        }
-        // Commit bookkeeping carries the original Any unchanged. Only query
-        // loading or an operation consuming FRI needs to interpret its encoding.
-        return Ok(indices);
-    }
-    if let Some(frag_reuse_index_meta) =
-        indices.iter().find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
-    {
-        // Query planning loads the listing several times per scan, and each
-        // remap walks the whole reuse history.
-        let remapped_key = DerivedIndexListingKey {
-            version: metadata_key.version,
-            store_identity: metadata_key.store_identity,
-            e_tag: metadata_key.e_tag,
-        };
-        if let Some(remapped) = dataset.index_cache.get_with_key(&remapped_key).await {
-            return Ok(remapped);
-        }
-        let identity = frag_reuse::v0_cache_identity(dataset, frag_reuse_index_meta);
-        let fri_key = FragReuseIndexKey { uuid: &identity };
-        let frag_reuse_index = dataset
-            .index_cache
-            .get_or_insert_with_key(fri_key, || async move {
-                let index_details =
-                    load_frag_reuse_index_details(dataset, frag_reuse_index_meta).await?;
-                open_frag_reuse_index(frag_reuse_index_meta.uuid, index_details.as_ref()).await
-            })
-            .await?;
-        let mut remapped = indices.as_ref().clone();
-        for idx in remapped.iter_mut() {
-            if let Some(bitmap) = idx.fragment_bitmap.as_mut() {
-                frag_reuse_index.remap_fragment_bitmap(bitmap)?;
-            }
-        }
-        let remapped = Arc::new(remapped);
-        // A later call may still infer the missing details; don't pin this list.
-        if !indices
-            .iter()
-            .any(|idx| needs_vector_details_inference(idx, dataset.schema()))
-        {
-            dataset
-                .index_cache
-                .insert_with_key(&remapped_key, remapped.clone())
-                .await;
-        }
-        Ok(remapped)
-    } else {
-        Ok(indices)
-    }
+    let hook = crate::io::commit::LanceCommitHook::new(dataset.session.clone());
+    lance_table_runtime::commit::load_all_indices(&dataset.table_view().to_table(), Some(&hook))
+        .await
 }
 
 /// The segments named `name`, including any this build has no reader for.

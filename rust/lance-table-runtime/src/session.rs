@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use lance_core::cache::{CacheMetricsKind, LanceCache, QuickCacheBackend, QuickCacheShardPolicy};
 use lance_io::object_store::ObjectStoreRegistry;
-use lance_table::format::IndexMetadata;
+use lance_table::format::{IndexMetadata, Manifest};
 
 use crate::caches::GlobalMetadataCache;
 
@@ -33,7 +33,7 @@ pub struct TableSession {
     index_cache: LanceCache,
     store_registry: Arc<ObjectStoreRegistry>,
     unregistered_external_blob_policy: UnregisteredExternalBlobPolicy,
-    index_metadata_observer: Option<fn(&[IndexMetadata])>,
+    index_metadata_observer: Option<fn(&Manifest, &[IndexMetadata])>,
 }
 
 impl TableSession {
@@ -56,10 +56,13 @@ impl TableSession {
         }
     }
 
-    /// Receive raw index metadata when a manifest read prefetches its index
+    /// Receive the manifest and its raw index metadata when reading the index
     /// section. The runtime treats each index's implementation details as opaque.
     #[doc(hidden)]
-    pub fn with_index_metadata_observer(mut self, observer: fn(&[IndexMetadata])) -> Self {
+    pub fn with_index_metadata_observer(
+        mut self,
+        observer: fn(&Manifest, &[IndexMetadata]),
+    ) -> Self {
         self.index_metadata_observer = Some(observer);
         self
     }
@@ -68,15 +71,20 @@ impl TableSession {
         &self,
         uri: &str,
         key: &crate::caches::IndexMetadataKey<'_>,
+        manifest: &Manifest,
         indices: Vec<IndexMetadata>,
     ) {
-        if let Some(observer) = self.index_metadata_observer {
-            observer(&indices);
-        }
+        self.observe_index_metadata(manifest, &indices);
         self.index_cache
             .with_key_prefix(uri)
             .insert_with_key(key, Arc::new(indices))
             .await;
+    }
+
+    pub(crate) fn observe_index_metadata(&self, manifest: &Manifest, indices: &[IndexMetadata]) {
+        if let Some(observer) = self.index_metadata_observer {
+            observer(manifest, indices);
+        }
     }
 
     /// The shared cache for table and file metadata.

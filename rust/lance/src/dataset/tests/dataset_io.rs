@@ -5583,7 +5583,7 @@ async fn forge_legacy_nullable_primary_key(uri: &str, with_mem_wal: bool) -> Dat
     // make building the fixture depend on the very validation these tests
     // exercise, so a regression would show up as a fixture that cannot be
     // built rather than as the behaviour under test changing.
-    manifest.set_timestamp(crate::dataset::timestamp_to_nanos(None));
+    manifest.set_timestamp(crate::utils::temporal::timestamp_to_nanos(None));
     manifest.update_max_fragment_id();
     dataset
         .table_state
