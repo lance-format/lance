@@ -514,7 +514,8 @@ impl FileFragment {
     /// * Field ids are distinct between data files.
     /// * The deletion file exists and has row offsets in the correct range.
     /// * [`Fragment::physical_rows`], when present, matches the data-file length.
-    /// * [`DeletionFile::num_deleted_rows`], when present, matches the deletion-vector length.
+    /// * [`DeletionFile::num_deleted_rows`](lance_table::format::DeletionFile::num_deleted_rows),
+    ///   when present, matches the deletion-vector length.
     ///
     /// When no file holds user data, the fragment is accepted if the manifest contains
     /// writer-version metadata, [`Fragment::physical_rows`] is present, and the

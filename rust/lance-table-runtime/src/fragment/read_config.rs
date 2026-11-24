@@ -93,8 +93,8 @@ pub struct FragReadConfig {
     ///
     /// Deleted rows have null `_rowid` and `_rowaddr` values when those columns
     /// are enabled. Payload and row-version columns are unchanged.
-    /// [`FileFragment::open`] requires `with_row_id` or `with_row_address` when
-    /// this is true. Defaults to false.
+    /// [`FileFragment::open`](super::FileFragment::open) requires `with_row_id` or
+    /// `with_row_address` when this is true. Defaults to false.
     pub make_deletions_null: bool,
     // Add the last updated at version column
     pub with_row_last_updated_at_version: bool,

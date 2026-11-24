@@ -39,7 +39,7 @@ const LINEAGE_COLUMNS: [(&str, i32); 3] = [
 ];
 
 /// The hidden column a spilled lineage sequence is stored in: a non-nullable
-/// `UInt64` named after the sequence in [`LINEAGE_COLUMNS`], under its
+/// `UInt64` named after the sequence in `LINEAGE_COLUMNS`, under its
 /// reserved `field_id`.
 pub fn lineage_field(field_id: i32) -> Result<lance_core::datatypes::Field> {
     let (name, _) = LINEAGE_COLUMNS
