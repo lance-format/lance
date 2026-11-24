@@ -410,52 +410,26 @@ impl AddRowOffsetExec {
         input: Arc<dyn ExecutionPlan>,
         dataset: Arc<Dataset>,
     ) -> LanceResult<Self> {
-        let frag_id_to_offset = Self::compute_frag_id_to_offset(dataset).await?;
-        Self::internal_new(input, frag_id_to_offset)
-    }
-
-    async fn compute_frag_id_to_offset(
-        dataset: Arc<Dataset>,
-    ) -> LanceResult<Arc<HashMap<u32, FragmentRowOffset>>> {
-        // On a metadata-cache miss, a deletion vector stored in a file costs an
-        // object-store read, so load them concurrently. `buffered`
-        // keeps fragment order, which the row-offset accumulation below needs.
-        let frag_infos = futures::stream::iter(dataset.get_fragments())
-            .map(|frag| async move {
-                let deletion_vector = frag.get_deletion_vector().await?;
-                // Should be sync unless the dataset was written by an extremely
-                // old lance version
-                let num_rows = frag.count_rows(None).await?;
-                Ok::<_, LanceError>((frag.id() as u32, deletion_vector, num_rows))
-            })
-            .buffered(dataset.table_state.object_store.io_parallelism())
-            .try_collect::<Vec<_>>()
+        let offsets = dataset
+            .table_view()
+            .to_table()
+            .fragment_row_offsets()
             .await?;
-
-        let mut frag_id_to_offset = HashMap::with_capacity(frag_infos.len());
-        let mut row_offset = 0;
-        for (frag_id, deletion_vector, num_rows) in frag_infos {
-            frag_id_to_offset.insert(
-                frag_id,
-                FragmentRowOffset {
-                    row_offset,
-                    deletion_vector,
-                },
-            );
-            row_offset += num_rows as u64;
-        }
-
-        Ok(Arc::new(frag_id_to_offset))
+        Self::internal_new(input, Arc::new(offsets))
     }
 
     pub async fn compute_row_offset_array(
         row_addr: &ArrayRef,
         dataset: Arc<Dataset>,
     ) -> Result<ArrayRef> {
-        let frag_id_to_offset = Self::compute_frag_id_to_offset(dataset).await?;
+        let frag_id_to_offset = dataset
+            .table_view()
+            .to_table()
+            .fragment_row_offsets()
+            .await?;
         Ok(Arc::new(compute_row_offset_array(
             row_addr.as_primitive::<UInt64Type>(),
-            frag_id_to_offset.as_ref(),
+            &frag_id_to_offset,
         )?))
     }
 }

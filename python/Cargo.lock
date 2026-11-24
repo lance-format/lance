@@ -4703,6 +4703,7 @@ dependencies = [
  "arrow-select",
  "async-trait",
  "byteorder",
+ "bytes",
  "chrono",
  "futures",
  "itertools 0.14.0",

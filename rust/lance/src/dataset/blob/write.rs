@@ -772,8 +772,8 @@ impl BlobPreprocessor {
                 (&self.object_store, path, 0, *size)
             }
             BlobWriteObject::Stored(file) => (
-                file.source.object_store.as_ref(),
-                file.source.path.clone(),
+                file.object_store().as_ref(),
+                file.data_path().clone(),
                 file.position(),
                 file.size(),
             ),

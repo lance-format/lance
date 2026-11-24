@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::num::NonZero;
 use std::sync::Arc;
 
 use arrow_array::types::{Int32Type, UInt64Type};
@@ -11,15 +10,13 @@ use futures::{StreamExt, TryStreamExt};
 use lance_core::datatypes::Schema;
 use lance_core::utils::{address::RowAddress, deletion::DeletionVector};
 use lance_core::{ROW_ADDR, ROW_CREATED_AT_VERSION, ROW_ID, ROW_LAST_UPDATED_AT_VERSION, Result};
-use lance_file::{version::ConcreteFileVersion, versions};
+use lance_file::version::ConcreteFileVersion;
 use lance_io::object_store::ObjectStore;
-use lance_table::feature_flags::apply_feature_flags;
 use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
 use lance_table::format::{
-    DataFile, DataStorageFormat, Fragment, Manifest, ROW_CREATED_AT_VERSION_FIELD_ID,
-    ROW_ID_FIELD_ID, ROW_LAST_UPDATED_AT_VERSION_FIELD_ID, RowDatasetVersionMeta, RowIdMeta,
+    DataStorageFormat, Fragment, Manifest, ROW_CREATED_AT_VERSION_FIELD_ID, ROW_ID_FIELD_ID,
+    ROW_LAST_UPDATED_AT_VERSION_FIELD_ID, RowDatasetVersionMeta, RowIdMeta,
 };
-use lance_table::io::commit::{ManifestNamingScheme, write_manifest_file_to_path};
 use lance_table::io::deletion::write_deletion_file;
 use lance_table::rowids::{RowIdSequence, write_row_ids};
 use lance_table::utils::stream::ReadBatchFutStream;
@@ -27,8 +24,8 @@ use object_store::path::Path;
 
 use super::{FragReadConfig, resolve_actual_row_ids};
 use crate::Table;
-use crate::paths::DATA_DIR;
 use crate::rowids::{get_row_id_index, validate_stable_row_ids};
+use crate::test_util::{publish_manifest, write_file};
 
 #[test]
 fn test_resolve_actual_row_ids() {
@@ -80,34 +77,6 @@ fn test_resolve_actual_row_ids_matches_a_walk_over_live_rows() {
 
 const FILE_VERSION: ConcreteFileVersion = ConcreteFileVersion::V2_1;
 
-async fn write_file(store: &ObjectStore, base: &Path, name: &str, batch: &RecordBatch) -> DataFile {
-    let schema = Schema::try_from(batch.schema_ref().as_ref()).unwrap();
-    let field_ids = schema.field_ids();
-    let path = base.clone().join(DATA_DIR).join(name);
-    let file = store.create(&path).await.unwrap();
-    let mut writer =
-        versions::create_writer(FILE_VERSION, file, schema, Default::default()).unwrap();
-    writer.write_batch(batch).await.unwrap();
-    let summary = writer.finish().await.unwrap();
-
-    DataFile::new(
-        name,
-        field_ids,
-        (0..batch.num_columns() as i32).collect(),
-        FILE_VERSION,
-        NonZero::new(summary.size_bytes),
-        None,
-    )
-}
-
-async fn publish_manifest(store: &ObjectStore, base: &Path, manifest: &mut Manifest) {
-    apply_feature_flags(manifest, false, false).unwrap();
-    let path = ManifestNamingScheme::V2.manifest_path(base, manifest.version);
-    write_manifest_file_to_path(store, manifest, None, &path, None)
-        .await
-        .unwrap();
-}
-
 async fn combine(stream: ReadBatchFutStream) -> Result<RecordBatch> {
     let batches = stream.buffered(2).try_collect::<Vec<_>>().await?;
     Ok(concat_batches(batches[0].schema_ref(), &batches)?)
@@ -126,8 +95,8 @@ async fn reads_fragments_with_deletions_overlays_and_spilled_lineage() {
 
     let first = record_batch!(("id", Int32, [10, 20, 30, 40, 50])).unwrap();
     let second = record_batch!(("id", Int32, [60, 70])).unwrap();
-    let first_file = write_file(&store, &base, "first.lance", &first).await;
-    let second_file = write_file(&store, &base, "second.lance", &second).await;
+    let first_file = write_file(&store, &base, "first.lance", &first, FILE_VERSION).await;
+    let second_file = write_file(&store, &base, "second.lance", &second, FILE_VERSION).await;
 
     let lineage = record_batch!(
         (ROW_ID, UInt64, [100, 101, 102, 103, 104]),
@@ -135,7 +104,7 @@ async fn reads_fragments_with_deletions_overlays_and_spilled_lineage() {
         (ROW_LAST_UPDATED_AT_VERSION, UInt64, [1, 2, 3, 1, 3])
     )
     .unwrap();
-    let mut lineage_file = write_file(&store, &base, "lineage.lance", &lineage).await;
+    let mut lineage_file = write_file(&store, &base, "lineage.lance", &lineage, FILE_VERSION).await;
     lineage_file.fields = Arc::from([
         ROW_ID_FIELD_ID,
         ROW_CREATED_AT_VERSION_FIELD_ID,
@@ -146,12 +115,12 @@ async fn reads_fragments_with_deletions_overlays_and_spilled_lineage() {
     let newer = record_batch!(("id", Int32, [Some(333), None])).unwrap();
     let overlays = vec![
         DataOverlayFile {
-            data_file: write_file(&store, &base, "older.lance", &older).await,
+            data_file: write_file(&store, &base, "older.lance", &older, FILE_VERSION).await,
             coverage: OverlayCoverage::dense([1, 2, 4].into_iter().collect()),
             committed_version: 2,
         },
         DataOverlayFile {
-            data_file: write_file(&store, &base, "newer.lance", &newer).await,
+            data_file: write_file(&store, &base, "newer.lance", &newer, FILE_VERSION).await,
             coverage: OverlayCoverage::dense([2, 4].into_iter().collect()),
             committed_version: 3,
         },
@@ -307,7 +276,7 @@ async fn storage_statistics_require_full_file_metadata() {
         ("e", Int32, [1, 2])
     )
     .unwrap();
-    let file = write_file(&store, &base, "wide.lance", &batch).await;
+    let file = write_file(&store, &base, "wide.lance", &batch, FILE_VERSION).await;
     let fragment = Fragment {
         files: vec![file],
         physical_rows: Some(2),
