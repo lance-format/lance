@@ -439,7 +439,11 @@ impl StagedTransaction {
             )?);
         }
         let step = UserStep::new("append", actions);
-        let pins_base_version = step_pins_base_version(&step, &self.base.manifest)?;
+        // Managed and external Blob v2 descriptors bake staging base ids into
+        // immutable data files, so pin the base version once a base was added.
+        let pins_base_version = step_pins_base_version(&step, &self.base.manifest)?
+            || (self.state.next_local_base_id > 0
+                && schema_has_blob(&self.state.append_base.manifest.schema));
         let promotes_legacy_blob =
             step_promotes_legacy_blob(&self.state.append_base.manifest.schema, &step.actions);
         let next_working = self.state.working.apply_step_checked(&step)?;
@@ -970,6 +974,12 @@ fn preassigned_row_ids_pin_base(
                 .is_some_and(|range| *range.end() >= manifest.next_row_id))
         }
     }
+}
+
+fn schema_has_blob(schema: &Schema) -> bool {
+    schema
+        .fields_pre_order()
+        .any(|field| field.is_blob() || field.is_blob_v2())
 }
 
 /// A 2.2 or newer file promotes an unpromoted legacy blob field when the
@@ -4971,5 +4981,205 @@ mod tests {
             .map(|f| f.files[0].base_id)
             .collect();
         assert_eq!(base_ids, [None, Some(racer_id), Some(a_id), Some(b_id)]);
+    }
+
+    #[rstest]
+    #[case::uncontended(false)]
+    #[case::concurrent_conflict(true)]
+    #[tokio::test]
+    async fn test_staged_add_bases_with_managed_blob_v2(#[case] concurrent: bool) {
+        use crate::blob::{BlobArrayBuilder, blob_field};
+        use crate::dataset::blob::test_util::managed_blob_schema;
+        use lance_arrow::{
+            ARROW_EXT_NAME_KEY, BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY,
+            BLOB_INLINE_SIZE_THRESHOLD_META_KEY, BLOB_V2_EXT_NAME,
+        };
+        use lance_core::datatypes::BlobKind;
+
+        let dir = TempStrDir::default();
+        let staged_base = TempStrDir::default();
+        let racer_base = TempStrDir::default();
+        let field = blob_field("blob", true).with_metadata(HashMap::from([
+            (ARROW_EXT_NAME_KEY.to_string(), BLOB_V2_EXT_NAME.to_string()),
+            (
+                BLOB_INLINE_SIZE_THRESHOLD_META_KEY.to_string(),
+                "8".to_string(),
+            ),
+            (
+                BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY.to_string(),
+                "24".to_string(),
+            ),
+        ]));
+        let schema = Arc::new(managed_blob_schema(vec![field]));
+
+        let mut init_blobs = BlobArrayBuilder::new(1);
+        init_blobs.push_bytes(b"seed").unwrap();
+        let init_batch =
+            RecordBatch::try_new(schema.clone(), vec![init_blobs.finish().unwrap()]).unwrap();
+        let dataset = InsertBuilder::new(dir.as_str())
+            .with_params(&WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                ..Default::default()
+            })
+            .execute(vec![init_batch])
+            .await
+            .unwrap();
+
+        let payload = b"staged managed blob payload value";
+        let mut blobs = BlobArrayBuilder::new(1);
+        blobs.push_bytes(payload).unwrap();
+        let batch = RecordBatch::try_new(schema.clone(), vec![blobs.finish().unwrap()]).unwrap();
+
+        let mut tx = dataset.begin_transaction().await.unwrap();
+        tx.add_bases(vec![BasePath::new(
+            0,
+            staged_base.to_string(),
+            Some("blobs".into()),
+            true,
+        )])
+        .unwrap();
+        tx.append_with_params(
+            vec![batch],
+            &WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                target_base_names_or_paths: Some(vec!["blobs".into()]),
+                ..append_params()
+            },
+        )
+        .await
+        .unwrap();
+
+        if concurrent {
+            let mut racer = dataset.begin_transaction().await.unwrap();
+            racer
+                .add_bases(vec![BasePath::new(
+                    0,
+                    racer_base.to_string(),
+                    Some("racer".into()),
+                    true,
+                )])
+                .unwrap();
+            racer.commit().await.unwrap();
+
+            let err = tx.commit().await.unwrap_err();
+            assert!(
+                matches!(err, Error::RetryableCommitConflict { .. }),
+                "{err:?}"
+            );
+            return;
+        }
+
+        tx.commit().await.unwrap();
+        let reopened = Arc::new(Dataset::open(dir.as_str()).await.unwrap());
+        let base_id = reopened
+            .manifest
+            .base_paths
+            .values()
+            .find(|b| b.name.as_deref() == Some("blobs"))
+            .unwrap()
+            .id;
+        assert_eq!(
+            reopened.manifest.fragments[1].files[0].base_id,
+            Some(base_id)
+        );
+        let values = reopened
+            .take_blobs_by_indices(&[0, 1], "blob")
+            .await
+            .unwrap();
+        assert_eq!(values[1].as_ref().unwrap().kind(), BlobKind::Managed);
+        assert_eq!(
+            values[1].as_ref().unwrap().read().await.unwrap().as_ref(),
+            payload
+        );
+    }
+
+    #[rstest]
+    #[case::uncontended(false)]
+    #[case::concurrent_conflict(true)]
+    #[tokio::test]
+    async fn test_staged_add_bases_with_external_blob_v2_in_primary_file(#[case] concurrent: bool) {
+        use crate::blob::{BlobArrayBuilder, blob_field};
+        use arrow_schema::Schema as ArrowSchema;
+        use lance_core::datatypes::BlobKind;
+
+        let dir = TempStrDir::default();
+        let ext_base = lance_core::utils::tempfile::TempDir::default();
+        let racer_base = TempStrDir::default();
+        let payload = b"staged external blob payload value";
+        let ext_file = ext_base.std_path().join("payload.bin");
+        std::fs::write(&ext_file, payload).unwrap();
+        let ext_base_uri = format!("file://{}", ext_base.std_path().display());
+        let ext_file_uri = format!("file://{}", ext_file.display());
+
+        let schema = Arc::new(ArrowSchema::new(vec![blob_field("blob", true)]));
+        let mut init_blobs = BlobArrayBuilder::new(1);
+        init_blobs.push_bytes(b"seed").unwrap();
+        let init_batch =
+            RecordBatch::try_new(schema.clone(), vec![init_blobs.finish().unwrap()]).unwrap();
+        let dataset = InsertBuilder::new(dir.as_str())
+            .with_params(&WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                ..Default::default()
+            })
+            .execute(vec![init_batch])
+            .await
+            .unwrap();
+
+        let mut blobs = BlobArrayBuilder::new(1);
+        blobs.push_uri(ext_file_uri).unwrap();
+        let batch = RecordBatch::try_new(schema.clone(), vec![blobs.finish().unwrap()]).unwrap();
+
+        let mut tx = dataset.begin_transaction().await.unwrap();
+        tx.add_bases(vec![BasePath::new(
+            0,
+            ext_base_uri,
+            Some("ext".into()),
+            false,
+        )])
+        .unwrap();
+        // Write into the primary data file while the external descriptor points
+        // to the staged base.
+        tx.append_with_params(
+            vec![batch],
+            &WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                ..append_params()
+            },
+        )
+        .await
+        .unwrap();
+
+        if concurrent {
+            let mut racer = dataset.begin_transaction().await.unwrap();
+            racer
+                .add_bases(vec![BasePath::new(
+                    0,
+                    racer_base.to_string(),
+                    Some("racer".into()),
+                    true,
+                )])
+                .unwrap();
+            racer.commit().await.unwrap();
+
+            let err = tx.commit().await.unwrap_err();
+            assert!(
+                matches!(err, Error::RetryableCommitConflict { .. }),
+                "{err:?}"
+            );
+            return;
+        }
+
+        tx.commit().await.unwrap();
+        let reopened = Arc::new(Dataset::open(dir.as_str()).await.unwrap());
+        assert_eq!(reopened.manifest.fragments[1].files[0].base_id, None);
+        let values = reopened
+            .take_blobs_by_indices(&[0, 1], "blob")
+            .await
+            .unwrap();
+        assert_eq!(values[1].as_ref().unwrap().kind(), BlobKind::External);
+        assert_eq!(
+            values[1].as_ref().unwrap().read().await.unwrap().as_ref(),
+            payload
+        );
     }
 }
