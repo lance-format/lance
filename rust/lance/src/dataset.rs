@@ -2124,7 +2124,10 @@ impl Dataset {
         .await
     }
 
-    async fn apply_commit_with_expected_latest_version(
+    /// [`Self::apply_commit`] that lands only on `expected_latest_version`:
+    /// one attempt, no rebase, and a retryable conflict when a newer version
+    /// was committed first.
+    pub(crate) async fn apply_commit_with_expected_latest_version(
         &mut self,
         transaction: Transaction,
         write_config: &ManifestWriteConfig,
