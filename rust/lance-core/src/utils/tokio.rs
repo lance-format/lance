@@ -65,8 +65,9 @@ fn parse_env_usize(name: &str, raw: &str, min: usize) -> Result<usize, String> {
 
 /// Number of CPU cores held back for I/O and control tasks.
 ///
-/// Overridable via the `LANCE_IO_CORE_RESERVATION` environment variable; when
-/// unset it is [`default_io_core_reservation`] of the visible cores. `0` is
+/// Overridable via the `LANCE_IO_CORE_RESERVATION` environment variable. When
+/// unset it is a quarter of the visible logical CPUs, rounded down and capped
+/// at 2: `0` on up to 3 CPUs, `1` on 4 to 7, and `2` on 8 or more. `0` is
 /// allowed (reserve nothing); [`get_num_compute_intensive_cpus`] subtracts this
 /// from the core count to size the compute pool. A non-integer value panics on
 /// first access with an error naming the variable.
