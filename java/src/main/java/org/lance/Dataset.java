@@ -478,10 +478,11 @@ public class Dataset implements Closeable {
             namespaceClient,
             tableId,
             namespaceClientManagedVersioning);
-    dataset.allocator = allocator == null ? new RootAllocator(Long.MAX_VALUE) : allocator;
     dataset.separateDerivedAllocators = selfManagedAllocator;
     if (selfManagedAllocator) {
-      dataset.allocatorOwners = new AtomicInteger(1);
+      dataset.ownAllocator(allocator == null ? new RootAllocator(Long.MAX_VALUE) : allocator);
+    } else {
+      dataset.allocator = allocator;
     }
     if (effectiveSession != null) {
       dataset.session = effectiveSession;
@@ -637,6 +638,11 @@ public class Dataset implements Closeable {
     this.allocator = allocator;
   }
 
+  private void ownAllocator(BufferAllocator allocator) {
+    this.allocator = allocator;
+    allocatorOwners = new AtomicInteger(1);
+  }
+
   void shareAllocator(Dataset source) {
     allocator = source.allocator;
     allocatorOwners = source.allocatorOwners;
@@ -647,7 +653,7 @@ public class Dataset implements Closeable {
 
   void initializeDerivedAllocator(Dataset source) {
     if (source.separateDerivedAllocators) {
-      allocator = new RootAllocator(Long.MAX_VALUE);
+      ownAllocator(new RootAllocator(Long.MAX_VALUE));
     } else {
       shareAllocator(source);
     }
@@ -1282,8 +1288,7 @@ public class Dataset implements Closeable {
 
   private Dataset initializeIndependentDataset(Dataset result) {
     if (allocatorOwners != null || allocator == null) {
-      result.allocator = new RootAllocator(Long.MAX_VALUE);
-      result.allocatorOwners = new AtomicInteger(1);
+      result.ownAllocator(new RootAllocator(Long.MAX_VALUE));
     } else {
       result.shareAllocator(this);
     }
