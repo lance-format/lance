@@ -54,7 +54,9 @@ use lance::dataset::{
     transaction::{Operation, Transaction},
 };
 use lance::index::vector::utils::get_vector_type;
-use lance::index::{DatasetIndexExt, DatasetIndexInternalExt, vector::VectorIndexParams};
+use lance::index::{
+    DatasetIndexExt, DatasetIndexInternalExt, IndexScanStatisticsOptions, vector::VectorIndexParams,
+};
 use lance::{dataset::builder::DatasetBuilder, index::vector::IndexFileVersion};
 use lance_arrow::as_fixed_size_list_array;
 use lance_core::Error;
@@ -86,7 +88,8 @@ use crate::file::object_store_from_uri_or_path;
 use crate::fragment::FileFragment;
 use crate::fts::FtsTokenizerOptions;
 use crate::indices::{
-    PyIndexConfig, PyIndexDescription, extract_index_segments, parse_index_segment_ids,
+    PyIndexConfig, PyIndexDescription, PyIndexScanStatistics, extract_index_segments,
+    parse_index_segment_ids,
 };
 use crate::namespace::extract_namespace_arc;
 use crate::rt;
@@ -890,6 +893,22 @@ impl Dataset {
     #[getter(has_stable_row_ids)]
     fn has_stable_row_ids(&self) -> bool {
         self.ds.manifest().uses_stable_row_ids()
+    }
+
+    #[pyo3(signature = (index_name, *, include_segment_stats = false))]
+    fn index_scan_statistics(
+        &self,
+        index_name: &str,
+        include_segment_stats: bool,
+    ) -> PyResult<PyIndexScanStatistics> {
+        let options =
+            IndexScanStatisticsOptions::default().with_segment_stats(include_segment_stats);
+        match rt().block_on(None, self.ds.index_scan_statistics(index_name, options))? {
+            Err(lance::Error::IndexNotFound { .. }) => Err(PyKeyError::new_err(format!(
+                "Index \"{index_name}\" not found"
+            ))),
+            result => result.map(Into::into).infer_error(),
+        }
     }
 
     /// Get index statistics

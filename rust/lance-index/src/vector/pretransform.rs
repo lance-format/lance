@@ -300,6 +300,10 @@ impl VectorIndex for PreTransformIndex {
         self.inner.partition_size(part_id)
     }
 
+    fn ivf_partition_entry_counts(&self) -> Result<Option<Vec<u64>>> {
+        self.inner.ivf_partition_entry_counts()
+    }
+
     fn sub_index_type(&self) -> (SubIndexType, QuantizationType) {
         self.inner.sub_index_type()
     }

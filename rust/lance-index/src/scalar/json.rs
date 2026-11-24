@@ -33,6 +33,7 @@ use lance_datafusion_exec::exec::{LanceExecutionOptions, OneShotExec, execute_pl
 use lance_datafusion_exec::udf::json::{
     JsonbType, json_get_bool_udf, json_get_float_udf, json_get_int_udf, json_get_string_udf,
 };
+use lance_table::format::IndexDetailsType;
 use prost::Message;
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
@@ -46,6 +47,7 @@ use lance_core::{
 use crate::{
     Index, IndexType,
     metrics::MetricsCollector,
+    pb::JsonTargetDataType,
     registry::IndexPluginRegistry,
     scalar::{
         AnyQuery, BloomFilterQuery, CreatedIndex, IndexStore, RowIdRemapper, SargableQuery,
@@ -82,38 +84,16 @@ const JSON_INDEX_VERSION: u32 = JSON_ROW_ADDR_DOMAIN_VERSION;
 /// format. `None` for every other target, whose format has not changed since:
 /// its plugin's current version is still correct.
 fn legacy_target_index_version(target_details: &prost_types::Any) -> Option<u32> {
-    if target_details.type_url.ends_with("BTreeIndexDetails") {
-        Some(crate::scalar::btree::BTREE_ROW_ID_DOMAIN_VERSION)
-    } else if target_details.type_url.ends_with("BitmapIndexDetails") {
-        Some(crate::scalar::bitmap::BITMAP_ROW_ID_DOMAIN_VERSION)
-    } else if target_details.type_url.ends_with("LabelListIndexDetails") {
-        Some(crate::scalar::label_list::LABEL_LIST_ROW_ID_DOMAIN_VERSION)
-    } else if target_details.type_url.ends_with("NGramIndexDetails") {
-        Some(crate::scalar::ngram::NGRAM_ROW_ID_DOMAIN_VERSION)
-    } else if target_details.type_url.ends_with("RTreeIndexDetails") {
-        // RTree lives in lance-geo, which depends on lance-index -- this
-        // crate cannot import lance_geo::rtree::RTREE_ROW_ID_DOMAIN_VERSION
-        // without a cycle. Its value (0) is a fixed historical constant, not
-        // something that can change under this match.
-        Some(0)
-    } else {
-        None
-    }
+    IndexDetailsType::from_url(&target_details.type_url)?.legacy_json_target_version()
 }
 
 /// Whether `index_details` belong to a JSON index whose freshly trained segments
-/// are [`JSON_ROW_ADDR_DOMAIN_VERSION`], so that a segment of it written before
-/// that version is classified as row-id domain while a fresh one is not.
-///
-/// That covers targets that moved from row ids to row addresses (BTree,
-/// Bitmap, LabelList, NGram, RTree), whose legacy segments really store row
-/// ids, and targets that always stored row addresses (ZoneMap, BloomFilter,
-/// FM), whose legacy segments store addresses but carry the version-0
-/// wrapper that `IndexMetadata::results_are_row_addrs` reads as row ids.
-/// Either way such a segment cannot share a named index with a fresh one and
-/// must be rebuilt.
+/// are [`JSON_ROW_ADDR_DOMAIN_VERSION`]. These include targets that migrated
+/// from row IDs to addresses and targets that have always stored addresses.
+/// Optimization uses this to rebuild segments with the older wrapper version
+/// before combining them with a fresh address-domain segment.
 pub fn wraps_row_addr_domain_target(index_details: &prost_types::Any) -> bool {
-    index_details.type_url.ends_with("JsonIndexDetails")
+    IndexDetailsType::from_url(&index_details.type_url) == Some(IndexDetailsType::Json)
         && crate::pb::JsonIndexDetails::decode(index_details.value.as_slice())
             .ok()
             .and_then(|details| details.target_details)
@@ -1534,28 +1514,49 @@ impl BasicTrainer for JsonIndexPlugin {
 /// `target_data_type` is deliberately not part of it: whether this build read
 /// the type from the details or recovered it from the target changes what
 /// licenses the answer, not what the answer is.
+fn canonical_query_target(
+    target: &prost_types::Any,
+    registry: &IndexPluginRegistry,
+) -> Option<prost_types::Any> {
+    let name = registry.canonical_details_type_name(&target.type_url)?;
+    let value = if IndexDetailsType::from_url(&target.type_url) == Some(IndexDetailsType::Json) {
+        let mut wrapper = crate::pb::JsonIndexDetails::decode(target.value.as_slice()).ok()?;
+        if !JsonQueryParser::path_matches_typed_accessor(&wrapper.path) {
+            return None;
+        }
+        let inner = wrapper.target_details.as_ref()?;
+        wrapper.target_index_version = Some(wrapper.effective_target_version(inner));
+        wrapper.target_details = Some(canonical_query_target(inner, registry)?);
+        wrapper.encode_to_vec()
+    } else {
+        target.value.clone()
+    };
+    Some(prost_types::Any {
+        type_url: name.to_string(),
+        value,
+    })
+}
+
 fn query_domain(
     details: &crate::pb::JsonIndexDetails,
     target_details: &prost_types::Any,
+    registry: &IndexPluginRegistry,
     index_version: u32,
     data_type: DataType,
-) -> QueryDomain {
-    let target_index_version = details
-        .target_index_version
-        .or_else(|| legacy_target_index_version(target_details))
-        .unwrap_or(0);
+) -> Option<QueryDomain> {
+    let target_index_version = details.effective_target_version(target_details);
     let normalized = crate::pb::JsonIndexDetails {
         path: details.path.clone(),
-        target_details: Some(target_details.clone()),
+        target_details: Some(canonical_query_target(target_details, registry)?),
         target_data_type: crate::pb::JsonTargetDataType::Unspecified as i32,
         target_index_version: Some(target_index_version),
     };
     let mut identity = normalized.encode_to_vec();
     identity.extend_from_slice(&index_version.to_le_bytes());
-    QueryDomain {
+    Some(QueryDomain {
         data_type,
         identity: Some(identity),
-    }
+    })
 }
 
 #[async_trait]
@@ -1636,16 +1637,9 @@ impl ScalarIndexPlugin for JsonIndexPlugin {
         let registry = self.registry().ok()?;
         let json_details =
             crate::pb::JsonIndexDetails::decode(index_details.value.as_slice()).ok()?;
-        let target_details = json_details.target_details.as_ref()?;
-        let target_plugin = registry.get_plugin_by_details(target_details).ok()?;
-        // Older JSON-wrapped inverted indexes were never routable. Current training rejects this
-        // combination, so keep legacy metadata inert instead of enabling only part of its
-        // unsupported query path.
-        if target_plugin.name().eq_ignore_ascii_case("inverted") {
-            return None;
-        }
-        // TODO: Use something like ${index_name}_${path} for the index name?  Don't have access to path here tho
-        let target_parser = target_plugin.new_query_parser(index_name, target_details)?;
+        let (target_details, target_plugin) = json_details.resolve_target(&registry).ok()??;
+        let target_parser =
+            json_details.target_query_parser(index_name, target_details, target_plugin)?;
         // A recorded type is what licenses answering a typed accessor. `Unspecified`
         // does not: planning asks `recover_query_domain` to read it from the target
         // instead, so this parser is not used. An unrecognized value is not
@@ -1664,15 +1658,23 @@ impl ScalarIndexPlugin for JsonIndexPlugin {
     ) -> Option<QueryDomain> {
         let json_details =
             crate::pb::JsonIndexDetails::decode(index_details.value.as_slice()).ok()?;
-        let target_details = json_details.target_details.as_ref()?;
-        let data_type =
-            DataType::from(JsonIndexTargetType::from_pb(json_details.target_data_type)?);
-        Some(query_domain(
-            &json_details,
-            target_details,
-            index_version,
-            data_type,
-        ))
+        let registry = self.registry().ok()?;
+        let (target_details, _) = json_details.resolve_target(&registry).ok()??;
+        json_details.recorded_domain(target_details, &registry, index_version)
+    }
+
+    fn query_domain_recovery_support(&self, index_details: &prost_types::Any) -> Option<bool> {
+        let Ok(json_details) = crate::pb::JsonIndexDetails::decode(index_details.value.as_slice())
+        else {
+            return Some(false);
+        };
+        let Ok(registry) = self.registry() else {
+            return Some(false);
+        };
+        let Ok(Some((target, plugin))) = json_details.resolve_target(&registry) else {
+            return Some(false);
+        };
+        json_details.target_recovery_support(target, plugin)
     }
 
     async fn recover_query_domain(
@@ -1690,26 +1692,17 @@ impl ScalarIndexPlugin for JsonIndexPlugin {
         if json_details.target_data_type != crate::pb::JsonTargetDataType::Unspecified as i32 {
             return Ok(None);
         }
-        let Some(target_details) = json_details.target_details.as_ref() else {
-            return Ok(None);
-        };
         let registry = self.registry()?;
-        let Ok(target_plugin) = registry.get_plugin_by_details(target_details) else {
-            // A target this build has no reader for cannot say what its keys hold.
+        let Some((target_details, target_plugin)) = json_details.resolve_target(&registry)? else {
             return Ok(None);
         };
-        // Older JSON-wrapped inverted indexes were never routable, and training
-        // rejects the combination, so keep that legacy metadata inert here too.
-        if target_plugin.name().eq_ignore_ascii_case("inverted") {
+        if json_details.target_recovery_support(target_details, target_plugin) == Some(false) {
             return Ok(None);
         }
         // The target's own persisted version is in `target_index_version`, with the
         // same fallback `load_index` uses for targets written before that field
         // existed. `index_version` in the identity is the wrapper's own version.
-        let target_index_version = json_details
-            .target_index_version
-            .or_else(|| legacy_target_index_version(target_details))
-            .unwrap_or(0);
+        let target_index_version = json_details.effective_target_version(target_details);
         let (target_parser, target_data_type) = match target_plugin
             .recover_query_domain(
                 index_name.clone(),
@@ -1745,11 +1738,20 @@ impl ScalarIndexPlugin for JsonIndexPlugin {
         let Ok(known) = JsonIndexTargetType::try_from(&target_data_type) else {
             return Ok(None);
         };
+        if known == JsonIndexTargetType::LargeBinary {
+            return Ok(None);
+        }
         let data_type = DataType::from(known);
         let parser = JsonQueryParser::new(json_details.path.clone(), target_parser)
             .with_recorded_target_type(Some(data_type.clone()));
-        let domain = query_domain(&json_details, target_details, index_version, data_type);
-        Ok(Some((Box::new(parser), domain)))
+        Ok(query_domain(
+            &json_details,
+            target_details,
+            &registry,
+            index_version,
+            data_type,
+        )
+        .map(|domain| (Box::new(parser) as Box<dyn ScalarQueryParser>, domain)))
     }
 
     async fn load_index(
@@ -1760,21 +1762,23 @@ impl ScalarIndexPlugin for JsonIndexPlugin {
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
-        let registry = self.registry().unwrap();
+        let registry = self.registry()?;
         let json_details = crate::pb::JsonIndexDetails::decode(index_details.value.as_slice())?;
-        let target_details = json_details.target_details.as_ref().expect_ok()?;
-        let target_plugin = registry.get_plugin_by_details(target_details).unwrap();
-
-        // `_index_version` is this *wrapper's* version (`JSON_INDEX_VERSION`), not the
-        // target's. The target's own persisted version lives in `target_index_version`;
-        //
-        // If `target_index_version` is missing then we have to guess.  Our best guess
-        // is that this is an old index written before `target_index_version` was added.
-        // These indexes were the old versions that stored row ids and not row addresses.
-        let target_index_version = json_details
-            .target_index_version
-            .or_else(|| legacy_target_index_version(target_details))
-            .unwrap_or(0);
+        let (target_details, target_plugin) = json_details
+            .resolve_target(&registry)
+            .map_err(|error| {
+                Error::index(format!("JSON index path '{}': {error}", json_details.path))
+            })?
+            .ok_or_else(|| {
+                let target = json_details.target_details.as_ref();
+                Error::not_supported(format!(
+                    "JSON index path '{}' has no reader for target '{}' at version {:?}",
+                    json_details.path,
+                    target.map_or("", |target| target.type_url.as_str()),
+                    target.map(|target| json_details.effective_target_version(target)),
+                ))
+            })?;
+        let target_index_version = json_details.effective_target_version(target_details);
 
         let target_index = target_plugin
             .load_index(
@@ -1785,9 +1789,10 @@ impl ScalarIndexPlugin for JsonIndexPlugin {
                 &cache.with_key_prefix("json_target"),
             )
             .await?;
+        let target_plugin_name = target_plugin.name().to_string();
         let mut index = JsonIndex::new(target_index, json_details.path)
             .with_target_data_type(json_details.target_data_type);
-        index.target_plugin_name = Some(target_plugin.name().to_string());
+        index.target_plugin_name = Some(target_plugin_name);
         Ok(Arc::new(index))
     }
 
@@ -1885,11 +1890,131 @@ impl ScalarIndexPlugin for JsonIndexPlugin {
     }
 
     fn details_as_json(&self, details: &prost_types::Any) -> Result<serde_json::Value> {
-        let registry = self.registry().unwrap();
+        let registry = self.registry()?;
         let json_details = crate::pb::JsonIndexDetails::decode(details.value.as_slice())?;
-        let target_details = json_details.target_details.as_ref().expect_ok()?;
-        let target_plugin = registry.get_plugin_by_details(target_details).unwrap();
-        let target_details_json = target_plugin.details_as_json(target_details)?;
+        let (target, plugin) = json_details
+            .resolve_target(&registry)?
+            .ok_or_else(|| Error::not_supported("JSON index target reader is unavailable"))?;
+        Ok(json_details.render_details(plugin.details_as_json(target)?))
+    }
+}
+
+impl crate::pb::JsonIndexDetails {
+    /// Whether the recorded value type permits a typed query or legacy type recovery.
+    pub fn target_data_type_allows_query(&self) -> bool {
+        matches!(
+            JsonTargetDataType::try_from(self.target_data_type),
+            Ok(JsonTargetDataType::Unspecified
+                | JsonTargetDataType::Boolean
+                | JsonTargetDataType::Int64
+                | JsonTargetDataType::Float64
+                | JsonTargetDataType::Utf8)
+        )
+    }
+
+    /// Whether a resolved target has a scalar filter parser or supports
+    /// recovering the wrapper's omitted value type, without opening index files.
+    pub fn target_allows_query(
+        &self,
+        index_name: &str,
+        target: &prost_types::Any,
+        plugin: &dyn ScalarIndexPlugin,
+    ) -> bool {
+        if self.target_data_type == JsonTargetDataType::Unspecified as i32 {
+            self.target_recovery_support(target, plugin) == Some(true)
+        } else {
+            self.target_query_parser(index_name.to_string(), target, plugin)
+                .is_some()
+        }
+    }
+
+    fn target_query_parser(
+        &self,
+        index_name: String,
+        target: &prost_types::Any,
+        plugin: &dyn ScalarIndexPlugin,
+    ) -> Option<Box<dyn ScalarQueryParser>> {
+        // Legacy JSON-wrapped inverted indices are readable but were never routable.
+        if !JsonQueryParser::path_matches_typed_accessor(&self.path)
+            || !self.target_data_type_allows_query()
+            || self.target_data_type == JsonTargetDataType::Unspecified as i32
+            || plugin.name().eq_ignore_ascii_case("inverted")
+        {
+            return None;
+        }
+        plugin.new_query_parser(index_name, target)
+    }
+
+    fn target_recovery_support(
+        &self,
+        target: &prost_types::Any,
+        plugin: &dyn ScalarIndexPlugin,
+    ) -> Option<bool> {
+        if !JsonQueryParser::path_matches_typed_accessor(&self.path)
+            || self.target_data_type != JsonTargetDataType::Unspecified as i32
+            || plugin.name().eq_ignore_ascii_case("inverted")
+        {
+            return Some(false);
+        }
+        if plugin.name().eq_ignore_ascii_case("ngram") {
+            return Some(true);
+        }
+        plugin.query_domain_recovery_support(target)
+    }
+
+    /// The target version used by readers, including the row-ID format for
+    /// targets written before the wrapper recorded a version.
+    pub fn effective_target_version(&self, target: &prost_types::Any) -> u32 {
+        self.target_index_version
+            .or_else(|| legacy_target_index_version(target))
+            .unwrap_or(0)
+    }
+
+    /// The query domain this wrapper proves from recorded metadata for its resolved target.
+    /// An omitted type needs recovery unless the training contract fixes the type.
+    pub fn recorded_domain(
+        &self,
+        target: &prost_types::Any,
+        registry: &IndexPluginRegistry,
+        index_version: u32,
+    ) -> Option<QueryDomain> {
+        if !JsonQueryParser::path_matches_typed_accessor(&self.path)
+            || !self.target_data_type_allows_query()
+        {
+            return None;
+        }
+        let data_type = match JsonIndexTargetType::from_pb(self.target_data_type) {
+            Some(target_type) => target_type.into(),
+            None if IndexDetailsType::from_url(&target.type_url)
+                == Some(IndexDetailsType::NGram) =>
+            {
+                DataType::Utf8
+            }
+            None => return None,
+        };
+        query_domain(self, target, registry, index_version, data_type)
+    }
+
+    /// Resolve the recorded target against this registry and its supported versions.
+    /// Returns `None` when the recorded target has no compatible reader.
+    pub fn resolve_target<'a>(
+        &'a self,
+        registry: &'a IndexPluginRegistry,
+    ) -> Result<Option<(&'a prost_types::Any, &'a dyn ScalarIndexPlugin)>> {
+        let target = self
+            .target_details
+            .as_ref()
+            .ok_or_else(|| Error::index("JSON index details are missing target_details"))?;
+        if !registry.supports_details(target) {
+            return Ok(None);
+        }
+        let plugin = registry.get_plugin_by_details(target)?;
+        Ok((self.effective_target_version(target) <= plugin.version()).then_some((target, plugin)))
+    }
+
+    /// Render the wrapper and its decoded target settings for display.
+    pub fn render_details(&self, target_details_json: serde_json::Value) -> serde_json::Value {
+        let json_details = self;
         let mut details_json = serde_json::json!({
             "path": json_details.path,
             "target_details": target_details_json,
@@ -1904,7 +2029,7 @@ impl ScalarIndexPlugin for JsonIndexPlugin {
                 .unwrap_or_else(|| format!("unknown({})", json_details.target_data_type));
             details_json["target_data_type"] = serde_json::json!(reported);
         }
-        Ok(details_json)
+        details_json
     }
 }
 
@@ -2677,6 +2802,28 @@ mod tests {
             "an absent target version falls back to the one the build used"
         );
 
+        let wrap_target = |target| {
+            prost_types::Any::from_msg(&crate::pb::JsonIndexDetails {
+                path: "outer".into(),
+                target_details: Some(target),
+                target_data_type: crate::pb::JsonTargetDataType::Utf8 as i32,
+                target_index_version: Some(0),
+            })
+            .unwrap()
+        };
+        let nested = plugin
+            .recorded_query_domain(&wrap_target(details("p", Some(0))), 0)
+            .unwrap();
+        let mut inner =
+            crate::pb::JsonIndexDetails::decode(details("p", None).value.as_slice()).unwrap();
+        inner.target_details.as_mut().unwrap().type_url =
+            "https://types.example/LANCE.INDEX.PB.btreeindexdetails".into();
+        let inner = prost_types::Any::from_msg(&inner).unwrap();
+        assert_eq!(
+            Some(nested),
+            plugin.recorded_query_domain(&wrap_target(inner), 0),
+        );
+
         let other_path = plugin
             .recorded_query_domain(&details("q", Some(0)), 0)
             .unwrap();
@@ -2736,7 +2883,7 @@ mod tests {
         })
         .unwrap();
         let index_details = prost_types::Any::from_msg(&crate::pb::JsonIndexDetails {
-            path: "$.value".to_string(),
+            path: "value".to_string(),
             target_details: Some(target_details),
             target_data_type: crate::pb::JsonTargetDataType::Utf8 as i32,
             target_index_version: None,
@@ -2754,7 +2901,7 @@ mod tests {
         };
         assert_eq!(search.index_type, "ZoneMap");
         let query = search.query.as_any().downcast_ref::<JsonQuery>().unwrap();
-        assert_eq!(query.path(), "$.value");
+        assert_eq!(query.path(), "value");
         assert!(matches!(
             query
                 .target_query()
@@ -2781,7 +2928,7 @@ mod tests {
         })
         .unwrap();
         let index_details = prost_types::Any::from_msg(&crate::pb::JsonIndexDetails {
-            path: "$.value".to_string(),
+            path: "value".to_string(),
             target_details: Some(target_details),
             target_data_type: crate::pb::JsonTargetDataType::Unspecified as i32,
             target_index_version: None,

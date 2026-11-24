@@ -24,7 +24,7 @@ from conftest import ProgressRecorder, progress_event_tags, stage_progress_value
 from lance import LanceDataset, LanceFragment
 from lance._dataset.index import VectorIndexReader
 from lance._dataset.scanner import ScannerBuilder, VectorSearchQuery
-from lance.indices import IndexFileVersion, IndicesBuilder
+from lance.indices import IndexFileVersion, IndexScanStatistics, IndicesBuilder
 from lance.query import MatchQuery, PhraseQuery
 from lance.util import (  # noqa: E402
     _target_partition_size_to_num_partitions,
@@ -5064,3 +5064,61 @@ def test_fts_filter_vector_search(tmp_path):
 
     with pytest.raises(ValueError):
         scanner.to_table()
+
+
+def test_index_scan_statistics_candidates_and_snapshot(tmp_path):
+    centroids = np.eye(2, dtype=np.float32)
+    vectors = np.repeat(centroids, [5, 3], axis=0)
+    values = pa.array(vectors.ravel())
+    vectors = pa.FixedSizeListArray.from_arrays(
+        values, 2, mask=pa.array([False, True, False, False, False, True, False, False])
+    )
+    table = pa.table({"vector": vectors, "id": np.arange(8)})
+    dataset = lance.write_dataset(table, tmp_path, max_rows_per_file=4)
+    for metric in ("l2", "cosine"):
+        dataset.create_index(
+            "vector",
+            "IVF_FLAT",
+            name=f"vector_{metric}",
+            metric=metric,
+            num_partitions=2,
+            ivf_centroids=centroids,
+        )
+    prior = lance.dataset(tmp_path, version=dataset.version)
+    dataset.delete("id = 0")
+    dataset = lance.write_dataset(table.slice(6), dataset.uri, mode="append")
+
+    l2 = dataset.index_scan_statistics("vector_l2")
+    cosine = dataset.index_scan_statistics("vector_cosine", include_segment_stats=True)
+    assert isinstance(l2, IndexScanStatistics)
+    assert l2.dataset_version == cosine.dataset_version == dataset.version
+    assert l2.fragment_count == cosine.fragment_count == 3
+    assert l2.live_rows == cosine.live_rows == 9
+    assert l2.deleted_rows == cosine.deleted_rows == 1
+    assert l2.total_data_bytes == cosine.total_data_bytes > 0
+    assert l2.coverage.covered_fragment_count == 2
+    assert list(l2.coverage.uncovered_fragment_ids) == [2]
+    assert l2.coverage.uncovered_fragment_live_rows == 2
+    assert cosine.coverage.covered_fragment_live_rows == 7
+    assert l2.metric_type == "l2"
+    assert cosine.metric_type == "cosine"
+    assert l2.segments[0].uuid != cosine.segments[0].uuid
+    assert isinstance(uuid.UUID(cosine.segments[0].uuid), uuid.UUID)
+    assert l2.segments[0].ivf is None
+    assert cosine.segments[0].base_id is None
+    assert cosine.segments[0].ivf.num_partitions == 2
+    assert cosine.segments[0].ivf.partition_entry_counts == [4, 2]
+    assert cosine.segments[0].ivf.indexed_vector_entries == 6
+
+    prior_stats = prior.index_scan_statistics("vector_cosine")
+    assert prior_stats.dataset_version == prior.version
+    assert prior_stats.live_rows == 8
+    assert prior_stats.deleted_rows == 0
+    assert len(prior_stats.coverage.uncovered_fragment_ids) == 0
+    assert prior_stats.coverage.uncovered_data_bytes == 0
+    assert prior_stats.segments[0].uuid == cosine.segments[0].uuid
+    assert prior_stats.details == cosine.details
+    with pytest.raises(AttributeError):
+        setattr(l2, "live_rows", 100)
+    with pytest.raises(KeyError, match="missing_index"):
+        dataset.index_scan_statistics("missing_index")

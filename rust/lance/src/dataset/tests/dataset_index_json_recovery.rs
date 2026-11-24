@@ -5,7 +5,13 @@
 
 use super::json_filter_ids;
 use super::*;
-use crate::index::CreateIndexBuilder;
+use crate::dataset::optimize::{CompactionOptions, compact_files};
+use crate::index::frag_reuse_reader::tests::persist_fixture;
+use crate::index::{CreateIndexBuilder, IndexScanStatisticsOptions};
+use lance_index::pb::JsonIndexDetails;
+use lance_index::pb::JsonTargetDataType;
+use lance_table::format::IndexMetadata;
+use prost::Message;
 
 /// [`json_batch`] plus an `id` column that identifies a row across
 /// `max_rows_per_file = 1`, so tests can compare ids instead of whole rows.
@@ -382,6 +388,82 @@ async fn json_index_segment_per_fragment(
     segments
 }
 
+async fn assert_json_scan_coverage(
+    dataset: &Dataset,
+    name: &str,
+    rows_per_segment: Option<u64>,
+    has_logical_coverage: bool,
+) {
+    let recorded = dataset.load_indices_by_name(name).await.unwrap();
+    let cold = DatasetBuilder::from_uri(dataset.uri())
+        .with_session(Arc::new(Session::default()))
+        .load()
+        .await
+        .unwrap();
+    assert_eq!(cold.manifest().version, dataset.manifest().version);
+    let io = cold.table_state.object_store.io_tracker();
+    let options = IndexScanStatisticsOptions::default();
+    for (warm, detail) in [(false, false), (true, false), (true, true)] {
+        if warm {
+            cold.load_indices().await.unwrap();
+        }
+        io.incremental_stats();
+        let stats = cold
+            .index_scan_statistics(name, options.with_segment_stats(detail))
+            .await
+            .unwrap();
+        let storage = io.incremental_stats();
+        assert_eq!(storage.write_iops, 0);
+        assert!(storage.read_iops > 0);
+        assert!(!storage.requests.is_empty());
+        if !detail {
+            assert!(
+                storage.requests.iter().all(|request| {
+                    request.path == cold.manifest_location().path
+                        && !request.method.starts_with("list")
+                }),
+                "{:?}",
+                storage.requests
+            );
+        }
+        assert_eq!(stats.segments.len(), recorded.len());
+        let mut all_covered = true;
+        for metadata in &recorded {
+            let segment = stats
+                .segments
+                .iter()
+                .find(|segment| segment.uuid == metadata.uuid)
+                .unwrap();
+            let wrapper =
+                JsonIndexDetails::decode(metadata.index_details.as_ref().unwrap().value.as_slice())
+                    .unwrap();
+            let target = wrapper.target_details.as_ref().unwrap();
+            let type_needs_recovery = wrapper.target_data_type
+                == JsonTargetDataType::Unspecified as i32
+                && !target.type_url.ends_with("NGramIndexDetails");
+            let expected = rows_per_segment.filter(|_| detail || !type_needs_recovery);
+            all_covered &= expected.is_some();
+            assert_eq!(
+                segment.covered_fragment_ids.as_ref(),
+                expected.and(metadata.fragment_bitmap.as_ref())
+            );
+            assert_eq!(segment.covered_fragment_live_rows, expected);
+            assert!(segment.details.is_some());
+            assert_eq!(segment.size_bytes, metadata.total_size_bytes());
+        }
+        assert_eq!(
+            stats.coverage.is_some(),
+            has_logical_coverage && all_covered
+        );
+        if let Some(coverage) = stats.coverage {
+            assert_eq!(coverage.covered_fragment_live_rows, stats.live_rows);
+            assert_eq!(coverage.covered_live_row_ratio, Some(1.0));
+            assert_eq!(coverage.uncovered_fragment_live_rows, Some(0));
+            assert_eq!(coverage.uncovered_data_bytes, Some(0));
+        }
+    }
+}
+
 /// Recovering a type is an optimization, so a target whose files cannot be read
 /// must not fail the query. Planning keeps working and the predicate is left to
 /// the scan, which is how this index behaved before recovery existed.
@@ -506,6 +588,8 @@ async fn test_json_multi_segment_routing_requires_one_domain(
         4,
         "the fixture must exercise several segments under one name"
     );
+
+    assert_json_scan_coverage(&dataset, "json_v_idx", Some(1), true).await;
 
     // Rows 1 and 2 come from recovered segments and row 3 from a recorded one,
     // so answering all three requires both to have established the same domain.
@@ -662,6 +746,7 @@ async fn test_json_multi_segment_same_type_different_path_is_not_routed(
         })
         .collect::<Vec<_>>();
     assert_eq!(paths, vec!["a", "b"]);
+    assert_json_scan_coverage(&dataset, "json_mixed_path_idx", Some(2), false).await;
 
     // Rows 1 and 3 are the ones a name-wide search gets wrong: `a = 1` matches
     // `b = 1` in segment 1's fragment, `a = 3` has no key in either segment's
@@ -703,11 +788,14 @@ async fn test_json_multi_segment_same_type_different_path_is_not_routed(
 /// target only narrows to a zone, and both policies are baked into the query
 /// before execution opens every segment.
 #[rstest]
-#[case::legacy(LanceFileVersion::Legacy)]
-#[case::stable(LanceFileVersion::Stable)]
+#[case::legacy(LanceFileVersion::Legacy, "zonemap", true)]
+#[case::stable(LanceFileVersion::Stable, "zonemap", true)]
+#[case::recorded_bitmap(LanceFileVersion::Stable, "bitmap", false)]
 #[tokio::test]
 async fn test_json_multi_segment_requires_one_target_kind_and_config(
     #[case] data_storage_version: LanceFileVersion,
+    #[case] second_target: &str,
+    #[case] recover_type: bool,
 ) {
     use lance_index::pb::JsonIndexDetails;
     use prost::Message;
@@ -736,16 +824,15 @@ async fn test_json_multi_segment_requires_one_target_kind_and_config(
     .await
     .unwrap();
     let unspecified = lance_index::pb::JsonTargetDataType::Unspecified as i32;
-    let segments = json_index_segment_per_fragment(
-        &mut dataset,
-        "json_v_idx",
-        &[
-            JsonSegmentSpec::new("btree", "Utf8", "v").with_recorded_target_data_type(unspecified),
-            JsonSegmentSpec::new("zonemap", "Utf8", "v")
-                .with_recorded_target_data_type(unspecified),
-        ],
-    )
-    .await;
+    let specs = ["btree", second_target].map(|target| {
+        let spec = JsonSegmentSpec::new(target, "Utf8", "v");
+        if recover_type {
+            spec.with_recorded_target_data_type(unspecified)
+        } else {
+            spec
+        }
+    });
+    let segments = json_index_segment_per_fragment(&mut dataset, "json_v_idx", &specs).await;
     dataset
         .commit_existing_index_segments("json_v_idx", "json", segments)
         .await
@@ -763,6 +850,7 @@ async fn test_json_multi_segment_requires_one_target_kind_and_config(
         .collect::<Vec<_>>();
     assert_eq!(target_types.len(), 2);
     assert_ne!(target_types[0], target_types[1]);
+    assert_json_scan_coverage(&dataset, "json_v_idx", Some(2), false).await;
     for (filter, expected_ids) in [
         ("json_get_string(json, 'v') = 'needle'", vec![0, 2]),
         ("json_get_string(json, 'v') IS NULL", vec![]),
@@ -860,6 +948,7 @@ async fn test_json_multi_segment_requires_one_target_config(
         vec![true, false],
         "the fixture needs one exact and one approximate null policy"
     );
+    assert_json_scan_coverage(&dataset, "json_v_idx", Some(2), false).await;
 
     let filter = "json_get_string(json, 'v') IS NULL";
     let indexed = json_filter_ids(&dataset, filter, true).await;
@@ -1675,6 +1764,7 @@ async fn test_json_unrecorded_target_type_boundaries(
         JsonTargetDataType::Unspecified as i32,
     )
     .await;
+    assert_json_scan_coverage(&dataset, "json_p_idx", Some(4), true).await;
     // A bitmap target stores its keys in the lookup file's `keys` column with
     // the type it was trained on, so the same recovery applies.
     for (filter, expected_ids) in [
@@ -1683,6 +1773,7 @@ async fn test_json_unrecorded_target_type_boundaries(
     ] {
         let indexed = json_filter_ids(&dataset, filter, true).await;
         assert_eq!(indexed, expected_ids, "indexed scan: {filter}");
+        assert_eq!(indexed, json_filter_ids(&dataset, filter, false).await);
         let plan = dataset
             .scan()
             .filter(filter)
@@ -1715,12 +1806,14 @@ async fn test_json_unrecorded_target_type_boundaries(
         JsonTargetDataType::Unspecified as i32,
     )
     .await;
+    assert_json_scan_coverage(&dataset, "json_p_idx", Some(4), true).await;
     for (filter, expected_ids) in [
         ("json_get_string(json, 'p') IS NULL", vec![1, 2]),
         ("json_get_int(json, 'p') IS NULL", vec![0, 1, 2]),
     ] {
         let indexed = json_filter_ids(&dataset, filter, true).await;
         assert_eq!(indexed, expected_ids, "indexed scan: {filter}");
+        assert_eq!(indexed, json_filter_ids(&dataset, filter, false).await);
         let plan = dataset
             .scan()
             .filter(filter)
@@ -1751,12 +1844,14 @@ async fn test_json_unrecorded_target_type_boundaries(
         JsonTargetDataType::Unspecified as i32,
     )
     .await;
+    assert_json_scan_coverage(&dataset, "json_p_idx", Some(4), true).await;
     for (filter, expected_ids, uses_index) in [
         ("contains(json_get_string(json, 'p'), 'man')", vec![0], true),
         ("json_get_int(json, 'p') IS NULL", vec![0, 1, 2], false),
     ] {
         let indexed = json_filter_ids(&dataset, filter, true).await;
         assert_eq!(indexed, expected_ids, "indexed scan: {filter}");
+        assert_eq!(indexed, json_filter_ids(&dataset, filter, false).await);
         let plan = dataset
             .scan()
             .filter(filter)
@@ -1776,32 +1871,654 @@ async fn test_json_unrecorded_target_type_boundaries(
             );
         }
     }
+}
 
-    // A BloomFilter persists no key type at all, so there is nothing to recover
-    // from: its value domain is unknowable from the index alone and the scan
-    // has to answer.
-    let bloom_uri = TempStrDir::default();
-    let dataset = json_index_with_recorded_type(
-        &bloom_uri,
-        data_storage_version,
-        "bloomfilter",
-        JsonTargetDataType::Unspecified as i32,
+#[rstest]
+#[case::legacy_bloom("bloomfilter", JsonTargetDataType::Unspecified, false, false)]
+#[case::nested_legacy_bloom("bloomfilter", JsonTargetDataType::Unspecified, false, true)]
+#[case::typed_bloom("bloomfilter", JsonTargetDataType::Utf8, true, false)]
+#[case::typed_minhash("minhashlsh", JsonTargetDataType::Utf8, false, false)]
+#[case::legacy_btree("btree", JsonTargetDataType::Unspecified, true, false)]
+#[tokio::test]
+async fn test_json_backing_query_eligibility(
+    #[case] target: &str,
+    #[case] target_type: JsonTargetDataType,
+    #[case] routes: bool,
+    #[case] nested: bool,
+) {
+    let uri = TempStrDir::default();
+    let mut dataset = json_index_with_recorded_docs(
+        &uri,
+        LanceFileVersion::Stable,
+        target,
+        target_type as i32,
+        &[r#"{"p":"many"}"#, r#"{"p":null}"#, r#"{}"#, r#"{"p":"7"}"#],
+        2,
     )
     .await;
-    for filter in [
-        "json_get_string(json, 'p') = '7'",
-        "json_get_string(json, 'p') IS NULL",
-    ] {
-        let plan = dataset
-            .scan()
-            .filter(filter)
+    if nested {
+        let mut segment = dataset
+            .load_indices_by_name("json_p_idx")
+            .await
             .unwrap()
-            .explain_plan(false)
+            .remove(0);
+        let outer = JsonIndexDetails {
+            path: "p".into(),
+            target_details: segment.index_details.as_deref().cloned(),
+            target_index_version: Some(segment.index_version as u32),
+            target_data_type: JsonTargetDataType::Utf8 as i32,
+        };
+        segment.index_details = Some(Arc::new(prost_types::Any::from_msg(&outer).unwrap()));
+        persist_fixture(&mut dataset, vec![segment]).await;
+    }
+    assert_json_scan_coverage(&dataset, "json_p_idx", routes.then_some(4), routes).await;
+    let dataset = DatasetBuilder::from_uri(uri.as_str()).load().await.unwrap();
+    let filter = "json_get_string(json, 'p') = '7'";
+    let plan = dataset
+        .scan()
+        .filter(filter)
+        .unwrap()
+        .explain_plan(false)
+        .await
+        .unwrap();
+    assert_eq!(plan.contains("ScalarIndexQuery"), routes, "{plan}");
+    assert_eq!(json_filter_ids(&dataset, filter, true).await, vec![3]);
+    assert_eq!(json_filter_ids(&dataset, filter, false).await, vec![3]);
+}
+
+#[rstest]
+#[case::integer(JsonTargetDataType::Int64 as i32, "int64", true)]
+#[case::binary(JsonTargetDataType::LargeBinary as i32, "large_binary", false)]
+#[case::future(99, "unknown(99)", false)]
+#[tokio::test]
+async fn test_index_scan_statistics_json_query_coverage(
+    #[case] recorded_type: i32,
+    #[case] type_name: &str,
+    #[case] is_routable: bool,
+) {
+    let test_uri = TempStrDir::default();
+    let batch = json_id_batch(vec![r#"{"p": 7}"#, r#"{"p": 9}"#]);
+    let schema = batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch)], schema),
+        &test_uri,
+        Some(WriteParams {
+            max_rows_per_file: 1,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let name = "json_scan_stats_idx";
+    let segments = json_index_segment_per_fragment(
+        &mut dataset,
+        name,
+        &[
+            JsonSegmentSpec::new("btree", "Int64", "p"),
+            JsonSegmentSpec::new("btree", "Int64", "p")
+                .with_recorded_target_data_type(recorded_type),
+        ],
+    )
+    .await;
+    let valid_uuid = segments[0].uuid;
+    let specialized_uuid = segments[1].uuid;
+    dataset
+        .commit_existing_index_segments(name, "json", segments)
+        .await
+        .unwrap();
+
+    for detailed in [false, true] {
+        let stats = dataset
+            .index_scan_statistics(
+                name,
+                IndexScanStatisticsOptions::default().with_segment_stats(detailed),
+            )
             .await
             .unwrap();
+        assert_eq!(stats.live_rows, Some(2));
+        assert_eq!(stats.coverage.is_some(), is_routable);
+        if let Some(coverage) = stats.coverage {
+            assert_eq!(coverage.covered_fragment_count, 2);
+            assert_eq!(coverage.uncovered_fragment_live_rows, Some(0));
+        }
+        let valid = stats
+            .segments
+            .iter()
+            .find(|segment| segment.uuid == valid_uuid)
+            .unwrap();
+        assert_eq!(valid.covered_fragment_live_rows, Some(1));
+        let specialized = stats
+            .segments
+            .iter()
+            .find(|segment| segment.uuid == specialized_uuid)
+            .unwrap();
+        assert_eq!(specialized.covered_fragment_ids.is_some(), is_routable);
+        assert!(specialized.size_bytes.is_some());
+        let details = specialized.details.as_ref().unwrap();
+        assert_eq!(details["target_data_type"], type_name);
+        assert_eq!(details["target_index_type"], "BTree");
+    }
+    let filter = "json_get_int(json, 'p') = 7";
+    let plan = dataset
+        .scan()
+        .filter(filter)
+        .unwrap()
+        .explain_plan(false)
+        .await
+        .unwrap();
+    assert_eq!(plan.contains(name), is_routable, "{plan}");
+    assert_eq!(json_filter_ids(&dataset, filter, true).await, vec![0]);
+    assert_eq!(json_filter_ids(&dataset, filter, false).await, vec![0]);
+}
+
+#[rstest]
+#[case::implicit_version(None)]
+#[case::case_change(Some("/LANCE.TABLE.btreeindexdetails"))]
+#[case::historical_package(Some("/lance.index.pb.BTreeIndexDetails"))]
+#[case::authority(Some("https://types.example/lance.table.BTreeIndexDetails"))]
+#[tokio::test]
+async fn test_json_multi_segment_agrees_on_effective_domain(#[case] alias: Option<&str>) {
+    let test_uri = TempStrDir::default();
+    let batch = json_id_batch(vec![r#"{"p": 7}"#, r#"{"p": 9}"#]);
+    let schema = batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch)], schema),
+        &test_uri,
+        Some(WriteParams {
+            max_rows_per_file: 1,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let name = "json_same_domain";
+    let mut segments = json_index_segment_per_fragment(
+        &mut dataset,
+        name,
+        &[
+            JsonSegmentSpec::new("btree", "Int64", "p"),
+            JsonSegmentSpec::new("btree", "Int64", "p"),
+        ],
+    )
+    .await;
+    for (position, segment) in segments.iter_mut().enumerate() {
+        let mut details =
+            JsonIndexDetails::decode(segment.index_details.as_ref().unwrap().value.as_slice())
+                .unwrap();
+        assert_eq!(details.target_index_version, Some(0));
+        if position == 1 {
+            if let Some(alias) = alias {
+                details.target_details.as_mut().unwrap().type_url = alias.into();
+            } else {
+                details.target_index_version = None;
+            }
+            segment.index_details = Some(Arc::new(prost_types::Any::from_msg(&details).unwrap()));
+        }
+    }
+    dataset
+        .commit_existing_index_segments(name, "json", segments)
+        .await
+        .unwrap();
+    assert_json_scan_coverage(&dataset, name, Some(1), true).await;
+    let dataset = DatasetBuilder::from_uri(test_uri.as_str())
+        .load()
+        .await
+        .unwrap();
+    let filter = "json_get_int(json, 'p') >= 7";
+    let plan = dataset
+        .scan()
+        .filter(filter)
+        .unwrap()
+        .explain_plan(false)
+        .await
+        .unwrap();
+    assert!(
+        plan.contains("ScalarIndexQuery") && plan.contains(name),
+        "{plan}"
+    );
+    assert_eq!(json_filter_ids(&dataset, filter, true).await, vec![0, 1]);
+    assert_eq!(json_filter_ids(&dataset, filter, false).await, vec![0, 1]);
+}
+
+#[rstest]
+#[case::authority("type.googleapis.com/lance.index.pb.JsonIndexDetails", true)]
+#[case::case_change("/LANCE.INDEX.PB.JSONINDEXDETAILS", true)]
+#[case::foreign("/example.JsonIndexDetails", false)]
+#[tokio::test]
+async fn test_json_multi_segment_outer_identity(
+    #[case] alias: &str,
+    #[case] compatible: bool,
+    #[values("staged", "retained", "transaction")] publication: &str,
+) {
+    let uri = TempStrDir::default();
+    let batch = json_id_batch(vec![r#"{"p":0}"#, r#"{"p":1}"#, r#"{"p":2}"#, r#"{"p":3}"#]);
+    let schema = batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch)], schema),
+        &uri,
+        Some(WriteParams {
+            max_rows_per_file: 2,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let name = "json_outer";
+    let mut segments = json_index_segment_per_fragment(
+        &mut dataset,
+        name,
+        &[
+            JsonSegmentSpec::new("btree", "Int64", "p"),
+            JsonSegmentSpec::new("btree", "Int64", "p"),
+        ],
+    )
+    .await;
+    Arc::make_mut(segments[1].index_details.as_mut().unwrap()).type_url = alias.into();
+    let first_uuid = segments[0].uuid;
+    let second_uuid = segments[1].uuid;
+
+    let committed = match publication {
+        "transaction" => {
+            let transaction = Transaction::new(
+                dataset.manifest().version,
+                Operation::CreateIndex {
+                    new_indices: segments,
+                    removed_indices: vec![],
+                },
+                None,
+            );
+            dataset
+                .apply_commit(transaction, &Default::default(), &Default::default())
+                .await
+        }
+        "retained" => {
+            let second = segments.pop().unwrap();
+            dataset
+                .commit_existing_index_segments(name, "json", segments)
+                .await
+                .unwrap();
+            dataset
+                .commit_existing_index_segments(name, "json", vec![second])
+                .await
+        }
+        _ => {
+            dataset
+                .commit_existing_index_segments(name, "json", segments)
+                .await
+        }
+    };
+    if !compatible && publication != "transaction" {
+        let error = committed.unwrap_err();
+        let message = error.to_string();
         assert!(
-            !plan.contains("json_p_idx"),
-            "a bloom filter target cannot report a value domain and must not be routed: {plan}"
+            message.contains("incompatible index detail types")
+                || message.contains("cannot change index"),
+            "{message}"
         );
+        return;
+    }
+    committed.unwrap();
+    let dataset = DatasetBuilder::from_uri(uri.as_str()).load().await.unwrap();
+
+    if compatible {
+        assert_json_scan_coverage(&dataset, name, Some(2), true).await;
+        let fragments = dataset.fragment_bitmap();
+        let scope =
+            crate::index::scalar_logical::scalar_index_fragment_bitmap(&dataset, "json", name)
+                .await
+                .unwrap();
+        assert_eq!(scope.as_ref(), Some(fragments.as_ref()));
+        let filter = "json_get_int(json, 'p') >= 0";
+        assert_eq!(
+            dataset
+                .count_indexed_rows(name, filter, Some(&[first_uuid, second_uuid]), None)
+                .await
+                .unwrap(),
+            4
+        );
+    } else {
+        for detail in [false, true] {
+            let stats = dataset
+                .index_scan_statistics(
+                    name,
+                    IndexScanStatisticsOptions::default().with_segment_stats(detail),
+                )
+                .await
+                .unwrap();
+            assert!(stats.coverage.is_none());
+            assert!(
+                stats
+                    .segments
+                    .iter()
+                    .find(|segment| segment.uuid == second_uuid)
+                    .unwrap()
+                    .covered_fragment_ids
+                    .is_none()
+            );
+        }
+    }
+    let filter = "json_get_int(json, 'p') >= 2";
+    let plan = dataset
+        .scan()
+        .filter(filter)
+        .unwrap()
+        .explain_plan(false)
+        .await
+        .unwrap();
+    if compatible {
+        assert!(
+            plan.contains("ScalarIndexQuery") && plan.contains(name),
+            "{plan}"
+        );
+    }
+    assert_eq!(json_filter_ids(&dataset, filter, true).await, vec![2, 3]);
+    assert_eq!(json_filter_ids(&dataset, filter, false).await, vec![2, 3]);
+}
+
+#[rstest]
+#[case::bare("p", "json_get_int(json, 'p') = 2", true)]
+#[case::rooted("$.p", "json_get_int(json, 'p') = 2", false)]
+#[case::nested("n.v", "json_get_int(json_get(json, 'n'), 'v') = 2", false)]
+#[case::numeric("0", "json_get_int(json, '0') = 2", false)]
+#[tokio::test]
+async fn test_json_scan_statistics_requires_routable_path(
+    #[case] path: &str,
+    #[case] filter: &str,
+    #[case] routable: bool,
+) {
+    let uri = TempStrDir::default();
+    let batch = json_id_batch(vec![
+        r#"{"p":0,"n":{"v":0},"0":0}"#,
+        r#"{"p":1,"n":{"v":1},"0":1}"#,
+        r#"{"p":2,"n":{"v":2},"0":2}"#,
+        r#"{"p":3,"n":{"v":3},"0":3}"#,
+    ]);
+    let schema = batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch)], schema),
+        &uri,
+        Some(WriteParams {
+            max_rows_per_file: 2,
+            enable_stable_row_ids: true,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let name = "json_path";
+    let params = ScalarIndexParams::new("json".into()).with_params(&serde_json::json!({
+        "target_index_type": "btree", "target_data_type": "Int64", "path": path,
+    }));
+    dataset
+        .create_index(
+            &["json"],
+            IndexType::Scalar,
+            Some(name.into()),
+            &params,
+            false,
+        )
+        .await
+        .unwrap();
+    let dataset = DatasetBuilder::from_uri(uri.as_str()).load().await.unwrap();
+    assert_json_scan_coverage(&dataset, name, routable.then_some(4), routable).await;
+    for detail in [false, true] {
+        let stats = dataset
+            .index_scan_statistics(
+                name,
+                IndexScanStatisticsOptions::default().with_segment_stats(detail),
+            )
+            .await
+            .unwrap();
+        let details = stats.details.unwrap();
+        assert_eq!(details["path"], path);
+        assert_eq!(details["target_index_type"], "BTree");
+        assert_eq!(stats.segments[0].index_version, 1);
+        assert!(stats.segments[0].size_bytes.is_some_and(|bytes| bytes > 0));
+    }
+    let plan = dataset
+        .scan()
+        .filter(filter)
+        .unwrap()
+        .explain_plan(false)
+        .await
+        .unwrap();
+    assert_eq!(plan.contains("ScalarIndexQuery"), routable, "{plan}");
+    assert_eq!(json_filter_ids(&dataset, filter, true).await, vec![2]);
+    assert_eq!(json_filter_ids(&dataset, filter, false).await, vec![2]);
+}
+
+#[rstest]
+#[case::json_canonical(true, None)]
+#[case::json_mixed_case(true, Some("/LANCE.INDEX.PB.jsonindexdetails"))]
+#[case::btree_canonical(false, None)]
+#[case::btree_mixed_case(false, Some("/LANCE.TABLE.btreeindexdetails"))]
+#[tokio::test]
+async fn test_json_and_btree_coverage_after_stable_row_id_rewrite(
+    #[case] json: bool,
+    #[case] alias: Option<&str>,
+) {
+    let uri = TempStrDir::default();
+    let batch = json_id_batch(vec![r#"{"p":0}"#, r#"{"p":1}"#, r#"{"p":2}"#, r#"{"p":3}"#]);
+    let schema = batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch)], schema),
+        &uri,
+        Some(WriteParams {
+            enable_stable_row_ids: true,
+            max_rows_per_file: 2,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let name = "rewritten_idx";
+    let (column, filter, params) = if json {
+        (
+            "json",
+            "json_get_int(json, 'p') = 2",
+            ScalarIndexParams::new("json".into()).with_params(&serde_json::json!({
+                "target_index_type": "btree",
+                "target_data_type": "Int64",
+                "path": "p",
+            })),
+        )
+    } else {
+        ("id", "id = 2", ScalarIndexParams::default())
+    };
+    let mut segment = dataset
+        .create_index_builder(&[column], IndexType::Scalar, &params)
+        .name(name.into())
+        .execute_uncommitted()
+        .await
+        .unwrap();
+    assert_eq!(segment.index_version, 1);
+    if let Some(alias) = alias {
+        Arc::make_mut(segment.index_details.as_mut().unwrap()).type_url = alias.into();
+    }
+    let original_uuid = segment.uuid;
+    dataset
+        .commit_existing_index_segments(name, column, vec![segment])
+        .await
+        .unwrap();
+    let mut dataset = DatasetBuilder::from_uri(uri.as_str()).load().await.unwrap();
+    assert_eq!(json_filter_ids(&dataset, filter, true).await, vec![2]);
+    let metrics = compact_files(
+        &mut dataset,
+        CompactionOptions {
+            target_rows_per_fragment: 10,
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(metrics.fragments_removed, 2);
+    assert_eq!(metrics.fragments_added, 1);
+
+    let dataset = DatasetBuilder::from_uri(uri.as_str()).load().await.unwrap();
+    assert_eq!(
+        dataset.fragment_bitmap().iter().collect::<Vec<_>>(),
+        vec![2]
+    );
+    for detailed in [false, true] {
+        let stats = dataset
+            .index_scan_statistics(
+                name,
+                IndexScanStatisticsOptions::default().with_segment_stats(detailed),
+            )
+            .await
+            .unwrap();
+        let segment = &stats.segments[0];
+        let coverage = stats.coverage.unwrap();
+        if json {
+            assert_eq!(segment.uuid, original_uuid);
+            assert_eq!(coverage.covered_fragment_live_rows, Some(0));
+            assert_eq!(coverage.uncovered_fragment_live_rows, Some(4));
+        } else {
+            assert_ne!(segment.uuid, original_uuid);
+            assert_eq!(coverage.covered_fragment_live_rows, Some(4));
+            assert_eq!(coverage.uncovered_fragment_live_rows, Some(0));
+        }
+    }
+    assert_eq!(json_filter_ids(&dataset, filter, true).await, vec![2]);
+    assert_eq!(json_filter_ids(&dataset, filter, false).await, vec![2]);
+}
+
+#[rstest]
+#[case::recorded_btree("btree", JsonTargetDataType::Int64 as i32)]
+#[case::recovered_btree("btree", JsonTargetDataType::Unspecified as i32)]
+#[case::recorded_foreign("foreign", JsonTargetDataType::Int64 as i32)]
+#[case::unspecified_foreign("foreign", JsonTargetDataType::Unspecified as i32)]
+#[case::recorded_future("future", JsonTargetDataType::Int64 as i32)]
+#[case::unspecified_future("future", JsonTargetDataType::Unspecified as i32)]
+#[case::recorded_inverted("inverted", JsonTargetDataType::Int64 as i32)]
+#[case::unspecified_inverted("inverted", JsonTargetDataType::Unspecified as i32)]
+#[tokio::test]
+async fn test_index_scan_statistics_json_resolved_target(
+    #[case] target: &str,
+    #[case] recorded_type: i32,
+) {
+    let test_uri = TempStrDir::default();
+    let batch = json_id_batch(vec![r#"{"p": 7}"#, r#"{"p": 9}"#]);
+    let mut fields = batch.schema().fields().iter().cloned().collect::<Vec<_>>();
+    fields.push(Arc::new(ArrowField::new("text", DataType::Utf8, false)));
+    let mut columns = batch.columns().to_vec();
+    columns.push(Arc::new(StringArray::from(vec!["seven", "nine"])));
+    let schema = Arc::new(ArrowSchema::new(fields));
+    let batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch)], schema),
+        &test_uri,
+        None,
+    )
+    .await
+    .unwrap();
+    let name = "json_resolved_target";
+    let (mut segment, mut wrapper) = if target == "inverted" {
+        let segment = dataset
+            .create_index_builder(
+                &["text"],
+                IndexType::Inverted,
+                &InvertedIndexParams::default(),
+            )
+            .name(name.into())
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        let wrapper = JsonIndexDetails {
+            path: "p".into(),
+            target_details: segment.index_details.as_deref().cloned(),
+            target_index_version: Some(segment.index_version as u32),
+            ..Default::default()
+        };
+        (
+            IndexMetadata {
+                fields: vec![dataset.schema().field_id("json").unwrap()],
+                index_version: 0,
+                ..segment
+            },
+            wrapper,
+        )
+    } else {
+        let params = ScalarIndexParams::new("json".into()).with_params(&serde_json::json!({
+            "target_index_type": "btree", "target_data_type": "Int64", "path": "p",
+        }));
+        let segment = dataset
+            .create_index_builder(&["json"], IndexType::Scalar, &params)
+            .name(name.into())
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        let wrapper =
+            JsonIndexDetails::decode(segment.index_details.as_ref().unwrap().value.as_slice())
+                .unwrap();
+        (segment, wrapper)
+    };
+    wrapper.target_data_type = recorded_type;
+    if target == "foreign" {
+        wrapper.target_details.as_mut().unwrap().type_url = "/example.BTreeIndexDetails".into();
+    } else if target == "future" {
+        wrapper.target_index_version = Some(99);
+    }
+    segment.index_details = Some(Arc::new(prost_types::Any::from_msg(&wrapper).unwrap()));
+    let uuid = segment.uuid;
+    let footprint = segment.total_size_bytes();
+    persist_fixture(&mut dataset, vec![segment]).await;
+    let dataset = DatasetBuilder::from_uri(&test_uri)
+        .with_session(Arc::new(Session::default()))
+        .load()
+        .await
+        .unwrap();
+    let is_routable = target == "btree";
+    for detail in [false, true] {
+        let stats = dataset
+            .index_scan_statistics(
+                name,
+                IndexScanStatisticsOptions::default().with_segment_stats(detail),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stats.index_type.as_deref(), Some("Json"));
+        let has_coverage =
+            is_routable && (detail || recorded_type != JsonTargetDataType::Unspecified as i32);
+        assert_eq!(stats.coverage.is_some(), has_coverage);
+        let segment = &stats.segments[0];
+        assert_eq!(segment.uuid, uuid);
+        assert_eq!(segment.size_bytes, footprint);
+        assert_eq!(
+            segment.covered_fragment_live_rows,
+            has_coverage.then_some(2)
+        );
+        match target {
+            "btree" => assert_eq!(stats.details.unwrap()["target_index_type"], "BTree"),
+            "inverted" => assert_eq!(stats.details.unwrap()["target_index_type"], "Inverted"),
+            _ => assert!(stats.details.is_none()),
+        }
+    }
+
+    let filter = "json_get_int(json, 'p') = 7";
+    let plan = dataset
+        .scan()
+        .filter(filter)
+        .unwrap()
+        .explain_plan(false)
+        .await
+        .unwrap();
+    assert_eq!(plan.contains(name), is_routable, "{plan}");
+    assert_eq!(json_filter_ids(&dataset, filter, true).await, vec![0]);
+    assert_eq!(json_filter_ids(&dataset, filter, false).await, vec![0]);
+    if target == "foreign" || target == "future" {
+        let error = dataset
+            .open_scalar_index("json", &uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("JSON index path 'p'"), "{message}");
+        let expected = if target == "foreign" {
+            "/example.BTreeIndexDetails"
+        } else {
+            "99"
+        };
+        assert!(message.contains(expected), "{message}");
     }
 }

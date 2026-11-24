@@ -17,16 +17,22 @@ use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use futures::{FutureExt, StreamExt, TryStreamExt};
 use itertools::Itertools;
+use lance_index::pb::JsonIndexDetails;
+use lance_index::scalar::bloomfilter::read_bloomfilter_zone_fragments;
+use lance_index::scalar::inverted::is_inverted_details_type;
+use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::{
     FtsPrewarmResult, IndexCriteria, IndexDescription, IndexParams, IndexType, PrewarmOptions,
     frag_reuse::FRAG_REUSE_INDEX_NAME, is_system_index, mem_wal::MEM_WAL_INDEX_NAME,
     metrics::NoOpMetricsCollector, optimize::OptimizeOptions,
 };
-use lance_table::format::{IndexMetadata, list_index_files_with_sizes};
+use lance_table::format::{IndexDetailsType, IndexMetadata, list_index_files_with_sizes};
+use prost::Message;
 use roaring::RoaringBitmap;
 use tracing::instrument;
 use uuid::Uuid;
 
+use crate::dataset::index::LanceIndexStoreExt;
 use crate::dataset::transaction::{Operation, ReadVersionState, Transaction};
 use crate::index::api::{DatasetIndexExt, IndexSegment, IndexSegmentStatistics, IntoIndexSegment};
 use crate::index::append;
@@ -42,7 +48,10 @@ use crate::index::prewarm::{filter_index_segments_by_ids, prewarm_index_segments
 use crate::index::provenance::{
     prune_stale_segment_coverage, remap_merged_segment_coverage, replay_staged_segments,
 };
-use crate::index::scalar::{self, IndexDetails, index_matches_criteria};
+use crate::index::scalar::{
+    self, IndexDetails, SCALAR_INDEX_PLUGIN_REGISTRY, index_details_type_matches,
+    index_matches_criteria,
+};
 use crate::index::segment::{
     index_is_usable, retain_committed_inverted_files, segment_has_bitmap_details,
     segment_has_bloomfilter_details, segment_has_btree_details, segment_has_fmindex_details,
@@ -201,7 +210,7 @@ pub(super) async fn build_index_metadata_from_segments(
             index_version,
             dataset_version,
         ) = segment.into_parts();
-        let is_inverted_index = index_details.type_url.ends_with("InvertedIndexDetails");
+        let is_inverted_index = is_inverted_details_type(&index_details.type_url);
         if is_inverted_index {
             let metadata = IndexMetadata {
                 uuid,
@@ -548,6 +557,111 @@ impl Dataset {
             Some(version) => Err(Error::not_supported(format!(
                 "FRI index_version {version} is unsupported. Please upgrade to a newer version",
             ))),
+        }
+    }
+
+    /// A stable-ID wrapper that may have inherited stale coverage from an
+    /// old writer and whose metadata permits building or recovering a parser.
+    pub(super) fn legacy_json_requires_query_verification(&self, index: &IndexMetadata) -> bool {
+        self.legacy_json_verification_uses_projected_bloom(index)
+            .is_some()
+    }
+
+    fn legacy_json_verification_uses_projected_bloom(&self, index: &IndexMetadata) -> Option<bool> {
+        if !self.manifest.uses_stable_row_ids()
+            || !index.legacy_json_coverage_requires_verification()
+        {
+            return None;
+        }
+        let wrapper =
+            JsonIndexDetails::decode(index.index_details.as_ref()?.value.as_slice()).ok()?;
+        let (target, plugin) = wrapper
+            .resolve_target(&SCALAR_INDEX_PLUGIN_REGISTRY)
+            .ok()??;
+        wrapper
+            .target_allows_query(&index.name, target, plugin)
+            .then_some(
+                IndexDetailsType::from_url(&target.type_url) == Some(IndexDetailsType::BloomFilter),
+            )
+    }
+
+    /// Resolve coverage for a named consumer without opening unrelated scalar indices.
+    pub(crate) async fn load_indices_with_verified_legacy_json_coverage(
+        &self,
+        name: &str,
+    ) -> Result<Vec<IndexMetadata>> {
+        let mut indices = self.load_indices_by_name(name).await?;
+        for index in &mut indices {
+            if let Some(is_bloom_filter) = self.legacy_json_verification_uses_projected_bloom(index)
+            {
+                index.fragment_bitmap = Some(
+                    self.verify_legacy_json_coverage(index, is_bloom_filter)
+                        .await
+                        .unwrap_or_default(),
+                );
+            }
+        }
+        Ok(indices)
+    }
+
+    pub(super) async fn verified_legacy_json_query_fragments(
+        &self,
+        index: &IndexMetadata,
+    ) -> Option<RoaringBitmap> {
+        let is_bloom_filter = self.legacy_json_verification_uses_projected_bloom(index)?;
+        self.verify_legacy_json_coverage(index, is_bloom_filter)
+            .await
+    }
+
+    /// Resolve the registered coverage of a legacy JSON segment on a stable-ID
+    /// snapshot without fragment reuse. The target's physical fragment IDs
+    /// are authoritative for the subset the segment can still serve.
+    async fn verify_legacy_json_coverage(
+        &self,
+        index: &IndexMetadata,
+        is_bloom_filter: bool,
+    ) -> Option<RoaringBitmap> {
+        let mut coverage = index.effective_fragment_bitmap(self.fragment_bitmap())?;
+        if coverage.is_empty() {
+            return Some(coverage);
+        }
+        let open = async {
+            if is_bloom_filter {
+                let store = LanceIndexStore::from_dataset_for_existing(self, index).await?;
+                return read_bloomfilter_zone_fragments(&store).await.map(Some);
+            }
+            let field_id = index.keyed_field().ok_or_else(|| {
+                Error::index(format!("JSON segment {} must index one field", index.uuid))
+            })?;
+            let column = self.schema().field_path(field_id)?;
+            let target = scalar::open_scalar_index_with_remapping(
+                self,
+                &column,
+                index,
+                None,
+                &NoOpMetricsCollector,
+            )
+            .await?;
+            if target.results_are_row_addresses() {
+                target.calculate_included_frags().await.map(Some)
+            } else {
+                Ok(None)
+            }
+        };
+        match open.await {
+            Ok(Some(included)) => {
+                coverage &= included;
+                Some(coverage)
+            }
+            Ok(None) => None,
+            Err(error) => {
+                log::warn!(
+                    "Could not verify coverage of JSON index '{}' ({}): {error}",
+                    index.name,
+                    index.uuid,
+                );
+                None
+            }
         }
     }
 }
@@ -973,7 +1087,9 @@ impl DatasetIndexExt for Dataset {
                 return Some("<unknown>".to_owned());
             };
             let existing_type_url = existing_details.type_url.as_str();
-            (Some(existing_type_url) != incoming_type_url.as_deref())
+            incoming_type_url
+                .as_deref()
+                .is_none_or(|incoming| !index_details_type_matches(existing_type_url, incoming))
                 .then(|| existing_type_url.to_owned())
         });
         let missing_fragments = &dataset_fragments - &incoming_fragments;

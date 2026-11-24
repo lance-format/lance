@@ -24,6 +24,8 @@ mod wand;
 
 use futures::{StreamExt, TryStreamExt, stream};
 use lance_index_core::remapping::BatchRowIdRemapper;
+use lance_table::format::IndexDetailsType;
+use prost::Message;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
 
@@ -645,9 +647,9 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
     fn new_query_parser(
         &self,
         index_name: String,
-        _index_details: &prost_types::Any,
+        index_details: &prost_types::Any,
     ) -> Option<Box<dyn ScalarQueryParser>> {
-        let Ok(index_details) = _index_details.to_msg::<pbold::InvertedIndexDetails>() else {
+        let Ok(index_details) = decode_inverted_details(index_details) else {
             return None;
         };
 
@@ -675,7 +677,7 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
         let index = InvertedIndex::load(index_store, frag_reuse_index, cache).await?;
-        let details = index_details.to_msg::<pbold::InvertedIndexDetails>()?;
+        let details = decode_inverted_details(index_details)?;
         let expected_granularity = DocumentGranularity::try_from(details.document_granularity)?;
         let physical_granularity = index.params().get_document_granularity();
         if physical_granularity != expected_granularity {
@@ -700,7 +702,7 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
     ) -> Result<Arc<dyn ScalarIndex>> {
         let index =
             InvertedIndex::load_with_remapping(index_store, frag_reuse_index, cache).await?;
-        let details = index_details.to_msg::<pbold::InvertedIndexDetails>()?;
+        let details = decode_inverted_details(index_details)?;
         let expected_granularity = DocumentGranularity::try_from(details.document_granularity)?;
         let physical_granularity = index.params().get_document_granularity();
         if physical_granularity != expected_granularity {
@@ -803,10 +805,27 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
     }
 
     fn details_as_json(&self, details: &prost_types::Any) -> Result<serde_json::Value> {
-        let index_details = details.to_msg::<pbold::InvertedIndexDetails>()?;
+        let index_details = decode_inverted_details(details)?;
         let index_params = InvertedIndexParams::try_from(&index_details)?;
         Ok(index_params.to_details_json()?)
     }
+}
+
+/// Whether the URL identifies a registered inverted index details message.
+pub fn is_inverted_details_type(type_url: &str) -> bool {
+    IndexDetailsType::from_url(type_url) == Some(IndexDetailsType::Inverted)
+}
+
+fn decode_inverted_details(details: &prost_types::Any) -> Result<pbold::InvertedIndexDetails> {
+    if !is_inverted_details_type(&details.type_url) {
+        return Err(Error::invalid_input(format!(
+            "Unrecognized inverted index details type {}",
+            details.type_url
+        )));
+    }
+    Ok(pbold::InvertedIndexDetails::decode(
+        details.value.as_slice(),
+    )?)
 }
 
 #[cfg(test)]

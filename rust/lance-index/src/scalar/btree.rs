@@ -4428,6 +4428,10 @@ impl ScalarIndexPlugin for BTreeIndexPlugin {
         )))
     }
 
+    fn query_domain_recovery_support(&self, _index_details: &prost_types::Any) -> Option<bool> {
+        Some(true)
+    }
+
     async fn recover_query_domain(
         &self,
         index_name: String,

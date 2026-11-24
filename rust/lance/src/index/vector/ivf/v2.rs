@@ -3625,6 +3625,18 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         self.storage.partition_size(part_id)
     }
 
+    fn ivf_partition_entry_counts(&self) -> Result<Option<Vec<u64>>> {
+        let lengths = &self.storage.ivf().lengths;
+        let partitions = self.ivf.num_partitions();
+        if lengths.len() != partitions {
+            return Err(Error::index(format!(
+                "IVF model has {partitions} partitions but vector storage has {}",
+                lengths.len()
+            )));
+        }
+        Ok(Some(lengths.iter().copied().map(u64::from).collect()))
+    }
+
     /// the index type of this vector index.
     fn sub_index_type(&self) -> (SubIndexType, QuantizationType) {
         (S::name().try_into().unwrap(), Q::quantization_type())

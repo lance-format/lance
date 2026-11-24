@@ -32,6 +32,7 @@ pub(crate) mod provenance;
 pub(crate) mod remap;
 pub mod scalar;
 pub(crate) mod scalar_logical;
+mod scan_statistics;
 pub(crate) mod segment;
 pub(crate) mod segment_coverage;
 mod statistics;
@@ -48,6 +49,10 @@ pub use create::CreateIndexBuilder;
 pub use lance_index::IndexDescription;
 pub use lance_index::IndexParams;
 pub use lance_index::progress::{IndexBuildProgress, NoopIndexBuildProgress};
+pub use scan_statistics::{
+    IndexScanCoverage, IndexScanIvfStatistics, IndexScanSegmentStatistics, IndexScanStatistics,
+    IndexScanStatisticsOptions,
+};
 
 /// Register a statically linked scalar index plugin before using any datasets.
 ///

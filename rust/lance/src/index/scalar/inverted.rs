@@ -22,6 +22,7 @@ use lance_core::{
 use lance_index::pbold::InvertedIndexDetails;
 use lance_index::progress::IndexBuildProgress;
 use lance_index::scalar::inverted::builder::{FinalizeOptions, finalize_staged_index_to};
+use lance_index::scalar::inverted::is_inverted_details_type;
 use lance_index::scalar::inverted::{
     DocumentGranularity, InvertedIndex, InvertedIndexParams, doc_index_storage_column,
 };
@@ -554,7 +555,7 @@ pub(crate) async fn indexed_fts_document_granularities(
             continue;
         }
         let details_any = fetch_index_details(dataset, &resolved.canonical_path, index).await?;
-        if !details_any.type_url.ends_with("InvertedIndexDetails") {
+        if !is_inverted_details_type(&details_any.type_url) {
             continue;
         }
         let details =
@@ -612,7 +613,7 @@ pub(crate) async fn indexed_fts_index_params(
             continue;
         }
         let details_any = fetch_index_details(dataset, &resolved.canonical_path, index).await?;
-        if !details_any.type_url.ends_with("InvertedIndexDetails") {
+        if !is_inverted_details_type(&details_any.type_url) {
             continue;
         }
         let details =

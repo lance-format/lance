@@ -10,6 +10,10 @@ from .pq import PqModel
 
 IndexSegmentDescription = _lance.indices.IndexSegmentDescription
 IndexSegment = _lance.indices.IndexSegment
+IndexScanCoverage = _lance.indices.IndexScanCoverage
+IndexScanIvfStatistics = _lance.indices.IndexScanIvfStatistics
+IndexScanSegmentStatistics = _lance.indices.IndexScanSegmentStatistics
+IndexScanStatistics = _lance.indices.IndexScanStatistics
 
 __all__ = [
     "IndicesBuilder",
@@ -19,6 +23,10 @@ __all__ = [
     "IndexFileVersion",
     "IndexSegment",
     "IndexSegmentDescription",
+    "IndexScanCoverage",
+    "IndexScanIvfStatistics",
+    "IndexScanSegmentStatistics",
+    "IndexScanStatistics",
 ]
 
 

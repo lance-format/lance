@@ -266,6 +266,9 @@ pub(crate) fn optimizable_indices<'a>(
         if !options.retrain
             && options.num_indices_to_merge.is_none_or(|n| n == 0)
             && index_group_is_scalar(dataset, &deltas)
+            && !deltas
+                .iter()
+                .any(|index| dataset.legacy_json_requires_query_verification(index))
             && index_group_has_no_unindexed(dataset, &deltas)
         {
             continue;

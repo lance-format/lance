@@ -31,6 +31,7 @@ use uuid::Uuid;
 use crate::index::DatasetIndexExt;
 use crate::index::create::CreateIndexBuilder;
 use crate::index::loading::DatasetIndexInternalExt;
+use crate::index::vector::details::is_vector_details_type;
 use crate::session::index_caches::ProstAny;
 use crate::{
     Dataset,
@@ -63,10 +64,12 @@ use lance_index::scalar::IndexStore;
 use lance_index::scalar::bloomfilter::BLOOMFILTER_FILENAME;
 use lance_index::scalar::btree::BTREE_LOOKUP_NAME;
 use lance_index::scalar::inverted::builder::resolve_num_workers;
+use lance_index::scalar::inverted::is_inverted_details_type;
 use lance_index::scalar::inverted::{InvertedIndex, METADATA_FILE};
 use lance_index::scalar::label_list::{
     LABEL_LIST_NULLS_METADATA_KEY, LABEL_LIST_NULLS_MIN_VERSION,
 };
+use lance_index::scalar::minhash_lsh::is_minhash_details_type;
 use lance_index::scalar::ngram::POSTINGS_FILENAME;
 use lance_index::scalar::registry::{
     ScalarIndexCacheKey, ScalarIndexLoad, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering,
@@ -391,23 +394,34 @@ pub(crate) static SCALAR_INDEX_PLUGIN_REGISTRY: LazyLock<Arc<IndexPluginRegistry
         IndexPluginRegistry::with_default_plugins()
     });
 
+/// Registered scalar aliases share one identity. Details outside the scalar
+/// registry retain their original URL as their identity.
+pub(super) fn index_details_type_matches(left: &str, right: &str) -> bool {
+    left == right
+        || SCALAR_INDEX_PLUGIN_REGISTRY
+            .canonical_details_type_name(left)
+            .is_some_and(|name| {
+                SCALAR_INDEX_PLUGIN_REGISTRY.canonical_details_type_name(right) == Some(name)
+            })
+}
+
 pub struct IndexDetails(pub Arc<prost_types::Any>);
 
 impl IndexDetails {
     /// Returns true if the index is a vector index
     pub fn is_vector(&self) -> bool {
-        self.0.type_url.ends_with("VectorIndexDetails")
+        is_vector_details_type(&self.0.type_url)
     }
 
     /// Returns true if the index supports FTS
     pub fn supports_fts(&self) -> bool {
         // In the future this may need to change if we want FTS indices to be pluggable
-        self.0.type_url.ends_with("InvertedIndexDetails")
+        is_inverted_details_type(&self.0.type_url)
     }
 
     /// Returns true if the index supports MinHash similarity search
     pub fn supports_minhash(&self) -> bool {
-        self.0.type_url.ends_with("MinHashLshIndexDetails")
+        is_minhash_details_type(&self.0.type_url)
     }
 
     /// Returns the plugin for the index
@@ -761,7 +775,7 @@ pub async fn fetch_index_details(
         None => infer_scalar_index_details(dataset, column, index).await?,
     };
 
-    if index_details.type_url.ends_with("InvertedIndexDetails") {
+    if is_inverted_details_type(&index_details.type_url) {
         let details =
             InvertedIndexDetails::decode(index_details.value.as_slice()).map_err(|err| {
                 Error::io(format!(
@@ -926,6 +940,20 @@ pub(crate) async fn open_scalar_index_with_plan(
     purpose: super::frag_reuse::OpenPurpose,
     metrics: &dyn MetricsCollector,
 ) -> Result<Arc<dyn ScalarIndex>> {
+    let resolved = super::frag_reuse::open_row_id_remapping_with_plan(
+        dataset, index, staged, purpose, metrics,
+    )
+    .await?;
+    open_scalar_index_with_remapping(dataset, column, index, resolved, metrics).await
+}
+
+pub(super) async fn open_scalar_index_with_remapping(
+    dataset: &Dataset,
+    column: &str,
+    index: &IndexMetadata,
+    resolved: Option<(Uuid, ResolvedRemapping)>,
+    metrics: &dyn MetricsCollector,
+) -> Result<Arc<dyn ScalarIndex>> {
     let index_uuid = index.uuid;
     let index_store = Arc::new(LanceIndexStore::from_dataset_for_existing(dataset, index).await?);
 
@@ -935,10 +963,6 @@ pub(crate) async fn open_scalar_index_with_plan(
     }
     let plugin = SCALAR_INDEX_PLUGIN_REGISTRY.get_plugin_by_details(index_details.as_ref())?;
 
-    let resolved = super::frag_reuse::open_row_id_remapping_with_plan(
-        dataset, index, staged, purpose, metrics,
-    )
-    .await?;
     let cache_id = super::frag_reuse::fri_cache_id(&resolved);
     let index_cache =
         super::frag_reuse::scoped_index_cache(dataset, &resolved).for_index(&index.uuid, cache_id);
@@ -1176,7 +1200,7 @@ pub fn index_matches_criteria(
         let is_fts_index = index
             .index_details
             .as_ref()
-            .is_some_and(|details| details.type_url.ends_with("InvertedIndexDetails"));
+            .is_some_and(|details| is_inverted_details_type(&details.type_url));
         if criteria.must_support_fts && is_fts_index {
             let requested_granularity = criteria
                 .fts_document_granularity

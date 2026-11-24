@@ -6,6 +6,7 @@
 use crate::Dataset;
 use lance_core::utils::address::RowAddress;
 use lance_core::{Error, Result};
+use lance_index::scalar::inverted::is_inverted_details_type;
 use lance_table::format::IndexMetadata;
 use lance_table::system_index::frag_reuse::ledger::FragReuseLedger;
 use roaring::RoaringBitmap;
@@ -164,7 +165,7 @@ pub(crate) async fn segment_supports_batch_remapping(
             super::frag_reuse_remapping::vector_supports_batch_remapping(dataset, index).await?,
         ));
     }
-    if details.type_url.ends_with("InvertedIndexDetails") {
+    if is_inverted_details_type(&details.type_url) {
         return super::frag_reuse_remapping::inverted_supports_batch_remapping(dataset, index)
             .await;
     }

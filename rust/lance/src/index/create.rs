@@ -1229,7 +1229,7 @@ mod tests {
 
     use super::*;
     use crate::dataset::{ColumnAlteration, WriteMode, WriteParams};
-    use crate::index::{DatasetIndexExt, IndexSegment};
+    use crate::index::{DatasetIndexExt, IndexScanStatisticsOptions, IndexSegment};
     use crate::utils::test::covering;
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
     use arrow::datatypes::{Float32Type, Int32Type, Int64Type};
@@ -3734,6 +3734,18 @@ mod tests {
             logical_index.as_ivf().unwrap().num_partitions_per_segment(),
             vec![(metadata.uuid, expected_partitions)]
         );
+        let stats = dataset
+            .index_scan_statistics(
+                "vector_idx",
+                IndexScanStatisticsOptions::default().with_segment_stats(true),
+            )
+            .await
+            .unwrap();
+        let coverage = stats.coverage.unwrap();
+        assert_eq!(coverage.covered_fragment_live_rows, Some(0));
+        let ivf = stats.segments[0].ivf.as_ref().unwrap();
+        assert_eq!(ivf.indexed_vector_entries, 0);
+        assert_eq!(ivf.partition_entry_counts, vec![0; expected_partitions]);
     }
 
     #[tokio::test]

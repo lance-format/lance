@@ -56,7 +56,7 @@ pub trait VectorIndexExtension: IndexExtension {
 mod test {
     use crate::{
         dataset::{builder::DatasetBuilder, scanner::test_dataset::TestVectorDataset},
-        index::{PreFilter, loading::DatasetIndexInternalExt},
+        index::{IndexScanStatisticsOptions, PreFilter, loading::DatasetIndexInternalExt},
         session::Session,
     };
 
@@ -385,7 +385,34 @@ mod test {
         let idx = ds_without_extension.load_indices().await.unwrap();
         assert_eq!(idx.len(), 1);
         // get the index uuid
-        let index_uuid = idx.first().unwrap().uuid;
+        let metadata = idx.first().unwrap();
+        let index_uuid = metadata.uuid;
+        let options = IndexScanStatisticsOptions::default();
+        let stats = ds_with_extension
+            .index_scan_statistics(&metadata.name, options)
+            .await
+            .unwrap();
+        assert_eq!(stats.segments[0].uuid, index_uuid);
+        assert_eq!(stats.dataset_version, ds_with_extension.manifest().version);
+        assert!(stats.live_rows.is_some());
+        assert!(stats.segments[0].ivf.is_none());
+        assert!(
+            !idx_ext
+                .load_index_called
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
+
+        let detailed = ds_with_extension
+            .index_scan_statistics(&metadata.name, options.with_segment_stats(true))
+            .await
+            .unwrap();
+        assert_eq!(detailed.segments[0].uuid, index_uuid);
+        assert!(detailed.segments[0].ivf.is_none());
+        assert!(
+            idx_ext
+                .load_index_called
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
 
         // trying to open the index should fail as there is no extension loader
         assert!(

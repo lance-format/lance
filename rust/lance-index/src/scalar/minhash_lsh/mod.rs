@@ -84,6 +84,7 @@ use lance_encoding::constants::{
     COMPRESSION_META_KEY, STRUCTURAL_ENCODING_FULLZIP, STRUCTURAL_ENCODING_META_KEY,
 };
 use lance_select::RowAddrMask;
+use lance_table::format::IndexDetailsType;
 use lance_tokenizer::TokenStream;
 use prost::Message;
 use rayon::slice::ParallelSliceMut;
@@ -482,7 +483,7 @@ impl MinHashLshIndexParams {
 
     /// Parse the details stored in the index metadata.
     pub fn from_details_any(details: &prost_types::Any) -> Result<Self> {
-        Self::from_details(&details.to_msg::<pb::MinHashLshIndexDetails>()?)
+        Self::from_details(&decode_minhash_details(details)?)
     }
 
     fn details_hex(&self) -> Result<String> {
@@ -498,6 +499,23 @@ impl MinHashLshIndexParams {
         })?;
         Self::from_details(&details)
     }
+}
+
+/// Whether the supplied type URL declares the registered MinHash LSH details message.
+pub fn is_minhash_details_type(type_url: &str) -> bool {
+    IndexDetailsType::from_url(type_url) == Some(IndexDetailsType::MinHashLsh)
+}
+
+fn decode_minhash_details(details: &prost_types::Any) -> Result<pb::MinHashLshIndexDetails> {
+    if !is_minhash_details_type(&details.type_url) {
+        return Err(Error::invalid_input(format!(
+            "Unrecognized MinHash LSH details type {}",
+            details.type_url
+        )));
+    }
+    Ok(pb::MinHashLshIndexDetails::decode(
+        details.value.as_slice(),
+    )?)
 }
 
 /// Deterministic 64-bit generator (SplitMix64) used to derive the permutation
@@ -946,7 +964,7 @@ impl ScalarIndexPlugin for MinHashLshIndexPlugin {
     }
 
     fn details_as_json(&self, details: &prost_types::Any) -> Result<serde_json::Value> {
-        let details = details.to_msg::<pb::MinHashLshIndexDetails>()?;
+        let details = decode_minhash_details(details)?;
         let params = MinHashLshIndexParams::from_details(&details)?;
         let mut value = serde_json::to_value(&params)?;
         if let Some(object) = value.as_object_mut() {
