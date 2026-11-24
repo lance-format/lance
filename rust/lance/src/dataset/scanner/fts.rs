@@ -17,14 +17,16 @@ use arrow_schema::{DataType, Schema as ArrowSchema, SortOptions};
 use async_recursion::async_recursion;
 use datafusion::common::{JoinType, NullEquality};
 use datafusion::functions_aggregate;
+use datafusion::logical_expr::lit;
 use datafusion::physical_expr::PhysicalSortExpr;
 use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy};
+use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::union::UnionExec;
 use datafusion::physical_plan::{ExecutionPlan, expressions};
 use datafusion_physical_expr::expressions::Column;
-use datafusion_physical_expr::{Partitioning, PhysicalExpr};
+use datafusion_physical_expr::{LexOrdering, Partitioning, PhysicalExpr};
 use datafusion_physical_plan::empty::EmptyExec;
 use datafusion_physical_plan::joins::{HashJoinExec, PartitionMode};
 use datafusion_physical_plan::projection::ProjectionExec;
@@ -68,7 +70,9 @@ use crate::io::exec::fts::{
     PhraseQueryExec, SharedFtsScorer, SharedFtsScorerExec,
     build_boolean_query_children_with_schema,
 };
-use crate::io::exec::{FilterPlan as ExprFilterPlan, PreFilterSource, RowAddrMaskFilterExec};
+use crate::io::exec::{
+    FilterPlan as ExprFilterPlan, LanceFilterExec, PreFilterSource, RowAddrMaskFilterExec,
+};
 use crate::{Error, Result};
 
 use super::{FilterPlan, PlannedFilteredScan, Scanner, fts_indexed_columns};
@@ -279,6 +283,25 @@ fn has_complete_hybrid_fts_coverage(
         return false;
     }
     indexed | residual == target
+}
+
+/// An empty FTS result for an explicit zero candidate budget.
+///
+/// A zero fetch must not reach `SortExec`: DataFusion lowers it into a `TopK`
+/// heap that asserts `k > 0`. Filtering with a false predicate keeps the input
+/// schema and still executes the child, so checks that only run during
+/// execution (notably `combined_fields` tokenizer compatibility) still report
+/// their errors. The coalesce gives the sort its single input partition, and a
+/// fetch-less sort is not a distribution-only operator, so `EnforceDistribution`
+/// cannot strip the single-partition output. The sort also consumes the whole
+/// child stream, which keeps those errors observable.
+pub fn zero_candidate_plan(
+    input: Arc<dyn ExecutionPlan>,
+    ordering: LexOrdering,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    let filtered = Arc::new(LanceFilterExec::try_new(lit(false), input)?);
+    let single_partition = Arc::new(CoalescePartitionsExec::new(filtered));
+    Ok(Arc::new(SortExec::new(ordering, single_partition)))
 }
 
 fn validate_fts_query_contract(query: &FtsQuery) -> Result<()> {
@@ -1552,6 +1575,9 @@ impl Scanner {
                     schema,
                 )?);
                 let sort_exprs = Self::fts_score_sort_exprs(fts_node.schema().as_ref())?;
+                if params.limit == Some(0) {
+                    return zero_candidate_plan(fts_node, sort_exprs.into());
+                }
 
                 // `params.limit` is the recursive planning contract. Compound
                 // parents pass `None` when they require every candidate.
@@ -2275,6 +2301,10 @@ impl Scanner {
                 ));
             }
         };
+        if params.limit == Some(0) {
+            let sort_exprs = Self::fts_score_sort_exprs(plan.schema().as_ref())?;
+            return zero_candidate_plan(plan, sort_exprs.into());
+        }
         let plan = Arc::new(RepartitionExec::try_new(
             plan,
             Partitioning::RoundRobinBatch(1),
@@ -2660,13 +2690,18 @@ impl Scanner {
                 Partitioning::RoundRobinBatch(1),
             )?)
         };
-        let plan: Arc<dyn ExecutionPlan> = Arc::new(
-            SortExec::new(
-                Self::fts_score_sort_exprs(scored_plan.schema().as_ref())?.into(),
-                scored_plan,
+        let plan: Arc<dyn ExecutionPlan> = if params.limit == Some(0) {
+            let sort_exprs = Self::fts_score_sort_exprs(scored_plan.schema().as_ref())?;
+            zero_candidate_plan(scored_plan, sort_exprs.into())?
+        } else {
+            Arc::new(
+                SortExec::new(
+                    Self::fts_score_sort_exprs(scored_plan.schema().as_ref())?.into(),
+                    scored_plan,
+                )
+                .with_fetch(params.limit),
             )
-            .with_fetch(params.limit),
-        );
+        };
         Ok(match shared_scorer {
             Some(shared_scorer) => Arc::new(SharedFtsScorerExec::new_combined(plan, shared_scorer)),
             None => plan,

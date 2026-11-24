@@ -9,6 +9,7 @@ use itertools::Itertools;
 use lance_io::object_store::ObjectStore;
 use lance_table::io::commit::{CommitHandler, VERSIONS_DIR};
 use lance_table::io::deletion::DELETIONS_DIR;
+use lance_table::system_index::mem_wal::is_mem_wal_dir_name;
 use object_store::{
     Error as ObjectStoreError,
     path::{Path, PathPart},
@@ -16,12 +17,10 @@ use object_store::{
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-use crate::dataset::branch_location::BranchLocation;
-use crate::dataset::mem_wal::util::is_mem_wal_dir_name;
-use crate::dataset::refs::Ref::{Tag, Version, VersionNumber};
-use crate::dataset::{BLOBS_DIR, DATA_DIR, FRAG_REUSE_DIR, INDICES_DIR, TRANSACTIONS_DIR};
-use crate::utils::temporal::utc_now;
-use crate::{Error, Result};
+use crate::branch_location::BranchLocation;
+use crate::paths::{BLOBS_DIR, DATA_DIR, FRAG_REUSE_DIR, INDICES_DIR, TRANSACTIONS_DIR};
+use crate::refs::Ref::{Tag, Version, VersionNumber};
+use lance_core::{Error, Result};
 use serde::de::DeserializeOwned;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
@@ -93,9 +92,9 @@ impl fmt::Display for Ref {
 
 #[derive(Debug, Clone)]
 pub struct Refs {
-    pub(crate) object_store: Arc<ObjectStore>,
-    pub(crate) commit_handler: Arc<dyn CommitHandler>,
-    pub(crate) base_location: BranchLocation,
+    object_store: Arc<ObjectStore>,
+    commit_handler: Arc<dyn CommitHandler>,
+    base_location: BranchLocation,
 }
 
 impl Refs {
@@ -244,7 +243,7 @@ impl Tags<'_> {
         let root_location = self.refs.root()?;
         let tag_file = tag_path(&root_location.path, tag);
 
-        let now = utc_now();
+        let now = Utc::now();
         let tag_contents = self
             .build_tag_content_by_ref(reference, Some(now), Some(now))
             .await?;
@@ -285,7 +284,7 @@ impl Tags<'_> {
         }
         let mut tag_contents = TagContents::from_path(&tag_file, self.object_store()).await?;
         let updated_reference = self
-            .build_tag_content_by_ref(reference, tag_contents.created_at, Some(utc_now()))
+            .build_tag_content_by_ref(reference, tag_contents.created_at, Some(Utc::now()))
             .await?;
         tag_contents.branch = updated_reference.branch;
         tag_contents.version = updated_reference.version;
@@ -473,7 +472,8 @@ impl Branches<'_> {
     }
 
     // Only create branch metadata, returning the contents that were written
-    pub(crate) async fn create(
+    #[doc(hidden)]
+    pub async fn create(
         &self,
         branch_name: &str,
         version_number: u64,
@@ -1191,11 +1191,11 @@ pub struct BranchContents {
     pub metadata: HashMap<String, String>,
 }
 
-/// A branch name reserved by [`Dataset::reserve_branch`](crate::Dataset::reserve_branch)
+/// A reserved branch name
 /// whose branch dataset has not been cloned yet.
 ///
-/// Pass it to [`Dataset::complete_branch`](crate::Dataset::complete_branch) to clone the
-/// reserved source version, or delete the branch to abandon the reservation.
+/// Complete the reservation by cloning the source version into the new branch,
+/// or delete the branch to abandon the reservation.
 #[derive(Debug)]
 #[must_use = "a reserved branch keeps its name until it is completed or deleted"]
 pub struct BranchReservation {
@@ -1415,14 +1415,16 @@ pub fn branch_contents_path(base_path: &Path, branch: &str) -> Path {
     base_branches_contents_path(base_path).join(format!("{}.json", branch))
 }
 
-pub(crate) fn normalize_branch(branch: Option<&str>) -> String {
+#[doc(hidden)]
+pub fn normalize_branch(branch: Option<&str>) -> String {
     match branch {
         None => MAIN_BRANCH.to_string(),
         Some(name) => name.to_string(),
     }
 }
 
-pub(crate) fn standardize_branch(branch: &str) -> Option<String> {
+#[doc(hidden)]
+pub fn standardize_branch(branch: &str) -> Option<String> {
     match branch {
         MAIN_BRANCH => None,
         name => Some(name.to_string()),
@@ -1483,10 +1485,10 @@ impl BranchContents {
 /// by older versions remain accessible.
 ///
 /// ```
-/// # use lance::dataset::refs::check_valid_branch;
+/// # use lance_table_runtime::refs::check_valid_branch;
 /// check_valid_branch("feature/new-model")?;
 /// assert!(check_valid_branch("feature/.").is_err());
-/// # Ok::<(), lance::Error>(())
+/// # Ok::<(), lance_core::Error>(())
 /// ```
 pub fn check_valid_branch(branch_name: &str) -> Result<()> {
     if branch_name.is_empty() {
@@ -1555,7 +1557,8 @@ pub fn check_valid_branch(branch_name: &str) -> Result<()> {
     Ok(())
 }
 
-pub(crate) const REFS_DIR: &str = "_refs";
+#[doc(hidden)]
+pub const REFS_DIR: &str = "_refs";
 
 // Nested branches cannot use these names because they overlap
 // directories owned by their ancestors.
@@ -1663,7 +1666,6 @@ pub fn check_valid_tag(s: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use datafusion::common::assert_contains;
 
     use rstest::rstest;
 
@@ -1706,9 +1708,12 @@ mod tests {
         )]
         r: &str,
     ) {
-        assert_contains!(
-            check_valid_tag(r).err().unwrap().to_string(),
-            "Ref is invalid: Ref"
+        assert!(
+            check_valid_tag(r)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("Ref is invalid: Ref")
         );
     }
 
@@ -1759,7 +1764,7 @@ mod tests {
         check_valid_branch(branch_name).unwrap();
         let error = check_new_branch(branch_name).unwrap_err();
         assert!(matches!(error, Error::InvalidRef { .. }), "{error}");
-        assert_contains!(error.to_string(), "after the first segment");
+        assert!(error.to_string().contains("after the first segment"));
     }
 
     #[rstest]
@@ -1795,7 +1800,7 @@ mod tests {
     fn test_branch_dot_segments(#[case] branch_name: &str) {
         let error = check_valid_branch(branch_name).unwrap_err();
         assert!(matches!(error, Error::InvalidRef { .. }), "{error}");
-        assert_contains!(error.to_string(), "'.' segment");
+        assert!(error.to_string().contains("'.' segment"));
     }
 
     #[rstest]
@@ -1814,7 +1819,7 @@ mod tests {
         } else {
             let error = result.unwrap_err();
             assert!(matches!(error, Error::InvalidRef { .. }), "{error}");
-            assert_contains!(error.to_string(), "maximum is 211 bytes");
+            assert!(error.to_string().contains("maximum is 211 bytes"));
         }
     }
 

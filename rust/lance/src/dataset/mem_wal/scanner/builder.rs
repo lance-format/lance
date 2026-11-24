@@ -31,6 +31,7 @@ use super::point_lookup::LsmPointLookupPlanner;
 use super::projection::validate_projection_names;
 use super::sstable_cache::{DatasetCache, SsTableWarmer};
 use super::vector_search::ProbeBounds;
+use super::{SearchQuery, SearchState, validate_nearest_query};
 use crate::dataset::Dataset;
 use crate::dataset::mem_wal::util::derived_store_params;
 use crate::dataset::utils::SchemaAdapter;
@@ -214,10 +215,8 @@ pub struct LsmScanner {
     filter: Option<Expr>,
     limit: Option<usize>,
     offset: Option<usize>,
-    /// Vector (KNN) search; when set, `create_plan` routes to the vector planner.
-    nearest: Option<LsmVectorQuery>,
-    /// Full-text search; when set, `create_plan` routes to the FTS planner.
-    full_text_query: Option<FullTextSearchQuery>,
+    /// Vector KNN and full-text search; mutually exclusive at plan time.
+    search: SearchState<LsmVectorQuery, FullTextSearchQuery>,
 
     // Internal columns
     with_row_address: bool,
@@ -280,8 +279,7 @@ impl LsmScanner {
             filter: None,
             limit: None,
             offset: None,
-            nearest: None,
-            full_text_query: None,
+            search: SearchState::new(),
             with_row_address: false,
             with_memtable_gen: false,
             pk_columns,
@@ -328,8 +326,7 @@ impl LsmScanner {
             filter: None,
             limit: None,
             offset: None,
-            nearest: None,
-            full_text_query: None,
+            search: SearchState::new(),
             with_row_address: false,
             with_memtable_gen: false,
             pk_columns,
@@ -501,15 +498,8 @@ impl LsmScanner {
     /// [`Self::nprobes`], [`Self::minimum_nprobes`], [`Self::maximum_nprobes`],
     /// [`Self::refine`], and [`Self::distance_metric`].
     pub fn nearest(mut self, column: &str, key: &dyn Array, k: usize) -> Result<Self> {
-        if k == 0 {
-            return Err(Error::invalid_input("k must be positive".to_string()));
-        }
-        if key.is_empty() {
-            return Err(Error::invalid_input(
-                "query vector must have non-zero length".to_string(),
-            ));
-        }
-        self.nearest = Some(LsmVectorQuery {
+        validate_nearest_query(key, k)?;
+        self.search.set_vector(LsmVectorQuery {
             column: column.to_string(),
             key: key.slice(0, key.len()),
             k,
@@ -523,7 +513,7 @@ impl LsmScanner {
     /// Search exactly `nprobes` IVF partitions on indexed arms by setting both
     /// probe bounds. No-op unless [`Self::nearest`] was called.
     pub fn nprobes(mut self, nprobes: usize) -> Self {
-        if let Some(q) = self.nearest.as_mut() {
+        if let Some(q) = self.search.vector_mut() {
             q.probe_bounds.minimum_nprobes = Some(nprobes);
             q.probe_bounds.maximum_nprobes = Some(nprobes);
         }
@@ -535,7 +525,7 @@ impl LsmScanner {
     /// When unset, the underlying Lance scanner supplies its default. No-op
     /// unless [`Self::nearest`] was called.
     pub fn minimum_nprobes(mut self, minimum_nprobes: usize) -> Self {
-        if let Some(q) = self.nearest.as_mut() {
+        if let Some(q) = self.search.vector_mut() {
             q.probe_bounds.minimum_nprobes = Some(minimum_nprobes);
         }
         self
@@ -546,7 +536,7 @@ impl LsmScanner {
     /// When unset, all partitions may be searched if needed. No-op unless
     /// [`Self::nearest`] was called.
     pub fn maximum_nprobes(mut self, maximum_nprobes: usize) -> Self {
-        if let Some(q) = self.nearest.as_mut() {
+        if let Some(q) = self.search.vector_mut() {
             q.probe_bounds.maximum_nprobes = Some(maximum_nprobes);
         }
         self
@@ -555,7 +545,7 @@ impl LsmScanner {
     /// Re-rank base and SSTable candidates by exact distance over `refine_factor`
     /// times as many. `0` clears it; no-op unless `nearest` was set.
     pub fn refine(mut self, refine_factor: u32) -> Self {
-        if let Some(q) = self.nearest.as_mut() {
+        if let Some(q) = self.search.vector_mut() {
             q.refine_factor = (refine_factor > 0).then_some(refine_factor);
         }
         self
@@ -564,7 +554,7 @@ impl LsmScanner {
     /// Distance metric for the vector search. Defaults to L2. No-op unless
     /// [`Self::nearest`] was called.
     pub fn distance_metric(mut self, metric: DistanceType) -> Self {
-        if let Some(q) = self.nearest.as_mut() {
+        if let Some(q) = self.search.vector_mut() {
             q.metric_type = Some(metric);
         }
         self
@@ -608,21 +598,17 @@ impl LsmScanner {
     pub async fn create_plan(&self) -> Result<Arc<dyn ExecutionPlan>> {
         // Dispatch by builder state, mirroring `Scanner::create_plan` and
         // `MemTableScanner::create_plan`: vector search, then full-text search,
-        // then the (point-lookup or union) plain scan.
-        // The LSM path has no hybrid mode, so reject combined search rather than
+        // then the (point-lookup or union) plain scan. The LSM path has no
+        // hybrid mode, so `SearchState` rejects a combined search rather than
         // silently dropping the full-text query under the vector dispatch.
-        if self.nearest.is_some() && self.full_text_query.is_some() {
-            return Err(Error::invalid_input(
-                "LSM scanner does not support combined vector and full-text search".to_string(),
-            ));
+        match self
+            .search
+            .resolve("LSM scanner does not support combined vector and full-text search")?
+        {
+            SearchQuery::Vector(query) => self.plan_vector(query).await,
+            SearchQuery::FullText(query) => self.plan_fts(query).await,
+            SearchQuery::Scan => self.plan_scan(self.projection.as_deref()).await,
         }
-        if self.nearest.is_some() {
-            return self.plan_vector().await;
-        }
-        if self.full_text_query.is_some() {
-            return self.plan_fts().await;
-        }
-        self.plan_scan(self.projection.as_deref()).await
     }
 
     /// Apply the builder's `limit`/`offset` on top of a search plan. The plain
@@ -637,11 +623,7 @@ impl LsmScanner {
 
     /// Vector (KNN) search across base ∪ SSTables ∪ in-memory, via the LSM vector
     /// planner. Honors the builder filter as a prefilter.
-    async fn plan_vector(&self) -> Result<Arc<dyn ExecutionPlan>> {
-        let nearest = self
-            .nearest
-            .as_ref()
-            .expect("plan_vector requires a nearest query");
+    async fn plan_vector(&self, nearest: &LsmVectorQuery) -> Result<Arc<dyn ExecutionPlan>> {
         let base_schema = self.schema();
         let dim = vector_dim(base_schema.as_ref(), &nearest.column)?;
         let query_fsl = key_to_fsl(nearest.key.as_ref(), dim)?;
@@ -694,11 +676,7 @@ impl LsmScanner {
     /// Full-text search across base ∪ SSTables ∪ in-memory, via the LSM FTS
     /// planner. Query/scanner limits bound per-source fetches when present;
     /// otherwise the search remains unbounded and any offset is applied above.
-    async fn plan_fts(&self) -> Result<Arc<dyn ExecutionPlan>> {
-        let query = self
-            .full_text_query
-            .as_ref()
-            .expect("plan_fts requires a full-text query");
+    async fn plan_fts(&self, query: &FullTextSearchQuery) -> Result<Arc<dyn ExecutionPlan>> {
         let base_schema = self.schema();
         let query_limit = query
             .limit
@@ -836,7 +814,7 @@ impl LsmScanner {
     /// scanner limit/offset still apply to the final merged result. The LSM
     /// path supports a single FTS-indexed column.
     pub fn full_text_search(mut self, query: FullTextSearchQuery) -> Result<Self> {
-        self.full_text_query = Some(query);
+        self.search.set_full_text(query);
         Ok(self)
     }
 
@@ -887,7 +865,7 @@ impl LsmScanner {
         // plain scan needs none of the projected columns either, so it reads
         // only the key and filter columns instead of a possibly wide
         // projection. Searches keep their own plan.
-        let plan = if self.nearest.is_some() || self.full_text_query.is_some() {
+        let plan = if self.search.has_search() {
             self.create_plan().await?
         } else {
             self.plan_scan(Some(&[])).await?
@@ -1292,9 +1270,9 @@ mod tests {
         let scanner = LsmScanner::new(base.clone(), vec![], vec!["id".to_string()])
             .project(&["vector"])
             .unwrap();
-        let _ = base.object_store.io_stats_incremental(); // reset
+        let _ = base.table_state.object_store.io_stats_incremental(); // reset
         let count = scanner.count_rows().await.unwrap();
-        let stats = base.object_store.io_stats_incremental();
+        let stats = base.table_state.object_store.io_stats_incremental();
 
         assert_eq!(count, ROWS as u64, "count must match the base row count");
         assert!(
@@ -1514,22 +1492,22 @@ mod tests {
         };
 
         let scanner = new_scanner();
-        let query = scanner.nearest.as_ref().unwrap();
+        let query = scanner.search.vector().unwrap();
         assert_eq!(query.probe_bounds.minimum_nprobes, None);
         assert_eq!(query.probe_bounds.maximum_nprobes, None);
 
         let scanner = new_scanner().nprobes(20);
-        let query = scanner.nearest.as_ref().unwrap();
+        let query = scanner.search.vector().unwrap();
         assert_eq!(query.probe_bounds.minimum_nprobes, Some(20));
         assert_eq!(query.probe_bounds.maximum_nprobes, Some(20));
 
         let scanner = new_scanner().minimum_nprobes(20);
-        let query = scanner.nearest.as_ref().unwrap();
+        let query = scanner.search.vector().unwrap();
         assert_eq!(query.probe_bounds.minimum_nprobes, Some(20));
         assert_eq!(query.probe_bounds.maximum_nprobes, None);
 
         let scanner = new_scanner().maximum_nprobes(20);
-        let query = scanner.nearest.as_ref().unwrap();
+        let query = scanner.search.vector().unwrap();
         assert_eq!(query.probe_bounds.minimum_nprobes, None);
         assert_eq!(query.probe_bounds.maximum_nprobes, Some(20));
     }
@@ -1845,6 +1823,51 @@ mod tests {
             vec![2],
             "query-level FTS limit=2 plus offset=1 must page within the top 2; got {out:?}"
         );
+
+        // A zero inner candidate budget stays empty even with a positive outer
+        // limit, and keeps the projected schema of the same scanner.
+        let positive = LsmScanner::new(base.clone(), vec![], vec!["id".to_string()])
+            .full_text_search(
+                FullTextSearchQuery::new("lance".to_string())
+                    .with_column("text".to_string())
+                    .unwrap()
+                    .limit(Some(1)),
+            )
+            .unwrap()
+            .limit(Some(2), None)
+            .unwrap();
+        let expected_schema = positive.create_plan().await.unwrap().schema();
+
+        let zero = LsmScanner::new(base.clone(), vec![], vec!["id".to_string()])
+            .full_text_search(
+                FullTextSearchQuery::new("lance".to_string())
+                    .with_column("text".to_string())
+                    .unwrap()
+                    .limit(Some(0)),
+            )
+            .unwrap()
+            .limit(Some(2), None)
+            .unwrap();
+        let plan = zero.create_plan().await.unwrap();
+        assert_eq!(plan.schema(), expected_schema);
+        assert_eq!(
+            plan.properties().output_partitioning().partition_count(),
+            1,
+            "the zero-candidate plan must keep the sort's single-partition contract"
+        );
+        let batches: Vec<RecordBatch> = plan
+            .execute(0, datafusion::prelude::SessionContext::new().task_ctx())
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(
+            batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+            0
+        );
+        for batch in &batches {
+            assert_eq!(batch.schema(), expected_schema);
+        }
 
         let scanner = LsmScanner::new(base, vec![], vec!["id".to_string()])
             .full_text_search(

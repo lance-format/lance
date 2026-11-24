@@ -1049,6 +1049,7 @@ async fn test_datafile_replacement() {
 
     // write a new datafile
     let object_writer = dataset
+        .table_state
         .object_store
         .create(&Path::from("data/test.lance"))
         .await
@@ -1158,6 +1159,7 @@ async fn test_datafile_partial_replacement() {
 
     // write a new datafile
     let object_writer = dataset
+        .table_state
         .object_store
         .create(&Path::from("data/test.lance"))
         .await
@@ -1400,7 +1402,8 @@ async fn test_replace_dataset() {
         .await
         .unwrap();
 
-    ds.object_store
+    ds.table_state
+        .object_store
         .as_ref()
         .remove_dir_all(test_path)
         .await
@@ -2424,7 +2427,7 @@ async fn test_update_struct_column_keeps_nested_index() {
         .expect("nested s.x index")
         .clone();
     let effective = sx_idx
-        .effective_fragment_bitmap(&dataset.fragment_bitmap)
+        .effective_fragment_bitmap(&dataset.table_state.fragment_bitmap)
         .expect("index has a fragment bitmap");
     assert_eq!(
         effective.iter().collect::<Vec<_>>(),
@@ -2567,12 +2570,16 @@ async fn test_merge_insert_flat_index_stable_row_id() {
     // coverage ({0}) is a strict subset of the live fragments ({0, 1}), so the
     // rewritten fragment is left to a full scan.
     assert_eq!(
-        dataset.fragment_bitmap.iter().collect::<Vec<_>>(),
+        dataset
+            .table_state
+            .fragment_bitmap
+            .iter()
+            .collect::<Vec<_>>(),
         vec![0, 1],
         "the update should have produced a second fragment"
     );
     let effective = val_idx
-        .effective_fragment_bitmap(&dataset.fragment_bitmap)
+        .effective_fragment_bitmap(&dataset.table_state.fragment_bitmap)
         .expect("index has a fragment bitmap");
     assert_eq!(
         effective.iter().collect::<Vec<_>>(),
@@ -2580,7 +2587,7 @@ async fn test_merge_insert_flat_index_stable_row_id() {
         "index effectively covers only fragment 0"
     );
     assert!(
-        effective.len() < dataset.fragment_bitmap.len(),
+        effective.len() < dataset.table_state.fragment_bitmap.len(),
         "scan must be partially indexed: the rewritten fragment is not covered by the index"
     );
 
@@ -2839,7 +2846,11 @@ async fn test_merge_insert_flat_index_stable_row_id_multiple_indexes() {
 
     // The update produced a second fragment holding the rewritten row id=1.
     assert_eq!(
-        dataset.fragment_bitmap.iter().collect::<Vec<_>>(),
+        dataset
+            .table_state
+            .fragment_bitmap
+            .iter()
+            .collect::<Vec<_>>(),
         vec![0, 1],
         "update should have produced a second fragment"
     );
@@ -2908,6 +2919,7 @@ async fn test_data_replacement_advances_row_lineage() {
     )
     .unwrap();
     let object_writer = dataset
+        .table_state
         .object_store
         .create(&Path::from("data/lineage_replacement.lance"))
         .await
@@ -3015,6 +3027,7 @@ async fn test_data_replacement_invalidates_index_bitmap() {
     .unwrap();
 
     let object_writer = dataset
+        .table_state
         .object_store
         .create(&Path::from("data/replacement.lance"))
         .await
@@ -3055,7 +3068,7 @@ async fn test_data_replacement_invalidates_index_bitmap() {
     let indices = dataset.load_indices().await.unwrap();
     let a_index = indices.iter().find(|idx| idx.name == "a_idx").unwrap();
     let effective = a_index
-        .effective_fragment_bitmap(&dataset.fragment_bitmap)
+        .effective_fragment_bitmap(&dataset.table_state.fragment_bitmap)
         .unwrap();
     assert!(
         !effective.contains(0),
@@ -3197,7 +3210,12 @@ async fn test_merge_rewriting_indexed_column_keeps_index_consistent() {
     )
     .unwrap();
     let new_a_path = dataset.data_dir().join("merge_new_a.lance");
-    let object_writer = dataset.object_store.create(&new_a_path).await.unwrap();
+    let object_writer = dataset
+        .table_state
+        .object_store
+        .create(&new_a_path)
+        .await
+        .unwrap();
     let mut writer = lance_file::versions::v2_2::create_writer(
         object_writer,
         a_only.as_ref().try_into().unwrap(),
@@ -3298,6 +3316,7 @@ async fn test_data_replacement_populates_invalidated_bitmap() {
     .unwrap();
 
     let object_writer = dataset
+        .table_state
         .object_store
         .create(&Path::from("data/replacement_inv.lance"))
         .await
@@ -3424,6 +3443,7 @@ async fn test_fts_stale_entries_after_data_replacement() {
     .unwrap();
     let replacement_path = dataset.data_dir().join("replacement.lance");
     let object_writer = dataset
+        .table_state
         .object_store
         .create(&replacement_path)
         .await
@@ -3557,6 +3577,7 @@ async fn test_cross_column_fast_search_blocks_column_local_stale_postings() {
     .unwrap();
     let replacement_path = dataset.data_dir().join("body_replacement.lance");
     let object_writer = dataset
+        .table_state
         .object_store
         .create(&replacement_path)
         .await
@@ -3738,6 +3759,7 @@ async fn test_vector_index_after_data_replacement() {
 
     let replacement_path = dataset.data_dir().join("replacement.lance");
     let object_writer = dataset
+        .table_state
         .object_store
         .create(&replacement_path)
         .await

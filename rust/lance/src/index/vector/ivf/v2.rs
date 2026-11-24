@@ -2565,16 +2565,89 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         partition_id: usize,
         io_stats: Option<IoStats>,
     ) -> Result<PartitionEntry<S, Q>> {
-        let batch = self
-            .read_sub_index_batch(
-                partition_id,
-                self.read_projection.as_ref(),
-                io_stats.clone(),
-            )
+        let storage = self
+            .load_partition_storage(partition_id, io_stats.clone())
             .await?;
-        let idx = S::load(batch)?;
-        let storage = self.load_partition_storage(partition_id, io_stats).await?;
+        let idx = match self
+            .dropped_row_positions(partition_id, storage.len(), io_stats.as_ref())
+            .await?
+        {
+            Some(new_ids) => {
+                self.load_realigned_sub_index(partition_id, &new_ids, &storage, io_stats)
+                    .await?
+            }
+            None => {
+                let batch = self
+                    .read_sub_index_batch(partition_id, self.read_projection.as_ref(), io_stats)
+                    .await?;
+                S::load(batch)?
+            }
+        };
         Ok(PartitionEntry::new(idx, storage))
+    }
+
+    /// The positions [`IvfSubIndex::remap_positions`] realigns a partition's
+    /// sub-index with, or `None` when it needs no realignment: the sub-index
+    /// does not address storage rows by position, or the loaded storage, of
+    /// `storage_rows` rows, dropped none of the stored ones.
+    ///
+    /// Drops are detected against the stored row count rather than the
+    /// sub-index's, since a graph may cover only a prefix of its storage. Only
+    /// a row-ID remapping drops rows, so this reads the partition's row IDs
+    /// again only while deferred compaction has deleted some of them.
+    pub(crate) async fn dropped_row_positions(
+        &self,
+        partition_id: usize,
+        storage_rows: usize,
+        io_stats: Option<&IoStats>,
+    ) -> Result<Option<Vec<Option<u32>>>> {
+        let Some(sub_index_rows) = S::positional_rows(&self.sub_index_metadata[partition_id])?
+        else {
+            return Ok(None);
+        };
+        let stored_rows = self.storage.partition_size(partition_id);
+        if storage_rows == stored_rows {
+            return Ok(None);
+        }
+        let mut new_ids = self
+            .storage
+            .partition_row_positions(partition_id, io_stats)
+            .await?;
+        let num_kept = new_ids.iter().flatten().count();
+        if new_ids.len() != stored_rows || num_kept != storage_rows || sub_index_rows > stored_rows
+        {
+            return Err(Error::internal(format!(
+                "partition {partition_id} of index {}: the sub-index addresses {sub_index_rows} of \
+                 {stored_rows} stored rows and the loaded storage holds {storage_rows}, but the \
+                 row-ID remapping keeps {num_kept} of {} rows",
+                self.uuid,
+                new_ids.len()
+            )));
+        }
+        new_ids.truncate(sub_index_rows);
+        Ok(Some(new_ids))
+    }
+
+    /// Load a partition's sub-index realigned with `storage`, which dropped
+    /// rows. [`IvfSubIndex::remap_positions`] needs every column, so this
+    /// bypasses the narrowed search projection.
+    async fn load_realigned_sub_index(
+        &self,
+        partition_id: usize,
+        new_ids: &[Option<u32>],
+        storage: &Q::Storage,
+        io_stats: Option<IoStats>,
+    ) -> Result<S> {
+        let batch = self
+            .read_sub_index_batch(partition_id, None, io_stats)
+            .await?;
+        // Scoring rows pairwise needs storage staged from the centroid, as a
+        // graph build does.
+        let staged = match self.ivf.centroid(partition_id) {
+            Some(centroid) => storage.clone().with_centroid(centroid.as_ref())?,
+            None => storage.clone(),
+        };
+        S::load(S::remap_positions(batch, new_ids, &staged)?)
     }
 
     async fn load_plane_partition_entry(
@@ -2695,6 +2768,18 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             .storage
             .materialize_partition_for_prewarm(batches.storage);
         let (index, storage) = tokio::try_join!(index, storage)?;
+        // The prewarm read uses the search projection, which a realignment
+        // cannot use, so a partition that dropped rows reads its sub-index again.
+        let index = match self
+            .dropped_row_positions(partition_id, storage.len(), None)
+            .await?
+        {
+            Some(new_ids) => {
+                self.load_realigned_sub_index(partition_id, &new_ids, &storage, None)
+                    .await?
+            }
+            None => index,
+        };
         Ok(PartitionEntry::new(index, storage))
     }
 

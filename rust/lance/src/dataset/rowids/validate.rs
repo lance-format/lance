@@ -29,13 +29,13 @@ pub async fn validate_stable_row_ids(dataset: &Dataset) -> Result<()> {
         return Ok(());
     }
 
-    let corrupt = |message: String| Error::corrupt_file(dataset.base.clone(), message);
+    let corrupt = |message: String| Error::corrupt_file(dataset.table_state.base.clone(), message);
 
     for fragment in dataset.manifest.fragments.iter() {
         if fragment.row_id_meta.is_none() {
             return Err(corrupt(format!(
                 "Fragment {} has no row id metadata, but dataset {:?} uses stable row ids",
-                fragment.id, dataset.base
+                fragment.id, dataset.table_state.base
             )));
         }
     }
@@ -48,7 +48,7 @@ pub async fn validate_stable_row_ids(dataset: &Dataset) -> Result<()> {
             let deletion_vector = fragment.get_deletion_vector().await?;
             Result::Ok((fragment, sequence, deletion_vector))
         })
-        .buffered(dataset.object_store.io_parallelism())
+        .buffered(dataset.table_state.object_store.io_parallelism())
         .try_collect()
         .await?;
 
@@ -60,7 +60,7 @@ pub async fn validate_stable_row_ids(dataset: &Dataset) -> Result<()> {
         let physical_rows = metadata.physical_rows.ok_or_else(|| {
             corrupt(format!(
                 "Fragment {} has an unknown physical row count, but dataset {:?} uses stable row ids",
-                metadata.id, dataset.base
+                metadata.id, dataset.table_state.base
             ))
         })? as u64;
 
@@ -70,7 +70,7 @@ pub async fn validate_stable_row_ids(dataset: &Dataset) -> Result<()> {
                 metadata.id,
                 sequence.len(),
                 physical_rows,
-                dataset.base
+                dataset.table_state.base
             )));
         }
 
@@ -91,7 +91,7 @@ pub async fn validate_stable_row_ids(dataset: &Dataset) -> Result<()> {
                 if versions != physical_rows {
                     return Err(corrupt(format!(
                         "Fragment {} has {} {} versions, but {} physical rows, in dataset {:?}",
-                        metadata.id, versions, name, physical_rows, dataset.base
+                        metadata.id, versions, name, physical_rows, dataset.table_state.base
                     )));
                 }
             }
@@ -119,7 +119,7 @@ pub async fn validate_stable_row_ids(dataset: &Dataset) -> Result<()> {
                     describe_first_live_slot(&fragments[..=index], row_id),
                     metadata.id,
                     offset,
-                    dataset.base
+                    dataset.table_state.base
                 )));
             }
         }
@@ -130,7 +130,7 @@ pub async fn validate_stable_row_ids(dataset: &Dataset) -> Result<()> {
     {
         return Err(corrupt(format!(
             "Dataset {:?} will hand out row id {} next, but row id {} is already in use",
-            dataset.base, dataset.manifest.next_row_id, max_row_id
+            dataset.table_state.base, dataset.manifest.next_row_id, max_row_id
         )));
     }
 

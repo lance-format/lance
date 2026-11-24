@@ -41,6 +41,18 @@
 //! ([`NullableIndexExprResult`], backed by [`NullableRowAddrMask`]) —
 //! the per-endpoint algebra already implements two-valued and SQL
 //! three-valued logic correctly inside each mask type.
+//!
+//! Each result also carries a [`MaskDomain`] saying whether the u64s inside
+//! its mask are physical row addresses or stable row ids. Both domains are
+//! stored in the *same* `RowAddrMask`/`NullableRowAddrMask` container (both
+//! are just u64-keyed tree maps) — there is no separate row-id-shaped result
+//! type. `BitAnd`/`BitOr` require both sides to already agree on domain
+//! (callers reconcile mismatched domains before combining, since doing so
+//! generally requires an async index lookup that the pure boolean algebra
+//! here can't perform).
+//!
+//! Stable row id masks are a legacy case from old indices. All newer
+//! indices should produce row addresses as the result.
 
 use std::sync::{Arc, LazyLock};
 
@@ -48,9 +60,21 @@ use arrow_array::{Array, RecordBatch, UInt32Array, builder::BinaryBuilder};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use roaring::RoaringBitmap;
 
-use lance_core::{Error, Result};
+use lance_core::{Error, Result, deepsize::DeepSizeOf};
 
 use crate::mask::{NullableRowAddrMask, RowAddrMask, RowSetOps};
+
+/// Which domain the u64s inside an [`IndexExprResult`]/[`NullableIndexExprResult`]
+/// mask are in: physical row addresses, or stable row ids.
+///
+/// See the module doc for why both domains share the same mask container.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, DeepSizeOf)]
+pub enum MaskDomain {
+    /// The mask holds physical row addresses (`fragment_id << 32 | offset`).
+    RowAddress,
+    /// The mask holds stable row ids.
+    RowId,
+}
 
 /// Result of an index search before NULL rows are dropped. Each endpoint
 /// is a [`NullableRowAddrMask`] carrying SQL three-valued logic info.
@@ -61,6 +85,8 @@ pub struct NullableIndexExprResult {
     /// Rows that may be TRUE. Rows outside `upper` are guaranteed to be
     /// FALSE / NULL (and so not in a `WHERE` answer set).
     pub upper: NullableRowAddrMask,
+    /// Which domain `lower`/`upper` are expressed in.
+    pub domain: MaskDomain,
     // O(1) cache for is_exact(). Set by constructors and propagated
     // elementwise through the boolean algebra.
     exact: bool,
@@ -69,10 +95,15 @@ pub struct NullableIndexExprResult {
 impl NullableIndexExprResult {
     /// Precise result — every row in `mask` is in the answer and every
     /// row outside is not. Equivalent to the old `Exact` variant.
+    ///
+    /// Defaults to [`MaskDomain::RowAddress`] — the common case now that every
+    /// builtin scalar index type produces that domain. Chain [`Self::with_domain`]
+    /// for the increasingly rare row-id-domain case.
     pub fn exact(mask: NullableRowAddrMask) -> Self {
         Self {
             lower: mask.clone(),
             upper: mask,
+            domain: MaskDomain::RowAddress,
             exact: true,
         }
     }
@@ -80,10 +111,13 @@ impl NullableIndexExprResult {
     /// Upper-bound-only result — rows outside `mask` are guaranteed not
     /// to match; rows inside may match and require a recheck.
     /// Equivalent to the old `AtMost` variant.
+    ///
+    /// Defaults to [`MaskDomain::RowAddress`]; see [`Self::exact`].
     pub fn at_most(mask: NullableRowAddrMask) -> Self {
         Self {
             lower: NullableRowAddrMask::allow_nothing(),
             upper: mask,
+            domain: MaskDomain::RowAddress,
             exact: false,
         }
     }
@@ -91,10 +125,13 @@ impl NullableIndexExprResult {
     /// Lower-bound-only result — rows in `mask` are guaranteed to match;
     /// rows outside may match too and require a recheck. Equivalent to
     /// the old `AtLeast` variant.
+    ///
+    /// Defaults to [`MaskDomain::RowAddress`]; see [`Self::exact`].
     pub fn at_least(mask: NullableRowAddrMask) -> Self {
         Self {
             lower: mask,
             upper: NullableRowAddrMask::all_rows(),
+            domain: MaskDomain::RowAddress,
             exact: false,
         }
     }
@@ -104,6 +141,8 @@ impl NullableIndexExprResult {
     /// `lower` rows are guaranteed TRUE and `upper` rows may be TRUE, with
     /// NULL state preserved at both endpoints. Equal endpoints are canonicalized
     /// to [`Self::exact`] so `is_exact()` remains structural.
+    ///
+    /// Defaults to [`MaskDomain::RowAddress`]; see [`Self::exact`].
     pub fn new(lower: NullableRowAddrMask, upper: NullableRowAddrMask) -> Self {
         if lower == upper {
             Self::exact(lower)
@@ -111,9 +150,20 @@ impl NullableIndexExprResult {
             Self {
                 lower,
                 upper,
+                domain: MaskDomain::RowAddress,
                 exact: false,
             }
         }
+    }
+
+    /// Return `self` tagged with a different domain, without touching the mask data.
+    ///
+    /// Use this only when the caller knows the retagging is correct (e.g. a
+    /// dataset with no stable row ids, where address and id coincide) — it does
+    /// not translate any values.
+    pub fn with_domain(mut self, domain: MaskDomain) -> Self {
+        self.domain = domain;
+        self
     }
 
     /// True if the result is exact — the answer is precisely the lower
@@ -151,16 +201,21 @@ impl NullableIndexExprResult {
     /// # Ok(())
     /// # }
     /// ```
+    ///
+    /// This does not change `domain` — if `transform` changes which domain the
+    /// mask is in (e.g. translating addresses to row ids), call [`Self::with_domain`]
+    /// on the result.
     pub async fn try_map<E, F, Fut>(self, mut transform: F) -> std::result::Result<Self, E>
     where
         F: FnMut(NullableRowAddrMask) -> Fut,
         Fut: std::future::Future<Output = std::result::Result<NullableRowAddrMask, E>>,
     {
         let lower = transform(self.lower).await?;
+        let domain = self.domain;
         if self.exact {
-            Ok(Self::exact(lower))
+            Ok(Self::exact(lower).with_domain(domain))
         } else {
-            Ok(Self::new(lower, transform(self.upper).await?))
+            Ok(Self::new(lower, transform(self.upper).await?).with_domain(domain))
         }
     }
 
@@ -194,6 +249,7 @@ impl NullableIndexExprResult {
         IndexExprResult {
             lower: self.lower.drop_nulls(),
             upper: self.upper.drop_nulls(),
+            domain: self.domain,
             exact: self.exact,
         }
     }
@@ -206,6 +262,7 @@ impl std::ops::Not for NullableIndexExprResult {
         Self {
             lower: !self.upper,
             upper: !self.lower,
+            domain: self.domain,
             exact: self.exact,
         }
     }
@@ -214,10 +271,19 @@ impl std::ops::Not for NullableIndexExprResult {
 impl std::ops::BitAnd<Self> for NullableIndexExprResult {
     type Output = Self;
 
+    /// # Panics (debug only)
+    /// If `self` and `rhs` are in different domains. Callers must reconcile
+    /// domains (see the module doc) before combining.
     fn bitand(self, rhs: Self) -> Self {
+        debug_assert_eq!(
+            self.domain, rhs.domain,
+            "combined NullableIndexExprResult masks with mismatched domains — \
+             caller must reconcile domains first"
+        );
         Self {
             lower: self.lower & rhs.lower,
             upper: self.upper & rhs.upper,
+            domain: self.domain,
             exact: self.exact && rhs.exact,
         }
     }
@@ -226,10 +292,19 @@ impl std::ops::BitAnd<Self> for NullableIndexExprResult {
 impl std::ops::BitOr<Self> for NullableIndexExprResult {
     type Output = Self;
 
+    /// # Panics (debug only)
+    /// If `self` and `rhs` are in different domains. Callers must reconcile
+    /// domains (see the module doc) before combining.
     fn bitor(self, rhs: Self) -> Self {
+        debug_assert_eq!(
+            self.domain, rhs.domain,
+            "combined NullableIndexExprResult masks with mismatched domains — \
+             caller must reconcile domains first"
+        );
         Self {
             lower: self.lower | rhs.lower,
             upper: self.upper | rhs.upper,
+            domain: self.domain,
             exact: self.exact && rhs.exact,
         }
     }
@@ -244,6 +319,8 @@ pub struct IndexExprResult {
     /// Rows that may be in the answer. Rows outside `upper` are
     /// guaranteed not in the answer.
     pub upper: RowAddrMask,
+    /// Which domain `lower`/`upper` are expressed in.
+    pub domain: MaskDomain,
     // O(1) cache for is_exact(). Set by constructors and propagated
     // elementwise through the boolean algebra.
     exact: bool,
@@ -252,28 +329,39 @@ pub struct IndexExprResult {
 impl IndexExprResult {
     /// Precise result — every row in `mask` is in the answer and every
     /// row outside is not. Equivalent to the old `Exact` variant.
+    ///
+    /// Defaults to [`MaskDomain::RowAddress`] — the common case now that every
+    /// builtin scalar index type produces that domain. Chain [`Self::with_domain`]
+    /// for the increasingly rare row-id-domain case.
     pub fn exact(mask: RowAddrMask) -> Self {
         Self {
             lower: mask.clone(),
             upper: mask,
+            domain: MaskDomain::RowAddress,
             exact: true,
         }
     }
 
     /// Upper-bound-only result. Equivalent to the old `AtMost` variant.
+    ///
+    /// Defaults to [`MaskDomain::RowAddress`]; see [`Self::exact`].
     pub fn at_most(mask: RowAddrMask) -> Self {
         Self {
             lower: RowAddrMask::allow_nothing(),
             upper: mask,
+            domain: MaskDomain::RowAddress,
             exact: false,
         }
     }
 
     /// Lower-bound-only result. Equivalent to the old `AtLeast` variant.
+    ///
+    /// Defaults to [`MaskDomain::RowAddress`]; see [`Self::exact`].
     pub fn at_least(mask: RowAddrMask) -> Self {
         Self {
             lower: mask,
             upper: RowAddrMask::all_rows(),
+            domain: MaskDomain::RowAddress,
             exact: false,
         }
     }
@@ -284,11 +372,44 @@ impl IndexExprResult {
     /// Use [`Self::exact`] / [`Self::at_most`] / [`Self::at_least`] for
     /// the three degenerate shapes; this constructor is only needed when
     /// both endpoints are non-trivial.
+    ///
+    /// Defaults to [`MaskDomain::RowAddress`]; see [`Self::exact`].
     pub fn new(lower: RowAddrMask, upper: RowAddrMask) -> Self {
         Self {
             lower,
             upper,
+            domain: MaskDomain::RowAddress,
             exact: false,
+        }
+    }
+
+    /// Return `self` tagged with a different domain, without touching the mask data.
+    ///
+    /// Use this only when the caller knows the retagging is correct (e.g. a
+    /// dataset with no stable row ids, where address and id coincide) — it does
+    /// not translate any values.
+    pub fn with_domain(mut self, domain: MaskDomain) -> Self {
+        self.domain = domain;
+        self
+    }
+
+    /// Transform the endpoints, evaluating `transform` only once for an exact result.
+    ///
+    /// Mirrors [`NullableIndexExprResult::try_map`] but operates on the
+    /// post-`drop_nulls` [`RowAddrMask`] form. Does not change `domain` — if
+    /// `transform` changes which domain the mask is in, call [`Self::with_domain`]
+    /// on the result.
+    pub async fn try_map<E, F, Fut>(self, mut transform: F) -> std::result::Result<Self, E>
+    where
+        F: FnMut(RowAddrMask) -> Fut,
+        Fut: std::future::Future<Output = std::result::Result<RowAddrMask, E>>,
+    {
+        let lower = transform(self.lower).await?;
+        let domain = self.domain;
+        if self.exact {
+            Ok(Self::exact(lower).with_domain(domain))
+        } else {
+            Ok(Self::new(lower, transform(self.upper).await?).with_domain(domain))
         }
     }
 
@@ -323,6 +444,7 @@ impl std::ops::Not for IndexExprResult {
         Self {
             lower: !self.upper,
             upper: !self.lower,
+            domain: self.domain,
             exact: self.exact,
         }
     }
@@ -331,10 +453,19 @@ impl std::ops::Not for IndexExprResult {
 impl std::ops::BitAnd<Self> for IndexExprResult {
     type Output = Self;
 
+    /// # Panics (debug only)
+    /// If `self` and `rhs` are in different domains. Callers must reconcile
+    /// domains (see the module doc) before combining.
     fn bitand(self, rhs: Self) -> Self {
+        debug_assert_eq!(
+            self.domain, rhs.domain,
+            "combined IndexExprResult masks with mismatched domains — \
+             caller must reconcile domains first"
+        );
         Self {
             lower: self.lower & rhs.lower,
             upper: self.upper & rhs.upper,
+            domain: self.domain,
             exact: self.exact && rhs.exact,
         }
     }
@@ -343,10 +474,19 @@ impl std::ops::BitAnd<Self> for IndexExprResult {
 impl std::ops::BitOr<Self> for IndexExprResult {
     type Output = Self;
 
+    /// # Panics (debug only)
+    /// If `self` and `rhs` are in different domains. Callers must reconcile
+    /// domains (see the module doc) before combining.
     fn bitor(self, rhs: Self) -> Self {
+        debug_assert_eq!(
+            self.domain, rhs.domain,
+            "combined IndexExprResult masks with mismatched domains — \
+             caller must reconcile domains first"
+        );
         Self {
             lower: self.lower | rhs.lower,
             upper: self.upper | rhs.upper,
+            domain: self.domain,
             exact: self.exact && rhs.exact,
         }
     }
@@ -463,6 +603,11 @@ impl IndexExprResult {
     }
 
     /// Deserialize from a record batch produced by [`Self::serialize`].
+    ///
+    /// The wire format carries no domain bit: every producer of this format
+    /// (e.g. `ScalarIndexExec`) is required to finalize its result to
+    /// [`MaskDomain::RowAddress`] before serializing, so this always tags the
+    /// result `RowAddress` on the way back out.
     pub fn deserialize(batch: &RecordBatch) -> Result<(Self, RoaringBitmap)> {
         use arrow_array::cast::AsArray;
 
@@ -497,6 +642,7 @@ impl IndexExprResult {
                 Self {
                     lower,
                     upper,
+                    domain: MaskDomain::RowAddress,
                     exact: false,
                 }
             }

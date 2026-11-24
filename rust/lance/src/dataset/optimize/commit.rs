@@ -28,7 +28,7 @@ use crate::dataset::transaction::{
 use crate::index::frag_reuse::build_new_frag_reuse_index;
 use crate::index::frag_reuse_with_stable_row_ids::ensure_frag_reuse_recording_allowed;
 use crate::index::loading::load_all_indices;
-use crate::io::commit::{commit_transaction, default_commit_retry_timeout};
+use crate::io::commit::{CommitTransactionOptions, commit_transaction};
 use crate::io::deletion::read_dataset_deletion_file;
 use lance_core::utils::row_addr_remap::{GroupInput, RowAddrRemap};
 use lance_core::{Error, Result};
@@ -49,17 +49,18 @@ pub(super) async fn reserve_fragment_ids(
         None,
     );
 
+    let build_config = Default::default();
+    let commit_config = Default::default();
     let (manifest, _) = commit_transaction(
         dataset,
-        dataset.object_store.as_ref(),
-        dataset.commit_handler.as_ref(),
+        dataset.table_state.object_store.as_ref(),
+        dataset.table_state.commit_handler.as_ref(),
         &transaction,
-        &Default::default(),
-        &Default::default(),
-        default_commit_retry_timeout(),
-        dataset.manifest_location.naming_scheme,
-        None,
-        None,
+        CommitTransactionOptions::new(
+            &build_config,
+            &commit_config,
+            dataset.table_state.manifest_location.naming_scheme,
+        ),
     )
     .await?;
 

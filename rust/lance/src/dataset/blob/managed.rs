@@ -207,7 +207,7 @@ pub(in crate::dataset) async fn managed_paths(
         match &root {
             BaseResolution::Resolved(root) => {
                 let path = join_base_and_relative_path(root, &uri)?;
-                if crate::dataset::cleanup::in_blob_deletion_scope(&owner.base, &path) {
+                if crate::dataset::cleanup::in_blob_deletion_scope(&owner.table_state.base, &path) {
                     paths.insert(path);
                     continue;
                 }
@@ -216,7 +216,7 @@ pub(in crate::dataset) async fn managed_paths(
             BaseResolution::Unresolved => {}
         }
         if owner_base_ids.contains(&base_id) {
-            paths.insert(join_base_and_relative_path(&owner.base, &uri)?);
+            paths.insert(join_base_and_relative_path(&owner.table_state.base, &uri)?);
         }
     }
     Ok(paths)
@@ -226,11 +226,11 @@ fn primary_root(dataset: &Dataset, owner: &Dataset) -> BaseResolution {
     let registry = dataset.session.store_registry();
     if may_be_same_store(
         registry.as_ref(),
-        &owner.object_store,
-        dataset.object_store.scheme(),
-        &dataset.object_store.store_prefix,
+        &owner.table_state.object_store,
+        dataset.table_state.object_store.scheme(),
+        &dataset.table_state.object_store.store_prefix,
     ) {
-        BaseResolution::Resolved(dataset.base.clone())
+        BaseResolution::Resolved(dataset.table_state.base.clone())
     } else {
         BaseResolution::Foreign
     }
@@ -251,7 +251,7 @@ async fn registered_root(
         Ok(base_store) => {
             if !may_be_same_store(
                 registry.as_ref(),
-                &owner.object_store,
+                &owner.table_state.object_store,
                 base_store.scheme(),
                 &base_store.store_prefix,
             ) {
@@ -385,7 +385,7 @@ pub async fn preserve_managed_descriptors(
         .manifest
         .base_paths
         .values()
-        .find(|base| base.path == dataset.uri)
+        .find(|base| base.path == dataset.table_state.uri)
         .map(|base| base.id);
     let preserve_base = |source_base_id: Option<u32>| -> Result<Option<u32>> {
         match (source_base_id, target_base_id) {
@@ -393,7 +393,7 @@ pub async fn preserve_managed_descriptors(
                 Error::invalid_input(format!(
                     "Cannot preserve primary-storage blob references in target base {target}: \
                      dataset URI '{}' has no registered base",
-                    dataset.uri
+                    dataset.table_state.uri
                 ))
             }),
             _ => Ok(source_base_id),

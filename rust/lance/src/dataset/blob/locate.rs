@@ -331,7 +331,7 @@ impl<'a> BlobLocator<'a> {
                 let size = source.object_store.size(&source.path).await?;
                 Ok::<_, Error>((key, size))
             })
-            .buffer_unordered(self.dataset.object_store.io_parallelism())
+            .buffer_unordered(self.dataset.table_state.object_store.io_parallelism())
             .try_collect()
             .await?;
         self.external_sizes.extend(sizes);
@@ -354,6 +354,7 @@ impl<'a> BlobLocator<'a> {
             let registry = self.dataset.session.store_registry();
             let params = self
                 .dataset
+                .table_state
                 .store_params
                 .as_deref()
                 .cloned()
@@ -520,7 +521,7 @@ impl<'a> BlobLocator<'a> {
 
     fn base_root(&mut self, base_id: Option<u32>) -> Result<Path> {
         let Some(base_id) = base_id else {
-            return Ok(self.dataset.base.clone());
+            return Ok(self.dataset.table_state.base.clone());
         };
         if let Some(root) = self.base_roots.get(&base_id) {
             return Ok(root.clone());
@@ -543,7 +544,7 @@ impl<'a> BlobLocator<'a> {
 
     async fn store(&mut self, base_id: Option<u32>) -> Result<Arc<ObjectStore>> {
         let Some(base_id) = base_id else {
-            return Ok(self.dataset.object_store.clone());
+            return Ok(self.dataset.table_state.object_store.clone());
         };
         if let Some(store) = self.stores.get(&base_id) {
             return Ok(store.clone());

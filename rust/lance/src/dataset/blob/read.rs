@@ -283,7 +283,7 @@ impl ReadBlobsBuilder {
                 })
             })?;
         read_partitioned_blob_selection(
-            Some(self.dataset.object_store.as_ref()),
+            Some(self.dataset.table_state.object_store.as_ref()),
             &self.options,
             partitioned,
             move |blob| {
@@ -420,7 +420,7 @@ impl ReadBlobRangesBuilder {
             },
         )?;
         read_partitioned_blob_selection(
-            Some(self.inner.dataset.object_store.as_ref()),
+            Some(self.inner.dataset.table_state.object_store.as_ref()),
             &self.inner.options,
             partitioned,
             move |blob| {
@@ -2242,7 +2242,7 @@ mod tests {
         for blob in &blobs {
             assert_eq!(blob.as_ref().unwrap().kind(), kind);
         }
-        let _ = dataset.object_store.io_stats_incremental();
+        let _ = dataset.table_state.object_store.io_stats_incremental();
         let results = dataset
             .read_blob_ranges("blob")
             .unwrap()
@@ -2250,7 +2250,7 @@ mod tests {
             .execute()
             .await
             .unwrap();
-        let stats = dataset.object_store.io_stats_incremental();
+        let stats = dataset.table_state.object_store.io_stats_incremental();
 
         assert_eq!(results.len(), indices.len());
         for ((result, row), blob) in results.iter().zip(indices).zip(blobs) {
