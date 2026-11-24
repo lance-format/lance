@@ -1316,7 +1316,7 @@ impl Dataset {
             minor_version,
         ) {
             (0, 1) | (0, 0) => {
-                info!(target: TRACE_IO_EVENTS, index_uuid=%uuid, r#type=IO_TYPE_OPEN_VECTOR, prepare_us=prepare_start.elapsed().as_micros() as u64, version="0.1", index_type="IVF_PQ");
+                info!(target: TRACE_IO_EVENTS, index_uuid=%uuid, r#type=IO_TYPE_OPEN_VECTOR, prepare_us=i64::try_from(prepare_start.elapsed().as_micros()).unwrap_or(i64::MAX), version="0.1", index_type="IVF_PQ");
                 let proto = open_index_proto(reader.as_ref()).await?;
                 match &proto.implementation {
                     Some(Implementation::VectorIndex(vector_index)) => {
@@ -1338,7 +1338,7 @@ impl Dataset {
             }
 
             (0, 2) => {
-                info!(target: TRACE_IO_EVENTS, index_uuid=%uuid, r#type=IO_TYPE_OPEN_VECTOR, prepare_us=prepare_start.elapsed().as_micros() as u64, version="0.2", index_type="IVF_PQ");
+                info!(target: TRACE_IO_EVENTS, index_uuid=%uuid, r#type=IO_TYPE_OPEN_VECTOR, prepare_us=i64::try_from(prepare_start.elapsed().as_micros()).unwrap_or(i64::MAX), version="0.2", index_type="IVF_PQ");
                 let reader = V1FileReader::try_new_self_described_from_reader(
                     lazy_reader,
                     Some(
@@ -1370,7 +1370,7 @@ impl Dataset {
 
                 let (_, element_type) = get_vector_type(self.schema(), &field_path)?;
 
-                info!(target: TRACE_IO_EVENTS, index_uuid=%uuid, r#type=IO_TYPE_OPEN_VECTOR, prepare_us=prepare_start.elapsed().as_micros() as u64, version="0.3", index_type=index_metadata.index_type);
+                info!(target: TRACE_IO_EVENTS, index_uuid=%uuid, r#type=IO_TYPE_OPEN_VECTOR, prepare_us=i64::try_from(prepare_start.elapsed().as_micros()).unwrap_or(i64::MAX), version="0.3", index_type=index_metadata.index_type);
 
                 match index_metadata.index_type.as_str() {
                     "IVF_FLAT" => match element_type {

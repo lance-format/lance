@@ -2003,7 +2003,10 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         let mut finish_phase = |field: &'static str| {
             if let (Some(span), Some(last)) = (&span, &mut checkpoint) {
                 let now = Instant::now();
-                span.record(field, (now - *last).as_micros() as u64);
+                span.record(
+                    field,
+                    i64::try_from((now - *last).as_micros()).unwrap_or(i64::MAX),
+                );
                 *last = now;
             }
         };
@@ -2162,8 +2165,14 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         let read_projection = Self::read_projection(&index_reader)?;
         finish_phase("query_state_us");
         if let Some(span) = span {
-            span.record("scheduler_requests", open_io_stats.requests);
-            span.record("scheduler_bytes", open_io_stats.bytes_read);
+            span.record(
+                "scheduler_requests",
+                i64::try_from(open_io_stats.requests).unwrap_or(i64::MAX),
+            );
+            span.record(
+                "scheduler_bytes",
+                i64::try_from(open_io_stats.bytes_read).unwrap_or(i64::MAX),
+            );
         }
         Ok(Self {
             uri: to_local_path(&uri),
