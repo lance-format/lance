@@ -57,6 +57,18 @@ impl CommitDestination<'_> {
     }
 }
 
+impl From<Table> for CommitDestination<'_> {
+    fn from(table: Table) -> Self {
+        Self::Table(Arc::new(table))
+    }
+}
+
+impl From<&Table> for CommitDestination<'_> {
+    fn from(table: &Table) -> Self {
+        Self::from(table.clone())
+    }
+}
+
 impl From<Arc<Table>> for CommitDestination<'_> {
     fn from(dataset: Arc<Table>) -> Self {
         CommitDestination::Table(dataset)

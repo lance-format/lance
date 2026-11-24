@@ -326,13 +326,6 @@ impl<'a> CommitBuilder<'a> {
         self
     }
 
-    /// Create the dataset keeping an existing table's field IDs; see
-    /// [`InsertBuilder::with_inherited_field_ids`](super::InsertBuilder::with_inherited_field_ids).
-    pub(crate) fn with_inherited_field_ids(mut self) -> Self {
-        self.inner = self.inner.with_inherited_field_ids();
-        self
-    }
-
     /// Opt in to committing an action-based transaction.
     ///
     /// Transaction V2 -- a [`Transaction`] whose operation is a

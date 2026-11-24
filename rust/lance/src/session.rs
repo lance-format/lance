@@ -621,6 +621,12 @@ impl Session {
     }
 }
 
+impl AsRef<TableSession> for Session {
+    fn as_ref(&self) -> &TableSession {
+        &self.table_session
+    }
+}
+
 impl Default for Session {
     fn default() -> Self {
         Self::new(

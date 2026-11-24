@@ -3,8 +3,8 @@
 
 use std::{collections::HashSet, sync::Arc};
 
-use arrow::array::AsArray;
-use arrow::datatypes::UInt64Type;
+use arrow_array::cast::AsArray;
+use arrow_array::types::UInt64Type;
 use arrow_array::{Array, ArrayRef, RecordBatch};
 use arrow_buffer::ArrowNativeType;
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField};
@@ -20,13 +20,13 @@ use lance_core::datatypes::BlobV2Layout;
 use lance_core::{Error, Result};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(in crate::dataset) struct ResolvedExternalBase {
+pub(super) struct ResolvedExternalBase {
     pub base_id: u32,
     pub relative_path: String,
 }
 
 #[derive(Clone, Debug)]
-pub(in crate::dataset) struct ExternalBaseCandidate {
+pub struct ExternalBaseCandidate {
     pub base_id: u32,
     pub store_prefix: String,
     pub base_path: Path,
@@ -34,15 +34,16 @@ pub(in crate::dataset) struct ExternalBaseCandidate {
 }
 
 #[derive(Debug)]
-pub(in crate::dataset) struct ExternalBaseResolver {
+#[doc(hidden)]
+pub struct ExternalBaseResolver {
     candidates: Vec<ExternalBaseCandidate>,
-    pub(in crate::dataset) registered_base_ids: RoaringBitmap,
-    pub(in crate::dataset) unregistered_external_blob_policy: UnregisteredExternalBlobPolicy,
+    pub(crate) registered_base_ids: RoaringBitmap,
+    pub(crate) unregistered_external_blob_policy: UnregisteredExternalBlobPolicy,
     store_registry: Arc<ObjectStoreRegistry>,
 }
 
 impl ExternalBaseResolver {
-    pub(in crate::dataset) fn new(
+    pub(crate) fn new(
         candidates: Vec<ExternalBaseCandidate>,
         store_registry: Arc<ObjectStoreRegistry>,
     ) -> Self {
@@ -54,7 +55,7 @@ impl ExternalBaseResolver {
         }
     }
 
-    pub(crate) async fn resolve_external_uri(
+    pub(super) async fn resolve_external_uri(
         &self,
         uri: &str,
     ) -> Result<Option<ResolvedExternalBase>> {
@@ -292,7 +293,8 @@ pub(super) fn collect_external_blob_uris(
 /// Existing rows can contain trusted absolute references that were accepted by an earlier write.
 /// Update paths use this check before allowing those fallback values through the writer, so newly
 /// matched values must still resolve beneath a registered external base.
-pub(in crate::dataset) async fn validate_external_blob_references(
+#[doc(hidden)]
+pub async fn validate_external_blob_references(
     resolver: &ExternalBaseResolver,
     batch: &RecordBatch,
     selected_rows: &[bool],
@@ -334,32 +336,55 @@ pub(super) fn normalize_external_absolute_uri(uri: &str) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    use crate::dataset::blob::materialize::{
-        BlobMaterializationContext, materialize_blob_v2_binary_batch_with_context,
-    };
-    use crate::{
-        Dataset,
-        blob::{BlobArrayBuilder, blob_field},
-        dataset::WriteParams,
-    };
-    use arrow::{
-        array::AsArray,
-        datatypes::{UInt8Type, UInt32Type, UInt64Type},
-    };
-    use arrow_array::RecordBatch;
-    use arrow_array::RecordBatchIterator;
-    use arrow_schema::Schema;
-    use lance_core::datatypes::{BlobHandling, BlobKind, OnMissing};
-    use lance_core::utils::tempfile::TempDir;
-    use lance_file::version::LanceFileVersion;
-    use lance_io::object_store::{
-        ObjectStore, ObjectStoreParams, ObjectStoreRegistry, StorageOptionsAccessor,
-    };
-    use lance_table::format::BasePath;
+    #[cfg(feature = "azure")]
     use std::collections::HashMap;
-    use std::sync::Arc;
+
+    #[cfg(feature = "azure")]
+    use lance_table::format::BasePath;
+
+    use super::*;
+    use arrow_array::types::{UInt8Type, UInt32Type};
+    use arrow_schema::Schema;
+    use async_trait::async_trait;
+    use lance_core::{
+        ROW_ADDR,
+        datatypes::{BlobHandling, BlobKind, OnMissing, Projection},
+        utils::tempfile::TempDir,
+    };
+    use lance_file::version::LanceFileVersion;
+    use lance_io::object_store::ObjectStoreProvider;
+    #[cfg(feature = "azure")]
+    use lance_io::object_store::StorageOptionsAccessor;
+    use rstest::rstest;
+
+    use crate::blob::{
+        BlobArrayBuilder, BlobMaterializationContext, blob_field,
+        materialize_blob_v2_binary_batch_with_admission,
+    };
+    use crate::{InsertBuilder, WriteParams};
+
+    #[derive(Debug)]
+    struct ReferenceProbeProvider;
+
+    #[async_trait]
+    impl ObjectStoreProvider for ReferenceProbeProvider {
+        async fn new_store(&self, _uri: Url, _params: &ObjectStoreParams) -> Result<ObjectStore> {
+            panic!("resolving an external reference must not open a store");
+        }
+
+        fn extract_path(&self, uri: &Url) -> Result<Path> {
+            Path::from_url_path(uri.path())
+                .map_err(|error| Error::invalid_input(format!("Invalid source path: {error}")))
+        }
+
+        fn calculate_object_store_prefix(
+            &self,
+            _uri: &Url,
+            _options: Option<&std::collections::HashMap<String, String>>,
+        ) -> Result<String> {
+            Ok("probe".to_string())
+        }
+    }
 
     #[cfg(feature = "azure")]
     fn azure_store_params(account_name: &str) -> ObjectStoreParams {
@@ -438,6 +463,75 @@ mod tests {
         assert_eq!(resolved_b.relative_path, "file.bin");
     }
 
+    #[rstest]
+    #[case::absolute("/tmp/external-base/payload")]
+    #[case::relative("external-base/payload")]
+    #[tokio::test]
+    async fn test_external_reference_matches_local_paths_when_provider_is_enabled(
+        #[case] uri: &str,
+    ) {
+        let registry = Arc::new(ObjectStoreRegistry::default());
+        let path = ObjectStore::extract_path_from_uri(registry.clone(), uri).unwrap();
+        let base = path.parent().unwrap();
+        let mut resolver = ExternalBaseResolver::new(
+            vec![ExternalBaseCandidate {
+                base_id: 2,
+                store_prefix: "file".to_string(),
+                base_path: base,
+                store_params: ObjectStoreParams::default(),
+            }],
+            registry,
+        );
+        resolver.unregistered_external_blob_policy = UnregisteredExternalBlobPolicy::Deny;
+        let matched = resolver.resolve_external_uri(uri).await.unwrap().unwrap();
+        assert_eq!(matched.base_id, 2);
+        assert_eq!(matched.relative_path, "payload");
+    }
+
+    #[tokio::test]
+    async fn test_external_reference_preserves_registered_matches_and_input_errors() {
+        let registry = Arc::new(
+            ObjectStoreRegistry::default()
+                .without_providers(["file", "file-object-store", "file+uring"])
+                .unwrap(),
+        );
+        registry.insert("probe", Arc::new(ReferenceProbeProvider));
+        let mut resolver = ExternalBaseResolver::new(
+            vec![ExternalBaseCandidate {
+                base_id: 2,
+                store_prefix: "probe".to_string(),
+                base_path: Path::from("base"),
+                store_params: ObjectStoreParams::default(),
+            }],
+            registry,
+        );
+        resolver.unregistered_external_blob_policy = UnregisteredExternalBlobPolicy::Deny;
+        let matched = resolver
+            .resolve_external_uri("probe://bucket/base/payload")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(matched.base_id, 2);
+        assert_eq!(matched.relative_path, "payload");
+        let error = resolver
+            .resolve_external_uri("probe://bucket/base/%FF")
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(error.to_string().contains("Invalid source path"), "{error}");
+        assert!(!error.to_string().contains("Remote tables"), "{error}");
+        resolver.unregistered_external_blob_policy = UnregisteredExternalBlobPolicy::Allow;
+        let error = resolver
+            .resolve_external_uri("file:///etc/passwd")
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(
+            error.to_string().contains("Unknown scheme: file"),
+            "{error}"
+        );
+    }
+
     #[tokio::test]
     async fn test_blob_v2_external_outside_base_allowed() {
         let dataset_dir = TempDir::default();
@@ -451,30 +545,22 @@ mod tests {
         let blob_array: arrow_array::ArrayRef = blob_builder.finish().unwrap();
         let schema = Arc::new(Schema::new(vec![blob_field("blob", true)]));
         let batch = RecordBatch::try_new(schema.clone(), vec![blob_array]).unwrap();
-        let reader = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
-
-        let dataset = Arc::new(
-            Dataset::write(
-                reader,
-                &dataset_dir.path_str(),
-                Some(WriteParams {
-                    data_storage_version: Some(LanceFileVersion::V2_2),
-                    allow_external_blob_outside_bases: true,
-                    ..Default::default()
-                }),
-            )
-            .await
-            .unwrap(),
-        );
-
-        let descriptor_batch = dataset
-            .scan()
-            .project(&["blob"])
-            .unwrap()
-            .with_row_address()
-            .try_into_batch()
+        let params = WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            allow_external_blob_outside_bases: true,
+            ..Default::default()
+        };
+        let table = InsertBuilder::new(dataset_dir.path_str().as_str())
+            .with_params(&params)
+            .execute(vec![batch])
             .await
             .unwrap();
+
+        let projection = table
+            .schema()
+            .project_preserve_system_columns(&["blob", ROW_ADDR])
+            .unwrap();
+        let descriptor_batch = table.take(&[0], &projection).await.unwrap();
         {
             let desc = descriptor_batch.column_by_name("blob").unwrap().as_struct();
             assert_eq!(
@@ -487,8 +573,7 @@ mod tests {
             assert_eq!(desc.column(4).as_string::<i32>().value(0), expected_uri);
         }
 
-        let output_schema = dataset
-            .empty_projection()
+        let output_schema = Projection::empty(Arc::new(table.schema().clone()))
             .union_columns(["blob"], OnMissing::Error)
             .unwrap()
             .with_blob_handling(BlobHandling::AllBinary)
@@ -496,11 +581,12 @@ mod tests {
         let descriptor_bytes =
             u64::try_from(descriptor_batch.get_array_memory_size()).unwrap_or(u64::MAX);
         let context = BlobMaterializationContext::new(None, Some(1));
-        let materialized = materialize_blob_v2_binary_batch_with_context(
-            &dataset,
+        let materialized = materialize_blob_v2_binary_batch_with_admission(
+            &table,
             &output_schema,
             descriptor_batch,
             &context,
+            context.admission(),
         )
         .await
         .unwrap();
@@ -538,7 +624,7 @@ mod tests {
             0
         );
 
-        let blobs = dataset.take_blobs_by_indices(&[0], "blob").await.unwrap();
+        let blobs = table.take_blobs_by_indices(&[0], "blob").await.unwrap();
         assert_eq!(blobs.len(), 1);
         assert_eq!(
             blobs[0].as_ref().unwrap().read().await.unwrap().as_ref(),

@@ -5,17 +5,17 @@ use object_store::path::Path;
 
 use super::BlobFile;
 use crate::blob::BlobDescriptor;
-use crate::dataset::BLOBS_DIR;
-use crate::{Error, Result};
+use crate::paths::BLOBS_DIR;
 use lance_core::utils::blob::validate_managed_reference;
+use lance_core::{Error, Result};
 
 /// Trusted payload sources for a single prepared Blob v2 batch.
 ///
 /// Add each source and put the returned descriptor in the corresponding leaf
-/// using [`crate::BlobDescriptorArrayBuilder`]. These descriptors are local to
+/// using [`crate::blob::BlobDescriptorArrayBuilder`]. These descriptors are local to
 /// the batch and must be written with
-/// [`crate::dataset::fragment::FileFragment::write_columns_with_blob_sources`]
-/// or [`crate::Dataset::write_data_file_part_with_blob_sources`]. The writer
+/// [`crate::FileFragment::write_columns_with_blob_sources`]
+/// or [`crate::Table::write_data_file_part_with_blob_sources`]. The writer
 /// resolves every Packed descriptor in those arrays through this map. Use
 /// [`Self::add_blob_file`] to carry an existing Packed or Dedicated value
 /// forward. Only trusted code should build the arrays and resolve payloads.
@@ -43,10 +43,10 @@ impl BlobWriteSources {
     /// copy instead.
     ///
     /// ```
-    /// use lance::blob::BlobWriteSources;
+    /// use lance_table_runtime::blob::BlobWriteSources;
     /// use object_store::path::Path;
     ///
-    /// # fn example() -> lance::Result<()> {
+    /// # fn example() -> lance_core::Result<()> {
     /// let mut sources = BlobWriteSources::default();
     /// let descriptor = sources.add_uploaded_blob(
     ///     Path::from("_blobs/ingest/attempt-12/value.payload"), 1024,
@@ -99,7 +99,7 @@ impl BlobWriteSources {
         })
     }
 
-    pub(in crate::dataset) fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.sources.is_empty()
     }
 

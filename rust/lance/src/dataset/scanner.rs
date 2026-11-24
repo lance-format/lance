@@ -60,7 +60,7 @@ use tracing::{Span, info_span, instrument};
 use uuid::Uuid;
 
 use super::Dataset;
-use crate::dataset::utils::SchemaAdapter;
+use crate::dataset::utils::to_logical_stream;
 use crate::datatypes::Schema;
 use crate::index::scalar::{IndexDetails, fetch_index_details};
 use crate::io::exec::LanceFilterExec;
@@ -937,13 +937,7 @@ pub struct DatasetRecordBatchStream {
 
 impl DatasetRecordBatchStream {
     pub fn new(exec_node: SendableRecordBatchStream) -> Self {
-        let schema = exec_node.schema();
-        let adapter = SchemaAdapter::new(schema.clone());
-        let exec_node = if SchemaAdapter::requires_logical_conversion(&schema) {
-            adapter.to_logical_stream(exec_node)
-        } else {
-            exec_node
-        };
+        let exec_node = to_logical_stream(exec_node);
 
         let span = info_span!("DatasetRecordBatchStream");
         Self { exec_node, span }

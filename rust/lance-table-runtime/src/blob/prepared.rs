@@ -3,8 +3,8 @@
 
 use std::{collections::HashSet, sync::Arc};
 
-use arrow::array::AsArray;
-use arrow::datatypes::{UInt8Type, UInt32Type, UInt64Type};
+use arrow_array::cast::AsArray;
+use arrow_array::types::{UInt8Type, UInt32Type, UInt64Type};
 use arrow_array::{
     Array, ArrayRef, GenericListArray, RecordBatch, StringArray, StructArray, UInt8Array,
     UInt32Array, UInt64Array,
@@ -329,9 +329,9 @@ pub fn prepared_sidecar_bytes(batch: &RecordBatch) -> Result<u64> {
 mod tests {
     use super::*;
 
+    use crate::blob::locate::StoredBlob;
     use crate::blob::{BlobDescriptor, BlobDescriptorArrayBuilder};
-    use crate::dataset::blob::locate::StoredBlob;
-    use arrow::array::AsArray;
+    use arrow_array::cast::AsArray;
     use arrow_array::{ListArray, RecordBatch, StructArray};
     use arrow_buffer::{NullBuffer, OffsetBuffer};
     use arrow_schema::{DataType, Field, Fields, Schema};

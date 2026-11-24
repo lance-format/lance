@@ -44,7 +44,7 @@ use lance_table::io::commit::{
 use crate::io::commit::namespace_manifest::LanceNamespaceExternalManifestStore;
 use lance_table::io::manifest::{read_manifest, read_manifest_indexes};
 use lance_table_runtime::base::has_any_entry;
-pub(crate) use lance_table_runtime::paths::{BLOBS_DIR, DATA_DIR, INDICES_DIR, TRANSACTIONS_DIR};
+pub(crate) use lance_table_runtime::paths::{DATA_DIR, INDICES_DIR, TRANSACTIONS_DIR};
 use lance_table_runtime::{Table, TableState, TableView};
 pub use lance_table_runtime::{Version, VersionRef, VersionTransaction};
 use object_store::path::Path;
@@ -66,7 +66,6 @@ pub mod builder;
 pub mod cleanup;
 pub mod compaction_stats;
 mod data_file;
-mod data_file_part;
 pub mod deletions;
 pub mod delta;
 pub mod expire;
@@ -122,7 +121,7 @@ pub(crate) mod versions;
 pub mod write;
 
 pub use data_file::DataFileTarget;
-pub use data_file_part::DataFilePart;
+pub use lance_table_runtime::write::DataFilePart;
 
 pub(crate) use take::row_offsets_to_row_addresses;
 
@@ -2432,10 +2431,6 @@ impl Dataset {
     /// If `base_id` is `None`, returns the default data directory.
     pub(crate) fn data_file_dir_for_base(&self, base_id: Option<u32>) -> Result<Path> {
         self.table_view().data_file_dir_for_base(base_id)
-    }
-
-    pub(crate) fn blob_base_path(&self, base_id: Option<u32>) -> Result<Path> {
-        self.table_view().blob_base_path(base_id)
     }
 
     /// Resolve the object store for the primary dataset or an additional base.
