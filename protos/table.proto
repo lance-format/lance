@@ -363,7 +363,7 @@ message IndexMetadata {
    */
   repeated int32 fields = 2;
 
-  // Index name. Must be unique within one dataset version.
+  // Logical index name shared by all segments of the index.
   string name = 3;
 
   // The version of the dataset this index was built from.
@@ -401,7 +401,7 @@ message IndexMetadata {
    */
   google.protobuf.Any index_details = 6;
 
-  // The minimum lance version that this index is compatible with.
+  // Index format version for this segment. If unset, use version 0.
   optional int32 index_version = 7;
 
   /* Timestamp when the index was created (UTC timestamp in milliseconds since epoch)
@@ -411,9 +411,7 @@ message IndexMetadata {
    */
   optional uint64 created_at = 8;
 
-  /* The base path index of the data file. Used when the file is imported or referred from another dataset.
-   * Lance use it as key of the base_paths field in Manifest to determine the actual base path of the data file.
-   */
+  // Base path ID for the index files. If unset, use the dataset base path.
   optional uint32 base_id = 9;
 
   /* List of files and their sizes for this index segment.
