@@ -560,7 +560,7 @@ async fn test_optimize_ivf_pq_legacy_segments(#[case] num_bits: u8) {
         .indices_dir()
         .join(indices[0].uuid.to_string())
         .join(INDEX_FILE_NAME);
-    let reader = dataset.object_store.open(&path).await.unwrap();
+    let reader = dataset.table_state.object_store.open(&path).await.unwrap();
     let footer = read_last_block(reader.as_ref()).await.unwrap();
     assert_eq!(
         read_metadata_offset(&footer).unwrap(),

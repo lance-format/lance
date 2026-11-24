@@ -1098,7 +1098,7 @@ mod tests {
             .indices_dir()
             .join(index.uuid.to_string())
             .join(INDEX_FILE_NAME);
-        let reader = dataset.object_store.open(&path).await.unwrap();
+        let reader = dataset.table_state.object_store.open(&path).await.unwrap();
         read_last_block(reader.as_ref()).await.unwrap()
     }
 
