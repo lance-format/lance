@@ -4290,6 +4290,42 @@ async fn test_vector_index_types_use_physical_files_and_cache_only_types() {
 }
 
 #[tokio::test]
+async fn test_ivf_partition_shape_per_segment_only_reads_index_file() {
+    let mut dataset = write_small_vector_dataset("memory://").await;
+    let mut entries = Vec::new();
+    let mut expected = Vec::new();
+    for (count, ids) in [(2, vec![0, 1]), (4, vec![2, 3])] {
+        let params = VectorIndexParams::ivf_flat(count, DistanceType::L2);
+        let segment = build_vector_segment(&mut dataset, &params, ids).await;
+        expected.push((segment.uuid, (count, 16)));
+        entries.push(("vector_idx", segment));
+    }
+    let mut dataset = commit_raw_index_segments(&dataset, entries, vec![], false)
+        .await
+        .unwrap();
+    dataset.load_indices().await.unwrap();
+    let _ = dataset.object_store.io_stats_incremental();
+    for (uuid, shape) in &expected {
+        assert_eq!(dataset.ivf_partition_shape(uuid).await.unwrap(), *shape);
+        let cold = dataset.object_store.io_stats_incremental();
+        let filename = format!("/{uuid}/{}", lance_index::INDEX_FILE_NAME);
+        assert!(!cold.requests.is_empty());
+        assert!(
+            cold.requests
+                .iter()
+                .all(|request| request.path.as_ref().ends_with(&filename))
+        );
+        assert_eq!(dataset.ivf_partition_shape(uuid).await.unwrap(), *shape);
+        assert_eq!(dataset.object_store.io_stats_incremental().read_iops, 0);
+    }
+    dataset.drop_index("vector_idx").await.unwrap();
+    assert!(matches!(
+        dataset.ivf_partition_shape(&expected[0].0).await,
+        Err(lance_core::Error::IndexNotFound { .. })
+    ));
+}
+
+#[tokio::test]
 async fn test_vector_index_types_use_legacy_query_opener() {
     let dataset = write_legacy_v1_dataset("memory://").await;
     let segment = build_legacy_v1_segment(&dataset, DistanceType::L2, vec![0, 1]).await;

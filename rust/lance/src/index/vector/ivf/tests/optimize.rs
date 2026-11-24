@@ -262,6 +262,13 @@ async fn test_optimize_legacy_hnsw_sq_refuses_before_writing() {
         .open_vector_index("vector", &legacy_uuid, &NoOpMetricsCollector)
         .await
         .unwrap();
+    assert_eq!(
+        dataset.ivf_partition_shape(&legacy_uuid).await.unwrap(),
+        (
+            legacy.ivf_model().num_partitions(),
+            legacy.ivf_model().dimension()
+        ),
+    );
     assert!(
         legacy.as_any().is::<IVFIndex>(),
         "the fixture is a v1 IVFIndex"

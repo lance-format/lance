@@ -62,7 +62,7 @@ impl VectorQueryContract {
     /// The contract an index file of the current format records in its
     /// schema: the type the opener dispatches on, and the metric the opened
     /// index ranks by.
-    fn from_file_metadata(metadata: &IndexMetadata) -> Result<Self> {
+    pub(super) fn from_file_metadata(metadata: &IndexMetadata) -> Result<Self> {
         let index_type = IndexType::try_from(metadata.index_type.as_str())?;
         // The opener opens these files only as one of the IVF types.
         if !index_type.is_vector() || index_type == IndexType::Vector {

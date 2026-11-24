@@ -1326,6 +1326,15 @@ impl FileReader {
     /// Reads only the file schema, without loading column metadata or user global
     /// buffers. Returns a version conflict for a legacy file.
     pub async fn read_schema(scheduler: &FileScheduler) -> Result<Schema> {
+        Ok(Self::read_schema_and_global_buffers(scheduler).await?.0)
+    }
+
+    /// Reads the schema and the validated locations of the global buffers in one
+    /// footer lookup. A caller can range-read part of a buffer without opening
+    /// the file's columns. Buffer zero describes the schema itself.
+    pub async fn read_schema_and_global_buffers(
+        scheduler: &FileScheduler,
+    ) -> Result<(Schema, Vec<BufferDescriptor>)> {
         let (tail, file_len) = Self::read_tail(scheduler).await?;
         // A short legacy file may not even have room for a current-format footer.
         if tail.len() < FOOTER_LEN
@@ -1340,7 +1349,7 @@ impl FileReader {
         }
         let (_, _, buffers) = Self::read_current_footer(scheduler, &tail, file_len).await?;
         let (_, schema) = Self::read_schema_buffer(scheduler, &tail, file_len, &buffers[0]).await?;
-        Ok(schema)
+        Ok((schema, buffers))
     }
 
     async fn read_raw_metadata_index_with_known_schema(
