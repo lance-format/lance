@@ -613,8 +613,8 @@ impl FilteredReadStream {
             base_schedulers.unwrap_or_else(|| Self::make_base_schedulers(&options));
         let threading_mode = options.threading_mode;
 
-        let io_parallelism = dataset.object_store.io_parallelism();
-        let object_store = dataset.object_store.clone();
+        let io_parallelism = dataset.table_state.object_store.io_parallelism();
+        let object_store = dataset.table_state.object_store.clone();
         let fragment_readahead = options
             .fragment_readahead
             .unwrap_or_else(|| (*DEFAULT_FRAGMENT_READAHEAD).unwrap_or(io_parallelism * 2))
@@ -728,7 +728,7 @@ impl FilteredReadStream {
         dataset: &Arc<Dataset>,
         options: &FilteredReadOptions,
     ) -> Result<Vec<LoadedFragment>> {
-        let io_parallelism = dataset.object_store.io_parallelism();
+        let io_parallelism = dataset.table_state.object_store.io_parallelism();
         let fragments = options.selected_fragments(dataset.as_ref());
         // Ideally we don't need to collect here but if we don't we get "implementation of FnOnce is
         // not general enough" false positives from rustc
@@ -753,7 +753,7 @@ impl FilteredReadStream {
     /// Create the I/O scheduler for a read (explicit option → env override →
     /// max bandwidth)
     fn make_scan_scheduler(dataset: &Dataset, options: &FilteredReadOptions) -> Arc<ScanScheduler> {
-        let obj_store = dataset.object_store.clone();
+        let obj_store = dataset.table_state.object_store.clone();
         let scheduler_config = if let Some(io_buffer_size_bytes) = options
             .io_buffer_size_bytes
             .or_else(get_default_io_buffer_size_override)
@@ -802,7 +802,7 @@ impl FilteredReadStream {
                 .checked_sub(num_deleted_rows)
                 .ok_or_else(|| {
                     Error::corrupt_file(
-                        dataset.base.clone(),
+                        dataset.table_state.base.clone(),
                         format!(
                             "Fragment {} has {} physical rows but {} deleted rows",
                             frag.id, num_physical_rows, num_deleted_rows
@@ -1044,7 +1044,7 @@ impl FilteredReadStream {
         let default_batch_size = options.batch_size.unwrap_or_else(|| {
             get_default_batch_size().unwrap_or_else(|| {
                 std::cmp::max(
-                    dataset.object_store.as_ref().block_size() / 4,
+                    dataset.table_state.object_store.as_ref().block_size() / 4,
                     BATCH_SIZE_FALLBACK,
                 )
             }) as u32
@@ -2896,7 +2896,7 @@ impl FilteredReadExec {
                 }
 
                 // Load fragments to compute the plan
-                let io_parallelism = dataset.object_store.io_parallelism();
+                let io_parallelism = dataset.table_state.object_store.io_parallelism();
                 let fragments = options.selected_fragments(dataset.as_ref());
 
                 let with_deleted_rows = options.with_deleted_rows;
@@ -3291,7 +3291,7 @@ impl RowStreamRead {
             })
             .collect::<Vec<_>>();
         let mut matched_fragments = futures::stream::iter(fragment_futures)
-            .buffered(self.dataset.object_store.io_parallelism())
+            .buffered(self.dataset.table_state.object_store.io_parallelism())
             .try_collect::<Vec<_>>()
             .await?;
         matched_fragments.sort_unstable_by_key(|(position, _, _, _)| *position);
@@ -4042,9 +4042,10 @@ impl ExecutionPlan for FilteredReadExec {
             );
         let measured = column_width::measuring(
             stream.boxed(),
-            self.dataset.metadata_cache.clone(),
+            self.dataset.table_state.metadata_cache.clone(),
             self.dataset.manifest().version,
             self.dataset
+                .table_state
                 .manifest_location
                 .e_tag
                 .clone()
@@ -7219,14 +7220,14 @@ mod tests {
             let input = rows_input(vec![input]);
             let options = FilteredReadOptions::basic_full_read(&dataset);
             let plan = FilteredReadExec::try_new(dataset.clone(), options, Some(input)).unwrap();
-            dataset.object_store.io_stats_incremental();
+            dataset.table_state.object_store.io_stats_incremental();
             let batches = run(&plan).await;
             let batch = concat_batches(&plan.schema(), &batches).unwrap();
             assert_eq!(
                 batch["i"].as_primitive::<Int32Type>().values().as_ref(),
                 [14, 2, 2]
             );
-            let stats = dataset.object_store.io_stats_incremental();
+            let stats = dataset.table_state.object_store.io_stats_incremental();
             for fragment in fragments {
                 assert_eq!(
                     lineage_reads(&stats, &fragment) > 0,
@@ -8722,7 +8723,7 @@ mod tests {
                     let partition_metrics = Arc::new(FilteredReadPartitionMetrics::new(
                         &timer_metrics,
                         0,
-                        &dataset.object_store,
+                        &dataset.table_state.object_store,
                     ));
                     let mut cancelled = Box::pin({
                         let partition_metrics = partition_metrics.clone();

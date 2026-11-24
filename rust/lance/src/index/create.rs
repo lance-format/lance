@@ -698,7 +698,7 @@ impl<'a> CreateIndexBuilder<'a> {
                 // Capture file sizes after vector index creation
                 let index_dir = self.dataset.indices_dir().join(index_id.to_string());
                 let files =
-                    list_index_files_with_sizes(&self.dataset.object_store, &index_dir).await?;
+                    list_index_files_with_sizes(&self.dataset.table_state.object_store, &index_dir).await?;
                 CreatedIndex {
                     index_details: vector_index_details_default(),
                     index_version: self.index_type.version() as u32,
@@ -726,7 +726,7 @@ impl<'a> CreateIndexBuilder<'a> {
             fragment_bitmap: if train {
                 match &self.fragments {
                     Some(fragment_ids) => Some(fragment_ids.iter().collect()),
-                    None => Some(self.dataset.fragment_bitmap.as_ref().clone()),
+                    None => Some(self.dataset.table_state.fragment_bitmap.as_ref().clone()),
                 }
             } else {
                 // Empty bitmap for untrained indices
@@ -886,7 +886,13 @@ impl<'a> CreateIndexBuilder<'a> {
             )));
         }
 
-        let all_fragment_ids: Vec<u32> = self.dataset.fragment_bitmap.as_ref().iter().collect();
+        let all_fragment_ids: Vec<u32> = self
+            .dataset
+            .table_state
+            .fragment_bitmap
+            .as_ref()
+            .iter()
+            .collect();
         if !train || all_fragment_ids.is_empty() {
             let segment_uuid = Uuid::new_v4();
             let created_index = build_scalar_index(
@@ -1120,7 +1126,7 @@ async fn should_train_index(
         return Ok(false);
     }
 
-    if dataset.fragment_bitmap.is_empty() {
+    if dataset.table_state.fragment_bitmap.is_empty() {
         return Ok(false);
     }
 
@@ -1150,7 +1156,7 @@ fn vector_params_have_precomputed_ivf(params: &VectorIndexParams) -> bool {
 fn effective_vector_fragments(dataset: &Dataset, fragments: Option<&[u32]>) -> Option<Vec<u32>> {
     let fragments = Dataset::normalize_fragment_ids(fragments?);
     let fragment_bitmap: roaring::RoaringBitmap = fragments.iter().copied().collect();
-    (fragment_bitmap != *dataset.fragment_bitmap).then_some(fragments)
+    (fragment_bitmap != *dataset.table_state.fragment_bitmap).then_some(fragments)
 }
 
 /// Validate that a user-supplied `index_uuid` is permitted for this build.
@@ -2297,7 +2303,7 @@ mod tests {
         expected: &[(&str, StageIo)],
     ) {
         let progress = Arc::new(IoRecordingProgress {
-            store: dataset.object_store.clone(),
+            store: dataset.table_state.object_store.clone(),
             events: Default::default(),
         });
         let mut builder = CreateIndexBuilder::new(&mut dataset, &[column], index_type, params)
@@ -2598,7 +2604,7 @@ mod tests {
     /// shard files. Locks the "every segment has exactly one lookup" invariant.
     async fn assert_canonical_btree_segment(dataset: &Dataset, uuid: &Uuid) {
         let index_dir = dataset.indices_dir().join(uuid.to_string());
-        let files = list_index_files_with_sizes(&dataset.object_store, &index_dir)
+        let files = list_index_files_with_sizes(&dataset.table_state.object_store, &index_dir)
             .await
             .unwrap();
         let names: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
@@ -2787,6 +2793,7 @@ mod tests {
             .join(live_index.uuid.to_string())
             .join(BITMAP_LOOKUP_NAME);
         let artifact_before = dataset
+            .table_state
             .object_store
             .read_one_all(&artifact_path)
             .await
@@ -2817,6 +2824,7 @@ mod tests {
         }
         assert_eq!(dataset.version().version, version_before);
         let artifact_after = dataset
+            .table_state
             .object_store
             .read_one_all(&artifact_path)
             .await
@@ -3184,7 +3192,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             logical.calculate_included_frags().await.unwrap(),
-            dataset.fragment_bitmap.as_ref().clone()
+            dataset.table_state.fragment_bitmap.as_ref().clone()
         );
 
         let mut trimmed = staged.clone();
@@ -3234,7 +3242,7 @@ mod tests {
         assert_eq!(merged.dataset_version, expected_dataset_version);
         assert_eq!(
             merged.fragment_bitmap.as_ref().unwrap(),
-            dataset.fragment_bitmap.as_ref()
+            dataset.table_state.fragment_bitmap.as_ref()
         );
         assert!(
             merged
@@ -3339,6 +3347,7 @@ mod tests {
                 .join(lance_index::INDEX_FILE_NAME);
             assert!(
                 dataset
+                    .table_state
                     .object_store
                     .as_ref()
                     .exists(&segment_index)
@@ -3417,7 +3426,7 @@ mod tests {
 
         assert_eq!(
             segment.fragment_bitmap.as_ref().unwrap(),
-            dataset.fragment_bitmap.as_ref()
+            dataset.table_state.fragment_bitmap.as_ref()
         );
     }
 
@@ -4083,6 +4092,7 @@ mod tests {
             .join("staging")
             .join("orphan.lance");
         dataset
+            .table_state
             .object_store
             .put(&stale_staging_path, b"stale")
             .await
@@ -4101,6 +4111,7 @@ mod tests {
                 .join(lance_index::scalar::inverted::METADATA_FILE);
             assert!(
                 dataset
+                    .table_state
                     .object_store
                     .as_ref()
                     .exists(&metadata_path)
@@ -4210,7 +4221,7 @@ mod tests {
         .unwrap();
 
         let staged_coverage = staged.fragment_bitmap.clone().unwrap();
-        let live = dataset.fragment_bitmap.as_ref();
+        let live = dataset.table_state.fragment_bitmap.as_ref();
         assert!(
             !staged_coverage.is_subset(live) && !staged_coverage.is_disjoint(live),
             "precondition: the staged coverage must be partly retired, staged {staged_coverage:?} live {live:?}"
@@ -4241,7 +4252,7 @@ mod tests {
             .expect("a merged segment records its coverage");
         assert_eq!(
             coverage,
-            &(&staged_coverage & dataset.fragment_bitmap.as_ref()),
+            &(&staged_coverage & dataset.table_state.fragment_bitmap.as_ref()),
             "with no applicable mapping the claim is exactly the staged fragments still live"
         );
         assert!(
@@ -4360,7 +4371,7 @@ mod tests {
             .as_ref()
             .expect("a merged segment records its coverage");
         assert!(
-            coverage.is_disjoint(dataset.fragment_bitmap.as_ref()),
+            coverage.is_disjoint(dataset.table_state.fragment_bitmap.as_ref()),
             "a merge with no applicable mapping must not claim live fragments, got {coverage:?}"
         );
         assert!(
@@ -4695,6 +4706,7 @@ mod tests {
             );
             assert!(
                 row_addrs.iter().all(|row_addr| dataset
+                    .table_state
                     .fragment_bitmap
                     .contains(RowAddress::from(u64::from(*row_addr)).fragment_id())),
                 "{index_type:?} merge returned retired row addresses (compacted: {compact})"
@@ -5247,7 +5259,7 @@ mod tests {
         .await
         .unwrap();
         assert!(
-            !dataset.fragment_bitmap.contains(0),
+            !dataset.table_state.fragment_bitmap.contains(0),
             "compaction should retire fragment 0"
         );
 
@@ -5399,7 +5411,7 @@ mod tests {
                 "vector",
                 vec![IndexSegment::new(
                     uuid,
-                    dataset.fragment_bitmap.as_ref().clone(),
+                    dataset.table_state.fragment_bitmap.as_ref().clone(),
                     [dataset.schema().field("vector").unwrap().id],
                     Arc::new(vector_index_details(&params, None)),
                     IndexType::IvfHnswFlat.version(),
@@ -5415,7 +5427,7 @@ mod tests {
         assert_eq!(indices[0].uuid, uuid);
         assert_eq!(
             indices[0].fragment_bitmap.as_ref().unwrap(),
-            dataset.fragment_bitmap.as_ref()
+            dataset.table_state.fragment_bitmap.as_ref()
         );
         assert_eq!(indices[0].dataset_version, source_dataset_version);
 
@@ -5425,7 +5437,7 @@ mod tests {
                 "vector",
                 vec![IndexSegment::new(
                     Uuid::new_v4(),
-                    dataset.fragment_bitmap.as_ref().clone(),
+                    dataset.table_state.fragment_bitmap.as_ref().clone(),
                     [dataset.schema().field("vector").unwrap().id],
                     Arc::new(vector_index_details(&params, None)),
                     IndexType::IvfHnswFlat.version(),

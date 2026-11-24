@@ -657,14 +657,15 @@ mod tests {
         manifest.transaction_section = None;
         apply_frag_reuse_with_stable_row_ids_flag(&mut manifest, &indices);
         let location = dataset
+            .table_state
             .commit_handler
             .commit(
                 &mut manifest,
                 Some(indices),
-                &dataset.base,
-                &dataset.object_store,
+                &dataset.table_state.base,
+                &dataset.table_state.object_store,
                 write_manifest_file_to_path,
-                dataset.manifest_location.naming_scheme,
+                dataset.table_state.manifest_location.naming_scheme,
                 None,
             )
             .await

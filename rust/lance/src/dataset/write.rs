@@ -27,9 +27,7 @@ use lance_file::versions::v1::writer::{
 };
 use lance_file::writer::{self as current_writer, FileWriteSummary};
 use lance_file::{versions as file_versions, writer::FileWriterOptions};
-use lance_io::object_store::{
-    ObjectStore, ObjectStoreParams, ObjectStoreRegistry, parse_base_scoped_key,
-};
+use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
 use lance_io::stream::SendableRecordBatchStream;
 use lance_io::traits::Writer;
 use lance_table::feature_flags::managed_blobs_enabled;
@@ -37,6 +35,7 @@ use lance_table::format::{BasePath, DataFile, Fragment};
 use lance_table::io::commit::{CommitHandler, commit_handler_from_url};
 use lance_table::io::manifest::ManifestDescribing;
 use lance_table::transaction::{Operation, resolve_arrow_field_ids};
+use lance_table_runtime::base::log_unregistered_base_scoped_options;
 use object_store::{ObjectStoreExt, path::Path};
 use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
@@ -457,7 +456,7 @@ impl WriteDestination<'_> {
 
     pub fn uri(&self) -> String {
         match self {
-            WriteDestination::Dataset(dataset) => dataset.uri.clone(),
+            WriteDestination::Dataset(dataset) => dataset.table_state.uri.clone(),
             WriteDestination::Uri(uri) => uri.to_string(),
         }
     }
@@ -1787,37 +1786,6 @@ fn append_external_base_candidate(
             base_path: extracted_path,
             store_params,
         });
-    }
-}
-
-/// Log base-scoped storage options (`base_<id>.<key>`) whose id does not
-/// match any registered base path. Unregistered entries are ignored during
-/// resolution. The open path logs at debug, since options may legitimately be
-/// vended for bases the loaded version does not register; the write path logs
-/// at warn, since ids are already assigned there and an unmatched id is much
-/// more likely a mistake.
-pub(crate) fn log_unregistered_base_scoped_options(
-    store_params: Option<&ObjectStoreParams>,
-    base_paths: &HashMap<u32, BasePath>,
-    level: log::Level,
-) {
-    if !log::log_enabled!(level) {
-        return;
-    }
-    let Some(options) = store_params.and_then(|params| params.storage_options()) else {
-        return;
-    };
-    let unregistered = options
-        .keys()
-        .filter_map(|key| parse_base_scoped_key(key).map(|(id, _)| id))
-        .filter(|id| !base_paths.contains_key(id))
-        .collect::<BTreeSet<_>>();
-    if !unregistered.is_empty() {
-        log::log!(
-            level,
-            "Ignoring base-scoped storage options for unregistered base path ids: {:?}",
-            unregistered
-        );
     }
 }
 
@@ -6339,14 +6307,15 @@ mod tests {
             .unwrap();
 
         let scheduler = ScanScheduler::new(
-            dataset.object_store.clone(),
-            SchedulerConfig::max_bandwidth(&dataset.object_store),
+            dataset.table_state.object_store.clone(),
+            SchedulerConfig::max_bandwidth(&dataset.table_state.object_store),
         );
         let fragments = dataset.get_fragments();
         assert_eq!(fragments.len(), 3);
         for fragment in fragments {
             let data_file = fragment.metadata.files.first().unwrap();
             let path = dataset
+                .table_state
                 .base
                 .clone()
                 .join(super::DATA_DIR)
@@ -6359,7 +6328,10 @@ mod tests {
                 file_scheduler,
                 None,
                 Default::default(),
-                &dataset.metadata_cache.file_metadata_cache(&path),
+                &dataset
+                    .table_state
+                    .metadata_cache
+                    .file_metadata_cache(&path),
                 FileReaderOptions::default(),
             )
             .await
@@ -6421,10 +6393,11 @@ mod tests {
         let data_file = new_fragment.files.first().unwrap();
 
         let scheduler = ScanScheduler::new(
-            dataset.object_store.clone(),
-            SchedulerConfig::max_bandwidth(&dataset.object_store),
+            dataset.table_state.object_store.clone(),
+            SchedulerConfig::max_bandwidth(&dataset.table_state.object_store),
         );
         let path = dataset
+            .table_state
             .base
             .clone()
             .join(super::DATA_DIR)
@@ -6437,7 +6410,10 @@ mod tests {
             file_scheduler,
             None,
             Default::default(),
-            &dataset.metadata_cache.file_metadata_cache(&path),
+            &dataset
+                .table_state
+                .metadata_cache
+                .file_metadata_cache(&path),
             FileReaderOptions::default(),
         )
         .await

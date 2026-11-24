@@ -565,10 +565,10 @@ fn serving_file(fragment: &Fragment, field_id: i32) -> &DataFile {
 
 async fn open_data_file(dataset: &Dataset, path: &str) -> FileReader {
     let scheduler = ScanScheduler::new(
-        dataset.object_store.clone(),
-        SchedulerConfig::max_bandwidth(&dataset.object_store),
+        dataset.table_state.object_store.clone(),
+        SchedulerConfig::max_bandwidth(&dataset.table_state.object_store),
     );
-    let path = dataset.base.clone().join(DATA_DIR).join(path);
+    let path = dataset.table_state.base.clone().join(DATA_DIR).join(path);
     let file_scheduler = scheduler
         .open_file(&path, &CachedFileSize::unknown())
         .await
@@ -577,7 +577,10 @@ async fn open_data_file(dataset: &Dataset, path: &str) -> FileReader {
         file_scheduler,
         None,
         Default::default(),
-        &dataset.metadata_cache.file_metadata_cache(&path),
+        &dataset
+            .table_state
+            .metadata_cache
+            .file_metadata_cache(&path),
         FileReaderOptions::default(),
     )
     .await
@@ -2642,10 +2645,17 @@ async fn test_binary_copy_translates_remapped_seed_fields() {
             assert!(seed_in_file(&source, &file.path, "id").await.is_some());
             assert!(seed_in_file(&source, &file.path, "val").await.is_some());
             destination
+                .table_state
                 .object_store
                 .copy(
-                    &source.base.clone().join(DATA_DIR).join(file.path.as_str()),
+                    &source
+                        .table_state
+                        .base
+                        .clone()
+                        .join(DATA_DIR)
+                        .join(file.path.as_str()),
                     &destination
+                        .table_state
                         .base
                         .clone()
                         .join(DATA_DIR)

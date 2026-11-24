@@ -133,8 +133,8 @@ impl Dataset {
 pub async fn cleanup_frag_reuse_index(dataset: &mut Dataset) -> lance_core::Result<()> {
     // check against index metadata before auto-remap
     let indices = read_manifest_indexes(
-        &dataset.object_store,
-        &dataset.manifest_location,
+        &dataset.table_state.object_store,
+        &dataset.table_state.manifest_location,
         &dataset.manifest,
     )
     .await?;
@@ -344,8 +344,8 @@ pub(crate) async fn derive_superseded_segments(
     dataset: &Dataset,
 ) -> lance_core::Result<Vec<IndexMetadata>> {
     let stored = read_manifest_indexes(
-        &dataset.object_store,
-        &dataset.manifest_location,
+        &dataset.table_state.object_store,
+        &dataset.table_state.manifest_location,
         &dataset.manifest,
     )
     .await?;
@@ -394,7 +394,7 @@ pub(crate) async fn derive_superseded_segments(
                 .map(|bitmap| (idx.uuid, bitmap))
         })
         .collect();
-    let live = dataset.fragment_bitmap.as_ref();
+    let live = dataset.table_state.fragment_bitmap.as_ref();
 
     let mut groups: HashMap<&str, Vec<&IndexMetadata>> = HashMap::new();
     for index in stored.iter() {
@@ -567,8 +567,8 @@ pub(crate) fn is_tagged_trim_operation(
 /// separately by dataset cleanup.
 pub(crate) async fn derive_tagged_trim(dataset: &Dataset) -> lance_core::Result<TaggedTrimOutcome> {
     let indices = read_manifest_indexes(
-        &dataset.object_store,
-        &dataset.manifest_location,
+        &dataset.table_state.object_store,
+        &dataset.table_state.manifest_location,
         &dataset.manifest,
     )
     .await?;
@@ -602,7 +602,7 @@ pub(crate) async fn derive_tagged_trim(dataset: &Dataset) -> lance_core::Result<
     let retained = compute_tagged_retention(
         &elements,
         &indices,
-        dataset.fragment_bitmap.as_ref(),
+        dataset.table_state.fragment_bitmap.as_ref(),
         crate::index::segment::index_is_usable,
     );
 
@@ -927,8 +927,8 @@ pub(crate) mod tests {
         assert_eq!(fri.index_version, 0);
         let raw_key = IndexMetadataKey {
             version: dataset.manifest.version,
-            store_identity: &dataset.object_store.store_prefix,
-            e_tag: dataset.manifest_location.e_tag.as_deref(),
+            store_identity: &dataset.table_state.object_store.store_prefix,
+            e_tag: dataset.table_state.manifest_location.e_tag.as_deref(),
         };
         let remapped_key = DerivedIndexListingKey {
             version: raw_key.version,
@@ -2686,8 +2686,8 @@ pub(crate) mod tests {
 
         async fn stored_segments(dataset: &Dataset, name: &str) -> Vec<IndexMetadata> {
             read_manifest_indexes(
-                &dataset.object_store,
-                &dataset.manifest_location,
+                &dataset.table_state.object_store,
+                &dataset.table_state.manifest_location,
                 &dataset.manifest,
             )
             .await
@@ -2740,7 +2740,7 @@ pub(crate) mod tests {
         /// Union of the coverage the reader attributes to the usable
         /// segments of `name`, restricted to live fragments.
         async fn covered_fragments(dataset: &Dataset, name: &str) -> roaring::RoaringBitmap {
-            let live = dataset.fragment_bitmap.as_ref();
+            let live = dataset.table_state.fragment_bitmap.as_ref();
             let mut covered = roaring::RoaringBitmap::new();
             for index in dataset.load_indices().await.unwrap().iter() {
                 if index.name == name
@@ -2995,8 +2995,8 @@ pub(crate) mod tests {
                 ..entry.clone()
             };
             let indices = read_manifest_indexes(
-                &dataset.object_store,
-                &dataset.manifest_location,
+                &dataset.table_state.object_store,
+                &dataset.table_state.manifest_location,
                 &dataset.manifest,
             )
             .await

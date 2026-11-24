@@ -241,7 +241,7 @@ async fn assert_index_matches_scan_with(
 }
 
 fn io(dataset: &Dataset) -> IoStats {
-    dataset.object_store.io_stats_incremental()
+    dataset.table_state.object_store.io_stats_incremental()
 }
 
 async fn open_data_file(dataset: &Dataset, file: &DataFile) -> FileReader {
@@ -250,8 +250,8 @@ async fn open_data_file(dataset: &Dataset, file: &DataFile) -> FileReader {
         .unwrap()
         .join(file.path.as_str());
     let scheduler = ScanScheduler::new(
-        dataset.object_store.clone(),
-        SchedulerConfig::max_bandwidth(&dataset.object_store),
+        dataset.table_state.object_store.clone(),
+        SchedulerConfig::max_bandwidth(&dataset.table_state.object_store),
     );
     let file_scheduler = scheduler
         .open_file(&path, &CachedFileSize::unknown())
@@ -261,7 +261,10 @@ async fn open_data_file(dataset: &Dataset, file: &DataFile) -> FileReader {
         file_scheduler,
         None,
         Default::default(),
-        &dataset.metadata_cache.file_metadata_cache(&path),
+        &dataset
+            .table_state
+            .metadata_cache
+            .file_metadata_cache(&path),
         FileReaderOptions::default(),
     )
     .await

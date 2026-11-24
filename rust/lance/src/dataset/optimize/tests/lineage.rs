@@ -316,7 +316,7 @@ async fn test_row_addrs_only_used_with_remappable_index(
             assert_eq!(current.fragment_bitmap, original.fragment_bitmap);
             assert!(
                 current
-                    .effective_fragment_bitmap(dataset.fragment_bitmap.as_ref())
+                    .effective_fragment_bitmap(dataset.table_state.fragment_bitmap.as_ref())
                     .unwrap()
                     .is_empty()
             );
@@ -341,7 +341,7 @@ async fn test_row_addrs_only_used_with_remappable_index(
         let indices = dataset.load_indices().await.unwrap();
         assert_eq!(
             indices[0].fragment_bitmap.as_ref(),
-            Some(dataset.fragment_bitmap.as_ref())
+            Some(dataset.table_state.fragment_bitmap.as_ref())
         );
     }
 }
@@ -680,7 +680,7 @@ async fn test_distributed_compaction_with_stable_row_ids(
         let row_id_index = RowIdIndexKey {
             version: worker.manifest.version,
             with_deletions: true,
-            e_tag: worker.manifest_location.e_tag.as_deref(),
+            e_tag: worker.table_state.manifest_location.e_tag.as_deref(),
         };
         assert!(
             worker

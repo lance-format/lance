@@ -146,7 +146,7 @@ impl PrefilterUnionExec {
         if scope.is_empty() {
             return Ok(Arc::new(RowAddrMask::allow_nothing()));
         }
-        let missing = &scope - dataset.fragment_bitmap.as_ref();
+        let missing = &scope - dataset.table_state.fragment_bitmap.as_ref();
         if !missing.is_empty() {
             return Err(Error::internal(format!(
                 "prefilter scope contains missing fragment_ids={missing:?}, dataset_version={}",

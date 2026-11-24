@@ -45,7 +45,7 @@ pub(in crate::index) async fn merge_segments(
                 .values()
                 .fold(RoaringBitmap::new(), |acc, bitmap| acc | bitmap);
         }
-        None => fragment_bitmap &= dataset.fragment_bitmap.as_ref(),
+        None => fragment_bitmap &= dataset.table_state.fragment_bitmap.as_ref(),
     }
 
     if fragment_bitmap.is_empty() {

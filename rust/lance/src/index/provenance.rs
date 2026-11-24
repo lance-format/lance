@@ -69,7 +69,7 @@ pub(super) async fn remap_merged_segment_coverage(
                 Some(SegmentRemappingPlan::Identity) => segment
                     .fragment_bitmap
                     .as_ref()
-                    .map(|bitmap| bitmap & dataset.fragment_bitmap.as_ref())
+                    .map(|bitmap| bitmap & dataset.table_state.fragment_bitmap.as_ref())
                     .unwrap_or_default(),
                 Some(SegmentRemappingPlan::MissingCoverage(_)) | None => {
                     return Err(Error::not_supported(format!(
@@ -109,7 +109,7 @@ pub(super) async fn remap_merged_segment_coverage(
     let has_fragment_reuse_index = frag_reuse_index.is_some();
     // Partly retired counts as stale: the retired half is about to be
     // intersected away, which drops its rows from the merged index.
-    let coverage_is_stale = !staged_coverage.is_subset(&dataset.fragment_bitmap);
+    let coverage_is_stale = !staged_coverage.is_subset(&dataset.table_state.fragment_bitmap);
     let Some(frag_reuse_index) = frag_reuse_index
         .filter(|index| append::fragment_reuse_affects_segments(index, segments.iter()))
     else {

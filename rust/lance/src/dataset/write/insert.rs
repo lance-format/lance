@@ -344,7 +344,7 @@ impl<'a> InsertBuilder<'a> {
         // Write mode
         match (&context.params.mode, &context.dest) {
             (WriteMode::Create, WriteDestination::Dataset(ds)) => {
-                return Err(Error::dataset_already_exists(ds.uri.clone()));
+                return Err(Error::dataset_already_exists(ds.table_state.uri.clone()));
             }
             (WriteMode::Append | WriteMode::Overwrite, WriteDestination::Uri(uri)) => {
                 log::warn!("No existing dataset at {uri}, it will be created");
@@ -428,12 +428,12 @@ impl<'a> InsertBuilder<'a> {
         }
         let (object_store, base_path, commit_handler) = match &self.dest {
             WriteDestination::Dataset(dataset) => (
-                dataset.object_store.clone(),
-                dataset.base.clone(),
+                dataset.table_state.object_store.clone(),
+                dataset.table_state.base.clone(),
                 params
                     .commit_handler
                     .clone()
-                    .unwrap_or_else(|| dataset.commit_handler.clone()),
+                    .unwrap_or_else(|| dataset.table_state.commit_handler.clone()),
             ),
             WriteDestination::Uri(uri) => {
                 let registry = params
@@ -912,7 +912,7 @@ mod test {
             ))
             .await
             .unwrap();
-        dataset.commit_handler = commit_handler_from_url("cos://bucket/dataset", &None)
+        dataset.table_state.commit_handler = commit_handler_from_url("cos://bucket/dataset", &None)
             .await
             .unwrap();
 

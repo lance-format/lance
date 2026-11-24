@@ -517,8 +517,8 @@ async fn test_state_entry_carries_quantizer_before_admission() {
         entry
             .0
             .reconstruct(
-                dataset.object_store.clone(),
-                dataset.metadata_cache.as_ref(),
+                dataset.table_state.object_store.clone(),
+                dataset.table_state.metadata_cache.as_ref(),
                 LanceCache::no_cache(),
                 None,
                 super::IvfOpenContext::default(),
@@ -1407,12 +1407,17 @@ async fn test_pairwise_partition_replay_has_no_source_io(#[case] bits: Option<us
         .unwrap();
     let session = dataset.session();
     let store = session.spill_store();
-    dataset.object_store.as_ref().io_stats_incremental();
+    dataset
+        .table_state
+        .object_store
+        .as_ref()
+        .io_stats_incremental();
     let memory = index
         .prepare_pairwise_partition(0, BATCH_SIZE, 16 * 1024 * 1024, store)
         .await
         .unwrap();
     let memory_bytes = dataset
+        .table_state
         .object_store
         .as_ref()
         .io_stats_incremental()
@@ -1422,6 +1427,7 @@ async fn test_pairwise_partition_replay_has_no_source_io(#[case] bits: Option<us
         .await
         .unwrap();
     let spilled_bytes = dataset
+        .table_state
         .object_store
         .as_ref()
         .io_stats_incremental()
@@ -1434,7 +1440,11 @@ async fn test_pairwise_partition_replay_has_no_source_io(#[case] bits: Option<us
         spilled_bytes < 2 * memory_bytes,
         "spilled preparation read {spilled_bytes} bytes, in-memory {memory_bytes}"
     );
-    dataset.object_store.as_ref().io_stats_incremental();
+    dataset
+        .table_state
+        .object_store
+        .as_ref()
+        .io_stats_incremental();
     let mut seen = HashSet::new();
     for _ in 0..3 {
         for batch_id in 0..NUM_ROWS.div_ceil(BATCH_SIZE) {
@@ -1450,7 +1460,11 @@ async fn test_pairwise_partition_replay_has_no_source_io(#[case] bits: Option<us
         }
     }
     assert_eq!(seen, (0..NUM_ROWS as u64).collect::<HashSet<u64>>());
-    let stats = dataset.object_store.as_ref().io_stats_incremental();
+    let stats = dataset
+        .table_state
+        .object_store
+        .as_ref()
+        .io_stats_incremental();
     assert_eq!(
         stats.read_iops, 0,
         "replay must not reread the source index"
@@ -2651,6 +2665,7 @@ async fn test_distributed_vector_build_commits_multiple_segments_and_preserves_q
             .join(lance_index::INDEX_FILE_NAME);
         assert!(
             ds_split
+                .table_state
                 .object_store
                 .as_ref()
                 .exists(&segment_index)
@@ -3888,8 +3903,8 @@ async fn test_raw_index_commit_reads_each_segment_of_a_mixed_index(
     if matches!(commit, MixedIndexCommit::AddAfterACommit) {
         dataset.delete("false").await.unwrap();
         let saved = lance_table::io::manifest::read_manifest_indexes(
-            &dataset.object_store,
-            &dataset.manifest_location,
+            &dataset.table_state.object_store,
+            &dataset.table_state.manifest_location,
             &dataset.manifest,
         )
         .await
@@ -4310,14 +4325,14 @@ async fn test_vector_index_types_use_physical_files_and_cache_only_types() {
     .await
     .unwrap();
     dataset.load_indices().await.unwrap();
-    let _ = dataset.object_store.io_stats_incremental();
+    let _ = dataset.table_state.object_store.io_stats_incremental();
     let uuids = [flat_uuid, rq_uuid, flat_uuid];
     let expected = vec![IndexType::IvfFlat, IndexType::IvfRq, IndexType::IvfFlat];
     assert_eq!(
         dataset.vector_index_types("vector", &uuids).await.unwrap(),
         expected
     );
-    let cold = dataset.object_store.io_stats_incremental();
+    let cold = dataset.table_state.object_store.io_stats_incremental();
     assert!(!cold.requests.is_empty());
     for uuid in [flat_uuid, rq_uuid] {
         let path = format!("/{uuid}/{}", lance_index::INDEX_FILE_NAME);
@@ -4336,7 +4351,14 @@ async fn test_vector_index_types_use_physical_files_and_cache_only_types() {
         dataset.vector_index_types("vector", &uuids).await.unwrap(),
         expected
     );
-    assert_eq!(dataset.object_store.io_stats_incremental().read_iops, 0);
+    assert_eq!(
+        dataset
+            .table_state
+            .object_store
+            .io_stats_incremental()
+            .read_iops,
+        0
+    );
     assert!(dataset.vector_index_types("vector2", &uuids).await.is_err());
 
     dataset.drop_index("rq").await.unwrap();
@@ -4361,10 +4383,10 @@ async fn test_ivf_partition_shape_per_segment_only_reads_index_file() {
         .await
         .unwrap();
     dataset.load_indices().await.unwrap();
-    let _ = dataset.object_store.io_stats_incremental();
+    let _ = dataset.table_state.object_store.io_stats_incremental();
     for (uuid, shape) in &expected {
         assert_eq!(dataset.ivf_partition_shape(uuid).await.unwrap(), *shape);
-        let cold = dataset.object_store.io_stats_incremental();
+        let cold = dataset.table_state.object_store.io_stats_incremental();
         let filename = format!("/{uuid}/{}", lance_index::INDEX_FILE_NAME);
         assert!(!cold.requests.is_empty());
         assert!(
@@ -4373,7 +4395,14 @@ async fn test_ivf_partition_shape_per_segment_only_reads_index_file() {
                 .all(|request| request.path.as_ref().ends_with(&filename))
         );
         assert_eq!(dataset.ivf_partition_shape(uuid).await.unwrap(), *shape);
-        assert_eq!(dataset.object_store.io_stats_incremental().read_iops, 0);
+        assert_eq!(
+            dataset
+                .table_state
+                .object_store
+                .io_stats_incremental()
+                .read_iops,
+            0
+        );
     }
     dataset.drop_index("vector_idx").await.unwrap();
     assert!(matches!(
@@ -4410,7 +4439,7 @@ async fn index_file_version(dataset: &Dataset, segment: &IndexMetadata) -> (u16,
         .unwrap()
         .join(segment.uuid.to_string())
         .join(lance_index::INDEX_FILE_NAME);
-    let reader = dataset.object_store.open(&path).await.unwrap();
+    let reader = dataset.table_state.object_store.open(&path).await.unwrap();
     let footer = lance_io::utils::read_last_block(reader.as_ref())
         .await
         .unwrap();
@@ -4568,7 +4597,7 @@ async fn test_optimize_legacy_v1_hnsw_pq_refuses_incremental_optimize_and_retrai
     ));
     assert_eq!(
         segments[0].fragment_bitmap.as_ref().unwrap(),
-        dataset.fragment_bitmap.as_ref()
+        dataset.table_state.fragment_bitmap.as_ref()
     );
 }
 
@@ -4847,7 +4876,7 @@ async fn test_merge_index_metadata_reports_progress() {
 
     let progress = Arc::new(RecordingProgress::default());
     let merged_segment = crate::index::vector::ivf::merge_segments_with_progress(
-        dataset.object_store.as_ref(),
+        dataset.table_state.object_store.as_ref(),
         &dataset.indices_dir(),
         segments,
         progress.clone(),
@@ -4981,7 +5010,7 @@ async fn test_distributed_ivf_sq_worker_training_respects_fragment_filter() {
         .unwrap();
 
     let scheduler = ScanScheduler::new(
-        Arc::new(dataset.object_store.as_ref().clone()),
+        Arc::new(dataset.table_state.object_store.as_ref().clone()),
         SchedulerConfig::default_for_testing(),
     );
     let sq_meta = get_sq_metadata(&dataset, scheduler, &segment.uuid.to_string()).await;
@@ -6582,7 +6611,7 @@ async fn test_storage_open_fetches_ivf_and_quantizer_buffers_together() {
 
     let in_flight = Arc::new(AtomicUsize::new(0));
     let max_in_flight = Arc::new(AtomicUsize::new(0));
-    let mut probed = dataset.object_store.as_ref().clone();
+    let mut probed = dataset.table_state.object_store.as_ref().clone();
     probed.inner = Arc::new(ConcurrencyProbeStore {
         target: probed.inner.clone(),
         in_flight: in_flight.clone(),
@@ -6785,7 +6814,7 @@ async fn test_hnsw_read_projection_moves_fewer_bytes() {
 
     let row_range = hnsw.ivf.row_range(0);
     assert!(!row_range.is_empty(), "partition 0 should hold rows");
-    let store = dataset.object_store.as_ref();
+    let store = dataset.table_state.object_store.as_ref();
 
     let read_bytes_for = async |projection: lance_file::reader::ReaderProjection| {
         let _ = store.io_stats_incremental();
@@ -8854,7 +8883,11 @@ async fn test_prewarm_vector_index(#[case] params: VectorIndexParams) {
     let before_prewarm = dataset.session().cache_diagnostics();
 
     // Reset IO stats after index creation.
-    dataset.object_store.as_ref().io_stats_incremental();
+    dataset
+        .table_state
+        .object_store
+        .as_ref()
+        .io_stats_incremental();
 
     // Concurrent prewarms should single-flight each partition through the
     // cache loader and leave a complete warm cache for both callers.
@@ -8868,7 +8901,11 @@ async fn test_prewarm_vector_index(#[case] params: VectorIndexParams) {
     .expect("concurrent prewarms deadlocked");
     first.unwrap();
     second.unwrap();
-    let stats = dataset.object_store.as_ref().io_stats_incremental();
+    let stats = dataset
+        .table_state
+        .object_store
+        .as_ref()
+        .io_stats_incremental();
     assert!(
         stats.read_iops > 0,
         "prewarm should have read from disk, but read_iops was 0"
@@ -8897,7 +8934,11 @@ async fn test_prewarm_vector_index(#[case] params: VectorIndexParams) {
         .try_into_batch()
         .await
         .unwrap();
-    let stats = dataset.object_store.as_ref().io_stats_incremental();
+    let stats = dataset
+        .table_state
+        .object_store
+        .as_ref()
+        .io_stats_incremental();
     assert_io_eq!(
         stats,
         read_iops,
@@ -8917,7 +8958,11 @@ async fn test_prewarm_vector_index(#[case] params: VectorIndexParams) {
 
     // Second prewarm should not need IO (already cached).
     dataset.prewarm_index(INDEX_NAME).await.unwrap();
-    let stats = dataset.object_store.as_ref().io_stats_incremental();
+    let stats = dataset
+        .table_state
+        .object_store
+        .as_ref()
+        .io_stats_incremental();
     assert_io_eq!(stats, read_iops, 0, "second prewarm should not perform IO");
 }
 
@@ -9182,8 +9227,8 @@ async fn test_prewarm_and_query_with_serializing_backend(
     );
     let query_key = QueryIndexListingKey(DerivedIndexListingKey {
         version: dataset.manifest.version,
-        store_identity: &dataset.object_store.store_prefix,
-        e_tag: dataset.manifest_location.e_tag.as_deref(),
+        store_identity: &dataset.table_state.object_store.store_prefix,
+        e_tag: dataset.table_state.manifest_location.e_tag.as_deref(),
     });
     assert!(
         dataset.index_cache.get_with_key(&query_key).await.is_some(),
@@ -9264,7 +9309,11 @@ async fn test_prewarm_and_query_with_serializing_backend(
         "serialized IVF query recall is below threshold: {recall}"
     );
 
-    dataset.object_store.as_ref().io_stats_incremental();
+    dataset
+        .table_state
+        .object_store
+        .as_ref()
+        .io_stats_incremental();
     dataset
         .scan()
         .nearest("vector", &q, 10)
@@ -9276,7 +9325,11 @@ async fn test_prewarm_and_query_with_serializing_backend(
         .try_into_batch()
         .await
         .unwrap();
-    let stats = dataset.object_store.as_ref().io_stats_incremental();
+    let stats = dataset
+        .table_state
+        .object_store
+        .as_ref()
+        .io_stats_incremental();
     assert_io_eq!(
         stats,
         read_iops,

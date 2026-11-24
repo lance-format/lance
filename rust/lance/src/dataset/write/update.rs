@@ -578,8 +578,8 @@ impl UpdateJob {
         let (mut new_fragments, _) = write_fragments_internal_with_file_row_counts(
             self.write_version,
             Some(&self.dataset),
-            self.dataset.object_store.clone(),
-            &self.dataset.base,
+            self.dataset.table_state.object_store.clone(),
+            &self.dataset.table_state.base,
             self.dataset.schema().clone(),
             Box::pin(stream),
             write_params,
@@ -603,8 +603,8 @@ impl UpdateJob {
                 .await;
             if let Err(e) = placed {
                 cleanup_data_fragments(
-                    &self.dataset.object_store,
-                    &self.dataset.base,
+                    &self.dataset.table_state.object_store,
+                    &self.dataset.table_state.base,
                     None,
                     &new_fragments,
                 )
@@ -621,8 +621,8 @@ impl UpdateJob {
             Ok(v) => v,
             Err(e) => {
                 cleanup_data_fragments(
-                    &self.dataset.object_store,
-                    &self.dataset.base,
+                    &self.dataset.table_state.object_store,
+                    &self.dataset.table_state.base,
                     None,
                     &new_fragments,
                 )
@@ -852,7 +852,7 @@ impl UpdateJob {
                     }
                 }
             })
-            .buffer_unordered(self.dataset.object_store.io_parallelism());
+            .buffer_unordered(self.dataset.table_state.object_store.io_parallelism());
 
         while let Some(res) = stream.next().await.transpose()? {
             match res {
@@ -3330,7 +3330,7 @@ mod tests {
         )
         .await
         .unwrap();
-        ds.object_store.io_stats_incremental();
+        ds.table_state.object_store.io_stats_incremental();
         Arc::new(ds)
     }
 
@@ -3356,7 +3356,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.rows_updated, 32);
-        let read_bytes = ds.object_store.io_stats_incremental().read_bytes;
+        let read_bytes = ds
+            .table_state
+            .object_store
+            .io_stats_incremental()
+            .read_bytes;
         assert_eq!(
             read_bytes >= MATCHED_PAYLOAD_BYTES,
             reads_payload,

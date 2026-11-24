@@ -53,7 +53,7 @@ pub(in crate::index) fn effective_coverage(
     dataset: &Dataset,
     segments: &[&IndexMetadata],
 ) -> Result<Vec<RoaringBitmap>> {
-    let dataset_fragments = dataset.fragment_bitmap.as_ref();
+    let dataset_fragments = dataset.table_state.fragment_bitmap.as_ref();
     segments
         .iter()
         .map(|segment| {
@@ -138,7 +138,7 @@ pub(in crate::index) async fn segments_hold_rewritten_fragments(
     frag_reuse_index: Option<&CompactFragReuseIndex>,
     segments: &[&IndexMetadata],
 ) -> Result<bool> {
-    let mut answering = dataset.fragment_bitmap.as_ref().clone();
+    let mut answering = dataset.table_state.fragment_bitmap.as_ref().clone();
     if let Some(frag_reuse_index) = frag_reuse_index {
         answering.extend(
             frag_reuse_index

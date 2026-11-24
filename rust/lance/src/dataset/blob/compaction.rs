@@ -268,6 +268,7 @@ mod tests {
 
         for fragment in dataset.get_fragments() {
             let objects = dataset
+                .table_state
                 .object_store
                 .read_dir_all(
                     &dataset
@@ -288,8 +289,9 @@ mod tests {
         let (_dir, mut dataset) = fixture().await;
         let version = dataset.manifest.version;
         let before = dataset
+            .table_state
             .object_store
-            .read_dir_all(&dataset.base, None)
+            .read_dir_all(&dataset.table_state.base, None)
             .try_collect::<Vec<_>>()
             .await
             .unwrap();
@@ -298,6 +300,7 @@ mod tests {
             .find(|o| o.location.extension() == Some("blob"))
             .unwrap();
         dataset
+            .table_state
             .object_store
             .delete(&sidecar.location)
             .await
@@ -309,8 +312,9 @@ mod tests {
         assert!(matches!(error, Error::NotFound { .. } | Error::IO { .. }));
         assert_eq!(dataset.manifest.version, version);
         let after = dataset
+            .table_state
             .object_store
-            .read_dir_all(&dataset.base, None)
+            .read_dir_all(&dataset.table_state.base, None)
             .try_collect::<Vec<_>>()
             .await
             .unwrap();
@@ -401,6 +405,7 @@ mod tests {
                 .unwrap()
                 .join(data_file_key_from_path(&file.path));
             let retained = dataset
+                .table_state
                 .object_store
                 .read_dir_all(&sidecar_dir, None)
                 .try_collect::<Vec<_>>()
@@ -437,8 +442,9 @@ mod tests {
         scan.with_row_address();
         let batch = scan.try_into_batch().await.unwrap();
         let objects = dataset
+            .table_state
             .object_store
-            .read_dir_all(&dataset.base, None)
+            .read_dir_all(&dataset.table_state.base, None)
             .try_collect::<Vec<_>>()
             .await
             .unwrap();
@@ -446,7 +452,12 @@ mod tests {
             .iter()
             .filter(|o| o.location.extension() == Some("blob"))
         {
-            dataset.object_store.delete(&object.location).await.unwrap();
+            dataset
+                .table_state
+                .object_store
+                .delete(&object.location)
+                .await
+                .unwrap();
         }
         let plan =
             BlobV2BatchRewritePlan::try_new(dataset.schema(), batch.schema().as_ref(), false, true)

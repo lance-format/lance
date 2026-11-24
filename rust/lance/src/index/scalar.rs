@@ -336,6 +336,7 @@ pub(crate) async fn load_fts_training_data(
     let mut dataset = dataset.clone();
     Arc::make_mut(
         dataset
+            .table_state
             .file_reader_options
             .get_or_insert_with(Default::default),
     )
@@ -1865,11 +1866,12 @@ mod tests {
             .await
             .unwrap();
         if let Some(byte_target) = byte_target {
-            dataset.file_reader_options = Some(Arc::new(lance_file::reader::FileReaderOptions {
-                batch_size_bytes: Some(byte_target),
-                read_chunk_size: 1024 * 1024,
-                ..Default::default()
-            }));
+            dataset.table_state.file_reader_options =
+                Some(Arc::new(lance_file::reader::FileReaderOptions {
+                    batch_size_bytes: Some(byte_target),
+                    read_chunk_size: 1024 * 1024,
+                    ..Default::default()
+                }));
         }
         assert!(largest_original_batch(&dataset).await >= 40);
         let params = InvertedIndexParams::default().num_workers(workers);
@@ -1901,10 +1903,10 @@ mod tests {
         assert_eq!(batch_rows.iter().sum::<usize>(), 80);
         if byte_target.is_none() {
             assert!(batch_rows.iter().all(|&rows| rows < 40), "{batch_rows:?}");
-            assert!(dataset.file_reader_options.is_none());
+            assert!(dataset.table_state.file_reader_options.is_none());
         } else {
             assert!(batch_rows.iter().any(|&rows| rows >= 40), "{batch_rows:?}");
-            let options = dataset.file_reader_options.as_ref().unwrap();
+            let options = dataset.table_state.file_reader_options.as_ref().unwrap();
             assert_eq!(options.batch_size_bytes, byte_target);
             assert_eq!(options.read_chunk_size, 1024 * 1024);
         }

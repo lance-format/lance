@@ -206,8 +206,8 @@ async fn test_session_store_registry() {
         .unwrap();
     assert_eq!(registry.active_stores().len(), 1);
     assert_eq!(
-        Arc::as_ptr(&dataset.object_store.as_ref().inner),
-        Arc::as_ptr(&dataset2.object_store.as_ref().inner)
+        Arc::as_ptr(&dataset.table_state.object_store.as_ref().inner),
+        Arc::as_ptr(&dataset2.table_state.object_store.as_ref().inner)
     );
 
     // If we create another with **different parameters**, it should create a new store.
@@ -226,8 +226,8 @@ async fn test_session_store_registry() {
         .unwrap();
     assert_eq!(registry.active_stores().len(), 2);
     assert_ne!(
-        Arc::as_ptr(&dataset.object_store.as_ref().inner),
-        Arc::as_ptr(&dataset3.object_store.as_ref().inner)
+        Arc::as_ptr(&dataset.table_state.object_store.as_ref().inner),
+        Arc::as_ptr(&dataset3.table_state.object_store.as_ref().inner)
     );
 
     // Remove both datasets
@@ -236,37 +236,6 @@ async fn test_session_store_registry() {
     drop(dataset2);
     drop(dataset);
     assert_eq!(registry.active_stores().len(), 0);
-}
-
-#[test]
-fn test_decode_inline_transaction_tolerates_unknown_operations() {
-    use crate::dataset::decode_inline_transaction;
-    use lance_table::format::pb;
-    use prost::Message;
-
-    // A transaction written by a newer version of Lance may carry an operation
-    // this version cannot decode; prost surfaces it as a missing oneof. It
-    // decodes as `Operation::Unknown` rather than failing.
-    let unknown_operation = pb::Transaction {
-        read_version: 1,
-        uuid: "test".to_string(),
-        ..Default::default()
-    };
-    let decoded = decode_inline_transaction(&unknown_operation.encode_to_vec(), 42).unwrap();
-    assert!(matches!(decoded.operation, Operation::Unknown { .. }));
-
-    // Corrupt bytes are likewise tolerated.
-    assert!(decode_inline_transaction(&[0xff, 0xff, 0xff], 42).is_none());
-
-    // A decodable transaction is returned.
-    let known = pb::Transaction::try_from(&Transaction::new(
-        1,
-        Operation::Append { fragments: vec![] },
-        None,
-    ))
-    .unwrap();
-    let decoded = decode_inline_transaction(&known.encode_to_vec(), 42).unwrap();
-    assert!(matches!(decoded.operation, Operation::Append { .. }));
 }
 
 /// A transaction as a future Lance might write it: the `operation` oneof holds
@@ -306,7 +275,7 @@ async fn rewrite_inline_transaction(
 
     assert!(dataset.manifest.index_section.is_none());
     let path = &dataset.manifest_location().path;
-    let mut writer = ObjectWriter::new(dataset.object_store.as_ref(), path)
+    let mut writer = ObjectWriter::new(dataset.table_state.object_store.as_ref(), path)
         .await
         .unwrap();
     let tx_pos = writer.write_protobuf(inline_tx).await.unwrap() as u64;
@@ -393,6 +362,7 @@ async fn test_inline_transaction_written_to_new_field() {
     let test_uri = TempStrDir::default();
     let dataset = two_version_dataset(&test_uri).await;
     let bytes = dataset
+        .table_state
         .object_store
         .read_one_all(&dataset.manifest_location().path)
         .await
@@ -420,11 +390,18 @@ async fn test_read_inline_transaction_from_deprecated_field() {
     .await;
     // Remove the external copy so only field 21 can supply the transaction.
     let tx_path = dataset
+        .table_state
         .base
         .clone()
         .join(TRANSACTIONS_DIR)
         .join(dataset.manifest.transaction_file.as_deref().unwrap());
-    dataset.object_store.inner.delete(&tx_path).await.unwrap();
+    dataset
+        .table_state
+        .object_store
+        .inner
+        .delete(&tx_path)
+        .await
+        .unwrap();
 
     let dataset = Dataset::open(&test_uri).await.unwrap();
     assert!(dataset.manifest.transaction_section.is_some());
@@ -449,13 +426,16 @@ async fn test_read_inline_transaction_from_released_deprecated_field() {
 
 #[test]
 fn test_distinct_unknown_transactions_are_not_equal() {
-    use crate::dataset::decode_inline_transaction;
+    use lance_table::format::pb;
     use prost::Message;
 
     // Commit-outcome detection compares transactions for equality; two
     // unknown operations must not be mistaken for the same commit.
     let decode = |uuid: &str| {
-        decode_inline_transaction(&future_transaction(uuid).encode_to_vec(), 2).unwrap()
+        Transaction::try_from(
+            pb::Transaction::decode(future_transaction(uuid).encode_to_vec().as_slice()).unwrap(),
+        )
+        .unwrap()
     };
     assert_eq!(decode("a"), decode("a"));
     assert_ne!(decode("a"), decode("b"));
@@ -594,11 +574,12 @@ async fn test_inline_transaction() {
     async fn delete_external_tx_file(ds: &Dataset) {
         if let Some(tx_file) = ds.manifest.transaction_file.as_ref() {
             let tx_path = ds
+                .table_state
                 .base
                 .clone()
                 .join(TRANSACTIONS_DIR)
                 .join(tx_file.as_str());
-            let _ = ds.object_store.inner.delete(&tx_path).await; // ignore errors
+            let _ = ds.table_state.object_store.inner.delete(&tx_path).await; // ignore errors
         }
     }
 
@@ -617,17 +598,25 @@ async fn test_inline_transaction() {
     assert_eq!(read_tx, tx.clone());
 
     // Case 2: reading small manifest caches transaction data, eliminating transaction reading IO.
-    let read_ds2 = DatasetBuilder::from_uri(ds2.uri.clone())
+    let read_ds2 = DatasetBuilder::from_uri(ds2.table_state.uri.clone())
         .with_session(session.clone())
         .load()
         .await
         .unwrap();
-    let stats = read_ds2.object_store.as_ref().io_stats_incremental(); // Reset
+    let stats = read_ds2
+        .table_state
+        .object_store
+        .as_ref()
+        .io_stats_incremental(); // Reset
     assert!(stats.read_bytes < 64 * 1024);
     // Because the manifest is so small, we should have opportunistically
     // cached the transaction in memory already.
     let inline_tx = read_ds2.read_transaction().await.unwrap().unwrap();
-    let stats = read_ds2.object_store.as_ref().io_stats_incremental();
+    let stats = read_ds2
+        .table_state
+        .object_store
+        .as_ref()
+        .io_stats_incremental();
     assert_eq!(stats.read_iops, 0);
     assert_eq!(stats.read_bytes, 0);
     assert_eq!(inline_tx, tx);
@@ -636,8 +625,8 @@ async fn test_inline_transaction() {
     let ds = create_dataset(2).await;
     let tx = make_tx(ds.manifest().version);
     let tx_file = crate::io::commit::write_transaction_file(
-        ds.object_store.as_ref(),
-        &ds.base,
+        ds.table_state.object_store.as_ref(),
+        &ds.table_state.base,
         &lance_table::format::pb::Transaction::try_from(&tx).unwrap(),
         None,
     )
@@ -653,9 +642,9 @@ async fn test_inline_transaction() {
         )
         .unwrap();
     let location = write_manifest_file(
-        ds.object_store.as_ref(),
-        ds.commit_handler.as_ref(),
-        &ds.base,
+        ds.table_state.object_store.as_ref(),
+        ds.table_state.commit_handler.as_ref(),
+        &ds.table_state.base,
         &mut manifest,
         if indices.is_empty() {
             None
@@ -663,7 +652,7 @@ async fn test_inline_transaction() {
             Some(indices.clone())
         },
         &build_config,
-        ds.manifest_location.naming_scheme,
+        ds.table_state.manifest_location.naming_scheme,
         None,
         // Previously classified from a None inline copy, which validated.
         true,
@@ -676,12 +665,12 @@ async fn test_inline_transaction() {
 
     // The handle's own version takes the same external-file fallback without
     // touching the manifest again.
-    ds_new.object_store.io_stats_incremental();
+    ds_new.table_state.object_store.io_stats_incremental();
     let version_transaction = ds_new
         .read_version_transaction(location.version)
         .await
         .unwrap();
-    let stats = ds_new.object_store.io_stats_incremental();
+    let stats = ds_new.table_state.object_store.io_stats_incremental();
     assert_eq!(version_transaction.transaction, Some(tx.clone()));
     assert!(
         stats.read_iops >= 1,
@@ -813,7 +802,8 @@ fn ranged_read_bytes(stats: &IoStats) -> u64 {
 
 /// Manifest body bytes of the dataset handle's current version.
 async fn manifest_size(ds: &Dataset) -> u64 {
-    ds.object_store
+    ds.table_state
+        .object_store
         .stat(&ds.manifest_location().path)
         .await
         .unwrap()
@@ -863,15 +853,15 @@ async fn test_read_version_transaction_same_version_skips_manifest_read() {
         .load()
         .await
         .unwrap();
-    yardstick.object_store.io_stats_incremental();
+    yardstick.table_state.object_store.io_stats_incremental();
     let expected_transaction = yardstick.read_transaction().await.unwrap();
-    let yardstick_stats = yardstick.object_store.io_stats_incremental();
+    let yardstick_stats = yardstick.table_state.object_store.io_stats_incremental();
 
     // Same version as the handle: no resolve, no manifest body, just the
     // transaction message (one block).
-    ds.object_store.io_stats_incremental();
+    ds.table_state.object_store.io_stats_incremental();
     let same_version = ds.read_version_transaction(latest).await.unwrap();
-    let stats = ds.object_store.io_stats_incremental();
+    let stats = ds.table_state.object_store.io_stats_incremental();
     assert_eq!(stats.read_iops, yardstick_stats.read_iops);
     assert_eq!(stats.read_bytes, yardstick_stats.read_bytes);
     assert!(
@@ -887,7 +877,7 @@ async fn test_read_version_transaction_same_version_skips_manifest_read() {
     // The session transaction cache is keyed only by version, so it is not
     // populated: `read_transaction()` still pays its own storage read.
     assert_eq!(ds.read_transaction().await.unwrap(), expected_transaction);
-    let stats = ds.object_store.io_stats_incremental();
+    let stats = ds.table_state.object_store.io_stats_incremental();
     assert_eq!(stats.read_iops, yardstick_stats.read_iops);
     assert_eq!(stats.read_bytes, yardstick_stats.read_bytes);
 
@@ -899,9 +889,9 @@ async fn test_read_version_transaction_same_version_skips_manifest_read() {
         .load()
         .await
         .unwrap();
-    historical.object_store.io_stats_incremental();
+    historical.table_state.object_store.io_stats_incremental();
     let via_fallback = historical.read_version_transaction(latest).await.unwrap();
-    let stats = historical.object_store.io_stats_incremental();
+    let stats = historical.table_state.object_store.io_stats_incremental();
     assert!(
         ranged_read_bytes(&stats) > MANIFEST_PADDING_BYTES as u64,
         "fallback should read the manifest body: {:#?}",
@@ -922,9 +912,9 @@ async fn test_read_version_transaction_same_version_skips_manifest_read() {
     // and still resolves latest through the fallback.
     let old_version = 3;
     let old = ds.checkout_version(old_version).await.unwrap();
-    old.object_store.io_stats_incremental();
+    old.table_state.object_store.io_stats_incremental();
     let old_transaction = old.read_version_transaction(old_version).await.unwrap();
-    let stats = old.object_store.io_stats_incremental();
+    let stats = old.table_state.object_store.io_stats_incremental();
     assert!(
         stats.read_bytes <= 4 * 1024,
         "expected at most one 4 KiB block, read {} bytes",
@@ -952,9 +942,9 @@ async fn test_read_version_transaction_same_version_skips_manifest_read() {
         .unwrap();
     assert_eq!(other.version().version, latest);
     let metadata_stats_before = session.metadata_cache_stats().await;
-    other.object_store.io_stats_incremental();
+    other.table_state.object_store.io_stats_incremental();
     let via_cached_manifest = other.read_version_transaction(old_version).await.unwrap();
-    let stats = other.object_store.io_stats_incremental();
+    let stats = other.table_state.object_store.io_stats_incremental();
     // Resolving the location still costs a HEAD, but the manifest body is not
     // fetched.
     assert!(
@@ -978,12 +968,12 @@ async fn test_read_version_transaction_same_version_skips_manifest_read() {
         .load()
         .await
         .unwrap();
-    uncached.object_store.io_stats_incremental();
+    uncached.table_state.object_store.io_stats_incremental();
     let via_uncached_manifest = uncached
         .read_version_transaction(old_version)
         .await
         .unwrap();
-    let stats = uncached.object_store.io_stats_incremental();
+    let stats = uncached.table_state.object_store.io_stats_incremental();
     assert!(
         ranged_read_bytes(&stats) > MANIFEST_PADDING_BYTES as u64,
         "uncached manifest should be read in full: {:#?}",
@@ -1045,8 +1035,8 @@ async fn test_read_version_transaction_after_recreate_at_same_uri() {
         .unwrap();
     assert_eq!(reopened.version().version, 1);
     assert_ne!(
-        reopened.manifest_location.e_tag,
-        old_reader.manifest_location.e_tag
+        reopened.table_state.manifest_location.e_tag,
+        old_reader.table_state.manifest_location.e_tag
     );
 
     let actual = reopened.read_version_transaction(1).await.unwrap();
@@ -1067,6 +1057,7 @@ async fn test_read_transaction_recovers_from_stale_manifest_size() {
     let mut stale = ds.manifest_location().clone();
     stale.size = Some(1);
     let recovered = ds
+        .table_state
         .read_transaction_from_storage(&manifest, &stale)
         .await
         .unwrap();

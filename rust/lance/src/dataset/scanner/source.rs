@@ -699,7 +699,7 @@ impl Scanner {
             None => mask,
         };
         let index_result = IndexExprResult::exact(mask);
-        let fragments_covered = self.dataset.fragment_bitmap.as_ref().clone();
+        let fragments_covered = self.dataset.table_state.fragment_bitmap.as_ref().clone();
         let format = self.index_expr_result_format();
         let batch = index_result.serialize(&fragments_covered, format)?;
         // An index result is one control frame. Preserve both rows even when

@@ -814,7 +814,7 @@ mod tests {
             ..Default::default()
         }
         .with_target_base_names_or_paths(vec!["base2".to_string()]);
-        let fragments = FragmentCreateBuilder::new(dataset.uri.as_str())
+        let fragments = FragmentCreateBuilder::new(dataset.table_state.uri.as_str())
             .write_params(&append_params)
             .write_fragments(test_data())
             .await
@@ -846,7 +846,7 @@ mod tests {
             ..Default::default()
         }
         .with_target_all_bases(false);
-        let fragments = FragmentCreateBuilder::new(dataset.uri.as_str())
+        let fragments = FragmentCreateBuilder::new(dataset.table_state.uri.as_str())
             .write_params(&append_params)
             .write_fragments(test_data())
             .await
@@ -860,7 +860,7 @@ mod tests {
             ..Default::default()
         }
         .with_target_all_bases(true);
-        let fragments = FragmentCreateBuilder::new(dataset.uri.as_str())
+        let fragments = FragmentCreateBuilder::new(dataset.table_state.uri.as_str())
             .write_params(&append_params)
             .write_fragments(test_data())
             .await
@@ -894,10 +894,13 @@ mod tests {
             target_bases: Some(vec![3]),
             ..Default::default()
         };
-        let fragments =
-            FileFragment::create_fragments(dataset.uri.as_str(), test_data(), Some(params))
-                .await
-                .unwrap();
+        let fragments = FileFragment::create_fragments(
+            dataset.table_state.uri.as_str(),
+            test_data(),
+            Some(params),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(fragments.len(), 3);
         for fragment in &fragments {
@@ -934,10 +937,13 @@ mod tests {
             target_all_bases: Some(false),
             ..Default::default()
         };
-        let fragments =
-            FileFragment::create_fragments(dataset.uri.as_str(), test_data(), Some(params))
-                .await
-                .unwrap();
+        let fragments = FileFragment::create_fragments(
+            dataset.table_state.uri.as_str(),
+            test_data(),
+            Some(params),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(fragments.len(), 3);
         let expected = [(Some(2), &existing), (Some(3), &base_a), (Some(4), &base_b)];

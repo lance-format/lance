@@ -159,7 +159,7 @@ pub async fn open_mapping(
         ),
         Mapping::StablePartition(reference) => {
             let base = match reference.base_id {
-                None => dataset.base.clone(),
+                None => dataset.table_state.base.clone(),
                 Some(id) => dataset
                     .manifest
                     .base_paths
@@ -196,7 +196,10 @@ pub async fn open_mapping(
                     let (store, directory) = store.ok_or_else(|| {
                         lance_core::Error::internal("missing stable-partition store binding")
                     })?;
-                    let metadata_cache = dataset.metadata_cache.file_metadata_cache(&directory);
+                    let metadata_cache = dataset
+                        .table_state
+                        .metadata_cache
+                        .file_metadata_cache(&directory);
                     let store = LanceIndexStore::new(store, directory, Arc::new(metadata_cache))
                         .with_file_sizes(HashMap::from([(
                             MAPPING_FILE.to_string(),
