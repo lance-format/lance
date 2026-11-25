@@ -29,11 +29,10 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio::sync::OnceCell;
 
-use crate::context::DynamicContextProvider;
-
 use lance_core::{Error, Result};
 use lance_namespace::LanceNamespace;
 
+use crate::context::DynamicContextProvider;
 use crate::credentials::CredentialVendor;
 
 /// Thread-safe metrics tracker for namespace operations.
@@ -143,6 +142,66 @@ pub(crate) struct TableStatus {
     pub(crate) has_reserved_file: bool,
 }
 
+/// How a [`DirectoryNamespace`] discovers tables for reads.
+///
+/// The builder keeps its three compatibility flags, but their supported
+/// combinations collapse into these modes. Migration only applies when both
+/// manifest and directory listing are enabled and is ignored otherwise.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TableDiscoveryMode {
+    /// Neither source is enabled. Reads find no tables, while writes still
+    /// target the directory because manifest writes are disabled.
+    NoDiscovery,
+    /// Directory listing is the only read source.
+    DirectoryOnly,
+    /// The manifest is the only read source.
+    ManifestOnly,
+    /// Both are enabled without migration: root tables use directory listing,
+    /// while child namespaces use the manifest.
+    DirectoryFirst,
+    /// Both are enabled with migration: root tables probe the manifest first
+    /// and fall back to directory listing, and root listings merge both.
+    ManifestFirst,
+}
+
+impl TableDiscoveryMode {
+    fn from_flags(
+        manifest_enabled: bool,
+        dir_listing_enabled: bool,
+        migration_enabled: bool,
+    ) -> Self {
+        match (manifest_enabled, dir_listing_enabled, migration_enabled) {
+            (false, false, _) => Self::NoDiscovery,
+            (false, true, _) => Self::DirectoryOnly,
+            (true, false, _) => Self::ManifestOnly,
+            (true, true, false) => Self::DirectoryFirst,
+            (true, true, true) => Self::ManifestFirst,
+        }
+    }
+
+    fn has_manifest(self) -> bool {
+        matches!(
+            self,
+            Self::ManifestOnly | Self::DirectoryFirst | Self::ManifestFirst
+        )
+    }
+
+    fn has_directory_listing(self) -> bool {
+        matches!(
+            self,
+            Self::DirectoryOnly | Self::DirectoryFirst | Self::ManifestFirst
+        )
+    }
+
+    fn uses_manifest_for_root(self) -> bool {
+        matches!(self, Self::ManifestOnly | Self::ManifestFirst)
+    }
+
+    fn merges_manifest_listing(self) -> bool {
+        matches!(self, Self::ManifestFirst)
+    }
+}
+
 /// Directory-based implementation of Lance Namespace.
 ///
 /// This implementation stores tables as Lance datasets in a directory structure.
@@ -156,8 +215,10 @@ pub(crate) struct TableStatus {
 /// - Ability to track table metadata
 /// - Foundation for future features like namespaces and table renaming
 ///
-/// When `dir_listing_enabled=true`, the namespace falls back to directory scanning for tables not
-/// found in the manifest, enabling gradual migration.
+/// When both `manifest_enabled` and `dir_listing_enabled` are set, root-level tables are
+/// discovered through directory listing. Child namespaces always use the manifest. Set
+/// `dir_listing_to_manifest_migration_enabled=true` to make the manifest authoritative for
+/// root-level tables while directory listing supplies tables that have not been migrated yet.
 ///
 /// ## Credential Vending
 ///
@@ -174,24 +235,19 @@ pub struct DirectoryNamespace {
     base_path: Path,
     manifest_ns: OnceCell<Arc<manifest::ManifestNamespace>>,
     write_manifest_ns: OnceCell<Arc<manifest::ManifestNamespace>>,
-    manifest_enabled: bool,
-    dir_listing_enabled: bool,
+    table_discovery_mode: TableDiscoveryMode,
     inline_optimization_enabled: bool,
     commit_retries: Option<u32>,
-    /// When true, root-level table operations check the manifest first before
-    /// falling back to directory listing. When false, root-level tables skip
-    /// the manifest check and use directory listing directly.
-    dir_listing_to_manifest_migration_enabled: bool,
     /// When true, `describe_table` returns `managed_versioning: true` to indicate
     /// commits should go through namespace table version APIs.
     table_version_tracking_enabled: bool,
     /// Credential vendor created once during initialization.
     /// Used to vend temporary credentials for table access.
     credential_vendor: Option<Arc<dyn CredentialVendor>>,
-    /// Dynamic context provider for per-request context.
-    /// Stored but not directly used in operations (available for future extensions).
-    #[allow(dead_code)]
-    context_provider: Option<Arc<dyn DynamicContextProvider>>,
+    /// Retained for the lifetime of the namespace. DirectoryNamespace does not
+    /// call the provider, but dropping it earlier would release resources owned
+    /// by it, such as a Python object or Java global reference.
+    _context_provider: Option<Arc<dyn DynamicContextProvider>>,
     /// When true, returns input storage options in responses when no credential vendor is configured.
     vend_input_storage_options: bool,
     /// Refresh interval in milliseconds for vended input storage options.

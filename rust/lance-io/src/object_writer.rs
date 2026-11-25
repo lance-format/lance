@@ -509,6 +509,12 @@ impl AsyncWrite for ObjectWriter {
             if buf.is_empty() {
                 return Poll::Ready(Ok(0));
             }
+            if matches!(self.state, UploadState::Done(_)) {
+                return Poll::Ready(Err(io::Error::other(format!(
+                    "cannot write to ObjectWriter for {} after shutdown",
+                    self.path
+                ))));
+            }
 
             // Fill buffer up to remaining capacity.
             let remaining_capacity = self.buffer.capacity() - self.buffer.len();
@@ -1629,6 +1635,37 @@ mod tests {
         .await
         .expect("valid concurrency must not stall writes or shutdown");
         assert_eq!(result.size, payload.len());
+        let persisted = store.inner.get(&path).await.unwrap().bytes().await.unwrap();
+        assert_eq!(persisted.as_ref(), payload.as_slice());
+    }
+
+    #[rstest]
+    #[case::single_put(1)]
+    #[case::multipart_short_tail(initial_upload_size() + 1)]
+    #[case::multipart_exact_multiple(initial_upload_size())]
+    #[tokio::test]
+    async fn test_write_after_shutdown(#[case] size: usize) {
+        let store = LanceObjectStore::memory();
+        let path = Path::from("closed.lance");
+        let mut writer = ObjectWriter::new(&store, &path).await.unwrap();
+        let payload = vec![0x5a; size];
+        writer.write_all(&payload).await.unwrap();
+        let finalized = Writer::shutdown(&mut writer).await.unwrap();
+        assert_eq!(finalized.size, size);
+
+        let error = writer
+            .write(b"x")
+            .now_or_never()
+            .expect("a write after shutdown must resolve immediately")
+            .expect_err("a closed writer must reject bytes");
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert!(error.to_string().contains(path.as_ref()));
+        assert_eq!(writer.write(&[]).now_or_never().unwrap().unwrap(), 0);
+        assert_eq!(writer.tell().await.unwrap(), size);
+
+        let repeated = Writer::shutdown(&mut writer).await.unwrap();
+        assert_eq!(repeated.size, size);
+        assert_eq!(repeated.e_tag, finalized.e_tag);
         let persisted = store.inner.get(&path).await.unwrap().bytes().await.unwrap();
         assert_eq!(persisted.as_ref(), payload.as_slice());
     }

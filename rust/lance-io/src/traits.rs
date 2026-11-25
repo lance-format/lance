@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::ops::Range;
+use std::{ops::Range, sync::Arc};
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{StreamExt, future::BoxFuture, stream::BoxStream};
 use lance_core::deepsize::DeepSizeOf;
+use lance_core::utils::io_stats::IoStatsRecorder;
 use object_store::path::Path;
 use prost::Message;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
@@ -107,14 +108,7 @@ impl<W: Writer + ?Sized> WriteExt for W {
     }
 
     async fn copy_from_reader(&mut self, reader: &dyn Reader) -> Result<usize> {
-        let mut stream = reader.get_stream().await?;
-        let mut copied = 0usize;
-        while let Some(chunk) = stream.next().await {
-            let bytes = chunk?;
-            copied += bytes.len();
-            self.write_all(&bytes).await?;
-        }
-        Ok(copied)
+        copy_reader_with_progress(self, reader, |_| {}).await
     }
 
     async fn copy_range_from_reader(
@@ -131,6 +125,22 @@ impl<W: Writer + ?Sized> WriteExt for W {
         }
         Ok(copied)
     }
+}
+
+pub(crate) async fn copy_reader_with_progress<W: Writer + ?Sized>(
+    writer: &mut W,
+    reader: &dyn Reader,
+    mut accepted: impl FnMut(usize) + Send,
+) -> Result<usize> {
+    let mut stream = reader.get_stream().await?;
+    let mut copied = 0;
+    while let Some(chunk) = stream.next().await {
+        let bytes = chunk?;
+        writer.write_all(&bytes).await?;
+        copied += bytes.len();
+        accepted(copied);
+    }
+    Ok(copied)
 }
 
 pub trait Reader: std::fmt::Debug + Send + Sync + DeepSizeOf {
@@ -150,6 +160,17 @@ pub trait Reader: std::fmt::Debug + Send + Sync + DeepSizeOf {
     /// TODO: change to read_at()?
     fn get_range(&self, range: Range<usize>) -> BoxFuture<'static, object_store::Result<Bytes>>;
 
+    /// Read a range while reporting Lance-visible transport attempts.
+    ///
+    /// Readers without transport-level visibility keep the default behavior.
+    fn get_range_with_stats(
+        &self,
+        range: Range<usize>,
+        _stats: Arc<dyn IoStatsRecorder>,
+    ) -> BoxFuture<'static, object_store::Result<Bytes>> {
+        self.get_range(range)
+    }
+
     /// Read all bytes from the object.
     ///
     /// By default this reads the size in a separate IOP but some implementations
@@ -157,6 +178,13 @@ pub trait Reader: std::fmt::Debug + Send + Sync + DeepSizeOf {
     fn get_all(&self) -> BoxFuture<'_, object_store::Result<Bytes>>;
 
     /// Read the entire object as a byte stream.
+    ///
+    /// [`CloudObjectReader`](crate::object_reader::CloudObjectReader) uses its
+    /// configured download retry budget for request and body failures. A failed
+    /// body resumes at the first undelivered byte, pinned to the initial ETag or
+    /// object version using a condition supported by the provider. Without a
+    /// supported condition and identifier, the original body error propagates
+    /// instead of risking a read that combines different objects.
     fn get_stream(&self) -> BoxFuture<'_, object_store::Result<ByteStream>> {
         Box::pin(async move {
             let bytes = self.get_all().await?;
@@ -165,6 +193,9 @@ pub trait Reader: std::fmt::Debug + Send + Sync + DeepSizeOf {
     }
 
     /// Read a byte range as a byte stream.
+    ///
+    /// Cloud readers use the same retry behavior as [`Self::get_stream`], with
+    /// resumed requests bounded by the original response range.
     fn get_range_stream(
         &self,
         range: Range<usize>,

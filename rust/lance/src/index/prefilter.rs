@@ -168,7 +168,7 @@ impl DatasetPreFilter {
         .collect::<Vec<_>>()
         .await;
         let mut frag_id_deletion_vectors = stream::iter(frag_id_deletion_vectors)
-            .buffer_unordered(dataset.object_store.io_parallelism());
+            .buffer_unordered(dataset.table_state.object_store.io_parallelism());
 
         let mut deleted_ids = RowAddrTreeMap::new();
         while let Some((id, deletion_vector)) = frag_id_deletion_vectors.try_next().await? {
@@ -206,7 +206,7 @@ impl DatasetPreFilter {
             }
             Ok::<_, crate::Error>((id, live_rows))
         })
-        .buffer_unordered(dataset.object_store.io_parallelism());
+        .buffer_unordered(dataset.table_state.object_store.io_parallelism());
         let mut allowed = RowAddrTreeMap::new();
         while let Some((id, rows)) = fragment_rows.try_next().await? {
             allowed.insert_bitmap(id, rows);
@@ -248,7 +248,7 @@ impl DatasetPreFilter {
                     let (row_ids, deletion_vector) = join!(row_ids, deletion_vector);
                     Ok::<_, crate::Error>((row_ids?, deletion_vector?))
                 })
-                .buffer_unordered(dataset.object_store.as_ref().io_parallelism())
+                .buffer_unordered(dataset.table_state.object_store.as_ref().io_parallelism())
                 .try_collect::<Vec<_>>()
                 .await
         }
@@ -293,6 +293,7 @@ impl DatasetPreFilter {
             restrict_hash,
         };
         dataset
+            .table_state
             .metadata_cache
             .as_ref()
             .get_or_insert_with_key(key, load_mask)
@@ -433,6 +434,7 @@ impl DatasetPreFilter {
                     };
                     let loader_dataset = dataset.clone();
                     dataset
+                        .table_state
                         .metadata_cache
                         .as_ref()
                         .get_or_insert_with_key(key, move || async move {
@@ -555,6 +557,10 @@ impl PreFilter for DatasetPreFilter {
             && self.filtered_ids.is_none()
             && self.deleted_fragments.is_none()
             && self.overlay_block.is_none()
+    }
+
+    fn deletions_only(&self) -> bool {
+        self.only_deletions()
     }
 
     /// Get the row id mask for this prefilter
@@ -1012,7 +1018,7 @@ mod test {
     ) {
         let datasets = test_datasets(use_stable_row_id).await;
         let mut dataset = (*datasets.deletions_no_missing_frags).clone();
-        dataset.manifest_location.e_tag = None;
+        dataset.table_state.manifest_location.e_tag = None;
         let dataset = Arc::new(dataset);
 
         let load_mask = || {
@@ -1095,7 +1101,8 @@ mod test {
         // A recreated dataset restarts its version history, so an entry from
         // the same version under a different e-tag must not be reused.
         let mut other_generation = (*dataset).clone();
-        other_generation.manifest_location.e_tag = Some("second-generation".to_string());
+        other_generation.table_state.manifest_location.e_tag =
+            Some("second-generation".to_string());
         let other_generation_mask =
             DatasetPreFilter::create_deletion_mask_impl(Arc::new(other_generation), covered, false)
                 .expect("deletion mask")

@@ -149,7 +149,7 @@ Used for fragments with sparse deletions where maintaining the range is efficien
 ##### Range with Bitmap (Dense Deletions)
 
 For sorted values with many gaps.
-The bitmap encodes 8 values per byte, with the most significant bit representing the first value.
+The bitmap encodes 8 values per byte, with the least significant bit representing the first value.
 Used for fragments with dense deletion patterns.
 
 <details>

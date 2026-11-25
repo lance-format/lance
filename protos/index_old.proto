@@ -7,7 +7,7 @@ package lance.table;
 
 /* NOTE: Do *NOT* add new index details here.  Add them to the index.proto file instead.
  * This file is in the lance.table package namespace while the index.proto file is in the
- * lance.index package namespace.
+ * lance.index.pb package namespace.
  *
  * These are only here for forward compatibility.  Older versions of Lance expect btree indexes
  * to have lance.table in the package namespace.

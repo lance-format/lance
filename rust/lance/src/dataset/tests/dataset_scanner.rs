@@ -1227,8 +1227,8 @@ async fn test_scan_miniblock_dictionary_out_of_line_bitpacking_does_not_panic() 
 
     let file_path = dataset.data_dir().join(data_file.path.as_str());
     let scheduler = ScanScheduler::new(
-        dataset.object_store.clone(),
-        SchedulerConfig::max_bandwidth(&dataset.object_store),
+        dataset.table_state.object_store.clone(),
+        SchedulerConfig::max_bandwidth(&dataset.table_state.object_store),
     );
     let file_scheduler = scheduler
         .open_file(&file_path, &CachedFileSize::unknown())
@@ -2522,7 +2522,10 @@ async fn test_any_element_nested_hidden_values_under_null_struct() {
         .await
         .unwrap();
     assert_eq!(dataset.get_fragments().len(), 2);
-    assert_eq!(dataset.get_fragment(0).unwrap().metadata.overlays.len(), 1);
+    assert_eq!(
+        dataset.get_fragment(0).unwrap().metadata().overlays.len(),
+        1
+    );
 
     // Prove the scanner input carries `tag` below a NULL `details` and a NULL
     // `info`: the filter below can only tell the fix from the bug if it does.
@@ -2577,4 +2580,60 @@ async fn test_any_element_nested_hidden_values_under_null_struct() {
             "count_rows(`{filter}`)"
         );
     }
+}
+
+/// A fragment-scoped flat (unindexed) full-text search with a scoped BTree
+/// scalar-index prefilter combines through `PrefilterUnionExec`, whose output
+/// is row-id domain. The flat FTS node (`FlatMatchQueryExec`) must recognize
+/// that and skip re-converting it, or it misreads stable row ids as physical
+/// offsets and fails a live fragment.
+#[tokio::test]
+async fn test_stable_flat_fts_scoped_scalar_prefilter() {
+    let batch = record_batch!(
+        ("id", Int32, (0..9).collect::<Vec<_>>()),
+        ("text", Utf8, vec!["token"; 9])
+    )
+    .unwrap();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+        "memory://",
+        Some(WriteParams {
+            enable_stable_row_ids: true,
+            max_rows_per_file: 3,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    dataset
+        .create_index(
+            &["id"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+
+    let query = FullTextSearchQuery::new("token".to_owned())
+        .with_column("text".to_owned())
+        .unwrap();
+    let mut baseline = dataset.scan();
+    baseline
+        .with_fragments(vec![dataset.fragments()[1].clone()])
+        .use_scalar_index(false)
+        .filter("id >= 3 AND id < 6")
+        .unwrap();
+    baseline.full_text_search(query.clone()).unwrap();
+    assert_eq!(baseline.try_into_batch().await.unwrap().num_rows(), 3);
+
+    let mut scanner = dataset.scan();
+    scanner
+        .with_fragments(vec![dataset.fragments()[1].clone()])
+        .prefilter(true)
+        .filter("id >= 3 AND id < 6")
+        .unwrap();
+    scanner.full_text_search(query).unwrap();
+    assert_eq!(scanner.try_into_batch().await.unwrap().num_rows(), 3);
 }

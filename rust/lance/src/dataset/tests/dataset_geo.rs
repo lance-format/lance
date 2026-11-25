@@ -1079,7 +1079,7 @@ async fn test_rtree_distributed_optimize(
         );
     }
 
-    dataset.object_store.io_stats_incremental();
+    dataset.table_state.object_store.io_stats_incremental();
     let mut built = Vec::new();
     for task in &plan.tasks {
         built.push(task.execute(&dataset).await.unwrap().unwrap());
@@ -1088,7 +1088,7 @@ async fn test_rtree_distributed_optimize(
     for merge in &plan.merges {
         merged.push(merge.execute(&dataset, &built).await.unwrap().unwrap());
     }
-    let io = dataset.object_store.io_stats_incremental();
+    let io = dataset.table_state.object_store.io_stats_incremental();
     assert!(
         io.requests
             .iter()

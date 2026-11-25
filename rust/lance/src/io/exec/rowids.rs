@@ -21,13 +21,11 @@ use datafusion_physical_plan::Statistics;
 use datafusion_physical_plan::execution_plan::CardinalityEffect;
 use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
 use futures::{StreamExt, TryStreamExt};
-use lance_core::utils::address::RowAddress;
-use lance_core::utils::deletion::DeletionVector;
 use lance_core::{
     Error as LanceError, ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_OFFSET, ROW_OFFSET_FIELD,
     Result as LanceResult,
 };
-use lance_table::rowids::RowIdIndex;
+use lance_table::rowids::{FragmentRowOffset, RowIdIndex, compute_row_offset_array};
 
 use crate::Dataset;
 use crate::dataset::rowids::get_row_id_index;
@@ -355,14 +353,6 @@ impl ExecutionPlan for AddRowAddrExec {
     }
 }
 
-#[derive(Debug)]
-struct FragInfo {
-    // The dataset offset of the first row in the fragment
-    row_offset: u64,
-    // The key is the cumulative row offset in the fragment, the value is the number of rows deleted so far
-    deletion_vector: Option<Arc<DeletionVector>>,
-}
-
 /// Add a `_rowoffset` column to a stream of record batches that have a `_rowaddr` column.
 ///
 /// The row offset is the number of rows between the current row and the first row in the dataset.
@@ -370,14 +360,14 @@ struct FragInfo {
 pub struct AddRowOffsetExec {
     input: Arc<dyn ExecutionPlan>,
     row_addr_pos: usize,
-    frag_id_to_offset: Arc<HashMap<u32, FragInfo>>,
+    frag_id_to_offset: Arc<HashMap<u32, FragmentRowOffset>>,
     properties: Arc<PlanProperties>,
 }
 
 impl AddRowOffsetExec {
     fn internal_new(
         input: Arc<dyn ExecutionPlan>,
-        frag_id_to_offset: Arc<HashMap<u32, FragInfo>>,
+        frag_id_to_offset: Arc<HashMap<u32, FragmentRowOffset>>,
     ) -> LanceResult<Self> {
         let input_schema = input.schema();
         let row_addr_pos = input_schema.index_of(ROW_ADDR).map_err(|_| {
@@ -420,107 +410,27 @@ impl AddRowOffsetExec {
         input: Arc<dyn ExecutionPlan>,
         dataset: Arc<Dataset>,
     ) -> LanceResult<Self> {
-        let frag_id_to_offset = Self::compute_frag_id_to_offset(dataset).await?;
-        Self::internal_new(input, frag_id_to_offset)
-    }
-
-    async fn compute_frag_id_to_offset(
-        dataset: Arc<Dataset>,
-    ) -> LanceResult<Arc<HashMap<u32, FragInfo>>> {
-        // On a metadata-cache miss, a deletion vector stored in a file costs an
-        // object-store read, so load them concurrently. `buffered`
-        // keeps fragment order, which the row-offset accumulation below needs.
-        let frag_infos = futures::stream::iter(dataset.get_fragments())
-            .map(|frag| async move {
-                let deletion_vector = frag.get_deletion_vector().await?;
-                // Should be sync unless the dataset was written by an extremely
-                // old lance version
-                let num_rows = frag.count_rows(None).await?;
-                Ok::<_, LanceError>((frag.id() as u32, deletion_vector, num_rows))
-            })
-            .buffered(dataset.object_store.io_parallelism())
-            .try_collect::<Vec<_>>()
+        let offsets = dataset
+            .table_view()
+            .to_table()
+            .fragment_row_offsets()
             .await?;
-
-        let mut frag_id_to_offset = HashMap::with_capacity(frag_infos.len());
-        let mut row_offset = 0;
-        for (frag_id, deletion_vector, num_rows) in frag_infos {
-            frag_id_to_offset.insert(
-                frag_id,
-                FragInfo {
-                    row_offset,
-                    deletion_vector,
-                },
-            );
-            row_offset += num_rows as u64;
-        }
-
-        Ok(Arc::new(frag_id_to_offset))
+        Self::internal_new(input, Arc::new(offsets))
     }
 
     pub async fn compute_row_offset_array(
         row_addr: &ArrayRef,
         dataset: Arc<Dataset>,
     ) -> Result<ArrayRef> {
-        let frag_id_to_offset = Self::compute_frag_id_to_offset(dataset).await?;
-        Self::compute_row_offsets(row_addr, frag_id_to_offset.as_ref())
-    }
-
-    fn compute_row_offsets(
-        row_addr: &ArrayRef,
-        frag_id_to_offset: &HashMap<u32, FragInfo>,
-    ) -> Result<ArrayRef> {
-        let row_addr_values = row_addr.as_primitive::<UInt64Type>().values();
-        let mut row_offsets = vec![0; row_addr_values.len()];
-        // The deletion iterator only moves forward, so compute in address order and
-        // scatter the offsets back into input order.
-        let mut sorted_row_indices = (0..row_addr_values.len()).collect::<Vec<_>>();
-        sorted_row_indices.sort_unstable_by_key(|index| row_addr_values[*index]);
-
-        let mut last_frag_id = u32::MAX;
-        let mut last_frag_offset = 0;
-        let mut last_frag_delete_count = 0;
-        let mut dv_iter = None;
-
-        for row_index in sorted_row_indices {
-            let addr = RowAddress::new_from_u64(row_addr_values[row_index]);
-            let frag_id = addr.fragment_id();
-            if frag_id != last_frag_id {
-                last_frag_id = frag_id;
-                let Some(frag_info) = frag_id_to_offset.get(&frag_id) else {
-                    return Err(DataFusionError::External(Box::new(LanceError::internal(
-                        format!(
-                            "A row address referred to a fragment {} that wasn't in the frag_id_to_offset map",
-                            frag_id
-                        ),
-                    ))));
-                };
-                last_frag_offset = frag_info.row_offset;
-                last_frag_delete_count = 0;
-                dv_iter = frag_info
-                    .deletion_vector
-                    .as_ref()
-                    .map(|dv| dv.to_sorted_iter().peekable());
-            }
-
-            let row_offset = addr.row_offset();
-            if let Some(dv_iter) = &mut dv_iter {
-                while dv_iter.peek().is_some() {
-                    if *dv_iter.peek().unwrap() < row_offset {
-                        dv_iter.next();
-                        last_frag_delete_count += 1;
-                    } else {
-                        break;
-                    }
-                }
-                row_offsets[row_index] =
-                    last_frag_offset + row_offset as u64 - last_frag_delete_count as u64;
-            } else {
-                row_offsets[row_index] = last_frag_offset + row_offset as u64;
-            }
-        }
-
-        Ok(Arc::new(UInt64Array::from(row_offsets)))
+        let frag_id_to_offset = dataset
+            .table_view()
+            .to_table()
+            .fragment_row_offsets()
+            .await?;
+        Ok(Arc::new(compute_row_offset_array(
+            row_addr.as_primitive::<UInt64Type>(),
+            &frag_id_to_offset,
+        )?))
     }
 }
 
@@ -619,8 +529,8 @@ impl ExecutionPlan for AddRowOffsetExec {
             let frag_id_to_offset = frag_id_to_offset.clone();
             async move {
                 let batch = batch?;
-                let row_addr = batch.column(row_addr_pos);
-                let row_offsets = Self::compute_row_offsets(row_addr, frag_id_to_offset.as_ref())?;
+                let row_addr = batch.column(row_addr_pos).as_primitive::<UInt64Type>();
+                let row_offsets = compute_row_offset_array(row_addr, frag_id_to_offset.as_ref())?;
                 let mut columns = batch.columns().to_vec();
                 columns.push(Arc::new(row_offsets));
                 Ok(RecordBatch::try_new(schema.clone(), columns)?)
@@ -846,29 +756,6 @@ mod test {
                 .compute(input.as_ref(), &args)
                 .unwrap(),
             input_stats
-        );
-    }
-
-    #[test]
-    fn test_row_offsets_with_unsorted_addresses() {
-        let row_addrs: ArrayRef = Arc::new(UInt64Array::from(vec![
-            u64::from(RowAddress::new_from_parts(0, 100)),
-            u64::from(RowAddress::new_from_parts(0, 50)),
-        ]));
-        let frag_id_to_offset = HashMap::from([(
-            0,
-            FragInfo {
-                row_offset: 1_000,
-                deletion_vector: Some(Arc::new(DeletionVector::from_iter([10, 60]))),
-            },
-        )]);
-
-        let row_offsets =
-            AddRowOffsetExec::compute_row_offsets(&row_addrs, &frag_id_to_offset).unwrap();
-
-        assert_eq!(
-            row_offsets.as_primitive::<UInt64Type>().values(),
-            &[1_098, 1_049]
         );
     }
 
