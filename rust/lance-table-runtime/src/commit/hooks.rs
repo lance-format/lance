@@ -144,31 +144,47 @@ impl CommitHooks<'_> {
         })
     }
 
-    /// Whether a commit stores its transaction inline in the manifest.
-    ///
-    /// Transactions above [`Self::inline_transaction_limit`] normally live only
-    /// in the external transaction file. When that file is disabled the inline
-    /// copy is the only durable one, so it is kept regardless of size, up to
-    /// the `u32` length prefix of the inline section. A larger transaction is
-    /// rejected before anything is published.
+    /// Whether a commit stores its transaction inline in the manifest. See
+    /// [`inline_decision`].
     pub(crate) fn inlines_transaction(
         &self,
         encoded_len: usize,
         transaction_file_disabled: bool,
     ) -> Result<bool> {
-        if encoded_len <= self.inline_transaction_limit() {
-            return Ok(true);
-        }
-        if !transaction_file_disabled {
-            return Ok(false);
-        }
-        if encoded_len > MAX_INLINE_SECTION_BYTES {
+        inline_decision(
+            encoded_len,
+            self.inline_transaction_limit(),
+            transaction_file_disabled,
+        )
+    }
+}
+
+/// Whether a transaction of `encoded_len` bytes is stored inline.
+///
+/// The inline section is prefixed with its length as a `u32`, so nothing
+/// larger can be inlined, whatever `inline_limit` a lifecycle hook supplies.
+/// Above that, the transaction goes to the external file, or the commit is
+/// rejected before anything is published when the file is disabled.
+/// Otherwise transactions within `inline_limit` are inlined, and larger ones
+/// live only in the external file unless it is disabled, in which case the
+/// inline copy is the only durable one and is kept regardless of the limit.
+fn inline_decision(
+    encoded_len: usize,
+    inline_limit: usize,
+    transaction_file_disabled: bool,
+) -> Result<bool> {
+    if encoded_len > MAX_INLINE_SECTION_BYTES {
+        if transaction_file_disabled {
             return Err(Error::invalid_input(format!(
-                "transaction is {encoded_len} bytes, but with disable_transaction_file                  it must be stored inline in the manifest, which holds at most                  {MAX_INLINE_SECTION_BYTES} bytes; keep the transaction file enabled                  for this commit"
+                "transaction is {encoded_len} bytes, but with disable_transaction_file it \
+                 must be stored inline in the manifest, which holds at most \
+                 {MAX_INLINE_SECTION_BYTES} bytes; keep the transaction file enabled for \
+                 this commit"
             )));
         }
-        Ok(true)
+        return Ok(false);
     }
+    Ok(transaction_file_disabled || encoded_len <= inline_limit)
 }
 
 /// Largest transaction the inline manifest section can hold: the section is
@@ -185,24 +201,38 @@ fn now_nanos() -> u128 {
 mod tests {
     use super::*;
 
+    const SECTION: usize = MAX_INLINE_SECTION_BYTES;
+    const DEFAULT: usize = MAX_INLINE_TRANSACTION_BYTES;
+
     #[rstest::rstest]
-    #[case::small_with_file(1, false, Some(true))]
-    #[case::large_with_file(MAX_INLINE_TRANSACTION_BYTES + 1, false, Some(false))]
-    #[case::large_without_file(MAX_INLINE_TRANSACTION_BYTES + 1, true, Some(true))]
-    #[case::section_limit_without_file(MAX_INLINE_SECTION_BYTES, true, Some(true))]
-    #[case::over_section_limit_without_file(MAX_INLINE_SECTION_BYTES + 1, true, None)]
-    #[case::over_section_limit_with_file(MAX_INLINE_SECTION_BYTES + 1, false, Some(false))]
+    #[case::small_with_file(1, DEFAULT, false, Some(true))]
+    #[case::large_with_file(DEFAULT + 1, DEFAULT, false, Some(false))]
+    #[case::large_without_file(DEFAULT + 1, DEFAULT, true, Some(true))]
+    #[case::section_limit_without_file(SECTION, DEFAULT, true, Some(true))]
+    #[case::over_section_limit_without_file(SECTION + 1, DEFAULT, true, None)]
+    #[case::over_section_limit_with_file(SECTION + 1, DEFAULT, false, Some(false))]
+    // A lifecycle hook may raise the limit past what the section can encode.
+    #[case::hook_limit_over_section_with_file(SECTION + 1, usize::MAX, false, Some(false))]
+    #[case::hook_limit_over_section_without_file(SECTION + 1, usize::MAX, true, None)]
+    #[case::hook_limit_at_section(SECTION, usize::MAX, false, Some(true))]
     fn test_inlines_transaction(
         #[case] encoded_len: usize,
+        #[case] inline_limit: usize,
         #[case] transaction_file_disabled: bool,
         #[case] expected: Option<bool>,
     ) {
         // Only the length is checked, so the u32 boundary needs no allocation.
-        let result =
-            CommitHooks::default().inlines_transaction(encoded_len, transaction_file_disabled);
+        let result = inline_decision(encoded_len, inline_limit, transaction_file_disabled);
         match expected {
             Some(inline) => assert_eq!(result.unwrap(), inline),
             None => assert!(matches!(result, Err(Error::InvalidInput { .. }))),
         }
+    }
+
+    #[test]
+    fn test_commit_hooks_use_default_inline_limit() {
+        let hooks = CommitHooks::default();
+        assert!(hooks.inlines_transaction(DEFAULT, false).unwrap());
+        assert!(!hooks.inlines_transaction(DEFAULT + 1, false).unwrap());
     }
 }
