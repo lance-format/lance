@@ -82,54 +82,76 @@ def test_pip_install_succeeds_first_try_without_sleeping(monkeypatch, no_sleep):
 
 
 class _FakeRunner:
-    """Stands in for the runner subprocess; `returncode` None means alive."""
+    """Stands in for the runner subprocess; `returncode` None means alive.
 
-    def __init__(self, *args, **kwargs):
+    Records the stderr file it was given and the calls made on it.
+    """
+
+    instances: list["_FakeRunner"] = []
+
+    def __init__(self, *args, stderr=None, **kwargs):
         self.stdin = open(os.devnull, "wb")
+        self.stderr_file = stderr
         self.returncode = None
+        self.calls: list[str] = []
+        self.wait_times_out = False
+        _FakeRunner.instances.append(self)
 
     def poll(self):
         return self.returncode
 
     def terminate(self):
-        self.returncode = -15
+        self.calls.append("terminate")
 
     def wait(self, timeout=None):
+        self.calls.append("wait")
+        if self.wait_times_out and timeout is not None:
+            raise subprocess.TimeoutExpired("runner", timeout)
+        self.returncode = -9 if "kill" in self.calls else -15
         return self.returncode
 
     def kill(self):
-        self.returncode = -9
+        self.calls.append("kill")
 
 
 @pytest.fixture
-def fake_runner(monkeypatch, tmp_path):
-    monkeypatch.setattr(venv_manager.subprocess, "Popen", _FakeRunner)
+def executor(tmp_path):
+    _FakeRunner.instances.clear()
     venv_path = tmp_path / "venv"
     venv_path.mkdir()
     return venv_manager.VenvExecutor("0.0.0", venv_path)
 
 
-def test_cleanup_closes_runner_stderr_handle(fake_runner):
-    fake_runner._ensure_subprocess()
-    handle = fake_runner._stderr_file
-    assert not handle.closed
+@pytest.mark.parametrize("wait_times_out", [False, True])
+def test_runner_stderr_handle_is_closed_in_the_parent(
+    monkeypatch, executor, wait_times_out
+):
+    monkeypatch.setattr(venv_manager.subprocess, "Popen", _FakeRunner)
+    executor._ensure_subprocess()
+    runner = _FakeRunner.instances[-1]
+    # The child holds its own copy; the parent's handle closes right away.
+    assert runner.stderr_file.closed
 
-    fake_runner.cleanup()
-    assert handle.closed
-    assert fake_runner._stderr_file is None
-    assert not fake_runner.venv_path.exists()
+    runner.wait_times_out = wait_times_out
+    executor.cleanup()
+    expected = ["terminate", "wait"] + (["kill", "wait"] if wait_times_out else [])
+    assert runner.calls == expected
+    assert not executor.venv_path.exists()
 
     # A second cleanup is a no-op.
-    fake_runner.cleanup()
+    executor.cleanup()
 
 
-def test_restarting_a_crashed_runner_closes_its_old_stderr_handle(fake_runner):
-    fake_runner._ensure_subprocess()
-    old_handle = fake_runner._stderr_file
-    fake_runner._subprocess.returncode = 1  # the runner crashed
+def test_runner_stderr_handle_is_closed_when_startup_fails(monkeypatch, executor):
+    handed_to_popen = []
 
-    fake_runner._ensure_subprocess()
-    assert old_handle.closed
-    assert not fake_runner._stderr_file.closed
+    def failing_popen(*args, stderr=None, **kwargs):
+        handed_to_popen.append(stderr)
+        raise FileNotFoundError("python")
 
-    fake_runner.cleanup()
+    monkeypatch.setattr(venv_manager.subprocess, "Popen", failing_popen)
+    with pytest.raises(FileNotFoundError):
+        executor._ensure_subprocess()
+    assert handed_to_popen[0].closed
+    executor.cleanup()
+    assert not executor.venv_path.exists()
