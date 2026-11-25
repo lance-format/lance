@@ -3360,6 +3360,9 @@ impl RowStreamRead {
         num_physical_rows: u64,
         deletion_vector: Option<&DeletionVector>,
     ) -> Vec<Range<u64>> {
+        // Roaring converts bitsets with at most this many offsets to arrays.
+        const ROARING_ARRAY_LIMIT: u64 = 4096;
+
         let mut requested = Cow::Borrowed(requested);
         if let Ok(end) = u32::try_from(num_physical_rows)
             && requested.max().is_some_and(|offset| offset >= end)
@@ -3403,6 +3406,19 @@ impl RowStreamRead {
                 } else {
                     Self::requested_ranges_minus_sorted_offsets(&surviving, std::iter::empty())
                 }
+            }
+            // Point removal avoids sorting when every removal is a bit clear.
+            Some(DeletionVector::Set(offsets))
+                if count.saturating_sub(offsets.len() as u64) > ROARING_ARRAY_LIMIT
+                    && bounds
+                        .is_some_and(|(first, last)| first >> u16::BITS == last >> u16::BITS)
+                    && requested.statistics().n_bitset_containers == 1 =>
+            {
+                let mut surviving = requested.into_owned();
+                for &offset in offsets {
+                    surviving.remove(offset);
+                }
+                bitmap_to_ranges(&surviving)
             }
             // Sorting a small set once lets us apply deletions to whole runs.
             // Dense or well-occupied requests can amortize sorting a larger set.
@@ -6278,6 +6294,22 @@ mod tests {
             dense
         };
         assert_eq!(offsets.len(), 2048);
+        assert_partial_fragment_ranges(&requested, 1_000_000, &DeletionVector::Set(offsets));
+    }
+
+    #[rstest]
+    #[case::short_runs(0)]
+    #[case::one_above_array_limit(453)]
+    #[case::at_array_limit(454)]
+    fn test_partial_fragment_ranges_with_bitset_and_set_deletions(#[case] extra_deletions: u32) {
+        let requested: RoaringBitmap = (0..910).flat_map(|run| run * 10..run * 10 + 9).collect();
+        assert_eq!(requested.len(), 8190);
+        assert_eq!(requested.statistics().n_bitset_containers, 1);
+        let offsets = (0..910)
+            .flat_map(|run| run * 10..run * 10 + 4)
+            .chain((0..extra_deletions).map(|run| run * 10 + 4))
+            .collect();
+
         assert_partial_fragment_ranges(&requested, 1_000_000, &DeletionVector::Set(offsets));
     }
 
