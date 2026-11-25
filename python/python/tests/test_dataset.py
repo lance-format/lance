@@ -1002,6 +1002,27 @@ def test_v2_manifest_paths_migration(tmp_path: Path):
     assert re.match(r"\d{20}\.manifest", manifest_path[0])
 
 
+@pytest.mark.parametrize("migrate", [False, True])
+def test_migrate_to_non_reusable_field_ids(tmp_path: Path, migrate: bool):
+    ds = lance.write_dataset(pa.table({"a": [1, 2, 3]}), tmp_path)
+    ds.add_columns({"b": "a * 10"})
+    if migrate:
+        version = ds.version
+        ds.migrate_to_non_reusable_field_ids()
+        assert ds.version == version + 1
+        # Running it again is a no-op.
+        ds.migrate_to_non_reusable_field_ids()
+        assert ds.version == version + 1
+    ds.drop_columns(["b"])
+    ds.add_columns({"c": "a * 7"})
+
+    field_ids = {
+        f.name(): f.id() for f in lance.dataset(tmp_path).lance_schema.fields()
+    }
+    # Without the migration, c takes b's dropped ID.
+    assert field_ids == {"a": 0, "c": 2 if migrate else 1}
+
+
 def test_tag(tmp_path: Path):
     table = pa.Table.from_pydict({"colA": [1, 2, 3], "colB": [4, 5, 6]})
     base_dir = tmp_path / "test"

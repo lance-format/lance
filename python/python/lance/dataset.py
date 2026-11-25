@@ -5252,6 +5252,23 @@ class LanceDataset(pa.dataset.Dataset):
         """
         self._ds.migrate_manifest_paths_v2()
 
+    def migrate_to_non_reusable_field_ids(self) -> None:
+        """
+        Stop reusing field IDs in this dataset.
+
+        By default, dropping the column with the highest field ID lets the next
+        added column take that ID again. After this migration, new fields always
+        get an ID above every ID the dataset has used, so a field ID keeps
+        naming one column for the life of the dataset.
+
+        The migration commits a new version. It is one-way and idempotent.
+
+        WARNING: before running this, make sure every client that writes to the
+        dataset enforces writer feature flags. A client
+        that ignores them may discard the high-water mark and reuse field IDs.
+        """
+        self._ds.migrate_to_non_reusable_field_ids()
+
     def delete_config_keys(self, keys: list[str]) -> None:
         """Delete specified configuration keys from the dataset.
 
