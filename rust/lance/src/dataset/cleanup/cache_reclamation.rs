@@ -5,7 +5,7 @@
 
 use super::{CleanupInspection, CleanupTask};
 use crate::session::caches::{ManifestKey, RowAddrMaskKey, TransactionKey};
-use crate::session::index_caches::{IndexMetadataKey, RowIdIndexKey};
+use crate::session::index_caches::RowIdIndexKey;
 
 /// A manifest that has aged out and is queued for deletion.
 #[derive(Clone, Debug)]
@@ -38,14 +38,23 @@ impl<'a> CleanupTask<'a> {
     /// the key families whose identity can be rebuilt from the version and
     /// manifest-listing e-tag: [`ManifestKey`],
     /// [`TransactionKey`], and whole-dataset [`RowAddrMaskKey`] in the
-    /// dataset's metadata cache, and both [`RowIdIndexKey`] variants and
-    /// [`IndexMetadataKey`] in the dataset's index cache.
+    /// dataset's metadata cache, and both [`RowIdIndexKey`] variants in the
+    /// dataset's index cache.
+    ///
+    /// Index-metadata listings are deliberately not invalidated. An
+    /// already-open handle can still commit an index over a version cleanup
+    /// has deleted: the commit rebases through the conflict resolver, which
+    /// re-reads the intermediate versions' index metadata through this cache,
+    /// and the deleted manifest file cannot serve that read again. The cached
+    /// listing is the last copy, so evicting it turns the commit into a
+    /// `NotFound`.
     ///
     /// Other version-scoped entries remain subject to capacity-based eviction,
-    /// including manifest and index-metadata entries written without an e-tag
-    /// by Rename commit handlers, derived index listings, segment ownership
-    /// masks, row address masks restricted to a query-specific fragment subset,
-    /// and per-fragment deletion-vector and row-id-sequence entries.
+    /// including index-metadata entries, manifest entries written without an
+    /// e-tag by Rename commit handlers, derived index listings, segment
+    /// ownership masks, row address masks restricted to a query-specific
+    /// fragment subset, and per-fragment deletion-vector and row-id-sequence
+    /// entries.
     pub(super) async fn invalidate_stale_version_caches(
         &self,
         stale_versions: &[(u64, Option<String>)],
@@ -57,7 +66,6 @@ impl<'a> CleanupTask<'a> {
             return;
         }
 
-        let store_identity = self.dataset.table_state.object_store.store_prefix.clone();
         for (version, e_tag) in stale_versions {
             let e_tag = e_tag.as_deref();
             self.dataset
@@ -98,14 +106,6 @@ impl<'a> CleanupTask<'a> {
                 .invalidate_key(&RowIdIndexKey {
                     version: *version,
                     with_deletions: false,
-                    e_tag,
-                })
-                .await;
-            self.dataset
-                .index_cache
-                .invalidate_key(&IndexMetadataKey {
-                    version: *version,
-                    store_identity: &store_identity,
                     e_tag,
                 })
                 .await;

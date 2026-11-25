@@ -17,8 +17,11 @@ use super::*;
 /// real vector index build and a later `optimize_indices()` call so the
 /// index cache (not just the metadata cache) accumulates version-keyed
 /// entries the way production code populates them, runs cleanup to retain
-/// only the latest version, and asserts that both caches shrink because
-/// the stale versions' entries were invalidated.
+/// only the latest version, and asserts that the metadata cache shrinks
+/// because the stale versions' entries were invalidated. The index cache is
+/// asserted unchanged: index-metadata listings are deliberately kept, since
+/// an already-open handle can still commit an index over a cleaned-up
+/// version by re-reading them through the conflict resolver.
 #[tokio::test]
 async fn cleanup_evicts_stale_version_caches() {
     use crate::session::Session;
@@ -136,7 +139,11 @@ async fn cleanup_evicts_stale_version_caches() {
     let metadata_after = session.metadata_cache_stats().await;
     let index_after = session.index_cache_stats().await;
     assert_lt!(metadata_after.num_entries, metadata_before.num_entries);
-    assert_lt!(index_after.num_entries, index_before.num_entries);
+    // Index-metadata listings survive cleanup on purpose: they are the last
+    // copy a live handle can rebase an index commit over. The row id index
+    // entries, which are reclaimed, are covered by
+    // `cleanup_reclaims_stale_row_id_index_entries`.
+    assert_eq!(index_after.num_entries, index_before.num_entries);
 
     // The surviving dataset must still be fully readable after the
     // invalidation: evicting stale versions must not touch live entries.
