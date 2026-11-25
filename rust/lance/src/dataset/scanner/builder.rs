@@ -52,7 +52,7 @@ use super::aggregate::AggregateExpr;
 use super::vector::VectorRefinement;
 use super::{
     BATCH_SIZE_FALLBACK, ColumnOrdering, ExprFilter, LanceFilter, MaterializationStyle,
-    QueryFilter, ScalarIndexSelection, Scanner, get_default_batch_size,
+    OrderedIndexMode, QueryFilter, ScalarIndexSelection, Scanner, get_default_batch_size,
 };
 
 impl Scanner {
@@ -94,6 +94,7 @@ impl Scanner {
             fast_search: false,
             use_scalar_index: true,
             ignored_scalar_index_names: HashSet::new(),
+            ordered_index: OrderedIndexMode::default(),
             include_deleted_rows: false,
             scan_stats_callback: None,
             strict_batch_size: false,
@@ -725,12 +726,16 @@ impl Scanner {
         self
     }
 
-    /// Ignore named scalar indices from expression-filter planning.
+    /// Ignore named scalar indices from expression-filter planning and ordered
+    /// reads.
     ///
     /// Other scalar indices remain eligible, and the original filter is still
     /// evaluated for rows selected by the remaining scan plan. Names that do
     /// not identify an available scalar index have no effect. This option is
     /// ignored when scalar indices are disabled with [`Self::use_scalar_index`].
+    ///
+    /// An ignored index never serves an ordered read for [`Self::order_by`].
+    /// See [`Self::ordered_index`].
     ///
     /// Inverted index names are also honored for expression filters such as
     /// `contains_tokens`, which fall back to evaluating the function without that

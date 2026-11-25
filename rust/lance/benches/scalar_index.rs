@@ -10,14 +10,18 @@ use arrow_array::{
 use criterion::{Criterion, criterion_group, criterion_main};
 use datafusion::{physical_plan::SendableRecordBatchStream, scalar::ScalarValue};
 use futures::{FutureExt, TryStreamExt};
+use lance::dataset::WriteParams;
+use lance::dataset::scanner::{ColumnOrdering, OrderedIndexMode, Scanner};
+use lance::index::DatasetIndexExt;
 use lance::{Dataset, io::ObjectStore};
 use lance_core::ROW_ADDR;
 use lance_core::cache::LanceCache;
 use lance_core::utils::tempfile::TempStrDir;
 use lance_datafusion::utils::reader_to_stream;
 use lance_datagen::{BatchCount, RowCount, array, gen_batch};
+use lance_index::IndexType;
 use lance_index::scalar::{
-    IndexStore, SargableQuery, ScalarIndex, SearchResult,
+    BuiltinIndexType, IndexStore, SargableQuery, ScalarIndex, ScalarIndexParams, SearchResult,
     btree::{DEFAULT_BTREE_BATCH_SIZE, train_btree_index},
     lance_format::LanceIndexStore,
     registry::{ScalarIndexPlugin, VALUE_COLUMN_NAME},
@@ -182,6 +186,44 @@ async fn warm_indexed_isin_search(index: &dyn ScalarIndex) {
     assert_eq!(row_ids.true_rows().len(), Some(3));
 }
 
+async fn ordered_limit_dataset(tempdir: &TempStrDir) -> Dataset {
+    let data = gen_batch()
+        .col("ts", array::rand::<UInt64Type>())
+        .col("id", array::step::<UInt64Type>())
+        .into_reader_rows(RowCount::from(100_000), BatchCount::from(100));
+    let params = WriteParams {
+        max_rows_per_file: 1_000_000,
+        ..Default::default()
+    };
+    let mut dataset = Dataset::write(data, tempdir.as_str(), Some(params))
+        .await
+        .unwrap();
+    dataset
+        .create_index(
+            &["ts"],
+            IndexType::BTree,
+            Some("ts_idx".into()),
+            &ScalarIndexParams::for_builtin(BuiltinIndexType::BTree),
+            false,
+        )
+        .await
+        .unwrap();
+    dataset
+}
+
+async fn ordered_limit(dataset: &Dataset, configure: impl Fn(&mut Scanner)) {
+    let mut scanner = dataset.scan();
+    scanner
+        .project(&["id"])
+        .unwrap()
+        .order_by(Some(vec![ColumnOrdering::desc_nulls_last("ts".into())]))
+        .unwrap()
+        .limit(Some(100), None)
+        .unwrap();
+    configure(&mut scanner);
+    assert_eq!(scanner.try_into_batch().await.unwrap().num_rows(), 100);
+}
+
 fn bench_baseline(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
 
@@ -225,17 +267,42 @@ fn bench_warm_indexed(c: &mut Criterion) {
     });
 }
 
+fn bench_ordered_limit(c: &mut Criterion) {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let tempdir = TempStrDir::default();
+    let dataset = rt.block_on(ordered_limit_dataset(&tempdir));
+    let mut group = c.benchmark_group("ordered_limit");
+    group.bench_function("ordered_index_auto", |b| {
+        b.iter(|| rt.block_on(ordered_limit(&dataset, |_| {})));
+    });
+    group.bench_function("ordered_index_off", |b| {
+        b.iter(|| {
+            rt.block_on(ordered_limit(&dataset, |scanner| {
+                scanner.ordered_index(OrderedIndexMode::Off);
+            }))
+        });
+    });
+    group.bench_function("declined_by_filter", |b| {
+        b.iter(|| {
+            rt.block_on(ordered_limit(&dataset, |scanner| {
+                scanner.filter("id >= 0").unwrap();
+            }))
+        });
+    });
+    group.finish();
+}
+
 #[cfg(target_os = "linux")]
 criterion_group!(
     name=benches;
     config = Criterion::default().significance_level(0.1).sample_size(10)
         .with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
-    targets = bench_baseline, bench_warm_indexed);
+    targets = bench_baseline, bench_warm_indexed, bench_ordered_limit);
 
 #[cfg(not(target_os = "linux"))]
 criterion_group!(
     name=benches;
     config = Criterion::default().significance_level(0.1).sample_size(10);
-    targets = bench_baseline, bench_warm_indexed);
+    targets = bench_baseline, bench_warm_indexed, bench_ordered_limit);
 
 criterion_main!(benches);

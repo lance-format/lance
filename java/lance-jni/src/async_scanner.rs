@@ -11,7 +11,7 @@ use crate::task_tracker::{TASK_TRACKER, TaskInfo};
 use crate::{RT, block_on};
 use arrow::ffi::FFI_ArrowSchema;
 use jni::JNIEnv;
-use jni::objects::JObject;
+use jni::objects::{JObject, JString};
 use jni::sys::{jboolean, jint, jlong};
 use lance::dataset::scanner::Scanner;
 use lance_io::ffi::to_ffi_arrow_array_stream;
@@ -199,6 +199,7 @@ pub extern "system" fn Java_org_lance_ipc_AsyncScanner_createAsyncScanner<'local
     column_orderings: JObject<'local>,
     use_scalar_index: jboolean,
     ignored_scalar_indices_obj: JObject<'local>,
+    ordered_index: JString<'local>,
     fast_search: jboolean,
     substrait_aggregate_obj: JObject<'local>,
     include_deleted_rows: jboolean,
@@ -233,6 +234,7 @@ pub extern "system" fn Java_org_lance_ipc_AsyncScanner_createAsyncScanner<'local
             column_orderings,
             use_scalar_index,
             ignored_scalar_indices_obj,
+            ordered_index,
             fast_search,
             substrait_aggregate_obj,
             include_deleted_rows,
@@ -269,6 +271,7 @@ fn inner_create_async_scanner<'local>(
     column_orderings: JObject<'local>,
     use_scalar_index: jboolean,
     ignored_scalar_indices_obj: JObject<'local>,
+    ordered_index: JString<'local>,
     fast_search: jboolean,
     substrait_aggregate_obj: JObject<'local>,
     include_deleted_rows: jboolean,
@@ -304,6 +307,7 @@ fn inner_create_async_scanner<'local>(
         column_orderings,
         use_scalar_index,
         ignored_scalar_indices_obj,
+        ordered_index,
         fast_search,
         substrait_aggregate_obj,
         include_deleted_rows,
