@@ -38,6 +38,7 @@ use lance_index::vector::{
     ApproxMode, PartitionSearchControl, Query, VECTOR_RESULT_SCHEMA, VectorIndex,
 };
 use lance_select::{RowAddrMask, RowAddrSelection};
+use tokio::sync::OnceCell;
 
 use super::{
     IVFIndex, PartitionEntry, PreparedPartitionGuard, PreparedPartitionSearch,
@@ -217,6 +218,7 @@ pub(super) fn controlled_partition_stream(
 pub struct RabitScanContext {
     index: Arc<RabitIndex>,
     raw_query: Option<Arc<RabitRawQueryContext>>,
+    lookup_mask: Arc<OnceCell<Arc<RowAddrMask>>>,
     /// Original query, before setting each partition's centroid distance.
     pub query: Query,
     /// Ordered partition identifiers, paired with `centroid_distances`.
@@ -287,6 +289,7 @@ impl RabitScanContext {
         Self {
             index,
             raw_query,
+            lookup_mask: Arc::new(OnceCell::new()),
             query,
             partitions,
             centroid_distances,
@@ -432,6 +435,22 @@ impl RabitScanContext {
             self.pre_filter.clone(),
         )
         .await?;
+        let mask = self
+            .lookup_mask
+            .get_or_try_init(|| async {
+                let mut mask = self.pre_filter.mask().as_ref().clone();
+                lance_core::utils::tokio::spawn_cpu(move || {
+                    match &mut mask {
+                        RowAddrMask::AllowList(rows) | RowAddrMask::BlockList(rows) => {
+                            rows.optimize_for_lookup();
+                        }
+                    }
+                    Ok::<_, Error>(Arc::new(mask))
+                })
+                .await
+            })
+            .await?
+            .clone();
         let context = self.clone();
         let in_flight = self.index.prepared_partitions.track();
         lance_core::utils::tokio::spawn_cpu(move || {
@@ -487,7 +506,6 @@ impl RabitScanContext {
                     .row_ids()
                     .any(|&row_id| row_id == RowAddress::TOMBSTONE_ROW);
             let accept = needs_mask.then(|| {
-                let mask = pre_filter.mask();
                 let (rows, is_allow_list) = match mask.as_ref() {
                     RowAddrMask::AllowList(rows) => (rows, true),
                     RowAddrMask::BlockList(rows) => (rows, false),
