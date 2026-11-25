@@ -443,8 +443,50 @@ async fn managed_append_preserves_primary_base_root_semantics(
         dataset
             .get_fragments()
             .iter()
-            .all(|fragment| fragment.metadata.files[0].base_id.is_none())
+            .all(|fragment| fragment.metadata().files[0].base_id.is_none())
     );
+}
+
+#[rstest]
+#[case::primary(None)]
+#[case::registered(Some(7))]
+#[tokio::test]
+async fn take_blobs_reports_resolved_managed_base(#[case] file_base: Option<u32>) {
+    let dir = TempStrDir::default();
+    let mut values = BlobDescriptorArrayBuilder::new("blob");
+    // Both descriptors name the same object, one via the data file's base and
+    // the other via a registered base pointing at the same directory.
+    for base_id in [None, Some(7)] {
+        values
+            .push(BlobDescriptor::Managed {
+                base_id,
+                uri: "_blobs/shared.blob".to_string(),
+                offset: 0,
+                size: 1,
+            })
+            .unwrap();
+    }
+    let (field, values) = values.finish().unwrap().into_parts();
+    let schema = Arc::new(managed_blob_schema(vec![field]));
+    let batch = RecordBatch::try_new(schema.clone(), vec![values]).unwrap();
+    let dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch)], schema),
+        &dir,
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            initial_bases: Some(vec![BasePath::new(7, dir.to_string(), None, true)]),
+            target_bases: file_base.map(|id| vec![id]),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let files = Arc::new(dataset).take_blobs(&[0, 1], "blob").await.unwrap();
+    let inherited = files[0].as_ref().unwrap();
+    let explicit = files[1].as_ref().unwrap();
+    assert_eq!(inherited.data_path(), explicit.data_path());
+    assert_eq!(inherited.base_id(), file_base);
+    assert_eq!(explicit.base_id(), Some(7));
 }
 
 #[rstest]
@@ -601,8 +643,9 @@ async fn managed_compaction_preserves_sidecars_after_source_gc(
     };
     assert_eq!(dataset.manifest.fragments.len(), 2);
     let before = dataset
+        .table_state
         .object_store
-        .read_dir_all(&dataset.base, None)
+        .read_dir_all(&dataset.table_state.base, None)
         .try_collect::<Vec<_>>()
         .await
         .unwrap();
@@ -639,8 +682,9 @@ async fn managed_compaction_preserves_sidecars_after_source_gc(
     .await
     .unwrap();
     let after = dataset
+        .table_state
         .object_store
-        .read_dir_all(&dataset.base, None)
+        .read_dir_all(&dataset.table_state.base, None)
         .try_collect::<Vec<_>>()
         .await
         .unwrap();
@@ -1013,7 +1057,7 @@ async fn managed_clone_preserves_existing_retention_contract(
     if deep && !registered {
         assert_eq!(source.manifest.fragments, cloned.manifest.fragments);
         for fragment in source.get_fragments() {
-            for file in &fragment.metadata.files {
+            for file in &fragment.metadata().files {
                 let relative = format!("data/{}", file.path);
                 assert_eq!(
                     std::fs::read(std::path::Path::new(source_dir.as_ref()).join(&relative))
@@ -1838,6 +1882,7 @@ async fn test_released_legacy_blob_reads_from_shallow_clone(
         for (file, &index) in files.iter().zip(&indices) {
             match (file, expected[index as usize]) {
                 (Some(file), Some(payload)) => {
+                    assert_eq!(file.base_id(), base_id);
                     assert_eq!(file.read().await.unwrap().as_ref(), payload);
                 }
                 (None, None) => {}
@@ -2244,6 +2289,7 @@ async fn test_read_legacy_and_v2_blob_layouts_from_one_file() {
     .unwrap();
     let data_file_name = format!("{}.lance", Uuid::new_v4());
     let object_writer = dataset
+        .table_state
         .object_store
         .create(&dataset.data_dir().join(data_file_name.as_str()))
         .await
@@ -2413,7 +2459,7 @@ async fn test_data_replacement_uses_blob_descriptor_array_builder_prepared_packe
     let packed_path = blob_path(&dataset.data_dir(), &file_id, blob_id);
     let mut blob_writer = BlobDescriptorArrayBuilder::new("blob");
     let mut packed = PackedBlobWriter::try_new(
-        dataset.object_store.as_ref().clone(),
+        dataset.table_state.object_store.as_ref().clone(),
         data_file_path.clone(),
         blob_id,
     )
@@ -2437,7 +2483,12 @@ async fn test_data_replacement_uses_blob_descriptor_array_builder_prepared_packe
     )
     .unwrap();
 
-    let object_writer = dataset.object_store.create(&data_file_path).await.unwrap();
+    let object_writer = dataset
+        .table_state
+        .object_store
+        .create(&data_file_path)
+        .await
+        .unwrap();
     let mut file_writer = lance_file::versions::v2_2::create_writer(
         object_writer,
         crate::datatypes::Schema::try_from(append_schema.as_ref()).unwrap(),
@@ -2588,7 +2639,7 @@ async fn test_data_replacement_uses_blob_descriptor_array_builder_prepared_neste
     let blob_id = 1;
     let mut blob_writer = BlobDescriptorArrayBuilder::new("blob");
     let mut packed = PackedBlobWriter::try_new(
-        dataset.object_store.as_ref().clone(),
+        dataset.table_state.object_store.as_ref().clone(),
         data_file_path.clone(),
         blob_id,
     )
@@ -2619,7 +2670,12 @@ async fn test_data_replacement_uses_blob_descriptor_array_builder_prepared_neste
     let replacement_batch =
         RecordBatch::try_new(replacement_schema.clone(), vec![info_array]).unwrap();
 
-    let object_writer = dataset.object_store.create(&data_file_path).await.unwrap();
+    let object_writer = dataset
+        .table_state
+        .object_store
+        .create(&data_file_path)
+        .await
+        .unwrap();
     let mut file_writer = lance_file::versions::v2_2::create_writer(
         object_writer,
         crate::datatypes::Schema::try_from(replacement_schema.as_ref()).unwrap(),
@@ -2724,7 +2780,12 @@ async fn test_create_data_file_skips_blob_orphans_with_top_level_name_collision(
     let replacement_batch =
         RecordBatch::try_new(replacement_schema.clone(), vec![info_array]).unwrap();
 
-    let object_writer = dataset.object_store.create(&data_file_path).await.unwrap();
+    let object_writer = dataset
+        .table_state
+        .object_store
+        .create(&data_file_path)
+        .await
+        .unwrap();
     let mut file_writer = lance_file::versions::v2_2::create_writer(
         object_writer,
         crate::datatypes::Schema::try_from(replacement_schema.as_ref()).unwrap(),
@@ -3178,12 +3239,12 @@ async fn test_read_blob_files_issue_only_payload_requests(#[case] kind: BlobKind
         .map(|row| handles[*row].as_ref())
         .collect::<Vec<_>>();
     requests.insert(1, None);
-    let _ = dataset.object_store.io_stats_incremental();
+    let _ = dataset.table_state.object_store.io_stats_incremental();
     let blobs = crate::blob::read_blob_files(requests)
         .execute()
         .await
         .unwrap();
-    let handle_stats = dataset.object_store.io_stats_incremental();
+    let handle_stats = dataset.table_state.object_store.io_stats_incremental();
 
     let mut expected = request_rows
         .iter()
@@ -3226,7 +3287,7 @@ async fn test_read_blob_files_issue_only_payload_requests(#[case] kind: BlobKind
         .execute()
         .await
         .unwrap();
-    let row_stats = dataset.object_store.io_stats_incremental();
+    let row_stats = dataset.table_state.object_store.io_stats_incremental();
     assert_eq!(
         rows.iter()
             .map(|blob| blob.data.as_deref())
@@ -3271,7 +3332,7 @@ async fn test_read_blob_file_ranges_coalesce_requests_across_handles() {
         (Some(first_handle), 0, 1000),
     ];
 
-    let _ = dataset.object_store.io_stats_incremental();
+    let _ = dataset.table_state.object_store.io_stats_incremental();
     let results = crate::blob::read_blob_file_ranges(
         requests
             .iter()
@@ -3280,7 +3341,7 @@ async fn test_read_blob_file_ranges_coalesce_requests_across_handles() {
     .execute()
     .await
     .unwrap();
-    let stats = dataset.object_store.io_stats_incremental();
+    let stats = dataset.table_state.object_store.io_stats_incremental();
 
     let expected = requests
         .iter()
@@ -3434,6 +3495,7 @@ async fn test_take_blob_v2_from_non_default_base_inline_reuses_store() {
         for blob in blobs {
             let blob = blob.as_ref().unwrap();
             assert_eq!(blob.kind(), BlobKind::Inline);
+            assert_eq!(blob.base_id(), Some(1));
             assert_eq!(
                 blob.read().await.unwrap().as_ref(),
                 fixture.expected.as_slice()
@@ -3462,6 +3524,7 @@ async fn test_take_blob_v2_from_non_default_base_dedicated() {
     assert_eq!(blobs.len(), 1);
     let blob = blobs[0].as_ref().unwrap();
     assert_eq!(blob.kind(), BlobKind::Dedicated);
+    assert_eq!(blob.base_id(), Some(1));
     assert_eq!(
         blob.read().await.unwrap().as_ref(),
         fixture.expected.as_slice()
@@ -3932,6 +3995,7 @@ async fn test_external_blob_unknown_sizes_are_resolved_once_and_concurrently() {
     for (row, file) in files.iter().enumerate() {
         let payload = &payloads[row / ROWS_PER_OBJECT];
         let file = file.as_ref().unwrap();
+        assert_eq!(file.base_id(), None);
         assert_eq!(file.size(), payload.len() as u64);
         assert_eq!(file.read().await.unwrap().as_ref(), payload.as_slice());
     }
@@ -4052,6 +4116,7 @@ async fn test_blob_v2_external_mapped_to_registered_base(
     let _ = external_store.io_stats_incremental();
     let blobs = dataset.take_blobs_by_indices(&[0], "blob").await.unwrap();
     assert_eq!(blobs.len(), 1);
+    assert_eq!(blobs[0].as_ref().unwrap().base_id(), Some(1));
     assert_eq!(
         blobs[0].as_ref().unwrap().read().await.unwrap().as_ref(),
         expected

@@ -63,7 +63,7 @@ These options apply to all object stores.
 |------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `allow_http`                 | Allow non-TLS, i.e. non-HTTPS connections. Default, `False`.                                                                                                                                                                                                                                            |
 | `block_size`                 | Gap in bytes below which two reads of one file are merged into a single request. Default, `4096` for local files and `65536` for object stores. Larger values cut the request count of scattered reads (for example a `take` of rows spread across a file) at the cost of reading the bytes in between.                                                                                                     |
-| `download_retry_count`       | Number of times to retry a download. Default, `3`. This limit is applied when the HTTP request succeeds but the response is not fully downloaded, typically due to a violation of `timeout`.                                                                                                            |
+| `download_retry_count`       | Number of times to retry a download. Default, `3`. This limit is applied when the HTTP request succeeds but the response is not fully downloaded, typically due to a violation of `timeout`. Streaming reads share this budget across request and body failures. |
 | `allow_invalid_certificates` | Skip certificate validation on https connections. Default, `False`. Warning: This is insecure and should only be used for testing.                                                                                                                                                                      |
 | `connect_timeout`            | Timeout for only the connect phase of a Client. Default, `5s`.                                                                                                                                                                                                                                          |
 | `timeout`                    | Timeout for the entire request, from connection until the response body has finished. Default, `30s`. This applies to each individual request, so on a large write it must cover one complete multipart part upload; raise it alongside `LANCE_INITIAL_UPLOAD_SIZE`.                                    |
@@ -75,6 +75,12 @@ These options apply to all object stores.
 | `client_retry_timeout`       | Timeout for the object store client to retry the request in seconds. Default, `180`.                                                                                                                                                                                                                    |
 | `scheduler_error_mode`       | Scheduler error handling. `best_effort` preserves the default behavior. `fail_fast` returns the first observed error and cancels the remaining physical reads in the same logical request. Other requests are not cancelled.                                                                            |
 | `object_store_cache_prune_threshold` | Smallest number of cached object stores at which a session's object store cache sweeps out entries for stores that are no longer in use. Default, `64`; `0` disables the sweep. The cache is shared by every dataset opened with the same session, and the last value seen applies to all of them. Mainly relevant when a shared session opens many tables with distinct storage options, such as tables opened through a namespace that vends per-table credentials. |
+
+Streaming downloads resume from the first undelivered byte using the original
+ETag or object version, including when copying a whole object or a byte range.
+Body errors propagate if no identifier can be used with a conditional request
+supported by the provider. Resumed responses with a different object identity,
+size, or byte range are rejected.
 
 An engine can apply `scheduler_error_mode` to every operation in a session by
 adding it to the storage options used for every dataset open. For example, a
@@ -276,8 +282,9 @@ passed as parameters to the `storage_options` parameter:
     }
     ```
 
-If you are using AWS SSO, you can specify the `AWS_PROFILE` environment variable.
-It cannot be specified in the `storage_options` parameter.
+If you are using AWS SSO, set the `aws_profile` storage option or the
+`AWS_PROFILE` environment variable. An explicit `aws_profile` takes precedence
+over the environment variable.
 
 The following keys can be used as both environment variables or keys in the
 `storage_options` parameter:
@@ -285,6 +292,7 @@ The following keys can be used as both environment variables or keys in the
 | Key                                                                 | Description                                                                                                                                      |
 |---------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------|
 | `aws_region` / `region`                                             | The AWS region the bucket is in. This can be automatically detected when using AWS S3, but must be specified for S3-compatible stores.           |
+| `aws_profile`                                                       | The AWS shared profile used for credentials. Native S3 also uses its region and endpoint when unset. Defaults to `AWS_PROFILE`.                  |
 | `aws_access_key_id` / `access_key_id`                               | The AWS access key ID to use.                                                                                                                    |
 | `aws_secret_access_key` / `secret_access_key`                       | The AWS secret access key to use.                                                                                                                |
 | `aws_session_token` / `session_token`                               | The AWS session token to use.                                                                                                                    |
@@ -294,6 +302,28 @@ The following keys can be used as both environment variables or keys in the
 | `aws_server_side_encryption`                                        | The server-side encryption algorithm to use. Must be one of `"AES256"`, `"aws:kms"`, or `"aws:kms:dsse"`. Default, `None`.                       |
 | `aws_sse_kms_key_id`                                                | The KMS key ID to use for server-side encryption. If set, `aws_server_side_encryption` must be `"aws:kms"` or `"aws:kms:dsse"`.                  |
 | `aws_sse_bucket_key_enabled`                                        | Whether to use bucket keys for server-side encryption.                                                                                           |
+
+For ordinary `s3://` buckets, Lance still discovers the bucket region when neither
+`aws_region` / `region` nor a custom endpoint is set. The profile's region is used
+only when a custom endpoint is configured.
+
+When `aws_endpoint` / `endpoint` is unset, the selected profile's top-level
+`endpoint_url` is used for the S3 store. Service-specific endpoints under
+`[services]` are not read by this path.
+
+`aws_profile` is a static storage option and participates in the object store
+cache identity. With a dynamic `StorageOptionsProvider`, cache identity is the
+provider's `provider_id`; a provider that can return different profiles must
+include that in its ID.
+
+The OpenDAL (`use_opendal`) path accepts `aws_profile` as an alias for OpenDAL's
+`profile`, but still requires an explicit region for S3-compatible endpoints.
+
+`aws_profile` applies to the S3 object store and to the DynamoDB commit handler
+for `s3+ddb://`. The DynamoDB client uses the same explicit profile credentials
+and signing region when `aws_region` / `region` is not set. Its endpoint remains
+`dynamodb_endpoint` / `DYNAMODB_ENDPOINT` and is independent of the S3 profile
+endpoint. The ordinary S3 endpoint/region discovery described above is unchanged.
 
 ### Credential provider selection
 
