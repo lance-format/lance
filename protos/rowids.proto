@@ -51,10 +51,9 @@ message U64Segment {
         /* A bitmap of the values in the range. The bitmap is a sequence of bytes,
          * where each byte represents 8 values. The first byte represents values
          * start to start + 7, the second byte represents values start + 8 to
-         * start + 15, and so on. The most significant bit of each byte represents
-         * the first value in the range, and the least significant bit represents
-         * the last value in the range. If the bit is set, the value is in the
-         * range; if it is not set, the value is not in the range.
+         * start + 15, and so on. Within each byte, the least significant bit
+         * represents the first of its eight values. A set bit means the value
+         * is present.
          */
         bytes bitmap = 3;
     }

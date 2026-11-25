@@ -801,8 +801,15 @@ async fn flat_bm25_preserves_zero_token_list_element_documents() {
     assert_eq!(scorer.num_docs_containing_token("hello"), 1);
 }
 
+#[rstest::rstest]
+#[case::plain("alpha", "alpha", "alpha filler filler filler")]
+#[case::stemming("RUNNING", "run", "runs filler filler filler")]
 #[tokio::test]
-async fn flat_bm25_search_uses_full_document_length_for_normalization() {
+async fn flat_bm25_search_uses_full_document_length_for_normalization(
+    #[case] query: &str,
+    #[case] short: &str,
+    #[case] long: &str,
+) {
     let schema = Arc::new(Schema::new(vec![
         ROW_ID_FIELD.clone(),
         Field::new("text", DataType::Utf8, false),
@@ -810,11 +817,8 @@ async fn flat_bm25_search_uses_full_document_length_for_normalization() {
     let batch = RecordBatch::try_new(
         schema.clone(),
         vec![
-            Arc::new(UInt64Array::from(vec![0u64, 1])),
-            Arc::new(StringArray::from(vec![
-                "alpha",
-                "alpha filler filler filler filler filler filler filler filler filler",
-            ])),
+            Arc::new(UInt64Array::from(vec![0u64, 1, 2])),
+            Arc::new(StringArray::from(vec![short, long, "filler filler"])),
         ],
     )
     .unwrap();
@@ -823,14 +827,12 @@ async fn flat_bm25_search_uses_full_document_length_for_normalization() {
         schema.clone(),
         stream::iter(vec![Ok(batch)]),
     ));
-    let tokenizer: Box<dyn LanceTokenizer> = Box::new(TextTokenizer::new(
-        TextAnalyzer::builder(SimpleTokenizer::default()).build(),
-    ));
+    let tokenizer = InvertedIndexParams::default().build().unwrap();
 
     let result_stream = flat_bm25_search_stream_with_metrics(
         input,
         "text".to_string(),
-        "alpha".to_string(),
+        query.to_string(),
         tokenizer,
         None,
         100,
@@ -844,6 +846,14 @@ async fn flat_bm25_search_uses_full_document_length_for_normalization() {
     let scores = scored[SCORE_COL].as_primitive::<Float32Type>();
 
     assert_eq!(row_ids.values(), &[0, 1]);
+    // Three nonempty documents, seven tokens, and two documents containing
+    // the query term. The nonmatching row contributes to both N and avgdl.
+    let idf = (1.0_f32 + 1.5 / 2.5).ln();
+    for (row, length) in [1.0_f32, 4.0].into_iter().enumerate() {
+        let norm = 1.2 * (0.25 + 0.75 * length / (7.0 / 3.0));
+        let expected = idf * 2.2 / (1.0 + norm);
+        assert!((scores.value(row) - expected).abs() < 1e-6);
+    }
     assert!(
         scores.value(0) > scores.value(1),
         "same term frequency should score shorter document higher; short={}, long={}",

@@ -22,7 +22,7 @@ pub async fn table_identifier_from_dataset(dataset: &Dataset) -> Result<pb::Tabl
     Ok(pb::TableIdentifier {
         uri: dataset.uri().to_string(),
         version: dataset.manifest.version,
-        manifest_etag: dataset.manifest_location.e_tag.clone(),
+        manifest_etag: dataset.manifest_location().e_tag.clone(),
         serialized_manifest: None,
         storage_options: dataset
             .latest_storage_options()
@@ -42,7 +42,7 @@ pub async fn table_identifier_from_dataset_with_manifest(
     Ok(pb::TableIdentifier {
         uri: dataset.uri().to_string(),
         version: dataset.manifest.version,
-        manifest_etag: dataset.manifest_location.e_tag.clone(),
+        manifest_etag: dataset.manifest_location().e_tag.clone(),
         serialized_manifest: Some(manifest_proto.encode_to_vec()),
         storage_options: dataset
             .latest_storage_options()

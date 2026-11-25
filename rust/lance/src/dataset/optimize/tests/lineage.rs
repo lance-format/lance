@@ -3,13 +3,15 @@
 
 //! Compaction tests for the lineage contract area.
 
+use lance_io::stream::{RecordBatchStreamAdapter, SendableRecordBatchStream};
+
 use super::*;
-use crate::dataset::optimize::execution::{
-    PlannedRowLineage, append_row_lineage_columns, can_use_binary_copy, place_planned_row_lineage,
+use crate::dataset::rowids::{RowLineage, RowLineagePlan, RowLineageSpill, plan_row_lineage_spill};
+use lance_table_runtime::optimize::execution::{
+    PlannedRowLineage, append_row_lineage_columns, place_planned_row_lineage,
     place_row_lineage_in_files,
 };
-use crate::dataset::optimize::planning::pins_dead_user_columns_for_lineage;
-use crate::dataset::rowids::{RowLineage, RowLineagePlan, RowLineageSpill, plan_row_lineage_spill};
+use lance_table_runtime::optimize::planning::pins_dead_user_columns_for_lineage;
 
 #[tokio::test]
 async fn test_compaction_balances_non_divisible_stable_task() {
@@ -46,7 +48,7 @@ async fn test_compaction_balances_non_divisible_stable_task() {
         dataset
             .get_fragments()
             .iter()
-            .map(|fragment| fragment.metadata.physical_rows.unwrap())
+            .map(|fragment| fragment.metadata().physical_rows.unwrap())
             .collect::<Vec<_>>(),
         [vec![11], vec![10; 9]].concat()
     );
@@ -123,7 +125,7 @@ async fn per_fragment_plan_spills_only_the_fragments_over_budget() {
         .collect::<Vec<_>>();
 
     place_planned_row_lineage(
-        &dataset,
+        &dataset.table_view().to_table(),
         &mut fragments,
         PlannedRowLineage {
             lineages,
@@ -172,9 +174,7 @@ async fn per_fragment_plan_spills_only_the_fragments_over_budget() {
 async fn append_row_lineage_columns_gives_each_batch_its_own_buffer() {
     let batch = arrow_array::record_batch!(("i", Int32, [0, 1, 2, 3])).unwrap();
     let schema = batch.schema();
-    let batches = vec![batch; 3]
-        .into_iter()
-        .map(Ok::<_, datafusion::error::DataFusionError>);
+    let batches = [batch.clone(), batch.clone(), batch].into_iter().map(Ok);
     let input: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
         schema,
         futures::stream::iter(batches),
@@ -316,7 +316,7 @@ async fn test_row_addrs_only_used_with_remappable_index(
             assert_eq!(current.fragment_bitmap, original.fragment_bitmap);
             assert!(
                 current
-                    .effective_fragment_bitmap(dataset.fragment_bitmap.as_ref())
+                    .effective_fragment_bitmap(dataset.table_state.fragment_bitmap.as_ref())
                     .unwrap()
                     .is_empty()
             );
@@ -341,7 +341,7 @@ async fn test_row_addrs_only_used_with_remappable_index(
         let indices = dataset.load_indices().await.unwrap();
         assert_eq!(
             indices[0].fragment_bitmap.as_ref(),
-            Some(dataset.fragment_bitmap.as_ref())
+            Some(dataset.table_state.fragment_bitmap.as_ref())
         );
     }
 }
@@ -680,7 +680,7 @@ async fn test_distributed_compaction_with_stable_row_ids(
         let row_id_index = RowIdIndexKey {
             version: worker.manifest.version,
             with_deletions: true,
-            e_tag: worker.manifest_location.e_tag.as_deref(),
+            e_tag: worker.table_state.manifest_location.e_tag.as_deref(),
         };
         assert!(
             worker

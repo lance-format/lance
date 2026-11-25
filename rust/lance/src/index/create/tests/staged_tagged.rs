@@ -688,7 +688,12 @@ async fn root_metadata_exists(dataset: &Dataset, segment: &IndexMetadata) -> boo
         .indices_dir()
         .join(segment.uuid.to_string())
         .join(lance_index::scalar::inverted::METADATA_FILE);
-    dataset.object_store.exists(&path).await.unwrap()
+    dataset
+        .table_state
+        .object_store
+        .exists(&path)
+        .await
+        .unwrap()
 }
 
 /// The NGram merge reads spill files and translates only through the v0
@@ -1011,7 +1016,7 @@ async fn narrowed_segment_beside_a_translated_segment(#[case] index_type: IndexT
     reserve_fragments(&mut dataset, 20).await;
     let dataset = commit_stable_partition(dataset, &[0], 10).await;
     assert_eq!(
-        dataset.fragment_bitmap.as_ref(),
+        dataset.table_state.fragment_bitmap.as_ref(),
         &RoaringBitmap::from_iter([1u32, 2, 10, 11])
     );
     assert_eq!(fri_entry(&dataset).await.unwrap().index_version, 1);

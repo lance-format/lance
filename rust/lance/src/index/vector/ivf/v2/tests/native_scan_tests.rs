@@ -776,6 +776,9 @@ async fn test_native_strategy_scoring_through_fragment_reuse(
         .open_vector_index("vector", &uuid, &NoOpMetricsCollector)
         .await
         .unwrap();
+    dataset
+        .table_state
+        .set_session(session.table_session.clone());
     dataset.session = session;
     let lazy = dataset
         .open_vector_index("vector", &uuid, &NoOpMetricsCollector)

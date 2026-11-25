@@ -50,8 +50,8 @@ async fn test_delete_concurrency(#[case] concurrency: Option<usize>, #[case] aut
     .unwrap();
     let expected = dataset.scan().try_into_batch().await.unwrap();
     // A small store default exercises explicit windows both below and above it.
-    dataset.object_store = Arc::new(ObjectStore::new(
-        dataset.object_store.inner.clone(),
+    dataset.table_state.object_store = Arc::new(ObjectStore::new(
+        dataset.table_state.object_store.inner.clone(),
         url::Url::parse("memory://").unwrap(),
         None,
         None,
@@ -108,7 +108,7 @@ async fn test_delete_concurrency(#[case] concurrency: Option<usize>, #[case] aut
         }
     };
     let explanation = operation.explain().await.unwrap();
-    let window = concurrency.unwrap_or_else(|| dataset.object_store.io_parallelism());
+    let window = concurrency.unwrap_or_else(|| dataset.table_state.object_store.io_parallelism());
     let candidate_count = explanation.candidate_files.len();
     if concurrency.is_some() {
         assert!(candidate_count >= window);
@@ -135,7 +135,12 @@ async fn cleanup_deletes_a_large_orphan_sweep() {
     let data_dir = dataset.data_dir();
     for index in 0..200 {
         let orphan = data_dir.clone().join(format!("orphan-{index:03}.lance"));
-        dataset.object_store.put(&orphan, &[0u8; 64]).await.unwrap();
+        dataset
+            .table_state
+            .object_store
+            .put(&orphan, &[0u8; 64])
+            .await
+            .unwrap();
     }
     drop(dataset);
 
@@ -230,7 +235,12 @@ async fn bulk_delete_counts_one_semaphore_unit_per_request() {
     let orphan_count = 2 * BULK_DELETE_BATCH_FILES + BULK_DELETE_MIN_FILES;
     for index in 0..orphan_count {
         let orphan = data_dir.clone().join(format!("orphan-{index:04}.lance"));
-        dataset.object_store.put(&orphan, &[0u8; 64]).await.unwrap();
+        dataset
+            .table_state
+            .object_store
+            .put(&orphan, &[0u8; 64])
+            .await
+            .unwrap();
     }
 
     let policy = CleanupPolicyBuilder::default()
@@ -307,7 +317,12 @@ async fn bulk_delete_rate_limit_admits_each_path() {
     let orphan_count = BULK_DELETE_MIN_FILES + 50;
     for index in 0..orphan_count {
         let orphan = data_dir.clone().join(format!("orphan-{index:03}.lance"));
-        dataset.object_store.put(&orphan, &[0u8; 64]).await.unwrap();
+        dataset
+            .table_state
+            .object_store
+            .put(&orphan, &[0u8; 64])
+            .await
+            .unwrap();
     }
 
     let rate = 200;

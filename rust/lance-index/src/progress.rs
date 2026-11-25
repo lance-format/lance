@@ -22,6 +22,12 @@ use std::sync::Arc;
 /// must be thread-safe.
 #[async_trait]
 pub trait IndexBuildProgress: std::fmt::Debug + Sync + Send {
+    /// Optional per-file observer for bulk copies. File identities distinguish
+    /// concurrent copies within this build.
+    fn copy_observer(&self) -> Option<&dyn lance_io::object_store::CopyObserver> {
+        None
+    }
+
     /// A named stage has started.
     ///
     /// `total` is the number of work units if known, and `unit` describes
