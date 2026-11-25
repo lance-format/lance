@@ -325,7 +325,11 @@ class LanceDataset(torch.utils.data.IterableDataset):
             The number of batches to read ahead in different (Rust) threads for each
             fragment.
         sampler: callable, optional
-            A function that samples the dataset.
+            A function that samples the dataset. The epoch of a
+            :class:`lance.sampler.ShardedFragmentSampler` or
+            :class:`lance.sampler.ShardedBatchSampler` is moved into shared memory
+            so that ``sampler.set_epoch()`` reaches DataLoader workers, including
+            persistent ones.
         to_tensor_fn : callable, optional
             A function that converts a pyarrow RecordBatch to torch.Tensor.
             Should accept a batch (RecordBatch or Dict[str, pa.Array]) as the first
@@ -379,6 +383,11 @@ class LanceDataset(torch.utils.data.IterableDataset):
 
     @property
     def sampler(self) -> Optional[Sampler]:
+        """The sampler, or None to let iteration choose one.
+
+        Assigning a sharded sampler moves its epoch into shared memory, as
+        passing it to the constructor does.
+        """
         return self._sampler
 
     @sampler.setter

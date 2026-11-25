@@ -4,6 +4,7 @@
 import copy
 import pickle
 import shutil
+import sys
 import weakref
 from itertools import chain
 from pathlib import Path
@@ -288,7 +289,24 @@ def test_sample_batches(tmp_path: Path):
 
 
 @pytest.mark.parametrize("sampler_cls", [ShardedFragmentSampler, ShardedBatchSampler])
-def test_set_epoch_reaches_persistent_workers(tmp_path: Path, sampler_cls):
+@pytest.mark.parametrize(
+    "start_method",
+    [
+        "spawn",
+        # fork is the Linux default up to Python 3.13 and the only start method
+        # that relies on the epoch being in shared memory before workers start.
+        # Forked lance workers crash on macOS (see test_fork.py).
+        pytest.param(
+            "fork",
+            marks=pytest.mark.skipif(
+                sys.platform != "linux", reason="forked lance workers need Linux"
+            ),
+        ),
+    ],
+)
+def test_set_epoch_reaches_persistent_workers(
+    tmp_path: Path, sampler_cls, start_method
+):
     lance.write_dataset(pa.table({"ids": range(400)}), tmp_path, max_rows_per_file=50)
     # Non-consecutive epochs: workers must see the value set_epoch stored,
     # not a count of how many epochs they have run.
@@ -323,7 +341,7 @@ def test_set_epoch_reaches_persistent_workers(tmp_path: Path, sampler_cls):
             True,
             num_workers=1,
             persistent_workers=True,
-            multiprocessing_context="spawn",
+            multiprocessing_context=start_method,
         )
     )
     assert persistent == expected
@@ -341,8 +359,8 @@ def test_set_epoch_ignores_torch_construction_context(
     lance.write_dataset(pa.table({"ids": range(10)}), tmp_path)
     sampler = sampler_cls(rank=0, world_size=1, randomize=True)
     sampler.set_epoch(2)
-    # Neither a default device nor inference mode while LanceDataset shares the
-    # epoch may leak into its storage, and the epoch already set must survive.
+    # Sharing under a default device or inference mode must still give a CPU
+    # tensor set_epoch can update, and the epoch already set must survive.
     with context():
         LanceDataset(tmp_path, batch_size=5, sampler=sampler)
     # spawn and forkserver workers would get shared storage from torch's pickler
@@ -367,13 +385,74 @@ def test_set_epoch_ignores_torch_construction_context(
         assert copied.sampler is not clone
         assert copied.sampler._epoch_value.is_shared()
         assert copied.sampler._epoch == 4
+        copied.sampler.set_epoch(5)
+        assert copied.sampler._epoch == 5
+        assert clone._epoch == 4
 
     # A copy made inside inference mode must not leave an inference tensor that
     # set_epoch cannot update outside it.
     with torch.inference_mode():
         copied = copy.deepcopy(dataset)
+        sampler_copy = copy.deepcopy(sampler)
     copied.sampler.set_epoch(5)
     assert copied.sampler._epoch == 5
+    # A sampler copied on its own never passes through LanceDataset.
+    sampler_copy.set_epoch(6)
+    assert sampler_copy._epoch == 6
+    # set_epoch inside inference mode still writes the shared storage.
+    with torch.inference_mode():
+        sampler.set_epoch(7)
+    assert sampler._epoch_value.is_shared()
+    sampler.set_epoch(8)
+    assert sampler._epoch == 8
+
+
+def test_set_epoch_keeps_storage_received_from_another_process(
+    tmp_path: Path, monkeypatch
+):
+    # A spawn or forkserver worker unpickles the dataset with the epoch already
+    # in shared memory. Sharing it again under a different strategy (a parent
+    # that called set_sharing_strategy) would move it off the parent's storage.
+    lance.write_dataset(pa.table({"ids": range(10)}), tmp_path)
+    sampler = ShardedBatchSampler(rank=0, world_size=1, randomize=True)
+    dataset = LanceDataset(tmp_path, batch_size=5, sampler=sampler)
+    storage = sampler._epoch_value.data_ptr()
+    current = torch.multiprocessing.get_sharing_strategy()
+    other = "file_descriptor" if current == "file_system" else "file_system"
+    monkeypatch.setattr(torch.multiprocessing, "get_sharing_strategy", lambda: other)
+    dataset.sampler = sampler
+    assert sampler._epoch_value.data_ptr() == storage
+
+
+def test_set_epoch_rejects_meta_epoch(tmp_path: Path):
+    lance.write_dataset(pa.table({"ids": range(10)}), tmp_path)
+    sampler = ShardedBatchSampler(rank=0, world_size=1, randomize=True)
+    sampler._epoch_value = torch.empty((), dtype=torch.int64, device="meta")
+    with pytest.raises(ValueError, match="meta device"):
+        LanceDataset(tmp_path, batch_size=5, sampler=sampler)
+
+
+_ACCELERATORS = [
+    device
+    for device, available in (
+        ("cuda", torch.cuda.is_available()),
+        ("mps", torch.backends.mps.is_available()),
+    )
+    if available
+]
+
+
+@pytest.mark.skipif(not _ACCELERATORS, reason="needs a CUDA or MPS device")
+def test_set_epoch_moves_epoch_loaded_onto_an_accelerator(tmp_path: Path):
+    # torch.load(..., map_location="cuda") puts the epoch tensor on the GPU,
+    # where share_memory_() does nothing.
+    lance.write_dataset(pa.table({"ids": range(10)}), tmp_path)
+    sampler = ShardedBatchSampler(rank=0, world_size=1, randomize=True)
+    sampler._epoch_value = torch.tensor(3, device=_ACCELERATORS[0])
+    LanceDataset(tmp_path, batch_size=5, sampler=sampler)
+    assert sampler._epoch_value.device.type == "cpu"
+    assert sampler._epoch_value.is_shared()
+    assert sampler._epoch == 3
 
 
 def test_set_epoch_survives_copies_of_subclasses_with_slots(tmp_path: Path):
@@ -448,7 +527,7 @@ def test_set_epoch_normalizes_integer_epochs(tmp_path: Path):
     sampler.set_epoch(np.int64(3))
     assert sampler._epoch == 3
 
-    # Integral floats seeded the same order as ints in earlier releases.
+    # Earlier releases accepted float epochs; integral ones are still accepted.
     sampler.set_epoch(4.0)
     assert sampler._epoch == 4
     sampler.set_epoch(np.float64(3))

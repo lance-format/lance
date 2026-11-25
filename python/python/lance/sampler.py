@@ -338,7 +338,11 @@ class _SharedEpoch:
         if isinstance(self._epoch_value, int):
             self._epoch_value = epoch
         else:
-            self._epoch_value.fill_(epoch)
+            # The tensor is an inference tensor when it was created or copied
+            # inside inference mode, and those only accept in-place updates
+            # there. A normal tensor updated there stays normal and shared.
+            with torch.inference_mode():
+                self._epoch_value.fill_(epoch)
 
     def set_epoch(self, epoch: int):
         """Set the epoch that is combined with ``seed`` to shuffle.
@@ -365,16 +369,23 @@ class _SharedEpoch:
             self._epoch = legacy_epoch
 
     def _share_epoch_with_workers(self) -> None:
-        # Create the tensor on CPU so a default device (e.g. CUDA) cannot redirect
-        # it, and outside inference mode so set_epoch can update it later. A copy
-        # made inside inference mode holds an inference tensor, so rebuild that too.
-        with torch.inference_mode(False):
-            if isinstance(self._epoch_value, int) or self._epoch_value.is_inference():
-                self._epoch_value = torch.tensor(
-                    int(self._epoch_value), dtype=torch.int64, device="cpu"
-                )
-            # Also covers a deep copy of a shared sampler, whose tensor is not
-            # shared. A no-op for a tensor that already is.
+        value = self._epoch_value
+        if not isinstance(value, int) and value.device.type == "meta":
+            raise ValueError(
+                "the sampler's epoch is a tensor on the meta device and has no "
+                "value; load the sampler onto the CPU"
+            )
+        # Shared memory is CPU only, so pin the tensor there: a default device
+        # (e.g. CUDA) or torch.load(map_location=...) must not redirect it.
+        if isinstance(value, int) or value.device.type != "cpu":
+            self._epoch_value = torch.tensor(
+                int(value), dtype=torch.int64, device="cpu"
+            )
+        # A deep copy of a shared sampler holds an unshared tensor. A tensor
+        # received from another process is already shared, and sharing it again
+        # under a strategy other than the sender's would move it to new storage
+        # the sender never writes.
+        if not self._epoch_value.is_shared():
             self._epoch_value.share_memory_()
 
 
