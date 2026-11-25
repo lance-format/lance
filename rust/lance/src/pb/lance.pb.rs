@@ -114,7 +114,7 @@ pub struct VectorQueryProto {
     #[prost(enumeration = "VectorRqGraphScoring", tag = "17")]
     pub rq_graph_scoring: i32,
     /// Beam width of the delta segments. Absent, as from a producer that predates
-    /// the field, means the executor's default policy.
+    /// the field, means every segment is searched with ef (Uniform).
     #[prost(message, optional, tag = "18")]
     pub segment_ef: ::core::option::Option<SegmentEfProto>,
 }
