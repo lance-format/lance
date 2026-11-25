@@ -206,6 +206,7 @@ fn opaque_segment(name: &str, fragment_bitmap: Option<RoaringBitmap>) -> IndexMe
         }]),
         clustering_id: None,
         metadata: HashMap::from([("writer".to_string(), "example".to_string())]),
+        local_fragment_aliases: Default::default(),
     }
 }
 
