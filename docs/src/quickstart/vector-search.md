@@ -122,13 +122,14 @@ Pass a two-dimensional query array to refine several queries together:
 --8<-- "snippets/quickstart/outputs/vector_search_quickstart.py.batch-search.txt"
 ```
 
-Results include a `query_index` column identifying each query. With fixed,
-positive `nprobes` and fully indexed IVF_FLAT/PQ/SQ/RQ data, Lance shares index
-partition scans and reads duplicate refinement candidates once per input batch.
-Each query still ranks only its own candidates. Vector reads are split into
-chunks targeting 32 MiB of decoded vector data; candidate metadata and per-query
-top-k results consume additional memory. Adaptive probes, HNSW, incomplete index
-coverage, stale vector overlays, and external row masks use per-query execution.
+Results include a `query_index` column identifying each query. On fully indexed
+IVF_FLAT/PQ/SQ/RQ data, Lance shares index partition scans across the batch, with
+fixed `nprobes` and, except on IVF_RQ, adaptive `nprobes`. With fixed `nprobes`
+it also reads duplicate refinement candidates once per input batch. Each query still ranks only its own
+candidates. Vector reads are split into chunks targeting 32 MiB of decoded vector
+data; candidate metadata and per-query top-k results consume additional memory.
+See [Batch Queries](../guide/vector_search.md#batch-queries) for the cases that
+use per-query execution.
 
 !!! note "Memory Usage"
     The latencies above include file I/O as Lance currently doesn't hold anything in memory. Along with index building speed, creating a purely in-memory version of the dataset would make the biggest impact on performance.
