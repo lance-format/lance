@@ -18,7 +18,7 @@ impl<'a> TransactionRebase<'a> {
         } else {
             Cow::Borrowed(dataset)
         };
-        Self::for_commit_attempt(&read, transaction, affected_rows, Some(&read)).await
+        Self::for_commit_attempt(&read, transaction, affected_rows, Some(&read), None).await
     }
 
     pub(in crate::commit) async fn for_commit_attempt(
@@ -26,6 +26,7 @@ impl<'a> TransactionRebase<'a> {
         transaction: Transaction,
         affected_rows: Option<&'a RowAddrTreeMap>,
         row_read: Option<&Table>,
+        merge_inserted_rows: Option<u64>,
     ) -> Result<Self> {
         match &transaction.operation {
             // These operations add new fragments or don't modify any.
@@ -97,9 +98,15 @@ impl<'a> TransactionRebase<'a> {
                     .chain(deleted_fragment_ids.iter().copied())
                     .collect::<HashSet<_>>();
 
+                // A column patch that publishes no new fragments cannot insert
+                // rows, including when staged by a writer without MERGE statistics.
+                let merge_inserted_rows = match &transaction.operation {
+                    Operation::Update { new_fragments, .. } if new_fragments.is_empty() => Some(0),
+                    _ => merge_inserted_rows,
+                };
                 let row_history = row_read
                     .filter(|_| staged_update::needs_row_history(&transaction, affected_rows))
-                    .map(staged_update::RowHistory::new);
+                    .map(|read| staged_update::RowHistory::new(read, merge_inserted_rows));
 
                 // short circuit for full fragment update or delete case
                 // set affected_rows as None with non-empty modified_fragment_ids
@@ -145,7 +152,7 @@ impl<'a> TransactionRebase<'a> {
                     staged_replay: false,
                 };
                 if rebase.row_history.is_some() {
-                    rebase.validate_row_rewrite();
+                    rebase.validate_row_rewrite(merge_inserted_rows);
                 }
                 Ok(rebase)
             }

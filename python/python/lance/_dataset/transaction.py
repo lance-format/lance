@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 import dataclasses
+import hashlib
+import pickle
 import uuid
 import warnings
 from abc import ABC
@@ -47,37 +49,47 @@ class Transaction:
     )
     tag: Optional[str] = None
 
-    def _row_deletions(self):
+    def _row_rewrite(self):
         op = self.operation
         if not (
             isinstance(op, LanceOperation.Update)
             and op.update_mode == "rewrite_rows"
             and not op.fields_modified
             and op.updated_fragment_offsets is None
-            and op.updated_fragments
         ):
             return None
+        # File descriptors identify the output keys without copying potentially
+        # large inline row-ID and version arrays into the worker handoff.
+        digest = hashlib.sha256()
+        for fragment in op.new_fragments:
+            if fragment.overlays or fragment.deletion_file is not None:
+                return None
+            digest.update(
+                pickle.dumps((fragment.physical_rows, fragment.files), protocol=5)
+            )
         return (
             self.read_version,
             tuple(op.removed_fragment_ids),
+            op.inserted_rows_filter,
             tuple(
                 (fragment.id, fragment.deletion_file)
                 for fragment in op.updated_fragments
             ),
+            digest.digest(),
         )
 
-    def _set_affected_rows(self, rows: bytes) -> None:
-        # DeletionFile values are immutable and pickle shares them with the
-        # operation. Bind the hint to the deletions the worker actually staged.
-        deletions = self._row_deletions()
-        if deletions is not None:
-            self._staged_rows = (deletions, rows)
+    def _set_staged_merge_write(
+        self, rows: Optional[bytes], num_inserted_rows: int
+    ) -> None:
+        rewrite = self._row_rewrite()
+        if rewrite is not None:
+            self._staged_rows = (rewrite, rows, num_inserted_rows)
 
     @property
-    def _affected_rows(self) -> Optional[bytes]:
+    def _staged_merge_write(self) -> Optional[tuple[Optional[bytes], int]]:
         staged = getattr(self, "_staged_rows", None)
-        if staged is not None and staged[0] == self._row_deletions():
-            return staged[1]
+        if staged is not None and len(staged) == 3 and staged[0] == self._row_rewrite():
+            return staged[1], staged[2]
         return None
 
 

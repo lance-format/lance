@@ -877,6 +877,9 @@ pub struct UncommittedMergeInsert {
     /// [`CommitBuilder::with_affected_rows`](crate::dataset::CommitBuilder::with_affected_rows) when committing the staged transaction
     /// to distinguish disjoint row updates within the same fragment.
     pub affected_rows: Option<RowAddrTreeMap>,
+    /// Staging statistics. Pass the observed insert count to
+    /// [`CommitBuilder::with_merge_inserted_rows`](crate::dataset::CommitBuilder::with_merge_inserted_rows)
+    /// when committing the same transaction.
     pub stats: MergeStats,
     pub inserted_rows_filter: Option<KeyExistenceFilter>,
 }

@@ -233,6 +233,7 @@ pub struct CommitTransactionOptions<'a> {
     pub retry_timeout: Duration,
     pub manifest_naming_scheme: ManifestNamingScheme,
     pub affected_rows: Option<&'a RowAddrTreeMap>,
+    merge_inserted_rows: Option<u64>,
     append_idempotency_key: Option<AppendIdempotencyKey<'a>>,
     pub expected_latest_version: Option<u64>,
     /// Whether this commit is a tagged fragment-reuse-index trim derived by the
@@ -252,6 +253,7 @@ impl<'a> CommitTransactionOptions<'a> {
             retry_timeout: default_commit_retry_timeout(),
             manifest_naming_scheme,
             affected_rows: None,
+            merge_inserted_rows: None,
             append_idempotency_key: None,
             expected_latest_version: None,
             tagged_frag_reuse_trim: false,
@@ -265,6 +267,11 @@ impl<'a> CommitTransactionOptions<'a> {
 
     pub fn with_affected_rows(mut self, affected_rows: Option<&'a RowAddrTreeMap>) -> Self {
         self.affected_rows = affected_rows;
+        self
+    }
+
+    pub(super) fn with_merge_inserted_rows(mut self, count: Option<u64>) -> Self {
+        self.merge_inserted_rows = count;
         self
     }
 
@@ -302,6 +309,7 @@ pub async fn commit_transaction(
         retry_timeout,
         manifest_naming_scheme,
         affected_rows,
+        merge_inserted_rows,
         append_idempotency_key,
         expected_latest_version,
         tagged_frag_reuse_trim,
@@ -438,6 +446,7 @@ pub async fn commit_transaction(
                 transaction,
                 affected_rows,
                 (!other_transactions.is_empty()).then_some(&read_version_dataset),
+                merge_inserted_rows,
             )
             .await?
             .with_read_version_dataset(&read_version_dataset);

@@ -298,6 +298,12 @@ impl<'a> TransactionRebase<'a> {
                         // transaction, so we must fail to be safe.
                         return Err(self.retryable_conflict_err(other_transaction, other_version));
                     }
+                    (None, Some(_)) if !self_new_fragments.is_empty() => {
+                        // Older MERGE writers omitted the filter when ON listed
+                        // a composite primary key in a different order. Their
+                        // output can contain the same new key in another fragment.
+                        return Err(self.retryable_conflict_err(other_transaction, other_version));
+                    }
                     _ => {}
                 }
             }

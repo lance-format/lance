@@ -3126,11 +3126,15 @@ impl Dataset {
             .with_max_retries(max_retries.unwrap_or(20))
             .with_timeout(commit_timeout);
 
-        match transaction.getattr("_affected_rows") {
-            Ok(rows) if !rows.is_none() => {
-                let rows = rows.cast::<PyBytes>()?;
-                let rows = RowAddrTreeMap::deserialize_from(rows.as_bytes()).infer_error()?;
-                builder = builder.with_affected_rows(rows);
+        match transaction.getattr("_staged_merge_write") {
+            Ok(write) if !write.is_none() => {
+                let (rows, count): (Option<Bound<'_, PyBytes>>, u64) = write.extract()?;
+                builder = builder.with_merge_inserted_rows(count);
+                if let Some(rows) = rows {
+                    builder = builder.with_affected_rows(
+                        RowAddrTreeMap::deserialize_from(rows.as_bytes()).infer_error()?,
+                    );
+                }
             }
             Ok(_) => {}
             Err(err) if err.is_instance_of::<PyAttributeError>(transaction.py()) => {}

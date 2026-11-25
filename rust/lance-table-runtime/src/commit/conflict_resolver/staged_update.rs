@@ -13,7 +13,10 @@ use std::collections::hash_map::Entry;
 #[derive(Debug)]
 pub(super) struct RowHistory {
     read: Table,
+    merge_inserted_rows: Option<u64>,
     latest: HashMap<u64, (u64, Option<DeletionFile>)>,
+    // First mutation of fragments absent at the staged read version.
+    first_new_changes: HashMap<u64, u64>,
     superseded: Vec<(u64, u64, Option<DeletionFile>)>,
     check_intermediate_keys: Option<bool>,
     // Keep the existing precedence of incompatible transaction pairs.
@@ -21,10 +24,12 @@ pub(super) struct RowHistory {
 }
 
 impl RowHistory {
-    pub(super) fn new(read: &Table) -> Box<Self> {
+    pub(super) fn new(read: &Table, merge_inserted_rows: Option<u64>) -> Box<Self> {
         Box::new(Self {
             read: read.clone(),
+            merge_inserted_rows,
             latest: HashMap::new(),
+            first_new_changes: HashMap::new(),
             superseded: Vec::new(),
             check_intermediate_keys: None,
             key_error: None,
@@ -52,18 +57,27 @@ pub(super) fn needs_row_history(
 impl TransactionRebase<'_> {
     /// Physical row addresses describe a row rewrite only while the retained
     /// fragments still refer to the data the writer read.
-    pub(super) fn validate_row_rewrite(&mut self) {
+    pub(super) fn validate_row_rewrite(&mut self, merge_inserted_rows: Option<u64>) {
+        let Operation::Update {
+            update_mode: Some(UpdateMode::RewriteRows),
+            updated_fragments,
+            inserted_rows_filter,
+            ..
+        } = &self.transaction.operation
+        else {
+            return;
+        };
+        // Physical addresses cover matched rows only. Without a key filter,
+        // an insert-capable handoff still needs the fragment conflict check.
+        let untracked_inserts =
+            inserted_rows_filter.is_none() && merge_inserted_rows.is_some_and(|n| n > 0);
         if self.affected_rows.is_some()
-            && let Operation::Update {
-                update_mode: Some(UpdateMode::RewriteRows),
-                updated_fragments,
-                ..
-            } = &self.transaction.operation
-            && !updated_fragments.iter().all(|written| {
-                self.initial_fragments
-                    .get(&written.id)
-                    .is_some_and(|(read, _)| same_row_layout(read, written))
-            })
+            && (untracked_inserts
+                || !updated_fragments.iter().all(|written| {
+                    self.initial_fragments
+                        .get(&written.id)
+                        .is_some_and(|(read, _)| same_row_layout(read, written))
+                }))
         {
             self.affected_rows = None;
         }
@@ -86,19 +100,23 @@ impl TransactionRebase<'_> {
             _ => None,
         };
         if let Some(keys) = keys {
-            history.key_error =
-                match changes_key_domain(&concurrent.operation, keys, history.read.schema()) {
-                    Ok(false) => None,
-                    Ok(true) => Some(Error::retryable_commit_conflict_source(
-                        version,
-                        format!(
-                            "Concurrent {} at version {version} may introduce a key inserted by {}",
-                            concurrent.operation, self.transaction.uuid
-                        )
-                        .into(),
-                    )),
-                    Err(error) => Some(error),
-                };
+            history.key_error = match changes_key_domain(
+                &concurrent.operation,
+                keys,
+                history.read.schema(),
+                history.merge_inserted_rows,
+            ) {
+                Ok(false) => None,
+                Ok(true) => Some(Error::retryable_commit_conflict_source(
+                    version,
+                    format!(
+                        "Concurrent {} at version {version} may introduce a key inserted by {}",
+                        concurrent.operation, self.transaction.uuid
+                    )
+                    .into(),
+                )),
+                Err(error) => Some(error),
+            };
             if history.key_error.is_some() {
                 return;
             }
@@ -119,11 +137,18 @@ impl TransactionRebase<'_> {
             // equal to the read snapshot may have restored an earlier deletion.
             let touched = self.affected_rows.is_some() && self.initial_fragments.contains_key(&id);
             let may_revive_key = keys.is_some()
-                && history
-                    .read
-                    .view()
-                    .find_fragment(id)
-                    .is_none_or(|read| read.deletion_file.is_some());
+                && match history.read.view().find_fragment(id) {
+                    Some(read) => read.deletion_file.is_some(),
+                    None if history.merge_inserted_rows == Some(0) => false,
+                    None => {
+                        history
+                            .first_new_changes
+                            .entry(id)
+                            .and_modify(|first| *first = (*first).min(version))
+                            .or_insert(version);
+                        true
+                    }
+                };
             if !touched && !may_revive_key {
                 continue;
             }
@@ -145,9 +170,10 @@ impl TransactionRebase<'_> {
             }
             let check_keys = may_revive_key
                 && keys.is_some_and(|filter| {
-                    *history
-                        .check_intermediate_keys
-                        .get_or_insert_with(|| !proves_no_inserts(history.read.schema(), filter))
+                    *history.check_intermediate_keys.get_or_insert_with(|| {
+                        history.merge_inserted_rows != Some(0)
+                            && !proves_no_inserts(history.read.schema(), filter)
+                    })
                 });
             let may_delete_row = earlier_file.is_some()
                 && self
@@ -181,6 +207,7 @@ impl TransactionRebase<'_> {
         let read = &history.read;
         let rows = self.affected_rows;
         let check_keys = history.check_intermediate_keys.unwrap_or(false);
+        let first_changes = &history.first_new_changes;
         let superseded = history
             .superseded
             .into_iter()
@@ -189,39 +216,65 @@ impl TransactionRebase<'_> {
             .latest
             .into_iter()
             .map(|(id, (version, file))| (id, version, file, true));
-        futures::stream::iter(superseded.chain(latest))
-            .map(Ok)
-            .try_for_each_concurrent(parallelism, |(id, version, file, latest)| async move {
-                if !latest
-                    && let Some(moved) = rows.and_then(|rows| rows.get(&(id as u32)))
-                    && let Some(mask) = &file
-                {
-                    let deleted = read_table_deletion_file(dataset, id, mask).await?;
-                    if overlaps_deletion(moved, &deleted) {
-                        return Err(conflict(id, version));
-                    }
-                }
-                // A key can reappear and move to another fragment before the
-                // final mask hides its original offset again.
-                if !latest && !check_keys {
-                    return Ok(());
-                }
-                let Some(original) = read.view().find_fragment(id) else {
-                    return Err(conflict(id, version));
-                };
-                if deletion_mask_shrank(
-                    original.deletion_file.as_ref(),
-                    file.as_ref(),
-                    |file| read_table_deletion_file(read, id, file),
-                    |file| read_table_deletion_file(dataset, id, file),
-                )
-                .await?
-                {
+        let check_mask = async |baseline: &Table, change| {
+            let (id, version, file, latest): (u64, u64, Option<DeletionFile>, bool) = change;
+            if !latest
+                && let Some(moved) = rows.and_then(|rows| rows.get(&(id as u32)))
+                && let Some(mask) = &file
+            {
+                let deleted = read_table_deletion_file(dataset, id, mask).await?;
+                if overlaps_deletion(moved, &deleted) {
                     return Err(conflict(id, version));
                 }
-                Ok(())
-            })
-            .await
+            }
+            // A key can reappear and move to another fragment before the
+            // final mask hides its original offset again.
+            if !latest && !check_keys {
+                return Ok(());
+            }
+            // For a fragment introduced after staging, compare against the
+            // actual mask preceding this change. A delete from newly
+            // written rows only shrinks the visible key domain.
+            let original = baseline
+                .view()
+                .find_fragment(id)
+                .ok_or_else(|| conflict(id, version))?;
+            if deletion_mask_shrank(
+                original.deletion_file.as_ref(),
+                file.as_ref(),
+                |file| read_table_deletion_file(baseline, id, file),
+                |file| read_table_deletion_file(dataset, id, file),
+            )
+            .await?
+            {
+                return Err(conflict(id, version));
+            }
+            Ok(())
+        };
+        let mut new_changes = HashMap::<_, Vec<_>>::new();
+        let read_changes = superseded.chain(latest).filter_map(|change| {
+            if let Some(&version) = first_changes.get(&change.0) {
+                new_changes.entry(version).or_default().push(change);
+                None
+            } else {
+                Some(Ok(change))
+            }
+        });
+        futures::stream::iter(read_changes)
+            .try_for_each_concurrent(parallelism, |change| check_mask(read, change))
+            .await?;
+        // Check fragments first changed in the same commit together. Release
+        // each historical manifest before loading the next one.
+        for (version, changes) in new_changes {
+            let before = version.checked_sub(1).ok_or_else(|| {
+                Error::invalid_input("A committed fragment change must have a positive version")
+            })?;
+            let previous = dataset.checkout_version(before).await?;
+            futures::stream::iter(changes.into_iter().map(Ok))
+                .try_for_each_concurrent(parallelism, |change| check_mask(&previous, change))
+                .await?;
+        }
+        Ok(())
     }
 
     /// A lost publication may have promoted a partial deletion to a whole
@@ -266,6 +319,7 @@ fn changes_key_domain(
     operation: &Operation,
     filter: &KeyExistenceFilter,
     read: &Schema,
+    merge_inserted_rows: Option<u64>,
 ) -> Result<bool> {
     let keys = &filter.field_ids;
     let affects_key = |field: &i32| *field >= 0 && field_affects_index(*field, keys, read);
@@ -273,11 +327,14 @@ fn changes_key_domain(
         Operation::Update {
             fields_modified,
             inserted_rows_filter: Some(other),
+            new_fragments,
             ..
         } => Ok(fields_modified
             .iter()
             .any(|&field| affects_key(&(field as i32)))
-            || !key_filters_cover_inserts(read, filter, other)),
+            || (merge_inserted_rows != Some(0)
+                && !new_fragments.is_empty()
+                && !key_filters_cover_inserts(read, filter, other))),
         Operation::DataOverlay { groups } => {
             for overlay in groups.iter().flat_map(|group| &group.overlays) {
                 for (pos, field) in overlay.data_file.fields.iter().enumerate() {

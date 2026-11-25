@@ -665,11 +665,22 @@ impl MergeInsertBuilder {
                 if !updated_fragments.is_empty()
         );
         let transaction = PyLance(staged.transaction).into_pyobject(py)?;
-        if let Some(rows) = staged.affected_rows.filter(|_| retained_fragments) {
-            let encoded = PyBytes::new_with(py, rows.serialized_size(), |buffer| {
-                rows.serialize_into(buffer).infer_error()
-            })?;
-            transaction.call_method1("_set_affected_rows", (encoded,))?;
+        let encoded = staged
+            .affected_rows
+            .filter(|_| retained_fragments)
+            .map(|rows| {
+                PyBytes::new_with(py, rows.serialized_size(), |buffer| {
+                    rows.serialize_into(buffer).infer_error()
+                })
+            })
+            .transpose()?;
+        if encoded.is_some()
+            || (staged.stats.num_inserted_rows == 0 && staged.inserted_rows_filter.is_some())
+        {
+            transaction.call_method1(
+                "_set_staged_merge_write",
+                (encoded, staged.stats.num_inserted_rows),
+            )?;
         }
         Ok((transaction, Self::build_stats(&staged.stats, py)?))
     }

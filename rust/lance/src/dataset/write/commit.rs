@@ -238,6 +238,24 @@ impl<'a> CommitBuilder<'a> {
         self
     }
 
+    /// Supply the insert count reported by the same uncommitted MERGE.
+    /// A zero count lets the resolver distinguish updates from unencoded insert keys.
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result, dataset::{CommitBuilder, write::merge_insert::UncommittedMergeInsert}};
+    /// # async fn commit(uri: &str, staged: UncommittedMergeInsert) -> Result<Dataset> {
+    /// let mut builder = CommitBuilder::new(uri).with_merge_inserted_rows(staged.stats.num_inserted_rows);
+    /// if let Some(rows) = staged.affected_rows {
+    ///     builder = builder.with_affected_rows(rows);
+    /// }
+    /// builder.execute(staged.transaction).await
+    /// # }
+    /// ```
+    pub fn with_merge_inserted_rows(mut self, count: u64) -> Self {
+        self.inner = self.inner.with_merge_inserted_rows(count);
+        self
+    }
+
     /// Set a timeout for the commit operation.
     ///
     /// The timeout bounds the *entire* [`Self::execute`] / [`Self::execute_batch`]
