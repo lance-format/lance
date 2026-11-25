@@ -61,6 +61,11 @@ folder contains a `datagen.py` script that generates one or more lance datasets.
   packs two 4-bit codes per byte, as every writer since 0.20.0 does; 0.19.2
   wrote one code per byte. Readers should search the packed layout, and refuse
   the other with a request to rebuild while compaction keeps its bytes.
+* `v0.24.1/legacy_ivf_pq_4bit_unpacked_appended`: The
+  `v0.19.2/legacy_ivf_pq_4bit_unpacked` dataset after Lance 0.24.1 appended 64
+  rows and an append-only optimize, which added a packed delta segment next to
+  the unpacked one. Readers should refuse search and incremental optimize on
+  it, as they do on the 0.19.2 layout.
 * `v14.0.3/legacy_ivf_pq_4bit_misremapped`: The `v0.24.1/legacy_ivf_pq_4bit`
   dataset after a delete and a compaction on Lance 14.0.3. Releases from
   0.20.0 through 14.0.3 read packed 4-bit pages at one byte per code, so the

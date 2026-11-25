@@ -799,9 +799,11 @@ mod tests {
     use lance_table::format::IndexMetadata;
     use object_store::path::Path;
     use tokio::io::AsyncWriteExt;
+    use uuid::Uuid;
 
     use crate::dataset::optimize::{CompactionOptions, compact_files};
     use crate::index::DatasetIndexExt;
+    use crate::index::DatasetIndexInternalExt;
     use crate::index::vector::ivf::build_ivf_model;
     use crate::utils::test::copy_test_data_to_tmp;
     use lance_index::INDEX_FILE_NAME;
@@ -1094,9 +1096,13 @@ mod tests {
     async fn index_file_footer(dataset: &Dataset) -> bytes::Bytes {
         let indices = dataset.load_indices().await.unwrap();
         let index = indices.iter().find(|i| i.name == "vector_idx").unwrap();
+        segment_file_footer(dataset, index).await
+    }
+
+    async fn segment_file_footer(dataset: &Dataset, segment: &IndexMetadata) -> bytes::Bytes {
         let path = dataset
             .indices_dir()
-            .join(index.uuid.to_string())
+            .join(segment.uuid.to_string())
             .join(INDEX_FILE_NAME);
         let reader = dataset.table_state.object_store.open(&path).await.unwrap();
         read_last_block(reader.as_ref()).await.unwrap()
@@ -1237,30 +1243,96 @@ mod tests {
         );
     }
 
+    async fn assert_search_asks_for_rebuild(dataset: &Dataset) {
+        let query = Float32Array::from(vec![0.5_f32; 16]);
+        let err = dataset
+            .scan()
+            .nearest("vector", &query, 10)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::NotSupported { .. }), "got {err:?}");
+        assert!(err.to_string().contains("Rebuild the index"), "got {err}");
+    }
+
+    /// Runs `options` and expects it to commit nothing: the dataset at `uri`,
+    /// reopened, has the same version, index segments and index directories.
+    async fn optimize_without_commit(
+        uri: &str,
+        dataset: &mut Dataset,
+        options: &OptimizeOptions,
+    ) -> Result<()> {
+        async fn segments(dataset: &Dataset) -> Vec<(Uuid, Option<RoaringBitmap>)> {
+            let indices = dataset.load_indices().await.unwrap();
+            indices
+                .iter()
+                .map(|index| (index.uuid, index.fragment_bitmap.clone()))
+                .collect()
+        }
+        let index_dirs = || {
+            std::fs::read_dir(format!("{uri}/_indices"))
+                .unwrap()
+                .count()
+        };
+        let version = dataset.version().version;
+        let before = segments(dataset).await;
+        let dirs = index_dirs();
+        let result = dataset.optimize_indices(options).await;
+        let reopened = Dataset::open(uri).await.unwrap();
+        assert_eq!(reopened.version().version, version);
+        assert_eq!(segments(&reopened).await, before);
+        assert_eq!(index_dirs(), dirs, "no index directory is left behind");
+        result
+    }
+
+    async fn assert_optimize_asks_for_rebuild(
+        uri: &str,
+        dataset: &mut Dataset,
+        options: &OptimizeOptions,
+    ) {
+        let err = optimize_without_commit(uri, dataset, options)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::NotSupported { .. }), "got {err:?}");
+        assert!(err.to_string().contains("Rebuild the index"), "got {err}");
+    }
+
+    /// Appends one fragment of rows with ids `ids` and random vectors seeded
+    /// by the first id.
+    async fn append_legacy_4bit_rows(dataset: &mut Dataset, ids: Range<i64>) {
+        let schema = Arc::new(Schema::from(dataset.schema()));
+        let num_rows = ids.end - ids.start;
+        let mut seed = [0u8; 32];
+        seed[..8].copy_from_slice(&ids.start.to_le_bytes());
+        let vectors = generate_random_array_with_seed::<Float32Type>(num_rows as usize * 16, seed);
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(arrow_array::Int64Array::from_iter_values(ids)),
+                Arc::new(FixedSizeListArray::try_new_from_values(vectors, 16).unwrap()),
+            ],
+        )
+        .unwrap();
+        dataset
+            .append(RecordBatchIterator::new(vec![Ok(batch)], schema), None)
+            .await
+            .unwrap();
+    }
+
     /// Two legacy 4-bit files that store one byte per sub-vector. pylance
     /// 0.19.2 wrote the first so. The second is the 0.24.1 fixture after a
     /// compaction on 14.0.3, which read each packed page at one byte per
     /// sub-vector and wrote the misread codes and row ids back. See
-    /// `datagen.py` next to each. Search and merging ask for a rebuild,
-    /// compaction keeps the stored bytes as 14.0.3 did, and retrain rebuilds.
+    /// `datagen.py` next to each. Search, appending and merging ask for a
+    /// rebuild, compaction keeps the stored bytes as 14.0.3 did, and retrain
+    /// rebuilds.
     #[rstest::rstest]
     #[case::written_before_0_20("v0.19.2/legacy_ivf_pq_4bit_unpacked")]
     #[case::misremapped("v14.0.3/legacy_ivf_pq_4bit_misremapped")]
     #[tokio::test]
     async fn test_legacy_4bit_ivf_pq_unpacked_index_asks_for_rebuild(#[case] fixture: &str) {
-        async fn assert_search_asks_for_rebuild(dataset: &Dataset) {
-            let query = Float32Array::from(vec![0.5_f32; 16]);
-            let err = dataset
-                .scan()
-                .nearest("vector", &query, 10)
-                .unwrap()
-                .try_into_batch()
-                .await
-                .unwrap_err();
-            assert!(err.to_string().contains("Rebuild the index"), "got {err}");
-        }
-
-        let (_test_dir, mut dataset) = open_legacy_4bit_fixture(fixture).await;
+        let (test_dir, mut dataset) = open_legacy_4bit_fixture(fixture).await;
         assert_search_asks_for_rebuild(&dataset).await;
 
         dataset.delete("id < 300").await.unwrap();
@@ -1286,26 +1358,144 @@ mod tests {
         );
         assert_search_asks_for_rebuild(&dataset).await;
 
-        let schema = Arc::new(Schema::from(dataset.schema()));
-        let vectors = generate_random_array_with_seed::<Float32Type>(64 * 16, [9u8; 32]);
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(arrow_array::Int64Array::from_iter_values(512..576)),
-                Arc::new(FixedSizeListArray::try_new_from_values(vectors, 16).unwrap()),
-            ],
-        )
-        .unwrap();
+        let uri = test_dir.path_str();
+        assert_optimize_asks_for_rebuild(&uri, &mut dataset, &OptimizeOptions::merge(1)).await;
+        append_legacy_4bit_rows(&mut dataset, 512..576).await;
+        for options in [OptimizeOptions::append(), OptimizeOptions::default()] {
+            assert_optimize_asks_for_rebuild(&uri, &mut dataset, &options).await;
+        }
+
         dataset
-            .append(RecordBatchIterator::new(vec![Ok(batch)], schema), None)
+            .optimize_indices(&OptimizeOptions::retrain())
             .await
             .unwrap();
-        let err = dataset
+        assert_legacy_4bit_rows_find_themselves(&dataset).await;
+    }
+
+    /// pylance 0.24.1 appended a packed delta segment to the 0.19.2 index, see
+    /// `test_data/v0.24.1/datagen.py`. A default optimize with new rows merges
+    /// only that delta, but search still fails on the older segment, so it
+    /// asks for a rebuild, as an append does.
+    #[tokio::test]
+    async fn test_legacy_4bit_ivf_pq_delta_on_unpacked_index_asks_for_rebuild() {
+        let (test_dir, mut dataset) =
+            open_legacy_4bit_fixture("v0.24.1/legacy_ivf_pq_4bit_unpacked_appended").await;
+        let segments = dataset.load_indices().await.unwrap();
+        let bitmaps = segments
+            .iter()
+            .map(|segment| segment.fragment_bitmap.clone().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            bitmaps,
+            vec![(0..4).collect::<RoaringBitmap>(), [4].into_iter().collect()]
+        );
+        assert_eq!(
+            read_metadata_offset(&segment_file_footer(&dataset, &segments[1]).await).unwrap(),
+            64 * (2 + 8),
+            "the delta packs two 4-bit codes per byte"
+        );
+        assert_search_asks_for_rebuild(&dataset).await;
+
+        let uri = test_dir.path_str();
+        append_legacy_4bit_rows(&mut dataset, 576..640).await;
+        for options in [OptimizeOptions::default(), OptimizeOptions::append()] {
+            assert_optimize_asks_for_rebuild(&uri, &mut dataset, &options).await;
+        }
+
+        dataset
+            .optimize_indices(&OptimizeOptions::retrain())
+            .await
+            .unwrap();
+        assert_legacy_4bit_rows_find_themselves(&dataset).await;
+    }
+
+    /// Commits a current-format segment over fragment `fragment` that reuses
+    /// the legacy codebook. Its centroids put every row in one partition, far
+    /// above four times its target size of 4, so optimize wants to split it.
+    async fn commit_current_format_segment(dataset: &mut Dataset, fragment: u32) -> Uuid {
+        let legacy_uuid = dataset.load_indices().await.unwrap()[0].uuid;
+        let legacy = dataset
+            .open_vector_index("vector", &legacy_uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let Quantizer::Product(pq) = legacy.quantizer() else {
+            panic!("a legacy IVF_PQ segment reports a product quantizer");
+        };
+        let centroids = FixedSizeListArray::try_new_from_values(
+            Float32Array::from_iter_values(
+                std::iter::repeat_n(0.5, 16).chain(std::iter::repeat_n(100.0, 16)),
+            ),
+            16,
+        )
+        .unwrap();
+        let mut ivf = IvfBuildParams::try_with_centroids(2, Arc::new(centroids)).unwrap();
+        ivf.target_partition_size = Some(4);
+        let params = crate::index::vector::VectorIndexParams::with_ivf_pq_params(
+            MetricType::L2,
+            ivf,
+            lance_index::vector::pq::PQBuildParams::with_codebook(
+                4,
+                4,
+                Arc::new(pq.codebook.values().clone()),
+            ),
+        );
+        let segment = crate::index::CreateIndexBuilder::new(
+            dataset,
+            &["vector"],
+            lance_index::IndexType::Vector,
+            &params,
+        )
+        .name("vector_idx".into())
+        .replace(true)
+        .fragments(vec![fragment])
+        .execute_uncommitted()
+        .await
+        .unwrap();
+        let uuid = segment.uuid;
+        dataset
+            .commit_existing_index_segments("vector_idx", "vector", vec![segment])
+            .await
+            .unwrap();
+        uuid
+    }
+
+    /// An unreadable legacy segment beside a current-format one. A rebalance
+    /// of the current-format segment still runs. New rows are refused by the
+    /// single-process and a named split optimize, an unnamed split optimize
+    /// skips the index, and retrain rebuilds.
+    #[tokio::test]
+    async fn test_legacy_4bit_unpacked_segment_beside_current_format_segment() {
+        let (test_dir, mut dataset) =
+            open_legacy_4bit_fixture("v0.19.2/legacy_ivf_pq_4bit_unpacked").await;
+        let uri = test_dir.path_str();
+        let legacy_uuid = dataset.load_indices().await.unwrap()[0].uuid;
+        append_legacy_4bit_rows(&mut dataset, 512..576).await;
+        let current_uuid = commit_current_format_segment(&mut dataset, 4).await;
+
+        dataset
             .optimize_indices(&OptimizeOptions::default())
             .await
-            .unwrap_err();
-        assert!(matches!(err, Error::NotSupported { .. }), "got {err:?}");
-        assert!(err.to_string().contains("Rebuild the index"), "got {err}");
+            .unwrap();
+        let uuids = dataset
+            .load_indices()
+            .await
+            .unwrap()
+            .iter()
+            .map(|index| index.uuid)
+            .collect::<Vec<_>>();
+        assert_eq!(uuids.len(), 2, "{uuids:?}");
+        assert!(uuids.contains(&legacy_uuid), "{uuids:?}");
+        assert!(!uuids.contains(&current_uuid), "rebalanced: {uuids:?}");
+
+        append_legacy_4bit_rows(&mut dataset, 576..640).await;
+        let split = OptimizeOptions::default().max_rows_per_task(Some(1000));
+        optimize_without_commit(&uri, &mut dataset, &split)
+            .await
+            .unwrap();
+        let named = split.index_names(vec!["vector_idx".into()]);
+        for options in [named, OptimizeOptions::default()] {
+            assert_optimize_asks_for_rebuild(&uri, &mut dataset, &options).await;
+        }
 
         dataset
             .optimize_indices(&OptimizeOptions::retrain())

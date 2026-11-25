@@ -819,6 +819,11 @@ pub(crate) async fn optimize_vector_indices(
             index_type_string(sub_index_type, quantization_type)
         )));
     }
+    // Refuse to merge a segment search cannot read, before any output file.
+    let num_to_merge = options.num_indices_to_merge.unwrap_or(1);
+    for index in existing_indices.iter().rev().take(num_to_merge) {
+        check_legacy_segment_readable(index.as_ref())?;
+    }
     // The legacy writers keep every posting of the segments they merge. With
     // stable row ids an updated row keeps its id in its new fragment, so its
     // old entry would stay in the index next to the new one.
@@ -1153,6 +1158,24 @@ pub(crate) async fn optimize_vector_indices_v2(
     Ok((new_uuid, summary.indices_merged, summary.files))
 }
 
+/// Fails for a legacy IVF_PQ segment whose 4-bit codes search cannot read,
+/// see [`PQIndex::check_codes_readable`].
+pub(crate) fn check_legacy_segment_readable(index: &dyn VectorIndex) -> Result<()> {
+    let Some(segment) = index.as_any().downcast_ref::<IVFIndex>() else {
+        return Ok(());
+    };
+    let Some(pq) = segment.sub_index.as_any().downcast_ref::<PQIndex>() else {
+        return Ok(());
+    };
+    pq.check_codes_readable().map_err(|err| match err {
+        Error::NotSupported { source, .. } => Error::not_supported(format!(
+            "optimizing vector index segment {}: {source}",
+            segment.uuid
+        )),
+        other => other,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn optimize_ivf_pq_indices(
     first_idx: &IVFIndex,
@@ -1166,31 +1189,6 @@ async fn optimize_ivf_pq_indices(
 ) -> Result<(usize, IndexFile)> {
     let metric_type = first_idx.metric_type;
     let dim = first_idx.ivf.dimension();
-
-    let start_pos = existing_indices
-        .len()
-        .saturating_sub(options.num_indices_to_merge.unwrap_or(1));
-    let indices_to_merge = existing_indices[start_pos..]
-        .iter()
-        .map(|idx| {
-            idx.as_any().downcast_ref::<IVFIndex>().ok_or(Error::index(
-                "optimizing vector index: it is not a IVF index".to_string(),
-            ))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    // Every page of a segment keeps the width its file was opened with, so a
-    // segment that cannot be merged is refused here, before the shuffle.
-    for idx in &indices_to_merge {
-        if let Some(segment_pq) = idx.sub_index.as_any().downcast_ref::<PQIndex>() {
-            segment_pq.check_codes_readable().map_err(|err| match err {
-                Error::NotSupported { source, .. } => Error::not_supported(format!(
-                    "optimizing vector index segment {}: {source}",
-                    idx.uuid
-                )),
-                other => other,
-            })?;
-        }
-    }
 
     // TODO: merge `lance::vector::ivf::IVF` and `lance-index::vector::ivf::Ivf`` implementations.
     let ivf = lance_index::vector::ivf::IvfTransformer::with_pq(
@@ -1220,6 +1218,18 @@ async fn optimize_ivf_pq_indices(
 
     let mut ivf_mut = IvfModel::new(first_idx.ivf.centroids.clone().unwrap(), first_idx.ivf.loss);
 
+    let start_pos = existing_indices
+        .len()
+        .saturating_sub(options.num_indices_to_merge.unwrap_or(1));
+
+    let indices_to_merge = existing_indices[start_pos..]
+        .iter()
+        .map(|idx| {
+            idx.as_any().downcast_ref::<IVFIndex>().ok_or(Error::index(
+                "optimizing vector index: it is not a IVF index".to_string(),
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
     write_pq_partitions(
         writer.as_mut(),
         &mut ivf_mut,

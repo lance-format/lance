@@ -37,8 +37,9 @@ use roaring::RoaringBitmap;
 use uuid::Uuid;
 
 use super::vector::ivf::{
-    IVFIndex, SteadyStateRebalance, VectorSegmentCompatibility, index_type_for_segmented_optimize,
-    optimize_vector_indices, select_steady_state_rebalance, vector_segment_compatibility,
+    IVFIndex, SteadyStateRebalance, VectorSegmentCompatibility, check_legacy_segment_readable,
+    index_type_for_segmented_optimize, optimize_vector_indices, select_steady_state_rebalance,
+    vector_segment_compatibility,
 };
 use super::vector::{LogicalVectorIndex, VectorIndexParams, details, fresh_vector_segment_params};
 use super::{CreateIndexBuilder, loading::DatasetIndexInternalExt};
@@ -1898,6 +1899,13 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
             let ivf_view = logical_index.as_ivf()?;
             let compatibility =
                 vector_segment_compatibility(&ivf_view, "optimizing logical vector index")?;
+            // New rows would be indexed next to every segment, and the index
+            // cannot be searched while one of them is unreadable.
+            if !unindexed.is_empty() {
+                for (_, index) in logical_index.iter() {
+                    check_legacy_segment_readable(index.as_ref())?;
+                }
+            }
             let explicit_append = options.num_indices_to_merge == Some(0);
             let default_append_for_heterogeneous_models = options.num_indices_to_merge.is_none()
                 && compatibility == VectorSegmentCompatibility::QueryCompatibleModelsDiffer;

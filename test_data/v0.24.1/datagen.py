@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
 import shutil
+from pathlib import Path
 
 import lance
 import numpy as np
@@ -39,3 +40,31 @@ dataset.create_index(
 stats = dataset.stats.index_stats("vector_idx")
 assert len(dataset.get_fragments()) == 4
 assert stats["indices"][0]["sub_index"]["nbits"] == 4
+
+# An append-only optimize adds a delta segment, written at the packed width,
+# next to the 0.19.2 segment, which it does not read.
+name = "legacy_ivf_pq_4bit_unpacked_appended"
+source = Path(__file__).parent.parent / "v0.19.2" / "legacy_ivf_pq_4bit_unpacked"
+num_appended = 64
+
+shutil.rmtree(name, ignore_errors=True)
+shutil.copytree(source, name)
+
+vectors = np.random.default_rng(7).random((num_appended, dimension), dtype=np.float32)
+data = pa.table(
+    {
+        "id": pa.array(np.arange(num_rows, num_rows + num_appended, dtype=np.int64)),
+        "vector": pa.FixedSizeListArray.from_arrays(
+            pa.array(vectors.reshape(-1)), dimension
+        ),
+    }
+)
+dataset = lance.write_dataset(data, name, mode="append")
+dataset.optimize.optimize_indices(num_indices_to_merge=0)
+
+dataset = lance.dataset(name)
+assert len(dataset.get_fragments()) == 5
+assert [index["fragment_ids"] for index in dataset.list_indices()] == [
+    {0, 1, 2, 3},
+    {4},
+]
