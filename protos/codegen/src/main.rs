@@ -153,7 +153,11 @@ fn generate_table(
     install_generated(
         &out_dir,
         &repo_root.join("rust/lance-table/src/pb"),
-        &["lance.table.rs", "lance.transaction.rs", "lance.snapshot.rs"],
+        &[
+            "lance.table.rs",
+            "lance.transaction.rs",
+            "lance.snapshot.rs",
+        ],
         check,
     )
 }
