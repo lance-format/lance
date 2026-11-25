@@ -350,6 +350,7 @@ fn task_read_config(table: &Table, options: &CompactionOptions) -> FragReadConfi
 }
 
 /// Write `columns` of `source` to one new data file.
+#[allow(clippy::too_many_arguments)]
 async fn write_one_file(
     source: &FileFragment,
     schema: &Schema,
