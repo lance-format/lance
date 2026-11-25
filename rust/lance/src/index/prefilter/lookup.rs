@@ -86,7 +86,7 @@ impl PreparedRowAddrMask {
             if values > budget {
                 return Self {
                     allow: false,
-                    roaring: Some(mask),
+                    roaring: Some(mask.clone()),
                     fragments: BTreeMap::new(),
                 };
             }
@@ -153,7 +153,10 @@ impl PreparedRowAddrMask {
         self.selection(rows, true).collect()
     }
 
-    pub(crate) fn selected_indices<'a>(&self, rows: impl Iterator<Item = &'a u64>) -> Vec<u64> {
+    pub(crate) fn selected_indices<'a>(
+        &self,
+        rows: impl Iterator<Item = &'a u64> + 'a,
+    ) -> Vec<u64> {
         if let Some(mask) = &self.roaring {
             return mask.selected_indices(rows);
         }
