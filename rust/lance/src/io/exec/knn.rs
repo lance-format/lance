@@ -3891,7 +3891,6 @@ mod tests {
             rows.extend([3, 7, u64::MAX, 3_u64 << 32]);
             let mut offsets = vec![u32::MAX];
             base.filter_row_offsets_into(Box::new(rows[..8].iter()), &mut offsets);
-            assert!(base.lookup_mask.get().is_none());
             assert_eq!(
                 offsets
                     .iter()
@@ -3900,7 +3899,6 @@ mod tests {
                 base.mask().selected_indices(rows[..8].iter())
             );
             base.filter_row_offsets_into(Box::new(rows.iter()), &mut offsets);
-            assert!(base.lookup_mask.get().is_some());
             assert_eq!(
                 offsets
                     .iter()

@@ -718,6 +718,62 @@ mod test {
         only_missing_frags: Arc<Dataset>,
     }
 
+    #[rstest]
+    #[case::allow(true)]
+    #[case::block(false)]
+    #[test]
+    fn test_dataset_prepared_mask_reuses_offsets(#[case] allow: bool) {
+        let rows = (0..70000_u64).rev().collect::<Vec<_>>();
+        let selected = rows.iter().copied().filter(|row| row % 3 == 0).collect();
+        let mask = Arc::new(if allow {
+            RowAddrMask::from_allowed(selected)
+        } else {
+            RowAddrMask::from_block(selected)
+        });
+        let filter = DatasetPreFilter {
+            deleted_ids: None,
+            filtered_ids: None,
+            deleted_fragments: None,
+            overlay_block: Some(mask.clone()),
+            final_mask: Mutex::new(OnceCell::from(mask.clone())),
+            lookup_mask: OnceLock::new(),
+        };
+        let mut offsets = vec![u32::MAX];
+        filter.filter_row_offsets_into(Box::new(rows[..8].iter()), &mut offsets);
+        assert!(filter.lookup_mask.get().is_none());
+        assert_eq!(
+            offsets
+                .iter()
+                .map(|&offset| u64::from(offset))
+                .collect::<Vec<_>>(),
+            mask.selected_indices(rows[..8].iter())
+        );
+        filter.filter_row_offsets_into(Box::new(rows.iter()), &mut offsets);
+        let prepared = filter.lookup_mask.get().unwrap();
+        assert_eq!(
+            offsets
+                .iter()
+                .map(|&offset| u64::from(offset))
+                .collect::<Vec<_>>(),
+            mask.selected_indices(rows.iter())
+        );
+        assert_eq!(
+            filter.filter_row_ids(Box::new(rows.iter())),
+            mask.selected_indices(rows.iter())
+        );
+        filter.filter_row_offsets_into(Box::new(rows[..8].iter()), &mut offsets);
+        assert_eq!(
+            offsets
+                .iter()
+                .map(|&offset| u64::from(offset))
+                .collect::<Vec<_>>(),
+            mask.selected_indices(rows[..8].iter())
+        );
+        assert!(std::ptr::eq(prepared, filter.lookup_mask.get().unwrap()));
+        filter.filter_row_offsets_into(Box::new(std::iter::empty()), &mut offsets);
+        assert!(offsets.is_empty());
+    }
+
     async fn test_datasets(use_stable_row_id: bool) -> TestDatasets {
         let test_data = BatchGenerator::new()
             .col(Box::new(IncrementingInt32::new().named("x")))
