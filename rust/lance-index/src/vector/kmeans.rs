@@ -4042,6 +4042,10 @@ mod tests {
     #[rstest]
     #[case::lloyd(HierarchicalNodeAlgorithm::Lloyd)]
     #[case::emeans(HierarchicalNodeAlgorithm::EMeans(EMeansParams::default()))]
+    #[case::emeans_fractional(HierarchicalNodeAlgorithm::EMeans(EMeansParams {
+        epochs: 2.5,
+        ..Default::default()
+    }))]
     fn test_hierarchical_kmeans_is_seeded_and_balanced(
         #[case] node_algorithm: HierarchicalNodeAlgorithm,
     ) {
