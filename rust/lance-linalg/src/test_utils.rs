@@ -2,9 +2,12 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use half::{bf16, f16};
+use lance_core::utils::cpu::Dispatch;
 use proptest::prelude::*;
 use proptest::test_runner::{Config, TestCaseResult, TestRunner};
 use std::ops::Range;
+
+use crate::distance::{BatchKernel, PairKernel};
 
 const CASES_PER_DIMENSION_SHARD: u32 = 16;
 const MIN_TEST_DIMENSION: usize = 4;
@@ -126,6 +129,41 @@ where
     runner.run(&strategy, property).unwrap();
 }
 
+/// Checks that `batch` mirrors `pair` candidate for candidate, and that each
+/// host-supported batch kernel writes, bit for bit, what its pair kernel
+/// returns for each vector. The batch is `[y, x]`.
+pub fn check_batch_matches_pair<T: Copy>(
+    pair: &Dispatch<PairKernel<T>>,
+    batch: &Dispatch<BatchKernel<T>>,
+    x: &[T],
+    y: &[T],
+) -> TestCaseResult {
+    prop_assert_eq!(pair.candidates().len(), batch.candidates().len());
+    let vectors = [y, x].concat();
+    for (pair, batch) in pair.candidates().iter().zip(batch.candidates()) {
+        prop_assert!(
+            pair.features() == batch.features(),
+            "{} and {} need different features",
+            pair.name(),
+            batch.name()
+        );
+        let (Some(pair_kernel), Some(batch_kernel)) = (pair.kernel(), batch.kernel()) else {
+            continue;
+        };
+        let mut got = [f32::NAN; 2];
+        batch_kernel.call(x, &vectors, x.len(), &mut got);
+        let want = [pair_kernel.call(x, y), pair_kernel.call(x, x)];
+        prop_assert!(
+            got.map(f32::to_bits) == want.map(f32::to_bits),
+            "{} at dim {}: {got:?} != {} {want:?}",
+            batch.name(),
+            x.len(),
+            pair.name()
+        );
+    }
+    Ok(())
+}
+
 /// Input pairs shared by the u8 distance kernel tests.
 pub mod u8_inputs {
     /// Covers empty input and both sides of the 32- and 64-element SIMD strides.
@@ -180,4 +218,45 @@ pub mod u8_inputs {
             })
             .collect()
     }
+}
+
+/// Checks that each host-supported batch kernel scores a vector the same, bit
+/// for bit, wherever it sits in the batch. A kernel may reduce a block of
+/// vectors together and the rest one at a time; the two must agree.
+///
+/// The batch is nine rotations of `y`: one block of eight plus one left over.
+/// Only the f32 batch kernels reduce blocks of vectors, so it takes their
+/// dispatch.
+pub fn check_batch_position_independent(
+    batch: &Dispatch<BatchKernel>,
+    x: &[f32],
+    y: &[f32],
+) -> TestCaseResult {
+    let vectors = (0..9)
+        .flat_map(|shift| {
+            let mut v = y.to_vec();
+            v.rotate_left(shift % y.len());
+            v
+        })
+        .collect::<Vec<_>>();
+    for candidate in batch.candidates() {
+        let Some(kernel) = candidate.kernel() else {
+            continue;
+        };
+        let mut together = [f32::NAN; 9];
+        kernel.call(x, &vectors, x.len(), &mut together);
+        for (i, v) in vectors.chunks_exact(x.len()).enumerate() {
+            let mut alone = [f32::NAN];
+            kernel.call(x, v, x.len(), &mut alone);
+            prop_assert!(
+                together[i].to_bits() == alone[0].to_bits(),
+                "{} at dim {}: vector {i} scored {} in the batch, {} alone",
+                candidate.name(),
+                x.len(),
+                together[i],
+                alone[0]
+            );
+        }
+    }
+    Ok(())
 }

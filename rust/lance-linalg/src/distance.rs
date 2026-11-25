@@ -50,6 +50,47 @@ macro_rules! half_c_kernels {
     };
 }
 
+/// Declares a batch candidate for each listed half-precision pair kernel,
+/// with the same features, that runs the pair kernel on each vector.
+#[cfg(kernel_support = "half")]
+macro_rules! half_c_batch_kernels {
+    ($(
+        $(#[$attr:meta])*
+        $candidate:ident: BatchKernel<$t:ty> = $name:ident($pair:ident; $($feature:literal),*);
+    )*) => {
+        $(
+            $(#[$attr])*
+            lance_core::target_kernel! {
+                #[target_features($($feature),*)]
+                #[candidate(pub(super) $candidate: $crate::distance::BatchKernel<$t>)]
+                /// Out of line even where the dispatch resolves at compile
+                /// time, so the loop gets registers of its own: inlined into
+                /// `l2_batch_into` on aarch64, LLVM spilled the batch pointer
+                /// to the stack, a store-to-load round trip on every
+                /// dimension-8 distance. Other tiers share it for uniformity.
+                #[inline(never)]
+                fn $name(x: &[$t], batch: &[$t], dimension: usize, output: &mut [f32]) {
+                    // A pointer walk rather than `zip` with `chunks_exact`:
+                    // the zip kept a row index, its successor and the row
+                    // count live across the C call, more values than x86
+                    // has callee-saved registers, so two of them were
+                    // reloaded from the stack on every row.
+                    let batch = &batch[..output.len() * dimension];
+                    let mut y = batch.as_ptr();
+                    for distance in output.iter_mut() {
+                        // SAFETY: `batch` holds `output.len()` vectors of
+                        // `dimension` elements.
+                        unsafe {
+                            *distance = $pair(x, std::slice::from_raw_parts(y, dimension));
+                            y = y.add(dimension);
+                        }
+                    }
+                }
+            }
+        )*
+    };
+}
+
 /// What build.rs compiles each half-precision C object for, as feature sets.
 /// Every `half_c` module checks its candidates against these at compile time.
 #[cfg(kernel_support = "half")]
