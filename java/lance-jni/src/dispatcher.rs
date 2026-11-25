@@ -96,7 +96,7 @@ fn handle_error(
     error: &str,
 ) {
     let error_jstr = match env.new_string(error) {
-        Ok(s) => s,
+        Ok(s) => env.auto_local(s),
         Err(e) => {
             log::error!("Failed to create JString for error: {:?}", e);
             let _ = env.exception_clear();

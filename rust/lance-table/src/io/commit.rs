@@ -29,6 +29,7 @@ use std::sync::atomic::AtomicBool;
 use std::{fmt::Debug, fs::DirEntry};
 
 use super::manifest::write_manifest;
+use chrono::{DateTime, Utc};
 use futures::Stream;
 use futures::future::Either;
 use futures::{
@@ -59,7 +60,9 @@ use {
     self::external_manifest::{ExternalManifestCommitHandler, ExternalManifestStore},
     aws_credential_types::provider::ProvideCredentials,
     aws_credential_types::provider::error::CredentialsError,
-    lance_io::object_store::{StorageOptions, providers::aws::build_aws_credential},
+    lance_io::object_store::{
+        StorageOptions, providers::aws::build_aws_credential_with_storage_options,
+    },
     object_store::aws::AmazonS3ConfigKey,
     object_store::aws::AwsCredentialProvider,
     std::borrow::Cow,
@@ -173,8 +176,7 @@ impl ManifestNamingScheme {
 /// And it should also run until completion before resuming other operations.
 pub async fn migrate_scheme_to_v2(object_store: &ObjectStore, dataset_base: &Path) -> Result<()> {
     object_store
-        .inner
-        .list(Some(&dataset_base.clone().join(VERSIONS_DIR)))
+        .list_objects(Some(&dataset_base.clone().join(VERSIONS_DIR)))
         .try_filter(|res| {
             let res = if let Some(filename) = res.location.filename() {
                 ManifestNamingScheme::detect_scheme(filename) == Some(ManifestNamingScheme::V1)
@@ -187,7 +189,7 @@ pub async fn migrate_scheme_to_v2(object_store: &ObjectStore, dataset_base: &Pat
             let filename = meta.location.filename().unwrap();
             let version = ManifestNamingScheme::V1.parse_version(filename).unwrap();
             let path = ManifestNamingScheme::V2.manifest_path(dataset_base, version);
-            object_store.inner.rename(&meta.location, &path).await?;
+            object_store.rename(&meta.location, &path).await?;
             Ok(())
         })
         .await?;
@@ -266,6 +268,17 @@ pub struct ManifestLocation {
     /// where it keeps one (`ExternalManifestStore::get_identity`). A dataset
     /// recreated at the same version has a different one.
     pub identity: Option<String>,
+    /// When the manifest object was last written, if the listing reported it.
+    ///
+    /// This is the object's write time, not `Manifest::timestamp`, which is the
+    /// logical commit time recorded inside the manifest. They agree closely in normal
+    /// operation but are not the same value: rewriting an object by copy or migration
+    /// moves this and leaves the commit time alone. Callers that need the commit time
+    /// must read the manifest.
+    ///
+    /// Populated by listings that see `ObjectMeta`; `None` when the location was
+    /// resolved by another route, such as probing a known version.
+    pub last_modified: Option<DateTime<Utc>>,
 }
 
 impl TryFrom<object_store::ObjectMeta> for ManifestLocation {
@@ -287,6 +300,7 @@ impl TryFrom<object_store::ObjectMeta> for ManifestLocation {
             naming_scheme: scheme,
             e_tag: meta.e_tag,
             identity: None,
+            last_modified: Some(meta.last_modified),
         })
     }
 }
@@ -401,7 +415,7 @@ async fn read_version_from_hint(object_store: &ObjectStore, base: &Path) -> Opti
 /// # }
 /// ```
 pub async fn read_version_hint(object_store: &ObjectStore, base: &Path) -> Result<Option<u64>> {
-    let result = match object_store.inner.get(&version_hint_path(base)).await {
+    let result = match object_store.read_object(&version_hint_path(base)).await {
         Ok(result) => result,
         Err(ObjectStoreError::NotFound { .. }) => return Ok(None),
         Err(error) => return Err(error.into()),
@@ -438,6 +452,7 @@ async fn read_version_hint_and_probe(
         naming_scheme: scheme,
         e_tag: meta.e_tag,
         identity: None,
+        last_modified: None,
     })
 }
 
@@ -476,16 +491,14 @@ async fn probe_versions_upward(
     // Newer datasets use V2; fall back to V1 if the V2 path is not found.
     let mut scheme = ManifestNamingScheme::V2;
     let meta = match object_store
-        .inner
-        .head(&scheme.manifest_path(base, from_version))
+        .stat(&scheme.manifest_path(base, from_version))
         .await
     {
         Ok(meta) => meta,
         Err(ObjectStoreError::NotFound { .. }) => {
             scheme = ManifestNamingScheme::V1;
             match object_store
-                .inner
-                .head(&scheme.manifest_path(base, from_version))
+                .stat(&scheme.manifest_path(base, from_version))
                 .await
             {
                 Ok(meta) => meta,
@@ -500,11 +513,7 @@ async fn probe_versions_upward(
     let mut version = from_version;
     loop {
         let next = version + 1;
-        match object_store
-            .inner
-            .head(&scheme.manifest_path(base, next))
-            .await
-        {
+        match object_store.stat(&scheme.manifest_path(base, next)).await {
             Ok(meta) => {
                 probed.push((next, meta));
                 version = next;
@@ -567,6 +576,7 @@ async fn list_manifests_since_version_with_hint(
             naming_scheme: scheme,
             e_tag: meta.e_tag,
             identity: None,
+            last_modified: None,
         })
         .collect();
 
@@ -579,8 +589,7 @@ async fn list_manifests_since_version_with_hint(
             futures::stream::iter((since_version + 1)..hint_version)
                 .map(|version| async move {
                     object_store
-                        .inner
-                        .head(&scheme.manifest_path(base, version))
+                        .stat(&scheme.manifest_path(base, version))
                         .await
                         .map(|meta| ManifestLocation {
                             version,
@@ -589,6 +598,7 @@ async fn list_manifests_since_version_with_hint(
                             naming_scheme: scheme,
                             e_tag: meta.e_tag,
                             identity: None,
+                            last_modified: None,
                         })
                 })
                 .buffer_unordered(object_store.io_parallelism())
@@ -646,6 +656,7 @@ async fn resolve_version_from_listing(
                 naming_scheme: scheme,
                 e_tag: meta.e_tag,
                 identity: None,
+                last_modified: None,
             })
         }
         // If the list is not lexically ordered, we need to iterate all manifests
@@ -680,6 +691,7 @@ async fn resolve_version_from_listing(
                 naming_scheme: scheme,
                 e_tag: current_meta.e_tag,
                 identity: None,
+                last_modified: None,
             })
         }
         (None, _) => Err(Error::not_found(
@@ -746,6 +758,7 @@ fn current_manifest_local(base: &Path) -> std::io::Result<Option<ManifestLocatio
             naming_scheme,
             e_tag: Some(get_etag(&metadata)),
             identity: None,
+            last_modified: None,
         }))
     } else {
         Ok(None)
@@ -781,6 +794,7 @@ fn detached_manifest_location_from_meta(
         naming_scheme: ManifestNamingScheme::V2,
         e_tag: meta.e_tag,
         identity: None,
+        last_modified: None,
     })
 }
 
@@ -789,8 +803,13 @@ pub fn list_detached_manifests<'a>(
     base_path: &Path,
     object_store: &'a dyn OSObjectStore,
 ) -> impl Stream<Item = Result<ManifestLocation>> + 'a {
+    let versions_dir = base_path.clone().join(VERSIONS_DIR);
+    // Detached names sort after every attached manifest and temporary file, so
+    // stores that support a start offset skip those on the server.
+    let offset = versions_dir.clone().join(DETACHED_VERSION_PREFIX);
     object_store
-        .read_dir_all(&base_path.clone().join(VERSIONS_DIR), None)
+        .list_with_offset(Some(&versions_dir), &offset)
+        .map_err(Error::from)
         .filter_map(|obj_meta| {
             futures::future::ready(
                 obj_meta
@@ -1125,6 +1144,7 @@ async fn default_resolve_version(
             size: None,
             e_tag: None,
             identity: None,
+            last_modified: None,
         });
     }
 
@@ -1139,6 +1159,7 @@ async fn default_resolve_version(
             naming_scheme: scheme,
             e_tag: meta.e_tag,
             identity: None,
+            last_modified: None,
         }),
         Err(ObjectStoreError::NotFound { .. }) => {
             // fallback to V1
@@ -1150,6 +1171,7 @@ async fn default_resolve_version(
                 naming_scheme: scheme,
                 e_tag: None,
                 identity: None,
+                last_modified: None,
             })
         }
         Err(e) => Err(e.into()),
@@ -1292,13 +1314,14 @@ pub async fn commit_handler_from_url(
 
             let provider_scheme = storage_options_raw.aws_provider_scheme()?;
 
-            let (aws_creds, region) = build_aws_credential(
+            let (aws_creds, region) = build_aws_credential_with_storage_options(
                 options.s3_credentials_refresh_offset,
                 options.aws_credentials.clone(),
                 Some(&storage_options),
                 region,
                 accessor,
                 provider_scheme,
+                &storage_options_raw,
             )
             .await?;
 
@@ -1409,6 +1432,7 @@ impl CommitHandler for UnsafeCommitHandler {
             path: version_path,
             e_tag: res.e_tag,
             identity: None,
+            last_modified: None,
         })
     }
 }
@@ -1527,7 +1551,7 @@ where
         let lease = LeaseGuard::new(self.lock(manifest.version).await?);
 
         // Head the location and make sure it's not already committed
-        match object_store.inner.head(&path).await {
+        match object_store.stat(&path).await {
             Ok(_) => {
                 // The path already exists, so it's already committed
                 // Release the lock
@@ -1560,6 +1584,7 @@ where
             path,
             e_tag: res.e_tag,
             identity: None,
+            last_modified: None,
         })
     }
 }
@@ -1634,21 +1659,25 @@ impl CommitHandler for RenameCommitHandler {
 
         let res = manifest_writer(object_store, manifest, indices, &tmp_path, transaction).await?;
 
-        match object_store
-            .inner
-            .rename_if_not_exists(&tmp_path, &path)
-            .await
-        {
+        match object_store.rename_if_not_exists(&tmp_path, &path).await {
             Ok(_) => {
                 // Successfully committed
                 write_version_hint(object_store, base_path, manifest.version).await;
+                // Without an atomic rename the store publishes by copying, so the
+                // staging object's token need not describe the final path.
+                let published = object_store
+                    .inner
+                    .head(&path)
+                    .await
+                    .map_err(|error| CommitError::OtherError(error.into()))?;
                 Ok(ManifestLocation {
                     version: manifest.version,
                     path,
                     size: Some(res.size as u64),
                     naming_scheme,
-                    e_tag: None, // Re-name can change e-tag.,
+                    e_tag: published.e_tag,
                     identity: None,
+                    last_modified: None,
                 })
             }
             Err(ObjectStoreError::AlreadyExists { .. }) => {
@@ -1709,8 +1738,7 @@ impl CommitHandler for ConditionalPutCommitHandler {
         let dummy_data = memory_store.read_one_all(&dummy_path.into()).await?;
         let size = dummy_data.len() as u64;
         let res = object_store
-            .inner
-            .put_opts(
+            .put_payload_opts(
                 &path,
                 dummy_data.into(),
                 PutOptions {
@@ -1735,6 +1763,7 @@ impl CommitHandler for ConditionalPutCommitHandler {
             naming_scheme,
             e_tag: res.e_tag,
             identity: None,
+            last_modified: None,
         })
     }
 }
@@ -1988,8 +2017,7 @@ mod tests {
             versions_dir.clone().join("irrelevant"),
         ];
         let actual_files = object_store
-            .inner
-            .list(Some(&versions_dir))
+            .list_objects(Some(&versions_dir))
             .map_ok(|res| res.location)
             .try_collect::<Vec<_>>()
             .await
@@ -2031,6 +2059,34 @@ mod tests {
             .unwrap();
 
         assert_eq!(actual_versions, expected_paths);
+    }
+
+    #[tokio::test]
+    async fn test_list_manifest_locations_reports_last_modified() {
+        // The listing already sees ObjectMeta, so the manifest write time is free.
+        // Dropping it forces callers that only need a version's age to read the whole
+        // manifest, which is the cost `expire_versions` exists to avoid.
+        let object_store = ObjectStore::memory();
+        let base = Path::from("base");
+        for version in 0..3 {
+            let path = ManifestNamingScheme::V2.manifest_path(&base, version);
+            object_store.put(&path, b"".as_slice()).await.unwrap();
+        }
+
+        let locations = ConditionalPutCommitHandler
+            .list_manifest_locations(&base, &object_store, true)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        assert_eq!(locations.len(), 3);
+        for location in &locations {
+            assert!(
+                location.last_modified.is_some(),
+                "version {} lost its write time in the listing",
+                location.version
+            );
+        }
     }
 
     #[tokio::test]
@@ -2451,9 +2507,16 @@ mod tests {
         let base = Path::from("base");
         let versions_dir = base.clone().join(VERSIONS_DIR);
 
-        // Create some regular manifests
+        // Create some regular manifests, under both naming schemes, and the other
+        // files that live next to them.
         for version in [1, 2, 3] {
-            let path = ManifestNamingScheme::V2.manifest_path(&base, version);
+            for scheme in [ManifestNamingScheme::V1, ManifestNamingScheme::V2] {
+                let path = scheme.manifest_path(&base, version);
+                object_store.put(&path, b"".as_slice()).await.unwrap();
+            }
+        }
+        for name in [".tmp_1.manifest_abc", VERSION_HINT_FILE] {
+            let path = versions_dir.clone().join(name);
             object_store.put(&path, b"".as_slice()).await.unwrap();
         }
 

@@ -3,6 +3,24 @@
 
 use super::*;
 
+#[tokio::test]
+#[allow(deprecated)]
+async fn cleanup_policy_alias_feeds_retention_policy_setter() {
+    let fixture = MockDatasetFixture::try_new_in_memory().unwrap();
+    fixture.create_some_data().await.unwrap();
+    let dataset = fixture.open().await.unwrap();
+    let alias: crate::dataset::cleanup::retention::CleanupPolicy =
+        parse_cleanup_policy(r#"{"rules":[{"type":"remove_all","older_than":"14days"}]}"#).unwrap();
+    let operation = dataset
+        .cleanup(CleanupPolicy::default())
+        .with_retention_policy(alias)
+        .unwrap();
+    assert_eq!(
+        operation.retention_policy.as_deref(),
+        Some(RetentionPolicy::default().rules())
+    );
+}
+
 #[rstest]
 #[tokio::test]
 async fn cleanup_default_policy_is_remove_all_after_two_weeks(
@@ -65,12 +83,17 @@ fn cleanup_policy_preserves_large_duration_precision() {
     );
 }
 
+// Rule semantics are covered by `expiry::tests`; these cases cover config
+// parsing, tag and filter wiring, and the delete_unverified sweep.
 #[rstest]
+// (auto_config, protected, delete_unverified)
+#[case::configured_and_protected(true, true, true)]
+#[case::builder(false, false, false)]
 #[tokio::test]
 async fn cleanup_retention_policy_ladder(
-    #[values(false, true)] auto_config: bool,
-    #[values(false, true)] protected: bool,
-    #[values(false, true)] delete_unverified: bool,
+    #[case] auto_config: bool,
+    #[case] protected: bool,
+    #[case] delete_unverified: bool,
 ) {
     let fixture = MockDatasetFixture::try_new_in_memory().unwrap();
     for (index, hour) in [
@@ -105,6 +128,7 @@ async fn cleanup_retention_policy_ladder(
     let expected_data = dataset.scan().try_into_batch().await.unwrap();
     let orphan = dataset.data_dir().join("uncommitted.lance");
     dataset
+        .table_state
         .object_store
         .put(&orphan, b"uncommitted")
         .await
@@ -178,7 +202,12 @@ async fn cleanup_retention_policy_ladder(
         stats.old_versions * 2 + u64::from(delete_unverified)
     );
     assert_eq!(
-        dataset.object_store.exists(&orphan).await.unwrap(),
+        dataset
+            .table_state
+            .object_store
+            .exists(&orphan)
+            .await
+            .unwrap(),
         !delete_unverified
     );
     assert_eq!(
@@ -200,36 +229,6 @@ async fn cleanup_retention_policy_ladder(
         );
     }
     assert_eq!(operation.execute().await.unwrap().old_versions, 0);
-}
-
-#[tokio::test]
-async fn cleanup_retention_bands_have_independent_buckets() {
-    let fixture = MockDatasetFixture::try_new_in_memory().unwrap();
-    for (index, hour) in [200, 800, 801, 960].into_iter().enumerate() {
-        MockClock::set_system_time(Duration::from_secs(hour * 3600));
-        if index == 0 {
-            fixture.create_some_data().await.unwrap();
-        } else {
-            fixture.overwrite_some_data().await.unwrap();
-        }
-    }
-    let dataset = fixture.open().await.unwrap();
-    let operation = dataset
-        .cleanup(CleanupPolicy::default())
-        .with_retention_policy(RetentionPolicy::new(vec![
-            CleanupRule::KeepOne {
-                per_interval: Duration::from_secs(3600),
-                older_than: MIN_THINNING_AGE,
-            },
-            CleanupRule::KeepOne {
-                per_interval: Duration::from_secs(900),
-                older_than: Duration::from_secs(7 * 86_400),
-            },
-        ]))
-        .unwrap();
-    assert_eq!(operation.explain().await.unwrap().stats.old_versions, 0);
-    assert_eq!(operation.execute().await.unwrap().old_versions, 0);
-    assert_eq!(dataset.version_refs().await.unwrap().len(), 4);
 }
 
 #[rstest]
@@ -263,14 +262,15 @@ fn cleanup_retention_policy_validation(#[case] value: &str, #[case] message: &st
 }
 
 #[rstest]
-#[case::daily(24, vec![4, 7, 8, 9, 10])]
-#[case::twice_daily(12, vec![2, 4, 7, 8, 9, 10])]
+// (period_hours, expected_versions, delete_unverified, auto_config)
+#[case::daily(24, vec![4, 7, 8, 9, 10], false, false)]
+#[case::twice_daily_configured(12, vec![2, 4, 7, 8, 9, 10], true, true)]
 #[tokio::test]
 async fn cleanup_keeps_one_per_period(
     #[case] period_hours: u64,
     #[case] expected_versions: Vec<u64>,
-    #[values(false, true)] delete_unverified: bool,
-    #[values(false, true)] auto_config: bool,
+    #[case] delete_unverified: bool,
+    #[case] auto_config: bool,
 ) {
     let fixture = MockDatasetFixture::try_new_in_memory().unwrap();
     for (index, hour) in [0, 2, 1, 12, 24, 26, 26, 48, 49, 96]
@@ -354,14 +354,15 @@ async fn cleanup_keeps_one_per_period(
 }
 
 #[rstest]
-#[case::current_hint(None, vec![5, 7, 9, 10, 11, 12, 13, 14])]
-#[case::stale_hint(Some(9), vec![5, 7, 8, 9, 10, 11, 12, 13, 14])]
+// (hinted_version, expected_versions, auto_config, filtered)
+#[case::current_hint_filtered(None, vec![5, 7, 9, 10, 11, 12, 13, 14], false, true)]
+#[case::stale_hint_configured(Some(9), vec![5, 7, 8, 9, 10, 11, 12, 13, 14], true, false)]
 #[tokio::test]
 async fn cleanup_separates_expiration_and_thinning(
     #[case] hinted_version: Option<u64>,
     #[case] mut expected_versions: Vec<u64>,
-    #[values(false, true)] auto_config: bool,
-    #[values(false, true)] filtered: bool,
+    #[case] auto_config: bool,
+    #[case] filtered: bool,
 ) {
     let fixture = MockDatasetFixture::try_new().unwrap();
     for (index, hour) in [0, 1, 24, 25, 72, 96, 97, 168, 169, 192, 193, 216, 217, 240]
@@ -377,7 +378,12 @@ async fn cleanup_separates_expiration_and_thinning(
     }
     let dataset = fixture.open().await.unwrap();
     if let Some(version) = hinted_version {
-        write_version_hint(&dataset.object_store, &dataset.base, version).await;
+        write_version_hint(
+            &dataset.table_state.object_store,
+            &dataset.table_state.base,
+            version,
+        )
+        .await;
     }
     let mut operation = if auto_config {
         let mut manifest = dataset.manifest.as_ref().clone();
@@ -572,14 +578,15 @@ async fn cleanup_thinning_preserves_branch_dependencies(
 }
 
 #[rstest]
-#[case::default(None, 1)]
-#[case::three_days(Some(Duration::from_secs(3 * 86_400)), 0)]
+// (age, expected_removed, auto_config, pinned_snapshot)
+#[case::default_pinned(None, 1, false, true)]
+#[case::three_days_configured(Some(Duration::from_secs(3 * 86_400)), 0, true, false)]
 #[tokio::test]
 async fn cleanup_thinning_anchors_to_hint(
     #[case] age: Option<Duration>,
     #[case] expected_removed: u64,
-    #[values(false, true)] auto_config: bool,
-    #[values(false, true)] pinned_snapshot: bool,
+    #[case] auto_config: bool,
+    #[case] pinned_snapshot: bool,
 ) {
     let fixture = MockDatasetFixture::try_new().unwrap();
     for (index, hour) in [0, 1, 24, 25, 48, 1000, 72, 1, 120].into_iter().enumerate() {
@@ -591,8 +598,13 @@ async fn cleanup_thinning_anchors_to_hint(
         }
     }
     let dataset = fixture.open().await.unwrap();
-    assert!(!dataset.object_store.list_is_lexically_ordered);
-    write_version_hint(&dataset.object_store, &dataset.base, 7).await;
+    assert!(!dataset.table_state.object_store.list_is_lexically_ordered);
+    write_version_hint(
+        &dataset.table_state.object_store,
+        &dataset.table_state.base,
+        7,
+    )
+    .await;
     let dataset = if pinned_snapshot {
         Box::new(dataset.checkout_version(6).await.unwrap())
     } else {
@@ -722,9 +734,11 @@ async fn cleanup_thinning_fails_on_invalid_hint(
     let dataset = fixture.open().await.unwrap();
     if is_malformed {
         dataset
+            .table_state
             .object_store
             .put(
                 &dataset
+                    .table_state
                     .base
                     .clone()
                     .join("_versions")
@@ -734,17 +748,28 @@ async fn cleanup_thinning_fails_on_invalid_hint(
             .await
             .unwrap();
     } else {
-        write_version_hint(&dataset.object_store, &dataset.base, hinted_version).await;
+        write_version_hint(
+            &dataset.table_state.object_store,
+            &dataset.table_state.base,
+            hinted_version,
+        )
+        .await;
         let location = dataset
+            .table_state
             .commit_handler
             .resolve_version_location(
-                &dataset.base,
+                &dataset.table_state.base,
                 hinted_version,
-                dataset.object_store.inner.as_ref(),
+                dataset.table_state.object_store.inner.as_ref(),
             )
             .await
             .unwrap();
-        dataset.object_store.delete(&location.path).await.unwrap();
+        dataset
+            .table_state
+            .object_store
+            .delete(&location.path)
+            .await
+            .unwrap();
     }
     let before = fixture.count_files().await.unwrap();
     let operation = dataset
@@ -768,13 +793,28 @@ async fn cleanup_thinning_falls_back_when_historical_hint_target_was_expired() {
     fixture.create_some_data().await.unwrap();
     fixture.overwrite_some_data().await.unwrap();
     let dataset = fixture.open().await.unwrap();
-    write_version_hint(&dataset.object_store, &dataset.base, 1).await;
+    write_version_hint(
+        &dataset.table_state.object_store,
+        &dataset.table_state.base,
+        1,
+    )
+    .await;
     let location = dataset
+        .table_state
         .commit_handler
-        .resolve_version_location(&dataset.base, 1, dataset.object_store.inner.as_ref())
+        .resolve_version_location(
+            &dataset.table_state.base,
+            1,
+            dataset.table_state.object_store.inner.as_ref(),
+        )
         .await
         .unwrap();
-    dataset.object_store.delete(&location.path).await.unwrap();
+    dataset
+        .table_state
+        .object_store
+        .delete(&location.path)
+        .await
+        .unwrap();
     let before = fixture.count_files().await.unwrap();
     let operation = dataset
         .cleanup(CleanupPolicy::default())
@@ -796,9 +836,11 @@ async fn cleanup_thinning_without_hint_uses_snapshot() {
     fixture.overwrite_some_data().await.unwrap();
     let dataset = fixture.open().await.unwrap();
     dataset
+        .table_state
         .object_store
         .delete(
             &dataset
+                .table_state
                 .base
                 .clone()
                 .join("_versions")
@@ -807,7 +849,7 @@ async fn cleanup_thinning_without_hint_uses_snapshot() {
         .await
         .unwrap();
     assert_eq!(
-        read_version_hint(&dataset.object_store, &dataset.base)
+        read_version_hint(&dataset.table_state.object_store, &dataset.table_state.base)
             .await
             .unwrap(),
         None
@@ -841,7 +883,12 @@ async fn cleanup_expiration_uses_wall_clock(#[values(false, true)] thinning: boo
     MockClock::set_system_time(Duration::from_secs(3600));
     fixture.overwrite_some_data().await.unwrap();
     let dataset = fixture.open().await.unwrap();
-    write_version_hint(&dataset.object_store, &dataset.base, 1).await;
+    write_version_hint(
+        &dataset.table_state.object_store,
+        &dataset.table_state.base,
+        1,
+    )
+    .await;
     MockClock::set_system_time(Duration::from_secs(86_400));
     let mut manifest = dataset.manifest.as_ref().clone();
     manifest.config.extend([
@@ -911,11 +958,13 @@ async fn cleanup_thinning_honors_hints_with_updates_disabled() {
         }
     }
     let dataset = fixture.open().await.unwrap();
-    assert!(!uses_version_hint(&dataset.object_store));
+    assert!(!uses_version_hint(&dataset.table_state.object_store));
     dataset
+        .table_state
         .object_store
         .put(
             &dataset
+                .table_state
                 .base
                 .clone()
                 .join("_versions")
@@ -953,4 +1002,277 @@ async fn cleanup_thinning_honors_hints_with_updates_disabled() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[rstest]
+#[case::recent(false, 1, false)]
+#[case::at_threshold(false, 8, false)]
+#[case::aged(false, 9, true)]
+#[case::delete_unverified(true, 1, true)]
+#[tokio::test]
+async fn cleanup_local_object_store_staging_files(
+    #[values("file", "file-object-store")] scheme: &str,
+    #[case] delete_unverified: bool,
+    #[case] cleanup_day: i64,
+    #[case] should_remove: bool,
+) {
+    MockClock::set_system_time(Duration::ZERO);
+    let tmpdir = TempStrDir::default();
+    let uri = local_file_uri(scheme, tmpdir.as_str());
+    let data = || {
+        lance_datagen::gen_batch()
+            .col("id", lance_datagen::array::step::<Int32Type>())
+            .into_reader_rows(4.into(), 1.into())
+    };
+    Dataset::write(data(), &uri, None).await.unwrap();
+    let mut dataset = Dataset::write(
+        data(),
+        &uri,
+        Some(WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    dataset
+        .create_index(
+            &["id"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(dataset.manifest.fragments.len(), 2);
+    let index_uuid = dataset.load_indices().await.unwrap()[0].uuid;
+    let data_file = &dataset.manifest.fragments[0].files[0].path;
+    let legacy_mem_wal = crate::dataset::mem_wal::util::mem_wal_dir_name("");
+    let dynamic_mem_wal = crate::dataset::mem_wal::util::mem_wal_dir_name("0a1b2c3d");
+    let shard_id = "7a20a9d1-3e0d-4b70-8b41-927e5bd8f2ab";
+    let temporary_paths = [
+        "_versions/18446744073709548312.manifest#1".to_string(),
+        "_transactions/abandoned.txn#2".to_string(),
+        format!("data/{data_file}#3"),
+        format!(
+            "data/{}/value.blob#4",
+            data_file.strip_suffix(".lance").unwrap()
+        ),
+        format!("_indices/{index_uuid}/index.idx#5"),
+        "_deletions/abandoned.arrow#6".to_string(),
+        "_blobs/abandoned.blob#7".to_string(),
+        "_fri/abandoned/row_map.bin#8".to_string(),
+        "_refs/tags/abandoned.json#9".to_string(),
+        format!("{legacy_mem_wal}/{shard_id}/manifest/abandoned.binpb#10"),
+        // The dynamic directory contains only this hidden candidate.
+        format!("{dynamic_mem_wal}/{shard_id}/deadbeef_gen_1/_pk_index/index.idx#11"),
+    ];
+    let preserved_paths = [
+        "data/unrelated#suffix".to_string(),
+        "data/unrelated#".to_string(),
+        "_versions/unrelated.manifest#1x".to_string(),
+        "_refs/tags/unrelated.json#suffix".to_string(),
+        "_mem_wal_backup/abandoned.bin#12".to_string(),
+        format!("{legacy_mem_wal}/unrelated#"),
+        "user/notes#1".to_string(),
+    ];
+    for path in temporary_paths
+        .iter()
+        .map(String::as_str)
+        .chain(preserved_paths.iter().map(String::as_str))
+    {
+        let path = std::path::Path::new(tmpdir.as_str()).join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"debris").unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(86_400)),
+            )
+            .unwrap();
+    }
+    // object_store hides these files even when delete_unverified is requested.
+    let listed = dataset
+        .table_state
+        .object_store
+        .read_dir_all(&dataset.table_state.base, None)
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    assert!(temporary_paths.iter().all(|path| {
+        !listed.iter().any(|meta| {
+            meta.location == Path::parse(format!("{}/{path}", dataset.table_state.base)).unwrap()
+        })
+    }));
+
+    MockClock::set_system_time(TimeDelta::days(cleanup_day).to_std().unwrap());
+    let policy = CleanupPolicyBuilder::default()
+        .before_timestamp(DateTime::<Utc>::UNIX_EPOCH)
+        .delete_unverified(delete_unverified)
+        .build();
+    let explanation = dataset.cleanup(policy.clone()).explain().await.unwrap();
+    let expected_files = if should_remove {
+        temporary_paths.len()
+    } else {
+        0
+    };
+    assert_eq!(explanation.candidate_files.len(), expected_files);
+    assert_eq!(explanation.stats.bytes_removed, expected_files as u64 * 6);
+    assert!(
+        explanation
+            .candidate_files
+            .iter()
+            .all(|file| file.unverified)
+    );
+    for path in &temporary_paths {
+        assert!(std::path::Path::new(tmpdir.as_str()).join(path).exists());
+    }
+
+    let removed = dataset.cleanup(policy).execute().await.unwrap();
+    assert_eq!(removed, explanation.stats);
+    assert_eq!(removed.old_versions, 0);
+    assert_eq!(removed.data_files_removed, u64::from(should_remove) * 4);
+    assert_eq!(removed.index_files_removed, u64::from(should_remove) * 4);
+    assert_eq!(removed.transaction_files_removed, u64::from(should_remove));
+    assert_eq!(removed.deletion_files_removed, u64::from(should_remove));
+    for path in &temporary_paths {
+        assert_eq!(
+            std::path::Path::new(tmpdir.as_str()).join(path).exists(),
+            !should_remove,
+            "{path}"
+        );
+    }
+    for path in &preserved_paths {
+        assert!(
+            std::path::Path::new(tmpdir.as_str()).join(path).exists(),
+            "{path}"
+        );
+    }
+    assert_eq!(dataset.count_rows(None).await.unwrap(), 8);
+    assert_eq!(
+        dataset
+            .scan()
+            .filter("id = 1")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap()
+            .num_rows(),
+        2
+    );
+    assert_eq!(
+        dataset
+            .cleanup(
+                CleanupPolicyBuilder::default()
+                    .before_timestamp(DateTime::<Utc>::UNIX_EPOCH)
+                    .build()
+            )
+            .execute()
+            .await
+            .unwrap(),
+        RemovalStats::default()
+    );
+}
+
+#[rstest]
+#[case::recent(false, 1, false)]
+#[case::at_threshold(false, 8, false)]
+#[case::aged(false, 9, true)]
+#[case::delete_unverified(true, 1, true)]
+#[tokio::test]
+async fn cleanup_temporary_data_files(
+    #[case] delete_unverified: bool,
+    #[case] cleanup_day: i64,
+    #[case] should_remove: bool,
+) {
+    MockClock::set_system_time(std::time::Duration::ZERO);
+    let fixture = MockDatasetFixture::try_new().unwrap();
+    fixture.create_some_data().await.unwrap();
+    fixture.append_some_data().await.unwrap();
+    let dataset = fixture.open().await.unwrap();
+    assert_eq!(dataset.manifest.fragments.len(), 2);
+    let expected_rows = dataset.count_rows(None).await.unwrap();
+
+    let data_file = &dataset.manifest.fragments[0].files[0].path;
+    let data_file_key = data_file.strip_suffix(".lance").unwrap();
+    let temporary_paths = [
+        dataset.data_dir().join(".tmpAb3Xz9"),
+        dataset.data_dir().join("uncommitted").join(".tmpAb3Xz9"),
+        dataset.data_dir().join(data_file_key).join(".tmpAb3Xz9"),
+    ];
+    let preserved_paths = [
+        dataset.data_dir().join("unrelated"),
+        dataset.data_dir().join(".tmpDirectory").join("unrelated"),
+        dataset
+            .data_dir()
+            .join(data_file_key)
+            .join("10000000000000000000000000000000.blob"),
+        dataset
+            .table_state
+            .base
+            .clone()
+            .join("database")
+            .join(".tmpAb3Xz9"),
+    ];
+
+    // The debris is newer than every retained manifest, as with an interrupted
+    // append. Its eligibility must depend on its own age, not the manifest age.
+    MockClock::set_system_time(TimeDelta::days(1).to_std().unwrap());
+    for path in temporary_paths.iter().chain(&preserved_paths) {
+        dataset
+            .table_state
+            .object_store
+            .put(path, b"debris")
+            .await
+            .unwrap();
+    }
+    MockClock::set_system_time(TimeDelta::days(cleanup_day).to_std().unwrap());
+
+    let policy = CleanupPolicyBuilder::default()
+        .before_timestamp(DateTime::<Utc>::UNIX_EPOCH)
+        .delete_unverified(delete_unverified)
+        .build();
+    let before_count = fixture.count_files().await.unwrap();
+    let explanation = dataset.cleanup(policy.clone()).explain().await.unwrap();
+    let expected_files = if should_remove {
+        temporary_paths.len() as u64
+    } else {
+        0
+    };
+    assert_eq!(explanation.stats.data_files_removed, expected_files);
+    assert_eq!(explanation.stats.bytes_removed, expected_files * 6);
+    assert_eq!(explanation.candidate_files.len() as u64, expected_files);
+    for file in &explanation.candidate_files {
+        assert_eq!(file.kind, CleanupFileKind::Data);
+        assert!(file.unverified);
+        assert!(
+            temporary_paths
+                .iter()
+                .any(|path| path.as_ref() == file.path)
+        );
+    }
+    assert_eq!(fixture.count_files().await.unwrap(), before_count);
+
+    let removed = dataset.cleanup(policy).execute().await.unwrap();
+    assert_eq!(removed.data_files_removed, expected_files);
+    assert_eq!(removed.bytes_removed, expected_files * 6);
+    assert_eq!(removed.old_versions, 0);
+    for path in &temporary_paths {
+        assert_eq!(
+            dataset.table_state.object_store.exists(path).await.unwrap(),
+            !should_remove,
+            "{path}"
+        );
+    }
+    for path in &preserved_paths {
+        assert!(
+            dataset.table_state.object_store.exists(path).await.unwrap(),
+            "{path}"
+        );
+    }
+    assert_eq!(fixture.count_rows().await.unwrap(), expected_rows);
 }

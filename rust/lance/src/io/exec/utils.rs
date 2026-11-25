@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use super::column_width::MeasuredWidths;
 use crate::datatypes::Field as LanceField;
 use crate::datatypes::Schema as LanceSchema;
 use lance_datafusion::utils::{
@@ -14,7 +15,7 @@ use lance_io::scheduler::{IoStats, ScanScheduler, ScanStats};
 use lance_table::format::IndexMetadata;
 use pin_project::pin_project;
 use roaring::RoaringBitmap;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -33,7 +34,7 @@ use datafusion::physical_plan::metrics::{
 };
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, RecordBatchStream,
-    SendableRecordBatchStream,
+    SendableRecordBatchStream, coalesce_partitions::CoalescePartitionsExec,
 };
 use datafusion_physical_expr::{Distribution, EquivalenceProperties, Partitioning};
 use datafusion_physical_plan::execution_plan::{Boundedness, EmissionType};
@@ -78,7 +79,7 @@ where
 pub enum PreFilterSource {
     /// The prefilter input is an array of row ids that match the filter condition
     FilteredRowIds(Arc<dyn ExecutionPlan>),
-    /// The prefilter input is a selection vector from an index query
+    /// The input is one serialized selection mask, including composed index and row-ID sources.
     ScalarIndexQuery(Arc<dyn ExecutionPlan>),
     /// There is no prefilter
     None,
@@ -313,13 +314,30 @@ impl Drop for SharedPreFilterWaiter {
     }
 }
 
+// Whether `node` is a `PrefilterUnionExec`, seeing through a single
+// `CoalescePartitionsExec` wrapper (the generic single-partition normalization
+// a caller may apply before handing the node off as a prefilter source).
+// `PrefilterUnionExec`'s own output stays row-id domain regardless of this
+// wrapping; this is the one place that distinction is still recovered by node
+// identity rather than an explicit tag (see `SelectionVectorToPrefilter`).
+pub(crate) fn is_prefilter_union(node: &Arc<dyn ExecutionPlan>) -> bool {
+    let node = match node.downcast_ref::<CoalescePartitionsExec>() {
+        Some(coalesce) => coalesce.input(),
+        None => node,
+    };
+    node.downcast_ref::<super::prefilter_union::PrefilterUnionExec>()
+        .is_some()
+}
+
 fn shared_prefilter_future(
     materialization: Arc<SharedPreFilterMaterialization>,
     source: Arc<dyn ExecutionPlan>,
     is_scalar_index_query: bool,
     context: Arc<datafusion::execution::TaskContext>,
     partition: usize,
+    dataset: Arc<Dataset>,
 ) -> BoxFuture<'static, Result<Arc<RowAddrMask>>> {
+    let is_prefilter_union = is_prefilter_union(&source);
     async move {
         let context_id = Arc::as_ptr(&context) as usize;
         let key = (context_id, partition);
@@ -351,7 +369,12 @@ fn shared_prefilter_future(
                             let result = async move {
                                 let stream = source.execute(partition, context)?;
                                 if is_scalar_index_query {
-                                    Box::new(SelectionVectorToPrefilter(stream)).load().await
+                                    Box::new(
+                                        SelectionVectorToPrefilter::new(stream, dataset)
+                                            .with_already_row_id_domain(is_prefilter_union),
+                                    )
+                                    .load()
+                                    .await
                                 } else {
                                     Box::new(FilteredRowIdsToPrefilter::new(stream))
                                         .load()
@@ -359,7 +382,7 @@ fn shared_prefilter_future(
                                 }
                             }
                             .await;
-                            CloneableResult::from(result.map(Arc::new))
+                            CloneableResult::from(result)
                         }
                         .boxed()
                         .shared()
@@ -397,6 +420,7 @@ fn prefilter_mask_future(
     prefilter_source: &PreFilterSource,
     external_mask: Option<Arc<RowAddrMask>>,
     metrics: &ExecutionPlanMetricsSet,
+    dataset: Arc<Dataset>,
 ) -> Result<Option<BoxFuture<'static, Result<Arc<RowAddrMask>>>>> {
     let mut shared_filter = None;
     let prefilter_loader = match &prefilter_source {
@@ -408,6 +432,7 @@ fn prefilter_mask_future(
                     false,
                     context,
                     partition,
+                    dataset,
                 ));
                 None
             } else {
@@ -427,23 +452,25 @@ fn prefilter_mask_future(
                     true,
                     context,
                     partition,
+                    dataset,
                 ));
                 None
             } else {
+                let is_prefilter_union = is_prefilter_union(src_node);
                 let stream = src_node.execute(partition, context)?;
-                Some(Box::new(SelectionVectorToPrefilter(stream)) as Box<dyn FilterLoader>)
+                Some(Box::new(
+                    SelectionVectorToPrefilter::new(stream, dataset)
+                        .with_already_row_id_domain(is_prefilter_union),
+                ) as Box<dyn FilterLoader>)
             }
         }
         PreFilterSource::None => None,
     };
     if let Some(shared_filter) = shared_filter {
         let shared_filter = match external_mask {
-            Some(mask) => async move {
-                Ok(Arc::new(
-                    mask.as_ref().clone() & shared_filter.await?.as_ref().clone(),
-                ))
+            Some(mask) => {
+                async move { Ok(Arc::new(mask.intersect_ref(&*shared_filter.await?))) }.boxed()
             }
-            .boxed(),
             None => shared_filter,
         };
         return Ok(Some(shared_filter));
@@ -454,11 +481,7 @@ fn prefilter_mask_future(
         }
         None => prefilter_loader,
     };
-    Ok(prefilter_loader.map(|loader| {
-        async move { loader.load().await.map(Arc::new) }
-            .in_current_span()
-            .boxed()
-    }))
+    Ok(prefilter_loader.map(|loader| loader.load().in_current_span().boxed()))
 }
 
 pub(crate) fn build_prefilter(
@@ -476,6 +499,7 @@ pub(crate) fn build_prefilter(
         prefilter_source,
         masks.external_mask,
         metrics,
+        ds.clone(),
     )?;
     let mut prefilter = DatasetPreFilter::new_with_filter_future(ds, index_meta, filter);
     if let Some(overlay_block) = masks.overlay_block {
@@ -502,6 +526,7 @@ pub(crate) fn build_prefilter_restricted_to_fragments(
         prefilter_source,
         masks.external_mask,
         metrics,
+        ds.clone(),
     )?;
     let mut prefilter = DatasetPreFilter::new_restricted_to_fragments(ds, fragments, filter);
     if let Some(overlay_block) = masks.overlay_block {
@@ -556,7 +581,7 @@ impl FilteredRowIdsToPrefilter {
 
 #[async_trait]
 impl FilterLoader for FilteredRowIdsToPrefilter {
-    async fn load(mut self: Box<Self>) -> Result<RowAddrMask> {
+    async fn load(mut self: Box<Self>) -> Result<Arc<RowAddrMask>> {
         let metrics = self.metrics.as_ref();
         let _load_timer = metrics.map(|m| m.load_time.timer());
         if let Some(metrics) = metrics {
@@ -592,17 +617,79 @@ impl FilterLoader for FilteredRowIdsToPrefilter {
         {
             metrics.row_ids.add(row_ids as usize);
         }
-        Ok(mask)
+        Ok(Arc::new(mask))
     }
 }
 
 // Utility to convert a serialized selection vector into a prefilter
-pub(crate) struct SelectionVectorToPrefilter(pub SendableRecordBatchStream);
+pub(crate) struct SelectionVectorToPrefilter {
+    stream: SendableRecordBatchStream,
+    dataset: Arc<Dataset>,
+    // The wire format carries no domain bit, so the producer's identity decides
+    // how to interpret it: `ScalarIndexExec` always emits row-address domain
+    // (needs converting, see below), but `PrefilterUnionExec` already finalizes
+    // its own combined result to row-id domain before serializing (to match its
+    // `missing` branch) — converting its output again would corrupt it, treating
+    // genuine row ids as if they were addresses.
+    already_row_id_domain: bool,
+}
+
+impl SelectionVectorToPrefilter {
+    pub(crate) fn new(stream: SendableRecordBatchStream, dataset: Arc<Dataset>) -> Self {
+        Self {
+            stream,
+            dataset,
+            already_row_id_domain: false,
+        }
+    }
+
+    /// Mark the source as already row-id domain (a `PrefilterUnionExec`), so
+    /// `load` does not re-finalize it.
+    pub(crate) fn with_already_row_id_domain(mut self, already_row_id_domain: bool) -> Self {
+        self.already_row_id_domain = already_row_id_domain;
+        self
+    }
+}
+
+/// Drop the listed matches the producer did not claim to cover, before the
+/// address -> row-id conversion below.
+///
+/// `fragments_covered` is the producer's index coverage already narrowed by its
+/// fragment scope, and it is the extent over which this result is authoritative
+/// (`FilteredReadExec` full-scans everything outside it). A listed address beyond
+/// it is one a shared index segment matched from past the scan's fragments:
+/// nothing downstream uses it, but resolving it to an id costs a row-id-sequence
+/// and deletion-vector load for that fragment. Narrowing first keeps a small
+/// scoped search's metadata I/O proportional to its scope.
+///
+/// Only an allow-list narrows. A block list names the rows that do *not* match,
+/// so dropping an entry unblocks that row, and this mask is the only thing
+/// bounding what the vector search considers — unlike
+/// [`super::prefilter_union::PrefilterUnionExec`], which can narrow either shape
+/// because it intersects the scope's own allow-list right after.
+fn restrict_to_covered_fragments(
+    result: IndexExprResult,
+    fragments_covered: &RoaringBitmap,
+) -> IndexExprResult {
+    let retain = |mask: RowAddrMask| match mask {
+        RowAddrMask::AllowList(mut set) => {
+            set.retain_fragments(fragments_covered.iter());
+            RowAddrMask::AllowList(set)
+        }
+        block_list @ RowAddrMask::BlockList(_) => block_list,
+    };
+    let domain = result.domain;
+    if result.is_exact() {
+        IndexExprResult::exact(retain(result.upper)).with_domain(domain)
+    } else {
+        IndexExprResult::new(retain(result.lower), retain(result.upper)).with_domain(domain)
+    }
+}
 
 #[async_trait]
 impl FilterLoader for SelectionVectorToPrefilter {
-    async fn load(mut self: Box<Self>) -> Result<RowAddrMask> {
-        let batch = self.0.try_next().await?.ok_or_else(|| {
+    async fn load(mut self: Box<Self>) -> Result<Arc<RowAddrMask>> {
+        let batch = self.stream.try_next().await?.ok_or_else(|| {
             Error::internal("Selection vector source for prefilter did not yield any batches")
         })?;
         // The vector-search prefilter wants the set of rows the search is
@@ -613,8 +700,18 @@ impl FilterLoader for SelectionVectorToPrefilter {
         // Use deserialize() here (rather than indexing "upper" directly) to
         // support both the TwoMask and the legacy ThreeVariant wire formats
         // that ScalarIndexExec may emit.
-        let (result, _) = IndexExprResult::deserialize(&batch)?;
-        Ok(result.upper)
+        let (result, fragments_covered) = IndexExprResult::deserialize(&batch)?;
+        // Vector/PQ indices are keyed by stable row id (trained with
+        // `.with_row_id()`), so convert here before this mask is matched
+        // against those ids — unless the source already did so (see
+        // `already_row_id_domain`).
+        let result = if self.already_row_id_domain {
+            result
+        } else {
+            let result = restrict_to_covered_fragments(result, &fragments_covered);
+            super::scalar_index::finalize_to_row_ids(&self.dataset, result).await?
+        };
+        Ok(Arc::new(result.upper))
     }
 }
 
@@ -1025,6 +1122,7 @@ impl IoMetrics {
 
 #[derive(Clone)]
 pub struct IndexMetrics {
+    selected_segments: Option<Arc<Mutex<BTreeSet<String>>>>,
     timings: [Time; IndexTiming::ALL.len()],
     indices_loaded: Count,
     parts_loaded: Count,
@@ -1043,6 +1141,7 @@ impl IndexMetrics {
     pub fn new(metrics: &ExecutionPlanMetricsSet, partition: usize) -> Self {
         Self {
             timings: IndexTiming::ALL.map(|stage| metrics.new_time(stage.name(), partition)),
+            selected_segments: None,
             indices_loaded: metrics.new_count(INDICES_LOADED_METRIC, partition),
             parts_loaded: metrics.new_count(PARTS_LOADED_METRIC, partition),
             index_comparisons: metrics.new_count(INDEX_COMPARISONS_METRIC, partition),
@@ -1060,9 +1159,26 @@ impl IndexMetrics {
     pub fn flush_io(&self) {
         self.io_metrics.record_stats(self.io_stats.snapshot());
     }
+
+    pub(crate) fn with_segment_tracking(mut self, segments: Arc<Mutex<BTreeSet<String>>>) -> Self {
+        self.selected_segments = Some(segments);
+        self
+    }
 }
 
 impl MetricsCollector for IndexMetrics {
+    fn records_index_segments(&self) -> bool {
+        self.selected_segments.is_some()
+    }
+
+    fn record_index_segments(&self, segments: &[String]) {
+        if let Some(selected) = &self.selected_segments {
+            selected
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .extend(segments.iter().cloned());
+        }
+    }
     fn record_timing(&self, stage: IndexTiming, duration: std::time::Duration) {
         self.timings[stage as usize].add_duration(duration);
     }
@@ -1106,12 +1222,38 @@ const MIN_BYTES_PER_ROW: f64 = 8.0;
 /// mode describes what it fetches rather than what it carries. Descriptors remain
 /// eligible for estimation, including a seeded width for any URI field.
 fn carries_blob_payload(emitted: &arrow_schema::Fields, dataset: &[LanceField]) -> bool {
-    emitted.iter().any(|field| {
-        let Some(lance) = dataset.iter().find(|f| f.name == *field.name()) else {
-            return false;
-        };
-        carried(field.data_type(), lance)
-    })
+    // Nothing in the dataset is a blob, so nothing emitted can be carrying one.
+    if !dataset.iter().any(holds_a_blob) {
+        return false;
+    }
+    emitted.iter().any(
+        |field| match dataset.iter().find(|f| f.name == *field.name()) {
+            Some(lance) => carried(field.data_type(), lance),
+            // An alias does not carry the blob marker, so a name the dataset does not
+            // know could be any of its blob columns. Treat binary as a payload.
+            None => holds_binary(field.data_type()),
+        },
+    )
+}
+
+/// Whether `lance` or any of its children is a blob field.
+fn holds_a_blob(lance: &LanceField) -> bool {
+    lance.is_blob() || lance.children.iter().any(holds_a_blob)
+}
+
+/// Whether `emitted` is, or nests, a binary payload.
+fn holds_binary(emitted: &DataType) -> bool {
+    match emitted {
+        DataType::Binary | DataType::LargeBinary => true,
+        DataType::Struct(children) => children.iter().any(|f| holds_binary(f.data_type())),
+        DataType::List(child)
+        | DataType::LargeList(child)
+        | DataType::ListView(child)
+        | DataType::LargeListView(child)
+        | DataType::FixedSizeList(child, _) => holds_binary(child.data_type()),
+        DataType::Map(entries, _) => holds_binary(entries.data_type()),
+        _ => false,
+    }
 }
 
 /// Whether `emitted` holds a blob payload described by `lance`, at any nesting.
@@ -1147,23 +1289,25 @@ const ASSUMED_LIST_LENGTH: f64 = 5.0;
 ///
 /// Unlike the decoder's estimate, this charges only dictionary keys. Shared
 /// dictionary values are omitted because their cardinality and size are unknown.
-fn seeded_value_bytes_per_row(data_type: &DataType) -> f64 {
+fn seeded_value_bytes_per_row(data_type: &DataType) -> Option<f64> {
     match data_type {
-        DataType::Dictionary(key, _) => key.byte_width_opt().unwrap_or(1) as f64,
+        // The keys are bounded but the values buffer they index is not, and Arrow
+        // counts it. A container cannot seed past that, so the unknown propagates.
+        DataType::Dictionary(_, _) => None,
         DataType::List(child) | DataType::LargeList(child) => {
-            ASSUMED_LIST_LENGTH * seeded_value_bytes_per_row(child.data_type())
+            Some(ASSUMED_LIST_LENGTH * seeded_value_bytes_per_row(child.data_type())?)
         }
         DataType::FixedSizeList(child, dim) => {
-            *dim as f64 * seeded_value_bytes_per_row(child.data_type())
+            Some(*dim as f64 * seeded_value_bytes_per_row(child.data_type())?)
         }
         DataType::Map(entries, _) => {
-            ASSUMED_LIST_LENGTH * seeded_value_bytes_per_row(entries.data_type())
+            Some(ASSUMED_LIST_LENGTH * seeded_value_bytes_per_row(entries.data_type())?)
         }
         DataType::Struct(fields) => fields
             .iter()
             .map(|field| seeded_value_bytes_per_row(field.data_type()))
             .sum(),
-        other => estimate_bytes_per_row(other),
+        other => Some(estimate_bytes_per_row(other)),
     }
 }
 
@@ -1198,38 +1342,66 @@ fn arrow_overhead_bytes_per_row(field: &arrow_schema::Field) -> f64 {
     validity + buffers
 }
 
+/// Whether every leaf under `data_type` has a width the schema fixes.
+fn schema_fixes_width(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::Null | DataType::Boolean => true,
+        DataType::Struct(fields) => fields.iter().all(|f| schema_fixes_width(f.data_type())),
+        DataType::FixedSizeList(child, _) => schema_fixes_width(child.data_type()),
+        DataType::Dictionary(_, _) => false,
+        other => other
+            .byte_width_opt()
+            .or_else(|| other.primitive_width())
+            .is_some(),
+    }
+}
+
 /// Estimated Arrow bytes per row of one field.
 ///
 /// Uses schema widths for fixed-size values and assumes a validity bitmap for
-/// nullable fields. Dictionary values, allocation padding, and per-batch overhead
-/// are omitted. Variable-width values use decoder seeds, such as 64 bytes for a
-/// string and five items for a list, rather than measured sizes.
-fn arrow_bytes_per_row(field: &arrow_schema::Field) -> f64 {
+/// nullable fields. Allocation padding and per-batch overhead are omitted.
+/// Variable-width values use a width a scan measured, and decoder seeds otherwise.
+fn arrow_bytes_per_row(field: &arrow_schema::Field, measured: &MeasuredWidths) -> Option<f64> {
     // A `NullArray` is a row count and nothing else: no values buffer and no
     // validity bitmap whatever the field's nullability says.
     if matches!(field.data_type(), DataType::Null) {
-        return 0.0;
+        return Some(0.0);
+    }
+    // A measurement covers the whole column, nested children included, and those
+    // children were never cached under their own identities. Take it wherever the
+    // schema leaves a leaf unbounded; a fixed layout keeps its exact arithmetic so
+    // one batch's padding cannot displace it.
+    if !schema_fixes_width(field.data_type())
+        && let Some(width) = measured.get(field)
+    {
+        return Some(width);
     }
     let validity = if field.is_nullable() { 1.0 / 8.0 } else { 0.0 };
     match field.data_type() {
-        DataType::Boolean => validity + 1.0 / 8.0,
-        DataType::Struct(fields) => {
+        DataType::Boolean => Some(validity + 1.0 / 8.0),
+        DataType::Struct(fields) => Some(
             validity
                 + fields
                     .iter()
-                    .map(|field| arrow_bytes_per_row(field))
-                    .sum::<f64>()
-        }
+                    .map(|field| arrow_bytes_per_row(field, measured))
+                    .sum::<Option<f64>>()?,
+        ),
         // Fixed-size lists store child values without an offset buffer.
-        DataType::FixedSizeList(child, dim) => validity + *dim as f64 * arrow_bytes_per_row(child),
-        // Count one key per row. The shared values buffer can be substantial,
-        // but its size and cardinality are not described by the schema.
-        DataType::Dictionary(key, _) => validity + key.byte_width_opt().unwrap_or(1) as f64,
+        DataType::FixedSizeList(child, dim) => {
+            Some(validity + *dim as f64 * arrow_bytes_per_row(child, measured)?)
+        }
+        // The shared values buffer is not bounded by the schema and Arrow counts it
+        // in `get_array_memory_size`, so only a measurement sizes a dictionary: a
+        // thousand rows keyed into one 100 KB value cost ~102 bytes a row, not 2.
+        DataType::Dictionary(_, _) => measured.get(field),
         // Arrow covers fixed-width types missing from `byte_width_opt`.
         other => match other.byte_width_opt().or_else(|| other.primitive_width()) {
-            Some(width) => validity + width as f64,
-            // `arrow_overhead_bytes_per_row` carries the validity term for these.
-            None => seeded_value_bytes_per_row(other) + arrow_overhead_bytes_per_row(field),
+            Some(width) => Some(validity + width as f64),
+            // The schema is silent here. A width a scan measured beats the seed;
+            // `arrow_overhead_bytes_per_row` carries the validity term for both.
+            None => measured.get(field).or_else(|| {
+                Some(seeded_value_bytes_per_row(other)? + arrow_overhead_bytes_per_row(field))
+            }),
         },
     }
 }
@@ -1237,11 +1409,12 @@ fn arrow_bytes_per_row(field: &arrow_schema::Field) -> f64 {
 /// Estimated Arrow bytes per row, floored at [`MIN_BYTES_PER_ROW`].
 ///
 /// Returns `None` for a carried blob payload or a nonpositive estimated width.
-/// Uses schema widths where available and decoder seeds otherwise. Callers cache
-/// this at construction; dataset metadata identifies blobs in the output schema.
+/// Uses schema widths where available, a width a scan measured where not, and
+/// decoder seeds otherwise.
 pub(crate) fn estimated_bytes_per_row(
     schema: &arrow_schema::Schema,
     dataset_schema: &LanceSchema,
+    measured: &MeasuredWidths,
 ) -> Option<f64> {
     if carries_blob_payload(schema.fields(), &dataset_schema.fields) {
         return None;
@@ -1249,8 +1422,8 @@ pub(crate) fn estimated_bytes_per_row(
     let bytes_per_row: f64 = schema
         .fields()
         .iter()
-        .map(|field| arrow_bytes_per_row(field))
-        .sum();
+        .map(|field| arrow_bytes_per_row(field, measured))
+        .sum::<Option<f64>>()?;
     if bytes_per_row <= 0.0 {
         return None;
     }
@@ -1276,6 +1449,7 @@ pub(crate) fn estimated_total_byte_size(
 mod tests {
     use super::LanceField;
     use super::LanceSchema;
+    use super::MeasuredWidths;
     use lance_arrow::{ARROW_EXT_NAME_KEY, BLOB_META_KEY, BLOB_V2_EXT_NAME};
 
     use lance_index::metrics::{IndexTiming, LocalMetricsCollector, MetricsCollector};
@@ -1307,7 +1481,7 @@ mod tests {
     use futures::{StreamExt, TryStreamExt, stream};
     use lance_core::{ROW_ID, utils::futures::Capacity};
     use lance_datafusion::exec::{LanceExecutionOptions, OneShotExec, execute_plan};
-    use lance_datagen::{BatchCount, RowCount, array};
+    use lance_datagen::{BatchCount, RowCount, array, gen_batch};
     use lance_index::prefilter::FilterLoader;
     use lance_select::result::IndexExprResultWireFormat;
     use lance_select::{RowAddrMask, RowAddrTreeMap, RowSetOps, result::IndexExprResult};
@@ -1319,6 +1493,162 @@ mod tests {
         SharedPreFilterExec, SharedPreFilterMaterialization, prefilter_mask_future,
         shared_prefilter_future,
     };
+    use crate::Dataset;
+    use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+
+    // A minimal non-stable-row-id dataset, purely to satisfy
+    // `shared_prefilter_future`/`SelectionVectorToPrefilter`'s dataset
+    // parameter in tests that don't otherwise need a real one — the
+    // row-id -> row-address finalization it does is then a guaranteed no-op.
+    async fn test_dataset() -> Arc<Dataset> {
+        Arc::new(
+            gen_batch()
+                .col("i", array::step::<arrow_array::types::Int32Type>())
+                .into_ram_dataset(FragmentCount::from(1), FragmentRowCount::from(1))
+                .await
+                .unwrap(),
+        )
+    }
+
+    // A `PrefilterUnionExec`'s row-id-domain output is recovered by node
+    // identity (no domain bit survives the wire format — see
+    // `SelectionVectorToPrefilter`), so a caller that wraps it in a generic
+    // single-partition `CoalescePartitionsExec` before handing it off as a
+    // prefilter source must not defeat that recognition.
+    #[tokio::test]
+    async fn test_is_prefilter_union_sees_through_coalesce_wrapper() {
+        use super::super::prefilter_union::PrefilterUnionExec;
+        use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
+
+        let dataset = test_dataset().await;
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                ROW_ID,
+                DataType::UInt64,
+                false,
+            )])),
+            vec![Arc::new(UInt64Array::from_iter_values(0_u64..1))],
+        )
+        .unwrap();
+        let scalar = Arc::new(OneShotExec::from_batch(batch.clone())) as Arc<dyn ExecutionPlan>;
+        let union = Arc::new(PrefilterUnionExec::new(
+            dataset,
+            scalar,
+            None,
+            RoaringBitmap::new(),
+            RoaringBitmap::new(),
+            IndexExprResultWireFormat::default(),
+        )) as Arc<dyn ExecutionPlan>;
+
+        assert!(super::is_prefilter_union(&union));
+        let wrapped =
+            Arc::new(CoalescePartitionsExec::new(union.clone())) as Arc<dyn ExecutionPlan>;
+        assert!(
+            super::is_prefilter_union(&wrapped),
+            "must see through a CoalescePartitionsExec wrapper"
+        );
+
+        let unrelated = Arc::new(OneShotExec::from_batch(batch)) as Arc<dyn ExecutionPlan>;
+        assert!(!super::is_prefilter_union(&unrelated));
+        let unrelated_wrapped =
+            Arc::new(CoalescePartitionsExec::new(unrelated)) as Arc<dyn ExecutionPlan>;
+        assert!(!super::is_prefilter_union(&unrelated_wrapped));
+    }
+
+    /// A shared index segment can list matches from fragments outside the
+    /// scan's scope. `SelectionVectorToPrefilter` must drop those before the
+    /// reverse (address -> id) conversion, which loads a row-id sequence and
+    /// deletion vector per fragment it touches.
+    #[tokio::test]
+    async fn scoped_selection_vector_reads_only_scoped_deletions() {
+        use crate::dataset::ReadParams;
+        use crate::dataset::builder::DatasetBuilder;
+        use arrow_array::record_batch;
+        use datafusion::datasource::memory::MemorySourceConfig;
+        use lance_core::utils::address::RowAddress;
+        use lance_core::utils::tempfile::TempStrDir;
+        use lance_io::object_store::ObjectStoreParams;
+        use lance_io::utils::tracking_store::IOTracker;
+        use lance_table::io::deletion::relative_deletion_file_path;
+
+        let tmp = TempStrDir::default();
+        let path = tmp.as_str();
+        let prefix = if path.starts_with('/') { "" } else { "/" };
+        let uri = format!("file-object-store://{prefix}{path}");
+        let batch = record_batch!(("id", Int64, (0..12).collect::<Vec<_>>())).unwrap();
+        let mut dataset = Dataset::write(
+            arrow_array::RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+            &uri,
+            Some(crate::dataset::WriteParams {
+                max_rows_per_file: 4,
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset.delete("id IN (0, 5, 9)").await.unwrap();
+
+        let io = Arc::new(IOTracker::default());
+        let dataset = Arc::new(
+            DatasetBuilder::from_uri(&uri)
+                .with_read_params(ReadParams {
+                    store_options: Some(ObjectStoreParams {
+                        object_store_wrapper: Some(io.clone()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })
+                .load()
+                .await
+                .unwrap(),
+        );
+        let fragment = &dataset.fragments()[1];
+        let allowed_deletion =
+            relative_deletion_file_path(fragment.id, fragment.deletion_file.as_ref().unwrap());
+
+        // The mask lists matches across every fragment, but the producer's
+        // coverage says only fragment 1 is in scope.
+        let addresses = (0..3u32).flat_map(|fragment_id| {
+            (0..4u32).map(move |offset| u64::from(RowAddress::new_from_parts(fragment_id, offset)))
+        });
+        let format = IndexExprResultWireFormat::TwoMask;
+        let coverage: RoaringBitmap = [1].into_iter().collect();
+        let mask = IndexExprResult::exact(RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(
+            addresses,
+        )))
+        .serialize(&coverage, format)
+        .unwrap();
+        let scalar =
+            MemorySourceConfig::try_new_exec(&[vec![mask]], format.schema().clone(), None).unwrap();
+        let stream = scalar.execute(0, Arc::new(TaskContext::default())).unwrap();
+
+        io.incremental_stats();
+        let prefilter = Box::new(super::SelectionVectorToPrefilter::new(stream, dataset))
+            .load()
+            .await
+            .unwrap();
+        // Fragment 1 holds rows 4..8 with id=5 deleted, so only its live
+        // stable ids survive the conversion.
+        assert_eq!(
+            *prefilter,
+            RowAddrMask::from_allowed(RowAddrTreeMap::from_iter([4, 6, 7]))
+        );
+
+        let reads = io.incremental_stats();
+        let deletion_reads = reads
+            .requests
+            .iter()
+            .filter(|request| request.path.as_ref().contains("/_deletions/"))
+            .collect::<Vec<_>>();
+        assert!(!deletion_reads.is_empty());
+        assert!(
+            deletion_reads
+                .iter()
+                .all(|request| request.path.as_ref().ends_with(allowed_deletion.as_str())),
+            "scoped prefilter read another fragment's deletion file: {deletion_reads:?}"
+        );
+    }
 
     #[test]
     fn test_index_stage_timings() {
@@ -1465,6 +1795,7 @@ mod tests {
             "every field must declare its shared source dependency"
         );
         let context = Arc::new(datafusion::execution::TaskContext::default());
+        let dataset = test_dataset().await;
         let masks = futures::future::try_join_all(shared_sources.iter().map(|source| {
             shared_prefilter_future(
                 shared_materialization(source),
@@ -1472,6 +1803,7 @@ mod tests {
                 is_scalar_index_query,
                 context.clone(),
                 0,
+                dataset.clone(),
             )
         }))
         .await
@@ -1513,12 +1845,14 @@ mod tests {
         let source = PreFilterSource::FilteredRowIds(Arc::new(OneShotExec::new(stream)));
         let shared_sources = source.shared_for_multimatch_fields(2);
         let context = Arc::new(datafusion::execution::TaskContext::default());
+        let dataset = test_dataset().await;
         let left = shared_prefilter_future(
             shared_materialization(&shared_sources[0]),
             shared_source(&shared_sources[0]),
             false,
             context.clone(),
             0,
+            dataset.clone(),
         );
         let right = shared_prefilter_future(
             shared_materialization(&shared_sources[1]),
@@ -1526,6 +1860,7 @@ mod tests {
             false,
             context,
             0,
+            dataset,
         );
         let (left, right) = tokio::join!(left, right);
 
@@ -1576,12 +1911,14 @@ mod tests {
         let shared_sources = source.shared_for_multimatch_fields(2);
         let materialization = shared_materialization(&shared_sources[0]);
         let context = Arc::new(datafusion::execution::TaskContext::default());
+        let dataset = test_dataset().await;
         let first = tokio::spawn(shared_prefilter_future(
             materialization.clone(),
             shared_source(&shared_sources[0]),
             false,
             context.clone(),
             0,
+            dataset.clone(),
         ));
         tokio::time::timeout(std::time::Duration::from_secs(5), has_started)
             .await
@@ -1593,6 +1930,7 @@ mod tests {
             false,
             context,
             0,
+            dataset,
         ));
         loop {
             let waiters = materialization
@@ -1645,6 +1983,7 @@ mod tests {
             false,
             Arc::new(datafusion::execution::TaskContext::default()),
             0,
+            test_dataset().await,
         ));
         tokio::time::timeout(std::time::Duration::from_secs(5), has_started)
             .await
@@ -1694,6 +2033,7 @@ mod tests {
     struct MultiMatchPrefilterConsumer {
         field_sources: Vec<PreFilterSource>,
         schema: SchemaRef,
+        dataset: Arc<Dataset>,
     }
 
     impl PartitionStream for MultiMatchPrefilterConsumer {
@@ -1712,6 +2052,7 @@ mod tests {
                         source,
                         None,
                         &ExecutionPlanMetricsSet::new(),
+                        self.dataset.clone(),
                     )
                     .map(|mask| mask.expect("a filtered MultiMatch field loads a prefilter"))
                 })
@@ -1760,9 +2101,17 @@ mod tests {
             DataType::UInt64,
             true,
         )]));
+        let dataset = Arc::new(
+            gen_batch()
+                .col("i", array::step::<arrow_array::types::Int32Type>())
+                .into_ram_dataset(FragmentCount::from(1), FragmentRowCount::from(1))
+                .await
+                .unwrap(),
+        );
         let consumer = Arc::new(MultiMatchPrefilterConsumer {
             field_sources,
             schema: output_schema.clone(),
+            dataset,
         });
         let plan: Arc<dyn ExecutionPlan> = Arc::new(
             StreamingTableExec::try_new(
@@ -2036,19 +2385,24 @@ mod tests {
             Arc::new(Field::new("b", DataType::Float64, false)),
         ];
         assert_eq!(
-            super::estimated_bytes_per_row(&Schema::new(fields.clone()), &blobless),
+            super::estimated_bytes_per_row(
+                &Schema::new(fields.clone()),
+                &blobless,
+                &MeasuredWidths::default()
+            ),
             Some(12.0)
         );
 
         // Empty and null-only schemas have no value or validity buffers.
         assert_eq!(
-            super::estimated_bytes_per_row(&Schema::empty(), &blobless),
+            super::estimated_bytes_per_row(&Schema::empty(), &blobless, &MeasuredWidths::default()),
             None
         );
         assert_eq!(
             super::estimated_bytes_per_row(
                 &Schema::new(vec![Field::new("null", DataType::Null, true)]),
-                &blobless
+                &blobless,
+                &MeasuredWidths::default(),
             ),
             None
         );
@@ -2057,7 +2411,11 @@ mod tests {
         // fixed width, plus 64 of string, 4 of offset and a validity bit.
         fields.push(Arc::new(Field::new("note", DataType::Utf8, true)));
         assert_eq!(
-            super::estimated_bytes_per_row(&Schema::new(fields), &blobless),
+            super::estimated_bytes_per_row(
+                &Schema::new(fields),
+                &blobless,
+                &MeasuredWidths::default()
+            ),
             Some(80.125)
         );
     }
@@ -2075,7 +2433,79 @@ mod tests {
             .metadata
             .insert(BLOB_META_KEY.to_string(), "true".to_string());
 
-        assert_eq!(super::estimated_bytes_per_row(&emitted, &dataset), None);
+        assert_eq!(
+            super::estimated_bytes_per_row(&emitted, &dataset, &MeasuredWidths::default()),
+            None
+        );
+    }
+
+    /// Arrow counts a dictionary's shared values buffer in `get_array_memory_size`,
+    /// so a measurement is the only honest width for one. The key width is a floor
+    /// for a cold cache, not a substitute: a thousand rows keyed into one 100 KB
+    /// value cost ~102 bytes a row, not the 2 the keys suggest.
+    #[test]
+    fn a_measured_dictionary_width_beats_its_key_width() {
+        use arrow_array::{Array, DictionaryArray, Int16Array, StringArray, types::Int16Type};
+        let field = Field::new(
+            "dict",
+            DataType::Dictionary(Box::new(DataType::Int16), Box::new(DataType::Utf8)),
+            false,
+        );
+        let value = "x".repeat(100_000);
+        let values = Arc::new(StringArray::from(vec![value.as_str()]));
+        let keys = Int16Array::from(vec![0; 1_000]);
+        let array = DictionaryArray::<Int16Type>::try_new(keys, values).unwrap();
+        let actual = array.get_array_memory_size() as f64 / 1_000.0;
+        let measured = MeasuredWidths::from_iter([(field.clone(), actual)]);
+        let reported = super::arrow_bytes_per_row(&field, &measured)
+            .expect("a measured dictionary reports its measurement");
+        assert!(
+            reported >= actual / 2.0,
+            "actual={actual}, reported={reported}"
+        );
+
+        // Cold, there is no width to report rather than a key-only under-estimate.
+        assert_eq!(
+            super::arrow_bytes_per_row(&field, &MeasuredWidths::default()),
+            None
+        );
+    }
+
+    /// A materialized blob renamed by a projection loses its marker, so binary the
+    /// dataset cannot account for counts as a payload.
+    #[rstest]
+    #[case::same_name("blob", DataType::LargeBinary, true)]
+    #[case::aliased("payload", DataType::LargeBinary, true)]
+    // A column the dataset does not know, of a type no payload hides in, is fine.
+    #[case::aliased_fixed_width("count", DataType::Int64, false)]
+    fn binary_of_unknown_provenance_is_treated_as_a_payload(
+        #[case] emitted_name: &str,
+        #[case] emitted: DataType,
+        #[case] expected: bool,
+    ) {
+        let mut lance =
+            LanceField::try_from(&Field::new("blob", DataType::LargeBinary, true)).unwrap();
+        lance
+            .metadata
+            .insert(ARROW_EXT_NAME_KEY.to_string(), BLOB_V2_EXT_NAME.to_string());
+        let emitted = Schema::new(vec![Field::new(emitted_name, emitted, true)]);
+
+        assert_eq!(
+            super::carries_blob_payload(emitted.fields(), std::slice::from_ref(&lance)),
+            expected
+        );
+    }
+
+    /// The rule above costs nothing in a dataset that holds no blobs.
+    #[test]
+    fn an_alias_in_a_blobless_dataset_is_still_measurable() {
+        let lance = LanceField::try_from(&Field::new("data", DataType::LargeBinary, true)).unwrap();
+        let aliased = Schema::new(vec![Field::new("renamed", DataType::LargeBinary, true)]);
+
+        assert!(!super::carries_blob_payload(
+            aliased.fields(),
+            std::slice::from_ref(&lance)
+        ));
     }
 
     /// The guard keys on what a node emits, matched against the dataset's fields.
@@ -2113,14 +2543,55 @@ mod tests {
         );
     }
 
-    /// Covers schema widths, nullable overhead, and variable-width seeds.
+    /// A measured width replaces the seed where the schema is silent. Without it a
+    /// string reports the decoder's guess, which is what measuring exists to fix.
+    #[test]
+    fn a_measured_width_replaces_the_seed() {
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, false),
+        ]);
+        let blobless = LanceSchema::default();
+
+        // Seeded: 4 of int plus 64 of string and a 4-byte offset.
+        assert_eq!(
+            super::estimated_bytes_per_row(&schema, &blobless, &MeasuredWidths::default()),
+            Some(72.0)
+        );
+
+        let measured =
+            MeasuredWidths::from_iter([(Field::new("name", DataType::Utf8, false), 20.0)]);
+        assert_eq!(
+            super::estimated_bytes_per_row(&schema, &blobless, &measured),
+            Some(24.0),
+            "4 bytes of int plus the 20 measured for the string"
+        );
+    }
+
+    /// A measurement must not displace a width the schema already fixes: that would
+    /// fold one batch's padding into every later estimate.
+    #[test]
+    fn a_measurement_does_not_displace_a_width_the_schema_fixes() {
+        let schema = Schema::new(vec![Field::new("id", DataType::Int64, false)]);
+        let measured =
+            MeasuredWidths::from_iter([(Field::new("id", DataType::Int64, false), 999.0)]);
+
+        assert_eq!(
+            super::estimated_bytes_per_row(&schema, &LanceSchema::default(), &measured),
+            Some(super::MIN_BYTES_PER_ROW),
+            "8 bytes of int64, not the 999 measured"
+        );
+    }
+
+    /// Covers schema widths, nullable overhead, variable-width seeds, and the
+    /// types a cold cache cannot size.
     #[rstest]
-    #[case::fixed_width(Field::new("a", DataType::Int64, false), 8.0)]
+    #[case::fixed_width(Field::new("a", DataType::Int64, false), Some(8.0))]
     // A nullable field pays one validity bit a row.
-    #[case::fixed_width_nullable(Field::new("a", DataType::Int64, true), 8.125)]
+    #[case::fixed_width_nullable(Field::new("a", DataType::Int64, true), Some(8.125))]
     // Boolean values are a bit a row as well, so validity doubles the column.
-    #[case::boolean_nullable(Field::new("a", DataType::Boolean, true), 0.25)]
-    #[case::fixed_size_binary(Field::new("a", DataType::FixedSizeBinary(12), false), 12.0)]
+    #[case::boolean_nullable(Field::new("a", DataType::Boolean, true), Some(0.25))]
+    #[case::fixed_size_binary(Field::new("a", DataType::FixedSizeBinary(12), false), Some(12.0))]
     // Children pay their own validity once per value, not once per row: a 4-dim
     // vector of nullable floats carries four bits a row.
     #[case::fixed_size_list(
@@ -2129,7 +2600,7 @@ mod tests {
             DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 4),
             false,
         ),
-        16.5
+        Some(16.5)
     )]
     #[case::nested_struct(
         Field::new(
@@ -2140,17 +2611,17 @@ mod tests {
             ])),
             false,
         ),
-        12.125
+        Some(12.125)
     )]
-    #[case::null(Field::new("a", DataType::Null, true), 0.0)]
+    #[case::null(Field::new("a", DataType::Null, true), Some(0.0))]
     // Below: everything whose per-row cost the schema is silent about, seeded from
     // the decoder's estimate plus the buffers around it.
     // 64 bytes of value and 4 of offset.
-    #[case::utf8(Field::new("a", DataType::Utf8, false), 68.0)]
+    #[case::utf8(Field::new("a", DataType::Utf8, false), Some(68.0))]
     // 64 and an 8-byte offset.
-    #[case::large_binary(Field::new("a", DataType::LargeBinary, false), 72.0)]
+    #[case::large_binary(Field::new("a", DataType::LargeBinary, false), Some(72.0))]
     // The decoder's catch-all, with no offset buffer of its own.
-    #[case::utf8_view(Field::new("a", DataType::Utf8View, false), 64.0)]
+    #[case::utf8_view(Field::new("a", DataType::Utf8View, false), Some(64.0))]
     #[case::list(
         Field::new(
             "a",
@@ -2159,18 +2630,19 @@ mod tests {
         ),
         // Five 8-byte items, a 4-byte offset, and a validity bit for the list and
         // each assumed item.
-        44.75
+        Some(44.75)
     )]
-    // One Int8 key a row; shared dictionary values are omitted.
+    // The keys are bounded but the shared values buffer is not, so a cold
+    // dictionary has no width to report.
     #[case::dictionary(
         Field::new(
             "a",
             DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
             false,
         ),
-        1.0
+        None
     )]
-    // Nested dictionaries use keys too: five keys plus a four-byte list offset.
+    // A nested dictionary is no more bounded than a top-level one.
     #[case::nested_dictionary(
         Field::new(
             "a",
@@ -2181,11 +2653,11 @@ mod tests {
             ))),
             false,
         ),
-        9.0
+        None
     )]
     // A fixed-width type `byte_width_opt` does not enumerate still reports exactly,
     // via Arrow's own width rather than the 64-byte seed.
-    #[case::decimal64(Field::new("a", DataType::Decimal64(18, 2), false), 8.0)]
+    #[case::decimal64(Field::new("a", DataType::Decimal64(18, 2), false), Some(8.0))]
     // A struct sums its children, seeded child included.
     #[case::struct_with_a_string(
         Field::new(
@@ -2196,10 +2668,13 @@ mod tests {
             ])),
             false,
         ),
-        76.0
+        Some(76.0)
     )]
-    fn width_includes_schema_sizes_and_seeds(#[case] field: Field, #[case] expected: f64) {
-        assert_eq!(super::arrow_bytes_per_row(&field), expected);
+    fn width_includes_schema_sizes_and_seeds(#[case] field: Field, #[case] expected: Option<f64>) {
+        assert_eq!(
+            super::arrow_bytes_per_row(&field, &MeasuredWidths::default()),
+            expected
+        );
     }
 
     /// The floor reaches the default byte threshold at the default row threshold.
@@ -2221,7 +2696,11 @@ mod tests {
         // four million rows of this would still pass for less than 1 MiB.
         let narrow = Schema::new(vec![Field::new("flag", DataType::Boolean, true)]);
 
-        let width = super::estimated_bytes_per_row(&narrow, &LanceSchema::default());
+        let width = super::estimated_bytes_per_row(
+            &narrow,
+            &LanceSchema::default(),
+            &MeasuredWidths::default(),
+        );
         assert_eq!(width, Some(super::MIN_BYTES_PER_ROW), "the floor applies");
 
         let under = super::estimated_total_byte_size(Precision::Exact(collect_rows - 1), width);
@@ -2237,6 +2716,100 @@ mod tests {
             over.get_value()
                 .is_some_and(|bytes| *bytes >= collect_bytes),
             "the row count the row guard rejects has to fail the byte guard too: {over:?}"
+        );
+    }
+    /// A list of dictionaries reaches the container seed, which bounds the keys but
+    /// not the values buffer they index. Arrow counts that buffer, so a seeded width
+    /// under-reports by three orders of magnitude and would hand a hash join the
+    /// wrong build side.
+    #[test]
+    fn a_cold_nested_dictionary_has_no_width() {
+        use arrow_array::{
+            Array, DictionaryArray, Int16Array, ListArray, StringArray, types::Int16Type,
+        };
+        use arrow_buffer::{OffsetBuffer, ScalarBuffer};
+
+        let value = "x".repeat(100_000);
+        let values = Arc::new(StringArray::from(vec![value.as_str()]));
+        let keys = Int16Array::from(vec![0; 1_000]);
+        let dictionary = DictionaryArray::<Int16Type>::try_new(keys, values).unwrap();
+        let offsets = OffsetBuffer::new(ScalarBuffer::from(
+            (0..=100).map(|i| i * 10).collect::<Vec<i32>>(),
+        ));
+        let child = Arc::new(Field::new("item", dictionary.data_type().clone(), false));
+        let array = ListArray::new(child.clone(), offsets, Arc::new(dictionary), None);
+        let list = Field::new("items", DataType::List(child), false);
+        let schema = Schema::new(vec![list.clone()]);
+        let dataset_schema = LanceSchema::try_from(&schema).unwrap();
+        let actual = array.get_array_memory_size() as f64 / 100.0;
+
+        assert!(actual > 1_000.0, "the shared values dominate: {actual}");
+        assert_eq!(
+            super::estimated_bytes_per_row(&schema, &dataset_schema, &MeasuredWidths::default()),
+            None,
+            "the seed would have reported 14 bytes a row against {actual}"
+        );
+
+        // Measured, the column reports what the batch actually held.
+        let measured = MeasuredWidths::from_iter([(list, actual)]);
+        assert_eq!(
+            super::estimated_bytes_per_row(&schema, &dataset_schema, &measured),
+            Some(actual)
+        );
+    }
+    /// A measurement covers a whole column, and a struct's children were never
+    /// cached under their own identities, so recursing past the measurement leaves
+    /// a large nested string on the 64-byte seed.
+    #[test]
+    fn a_measured_struct_of_strings_reports_its_measurement() {
+        use arrow_array::{Array, StringArray, StructArray};
+
+        let child = Field::new("text", DataType::Utf8, false);
+        let children = Fields::from(vec![child]);
+        let field = Field::new("payload", DataType::Struct(children.clone()), false);
+        let value = "x".repeat(4_096);
+        let array = StructArray::new(
+            children,
+            vec![Arc::new(StringArray::from(vec![value.as_str(); 100]))],
+            None,
+        );
+        let actual = array.get_array_memory_size() as f64 / 100.0;
+        let schema = Schema::new(vec![field.clone()]);
+        let dataset_schema = LanceSchema::try_from(&schema).unwrap();
+
+        // Cold, the seed is all there is: 64 bytes of string and a 4-byte offset.
+        assert_eq!(
+            super::estimated_bytes_per_row(&schema, &dataset_schema, &MeasuredWidths::default()),
+            Some(68.0)
+        );
+
+        let measured = MeasuredWidths::from_iter([(field, actual)]);
+        assert_eq!(
+            super::estimated_bytes_per_row(&schema, &dataset_schema, &measured),
+            Some(actual),
+            "the seed reports 68 against {actual}"
+        );
+    }
+
+    /// The rule above must not reach a struct the schema already sizes, or one
+    /// batch's padding would displace exact arithmetic.
+    #[test]
+    fn a_measurement_does_not_displace_a_fixed_width_struct() {
+        let field = Field::new(
+            "point",
+            DataType::Struct(Fields::from(vec![
+                Field::new("x", DataType::Int64, false),
+                Field::new("y", DataType::Int64, false),
+            ])),
+            false,
+        );
+        let schema = Schema::new(vec![field.clone()]);
+        let measured = MeasuredWidths::from_iter([(field, 999.0)]);
+
+        assert_eq!(
+            super::estimated_bytes_per_row(&schema, &LanceSchema::default(), &measured),
+            Some(16.0),
+            "two int64s, not the 999 measured"
         );
     }
 }

@@ -224,28 +224,22 @@ pub(super) fn phrase_matches_positions(
 /// If we accumulate this many bytes we warn the user they probably want to use an FTS index instead.
 pub(super) const BYTES_ACCUMULATED_WARNING_THRESHOLD: u64 = 1024 * 1024 * 1024; // 1GB
 
-/// Consumes a stream of record batches and produces token counts
+/// Streams batches of token counts without retaining the input corpus
 ///
 /// The resulting batch will have three columns:
 /// - row_id: the row id of the document
 /// - all_tokens: the BM25 document length, discounting code identifier overlaps
 /// - query_token_counts: a fixed size list of the count of each query token in the document
 ///
-/// This is an unbounded accumulation, however, for most queries, the per-row
-/// growth will be fairly small.  As a result we can process millions of tokens
-/// with fairly modest memory usage.
-///
-/// However, it is unwise to do a flat search across billions of rows.  An FTS
-/// index should be created instead.
-pub(super) async fn tokenize_and_count(
-    input: impl Stream<Item = DataFusionResult<RecordBatch>> + Send,
+pub(super) fn tokenize_and_count(
+    input: impl Stream<Item = DataFusionResult<RecordBatch>> + Send + 'static,
     tokenizer: Box<dyn LanceTokenizer>,
     query_tokens: Arc<Tokens>,
     doc_col_idx: usize,
     elapsed_compute: Option<Time>,
     coordinate_rank: usize,
     phrase_slop: Option<u32>,
-) -> DataFusionResult<RecordBatch> {
+) -> SendableRecordBatchStream {
     let discount_overlaps = tokenizer.discount_overlaps();
     let mut output_fields: Vec<Arc<Field>> = vec![ROW_ID_SCHEMA.fields()[0].clone()];
     output_fields.extend((0..coordinate_rank).map(|rank| {
@@ -276,9 +270,6 @@ pub(super) async fn tokenize_and_count(
         query_tokens.as_ref(),
         phrase_slop.is_some(),
     ));
-    let bytes_accumulated = Arc::new(AtomicU64::new(0));
-    let bytes_warning_emitted = Arc::new(AtomicBool::new(false));
-
     let batches = input
         .map(move |batch| {
             let mut tokenizer = tokenizer.box_clone();
@@ -286,8 +277,6 @@ pub(super) async fn tokenize_and_count(
             let query_tokens = query_tokens.clone();
             let query_token_indices = query_token_indices.clone();
             let query_groups = query_groups.clone();
-            let bytes_accumulated = bytes_accumulated.clone();
-            let bytes_warning_emitted = bytes_warning_emitted.clone();
             let elapsed_compute = elapsed_compute.clone();
             spawn_cpu(move || {
                 // Time the per-batch CPU work so callers can attribute it to
@@ -475,25 +464,15 @@ pub(super) async fn tokenize_and_count(
                     columns.push(Arc::new(builder.finish()) as ArrayRef);
                 }
                 let result_batch = RecordBatch::try_new(output_schema, columns)?;
-                let bytes_accumulated = bytes_accumulated.fetch_add(result_batch.get_array_memory_size() as u64, Ordering::Relaxed);
-                if bytes_accumulated > BYTES_ACCUMULATED_WARNING_THRESHOLD && !bytes_warning_emitted.swap(true, Ordering::Relaxed) {
-                    tracing::warn!("Flat full text search is accumulating a large number of bytes.  Consider using an FTS index instead.");
-                }
-
                 if let Some(t) = &elapsed_compute {
                     t.add_duration(start.elapsed());
                 }
                 DataFusionResult::Ok(result_batch)
             })
         })
-        .buffered(get_num_compute_intensive_cpus())
-        .try_collect::<Vec<_>>()
-        .await?;
+        .buffered(get_num_compute_intensive_cpus());
 
-    Ok(arrow::compute::concat_batches(
-        &output_schema_clone,
-        &batches,
-    )?)
+    Box::pin(RecordBatchStreamAdapter::new(output_schema_clone, batches))
 }
 
 pub(super) fn tokenize_and_count_list<ListOffset: OffsetSizeTrait>(
@@ -718,6 +697,203 @@ pub(in super::super) async fn tokenize_and_blend_multi(
     Ok((chunks, totals))
 }
 
+/// Fold per-column corpus statistics for a flat `combined_fields` stream without
+/// retaining per-row blended scores or candidate arrays.
+#[allow(clippy::too_many_arguments)]
+pub(in super::super) async fn collect_flat_stats_multi(
+    input: impl Stream<Item = DataFusionResult<RecordBatch>> + Send,
+    tokenizer: Box<dyn LanceTokenizer>,
+    query_tokens: Arc<Tokens>,
+    doc_col_indices: Arc<Vec<usize>>,
+    stats_masks: Arc<Vec<Arc<RowAddrMask>>>,
+    elapsed_compute: Option<Time>,
+) -> DataFusionResult<FlatFieldStats> {
+    let num_columns = doc_col_indices.len();
+    let num_terms = query_tokens.len();
+    let query_token_indices = Arc::new(query_token_indices(query_tokens.as_ref()));
+
+    let tasks = input
+        .map(move |batch| {
+            let mut tokenizer = tokenizer.box_clone();
+            let query_token_indices = query_token_indices.clone();
+            let doc_col_indices = doc_col_indices.clone();
+            let stats_masks = stats_masks.clone();
+            let elapsed_compute = elapsed_compute.clone();
+            spawn_cpu(move || {
+                let start = std::time::Instant::now();
+                let batch = batch?;
+                let num_rows = batch.num_rows();
+                let row_id_array = batch[ROW_ID].as_primitive::<UInt64Type>();
+
+                let mut all_tokens = vec![0u64; num_rows * num_columns];
+                let mut counts = vec![0u64; num_rows * num_columns * num_terms];
+                for (column_slot, doc_col_idx) in doc_col_indices.iter().enumerate() {
+                    count_column_into(
+                        batch.column(*doc_col_idx),
+                        num_columns,
+                        num_terms,
+                        column_slot,
+                        &mut tokenizer,
+                        &query_token_indices,
+                        &mut all_tokens,
+                        &mut counts,
+                    )?;
+                }
+
+                let mut stats = FlatFieldStats::zeros(num_columns, num_terms);
+                let counts_stride = num_columns * num_terms;
+                for row in 0..num_rows {
+                    let lengths = &all_tokens[row * num_columns..(row + 1) * num_columns];
+                    if lengths.iter().all(|length| *length == 0) {
+                        continue;
+                    }
+                    let row_id = row_id_array.value(row);
+                    let row_counts = &counts[row * counts_stride..(row + 1) * counts_stride];
+                    stats.fold_row(row_id, &stats_masks, lengths, row_counts);
+                }
+
+                if let Some(t) = &elapsed_compute {
+                    t.add_duration(start.elapsed());
+                }
+                DataFusionResult::Ok(stats)
+            })
+        })
+        .buffered(get_num_compute_intensive_cpus());
+
+    let mut tasks = std::pin::pin!(tasks);
+    let mut totals = FlatFieldStats::zeros(num_columns, num_terms);
+    while let Some(stats) = tasks.next().await {
+        totals.merge(stats?);
+    }
+    Ok(totals)
+}
+
+/// Tokenize, blend, and score each flat `combined_fields` batch on the fly using a
+/// precomputed [`CombinedFieldsBM25Scorer`], avoiding whole-corpus buffering.
+#[allow(clippy::too_many_arguments)]
+pub(in super::super) fn tokenize_blend_and_score_multi(
+    input: impl Stream<Item = DataFusionResult<RecordBatch>> + Send + 'static,
+    tokenizer: Box<dyn LanceTokenizer>,
+    query_tokens: Arc<Tokens>,
+    terms: Arc<Vec<String>>,
+    doc_col_indices: Arc<Vec<usize>>,
+    weights: Arc<Vec<f32>>,
+    emit_mask: Option<Arc<RowAddrMask>>,
+    require_all_terms: bool,
+    scorer: Arc<super::super::scorer::CombinedFieldsBM25Scorer>,
+    target_batch_size: usize,
+    elapsed_compute: Option<Time>,
+) -> SendableRecordBatchStream {
+    let num_columns = doc_col_indices.len();
+    let num_terms = terms.len();
+    let query_token_indices = Arc::new(query_token_indices(query_tokens.as_ref()));
+
+    let scored_batches = input
+        .map(move |batch| {
+            let mut tokenizer = tokenizer.box_clone();
+            let query_token_indices = query_token_indices.clone();
+            let terms = terms.clone();
+            let doc_col_indices = doc_col_indices.clone();
+            let weights = weights.clone();
+            let emit_mask = emit_mask.clone();
+            let scorer = scorer.clone();
+            let elapsed_compute = elapsed_compute.clone();
+            spawn_cpu(move || {
+                let start = std::time::Instant::now();
+                let batch = batch?;
+                let num_rows = batch.num_rows();
+                let row_id_array = batch[ROW_ID].as_primitive::<UInt64Type>();
+
+                let mut all_tokens = vec![0u64; num_rows * num_columns];
+                let mut counts = vec![0u64; num_rows * num_columns * num_terms];
+                for (column_slot, doc_col_idx) in doc_col_indices.iter().enumerate() {
+                    count_column_into(
+                        batch.column(*doc_col_idx),
+                        num_columns,
+                        num_terms,
+                        column_slot,
+                        &mut tokenizer,
+                        &query_token_indices,
+                        &mut all_tokens,
+                        &mut counts,
+                    )?;
+                }
+
+                let mut row_ids = UInt64Builder::new();
+                let mut scores = Float32Builder::new();
+                let mut term_freqs = vec![0.0f32; num_terms];
+                let counts_stride = num_columns * num_terms;
+                for row in 0..num_rows {
+                    let row_id = row_id_array.value(row);
+                    if emit_mask
+                        .as_ref()
+                        .is_some_and(|mask| !mask.selected(row_id))
+                    {
+                        continue;
+                    }
+                    let lengths = &all_tokens[row * num_columns..(row + 1) * num_columns];
+                    if lengths.iter().all(|length| *length == 0) {
+                        continue;
+                    }
+                    let row_counts = &counts[row * counts_stride..(row + 1) * counts_stride];
+
+                    // Preserve exact column-slot f32 accumulation order.
+                    term_freqs.fill(0.0);
+                    let mut doc_length = 0f32;
+                    for (column, weight) in weights.iter().enumerate() {
+                        doc_length += weight * lengths[column] as f32;
+                        let base = column * num_terms;
+                        for (term, tf) in term_freqs.iter_mut().enumerate() {
+                            *tf += weight * row_counts[base + term] as f32;
+                        }
+                    }
+                    let matches = if require_all_terms {
+                        term_freqs.iter().all(|tf| *tf > 0.0)
+                    } else {
+                        term_freqs.iter().any(|tf| *tf > 0.0)
+                    };
+                    if !matches {
+                        continue;
+                    }
+                    let score: f32 = terms
+                        .iter()
+                        .zip(&term_freqs)
+                        .map(|(term, tf)| {
+                            scorer.query_weight(term) * scorer.doc_weight(*tf, doc_length)
+                        })
+                        .sum();
+                    if score > 0.0 {
+                        row_ids.append_value(row_id);
+                        scores.append_value(score);
+                    }
+                }
+
+                let batch = RecordBatch::try_new(
+                    FTS_SCHEMA.clone(),
+                    vec![
+                        Arc::new(row_ids.finish()) as ArrayRef,
+                        Arc::new(scores.finish()) as ArrayRef,
+                    ],
+                )?;
+                let slices = slice_into_batches(batch, target_batch_size);
+                if let Some(t) = &elapsed_compute {
+                    t.add_duration(start.elapsed());
+                }
+                DataFusionResult::Ok(slices)
+            })
+        })
+        .buffered(get_num_compute_intensive_cpus())
+        .flat_map(|res| match res {
+            Ok(batches) => stream::iter(batches).left_stream(),
+            Err(err) => stream::once(async move { Err(err) }).right_stream(),
+        });
+
+    Box::pin(RecordBatchStreamAdapter::new(
+        FTS_SCHEMA.clone(),
+        scored_batches,
+    ))
+}
+
 /// Tokenize one column into the `(row, column_slot)`-strided slots of
 /// `all_tokens` / `counts`. Mirrors [`tokenize_and_count`]'s per-type handling: a
 /// list column sums over its elements and a null leaves the slots at zero.
@@ -889,13 +1065,15 @@ pub(super) fn flat_bm25_score(
         .values()
         .iter()
         .copied();
-    let mut query_token_counts_iter = counted_input[FLAT_QUERY_TOKEN_COUNTS_COL]
+    let query_token_counts = counted_input[FLAT_QUERY_TOKEN_COUNTS_COL]
         .as_fixed_size_list()
         .values()
         .as_primitive::<UInt64Type>()
-        .values()
-        .iter()
-        .copied();
+        .values();
+    let query_weights = query_tokens
+        .into_iter()
+        .map(|token| idf(scorer.num_docs_containing_token(token), scorer.num_docs()))
+        .collect::<Vec<_>>();
     let phrase_matches = phrase_slop
         .map(|_| {
             counted_input
@@ -911,13 +1089,12 @@ pub(super) fn flat_bm25_score(
                 })
         })
         .transpose()?;
-    for input_index in 0..counted_input.num_rows() {
+    for (input_index, query_token_counts) in query_token_counts
+        .chunks_exact(query_tokens.len())
+        .enumerate()
+    {
         let num_tokens_in_doc = all_token_counts_iter.next().expect_ok()?;
         let row_id = row_ids_iter.next().expect_ok()?;
-        let mut query_token_counts = Vec::with_capacity(query_tokens.len());
-        for _ in query_tokens {
-            query_token_counts.push(query_token_counts_iter.next().expect_ok()?);
-        }
         if num_tokens_in_doc == 0 {
             continue;
         }
@@ -933,10 +1110,9 @@ pub(super) fn flat_bm25_score(
         }
         let doc_norm = K1 * (1.0 - B + B * num_tokens_in_doc as f32 / scorer.avg_doc_length());
         let mut score = 0.0;
-        for (token, freq) in query_tokens.into_iter().zip(query_token_counts) {
-            let freq = freq as f32;
-            let idf = idf(scorer.num_docs_containing_token(token), scorer.num_docs());
-            score += idf * (freq * (K1 + 1.0) / (freq + doc_norm));
+        for (weight, freq) in query_weights.iter().zip(query_token_counts) {
+            let freq = *freq as f32;
+            score += weight * (freq * (K1 + 1.0) / (freq + doc_norm));
         }
         if score > 0.0 {
             row_ids_builder.append_value(row_id);
@@ -1108,6 +1284,668 @@ pub struct FlatBm25SearchOptions {
     pub phrase_slop: Option<u32>,
 }
 
+/// Fuzzy matching options for [`flat_bm25_search_stream_with_fuzzy_and_scorer`].
+#[derive(Debug, Clone)]
+pub struct FlatBm25FuzzyOptions {
+    /// Edit distance (`Some(0)` exact, `Some(d > 0)` explicit fuzzy, `None` AUTO).
+    pub fuzziness: Option<u32>,
+    /// Maximum total expanded terms across all query groups.
+    pub max_expansions: usize,
+    /// Exact prefix length that must match before fuzzy edits apply.
+    pub prefix_length: u32,
+    /// Optional canonical pre-expanded vocabulary and corpus-wide BM25 scorer.
+    /// When set, skips flat vocabulary discovery and scores directly against
+    /// `prepared_query`.
+    pub prepared_query: Option<Arc<PreparedBm25Query>>,
+}
+
+impl Default for FlatBm25FuzzyOptions {
+    fn default() -> Self {
+        Self {
+            fuzziness: Some(0),
+            max_expansions: 50,
+            prefix_length: 0,
+            prepared_query: None,
+        }
+    }
+}
+
+struct FuzzyMatchedDoc {
+    row_id: u64,
+    doc_indices: Vec<u32>,
+    all_tokens: u64,
+    term_freqs: Vec<(String, u64)>,
+}
+
+struct FuzzyBatchAccum {
+    doc_count: usize,
+    total_tokens: u64,
+    term_df: HashMap<String, usize>,
+    candidates_by_group: Vec<BTreeSet<String>>,
+    matched_docs: Vec<FuzzyMatchedDoc>,
+}
+
+/// Run a flat BM25 search supporting exact matching, bounded fuzzy matching
+/// (with identical `FuzzyAutomaton`, `auto_fuzziness`, `prefix_length`, and
+/// `max_expansions` semantics to indexed search), and canonical
+/// [`PreparedBm25Query`] replay.
+#[allow(clippy::too_many_arguments)]
+pub async fn flat_bm25_search_stream_with_fuzzy_and_scorer(
+    input: SendableRecordBatchStream,
+    doc_col: String,
+    query: String,
+    doc_tokenizer: Box<dyn LanceTokenizer>,
+    mut query_tokenizer: Box<dyn LanceTokenizer>,
+    indexed_segments: &[Arc<InvertedIndex>],
+    base_scorer: Option<MemBM25Scorer>,
+    options: FlatBm25SearchOptions,
+    fuzzy: FlatBm25FuzzyOptions,
+) -> DataFusionResult<(
+    SendableRecordBatchStream,
+    MemBM25Scorer,
+    Option<Arc<PreparedBm25Query>>,
+)> {
+    // 1. Canonical prepared-query replay (exact or fuzzy, e.g. distributed flat).
+    if let Some(prepared) = fuzzy.prepared_query {
+        let FlatBm25SearchOptions {
+            target_batch_size,
+            elapsed_compute,
+            document_granularity,
+            operator,
+            boost,
+            phrase_slop,
+        } = options;
+        let output_schema = fts_schema(document_granularity);
+        let prepared_scorer = prepared.scorer().as_ref().clone();
+        if prepared.tokens().is_empty()
+            || (operator == Operator::And && !prepared.has_all_query_positions())
+        {
+            return Ok((
+                Box::pin(RecordBatchStreamAdapter::new(
+                    output_schema,
+                    stream::empty::<DataFusionResult<RecordBatch>>(),
+                )),
+                prepared_scorer,
+                Some(prepared),
+            ));
+        }
+
+        let input_schema = input.schema();
+        let doc_col_idx = input_schema.index_of(&doc_col)?;
+        let coordinate_rank = document_coordinate_rank(input_schema.as_ref());
+        if document_granularity.is_list_element() != (coordinate_rank > 0) {
+            return Err(datafusion_common::DataFusionError::Execution(
+                "flat FTS document granularity does not match its input coordinate columns"
+                    .to_string(),
+            ));
+        }
+        const ACCUMULATE_BYTES: usize = 256 * 1024;
+        const SLICE_BYTES: usize = 512 * 1024;
+        let chunked = lance_arrow::stream::rechunk_stream_by_size(
+            input,
+            input_schema,
+            ACCUMULATE_BYTES,
+            SLICE_BYTES,
+        );
+        let query_tokens = prepared.tokens().clone();
+        let counted_input = tokenize_and_count(
+            chunked,
+            doc_tokenizer,
+            query_tokens.clone(),
+            doc_col_idx,
+            elapsed_compute.clone(),
+            coordinate_rank,
+            phrase_slop,
+        );
+        let stream_scorer = prepared_scorer.clone();
+        let batches = counted_input
+            .map(move |batch_res| {
+                let start = std::time::Instant::now();
+                let result = batch_res.and_then(|batch| {
+                    flat_bm25_score(
+                        &query_tokens,
+                        &batch,
+                        &stream_scorer,
+                        document_granularity,
+                        operator,
+                        boost,
+                        phrase_slop,
+                    )
+                    .map(|scores| stream::iter(slice_into_batches(scores, target_batch_size)))
+                    .map_err(datafusion_common::DataFusionError::from)
+                });
+                if let Some(t) = &elapsed_compute {
+                    t.add_duration(start.elapsed());
+                }
+                result
+            })
+            .try_flatten();
+        return Ok((
+            Box::pin(RecordBatchStreamAdapter::new(output_schema, batches)),
+            prepared_scorer,
+            Some(prepared),
+        ));
+    }
+
+    // 2. Exact flat search: delegate straight to the existing fast path.
+    if !uses_fuzzy_expansion(fuzzy.fuzziness) {
+        let (stream, scorer) = flat_bm25_search_stream_with_options_and_scorer(
+            input,
+            doc_col,
+            query,
+            doc_tokenizer,
+            base_scorer,
+            options,
+        )
+        .await?;
+        return Ok((stream, scorer, None));
+    }
+
+    // 3. Genuine fuzzy flat search over unindexed rows (+ optional indexed segments).
+    let FlatBm25SearchOptions {
+        target_batch_size,
+        elapsed_compute,
+        document_granularity,
+        operator,
+        boost,
+        phrase_slop,
+    } = options;
+    let output_schema = fts_schema(document_granularity);
+    let pre_await_start = std::time::Instant::now();
+    let source_tokens = try_collect_query_tokens(&query, &mut query_tokenizer)?;
+    if source_tokens.is_empty() || fuzzy.max_expansions == 0 {
+        let scorer = base_scorer.unwrap_or_else(|| MemBM25Scorer::new(0, 0, HashMap::new()));
+        let empty_tokens = Tokens::try_from_parts(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            source_tokens.token_type().clone(),
+        )?;
+        let prepared = Arc::new(PreparedBm25Query::from_parts(
+            Arc::new(empty_tokens),
+            Arc::new(scorer.clone()),
+            source_tokens.is_empty(),
+        ));
+        return Ok((
+            Box::pin(RecordBatchStreamAdapter::new(
+                output_schema,
+                stream::empty::<DataFusionResult<RecordBatch>>(),
+            )),
+            scorer,
+            Some(prepared),
+        ));
+    }
+
+    let fuzzy_params = FtsSearchParams::new()
+        .with_fuzziness(fuzzy.fuzziness)
+        .with_max_expansions(fuzzy.max_expansions)
+        .with_prefix_length(fuzzy.prefix_length)
+        .with_phrase_slop(phrase_slop);
+    let mut grouped = BTreeMap::<u32, (u32, Vec<String>)>::new();
+    for idx in 0..source_tokens.len() {
+        let group = source_tokens.position_for_query(idx, phrase_slop.is_some());
+        let pos = source_tokens.position(idx);
+        let term = source_tokens.get_token(idx);
+        let entry = grouped.entry(group).or_insert_with(|| (pos, Vec::new()));
+        if !entry.1.iter().any(|existing| existing == term) {
+            entry.1.push(term.to_string());
+        }
+    }
+    let source_groups: Vec<(u32, u32, Vec<String>)> = grouped
+        .into_iter()
+        .map(|(g, (p, terms))| (g, p, terms))
+        .collect();
+    let mut group_automatons = Vec::with_capacity(source_groups.len());
+    for (_, _, terms) in &source_groups {
+        let mut automatons = Vec::with_capacity(terms.len());
+        for term in terms {
+            automatons.push(FuzzyAutomaton::new(
+                term,
+                source_tokens.token_type(),
+                &fuzzy_params,
+            )?);
+        }
+        group_automatons.push(automatons);
+    }
+    let group_automatons = Arc::new(group_automatons);
+    let num_groups = source_groups.len();
+
+    let input_schema = input.schema();
+    let doc_col_idx = input_schema.index_of(&doc_col)?;
+    let coordinate_rank = document_coordinate_rank(input_schema.as_ref());
+    if document_granularity.is_list_element() != (coordinate_rank > 0) {
+        return Err(datafusion_common::DataFusionError::Execution(
+            "flat FTS document granularity does not match its input coordinate columns".to_string(),
+        ));
+    }
+
+    const ACCUMULATE_BYTES: usize = 256 * 1024;
+    const SLICE_BYTES: usize = 512 * 1024;
+    let chunked = lance_arrow::stream::rechunk_stream_by_size(
+        input,
+        input_schema,
+        ACCUMULATE_BYTES,
+        SLICE_BYTES,
+    );
+    if let Some(t) = &elapsed_compute {
+        t.add_duration(pre_await_start.elapsed());
+    }
+
+    let discount_overlaps = doc_tokenizer.discount_overlaps();
+    let mut tasks = Box::pin(
+        chunked
+            .map(move |batch| {
+                let mut tokenizer = doc_tokenizer.box_clone();
+                let group_automatons = group_automatons.clone();
+                let elapsed_compute = elapsed_compute.clone();
+                spawn_cpu(move || {
+                    let start = std::time::Instant::now();
+                    let batch = batch?;
+                    let row_id_array = batch[ROW_ID].as_primitive::<UInt64Type>();
+                    let input_doc_indices = (0..coordinate_rank)
+                        .map(|rank| {
+                            let column_name = doc_index_storage_column(rank);
+                            batch
+                                .column_by_name(&column_name)
+                                .ok_or_else(|| {
+                                    datafusion_common::DataFusionError::Internal(format!(
+                                        "flat ListElement FTS is missing {column_name}"
+                                    ))
+                                })
+                                .map(|column| column.as_primitive::<UInt32Type>())
+                        })
+                        .collect::<DataFusionResult<Vec<_>>>()?;
+
+                    let mut accum = FuzzyBatchAccum {
+                        doc_count: 0,
+                        total_tokens: 0,
+                        term_df: HashMap::new(),
+                        candidates_by_group: vec![BTreeSet::new(); num_groups],
+                        matched_docs: Vec::new(),
+                    };
+                    // Per-batch memoization: each distinct token string is checked
+                    // against the fuzzy automatons at most once per batch.
+                    let mut token_match_cache = HashMap::<String, Vec<usize>>::new();
+                    let mut doc_term_freqs = HashMap::<String, u64>::new();
+
+                    let mut scan_text = |doc: &str,
+                                         doc_term_freqs: &mut HashMap<String, u64>,
+                                         candidates_by_group: &mut [BTreeSet<String>]|
+                     -> u64 {
+                        let mut stream = tokenizer.token_stream_for_doc(doc);
+                        let mut all_tokens = 0u64;
+                        let mut last_position = None;
+                        while let Some(token) = stream.next() {
+                            if !discount_overlaps || last_position != Some(token.position) {
+                                all_tokens += 1;
+                            }
+                            last_position = Some(token.position);
+                            let matched_groups =
+                                if let Some(cached) = token_match_cache.get(&token.text) {
+                                    cached.as_slice()
+                                } else {
+                                    let mut matched = Vec::new();
+                                    for (g_idx, automatons) in group_automatons.iter().enumerate() {
+                                        if automatons.iter().any(|a| a.matches_str(&token.text)) {
+                                            matched.push(g_idx);
+                                        }
+                                    }
+                                    token_match_cache.insert(token.text.clone(), matched);
+                                    token_match_cache[&token.text].as_slice()
+                                };
+                            if !matched_groups.is_empty() {
+                                for &g_idx in matched_groups {
+                                    candidates_by_group[g_idx].insert(token.text.clone());
+                                }
+                                *doc_term_freqs.entry(token.text.clone()).or_insert(0) += 1;
+                            }
+                        }
+                        all_tokens
+                    };
+
+                    let finish_doc =
+                        |row_index: usize,
+                         row_id: u64,
+                         all_tokens: u64,
+                         doc_term_freqs: &mut HashMap<String, u64>,
+                         accum: &mut FuzzyBatchAccum| {
+                            if coordinate_rank > 0 || all_tokens > 0 {
+                                accum.doc_count += 1;
+                                accum.total_tokens += all_tokens;
+                                if !doc_term_freqs.is_empty() {
+                                    let mut term_freqs = Vec::with_capacity(doc_term_freqs.len());
+                                    for (term, freq) in doc_term_freqs.drain() {
+                                        *accum.term_df.entry(term.clone()).or_insert(0) += 1;
+                                        term_freqs.push((term, freq));
+                                    }
+                                    let doc_indices = input_doc_indices
+                                        .iter()
+                                        .map(|col| col.value(row_index))
+                                        .collect();
+                                    accum.matched_docs.push(FuzzyMatchedDoc {
+                                        row_id,
+                                        doc_indices,
+                                        all_tokens,
+                                        term_freqs,
+                                    });
+                                }
+                            } else {
+                                doc_term_freqs.clear();
+                            }
+                        };
+
+                    match batch.column(doc_col_idx).data_type() {
+                        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => {
+                            for (row_index, (doc, row_id)) in
+                                iter_str_array(batch.column(doc_col_idx))
+                                    .zip(row_id_array.values().iter())
+                                    .enumerate()
+                            {
+                                doc_term_freqs.clear();
+                                let all_tokens = match doc {
+                                    Some(doc) => scan_text(
+                                        doc,
+                                        &mut doc_term_freqs,
+                                        &mut accum.candidates_by_group,
+                                    ),
+                                    None => 0,
+                                };
+                                finish_doc(
+                                    row_index,
+                                    *row_id,
+                                    all_tokens,
+                                    &mut doc_term_freqs,
+                                    &mut accum,
+                                );
+                            }
+                        }
+                        DataType::List(_) => {
+                            if coordinate_rank != 0 {
+                                return Err(datafusion_common::DataFusionError::Internal(
+                                "ListElement flat FTS input must be expanded to string documents"
+                                    .to_string(),
+                            ));
+                            }
+                            let doc_array = batch.column(doc_col_idx).as_list::<i32>();
+                            for i in 0..row_id_array.len() {
+                                doc_term_freqs.clear();
+                                let mut all_tokens = 0u64;
+                                if !doc_array.is_null(i) {
+                                    let elements = doc_array.value(i);
+                                    for element in iter_str_array(elements.as_ref()).flatten() {
+                                        all_tokens += scan_text(
+                                            element,
+                                            &mut doc_term_freqs,
+                                            &mut accum.candidates_by_group,
+                                        );
+                                    }
+                                }
+                                finish_doc(
+                                    i,
+                                    row_id_array.value(i),
+                                    all_tokens,
+                                    &mut doc_term_freqs,
+                                    &mut accum,
+                                );
+                            }
+                        }
+                        DataType::LargeList(_) => {
+                            if coordinate_rank != 0 {
+                                return Err(datafusion_common::DataFusionError::Internal(
+                                "ListElement flat FTS input must be expanded to string documents"
+                                    .to_string(),
+                            ));
+                            }
+                            let doc_array = batch.column(doc_col_idx).as_list::<i64>();
+                            for i in 0..row_id_array.len() {
+                                doc_term_freqs.clear();
+                                let mut all_tokens = 0u64;
+                                if !doc_array.is_null(i) {
+                                    let elements = doc_array.value(i);
+                                    for element in iter_str_array(elements.as_ref()).flatten() {
+                                        all_tokens += scan_text(
+                                            element,
+                                            &mut doc_term_freqs,
+                                            &mut accum.candidates_by_group,
+                                        );
+                                    }
+                                }
+                                finish_doc(
+                                    i,
+                                    row_id_array.value(i),
+                                    all_tokens,
+                                    &mut doc_term_freqs,
+                                    &mut accum,
+                                );
+                            }
+                        }
+                        data_type => {
+                            return Err(datafusion_common::DataFusionError::Execution(format!(
+                                "unsupported data type {} for flat full text search",
+                                data_type
+                            )));
+                        }
+                    }
+                    if let Some(t) = &elapsed_compute {
+                        t.add_duration(start.elapsed());
+                    }
+                    DataFusionResult::Ok(accum)
+                })
+            })
+            .buffered(get_num_compute_intensive_cpus()),
+    );
+
+    let mut flat_doc_count = 0usize;
+    let mut flat_total_tokens = 0u64;
+    let mut flat_df = HashMap::<String, usize>::new();
+    let mut candidates_by_group = vec![BTreeSet::<String>::new(); num_groups];
+    let mut matched_docs = Vec::new();
+    while let Some(batch_accum) = tasks.try_next().await? {
+        flat_doc_count += batch_accum.doc_count;
+        flat_total_tokens += batch_accum.total_tokens;
+        for (term, df) in batch_accum.term_df {
+            *flat_df.entry(term).or_insert(0) += df;
+        }
+        for (g_idx, group_set) in batch_accum.candidates_by_group.into_iter().enumerate() {
+            candidates_by_group[g_idx].extend(group_set);
+        }
+        matched_docs.extend(batch_accum.matched_docs);
+    }
+
+    // When both indexed segments and unindexed flat rows form one corpus, include
+    // the indexed segments' bounded expansions so the lexicographical budget cap
+    // applies uniformly across the whole dataset.
+    if !indexed_segments.is_empty() && base_scorer.is_none() {
+        for (g_idx, (_, _, source_terms)) in source_groups.iter().enumerate() {
+            let n = source_terms.len();
+            let group_tokens = Tokens::try_from_parts(
+                source_terms.clone(),
+                vec![0; n],
+                vec![0; n],
+                source_tokens.token_type().clone(),
+            )?;
+            for segment in indexed_segments {
+                let expanded = segment.expand_fuzzy_tokens(&group_tokens, &fuzzy_params)?;
+                for idx in 0..expanded.len() {
+                    candidates_by_group[g_idx].insert(expanded.get_token(idx).to_string());
+                }
+            }
+        }
+    }
+
+    // Canonical bounded lexicographical expansion across groups in ascending order.
+    let mut expanded_tokens = Vec::new();
+    let mut expanded_positions = Vec::new();
+    let mut expanded_groups = Vec::new();
+    let mut seen_pairs = HashSet::new();
+    for (g_idx, (orig_group, orig_pos, _)) in source_groups.iter().enumerate() {
+        let remaining = fuzzy.max_expansions.saturating_sub(expanded_tokens.len());
+        if remaining == 0 {
+            break;
+        }
+        for candidate in candidates_by_group[g_idx].iter().take(remaining) {
+            if expanded_tokens.len() >= fuzzy.max_expansions {
+                break;
+            }
+            if seen_pairs.insert((candidate.clone(), *orig_group)) {
+                expanded_tokens.push(candidate.clone());
+                expanded_positions.push(*orig_pos);
+                expanded_groups.push(*orig_group);
+            }
+        }
+    }
+    let surviving_groups: HashSet<u32> = expanded_groups.iter().copied().collect();
+    let has_all_query_positions = source_groups
+        .iter()
+        .all(|(orig_group, _, _)| surviving_groups.contains(orig_group));
+
+    let unique_expanded: Vec<String> = expanded_tokens
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let mut total_docs = flat_doc_count;
+    let mut total_tokens = flat_total_tokens;
+    let mut token_docs: HashMap<String, usize> = unique_expanded
+        .iter()
+        .map(|term| (term.clone(), flat_df.get(term).copied().unwrap_or(0)))
+        .collect();
+    if !indexed_segments.is_empty() && base_scorer.is_none() {
+        for segment in indexed_segments {
+            let (seg_tokens, seg_docs, seg_df) =
+                segment.bm25_stats_for_terms(&unique_expanded, None).await?;
+            total_docs += seg_docs;
+            total_tokens += seg_tokens;
+            for (term, df) in unique_expanded.iter().zip(seg_df) {
+                *token_docs.entry(term.clone()).or_insert(0) += df;
+            }
+        }
+    } else if let Some(base) = base_scorer {
+        total_docs += base.num_docs;
+        total_tokens += base.total_tokens;
+        for term in &unique_expanded {
+            *token_docs.entry(term.clone()).or_insert(0) += base.num_docs_containing_token(term);
+        }
+    }
+    let final_scorer = MemBM25Scorer::new(total_tokens, total_docs, token_docs);
+    let prepared_tokens = Tokens::try_from_parts(
+        expanded_tokens.clone(),
+        expanded_positions,
+        expanded_groups.clone(),
+        source_tokens.token_type().clone(),
+    )?;
+    let prepared_query = Arc::new(PreparedBm25Query::from_parts(
+        Arc::new(prepared_tokens),
+        Arc::new(final_scorer.clone()),
+        has_all_query_positions,
+    ));
+
+    if expanded_tokens.is_empty()
+        || (operator == Operator::And && !has_all_query_positions)
+        || matched_docs.is_empty()
+    {
+        return Ok((
+            Box::pin(RecordBatchStreamAdapter::new(
+                output_schema,
+                stream::empty::<DataFusionResult<RecordBatch>>(),
+            )),
+            final_scorer,
+            Some(prepared_query),
+        ));
+    }
+
+    // Score retained documents against ONLY the surviving expanded tokens.
+    let mut term_to_expanded_indices = HashMap::<&str, Vec<usize>>::new();
+    for (idx, token) in expanded_tokens.iter().enumerate() {
+        term_to_expanded_indices
+            .entry(token.as_str())
+            .or_default()
+            .push(idx);
+    }
+    let query_weights: Vec<f32> = expanded_tokens
+        .iter()
+        .map(|token| {
+            idf(
+                final_scorer.num_docs_containing_token(token),
+                final_scorer.num_docs(),
+            )
+        })
+        .collect();
+    let distinct_group_count = surviving_groups.len();
+    let avg_dl = final_scorer.avg_doc_length();
+
+    let mut row_ids_builder = UInt64Builder::with_capacity(matched_docs.len());
+    let mut scores_builder = Float32Builder::with_capacity(matched_docs.len());
+    let mut doc_indices_builder = document_granularity.is_list_element().then(|| {
+        ListBuilder::new(UInt32Builder::new()).with_field(Field::new(
+            "item",
+            DataType::UInt32,
+            false,
+        ))
+    });
+    let mut matched_groups_set = HashSet::with_capacity(distinct_group_count);
+
+    for doc in &matched_docs {
+        if doc.all_tokens == 0 {
+            continue;
+        }
+        let doc_norm = K1 * (1.0 - B + B * doc.all_tokens as f32 / avg_dl);
+        let mut score = 0.0f32;
+        let mut any_match = false;
+        matched_groups_set.clear();
+        for (term, freq) in &doc.term_freqs {
+            if let Some(indices) = term_to_expanded_indices.get(term.as_str()) {
+                any_match = true;
+                let freq_f = *freq as f32;
+                let tf_factor = freq_f * (K1 + 1.0) / (freq_f + doc_norm);
+                for &idx in indices {
+                    score += query_weights[idx] * tf_factor;
+                    if operator == Operator::And {
+                        matched_groups_set.insert(expanded_groups[idx]);
+                    }
+                }
+            }
+        }
+        if !any_match {
+            continue;
+        }
+        if operator == Operator::And && matched_groups_set.len() < distinct_group_count {
+            continue;
+        }
+        if score > 0.0 {
+            row_ids_builder.append_value(doc.row_id);
+            if let Some(builder) = doc_indices_builder.as_mut() {
+                for &coord in &doc.doc_indices {
+                    builder.values().append_value(coord);
+                }
+                builder.append(true);
+            }
+            scores_builder.append_value(score * boost);
+        }
+    }
+
+    let mut columns = vec![Arc::new(row_ids_builder.finish()) as ArrayRef];
+    if let Some(mut builder) = doc_indices_builder {
+        columns.push(Arc::new(builder.finish()) as ArrayRef);
+    }
+    columns.push(Arc::new(scores_builder.finish()) as ArrayRef);
+    let batch = RecordBatch::try_new(output_schema.clone(), columns)?;
+    let out_batches = if batch.num_rows() == 0 {
+        Vec::new()
+    } else {
+        slice_into_batches(batch, target_batch_size)
+    };
+    Ok((
+        Box::pin(RecordBatchStreamAdapter::new(
+            output_schema,
+            stream::iter(out_batches),
+        )),
+        final_scorer,
+        Some(prepared_query),
+    ))
+}
+
 /// Run a flat BM25 search and return the scorer initialized from both the
 /// optional indexed corpus and the flat input corpus.
 pub async fn flat_bm25_search_stream_with_options_and_scorer(
@@ -1178,7 +2016,7 @@ pub async fn flat_bm25_search_stream_with_options_and_scorer(
     // of the query tokens.  For example, if the query is "book" and the row is "the book shop"
     // and we are tokenizing with a whitespace tokenizer, we need to know that there are 3 tokens
     // and the token book appears once.
-    let counted_input = tokenize_and_count(
+    let mut counted_input = tokenize_and_count(
         chunked,
         tokenizer,
         query_tokens.clone(),
@@ -1186,40 +2024,96 @@ pub async fn flat_bm25_search_stream_with_options_and_scorer(
         elapsed_compute.clone(),
         coordinate_rank,
         phrase_slop,
-    )
-    .await?;
-
-    // Phase 3 - Calculate final scores (this is fairly cheap, probably don't need to parallelize).
-    // All post-await work is synchronous; time the scorer + score + slicing loop together.
-    let post_await_start = std::time::Instant::now();
-    let scorer = initialize_scorer(base_scorer.as_ref(), query_tokens.as_ref(), &counted_input);
-    let scores = flat_bm25_score(
-        query_tokens.as_ref(),
-        &counted_input,
-        &scorer,
-        document_granularity,
-        operator,
-        boost,
-        phrase_slop,
-    )?;
-
-    // Finally we emit batches according to the target batch size
-    let batches = slice_into_batches(scores, target_batch_size);
-    if let Some(t) = &elapsed_compute {
-        t.add_duration(post_await_start.elapsed());
+    );
+    let mut scorer = initialize_scorer(
+        base_scorer.as_ref(),
+        &query_tokens,
+        &RecordBatch::new_empty(counted_input.schema()),
+    );
+    let mut matching_batches = Vec::new();
+    let query_groups = query_position_groups(&query_tokens, phrase_slop.is_some());
+    let mut retained_bytes = 0;
+    let mut warned = false;
+    while let Some(batch) = counted_input.try_next().await? {
+        let start = std::time::Instant::now();
+        // Nonmatching documents still contribute to the corpus length and term
+        // frequencies. Discard their per-document counts only after this update.
+        scorer = initialize_scorer(Some(&scorer), &query_tokens, &batch);
+        let counts = batch
+            .column_by_name(FLAT_QUERY_TOKEN_COUNTS_COL)
+            .ok_or_else(|| Error::internal("flat FTS counts are missing query token counts"))?
+            .as_fixed_size_list()
+            .values()
+            .as_primitive::<UInt64Type>();
+        let phrase_matches = phrase_slop
+            .map(|_| {
+                batch
+                    .column_by_name(FLAT_PHRASE_MATCH_COL)
+                    .ok_or_else(|| Error::internal("flat phrase FTS is missing phrase matches"))
+                    .map(|column| column.as_boolean())
+            })
+            .transpose()?;
+        let matches = BooleanArray::from_iter(
+            counts
+                .values()
+                .chunks_exact(query_tokens.len())
+                .enumerate()
+                .map(|(row, counts)| {
+                    counts.iter().any(|count| *count > 0)
+                        && (operator != Operator::And
+                            || query_groups
+                                .iter()
+                                .all(|group| group.iter().any(|idx| counts[*idx] > 0)))
+                        && phrase_matches.is_none_or(|matches| matches.value(row))
+                }),
+        );
+        let batch = arrow::compute::filter_record_batch(&batch, &matches)?;
+        if batch.num_rows() > 0 {
+            retained_bytes += batch.get_array_memory_size() as u64;
+            if retained_bytes > BYTES_ACCUMULATED_WARNING_THRESHOLD && !warned {
+                tracing::warn!(
+                    "Flat full text search is retaining a large number of matching token counts. Consider using an FTS index instead."
+                );
+                warned = true;
+            }
+            matching_batches.push(batch);
+        }
+        if let Some(t) = &elapsed_compute {
+            t.add_duration(start.elapsed());
+        }
     }
+
+    // Statistics must be complete before either the indexed or flat arm scores.
+    // Score on demand, releasing each count batch as downstream top-k consumes it.
+    let stream_scorer = scorer.clone();
+    let batches = stream::iter(matching_batches)
+        .map(move |batch| {
+            let start = std::time::Instant::now();
+            let result = flat_bm25_score(
+                &query_tokens,
+                &batch,
+                &stream_scorer,
+                document_granularity,
+                operator,
+                boost,
+                phrase_slop,
+            )
+            .map(|scores| stream::iter(slice_into_batches(scores, target_batch_size)))
+            .map_err(datafusion_common::DataFusionError::from);
+            if let Some(t) = &elapsed_compute {
+                t.add_duration(start.elapsed());
+            }
+            result
+        })
+        .try_flatten();
     Ok((
-        Box::pin(RecordBatchStreamAdapter::new(
-            output_schema,
-            stream::iter(batches),
-        )),
+        Box::pin(RecordBatchStreamAdapter::new(output_schema, batches)),
         scorer,
     ))
 }
 
 /// Cut one scored batch into the `target_batch_size` chunks a flat FTS scan
-/// emits. Slicing is zero-copy, so the whole scan's scores stay in one
-/// allocation.
+/// emits. Slicing is zero-copy, so the input batch's scores share one allocation.
 pub(in super::super) fn slice_into_batches(
     batch: RecordBatch,
     target_batch_size: usize,

@@ -5,15 +5,19 @@
 
 use std::sync::Arc;
 
-use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use arrow_schema::{DataType, Field, Schema, SchemaRef, SortOptions};
+use datafusion::physical_expr::expressions::Column;
+use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
+use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::union::UnionExec;
 use datafusion::physical_plan::{ExecutionPlan, limit::GlobalLimitExec};
 use datafusion::prelude::{Expr, col};
 use futures::{StreamExt, TryStreamExt};
-use lance_core::Result;
+use lance_core::{Error, Result};
 use tracing::instrument;
 
 use crate::dataset::mem_wal::TOMBSTONE;
+use crate::dataset::scanner::ColumnOrdering;
 
 use super::collector::LsmDataSourceCollector;
 use super::data_source::LsmDataSource;
@@ -29,6 +33,55 @@ use super::projection::{
 use super::sstable_cache::{DatasetCache, SsTableWarmer, open_sstable};
 use crate::session::Session;
 use lance_io::object_store::ObjectStoreParams;
+
+/// Sort `plan` by `ordering`, keeping the top `offset + limit` rows.
+///
+/// Each key must be a top-level column `plan` emits with its full table type:
+/// a struct whose projection pruned or reordered its children would compare
+/// as a different key. A `LIMIT 0` validates the keys but skips the sort.
+pub(super) fn sort_top_k(
+    plan: Arc<dyn ExecutionPlan>,
+    ordering: &[ColumnOrdering],
+    table_schema: &Schema,
+    limit: Option<usize>,
+    offset: usize,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    let schema = plan.schema();
+    let exprs = ordering
+        .iter()
+        .map(|c| {
+            let (index, field) = schema.column_with_name(&c.column_name).ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "order_by column '{}' is not in the scan projection; \
+                     project it to sort by it",
+                    c.column_name
+                ))
+            })?;
+            let table_field = table_schema.field_with_name(&c.column_name)?;
+            if field.data_type() != table_field.data_type() {
+                return Err(Error::invalid_input(format!(
+                    "order_by column '{}' must be projected whole to sort by it",
+                    c.column_name
+                )));
+            }
+            Ok(PhysicalSortExpr {
+                expr: Arc::new(Column::new(&c.column_name, index)),
+                options: SortOptions {
+                    descending: !c.ascending,
+                    nulls_first: c.nulls_first,
+                },
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let ordering = LexOrdering::new(exprs)
+        .ok_or_else(|| Error::invalid_input("order_by requires at least one column".to_string()))?;
+    // DataFusion's top-k asserts `k > 0`; the limit above returns the empty result.
+    if limit == Some(0) {
+        return Ok(plan);
+    }
+    let fetch = limit.map(|l| l.saturating_add(offset));
+    Ok(Arc::new(SortExec::new(ordering, plan).with_fetch(fetch)))
+}
 
 /// Combine the user filter (if any) with `NOT _tombstone` so tombstone rows are
 /// dropped from a WAL-arm scan. Used only for sources whose schema carries the
@@ -131,6 +184,7 @@ impl LsmScanPlanner {
     /// * `filter` - Filter expression to apply
     /// * `limit` - Maximum rows to return
     /// * `offset` - Number of rows to skip
+    /// * `ordering` - Sort keys applied above the union; `None` scans unordered
     /// * `with_memtable_gen` - Whether to include _memtable_gen in output
     /// * `keep_row_address` - Whether to include _rowaddr in output
     ///
@@ -146,6 +200,7 @@ impl LsmScanPlanner {
     /// the output order, and with it any limit / offset, is the same on every
     /// run. `_memtable_gen` / `_rowaddr` are output-only and only produced
     /// when the caller opts in.
+    #[allow(clippy::too_many_arguments)]
     #[instrument(name = "lsm_plan_scan", level = "debug", skip_all, fields(has_filter = filter.is_some(), limit, offset))]
     pub async fn plan_scan(
         &self,
@@ -153,6 +208,7 @@ impl LsmScanPlanner {
         filter: Option<&Expr>,
         limit: Option<usize>,
         offset: Option<usize>,
+        ordering: Option<&[ColumnOrdering]>,
         with_memtable_gen: bool,
         keep_row_address: bool,
     ) -> Result<Arc<dyn ExecutionPlan>> {
@@ -198,7 +254,14 @@ impl LsmScanPlanner {
         // the LocalLimitExec below pull until it sees `n_needed` live rows or
         // reaches EOF. Sources without a block filter can still push the limit
         // down safely. The active memtable is in-memory and is never capped.
-        let n_needed = limit.map(|l| l.saturating_add(offset.unwrap_or(0)));
+        // An ordered scan takes the sort's top-k instead, so the any-N
+        // pushdown below must not run: it would hand the sort the first N rows
+        // in scan order rather than the N that rank highest.
+        let ordering = ordering.filter(|o| !o.is_empty());
+        let n_needed = match ordering {
+            Some(_) => None,
+            None => limit.map(|l| l.saturating_add(offset.unwrap_or(0))),
+        };
 
         // Building a source's scan opens its dataset: for a flushed
         // generation that is a manifest read and a schema read against
@@ -329,7 +392,19 @@ impl LsmScanPlanner {
             &self.canonical_scan_schema(projection, with_memtable_gen, keep_row_address)?,
         )?;
 
-        // 6. Add limit / offset if specified
+        // 6. Sort, then limit / offset if specified. The sort sits above the
+        // union and the cross-generation block-list, so its `fetch` keeps the
+        // top `offset + limit` *live* rows — capping a source before the block
+        // list is what leaves the ranked arms under-filled.
+        if let Some(ordering) = ordering {
+            plan = sort_top_k(
+                plan,
+                ordering,
+                &self.base_schema,
+                limit,
+                offset.unwrap_or(0),
+            )?;
+        }
         if limit.is_some() || offset.unwrap_or(0) > 0 {
             plan = Arc::new(GlobalLimitExec::new(plan, offset.unwrap_or(0), limit));
         }
@@ -625,11 +700,13 @@ mod integration_tests {
     use futures::TryStreamExt;
     use uuid::Uuid;
 
+    use crate::dataset::mem_wal::index::{IndexStore, MemIndexSpec};
+    use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
     use crate::dataset::mem_wal::scanner::LsmScanner;
     use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
     use crate::dataset::mem_wal::scanner::data_source::ShardSnapshot;
     use crate::dataset::mem_wal::scanner::sstable_cache::RunOnOpen;
-    use crate::dataset::mem_wal::write::{BatchStore, IndexStore, MemIndexSpec};
+    use crate::dataset::scanner::ColumnOrdering;
     use crate::dataset::{Dataset, WriteParams};
     use crate::utils::test::assert_plan_node_equals;
     use lance_core::datatypes::Schema as LanceSchema;
@@ -1196,6 +1273,215 @@ mod integration_tests {
         // Count total rows
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 3, "Should have 3 rows due to limit");
+    }
+
+    /// Helper: collect the `id` column of a scan result.
+    async fn scan_ids(scanner: LsmScanner) -> Vec<i32> {
+        let batch = scanner.try_into_batch().await.unwrap();
+        batch
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .iter()
+            .map(|v| v.unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_lsm_scan_order_by_ranks_across_sources() {
+        let (base_dataset, shard_snapshots, active_memtable, pk_columns, _temp_path) =
+            setup_multi_level_lsm().await;
+
+        let mut scanner = LsmScanner::new(base_dataset, shard_snapshots, pk_columns)
+            .order_by(Some(vec![ColumnOrdering::desc_nulls_last(
+                "id".to_string(),
+            )]))
+            .unwrap()
+            .limit(Some(3), None)
+            .unwrap();
+        if let Some((shard_id, memtable)) = active_memtable {
+            scanner = scanner.with_in_memory_memtables(shard_id, memtable);
+        }
+
+        assert_eq!(
+            scan_ids(scanner).await,
+            vec![7, 6, 5],
+            "top-k must rank over every source, not the first source to yield"
+        );
+    }
+
+    /// The any-N limit pushdown is unsound under a sort: it hands the sort the
+    /// first `n` rows in *scan* order. With ids written ascending and a
+    /// descending sort, a source-level fetch would return the k lowest ids.
+    #[tokio::test]
+    async fn test_lsm_scan_order_by_suppresses_any_n_pushdown() {
+        let schema = create_pk_schema();
+        let temp = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", temp.path().to_str().unwrap());
+        let ids: Vec<i32> = (1..=10).collect();
+        let base = Arc::new(
+            create_dataset(&base_uri, vec![create_test_batch(&schema, &ids, "base")]).await,
+        );
+
+        let scanner = LsmScanner::new(base, vec![], vec!["id".to_string()])
+            .order_by(Some(vec![ColumnOrdering::desc_nulls_last(
+                "id".to_string(),
+            )]))
+            .unwrap()
+            .limit(Some(3), None)
+            .unwrap();
+
+        assert_eq!(scan_ids(scanner).await, vec![10, 9, 8]);
+    }
+
+    /// The sort sits above the cross-generation block-list, so a stale base row
+    /// that would have out-ranked the live ones neither appears in the top-k
+    /// nor consumes one of its slots.
+    #[tokio::test]
+    async fn test_lsm_scan_order_by_ranks_live_rows_only() {
+        let schema = create_pk_schema();
+        let temp = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", temp.path().to_str().unwrap());
+        let base = Arc::new(
+            create_dataset(
+                &base_uri,
+                vec![create_test_batch(&schema, &[1, 2, 3], "zzz")],
+            )
+            .await,
+        );
+
+        // id=3's live name sorts last, so descending by name the live top-2 is
+        // zzz_2, zzz_1 -- the superseded zzz_3 must not take the first slot.
+        let (batch_store, index_store) = pk_indexed(&[create_test_batch(&schema, &[3], "aaa")]);
+        let scanner = LsmScanner::new(base, vec![], vec!["id".to_string()])
+            .with_in_memory_memtables(
+                Uuid::new_v4(),
+                InMemoryMemTables {
+                    active: InMemoryMemTableRef {
+                        batch_store,
+                        index_store,
+                        schema,
+                        generation: 1,
+                    },
+                    frozen: vec![],
+                },
+            )
+            .order_by(Some(vec![ColumnOrdering::desc_nulls_last(
+                "name".to_string(),
+            )]))
+            .unwrap()
+            .limit(Some(2), None)
+            .unwrap();
+
+        assert_eq!(scan_ids(scanner).await, vec![2, 1]);
+    }
+
+    /// Base rows `id=1, meta={a:1, b:9}` and `id=2, meta={a:2, b:0}`.
+    async fn struct_key_base(uri: &str) -> Arc<Dataset> {
+        use arrow_array::StructArray;
+        let mut id_metadata = HashMap::new();
+        id_metadata.insert(
+            "lance-schema:unenforced-primary-key".to_string(),
+            "true".to_string(),
+        );
+        let meta_fields = vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ];
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false).with_metadata(id_metadata),
+            Field::new("meta", DataType::Struct(meta_fields.clone().into()), false),
+        ]));
+        let meta = StructArray::new(
+            meta_fields.into(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(Int32Array::from(vec![9, 0])),
+            ],
+            None,
+        );
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int32Array::from(vec![1, 2])), Arc::new(meta)],
+        )
+        .unwrap();
+        Arc::new(create_dataset(uri, vec![batch]).await)
+    }
+
+    /// Sorting a struct key whose projection prunes its children would compare
+    /// the pruned struct, ranking by `meta.b` instead of `meta`. Both the scan
+    /// and the point-lookup entry points must reject it.
+    #[tokio::test]
+    async fn test_lsm_scan_order_by_rejects_pruned_struct_key() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = struct_key_base(&format!("{}/base", temp.path().to_str().unwrap())).await;
+        let ordered = |filter: Option<&str>, projection: &[&str]| {
+            let mut scanner = LsmScanner::new(base.clone(), vec![], vec!["id".to_string()])
+                .project(projection)
+                .unwrap()
+                .order_by(Some(vec![ColumnOrdering::asc_nulls_last(
+                    "meta".to_string(),
+                )]))
+                .unwrap()
+                .limit(Some(1), None)
+                .unwrap();
+            if let Some(filter) = filter {
+                scanner = scanner.filter(filter).unwrap();
+            }
+            scanner
+        };
+
+        for filter in [None, Some("id IN (1, 2)")] {
+            assert_eq!(
+                scan_ids(ordered(filter, &["id", "meta"])).await,
+                vec![1],
+                "full struct key ranks by meta.a first ({filter:?})"
+            );
+            let err = ordered(filter, &["id", "meta.b"])
+                .try_into_batch()
+                .await
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("meta"),
+                "pruned struct key must be rejected ({filter:?}): {err}"
+            );
+        }
+    }
+
+    /// An ordered `LIMIT 0` returns no rows with the projected schema, on both
+    /// the scan and the point-lookup entry points.
+    #[tokio::test]
+    async fn test_lsm_scan_order_by_limit_zero() {
+        let schema = create_pk_schema();
+        let temp = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", temp.path().to_str().unwrap());
+        let base = Arc::new(
+            create_dataset(&base_uri, vec![create_test_batch(&schema, &[1, 2, 3], "b")]).await,
+        );
+
+        for filter in [None, Some("id IN (1, 2)")] {
+            let ordered = |limit| {
+                let mut scanner = LsmScanner::new(base.clone(), vec![], vec!["id".to_string()])
+                    .project(&["name"])
+                    .unwrap()
+                    .order_by(Some(vec![ColumnOrdering::desc_nulls_last(
+                        "name".to_string(),
+                    )]))
+                    .unwrap()
+                    .limit(Some(limit), None)
+                    .unwrap();
+                if let Some(filter) = filter {
+                    scanner = scanner.filter(filter).unwrap();
+                }
+                scanner
+            };
+            let expected = ordered(1).try_into_batch().await.unwrap().schema();
+            let batch = ordered(0).try_into_batch().await.unwrap();
+            assert_eq!(batch.num_rows(), 0, "{filter:?}");
+            assert_eq!(batch.schema(), expected, "{filter:?}");
+        }
     }
 
     #[tokio::test]
@@ -2420,8 +2706,10 @@ mod integration_tests {
 
     /// Across a base table, a flushed generation, and frozen and active
     /// memtables, a scan from the memtables' filter indexes returns what
-    /// reading every row returns, whatever the filter, projection, limit and
-    /// offset.
+    /// reading every row returns, with and without a projection, limit and
+    /// offset. That the indexes answer like reading every row is checked over
+    /// many rounds at the memtable seam, in
+    /// `memtable_filter_indexes_answer_like_reading_every_row`.
     #[tokio::test]
     async fn test_lsm_scan_from_memtable_filter_indexes_answers_like_a_full_read() {
         use crate::dataset::mem_wal::TOMBSTONE;
@@ -2530,19 +2818,20 @@ mod integration_tests {
             (store, Arc::new(indexes))
         };
 
-        let (mut checked, mut index_reads) = (0, 0);
-        for round in 0..12 {
-            let temp = tempfile::tempdir().unwrap();
-            let base_uri = format!("{}/base", temp.path().to_str().unwrap());
-            let base_rows = rows(&mut next, 300, false);
-            let base = Arc::new(create_dataset(&base_uri, vec![disk_batch(&base_rows)]).await);
-            let shard_id = Uuid::new_v4();
-            let gen1_uri = format!("{}/_mem_wal/{}/gen_1", base_uri, shard_id);
-            create_dataset(&gen1_uri, vec![disk_batch(&rows(&mut next, 100, false))]).await;
-            let snapshot = ShardSnapshot::new(shard_id)
-                .with_current_generation(3)
-                .with_sstable(1, "gen_1".to_string());
+        let temp = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", temp.path().to_str().unwrap());
+        let base_rows = rows(&mut next, 300, false);
+        let base = Arc::new(create_dataset(&base_uri, vec![disk_batch(&base_rows)]).await);
+        let shard_id = Uuid::new_v4();
+        let gen1_uri = format!("{}/_mem_wal/{}/gen_1", base_uri, shard_id);
+        create_dataset(&gen1_uri, vec![disk_batch(&rows(&mut next, 100, false))]).await;
+        let snapshot = ShardSnapshot::new(shard_id)
+            .with_current_generation(3)
+            .with_sstable(1, "gen_1".to_string());
 
+        const ROUNDS: usize = 2;
+        let (mut checked, mut index_reads) = (0, 0);
+        for round in 0..ROUNDS {
             let frozen_batches: Vec<RecordBatch> = (0..4)
                 .map(|_| mem_batch(&rows(&mut next, 60, true)))
                 .collect();
@@ -2568,84 +2857,84 @@ mod integration_tests {
                 }],
             };
 
+            let projected_limit = [(Some(3), None), (Some(4), Some(2))][round];
             for filter in FILTERS {
-                for projection in [None, Some(vec!["id", "cat"])] {
-                    for (limit, offset) in [(None, None), (Some(3), None), (Some(4), Some(2))] {
-                        let read = |enabled: bool| {
-                            let mut scanner = LsmScanner::new(
-                                base.clone(),
-                                vec![snapshot.clone()],
-                                vec!["id".to_string()],
-                            )
-                            .with_in_memory_memtables(shard_id, in_memory.clone())
-                            .with_memtable_filter_indexes(enabled)
-                            .filter(filter)
-                            .unwrap();
-                            if let Some(columns) = &projection {
-                                scanner = scanner.project(columns).unwrap();
-                            }
-                            let scanner = scanner.limit(limit, offset).unwrap();
-                            async move {
-                                let plan = scanner.create_plan().await.unwrap();
-                                let shown = datafusion::physical_plan::displayable(plan.as_ref())
-                                    .indent(true)
-                                    .to_string();
-                                assert_eq!(shown.contains("newest_only=true"), enabled, "{shown}");
-                                let ctx = datafusion::prelude::SessionContext::new();
-                                let batches = datafusion::physical_plan::collect(
-                                    plan.clone(),
-                                    ctx.task_ctx(),
-                                )
-                                .await
-                                .unwrap();
-                                let mut out: Vec<(i32, Option<i32>)> = Vec::new();
-                                for batch in &batches {
-                                    let id = batch.column_by_name("id").unwrap();
-                                    let id = id.as_any().downcast_ref::<Int32Array>().unwrap();
-                                    let cat = batch.column_by_name("cat").unwrap();
-                                    let cat = cat.as_any().downcast_ref::<Int32Array>().unwrap();
-                                    for row in 0..batch.num_rows() {
-                                        out.push((
-                                            id.value(row),
-                                            cat.is_valid(row).then(|| cat.value(row)),
-                                        ));
-                                    }
+                for (projection, (limit, offset)) in [
+                    (None, (None, None)),
+                    (Some(vec!["id", "cat"]), projected_limit),
+                ] {
+                    let read = |enabled: bool| {
+                        let mut scanner = LsmScanner::new(
+                            base.clone(),
+                            vec![snapshot.clone()],
+                            vec!["id".to_string()],
+                        )
+                        .with_in_memory_memtables(shard_id, in_memory.clone())
+                        .with_memtable_filter_indexes(enabled)
+                        .filter(filter)
+                        .unwrap();
+                        if let Some(columns) = &projection {
+                            scanner = scanner.project(columns).unwrap();
+                        }
+                        let scanner = scanner.limit(limit, offset).unwrap();
+                        async move {
+                            let plan = scanner.create_plan().await.unwrap();
+                            let shown = datafusion::physical_plan::displayable(plan.as_ref())
+                                .indent(true)
+                                .to_string();
+                            assert_eq!(shown.contains("newest_only=true"), enabled, "{shown}");
+                            let ctx = datafusion::prelude::SessionContext::new();
+                            let batches =
+                                datafusion::physical_plan::collect(plan.clone(), ctx.task_ctx())
+                                    .await
+                                    .unwrap();
+                            let mut out: Vec<(i32, Option<i32>)> = Vec::new();
+                            for batch in &batches {
+                                let id = batch.column_by_name("id").unwrap();
+                                let id = id.as_any().downcast_ref::<Int32Array>().unwrap();
+                                let cat = batch.column_by_name("cat").unwrap();
+                                let cat = cat.as_any().downcast_ref::<Int32Array>().unwrap();
+                                for row in 0..batch.num_rows() {
+                                    out.push((
+                                        id.value(row),
+                                        cat.is_valid(row).then(|| cat.value(row)),
+                                    ));
                                 }
-                                out.sort_unstable();
-                                (out, newest_checks(&plan))
                             }
-                        };
-                        let context = format!(
-                            "round {round}, filter {filter}, projection {projection:?}, limit {limit:?}, offset {offset:?}"
-                        );
-                        let (full, checks) = read(false).await;
-                        assert_eq!(checks, 0, "{context}: the setting is off");
-                        let (from_indexes, checks) = read(true).await;
-                        if checks > 0 {
-                            index_reads += 1;
+                            out.sort_unstable();
+                            (out, newest_checks(&plan))
                         }
-                        if limit.is_none() {
-                            assert_eq!(from_indexes, full, "{context}");
-                        } else {
-                            // An unordered limit may return any rows that match,
-                            // each key once.
-                            assert_eq!(from_indexes.len(), full.len(), "{context}");
-                            let mut ids: Vec<i32> = from_indexes.iter().map(|row| row.0).collect();
-                            ids.dedup();
-                            assert_eq!(ids.len(), from_indexes.len(), "{context}: a key twice");
-                            let mut all =
-                                read_all(&base, &snapshot, shard_id, &in_memory, filter).await;
-                            all.sort_unstable();
-                            for row in &from_indexes {
-                                assert!(all.contains(row), "{context}: {row:?} does not match");
-                            }
-                        }
-                        checked += 1;
+                    };
+                    let context = format!(
+                        "round {round}, filter {filter}, projection {projection:?}, limit {limit:?}, offset {offset:?}"
+                    );
+                    let (full, checks) = read(false).await;
+                    assert_eq!(checks, 0, "{context}: the setting is off");
+                    let (from_indexes, checks) = read(true).await;
+                    if checks > 0 {
+                        index_reads += 1;
                     }
+                    if limit.is_none() {
+                        assert_eq!(from_indexes, full, "{context}");
+                    } else {
+                        // An unordered limit may return any rows that match,
+                        // each key once.
+                        assert_eq!(from_indexes.len(), full.len(), "{context}");
+                        let mut ids: Vec<i32> = from_indexes.iter().map(|row| row.0).collect();
+                        ids.dedup();
+                        assert_eq!(ids.len(), from_indexes.len(), "{context}: a key twice");
+                        let mut all =
+                            read_all(&base, &snapshot, shard_id, &in_memory, filter).await;
+                        all.sort_unstable();
+                        for row in &from_indexes {
+                            assert!(all.contains(row), "{context}: {row:?} does not match");
+                        }
+                    }
+                    checked += 1;
                 }
             }
         }
-        assert_eq!(checked, 12 * FILTERS.len() * 2 * 3);
+        assert_eq!(checked, ROUNDS * FILTERS.len() * 2);
         assert!(
             index_reads * 2 > checked,
             "most reads must take the index route: {index_reads} of {checked}"
@@ -2762,6 +3051,110 @@ mod integration_tests {
             vec![1, 3],
             "id=2 deleted via an SSTable tombstone"
         );
+    }
+
+    /// `count_rows` plans its own scan, without the caller's projection; it
+    /// must count what the scan returns across base, an SSTable and the
+    /// active memtable: an overwritten key once, a deleted key not at all,
+    /// and a filter on a column the projection leaves out.
+    #[tokio::test]
+    async fn test_lsm_count_rows_matches_scan_across_sources() {
+        let base_schema = create_pk_schema();
+        let mem_schema = ts_pk_schema();
+        let temp = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", temp.path().to_str().unwrap());
+        let base = Arc::new(
+            create_dataset(
+                &base_uri,
+                vec![create_test_batch(&base_schema, &[1, 2, 3, 4, 5], "base")],
+            )
+            .await,
+        );
+        // SSTable gen 1 overwrites id=3 and deletes id=4.
+        let shard_id = Uuid::new_v4();
+        let gen1_uri = format!("{}/_mem_wal/{}/gen_1", base_uri, shard_id);
+        create_dataset(
+            &gen1_uri,
+            vec![ts_batch(
+                &mem_schema,
+                &[(3, Some("gen1_3"), false), (4, None, true)],
+            )],
+        )
+        .await;
+        let shard_snapshot = ShardSnapshot::new(shard_id)
+            .with_current_generation(2)
+            .with_sstable(1, "gen_1".to_string());
+        // The active memtable overwrites id=1, deletes id=5 and adds id=6.
+        let active_batch = ts_batch(
+            &mem_schema,
+            &[
+                (1, Some("active_1"), false),
+                (5, None, true),
+                (6, Some("active_6"), false),
+            ],
+        );
+        let (bs, ix) = pk_indexed(&[active_batch]);
+        let scanner = |filter: &str, offset: Option<i64>| {
+            LsmScanner::new(
+                base.clone(),
+                vec![shard_snapshot.clone()],
+                vec!["id".to_string()],
+            )
+            .with_in_memory_memtables(
+                shard_id,
+                InMemoryMemTables {
+                    active: InMemoryMemTableRef {
+                        batch_store: bs.clone(),
+                        index_store: ix.clone(),
+                        schema: mem_schema.clone(),
+                        generation: 2,
+                    },
+                    frozen: vec![],
+                },
+            )
+            .project(&["name"])
+            .unwrap()
+            .filter(filter)
+            .unwrap()
+            .limit(None, offset)
+            .unwrap()
+        };
+
+        // Live keys: 1 (active), 2 (base), 3 (gen 1), 6 (active). The
+        // projection leaves out the key.
+        for (filter, offset, expected) in [
+            ("id > 0", None, 4),
+            ("name != 'base_2'", None, 3),
+            ("name LIKE 'base%'", None, 1),
+            ("id = 3", None, 1),
+            ("id IN (1, 4, 5, 6)", None, 2),
+            ("id > 0", Some(1), 3),
+        ] {
+            if filter.starts_with("id =") || filter.starts_with("id IN") {
+                let plan = scanner(filter, offset).create_plan().await.unwrap();
+                let plan = datafusion::physical_plan::displayable(plan.as_ref())
+                    .indent(true)
+                    .to_string();
+                assert!(
+                    plan.contains("OneShotStream"),
+                    "{filter} must take the point-lookup route:\n{plan}"
+                );
+            }
+            let batches: Vec<RecordBatch> = scanner(filter, offset)
+                .try_into_stream()
+                .await
+                .unwrap()
+                .try_collect()
+                .await
+                .unwrap();
+            let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+            assert_eq!(rows, expected, "scan, {filter}, offset {offset:?}");
+            assert_eq!(
+                scanner(filter, offset).count_rows().await.unwrap(),
+                expected as u64,
+                "count_rows, {filter}, offset {offset:?}"
+            );
+        }
     }
 
     #[tokio::test]

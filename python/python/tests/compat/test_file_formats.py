@@ -282,9 +282,8 @@ class BasicTypes2_1(UpgradeDowngradeTest):
             writer.write_batch(build_basic_types())
 
 
-# File format 2.2 is not in the stable 2.0.x line; gate this on the first
-# available pre-release that includes 2.2 support.
-@compat_test(min_version="4.0.0b1")
+# File format 2.2 is not in the stable 2.0.x line.
+@compat_test(min_version="4.0.0")
 class BasicTypes2_2(UpgradeDowngradeTest):
     """Test file format 2.2 compatibility with basic data types."""
 

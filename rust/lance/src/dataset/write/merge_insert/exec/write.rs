@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::HashSet;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicU64, Ordering},
@@ -13,7 +12,9 @@ use arrow_select;
 use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::common::{DataFusionError, Result as DFResult};
 use datafusion::physical_expr::PhysicalExpr;
-use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
+use datafusion::physical_plan::metrics::{
+    BaselineMetrics, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet,
+};
 use datafusion::{
     execution::{SendableRecordBatchStream, TaskContext},
     physical_plan::{
@@ -26,6 +27,7 @@ use datafusion_physical_expr::{EquivalenceProperties, Partitioning};
 use futures::{StreamExt, stream};
 use lance_arrow::RecordBatchExt;
 use lance_core::{Error, ROW_ADDR, ROW_CREATED_AT_VERSION, ROW_ID};
+use lance_datafusion::utils::from_datafusion_stream;
 use lance_table::format::{Fragment, RowDatasetVersionSequence, RowIdMeta};
 use lance_table::rowids::version::rechunk_version_sequences;
 use lance_table::rowids::{RowIdSequence, rechunk_sequences, write_row_ids};
@@ -61,7 +63,7 @@ use super::apply_deletions;
 
 /// Consumers own the producer task so cancelling a merge also stops polling
 /// its source, including when the producer is waiting on a full output queue.
-struct SplitterTask(tokio::task::JoinHandle<()>);
+struct SplitterTask(lance_core::utils::tokio::JoinHandle<()>);
 
 impl Drop for SplitterTask {
     fn drop(&mut self) {
@@ -123,8 +125,6 @@ struct MergeState {
     metrics: MergeInsertMetrics,
     /// Whether the dataset uses stable row ids.
     stable_row_ids: bool,
-    /// Set to track processed row IDs to detect duplicates
-    processed_row_ids: HashSet<u64>,
     /// Set to track non-null keys of rows inserted by FirstSeen mode
     processed_insert_keys: InsertedKeyTracker,
     /// The "on" column names for merge operation
@@ -147,7 +147,6 @@ impl MergeState {
             inserted_rows_filter: KeyExistenceFilterBuilder::new(field_ids),
             metrics,
             stable_row_ids,
-            processed_row_ids: HashSet::new(),
             processed_insert_keys: InsertedKeyTracker::default(),
             on_columns,
             source_dedupe_behavior,
@@ -168,14 +167,14 @@ impl MergeState {
                 // Delete action - only delete, don't write back
                 if !row_addr_array.is_null(row_idx) {
                     let row_addr = row_addr_array.value(row_idx);
-                    let row_id = row_id_array.value(row_idx);
 
                     // A source with duplicate keys matches the same target row
                     // more than once; apply the same dedupe policy as updates.
                     // (Target-only deletes from `delete_not_matched_by_source`
                     // also reach here but never duplicate, so they never trip
-                    // `Fail`.)
-                    if !self.processed_row_ids.insert(row_id) {
+                    // `Fail`.) Each target row has one address, so an address
+                    // already in `delete_row_addrs` marks a duplicate.
+                    if !self.delete_row_addrs.insert(row_addr) {
                         match self.source_dedupe_behavior {
                             SourceDedupeBehavior::Fail => {
                                 return Err(create_duplicate_row_error(
@@ -191,7 +190,6 @@ impl MergeState {
                         }
                     }
 
-                    self.delete_row_addrs.insert(row_addr);
                     self.metrics.num_deleted_rows.add(1);
                 }
                 Ok(None) // Don't keep this row
@@ -202,8 +200,9 @@ impl MergeState {
                     let row_addr = row_addr_array.value(row_idx);
                     let row_id = row_id_array.value(row_idx);
 
-                    // Check for duplicate _rowid in the current merge operation
-                    if !self.processed_row_ids.insert(row_id) {
+                    // A target row already in `delete_row_addrs` was matched
+                    // earlier in this merge.
+                    if !self.delete_row_addrs.insert(row_addr) {
                         match self.source_dedupe_behavior {
                             SourceDedupeBehavior::Fail => {
                                 return Err(create_duplicate_row_error(
@@ -218,8 +217,6 @@ impl MergeState {
                             }
                         }
                     }
-
-                    self.delete_row_addrs.insert(row_addr);
 
                     if self.stable_row_ids {
                         self.updating_row_ids.lock().unwrap().capture(&[row_id])?;
@@ -313,18 +310,7 @@ impl FullSchemaMergeInsertExec {
         ));
 
         // Check if ON columns match the schema's unenforced primary key
-        let field_ids: Vec<i32> = params
-            .on
-            .iter()
-            .filter_map(|name| dataset.schema().field(name).map(|f| f.id))
-            .collect();
-        let pk_field_ids: Vec<i32> = dataset
-            .schema()
-            .unenforced_primary_key()
-            .iter()
-            .map(|f| f.id)
-            .collect();
-        let is_primary_key = !pk_field_ids.is_empty() && field_ids == pk_field_ids;
+        let is_primary_key = params.primary_key_field_ids(dataset.schema()).is_some();
 
         Ok(Self {
             input,
@@ -744,16 +730,18 @@ impl FullSchemaMergeInsertExec {
                     let (fragments, _) = write_fragments_internal_impl(
                         params.write_version(dataset),
                         Some(dataset),
-                        dataset.object_store.clone(),
-                        &dataset.base,
+                        dataset.table_state.object_store.clone(),
+                        &dataset.table_state.base,
                         dataset.schema().clone(),
-                        stream,
+                        from_datafusion_stream(stream),
                         write_params.clone(),
                         target_bases,
                         None,
                         None,
                         false,
+                        false,
                         Some(created_blob_payloads.clone()),
+                        None,
                     )
                     .await?;
                     Ok(fragments)
@@ -787,8 +775,8 @@ impl FullSchemaMergeInsertExec {
         }
         if let Some(error) = write_error {
             cleanup_data_fragments(
-                &dataset.object_store,
-                &dataset.base,
+                &dataset.table_state.object_store,
+                &dataset.table_state.base,
                 target_bases.as_deref(),
                 &fragments,
             )
@@ -915,7 +903,7 @@ impl FullSchemaMergeInsertExec {
         // `AssertUnwindSafe` bound is fine.
         let panic_update_tx = update_tx.clone();
         let panic_insert_tx = insert_tx.clone();
-        let splitter = Arc::new(SplitterTask(tokio::spawn(async move {
+        let splitter = Arc::new(SplitterTask(lance_core::utils::tokio::spawn(async move {
             let result =
                 futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(async move {
                     let mut input_stream = input_stream;
@@ -1223,6 +1211,8 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
         context: Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
         let _baseline_metrics = BaselineMetrics::new(&self.metrics, partition);
+        let write_time =
+            MetricBuilder::new(&self.metrics).subset_time("merge_write_time", partition);
 
         // Input schema structure based on our logical plan:
         // - target._rowaddr: Address of existing rows to update/delete
@@ -1242,7 +1232,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
         let input_stream = if has_blob_v2_columns {
             let input_schema = input_stream.schema();
             let rewrite_plan = Arc::new(
-                crate::dataset::optimize::BlobV2BatchRewritePlan::try_new(
+                crate::dataset::blob::BlobV2BatchRewritePlan::try_new(
                     self.dataset.schema(),
                     input_schema.as_ref(),
                     true,
@@ -1318,6 +1308,8 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
         };
 
         let result_stream = stream::once(async move {
+            // Time lazy execution, including upstream waits, rather than stream construction.
+            let _write_timer = write_time.timer();
             // Step 2: Write new fragments using the filtered data (inserts + updates)
             let target_bases_info = resolve_target_bases(&dataset, &params).await?;
             // Keep a copy so failures after the write can clean up routed files.
@@ -1374,8 +1366,8 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
             .await;
             if let Err(error) = lineage_result {
                 cleanup_data_fragments(
-                    &dataset.object_store,
-                    &dataset.base,
+                    &dataset.table_state.object_store,
+                    &dataset.table_state.base,
                     cleanup_bases.as_deref(),
                     &new_fragments,
                 )
@@ -1408,8 +1400,8 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
                         // The new data files are not committed; remove them (including
                         // ones routed to target bases) before surfacing the error.
                         cleanup_data_fragments(
-                            &dataset.object_store,
-                            &dataset.base,
+                            &dataset.table_state.object_store,
+                            &dataset.table_state.base,
                             cleanup_bases.as_deref(),
                             &new_fragments,
                         )
@@ -1637,6 +1629,7 @@ mod tests {
         let (exec, state) = splitter_fixture().await;
         let mut before = exec
             .dataset
+            .table_state
             .object_store
             .read_dir(exec.dataset.data_dir())
             .await
@@ -1703,6 +1696,7 @@ mod tests {
             .unwrap();
         let mut after = exec
             .dataset
+            .table_state
             .object_store
             .read_dir(exec.dataset.data_dir())
             .await
@@ -1914,8 +1908,9 @@ mod tests {
             SourceDedupeBehavior::Fail,
         );
 
-        let row_addr_array = UInt64Array::from(vec![1000, 2000, 3000]);
-        let row_id_array = UInt64Array::from(vec![100, 100, 300]); // Duplicate row_id 100
+        // Rows 0 and 1 match the same target row.
+        let row_addr_array = UInt64Array::from(vec![1000, 1000, 3000]);
+        let row_id_array = UInt64Array::from(vec![100, 100, 300]);
 
         let result1 = merge_state.process_row_action(
             Action::UpdateAll,
@@ -1970,8 +1965,9 @@ mod tests {
             SourceDedupeBehavior::FirstSeen,
         );
 
-        let row_addr_array = UInt64Array::from(vec![1000, 2000, 3000]);
-        let row_id_array = UInt64Array::from(vec![100, 100, 300]); // Duplicate row_id 100
+        // Rows 0 and 1 match the same target row.
+        let row_addr_array = UInt64Array::from(vec![1000, 1000, 3000]);
+        let row_id_array = UInt64Array::from(vec![100, 100, 300]);
 
         let result1 = merge_state.process_row_action(
             Action::UpdateAll,

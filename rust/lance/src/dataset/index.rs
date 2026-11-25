@@ -16,7 +16,7 @@ use crate::Dataset;
 use crate::dataset::optimize::RemappedIndex;
 use crate::dataset::optimize::remapping::RemapResult;
 use crate::index::DatasetIndexExt;
-use crate::index::remap_index;
+use crate::index::remap::remap_index;
 use crate::index::scalar::{IndexDetails, infer_scalar_index_details};
 use arrow_schema::DataType;
 use async_trait::async_trait;
@@ -187,7 +187,7 @@ impl DatasetIndexRemapper {
         let mut segment_results = Vec::with_capacity(segments.len());
         for segment in segments {
             // See the call-site note in `remap_indices` about boxing this future.
-            let result = Box::pin(crate::index::remap_index(
+            let result = Box::pin(crate::index::remap::remap_index(
                 &self.dataset,
                 &segment.uuid,
                 mapping,
@@ -248,6 +248,7 @@ impl DatasetIndexRemapper {
             let intermediate_dir = self.dataset.indices_dir().join(remapped.new_id.to_string());
             if let Err(error) = self
                 .dataset
+                .table_state
                 .object_store
                 .remove_dir_all(intermediate_dir)
                 .await
@@ -397,10 +398,13 @@ pub(crate) fn dataset_format_version(dataset: &Dataset) -> ConcreteFileVersion {
 impl LanceIndexStoreExt for LanceIndexStore {
     fn from_dataset_for_new(dataset: &Dataset, uuid: &Uuid) -> Result<Self> {
         let index_dir = dataset.indices_dir().join(uuid.to_string());
-        let cache = dataset.metadata_cache.file_metadata_cache(&index_dir);
+        let cache = dataset
+            .table_state
+            .metadata_cache
+            .file_metadata_cache(&index_dir);
         let format_version = dataset_format_version(dataset);
         Ok(Self::with_format_version(
-            dataset.object_store.clone(),
+            dataset.table_state.object_store.clone(),
             index_dir,
             Arc::new(cache),
             format_version,
@@ -411,7 +415,10 @@ impl LanceIndexStoreExt for LanceIndexStore {
         let index_dir = dataset
             .indice_files_dir(index)?
             .join(index.uuid.to_string());
-        let cache = dataset.metadata_cache.file_metadata_cache(&index_dir);
+        let cache = dataset
+            .table_state
+            .metadata_cache
+            .file_metadata_cache(&index_dir);
         let format_version = dataset_format_version(dataset);
         let object_store = dataset.object_store_for_index(index).await?;
         let store =
@@ -427,7 +434,7 @@ mod tests {
     use crate::dataset::transaction::{Operation, Transaction};
     use crate::index::frag_reuse::build_frag_reuse_index_metadata;
     use crate::index::vector::VectorIndexParams;
-    use crate::index::{DatasetIndexExt, DatasetIndexInternalExt, IntoIndexSegment};
+    use crate::index::{DatasetIndexExt, IntoIndexSegment, loading::DatasetIndexInternalExt};
     use futures::TryStreamExt;
     use lance_datagen::{BatchCount, RowCount, array};
     use lance_index::IndexType;
@@ -454,7 +461,7 @@ mod tests {
             FragReuseIndexDetails {
                 versions: Vec::new(),
             },
-            Default::default(),
+            std::iter::once(0_u32).collect(),
         )
         .await
         .unwrap();
@@ -474,6 +481,20 @@ mod tests {
         let indices = dataset.load_indices().await.unwrap();
         assert_eq!(indices.len(), 1);
         assert_eq!(indices[0].name, FRAG_REUSE_INDEX_NAME);
+        assert_eq!(
+            indices[0].fragment_bitmap.as_ref().unwrap().len(),
+            1,
+            "the regression requires a bitmap-bearing system index"
+        );
+
+        let descriptions = dataset.describe_indices(None).await.unwrap();
+        assert_eq!(descriptions.len(), 1);
+        assert_eq!(descriptions[0].name(), FRAG_REUSE_INDEX_NAME);
+        assert_eq!(descriptions[0].details().unwrap(), "{}");
+        assert!(
+            descriptions[0].fragment_coverage().is_none(),
+            "fragment-reuse metadata does not represent data-index coverage"
+        );
         assert!(options.create_remapper(&dataset).await.unwrap().is_none());
     }
 
@@ -573,6 +594,7 @@ mod tests {
         let second_segment_dir = dataset.indices_dir().join(second_segment_uuid.to_string());
         for file_name in ["index.idx", "auxiliary.idx"] {
             dataset
+                .table_state
                 .object_store
                 .as_ref()
                 .copy(
@@ -629,7 +651,7 @@ mod tests {
         // Both files store all fragments, but metadata assigns each only one.
         // Independent remaps retain stored rows; staging remaps enforce ownership.
         for owned_fragments in [None, committed[0].fragment_bitmap.as_ref()] {
-            let result = crate::index::remap_index(
+            let result = crate::index::remap::remap_index(
                 &dataset,
                 &committed[0].uuid,
                 &RowAddrTranslator::sync(RowAddrRemap::empty()),
@@ -798,12 +820,12 @@ mod tests {
             index.index_details = None;
             index.index_version = 0;
         }
-        index.covering_fields = index.fields.clone();
-        index.covering_fields.push(999);
+        index.covering_fields = vec![999, 999];
+        dataset.index_cache.clear().await;
         let metadata_key = crate::session::index_caches::IndexMetadataKey {
             version: dataset.version().version,
-            store_identity: &dataset.object_store.store_prefix,
-            e_tag: dataset.manifest_location.e_tag.as_deref(),
+            store_identity: &dataset.table_state.object_store.store_prefix,
+            e_tag: dataset.table_state.manifest_location.e_tag.as_deref(),
         };
         dataset
             .index_cache
@@ -823,7 +845,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            error.to_string().contains("are not among its fields"),
+            error.to_string().contains("more than once"),
             "malformed covering must fail closed via the validator, not be \
              withdrawn as an ordinary covered index; got: {error}"
         );

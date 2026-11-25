@@ -22,6 +22,7 @@ import org.lance.Ref;
 import org.lance.Session;
 import org.lance.Transaction;
 import org.lance.WriteParams;
+import org.lance.expire.ExpireVersionsPolicy;
 import org.lance.namespace.errors.ErrorCode;
 import org.lance.namespace.errors.LanceNamespaceException;
 import org.lance.namespace.model.CountTableRowsRequest;
@@ -80,17 +81,23 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.io.ByteArrayOutputStream;
+import java.io.IOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.Callable;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -217,6 +224,97 @@ public class DirectoryNamespaceTest {
     assertTrue(
         versionRejectingNamespace.getDescribeTableCallCount() > 0,
         "Expected describeTable to be called when opening through namespace");
+  }
+
+  @Test
+  void testReadsProceedWhileStorageOptionsRefreshIsInFlight() throws Exception {
+    // Vended storage options expire 1 ms after they are issued, so every
+    // getLatestStorageOptions() call refreshes them through describeTable.
+    DirectoryNamespace vendingNamespace = new DirectoryNamespace();
+    Map<String, String> config = new HashMap<>();
+    config.put("root", tempDir.resolve("vending").toString());
+    config.put("storage.refresh_offset_millis", "1000");
+    config.put("vend_input_storage_options", "true");
+    config.put("vend_input_storage_options_refresh_interval_millis", "1");
+    vendingNamespace.initialize(config, allocator);
+    BlockingDescribeNamespace blockingNamespace = new BlockingDescribeNamespace(vendingNamespace);
+    List<String> tableId = Arrays.asList("refresh_in_flight");
+    blockingNamespace.createTable(new CreateTableRequest().id(tableId), createTestTableData());
+
+    ExecutorService executor = Executors.newCachedThreadPool();
+    try (Dataset dataset =
+        Dataset.open()
+            .allocator(allocator)
+            .namespaceClient(blockingNamespace)
+            .tableId(tableId)
+            .build()) {
+      dataset.tags().create("v1", 1);
+      // Exercise representative reads affected by the clone-before-I/O change. Their
+      // progress while the refresh is parked shows that they do not wait for it; it does
+      // not prove that every read entry point releases the native field guard.
+      Map<String, Callable<Object>> reads = new LinkedHashMap<>();
+      reads.put("countRows", dataset::countRows);
+      reads.put("take", () -> countBatchRows(dataset.take(Arrays.asList(0L), Arrays.asList("id"))));
+      reads.put(
+          "takeRows",
+          () -> countBatchRows(dataset.takeRows(Arrays.asList(0L), Arrays.asList("id"))));
+      reads.put("sample", () -> countBatchRows(dataset.sample(1, Arrays.asList("id"))));
+      reads.put("getVersionCount", dataset::getVersionCount);
+      reads.put("latestVersion", dataset::latestVersion);
+      reads.put("listVersions", dataset::listVersions);
+      reads.put("calculateDataSize", dataset::calculateDataSize);
+      reads.put("listIndexes", dataset::listIndexes);
+      reads.put("getIndexes", dataset::getIndexes);
+      reads.put("describeIndices", dataset::describeIndices);
+      reads.put("getTableMetadata", dataset::getTableMetadata);
+      reads.put(
+          "explainExpireVersions",
+          () ->
+              dataset.explainExpireVersions(
+                  ExpireVersionsPolicy.builder().withBeforeVersion(1).build()));
+      reads.put("tags.list", () -> dataset.tags().list());
+      reads.put("tags.getVersion", () -> dataset.tags().getVersion("v1"));
+      reads.put("branches.list", () -> dataset.branches().list());
+      reads.put("Fragment.countRows", () -> dataset.getFragments().get(0).countRows());
+
+      blockingNamespace.blockNextDescribe();
+      Future<Map<String, String>> refresh = executor.submit(dataset::getLatestStorageOptions);
+      try {
+        assertTrue(
+            blockingNamespace.awaitBlocked(10, TimeUnit.SECONDS),
+            "Expected the storage options refresh to call describeTable");
+        // The refresh is parked inside native code. Reads on the same Dataset must not
+        // wait for it.
+        Map<String, Future<Object>> inFlight = new LinkedHashMap<>();
+        reads.forEach((name, read) -> inFlight.put(name, executor.submit(read)));
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+        List<String> waited = new ArrayList<>();
+        for (Map.Entry<String, Future<Object>> entry : inFlight.entrySet()) {
+          try {
+            entry.getValue().get(Math.max(0, deadline - System.nanoTime()), TimeUnit.NANOSECONDS);
+          } catch (TimeoutException e) {
+            waited.add(entry.getKey());
+          }
+        }
+        assertEquals(
+            Collections.emptyList(), waited, "Reads waited for the in-flight refresh: " + waited);
+      } finally {
+        blockingNamespace.release();
+      }
+      refresh.get(10, TimeUnit.SECONDS);
+    } finally {
+      executor.shutdownNow();
+    }
+  }
+
+  private static long countBatchRows(ArrowReader reader) throws IOException {
+    try (ArrowReader batches = reader) {
+      long rows = 0;
+      while (batches.loadNextBatch()) {
+        rows += batches.getVectorSchemaRoot().getRowCount();
+      }
+      return rows;
+    }
   }
 
   @Test
@@ -1536,6 +1634,43 @@ public class DirectoryNamespaceTest {
         writer.writeBatch();
       }
       return out.toByteArray();
+    }
+  }
+
+  /** Holds one describeTable call until released, keeping a storage options refresh in flight. */
+  private static class BlockingDescribeNamespace extends CustomNamespace {
+    private final AtomicBoolean blockNext = new AtomicBoolean();
+    private final CountDownLatch blocked = new CountDownLatch(1);
+    private final CountDownLatch released = new CountDownLatch(1);
+
+    BlockingDescribeNamespace(DirectoryNamespace inner) {
+      super(inner);
+    }
+
+    void blockNextDescribe() {
+      blockNext.set(true);
+    }
+
+    boolean awaitBlocked(long timeout, TimeUnit unit) throws InterruptedException {
+      return blocked.await(timeout, unit);
+    }
+
+    void release() {
+      released.countDown();
+    }
+
+    @Override
+    public DescribeTableResponse describeTable(DescribeTableRequest request) {
+      if (blockNext.compareAndSet(true, false)) {
+        blocked.countDown();
+        try {
+          released.await();
+        } catch (InterruptedException e) {
+          Thread.currentThread().interrupt();
+          throw new IllegalStateException("Interrupted while blocking describeTable", e);
+        }
+      }
+      return super.describeTable(request);
     }
   }
 

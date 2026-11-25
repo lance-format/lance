@@ -33,9 +33,10 @@ use uuid::Uuid;
 
 use super::data_source::{FreshTierWatermark, LsmDataSource, LsmGeneration};
 use super::sstable_cache::{DatasetCache, open_sstable};
+use crate::dataset::mem_wal::index::IndexStore;
 use crate::dataset::mem_wal::index::encode_pk_tuple;
+use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
 use crate::dataset::mem_wal::util::PK_INDEX_DIR;
-use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
 use crate::session::Session;
 use lance_io::object_store::ObjectStoreParams;
 
@@ -400,13 +401,20 @@ async fn open_pk_index(
     sstable_cache: Option<&Arc<dyn DatasetCache>>,
 ) -> Result<Arc<dyn ScalarIndex>> {
     let dataset = open_sstable(path, session, store_params, sstable_cache, None).await?;
+    load_pk_index(&dataset).await
+}
+
+/// Open the standalone PK sidecar using the generation's storage and session cache.
+pub(super) async fn load_pk_index(dataset: &crate::Dataset) -> Result<Arc<dyn ScalarIndex>> {
     // Namespace the session index cache by the (immutable) SSTable path so this
     // sidecar's pages live alongside every other index instead of a bespoke
     // cache. `fri_uuid` is None — SSTables carry no fragment-reuse.
-    let index_cache = dataset.index_cache.for_index(&path_cache_uuid(path), None);
-    let index_dir = dataset.base.clone().join(PK_INDEX_DIR);
+    let index_cache = dataset
+        .index_cache
+        .for_index(&path_cache_uuid(dataset.uri()), None);
+    let index_dir = dataset.table_state.base.clone().join(PK_INDEX_DIR);
     let store: Arc<dyn ScalarIndexStore> = Arc::new(LanceIndexStore::new(
-        dataset.object_store.clone(),
+        dataset.table_state.object_store.clone(),
         index_dir,
         Arc::new(index_cache.clone()),
     ));
@@ -493,8 +501,8 @@ pub async fn write_pk_sidecar(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dataset::mem_wal::index::IndexStore;
     use crate::dataset::mem_wal::scanner::data_source::{LsmDataSource, LsmGeneration};
-    use crate::dataset::mem_wal::write::IndexStore;
     use arrow_array::{Int32Array, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
     use std::sync::Arc;

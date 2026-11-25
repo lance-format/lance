@@ -15,6 +15,7 @@ use rstest::rstest;
 
 use super::*;
 use crate::metrics::{LocalMetricsCollector, NoOpMetricsCollector};
+use crate::progress::noop_progress;
 use crate::scalar::lance_format::LanceIndexStore;
 
 fn test_store() -> (TempObjDir, Arc<LanceIndexStore>) {
@@ -31,7 +32,7 @@ fn test_store() -> (TempObjDir, Arc<LanceIndexStore>) {
 fn text_stream(rows: &[(Option<&str>, u64)], batch_rows: usize) -> SendableRecordBatchStream {
     let schema = Arc::new(Schema::new(vec![
         Field::new(VALUE_COLUMN_NAME, DataType::Utf8, true),
-        Field::new(ROW_ID, DataType::UInt64, false),
+        Field::new(ROW_ADDR, DataType::UInt64, false),
     ]));
     let batches: Vec<datafusion_common::Result<RecordBatch>> = rows
         .chunks(batch_rows.max(1))
@@ -412,6 +413,15 @@ async fn test_rows_without_tokens_are_not_indexed() {
         vec![10, 14]
     );
     assert!(search(&index, "   ", 10).await.is_empty());
+    let mut signatures = index.scan_signatures(Arc::new(RowAddrMask::all_rows()));
+    let batch = signatures.try_next().await.unwrap().unwrap();
+    assert_eq!(
+        batch[ROW_ADDR].as_primitive::<UInt64Type>().values(),
+        &[10, 14]
+    );
+    let values = batch[SIGNATURE_COL].as_fixed_size_list();
+    assert_eq!(values.value(0).to_data(), values.value(1).to_data());
+    assert!(signatures.try_next().await.unwrap().is_none());
 
     for rows in [vec![], vec![(None, 0), (Some(""), 1)]] {
         let (_tmpdir, store) = test_store();
@@ -419,6 +429,14 @@ async fn test_rows_without_tokens_are_not_indexed() {
             build_and_load(&store, default_builder(), &rows, 4, &LanceCache::no_cache()).await;
         assert_eq!(empty.num_docs(), 0);
         assert!(search(&empty, "anything at all here", 5).await.is_empty());
+        assert!(
+            empty
+                .scan_signatures(Arc::new(RowAddrMask::all_rows()))
+                .try_next()
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 }
 
@@ -613,7 +631,7 @@ async fn test_load_rejects_mismatched_details_or_schema() {
     );
 
     // Replace the signature file with one whose signature is wider.
-    let other_schema = signatures_schema(params.num_hashes as i32 + 1);
+    let other_schema = signatures_schema(params.num_hashes as i32 + 1, true);
     let mut writer = store
         .new_index_file(SIGNATURES_FILENAME, other_schema.clone())
         .await
@@ -746,6 +764,20 @@ async fn test_rebuilds_remap_rows_of_a_deferred_compaction() {
     .unwrap();
     assert_eq!(row_ids(&index, &bases[0], 1).await, vec![compacted(0)]);
 
+    // Filtering is in the current ID domain, after deferred remapping.
+    let live = RowAddrMask::from_allowed(RowAddrTreeMap::from_iter([
+        compacted(0),
+        compacted(2),
+        compacted(3),
+    ]));
+    let mut signatures = index.scan_signatures(Arc::new(live));
+    let batch = signatures.try_next().await.unwrap().unwrap();
+    assert_eq!(
+        batch[ROW_ADDR].as_primitive::<UInt64Type>().values(),
+        &[compacted(0), compacted(3)]
+    );
+    assert!(signatures.try_next().await.unwrap().is_none());
+
     // Keep the compacted fragment, add a duplicate of row 3
     let filter = OldIndexDataFilter::Fragments {
         to_keep: RoaringBitmap::from_iter([1u32]),
@@ -800,9 +832,11 @@ async fn test_merge_segments() {
         (0..4u64).map(|i| (1u64 << 32) | i),
     ));
     let (_dir_merged, merged_store) = test_store();
-    let created = merge_minhash_indices(
+    let created = MinHashLshIndex::merge_segments(
         &[(&segment_a, None), (&segment_b, Some(&filter_b))],
+        None,
         merged_store.as_ref(),
+        noop_progress(),
     )
     .await
     .unwrap();
@@ -830,9 +864,11 @@ async fn test_merge_segments() {
     )
     .unwrap();
     let segment_c = build_and_load(&store_c, other, &rows_a, 3, &LanceCache::no_cache()).await;
-    let Err(err) = merge_minhash_indices(
+    let Err(err) = MinHashLshIndex::merge_segments(
         &[(&segment_a, None), (&segment_c, None)],
+        None,
         merged_store.as_ref(),
+        noop_progress(),
     )
     .await
     else {

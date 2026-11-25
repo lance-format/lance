@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use arrow::array::{ArrayBuilder, AsArray, Float32Builder, ListBuilder, UInt32Builder};
 use arrow::datatypes::{Float32Type, UInt32Type};
-use arrow_array::{Array, RecordBatch};
+use arrow_array::{Array, ListArray, PrimitiveArray, RecordBatch};
 use itertools::Itertools;
 use lance_core::{Error, Result};
 use rayon::prelude::*;
@@ -32,22 +32,24 @@ use crate::vector::graph::{
 use crate::vector::storage::{DistCalculator, VectorStore};
 use crate::vector::v3::subindex::IvfSubIndex;
 
-/// Rewrite a serialized HNSW graph after some of its nodes were removed.
-///
-/// `graph` is the batch written by [`HNSW::to_batch`], including the distance
-/// column. `new_ids[old_id]` is the id node `old_id` takes after the removal,
-/// or `None` if it was removed; surviving ids must keep their relative order,
-/// which is what every vector storage `remap` produces.
-///
-/// Surviving adjacency lists and their distances are kept, minus the edges to
-/// removed nodes; nothing is re-linked, so node degree drops by the number of
-/// removed neighbors. If the entry point is removed, the first surviving node
-/// on the highest non-empty level replaces it, so search still starts from
-/// the top of the graph.
-///
-/// `new_ids` must have one entry per graph node. If no node is removed, the
-/// input batch is returned as is. Returns an empty batch if no node survives.
-pub fn remap_graph_batch(graph: &RecordBatch, new_ids: &[Option<u32>]) -> Result<RecordBatch> {
+/// A serialized HNSW graph batch, decoded and validated against the
+/// `new_ids` a remap supplies.
+struct DecodedGraph<'a> {
+    metadata: HnswMetadata,
+    ids: &'a PrimitiveArray<UInt32Type>,
+    neighbors: &'a ListArray,
+    distances: &'a ListArray,
+    neighbor_values: &'a [u32],
+    distance_values: &'a [f32],
+    /// `true` when `new_ids` keeps every node's id, so callers can return
+    /// the batch unchanged.
+    identity: bool,
+}
+
+/// Decode the metadata and columns both remap paths walk, enforcing the
+/// writer-schema contract (metadata presence, level-0 node count versus the
+/// remap coverage, column presence and types) exactly once.
+fn decode_graph<'a>(graph: &'a RecordBatch, new_ids: &[Option<u32>]) -> Result<DecodedGraph<'a>> {
     let metadata_json = graph
         .schema_ref()
         .metadata()
@@ -94,11 +96,48 @@ pub fn remap_graph_batch(graph: &RecordBatch, new_ids: &[Option<u32>]) -> Result
         .as_primitive_opt::<Float32Type>()
         .ok_or_else(|| Error::index(format!("{DIST_COL} must be List<Float32>")))?
         .values();
-    if new_ids
+    let identity = new_ids
         .iter()
         .enumerate()
-        .all(|(old_id, new_id)| *new_id == Some(old_id as u32))
-    {
+        .all(|(old_id, new_id)| *new_id == Some(old_id as u32));
+    Ok(DecodedGraph {
+        metadata,
+        ids,
+        neighbors,
+        distances,
+        neighbor_values,
+        distance_values,
+        identity,
+    })
+}
+
+/// Rewrite a serialized HNSW graph after some of its nodes were removed.
+///
+/// `graph` is the batch written by [`HNSW::to_batch`], including the distance
+/// column. `new_ids[old_id]` is the id node `old_id` takes after the removal,
+/// or `None` if it was removed; surviving ids must keep their relative order,
+/// which is what every vector storage `remap` produces.
+///
+/// Surviving adjacency lists and their distances are kept, minus the edges to
+/// removed nodes; nothing is re-linked, so node degree drops by the number of
+/// removed neighbors. If the entry point is removed, the first surviving node
+/// on the highest non-empty level replaces it, so search still starts from
+/// the top of the graph.
+///
+/// `new_ids` must have one entry per graph node. If no node is removed, the
+/// input batch is returned as is. Returns an empty batch if no node survives.
+pub fn remap_graph_batch(graph: &RecordBatch, new_ids: &[Option<u32>]) -> Result<RecordBatch> {
+    let decoded = decode_graph(graph, new_ids)?;
+    let DecodedGraph {
+        metadata,
+        ids,
+        neighbors,
+        distances,
+        neighbor_values,
+        distance_values,
+        identity,
+    } = decoded;
+    if identity {
         return Ok(graph.clone());
     }
     let new_id = |old_id: u32| new_ids.get(old_id as usize).copied().flatten();
@@ -216,56 +255,16 @@ struct ParsedGraph {
 }
 
 fn parse_graph(graph: &RecordBatch, new_ids: &[Option<u32>]) -> Result<ParsedGraph> {
-    let metadata_json = graph
-        .schema_ref()
-        .metadata()
-        .get(HNSW_METADATA_KEY)
-        .ok_or_else(|| Error::index(format!("{HNSW_METADATA_KEY} not found in HNSW batch")))?;
-    let metadata: HnswMetadata = serde_json::from_str(metadata_json).map_err(|e| {
-        Error::index(format!(
-            "Failed to decode HNSW metadata: {e}, json: {metadata_json}"
-        ))
-    })?;
-    let num_nodes = match metadata.level_offsets.as_slice() {
-        [start, end, ..] => end.saturating_sub(*start),
-        _ => 0,
-    };
-    if num_nodes != new_ids.len() {
-        return Err(Error::invalid_input(format!(
-            "HNSW graph has {num_nodes} nodes but the remap covers {} nodes",
-            new_ids.len()
-        )));
-    }
-    let column = |name: &str| {
-        graph.column_by_name(name).ok_or_else(|| {
-            Error::index(format!(
-                "HNSW batch has no {name} column; remapping needs every column the writer emits"
-            ))
-        })
-    };
-    let ids = column(VECTOR_ID_COL)?
-        .as_primitive_opt::<UInt32Type>()
-        .ok_or_else(|| Error::index(format!("{VECTOR_ID_COL} must be UInt32")))?;
-    let neighbors = column(NEIGHBORS_COL)?
-        .as_list_opt::<i32>()
-        .ok_or_else(|| Error::index(format!("{NEIGHBORS_COL} must be List<UInt32>")))?;
-    let distances = column(DIST_COL)?
-        .as_list_opt::<i32>()
-        .ok_or_else(|| Error::index(format!("{DIST_COL} must be List<Float32>")))?;
-    let neighbor_values = neighbors
-        .values()
-        .as_primitive_opt::<UInt32Type>()
-        .ok_or_else(|| Error::index(format!("{NEIGHBORS_COL} must be List<UInt32>")))?
-        .values();
-    let distance_values = distances
-        .values()
-        .as_primitive_opt::<Float32Type>()
-        .ok_or_else(|| Error::index(format!("{DIST_COL} must be List<Float32>")))?
-        .values();
-    let identity = new_ids
-        .iter()
-        .enumerate()
-        .all(|(old_id, new_id)| *new_id == Some(old_id as u32));
+    let decoded = decode_graph(graph, new_ids)?;
+    let DecodedGraph {
+        metadata,
+        ids,
+        neighbors,
+        distances,
+        neighbor_values,
+        distance_values,
+        identity,
+    } = decoded;
     let new_id = |old_id: u32| new_ids.get(old_id as usize).copied().flatten();
     let num_rows = graph.num_rows();
     let mut levels = Vec::with_capacity(metadata.level_offsets.len().saturating_sub(1));
@@ -468,6 +467,7 @@ fn reselect_damaged<S: VectorStore + Sync>(
         upper_bound: None,
         dist_q_c: 0.0,
         use_acorn: false,
+        rq_graph_scoring: Default::default(),
     };
     for level_idx in (0..levels.len()).rev() {
         if levels[level_idx].damaged.is_empty() {
@@ -603,7 +603,8 @@ fn level_from_rows<S: VectorStore>(
 /// parallel insert.
 ///
 /// `storage` is the remapped partition, in the new local-id order `new_ids`
-/// assigns. With no deletions the input batch is returned unchanged.
+/// assigns; rows past the last kept node are ones the graph never reached.
+/// With no deletions the input batch is returned unchanged.
 pub fn remap_graph_repair<S: VectorStore + Sync>(
     graph: &RecordBatch,
     new_ids: &[Option<u32>],
@@ -614,7 +615,9 @@ pub fn remap_graph_repair<S: VectorStore + Sync>(
         return Ok(graph.clone());
     }
     let kept = new_ids.iter().filter(|id| id.is_some()).count();
-    if storage.len() != kept {
+    // Storage may hold rows past the graph's last node, which the graph never
+    // reached; it only has to hold every node the graph keeps.
+    if storage.len() < kept {
         return Err(Error::invalid_input(format!(
             "remapped storage has {} rows but the graph kept {kept} nodes",
             storage.len()
@@ -700,6 +703,106 @@ pub fn remap_graph_repair<S: VectorStore + Sync>(
     )?)
 }
 
+/// Remap like [`remap_graph_batch`], falling back to [`remap_graph_repair`]
+/// only when dropping the removed nodes strands a survivor.
+///
+/// Search walks level 0 from the entry point, so a survivor whose every path
+/// from it crossed a removed node can never be returned again, however wide the
+/// search. Checking that is a linear walk over the remapped graph, while
+/// repair re-searches every damaged node, so graphs that stay connected keep
+/// the cheap remap.
+pub fn remap_graph_connected<S: VectorStore + Sync>(
+    graph: &RecordBatch,
+    new_ids: &[Option<u32>],
+    storage: &S,
+) -> Result<RecordBatch> {
+    let remapped = remap_graph_batch(graph, new_ids)?;
+    // With no survivor the remap is an empty batch without graph metadata.
+    if remapped.num_rows() == 0 {
+        return Ok(remapped);
+    }
+    let (reached, total) = level0_reachability(&remapped)?;
+    if reached == total {
+        return Ok(remapped);
+    }
+    remap_graph_repair(graph, new_ids, storage)
+}
+
+/// The number of level-0 nodes of a serialized graph reachable from its entry
+/// point, and the number of level-0 nodes.
+fn level0_reachability(graph: &RecordBatch) -> Result<(usize, usize)> {
+    let metadata_json = graph
+        .schema_ref()
+        .metadata()
+        .get(HNSW_METADATA_KEY)
+        .ok_or_else(|| Error::index(format!("{HNSW_METADATA_KEY} not found in HNSW batch")))?;
+    let metadata: HnswMetadata = serde_json::from_str(metadata_json).map_err(|e| {
+        Error::index(format!(
+            "Failed to decode HNSW metadata: {e}, json: {metadata_json}"
+        ))
+    })?;
+    let (start, num_nodes) = match metadata.level_offsets.as_slice() {
+        [start, end, ..] => (*start, end.saturating_sub(*start)),
+        _ => (0, 0),
+    };
+    if num_nodes == 0 {
+        return Ok((0, 0));
+    }
+    let ids = graph
+        .column_by_name(VECTOR_ID_COL)
+        .and_then(|ids| ids.as_primitive_opt::<UInt32Type>())
+        .ok_or_else(|| Error::index(format!("HNSW batch needs a UInt32 {VECTOR_ID_COL} column")))?;
+    let neighbors = graph
+        .column_by_name(NEIGHBORS_COL)
+        .and_then(|neighbors| neighbors.as_list_opt::<i32>())
+        .ok_or_else(|| {
+            Error::index(format!(
+                "HNSW batch needs a List<UInt32> {NEIGHBORS_COL} column"
+            ))
+        })?;
+    let neighbor_values = neighbors
+        .values()
+        .as_primitive_opt::<UInt32Type>()
+        .ok_or_else(|| Error::index(format!("{NEIGHBORS_COL} must be List<UInt32>")))?
+        .values();
+    let offsets = neighbors.value_offsets();
+
+    let mut row_of = vec![usize::MAX; num_nodes];
+    for row in start..start + num_nodes {
+        let id = ids.value(row) as usize;
+        if id >= num_nodes {
+            return Err(Error::index(format!(
+                "HNSW level-0 node {id} is out of range for {num_nodes} nodes"
+            )));
+        }
+        row_of[id] = row;
+    }
+    let entry = metadata.entry_point as usize;
+    if entry >= num_nodes {
+        return Ok((0, num_nodes));
+    }
+    let mut reached = vec![false; num_nodes];
+    reached[entry] = true;
+    let mut num_reached = 1;
+    let mut stack = vec![entry];
+    while let Some(node) = stack.pop() {
+        let row = row_of[node];
+        if row == usize::MAX {
+            continue;
+        }
+        let edges = &neighbor_values[offsets[row] as usize..offsets[row + 1] as usize];
+        for &neighbor in edges {
+            let neighbor = neighbor as usize;
+            if neighbor < num_nodes && !reached[neighbor] {
+                reached[neighbor] = true;
+                num_reached += 1;
+                stack.push(neighbor);
+            }
+        }
+    }
+    Ok((num_reached, num_nodes))
+}
+
 /// Level 0 of a repaired graph, as the builder's stranded-node linker sees it.
 struct Level0Adj<'a> {
     edges: &'a mut [Vec<(u32, f32)>],
@@ -758,7 +861,9 @@ mod tests {
     use lance_testing::datagen::generate_random_array_with_seed;
     use rstest::rstest;
 
-    use super::{remap_graph_batch, remap_graph_repair};
+    use super::{
+        level0_reachability, remap_graph_batch, remap_graph_connected, remap_graph_repair,
+    };
     use crate::vector::DIST_COL;
     use crate::vector::flat::storage::FlatFloatStorage;
     use crate::vector::graph::NEIGHBORS_COL;
@@ -799,6 +904,7 @@ mod tests {
             upper_bound: None,
             dist_q_c: 0.0,
             use_acorn: false,
+            rq_graph_scoring: Default::default(),
         }
     }
 
@@ -1011,10 +1117,14 @@ mod tests {
 
     #[test]
     fn test_remap_removing_every_node() {
-        let (_, hnsw) = build(64);
+        let (vectors, hnsw) = build(64);
         let batch = hnsw.to_batch().unwrap();
         let remapped = remap_graph_batch(&batch, &[None; 64]).unwrap();
         assert_eq!(remapped.num_rows(), 0);
+        assert!(HNSW::load(remapped).unwrap().is_empty());
+
+        let empty_store = FlatFloatStorage::new(vectors.slice(0, 0), DistanceType::L2);
+        let remapped = remap_graph_connected(&batch, &[None; 64], &empty_store).unwrap();
         assert!(HNSW::load(remapped).unwrap().is_empty());
     }
 
@@ -1031,6 +1141,34 @@ mod tests {
         let new_ids = (0..64).map(Some).collect::<Vec<_>>();
         let err = remap_graph_batch(&projected, &new_ids).unwrap_err();
         assert!(err.to_string().contains(DIST_COL), "{err}");
+    }
+
+    /// A graph that stays connected once removed nodes are dropped keeps the
+    /// cheap remap instead of being repaired.
+    #[test]
+    fn test_connected_remap_skips_repair_of_connected_graph() {
+        let (vectors, hnsw) = build(TOTAL);
+        let batch = hnsw.to_batch().unwrap();
+        let mut new_ids = Vec::with_capacity(TOTAL);
+        let mut kept_idx = Vec::new();
+        for old_id in 0..TOTAL {
+            if old_id % 10 == 0 {
+                new_ids.push(None);
+            } else {
+                new_ids.push(Some(kept_idx.len() as u32));
+                kept_idx.push(old_id as u32);
+            }
+        }
+        let kept = take(&vectors, &UInt32Array::from(kept_idx), None).unwrap();
+        let kept_store = FlatFloatStorage::new(kept.as_fixed_size_list().clone(), DistanceType::L2);
+
+        let dropped = remap_graph_batch(&batch, &new_ids).unwrap();
+        let (reached, total) = level0_reachability(&dropped).unwrap();
+        assert_eq!(reached, total, "a dense graph should survive 10% removals");
+        assert_eq!(
+            remap_graph_connected(&batch, &new_ids, &kept_store).unwrap(),
+            dropped
+        );
     }
 
     /// Deleting from a graph of identical vectors drops the only inbound edge of
@@ -1063,10 +1201,19 @@ mod tests {
         let kept = kept.as_fixed_size_list().clone();
         let kept_store = FlatFloatStorage::new(kept, DistanceType::L2);
 
+        let dropped = remap_graph_batch(&batch, &new_ids).unwrap();
+        let (reached, total) = level0_reachability(&dropped).unwrap();
+        assert!(reached < total, "dropping nodes should strand survivors");
+
         let repaired = remap_graph_repair(&batch, &new_ids, &kept_store).unwrap();
-        let (reached, total) = reachable_from_entry(&repaired);
+        let (reached, total) = level0_reachability(&repaired).unwrap();
         assert_eq!(reached, total, "repair left nodes stranded");
         assert_eq!(total, N - N / 100);
+        assert_eq!(
+            remap_graph_connected(&batch, &new_ids, &kept_store).unwrap(),
+            repaired,
+            "a stranded graph should be repaired"
+        );
 
         let params = HnswQueryParams {
             ef: 300,
@@ -1074,6 +1221,7 @@ mod tests {
             upper_bound: None,
             dist_q_c: 0.0,
             use_acorn: false,
+            rq_graph_scoring: Default::default(),
         };
         let hits = HNSW::load(repaired)
             .unwrap()
@@ -1082,47 +1230,5 @@ mod tests {
             .0
             .len();
         assert_eq!(hits, 300);
-    }
-
-    fn reachable_from_entry(batch: &RecordBatch) -> (usize, usize) {
-        let meta = metadata(batch);
-        let ids = batch[VECTOR_ID_COL].as_primitive::<UInt32Type>();
-        let neighbors = batch[NEIGHBORS_COL].as_list::<i32>();
-        let level0 = meta.level_offsets[1];
-        let n = ids.values()[..level0].iter().copied().max().unwrap_or(0) as usize + 1;
-        let mut adj = vec![Vec::new(); n];
-        let mut present = vec![false; n];
-        for row in 0..level0 {
-            let id = ids.value(row) as usize;
-            present[id] = true;
-            adj[id] = neighbors
-                .value(row)
-                .as_primitive::<UInt32Type>()
-                .values()
-                .to_vec();
-        }
-        let mut reachable = vec![false; n];
-        let mut queue = std::collections::VecDeque::new();
-        let entry = meta.entry_point as usize;
-        if entry < n {
-            reachable[entry] = true;
-            queue.push_back(entry);
-        }
-        while let Some(current) = queue.pop_front() {
-            for &neighbor in &adj[current] {
-                let neighbor = neighbor as usize;
-                if neighbor < n && !reachable[neighbor] {
-                    reachable[neighbor] = true;
-                    queue.push_back(neighbor);
-                }
-            }
-        }
-        let total = present.iter().filter(|on| **on).count();
-        let reached = present
-            .iter()
-            .zip(&reachable)
-            .filter(|(on, reached)| **on && **reached)
-            .count();
-        (reached, total)
     }
 }

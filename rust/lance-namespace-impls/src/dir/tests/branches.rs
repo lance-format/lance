@@ -4,7 +4,7 @@
 use super::*;
 
 #[tokio::test]
-async fn test_list_table_versions_on_branch() {
+async fn test_list_table_versions_pagination_on_branch() {
     let (namespace, _temp_dir) = create_test_namespace().await;
     create_scalar_table(&namespace, "users").await;
     create_branch_with_commits(&namespace, "users", "exp", 2).await;
@@ -22,6 +22,27 @@ async fn test_list_table_versions_on_branch() {
         "branch versions must resolve to branch manifests: {:?}",
         branch_versions
     );
+
+    let mut request = ListTableVersionsRequest {
+        id: Some(vec!["users".into()]),
+        branch: Some("exp".into()),
+        limit: Some(1),
+        ..Default::default()
+    };
+    let first = namespace
+        .list_table_versions(request.clone())
+        .await
+        .unwrap();
+    assert_eq!(first.versions, branch_versions[..1]);
+    request.page_token = Some(
+        first
+            .page_token
+            .expect("non-final page needs a continuation"),
+    );
+    request.limit = None;
+    let rest = namespace.list_table_versions(request).await.unwrap();
+    assert_eq!(rest.versions, branch_versions[1..]);
+    assert!(rest.page_token.is_none());
 
     // Unset and "main" behave identically and never see the tree path.
     let main_versions = list_versions(&namespace, "users", None).await.unwrap();
@@ -193,8 +214,7 @@ async fn test_create_table_version_on_branch() {
     let versions_dir = branch_ds.versions_dir();
     let store = branch_ds.object_store(None).await.unwrap();
     let existing = store
-        .inner
-        .list(Some(&versions_dir))
+        .list_objects(Some(&versions_dir))
         .try_collect::<Vec<_>>()
         .await
         .unwrap()
@@ -207,15 +227,14 @@ async fn test_create_table_version_on_branch() {
         })
         .expect("a branch manifest");
     let bytes = store
-        .inner
-        .get(&existing.location)
+        .read_object(&existing.location)
         .await
         .unwrap()
         .bytes()
         .await
         .unwrap();
     let staging = versions_dir.join("staging_manifest");
-    store.inner.put(&staging, bytes.into()).await.unwrap();
+    store.put_payload(&staging, bytes.into()).await.unwrap();
 
     let main_before = list_versions(&namespace, "users", None)
         .await
@@ -569,8 +588,7 @@ async fn test_branch_ops_reject_zombie_branch() {
     let dataset = open_dataset(&namespace, "users").await;
     let store = dataset.object_store(None).await.unwrap();
     let manifest = store
-        .inner
-        .list(Some(&dataset.versions_dir()))
+        .list_objects(Some(&dataset.versions_dir()))
         .try_collect::<Vec<_>>()
         .await
         .unwrap()
@@ -583,8 +601,7 @@ async fn test_branch_ops_reject_zombie_branch() {
         })
         .expect("a manifest");
     let bytes = store
-        .inner
-        .get(&manifest.location)
+        .read_object(&manifest.location)
         .await
         .unwrap()
         .bytes()
@@ -597,7 +614,7 @@ async fn test_branch_ops_reject_zombie_branch() {
         .path
         .join(VERSIONS_DIR)
         .join(manifest.location.filename().unwrap());
-    store.inner.put(&zombie, bytes.into()).await.unwrap();
+    store.put_payload(&zombie, bytes.into()).await.unwrap();
 
     assert!(dataset.branches().get("ghost").await.is_err());
 
@@ -1216,8 +1233,7 @@ async fn test_managed_branch_open_and_commit() {
     let store = branch_ds.object_store(None).await.unwrap();
     let branch_data = branch_base.clone().join("data");
     let branch_files = store
-        .inner
-        .list(Some(&branch_data))
+        .list_objects(Some(&branch_data))
         .try_collect::<Vec<_>>()
         .await
         .unwrap();

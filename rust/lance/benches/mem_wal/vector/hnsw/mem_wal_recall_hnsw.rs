@@ -27,7 +27,8 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use futures::TryStreamExt;
 use lance::dataset::mem_wal::DatasetMemWalExt;
-use lance::dataset::mem_wal::write::{MemTableScanner, ShardWriterConfig};
+use lance::dataset::mem_wal::MemTableScanner;
+use lance::dataset::mem_wal::write::ShardWriterConfig;
 use lance::dataset::{Dataset, WriteParams};
 use lance::index::vector::VectorIndexParams;
 use lance::index::{DatasetIndexExt, DatasetIndexInternalExt};
@@ -596,6 +597,7 @@ async fn run_checkpoint(
                     query_parallelism: 1,
                     dist_q_c: 0.0,
                     approx_mode: Default::default(),
+                    rq_graph_scoring: Default::default(),
                 };
                 // IVFIndex::search is intentionally unimplemented (top-level does
                 // partition-aware search); replicate the ANN exec node: pick the

@@ -1669,11 +1669,17 @@ async fn test_binary_copy_gate_rejects_unrecognized_extra_buffers() {
         // A second data file with one extra global buffer that is not a seed.
         let filename = "doctored.lance".to_string();
         let path = dataset
+            .table_state
             .base
             .clone()
             .join(crate::dataset::DATA_DIR)
             .join(filename.as_str());
-        let object_writer = dataset.object_store.create(&path).await.unwrap();
+        let object_writer = dataset
+            .table_state
+            .object_store
+            .create(&path)
+            .await
+            .unwrap();
         let mut writer = file_versions::create_writer(
             version,
             object_writer,
@@ -1727,19 +1733,25 @@ async fn test_binary_copy_gate_rejects_unrecognized_extra_buffers() {
     }
 }
 
-/// Binary copy carries seeds exactly when every input had them, and copies
-/// the pages either way.
+/// Binary copy carries version 1 seeds when every input had them, drops
+/// version 0 seeds without activating `FLAG_ZONE_WRITE_SEEDS`, and copies the
+/// pages in all cases.
 #[tokio::test]
 async fn test_binary_copy_seed_carry_follows_inputs() {
     use lance_index::IndexType;
     use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
+    use lance_table::feature_flags::{FLAG_ZONE_WRITE_SEEDS, ZONE_WRITE_SEEDS_VERSION_KEY};
 
     let rows_per_file = 2_048usize;
     let files = 8usize;
-    for seeded in [false, true] {
-        // Both runs copy `files` inputs of `rows_per_file` rows. The seeded
-        // run appends them after a zone map index exists (the covered
-        // training fragment forms its own bin and stays put).
+    for (seeded, activate_v1, expect_carried) in [
+        (false, false, false),
+        (true, false, false),
+        (true, true, true),
+    ] {
+        // Every run copies `files` inputs of `rows_per_file` rows. Seeded runs
+        // append them after a zone map index exists (the covered training
+        // fragment forms its own bin and stays put).
         let mut dataset = Dataset::write(
             RecordBatchIterator::new([Ok(seed_test_batch(0, 16))], seed_test_schema()),
             "memory://",
@@ -1747,6 +1759,12 @@ async fn test_binary_copy_seed_carry_follows_inputs() {
         )
         .await
         .unwrap();
+        if activate_v1 {
+            dataset
+                .update_config([(ZONE_WRITE_SEEDS_VERSION_KEY, "1")])
+                .await
+                .unwrap();
+        }
         if seeded {
             let params = ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap)
                 .with_params(&serde_json::json!({"use_seeds": true}));
@@ -1783,7 +1801,14 @@ async fn test_binary_copy_seed_carry_follows_inputs() {
         )
         .await
         .unwrap();
-        assert_eq!(metrics.fragments_added, 1, "seeded={seeded}");
+        assert_eq!(
+            metrics.fragments_added, 1,
+            "seeded={seeded} activate_v1={activate_v1}"
+        );
+        assert_eq!(
+            dataset.manifest.reader_feature_flags & FLAG_ZONE_WRITE_SEEDS != 0,
+            activate_v1
+        );
 
         for fragment in dataset.fragments().iter() {
             if fragment.id <= max_before {
@@ -1791,11 +1816,12 @@ async fn test_binary_copy_seed_carry_follows_inputs() {
             }
             for file in &fragment.files {
                 let path = dataset
+                    .table_state
                     .base
                     .clone()
                     .join(crate::dataset::DATA_DIR)
                     .join(file.path.as_str());
-                let store = dataset.object_store.clone();
+                let store = dataset.table_state.object_store.clone();
                 let scheduler = lance_io::scheduler::ScanScheduler::new(
                     store.clone(),
                     lance_io::scheduler::SchedulerConfig::max_bandwidth(&store),
@@ -1809,8 +1835,8 @@ async fn test_binary_copy_seed_carry_follows_inputs() {
                     .unwrap();
                 assert_eq!(
                     meta.file_buffers.len() > 1,
-                    seeded,
-                    "seeds must be carried exactly when inputs had them"
+                    expect_carried,
+                    "seeded={seeded} activate_v1={activate_v1}"
                 );
             }
         }

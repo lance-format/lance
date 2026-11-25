@@ -13,8 +13,9 @@ use uuid::Uuid;
 
 use super::data_source::{LsmDataSource, LsmGeneration, ShardSnapshot};
 use crate::dataset::Dataset;
+use crate::dataset::mem_wal::index::IndexStore;
+use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
 use crate::dataset::mem_wal::util::sstable_uri;
-use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
 
 /// A point-in-time handle to one in-memory memtable, active or frozen —
 /// structurally identical (a frozen memtable is just the immutable case).

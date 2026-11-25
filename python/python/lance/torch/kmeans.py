@@ -66,10 +66,10 @@ class KMeans:
         self.max_iters = max_iters
 
         self.metric = _normalize_metric_type(metric)
-        if metric in ["l2", "cosine"]:
+        if self.metric in ["l2", "cosine"]:
             # Cosine uses normalized unit vector and calculate l2 distance
             self.dist_func = l2_distance
-        elif metric == "dot":
+        elif self.metric == "dot":
             self.dist_func = dot_distance
         else:
             raise ValueError(
@@ -92,9 +92,10 @@ class KMeans:
         self, data: Union[pa.FixedSizeListArray, np.ndarray, torch.Tensor]
     ) -> torch.Tensor:
         if isinstance(data, pa.FixedSizeListArray):
-            np_tensor = data.values.to_numpy(zero_copy_only=False).reshape(
-                -1, data.type.list_size
-            )
+            # ``values`` ignores the array offset and length, so slice explicitly.
+            dim = data.type.list_size
+            values = data.values.slice(data.offset * dim, len(data) * dim)
+            np_tensor = values.to_numpy(zero_copy_only=False).reshape(-1, dim)
             data = torch.from_numpy(np_tensor)
         elif _check_for_numpy(data) and isinstance(data, np.ndarray):
             data = torch.from_numpy(data)
@@ -118,7 +119,9 @@ class KMeans:
 
         is_numpy = _check_for_numpy(data) and isinstance(data, np.ndarray)
         if is_numpy or (_check_for_torch(data) and isinstance(data, torch.Tensor)):
-            indices = np.random.choice(data.shape[0], self.k)
+            # Use the seed when given; otherwise keep the global NumPy generator.
+            rng = np.random if self.seed is None else np.random.default_rng(self.seed)
+            indices = rng.choice(data.shape[0], self.k)
             if is_numpy:
                 data = torch.from_numpy(data)
             self.centroids = data[indices]
@@ -270,7 +273,7 @@ class KMeans:
             )
             raise StopIteration("kmeans: converged")
 
-        if abs(total_dist - last_dist) / total_dist < self.tolerance:
+        if abs(total_dist - last_dist) / abs(total_dist) < self.tolerance:
             raise StopIteration("kmeans: converged")
 
         # cast to the type we get the data in

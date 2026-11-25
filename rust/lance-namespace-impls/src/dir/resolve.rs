@@ -31,7 +31,7 @@ impl DirectoryNamespace {
     pub(super) async fn manifest_ns_for_write(
         &self,
     ) -> Result<Option<Arc<manifest::ManifestNamespace>>> {
-        if !self.manifest_enabled {
+        if !self.table_discovery_mode.has_manifest() {
             return Ok(None);
         }
 
@@ -44,7 +44,7 @@ impl DirectoryNamespace {
                     self.session.clone(),
                     self.object_store.clone(),
                     self.base_path.clone(),
-                    self.dir_listing_enabled,
+                    self.table_discovery_mode.has_directory_listing(),
                     self.inline_optimization_enabled,
                     self.commit_retries,
                 )
@@ -67,7 +67,7 @@ impl DirectoryNamespace {
     /// once the cell is populated; unlike `manifest_ns_for_write` it never
     /// creates the manifest.
     pub(super) async fn ensure_read_manifest(&self) -> Result<()> {
-        if !self.manifest_enabled
+        if !self.table_discovery_mode.has_manifest()
             || self.manifest_ns.get().is_some()
             || self.write_manifest_ns.get().is_some()
         {
@@ -82,7 +82,7 @@ impl DirectoryNamespace {
                     self.session.clone(),
                     self.object_store.clone(),
                     self.base_path.clone(),
-                    self.dir_listing_enabled,
+                    self.table_discovery_mode.has_directory_listing(),
                     self.inline_optimization_enabled,
                     self.commit_retries,
                 )
@@ -102,7 +102,7 @@ impl DirectoryNamespace {
     }
 
     pub(super) fn child_namespace_requires_manifest_error(&self) -> Error {
-        if self.manifest_enabled {
+        if self.table_discovery_mode.has_manifest() {
             NamespaceError::NamespaceNotFound {
                 message: "Child namespace reads require an existing __manifest dataset".to_string(),
             }
@@ -433,6 +433,7 @@ impl DirectoryNamespace {
                     "Too many concurrent writes for {} on table at '{}', please retry later: {}",
                     operation, table_uri, detail
                 ),
+                retry_after: None,
             },
             // Semantic conflicts: a concurrent change is incompatible with this one and retrying
             // as-is would not help, so surface them as `ConcurrentModification` (kept aligned with
@@ -826,6 +827,7 @@ impl DirectoryNamespace {
                     message: format!(
                         "Storage request was throttled while resolving table: {detail}"
                     ),
+                    retry_after: None,
                 }
                 .into();
             }
@@ -871,12 +873,15 @@ impl DirectoryNamespace {
         false
     }
 
-    /// Map a dataset/version/branch open error: a transient IO error propagates
-    /// typed via [`classify_storage_error`], while a genuine not-found (missing
-    /// dataset, version, or ref) keeps the caller's `not_found` variant.
+    /// Map a dataset/version/branch open error: a transient IO error or a corrupt
+    /// file propagates typed via [`classify_storage_error`], while a genuine
+    /// not-found (missing dataset, version, or ref) keeps the caller's `not_found`
+    /// variant.
     pub(super) fn map_open_error(err: Error, not_found: NamespaceError) -> Error {
-        if matches!(err.find_root(), Error::IO { .. })
-            && !manifest::ManifestNamespace::is_not_found_load_error(&err)
+        if matches!(
+            err.find_root(),
+            Error::IO { .. } | Error::CorruptFile { .. }
+        ) && !manifest::ManifestNamespace::is_not_found_load_error(&err)
         {
             return Self::classify_storage_error(err);
         }

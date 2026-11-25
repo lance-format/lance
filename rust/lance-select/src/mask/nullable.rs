@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use itertools::{EitherOrBoth, Itertools};
 use lance_core::deepsize::DeepSizeOf;
 
-use super::{RowAddrMask, RowAddrTreeMap, RowSetOps};
+use super::RowAddrSelection::{Full, Partial};
+use super::{RowAddrMask, RowAddrSelection, RowAddrTreeMap, RowSetOps};
 
 /// A set of row ids, with optional set of nulls.
 ///
@@ -75,10 +77,18 @@ impl NullableRowAddrSet {
 
     /// Get the TRUE rows (selected but not null)
     pub fn true_rows(&self) -> RowAddrTreeMap {
-        self.selected.clone() - self.nulls.clone()
+        self.selected.clone() - &self.nulls
     }
 
-    /// Split into the raw `selected` and `nulls` sets, the inverse of [`Self::new`].
+    /// Consume the selection and return its raw selected and null sets without copying.
+    ///
+    /// ```
+    /// use lance_select::{NullableRowAddrSet, RowAddrTreeMap};
+    /// let set = NullableRowAddrSet::new(RowAddrTreeMap::new(), RowAddrTreeMap::new());
+    /// let (selected, nulls) = set.into_parts();
+    /// assert_eq!(selected, RowAddrTreeMap::new());
+    /// assert_eq!(nulls, RowAddrTreeMap::new());
+    /// ```
     pub fn into_parts(self) -> (RowAddrTreeMap, RowAddrTreeMap) {
         (self.selected, self.nulls)
     }
@@ -113,7 +123,67 @@ impl PartialEq for NullableRowAddrSet {
         // Kleene state on every row. Comparing raw `selected` would be wrong
         // because a NULL row can be represented either inside or outside the
         // `selected` bitmap.
-        self.true_rows() == other.true_rows() && self.nulls == other.nulls
+        if self.nulls != other.nulls && !maps_equal_except_nulls(&self.nulls, &other.nulls, None) {
+            return false;
+        }
+        maps_equal_except_nulls(&self.selected, &other.selected, Some(&self.nulls))
+    }
+}
+
+fn maps_equal_except_nulls(
+    left: &RowAddrTreeMap,
+    right: &RowAddrTreeMap,
+    nulls: Option<&RowAddrTreeMap>,
+) -> bool {
+    left.iter()
+        .merge_join_by(right.iter(), |(left, _), (right, _)| left.cmp(right))
+        .all(|entry| {
+            let (fragment, left, right) = match entry {
+                EitherOrBoth::Both((fragment, left), (_, right)) => {
+                    (fragment, Some(left), Some(right))
+                }
+                EitherOrBoth::Left((fragment, left)) => (fragment, Some(left), None),
+                EitherOrBoth::Right((fragment, right)) => (fragment, None, Some(right)),
+            };
+            selections_equal_except_nulls(left, right, nulls.and_then(|nulls| nulls.get(fragment)))
+        })
+}
+
+fn selections_equal_except_nulls(
+    left: Option<&RowAddrSelection>,
+    right: Option<&RowAddrSelection>,
+    nulls: Option<&RowAddrSelection>,
+) -> bool {
+    if matches!(nulls, Some(Full)) {
+        return true;
+    }
+    let nulls = match nulls {
+        Some(Partial(nulls)) => Some(nulls),
+        _ => None,
+    };
+    match (left, right) {
+        (Some(Full), Some(Full)) | (None, None) => true,
+        (Some(Partial(left)), Some(Partial(right))) => {
+            if let Some(nulls) = nulls {
+                // Only differences outside NULL rows matter. Limit scratch space
+                // to one fragment instead of cloning both complete TRUE sets.
+                (left ^ right).is_subset(nulls)
+            } else {
+                left == right
+            }
+        }
+        (Some(Partial(rows)), None) | (None, Some(Partial(rows))) => {
+            nulls.map_or_else(|| rows.is_empty(), |nulls| rows.is_subset(nulls))
+        }
+        (Some(Full), Some(Partial(rows))) | (Some(Partial(rows)), Some(Full)) => {
+            // Full fragments need no bitmap expansion: rows OR nulls must
+            // cover the entire u32 offset domain.
+            nulls.map_or_else(
+                || rows.is_full(),
+                |nulls| rows.union_len(nulls) == u64::from(u32::MAX) + 1,
+            )
+        }
+        (Some(Full), None) | (None, Some(Full)) => nulls.is_some_and(|nulls| nulls.is_full()),
     }
 }
 
@@ -305,6 +375,11 @@ impl std::ops::BitOr for NullableRowAddrMask {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
+    use proptest::prelude::*;
+    use roaring::RoaringBitmap;
+
     use super::*;
 
     fn rows(ids: &[u64]) -> RowAddrTreeMap {
@@ -510,6 +585,110 @@ mod tests {
         assert_eq!(a, b);
         assert_eq!(a.true_rows(), b.true_rows());
         assert_eq!(a.null_rows(), b.null_rows());
+    }
+
+    proptest! {
+        #[test]
+        fn equality_matches_independent_three_valued_sets(
+            selected_left in prop::collection::btree_set(0_u64..24, 0..24),
+            selected_right in prop::collection::btree_set(0_u64..24, 0..24),
+            nulls_left in prop::collection::btree_set(0_u64..24, 0..24),
+            nulls_right in prop::collection::btree_set(0_u64..24, 0..24),
+        ) {
+            // Spread a small independent universe over multiple physical fragments.
+            let address = |id: &u64| ((*id / 8) << 32) | (*id % 8);
+            let make_set = |selected: &BTreeSet<u64>, nulls: &BTreeSet<u64>| {
+                NullableRowAddrSet::new(
+                    selected.iter().map(address).collect(),
+                    nulls.iter().map(address).collect(),
+                )
+            };
+            let left = make_set(&selected_left, &nulls_left);
+            let right = make_set(&selected_right, &nulls_right);
+            let expected_equal = nulls_left == nulls_right
+                && selected_left.difference(&nulls_left).eq(selected_right.difference(&nulls_right));
+            prop_assert_eq!(left == right, expected_equal);
+
+            // Including or excluding NULL rows from selected must not affect equality,
+            // including when the equivalent masks pass through Boolean operators.
+            let equivalent = make_set(
+                &selected_left.symmetric_difference(&nulls_left).copied().collect(),
+                &nulls_left,
+            );
+            prop_assert_eq!(&left, &equivalent);
+            let left = NullableRowAddrMask::AllowList(left);
+            let equivalent = NullableRowAddrMask::AllowList(equivalent);
+            let right = NullableRowAddrMask::AllowList(right);
+            prop_assert_eq!(!left.clone(), !equivalent.clone());
+            prop_assert_eq!(left.clone() & right.clone(), equivalent.clone() & right.clone());
+            prop_assert_eq!(left | right.clone(), equivalent | right);
+        }
+    }
+
+    #[test]
+    fn equality_accepts_equivalent_fragment_encodings() {
+        let selected = rows(&[1, 2]);
+        let mut empty_nulls = RowAddrTreeMap::new();
+        empty_nulls.insert_bitmap(0, RoaringBitmap::new());
+        assert_eq!(
+            NullableRowAddrSet::new(selected.clone(), RowAddrTreeMap::new()),
+            NullableRowAddrSet::new(selected.clone(), empty_nulls),
+        );
+
+        let mut full_nulls = RowAddrTreeMap::new();
+        full_nulls.insert_fragment(0);
+        let mut explicit_nulls = RowAddrTreeMap::new();
+        explicit_nulls.insert_bitmap(0, RoaringBitmap::full());
+        assert_eq!(
+            NullableRowAddrSet::new(selected.clone(), full_nulls),
+            NullableRowAddrSet::new(selected, explicit_nulls),
+        );
+    }
+
+    #[test]
+    fn equality_handles_full_and_missing_fragments() {
+        let mut full = RowAddrTreeMap::new();
+        full.insert_fragment(7);
+        let mut selected = RowAddrTreeMap::new();
+        selected.insert_bitmap(7, RoaringBitmap::from([0, u32::MAX]));
+        let empty = RowAddrTreeMap::new();
+        let all_null = NullableRowAddrSet::new(full.clone(), full.clone());
+        assert_eq!(
+            all_null,
+            NullableRowAddrSet::new(empty.clone(), full.clone())
+        );
+        assert_eq!(
+            all_null,
+            NullableRowAddrSet::new(selected.clone(), full.clone())
+        );
+        assert_ne!(
+            NullableRowAddrSet::new(full.clone(), empty.clone()),
+            NullableRowAddrSet::new(selected.clone(), empty.clone()),
+        );
+        assert_eq!(
+            NullableRowAddrSet::new(selected.clone(), selected.clone()),
+            NullableRowAddrSet::new(empty.clone(), selected.clone()),
+        );
+        assert_ne!(
+            NullableRowAddrSet::new(full, selected.clone()),
+            NullableRowAddrSet::new(empty, selected),
+        );
+
+        // The only non-NULL offsets are the two u32 boundaries. Comparing a
+        // full fragment against those explicit offsets must not expand Full.
+        let mut null_offsets = RoaringBitmap::full();
+        null_offsets.remove(0);
+        null_offsets.remove(u32::MAX);
+        let mut nulls = RowAddrTreeMap::new();
+        nulls.insert_bitmap(7, null_offsets);
+        let mut full = RowAddrTreeMap::new();
+        full.insert_fragment(7);
+        let mut boundaries = RowAddrTreeMap::new();
+        boundaries.insert_bitmap(7, RoaringBitmap::from([0, u32::MAX]));
+        assert_eq!(
+            NullableRowAddrSet::new(full, nulls.clone()),
+            NullableRowAddrSet::new(boundaries, nulls),
+        );
     }
 
     #[test]

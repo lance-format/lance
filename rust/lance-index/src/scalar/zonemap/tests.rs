@@ -10,15 +10,19 @@ use crate::scalar::registry::VALUE_COLUMN_NAME;
 use crate::scalar::{IndexStore, zonemap::ROWS_PER_ZONE_DEFAULT};
 use std::sync::Arc;
 
+use crate::progress::NoopIndexBuildProgress;
 use crate::scalar::registry::ScalarIndexPlugin;
 use crate::scalar::zoned::ZoneBound;
 use crate::scalar::zonemap::{
     CarriedSeed, MergeableSeed, ZoneMapIndexPlugin, ZoneMapIndexVersion, ZoneMapStatistics,
     make_zone_map_index_details,
 };
-use arrow::datatypes::{ArrowPrimitiveType, Decimal128Type, Float32Type, Float64Type, Int64Type};
+use arrow::datatypes::{
+    ArrowPrimitiveType, Decimal128Type, Float32Type, Float64Type, Int32Type, Int64Type,
+};
 use arrow_array::{
-    Array, Float64Array, PrimitiveArray, RecordBatch, UInt32Array, UInt64Array, record_batch,
+    Array, Float64Array, PrimitiveArray, RecordBatch, StringArray, UInt32Array, UInt64Array,
+    record_batch,
 };
 use arrow_schema::{DataType, Field, Schema};
 use datafusion_common::ScalarValue;
@@ -47,9 +51,9 @@ use crate::scalar::{
     zonemap::{
         HarvestedZoneSeed, ReusedZones, SEED_NULL_BITMAP_META_KEY, SEED_VERSION_META_KEY,
         SeedOutcome, ZONEMAP_FILENAME, ZONEMAP_SIZE_META_KEY, ZoneMapIndex,
-        ZoneMapIndexBuilderParams, ZoneMapProcessor, ZoneMapSeedWriter, ZoneMapSegmentBase,
-        build_zonemap_segment, merge_seeds_for_binary_copy, merge_zonemap_indices,
-        parse_seed_for_binary_copy, place_records, remap_zone,
+        ZoneMapIndexBuilderParams, ZoneMapProcessor, ZoneMapSeedVersion, ZoneMapSeedWriter,
+        ZoneMapSegmentBase, build_zonemap_segment, merge_seeds_for_binary_copy,
+        merge_zonemap_indices, parse_seed_for_binary_copy, place_records, remap_zone,
     },
 };
 use arrow_array::Int32Array;
@@ -129,6 +133,7 @@ where
         stream,
         test_store.as_ref(),
         Some(ZoneMapIndexBuilderParams::new(2)),
+        &NoopIndexBuildProgress,
     )
     .await
     .unwrap();
@@ -364,6 +369,26 @@ async fn test_remapped_legacy_nan_marker_zone_keeps_bounded_range_candidate() {
     source_mut.null_rows = None;
     let new_row = 3_u64 << 32;
     source_mut.fri = Some(Arc::new(TestRemapper::new([(0, new_row)])));
+
+    let raw_zones = source.zones_as_batch().unwrap();
+    let column_u64 = |name| {
+        raw_zones
+            .column_by_name(name)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap()
+    };
+    assert_eq!(column_u64("fragment_id").value(0), 0);
+    assert_eq!(column_u64("zone_start").value(0), 0);
+    assert_eq!(column_u64("zone_length").value(0), 2);
+    let negative_nan_count = raw_zones
+        .column_by_name("negative_nan_count")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<UInt32Array>()
+        .unwrap();
+    assert!(negative_nan_count.is_null(0));
 
     let remapped = remap_zone(
         &source.zones[0],
@@ -630,9 +655,14 @@ async fn test_empty_zonemap_index() {
         stream::once(std::future::ready(Ok(data))),
     ));
 
-    ZoneMapIndexPlugin::train_zonemap_index(data_stream, test_store.as_ref(), None)
-        .await
-        .unwrap();
+    ZoneMapIndexPlugin::train_zonemap_index(
+        data_stream,
+        test_store.as_ref(),
+        None,
+        &NoopIndexBuildProgress,
+    )
+    .await
+    .unwrap();
 
     log::debug!("Successfully wrote the index file");
 
@@ -680,6 +710,7 @@ async fn test_null_zonemap_index() {
         stream,
         test_store.as_ref(),
         Some(ZoneMapIndexBuilderParams::new(5000)),
+        &NoopIndexBuildProgress,
     )
     .await
     .unwrap();
@@ -816,7 +847,7 @@ async fn test_zonemap_null_handling_in_queries() {
     let stream = Box::pin(RecordBatchStreamAdapter::new(schema, stream));
 
     // Train and write the zonemap index
-    ZoneMapIndexPlugin::train_zonemap_index(stream, store.as_ref(), None)
+    ZoneMapIndexPlugin::train_zonemap_index(stream, store.as_ref(), None, &NoopIndexBuildProgress)
         .await
         .unwrap();
 
@@ -919,6 +950,7 @@ async fn test_nan_zonemap_index() {
         data_stream,
         test_store.as_ref(),
         Some(ZoneMapIndexBuilderParams::new(100)),
+        &NoopIndexBuildProgress,
     )
     .await
     .unwrap();
@@ -1134,6 +1166,7 @@ async fn test_basic_zonemap_index() {
         data_stream,
         test_store.as_ref(),
         Some(ZoneMapIndexBuilderParams::new(100)),
+        &NoopIndexBuildProgress,
     )
     .await
     .unwrap();
@@ -1343,6 +1376,7 @@ async fn test_complex_zonemap_index() {
         data_stream,
         test_store.as_ref(),
         Some(ZoneMapIndexBuilderParams::default()),
+        &NoopIndexBuildProgress,
     )
     .await
     .unwrap();
@@ -1512,6 +1546,7 @@ async fn test_multiple_fragments_zonemap() {
             data_stream,
             test_store.as_ref(),
             Some(ZoneMapIndexBuilderParams::new(5000)),
+            &NoopIndexBuildProgress,
         )
         .await
         .unwrap();
@@ -1731,6 +1766,7 @@ async fn test_multiple_fragments_zonemap() {
             data_stream,
             test_store.as_ref(),
             Some(ZoneMapIndexBuilderParams::default()),
+            &NoopIndexBuildProgress,
         )
         .await
         .unwrap();
@@ -1815,6 +1851,7 @@ async fn test_multiple_fragments_zonemap() {
             data_stream,
             test_store.as_ref(),
             Some(ZoneMapIndexBuilderParams::new(ROWS_PER_ZONE_DEFAULT * 3)),
+            &NoopIndexBuildProgress,
         )
         .await
         .unwrap();
@@ -2203,6 +2240,67 @@ async fn test_like_prefix_large_utf8() {
     let mut expected = RowAddrTreeMap::new();
     expected.insert_range((1u64 << 32)..((1u64 << 32) + 100));
 
+    assert_eq!(result, SearchResult::at_most(expected));
+}
+
+/// Zones trained on a dictionary column have no extrema, so a prefix query
+/// keeps every zone with a non-null value instead of pruning them all.
+#[tokio::test]
+async fn test_like_prefix_dictionary_zones_without_extrema() {
+    let tmpdir = TempObjDir::default();
+    let test_store = local_store(&tmpdir);
+    let values: arrow_array::DictionaryArray<Int32Type> = vec![
+        Some("p012"),
+        Some("p013"),
+        None,
+        None,
+        Some("p099"),
+        Some("x"),
+    ]
+    .into_iter()
+    .collect();
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        VALUE_COLUMN_NAME,
+        values.data_type().clone(),
+        true,
+    )]));
+    let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(values)]).unwrap();
+    let stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+        schema,
+        stream::iter([Ok(batch)]),
+    ));
+    ZoneMapIndexPlugin::train_zonemap_index(
+        add_row_addr(stream),
+        test_store.as_ref(),
+        Some(ZoneMapIndexBuilderParams::new(2)),
+        &NoopIndexBuildProgress,
+    )
+    .await
+    .unwrap();
+    let index = ZoneMapIndex::load(
+        test_store,
+        None,
+        &LanceCache::no_cache(),
+        false,
+        ZoneMapIndexVersion::V1,
+    )
+    .await
+    .unwrap();
+    assert!(
+        index
+            .zones
+            .iter()
+            .all(|zone| zone.min.is_null() && zone.max.is_null()),
+        "dictionary zones are expected to store no extrema"
+    );
+
+    let query = SargableQuery::LikePrefix(ScalarValue::Utf8(Some("p01".to_string())));
+    let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+
+    // The all-null middle zone holds no value the prefix could match
+    let mut expected = RowAddrTreeMap::new();
+    expected.insert_range(0..2);
+    expected.insert_range(4..6);
     assert_eq!(result, SearchResult::at_most(expected));
 }
 
@@ -2614,6 +2712,85 @@ async fn test_zone_map_seed_writer_empty() {
     let mut writer = ZoneMapSeedWriter::new("col", 8, DataType::Int32).unwrap();
     let result = writer.finish().unwrap();
     assert!(result.is_none(), "empty fragment should return None");
+}
+
+#[test]
+fn test_zone_map_seed_writer_v0_format_and_nan_marker() {
+    let mut writer = ZoneMapSeedWriter::new("f", 4, DataType::Float64)
+        .unwrap()
+        .with_version(ZoneMapSeedVersion::V0);
+    assert_eq!(writer.required_feature_flags(), 0);
+
+    // Zone 0: finite + negative NaN + null -> V0 keeps ordinary min, writes max = +NaN.
+    // Zone 1: all positive NaNs -> V0 has null min, max = +NaN.
+    // Zone 2: finite only -> V0 keeps ordinary min and max.
+    let values: ArrayRef = Arc::new(Float64Array::from(vec![
+        Some(1.0),
+        Some(5.0),
+        Some(-f64::NAN),
+        None,
+        Some(f64::NAN),
+        Some(f64::NAN),
+        Some(f64::NAN),
+        Some(f64::NAN),
+        Some(10.0),
+        Some(20.0),
+    ]));
+    writer.observe_batch(&values).unwrap();
+    let bytes = writer.finish().unwrap().expect("should produce bytes");
+
+    let reader =
+        arrow_ipc::reader::FileReader::try_new(std::io::Cursor::new(bytes.as_ref()), None).unwrap();
+    let schema = reader.schema();
+    assert!(
+        !schema.metadata.contains_key(SEED_VERSION_META_KEY),
+        "V0 seed must omit version metadata"
+    );
+    assert!(
+        schema.field_with_name("negative_nan_count").is_err(),
+        "V0 seed must omit negative_nan_count"
+    );
+    assert_eq!(schema.fields().len(), 5);
+    assert!(schema.metadata.contains_key(SEED_NULL_BITMAP_META_KEY));
+
+    let (zones, null_bitmap) = ZoneMapSeedWriter::deserialize_seed(3, &bytes).unwrap();
+    assert_eq!(zones.len(), 3);
+    assert_eq!(zones[0].min, ScalarValue::Float64(Some(1.0)));
+    assert!(ZoneMapIndex::scalar_is_nan(&zones[0].max));
+    assert!(!ZoneMapIndex::scalar_is_negative_nan(&zones[0].max));
+    assert_eq!(zones[0].null_count, 1);
+    assert_eq!(zones[0].nan_count, 1);
+    assert_eq!(zones[0].negative_nan_count, None);
+
+    assert_eq!(zones[1].min, ScalarValue::Float64(None));
+    assert!(ZoneMapIndex::scalar_is_nan(&zones[1].max));
+    assert_eq!(zones[1].nan_count, 4);
+    assert_eq!(zones[1].negative_nan_count, None);
+
+    assert_eq!(zones[2].min, ScalarValue::Float64(Some(10.0)));
+    assert_eq!(zones[2].max, ScalarValue::Float64(Some(20.0)));
+    assert_eq!(zones[2].nan_count, 0);
+    assert_eq!(zones[2].negative_nan_count, None);
+
+    let bitmap = null_bitmap.expect("null bitmap should be recorded by default");
+    assert_eq!(bitmap.len(), 1);
+    assert!(bitmap.contains(3));
+
+    // Disabling null positions omits SEED_NULL_BITMAP_META_KEY in V0 as well.
+    let mut no_pos = ZoneMapSeedWriter::new("s", 4, DataType::Utf8)
+        .unwrap()
+        .with_version(ZoneMapSeedVersion::V0)
+        .with_null_positions(false);
+    let strings: ArrayRef = Arc::new(StringArray::from(vec![Some("a"), None, Some("z")]));
+    no_pos.observe_batch(&strings).unwrap();
+    let no_pos_bytes = no_pos.finish().unwrap().expect("should produce bytes");
+    let (s_zones, s_bitmap) = ZoneMapSeedWriter::deserialize_seed(4, &no_pos_bytes).unwrap();
+    assert_eq!(s_zones.len(), 1);
+    assert_eq!(s_zones[0].min, ScalarValue::Utf8(Some("a".into())));
+    assert_eq!(s_zones[0].max, ScalarValue::Utf8(Some("z".into())));
+    assert_eq!(s_zones[0].null_count, 1);
+    assert_eq!(s_zones[0].negative_nan_count, None);
+    assert_eq!(s_bitmap, None);
 }
 
 /// Seeds produced for fragments that contain null values must carry a null
@@ -3757,6 +3934,7 @@ async fn train_and_load_fsl(rows: Vec<Vec<Option<f32>>>, list_size: i32) -> Arc<
         stream,
         test_store.as_ref(),
         Some(ZoneMapIndexBuilderParams::new(4)),
+        &NoopIndexBuildProgress,
     )
     .await
     .unwrap();
@@ -3877,6 +4055,7 @@ async fn test_fsl_zonemap_null_list() {
         stream,
         test_store.as_ref(),
         Some(ZoneMapIndexBuilderParams::new(4)),
+        &NoopIndexBuildProgress,
     )
     .await
     .unwrap();
@@ -3994,6 +4173,7 @@ async fn test_fsl_zonemap_all_null_zone() {
         stream,
         test_store.as_ref(),
         Some(ZoneMapIndexBuilderParams::new(4)),
+        &NoopIndexBuildProgress,
     )
     .await
     .unwrap();
@@ -4062,6 +4242,7 @@ async fn test_struct_zonemap_null_tracking() {
         stream,
         test_store.as_ref(),
         Some(ZoneMapIndexBuilderParams::new(10)),
+        &NoopIndexBuildProgress,
     )
     .await
     .unwrap();
@@ -4141,6 +4322,7 @@ async fn test_list_zonemap_null_tracking() {
         stream,
         test_store.as_ref(),
         Some(ZoneMapIndexBuilderParams::new(10)),
+        &NoopIndexBuildProgress,
     )
     .await
     .unwrap();
@@ -4395,6 +4577,7 @@ async fn test_list_zonemap_training_ignores_child_nulls() {
         stream,
         test_store.as_ref(),
         Some(ZoneMapIndexBuilderParams::new(10)),
+        &NoopIndexBuildProgress,
     )
     .await
     .unwrap();
@@ -5011,7 +5194,12 @@ fn test_reuse_rejects_missing_bounds_but_accepts_all_null_records() {
 
     fn seed_from_records(records: &[ZoneMapStatistics]) -> FragmentSeed {
         use arrow_ipc::writer::FileWriter;
-        let batch = ZoneMapSeedWriter::seed_batch_from_zones(records, &DataType::Int32).unwrap();
+        let batch = ZoneMapSeedWriter::seed_batch_from_zones(
+            records,
+            &DataType::Int32,
+            ZoneMapSeedVersion::V1,
+        )
+        .unwrap();
         let mut buf = std::io::Cursor::new(Vec::new());
         {
             let mut writer = FileWriter::try_new(&mut buf, batch.schema_ref()).unwrap();
@@ -5561,6 +5749,7 @@ async fn train_float_index_in(
         add_row_addr(stream),
         store.as_ref(),
         Some(ZoneMapIndexBuilderParams::new(rows_per_zone)),
+        &NoopIndexBuildProgress,
     )
     .await
     .unwrap();

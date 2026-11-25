@@ -241,8 +241,7 @@ mod test {
         let body = b"manifest body";
 
         object_store
-            .inner
-            .put(&final_path, PutPayload::from_static(body))
+            .put_payload(&final_path, PutPayload::from_static(body))
             .await
             .expect("seed finalized manifest");
         inner_store
@@ -274,8 +273,7 @@ mod test {
         let v1_path = ManifestNamingScheme::V1.manifest_path(&base_path, version);
 
         object_store
-            .inner
-            .put(&v1_path, PutPayload::from_static(b"v1 manifest body"))
+            .put_payload(&v1_path, PutPayload::from_static(b"v1 manifest body"))
             .await
             .expect("seed V1 manifest");
         inner_store.lock().await.insert(
@@ -307,8 +305,7 @@ mod test {
         let body = b"manifest body";
 
         object_store
-            .inner
-            .put(&final_path, PutPayload::from_static(body))
+            .put_payload(&final_path, PutPayload::from_static(body))
             .await
             .expect("seed finalized manifest");
         let handler = ExternalManifestCommitHandler {
@@ -320,6 +317,7 @@ mod test {
                     naming_scheme: ManifestNamingScheme::V2,
                     e_tag: None,
                     identity: None,
+                    last_modified: None,
                 },
                 verify_store: None,
             }),
@@ -342,8 +340,7 @@ mod test {
         let body = b"manifest body";
 
         object_store
-            .inner
-            .put(&final_path, PutPayload::from_static(body))
+            .put_payload(&final_path, PutPayload::from_static(body))
             .await
             .expect("seed finalized manifest");
         let handler = ExternalManifestCommitHandler {
@@ -355,6 +352,7 @@ mod test {
                     naming_scheme: ManifestNamingScheme::V2,
                     e_tag: None,
                     identity: None,
+                    last_modified: None,
                 },
                 verify_store: None,
             }),
@@ -365,8 +363,7 @@ mod test {
             .await
             .expect("the canonical manifest should resolve from object storage");
         let current_meta = object_store
-            .inner
-            .head(&resolved.path)
+            .stat(&resolved.path)
             .await
             .expect("read current object-store metadata");
         assert_eq!(resolved.e_tag, current_meta.e_tag);
@@ -394,6 +391,7 @@ mod test {
                 naming_scheme: ManifestNamingScheme::V2,
                 e_tag: staging_meta.e_tag.clone(),
                 identity: None,
+                last_modified: None,
             },
             verify_store: Some(object_store.clone()),
         };
@@ -432,13 +430,11 @@ mod test {
         let version = 1;
         let staging_path = Path::from("repro/_versions/1.manifest.staging-abcd");
         object_store
-            .inner
-            .put(&staging_path, PutPayload::from_static(b"manifest body"))
+            .put_payload(&staging_path, PutPayload::from_static(b"manifest body"))
             .await
             .expect("seed staging manifest");
         let staging_meta = object_store
-            .inner
-            .head(&staging_path)
+            .stat(&staging_path)
             .await
             .expect("read staging metadata");
 
@@ -451,6 +447,7 @@ mod test {
                     naming_scheme: ManifestNamingScheme::V2,
                     e_tag: staging_meta.e_tag.clone(),
                     identity: None,
+                    last_modified: None,
                 },
                 verify_store: Some(object_store.inner.clone()),
             }),
@@ -461,8 +458,7 @@ mod test {
             .await
             .expect("finalize manifest");
         let final_meta = object_store
-            .inner
-            .head(&location.path)
+            .stat(&location.path)
             .await
             .expect("read finalized metadata");
 
@@ -537,6 +533,62 @@ mod test {
             .await
             .unwrap();
         assert_eq!(ds.count_rows(None).await.unwrap(), 100);
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn restore_from_publishes_through_the_external_commit_handler() {
+        let external = Arc::new(TestExternalManifestStore::new());
+        let handler = Arc::new(ExternalManifestCommitHandler {
+            external_manifest_store: external.clone(),
+        });
+        let mut data_gen =
+            BatchGenerator::new().col(Box::new(IncrementingInt32::new().named("x".to_owned())));
+        let dir = TempStrDir::default();
+
+        Dataset::write(
+            data_gen.batch(10),
+            &dir,
+            Some(write_params(handler.clone())),
+        )
+        .await
+        .unwrap();
+        Dataset::write(
+            data_gen.batch(10),
+            &dir,
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                commit_handler: Some(handler.clone()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let latest = DatasetBuilder::from_uri(&dir)
+            .with_read_params(read_params(handler.clone()))
+            .load()
+            .await
+            .unwrap();
+        assert_eq!(latest.version().version, 2);
+        let mut target = latest.checkout_version(1).await.unwrap();
+        target.restore_from(2).await.unwrap();
+        assert_eq!(target.version().version, 3);
+
+        let latest = external
+            .get_latest_version(target.table_state.base.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(latest.0, 3);
+
+        let reopened = DatasetBuilder::from_uri(&dir)
+            .with_read_params(read_params(handler))
+            .load()
+            .await
+            .unwrap();
+        assert_eq!(reopened.version().version, 3);
+        assert_eq!(reopened.count_rows(None).await.unwrap(), 10);
     }
 
     #[cfg(not(windows))]
@@ -668,20 +720,20 @@ mod test {
             .join(format!("6.manifest-{}", uuid::Uuid::new_v4()));
         localfs
             .rename(
-                &ManifestNamingScheme::V1.manifest_path(&ds.base, 6),
+                &ManifestNamingScheme::V1.manifest_path(&ds.table_state.base, 6),
                 &version_six_staging_location,
             )
             .await
             .unwrap();
         {
             inner_store.lock().await.insert(
-                (ds.base.to_string(), 6),
+                (ds.table_state.base.to_string(), 6),
                 version_six_staging_location.to_string(),
             );
         }
         // set the store back to dataset path with -{uuid} suffix
         let mut version_six = localfs
-            .list(Some(&ds.base))
+            .list(Some(&ds.table_state.base))
             .try_filter(|p| {
                 let p = p.clone();
                 async move { p.location.filename().unwrap().starts_with("6.manifest-") }
@@ -693,7 +745,7 @@ mod test {
         let version_six_staging_location = version_six.pop().unwrap().unwrap().location;
         {
             inner_store.lock().await.insert(
-                (ds.base.to_string(), 6),
+                (ds.table_state.base.to_string(), 6),
                 version_six_staging_location.to_string(),
             );
         }
@@ -713,14 +765,17 @@ mod test {
         assert_eq!(ds.count_rows(None).await.unwrap(), 60);
 
         {
-            inner_store.lock().await.remove(&(ds.base.to_string(), 6));
+            inner_store
+                .lock()
+                .await
+                .remove(&(ds.table_state.base.to_string(), 6));
         }
         assert!(
             handler
                 .version_exists(
-                    &ds.base,
+                    &ds.table_state.base,
                     6,
-                    ds.object_store.inner.as_ref(),
+                    ds.table_state.object_store.inner.as_ref(),
                     ds.manifest_location().naming_scheme,
                 )
                 .await
@@ -729,9 +784,9 @@ mod test {
         assert!(
             !handler
                 .version_exists(
-                    &ds.base,
+                    &ds.table_state.base,
                     7,
-                    ds.object_store.inner.as_ref(),
+                    ds.table_state.object_store.inner.as_ref(),
                     ds.manifest_location().naming_scheme,
                 )
                 .await
@@ -796,17 +851,22 @@ mod test {
         let orphan_staging_manifest =
             Path::parse(format!("{}-{}", canonical_manifest, uuid::Uuid::new_v4())).unwrap();
         dataset
+            .table_state
             .object_store
             .copy(&canonical_manifest, &authoritative_staging_manifest)
             .await
             .unwrap();
         dataset
+            .table_state
             .object_store
             .copy(&canonical_manifest, &orphan_staging_manifest)
             .await
             .unwrap();
         manifest_records.lock().await.insert(
-            (dataset.base.to_string(), dataset.version().version),
+            (
+                dataset.table_state.base.to_string(),
+                dataset.version().version,
+            ),
             authoritative_staging_manifest.to_string(),
         );
 
@@ -822,6 +882,7 @@ mod test {
 
         assert!(
             dataset
+                .table_state
                 .object_store
                 .exists(&authoritative_staging_manifest)
                 .await
@@ -830,6 +891,7 @@ mod test {
         );
         assert!(
             !dataset
+                .table_state
                 .object_store
                 .exists(&orphan_staging_manifest)
                 .await

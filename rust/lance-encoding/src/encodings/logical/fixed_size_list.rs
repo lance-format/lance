@@ -295,7 +295,6 @@ impl StructuralFieldDecoder for StructuralFixedSizeListDecoder {
         Ok(Box::new(StructuralFixedSizeListDecodeTask::new(
             child_task,
             self.data_type.clone(),
-            num_rows,
         )))
     }
 
@@ -308,19 +307,13 @@ impl StructuralFieldDecoder for StructuralFixedSizeListDecoder {
 struct StructuralFixedSizeListDecodeTask {
     child_task: Box<dyn StructuralDecodeArrayTask>,
     data_type: DataType,
-    num_rows: u64,
 }
 
 impl StructuralFixedSizeListDecodeTask {
-    fn new(
-        child_task: Box<dyn StructuralDecodeArrayTask>,
-        data_type: DataType,
-        num_rows: u64,
-    ) -> Self {
+    fn new(child_task: Box<dyn StructuralDecodeArrayTask>, data_type: DataType) -> Self {
         Self {
             child_task,
             data_type,
-            num_rows,
         }
     }
 }
@@ -334,11 +327,21 @@ impl StructuralDecodeArrayTask for StructuralFixedSizeListDecodeTask {
         } = self.child_task.decode()?;
         match &self.data_type {
             DataType::FixedSizeList(child_field, dimension) => {
-                let num_rows = self.num_rows as usize;
-                let validity = repdef.unravel_fsl_validity(num_rows, *dimension as usize)?;
+                let dimension = usize::try_from(*dimension).map_err(|_| {
+                    Error::invalid_input("Fixed-size-list dimension must be positive")
+                })?;
+                if dimension == 0 || !array.len().is_multiple_of(dimension) {
+                    return Err(Error::invalid_input(
+                        "Fixed-size-list child count is not a whole number of slots",
+                    ));
+                }
+                // A surrounding variable list can contain a different number
+                // of FSL values than the top-level rows requested by the scan.
+                let num_rows = array.len() / dimension;
+                let validity = repdef.unravel_fsl_validity(num_rows, dimension)?;
                 let fsl_array = arrow_array::FixedSizeListArray::try_new(
                     child_field.clone(),
-                    *dimension,
+                    dimension as i32,
                     array,
                     validity,
                 )?;
@@ -785,9 +788,10 @@ mod tests {
         #[values(TestEncoding::StructuralU32, TestEncoding::StructuralSparse)]
         encoding: TestEncoding,
         #[values(4096, 1024 * 1024)] page_size: u64,
-        #[values(false, true)] use_slicing: bool,
-        #[values(1, 5, 10)] ingest_batch_count: u32,
+        // Slicing a single ingest batch is a no-op, so that pair is omitted.
+        #[values((false, 1), (false, 5), (false, 10), (true, 5), (true, 10))] ingest: (bool, u32),
     ) {
+        let (use_slicing, ingest_batch_count) = ingest;
         let data_type = make_fsl_struct_type(struct_fields, dimension);
         let mut field_metadata = HashMap::new();
         field_metadata.insert(

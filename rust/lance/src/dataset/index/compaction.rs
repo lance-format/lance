@@ -5,7 +5,7 @@
 
 use crate::Dataset;
 use crate::index::vector::ivf::compaction_vector_segment_merge_groups;
-use crate::index::{DatasetIndexInternalExt, LogicalVectorIndex};
+use crate::index::{LogicalVectorIndex, loading::DatasetIndexInternalExt};
 use futures::{StreamExt, stream};
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::pb::{VectorIndexDetails, vector_index_details::Compression};
@@ -50,7 +50,7 @@ pub async fn vector_segment_merge_groups_for_compaction<'a>(
                     .map(|index| (segment, index))
             }
         })
-        .buffered(dataset.object_store.io_parallelism())
+        .buffered(dataset.table_state.object_store.io_parallelism())
         .collect::<Vec<_>>()
         .await;
     let opened = opened

@@ -8,17 +8,25 @@ use std::vec;
 use crate::dataset::builder::DatasetBuilder;
 use crate::dataset::transaction::{Operation, Transaction, UpdateMode, UpdatedFragmentOffsets};
 use crate::dataset::{
-    ColumnAlteration, ManifestWriteConfig, NewColumnTransform, TRANSACTIONS_DIR, UpdateBuilder,
+    ColumnAlteration, NewColumnTransform, ReadParams, TRANSACTIONS_DIR, UpdateBuilder,
     write_manifest_file,
 };
 use crate::io::ObjectStoreParams;
 use crate::session::Session;
 use crate::{Dataset, Result};
 use lance_file::version::LanceFileVersion;
-use lance_table::feature_flags::{FLAG_COVERED_INDEX_METADATA, FLAG_ROW_ADDR_INDICES};
-use lance_table::format::IndexMetadata;
-use lance_table::io::commit::ManifestNamingScheme;
+use lance_table::feature_flags::{
+    FLAG_COVERED_INDEX_METADATA, FLAG_INDEPENDENT_COVERING_FIELDS, FLAG_ROW_ADDR_INDICES,
+};
+use lance_table::format::{IndexMetadata, Manifest, Transaction as ManifestTransaction};
+use lance_table::io::commit::{
+    CommitError, CommitHandler, ConditionalPutCommitHandler, ManifestLocation,
+    ManifestNamingScheme, ManifestWriter,
+};
+use object_store::path::Path;
 use roaring::RoaringBitmap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::sync::Notify;
 use uuid::Uuid;
 
 use crate::dataset::write::{CommitBuilder, InsertBuilder, WriteMode, WriteParams};
@@ -198,8 +206,8 @@ async fn test_session_store_registry() {
         .unwrap();
     assert_eq!(registry.active_stores().len(), 1);
     assert_eq!(
-        Arc::as_ptr(&dataset.object_store.as_ref().inner),
-        Arc::as_ptr(&dataset2.object_store.as_ref().inner)
+        Arc::as_ptr(&dataset.table_state.object_store.as_ref().inner),
+        Arc::as_ptr(&dataset2.table_state.object_store.as_ref().inner)
     );
 
     // If we create another with **different parameters**, it should create a new store.
@@ -218,8 +226,8 @@ async fn test_session_store_registry() {
         .unwrap();
     assert_eq!(registry.active_stores().len(), 2);
     assert_ne!(
-        Arc::as_ptr(&dataset.object_store.as_ref().inner),
-        Arc::as_ptr(&dataset3.object_store.as_ref().inner)
+        Arc::as_ptr(&dataset.table_state.object_store.as_ref().inner),
+        Arc::as_ptr(&dataset3.table_state.object_store.as_ref().inner)
     );
 
     // Remove both datasets
@@ -228,37 +236,6 @@ async fn test_session_store_registry() {
     drop(dataset2);
     drop(dataset);
     assert_eq!(registry.active_stores().len(), 0);
-}
-
-#[test]
-fn test_decode_inline_transaction_tolerates_unknown_operations() {
-    use crate::dataset::decode_inline_transaction;
-    use lance_table::format::pb;
-    use prost::Message;
-
-    // A transaction written by a newer version of Lance may carry an operation
-    // this version cannot decode; prost surfaces it as a missing oneof. It
-    // decodes as `Operation::Unknown` rather than failing.
-    let unknown_operation = pb::Transaction {
-        read_version: 1,
-        uuid: "test".to_string(),
-        ..Default::default()
-    };
-    let decoded = decode_inline_transaction(&unknown_operation.encode_to_vec(), 42).unwrap();
-    assert!(matches!(decoded.operation, Operation::Unknown { .. }));
-
-    // Corrupt bytes are likewise tolerated.
-    assert!(decode_inline_transaction(&[0xff, 0xff, 0xff], 42).is_none());
-
-    // A decodable transaction is returned.
-    let known = pb::Transaction::try_from(&Transaction::new(
-        1,
-        Operation::Append { fragments: vec![] },
-        None,
-    ))
-    .unwrap();
-    let decoded = decode_inline_transaction(&known.encode_to_vec(), 42).unwrap();
-    assert!(matches!(decoded.operation, Operation::Append { .. }));
 }
 
 /// A transaction as a future Lance might write it: the `operation` oneof holds
@@ -298,7 +275,7 @@ async fn rewrite_inline_transaction(
 
     assert!(dataset.manifest.index_section.is_none());
     let path = &dataset.manifest_location().path;
-    let mut writer = ObjectWriter::new(dataset.object_store.as_ref(), path)
+    let mut writer = ObjectWriter::new(dataset.table_state.object_store.as_ref(), path)
         .await
         .unwrap();
     let tx_pos = writer.write_protobuf(inline_tx).await.unwrap() as u64;
@@ -385,6 +362,7 @@ async fn test_inline_transaction_written_to_new_field() {
     let test_uri = TempStrDir::default();
     let dataset = two_version_dataset(&test_uri).await;
     let bytes = dataset
+        .table_state
         .object_store
         .read_one_all(&dataset.manifest_location().path)
         .await
@@ -412,11 +390,18 @@ async fn test_read_inline_transaction_from_deprecated_field() {
     .await;
     // Remove the external copy so only field 21 can supply the transaction.
     let tx_path = dataset
+        .table_state
         .base
         .clone()
         .join(TRANSACTIONS_DIR)
         .join(dataset.manifest.transaction_file.as_deref().unwrap());
-    dataset.object_store.inner.delete(&tx_path).await.unwrap();
+    dataset
+        .table_state
+        .object_store
+        .inner
+        .delete(&tx_path)
+        .await
+        .unwrap();
 
     let dataset = Dataset::open(&test_uri).await.unwrap();
     assert!(dataset.manifest.transaction_section.is_some());
@@ -441,13 +426,16 @@ async fn test_read_inline_transaction_from_released_deprecated_field() {
 
 #[test]
 fn test_distinct_unknown_transactions_are_not_equal() {
-    use crate::dataset::decode_inline_transaction;
+    use lance_table::format::pb;
     use prost::Message;
 
     // Commit-outcome detection compares transactions for equality; two
     // unknown operations must not be mistaken for the same commit.
     let decode = |uuid: &str| {
-        decode_inline_transaction(&future_transaction(uuid).encode_to_vec(), 2).unwrap()
+        Transaction::try_from(
+            pb::Transaction::decode(future_transaction(uuid).encode_to_vec().as_slice()).unwrap(),
+        )
+        .unwrap()
     };
     assert_eq!(decode("a"), decode("a"));
     assert_ne!(decode("a"), decode("b"));
@@ -586,11 +574,12 @@ async fn test_inline_transaction() {
     async fn delete_external_tx_file(ds: &Dataset) {
         if let Some(tx_file) = ds.manifest.transaction_file.as_ref() {
             let tx_path = ds
+                .table_state
                 .base
                 .clone()
                 .join(TRANSACTIONS_DIR)
                 .join(tx_file.as_str());
-            let _ = ds.object_store.inner.delete(&tx_path).await; // ignore errors
+            let _ = ds.table_state.object_store.inner.delete(&tx_path).await; // ignore errors
         }
     }
 
@@ -609,17 +598,25 @@ async fn test_inline_transaction() {
     assert_eq!(read_tx, tx.clone());
 
     // Case 2: reading small manifest caches transaction data, eliminating transaction reading IO.
-    let read_ds2 = DatasetBuilder::from_uri(ds2.uri.clone())
+    let read_ds2 = DatasetBuilder::from_uri(ds2.table_state.uri.clone())
         .with_session(session.clone())
         .load()
         .await
         .unwrap();
-    let stats = read_ds2.object_store.as_ref().io_stats_incremental(); // Reset
+    let stats = read_ds2
+        .table_state
+        .object_store
+        .as_ref()
+        .io_stats_incremental(); // Reset
     assert!(stats.read_bytes < 64 * 1024);
     // Because the manifest is so small, we should have opportunistically
     // cached the transaction in memory already.
     let inline_tx = read_ds2.read_transaction().await.unwrap().unwrap();
-    let stats = read_ds2.object_store.as_ref().io_stats_incremental();
+    let stats = read_ds2
+        .table_state
+        .object_store
+        .as_ref()
+        .io_stats_incremental();
     assert_eq!(stats.read_iops, 0);
     assert_eq!(stats.read_bytes, 0);
     assert_eq!(inline_tx, tx);
@@ -628,32 +625,34 @@ async fn test_inline_transaction() {
     let ds = create_dataset(2).await;
     let tx = make_tx(ds.manifest().version);
     let tx_file = crate::io::commit::write_transaction_file(
-        ds.object_store.as_ref(),
-        &ds.base,
+        ds.table_state.object_store.as_ref(),
+        &ds.table_state.base,
         &lance_table::format::pb::Transaction::try_from(&tx).unwrap(),
+        None,
     )
     .await
     .unwrap();
+    let build_config = lance_table::format::ManifestBuildConfig::default();
     let (mut manifest, indices) = tx
         .build_manifest(
             Some(ds.manifest.as_ref()),
             ds.load_indices().await.unwrap().as_ref().clone(),
             &tx_file,
-            &ManifestWriteConfig::default().to_build_config(),
+            &build_config,
         )
         .unwrap();
     let location = write_manifest_file(
-        ds.object_store.as_ref(),
-        ds.commit_handler.as_ref(),
-        &ds.base,
+        ds.table_state.object_store.as_ref(),
+        ds.table_state.commit_handler.as_ref(),
+        &ds.table_state.base,
         &mut manifest,
         if indices.is_empty() {
             None
         } else {
             Some(indices.clone())
         },
-        &ManifestWriteConfig::default(),
-        ds.manifest_location.naming_scheme,
+        &build_config,
+        ds.table_state.manifest_location.naming_scheme,
         None,
         // Previously classified from a None inline copy, which validated.
         true,
@@ -666,12 +665,12 @@ async fn test_inline_transaction() {
 
     // The handle's own version takes the same external-file fallback without
     // touching the manifest again.
-    ds_new.object_store.io_stats_incremental();
+    ds_new.table_state.object_store.io_stats_incremental();
     let version_transaction = ds_new
         .read_version_transaction(location.version)
         .await
         .unwrap();
-    let stats = ds_new.object_store.io_stats_incremental();
+    let stats = ds_new.table_state.object_store.io_stats_incremental();
     assert_eq!(version_transaction.transaction, Some(tx.clone()));
     assert!(
         stats.read_iops >= 1,
@@ -803,9 +802,9 @@ fn ranged_read_bytes(stats: &IoStats) -> u64 {
 
 /// Manifest body bytes of the dataset handle's current version.
 async fn manifest_size(ds: &Dataset) -> u64 {
-    ds.object_store
-        .inner
-        .head(&ds.manifest_location().path)
+    ds.table_state
+        .object_store
+        .stat(&ds.manifest_location().path)
         .await
         .unwrap()
         .size
@@ -854,15 +853,15 @@ async fn test_read_version_transaction_same_version_skips_manifest_read() {
         .load()
         .await
         .unwrap();
-    yardstick.object_store.io_stats_incremental();
+    yardstick.table_state.object_store.io_stats_incremental();
     let expected_transaction = yardstick.read_transaction().await.unwrap();
-    let yardstick_stats = yardstick.object_store.io_stats_incremental();
+    let yardstick_stats = yardstick.table_state.object_store.io_stats_incremental();
 
     // Same version as the handle: no resolve, no manifest body, just the
     // transaction message (one block).
-    ds.object_store.io_stats_incremental();
+    ds.table_state.object_store.io_stats_incremental();
     let same_version = ds.read_version_transaction(latest).await.unwrap();
-    let stats = ds.object_store.io_stats_incremental();
+    let stats = ds.table_state.object_store.io_stats_incremental();
     assert_eq!(stats.read_iops, yardstick_stats.read_iops);
     assert_eq!(stats.read_bytes, yardstick_stats.read_bytes);
     assert!(
@@ -878,7 +877,7 @@ async fn test_read_version_transaction_same_version_skips_manifest_read() {
     // The session transaction cache is keyed only by version, so it is not
     // populated: `read_transaction()` still pays its own storage read.
     assert_eq!(ds.read_transaction().await.unwrap(), expected_transaction);
-    let stats = ds.object_store.io_stats_incremental();
+    let stats = ds.table_state.object_store.io_stats_incremental();
     assert_eq!(stats.read_iops, yardstick_stats.read_iops);
     assert_eq!(stats.read_bytes, yardstick_stats.read_bytes);
 
@@ -890,9 +889,9 @@ async fn test_read_version_transaction_same_version_skips_manifest_read() {
         .load()
         .await
         .unwrap();
-    historical.object_store.io_stats_incremental();
+    historical.table_state.object_store.io_stats_incremental();
     let via_fallback = historical.read_version_transaction(latest).await.unwrap();
-    let stats = historical.object_store.io_stats_incremental();
+    let stats = historical.table_state.object_store.io_stats_incremental();
     assert!(
         ranged_read_bytes(&stats) > MANIFEST_PADDING_BYTES as u64,
         "fallback should read the manifest body: {:#?}",
@@ -913,9 +912,9 @@ async fn test_read_version_transaction_same_version_skips_manifest_read() {
     // and still resolves latest through the fallback.
     let old_version = 3;
     let old = ds.checkout_version(old_version).await.unwrap();
-    old.object_store.io_stats_incremental();
+    old.table_state.object_store.io_stats_incremental();
     let old_transaction = old.read_version_transaction(old_version).await.unwrap();
-    let stats = old.object_store.io_stats_incremental();
+    let stats = old.table_state.object_store.io_stats_incremental();
     assert!(
         stats.read_bytes <= 4 * 1024,
         "expected at most one 4 KiB block, read {} bytes",
@@ -943,9 +942,9 @@ async fn test_read_version_transaction_same_version_skips_manifest_read() {
         .unwrap();
     assert_eq!(other.version().version, latest);
     let metadata_stats_before = session.metadata_cache_stats().await;
-    other.object_store.io_stats_incremental();
+    other.table_state.object_store.io_stats_incremental();
     let via_cached_manifest = other.read_version_transaction(old_version).await.unwrap();
-    let stats = other.object_store.io_stats_incremental();
+    let stats = other.table_state.object_store.io_stats_incremental();
     // Resolving the location still costs a HEAD, but the manifest body is not
     // fetched.
     assert!(
@@ -969,12 +968,12 @@ async fn test_read_version_transaction_same_version_skips_manifest_read() {
         .load()
         .await
         .unwrap();
-    uncached.object_store.io_stats_incremental();
+    uncached.table_state.object_store.io_stats_incremental();
     let via_uncached_manifest = uncached
         .read_version_transaction(old_version)
         .await
         .unwrap();
-    let stats = uncached.object_store.io_stats_incremental();
+    let stats = uncached.table_state.object_store.io_stats_incremental();
     assert!(
         ranged_read_bytes(&stats) > MANIFEST_PADDING_BYTES as u64,
         "uncached manifest should be read in full: {:#?}",
@@ -1036,8 +1035,8 @@ async fn test_read_version_transaction_after_recreate_at_same_uri() {
         .unwrap();
     assert_eq!(reopened.version().version, 1);
     assert_ne!(
-        reopened.manifest_location.e_tag,
-        old_reader.manifest_location.e_tag
+        reopened.table_state.manifest_location.e_tag,
+        old_reader.table_state.manifest_location.e_tag
     );
 
     let actual = reopened.read_version_transaction(1).await.unwrap();
@@ -1058,6 +1057,7 @@ async fn test_read_transaction_recovers_from_stale_manifest_size() {
     let mut stale = ds.manifest_location().clone();
     stale.size = Some(1);
     let recovered = ds
+        .table_state
         .read_transaction_from_storage(&manifest, &stale)
         .await
         .unwrap();
@@ -1423,6 +1423,232 @@ async fn test_spilled_restore_and_deep_clone_read_own_transaction() {
     assert!(cloned.manifest.transaction_section.is_none());
     assert_ne!(cloned.manifest.transaction_file, source_tx_file);
     assert_eq!(cloned.read_transaction().await.unwrap().unwrap(), clone_tx);
+}
+
+async fn restore_fence_dataset() -> (TempStrDir, Dataset) {
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "id",
+        DataType::Int32,
+        false,
+    )]));
+    let first = record_batch!(("id", Int32, [1])).unwrap();
+    let second = record_batch!(("id", Int32, [2])).unwrap();
+    let dir = TempStrDir::default();
+    Dataset::write(
+        RecordBatchIterator::new([Ok(first)], schema.clone()),
+        &dir,
+        None,
+    )
+    .await
+    .unwrap();
+    let dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(second)], schema),
+        &dir,
+        Some(WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.version().version, 2);
+    (dir, dataset)
+}
+
+#[tokio::test]
+async fn test_restore_from_requires_the_expected_latest_version() {
+    let (dir, _) = restore_fence_dataset().await;
+    let mut target = reopen(&dir).await.checkout_version(1).await.unwrap();
+
+    target.restore_from(2).await.unwrap();
+
+    assert_eq!(target.version().version, 3);
+    let restored = reopen(&dir).await;
+    assert_eq!(restored.version().version, 3);
+    assert_eq!(restored.count_rows(None).await.unwrap(), 1);
+    let batch = restored.scan().try_into_batch().await.unwrap();
+    assert_eq!(batch["id"].as_primitive::<Int32Type>().values(), &[1]);
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ConcurrentCommit {
+    UpdateConfig,
+    Merge,
+}
+
+#[rstest::rstest]
+#[case::update_config(ConcurrentCommit::UpdateConfig)]
+#[case::merge(ConcurrentCommit::Merge)]
+#[tokio::test]
+async fn test_restore_from_rejects_a_concurrent_commit(#[case] commit: ConcurrentCommit) {
+    let (dir, _) = restore_fence_dataset().await;
+    let mut target = reopen(&dir).await.checkout_version(1).await.unwrap();
+    let mut writer = reopen(&dir).await;
+    match commit {
+        ConcurrentCommit::UpdateConfig => {
+            writer
+                .update_schema_metadata([("restore_fence", "advanced")])
+                .await
+                .unwrap();
+        }
+        ConcurrentCommit::Merge => {
+            writer
+                .add_columns(
+                    NewColumnTransform::SqlExpressions(vec![(
+                        "added".to_string(),
+                        "id + 10".to_string(),
+                    )]),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+    }
+
+    let error = target.restore_from(2).await.unwrap_err();
+    assert!(
+        matches!(error, Error::RetryableCommitConflict { version: 2, .. }),
+        "restore must return a retryable conflict: {error:?}"
+    );
+    assert!(
+        error.to_string().contains("latest version advanced"),
+        "{error}"
+    );
+
+    let latest = reopen(&dir).await;
+    assert_eq!(latest.version().version, 3);
+    assert_eq!(latest.count_rows(None).await.unwrap(), 2);
+    match commit {
+        ConcurrentCommit::UpdateConfig => {
+            assert_eq!(
+                latest
+                    .schema()
+                    .metadata
+                    .get("restore_fence")
+                    .map(String::as_str),
+                Some("advanced")
+            );
+        }
+        ConcurrentCommit::Merge => {
+            assert!(latest.schema().field("added").is_some());
+        }
+    }
+}
+
+#[derive(Debug)]
+struct GateNextCommitHandler {
+    inner: Arc<dyn CommitHandler>,
+    gate_next: AtomicBool,
+    entered: Notify,
+    release: Notify,
+}
+
+impl GateNextCommitHandler {
+    fn arm(&self) {
+        self.gate_next.store(true, Ordering::SeqCst);
+    }
+}
+
+#[async_trait::async_trait]
+impl CommitHandler for GateNextCommitHandler {
+    fn is_version_not_found_definitive(&self) -> bool {
+        self.inner.is_version_not_found_definitive()
+    }
+
+    fn propagate_commit_error_after_success(&self) -> bool {
+        self.inner.propagate_commit_error_after_success()
+    }
+
+    async fn commit(
+        &self,
+        manifest: &mut Manifest,
+        indices: Option<Vec<IndexMetadata>>,
+        base_path: &Path,
+        object_store: &lance_io::object_store::ObjectStore,
+        manifest_writer: ManifestWriter,
+        naming_scheme: ManifestNamingScheme,
+        transaction: Option<ManifestTransaction>,
+    ) -> std::result::Result<ManifestLocation, CommitError> {
+        if self.gate_next.swap(false, Ordering::SeqCst) {
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
+        self.inner
+            .commit(
+                manifest,
+                indices,
+                base_path,
+                object_store,
+                manifest_writer,
+                naming_scheme,
+                transaction,
+            )
+            .await
+    }
+}
+
+/// Once the restore has checked its predecessor, a commit that wins the next
+/// version must make the restore conflict instead of rebasing to a later
+/// version.
+#[tokio::test]
+async fn test_restore_from_does_not_rebase_after_predecessor_validation() {
+    let (dir, _) = restore_fence_dataset().await;
+    let handler = Arc::new(GateNextCommitHandler {
+        inner: Arc::new(ConditionalPutCommitHandler),
+        gate_next: AtomicBool::new(false),
+        entered: Notify::new(),
+        release: Notify::new(),
+    });
+    handler.arm();
+
+    let restore_handler: Arc<dyn CommitHandler> = handler.clone();
+    let mut target = DatasetBuilder::from_uri(&dir)
+        .with_read_params(ReadParams {
+            commit_handler: Some(restore_handler),
+            ..Default::default()
+        })
+        .load()
+        .await
+        .unwrap()
+        .checkout_version(1)
+        .await
+        .unwrap();
+
+    let restore = tokio::spawn(async move { target.restore_from(2).await });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        handler.entered.notified(),
+    )
+    .await
+    .expect("restore must reach publication");
+
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "id",
+        DataType::Int32,
+        false,
+    )]));
+    Dataset::write(
+        RecordBatchIterator::new([Ok(record_batch!(("id", Int32, [3])).unwrap())], schema),
+        &dir,
+        Some(WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    handler.release.notify_one();
+    let error = restore.await.unwrap().unwrap_err();
+    assert!(
+        matches!(error, Error::RetryableCommitConflict { version: 3, .. }),
+        "restore must not rebase after validation: {error:?}"
+    );
+
+    let latest = reopen(&dir).await;
+    assert_eq!(latest.version().version, 3);
+    assert_eq!(latest.count_rows(None).await.unwrap(), 3);
 }
 
 /// Partial RewriteColumns refresh in `build_manifest`: only matched physical
@@ -2195,10 +2421,14 @@ async fn test_alter_columns_materializes_fresh_field_id_in_every_fragment() {
     assert_eq!(batch["a"].as_primitive::<Int64Type>().values(), &[1, 2]);
 }
 
-/// A covering declaration that is not a suffix of `fields` must be refused
-/// at commit, not silently accepted and later misread as a keyed column.
+#[rstest::rstest]
+#[case::independent(vec![0], None)]
+#[case::repeated_carried_field(vec![1, 1], Some("more than once"))]
 #[tokio::test]
-async fn test_create_index_rejects_non_suffix_covering_fields() {
+async fn test_create_index_commits_independent_covering_fields(
+    #[case] covering_fields: Vec<i32>,
+    #[case] refusal: Option<&str>,
+) {
     let dir = TempStrDir::default();
     let uri = dir.as_str();
 
@@ -2217,13 +2447,11 @@ async fn test_create_index_rejects_non_suffix_covering_fields() {
     let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
     let mut dataset = Dataset::write(reader, uri, None).await.unwrap();
 
-    // fields = [0, 1] with covering = [0]: field 0 is the leading entry,
-    // not the trailing one, so this claims the keyed column is covered.
-    let bad_index = IndexMetadata {
+    let index = IndexMetadata {
         uuid: Uuid::new_v4(),
-        name: "bad_idx".to_string(),
+        name: "covered_idx".to_string(),
         fields: vec![0, 1],
-        covering_fields: vec![0],
+        covering_fields: covering_fields.clone(),
         dataset_version: dataset.manifest.version,
         fragment_bitmap: Some(RoaringBitmap::from_iter([0u32])),
         index_details: None,
@@ -2238,24 +2466,35 @@ async fn test_create_index_rejects_non_suffix_covering_fields() {
     let transaction = Transaction::new(
         dataset.manifest.version,
         Operation::CreateIndex {
-            new_indices: vec![bad_index],
+            new_indices: vec![index],
             removed_indices: vec![],
         },
         None,
     );
 
-    let err = dataset
+    let committed = dataset
         .apply_commit(transaction, &Default::default(), &Default::default())
-        .await
-        .expect_err("a non-suffix covering declaration must not commit");
-    assert!(
-        matches!(err, Error::InvalidInput { .. }),
-        "expected InvalidInput, got {err:?}"
-    );
-    assert!(
-        err.to_string().contains("must come last"),
-        "unexpected message: {err}"
-    );
+        .await;
+    if let Some(refusal) = refusal {
+        let err = committed.expect_err("a repeated carried field must not commit");
+        assert!(
+            matches!(err, Error::InvalidInput { .. }),
+            "expected InvalidInput, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains(refusal),
+            "unexpected message: {err}"
+        );
+        return;
+    }
+    committed.unwrap();
+    let covering = FLAG_COVERED_INDEX_METADATA | FLAG_INDEPENDENT_COVERING_FIELDS;
+    assert_eq!(dataset.manifest.reader_feature_flags & covering, covering);
+    assert_eq!(dataset.manifest.writer_feature_flags & covering, covering);
+    let reopened = DatasetBuilder::from_uri(uri).load().await.unwrap();
+    let stored = reopened.load_indices().await.unwrap();
+    assert_eq!(stored[0].keyed_fields(), [0, 1]);
+    assert_eq!(stored[0].covering_fields, covering_fields);
 }
 
 /// A shallow clone copies the index metadata wholesale, `covering_fields`
@@ -2574,4 +2813,3352 @@ async fn test_covering_commit_fences_the_table_with_a_feature_flag() {
         0,
         "dropping the last covering index must clear the fence"
     );
+}
+
+mod composite {
+    //! End-to-end coverage for committing an action set against a real dataset.
+    //!
+    //! Each of these is a single commit that does work a named operation would
+    //! have needed several commits for: a fragment is added and then modified, a
+    //! field is added and then filled, all inside one version. That is what the
+    //! action vocabulary buys -- steps that reference each other's minted ids can
+    //! be squashed into one atomic manifest change.
+    //!
+    //! The commit path checks that a referenced data file exists, so most tests
+    //! point their actions at files the fixture dataset already wrote and inspect
+    //! the resulting manifests rather than read values -- the files hold the
+    //! wrong columns for where they end up attached. Tests that need real values
+    //! write a fixture whose columns stay aligned and read through the scanner.
+
+    use std::sync::Arc;
+
+    use crate::dataset::{CommitBuilder, InsertBuilder, WriteParams};
+    use crate::index::DatasetIndexExt;
+    use crate::index::loading::load_all_indices;
+    use crate::index::vector::VectorIndexParams;
+    use crate::{Dataset, Error, Result};
+    use arrow_array::cast::AsArray;
+    use arrow_array::types::{Int32Type, UInt64Type};
+    use arrow_array::{
+        Array, FixedSizeListArray, Float32Array, Int32Array, RecordBatch, StructArray,
+    };
+    use arrow_schema::{DataType, Field, Schema};
+    use futures::{TryStreamExt, stream};
+    use lance_arrow::FixedSizeListArrayExt;
+    use lance_core::datatypes::Field as LanceField;
+    use lance_core::utils::tempfile::TempStrDir;
+    use lance_file::version::LanceFileVersion;
+    use lance_index::IndexType;
+    use lance_index::pb::vector_index_details::{Compression, FlatCompression};
+    use lance_index::pb::{VectorIndexDetails, VectorMetricType};
+    use lance_index::scalar::ScalarIndexParams;
+    use lance_index::vector::{
+        hnsw::builder::HnswBuildParams, ivf::IvfBuildParams, sq::builder::SQBuildParams,
+    };
+    use lance_linalg::distance::DistanceType;
+    use lance_table::feature_flags::{
+        FLAG_COVERED_INDEX_METADATA, FLAG_MANAGED_BLOBS, MANAGED_BLOBS_META_KEY,
+    };
+    use lance_table::format::key_existence::{FilterType, KeyExistenceFilter};
+    use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
+    use lance_table::format::{
+        BasePath, DataFile, DeletionFile, DeletionFileType, IndexMetadata, RowIdMeta,
+    };
+    use lance_table::rowids::{RowIdSequence, write_row_ids};
+    use lance_table::system_index::mem_wal::{
+        CompactedSsTable, MEM_WAL_INDEX_NAME, MemWalIndexDetails, load_mem_wal_index_details,
+        new_mem_wal_index_meta,
+    };
+    use lance_table::transaction::action::{
+        Action, AddBase, AddDataFile, AddField, AddFragment, AddIndexSegment, AddOverlays,
+        AdjustIndexCoverage, AlterField, AssertCellsUnchanged, AssertUniqueKeys,
+        CompositeOperation, ConfigUpdate, DropField, FieldRef, Ref, RefreshRowVersionMetadata,
+        RemoveFragment, RemoveIndexSegment, ReserveFragmentIds, ReserveRowIds, ResetTable,
+        RowSelection, SelectedRows, SetDeletionFile, TombstoneFieldData, UpdateCompactedSsTables,
+        UserStep,
+    };
+    use lance_table::transaction::{Operation, Transaction, UpdateMap, UpdateMapEntry};
+    use roaring::RoaringBitmap;
+    use std::collections::{HashMap, HashSet};
+    use uuid::Uuid;
+
+    /// A two-fragment dataset, so its two data files can stand in for the files an
+    /// action set would otherwise have had to write. Its column is nullable, so
+    /// a test may mint a fragment without writing data for it.
+    async fn test_dataset(enable_stable_row_ids: bool) -> Dataset {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, true)]));
+        let data =
+            RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from_iter_values(0..10))])
+                .unwrap();
+
+        InsertBuilder::new("memory://")
+            .with_params(&WriteParams {
+                enable_stable_row_ids,
+                max_rows_per_file: 5,
+                ..Default::default()
+            })
+            .execute(vec![data])
+            .await
+            .unwrap()
+    }
+
+    /// A data file of `fragment`, as an `AddDataFile` carries it: with no
+    /// field list of its own, since the action's `field_ids` is that list.
+    fn existing_data_file(dataset: &Dataset, fragment: usize) -> DataFile {
+        without_fields(existing_overlay_file(dataset, fragment))
+    }
+
+    /// A data file of `fragment` as an overlay carries it, field list and all.
+    fn existing_overlay_file(dataset: &Dataset, fragment: usize) -> DataFile {
+        dataset.fragments()[fragment].files[0].clone()
+    }
+
+    fn without_fields(file: DataFile) -> DataFile {
+        DataFile {
+            fields: Arc::from([]),
+            ..file
+        }
+    }
+
+    fn int32_field(name: &str) -> LanceField {
+        LanceField::try_from(Field::new(name, DataType::Int32, true)).unwrap()
+    }
+
+    fn composite_txn(read_version: u64, actions: Vec<Action>) -> Transaction {
+        Transaction::new(
+            read_version,
+            Operation::CompositeOperation(CompositeOperation::new(vec![UserStep::new(
+                "step", actions,
+            )])),
+            None,
+        )
+    }
+
+    async fn try_commit(dataset: Dataset, actions: Vec<Action>) -> Result<Dataset> {
+        let read_version = dataset.version().version;
+        CommitBuilder::new(Arc::new(dataset))
+            .with_experimental_composite_operations(true)
+            .execute(composite_txn(read_version, actions))
+            .await
+    }
+
+    async fn commit(dataset: Dataset, actions: Vec<Action>) -> Dataset {
+        try_commit(dataset, actions).await.unwrap()
+    }
+
+    /// The covering fence is re-derived from the published index list on every
+    /// commit rather than inherited -- `Manifest::new_from_previous` zeroes both
+    /// flag words -- so every build path has to re-derive it. See
+    /// `test_covering_commit_fences_the_table_with_a_feature_flag` for what the
+    /// fence protects; without this, the first composite operation on a covered
+    /// table republishes its covering indices with the fence down.
+    #[tokio::test]
+    async fn test_a_composite_commit_keeps_the_covering_fence() {
+        // Two columns, so the index can be keyed on one and merely carry the
+        // other -- a covering index needs at least one field left indexed.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ]));
+        let data = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..10)),
+                Arc::new(Int32Array::from_iter_values(10..20)),
+            ],
+        )
+        .unwrap();
+        let mut dataset = InsertBuilder::new("memory://")
+            .with_params(&WriteParams {
+                max_rows_per_file: 5,
+                ..Default::default()
+            })
+            .execute(vec![data])
+            .await
+            .unwrap();
+
+        let index = IndexMetadata {
+            uuid: Uuid::new_v4(),
+            name: "covered_idx".to_string(),
+            fields: vec![0, 1],
+            covering_fields: vec![1],
+            dataset_version: dataset.manifest.version,
+            fragment_bitmap: Some(RoaringBitmap::from_iter([0u32, 1])),
+            index_details: None,
+            index_version: 0,
+            created_at: None,
+            base_id: None,
+            files: None,
+            clustering_id: None,
+            metadata: Default::default(),
+        };
+        dataset
+            .apply_commit(
+                Transaction::new(
+                    dataset.manifest.version,
+                    Operation::CreateIndex {
+                        new_indices: vec![index],
+                        removed_indices: vec![],
+                    },
+                    None,
+                ),
+                &Default::default(),
+                &Default::default(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(
+            dataset.manifest.reader_feature_flags & FLAG_COVERED_INDEX_METADATA,
+            0,
+            "precondition: the covering commit fenced the table"
+        );
+
+        // Any action set will do -- the fence is a property of the index list
+        // this commit publishes, not of what the actions touch.
+        let dataset = commit(
+            dataset,
+            vec![Action::ReserveFragmentIds(ReserveFragmentIds { count: 1 })],
+        )
+        .await;
+
+        assert_ne!(
+            dataset.manifest.reader_feature_flags & FLAG_COVERED_INDEX_METADATA,
+            0,
+            "an action commit must not lift the covering fence"
+        );
+        assert_ne!(
+            dataset.manifest.writer_feature_flags & FLAG_COVERED_INDEX_METADATA,
+            0,
+            "an action commit must not lift the writer half of the fence"
+        );
+    }
+
+    /// Transaction V2 is experimental for now, so a caller has to opt in before
+    /// a composite operation is written into a dataset's history.
+    #[tokio::test]
+    async fn test_committing_a_composite_operation_requires_opting_in() {
+        let dataset = test_dataset(false).await;
+        let read_version = dataset.version().version;
+
+        let error = CommitBuilder::new(Arc::new(dataset))
+            .execute(composite_txn(
+                read_version,
+                vec![Action::RemoveFragment(RemoveFragment {
+                    fragment: Ref::Committed(0),
+                    data_change: true,
+                })],
+            ))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, Error::NotSupported { .. }), "{error:?}");
+        assert!(
+            error
+                .to_string()
+                .contains("with_experimental_composite_operations"),
+            "{error}"
+        );
+    }
+
+    /// Version independence: the same action set, committed after losing any
+    /// number of races, lands the same change it would have landed alone.
+    ///
+    /// This is the property [`Ref::Local`] exists for. Each replay re-resolves
+    /// the local tokens against whatever version won, so the ids come out
+    /// different every time while the shape -- which field the minted fragment
+    /// carries data for, and where it sits in the schema -- does not. A writer
+    /// that stamped ids in itself would either collide with a racer or silently
+    /// bind its data to the racer's field.
+    #[rstest::rstest]
+    #[case::uncontended(0)]
+    #[case::one_loss(1)]
+    #[case::three_losses(3)]
+    #[tokio::test]
+    async fn test_an_action_set_lands_the_same_change_however_many_races_it_loses(
+        #[case] losses: usize,
+    ) {
+        let dataset = Arc::new(test_dataset(false).await);
+        let read_version = dataset.version().version;
+        let fragments_before = dataset.fragments().len();
+        let borrowed_file = existing_data_file(&dataset, 0);
+
+        // Each racer mints in the same three id spaces this action set does, so
+        // every one of them moves the ids it would otherwise have taken.
+        for racer in 0..losses {
+            CommitBuilder::new(dataset.clone())
+                .with_experimental_composite_operations(true)
+                .execute(composite_txn(
+                    dataset.version().version,
+                    vec![
+                        Action::AddField(AddField {
+                            local: 0,
+                            parent: None,
+                            def: int32_field(&format!("racer_{racer}")),
+                        }),
+                        Action::AddFragment(AddFragment {
+                            id: Ref::Local(0),
+                            physical_rows: 5,
+                            row_id_meta: None,
+                            last_updated_at_version_meta: None,
+                            created_at_version_meta: None,
+                            data_change: true,
+                        }),
+                    ],
+                ))
+                .await
+                .unwrap();
+        }
+
+        // Still reading the version it was built against, so it has to relocate
+        // onto everything the racers committed.
+        let committed = CommitBuilder::new(dataset)
+            .with_experimental_composite_operations(true)
+            .execute(composite_txn(
+                read_version,
+                vec![
+                    Action::AddField(AddField {
+                        local: 0,
+                        parent: None,
+                        def: int32_field("mine"),
+                    }),
+                    Action::AddFragment(AddFragment {
+                        id: Ref::Local(0),
+                        physical_rows: 5,
+                        row_id_meta: None,
+                        last_updated_at_version_meta: None,
+                        created_at_version_meta: None,
+                        data_change: true,
+                    }),
+                    Action::AddDataFile(AddDataFile {
+                        fragment: Ref::Local(0),
+                        file: without_fields(borrowed_file),
+                        field_ids: vec![FieldRef::Local(0)],
+                        data_change: true,
+                        base: None,
+                    }),
+                ],
+            ))
+            .await
+            .unwrap();
+
+        // The change itself: one new field named "mine", one new fragment, and
+        // that fragment's one data file backing exactly that field. None of it
+        // depends on how many commits landed in between.
+        let mine = committed
+            .schema()
+            .fields
+            .iter()
+            .find(|field| field.name == "mine")
+            .expect("the field this action set added should be in the schema");
+        assert_eq!(
+            committed.fragments().len(),
+            fragments_before + losses + 1,
+            "every racer and this set should each have added one fragment"
+        );
+
+        let minted = committed.fragments().last().unwrap();
+        assert_eq!(minted.files.len(), 1);
+        assert_eq!(
+            minted.files[0].fields.as_ref(),
+            &[mine.id],
+            "the data file must be bound to the field this set minted, not a racer's"
+        );
+
+        // Distinct ids all round: relocation re-resolved rather than reused.
+        let field_ids: HashSet<i32> = committed.schema().fields.iter().map(|f| f.id).collect();
+        assert_eq!(field_ids.len(), committed.schema().fields.len());
+        let fragment_ids: HashSet<u64> = committed.fragments().iter().map(|f| f.id).collect();
+        assert_eq!(fragment_ids.len(), committed.fragments().len());
+    }
+
+    /// The rest of the vocabulary, one commit each. These carry no
+    /// cross-referencing between steps -- that is covered above -- and exist so
+    /// that every action is exercised through the real commit path, not only
+    /// through `build_manifest`.
+    #[tokio::test]
+    async fn test_one_commit_adds_a_base() {
+        let dataset = test_dataset(false).await;
+
+        let dataset = commit(
+            dataset,
+            vec![Action::AddBase(AddBase {
+                local: 0,
+                base: BasePath::new(
+                    0,
+                    "s3://elsewhere/data".into(),
+                    Some("staging".into()),
+                    false,
+                ),
+            })],
+        )
+        .await;
+
+        let base = dataset
+            .manifest()
+            .base_paths
+            .values()
+            .find(|base| base.name.as_deref() == Some("staging"))
+            .expect("the base should be in the manifest");
+        assert_eq!(base.path, "s3://elsewhere/data");
+    }
+
+    #[tokio::test]
+    async fn test_one_commit_removes_a_fragment() {
+        let dataset = test_dataset(false).await;
+        let removed = dataset.fragments()[0].id;
+
+        let dataset = commit(
+            dataset,
+            vec![Action::RemoveFragment(RemoveFragment {
+                fragment: Ref::Committed(removed),
+                data_change: true,
+            })],
+        )
+        .await;
+
+        assert_eq!(dataset.fragments().len(), 1);
+        assert!(dataset.fragments().iter().all(|f| f.id != removed));
+    }
+
+    #[tokio::test]
+    async fn test_one_commit_sets_a_deletion_file() {
+        let dataset = test_dataset(false).await;
+        let fragment_id = dataset.fragments()[0].id;
+        let read_version = dataset.version().version;
+
+        let dataset = commit(
+            dataset,
+            vec![Action::SetDeletionFile(SetDeletionFile {
+                fragment: Ref::Committed(fragment_id),
+                deletion_file: DeletionFile {
+                    read_version,
+                    id: 1,
+                    file_type: DeletionFileType::Array,
+                    num_deleted_rows: Some(2),
+                    base_id: None,
+                    path: None,
+                    inline: None,
+                },
+                data_change: true,
+                base: None,
+            })],
+        )
+        .await;
+
+        let deletion = dataset.fragments()[0]
+            .deletion_file
+            .as_ref()
+            .expect("the fragment should carry a deletion file");
+        assert_eq!(deletion.num_deleted_rows, Some(2));
+        assert_eq!(deletion.read_version, read_version);
+    }
+
+    #[tokio::test]
+    async fn test_one_commit_alters_a_field() {
+        let dataset = test_dataset(false).await;
+        let field_id = dataset.schema().fields[0].id;
+
+        let dataset = commit(
+            dataset,
+            vec![Action::AlterField(AlterField {
+                field: FieldRef::Committed(field_id),
+                name: Some("renamed".into()),
+                nullable: Some(true),
+            })],
+        )
+        .await;
+
+        let field = dataset.schema().field_by_id(field_id).unwrap();
+        assert_eq!(field.name, "renamed");
+        assert!(field.nullable);
+    }
+
+    #[tokio::test]
+    async fn test_one_commit_resets_the_table() {
+        let dataset = test_dataset(false).await;
+        assert_eq!(dataset.fragments().len(), 2);
+
+        let dataset = commit(dataset, vec![Action::ResetTable(ResetTable)]).await;
+
+        assert!(dataset.fragments().is_empty());
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_one_commit_updates_the_config() {
+        let dataset = test_dataset(false).await;
+
+        let dataset = commit(
+            dataset,
+            vec![Action::ConfigUpdate(ConfigUpdate {
+                config: Some(UpdateMap {
+                    update_entries: vec![UpdateMapEntry {
+                        key: "owner".into(),
+                        value: Some("analytics".into()),
+                    }],
+                    replace: false,
+                }),
+                table_metadata: None,
+                schema_metadata: None,
+                field_metadata: Vec::new(),
+            })],
+        )
+        .await;
+
+        assert_eq!(
+            dataset.manifest().config.get("owner").map(String::as_str),
+            Some("analytics")
+        );
+    }
+
+    /// `SetDeletionFile` carries an absolute post-image -- the whole deletion
+    /// file, computed against the read version -- and apply writes it in
+    /// blindly. That is only safe because two sets touching the same fragment's
+    /// deletions collide on `Coordinate::FragmentDeletions`: without the
+    /// conflict, the loser's deletions would be silently dropped rather than
+    /// recomputed. This pins that.
+    #[tokio::test]
+    async fn test_two_action_sets_setting_the_same_deletion_file_conflict() {
+        let dataset = Arc::new(test_dataset(false).await);
+        let read_version = dataset.version().version;
+        let fragment_id = dataset.fragments()[0].id;
+
+        let delete = |id: u64| {
+            composite_txn(
+                read_version,
+                vec![Action::SetDeletionFile(SetDeletionFile {
+                    fragment: Ref::Committed(fragment_id),
+                    deletion_file: DeletionFile {
+                        read_version,
+                        id,
+                        file_type: DeletionFileType::Array,
+                        num_deleted_rows: Some(1),
+                        base_id: None,
+                        path: None,
+                        inline: None,
+                    },
+                    data_change: true,
+                    base: None,
+                })],
+            )
+        };
+
+        CommitBuilder::new(dataset.clone())
+            .with_experimental_composite_operations(true)
+            .execute(delete(1))
+            .await
+            .unwrap();
+
+        let error = CommitBuilder::new(dataset)
+            .with_experimental_composite_operations(true)
+            .with_max_retries(0)
+            .execute(delete(2))
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, Error::RetryableCommitConflict { .. }),
+            "{error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_one_commit_adds_a_fragment_and_then_modifies_it() {
+        let dataset = test_dataset(false).await;
+        let before = dataset.version().version;
+        let first_file = existing_data_file(&dataset, 0);
+        let second_file = existing_data_file(&dataset, 1);
+        let second_path = second_file.path.clone();
+
+        let dataset = commit(
+            dataset,
+            vec![
+                Action::AddFragment(AddFragment {
+                    id: Ref::Local(0),
+                    physical_rows: 4,
+                    row_id_meta: None,
+                    last_updated_at_version_meta: None,
+                    created_at_version_meta: None,
+                    data_change: true,
+                }),
+                Action::AddDataFile(AddDataFile {
+                    fragment: Ref::Local(0),
+                    file: first_file,
+                    field_ids: vec![FieldRef::Committed(0)],
+                    data_change: true,
+                    base: None,
+                }),
+                // The same commit then replaces the data it just added, naming the
+                // fragment by the token it was minted under.
+                Action::TombstoneFieldData(TombstoneFieldData {
+                    fragment: Ref::Local(0),
+                    field_ids: vec![FieldRef::Committed(0)],
+                    data_change: true,
+                }),
+                Action::AddDataFile(AddDataFile {
+                    fragment: Ref::Local(0),
+                    file: second_file,
+                    field_ids: vec![FieldRef::Committed(0)],
+                    data_change: true,
+                    base: None,
+                }),
+            ],
+        )
+        .await;
+
+        assert_eq!(dataset.version().version, before + 1);
+        let fragments = dataset.fragments();
+        assert_eq!(fragments.len(), 3);
+        let added = fragments.last().unwrap();
+        assert_eq!(added.physical_rows, Some(4));
+        // The tombstoned file is gone; only the replacement survives the commit.
+        let paths = added
+            .files
+            .iter()
+            .map(|file| file.path.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(paths, vec![second_path]);
+    }
+
+    #[tokio::test]
+    async fn test_one_commit_adds_a_field_and_then_fills_it() {
+        let dataset = test_dataset(false).await;
+        let fragment_id = dataset.fragments()[0].id;
+        let file = existing_data_file(&dataset, 1);
+        let path = file.path.clone();
+
+        let dataset = commit(
+            dataset,
+            vec![
+                Action::AddField(AddField {
+                    local: 0,
+                    parent: None,
+                    def: lance_core::datatypes::Field::try_from(Field::new(
+                        "b",
+                        DataType::Int32,
+                        true,
+                    ))
+                    .unwrap(),
+                }),
+                Action::AddDataFile(AddDataFile {
+                    fragment: Ref::Committed(fragment_id),
+                    file: without_fields(file),
+                    field_ids: vec![FieldRef::Local(0)],
+                    data_change: true,
+                    base: None,
+                }),
+            ],
+        )
+        .await;
+
+        let field = dataset.schema().field("b").expect("field b was added");
+        let fragment = &dataset.fragments()[0];
+        let added = fragment
+            .files
+            .iter()
+            .find(|file| file.path == path)
+            .expect("the new field's data file was attached");
+        // The file points at the id the commit minted, which the caller never knew.
+        assert_eq!(added.fields.as_ref(), &[field.id]);
+    }
+
+    #[tokio::test]
+    async fn test_one_commit_swaps_a_field_for_a_new_one() {
+        let dataset = test_dataset(false).await;
+        let fragment_id = dataset.fragments()[0].id;
+        let file = existing_data_file(&dataset, 1);
+
+        let dataset = commit(
+            dataset,
+            vec![
+                Action::DropField(DropField {
+                    field: FieldRef::Committed(0),
+                }),
+                Action::AddField(AddField {
+                    local: 0,
+                    parent: None,
+                    def: lance_core::datatypes::Field::try_from(Field::new(
+                        "a",
+                        DataType::Int64,
+                        true,
+                    ))
+                    .unwrap(),
+                }),
+                Action::AddDataFile(AddDataFile {
+                    fragment: Ref::Committed(fragment_id),
+                    file: without_fields(file),
+                    field_ids: vec![FieldRef::Local(0)],
+                    data_change: true,
+                    base: None,
+                }),
+            ],
+        )
+        .await;
+
+        // Dropping "a" and adding a new "a" of a different type is one version, and
+        // the new field gets a fresh id rather than inheriting the dropped one.
+        let schema = dataset.schema();
+        assert_eq!(schema.fields.len(), 1);
+        let field = schema.field("a").unwrap();
+        assert_ne!(field.id, 0);
+        assert_eq!(field.logical_type.to_string(), "int64");
+    }
+
+    /// A legacy V1 reader finds a field's pages by its position among the file's
+    /// fields, so dropping the first column must not tombstone its slot while a
+    /// sibling in the same file is still live. Reading the survivor through the
+    /// scanner is the check: if the file's field list shifts, `b` decodes `a`'s
+    /// pages and returns the wrong values at the wrong row ids.
+    #[tokio::test]
+    async fn test_dropping_the_first_field_of_a_v1_file_keeps_the_surviving_values() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ]));
+        let data = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from_iter_values([10, 11, 12, 13])),
+                // Disjoint from `a`: decoding the wrong pages gives values that
+                // cannot be mistaken for the right ones.
+                Arc::new(Int32Array::from_iter_values([100, 101, 102, 103])),
+            ],
+        )
+        .unwrap();
+        let test_uri = TempStrDir::default();
+        let dataset = InsertBuilder::new(test_uri.as_str())
+            .with_params(&WriteParams {
+                data_storage_version: Some(LanceFileVersion::Legacy),
+                enable_stable_row_ids: true,
+                max_rows_per_file: 2,
+                ..Default::default()
+            })
+            .execute(vec![data])
+            .await
+            .unwrap();
+
+        assert_eq!(dataset.fragments().len(), 2);
+        for fragment in dataset.fragments().iter() {
+            assert_eq!(fragment.files.len(), 1);
+            assert_eq!(
+                fragment.files[0].file_version().unwrap(),
+                LanceFileVersion::Legacy.resolve()
+            );
+            assert_eq!(fragment.files[0].fields.as_ref(), &[0, 1]);
+        }
+        let before = dataset.scan().with_row_id().try_into_batch().await.unwrap();
+        assert_eq!(
+            before["a"].as_primitive::<Int32Type>().values(),
+            &[10, 11, 12, 13]
+        );
+        assert_eq!(
+            before["b"].as_primitive::<Int32Type>().values(),
+            &[100, 101, 102, 103]
+        );
+        let row_ids = before["_rowid"]
+            .as_primitive::<UInt64Type>()
+            .values()
+            .to_vec();
+        assert_eq!(row_ids, vec![0, 1, 2, 3]);
+
+        let committed = commit(
+            dataset,
+            vec![Action::DropField(DropField {
+                field: FieldRef::Committed(0),
+            })],
+        )
+        .await;
+        // Reopen with a fresh session so the page table is loaded from the
+        // committed file, not from the cache the pre-commit read populated.
+        let dataset = Dataset::open(test_uri.as_str()).await.unwrap();
+        assert_eq!(dataset.version().version, committed.version().version);
+
+        assert_eq!(dataset.schema().fields.len(), 1);
+        assert!(dataset.schema().field("b").is_some());
+        for fragment in dataset.fragments().iter() {
+            assert_eq!(fragment.files.len(), 1);
+            // The slot the dropped field was written at stays in place while
+            // `b` is live, so the reader can still find `b`'s pages.
+            assert_eq!(fragment.files[0].fields.as_ref(), &[0, 1]);
+        }
+
+        let after = dataset.scan().with_row_id().try_into_batch().await.unwrap();
+        assert!(after.column_by_name("a").is_none());
+        assert_eq!(
+            after["b"].as_primitive::<Int32Type>().values(),
+            &[100, 101, 102, 103]
+        );
+        assert_eq!(
+            after["_rowid"].as_primitive::<UInt64Type>().values(),
+            row_ids.as_slice()
+        );
+        // Values and row ids must still agree pair-wise, not just as sets.
+        for (value, row_id) in after["b"]
+            .as_primitive::<Int32Type>()
+            .values()
+            .iter()
+            .zip(after["_rowid"].as_primitive::<UInt64Type>().values())
+        {
+            assert_eq!(*value - 100, *row_id as i32);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_one_commit_assigns_row_ids_to_the_fragments_it_mints() {
+        let dataset = test_dataset(true).await;
+        let next_row_id = dataset.manifest().next_row_id;
+        assert_eq!(next_row_id, 10);
+
+        let dataset = commit(
+            dataset,
+            vec![
+                Action::AddFragment(AddFragment {
+                    id: Ref::Local(0),
+                    physical_rows: 4,
+                    row_id_meta: None,
+                    last_updated_at_version_meta: None,
+                    created_at_version_meta: None,
+                    data_change: true,
+                }),
+                Action::AddFragment(AddFragment {
+                    id: Ref::Local(1),
+                    physical_rows: 6,
+                    row_id_meta: None,
+                    last_updated_at_version_meta: None,
+                    created_at_version_meta: None,
+                    data_change: true,
+                }),
+            ],
+        )
+        .await;
+
+        assert_eq!(dataset.manifest().next_row_id, 20);
+        for fragment in dataset.fragments().iter().skip(2) {
+            assert!(
+                fragment.row_id_meta.is_some(),
+                "fragment {} was minted without row ids",
+                fragment.id
+            );
+            assert!(fragment.created_at_version_meta.is_some());
+        }
+    }
+
+    /// The flow a writer needs when it has to know ids before it commits --
+    /// because it is baking them into an index it writes in the same commit as
+    /// the data. One reservation commit, then one commit carrying both.
+    #[tokio::test]
+    async fn test_a_reservation_lets_a_later_commit_name_its_ids() {
+        let dataset = test_dataset(true).await;
+        let file = existing_data_file(&dataset, 0);
+        assert_eq!(dataset.manifest.max_fragment_id, Some(1));
+        assert_eq!(dataset.manifest.next_row_id, 10);
+
+        let reserved = commit(
+            dataset,
+            vec![
+                Action::ReserveFragmentIds(ReserveFragmentIds { count: 1 }),
+                Action::ReserveRowIds(ReserveRowIds { count: 5 }),
+            ],
+        )
+        .await;
+
+        // The writer reads its range off the committed high-water marks: one
+        // fragment id ending at 2, and five row ids ending at 15.
+        assert_eq!(reserved.manifest.max_fragment_id, Some(2));
+        assert_eq!(reserved.manifest.next_row_id, 15);
+
+        let written = commit(
+            reserved,
+            vec![
+                Action::AddFragment(AddFragment {
+                    id: Ref::Committed(2),
+                    physical_rows: 5,
+                    row_id_meta: Some(RowIdMeta::Inline(
+                        write_row_ids(&RowIdSequence::from(10u64..15)).into(),
+                    )),
+                    last_updated_at_version_meta: None,
+                    created_at_version_meta: None,
+                    data_change: true,
+                }),
+                Action::AddDataFile(AddDataFile {
+                    fragment: Ref::Committed(2),
+                    file: without_fields(file),
+                    field_ids: vec![FieldRef::Committed(0)],
+                    data_change: true,
+                    base: None,
+                }),
+            ],
+        )
+        .await;
+
+        assert_eq!(
+            written.fragments().iter().map(|f| f.id).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        // Both reservations were consumed rather than added to: the fragment
+        // landed on the id it named, and the rows kept the ids they arrived
+        // with instead of being numbered again.
+        assert_eq!(written.manifest.max_fragment_id, Some(2));
+        assert_eq!(written.manifest.next_row_id, 15);
+    }
+
+    #[tokio::test]
+    async fn test_two_action_sets_on_disjoint_coordinates_both_commit() {
+        let dataset = Arc::new(test_dataset(false).await);
+        let read_version = dataset.version().version;
+
+        let append = |local| {
+            vec![Action::AddFragment(AddFragment {
+                id: Ref::Local(local),
+                physical_rows: 4,
+                row_id_meta: None,
+                last_updated_at_version_meta: None,
+                created_at_version_meta: None,
+                data_change: true,
+            })]
+        };
+
+        let first = CommitBuilder::new(dataset.clone())
+            .with_experimental_composite_operations(true)
+            .execute(Transaction::new(
+                read_version,
+                Operation::CompositeOperation(CompositeOperation::new(vec![UserStep::new(
+                    "step",
+                    append(0),
+                )])),
+                None,
+            ))
+            .await
+            .unwrap();
+
+        // The second commit still reads the original version, so it has to be
+        // checked against the first. Both only mint, so neither writes anything
+        // the other does.
+        let second = CommitBuilder::new(dataset)
+            .with_experimental_composite_operations(true)
+            .execute(Transaction::new(
+                read_version,
+                Operation::CompositeOperation(CompositeOperation::new(vec![UserStep::new(
+                    "step",
+                    append(0),
+                )])),
+                None,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(second.version().version, first.version().version + 1);
+        assert_eq!(second.fragments().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn test_two_action_sets_writing_the_same_field_data_conflict() {
+        let dataset = Arc::new(test_dataset(false).await);
+        let read_version = dataset.version().version;
+        let fragment_id = dataset.fragments()[0].id;
+
+        let tombstone = || {
+            Transaction::new(
+                read_version,
+                Operation::CompositeOperation(CompositeOperation::new(vec![UserStep::new(
+                    "step",
+                    vec![Action::TombstoneFieldData(TombstoneFieldData {
+                        fragment: Ref::Committed(fragment_id),
+                        field_ids: vec![FieldRef::Committed(0)],
+                        data_change: true,
+                    })],
+                )])),
+                None,
+            )
+        };
+
+        CommitBuilder::new(dataset.clone())
+            .with_experimental_composite_operations(true)
+            .execute(tombstone())
+            .await
+            .unwrap();
+
+        let error = CommitBuilder::new(dataset)
+            .with_experimental_composite_operations(true)
+            .with_max_retries(0)
+            .execute(tombstone())
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("preempted"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// One fragment of five rows with `a` = 0..5 and `b` = 10..15.
+    async fn two_column_dataset() -> Dataset {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ]));
+        let data = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..5)),
+                Arc::new(Int32Array::from_iter_values(10..15)),
+            ],
+        )
+        .unwrap();
+        InsertBuilder::new("memory://")
+            .execute(vec![data])
+            .await
+            .unwrap()
+    }
+
+    /// `UPDATE t SET {target} = {source}` over the only fragment, as an action
+    /// set: rewrite `target` with `source`'s values, and declare the read of
+    /// `source` when `declare_read` is set.
+    async fn set_column_from(
+        dataset: &Dataset,
+        target: &str,
+        source: &str,
+        declare_read: bool,
+    ) -> Vec<Action> {
+        let fragment = dataset.get_fragments().remove(0);
+        let source_values = dataset
+            .scan()
+            .project(&[source])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap()
+            .column(0)
+            .clone();
+        let target_schema = dataset.schema().project(&[target]).unwrap();
+        let batch =
+            RecordBatch::try_new(Arc::new(Schema::from(&target_schema)), vec![source_values])
+                .unwrap();
+        let (fragment_id, file) = fragment
+            .write_columns(stream::iter(vec![Ok(batch)]), &target_schema)
+            .await
+            .map(|group| (group.0, group.1))
+            .unwrap();
+        let target_id = dataset.schema().field(target).unwrap().id;
+        let source_id = dataset.schema().field(source).unwrap().id;
+
+        let mut actions = vec![
+            Action::TombstoneFieldData(TombstoneFieldData {
+                fragment: Ref::Committed(fragment_id),
+                field_ids: vec![FieldRef::Committed(target_id)],
+                data_change: true,
+            }),
+            Action::AddDataFile(AddDataFile {
+                fragment: Ref::Committed(fragment_id),
+                file: without_fields(file),
+                field_ids: vec![FieldRef::Committed(target_id)],
+                data_change: true,
+                base: None,
+            }),
+        ];
+        if declare_read {
+            actions.push(Action::AssertCellsUnchanged(AssertCellsUnchanged {
+                fields: vec![FieldRef::Committed(source_id)],
+                rows: vec![RowSelection {
+                    fragment_id: u32::try_from(fragment_id).unwrap(),
+                    rows: SelectedRows::Full,
+                }],
+            }));
+        }
+        actions
+    }
+
+    /// `a = b` and `b = a` from one snapshot write disjoint columns. Without
+    /// declared reads both commit and the columns end up swapped, which neither
+    /// serial order produces (either leaves them equal) -- snapshot isolation.
+    /// With each declaring the column it read, the second commit conflicts.
+    #[rstest::rstest]
+    #[case::reads_declared(true)]
+    #[case::reads_undeclared(false)]
+    #[tokio::test]
+    async fn test_swapping_two_columns_concurrently(#[case] declare_reads: bool) {
+        let dataset = two_column_dataset().await;
+        let read_version = dataset.version().version;
+        let a_from_b = set_column_from(&dataset, "a", "b", declare_reads).await;
+        let b_from_a = set_column_from(&dataset, "b", "a", declare_reads).await;
+
+        let updated = commit(dataset, a_from_b).await;
+        let result = CommitBuilder::new(Arc::new(updated))
+            .with_experimental_composite_operations(true)
+            .with_max_retries(0)
+            .execute(composite_txn(read_version, b_from_a))
+            .await;
+
+        if declare_reads {
+            let error = result.unwrap_err();
+            assert!(
+                matches!(error, Error::RetryableCommitConflict { .. }),
+                "{error:?}"
+            );
+            return;
+        }
+        let swapped = result.unwrap();
+        let batch = swapped.scan().try_into_batch().await.unwrap();
+        assert_eq!(
+            batch["a"].as_ref(),
+            &Int32Array::from_iter_values(10..15) as &dyn arrow_array::Array
+        );
+        assert_eq!(
+            batch["b"].as_ref(),
+            &Int32Array::from_iter_values(0..5) as &dyn arrow_array::Array
+        );
+    }
+
+    /// Footprints are compared only against transactions that survive. With
+    /// the commit that wrote `a` cleaned up, the declared read of `a` has
+    /// nothing to conflict with, so the commit must refuse the gap rather than
+    /// swap the columns.
+    #[rstest::rstest]
+    #[case::history_present(false)]
+    #[case::history_cleaned(true)]
+    #[tokio::test]
+    async fn test_a_declared_read_conflicts_across_cleaned_up_history(#[case] clean_history: bool) {
+        let original = two_column_dataset().await;
+        let read_version = original.version().version;
+        let a_from_b = set_column_from(&original, "a", "b", true).await;
+        let b_from_a = set_column_from(&original, "b", "a", true).await;
+        let updated = commit(original.clone(), a_from_b).await;
+        let latest = commit(updated, append_with_both_fields(&original)).await;
+        assert_eq!(latest.version().version, read_version + 2);
+        if clean_history {
+            let policy = crate::dataset::cleanup::CleanupPolicyBuilder::default()
+                .versions(vec![read_version + 1])
+                .unwrap()
+                .build();
+            let stats = latest.cleanup(policy).execute().await.unwrap();
+            assert_eq!(stats.old_versions, 1);
+        }
+
+        let error = CommitBuilder::new(Arc::new(original))
+            .with_experimental_composite_operations(true)
+            .with_max_retries(0)
+            .execute(composite_txn(read_version, b_from_a))
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, Error::RetryableCommitConflict { .. }),
+            "{error:?}"
+        );
+    }
+
+    fn append_with_both_fields(dataset: &Dataset) -> Vec<Action> {
+        vec![
+            Action::AddFragment(AddFragment {
+                id: Ref::Local(0),
+                physical_rows: 5,
+                row_id_meta: None,
+                last_updated_at_version_meta: None,
+                created_at_version_meta: None,
+                data_change: true,
+            }),
+            Action::AddDataFile(AddDataFile {
+                fragment: Ref::Local(0),
+                file: existing_data_file(dataset, 0),
+                field_ids: vec![FieldRef::Committed(0), FieldRef::Committed(1)],
+                data_change: true,
+                base: None,
+            }),
+        ]
+    }
+
+    fn append_with_field_zero(dataset: &Dataset) -> Vec<Action> {
+        vec![
+            Action::AddFragment(AddFragment {
+                id: Ref::Local(0),
+                physical_rows: 5,
+                row_id_meta: None,
+                last_updated_at_version_meta: None,
+                created_at_version_meta: None,
+                data_change: true,
+            }),
+            Action::AddDataFile(AddDataFile {
+                fragment: Ref::Local(0),
+                file: existing_data_file(dataset, 0),
+                field_ids: vec![FieldRef::Committed(0)],
+                data_change: true,
+                base: None,
+            }),
+        ]
+    }
+
+    /// Commit `actions` against `dataset`'s version, expecting to lose a race.
+    async fn commit_expecting_conflict(dataset: &Dataset, read_version: u64, actions: Vec<Action>) {
+        let error = CommitBuilder::new(Arc::new(dataset.clone()))
+            .with_experimental_composite_operations(true)
+            .with_max_retries(0)
+            .execute(composite_txn(read_version, actions))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, Error::RetryableCommitConflict { .. }),
+            "{error:?}"
+        );
+    }
+
+    fn add_non_nullable_b_over_existing_data(dataset: &Dataset) -> Vec<Action> {
+        let mut actions = vec![Action::AddField(AddField {
+            local: 0,
+            parent: None,
+            def: LanceField::try_from(Field::new("b", DataType::Int32, false)).unwrap(),
+        })];
+        for (index, fragment) in dataset.fragments().iter().enumerate() {
+            actions.push(Action::AddDataFile(AddDataFile {
+                fragment: Ref::Committed(fragment.id),
+                file: existing_data_file(dataset, index),
+                field_ids: vec![FieldRef::Local(0)],
+                data_change: true,
+                base: None,
+            }));
+        }
+        actions
+    }
+
+    /// A stale append mints rows that carry no value for a column added while it
+    /// was being prepared, and the column is not nullable.
+    #[tokio::test]
+    async fn test_non_nullable_add_conflicts_with_a_stale_append_in_either_order() {
+        let original = test_dataset(false).await;
+        let read_version = original.version().version;
+        let with_b = commit(
+            original.clone(),
+            add_non_nullable_b_over_existing_data(&original),
+        )
+        .await;
+        commit_expecting_conflict(&with_b, read_version, append_with_field_zero(&original)).await;
+
+        let original = test_dataset(false).await;
+        let appended = commit(original.clone(), append_with_field_zero(&original)).await;
+        commit_expecting_conflict(
+            &appended,
+            read_version,
+            add_non_nullable_b_over_existing_data(&original),
+        )
+        .await;
+    }
+
+    async fn nullable_test_dataset() -> Dataset {
+        commit(
+            test_dataset(false).await,
+            vec![Action::AlterField(AlterField {
+                field: FieldRef::Committed(0),
+                name: None,
+                nullable: Some(true),
+            })],
+        )
+        .await
+    }
+
+    fn tighten_field_zero() -> Vec<Action> {
+        vec![Action::AlterField(AlterField {
+            field: FieldRef::Committed(0),
+            name: None,
+            nullable: Some(false),
+        })]
+    }
+
+    /// The tightening was valid against the version it read, but nulls written
+    /// since are never revalidated by applying it.
+    #[tokio::test]
+    async fn test_tightening_conflicts_with_a_concurrent_append_in_either_order() {
+        let nullable = nullable_test_dataset().await;
+        let read_version = nullable.version().version;
+        let appended = commit(nullable.clone(), append_with_field_zero(&nullable)).await;
+        commit_expecting_conflict(&appended, read_version, tighten_field_zero()).await;
+
+        let nullable = nullable_test_dataset().await;
+        let tightened = commit(nullable.clone(), tighten_field_zero()).await;
+        commit_expecting_conflict(&tightened, read_version, append_with_field_zero(&nullable))
+            .await;
+    }
+
+    /// Adding a nullable field and tightening it in one set promises a value in
+    /// every row, which a stale append cannot keep.
+    #[rstest::rstest]
+    #[case::add_and_tighten_first(false)]
+    #[case::append_first(true)]
+    #[tokio::test]
+    async fn test_adding_then_tightening_a_local_field_conflicts_with_a_stale_append(
+        #[case] append_first: bool,
+    ) {
+        let original = test_dataset(false).await;
+        let read_version = original.version().version;
+        let mut add_and_tighten = vec![
+            Action::AddField(AddField {
+                local: 0,
+                parent: None,
+                def: int32_field("b"),
+            }),
+            Action::AlterField(AlterField {
+                field: FieldRef::Local(0),
+                name: None,
+                nullable: Some(false),
+            }),
+        ];
+        for (index, fragment) in original.fragments().iter().enumerate() {
+            add_and_tighten.push(Action::AddDataFile(AddDataFile {
+                fragment: Ref::Committed(fragment.id),
+                file: existing_data_file(&original, index),
+                field_ids: vec![FieldRef::Local(0)],
+                data_change: true,
+                base: None,
+            }));
+        }
+        let append = append_with_field_zero(&original);
+        let (first, stale) = if append_first {
+            (append, add_and_tighten)
+        } else {
+            (add_and_tighten, append)
+        };
+        let current = commit(original, first).await;
+        commit_expecting_conflict(&current, read_version, stale).await;
+    }
+
+    /// A stale append that never names the tightened field still leaves it null
+    /// in every row it adds.
+    #[rstest::rstest]
+    #[case::tightening_first(false)]
+    #[case::append_first(true)]
+    #[tokio::test]
+    async fn test_tightening_conflicts_with_an_append_omitting_the_field(
+        #[case] append_first: bool,
+    ) {
+        let nullable = nullable_test_dataset().await;
+        let with_b = commit(
+            nullable,
+            vec![Action::AddField(AddField {
+                local: 0,
+                parent: None,
+                def: int32_field("b"),
+            })],
+        )
+        .await;
+        let read_version = with_b.version().version;
+        let b = with_b.schema().field("b").unwrap().id;
+        let append_only_b = vec![
+            Action::AddFragment(AddFragment {
+                id: Ref::Local(0),
+                physical_rows: 5,
+                row_id_meta: None,
+                last_updated_at_version_meta: None,
+                created_at_version_meta: None,
+                data_change: true,
+            }),
+            Action::AddDataFile(AddDataFile {
+                fragment: Ref::Local(0),
+                file: existing_data_file(&with_b, 0),
+                field_ids: vec![FieldRef::Committed(b)],
+                data_change: true,
+                base: None,
+            }),
+        ];
+        let (first, stale) = if append_first {
+            (append_only_b, tighten_field_zero())
+        } else {
+            (tighten_field_zero(), append_only_b)
+        };
+        let current = commit(with_b, first).await;
+        commit_expecting_conflict(&current, read_version, stale).await;
+    }
+
+    /// Detached commits allocate field ids from their own parent's watermark, so
+    /// two of them, or one and the main line, can mint the same id for
+    /// different fields.
+    #[tokio::test]
+    async fn test_detached_composite_add_field_is_rejected_once_field_ids_are_non_reusable() {
+        let mut original = test_dataset(false).await;
+        original.migrate_manifest_paths_v2().await.unwrap();
+        original.migrate_to_non_reusable_field_ids().await.unwrap();
+        let read_version = original.version().version;
+        let original = Arc::new(original);
+        let detached = |actions| {
+            CommitBuilder::new(original.clone())
+                .with_experimental_composite_operations(true)
+                .with_detached(true)
+                .execute(composite_txn(read_version, actions))
+        };
+
+        let error = detached(vec![Action::AddField(AddField {
+            local: 0,
+            parent: None,
+            def: int32_field("detached"),
+        })])
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("Detached"), "{error}");
+
+        detached(vec![Action::AlterField(AlterField {
+            field: FieldRef::Committed(0),
+            name: Some("renamed".into()),
+            nullable: None,
+        })])
+        .await
+        .unwrap();
+    }
+
+    fn packed_batch(values: Vec<i32>) -> RecordBatch {
+        let child = Arc::new(Field::new("x", DataType::Int32, false));
+        let field =
+            Field::new("s", DataType::Struct(vec![child.clone()].into()), false).with_metadata(
+                HashMap::from([("lance-encoding:packed".to_string(), "true".to_string())]),
+            );
+        let array = StructArray::from(vec![(
+            child,
+            Arc::new(Int32Array::from(values)) as arrow_array::ArrayRef,
+        )]);
+        RecordBatch::try_new(Arc::new(Schema::new(vec![field])), vec![Arc::new(array)]).unwrap()
+    }
+
+    /// A packed struct is stored under the parent's field id, so rewriting it
+    /// changes what an index on a child recorded.
+    #[tokio::test]
+    async fn test_packed_parent_rewrite_removes_the_fragment_from_a_child_index() {
+        let mut original = InsertBuilder::new("memory://")
+            .with_params(&WriteParams {
+                max_rows_per_file: 2,
+                ..Default::default()
+            })
+            .execute(vec![packed_batch(vec![1, 2, 3, 4])])
+            .await
+            .unwrap();
+        original
+            .create_index(
+                &["s.x"],
+                IndexType::BTree,
+                None,
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+        let fragment = original.get_fragments().remove(0);
+        let (fragment_id, file) = fragment
+            .write_columns(
+                stream::iter(vec![Ok(packed_batch(vec![9, 10]))]),
+                original.schema(),
+            )
+            .await
+            .map(|group| (group.0, group.1))
+            .unwrap();
+        let fields: Vec<FieldRef> = file
+            .fields
+            .iter()
+            .map(|id| FieldRef::Committed(*id))
+            .collect();
+
+        let updated = commit(
+            original,
+            vec![
+                Action::TombstoneFieldData(TombstoneFieldData {
+                    fragment: Ref::Committed(fragment_id),
+                    field_ids: fields.clone(),
+                    data_change: true,
+                }),
+                Action::AddDataFile(AddDataFile {
+                    fragment: Ref::Committed(fragment_id),
+                    file: without_fields(file),
+                    field_ids: fields,
+                    data_change: true,
+                    base: None,
+                }),
+            ],
+        )
+        .await;
+
+        assert_eq!(
+            updated.count_rows(Some("s.x = 9".into())).await.unwrap(),
+            1,
+            "the indexed predicate missed the new value"
+        );
+    }
+
+    /// Every `ConfigUpdate` step is checked against the version the operation
+    /// read, so no single step sees the settings the set finally leaves. Each
+    /// step here is valid on its own; together they name both the retention
+    /// policy and the legacy interval it replaces.
+    #[tokio::test]
+    async fn test_a_contradictory_auto_cleanup_config_publishes_nothing() {
+        let dataset = test_dataset(false).await;
+        let version = dataset.version().version;
+        let set = |key: &str, value: &str| {
+            Action::ConfigUpdate(ConfigUpdate {
+                config: Some(UpdateMap {
+                    update_entries: vec![UpdateMapEntry {
+                        key: key.into(),
+                        value: Some(value.into()),
+                    }],
+                    replace: false,
+                }),
+                ..Default::default()
+            })
+        };
+
+        let error = try_commit(
+            dataset.clone(),
+            vec![
+                set("lance.auto_cleanup.interval", "10"),
+                set("lance.auto_cleanup.policy", "keep_last"),
+                set("lance.auto_cleanup.policy_interval", "10"),
+            ],
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("remove lance.auto_cleanup.interval"),
+            "unexpected error: {error}"
+        );
+
+        // Rejected before publication: the next commit lands on the version
+        // after the one the rejected set read, and none of its settings are
+        // visible. A version published by the rejected set would have moved it
+        // two versions on.
+        let dataset = commit(dataset, vec![set("owner", "analytics")]).await;
+        assert_eq!(dataset.version().version, version + 1);
+        assert_eq!(
+            dataset.manifest().config.get("owner").map(String::as_str),
+            Some("analytics")
+        );
+        for key in [
+            "lance.auto_cleanup.interval",
+            "lance.auto_cleanup.policy",
+            "lance.auto_cleanup.policy_interval",
+        ] {
+            assert!(
+                !dataset.manifest().config.contains_key(key),
+                "{key} outlived the rejected commit"
+            );
+        }
+    }
+
+    /// Schema metadata is edited by an action too, and the managed-blob fence
+    /// has to follow the schema the commit publishes rather than the version it
+    /// read. A set that only adds the metadata key must land both flag words,
+    /// and a value that is neither `true` nor `false` must publish nothing.
+    #[tokio::test]
+    async fn test_a_schema_metadata_opt_in_sets_the_managed_blob_flags() {
+        let dataset = test_dataset(false).await;
+        let version = dataset.version().version;
+        assert_eq!(
+            dataset.manifest().reader_feature_flags & FLAG_MANAGED_BLOBS,
+            0
+        );
+        let opt_in = |value: &str| {
+            Action::ConfigUpdate(ConfigUpdate {
+                schema_metadata: Some(UpdateMap {
+                    update_entries: vec![UpdateMapEntry {
+                        key: MANAGED_BLOBS_META_KEY.into(),
+                        value: Some(value.into()),
+                    }],
+                    replace: false,
+                }),
+                ..Default::default()
+            })
+        };
+
+        let error = try_commit(dataset.clone(), vec![opt_in("maybe")])
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("must be true or false"),
+            "unexpected error: {error}"
+        );
+
+        let dataset = commit(dataset, vec![opt_in("true")]).await;
+
+        assert_eq!(dataset.version().version, version + 1);
+        assert_eq!(
+            dataset
+                .schema()
+                .metadata
+                .get(MANAGED_BLOBS_META_KEY)
+                .map(String::as_str),
+            Some("true")
+        );
+        for (word, flags) in [
+            ("reader", dataset.manifest().reader_feature_flags),
+            ("writer", dataset.manifest().writer_feature_flags),
+        ] {
+            assert_ne!(
+                flags & FLAG_MANAGED_BLOBS,
+                0,
+                "the {word} flags do not fence the schema they publish"
+            );
+        }
+        assert!(dataset.manifest().has_managed_blobs());
+    }
+
+    /// Two fragments of a packed `s.x`, and a BTree on `s.x` staged over
+    /// fragment 0 but not committed. The segment records the child's field id.
+    async fn packed_table_with_staged_child_index() -> (Dataset, IndexMetadata) {
+        let mut dataset = InsertBuilder::new("memory://")
+            .with_params(&WriteParams {
+                max_rows_per_file: 2,
+                ..Default::default()
+            })
+            .execute(vec![packed_batch(vec![1, 2, 3, 4])])
+            .await
+            .unwrap();
+        let staged = dataset
+            .create_index_builder(&["s.x"], IndexType::BTree, &ScalarIndexParams::default())
+            .name("by_x".into())
+            .fragments(vec![0])
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        assert_eq!(staged.fields, vec![1]);
+        (dataset, staged)
+    }
+
+    /// Rewrite fragment 0's `s` with new values. A packed struct is written
+    /// under the parent's field id alone.
+    async fn rewrite_packed_parent(dataset: &Dataset) -> Vec<Action> {
+        let (fragment_id, file) = dataset
+            .get_fragments()
+            .remove(0)
+            .write_columns(
+                stream::iter(vec![Ok(packed_batch(vec![9, 10]))]),
+                dataset.schema(),
+            )
+            .await
+            .map(|group| (group.0, group.1))
+            .unwrap();
+        assert_eq!(file.fields.as_ref(), &[0]);
+        vec![
+            Action::TombstoneFieldData(TombstoneFieldData {
+                fragment: Ref::Committed(fragment_id),
+                field_ids: vec![FieldRef::Committed(0)],
+                data_change: true,
+            }),
+            Action::AddDataFile(AddDataFile {
+                fragment: Ref::Committed(fragment_id),
+                file: without_fields(file),
+                field_ids: vec![FieldRef::Committed(0)],
+                data_change: true,
+                base: None,
+            }),
+        ]
+    }
+
+    /// The segment was built from the child values the parent rewrite
+    /// replaced, and requires only the child's id, which the rewrite does not
+    /// name. Committed after the rewrite, it would answer `s.x = 9` from the
+    /// old values.
+    #[tokio::test]
+    async fn test_a_child_index_staged_before_a_packed_parent_rewrite_conflicts_with_it() {
+        let (dataset, staged) = packed_table_with_staged_child_index().await;
+        let stale = Arc::new(dataset.clone());
+        let rewrite = rewrite_packed_parent(&dataset).await;
+        commit(dataset, rewrite).await;
+
+        let error = commit_from_stale(stale, vec![add_built_segment(staged)])
+            .await
+            .expect_err("the segment describes child values the parent rewrite replaced");
+
+        assert!(
+            matches!(error, Error::RetryableCommitConflict { .. }),
+            "{error:?}"
+        );
+    }
+
+    /// The other order: the rewrite lands on the published segment and prunes
+    /// fragment 0 from it, so the indexed predicate falls back to a scan there.
+    #[tokio::test]
+    async fn test_a_packed_parent_rewrite_after_a_child_index_prunes_it() {
+        let (dataset, staged) = packed_table_with_staged_child_index().await;
+        let stale = Arc::new(dataset.clone());
+        let rewrite = rewrite_packed_parent(&dataset).await;
+        commit(dataset, vec![add_built_segment(staged)]).await;
+
+        let rewritten = commit_from_stale(stale, rewrite).await.unwrap();
+
+        let coverage = index_coverage_opt(&rewritten, "by_x").await;
+        assert!(!coverage.unwrap_or_default().contains(&0));
+        assert_eq!(
+            rewritten.count_rows(Some("s.x = 9".into())).await.unwrap(),
+            1
+        );
+    }
+
+    /// An index segment naming `covered`, with no files of its own -- these
+    /// tests inspect the manifest's index section rather than opening the index.
+    fn index_segment(name: &str, covered: Vec<Ref>) -> AddIndexSegment {
+        AddIndexSegment {
+            uuid: Uuid::new_v4(),
+            name: name.into(),
+            fields: vec![FieldRef::Committed(0)],
+            covering_fields: Vec::new(),
+            index_details: None,
+            index_version: 1,
+            covered_fragments: Some(covered),
+            files: Vec::new(),
+            base: None,
+            created_at: None,
+            dataset_version: None,
+            data_change: false,
+        }
+    }
+
+    async fn index_coverage(dataset: &Dataset, name: &str) -> Vec<u32> {
+        let indices = load_all_indices(dataset).await.unwrap();
+        let segment = indices
+            .iter()
+            .find(|index| index.name == name)
+            .expect("index segment should be committed");
+        segment
+            .fragment_bitmap
+            .as_ref()
+            .expect("coverage should be recorded")
+            .iter()
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_one_commit_appends_and_indexes_what_it_appended() {
+        let dataset = test_dataset(false).await;
+        let existing = dataset.fragments()[0].id;
+        let file = existing_data_file(&dataset, 0);
+
+        let dataset = commit(
+            dataset,
+            vec![
+                Action::AddFragment(AddFragment {
+                    id: Ref::Local(0),
+                    physical_rows: 5,
+                    row_id_meta: None,
+                    last_updated_at_version_meta: None,
+                    created_at_version_meta: None,
+                    data_change: true,
+                }),
+                Action::AddDataFile(AddDataFile {
+                    fragment: Ref::Local(0),
+                    file,
+                    field_ids: vec![FieldRef::Committed(0)],
+                    data_change: true,
+                    base: None,
+                }),
+                // The index covers the fragment this same commit minted, which
+                // has no id until the commit lands.
+                Action::AddIndexSegment(index_segment(
+                    "by_a",
+                    vec![Ref::Committed(existing), Ref::Local(0)],
+                )),
+            ],
+        )
+        .await;
+
+        let appended = dataset.fragments().last().unwrap().id;
+        assert_eq!(
+            index_coverage(&dataset, "by_a").await,
+            vec![existing as u32, appended as u32]
+        );
+    }
+
+    /// One commit adds a column, fills it in every committed fragment, and
+    /// indexes it, naming the field by the token it has until the commit lands.
+    ///
+    /// The transaction layer accepts this, but no index builder can write the
+    /// segment's files for it: a builder reads the column through the committed
+    /// schema, which does not have it yet. The segment below records coverage
+    /// only.
+    #[tokio::test]
+    async fn test_one_commit_adds_fills_and_indexes_a_field() {
+        let mut dataset = test_dataset(false).await;
+        let params = ScalarIndexParams::default();
+        let error = dataset
+            .create_index_builder(&["b"], IndexType::BTree, &params)
+            .execute_uncommitted()
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("column 'b' does not exist"),
+            "{error}"
+        );
+
+        let mut actions = vec![Action::AddField(AddField {
+            local: 0,
+            parent: None,
+            def: int32_field("b"),
+        })];
+        let mut covered = Vec::new();
+        for (index, fragment) in dataset.fragments().iter().enumerate() {
+            actions.push(Action::AddDataFile(AddDataFile {
+                fragment: Ref::Committed(fragment.id),
+                file: existing_data_file(&dataset, index),
+                field_ids: vec![FieldRef::Local(0)],
+                data_change: true,
+                base: None,
+            }));
+            covered.push(Ref::Committed(fragment.id));
+        }
+        actions.push(Action::AddIndexSegment(AddIndexSegment {
+            fields: vec![FieldRef::Local(0)],
+            ..index_segment("by_b", covered)
+        }));
+        let dataset = commit(dataset, actions).await;
+
+        let b = dataset.schema().field("b").expect("field b was added").id;
+        let indices = load_all_indices(&dataset).await.unwrap();
+        let segment = indices.iter().find(|index| index.name == "by_b").unwrap();
+        assert_eq!(segment.fields, vec![b]);
+        assert_eq!(index_coverage(&dataset, "by_b").await, vec![0, 1]);
+        let values = dataset
+            .scan()
+            .project(&["b"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(
+            values.column(0).as_ref(),
+            &Int32Array::from_iter_values(0..10) as &dyn arrow_array::Array
+        );
+    }
+
+    #[tokio::test]
+    async fn test_one_commit_replaces_an_index_segment() {
+        let dataset = test_dataset(false).await;
+        let old = index_segment("by_a", vec![Ref::Committed(0)]);
+        let old_uuid = old.uuid;
+        let dataset = commit(dataset, vec![Action::AddIndexSegment(old)]).await;
+
+        let new = index_segment("by_a", vec![Ref::Committed(0), Ref::Committed(1)]);
+        let new_uuid = new.uuid;
+        let dataset = commit(
+            dataset,
+            vec![
+                Action::RemoveIndexSegment(RemoveIndexSegment {
+                    uuid: old_uuid,
+                    name: "by_a".into(),
+                    data_change: false,
+                }),
+                Action::AddIndexSegment(new),
+            ],
+        )
+        .await;
+
+        let uuids = load_all_indices(&dataset)
+            .await
+            .unwrap()
+            .iter()
+            .map(|index| index.uuid)
+            .collect::<Vec<_>>();
+        assert_eq!(uuids, vec![new_uuid]);
+    }
+
+    /// Commit `actions` against `dataset` as it was, whatever has landed since.
+    /// This is what a concurrent writer does: it planned at that version and
+    /// arrives at the commit after someone else got there first.
+    async fn commit_from_stale(dataset: Arc<Dataset>, actions: Vec<Action>) -> Result<Dataset> {
+        let read_version = dataset.version().version;
+        CommitBuilder::new(dataset)
+            .with_experimental_composite_operations(true)
+            .execute(composite_txn(read_version, actions))
+            .await
+    }
+
+    #[tokio::test]
+    async fn test_two_writers_extend_one_index_over_disjoint_fragments() {
+        let dataset = test_dataset(false).await;
+        let stale = Arc::new(dataset.clone());
+
+        // The first writer wins the race; the second arrives against a version
+        // it has not seen.
+        commit(
+            dataset,
+            vec![Action::AddIndexSegment(index_segment(
+                "by_a",
+                vec![Ref::Committed(0)],
+            ))],
+        )
+        .await;
+
+        let dataset = commit_from_stale(
+            stale,
+            vec![Action::AddIndexSegment(index_segment(
+                "by_a",
+                vec![Ref::Committed(1)],
+            ))],
+        )
+        .await
+        .expect("segments over disjoint fragments both belong to the index");
+
+        let mut coverage = load_all_indices(&dataset)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|index| index.name == "by_a")
+            .map(|index| index.fragment_bitmap.as_ref().unwrap().iter().collect())
+            .collect::<Vec<Vec<u32>>>();
+        coverage.sort();
+        assert_eq!(coverage, vec![vec![0], vec![1]]);
+    }
+
+    #[tokio::test]
+    async fn test_two_writers_indexing_the_same_fragment_conflict() {
+        let dataset = test_dataset(false).await;
+        let stale = Arc::new(dataset.clone());
+
+        commit(
+            dataset,
+            vec![Action::AddIndexSegment(index_segment(
+                "by_a",
+                vec![Ref::Committed(0)],
+            ))],
+        )
+        .await;
+
+        let error = commit_from_stale(
+            stale,
+            vec![Action::AddIndexSegment(index_segment(
+                "by_a",
+                vec![Ref::Committed(0)],
+            ))],
+        )
+        .await
+        .expect_err("two segments describing one fragment would double-count its rows");
+
+        assert!(
+            matches!(error, Error::RetryableCommitConflict { .. }),
+            "{error:?}"
+        );
+    }
+
+    /// Replace field 0's data in fragment 0, the way an in-place column
+    /// rewrite does.
+    fn rewrite_field_zero(file: DataFile) -> Vec<Action> {
+        vec![
+            Action::TombstoneFieldData(TombstoneFieldData {
+                fragment: Ref::Committed(0),
+                field_ids: vec![FieldRef::Committed(0)],
+                data_change: true,
+            }),
+            Action::AddDataFile(AddDataFile {
+                fragment: Ref::Committed(0),
+                file,
+                field_ids: vec![FieldRef::Committed(0)],
+                data_change: true,
+                base: None,
+            }),
+        ]
+    }
+
+    /// The coverage of `name`, or `None` when no segment carries the name.
+    async fn index_coverage_opt(dataset: &Dataset, name: &str) -> Option<Vec<u32>> {
+        let indices = load_all_indices(dataset).await.unwrap();
+        let segment = indices.iter().find(|index| index.name == name)?;
+        Some(
+            segment
+                .fragment_bitmap
+                .as_ref()
+                .expect("coverage should be recorded")
+                .iter()
+                .collect(),
+        )
+    }
+
+    /// Control for the test below: when the rewrite is the *later* commit, the
+    /// coverage is repaired. `TombstoneFieldData::apply` rebinds the field,
+    /// which prunes the fragment from every index the manifest carries.
+    #[tokio::test]
+    async fn test_a_rewrite_prunes_an_index_segment_committed_before_it() {
+        let dataset = test_dataset(false).await;
+        let file = existing_data_file(&dataset, 0);
+
+        let dataset = commit(
+            dataset,
+            vec![Action::AddIndexSegment(index_segment(
+                "by_a",
+                vec![Ref::Committed(0)],
+            ))],
+        )
+        .await;
+        assert_eq!(index_coverage(&dataset, "by_a").await, vec![0]);
+
+        let dataset = commit(dataset, rewrite_field_zero(file)).await;
+
+        assert_eq!(
+            index_coverage_opt(&dataset, "by_a")
+                .await
+                .unwrap_or_default(),
+            Vec::<u32>::new(),
+            "the rewrite should have dropped fragment 0 from the coverage"
+        );
+    }
+
+    /// The same two commits in the other order must reach the same place.
+    ///
+    /// The format spec's third invalidation case -- a fragment has had one of
+    /// the index's columns updated in place -- "cannot be detected just by
+    /// examining metadata", so a reader trusts `fragment_bitmap` and has no
+    /// recourse. Keeping it honest is a write-path obligation.
+    ///
+    /// Apply-time pruning only discharges that obligation when the rewrite is
+    /// the later commit, as the control above shows. A segment built before the
+    /// rewrite but committed after it carries no rebind of its own, so nothing
+    /// prunes it. Its footprint has to catch it instead: the segment requires
+    /// the `FieldData` coordinates the rewrite writes.
+    #[tokio::test]
+    async fn test_an_index_segment_staged_before_a_rewrite_conflicts_with_it() {
+        let dataset = test_dataset(false).await;
+        let stale = Arc::new(dataset.clone());
+        let file = existing_data_file(&dataset, 0);
+
+        // The rewrite wins the race.
+        commit(dataset, rewrite_field_zero(file)).await;
+
+        // The loser built its segment from the values the rewrite replaced.
+        let committed = commit_from_stale(
+            stale,
+            vec![Action::AddIndexSegment(index_segment(
+                "by_a",
+                vec![Ref::Committed(0)],
+            ))],
+        )
+        .await;
+
+        // Rejected, because the segment requires the data it describes and the
+        // rewrite wrote it. Dropping fragment 0 from the arriving segment's
+        // coverage would also be sound and would waste less work -- it is what
+        // the legacy path does for `Operation::Update` -- but an action set is
+        // never rewritten to move to a newer version, so there is nowhere to
+        // put that here.
+        let error = committed.expect_err("the segment describes replaced values");
+        assert!(
+            matches!(error, Error::RetryableCommitConflict { .. }),
+            "{error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_commit_extends_an_index_segments_coverage() {
+        let dataset = test_dataset(false).await;
+        let segment = index_segment("by_a", vec![Ref::Committed(0)]);
+        let uuid = segment.uuid;
+        let dataset = commit(dataset, vec![Action::AddIndexSegment(segment)]).await;
+        assert_eq!(index_coverage(&dataset, "by_a").await, vec![0]);
+
+        let dataset = commit(
+            dataset,
+            vec![Action::AdjustIndexCoverage(AdjustIndexCoverage {
+                uuid,
+                name: "by_a".into(),
+                add_fragments: vec![Ref::Committed(1)],
+                remove_fragments: vec![0],
+                fields: vec![FieldRef::Committed(0)],
+                covering_fields: Vec::new(),
+            })],
+        )
+        .await;
+
+        assert_eq!(index_coverage(&dataset, "by_a").await, vec![1]);
+    }
+
+    /// Commit a segment a builder staged, as the action set a writer would
+    /// compose for it.
+    fn add_built_segment(metadata: IndexMetadata) -> Action {
+        Action::AddIndexSegment(AddIndexSegment {
+            uuid: metadata.uuid,
+            name: metadata.name,
+            fields: metadata
+                .fields
+                .into_iter()
+                .map(FieldRef::Committed)
+                .collect(),
+            covering_fields: Vec::new(),
+            index_details: metadata.index_details,
+            index_version: metadata.index_version,
+            covered_fragments: metadata
+                .fragment_bitmap
+                .map(|ids| ids.iter().map(|id| Ref::Committed(id as u64)).collect()),
+            files: metadata.files.unwrap_or_default(),
+            base: metadata.base_id.map(|id| Ref::Committed(id as u64)),
+            created_at: metadata.created_at,
+            dataset_version: Some(metadata.dataset_version),
+            data_change: false,
+        })
+    }
+
+    /// Two segments under one name keyed on different columns would have the
+    /// query path union values from the wrong column.
+    #[tokio::test]
+    async fn test_a_segment_cannot_join_an_index_keyed_on_another_column() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ]));
+        let data = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..10)),
+                Arc::new(Int32Array::from_iter_values(100..110)),
+            ],
+        )
+        .unwrap();
+        let mut dataset = InsertBuilder::new("memory://")
+            .with_params(&WriteParams {
+                max_rows_per_file: 5,
+                ..Default::default()
+            })
+            .execute(vec![data])
+            .await
+            .unwrap();
+        let params = ScalarIndexParams::default();
+        let first = dataset
+            .create_index_builder(&["a"], IndexType::BTree, &params)
+            .name("shared".into())
+            .fragments(vec![0])
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        let second = dataset
+            .create_index_builder(&["b"], IndexType::BTree, &params)
+            .name("shared".into())
+            .fragments(vec![1])
+            .execute_uncommitted()
+            .await
+            .unwrap();
+
+        let dataset = commit(dataset, vec![add_built_segment(first)]).await;
+        let error = try_commit(dataset, vec![add_built_segment(second)])
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(error.to_string().contains("shared"), "{error}");
+    }
+
+    /// A segment built before a rewrite the operation already reads would
+    /// resurrect the rewritten values, and the format has no way to detect an
+    /// in-place column rewrite from metadata alone.
+    #[tokio::test]
+    async fn test_a_segment_built_before_the_version_read_is_rejected() {
+        let mut dataset = test_dataset(false).await;
+        let staged = dataset
+            .create_index_builder(&["a"], IndexType::BTree, &ScalarIndexParams::default())
+            .name("shared".into())
+            .fragments(vec![1])
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        let file = existing_data_file(&dataset, 0);
+        let rewritten = commit(
+            dataset,
+            vec![
+                Action::TombstoneFieldData(TombstoneFieldData {
+                    fragment: Ref::Committed(1),
+                    field_ids: vec![FieldRef::Committed(0)],
+                    data_change: true,
+                }),
+                Action::AddDataFile(AddDataFile {
+                    fragment: Ref::Committed(1),
+                    file,
+                    field_ids: vec![FieldRef::Committed(0)],
+                    data_change: true,
+                    base: None,
+                }),
+            ],
+        )
+        .await;
+
+        let error = try_commit(rewritten, vec![add_built_segment(staged)])
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(error.to_string().contains("build snapshot"), "{error}");
+    }
+
+    /// A segment committed through the action path lands as the builder staged
+    /// it, and the query path can open and use it.
+    #[tokio::test]
+    async fn test_a_segment_built_at_the_version_read_commits() {
+        let mut dataset = test_dataset(false).await;
+        let staged = dataset
+            .create_index_builder(&["a"], IndexType::BTree, &ScalarIndexParams::default())
+            .name("shared".into())
+            .execute_uncommitted()
+            .await
+            .unwrap();
+
+        let dataset = commit(dataset, vec![add_built_segment(staged.clone())]).await;
+
+        let indices = load_all_indices(&dataset).await.unwrap();
+        let committed = indices.iter().find(|index| index.name == "shared").unwrap();
+        assert_eq!(committed, &staged);
+
+        let mut scan = dataset.scan();
+        scan.filter("a = 3").unwrap();
+        let plan = scan.explain_plan(true).await.unwrap();
+        assert!(plan.contains("ScalarIndexQuery"), "{plan}");
+        let batch = scan.try_into_batch().await.unwrap();
+        assert_eq!(
+            batch["a"].as_ref(),
+            &Int32Array::from(vec![3]) as &dyn arrow_array::Array
+        );
+    }
+
+    /// A built segment states the version it was built from, which is the
+    /// version its writer read. Losing the race to an unrelated append does
+    /// not change that, so the retry still commits.
+    #[tokio::test]
+    async fn test_a_built_segment_commits_after_an_unrelated_append() {
+        let mut dataset = test_dataset(false).await;
+        let read_version = dataset.version().version;
+        let staged = dataset
+            .create_index_builder(&["a"], IndexType::BTree, &ScalarIndexParams::default())
+            .name("shared".into())
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        let stale = Arc::new(dataset.clone());
+        let file = existing_data_file(&dataset, 0);
+
+        commit(
+            dataset,
+            vec![
+                Action::AddFragment(AddFragment {
+                    id: Ref::Local(0),
+                    physical_rows: 5,
+                    row_id_meta: None,
+                    last_updated_at_version_meta: None,
+                    created_at_version_meta: None,
+                    data_change: true,
+                }),
+                Action::AddDataFile(AddDataFile {
+                    fragment: Ref::Local(0),
+                    file,
+                    field_ids: vec![FieldRef::Committed(0)],
+                    data_change: true,
+                    base: None,
+                }),
+            ],
+        )
+        .await;
+
+        let dataset = commit_from_stale(stale, vec![add_built_segment(staged)])
+            .await
+            .expect("an append does not touch what the segment describes");
+
+        let indices = load_all_indices(&dataset).await.unwrap();
+        let segment = indices.iter().find(|index| index.name == "shared").unwrap();
+        assert_eq!(segment.dataset_version, read_version);
+        assert_eq!(index_coverage(&dataset, "shared").await, vec![0, 1]);
+    }
+
+    /// Concurrent writers extending one index must agree on its details byte
+    /// for byte, since `lance-table` cannot tell which ones matter to a query.
+    /// A training knob chosen per build is enough to conflict.
+    #[rstest::rstest]
+    #[case::identical_details(1024, false)]
+    #[case::different_target_partition_size(4096, true)]
+    #[tokio::test]
+    async fn test_concurrent_segments_of_one_index_must_share_details(
+        #[case] their_target_partition_size: u64,
+        #[case] conflicts: bool,
+    ) {
+        let details = |target_partition_size: u64| {
+            Some(Arc::new(
+                prost_types::Any::from_msg(&VectorIndexDetails {
+                    metric_type: VectorMetricType::L2.into(),
+                    target_partition_size,
+                    hnsw_index_config: None,
+                    compression: Some(Compression::Flat(FlatCompression {})),
+                    runtime_hints: Default::default(),
+                })
+                .unwrap(),
+            ))
+        };
+        let dataset = test_dataset(false).await;
+        let stale = Arc::new(dataset.clone());
+        commit(
+            dataset,
+            vec![Action::AddIndexSegment(AddIndexSegment {
+                index_details: details(1024),
+                ..index_segment("shared", vec![Ref::Committed(0)])
+            })],
+        )
+        .await;
+
+        let result = commit_from_stale(
+            stale,
+            vec![Action::AddIndexSegment(AddIndexSegment {
+                index_details: details(their_target_partition_size),
+                ..index_segment("shared", vec![Ref::Committed(1)])
+            })],
+        )
+        .await;
+
+        if conflicts {
+            let error = result.unwrap_err();
+            assert!(
+                matches!(error, Error::RetryableCommitConflict { .. }),
+                "{error:?}"
+            );
+        } else {
+            result.unwrap();
+        }
+    }
+
+    /// Raw actions must compare the files of all coexisting vector segments,
+    /// including retained ones, before publishing either kind of manifest.
+    #[rstest::rstest]
+    #[case::metric(VectorIndexParams::ivf_flat(1, DistanceType::Dot), "Dot")]
+    #[case::quantization(
+        VectorIndexParams::with_ivf_sq_params(
+            DistanceType::L2,
+            IvfBuildParams::new(1),
+            SQBuildParams::default()
+        ),
+        "IVF_SQ"
+    )]
+    #[case::sub_index(
+        VectorIndexParams::ivf_hnsw(
+            DistanceType::L2,
+            IvfBuildParams::new(1),
+            HnswBuildParams::default()
+        ),
+        "IVF_HNSW_FLAT"
+    )]
+    #[tokio::test]
+    async fn test_vector_segments_must_share_query_contract(
+        #[case] incoming_params: VectorIndexParams,
+        #[case] mismatch: &str,
+        #[values(false, true)] detached: bool,
+    ) {
+        let vectors = FixedSizeListArray::try_new_from_values(
+            Float32Array::from(vec![
+                2.0, 0.0, 3.0, 0.0, 4.0, 0.0, 5.0, 0.0, 100.0, 0.0, 101.0, 0.0, 102.0, 0.0, 103.0,
+                0.0,
+            ]),
+            2,
+        )
+        .unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("vector", vectors.data_type().clone(), false),
+        ]));
+        let data = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![0, 1, 2, 3, 4, 5, 6, 7])),
+                Arc::new(vectors),
+            ],
+        )
+        .unwrap();
+        let mut dataset = InsertBuilder::new("memory://")
+            .with_params(&WriteParams {
+                max_rows_per_file: 4,
+                ..Default::default()
+            })
+            .execute(vec![data])
+            .await
+            .unwrap();
+        // Built under a name of its own, since the builder refuses one the
+        // dataset already has, then staged to join `shared`.
+        async fn build(
+            dataset: &mut Dataset,
+            fragment: u32,
+            params: &VectorIndexParams,
+        ) -> IndexMetadata {
+            let staged = dataset
+                .create_index_builder(&["vector"], IndexType::Vector, params)
+                .name(format!("staged_{fragment}"))
+                .fragments(vec![fragment])
+                .execute_uncommitted()
+                .await
+                .unwrap();
+            IndexMetadata {
+                name: "shared".into(),
+                ..staged
+            }
+        }
+        let l2_params = VectorIndexParams::ivf_flat(1, DistanceType::L2);
+        let l2 = build(&mut dataset, 0, &l2_params).await;
+        let incoming = build(&mut dataset, 1, &incoming_params).await;
+        let assert_mismatch = |error: Error| {
+            assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+            let message = error.to_string();
+            assert!(message.contains("'shared'"), "{message}");
+            assert!(message.contains(mismatch), "{message}");
+        };
+
+        // Two additions in a single transaction must be checked together.
+        let transaction = composite_txn(
+            dataset.version_id(),
+            vec![
+                add_built_segment(l2.clone()),
+                add_built_segment(incoming.clone()),
+            ],
+        );
+        let error = CommitBuilder::new(Arc::new(dataset.clone()))
+            .with_experimental_composite_operations(true)
+            .with_detached(detached)
+            .execute(transaction)
+            .await
+            .unwrap_err();
+        assert_mismatch(error);
+
+        // The vector column may itself be introduced by these actions.
+        let mut field = dataset.schema().field("vector").unwrap().clone();
+        field.name = "new_vector".into();
+        field.nullable = true;
+        let mut actions = vec![Action::AddField(AddField {
+            local: 0,
+            parent: None,
+            def: field,
+        })];
+        for segment in [l2.clone(), incoming.clone()] {
+            let Action::AddIndexSegment(mut addition) = add_built_segment(segment) else {
+                unreachable!();
+            };
+            addition.fields = vec![FieldRef::Local(0)];
+            actions.push(Action::AddIndexSegment(addition));
+        }
+        let error = CommitBuilder::new(Arc::new(dataset.clone()))
+            .with_experimental_composite_operations(true)
+            .with_detached(detached)
+            .execute(composite_txn(dataset.version_id(), actions))
+            .await
+            .unwrap_err();
+        assert_mismatch(error);
+
+        // Concurrent writers still conflict on their differing details.
+        let stale = Arc::new(dataset.clone());
+        let mut dataset = commit(dataset, vec![add_built_segment(l2.clone())]).await;
+        let error = commit_from_stale(stale, vec![add_built_segment(incoming)])
+            .await
+            .expect_err("incompatible segments cannot join one index");
+        assert!(
+            matches!(error, Error::RetryableCommitConflict { .. }),
+            "{error:?}"
+        );
+
+        // A sequential addition must compare the retained segment's file,
+        // even when the incoming segment claims exactly the same details.
+        let mut incoming = build(&mut dataset, 1, &incoming_params).await;
+        incoming.index_details = l2.index_details.clone();
+        let error = CommitBuilder::new(Arc::new(dataset.clone()))
+            .with_experimental_composite_operations(true)
+            .with_detached(detached)
+            .execute(composite_txn(
+                dataset.version_id(),
+                vec![add_built_segment(incoming)],
+            ))
+            .await
+            .unwrap_err();
+        assert_mismatch(error);
+        let mut latest = dataset.clone();
+        latest.checkout_latest().await.unwrap();
+        assert_eq!(latest.version_id(), dataset.version_id());
+        assert_eq!(load_all_indices(&latest).await.unwrap().len(), 1);
+
+        // Adding compatible segments while removing the old contract is an
+        // atomic replacement, even when the additions precede the removal.
+        let first = build(&mut dataset, 0, &incoming_params).await;
+        let second = build(&mut dataset, 1, &incoming_params).await;
+        let dataset = CommitBuilder::new(Arc::new(dataset.clone()))
+            .with_experimental_composite_operations(true)
+            .with_detached(detached)
+            .execute(composite_txn(
+                dataset.version_id(),
+                vec![
+                    add_built_segment(first),
+                    add_built_segment(second),
+                    Action::RemoveIndexSegment(RemoveIndexSegment {
+                        uuid: l2.uuid,
+                        name: "shared".into(),
+                        data_change: false,
+                    }),
+                ],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(load_all_indices(&dataset).await.unwrap().len(), 2);
+        let mut scan = dataset.scan();
+        scan.nearest("vector", &Float32Array::from(vec![4.0, 0.0]), 4)
+            .unwrap()
+            .distance_metric(incoming_params.metric_type);
+        assert!(scan.explain_plan(true).await.unwrap().contains("ANN"));
+        let result = scan.try_into_batch().await.unwrap();
+        let expected = if incoming_params.metric_type == DistanceType::Dot {
+            [4, 5, 6, 7]
+        } else {
+            [0, 1, 2, 3]
+        };
+        let actual = result["id"].as_primitive::<Int32Type>();
+        let recalled = actual
+            .values()
+            .iter()
+            .filter(|id| expected.contains(id))
+            .count();
+        let recall = recalled as f64 / expected.len() as f64;
+        assert!(recall >= 0.5, "expected recall >= 0.5, got {recall}");
+    }
+
+    #[tokio::test]
+    async fn test_one_commit_appends_and_overlays_what_was_already_there() {
+        let dataset = test_dataset(false).await;
+        let overlaid = dataset.fragments()[0].id;
+        let file = existing_data_file(&dataset, 0);
+        let overlay_file = existing_overlay_file(&dataset, 1);
+        let expected_version = dataset.version().version + 1;
+
+        let dataset = commit(
+            dataset,
+            vec![
+                Action::AddFragment(AddFragment {
+                    id: Ref::Local(0),
+                    physical_rows: 5,
+                    row_id_meta: None,
+                    last_updated_at_version_meta: None,
+                    created_at_version_meta: None,
+                    data_change: true,
+                }),
+                Action::AddDataFile(AddDataFile {
+                    fragment: Ref::Local(0),
+                    file,
+                    field_ids: vec![FieldRef::Committed(0)],
+                    data_change: true,
+                    base: None,
+                }),
+                Action::AddOverlays(AddOverlays {
+                    fragment: Ref::Committed(overlaid),
+                    overlays: vec![DataOverlayFile {
+                        data_file: overlay_file,
+                        coverage: OverlayCoverage::dense([0u32, 2].into_iter().collect()),
+                        // Left for the commit to stamp.
+                        committed_version: 0,
+                    }],
+                    data_change: true,
+                }),
+            ],
+        )
+        .await;
+
+        assert_eq!(dataset.fragments().len(), 3);
+        let fragment = dataset
+            .fragments()
+            .iter()
+            .find(|fragment| fragment.id == overlaid)
+            .unwrap();
+        assert_eq!(fragment.overlays.len(), 1);
+        assert_eq!(fragment.overlays[0].committed_version, expected_version);
+    }
+
+    #[tokio::test]
+    async fn test_a_commit_restamps_row_versions_for_a_fragment_it_rewrote() {
+        let dataset = test_dataset(true).await;
+        let rewritten = dataset.fragments()[0].id;
+        let file = existing_data_file(&dataset, 1);
+        let expected_version = dataset.version().version + 1;
+
+        let dataset = commit(
+            dataset,
+            vec![
+                // Rewriting a column in place leaves the rows where they are, so
+                // nothing else in the commit says when they last changed.
+                Action::TombstoneFieldData(TombstoneFieldData {
+                    fragment: Ref::Committed(rewritten),
+                    field_ids: vec![FieldRef::Committed(0)],
+                    data_change: true,
+                }),
+                Action::AddDataFile(AddDataFile {
+                    fragment: Ref::Committed(rewritten),
+                    file,
+                    field_ids: vec![FieldRef::Committed(0)],
+                    data_change: true,
+                    base: None,
+                }),
+                Action::RefreshRowVersionMetadata(RefreshRowVersionMetadata {
+                    rows: vec![RowSelection {
+                        fragment_id: u32::try_from(rewritten).unwrap(),
+                        rows: SelectedRows::Full,
+                    }],
+                }),
+            ],
+        )
+        .await;
+
+        let fragment = dataset
+            .fragments()
+            .iter()
+            .find(|fragment| fragment.id == rewritten)
+            .unwrap();
+        let sequence = fragment
+            .last_updated_at_version_meta
+            .as_ref()
+            .expect("the rewritten fragment should carry a last-updated sequence")
+            .load_sequence()
+            .unwrap();
+        let versions = (0..fragment.physical_rows.unwrap())
+            .map(|offset| sequence.version_at(offset).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(versions, vec![expected_version; versions.len()]);
+    }
+
+    #[tokio::test]
+    async fn test_a_commit_records_mem_wal_compaction_progress() {
+        let dataset = test_dataset(false).await;
+        let shard = Uuid::new_v4();
+
+        // Progress is only recordable against a table that already carries the
+        // index, so put one there the way the MemWAL writer would.
+        let read_version = dataset.version().version;
+        let dataset = CommitBuilder::new(Arc::new(dataset))
+            .execute(Transaction::new(
+                read_version,
+                Operation::CreateIndex {
+                    new_indices: vec![
+                        new_mem_wal_index_meta(read_version, MemWalIndexDetails::default())
+                            .unwrap(),
+                    ],
+                    removed_indices: Vec::new(),
+                },
+                None,
+            ))
+            .await
+            .unwrap();
+
+        let dataset = commit(
+            dataset,
+            vec![Action::UpdateCompactedSsTables(UpdateCompactedSsTables {
+                compacted_sstables: vec![CompactedSsTable::new(shard, 3)],
+            })],
+        )
+        .await;
+
+        let indices = load_all_indices(&dataset).await.unwrap();
+        let mem_wal = indices
+            .iter()
+            .find(|index| index.name == MEM_WAL_INDEX_NAME)
+            .expect("the MemWAL index should still be there");
+        let details = load_mem_wal_index_details((*mem_wal).clone()).unwrap();
+        assert_eq!(details.compacted_sstables.len(), 1);
+        assert_eq!(details.compacted_sstables[0].shard_id, shard);
+        assert_eq!(details.compacted_sstables[0].generation, 3);
+
+        // The data is untouched: recording where rows live is not a change to
+        // them.
+        assert_eq!(dataset.fragments().len(), 2);
+    }
+
+    /// An append of five rows, asserting the hashes of their keys over `a`
+    /// when `key_hashes` is given.
+    fn keyed_append(dataset: &Dataset, key_hashes: Option<&[u64]>) -> Vec<Action> {
+        let mut actions = vec![
+            Action::AddFragment(AddFragment {
+                id: Ref::Local(0),
+                physical_rows: 5,
+                row_id_meta: None,
+                last_updated_at_version_meta: None,
+                created_at_version_meta: None,
+                data_change: true,
+            }),
+            Action::AddDataFile(AddDataFile {
+                fragment: Ref::Local(0),
+                file: existing_data_file(dataset, 0),
+                field_ids: vec![FieldRef::Committed(0)],
+                data_change: true,
+                base: None,
+            }),
+        ];
+        if let Some(key_hashes) = key_hashes {
+            actions.push(Action::AssertUniqueKeys(AssertUniqueKeys {
+                key_fields: vec![FieldRef::Committed(0)],
+                filter: KeyExistenceFilter {
+                    field_ids: Vec::new(),
+                    filter: FilterType::ExactSet(key_hashes.iter().copied().collect()),
+                },
+            }));
+        }
+        actions
+    }
+
+    #[tokio::test]
+    async fn test_a_key_assertion_commits_alongside_the_insert_it_guards() {
+        let dataset = test_dataset(false).await;
+        let before = dataset.fragments().len();
+        let actions = keyed_append(&dataset, Some(&[11, 12]));
+
+        let dataset = commit(dataset, actions).await;
+
+        assert_eq!(dataset.fragments().len(), before + 1);
+    }
+
+    /// The assertion travels through the transaction file and is compared by
+    /// the commit path's conflict check, not just by footprints in memory.
+    #[rstest::rstest]
+    #[case::overlapping_keys(Some(&[2, 3][..]), true)]
+    #[case::disjoint_keys(Some(&[3, 4][..]), false)]
+    #[case::unqualified_append(None, true)]
+    #[tokio::test]
+    async fn test_a_concurrent_insert_is_checked_against_a_key_assertion(
+        #[case] stale_key_hashes: Option<&'static [u64]>,
+        #[case] is_conflict: bool,
+    ) {
+        let dataset = test_dataset(false).await;
+        let read_version = dataset.version().version;
+        let committed = commit(dataset.clone(), keyed_append(&dataset, Some(&[1, 2]))).await;
+        let stale = keyed_append(&dataset, stale_key_hashes);
+
+        if is_conflict {
+            commit_expecting_conflict(&committed, read_version, stale).await;
+        } else {
+            let landed = CommitBuilder::new(Arc::new(committed.clone()))
+                .with_experimental_composite_operations(true)
+                .execute(composite_txn(read_version, stale))
+                .await
+                .unwrap();
+            assert_eq!(landed.fragments().len(), committed.fragments().len() + 1);
+        }
+    }
+
+    fn overlay_action(dataset: &Dataset, fragment: u64) -> Action {
+        Action::AddOverlays(AddOverlays {
+            fragment: Ref::Committed(fragment),
+            overlays: vec![DataOverlayFile {
+                data_file: existing_overlay_file(dataset, 1),
+                coverage: OverlayCoverage::dense(RoaringBitmap::from_iter(0..5)),
+                committed_version: 0,
+            }],
+            data_change: true,
+        })
+    }
+
+    /// Incremental consumers find changed rows through the last-updated
+    /// versions, so an overlay has to restamp the rows it covers -- including
+    /// on a fragment migrated to stable row ids, which has no sequence yet.
+    #[rstest::rstest]
+    #[case::stable_from_creation(false)]
+    #[case::migrated(true)]
+    #[tokio::test]
+    async fn test_overlaid_rows_are_reported_as_updated(#[case] migrated: bool) {
+        let mut dataset = test_dataset(!migrated).await;
+        if migrated {
+            dataset.migrate_to_stable_row_ids().await.unwrap();
+            assert!(
+                dataset.fragments()[0]
+                    .last_updated_at_version_meta
+                    .is_none()
+            );
+        }
+        let fragment = dataset.fragments()[0].id;
+        let before = dataset.version().version;
+        let actions = vec![overlay_action(&dataset, fragment)];
+
+        let dataset = commit(dataset, actions).await;
+
+        let delta = dataset
+            .delta()
+            .with_begin_version(before)
+            .with_end_version(before + 1)
+            .build()
+            .unwrap();
+        let updated: Vec<RecordBatch> = delta
+            .get_updated_rows()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(updated.iter().map(RecordBatch::num_rows).sum::<usize>(), 5);
+    }
+
+    /// A row-moving update deletes rows from the fragment and re-creates them
+    /// elsewhere from the base the overlay never modified.
+    #[tokio::test]
+    async fn test_an_overlay_and_a_row_moving_update_conflict_in_either_order() {
+        let moving_update = |dataset: &Dataset, fragment: u64, read_version: u64| {
+            vec![
+                Action::SetDeletionFile(SetDeletionFile {
+                    fragment: Ref::Committed(fragment),
+                    deletion_file: DeletionFile {
+                        read_version,
+                        id: 1,
+                        file_type: DeletionFileType::Array,
+                        num_deleted_rows: Some(1),
+                        base_id: None,
+                        path: None,
+                        inline: None,
+                    },
+                    data_change: true,
+                    base: None,
+                }),
+                Action::AddFragment(AddFragment {
+                    id: Ref::Local(0),
+                    physical_rows: 1,
+                    row_id_meta: None,
+                    last_updated_at_version_meta: None,
+                    created_at_version_meta: None,
+                    data_change: true,
+                }),
+                Action::AddDataFile(AddDataFile {
+                    fragment: Ref::Local(0),
+                    file: existing_data_file(dataset, 0),
+                    field_ids: vec![FieldRef::Committed(0)],
+                    data_change: true,
+                    base: None,
+                }),
+            ]
+        };
+
+        let original = test_dataset(false).await;
+        let fragment = original.fragments()[0].id;
+        let read_version = original.version().version;
+        let overlaid = commit(original.clone(), vec![overlay_action(&original, fragment)]).await;
+        commit_expecting_conflict(
+            &overlaid,
+            read_version,
+            moving_update(&original, fragment, read_version),
+        )
+        .await;
+
+        let original = test_dataset(false).await;
+        let updated = commit(
+            original.clone(),
+            moving_update(&original, fragment, read_version),
+        )
+        .await;
+        commit_expecting_conflict(
+            &updated,
+            read_version,
+            vec![overlay_action(&original, fragment)],
+        )
+        .await;
+    }
+
+    /// A re-encode keeps every row where it was and leaves the overlays alone,
+    /// so whichever lands first, the overlay still wins its cells.
+    #[rstest::rstest]
+    #[case::overlay_first(true)]
+    #[case::reencode_first(false)]
+    #[tokio::test]
+    async fn test_an_overlay_and_a_reencode_of_its_column_both_land(#[case] overlay_first: bool) {
+        let original = test_dataset(false).await;
+        let fragment = original.fragments()[0].id;
+        let read_version = original.version().version;
+        let overlay = vec![overlay_action(&original, fragment)];
+        let reencode = vec![
+            Action::TombstoneFieldData(TombstoneFieldData {
+                fragment: Ref::Committed(fragment),
+                field_ids: vec![FieldRef::Committed(0)],
+                data_change: false,
+            }),
+            Action::AddDataFile(AddDataFile {
+                fragment: Ref::Committed(fragment),
+                file: existing_data_file(&original, 0),
+                field_ids: vec![FieldRef::Committed(0)],
+                data_change: false,
+                base: None,
+            }),
+        ];
+        let (first, second) = if overlay_first {
+            (overlay, reencode)
+        } else {
+            (reencode, overlay)
+        };
+
+        let committed = commit(original, first).await;
+        let landed = CommitBuilder::new(Arc::new(committed))
+            .with_experimental_composite_operations(true)
+            .execute(composite_txn(read_version, second))
+            .await
+            .unwrap();
+
+        assert_eq!(landed.fragments()[0].overlays.len(), 1);
+        let values = landed.scan().try_into_batch().await.unwrap();
+        assert_eq!(
+            values.column(0).as_ref(),
+            &Int32Array::from_iter_values((5..10).chain(5..10)) as &dyn arrow_array::Array
+        );
+    }
+
+    /// A stale append that carries an overlay for a column a concurrent set
+    /// dropped would leave values for a field the schema no longer has.
+    #[tokio::test]
+    async fn test_an_overlay_on_a_minted_fragment_conflicts_with_a_dropped_field() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ]));
+        let data = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..10)),
+                Arc::new(Int32Array::from_iter_values(10..20)),
+            ],
+        )
+        .unwrap();
+        let dataset = InsertBuilder::new("memory://")
+            .with_params(&WriteParams {
+                max_rows_per_file: 5,
+                ..Default::default()
+            })
+            .execute(vec![data])
+            .await
+            .unwrap();
+        let read_version = dataset.version().version;
+        // The base file is declared for `b` alone, so the conflict with dropping
+        // `a` comes from the overlay, whose file carries `a`.
+        let stale_append = vec![
+            Action::AddFragment(AddFragment {
+                id: Ref::Local(0),
+                physical_rows: 5,
+                row_id_meta: None,
+                last_updated_at_version_meta: None,
+                created_at_version_meta: None,
+                data_change: true,
+            }),
+            Action::AddDataFile(AddDataFile {
+                fragment: Ref::Local(0),
+                file: existing_data_file(&dataset, 0),
+                field_ids: vec![FieldRef::Committed(1)],
+                data_change: true,
+                base: None,
+            }),
+            Action::AddOverlays(AddOverlays {
+                fragment: Ref::Local(0),
+                overlays: vec![DataOverlayFile {
+                    data_file: existing_overlay_file(&dataset, 1),
+                    coverage: OverlayCoverage::dense(RoaringBitmap::from_iter(0..5)),
+                    committed_version: 0,
+                }],
+                data_change: true,
+            }),
+        ];
+
+        let dropped = commit(
+            dataset.clone(),
+            vec![Action::DropField(DropField {
+                field: FieldRef::Committed(0),
+            })],
+        )
+        .await;
+
+        commit_expecting_conflict(&dropped, read_version, stale_append).await;
+    }
+
+    /// The fragment reuse actions against a real dataset, and how index
+    /// builds race the compactions that record them.
+    mod frag_reuse {
+        use super::*;
+        use crate::dataset::WriteMode;
+        use lance_core::utils::address::RowAddress;
+        use lance_table::format::pb::fragment_reuse_index_details as pb_fri;
+        use lance_table::system_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
+        use lance_table::transaction::action::{
+            AppendFragReuseTransition, FragReuseMapping, TrimFragReuse,
+        };
+        use roaring::RoaringTreemap;
+
+        const ROWS_PER_FRAGMENT: i32 = 5;
+
+        /// Four fragments of five rows; `a` runs 0..20 in fragment order.
+        async fn four_fragments() -> Dataset {
+            let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+            let data = RecordBatch::try_new(
+                schema,
+                vec![Arc::new(Int32Array::from_iter_values(
+                    0..4 * ROWS_PER_FRAGMENT,
+                ))],
+            )
+            .unwrap();
+            InsertBuilder::new("memory://")
+                .with_params(&WriteParams {
+                    max_rows_per_file: ROWS_PER_FRAGMENT as usize,
+                    ..Default::default()
+                })
+                .execute(vec![data])
+                .await
+                .unwrap()
+        }
+
+        /// Rewrite `sources` into one new fragment holding their rows in scan
+        /// order, recording the move as a transition when asked.
+        async fn compaction(
+            dataset: &Dataset,
+            sources: &[u64],
+            record_transition: bool,
+        ) -> Vec<Action> {
+            let fragments = sources
+                .iter()
+                .map(|id| {
+                    dataset
+                        .fragments()
+                        .iter()
+                        .find(|fragment| fragment.id == *id)
+                        .unwrap()
+                        .clone()
+                })
+                .collect::<Vec<_>>();
+            let mut scan = dataset.scan();
+            scan.with_fragments(fragments.clone());
+            let batch = scan.try_into_batch().await.unwrap();
+            let written = InsertBuilder::new(Arc::new(dataset.clone()))
+                .with_params(&WriteParams {
+                    mode: WriteMode::Append,
+                    max_rows_per_file: 1 << 20,
+                    ..Default::default()
+                })
+                .execute_uncommitted(vec![batch])
+                .await
+                .unwrap();
+            let Operation::Append { fragments: written } = written.operation else {
+                unreachable!()
+            };
+            let [written] = written.as_slice() else {
+                panic!("the rows fit one fragment");
+            };
+
+            let mut actions: Vec<Action> = sources
+                .iter()
+                .map(|source| {
+                    Action::RemoveFragment(RemoveFragment {
+                        fragment: Ref::Committed(*source),
+                        data_change: false,
+                    })
+                })
+                .collect();
+            actions.push(Action::AddFragment(AddFragment {
+                id: Ref::Local(0),
+                physical_rows: written.physical_rows.unwrap() as u64,
+                row_id_meta: None,
+                last_updated_at_version_meta: None,
+                created_at_version_meta: None,
+                data_change: false,
+            }));
+            for file in &written.files {
+                actions.push(Action::AddDataFile(AddDataFile {
+                    fragment: Ref::Local(0),
+                    field_ids: file
+                        .fields
+                        .iter()
+                        .copied()
+                        .map(FieldRef::Committed)
+                        .collect(),
+                    file: without_fields(file.clone()),
+                    data_change: false,
+                    base: None,
+                }));
+            }
+            if record_transition {
+                let mut survivors = RoaringTreemap::new();
+                for fragment in &fragments {
+                    for offset in 0..fragment.physical_rows.unwrap() as u32 {
+                        survivors
+                            .insert(RowAddress::new_from_parts(fragment.id as u32, offset).into());
+                    }
+                }
+                let mut changed_row_addrs = Vec::new();
+                survivors.serialize_into(&mut changed_row_addrs).unwrap();
+                actions.push(Action::AppendFragReuseTransition(
+                    AppendFragReuseTransition {
+                        sources: sources.iter().copied().map(Ref::Committed).collect(),
+                        destinations: vec![Ref::Local(0)],
+                        mapping: FragReuseMapping::OrderedCompaction(pb_fri::OrderedCompaction {
+                            changed_row_addrs,
+                        }),
+                    },
+                ));
+            }
+            actions
+        }
+
+        /// A B-tree segment of `a_idx` over `fragments`, built at `dataset`'s
+        /// version and not yet committed.
+        async fn build_segment(dataset: &Dataset, fragments: Vec<u32>) -> IndexMetadata {
+            let mut dataset = dataset.clone();
+            dataset
+                .create_index_builder(&["a"], IndexType::BTree, &ScalarIndexParams::default())
+                .name("a_idx".into())
+                .fragments(fragments)
+                .execute_uncommitted()
+                .await
+                .unwrap()
+        }
+
+        fn newest_fragment(dataset: &Dataset) -> u32 {
+            dataset.fragments().iter().map(|f| f.id).max().unwrap() as u32
+        }
+
+        /// The number of transitions the history records, or `None` without one.
+        async fn recorded_transitions(dataset: &Dataset) -> Option<usize> {
+            let indices = load_all_indices(dataset).await.unwrap();
+            let entry = indices
+                .iter()
+                .find(|index| index.name == FRAG_REUSE_INDEX_NAME)?;
+            let ledger = crate::index::frag_reuse::decode_frag_reuse_ledger(dataset, entry)
+                .await
+                .unwrap();
+            Some(ledger.transitions().len())
+        }
+
+        /// Every value of `a` that should be there is found exactly once,
+        /// whether the index or a scan answers.
+        async fn assert_each_value_once(dataset: &Dataset, values: std::ops::Range<i32>) {
+            for value in values.clone() {
+                assert_eq!(
+                    dataset
+                        .count_rows(Some(format!("a = {value}")))
+                        .await
+                        .unwrap(),
+                    1,
+                    "a = {value}"
+                );
+            }
+            assert_eq!(
+                dataset
+                    .count_rows(Some(format!(
+                        "a >= {} AND a < {}",
+                        values.start, values.end
+                    )))
+                    .await
+                    .unwrap(),
+                values.len()
+            );
+        }
+
+        /// How many rows the index alone returns for `a = value`: a fast
+        /// search skips every fragment no segment serves.
+        async fn indexed_matches(dataset: &Dataset, value: i32) -> usize {
+            let mut scan = dataset.scan();
+            scan.filter(&format!("a = {value}"))
+                .unwrap()
+                .fast_search()
+                .project(&["a"])
+                .unwrap();
+            scan.try_into_batch().await.unwrap().num_rows()
+        }
+
+        /// Removal isn't staleness: an index build and a compaction of the
+        /// fragments it covers both commit, in either order, with or without
+        /// a transition. With one the segment translates onto the
+        /// destination; without one it loses that coverage and the rows are
+        /// scanned. Either way every row is found once.
+        #[rstest::rstest]
+        #[case::build_lands_first_with_transition(true, true)]
+        #[case::build_lands_first_without_transition(true, false)]
+        #[case::compaction_lands_first_with_transition(false, true)]
+        #[case::compaction_lands_first_without_transition(false, false)]
+        #[tokio::test]
+        async fn test_an_index_build_and_a_compaction_both_commit(
+            #[case] build_lands_first: bool,
+            #[case] record_transition: bool,
+        ) {
+            let dataset = four_fragments().await;
+            let stale = Arc::new(dataset.clone());
+            let segment = build_segment(&dataset, vec![0, 1]).await;
+            let compact = compaction(&dataset, &[0, 1], record_transition).await;
+
+            let dataset = if build_lands_first {
+                let dataset = commit(dataset, vec![add_built_segment(segment)]).await;
+                drop(dataset);
+                commit_from_stale(stale, compact).await.unwrap()
+            } else {
+                let dataset = commit(dataset, compact).await;
+                drop(dataset);
+                commit_from_stale(stale, vec![add_built_segment(segment)])
+                    .await
+                    .unwrap()
+            };
+
+            let destination = newest_fragment(&dataset);
+            let served = dataset
+                .load_indices_by_name("a_idx")
+                .await
+                .unwrap()
+                .iter()
+                .flat_map(|segment| segment.fragment_bitmap.clone().unwrap_or_default())
+                .collect::<RoaringBitmap>();
+            assert_eq!(
+                served.contains(destination),
+                record_transition,
+                "{served:?}"
+            );
+            if record_transition {
+                for value in 0..2 * ROWS_PER_FRAGMENT {
+                    assert_eq!(indexed_matches(&dataset, value).await, 1, "a = {value}");
+                }
+            }
+            assert_eq!(
+                recorded_transitions(&dataset).await.is_some(),
+                record_transition
+            );
+            assert_each_value_once(&dataset, 0..4 * ROWS_PER_FRAGMENT).await;
+        }
+
+        /// Deleting a whole covered fragment is a removal too, and does not
+        /// fence a concurrent build either.
+        #[tokio::test]
+        async fn test_an_index_build_survives_a_whole_fragment_deletion() {
+            let dataset = four_fragments().await;
+            let stale = Arc::new(dataset.clone());
+            let segment = build_segment(&dataset, vec![0, 1]).await;
+            let deleted = commit(
+                dataset,
+                vec![Action::RemoveFragment(RemoveFragment {
+                    fragment: Ref::Committed(0),
+                    data_change: true,
+                })],
+            )
+            .await;
+            drop(deleted);
+
+            let dataset = commit_from_stale(stale, vec![add_built_segment(segment)])
+                .await
+                .unwrap();
+
+            assert_eq!(dataset.count_rows(Some("a < 5".into())).await.unwrap(), 0);
+            assert_each_value_once(&dataset, ROWS_PER_FRAGMENT..4 * ROWS_PER_FRAGMENT).await;
+        }
+
+        /// A column written into a committed fragment dies with the fragment,
+        /// so that write still conflicts with the fragment's removal.
+        #[tokio::test]
+        async fn test_a_column_written_into_a_fragment_conflicts_with_its_removal() {
+            let dataset = four_fragments().await;
+            let read_version = dataset.version().version;
+            let new_column = vec![
+                Action::AddField(AddField {
+                    local: 0,
+                    parent: None,
+                    def: int32_field("b"),
+                }),
+                Action::AddDataFile(AddDataFile {
+                    fragment: Ref::Committed(0),
+                    file: existing_data_file(&dataset, 0),
+                    field_ids: vec![FieldRef::Local(0)],
+                    data_change: true,
+                    base: None,
+                }),
+            ];
+            let compacted = commit(dataset, compaction_without_files(&[0])).await;
+
+            commit_expecting_conflict(&compacted, read_version, new_column).await;
+        }
+
+        /// The removal half of a compaction, which is all a conflict test
+        /// needs.
+        fn compaction_without_files(sources: &[u64]) -> Vec<Action> {
+            sources
+                .iter()
+                .map(|source| {
+                    Action::RemoveFragment(RemoveFragment {
+                        fragment: Ref::Committed(*source),
+                        data_change: false,
+                    })
+                })
+                .collect()
+        }
+
+        /// Compactions of disjoint fragments both record their transitions;
+        /// compactions sharing a source conflict through its removal.
+        #[rstest::rstest]
+        #[case::disjoint_sources(&[2, 3], true)]
+        #[case::shared_source(&[1, 2], false)]
+        #[tokio::test]
+        async fn test_two_compactions_recording_transitions(
+            #[case] theirs: &[u64],
+            #[case] both_commit: bool,
+        ) {
+            let dataset = four_fragments().await;
+            let read_version = dataset.version().version;
+            let stale = compaction(&dataset, theirs, true).await;
+            let first = commit(dataset.clone(), compaction(&dataset, &[0, 1], true).await).await;
+
+            if !both_commit {
+                commit_expecting_conflict(&first, read_version, stale).await;
+                return;
+            }
+            let second = commit_from_stale(Arc::new(dataset), stale).await.unwrap();
+            assert_eq!(recorded_transitions(&second).await, Some(2));
+            assert_each_value_once(&second, 0..4 * ROWS_PER_FRAGMENT).await;
+        }
+
+        /// A trim planned before a compaction landed judges the history it
+        /// lands on, so the compaction's transition, still needed by the
+        /// index over its sources, survives. Neither conflicts.
+        #[tokio::test]
+        async fn test_a_trim_keeps_a_transition_appended_concurrently() {
+            let dataset = four_fragments().await;
+            let segment = build_segment(&dataset, vec![0, 1, 2, 3]).await;
+            let dataset = commit(dataset, vec![add_built_segment(segment)]).await;
+            let stale = Arc::new(dataset.clone());
+            let compacted =
+                commit(dataset.clone(), compaction(&dataset, &[0, 1], true).await).await;
+            drop(compacted);
+
+            let trimmed = commit_from_stale(stale, vec![Action::TrimFragReuse(TrimFragReuse {})])
+                .await
+                .unwrap();
+
+            assert_eq!(recorded_transitions(&trimmed).await, Some(1));
+            assert_each_value_once(&trimmed, 0..4 * ROWS_PER_FRAGMENT).await;
+        }
+
+        /// A trim that drops a transition an in-flight build will need costs
+        /// that build its coverage of the moved rows, not correctness: both
+        /// commit and the rows are scanned.
+        #[tokio::test]
+        async fn test_a_trim_racing_an_index_build_loses_coverage_not_rows() {
+            let dataset = four_fragments().await;
+            let stale = Arc::new(dataset.clone());
+            let segment = build_segment(&dataset, vec![0, 1]).await;
+            let compacted =
+                commit(dataset.clone(), compaction(&dataset, &[0, 1], true).await).await;
+            let trimmed = commit(compacted, vec![Action::TrimFragReuse(TrimFragReuse {})]).await;
+            assert_eq!(recorded_transitions(&trimmed).await, None);
+            drop(trimmed);
+
+            let dataset = commit_from_stale(stale, vec![add_built_segment(segment)])
+                .await
+                .unwrap();
+
+            let served = dataset.load_indices_by_name("a_idx").await.unwrap();
+            assert!(
+                served.iter().all(|segment| !segment
+                    .fragment_bitmap
+                    .as_ref()
+                    .is_some_and(|bitmap| bitmap.contains(newest_fragment(&dataset)))),
+                "{served:?}"
+            );
+            assert_each_value_once(&dataset, 0..4 * ROWS_PER_FRAGMENT).await;
+        }
+
+        /// A segment built late over a compacted source and a newer one built
+        /// over its destination both cover the moved rows once the history is
+        /// applied. The reader gives direct
+        /// coverage precedence, so no row is counted twice.
+        #[tokio::test]
+        async fn test_a_late_source_segment_beside_a_destination_segment_counts_rows_once() {
+            let dataset = four_fragments().await;
+            let stale = Arc::new(dataset.clone());
+            let late = build_segment(&dataset, vec![1]).await;
+            let compacted = commit(dataset.clone(), compaction(&dataset, &[1], true).await).await;
+            let destination = newest_fragment(&compacted);
+            let direct = build_segment(&compacted, vec![destination]).await;
+            let indexed = commit(compacted, vec![add_built_segment(direct)]).await;
+            drop(indexed);
+
+            let dataset = commit_from_stale(stale, vec![add_built_segment(late)])
+                .await
+                .unwrap();
+
+            let stored = load_all_indices(&dataset).await.unwrap();
+            assert_eq!(
+                stored.iter().filter(|index| index.name == "a_idx").count(),
+                2
+            );
+            for value in ROWS_PER_FRAGMENT..2 * ROWS_PER_FRAGMENT {
+                assert_eq!(indexed_matches(&dataset, value).await, 1, "a = {value}");
+            }
+            assert_each_value_once(&dataset, 0..4 * ROWS_PER_FRAGMENT).await;
+        }
+    }
 }

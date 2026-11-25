@@ -1,10 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use lance_core::cache::{CacheBackend, LanceCache, QuickCacheBackend, QuickCacheShardPolicy};
+use datafusion::execution::context::SessionContext;
+
+use lance_core::cache::{
+    CacheBackend, CacheDiagnostics, CacheMetricsKind, CacheSnapshotMode, LanceCache,
+    QuickCacheBackend, QuickCacheShardPolicy,
+};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
 use lance_index::IndexType;
@@ -18,6 +24,7 @@ use crate::index::vector::ivf::v2::rabit_scan::RabitScanFactory;
 use crate::dataset::{DEFAULT_INDEX_CACHE_SIZE, DEFAULT_METADATA_CACHE_SIZE};
 use crate::session::caches::GlobalMetadataCache;
 use crate::session::index_caches::GlobalIndexCache;
+use lance_table_runtime::TableSession;
 
 use self::index_extension::IndexExtension;
 
@@ -25,7 +32,7 @@ use self::index_extension::IndexExtension;
 /// a small number of large, unequal partition entries.
 const AUTOMATIC_INDEX_CACHE_SHARD_POLICY: QuickCacheShardPolicy = QuickCacheShardPolicy::Single;
 
-pub(crate) mod caches;
+pub(crate) use lance_table_runtime::caches;
 pub mod index_caches;
 pub(crate) mod index_extension;
 
@@ -42,6 +49,22 @@ pub enum CacheSpec {
     /// Use an already constructed backend.
     Backend(Arc<dyn CacheBackend>),
 }
+
+/// Sampled lifetime diagnostics for both session cache tiers.
+///
+/// Activity belongs to each tier's wrapper state. Backends with equal
+/// [`CacheBackendDiagnostics::pool_id`](lance_core::cache::CacheBackendDiagnostics::pool_id)
+/// share occupancy and lifecycle counters; do not sum their physical bytes twice.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct SessionCacheDiagnostics {
+    /// Opened indices and index payloads.
+    pub index: CacheDiagnostics,
+    /// Dataset and file metadata.
+    pub metadata: CacheDiagnostics,
+}
+
+pub use lance_table_runtime::session::UnregisteredExternalBlobPolicy;
 
 /// A user session holds the runtime state for a [`crate::Dataset`]
 ///
@@ -66,16 +89,9 @@ pub struct Session {
     /// datasets and indices.
     pub(crate) index_cache: GlobalIndexCache,
 
-    /// Global cache for file metadata.
-    ///
-    /// Sub-caches are created from this cache for each dataset by adding the
-    /// URI as a key prefix. See the [`LanceDataset::metadata_cache`] field.
-    /// This prevents collisions between different datasets.
-    pub(crate) metadata_cache: caches::GlobalMetadataCache,
+    pub(crate) table_session: Arc<TableSession>,
 
     pub(crate) index_extensions: HashMap<(IndexType, String), Arc<dyn IndexExtension>>,
-
-    store_registry: Arc<ObjectStoreRegistry>,
 
     spill_store: Arc<dyn SpillStore>,
 
@@ -90,6 +106,10 @@ pub struct Session {
 
     /// Optional runtime strategy, rebound for each opened index.
     pub(crate) rabit_scan_factory: Option<Arc<dyn RabitScanFactory>>,
+
+    /// See [`Self::with_datafusion_session`]. Held type-erased so that proving
+    /// `Session: Send + Sync` does not walk DataFusion's plan types.
+    datafusion_session: Option<Arc<dyn Any + Send + Sync>>,
 }
 
 impl DeepSizeOf for Session {
@@ -97,7 +117,7 @@ impl DeepSizeOf for Session {
         let mut size = 0;
         // Measure the actual cache contents through the wrapper types
         size += self.index_cache.deep_size_of_children(context);
-        size += self.metadata_cache.deep_size_of_children(context);
+        size += self.metadata_cache().deep_size_of_children(context);
         for ext in self.index_extensions.values() {
             size += ext.deep_size_of_children(context);
         }
@@ -114,15 +134,23 @@ impl std::fmt::Debug for Session {
             )
             .field(
                 "file_metadata_cache",
-                &format!("LanceCache(items={})", self.metadata_cache.0.approx_size(),),
+                &format!(
+                    "LanceCache(items={})",
+                    self.file_metadata_cache().approx_size(),
+                ),
             )
             .field(
                 "index_extensions",
                 &self.index_extensions.keys().collect::<Vec<_>>(),
             )
+            .field(
+                "unregistered_external_blob_policy",
+                &self.unregistered_external_blob_policy(),
+            )
             .field("index_origin_latency", &self.index_origin_latency)
             .field("index_resident_columns", &self.index_resident_columns)
             .field("has_rabit_scan_factory", &self.rabit_scan_factory.is_some())
+            .field("has_datafusion_session", &self.datafusion_session.is_some())
             .finish()
     }
 }
@@ -145,22 +173,11 @@ impl Session {
         metadata_cache_size: usize,
         store_registry: Arc<ObjectStoreRegistry>,
     ) -> Self {
-        Self {
-            index_cache: GlobalIndexCache(Self::build_automatic_quick_cache(
-                index_cache_size,
-                AUTOMATIC_INDEX_CACHE_SHARD_POLICY,
-            )),
-            metadata_cache: GlobalMetadataCache(Self::build_automatic_quick_cache(
-                metadata_cache_size,
-                QuickCacheShardPolicy::Recommended,
-            )),
-            index_extensions: HashMap::new(),
+        Self::with_cache_backends(
+            CacheSpec::Size(index_cache_size),
+            CacheSpec::Size(metadata_cache_size),
             store_registry,
-            spill_store: Arc::new(LocalSpillStore::default()),
-            index_origin_latency: None,
-            index_resident_columns: ResidentColumnsSetting::Auto,
-            rabit_scan_factory: None,
-        }
+        )
     }
 
     /// Create a session with a custom index cache backend.
@@ -172,19 +189,46 @@ impl Session {
         metadata_cache_size: usize,
         store_registry: Arc<ObjectStoreRegistry>,
     ) -> Self {
-        Self {
-            index_cache: GlobalIndexCache(LanceCache::with_backend(index_cache_backend)),
-            metadata_cache: GlobalMetadataCache(Self::build_automatic_quick_cache(
-                metadata_cache_size,
-                QuickCacheShardPolicy::Recommended,
-            )),
-            index_extensions: HashMap::new(),
+        Self::with_cache_backends(
+            CacheSpec::Backend(index_cache_backend),
+            CacheSpec::Size(metadata_cache_size),
             store_registry,
-            spill_store: Arc::new(LocalSpillStore::default()),
-            index_origin_latency: None,
-            index_resident_columns: ResidentColumnsSetting::Auto,
-            rabit_scan_factory: None,
-        }
+        )
+    }
+
+    /// Set the policy for external blobs without a registered storage base.
+    ///
+    /// The default is [`UnregisteredExternalBlobPolicy::Allow`] for embedded use.
+    /// Servers should use [`UnregisteredExternalBlobPolicy::Deny`] before opening
+    /// datasets, including datasets written by other clients. This does not
+    /// restrict registered bases or remove file providers from the registry.
+    ///
+    /// ```
+    /// use lance::session::{Session, UnregisteredExternalBlobPolicy};
+    /// let session = Session::default()
+    ///     .with_unregistered_external_blob_policy(UnregisteredExternalBlobPolicy::Deny);
+    /// assert_eq!(session.unregistered_external_blob_policy(), UnregisteredExternalBlobPolicy::Deny);
+    /// ```
+    pub fn with_unregistered_external_blob_policy(
+        mut self,
+        policy: UnregisteredExternalBlobPolicy,
+    ) -> Self {
+        self.table_session = Arc::new(
+            self.table_session
+                .as_ref()
+                .clone()
+                .with_unregistered_external_blob_policy(policy),
+        );
+        self
+    }
+
+    /// The policy applied before resolving an unregistered external blob URI.
+    ///
+    /// When rebuilding a session with different caches, pass this value to
+    /// [`Self::with_unregistered_external_blob_policy`] on the replacement.
+    /// New sessions default to allowing unregistered references.
+    pub fn unregistered_external_blob_policy(&self) -> UnregisteredExternalBlobPolicy {
+        self.table_session.unregistered_external_blob_policy()
     }
 
     /// Replace the spill store used by this session.
@@ -281,6 +325,40 @@ impl Session {
         self
     }
 
+    /// The runtime RaBitQ strategy to rebind when opening an index.
+    ///
+    /// Callers rebuilding a session with isolated caches or object-store access
+    /// can retain its execution policy without sharing those resources. `None`
+    /// selects Lance's built-in full scan.
+    ///
+    /// ```
+    /// # use lance::session::Session;
+    /// fn retain_strategy(original: &Session, mut scoped: Session) -> Session {
+    ///     if let Some(factory) = original.rabit_scan_factory() {
+    ///         scoped = scoped.with_rabit_scan_factory(factory);
+    ///     }
+    ///     scoped
+    /// }
+    /// ```
+    pub fn rabit_scan_factory(&self) -> Option<Arc<dyn RabitScanFactory>> {
+        self.rabit_scan_factory.clone()
+    }
+
+    /// Attach a DataFusion session for planning expressions over this
+    /// session's datasets, e.g. with
+    /// [`lance_datafusion::planner::Planner::new_with_session`].
+    pub fn with_datafusion_session(mut self, session: SessionContext) -> Self {
+        self.datafusion_session = Some(Arc::new(session));
+        self
+    }
+
+    /// The session set by [`Self::with_datafusion_session`], if any.
+    pub fn datafusion_session(&self) -> Option<&SessionContext> {
+        self.datafusion_session
+            .as_ref()
+            .and_then(|session| session.downcast_ref())
+    }
+
     /// Return a reference to the session's spill store.
     ///
     /// Callers use this to obtain reclaimable scratch space for intermediate
@@ -328,21 +406,29 @@ impl Session {
             index_cache,
             DEFAULT_INDEX_CACHE_SIZE,
             AUTOMATIC_INDEX_CACHE_SHARD_POLICY,
+            CacheMetricsKind::Index,
         );
         let metadata_cache = Self::build_cache(
             metadata_cache,
             DEFAULT_METADATA_CACHE_SIZE,
             QuickCacheShardPolicy::Recommended,
+            CacheMetricsKind::Metadata,
         );
+        let index_cache = GlobalIndexCache(index_cache);
+        let table_session =
+            TableSession::with_caches(index_cache.0.clone(), metadata_cache, store_registry)
+                .with_index_metadata_observer(
+                    crate::index::loading::warn_about_unsupported_indices,
+                );
         Self {
-            index_cache: GlobalIndexCache(index_cache),
-            metadata_cache: GlobalMetadataCache(metadata_cache),
+            index_cache,
+            table_session: Arc::new(table_session),
             index_extensions: HashMap::new(),
-            store_registry,
             spill_store: Arc::new(LocalSpillStore::default()),
             index_origin_latency: None,
             index_resident_columns: ResidentColumnsSetting::Auto,
             rabit_scan_factory: None,
+            datafusion_session: None,
         }
     }
 
@@ -350,22 +436,30 @@ impl Session {
         spec: CacheSpec,
         default_size: usize,
         shard_policy: QuickCacheShardPolicy,
+        cache_kind: CacheMetricsKind,
     ) -> LanceCache {
         match spec {
-            CacheSpec::Default => Self::build_automatic_quick_cache(default_size, shard_policy),
-            CacheSpec::Size(size) => Self::build_automatic_quick_cache(size, shard_policy),
-            CacheSpec::Backend(backend) => LanceCache::with_backend(backend),
+            CacheSpec::Default => {
+                Self::build_automatic_quick_cache(default_size, shard_policy, cache_kind)
+            }
+            CacheSpec::Size(size) => {
+                Self::build_automatic_quick_cache(size, shard_policy, cache_kind)
+            }
+            CacheSpec::Backend(backend) => {
+                LanceCache::with_backend_and_metrics_kind(backend, cache_kind)
+            }
         }
     }
 
     fn build_automatic_quick_cache(
         capacity: usize,
         shard_policy: QuickCacheShardPolicy,
+        cache_kind: CacheMetricsKind,
     ) -> LanceCache {
-        LanceCache::with_backend(Arc::new(QuickCacheBackend::with_shard_policy(
-            capacity,
-            shard_policy,
-        )))
+        LanceCache::with_backend_and_metrics_kind(
+            Arc::new(QuickCacheBackend::with_shard_policy(capacity, shard_policy)),
+            cache_kind,
+        )
     }
 
     /// Register a new index extension.
@@ -427,28 +521,113 @@ impl Session {
     /// exact and is not guaranteed to be accurate.
     pub fn approx_num_items(&self) -> usize {
         self.index_cache.0.approx_size()
-            + self.metadata_cache.0.approx_size()
+            + self.file_metadata_cache().approx_size()
             + self.index_extensions.len()
     }
 
     /// Get the object store registry.
     pub fn store_registry(&self) -> Arc<ObjectStoreRegistry> {
-        self.store_registry.clone()
+        self.table_session.store_registry()
+    }
+
+    pub(crate) fn metadata_cache(&self) -> &GlobalMetadataCache {
+        self.table_session.metadata_cache()
     }
 
     /// Get a reference to the raw metadata cache (for use in index reconstruction).
     pub fn file_metadata_cache(&self) -> &LanceCache {
-        &self.metadata_cache.0
+        self.metadata_cache().cache()
     }
 
     /// Fetch statistics for the metadata cache
     pub async fn metadata_cache_stats(&self) -> lance_core::cache::CacheStats {
-        self.metadata_cache.0.stats().await
+        self.file_metadata_cache().stats().await
     }
 
     /// Fetch statistics for the index cache
     pub async fn index_cache_stats(&self) -> lance_core::cache::CacheStats {
         self.index_cache.0.stats().await
+    }
+
+    /// Inspect both caches without entry traversal or a metrics recorder.
+    /// Counts are lifetime cumulative, while existing stats reset on clear.
+    ///
+    /// ```
+    /// use lance::session::Session;
+    /// let snapshot = Session::default().cache_diagnostics();
+    /// assert_eq!(snapshot.index.activity.loads_in_flight, 0);
+    /// ```
+    pub fn cache_diagnostics(&self) -> SessionCacheDiagnostics {
+        SessionCacheDiagnostics {
+            index: self.index_cache.0.diagnostics(),
+            metadata: self.file_metadata_cache().diagnostics(),
+        }
+    }
+
+    /// Request refreshed backend accounting when needed. Fields are sampled
+    /// separately and can change concurrently; this does not lock the session.
+    pub async fn cache_diagnostics_with_mode(
+        &self,
+        mode: CacheSnapshotMode,
+    ) -> SessionCacheDiagnostics {
+        let (index, metadata) = futures::join!(
+            self.index_cache.0.diagnostics_with_mode(mode),
+            self.file_metadata_cache().diagnostics_with_mode(mode),
+        );
+        SessionCacheDiagnostics { index, metadata }
+    }
+
+    /// Collect bounded activity and scanned occupancy by stable cache key type.
+    ///
+    /// This is an explicit, potentially linear-time diagnostic request. The
+    /// default [`Session::cache_diagnostics`] and
+    /// [`Session::cache_diagnostics_with_mode`] remain constant cost.
+    ///
+    /// ```
+    /// # async fn example() {
+    /// use lance::session::Session;
+    /// use lance_core::cache::CacheSnapshotMode;
+    /// let snapshot = Session::default()
+    ///     .cache_diagnostics_by_type(CacheSnapshotMode::Approximate)
+    ///     .await;
+    /// assert!(snapshot.index.by_type.is_some());
+    /// # }
+    /// ```
+    pub async fn cache_diagnostics_by_type(
+        &self,
+        mode: CacheSnapshotMode,
+    ) -> SessionCacheDiagnostics {
+        let (index, metadata) = futures::join!(
+            self.index_cache.0.diagnostics_by_type(mode),
+            self.file_metadata_cache().diagnostics_by_type(mode),
+        );
+        SessionCacheDiagnostics { index, metadata }
+    }
+
+    /// Resize the index cache, evicting entries as needed to fit the new
+    /// weighted capacity.
+    ///
+    /// This lets a caller that manages several sessions bound their combined
+    /// memory without dropping or recreating them. Growing the capacity only
+    /// raises the budget; evicted entries are reloaded on demand. Clones of
+    /// this session share the cache, so they all observe the new capacity.
+    ///
+    /// Returns an error when the index cache backend cannot resize after
+    /// construction.
+    pub fn set_index_cache_capacity(&self, capacity: usize) -> Result<()> {
+        self.index_cache.0.set_capacity(capacity)
+    }
+
+    /// Resize the metadata cache, evicting entries as needed to fit the new
+    /// weighted capacity; see [`Self::set_index_cache_capacity`].
+    pub fn set_metadata_cache_capacity(&self, capacity: usize) -> Result<()> {
+        self.file_metadata_cache().set_capacity(capacity)
+    }
+}
+
+impl AsRef<TableSession> for Session {
+    fn as_ref(&self) -> &TableSession {
+        &self.table_session
     }
 }
 
@@ -468,7 +647,11 @@ mod tests {
     use lance_core::cache::{CacheKey, UnsizedCacheKey};
     use lance_core::deepsize::Context;
     use lance_index::vector::VectorIndex;
+    #[cfg(feature = "metrics")]
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
     use std::borrow::Cow;
+    #[cfg(feature = "metrics")]
+    use std::process::Command;
     use tokio::io::AsyncWriteExt;
 
     struct TestKey(&'static str);
@@ -481,6 +664,108 @@ mod tests {
 
         fn type_name() -> &'static str {
             "Test"
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cache_diagnostics_both_tiers_and_shared_namespaces() {
+        let session = Session::new(4096, 0, Default::default());
+        let first = session.index_cache.0.with_key_prefix("first-dataset");
+        let second = session.index_cache.0.with_key_prefix("second-dataset");
+        first
+            .get_or_insert_with_key(TestKey("entry"), || async { Ok(vec![1, 2, 3]) })
+            .await
+            .unwrap();
+        assert!(second.get_with_key(&TestKey("entry")).await.is_none());
+        assert!(first.get_with_key(&TestKey("entry")).await.is_some());
+        let snapshot = session.cache_diagnostics();
+        assert_eq!(
+            (snapshot.index.activity.hits, snapshot.index.activity.misses),
+            (1, 2)
+        );
+        assert_eq!(snapshot.index.backend.capacity_bytes, Some(4096));
+        assert_eq!(snapshot.metadata.backend.capacity_bytes, Some(0));
+        assert_eq!(snapshot.metadata.backend.enabled, Some(false));
+        assert_eq!(snapshot.metadata.utilization, None);
+        assert_eq!(snapshot.metadata.activity.loads_started, 0);
+        let refreshed = session
+            .cache_diagnostics_with_mode(CacheSnapshotMode::Refreshed)
+            .await;
+        assert_eq!(refreshed.index.backend.num_entries, Some(1));
+        let by_type = session
+            .cache_diagnostics_by_type(CacheSnapshotMode::Refreshed)
+            .await;
+        let index_by_type = by_type.index.by_type.unwrap();
+        assert_eq!(index_by_type.activity[0].type_name, "Test");
+        assert_eq!(index_by_type.occupancy.unwrap().types[0].num_entries, 1);
+        let legacy = session.index_cache_stats().await;
+        assert_eq!((legacy.hits, legacy.misses, legacy.num_entries), (1, 2, 1));
+    }
+
+    #[cfg(feature = "metrics")]
+    #[test]
+    fn test_session_cache_metric_labels_have_exact_cache_role() {
+        const NAME: &str = "session::tests::test_session_cache_metric_labels_have_exact_cache_role";
+        if std::env::var("LANCE_SESSION_METRICS_TEST").as_deref() != Ok(NAME) {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", NAME, "--nocapture"])
+                .env("LANCE_SESSION_METRICS_TEST", NAME)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            let session = Session::new(4096, 4096, Default::default());
+            runtime.block_on(async {
+                assert!(
+                    session
+                        .index_cache
+                        .0
+                        .get_with_key(&TestKey("metrics-index"))
+                        .await
+                        .is_none()
+                );
+                assert!(
+                    session
+                        .file_metadata_cache()
+                        .get_with_key(&TestKey("metrics-metadata"))
+                        .await
+                        .is_none()
+                );
+            });
+        });
+
+        let snapshot = snapshotter.snapshot().into_vec();
+        for cache in ["index", "metadata"] {
+            assert!(
+                snapshot.iter().any(|(key, _, _, value)| {
+                    let key = key.key();
+                    let labels = key
+                        .labels()
+                        .map(|label| (label.key(), label.value()))
+                        .collect::<Vec<_>>();
+                    key.name() == lance_core::cache::telemetry::METRIC_LOOKUPS
+                        && labels.len() == 4
+                        && labels.contains(&("cache", cache))
+                        && labels.contains(&("backend", "quick"))
+                        && labels.contains(&("type", "Test"))
+                        && labels.contains(&("outcome", "miss"))
+                        && matches!(value, DebugValue::Counter(1))
+                }),
+                "missing exact activity labels for {cache}"
+            );
         }
     }
 
@@ -620,7 +905,7 @@ mod tests {
         );
         // Metadata cache fell back to a size-based default. We can only
         // sanity-check that the session was constructed without panicking.
-        let stats = session.metadata_cache.0.stats().await;
+        let stats = session.file_metadata_cache().stats().await;
         assert_eq!(stats.num_entries, 0);
     }
 
@@ -645,14 +930,12 @@ mod tests {
         );
 
         session
-            .metadata_cache
-            .0
+            .file_metadata_cache()
             .insert_with_key(&TestKey("metadata-cache"), Arc::new(vec![4, 5, 6]))
             .await;
         assert!(
             session
-                .metadata_cache
-                .0
+                .file_metadata_cache()
                 .get_with_key(&TestKey("metadata-cache"))
                 .await
                 .is_some()
@@ -755,6 +1038,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn set_cache_capacity_resizes_both_caches() {
+        let session = Session::new(1 << 20, 1 << 20, Default::default());
+        for index in 0..4u64 {
+            session
+                .index_cache
+                .insert_with_key(&WeightedKey(index), Arc::new(DeclaredWeight(40)))
+                .await;
+            session
+                .file_metadata_cache()
+                .insert_with_key(&WeightedKey(index), Arc::new(DeclaredWeight(40)))
+                .await;
+        }
+        let entry_bytes = session.index_cache.size_bytes().await / 4;
+        assert!(entry_bytes > 0);
+        assert_eq!(
+            session.file_metadata_cache().size_bytes().await,
+            4 * entry_bytes
+        );
+
+        // Clones share the cache, so every handle observes the new capacity.
+        let clone = session.clone();
+        session.set_index_cache_capacity(2 * entry_bytes).unwrap();
+        session
+            .set_metadata_cache_capacity(2 * entry_bytes)
+            .unwrap();
+        for cache in [&session.index_cache, &clone.index_cache] {
+            assert_eq!(cache.capacity_bytes(), Some(2 * entry_bytes));
+            assert!(cache.size_bytes().await <= 2 * entry_bytes);
+            assert!(cache.size().await <= 2);
+        }
+        assert_eq!(
+            session.file_metadata_cache().capacity_bytes(),
+            Some(2 * entry_bytes)
+        );
+        assert!(session.file_metadata_cache().size_bytes().await <= 2 * entry_bytes);
+    }
+
+    #[tokio::test]
+    async fn set_cache_capacity_reports_unsupported_backends() {
+        use lance_core::cache::build_from_uri;
+
+        let backend = build_from_uri("moka://?capacity=1048576").unwrap();
+        let session = Session::with_cache_backends(
+            CacheSpec::Backend(backend),
+            CacheSpec::Default,
+            Default::default(),
+        );
+        let err = session.set_index_cache_capacity(1024).unwrap_err();
+        assert!(matches!(err, Error::NotSupported { .. }), "{err}");
+
+        // The default metadata backend supports resizing.
+        session.set_metadata_cache_capacity(1024).unwrap();
+        assert_eq!(session.file_metadata_cache().capacity_bytes(), Some(1024));
+    }
+
+    #[tokio::test]
     async fn test_custom_spill_store_injected() {
         let capped = Arc::new(LocalSpillStore::with_cap(50).unwrap());
         let session = Session::default().with_spill_store(capped);
@@ -771,5 +1110,19 @@ mod tests {
             ),
             "expected DiskCapExceeded, got {err}"
         );
+    }
+
+    #[test]
+    fn test_datafusion_session_is_shared_with_clones() {
+        assert!(Session::default().datafusion_session().is_none());
+
+        let datafusion_session = SessionContext::new();
+        let session = Session::default().with_datafusion_session(datafusion_session.clone());
+        for session in [&session, &session.clone()] {
+            assert_eq!(
+                session.datafusion_session().unwrap().session_id(),
+                datafusion_session.session_id()
+            );
+        }
     }
 }

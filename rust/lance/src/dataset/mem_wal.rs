@@ -61,7 +61,7 @@ pub mod write;
 use std::sync::Arc;
 
 use lance_core::Result;
-use lance_core::datatypes::{Field, LANCE_FIELD_ID_KEY, Schema};
+use lance_core::datatypes::{Schema, stamp_field_id};
 
 use arrow_array::RecordBatch;
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
@@ -218,56 +218,6 @@ pub fn arrow_schema_with_field_ids(schema: &Schema) -> ArrowSchema {
     ArrowSchema::new_with_metadata(fields, arrow.metadata().clone())
 }
 
-/// One field carrying its lance id, and its struct children carrying theirs.
-///
-/// A struct's children are fields in their own right: they have ids, a rename
-/// moves one child's name and not the parent's, and a reader that cannot see a
-/// child's id has only its name to go on.
-pub(crate) fn stamp_field_id(field: &ArrowField, among: &[Field]) -> ArrowField {
-    let Some(source) = among.iter().find(|f| f.name == *field.name()) else {
-        return field.clone();
-    };
-    let field = match source.id {
-        id if id >= 0 => {
-            let mut metadata = field.metadata().clone();
-            metadata.insert(LANCE_FIELD_ID_KEY.to_string(), id.to_string());
-            field.clone().with_metadata(metadata)
-        }
-        _ => field.clone(),
-    };
-    // A container carries its children inside its own type, and each of them is
-    // a field with an id of its own: a list's element, and that element's
-    // children in turn.
-    match field.data_type() {
-        DataType::Struct(children) => {
-            let children: Vec<ArrowField> = children
-                .iter()
-                .map(|child| stamp_field_id(child, &source.children))
-                .collect();
-            field.with_data_type(DataType::Struct(children.into()))
-        }
-        DataType::List(element) => {
-            let element = stamp_field_id(element, &source.children);
-            field.with_data_type(DataType::List(Arc::new(element)))
-        }
-        DataType::LargeList(element) => {
-            let element = stamp_field_id(element, &source.children);
-            field.with_data_type(DataType::LargeList(Arc::new(element)))
-        }
-        DataType::FixedSizeList(element, size) => {
-            let size = *size;
-            let element = stamp_field_id(element, &source.children);
-            field.with_data_type(DataType::FixedSizeList(Arc::new(element), size))
-        }
-        DataType::Map(entries, sorted) => {
-            let sorted = *sorted;
-            let entries = stamp_field_id(entries, &source.children);
-            field.with_data_type(DataType::Map(Arc::new(entries), sorted))
-        }
-        _ => field,
-    }
-}
-
 /// Extend the logical schema with the trailing `_tombstone` column — the
 /// intermediate [`relax_non_pk_nullability`] widens into the storage schema.
 ///
@@ -346,7 +296,8 @@ pub use sharding::{
     evaluate_sharding_spec_with_source_columns,
 };
 pub use wal::{
-    BatchDurableWatcher, WalAppendResult, WalAppender, WalReadEntry, WalTailer, fence_shard,
+    BatchDurableWatcher, WalAppendResult, WalAppender, WalEntry, WalEntryData, WalFlushFailure,
+    WalFlushResult, WalFlusher, WalReadEntry, WalTailer, fence_shard,
 };
 pub use write::FreezeFence;
 pub use write::ShardWriter;
@@ -357,7 +308,7 @@ pub use write::WriteResult;
 mod tests {
     use super::*;
     use arrow_schema::Fields;
-    use lance_core::datatypes::BlobV2Layout;
+    use lance_core::datatypes::{BlobV2Layout, LANCE_FIELD_ID_KEY};
 
     fn logical() -> ArrowSchema {
         ArrowSchema::new(vec![

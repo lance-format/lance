@@ -1053,6 +1053,37 @@ pub struct Tokens {
 }
 
 impl Tokens {
+    /// Reconstruct token values, phrase offsets and logical Match groups.
+    ///
+    /// Each vector must have one entry per token. Tokens sharing a Match group
+    /// are alternatives; different groups remain independent even when their
+    /// phrase offsets are equal. The token lookup map is rebuilt from values.
+    ///
+    /// ```
+    /// use lance_index::scalar::inverted::query::Tokens;
+    /// use lance_index::scalar::inverted::document_tokenizer::DocType;
+    /// let tokens = Tokens::try_from_parts(
+    ///     vec!["ab".into(), "bc".into()], vec![0, 0], vec![0, 1], DocType::Text,
+    /// ).unwrap();
+    /// assert_ne!(tokens.term_group(0), tokens.term_group(1));
+    /// ```
+    pub fn try_from_parts(
+        tokens: Vec<String>,
+        positions: Vec<u32>,
+        term_groups: Vec<u32>,
+        token_type: DocType,
+    ) -> Result<Self> {
+        if tokens.len() != positions.len() || tokens.len() != term_groups.len() {
+            return Err(Error::invalid_input(format!(
+                "FTS token state has {} tokens, {} phrase positions and {} Match groups; lengths must agree",
+                tokens.len(),
+                positions.len(),
+                term_groups.len(),
+            )));
+        }
+        Ok(Self::with_positions(tokens, positions, token_type).with_term_groups(term_groups))
+    }
+
     pub fn new(tokens: Vec<String>, token_type: DocType) -> Self {
         let positions = (0..tokens.len() as u32).collect();
         Self::with_positions(tokens, positions, token_type)

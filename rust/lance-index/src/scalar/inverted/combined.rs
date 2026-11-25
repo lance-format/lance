@@ -19,11 +19,14 @@
 //! ```
 //!
 //! Scoring uses exact (non-quantized) document lengths and a shared tokenizer
-//! across columns. Every candidate in the union of the query terms' postings is
-//! scored; see [`combined_fields_search`].
+//! across columns. A term-at-a-time MAXSCORE (Lucene `CombinedFieldQuery`'s
+//! constant per-term ceiling, ordinary MAXSCORE across terms) prunes candidate
+//! scoring for a top-k query without changing the top-k it returns; see
+//! [`combined_fields_search`].
 
 mod cursor;
 mod flat;
+mod maxscore;
 mod search;
 mod stats;
 #[cfg(test)]
@@ -34,9 +37,15 @@ use std::sync::Arc;
 use lance_core::{Error, Result};
 use lance_select::RowAddrTreeMap;
 
-pub use flat::flat_combined_fields_search_stream;
+pub use flat::{
+    collect_flat_combined_field_stats, flat_combined_fields_search_stream,
+    flat_combined_fields_search_with_scorer_stream,
+};
 pub use search::combined_fields_search;
-pub use stats::{CombinedCorpusStats, FlatFieldStats, build_combined_bm25_scorer};
+pub use stats::{
+    CombinedCorpusStats, FlatFieldStats, build_combined_bm25_scorer,
+    build_combined_bm25_scorer_from_totals,
+};
 
 use super::index::InvertedIndex;
 use super::query::Tokens;

@@ -69,7 +69,8 @@ use super::impact::{IMPACT_LEVEL1_BLOCKS, ImpactSkipData, ImpactSkipDataBuilder}
 use super::iter::PostingListIterator;
 use super::tokenizer::{LEGACY_BLOCK_SIZE, validate_block_size};
 use super::{
-    DocumentGranularity, FlatFieldStats, InvertedIndexBuilder, InvertedIndexParams, wand::*,
+    DocumentGranularity, FlatFieldStats, InvertedIndexBuilder, InvertedIndexParams,
+    PreparedBm25Query, wand::*,
 };
 use super::{
     builder::{InnerBuilder, PositionRecorder},
@@ -103,6 +104,7 @@ mod cache;
 mod doc_set;
 mod flat_search;
 mod format;
+mod grouping;
 mod inverted_index;
 mod partition;
 mod position_blocks;
@@ -116,11 +118,13 @@ mod scheduling;
 mod search;
 mod search_candidates;
 mod token_set;
+mod whole_positions;
 
 pub use cache::*;
 pub use doc_set::*;
 pub use flat_search::*;
 pub use format::*;
+use grouping::*;
 pub use inverted_index::*;
 pub use partition::*;
 use position_blocks::EncodedPositionBlocks;

@@ -1,104 +1,61 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
+
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use lance_core::cache::CacheBackend;
-
-use super::refs::{Branches, Ref, Refs, check_valid_branch, normalize_branch, standardize_branch};
-use super::versions;
-use super::{DEFAULT_INDEX_CACHE_SIZE, DEFAULT_METADATA_CACHE_SIZE, ReadParams, WriteParams};
-use crate::dataset::branch_location::BranchLocation;
-use crate::io::commit::namespace_manifest::LanceNamespaceExternalManifestStore;
-use crate::{Dataset, Error, Result, session::Session};
-use futures::{FutureExt, TryStreamExt};
-use lance_core::utils::tracing::{DATASET_LOADING_EVENT, TRACE_DATASET_EVENTS};
 use lance_file::reader::FileReaderOptions;
 use lance_io::object_store::{
-    DEFAULT_CLOUD_IO_PARALLELISM, LanceNamespaceStorageOptionsProvider, ObjectStore,
-    ObjectStoreParams, StorageOptions, StorageOptionsAccessor,
+    ObjectStore, ObjectStoreParams, StorageOptionsAccessor, StorageOptionsProvider,
 };
 use lance_namespace::LanceNamespace;
-use lance_namespace::models::DescribeTableRequest;
 use lance_table::{
-    feature_flags::ensure_can_read_manifest,
-    format::{Manifest, populate_manifest_schema_dictionaries},
-    io::commit::external_manifest::ExternalManifestCommitHandler,
-    io::commit::{CommitHandler, ManifestLocation, commit_handler_from_url},
+    format::Manifest,
+    io::commit::{CommitHandler, ManifestLocation},
 };
+use lance_table_runtime::TableBuilder;
 #[cfg(feature = "aws")]
 use object_store::aws::AwsCredentialProvider;
 use object_store::{DynObjectStore, path::Path};
-use prost::Message;
-use tracing::{info, instrument};
 use url::Url;
 
-/// builder for loading a [`Dataset`].
+use super::{DEFAULT_INDEX_CACHE_SIZE, DEFAULT_METADATA_CACHE_SIZE, ReadParams, WriteParams};
+use crate::{Dataset, Result, session::Session};
+
+/// Configure and open a dataset snapshot.
 #[derive(Clone)]
 pub struct DatasetBuilder {
-    /// Cache size for index cache. If it is zero, index cache is disabled.
+    table: TableBuilder,
     index_cache_size_bytes: usize,
-    /// Metadata cache size for the fragment metadata. If it is zero, metadata
-    /// cache is disabled.
     metadata_cache_size_bytes: usize,
-    /// Custom index cache backend. If set, overrides `index_cache_size_bytes`.
     index_cache_backend: Option<Arc<dyn CacheBackend>>,
-    /// Optional pre-loaded manifest to avoid loading it again.
-    manifest: Option<Manifest>,
     session: Option<Arc<Session>>,
-    commit_handler: Option<Arc<dyn CommitHandler>>,
-    options: ObjectStoreParams,
-    version: Option<Ref>,
-    table_uri: String,
-    file_reader_options: Option<FileReaderOptions>,
-    /// Storage options that override user-provided options (e.g., from namespace client)
-    storage_options_override: Option<HashMap<String, String>>,
-    /// Runtime-only exact object store bindings keyed by base path URI.
-    base_store_params: HashMap<String, ObjectStoreParams>,
-    /// Namespace-managed table info `(client, table_id)`, set by `from_namespace`
-    /// when the table uses managed versioning. The commit handler is built in
-    /// `build_object_store`, rooted at the resolved table path; the branch a
-    /// namespace request targets is derived per call from the base path the
-    /// handler is handed.
-    namespace_managed: Option<(Arc<dyn LanceNamespace>, Vec<String>)>,
 }
 
 impl std::fmt::Debug for DatasetBuilder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DatasetBuilder")
+            .field("table", &self.table)
             .field("index_cache_size_bytes", &self.index_cache_size_bytes)
             .field("metadata_cache_size_bytes", &self.metadata_cache_size_bytes)
-            .field("manifest", &self.manifest.is_some())
             .field("session", &self.session.is_some())
-            .field("commit_handler", &self.commit_handler.is_some())
-            .field("version", &self.version)
-            .field("table_uri", &self.table_uri)
-            .field("file_reader_options", &self.file_reader_options)
-            .field(
-                "storage_options_override",
-                &self.storage_options_override.is_some(),
-            )
-            .field("base_store_params", &!self.base_store_params.is_empty())
-            .field("namespace_managed", &self.namespace_managed.is_some())
             .finish()
     }
 }
 
 impl DatasetBuilder {
+    /// Build an opener for a Lance dataset URI or local path.
     pub fn from_uri<T: AsRef<str>>(table_uri: T) -> Self {
+        Self::from_table_builder(TableBuilder::from_uri(table_uri))
+    }
+
+    fn from_table_builder(table: TableBuilder) -> Self {
         Self {
+            table,
             index_cache_size_bytes: DEFAULT_INDEX_CACHE_SIZE,
             metadata_cache_size_bytes: DEFAULT_METADATA_CACHE_SIZE,
             index_cache_backend: None,
-            table_uri: table_uri.as_ref().to_string(),
-            options: ObjectStoreParams::default(),
-            commit_handler: None,
             session: None,
-            version: None,
-            manifest: None,
-            file_reader_options: None,
-            storage_options_override: None,
-            base_store_params: HashMap::new(),
-            namespace_managed: None,
         }
     }
 
@@ -135,58 +92,14 @@ impl DatasetBuilder {
     /// .load()
     /// .await?;
     /// ```
-    #[allow(deprecated)]
     pub async fn from_namespace(
         namespace_client: Arc<dyn LanceNamespace>,
         table_id: Vec<String>,
     ) -> Result<Self> {
-        let request = DescribeTableRequest {
-            id: Some(table_id.clone()),
-            vend_credentials: Some(true),
-            ..Default::default()
-        };
-
-        let response = namespace_client
-            .describe_table(request)
-            .await
-            .map_err(|e| Error::namespace_source(Box::new(e)))?;
-
-        let table_uri = response.location.ok_or_else(|| {
-            Error::namespace_source(Box::new(std::io::Error::other(
-                "Table location not found in namespace response",
-            )))
-        })?;
-
-        let mut builder = Self::from_uri(&table_uri);
-
-        // Defer building the commit handler to load(): the manifest store is
-        // rooted at the resolved table path, which is only known once the
-        // object store is built.
-        if response.managed_versioning == Some(true) {
-            builder.namespace_managed = Some((namespace_client.clone(), table_id.clone()));
-        }
-
-        // Use namespace storage options if available
-        let namespace_storage_options = response.storage_options;
-
-        builder.storage_options_override = namespace_storage_options.clone();
-
-        if let Some(initial_opts) = namespace_storage_options {
-            let provider: Arc<dyn lance_io::object_store::StorageOptionsProvider> = Arc::new(
-                LanceNamespaceStorageOptionsProvider::new(namespace_client, table_id),
-            );
-            builder.options.storage_options_accessor = Some(Arc::new(
-                StorageOptionsAccessor::with_initial_and_provider(initial_opts, provider),
-            ));
-        }
-
-        Ok(builder)
+        let builder = TableBuilder::from_namespace(namespace_client, table_id).await?;
+        Ok(Self::from_table_builder(builder))
     }
-}
 
-// Much of this builder is directly inspired from the to delta-rs table builder implementation
-// https://github.com/delta-io/delta-rs/main/crates/deltalake-core/src/table/builder.rs
-impl DatasetBuilder {
     /// Set the cache size for indices. Set to zero, to disable the cache.
     pub fn with_index_cache_size_bytes(mut self, cache_size: usize) -> Self {
         self.index_cache_size_bytes = cache_size;
@@ -233,38 +146,38 @@ impl DatasetBuilder {
     /// This is used to control the minimal request size.
     /// Defaults to 4KB for local files and 64KB for others
     pub fn with_block_size(mut self, block_size: usize) -> Self {
-        self.options.block_size = Some(block_size);
+        self.table = self.table.with_block_size(block_size);
         self
     }
 
     /// Sets `version` for the builder using a version number
     pub fn with_version(mut self, version: u64) -> Self {
-        self.version = Some(Ref::from(version));
+        self.table = self.table.with_version(version);
         self
     }
 
     /// Sets `version` for the builder using a branch and optional version number
     /// If version_number is null, checkout the latest version
     pub fn with_branch(mut self, branch: &str, version_number: Option<u64>) -> Self {
-        self.version = Some(Ref::from((branch, version_number)));
+        self.table = self.table.with_branch(branch, version_number);
         self
     }
 
     /// Sets `version` for the builder using a tag
     pub fn with_tag(mut self, tag: &str) -> Self {
-        self.version = Some(Ref::from(tag));
+        self.table = self.table.with_tag(tag);
         self
     }
 
     pub fn with_commit_handler(mut self, commit_handler: Arc<dyn CommitHandler>) -> Self {
-        self.commit_handler = Some(commit_handler);
+        self.table = self.table.with_commit_handler(commit_handler);
         self
     }
 
     /// Sets the s3 credentials refresh.
     /// This only applies to s3 storage.
     pub fn with_s3_credentials_refresh_offset(mut self, offset: Duration) -> Self {
-        self.options.s3_credentials_refresh_offset = offset;
+        self.table = self.table.with_s3_credentials_refresh_offset(offset);
         self
     }
 
@@ -272,7 +185,7 @@ impl DatasetBuilder {
     /// This only applies to aws object store.
     #[cfg(feature = "aws")]
     pub fn with_aws_credentials_provider(mut self, credentials: AwsCredentialProvider) -> Self {
-        self.options.aws_credentials = Some(credentials);
+        self.table = self.table.with_aws_credentials_provider(credentials);
         self
     }
 
@@ -285,8 +198,9 @@ impl DatasetBuilder {
         location: Url,
         commit_handler: Arc<dyn CommitHandler>,
     ) -> Self {
-        self.options.object_store = Some((object_store, location));
-        self.commit_handler = Some(commit_handler);
+        self.table = self
+            .table
+            .with_object_store(object_store, location, commit_handler);
         self
     }
 
@@ -294,8 +208,7 @@ impl DatasetBuilder {
     ///
     /// This is common when transferring a dataset across IPC boundaries.
     pub fn with_serialized_manifest(mut self, manifest: &[u8]) -> Result<Self> {
-        let manifest = Manifest::try_from(lance_table::format::pb::Manifest::decode(manifest)?)?;
-        self.manifest = Some(manifest);
+        self.table = self.table.with_serialized_manifest(manifest)?;
         Ok(self)
     }
 
@@ -320,27 +233,7 @@ impl DatasetBuilder {
     /// bindings set via [`Self::with_base_store_params`] take precedence over
     /// base-scoped keys.
     pub fn with_storage_options(mut self, storage_options: HashMap<String, String>) -> Self {
-        // Merge with existing options if accessor exists, otherwise create new static accessor
-        if let Some(existing) = self.options.storage_options_accessor.take() {
-            let mut merged = existing
-                .initial_storage_options()
-                .cloned()
-                .unwrap_or_default();
-            merged.extend(storage_options);
-            if let Some(provider) = existing.provider().cloned() {
-                self.options.storage_options_accessor = Some(Arc::new(
-                    StorageOptionsAccessor::with_initial_and_provider(merged, provider),
-                ));
-            } else {
-                self.options.storage_options_accessor = Some(Arc::new(
-                    StorageOptionsAccessor::with_static_options(merged),
-                ));
-            }
-        } else {
-            self.options.storage_options_accessor = Some(Arc::new(
-                StorageOptionsAccessor::with_static_options(storage_options),
-            ));
-        }
+        self.table = self.table.with_storage_options(storage_options);
         self
     }
 
@@ -352,25 +245,7 @@ impl DatasetBuilder {
     ///     .with_storage_option("region", "us-east-1");
     /// ```
     pub fn with_storage_option(mut self, key: impl AsRef<str>, value: impl AsRef<str>) -> Self {
-        let mut storage_options = self.options.storage_options().cloned().unwrap_or_default();
-        storage_options.insert(key.as_ref().to_string(), value.as_ref().to_string());
-
-        // Merge with existing accessor if present
-        if let Some(existing) = self.options.storage_options_accessor.take() {
-            if let Some(provider) = existing.provider().cloned() {
-                self.options.storage_options_accessor = Some(Arc::new(
-                    StorageOptionsAccessor::with_initial_and_provider(storage_options, provider),
-                ));
-            } else {
-                self.options.storage_options_accessor = Some(Arc::new(
-                    StorageOptionsAccessor::with_static_options(storage_options),
-                ));
-            }
-        } else {
-            self.options.storage_options_accessor = Some(Arc::new(
-                StorageOptionsAccessor::with_static_options(storage_options),
-            ));
-        }
+        self.table = self.table.with_storage_option(key, value);
         self
     }
 
@@ -420,22 +295,9 @@ impl DatasetBuilder {
     ///     .await?;
     pub fn with_storage_options_provider(
         mut self,
-        provider: Arc<dyn lance_io::object_store::StorageOptionsProvider>,
+        provider: Arc<dyn StorageOptionsProvider>,
     ) -> Self {
-        // Preserve existing storage options if any
-        if let Some(existing) = self.options.storage_options_accessor.take() {
-            if let Some(initial) = existing.initial_storage_options().cloned() {
-                self.options.storage_options_accessor = Some(Arc::new(
-                    StorageOptionsAccessor::with_initial_and_provider(initial, provider),
-                ));
-            } else {
-                self.options.storage_options_accessor =
-                    Some(Arc::new(StorageOptionsAccessor::with_provider(provider)));
-            }
-        } else {
-            self.options.storage_options_accessor =
-                Some(Arc::new(StorageOptionsAccessor::with_provider(provider)));
-        }
+        self.table = self.table.with_storage_options_provider(provider);
         self
     }
 
@@ -465,7 +327,7 @@ impl DatasetBuilder {
     ///     .await?;
     /// ```
     pub fn with_storage_options_accessor(mut self, accessor: Arc<StorageOptionsAccessor>) -> Self {
-        self.options.storage_options_accessor = Some(accessor);
+        self.table = self.table.with_storage_options_accessor(accessor);
         self
     }
 
@@ -481,8 +343,7 @@ impl DatasetBuilder {
         base_path: impl AsRef<str>,
         store_params: ObjectStoreParams,
     ) -> Self {
-        self.base_store_params
-            .insert(base_path.as_ref().to_string(), store_params);
+        self.table = self.table.with_base_store_params(base_path, store_params);
         self
     }
 
@@ -493,117 +354,52 @@ impl DatasetBuilder {
             .with_metadata_cache_size_bytes(read_params.metadata_cache_size_bytes);
 
         if let Some(options) = read_params.store_options {
-            self.options = options;
+            self.table = self.table.with_store_params(options);
         }
-
         if let Some(session) = read_params.session {
-            self.session = Some(session);
+            self = self.with_session(session);
         }
-
         if let Some(commit_handler) = read_params.commit_handler {
-            self.commit_handler = Some(commit_handler);
+            self.table = self.table.with_commit_handler(commit_handler);
         }
-
         if let Some(file_reader_options) = read_params.file_reader_options {
-            self.file_reader_options = Some(file_reader_options);
+            self.table = self.table.with_file_reader_options(file_reader_options);
         }
-
         self
     }
 
     /// Set options based on [WriteParams].
     pub fn with_write_params(mut self, write_params: WriteParams) -> Self {
         if let Some(options) = write_params.store_params {
-            self.options = options;
+            self.table = self.table.with_store_params(options);
         }
-
         if let Some(commit_handler) = write_params.commit_handler {
-            self.commit_handler = Some(commit_handler);
+            self.table = self.table.with_commit_handler(commit_handler);
         }
-
         self
     }
 
-    /// Re-use an existing session.
+    /// Re-use an existing session and its caches.
     ///
-    /// The session holds caches for index and metadata.
-    ///
-    /// If this is set, then `with_index_cache_size` and `with_metadata_cache_size` are ignored.
+    /// An explicit session takes precedence over cache sizes and backends
+    /// configured on this builder.
     pub fn with_session(mut self, session: Arc<Session>) -> Self {
+        self.table = self.table.with_session(session.table_session.clone());
         self.session = Some(session);
         self
     }
 
     /// Set exact object store params used as the dataset-level default binding.
     pub fn with_store_params(mut self, store_params: ObjectStoreParams) -> Self {
-        self.options = store_params;
+        self.table = self.table.with_store_params(store_params);
         self
     }
 
-    /// Build a lance object store for the given config
+    /// Build a Lance object store and commit handler for the given config.
     pub async fn build_object_store(
-        mut self,
+        self,
     ) -> Result<(Arc<ObjectStore>, Path, Arc<dyn CommitHandler>)> {
-        let storage_options = self
-            .options
-            .storage_options()
-            .cloned()
-            .map(StorageOptions::new)
-            .unwrap_or_default();
-        let download_retry_count = storage_options.download_retry_count();
-
-        let store_registry = self
-            .session
-            .as_ref()
-            .map(|s| s.store_registry())
-            .unwrap_or_default();
-
-        #[allow(deprecated)]
-        let (object_store, base_path) = match &self.options.object_store {
-            Some(store) => (
-                Arc::new(ObjectStore::new(
-                    store.0.clone(),
-                    store.1.clone(),
-                    self.options.block_size,
-                    self.options.object_store_wrapper.clone(),
-                    self.options.use_constant_size_upload_parts,
-                    store.1.scheme() != "file",
-                    // If user supplied an object store then we just assume it's probably
-                    // cloud-like
-                    DEFAULT_CLOUD_IO_PARALLELISM,
-                    download_retry_count,
-                    None, // No storage_options available here
-                )),
-                Path::from(store.1.path()),
-            ),
-            None => {
-                ObjectStore::from_uri_and_params(store_registry, &self.table_uri, &self.options)
-                    .await?
-            }
-        };
-
-        // Resolve the commit handler: an explicitly set one wins; otherwise a
-        // namespace-managed table builds a manifest store rooted at the resolved
-        // table path (the branch a request targets is derived per call from the
-        // base path the handler is handed); otherwise fall back to the default
-        // for the uri. Resolving here (not in load) keeps this pub method
-        // consistent for every caller.
-        let commit_handler: Arc<dyn CommitHandler> =
-            if let Some(commit_handler) = self.commit_handler.take() {
-                commit_handler
-            } else if let Some((namespace_client, table_id)) = self.namespace_managed.take() {
-                Arc::new(ExternalManifestCommitHandler {
-                    external_manifest_store: Arc::new(LanceNamespaceExternalManifestStore::new(
-                        namespace_client,
-                        table_id,
-                        base_path.clone(),
-                    )),
-                })
-            } else {
-                commit_handler_from_url(&self.table_uri, &Some(self.options.clone())).await?
-            };
-
-        Ok((object_store, base_path, commit_handler))
+        self.table.build_object_store().await
     }
 
     /// List manifest locations without reading the manifest contents.
@@ -613,90 +409,15 @@ impl DatasetBuilder {
     /// supported. Custom commit handlers and externally managed version stores are also not
     /// supported because listing physical manifest objects may omit committed versions whose
     /// authoritative locations are held outside the object store.
-    pub async fn list_manifest_locations(mut self) -> Result<Vec<ManifestLocation>> {
-        if self.version.is_some() {
-            return Err(Error::invalid_input(
-                "list_manifest_locations does not support an explicit version, branch, or tag",
-            ));
-        }
-        let uses_external_or_custom_commit_handler = self.commit_handler.is_some()
-            || self.namespace_managed.is_some()
-            || Url::parse(&self.table_uri).is_ok_and(|url| url.scheme() == "s3+ddb");
-        if uses_external_or_custom_commit_handler {
-            return Err(Error::not_supported(
-                "list_manifest_locations does not support external or custom commit handlers; \
-                 object-store listing may omit committed manifest locations",
-            ));
-        }
-        self.apply_storage_options_override();
-        let (object_store, base_path, commit_handler) = self.build_object_store().await?;
-        commit_handler
-            .list_manifest_locations(&base_path, object_store.as_ref(), false)
-            .try_collect()
-            .await
+    pub async fn list_manifest_locations(self) -> Result<Vec<ManifestLocation>> {
+        Box::pin(self.table.list_manifest_locations()).await
     }
 
-    #[instrument(skip_all)]
+    /// Open the configured snapshot, resolving the latest version by default.
     pub async fn load(self) -> Result<Dataset> {
-        let uri = self.table_uri.clone();
-        let target_ref = self.version.clone();
-        match self.load_impl().boxed().await {
-            Ok(dataset) => {
-                info!(target: TRACE_DATASET_EVENTS, event=DATASET_LOADING_EVENT, uri=uri, target_ref = ?target_ref, version=dataset.manifest.version, status="success");
-                Ok(dataset)
-            }
-            Err(e) => {
-                info!(target: TRACE_DATASET_EVENTS, event=DATASET_LOADING_EVENT, uri=uri, target_ref = ?target_ref, status="error");
-                Err(e)
-            }
-        }
-    }
-
-    // Runtime per-base overrides are supplied as storage options, but the dataset
-    // ultimately resolves object stores from ObjectStoreParams. Normalize once in
-    // the builder so reads only need to look up the prepared params by base path.
-    fn merge_store_params_with_storage_options(
-        params: &ObjectStoreParams,
-        override_options: &HashMap<String, String>,
-    ) -> ObjectStoreParams {
-        if override_options.is_empty() {
-            return params.clone();
-        }
-
-        let mut merged_params = params.clone();
-        let mut merged_options = merged_params.storage_options().cloned().unwrap_or_default();
-        merged_options.extend(override_options.clone());
-
-        let storage_options_accessor = match merged_params
-            .storage_options_accessor
-            .as_ref()
-            .and_then(|accessor| accessor.provider().cloned())
-        {
-            Some(provider) => Arc::new(StorageOptionsAccessor::with_initial_and_provider(
-                merged_options,
-                provider,
-            )),
-            None => Arc::new(StorageOptionsAccessor::with_static_options(merged_options)),
-        };
-        merged_params.storage_options_accessor = Some(storage_options_accessor);
-        merged_params
-    }
-
-    fn apply_storage_options_override(&mut self) {
-        if let Some(override_options) = self.storage_options_override.take() {
-            self.options =
-                Self::merge_store_params_with_storage_options(&self.options, &override_options);
-        }
-    }
-
-    async fn load_impl(mut self) -> Result<Dataset> {
-        // Apply storage_options_override to merge namespace client options with any existing accessor
-        self.apply_storage_options_override();
-
-        let index_cache_backend = self.index_cache_backend.take();
-        let session = match self.session.as_ref() {
-            Some(session) => session.clone(),
-            None => match index_cache_backend {
+        let session = self
+            .session
+            .unwrap_or_else(|| match self.index_cache_backend {
                 Some(backend) => Arc::new(Session::with_index_cache_backend(
                     backend,
                     self.metadata_cache_size_bytes,
@@ -707,171 +428,15 @@ impl DatasetBuilder {
                     self.metadata_cache_size_bytes,
                     Default::default(),
                 )),
-            },
-        };
-
-        let target_ref = self.version.clone();
-        let table_uri = self.table_uri.clone();
-
-        // How do we detect which version scheme is in use?
-        let manifest = self.manifest.take();
-
-        let file_reader_options = self.file_reader_options.clone();
-        let store_params = self.options.clone();
-        let base_store_params = (!self.base_store_params.is_empty())
-            .then(|| Arc::new(std::mem::take(&mut self.base_store_params)));
-
-        // A namespace-managed table is always addressed at its root uri, so the
-        // effective branch is resolvable before loading: the base path is
-        // qualified up front and the manifest store derives the branch from it.
-        // An explicitly supplied commit handler opts out of the managed flow.
-        let managed_store_active =
-            self.namespace_managed.is_some() && self.commit_handler.is_none();
-
-        let (object_store, base_path, commit_handler) = self.build_object_store().await?;
-
-        // Two cases that need to check out after loading the manifest:
-        // 1. If the target is configured as a branch, we need to check the branch field in the manifest
-        // and reload the right branch in case the uri is not the right one.
-        // 2. If the target is configured as a tag, and we don't find the tag under the table_uri,
-        // we need to get the root_location after loading the manifest and get the right version.
-        // In practice, we should try best to use the right uri and avoid double loading.
-        let mut need_delay_checkout = false;
-        let (mut branch, mut version_number) = match target_ref.clone() {
-            Some(Ref::Version(branch, version_number)) => {
-                if branch.is_some() && !managed_store_active {
-                    need_delay_checkout = true;
-                }
-                (branch, version_number)
-            }
-            // We don't have a current branch context, just specify the branch as main
-            // But the real branch will be specified by uri
-            Some(Ref::VersionNumber(version_number)) => (None, Some(version_number)),
-            // Here we assume the uri and path is the root.
-            // If tag not found, we need to delay checkout after loading by uri
-            Some(Ref::Tag(tag_name)) => {
-                let refs = Refs::new(
-                    object_store.clone(),
-                    commit_handler.clone(),
-                    BranchLocation {
-                        path: base_path.clone(),
-                        uri: table_uri.clone(),
-                        branch: None,
-                    },
-                );
-                match refs.tags().get(&tag_name).await {
-                    Ok(tag_content) => {
-                        if tag_content.branch.is_some() && !managed_store_active {
-                            // The tag's chain lives under a different base path
-                            // and the unmanaged handler resolves versions by
-                            // base path only, so load the root's latest first
-                            // and check the tag's branch/version out from it.
-                            need_delay_checkout = true;
-                            (tag_content.branch, None)
-                        } else {
-                            (tag_content.branch.clone(), Some(tag_content.version))
-                        }
-                    }
-                    Err(e) => {
-                        // A managed table is always rooted at the namespace
-                        // location, so a tag missing here is missing.
-                        if managed_store_active {
-                            return Err(e);
-                        }
-                        need_delay_checkout = true;
-                        (None, None)
-                    }
-                }
-            }
-            None => (None, None),
-        };
-
-        // Reject malformed branch names at the boundary (mirroring the branch
-        // CRUD paths) so they fail as InvalidRef instead of resolving oddly
-        if let Some(branch_name) = branch.as_deref()
-            && !Branches::is_main_branch(Some(branch_name))
-        {
-            check_valid_branch(branch_name)?;
-        }
-
-        // For a managed table the branch is known before loading; point the base
-        // path and uri at the branch chain so the loaded dataset is rooted there
-        // (data placement, refs and the path-derived store branch all follow the
-        // base path).
-        let (base_path, table_uri) = if managed_store_active && branch.is_some() {
-            let branch_location = BranchLocation {
-                path: base_path,
-                uri: table_uri,
-                branch: None,
-            }
-            .find_branch(branch.as_deref())?;
-            (branch_location.path, branch_location.uri)
-        } else {
-            (base_path, table_uri)
-        };
-
-        // A delayed checkout resolves (branch, version) against the right chain
-        // afterwards, so the uri's chain only needs its latest version here: the
-        // requested version number may not exist on that chain at all.
-        let load_version = if need_delay_checkout {
-            None
-        } else {
-            version_number
-        };
-        let dataset = Self::load_by_uri(
-            session,
-            manifest,
-            file_reader_options,
-            table_uri,
-            load_version,
-            object_store,
-            base_path,
-            commit_handler,
-            Some(store_params),
-            base_store_params,
-        )
-        .await?;
-
-        if managed_store_active {
-            // The base path was qualified above, so the loaded manifest must
-            // already be on the requested branch; a mismatch means the namespace
-            // resolved another chain.
-            let requested_branch = branch.as_deref().and_then(standardize_branch);
-            if dataset.manifest.branch.as_deref() != requested_branch.as_deref() {
-                return Err(Error::internal(format!(
-                    "open of branch '{}' resolved a manifest belonging to branch '{}'",
-                    normalize_branch(branch.as_deref()),
-                    normalize_branch(dataset.manifest.branch.as_deref()),
-                )));
-            }
-        }
-
-        if need_delay_checkout {
-            if let Some(Ref::Tag(tag_name)) = target_ref {
-                let tag_content = dataset.tags().get(tag_name.as_str()).await?;
-                branch = tag_content.branch.clone();
-                version_number = Some(tag_content.version);
-            }
-
-            let branch_differs = branch.as_deref() != dataset.manifest.branch.as_deref();
-            let version_differs =
-                version_number.is_some() && version_number != Some(dataset.manifest.version);
-            if branch_differs || version_differs {
-                return dataset
-                    .checkout_version((branch.as_deref(), version_number))
-                    .await;
-            }
-        }
-        if let Some(version_number) = version_number
-            && version_number != dataset.manifest.version
-        {
-            return Err(Error::VersionNotFound {
-                message: format!("version {} not found", version_number),
             });
-        }
-        Ok(dataset)
+        let table = self
+            .table
+            .load_with_session(session.table_session.clone())
+            .await?;
+        Ok(Dataset::from_table(table, session))
     }
 
+    /// Open a snapshot using an already resolved store and commit handler.
     #[allow(clippy::too_many_arguments)]
     pub async fn load_by_uri(
         session: Arc<Session>,
@@ -885,223 +450,19 @@ impl DatasetBuilder {
         store_params: Option<ObjectStoreParams>,
         base_store_params: Option<Arc<HashMap<String, ObjectStoreParams>>>,
     ) -> Result<Dataset> {
-        let (manifest, location) = if let Some(mut manifest) = manifest {
-            ensure_can_read_manifest(&manifest)?;
-            versions::check_manifest_storage_version(&mut manifest)?;
-            let location = commit_handler
-                .resolve_version_location(&base_path, manifest.version, &object_store.inner)
-                .await?;
-            if manifest.schema.has_dictionary_types() {
-                let reader = object_store.open(&location.path).await?;
-                populate_manifest_schema_dictionaries(&mut manifest, reader.as_ref()).await?;
-            }
-            (Arc::new(manifest), location)
-        } else {
-            let manifest_location = match version_number {
-                Some(version) => {
-                    let target_manifest_result = commit_handler
-                        .resolve_version_location(&base_path, version, &object_store.inner)
-                        .await;
-                    // This may fail due to the uri is not the right branch
-                    // In this case we should try to load the latest version and checkout the right branch and version_number
-                    match target_manifest_result {
-                        Ok(manifest_location) => manifest_location,
-                        Err(e) => {
-                            if let Error::VersionNotFound { message: _ } = e {
-                                // If the version is not found, we need to try to load the latest version.
-                                commit_handler
-                                    .resolve_latest_location(&base_path, &object_store)
-                                    .await?
-                            } else {
-                                return Err(e);
-                            }
-                        }
-                    }
-                }
-                None => commit_handler
-                    .resolve_latest_location(&base_path, &object_store)
-                    .await
-                    .map_err(|e| match &e {
-                        Error::NotFound { .. } => {
-                            Error::dataset_not_found(base_path.to_string(), Box::new(e))
-                        }
-                        _ => e,
-                    })?,
-            };
-
-            let manifest = Dataset::get_manifest(
-                &object_store,
-                &manifest_location,
-                &table_uri,
-                session.as_ref(),
-            )
-            .await?;
-            (manifest, manifest_location)
-        };
-
-        Dataset::checkout_manifest(
+        let table = TableBuilder::load_by_uri(
+            session.table_session.clone(),
+            manifest,
+            file_reader_options,
+            table_uri,
+            version_number,
             object_store,
             base_path,
-            table_uri,
-            manifest,
-            location,
-            session,
             commit_handler,
-            file_reader_options,
             store_params,
             base_store_params,
         )
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use async_trait::async_trait;
-    use lance_io::object_store::StorageOptionsProvider;
-    use lance_table::io::commit::UnsafeCommitHandler;
-
-    use super::*;
-    use lance_namespace::models::DescribeTableResponse;
-    use std::sync::Mutex;
-
-    #[derive(Debug)]
-    struct TestStorageOptionsProvider;
-
-    #[derive(Debug)]
-    struct TestNamespace;
-
-    #[async_trait]
-    impl LanceNamespace for TestNamespace {
-        fn namespace_id(&self) -> String {
-            "test-namespace".to_string()
-        }
-    }
-
-    #[async_trait]
-    impl StorageOptionsProvider for TestStorageOptionsProvider {
-        async fn fetch_storage_options(&self) -> Result<Option<HashMap<String, String>>> {
-            Ok(None)
-        }
-
-        fn provider_id(&self) -> String {
-            "test-storage-options-provider".to_string()
-        }
-    }
-
-    #[test]
-    fn test_storage_options_override_wins_and_preserves_provider() {
-        let caller_options = HashMap::from([
-            ("endpoint".to_string(), "caller".to_string()),
-            ("caller-only".to_string(), "caller-value".to_string()),
-        ]);
-        let provider: Arc<dyn StorageOptionsProvider> = Arc::new(TestStorageOptionsProvider);
-        let options = ObjectStoreParams {
-            storage_options_accessor: Some(Arc::new(
-                StorageOptionsAccessor::with_initial_and_provider(caller_options, provider),
-            )),
-            ..Default::default()
-        };
-        let mut builder = DatasetBuilder::from_uri("memory://table").with_store_params(options);
-        builder.storage_options_override = Some(HashMap::from([
-            ("endpoint".to_string(), "namespace".to_string()),
-            ("namespace-only".to_string(), "namespace-value".to_string()),
-        ]));
-
-        builder.apply_storage_options_override();
-
-        let merged = builder.options.storage_options().unwrap();
-        assert_eq!(merged.get("endpoint").unwrap(), "namespace");
-        assert_eq!(merged.get("caller-only").unwrap(), "caller-value");
-        assert_eq!(merged.get("namespace-only").unwrap(), "namespace-value");
-        assert_eq!(
-            builder
-                .options
-                .get_accessor()
-                .unwrap()
-                .provider()
-                .unwrap()
-                .provider_id(),
-            "test-storage-options-provider"
-        );
-        assert!(builder.storage_options_override.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_list_manifest_locations_rejects_external_and_custom_commit_handlers() {
-        let mut namespace_builder = DatasetBuilder::from_uri("memory://namespace-table");
-        namespace_builder.namespace_managed =
-            Some((Arc::new(TestNamespace), vec!["namespace-table".to_string()]));
-
-        let builders = [
-            DatasetBuilder::from_uri("memory://custom-handler-table")
-                .with_commit_handler(Arc::new(UnsafeCommitHandler)),
-            DatasetBuilder::from_uri("s3+ddb://bucket/table.lance?ddbTableName=manifest-table"),
-            namespace_builder,
-        ];
-
-        for builder in builders {
-            let err = builder.list_manifest_locations().await.unwrap_err();
-            assert!(matches!(err, Error::NotSupported { .. }));
-            assert!(
-                err.to_string()
-                    .contains("does not support external or custom commit handlers")
-            );
-        }
-    }
-
-    /// Mock namespace that records the describe request and vends storage
-    /// options only when explicitly asked -- the behavior of a fail-closed
-    /// server.
-    #[derive(Debug, Default)]
-    struct FailClosedNamespace {
-        seen: Mutex<Option<DescribeTableRequest>>,
-    }
-
-    #[async_trait]
-    impl LanceNamespace for FailClosedNamespace {
-        fn namespace_id(&self) -> String {
-            "fail-closed-mock".to_string()
-        }
-
-        async fn describe_table(
-            &self,
-            request: DescribeTableRequest,
-        ) -> lance_namespace::Result<DescribeTableResponse> {
-            let vend = request.vend_credentials == Some(true);
-            *self.seen.lock().unwrap() = Some(request);
-            Ok(DescribeTableResponse {
-                location: Some("memory://ns-table".to_string()),
-                storage_options: vend
-                    .then(|| HashMap::from([("vended".to_string(), "true".to_string())])),
-                ..Default::default()
-            })
-        }
-    }
-
-    /// The initial namespace describe must opt into credential vending
-    /// explicitly: a fail-closed server returns no storage options for an
-    /// unset flag, and the refresh provider is only installed when this first
-    /// response already carries them (ENT-2008).
-    #[tokio::test]
-    async fn test_from_namespace_requests_vended_credentials() {
-        let namespace = Arc::new(FailClosedNamespace::default());
-        let builder = DatasetBuilder::from_namespace(namespace.clone(), vec!["t".to_string()])
-            .await
-            .unwrap();
-
-        let seen = namespace.seen.lock().unwrap().take().unwrap();
-        assert_eq!(seen.vend_credentials, Some(true));
-        assert_eq!(seen.id, Some(vec!["t".to_string()]));
-        // The vended options made it onto the builder, so the refresh
-        // provider path (installed only when the first response carries
-        // options) is reachable.
-        assert_eq!(
-            builder
-                .storage_options_override
-                .as_ref()
-                .and_then(|o| o.get("vended"))
-                .map(String::as_str),
-            Some("true")
-        );
+        .await?;
+        Ok(Dataset::from_table(table, session))
     }
 }

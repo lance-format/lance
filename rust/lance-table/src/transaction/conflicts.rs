@@ -201,9 +201,15 @@ impl PartialEq for Operation {
                     && a_field == b_field
             }
             (
-                Self::DataReplacement { replacements: a },
-                Self::DataReplacement { replacements: b },
-            ) => a.len() == b.len() && a.iter().all(|r| b.contains(r)),
+                Self::DataReplacement {
+                    replacements: a,
+                    data_change: a_change,
+                },
+                Self::DataReplacement {
+                    replacements: b,
+                    data_change: b_change,
+                },
+            ) => a_change == b_change && a.len() == b.len() && a.iter().all(|r| b.contains(r)),
             // Handle all remaining combinations.
             // We spell out all combinations explicitly to prevent
             // us accidentally handling a new case in the wrong way.
@@ -866,6 +872,8 @@ impl PartialEq for Operation {
                 std::mem::discriminant(self) == std::mem::discriminant(other)
             }
             (Self::DataOverlay { groups: a }, Self::DataOverlay { groups: b }) => compare_vec(a, b),
+            (Self::CompositeOperation(a), Self::CompositeOperation(b)) => a == b,
+            (Self::CompositeOperation(_), _) | (_, Self::CompositeOperation(_)) => false,
             (Self::DataOverlay { .. }, _) | (_, Self::DataOverlay { .. }) => false,
             (Self::Unknown {}, Self::Unknown {}) => true,
             (Self::Unknown {}, _) | (_, Self::Unknown {}) => false,

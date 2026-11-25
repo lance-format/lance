@@ -43,7 +43,17 @@ tokens = lance.tokenize(
 Options set to `None` use the selected analyzer profile's default. For example,
 the code analyzer disables stemming and stop-word removal unless explicitly
 overridden. The exception is `max_token_length`: omitting it keeps the default
-length limit of 40, while `max_token_length=None` disables the limit.
+length limit of 40 UTF-8 bytes, while `max_token_length=None` disables the limit.
+
+### Token length limit
+
+`max_token_length` is an exclusive limit in UTF-8 bytes, not characters. Tokens
+whose encoded length is at least the limit are removed. With the default of 40,
+`"x" * 39` is retained, but `"x" * 40` is removed. Multibyte characters reach the
+limit sooner: `"é" * 20` contains 20 characters but 40 UTF-8 bytes, so it is also
+removed. To retain a 40-byte token, set `max_token_length` to at least 41 or use
+`None` to disable the limit. This boundary applies to both the text and code
+analyzers.
 
 ## ICU Tokenizer
 

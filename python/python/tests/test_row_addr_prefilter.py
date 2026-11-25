@@ -22,7 +22,7 @@ import lance
 import numpy as np
 import pyarrow as pa
 import pytest
-from lance.dataset import ScannerBuilder, serialize_row_addrs
+from lance._dataset.scanner import ScannerBuilder, serialize_row_addrs
 from lance.file import LanceFileWriter
 
 if TYPE_CHECKING:
@@ -232,7 +232,9 @@ def _overlay(
     return lance.LanceDataset.commit(ds, op, read_version=ds.version)
 
 
-def test_overlay_stale_replay_scan_respects_mask(tmp_path: Path) -> None:
+def test_overlay_stale_replay_scan_respects_mask(
+    tmp_path: Path, enable_unstable_data_overlay_files
+) -> None:
     base_dir = tmp_path / "ov_scan"
     ds = lance.write_dataset(
         pa.table(
@@ -272,7 +274,9 @@ def test_overlay_stale_replay_scan_respects_mask(tmp_path: Path) -> None:
     assert got["_rowid"].to_pylist() == [stale_addr]
 
 
-def test_overlay_stale_replay_ann_respects_mask(tmp_path: Path) -> None:
+def test_overlay_stale_replay_ann_respects_mask(
+    tmp_path: Path, enable_unstable_data_overlay_files
+) -> None:
     base_dir = tmp_path / "ov_ann"
     rng = np.random.default_rng(7)
     vectors = rng.standard_normal((N, DIM)).astype(np.float32)

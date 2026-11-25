@@ -14,12 +14,13 @@ use lance_io::traits::{ProtoStruct, Reader};
 use object_store::path::Path;
 use prost::Message;
 use prost_types::Timestamp;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;
 use std::sync::Arc;
 
+use super::encoded_fragments::{EncodedFragmentCache, carry_encoded_fragments};
 use super::{ClusteringDefinition, Fragment, InlineRowIds, RowIdMeta};
-use crate::feature_flags::{FLAG_COVERED_INDEX_METADATA, STICKY_READER_FLAGS, STICKY_WRITER_FLAGS};
+use crate::feature_flags::{COVERING_FLAGS, STICKY_READER_FLAGS, STICKY_WRITER_FLAGS};
 use crate::feature_flags::{FLAG_STABLE_ROW_IDS, has_deprecated_v2_feature_flag};
 use crate::format::fragment::DataFileFieldInterner;
 use crate::format::pb;
@@ -120,6 +121,10 @@ pub struct Manifest {
     /// first. Allocation takes `max_clustering_id + 1` and the value never
     /// decreases, including after definition removal or restore.
     pub max_clustering_id: u32,
+
+    /// Encoded bytes of `fragments`, reused when this manifest, or one derived
+    /// from it, is written. Ignored by equality.
+    encoded_fragments: EncodedFragmentCache,
 }
 
 // We use the most significant bit to indicate that a transaction is detached
@@ -191,6 +196,12 @@ impl Manifest {
         self.reader_feature_flags & crate::feature_flags::FLAG_MANAGED_BLOBS != 0
     }
 
+    /// Whether this table has activated version 1 zone write seeds.
+    pub fn has_zone_write_seeds(&self) -> bool {
+        self.reader_feature_flags & crate::feature_flags::FLAG_ZONE_WRITE_SEEDS != 0
+            && self.writer_feature_flags & crate::feature_flags::FLAG_ZONE_WRITE_SEEDS != 0
+    }
+
     pub fn new(
         schema: Schema,
         fragments: Arc<Vec<Fragment>>,
@@ -223,6 +234,7 @@ impl Manifest {
             base_paths,
             clustering: Vec::new(),
             max_clustering_id: 0,
+            encoded_fragments: EncodedFragmentCache::default(),
         }
     }
 
@@ -257,6 +269,7 @@ impl Manifest {
             base_paths: previous.base_paths.clone(),
             clustering: previous.clustering.clone(),
             max_clustering_id: previous.max_clustering_id,
+            encoded_fragments: EncodedFragmentCache::default(),
         }
     }
 
@@ -309,16 +322,18 @@ impl Manifest {
             // wholesale -- `covering_fields` included -- a build that predates
             // covering could then open it and read carried columns as keyed ones.
             // Kept unconditionally rather than derived from the cloned indexes:
-            // over-fencing a clone is harmless, under-fencing one is not.
+            // over-fencing a clone is harmless, under-fencing one is not. The
+            // independent-layout bit goes with it, so the cloned entries are
+            // written back under the contract they were read with.
             // Sticky capabilities are also retained because the clone keeps the
             // source file identities that require them. So are stable row ids:
             // they are otherwise derived from the fragments, so a clone of a table
             // whose rows were all deleted would lose them and stop assigning ids
             // from `next_row_id`.
             reader_feature_flags: self.reader_feature_flags
-                & (FLAG_COVERED_INDEX_METADATA | STICKY_READER_FLAGS | FLAG_STABLE_ROW_IDS),
+                & (COVERING_FLAGS | STICKY_READER_FLAGS | FLAG_STABLE_ROW_IDS),
             writer_feature_flags: self.writer_feature_flags
-                & (FLAG_COVERED_INDEX_METADATA | STICKY_WRITER_FLAGS | FLAG_STABLE_ROW_IDS),
+                & (COVERING_FLAGS | STICKY_WRITER_FLAGS | FLAG_STABLE_ROW_IDS),
             max_fragment_id: self.max_fragment_id,
             max_allocated_field_id: self.max_allocated_field_id,
             transaction_file: Some(transaction_file),
@@ -338,7 +353,45 @@ impl Manifest {
             // the definitions they reference and the allocation high-water mark.
             clustering: self.clustering.clone(),
             max_clustering_id: self.max_clustering_id,
+            encoded_fragments: EncodedFragmentCache::default(),
         }
+    }
+
+    /// Encoded `pb::DataFragment` bytes of `fragments`, by position, if the
+    /// cached encodings describe the current fragment list. A `None` entry is
+    /// a fragment that has to be encoded when the manifest is written.
+    pub(crate) fn encoded_fragments(&self) -> Option<&[Option<Bytes>]> {
+        self.encoded_fragments.get(&self.fragments)
+    }
+
+    /// Record `encoded[i]` as the encoded bytes of `fragments[i]`; the entries
+    /// are slices of one buffer of `retained_bytes` bytes.
+    pub(crate) fn set_encoded_fragments(
+        &mut self,
+        encoded: Vec<Option<Bytes>>,
+        retained_bytes: usize,
+    ) {
+        self.encoded_fragments =
+            EncodedFragmentCache::new(&self.fragments, encoded, retained_bytes);
+    }
+
+    /// Reuse `previous`'s encoded bytes for every fragment of this manifest
+    /// that was taken unchanged from `previous`.
+    ///
+    /// `changed_ids` must hold the id of every fragment this manifest added,
+    /// replaced or modified relative to `previous`. Callers derive it from the
+    /// transaction's own bookkeeping; fragments are never compared by content.
+    pub(crate) fn reuse_encoded_fragments(&mut self, previous: &Self, changed_ids: &[u64]) {
+        let Some(previous_encoded) = previous.encoded_fragments() else {
+            return;
+        };
+        let encoded = carry_encoded_fragments(
+            &previous.fragments,
+            previous_encoded,
+            &self.fragments,
+            changed_ids,
+        );
+        self.set_encoded_fragments(encoded, previous.encoded_fragments.retained_bytes());
     }
 
     /// Return the `timestamp_nanos` value as a Utc DateTime
@@ -803,36 +856,50 @@ impl TryFrom<pb::manifest::DataStorageFormat> for DataStorageFormat {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum StableRowIdMode {
+    /// Inherit stable row IDs from the previous manifest; disabled for new datasets.
+    #[default]
+    Inherit,
+    /// Enable stable row IDs on new datasets (or keep enabled on existing ones).
+    Enable,
+    /// Second step of `migrate_to_stable_row_ids`: bypasses the existing-dataset
+    /// guard and initializes `manifest.next_row_id` to `next_row_id`.
+    Migrate { next_row_id: u64 },
+}
+
 /// Options controlling how a new [`Manifest`] is assembled from a transaction.
 ///
-/// The timestamp arrives already resolved to nanoseconds since the Unix epoch.
-/// Callers own the clock so that a caller wanting a mockable one keeps it: the
-/// `lance` crate mocks `SystemTime` under `cfg(test)`, which only takes effect in
-/// that crate.
+/// The timestamp arrives already resolved to nanoseconds since the Unix epoch
+/// via [`Self::with_timestamp_nanos`]. Callers own the clock so that a caller
+/// wanting a mockable one keeps it: the `lance` crate mocks `SystemTime` under
+/// `cfg(test)`, which only takes effect in that crate.
+///
+/// ```
+/// use lance_table::format::ManifestBuildConfig;
+///
+/// let config = ManifestBuildConfig::new()
+///     .with_timestamp_nanos(1_700_000_000_000_000_000)
+///     .with_use_stable_row_ids(true);
+/// assert!(config.use_stable_row_ids());
+/// assert_eq!(config.timestamp_nanos(), Some(1_700_000_000_000_000_000));
+/// ```
 #[derive(Debug, Clone)]
 pub struct ManifestBuildConfig {
     /// Recompute the manifest's feature flags from the fragments and settings
     /// below. False leaves whatever flags the previous manifest carried.
-    pub auto_set_feature_flags: bool,
+    auto_set_feature_flags: bool,
     /// Value for the new manifest's timestamp, in nanoseconds since the Unix epoch.
-    pub timestamp_nanos: u128,
-    /// Request the stable row id feature. The flag is also inherited from the
-    /// previous manifest, so false does not turn it off for a dataset that has it.
-    pub use_stable_row_ids: bool,
-    /// Overwrite only: force the legacy (true) or v2 (false) file format. `None`
-    /// keeps the format the dataset already had.
-    pub use_legacy_format: Option<bool>,
-    /// Overwrite only: force this storage format, taking precedence over
-    /// `use_legacy_format`. `None` keeps the format the dataset already had.
-    pub storage_format: Option<DataStorageFormat>,
+    timestamp_nanos: Option<u128>,
+    /// Stable row id request / migration activation state.
+    stable_row_ids: StableRowIdMode,
+    /// Overwrite only: force this storage format. `None` keeps the format the
+    /// dataset already had.
+    storage_format: Option<DataStorageFormat>,
     /// Skip writing a detached transaction file for this commit.
-    pub disable_transaction_file: bool,
-    /// When `Some`, this commit is the second step of `migrate_to_stable_row_ids`.
-    /// It bypasses the "cannot enable stable row ids on existing dataset" guard and
-    /// sets `manifest.next_row_id` to the provided value before activating the flag.
-    pub migration_next_row_id: Option<u64>,
+    disable_transaction_file: bool,
     /// Whether this commit atomically activates non-reusable field IDs.
-    pub activate_non_reusable_field_ids: bool,
+    activate_non_reusable_field_ids: bool,
     /// For an `UpdateConfig` commit only: the COMPLETE list of clustering
     /// definitions the writer wants the next manifest to hold, built from the
     /// manifest it read. A current definition the list keeps must be unchanged
@@ -850,14 +917,173 @@ pub struct ManifestBuildConfig {
     /// A list identical to the current one is a no-op. Allocating a definition
     /// on a table with reusable field ids activates non-reusable field ids in
     /// the same commit, since definitions key on field ids.
-    pub clustering_definitions: Option<Vec<ClusteringDefinition>>,
+    clustering_definitions: Option<Vec<ClusteringDefinition>>,
     /// Row lineage sequences of the current manifest's fragments that live
     /// outside the manifest, read ahead of the build. An update that rewrites
     /// rows needs the existing row ids and created-at versions to carry each
     /// row's lineage over, and a partial column rewrite needs the existing
     /// last-updated-at versions; the build cannot read a data file itself. Only
     /// consulted for fragments whose sequences are spilled.
-    pub spilled_row_lineage: std::sync::Arc<crate::rowids::version::SpilledRowLineage>,
+    spilled_row_lineage: Arc<crate::rowids::version::SpilledRowLineage>,
+}
+
+impl Default for ManifestBuildConfig {
+    fn default() -> Self {
+        Self {
+            auto_set_feature_flags: true,
+            timestamp_nanos: None,
+            stable_row_ids: StableRowIdMode::Inherit,
+            storage_format: None,
+            disable_transaction_file: false,
+            activate_non_reusable_field_ids: false,
+            clustering_definitions: None,
+            spilled_row_lineage: Default::default(),
+        }
+    }
+}
+
+impl ManifestBuildConfig {
+    /// Create a new [`ManifestBuildConfig`] with default settings.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Recompute the manifest's feature flags from the fragments and settings.
+    /// Passing `false` leaves whatever flags the previous manifest carried.
+    ///
+    /// Default is `true`.
+    pub fn with_auto_set_feature_flags(mut self, enabled: bool) -> Self {
+        self.auto_set_feature_flags = enabled;
+        self
+    }
+
+    /// Whether feature flags should be recomputed when building/writing the manifest.
+    pub fn auto_set_feature_flags(&self) -> bool {
+        self.auto_set_feature_flags
+    }
+
+    /// Set the timestamp for the new manifest, in nanoseconds since the Unix epoch.
+    pub fn with_timestamp_nanos(mut self, timestamp_nanos: u128) -> Self {
+        self.timestamp_nanos = Some(timestamp_nanos);
+        self
+    }
+
+    /// The resolved manifest timestamp in nanoseconds since the Unix epoch, if set.
+    pub fn timestamp_nanos(&self) -> Option<u128> {
+        self.timestamp_nanos
+    }
+
+    /// Request the stable row id feature. The flag is also inherited from the
+    /// previous manifest, so `false` does not turn it off for a dataset that
+    /// already has it.
+    pub fn with_use_stable_row_ids(mut self, enabled: bool) -> Self {
+        if enabled {
+            if matches!(self.stable_row_ids, StableRowIdMode::Inherit) {
+                self.stable_row_ids = StableRowIdMode::Enable;
+            }
+        } else {
+            self.stable_row_ids = StableRowIdMode::Inherit;
+        }
+        self
+    }
+
+    /// Whether stable row IDs are requested (including via migration activation).
+    pub fn use_stable_row_ids(&self) -> bool {
+        !matches!(self.stable_row_ids, StableRowIdMode::Inherit)
+    }
+
+    /// Configure this commit as the second step of `migrate_to_stable_row_ids`.
+    ///
+    /// Implies [`Self::use_stable_row_ids`] = `true`, bypasses the "cannot
+    /// enable stable row ids on existing dataset" guard, and initializes
+    /// `manifest.next_row_id` to `next_row_id` before activating the flag.
+    pub fn with_migration_next_row_id(mut self, next_row_id: u64) -> Self {
+        self.stable_row_ids = StableRowIdMode::Migrate { next_row_id };
+        self
+    }
+
+    /// The `next_row_id` seed for a stable row ID migration activation commit, if any.
+    pub fn migration_next_row_id(&self) -> Option<u64> {
+        match self.stable_row_ids {
+            StableRowIdMode::Migrate { next_row_id } => Some(next_row_id),
+            StableRowIdMode::Inherit | StableRowIdMode::Enable => None,
+        }
+    }
+
+    /// Overwrite only: force this storage format. `None` keeps the format the
+    /// dataset already had.
+    pub fn with_storage_format(
+        mut self,
+        storage_format: impl Into<Option<DataStorageFormat>>,
+    ) -> Self {
+        self.storage_format = storage_format.into();
+        self
+    }
+
+    /// The explicitly requested storage format for overwrite/create commits, if any.
+    pub fn storage_format(&self) -> Option<&DataStorageFormat> {
+        self.storage_format.as_ref()
+    }
+
+    /// Skip writing a detached transaction file for this commit.
+    pub fn with_disable_transaction_file(mut self, disabled: bool) -> Self {
+        self.disable_transaction_file = disabled;
+        self
+    }
+
+    /// Whether detached transaction file writing is disabled for this commit.
+    pub fn disable_transaction_file(&self) -> bool {
+        self.disable_transaction_file
+    }
+
+    /// Atomically activate non-reusable field IDs in this commit.
+    pub fn with_activate_non_reusable_field_ids(mut self, activate: bool) -> Self {
+        self.activate_non_reusable_field_ids = activate;
+        self
+    }
+
+    /// Whether this commit atomically activates non-reusable field IDs.
+    pub fn activate_non_reusable_field_ids(&self) -> bool {
+        self.activate_non_reusable_field_ids
+    }
+
+    /// Set the complete desired clustering definitions list for an `UpdateConfig` commit.
+    pub fn with_clustering_definitions(mut self, definitions: Vec<ClusteringDefinition>) -> Self {
+        self.clustering_definitions = Some(definitions);
+        self
+    }
+
+    /// The desired clustering definitions list for an `UpdateConfig` commit, if provided.
+    pub fn clustering_definitions(&self) -> Option<&[ClusteringDefinition]> {
+        self.clustering_definitions.as_deref()
+    }
+
+    /// Whether the definitions list names an id the `read` manifest does not
+    /// hold, i.e. the commit allocates new definitions. One pass over each
+    /// list; the allocation itself is validated during manifest build.
+    pub fn allocates_clustering_definitions(&self, read: &Manifest) -> bool {
+        self.clustering_definitions.as_ref().is_some_and(|desired| {
+            let current: HashSet<u32> = read.clustering.iter().map(|c| c.id).collect();
+            desired
+                .iter()
+                .any(|definition| !current.contains(&definition.id))
+        })
+    }
+
+    /// Attach preloaded external row lineage sequences for fragments whose
+    /// lineage lives outside the manifest.
+    pub fn with_spilled_row_lineage(
+        mut self,
+        lineage: Arc<crate::rowids::version::SpilledRowLineage>,
+    ) -> Self {
+        self.spilled_row_lineage = lineage;
+        self
+    }
+
+    /// Preloaded external row lineage sequences for this build attempt.
+    pub fn spilled_row_lineage(&self) -> &Arc<crate::rowids::version::SpilledRowLineage> {
+        &self.spilled_row_lineage
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1146,6 +1372,7 @@ impl TryFrom<pb::Manifest> for Manifest {
                 .transaction_section
                 .or(p.transaction_section_deprecated)
                 .map(|i| i as usize),
+            encoded_fragments: EncodedFragmentCache::default(),
             fragment_offsets,
             next_row_id: p.next_row_id,
             data_storage_format,
@@ -1168,73 +1395,82 @@ impl TryFrom<pb::Manifest> for Manifest {
 
 impl From<&Manifest> for pb::Manifest {
     fn from(m: &Manifest) -> Self {
-        let timestamp_nanos = if m.timestamp_nanos == 0 {
-            None
-        } else {
-            let nanos = m.timestamp_nanos % 1e9 as u128;
-            let seconds = ((m.timestamp_nanos - nanos) / 1e9 as u128) as i64;
-            Some(Timestamp {
-                seconds,
-                nanos: nanos as i32,
-            })
-        };
-        let fields_with_meta: FieldsWithMeta = (&m.schema).into();
         Self {
-            fields: fields_with_meta.fields.0,
-            schema_metadata: m
-                .schema
-                .metadata
-                .iter()
-                .map(|(k, v)| (k.clone(), v.as_bytes().to_vec()))
-                .collect(),
-            version: m.version,
-            branch: m.branch.clone(),
-            clustering: m.clustering.iter().map(pb::Clustering::from).collect(),
-            max_clustering_id: m.max_clustering_id,
-            writer_version: m
-                .writer_version
-                .as_ref()
-                .map(|wv| pb::manifest::WriterVersion {
-                    library: wv.library.clone(),
-                    version: wv.version.clone(),
-                    prerelease: wv.prerelease.clone(),
-                    build_metadata: wv.build_metadata.clone(),
-                }),
             fragments: m.fragments.iter().map(pb::DataFragment::from).collect(),
-            fragment_tree: None,
-            table_metadata: m.table_metadata.clone(),
-            version_aux_data: m.version_aux_data as u64,
-            index_section: m.index_section.map(|i| i as u64),
-            timestamp: timestamp_nanos,
-            tag: m.tag.clone().unwrap_or_default(),
-            reader_feature_flags: m.reader_feature_flags,
-            writer_feature_flags: m.writer_feature_flags,
-            max_fragment_id: m.max_fragment_id,
-            max_allocated_field_id: m.max_allocated_field_id,
-            transaction_file: m.transaction_file.clone().unwrap_or_default(),
-            next_row_id: m.next_row_id,
-            data_format: Some(pb::manifest::DataStorageFormat {
-                file_format: m.data_storage_format.file_format.clone(),
-                version: m
-                    .data_storage_format
-                    .version
-                    .to_manifest_string()
-                    .to_string(),
-            }),
-            config: m.config.clone(),
-            base_paths: m
-                .base_paths
-                .values()
-                .map(|base_path| pb::BasePath {
-                    id: base_path.id,
-                    name: base_path.name.clone(),
-                    is_dataset_root: base_path.is_dataset_root,
-                    path: base_path.path.clone(),
-                })
-                .collect(),
-            transaction_section: m.transaction_section.map(|i| i as u64),
-            transaction_section_deprecated: None,
+            ..pb_manifest_without_fragments(m)
         }
+    }
+}
+
+/// The protobuf form of `m` with `fragments` left empty, for writers that
+/// encode the fragments themselves.
+pub fn pb_manifest_without_fragments(m: &Manifest) -> pb::Manifest {
+    let timestamp_nanos = if m.timestamp_nanos == 0 {
+        None
+    } else {
+        let nanos = m.timestamp_nanos % 1e9 as u128;
+        let seconds = ((m.timestamp_nanos - nanos) / 1e9 as u128) as i64;
+        Some(Timestamp {
+            seconds,
+            nanos: nanos as i32,
+        })
+    };
+    let fields_with_meta: FieldsWithMeta = (&m.schema).into();
+    pb::Manifest {
+        fields: fields_with_meta.fields.0,
+        schema_metadata: m
+            .schema
+            .metadata
+            .iter()
+            .map(|(k, v)| (k.clone(), v.as_bytes().to_vec()))
+            .collect(),
+        version: m.version,
+        branch: m.branch.clone(),
+        clustering: m.clustering.iter().map(pb::Clustering::from).collect(),
+        max_clustering_id: m.max_clustering_id,
+        writer_version: m
+            .writer_version
+            .as_ref()
+            .map(|wv| pb::manifest::WriterVersion {
+                library: wv.library.clone(),
+                version: wv.version.clone(),
+                prerelease: wv.prerelease.clone(),
+                build_metadata: wv.build_metadata.clone(),
+            }),
+        fragments: vec![],
+        fragment_tree: None,
+        table_metadata: m.table_metadata.clone(),
+        version_aux_data: m.version_aux_data as u64,
+        index_section: m.index_section.map(|i| i as u64),
+        timestamp: timestamp_nanos,
+        tag: m.tag.clone().unwrap_or_default(),
+        reader_feature_flags: m.reader_feature_flags,
+        writer_feature_flags: m.writer_feature_flags,
+        max_fragment_id: m.max_fragment_id,
+        max_allocated_field_id: m.max_allocated_field_id,
+        transaction_file: m.transaction_file.clone().unwrap_or_default(),
+        next_row_id: m.next_row_id,
+        data_format: Some(pb::manifest::DataStorageFormat {
+            file_format: m.data_storage_format.file_format.clone(),
+            version: m
+                .data_storage_format
+                .version
+                .to_manifest_string()
+                .to_string(),
+        }),
+        config: m.config.clone(),
+        base_paths: m
+            .base_paths
+            .values()
+            .map(|base_path| pb::BasePath {
+                id: base_path.id,
+                name: base_path.name.clone(),
+                is_dataset_root: base_path.is_dataset_root,
+                path: base_path.path.clone(),
+            })
+            .collect(),
+        transaction_section: m.transaction_section.map(|i| i as u64),
+        transaction_section_deprecated: None,
     }
 }
 
@@ -1298,7 +1534,10 @@ impl SelfDescribingFileReader for V1FileReader {
 
 #[cfg(test)]
 mod tests {
-    use crate::feature_flags::{FLAG_NON_REUSABLE_FIELD_IDS, FLAG_USE_V2_FORMAT_DEPRECATED};
+    use crate::feature_flags::{
+        CoveringContract, FLAG_COVERED_INDEX_METADATA, FLAG_NON_REUSABLE_FIELD_IDS,
+        FLAG_USE_V2_FORMAT_DEPRECATED,
+    };
     use crate::format::overlay::{DataOverlayFile, OverlayCoverage, TOMBSTONE_FIELD_ID};
     use crate::format::{DataFile, DeletionFile, DeletionFileType, IndexMetadata};
     use std::num::NonZero;
@@ -2070,6 +2309,42 @@ mod tests {
         assert_ne!(cloned.writer_feature_flags & FLAG_NON_REUSABLE_FIELD_IDS, 0);
     }
 
+    /// The clone copies the index section as read, so it must keep the
+    /// contract that section was read with.
+    #[rstest::rstest]
+    #[case::suffix(FLAG_COVERED_INDEX_METADATA)]
+    #[case::independent(COVERING_FLAGS)]
+    fn shallow_clone_keeps_the_covering_contract(#[case] flags: u64) {
+        let arrow_schema = ArrowSchema::new(vec![ArrowField::new(
+            "a",
+            arrow_schema::DataType::Int64,
+            false,
+        )]);
+        let mut manifest = Manifest::new(
+            Schema::try_from(&arrow_schema).unwrap(),
+            Arc::new(vec![]),
+            DataStorageFormat::default(),
+            HashMap::new(),
+        );
+        manifest.reader_feature_flags = flags;
+        manifest.writer_feature_flags = flags;
+
+        let cloned = manifest.shallow_clone(
+            Some("parent".to_string()),
+            "memory://parent".to_string(),
+            7,
+            None,
+            String::new(),
+        );
+
+        assert_eq!(cloned.reader_feature_flags & COVERING_FLAGS, flags);
+        assert_eq!(cloned.writer_feature_flags & COVERING_FLAGS, flags);
+        assert_eq!(
+            CoveringContract::of(&cloned),
+            CoveringContract::of(&manifest)
+        );
+    }
+
     #[test]
     fn test_config() {
         let arrow_schema = ArrowSchema::new(vec![ArrowField::new(
@@ -2218,6 +2493,7 @@ mod tests {
             file_type: DeletionFileType::Array,
             num_deleted_rows: Some(10),
             base_id: None,
+            path: None,
             inline: None,
         });
 
@@ -2257,5 +2533,33 @@ mod tests {
         //Just verify the transformation is OK
         let stats_map: BTreeMap<String, String> = deletion_summary.into();
         assert_eq!(stats_map.len(), 7)
+    }
+
+    #[test]
+    fn test_manifest_build_config_stable_row_id_invariants() {
+        let default = ManifestBuildConfig::default();
+        assert!(default.auto_set_feature_flags());
+        assert_eq!(default.timestamp_nanos(), None);
+        assert!(!default.use_stable_row_ids());
+        assert_eq!(default.migration_next_row_id(), None);
+        assert!(default.storage_format().is_none());
+        assert!(!default.disable_transaction_file());
+        assert!(!default.activate_non_reusable_field_ids());
+        assert!(default.clustering_definitions().is_none());
+
+        // Migration activation always implies stable row IDs.
+        let migrating = ManifestBuildConfig::new().with_migration_next_row_id(42);
+        assert!(migrating.use_stable_row_ids());
+        assert_eq!(migrating.migration_next_row_id(), Some(42));
+
+        // Redundantly enabling stable row IDs keeps the migration seed intact.
+        let still_migrating = migrating.with_use_stable_row_ids(true);
+        assert!(still_migrating.use_stable_row_ids());
+        assert_eq!(still_migrating.migration_next_row_id(), Some(42));
+
+        // Explicitly disabling clears migration activation too so the pair stays coherent.
+        let disabled = still_migrating.with_use_stable_row_ids(false);
+        assert!(!disabled.use_stable_row_ids());
+        assert_eq!(disabled.migration_next_row_id(), None);
     }
 }

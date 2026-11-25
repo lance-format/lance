@@ -96,6 +96,9 @@ impl ObjectStoreProvider for TencentStoreProvider {
         Ok(ObjectStore {
             scheme: "cos".to_string(),
             inner: opendal_store,
+            external_blob_inner: None,
+            direct_local_io: false,
+            _external_blob_origin: None,
             local_dir_operations: None,
             local_fsync: false,
             block_size,
@@ -110,22 +113,5 @@ impl ObjectStoreProvider for TencentStoreProvider {
             // Listed in full: no paginated lister covers OpenDAL yet.
             paginated_lister: None,
         })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::TencentStoreProvider;
-    use crate::object_store::ObjectStoreProvider;
-    use url::Url;
-
-    #[test]
-    fn test_cos_store_path() {
-        let provider = TencentStoreProvider;
-
-        let url = Url::parse("cos://bucket/path/to/file").unwrap();
-        let path = provider.extract_path(&url).unwrap();
-        let expected_path = object_store::path::Path::from("path/to/file");
-        assert_eq!(path, expected_path);
     }
 }

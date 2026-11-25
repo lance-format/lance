@@ -19,6 +19,7 @@ import org.lance.index.IndexType;
 import org.lance.index.scalar.ScalarIndexParams;
 import org.lance.ipc.AsyncScanner;
 import org.lance.ipc.FragmentSlice;
+import org.lance.ipc.FullTextQuery;
 import org.lance.ipc.MaterializationStyle;
 import org.lance.ipc.ScanOptions;
 
@@ -48,6 +49,7 @@ import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
@@ -239,6 +241,19 @@ public class AsyncScannerTest {
             ArrowReader reader = scanner.scanBatchesAsync().get(10, TimeUnit.SECONDS);
             assertEquals(5, countRows(reader));
             reader.close();
+          }
+
+          // Without an index query, fast search falls back to both fragments. A dropped
+          // ignore list in the async JNI path would incorrectly return only five rows.
+          ScanOptions ignoredOptions =
+              new ScanOptions.Builder()
+                  .filter("id < 5")
+                  .fastSearch(true)
+                  .ignoredScalarIndices(Collections.singletonList("id_btree_index"))
+                  .build();
+          try (AsyncScanner scanner = AsyncScanner.create(appended, ignoredOptions, allocator);
+              ArrowReader reader = scanner.scanBatchesAsync().get(10, TimeUnit.SECONDS)) {
+            assertEquals(10, countRows(reader));
           }
         }
       }
@@ -762,5 +777,44 @@ public class AsyncScannerTest {
             + stdout
             + "\n--- stderr ---\n"
             + stderr);
+  }
+
+  @Test
+  void testRepeatedNativeErrorsThenSuccess(@TempDir Path tempDir) throws Exception {
+    try (BufferAllocator allocator = new RootAllocator()) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(
+              allocator, tempDir.resolve("dispatcher_errors").toString());
+      testDataset.createEmptyDataset().close();
+      try (Dataset dataset = testDataset.write(1, 4)) {
+        ScanOptions invalid =
+            new ScanOptions.Builder()
+                .fullTextQuery(FullTextQuery.match("word", "missing_column"))
+                .build();
+        try (AsyncScanner scanner = AsyncScanner.create(dataset, invalid, allocator)) {
+          for (int i = 0; i < 64; i++) {
+            ExecutionException failure =
+                assertThrows(
+                    ExecutionException.class,
+                    () -> scanner.scanBatchesAsync().get(10, TimeUnit.SECONDS));
+            Throwable error = failure.getCause();
+            assertTrue(error instanceof LanceException);
+            while (error.getCause() != null) {
+              error = error.getCause();
+            }
+            assertTrue(error.getMessage().contains("missing_column"));
+          }
+        }
+        try (AsyncScanner scanner =
+                AsyncScanner.create(dataset, new ScanOptions.Builder().build(), allocator);
+            ArrowReader reader = scanner.scanBatchesAsync().get(10, TimeUnit.SECONDS)) {
+          int rows = 0;
+          while (reader.loadNextBatch()) {
+            rows += reader.getVectorSchemaRoot().getRowCount();
+          }
+          assertEquals(4, rows);
+        }
+      }
+    }
   }
 }

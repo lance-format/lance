@@ -4,8 +4,8 @@
 //! Reclaim session-cache entries whose dataset versions cleanup removes.
 
 use super::{CleanupInspection, CleanupTask};
-use crate::session::caches::{ManifestKey, RowAddrMaskKey, RowIdIndexKey, TransactionKey};
-use crate::session::index_caches::IndexMetadataKey;
+use crate::session::caches::{ManifestKey, RowAddrMaskKey, TransactionKey};
+use crate::session::index_caches::{IndexMetadataKey, RowIdIndexKey};
 
 /// A manifest that has aged out and is queued for deletion.
 #[derive(Clone, Debug)]
@@ -37,8 +37,9 @@ impl<'a> CleanupTask<'a> {
     /// write and read paths build them and invalidated one by one. This covers
     /// the key families whose identity can be rebuilt from the version and
     /// manifest-listing e-tag: [`ManifestKey`],
-    /// [`TransactionKey`], whole-dataset [`RowAddrMaskKey`], both
-    /// [`RowIdIndexKey`] variants, and [`IndexMetadataKey`].
+    /// [`TransactionKey`], and whole-dataset [`RowAddrMaskKey`] in the
+    /// dataset's metadata cache, and both [`RowIdIndexKey`] variants and
+    /// [`IndexMetadataKey`] in the dataset's index cache.
     ///
     /// Other version-scoped entries remain subject to capacity-based eviction,
     /// including manifest and index-metadata entries written without an e-tag
@@ -56,15 +57,11 @@ impl<'a> CleanupTask<'a> {
             return;
         }
 
-        let store_identity = self.dataset.object_store.store_prefix.clone();
-        let index_cache = self
-            .dataset
-            .session
-            .index_cache
-            .for_dataset(&self.dataset.uri);
+        let store_identity = self.dataset.table_state.object_store.store_prefix.clone();
         for (version, e_tag) in stale_versions {
             let e_tag = e_tag.as_deref();
             self.dataset
+                .table_state
                 .metadata_cache
                 .invalidate_key(&ManifestKey {
                     version: *version,
@@ -72,10 +69,12 @@ impl<'a> CleanupTask<'a> {
                 })
                 .await;
             self.dataset
+                .table_state
                 .metadata_cache
                 .invalidate_key(&TransactionKey { version: *version })
                 .await;
             self.dataset
+                .table_state
                 .metadata_cache
                 .invalidate_key(&RowAddrMaskKey {
                     version: *version,
@@ -83,11 +82,11 @@ impl<'a> CleanupTask<'a> {
                     restrict_hash: None,
                 })
                 .await;
-            // The cache keeps one row id index entry per `with_deletions`
-            // variant, and cleanup cannot know which variants this session
-            // populated, so both are invalidated.
+            // The index cache keeps one row id index entry per
+            // `with_deletions` variant, and cleanup cannot know which variants
+            // this session populated, so both are invalidated.
             self.dataset
-                .metadata_cache
+                .index_cache
                 .invalidate_key(&RowIdIndexKey {
                     version: *version,
                     with_deletions: true,
@@ -95,14 +94,15 @@ impl<'a> CleanupTask<'a> {
                 })
                 .await;
             self.dataset
-                .metadata_cache
+                .index_cache
                 .invalidate_key(&RowIdIndexKey {
                     version: *version,
                     with_deletions: false,
                     e_tag,
                 })
                 .await;
-            index_cache
+            self.dataset
+                .index_cache
                 .invalidate_key(&IndexMetadataKey {
                     version: *version,
                     store_identity: &store_identity,

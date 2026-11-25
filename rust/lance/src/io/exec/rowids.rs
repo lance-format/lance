@@ -21,13 +21,11 @@ use datafusion_physical_plan::Statistics;
 use datafusion_physical_plan::execution_plan::CardinalityEffect;
 use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
 use futures::{StreamExt, TryStreamExt};
-use lance_core::utils::address::RowAddress;
-use lance_core::utils::deletion::DeletionVector;
 use lance_core::{
     Error as LanceError, ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_OFFSET, ROW_OFFSET_FIELD,
     Result as LanceResult,
 };
-use lance_table::rowids::RowIdIndex;
+use lance_table::rowids::{FragmentRowOffset, RowIdIndex, compute_row_offset_array};
 
 use crate::Dataset;
 use crate::dataset::rowids::get_row_id_index;
@@ -355,14 +353,6 @@ impl ExecutionPlan for AddRowAddrExec {
     }
 }
 
-#[derive(Debug)]
-struct FragInfo {
-    // The dataset offset of the first row in the fragment
-    row_offset: u64,
-    // The key is the cumulative row offset in the fragment, the value is the number of rows deleted so far
-    deletion_vector: Option<Arc<DeletionVector>>,
-}
-
 /// Add a `_rowoffset` column to a stream of record batches that have a `_rowaddr` column.
 ///
 /// The row offset is the number of rows between the current row and the first row in the dataset.
@@ -370,14 +360,14 @@ struct FragInfo {
 pub struct AddRowOffsetExec {
     input: Arc<dyn ExecutionPlan>,
     row_addr_pos: usize,
-    frag_id_to_offset: Arc<HashMap<u32, FragInfo>>,
+    frag_id_to_offset: Arc<HashMap<u32, FragmentRowOffset>>,
     properties: Arc<PlanProperties>,
 }
 
 impl AddRowOffsetExec {
     fn internal_new(
         input: Arc<dyn ExecutionPlan>,
-        frag_id_to_offset: Arc<HashMap<u32, FragInfo>>,
+        frag_id_to_offset: Arc<HashMap<u32, FragmentRowOffset>>,
     ) -> LanceResult<Self> {
         let input_schema = input.schema();
         let row_addr_pos = input_schema.index_of(ROW_ADDR).map_err(|_| {
@@ -420,94 +410,27 @@ impl AddRowOffsetExec {
         input: Arc<dyn ExecutionPlan>,
         dataset: Arc<Dataset>,
     ) -> LanceResult<Self> {
-        let frag_id_to_offset = Self::compute_frag_id_to_offset(dataset).await?;
-        Self::internal_new(input, frag_id_to_offset)
-    }
-
-    async fn compute_frag_id_to_offset(
-        dataset: Arc<Dataset>,
-    ) -> LanceResult<Arc<HashMap<u32, FragInfo>>> {
-        let mut frag_id_to_offset = HashMap::new();
-        let mut row_offset = 0;
-        for frag in dataset.get_fragments() {
-            let deletion_vector = frag.get_deletion_vector().await?;
-            frag_id_to_offset.insert(
-                frag.id() as u32,
-                FragInfo {
-                    row_offset,
-                    deletion_vector,
-                },
-            );
-            // Should be sync unless the dataset was written by an extremely old lance version
-            row_offset += frag.count_rows(None).await? as u64;
-        }
-
-        Ok(Arc::new(frag_id_to_offset))
+        let offsets = dataset
+            .table_view()
+            .to_table()
+            .fragment_row_offsets()
+            .await?;
+        Self::internal_new(input, Arc::new(offsets))
     }
 
     pub async fn compute_row_offset_array(
         row_addr: &ArrayRef,
         dataset: Arc<Dataset>,
     ) -> Result<ArrayRef> {
-        let frag_id_to_offset = Self::compute_frag_id_to_offset(dataset).await?;
-        Self::compute_row_offsets(row_addr, frag_id_to_offset.as_ref())
-    }
-
-    fn compute_row_offsets(
-        row_addr: &ArrayRef,
-        frag_id_to_offset: &HashMap<u32, FragInfo>,
-    ) -> Result<ArrayRef> {
-        let row_addr_values = row_addr.as_primitive::<UInt64Type>().values();
-        let mut row_offsets = vec![0; row_addr_values.len()];
-        // The deletion iterator only moves forward, so compute in address order and
-        // scatter the offsets back into input order.
-        let mut sorted_row_indices = (0..row_addr_values.len()).collect::<Vec<_>>();
-        sorted_row_indices.sort_unstable_by_key(|index| row_addr_values[*index]);
-
-        let mut last_frag_id = u32::MAX;
-        let mut last_frag_offset = 0;
-        let mut last_frag_delete_count = 0;
-        let mut dv_iter = None;
-
-        for row_index in sorted_row_indices {
-            let addr = RowAddress::new_from_u64(row_addr_values[row_index]);
-            let frag_id = addr.fragment_id();
-            if frag_id != last_frag_id {
-                last_frag_id = frag_id;
-                let Some(frag_info) = frag_id_to_offset.get(&frag_id) else {
-                    return Err(DataFusionError::External(Box::new(LanceError::internal(
-                        format!(
-                            "A row address referred to a fragment {} that wasn't in the frag_id_to_offset map",
-                            frag_id
-                        ),
-                    ))));
-                };
-                last_frag_offset = frag_info.row_offset;
-                last_frag_delete_count = 0;
-                dv_iter = frag_info
-                    .deletion_vector
-                    .as_ref()
-                    .map(|dv| dv.to_sorted_iter().peekable());
-            }
-
-            let row_offset = addr.row_offset();
-            if let Some(dv_iter) = &mut dv_iter {
-                while dv_iter.peek().is_some() {
-                    if *dv_iter.peek().unwrap() < row_offset {
-                        dv_iter.next();
-                        last_frag_delete_count += 1;
-                    } else {
-                        break;
-                    }
-                }
-                row_offsets[row_index] =
-                    last_frag_offset + row_offset as u64 - last_frag_delete_count as u64;
-            } else {
-                row_offsets[row_index] = last_frag_offset + row_offset as u64;
-            }
-        }
-
-        Ok(Arc::new(UInt64Array::from(row_offsets)))
+        let frag_id_to_offset = dataset
+            .table_view()
+            .to_table()
+            .fragment_row_offsets()
+            .await?;
+        Ok(Arc::new(compute_row_offset_array(
+            row_addr.as_primitive::<UInt64Type>(),
+            &frag_id_to_offset,
+        )?))
     }
 }
 
@@ -606,8 +529,8 @@ impl ExecutionPlan for AddRowOffsetExec {
             let frag_id_to_offset = frag_id_to_offset.clone();
             async move {
                 let batch = batch?;
-                let row_addr = batch.column(row_addr_pos);
-                let row_offsets = Self::compute_row_offsets(row_addr, frag_id_to_offset.as_ref())?;
+                let row_addr = batch.column(row_addr_pos).as_primitive::<UInt64Type>();
+                let row_offsets = compute_row_offset_array(row_addr, frag_id_to_offset.as_ref())?;
                 let mut columns = batch.columns().to_vec();
                 columns.push(Arc::new(row_offsets));
                 Ok(RecordBatch::try_new(schema.clone(), columns)?)
@@ -622,6 +545,8 @@ impl ExecutionPlan for AddRowOffsetExec {
 
 #[cfg(test)]
 mod test {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use arrow_array::{Int32Array, RecordBatchIterator, record_batch};
     use arrow_schema::{DataType, Field};
     use datafusion::physical_plan::StatisticsArgs;
@@ -630,6 +555,8 @@ mod test {
     use futures::TryStreamExt;
     use lance_core::{ROW_ADDR, ROW_ID_FIELD};
     use lance_datafusion::exec::OneShotExec;
+    use lance_io::object_store::WrappingObjectStore;
+    use lance_table::io::deletion::DELETIONS_DIR;
     use rstest::rstest;
 
     use crate::dataset::WriteParams;
@@ -832,26 +759,189 @@ mod test {
         );
     }
 
-    #[test]
-    fn test_row_offsets_with_unsorted_addresses() {
-        let row_addrs: ArrayRef = Arc::new(UInt64Array::from(vec![
-            u64::from(RowAddress::new_from_parts(0, 100)),
-            u64::from(RowAddress::new_from_parts(0, 50)),
-        ]));
-        let frag_id_to_offset = HashMap::from([(
-            0,
-            FragInfo {
-                row_offset: 1_000,
-                deletion_vector: Some(Arc::new(DeletionVector::from_iter([10, 60]))),
-            },
-        )]);
+    /// Forwards every request, but for deletion-file reads records how many
+    /// were in flight at once. Instantaneous reads never overlap, so a short
+    /// delay on just those reads is what makes concurrency observable.
+    #[derive(Debug)]
+    struct DeletionReadCounter {
+        target: Arc<dyn object_store::ObjectStore>,
+        in_flight: Arc<AtomicUsize>,
+        max_in_flight: Arc<AtomicUsize>,
+    }
 
-        let row_offsets =
-            AddRowOffsetExec::compute_row_offsets(&row_addrs, &frag_id_to_offset).unwrap();
+    impl DeletionReadCounter {
+        fn is_deletion_path(location: &object_store::path::Path) -> bool {
+            location.as_ref().contains(DELETIONS_DIR)
+        }
 
-        assert_eq!(
-            row_offsets.as_primitive::<UInt64Type>().values(),
-            &[1_098, 1_049]
+        async fn enter(&self) {
+            let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_in_flight.fetch_max(now, Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    impl std::fmt::Display for DeletionReadCounter {
+        fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            write!(f, "DeletionReadCounter({})", self.target)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl object_store::ObjectStore for DeletionReadCounter {
+        async fn put_opts(
+            &self,
+            location: &object_store::path::Path,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            self.target.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &object_store::path::Path,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.target.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &object_store::path::Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            if Self::is_deletion_path(location) {
+                self.enter().await;
+            }
+            self.target.get_opts(location, options).await
+        }
+
+        async fn get_ranges(
+            &self,
+            location: &object_store::path::Path,
+            ranges: &[std::ops::Range<u64>],
+        ) -> object_store::Result<Vec<bytes::Bytes>> {
+            if Self::is_deletion_path(location) {
+                self.enter().await;
+            }
+            self.target.get_ranges(location, ranges).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<
+                'static,
+                object_store::Result<object_store::path::Path>,
+            >,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
+        {
+            self.target.delete_stream(locations)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.target.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.target.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+            opts: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.target.copy_opts(from, to, opts).await
+        }
+    }
+
+    /// Installs a [`DeletionReadCounter`] around a dataset's object store.
+    #[derive(Debug)]
+    struct DeletionReadCounterWrapper {
+        max_in_flight: Arc<AtomicUsize>,
+    }
+
+    impl WrappingObjectStore for DeletionReadCounterWrapper {
+        fn wrap(
+            &self,
+            _store_prefix: &str,
+            original: Arc<dyn object_store::ObjectStore>,
+        ) -> Arc<dyn object_store::ObjectStore> {
+            Arc::new(DeletionReadCounter {
+                target: original,
+                in_flight: Arc::new(AtomicUsize::new(0)),
+                max_in_flight: self.max_in_flight.clone(),
+            })
+        }
+
+        // The counter only observes reads, so listings keep their pushdown.
+        fn wrap_paginated(
+            &self,
+            _store_prefix: &str,
+            original: Arc<dyn object_store::list::PaginatedListStore>,
+        ) -> Option<Arc<dyn object_store::list::PaginatedListStore>> {
+            Some(original)
+        }
+    }
+
+    /// Planning a `_rowoffset` scan fetches one deletion file per fragment that
+    /// has one. Those reads must overlap instead of going out one fragment at a
+    /// time, or planning pays one read latency per fragment with a deletion
+    /// file.
+    #[tokio::test]
+    async fn test_row_offset_planning_overlaps_deletion_reads() {
+        const NUM_FRAGMENTS: usize = 32;
+        let schema = Arc::new(Schema::new(vec![Field::new("i", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter(
+                (0..NUM_FRAGMENTS * 2).map(|i| i as i32),
+            ))],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+        let mut dataset = Dataset::write(
+            reader,
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), NUM_FRAGMENTS);
+        // One deletion per fragment, so every fragment has a deletion file to fetch.
+        dataset.delete("i % 2 = 0").await.unwrap();
+
+        let max_in_flight = Arc::new(AtomicUsize::new(0));
+        let dataset = dataset
+            .with_object_store_wrappers([Arc::new(DeletionReadCounterWrapper {
+                max_in_flight: max_in_flight.clone(),
+            }) as Arc<dyn WrappingObjectStore>]);
+
+        let mut scan = dataset.scan();
+        scan.project(&[ROW_OFFSET]).unwrap();
+        let batch = scan.try_into_batch().await.unwrap();
+
+        // One survivor per fragment, so the live row offsets are 0..NUM_FRAGMENTS.
+        let offsets = batch[ROW_OFFSET].as_primitive::<UInt64Type>().values();
+        assert_eq!(offsets, &(0..NUM_FRAGMENTS as u64).collect::<Vec<_>>()[..]);
+
+        assert!(
+            max_in_flight.load(Ordering::SeqCst) >= 2,
+            "deletion-file reads during _rowoffset planning should overlap, but max in-flight was {}",
+            max_in_flight.load(Ordering::SeqCst)
         );
     }
 }

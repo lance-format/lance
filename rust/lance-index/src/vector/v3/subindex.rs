@@ -57,6 +57,48 @@ pub trait IvfSubIndex: Send + Sync + Debug + DeepSizeOf {
         None
     }
 
+    /// The number of storage rows a partition's sub-index addresses by
+    /// position, decoded from the partition's serialized sub-index
+    /// `metadata`, or `None` if the sub-index does not address storage rows
+    /// by position.
+    ///
+    /// A row-ID remapping drops deleted rows from the partition storage as it
+    /// loads, shifting every later position, so a positional sub-index must be
+    /// realigned with [`Self::remap_positions`] whenever the loaded storage
+    /// dropped rows. The count may be smaller than the stored rows: the
+    /// sub-index then covers only a prefix of them.
+    fn positional_rows(_metadata: &str) -> Result<Option<usize>> {
+        Ok(None)
+    }
+
+    /// Realign a serialized sub-index with storage that dropped rows as it
+    /// loaded.
+    ///
+    /// `data` is read with every column of [`Self::schema`].
+    /// `new_ids[position]` is the position the stored row at `position` takes
+    /// in the loaded `storage`, or `None` if the storage dropped it; surviving
+    /// rows keep their relative order. Sub-indices without positional
+    /// addressing return `data` unchanged.
+    fn remap_positions(
+        data: RecordBatch,
+        _new_ids: &[Option<u32>],
+        _storage: &impl VectorStore,
+    ) -> Result<RecordBatch> {
+        Ok(data)
+    }
+
+    /// Build the sub-index query params for one IVF partition.
+    ///
+    /// `query_key` is the partition-processed key and `dist_q_c` is the
+    /// distance from the query to that partition's centroid. Callers share one
+    /// [`Query`] across probes and pass both per-partition values here. The
+    /// default goes through `From<&Query>` and therefore still clones the query
+    /// once per probe; implementations that can build their params directly
+    /// should override it to avoid that clone.
+    fn query_params(query: &Query, query_key: &ArrayRef, dist_q_c: f32) -> Self::QueryParams {
+        query_params_from_processed(query, query_key, dist_q_c)
+    }
+
     /// Search the sub index for nearest neighbors.
     /// # Arguments:
     /// * `query` - The query vector
@@ -161,6 +203,16 @@ pub trait IvfSubIndex: Send + Sync + Debug + DeepSizeOf {
     fn to_batch(&self) -> Result<RecordBatch>;
 }
 
+fn query_params_from_processed<P>(query: &Query, query_key: &ArrayRef, dist_q_c: f32) -> P
+where
+    P: for<'a> From<&'a Query>,
+{
+    let mut query = query.clone();
+    query.key = query_key.clone();
+    query.dist_q_c = dist_q_c;
+    P::from(&query)
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum SubIndexType {
     Flat,
@@ -185,5 +237,66 @@ impl TryFrom<&str> for SubIndexType {
             "HNSW" => Ok(Self::Hnsw),
             _ => Err(Error::index(format!("unknown sub index type {}", value))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow_array::Float32Array;
+    use lance_linalg::distance::DistanceType;
+
+    use super::*;
+    use crate::vector::ApproxMode;
+
+    #[derive(Debug)]
+    struct CapturedParams {
+        key: ArrayRef,
+        dist_q_c: f32,
+        k: usize,
+    }
+
+    impl From<&Query> for CapturedParams {
+        fn from(query: &Query) -> Self {
+            Self {
+                key: query.key.clone(),
+                dist_q_c: query.dist_q_c,
+                k: query.k,
+            }
+        }
+    }
+
+    #[test]
+    fn default_query_params_receive_the_processed_key() {
+        let original_key = Arc::new(Float32Array::from(vec![1.0, 2.0])) as ArrayRef;
+        let processed_key = Arc::new(Float32Array::from(vec![3.0, 4.0])) as ArrayRef;
+        let query = Query {
+            column: "vector".to_owned(),
+            key: original_key.clone(),
+            k: 7,
+            lower_bound: None,
+            upper_bound: None,
+            minimum_nprobes: 1,
+            maximum_nprobes: None,
+            search_effort: 0.5,
+            ef: None,
+            refine_factor: None,
+            metric_type: Some(DistanceType::L2),
+            use_index: true,
+            query_parallelism: 0,
+            dist_q_c: 0.0,
+            approx_mode: ApproxMode::Normal,
+            rq_graph_scoring: Default::default(),
+        };
+
+        let params: CapturedParams = query_params_from_processed(&query, &processed_key, 9.5);
+
+        assert!(Arc::ptr_eq(&params.key, &processed_key));
+        assert!(!Arc::ptr_eq(&params.key, &original_key));
+        assert_eq!(params.dist_q_c, 9.5);
+        assert_eq!(params.k, 7);
+        assert!(Arc::ptr_eq(&query.key, &original_key));
+        assert_eq!(query.dist_q_c, 0.0);
     }
 }
