@@ -1709,36 +1709,3 @@ async fn test_a_zero_commit_timeout_publishes_nothing() {
     assert_eq!(reopened.version_id(), dataset.version_id());
     assert_eq!(ids(&reopened).await, [0, 1, 2, 3]);
 }
-
-#[tokio::test]
-async fn test_staged_commit_skips_auto_cleanup() {
-    use mock_instant::thread_local::MockClock;
-
-    MockClock::set_system_time(Duration::from_secs(1));
-    let dir = TempStrDir::default();
-    let dataset = InsertBuilder::new(dir.as_str())
-        .with_params(&WriteParams {
-            auto_cleanup: Some(crate::dataset::AutoCleanupParams {
-                interval: 1,
-                older_than: chrono::TimeDelta::zero(),
-            }),
-            ..Default::default()
-        })
-        .execute(vec![id_batch([0])])
-        .await
-        .unwrap();
-    MockClock::set_system_time(Duration::from_secs(2));
-    let mut dataset = Arc::new(dataset);
-    for id in 1..=2 {
-        let mut tx = dataset.begin_transaction().await.unwrap();
-        tx.append(vec![id_batch([id])]).await.unwrap();
-        dataset = Arc::new(tx.commit().await.unwrap());
-        MockClock::set_system_time(Duration::from_secs(2 + id as u64));
-    }
-    assert_eq!(dataset.version_id(), 3);
-    assert_eq!(ids(&dataset.checkout_version(1).await.unwrap()).await, [0]);
-    assert_eq!(
-        ids(&dataset.checkout_version(2).await.unwrap()).await,
-        [0, 1]
-    );
-}

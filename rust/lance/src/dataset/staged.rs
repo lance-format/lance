@@ -423,11 +423,8 @@ impl StagedTransaction {
 
     /// Set retries, timeout, properties, or a commit handler, then publish.
     pub fn commit_with(self) -> StagedCommitBuilder {
-        // An earlier scanner may still need files that commit-triggered cleanup
-        // would remove.
-        let commit = CommitBuilder::new(self.base.clone())
-            .with_experimental_composite_operations(true)
-            .with_skip_auto_cleanup(true);
+        let commit =
+            CommitBuilder::new(self.base.clone()).with_experimental_composite_operations(true);
         StagedCommitBuilder {
             transaction: self,
             commit,
