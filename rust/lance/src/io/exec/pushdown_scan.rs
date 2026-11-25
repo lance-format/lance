@@ -9,10 +9,12 @@ use arrow_array::types::{Int64Type, UInt64Type};
 use arrow_array::{Array, BooleanArray, Int64Array, PrimitiveArray, RecordBatch, UInt32Array};
 use arrow_schema::{DataType, Schema as ArrowSchema, SchemaRef};
 use arrow_select::filter::filter_record_batch;
+use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::logical_expr::col;
 use datafusion::logical_expr::interval_arithmetic::{Interval, NullableInterval};
 use datafusion::optimizer::simplify_expressions::{ExprSimplifier, SimplifyContext};
+use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::{ColumnarValue, PlanProperties};
@@ -42,7 +44,6 @@ use crate::{
     dataset::{
         ROW_ID,
         fragment::{FileFragment, V1FragmentReader},
-        versions,
     },
     datatypes::Schema,
 };
@@ -166,6 +167,13 @@ impl ExecutionPlan for LancePushdownScanExec {
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![]
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> datafusion::error::Result<TreeNodeRecursion>,
+    ) -> datafusion::error::Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
     }
 
     fn with_new_children(
@@ -303,8 +311,9 @@ impl FragmentScanner {
         if let Some(file_reader_options) = config.file_reader_options.clone() {
             frag_config = frag_config.with_file_reader_options(file_reader_options);
         }
-        let mut reader =
-            versions::open_v1_fragment_reader(&fragment, dataset.schema(), &frag_config).await?;
+        let mut reader = fragment
+            .open_v1_fragment_reader(dataset.schema(), &frag_config)
+            .await?;
         if config.make_deletions_null {
             reader.with_make_deletions_null();
         }
@@ -347,12 +356,14 @@ impl FragmentScanner {
             })
             .map(move |(batch_id, predicate)| {
                 let scanner_ref = scanner.clone();
-                tokio::task::spawn(async move { scanner_ref.read_batch(batch_id, predicate).await })
-                    .map(|res| match res {
-                        Ok(Ok(batch)) => Ok(batch),
-                        Ok(Err(err)) => Err(err),
-                        Err(join_err) => Err(DataFusionError::ExecutionJoin(Box::new(join_err))),
-                    })
+                lance_core::utils::tokio::spawn(async move {
+                    scanner_ref.read_batch(batch_id, predicate).await
+                })
+                .map(|res| match res {
+                    Ok(Ok(batch)) => Ok(batch),
+                    Ok(Err(err)) => Err(err),
+                    Err(join_err) => Err(DataFusionError::ExecutionJoin(Box::new(join_err))),
+                })
             });
 
         let stream = if ordered_output {

@@ -49,6 +49,14 @@ message FilteredReadThreadingModeProto {
 
 // Serializable form of FilteredReadOptions.
 message FilteredReadOptionsProto {
+  enum ListReadMode {
+    LIST_READ_MODE_UNSPECIFIED = 0;
+    // Preserve exact outer list lengths and validity without element payloads.
+    LIST_READ_MODE_LENGTH = 1;
+    // Preserve outer validity and emptiness; nonempty lengths may become one.
+    LIST_READ_MODE_NON_EMPTY = 2;
+  }
+
   optional U64Range scan_range_before_filter = 1;
   optional U64Range scan_range_after_filter = 2;
   bool with_deleted_rows = 3;
@@ -84,6 +92,21 @@ message FilteredReadOptionsProto {
    * refer to the exact dataset snapshot used to plan the scan.
    */
   optional bytes physical_row_addr_allowlist = 15;
+  /* List field IDs whose consumers need only the specified structural property.
+   * Element values are placeholders and must not be consumed or returned.
+   * An empty map requests ordinary reads. Unspecified or unknown modes are invalid.
+   * Older executors may ignore this field and read full values, preserving results
+   * but losing the optimization. These modes apply only to this read, not the dataset.
+   */
+  map<int32, ListReadMode> list_structure = 16;
+  /* If true, fragment_ids is an explicit fragment selection and may be empty
+   * ("read no fragments"). If false or absent (older planners), an empty
+   * fragment_ids list means no fragment selection; a repeated field alone
+   * cannot distinguish the two. A non-empty list is a selection regardless of
+   * this field. Older executors ignore this field and treat an empty list as
+   * no selection.
+   */
+  optional bool has_fragment_ids = 17;
 }
 
 /* Serializable form of FilteredReadPlan (planned/distributed mode).
@@ -123,4 +146,28 @@ message FilteredReadExecProto {
    * implement try_encode/try_decode in the PhysicalExtensionCodec.
    * TODO: implement serialize/deserialize for lance-specific index input ExecutionPlans.
    */
+}
+
+/* Visibility-aware execution envelope. The V1 messages remain unchanged so
+ * existing Rust callers can keep constructing them with exhaustive literals.
+ * Codecs must select this message using a distinct identifier or negotiated
+ * capability, for example its prost::Name type URL. Fields 1-3 are reserved to
+ * avoid overlap with FilteredReadExecProto: decoding with the wrong version
+ * leaves the required read/options absent and the conversion rejects it.
+ * The caller also transports index children and current-value replay branches.
+ */
+message FilteredReadExecV2Proto {
+  reserved 1 to 3;
+  // Required by conversion; absence is an invalid execution envelope.
+  FilteredReadExecProto read = 4;
+  /* If true, omit fragments outside the scalar index result's coverage.
+   * False preserves the normal fallback scan of unindexed fragments.
+   */
+  bool only_indexed_fragments = 5;
+  /* If present, a serialized RowAddrTreeMap of stale index entries to exclude.
+   * Entries use the index result's identifier domain: stable row IDs on stable-ID
+   * datasets, physical addresses otherwise. This is not a physical allowlist.
+   * If absent, no overlay exclusion is applied.
+   */
+  optional bytes overlay_block = 6;
 }

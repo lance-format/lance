@@ -2,16 +2,13 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use datafusion::execution::SendableRecordBatchStream;
-use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::scalar::bitmap::BitmapIndex;
-use lance_index::scalar::index_files_to_table;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::{CreatedIndex, OldIndexDataFilter};
 use lance_table::format::IndexMetadata;
-use std::sync::Arc;
-use uuid::Uuid;
 
-use crate::{Dataset, Error, Result, dataset::index::LanceIndexStoreExt};
+use super::segment_merge::{SegmentMerge, empty_value_row_id_stream, open_sources};
+use crate::{Dataset, Result};
 
 /// Open the given bitmap `segments` and k-way merge their postings, together
 /// with `new_data`, into a single bitmap index written to `new_store`.
@@ -24,29 +21,8 @@ pub(in crate::index) async fn open_and_merge_segments(
     old_data_filters: &[Option<OldIndexDataFilter>],
     staged: Option<&crate::index::frag_reuse::StagedRemappingPlans>,
 ) -> Result<CreatedIndex> {
-    let mut source_indices = Vec::with_capacity(segments.len());
-    for &segment in segments {
-        let scalar_index = super::open_scalar_index_with_plan(
-            dataset,
-            field_path,
-            segment,
-            staged.and_then(|plans| plans.get(&segment.uuid)),
-            crate::index::frag_reuse::OpenPurpose::Maintenance,
-            &NoOpMetricsCollector,
-        )
-        .await?;
-        let bitmap_index = scalar_index
-            .as_any()
-            .downcast_ref::<BitmapIndex>()
-            .ok_or_else(|| {
-                Error::index(format!(
-                    "Bitmap merge: expected bitmap segment {}, got {:?}",
-                    segment.uuid,
-                    scalar_index.index_type()
-                ))
-            })?;
-        source_indices.push(Arc::new(bitmap_index.clone()));
-    }
+    let source_indices =
+        open_sources::<BitmapIndex>(dataset, field_path, segments, staged, "Bitmap").await?;
     BitmapIndex::merge_segments(&source_indices, new_data, new_store, old_data_filters).await
 }
 
@@ -56,47 +32,29 @@ pub(in crate::index) async fn merge_segments(
     segments: Vec<IndexMetadata>,
     staged: Option<&crate::index::frag_reuse::StagedRemappingPlans>,
 ) -> Result<IndexMetadata> {
-    if segments.is_empty() {
-        return Err(Error::index("No segment metadata was provided".to_string()));
-    }
-
-    let field_id = *segments[0].fields.first().ok_or_else(|| {
-        Error::invalid_input(format!(
-            "CreateIndex: segment {} is missing field ids",
-            segments[0].uuid
-        ))
-    })?;
-    let field_path = dataset.schema().field_path(field_id)?;
-
-    let segment_refs: Vec<&IndexMetadata> = segments.iter().collect();
+    let merge = SegmentMerge::new(dataset, "Bitmap", &segments)?;
+    merge.reject_legacy_segments_on_stable(dataset, "Bitmap")?;
     let (fragment_bitmap, old_data_filters) =
-        crate::index::append::build_per_segment_filters(dataset, &segment_refs, staged, false)
-            .await?;
+        merge.per_segment_filters(dataset, staged, true).await?;
 
-    let new_uuid = Uuid::new_v4();
-    let new_store = LanceIndexStore::from_dataset_for_new(dataset, &new_uuid)?;
+    let (new_uuid, new_store) = merge.new_store(dataset)?;
     // Pure segment consolidation: no dataset scan, so `new_data` is an empty stream.
-    let empty_new_data = super::btree::empty_value_row_id_stream(dataset, field_id)?;
+    let new_data = empty_value_row_id_stream(dataset, merge.field_id())?;
     let created_index = open_and_merge_segments(
         dataset,
-        &field_path,
-        &segment_refs,
-        empty_new_data,
+        merge.field_path(),
+        merge.segments(),
+        new_data,
         &new_store,
         &old_data_filters,
         staged,
     )
     .await?;
 
-    Ok(IndexMetadata {
-        uuid: new_uuid,
-        dataset_version: dataset.manifest.version,
-        fragment_bitmap: Some(fragment_bitmap),
-        index_details: Some(Arc::new(created_index.index_details)),
-        index_version: created_index.index_version as i32,
-        created_at: Some(chrono::Utc::now()),
-        base_id: None,
-        files: Some(index_files_to_table(created_index.files)),
-        ..segments[0].clone()
-    })
+    Ok(merge.build_metadata(
+        new_uuid,
+        dataset.manifest.version,
+        fragment_bitmap,
+        created_index,
+    ))
 }

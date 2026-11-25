@@ -1569,6 +1569,11 @@ public class DirectoryNamespaceIntegrationTest {
       List<String> tableId = Arrays.asList("test_ns", tableName);
       byte[] tableData = createTestTableData();
 
+      // createTable requires the parent namespace to exist.
+      CreateNamespaceRequest createNsReq =
+          new CreateNamespaceRequest().id(Arrays.asList("test_ns"));
+      namespaceClient.createNamespace(createNsReq);
+
       CreateTableRequest createReq = new CreateTableRequest().id(tableId);
       CreateTableResponse createResp = namespaceClient.createTable(createReq, tableData);
       assertNotNull(createResp);

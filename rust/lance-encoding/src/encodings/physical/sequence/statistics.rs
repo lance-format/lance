@@ -191,6 +191,25 @@ fn analyze_typed_family<T: Copy + Eq>(
                     values.len()
                 ))
             })?;
+            // Strictly increasing offsets have one run per value. Derive their
+            // statistics directly instead of updating four state machines.
+            // Dictionary items still span the whole normalized chunk family.
+            if normalize
+                && member.len() >= 2
+                && member
+                    .windows(2)
+                    .all(|pair| to_u64(pair[0]) < to_u64(pair[1]))
+            {
+                if member.len() > MAX_BLOCK_DICTIONARY_ITEMS {
+                    dictionary = None;
+                } else if let Some(dictionary) = dictionary.as_mut() {
+                    let first = to_u64(member[0]);
+                    for &value in member {
+                        dictionary.push(to_u64(value) - first);
+                    }
+                }
+                return analyze_increasing_offsets(member, bits_per_value, sample_limit, to_u64);
+            }
             analyze_member(
                 member.iter().copied().map(to_u64),
                 bits_per_value,
@@ -203,6 +222,73 @@ fn analyze_typed_family<T: Copy + Eq>(
     Ok(FamilyStats {
         members,
         dictionary_items: dictionary.and_then(BoundedDistinct::finish),
+    })
+}
+
+fn analyze_increasing_offsets<T: Copy>(
+    values: &[T],
+    bits: u64,
+    sample_limit: usize,
+    to_u64: impl Fn(T) -> u64,
+) -> Result<MemberStats> {
+    let first = to_u64(values[0]);
+    let step = to_u64(values[1]) - first;
+    let mut min_delta = step;
+    let mut max_delta = step;
+    let mut delta_runs = 1;
+    let mut previous_delta = step;
+    let mut delta_step = None;
+    for (index, pair) in values.windows(2).enumerate().skip(1) {
+        let delta = to_u64(pair[1]) - to_u64(pair[0]);
+        min_delta = min_delta.min(delta);
+        max_delta = max_delta.max(delta);
+        delta_runs += u64::from(delta != previous_delta);
+        let difference = delta.checked_sub(previous_delta);
+        if index == 1 {
+            delta_step = difference;
+        } else if delta_step != difference {
+            delta_step = None;
+        }
+        previous_delta = delta;
+    }
+    let sample_values = values.len().min(sample_limit / (bits as usize / 8));
+    let mut sample = Vec::with_capacity(sample_values * (bits as usize / 8));
+    for value in &values[..sample_values] {
+        sample.extend_from_slice(&(to_u64(*value) - first).to_le_bytes()[..bits as usize / 8]);
+    }
+    let stats = SequenceStats {
+        bits_per_value: bits,
+        len: values.len() as u64,
+        first: Some(0),
+        min: 0,
+        max: to_u64(values[values.len() - 1]) - first,
+        arithmetic_step: (min_delta == max_delta).then_some(step),
+        run_count: values.len() as u64,
+        sample: sample.into(),
+    };
+    Ok(MemberStats {
+        run_values: stats.clone(),
+        run_lengths: SequenceStats {
+            bits_per_value: 32,
+            len: stats.len,
+            first: Some(1),
+            min: 1,
+            max: 1,
+            arithmetic_step: Some(0),
+            run_count: 1,
+            sample: Arc::from([]),
+        },
+        deltas: Some(SequenceStats {
+            bits_per_value: bits,
+            len: stats.len - 1,
+            first: Some(step),
+            min: min_delta,
+            max: max_delta,
+            arithmetic_step: delta_step,
+            run_count: delta_runs,
+            sample: Arc::from([]),
+        }),
+        values: stats,
     })
 }
 

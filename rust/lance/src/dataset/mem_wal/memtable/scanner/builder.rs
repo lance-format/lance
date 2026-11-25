@@ -25,12 +25,15 @@ use super::exec::{
     SCORE_COLUMN, ScalarMemIndexExec, VectorIndexExec,
 };
 use crate::dataset::mem_wal::index::{FtsQueryExpr, IndexedFilter, MemTableVisibility};
-use crate::dataset::mem_wal::scanner::{exec::validate_pk_types, parse_filter_expr};
+use crate::dataset::mem_wal::scanner::{
+    SearchQuery, SearchState, exec::validate_pk_types, parse_filter_expr, validate_nearest_query,
+};
 
+use crate::dataset::mem_wal::index::IndexStore;
 use crate::dataset::mem_wal::index::{
     FtsMemQuery, MemQuery, SearchOptions, VectorMemQuery, plan_filter,
 };
-use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
+use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
 
 /// Vector search query parameters.
 #[derive(Debug, Clone)]
@@ -540,8 +543,8 @@ pub struct MemTableScanner {
     filter: Option<Expr>,
     limit: Option<usize>,
     offset: Option<usize>,
-    nearest: Option<VectorQuery>,
-    full_text_query: Option<FtsQuery>,
+    /// Vector KNN and full-text search; mutually exclusive at plan time.
+    search: SearchState<VectorQuery, FtsQuery>,
     use_index: bool,
     batch_size: Option<usize>,
     /// Whether to include _rowid column in output.
@@ -602,8 +605,7 @@ impl MemTableScanner {
             filter: None,
             limit: None,
             offset: None,
-            nearest: None,
-            full_text_query: None,
+            search: SearchState::new(),
             use_index: true,
             batch_size: None,
             with_row_id: false,
@@ -729,15 +731,8 @@ impl MemTableScanner {
     /// * `query` - The query vector.
     /// * `k` - Number of nearest neighbors to return.
     pub fn nearest(&mut self, column: &str, query: &dyn Array, k: usize) -> Result<&mut Self> {
-        if k == 0 {
-            return Err(Error::invalid_input("k must be positive".to_string()));
-        }
-        if query.is_empty() {
-            return Err(Error::invalid_input(
-                "query vector must have non-zero length".to_string(),
-            ));
-        }
-        self.nearest = Some(VectorQuery {
+        validate_nearest_query(query, k)?;
+        self.search.set_vector(VectorQuery {
             column: column.to_string(),
             query_vector: query.slice(0, query.len()),
             k,
@@ -756,7 +751,7 @@ impl MemTableScanner {
     ///
     /// Sets both the minimum and maximum to `n`.
     pub fn nprobes(&mut self, n: usize) -> &mut Self {
-        if let Some(ref mut q) = self.nearest {
+        if let Some(q) = self.search.vector_mut() {
             q.nprobes = n;
             q.maximum_nprobes = Some(n);
         } else {
@@ -770,7 +765,7 @@ impl MemTableScanner {
     /// This is the minimum number of partitions to search. More partitions may be
     /// searched if needed to satisfy k results or recall requirements. Defaults to 1.
     pub fn minimum_nprobes(&mut self, n: usize) -> &mut Self {
-        if let Some(ref mut q) = self.nearest {
+        if let Some(q) = self.search.vector_mut() {
             q.nprobes = n;
         } else {
             log::warn!("minimum_nprobes is not set because nearest has not been called yet");
@@ -782,7 +777,7 @@ impl MemTableScanner {
     ///
     /// If not set, all partitions may be searched if needed to satisfy k results.
     pub fn maximum_nprobes(&mut self, n: usize) -> &mut Self {
-        if let Some(ref mut q) = self.nearest {
+        if let Some(q) = self.search.vector_mut() {
             q.maximum_nprobes = Some(n);
         } else {
             log::warn!("maximum_nprobes is not set because nearest has not been called yet");
@@ -794,7 +789,7 @@ impl MemTableScanner {
     ///
     /// If not set, uses the index's default metric type.
     pub fn distance_metric(&mut self, metric: DistanceType) -> &mut Self {
-        if let Some(ref mut q) = self.nearest {
+        if let Some(q) = self.search.vector_mut() {
             q.distance_type = Some(metric);
         } else {
             log::warn!("distance_metric is not set because nearest has not been called yet");
@@ -807,7 +802,7 @@ impl MemTableScanner {
     /// The number of candidates to reserve while searching. This controls the
     /// accuracy/speed tradeoff for HNSW-based indices.
     pub fn ef(&mut self, ef: usize) -> &mut Self {
-        if let Some(ref mut q) = self.nearest {
+        if let Some(q) = self.search.vector_mut() {
             q.ef = Some(ef);
         } else {
             log::warn!("ef is not set because nearest has not been called yet");
@@ -820,7 +815,7 @@ impl MemTableScanner {
     /// When set, the search will first retrieve `k * refine_factor` candidates
     /// using the approximate index, then re-rank them using the original vectors.
     pub fn refine(&mut self, factor: u32) -> &mut Self {
-        if let Some(ref mut q) = self.nearest {
+        if let Some(q) = self.search.vector_mut() {
             q.refine_factor = Some(factor);
         } else {
             log::warn!("refine is not set because nearest has not been called yet");
@@ -833,7 +828,7 @@ impl MemTableScanner {
     /// * `lower` - The lower bound (inclusive) of the distance.
     /// * `upper` - The upper bound (exclusive) of the distance.
     pub fn distance_range(&mut self, lower: Option<f32>, upper: Option<f32>) -> &mut Self {
-        if let Some(ref mut q) = self.nearest {
+        if let Some(q) = self.search.vector_mut() {
             q.distance_lower_bound = lower;
             q.distance_upper_bound = upper;
         } else {
@@ -849,7 +844,8 @@ impl MemTableScanner {
     /// queries are supported; compound queries (boolean/boost/multi-match) are
     /// not yet supported by the MemTable path and return an error.
     pub fn full_text_search(&mut self, query: FullTextSearchQuery) -> Result<&mut Self> {
-        self.full_text_query = Some(local_fts_query(query, Some(self.indexes.as_ref()))?);
+        self.search
+            .set_full_text(local_fts_query(query, Some(self.indexes.as_ref()))?);
         Ok(self)
     }
 
@@ -862,7 +858,8 @@ impl MemTableScanner {
     /// * `slop` - Maximum allowed distance between consecutive tokens.
     ///   0 means exact phrase match (tokens must be adjacent).
     pub fn full_text_phrase(&mut self, column: &str, phrase: &str, slop: u32) -> &mut Self {
-        self.full_text_query = Some(FtsQuery::phrase(column, phrase, slop));
+        self.search
+            .set_full_text(FtsQuery::phrase(column, phrase, slop));
         self
     }
 
@@ -881,7 +878,8 @@ impl MemTableScanner {
         should: Vec<String>,
         must_not: Vec<String>,
     ) -> &mut Self {
-        self.full_text_query = Some(FtsQuery::boolean(column, must, should, must_not));
+        self.search
+            .set_full_text(FtsQuery::boolean(column, must, should, must_not));
         self
     }
 
@@ -897,7 +895,7 @@ impl MemTableScanner {
     /// * `column` - The column to search.
     /// * `query` - The search query (may contain typos).
     pub fn full_text_fuzzy(&mut self, column: &str, query: &str) -> &mut Self {
-        self.full_text_query = Some(FtsQuery::fuzzy(column, query));
+        self.search.set_full_text(FtsQuery::fuzzy(column, query));
         self
     }
 
@@ -914,7 +912,8 @@ impl MemTableScanner {
         query: &str,
         fuzziness: u32,
     ) -> &mut Self {
-        self.full_text_query = Some(FtsQuery::fuzzy_with_distance(column, query, fuzziness));
+        self.search
+            .set_full_text(FtsQuery::fuzzy_with_distance(column, query, fuzziness));
         self
     }
 
@@ -933,7 +932,7 @@ impl MemTableScanner {
         fuzziness: Option<u32>,
         max_expansions: usize,
     ) -> &mut Self {
-        self.full_text_query = Some(FtsQuery::fuzzy_with_options(
+        self.search.set_full_text(FtsQuery::fuzzy_with_options(
             column,
             query,
             fuzziness,
@@ -955,7 +954,7 @@ impl MemTableScanner {
     ///
     /// * `wand_factor` - Value between 0.0 and 1.0
     pub fn fts_wand_factor(&mut self, wand_factor: f32) -> &mut Self {
-        if let Some(ref mut q) = self.full_text_query {
+        if let Some(q) = self.search.full_text_mut() {
             q.wand_factor = wand_factor.clamp(0.0, 1.0);
         } else {
             log::warn!(
@@ -970,7 +969,7 @@ impl MemTableScanner {
     /// does not reflect rows written since the last freeze). Only applies when a
     /// full-text query is set.
     pub fn fts_include_tail(&mut self, include_tail: bool) -> &mut Self {
-        if let Some(ref mut q) = self.full_text_query {
+        if let Some(q) = self.search.full_text_mut() {
             q.include_tail = include_tail;
         } else {
             log::warn!(
@@ -1086,19 +1085,13 @@ impl MemTableScanner {
 
     /// Create the execution plan based on the query configuration.
     pub async fn create_plan(&self) -> Result<Arc<dyn ExecutionPlan>> {
-        if self.nearest.is_some() && self.full_text_query.is_some() {
-            return Err(Error::invalid_input(
-                "MemTableScanner cannot combine vector and full-text search".to_string(),
-            ));
-        }
-
-        // Determine which type of plan to create
-        if let Some(ref vector_query) = self.nearest {
-            return self.plan_vector_search(vector_query).await;
-        }
-
-        if let Some(ref fts_query) = self.full_text_query {
-            return self.plan_fts_search(fts_query).await;
+        match self
+            .search
+            .resolve("MemTableScanner cannot combine vector and full-text search")?
+        {
+            SearchQuery::Vector(query) => return self.plan_vector_search(query).await,
+            SearchQuery::FullText(query) => return self.plan_fts_search(query).await,
+            SearchQuery::Scan => {}
         }
 
         // Split the filter into index searches and whatever is left.
@@ -1483,11 +1476,25 @@ impl MemTableScanner {
 mod tests {
     use super::*;
 
+    use arrow_array::cast::AsArray;
+    use datafusion::common::{DFSchema, stats::Precision};
+    use datafusion::config::ConfigOptions;
+    use datafusion::functions_aggregate::count::count_all;
+    use datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext;
+    use datafusion::physical_expr::execution_props::ExecutionProps;
+    use datafusion::physical_optimizer::{
+        PhysicalOptimizerRule, aggregate_statistics::AggregateStatistics,
+    };
+    use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy};
+    use datafusion::physical_plan::statistics::{StatisticsArgs, StatisticsContext};
+    use datafusion_physical_expr::aggregate::LoweredAggregateBuilder;
+
     use crate::dataset::mem_wal::memtable::scanner::{fallback_reads, newest_checks};
 
     /// A deduplicated filtered read from the filter indexes returns what
     /// reading every row returns, across overwrites, deletes, rows not yet
-    /// visible, and every key type, single and composite.
+    /// visible, every key type, single and composite, and filters over one
+    /// index, two, or an index beside a predicate it cannot answer.
     #[tokio::test]
     async fn memtable_filter_indexes_answer_like_reading_every_row() {
         use crate::dataset::mem_wal::TOMBSTONE;
@@ -1499,7 +1506,7 @@ mod tests {
             "red", "blue", "green", "amber", "black", "white", "grey", "pink", "cyan", "teal",
             "navy", "lime", "plum", "rose", "sand", "gold",
         ];
-        const FILTERS: [&str; 9] = [
+        const FILTERS: [&str; 17] = [
             "colour = 'red'",
             "colour IN ('red', 'blue')",
             "colour IS NULL",
@@ -1510,6 +1517,16 @@ mod tests {
             "colour BETWEEN 'red' AND 'blue'",
             "colour > 'red' AND colour < 'blue'",
             "colour > 'red' AND colour <= 'red'",
+            "n = 3",
+            "n IN (1, 2)",
+            "n < 3",
+            "n BETWEEN 30 AND 10",
+            "n > 20 AND n <= 20",
+            // Both indexes in one filter, and an index beside a predicate it
+            // cannot answer.
+            "n > 30 AND colour = 'red'",
+            "n = 3 OR colour = 'blue'",
+            "n = 3 AND colour LIKE 'r%'",
         ];
         // Every key type a memtable key index accepts.
         const KEY_TYPES: [DataType; 13] = [
@@ -1536,7 +1553,8 @@ mod tests {
             (seed >> 33) % bound
         };
         let (mut checked_reads, mut full_reads) = (0, 0);
-        for round in 0..150 {
+        // Twice through every pairing of key type with single or composite key.
+        for round in 0..2 * 3 * KEY_TYPES.len() {
             let composite = round % 3 == 1;
             let key_type = KEY_TYPES[round % KEY_TYPES.len()].clone();
             let string_key = matches!(
@@ -1547,11 +1565,15 @@ mod tests {
                 Field::new("a", key_type.clone(), false),
                 Field::new("b", DataType::Int32, false),
                 Field::new("colour", DataType::Utf8, true),
+                Field::new("n", DataType::Int32, true),
                 Field::new(TOMBSTONE, DataType::Boolean, false),
             ]));
             let lance_schema = LanceSchema::try_from(schema.as_ref()).unwrap();
             let mut indexes = IndexStore::from_specs(
-                &[MemIndexSpec::btree("colour_idx", 2, "colour")],
+                &[
+                    MemIndexSpec::btree("colour_idx", 2, "colour"),
+                    MemIndexSpec::btree("n_idx", 3, "n"),
+                ],
                 &lance_schema,
                 1024,
                 64,
@@ -1569,7 +1591,8 @@ mod tests {
             let batches = 1 + next(40) as usize;
             for position in 0..batches {
                 let rows = 1 + next(16) as usize;
-                let (mut a, mut b, mut colour, mut tombstone) = (vec![], vec![], vec![], vec![]);
+                let (mut a, mut b, mut colour, mut n, mut tombstone) =
+                    (vec![], vec![], vec![], vec![], vec![]);
                 for _ in 0..rows {
                     a.push(next(60) as i32);
                     b.push(if composite { next(3) as i32 } else { 1 });
@@ -1579,6 +1602,7 @@ mod tests {
                         16 => None,
                         c => Some(COLOURS[c as usize]),
                     });
+                    n.push((!deleted && next(12) != 0).then(|| next(40) as i32));
                     tombstone.push(deleted);
                 }
                 let batch = RecordBatch::try_new(
@@ -1597,6 +1621,7 @@ mod tests {
                         .unwrap(),
                         Arc::new(Int32Array::from(b)),
                         Arc::new(StringArray::from(colour)),
+                        Arc::new(Int32Array::from(n)),
                         Arc::new(BooleanArray::from(tombstone)),
                     ],
                 )
@@ -3335,6 +3360,133 @@ mod tests {
         .unwrap()
     }
 
+    #[rstest::rstest]
+    #[case::fewer_than_k(3, 2, None, None, 3, 3)]
+    #[case::empty(0, 0, None, None, 0, 0)]
+    #[case::no_visible_rows(20, 0, None, None, 0, 0)]
+    #[case::visibility(20, 1, None, None, 2, 2)]
+    #[case::prefilter(20, 2, Some("id = 1"), None, 1, 10)]
+    #[case::prefilter_no_matches(20, 2, Some("id > 99"), None, 0, 10)]
+    #[case::distance_bound(20, 2, None, Some(0.5), 1, 10)]
+    #[case::full_top_k(20, 2, None, None, 10, 10)]
+    #[tokio::test]
+    async fn vector_count_uses_actual_output(
+        #[values(false, true)] has_index: bool,
+        #[case] stored_rows: usize,
+        #[case] readable_count: usize,
+        #[case] filter: Option<&str>,
+        #[case] distance_upper_bound: Option<f32>,
+        #[case] expected_rows: usize,
+        #[case] estimated_rows: usize,
+    ) {
+        let batch = vector_batch().slice(0, stored_rows);
+        let schema = batch.schema();
+        let batch_store = Arc::new(BatchStore::with_capacity(2));
+        let mut indexes = IndexStore::new();
+        if has_index {
+            indexes.add_hnsw(
+                "vector_idx".to_string(),
+                1,
+                "vector".to_string(),
+                DistanceType::L2,
+                32,
+                2,
+            );
+        }
+        // Split the visible prefix from later rows to exercise snapshot bounds.
+        let first_rows = stored_rows.min(2);
+        for (offset, rows) in [(0, first_rows), (first_rows, stored_rows - first_rows)] {
+            if rows == 0 {
+                continue;
+            }
+            let batch = batch.slice(offset, rows);
+            let (position, row_offset, _) = batch_store.append(batch.clone()).unwrap();
+            indexes
+                .insert_with_batch_position(&batch, row_offset, Some(position))
+                .unwrap();
+        }
+        let mut scanner = MemTableScanner::new_at_readable_count(
+            batch_store,
+            Arc::new(indexes),
+            schema,
+            readable_count,
+        );
+        scanner
+            .nearest(
+                "vector",
+                &arrow_array::Float32Array::from(vec![0.0, 0.0]),
+                10,
+            )
+            .unwrap();
+        if let Some(filter) = filter {
+            scanner.filter(filter).unwrap();
+        }
+        scanner.distance_range(None, distance_upper_bound);
+        let input = scanner.create_plan().await.unwrap();
+        let plan = datafusion::physical_plan::displayable(input.as_ref())
+            .indent(true)
+            .to_string();
+        let route = if has_index && filter.is_none() {
+            "VectorIndexExec"
+        } else {
+            "MemTableBruteForceVectorExec"
+        };
+        assert!(plan.contains(route), "{plan}");
+        assert_eq!(
+            scanner.try_into_batch().await.unwrap().num_rows(),
+            expected_rows
+        );
+
+        let expr = count_all();
+        let input_schema = input.schema();
+        let df_schema = DFSchema::try_from(input_schema.as_ref().clone()).unwrap();
+        let aggregate = LoweredAggregateBuilder::new(
+            &expr,
+            &df_schema,
+            input_schema.as_ref(),
+            &ExecutionProps::default(),
+            &PhysicalPlanningContext::default(),
+        )
+        .with_name(expr.schema_name().to_string())
+        .with_human_display(expr.human_display().to_string())
+        .build()
+        .unwrap()
+        .aggregate;
+        let count_plan = Arc::new(
+            AggregateExec::try_new(
+                AggregateMode::Single,
+                PhysicalGroupBy::default(),
+                vec![aggregate],
+                vec![None],
+                input.clone(),
+                input_schema,
+            )
+            .unwrap(),
+        );
+        let optimized = AggregateStatistics::new()
+            .optimize(count_plan, &ConfigOptions::default())
+            .unwrap();
+        let result =
+            datafusion::physical_plan::collect(optimized, SessionContext::new().task_ctx())
+                .await
+                .unwrap();
+        assert_eq!(
+            result[0]
+                .column(0)
+                .as_primitive::<arrow_array::types::Int64Type>()
+                .value(0),
+            expected_rows as i64,
+            "optimized COUNT(*) must count the rows emitted by {route}"
+        );
+        assert_eq!(
+            StatisticsContext::new()
+                .compute(input.as_ref(), &StatisticsArgs::new())
+                .unwrap()
+                .num_rows,
+            Precision::Inexact(estimated_rows)
+        );
+    }
+
     /// The three nearest neighbours, through an HNSW that deviates.
     fn nearest(deviation: Deviation) -> MemTableScanner {
         let mut scanner = memtable_over(
@@ -3499,7 +3651,8 @@ mod tests {
     }
 
     /// Twelve rows in three batches of the values a comparison most often gets
-    /// wrong: nulls, NaN, both zeros, the infinities, empty and non-ASCII text.
+    /// wrong: nulls, both NaN signs, both zeros, the infinities, empty and
+    /// non-ASCII text.
     /// Each `indexed` column has a B-tree, one on a `declining` column declines
     /// every filter, and `rid` names each row with no index.
     fn differential_memtable(
@@ -3540,7 +3693,7 @@ mod tests {
             Some(1.5),
             None,
             Some(3.0),
-            Some(-0.0),
+            Some(-f64::NAN),
         ];
         let strs = [
             Some("apple"),
@@ -3644,6 +3797,42 @@ mod tests {
         rids
     }
 
+    /// Float filters treat both signs of zero and NaN as one value, through the
+    /// B-tree and through a scan alike. The rows are asserted because a scan and an
+    /// index can agree on the same wrong total-order answer.
+    #[rstest::rstest]
+    #[case::zero("f = 0.0", &[0, 1])]
+    #[case::zero_list("f IN (0.0, 1.5)", &[0, 1, 4, 8])]
+    #[case::nan("f = 'NaN'", &[3, 11])]
+    #[case::upper_bound("f < 0.0", &[5, 7])]
+    #[case::lower_bound("f > 1.0", &[3, 4, 6, 8, 10, 11])]
+    #[case::two_sided_bound("f BETWEEN -3.0 AND 2.0", &[0, 1, 4, 5, 8])]
+    #[case::negative_infinity_lower_bound("f >= '-Infinity'", &[0, 1, 3, 4, 5, 6, 7, 8, 10, 11])]
+    #[case::infinity_upper_bound("f <= 'Infinity'", &[0, 1, 4, 5, 6, 7, 8, 10])]
+    #[tokio::test]
+    async fn indexed_float_filters_ignore_sign_encodings(
+        #[case] filter: &str,
+        #[case] expected: &[i32],
+    ) {
+        let memtable = differential_memtable(&["f"], &[]);
+        let (batch_store, indexes, schema) = &memtable;
+        let mut scanner =
+            MemTableScanner::new(batch_store.clone(), indexes.clone(), schema.clone());
+        scanner.filter(filter).unwrap();
+        let plan = scanner.create_plan().await.unwrap();
+        let plan = datafusion::physical_plan::displayable(plan.as_ref())
+            .indent(false)
+            .to_string();
+        assert!(plan.contains("ScalarMemIndexExec"), "{filter}: {plan}");
+        for use_index in [false, true] {
+            assert_eq!(
+                filtered_rids(&memtable, filter, use_index).await,
+                expected,
+                "{filter} with use_index={use_index}"
+            );
+        }
+    }
+
     /// Every filter returns the same rows through the indexes as reading every
     /// row, with indexes on some columns so filters mix both, and with an index
     /// that declines inside `AND` and `OR`.
@@ -3701,6 +3890,8 @@ mod tests {
             "NOT (i = 7)",
             "i = 7 AND rid > 3",
             "i = 7 OR rid = 0",
+            "(i = 7 AND rid > 3) OR s = 'b'",
+            "(i > 0 AND rid < 6) OR (s = 'apple' AND rid >= 6)",
             "rid >= 6 AND f > 0.0",
             "b",
             "NOT b",
@@ -3731,6 +3922,8 @@ mod tests {
                     "s LIKE 'ap%'",
                     "b",
                     "d = DATE '2022-01-08'",
+                    "(i = 7 AND rid > 3) OR s = 'b'",
+                    "(i > 0 AND rid < 6) OR (s = 'apple' AND rid >= 6)",
                 ] {
                     let (batch_store, indexes, schema) = &memtable;
                     let mut scanner =
@@ -3917,7 +4110,7 @@ mod tests {
         for row in rows.iter().filter(|row| row.batch < visible_batches) {
             newest.insert(row.id, row);
         }
-        let l2 = DistanceType::L2.func::<f32>();
+        let l2 = DistanceType::L2.try_func::<f32>().unwrap();
         let mut out: Vec<(i64, f32)> = newest
             .values()
             .filter(|row| keep(row))

@@ -23,7 +23,9 @@
 use std::collections::HashMap;
 use std::fmt::{Debug, Display, Formatter};
 use std::ops::Range;
-use std::sync::{Arc, LazyLock, Weak};
+use std::sync::Arc;
+#[cfg(any(test, feature = "aws", feature = "azure", feature = "gcp"))]
+use std::sync::{LazyLock, Weak};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -39,9 +41,9 @@ use object_store::client::{
 };
 use object_store::path::Path;
 use object_store::{
-    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-    PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions, Result as OSResult,
-    UploadPart,
+    CopyMode, CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
+    ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions,
+    RenameTargetMode, Result as OSResult, UploadPart,
 };
 use rand::Rng;
 use tokio::sync::Mutex;
@@ -49,6 +51,7 @@ use tracing::{debug, warn};
 
 use object_store::list::{PaginatedListOptions, PaginatedListResult, PaginatedListStore};
 
+#[cfg(any(test, feature = "aws", feature = "azure", feature = "gcp"))]
 use crate::object_store::ObjectStoreParams;
 
 /// Match ObjectStore's documented delete concurrency to bound in-flight operations
@@ -58,26 +61,21 @@ const DELETE_CONCURRENCY: usize = 10;
 /// Check whether an `object_store::Error` represents a throttle response
 /// (HTTP 429 / 503) from a cloud object store.
 ///
-/// Regrettably, this information is not fully exposed by the `object_store` crate.
-/// There is no generic mechanism for a custom object store to return a throttle error.
-///
-/// However, the builtin object stores all use RetryError when retries are configured and
-/// throttle errors are returned.  Sadly, RetryError is not a public type, so we have to
-/// infer it from the error message.  This is potentially dangerous because these errors
-/// often include the URI itself and that URI could have any characters in it (e.g. if we
-/// look for 429 then we might match a 429 in a UUID).These error messages currently look like:
-///
-/// ", after ... retries, max_retries: ..., retry_timeout: ..."
-///
-/// So, as a crude heuristic, which should work for the builtin object stores, but won't
-/// work for custom object stores, we simply look for the string "retries, max_retries"
-/// in the error message.
+/// Native cloud stores wrap HTTP errors in a private `RetryError`. Inspect the
+/// underlying error message for a 503, including responses without a body or
+/// retry count. Keep the existing message checks for other store implementations.
 pub fn is_throttle_error(err: &object_store::Error) -> bool {
     // Only Generic errors can carry throttle responses
     if let object_store::Error::Generic { source, .. } = err {
+        let is_service_unavailable = source.source().is_some_and(|cause| {
+            cause
+                .to_string()
+                .starts_with("Server returned non-2xx status code: 503 ")
+        });
         let message = source.to_string();
         let lowercase = message.to_ascii_lowercase();
-        lowercase.contains("retries, max_retries")
+        is_service_unavailable
+            || lowercase.contains("retries, max_retries")
             || lowercase.contains("serverbusy")
             || lowercase.contains("server busy")
             || lowercase.contains("egress is over the account limit")
@@ -187,143 +185,105 @@ impl AimdThrottleConfig {
         }
     }
 
-    /// Build an `AimdThrottleConfig` from storage options and environment variables.
+    /// Build an AIMD configuration from storage options and environment variables.
     ///
-    /// Storage options take precedence over environment variables, which take
-    /// precedence over defaults. A single AIMD config is applied to all four
-    /// operation categories (read/write/delete/list).
+    /// Each controller setting (`initial_rate`, `min_rate`, `max_rate`,
+    /// `decrease_factor`, and `additive_increment`) accepts a category-specific
+    /// key such as `lance_aimd_read_max_rate`. Categories are `read`, `write`,
+    /// `delete`, and `list`. Each setting resolves in this order: category
+    /// storage option, category environment variable, generic storage option,
+    /// generic environment variable, then the category default.
     ///
-    /// | Setting              | Storage Option Key               | Env Var                          | Default |
-    /// |----------------------|----------------------------------|----------------------------------|---------|
-    /// | Initial rate         | `lance_aimd_initial_rate`        | `LANCE_AIMD_INITIAL_RATE`        | 2000    |
-    /// | Min rate             | `lance_aimd_min_rate`            | `LANCE_AIMD_MIN_RATE`            | 1       |
-    /// | Max rate             | `lance_aimd_max_rate`            | `LANCE_AIMD_MAX_RATE`            | 5000    |
-    /// | Decrease factor      | `lance_aimd_decrease_factor`     | `LANCE_AIMD_DECREASE_FACTOR`     | 0.5     |
-    /// | Additive increment   | `lance_aimd_additive_increment`  | `LANCE_AIMD_ADDITIVE_INCREMENT`  | 300     |
-    /// | Burst capacity       | `lance_aimd_burst_capacity`      | `LANCE_AIMD_BURST_CAPACITY`      | 100     |
-    /// | Max retries          | `lance_aimd_max_retries`         | `LANCE_AIMD_MAX_RETRIES`         | 3       |
-    /// | Min backoff ms       | `lance_aimd_min_backoff_ms`      | `LANCE_AIMD_MIN_BACKOFF_MS`      | 100     |
-    /// | Max backoff ms       | `lance_aimd_max_backoff_ms`      | `LANCE_AIMD_MAX_BACKOFF_MS`      | 300     |
+    /// Burst capacity and retry/backoff settings are shared by all categories.
+    /// They accept the generic storage option and its uppercase environment
+    /// variable, for example `lance_aimd_max_retries` and `LANCE_AIMD_MAX_RETRIES`.
     pub fn from_storage_options(
         storage_options: Option<&HashMap<String, String>>,
     ) -> lance_core::Result<Self> {
-        fn resolve_f64(
-            key: &str,
-            storage_options: Option<&HashMap<String, String>>,
-            default: f64,
-        ) -> lance_core::Result<f64> {
-            let env_key = key.to_ascii_uppercase();
-            if let Some(val) = storage_options.and_then(|opts| opts.get(key)) {
-                val.parse::<f64>().map_err(|_| {
-                    lance_core::Error::invalid_input(format!(
-                        "Invalid value for storage option '{key}': '{val}'"
-                    ))
-                })
-            } else if let Ok(val) = std::env::var(&env_key) {
-                val.parse::<f64>().map_err(|_| {
-                    lance_core::Error::invalid_input(format!(
-                        "Invalid value for env var '{env_key}': '{val}'"
-                    ))
-                })
-            } else {
-                Ok(default)
-            }
-        }
+        Self::default().resolve_options(storage_options, |key| std::env::var(key).ok())
+    }
 
-        fn resolve_u32(
-            key: &str,
-            storage_options: Option<&HashMap<String, String>>,
-            default: u32,
-        ) -> lance_core::Result<u32> {
-            let env_key = key.to_ascii_uppercase();
-            if let Some(val) = storage_options.and_then(|opts| opts.get(key)) {
-                val.parse::<u32>().map_err(|_| {
-                    lance_core::Error::invalid_input(format!(
-                        "Invalid value for storage option '{key}': '{val}'"
-                    ))
-                })
-            } else if let Ok(val) = std::env::var(&env_key) {
-                val.parse::<u32>().map_err(|_| {
-                    lance_core::Error::invalid_input(format!(
-                        "Invalid value for env var '{env_key}': '{val}'"
-                    ))
-                })
-            } else {
-                Ok(default)
-            }
-        }
-
-        fn resolve_usize(
-            key: &str,
-            storage_options: Option<&HashMap<String, String>>,
-            default: usize,
-        ) -> lance_core::Result<usize> {
-            let env_key = key.to_ascii_uppercase();
-            if let Some(val) = storage_options.and_then(|opts| opts.get(key)) {
-                val.parse::<usize>().map_err(|_| {
-                    lance_core::Error::invalid_input(format!(
-                        "Invalid value for storage option '{key}': '{val}'"
-                    ))
-                })
-            } else if let Ok(val) = std::env::var(&env_key) {
-                val.parse::<usize>().map_err(|_| {
-                    lance_core::Error::invalid_input(format!(
-                        "Invalid value for env var '{env_key}': '{val}'"
-                    ))
-                })
-            } else {
-                Ok(default)
-            }
-        }
-
-        fn resolve_u64(
-            key: &str,
-            storage_options: Option<&HashMap<String, String>>,
-            default: u64,
-        ) -> lance_core::Result<u64> {
-            let env_key = key.to_ascii_uppercase();
-            if let Some(val) = storage_options.and_then(|opts| opts.get(key)) {
-                val.parse::<u64>().map_err(|_| {
-                    lance_core::Error::invalid_input(format!(
-                        "Invalid value for storage option '{key}': '{val}'"
-                    ))
-                })
-            } else if let Ok(val) = std::env::var(&env_key) {
-                val.parse::<u64>().map_err(|_| {
-                    lance_core::Error::invalid_input(format!(
-                        "Invalid value for env var '{env_key}': '{val}'"
-                    ))
-                })
-            } else {
-                Ok(default)
-            }
-        }
-
-        let initial_rate = resolve_f64("lance_aimd_initial_rate", storage_options, 2000.0)?;
-        let min_rate = resolve_f64("lance_aimd_min_rate", storage_options, 1.0)?;
-        let max_rate = resolve_f64("lance_aimd_max_rate", storage_options, 5000.0)?;
-        let decrease_factor = resolve_f64("lance_aimd_decrease_factor", storage_options, 0.5)?;
-        let additive_increment =
-            resolve_f64("lance_aimd_additive_increment", storage_options, 300.0)?;
-        let burst_capacity = resolve_u32("lance_aimd_burst_capacity", storage_options, 100)?;
-        let max_retries = resolve_usize("lance_aimd_max_retries", storage_options, 3)?;
-        let min_backoff_ms = resolve_u64("lance_aimd_min_backoff_ms", storage_options, 100)?;
-        let max_backoff_ms = resolve_u64("lance_aimd_max_backoff_ms", storage_options, 300)?;
-
-        let aimd = AimdConfig::default()
-            .with_initial_rate(initial_rate)
-            .with_min_rate(min_rate)
-            .with_max_rate(max_rate)
-            .with_decrease_factor(decrease_factor)
-            .with_additive_increment(additive_increment);
-
+    fn resolve_options(
+        self,
+        storage_options: Option<&HashMap<String, String>>,
+        get_env: impl Fn(&str) -> Option<String>,
+    ) -> lance_core::Result<Self> {
+        let options = AimdOptions {
+            storage_options,
+            get_env,
+        };
         Ok(Self {
-            max_retries,
-            min_backoff_ms,
-            max_backoff_ms,
-            ..Self::default()
-                .with_aimd(aimd)
-                .with_burst_capacity(burst_capacity)
+            read: options.controller("read", self.read)?,
+            write: options.controller("write", self.write)?,
+            delete: options.controller("delete", self.delete)?,
+            list: options.controller("list", self.list)?,
+            burst_capacity: options.resolve(
+                "lance_aimd_burst_capacity",
+                None,
+                self.burst_capacity,
+            )?,
+            max_retries: options.resolve("lance_aimd_max_retries", None, self.max_retries)?,
+            min_backoff_ms: options.resolve(
+                "lance_aimd_min_backoff_ms",
+                None,
+                self.min_backoff_ms,
+            )?,
+            max_backoff_ms: options.resolve(
+                "lance_aimd_max_backoff_ms",
+                None,
+                self.max_backoff_ms,
+            )?,
+        })
+    }
+}
+
+struct AimdOptions<'a, F> {
+    storage_options: Option<&'a HashMap<String, String>>,
+    get_env: F,
+}
+
+impl<F: Fn(&str) -> Option<String>> AimdOptions<'_, F> {
+    fn resolve<T: std::str::FromStr>(
+        &self,
+        generic_key: &str,
+        category_key: Option<&str>,
+        default: T,
+    ) -> lance_core::Result<T> {
+        for key in category_key.into_iter().chain(std::iter::once(generic_key)) {
+            if let Some(value) = self.storage_options.and_then(|options| options.get(key)) {
+                return value.parse().map_err(|_| {
+                    lance_core::Error::invalid_input(format!(
+                        "Invalid value for storage option '{key}': '{value}'"
+                    ))
+                });
+            }
+            let env_key = key.to_ascii_uppercase();
+            if let Some(value) = (self.get_env)(&env_key) {
+                return value.parse().map_err(|_| {
+                    lance_core::Error::invalid_input(format!(
+                        "Invalid value for env var '{env_key}': '{value}'"
+                    ))
+                });
+            }
+        }
+        Ok(default)
+    }
+
+    fn controller(&self, category: &str, defaults: AimdConfig) -> lance_core::Result<AimdConfig> {
+        let resolve = |field, default| {
+            self.resolve(
+                &format!("lance_aimd_{field}"),
+                Some(&format!("lance_aimd_{category}_{field}")),
+                default,
+            )
+        };
+        Ok(AimdConfig {
+            initial_rate: resolve("initial_rate", defaults.initial_rate)?,
+            min_rate: resolve("min_rate", defaults.min_rate)?,
+            max_rate: resolve("max_rate", defaults.max_rate)?,
+            decrease_factor: resolve("decrease_factor", defaults.decrease_factor)?,
+            additive_increment: resolve("additive_increment", defaults.additive_increment)?,
+            ..defaults
         })
     }
 }
@@ -528,6 +488,16 @@ pub(crate) struct AimdThrottleState {
 
 impl AimdThrottleState {
     pub(crate) fn new(config: AimdThrottleConfig) -> lance_core::Result<Self> {
+        // A retry draws its backoff from `min..=max`, and sampling an empty
+        // range panics, so a range that cannot be sampled is rejected while
+        // the store is being built rather than on the first throttled request.
+        if config.min_backoff_ms > config.max_backoff_ms {
+            return Err(lance_core::Error::invalid_input(format!(
+                "lance_aimd_min_backoff_ms ({}) must not exceed lance_aimd_max_backoff_ms \
+                 ({}): the retry backoff is drawn from that range",
+                config.min_backoff_ms, config.max_backoff_ms
+            )));
+        }
         let burst_capacity = config.burst_capacity as f64;
         let max_retries = config.max_retries;
         let min_backoff_ms = config.min_backoff_ms;
@@ -564,6 +534,7 @@ impl AimdThrottleState {
         })
     }
 
+    #[cfg(any(test, feature = "aws", feature = "azure", feature = "gcp"))]
     fn downgrade(&self) -> WeakThrottleState {
         WeakThrottleState {
             read: Arc::downgrade(&self.read),
@@ -574,6 +545,7 @@ impl AimdThrottleState {
     }
 }
 
+#[cfg(any(test, feature = "aws", feature = "azure", feature = "gcp"))]
 /// A cache entry of [`SHARED_THROTTLE_STATES`]: alive exactly as long as some
 /// store still holds the budgets, since a store keeps all four.
 struct WeakThrottleState {
@@ -583,6 +555,7 @@ struct WeakThrottleState {
     list: Weak<OperationThrottle>,
 }
 
+#[cfg(any(test, feature = "aws", feature = "azure", feature = "gcp"))]
 impl WeakThrottleState {
     fn upgrade(&self) -> Option<AimdThrottleState> {
         Some(AimdThrottleState {
@@ -598,6 +571,7 @@ impl WeakThrottleState {
 /// registry caches stores under. The AIMD contract is one budget per bucket, so
 /// stores that are split further, one per dataset in the `dataset` metrics label
 /// mode, must share the bucket's budget rather than each getting a full one.
+#[cfg(any(test, feature = "aws", feature = "azure", feature = "gcp"))]
 static SHARED_THROTTLE_STATES: LazyLock<
     std::sync::Mutex<HashMap<(String, ObjectStoreParams), WeakThrottleState>>,
 > = LazyLock::new(Default::default);
@@ -605,11 +579,14 @@ static SHARED_THROTTLE_STATES: LazyLock<
 /// The throttle state for a store of `store_prefix` built with `params`: the one
 /// its sibling stores already use, or a fresh one. `None` when throttling is
 /// disabled by the params.
+#[cfg(any(test, feature = "aws", feature = "azure", feature = "gcp"))]
 pub(crate) fn shared_throttle_state(
     store_prefix: &str,
     params: &ObjectStoreParams,
+    defaults: AimdThrottleConfig,
 ) -> lance_core::Result<Option<AimdThrottleState>> {
-    let config = AimdThrottleConfig::from_storage_options(params.storage_options())?;
+    let config =
+        defaults.resolve_options(params.storage_options(), |key| std::env::var(key).ok())?;
     if config.is_disabled() {
         return Ok(None);
     }
@@ -647,6 +624,42 @@ impl<C> AimdHttpConnector<C> {
     }
 }
 
+/// The caller's connector from [`ObjectStoreParams::http_connector`], or object_store's default.
+#[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
+#[derive(Debug)]
+pub(crate) struct Transport(Arc<dyn HttpConnector>);
+
+#[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
+impl Transport {
+    pub(crate) fn new(connector: Option<&Arc<dyn HttpConnector>>) -> Self {
+        Self(
+            connector
+                .cloned()
+                .unwrap_or_else(|| Arc::new(object_store::client::ReqwestConnector::default())),
+        )
+    }
+}
+
+#[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
+impl HttpConnector for Transport {
+    fn connect(&self, options: &ClientOptions) -> object_store::Result<HttpClient> {
+        self.0.connect(options)
+    }
+}
+
+/// OpenDAL opens its own HTTP clients, so it would drop the caller's connector without notice.
+#[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
+pub(crate) fn reject_http_connector_for_opendal(
+    params: &ObjectStoreParams,
+) -> lance_core::Result<()> {
+    if params.http_connector.is_some() {
+        return Err(lance_core::Error::not_supported(
+            "OpendalStore does not support an explicit http_connector; unset use_opendal to use it",
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(all(
     any(feature = "aws", feature = "azure", feature = "gcp"),
     feature = "metrics"
@@ -654,9 +667,13 @@ impl<C> AimdHttpConnector<C> {
 pub(crate) fn cloud_http_connector(
     state: Option<&AimdThrottleState>,
     metrics_base: String,
+    transport: Transport,
 ) -> AimdHttpConnector<crate::object_store::metrics::MeteringHttpConnector> {
     AimdHttpConnector::new(
-        crate::object_store::metrics::MeteringHttpConnector::new(metrics_base),
+        crate::object_store::metrics::MeteringHttpConnector::with_transport(
+            metrics_base,
+            transport,
+        ),
         state,
     )
 }
@@ -668,8 +685,9 @@ pub(crate) fn cloud_http_connector(
 pub(crate) fn cloud_http_connector(
     state: Option<&AimdThrottleState>,
     _metrics_base: String,
-) -> AimdHttpConnector<object_store::client::ReqwestConnector> {
-    AimdHttpConnector::new(object_store::client::ReqwestConnector::default(), state)
+    transport: Transport,
+) -> AimdHttpConnector<Transport> {
+    AimdHttpConnector::new(transport, state)
 }
 
 #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
@@ -1360,9 +1378,56 @@ impl ObjectStore for AimdThrottledStore {
     }
 
     async fn rename_opts(&self, from: &Path, to: &Path, opts: RenameOptions) -> OSResult<()> {
-        self.write
-            .throttled(|| self.target.rename_opts(from, to, opts.clone()))
-            .await
+        let RenameOptions {
+            target_mode,
+            extensions,
+        } = opts;
+
+        match target_mode {
+            RenameTargetMode::Overwrite => {
+                // Delegate to the underlying store to preserve atomic rename
+                // semantics where the store supports them (e.g. local filesystem).
+                self.write
+                    .throttled(|| {
+                        self.target.rename_opts(
+                            from,
+                            to,
+                            RenameOptions {
+                                target_mode,
+                                extensions: extensions.clone(),
+                            },
+                        )
+                    })
+                    .await
+            }
+            RenameTargetMode::Create => {
+                // For rename_if_not_exists, the default object_store implementation
+                // is copy + delete. Perform the two steps under their respective
+                // throttles so they can be retried independently. If copy succeeds
+                // but delete is throttled, the caller's intent is satisfied: the
+                // destination now exists and the data has been committed.
+                let copy_options = CopyOptions {
+                    mode: CopyMode::Create,
+                    extensions: extensions.clone(),
+                };
+                self.write
+                    .throttled(|| self.target.copy_opts(from, to, copy_options.clone()))
+                    .await?;
+
+                // Best-effort cleanup of the source. Failure here does not change
+                // the outcome of the rename, so do not propagate the error.
+                if let Err(err) = self.delete.throttled(|| self.target.delete(from)).await {
+                    warn!(
+                        target: TRACE_OBJECT_STORE_THROTTLE,
+                        source = %from,
+                        destination = %to,
+                        error = %err,
+                        "rename_if_not_exists source cleanup failed after destination was created"
+                    );
+                }
+                Ok(())
+            }
+        }
     }
 }
 
@@ -1374,10 +1439,10 @@ mod tests {
     #[test]
     fn test_shared_throttle_state_follows_store_identity() {
         let params = ObjectStoreParams::default();
-        let a = shared_throttle_state("s3$shared-bucket", &params)
+        let a = shared_throttle_state("s3$shared-bucket", &params, Default::default())
             .unwrap()
             .unwrap();
-        let b = shared_throttle_state("s3$shared-bucket", &params)
+        let b = shared_throttle_state("s3$shared-bucket", &params, Default::default())
             .unwrap()
             .unwrap();
         // Two stores of one bucket, e.g. two datasets in dataset label mode, draw
@@ -1387,7 +1452,7 @@ mod tests {
         assert!(Arc::ptr_eq(&a.delete, &b.delete));
         assert!(Arc::ptr_eq(&a.list, &b.list));
 
-        let other = shared_throttle_state("s3$other-bucket", &params)
+        let other = shared_throttle_state("s3$other-bucket", &params, Default::default())
             .unwrap()
             .unwrap();
         assert!(!Arc::ptr_eq(&a.read, &other.read));
@@ -1399,15 +1464,112 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            shared_throttle_state("s3$shared-bucket", &disabled)
+            shared_throttle_state("s3$shared-bucket", &disabled, Default::default())
                 .unwrap()
                 .is_none()
         );
     }
+
     use object_store::memory::InMemory;
     use rstest::rstest;
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+    #[rstest]
+    #[case::category_option(Some("8000"), Some("7000"), Some("6000"), Some("5000"), 8000.0)]
+    #[case::category_env(None, Some("7000"), Some("6000"), Some("5000"), 7000.0)]
+    #[case::generic_option(None, None, Some("6000"), Some("5000"), 6000.0)]
+    #[case::generic_env(None, None, None, Some("5000"), 5000.0)]
+    #[case::category_default(None, None, None, None, 12_345.0)]
+    fn test_read_rate_option_precedence(
+        #[case] category_option: Option<&str>,
+        #[case] category_env: Option<&str>,
+        #[case] generic_option: Option<&str>,
+        #[case] generic_env: Option<&str>,
+        #[case] expected: f64,
+    ) {
+        let storage_options = [
+            ("lance_aimd_read_max_rate", category_option),
+            ("lance_aimd_max_rate", generic_option),
+        ]
+        .into_iter()
+        .filter_map(|(key, value)| Some((key.to_owned(), value?.to_owned())))
+        .collect();
+        let defaults = AimdThrottleConfig::default()
+            .with_read_aimd(AimdConfig::default().with_max_rate(12_345.0));
+        let config = defaults
+            .resolve_options(Some(&storage_options), |key| {
+                match key {
+                    "LANCE_AIMD_READ_MAX_RATE" => category_env,
+                    "LANCE_AIMD_MAX_RATE" => generic_env,
+                    _ => None,
+                }
+                .map(str::to_owned)
+            })
+            .unwrap();
+
+        assert_eq!(config.read.max_rate, expected);
+        let generic_rate = generic_option
+            .or(generic_env)
+            .map(|value| value.parse::<f64>().unwrap())
+            .unwrap_or(AimdThrottleConfig::default().write.max_rate);
+        for category in [config.write, config.delete, config.list] {
+            assert_eq!(category.max_rate, generic_rate);
+        }
+    }
+
+    #[test]
+    fn test_controller_options_resolve_per_field_and_category() {
+        let params = params_with(&[
+            ("lance_aimd_initial_rate", "1000"),
+            ("lance_aimd_read_initial_rate", "3000"),
+            ("lance_aimd_read_max_rate", "0"),
+            ("lance_aimd_write_min_rate", "25"),
+            ("lance_aimd_delete_decrease_factor", "0.25"),
+            ("lance_aimd_max_retries", "0"),
+        ]);
+        let config = AimdThrottleConfig::default()
+            .resolve_options(params.storage_options(), |key| match key {
+                "LANCE_AIMD_ADDITIVE_INCREMENT" => Some("100".to_owned()),
+                "LANCE_AIMD_LIST_ADDITIVE_INCREMENT" => Some("800".to_owned()),
+                "LANCE_AIMD_BURST_CAPACITY" => Some("150".to_owned()),
+                _ => None,
+            })
+            .unwrap();
+
+        assert!(config.is_disabled());
+        assert_eq!(config.burst_capacity, 150);
+        assert_eq!(config.read.initial_rate, 3000.0);
+        assert_eq!(config.read.max_rate, 0.0);
+        assert_eq!(config.write.min_rate, 25.0);
+        assert_eq!(config.delete.decrease_factor, 0.25);
+        assert_eq!(config.list.additive_increment, 800.0);
+        for category in [&config.write, &config.delete, &config.list] {
+            assert_eq!(category.initial_rate, 1000.0);
+        }
+        for category in [&config.read, &config.write, &config.delete] {
+            assert_eq!(category.additive_increment, 100.0);
+        }
+    }
+
+    #[test]
+    fn test_invalid_category_option_reports_the_selected_source() {
+        let params = params_with(&[("lance_aimd_max_rate", "6000")]);
+        let err = AimdThrottleConfig::default()
+            .resolve_options(params.storage_options(), |key| {
+                (key == "LANCE_AIMD_READ_MAX_RATE").then(|| "invalid".to_owned())
+            })
+            .unwrap_err();
+        assert!(matches!(err, lance_core::Error::InvalidInput { .. }));
+        assert!(err.to_string().contains("LANCE_AIMD_READ_MAX_RATE"));
+
+        let params = params_with(&[("lance_aimd_read_max_rate", "invalid")]);
+        let err = AimdThrottleConfig::default()
+            .resolve_options(params.storage_options(), |_| None)
+            .unwrap_err();
+        assert!(matches!(err, lance_core::Error::InvalidInput { .. }));
+        assert!(err.to_string().contains("lance_aimd_read_max_rate"));
+    }
 
     const THROTTLE_ERROR_RESPONSE: &str = "request failed, after 3 retries, max_retries: 3, retry_timeout: 30s - Server returned non-2xx status code: 503: x-ms-request-id: azure-request-id";
 
@@ -1416,6 +1578,74 @@ mod tests {
             store: "test",
             source: msg.into(),
         }
+    }
+
+    fn params_with(options: &[(&str, &str)]) -> ObjectStoreParams {
+        ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                options
+                    .iter()
+                    .map(|(key, value)| (key.to_string(), value.to_string()))
+                    .collect(),
+            ))),
+            ..Default::default()
+        }
+    }
+
+    /// A backoff range that cannot be sampled is rejected while the store is
+    /// being built. Reaching the sampler with one panics, and raising only the
+    /// minimum above the default maximum is enough to get there.
+    #[rstest]
+    #[case::min_above_explicit_max(
+        &[("lance_aimd_min_backoff_ms", "500"), ("lance_aimd_max_backoff_ms", "100")]
+    )]
+    #[case::min_above_default_max(&[("lance_aimd_min_backoff_ms", "500")])]
+    fn test_shared_throttle_state_rejects_an_unsamplable_backoff_range(
+        #[case] options: &[(&str, &str)],
+    ) {
+        let Err(err) = shared_throttle_state(
+            "s3$backoff-bucket",
+            &params_with(options),
+            Default::default(),
+        ) else {
+            panic!("an unsamplable backoff range must be rejected");
+        };
+        assert!(
+            matches!(err, lance_core::Error::InvalidInput { .. }),
+            "got: {err:?}"
+        );
+        let message = err.to_string();
+        assert!(message.contains("lance_aimd_min_backoff_ms"), "{message}");
+        assert!(message.contains("lance_aimd_max_backoff_ms"), "{message}");
+    }
+
+    /// Equal bounds are a one-value range, which samples fine.
+    #[test]
+    fn test_shared_throttle_state_accepts_equal_backoff_bounds() {
+        let params = params_with(&[
+            ("lance_aimd_min_backoff_ms", "250"),
+            ("lance_aimd_max_backoff_ms", "250"),
+        ]);
+        assert!(
+            shared_throttle_state("s3$equal-bounds-bucket", &params, Default::default())
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    /// With retries off nothing samples the range, and a store that opens
+    /// today has to keep opening.
+    #[test]
+    fn test_shared_throttle_state_ignores_the_backoff_range_when_disabled() {
+        let params = params_with(&[
+            ("lance_aimd_max_retries", "0"),
+            ("lance_aimd_min_backoff_ms", "500"),
+        ]);
+        assert!(
+            shared_throttle_state("s3$disabled-bucket", &params, Default::default())
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[rstest]
@@ -1440,6 +1670,45 @@ mod tests {
             msg,
             expected
         );
+    }
+
+    #[cfg(feature = "aws")]
+    #[tokio::test]
+    async fn test_retries_s3_head_with_bodyless_503_and_no_client_retries() {
+        use object_store::RetryConfig;
+        use object_store::aws::AmazonS3Builder;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("HEAD"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let store = AmazonS3Builder::new()
+            .with_bucket_name("bucket")
+            .with_region("us-east-1")
+            .with_endpoint(server.uri())
+            .with_allow_http(true)
+            .with_skip_signature(true)
+            .with_retry(RetryConfig {
+                max_retries: 0,
+                ..Default::default()
+            })
+            .build()
+            .unwrap();
+
+        let config = AimdThrottleConfig {
+            max_retries: 1,
+            min_backoff_ms: 0,
+            max_backoff_ms: 0,
+            ..Default::default()
+        };
+        let store = AimdThrottledStore::new(Arc::new(store), config).unwrap();
+        let err = store.head(&Path::from("object")).await.unwrap_err();
+        assert!(err.to_string().contains("status code: 503"));
+        assert!(is_throttle_error(&err));
     }
 
     #[test]
@@ -3403,5 +3672,231 @@ mod tests {
             "Parts were reordered! Got {:?} instead of AAAABBBB.",
             std::str::from_utf8(&bytes).unwrap_or("<non-utf8>"),
         );
+    }
+
+    #[tokio::test]
+    async fn test_rename_moves_object() {
+        let store = Arc::new(InMemory::new());
+        let config = AimdThrottleConfig::default();
+        let throttled = AimdThrottledStore::new(store, config).unwrap();
+
+        let from = Path::from("test/from.txt");
+        let to = Path::from("test/to.txt");
+        throttled
+            .put(&from, PutPayload::from_static(b"payload"))
+            .await
+            .unwrap();
+
+        throttled.rename(&from, &to).await.unwrap();
+
+        // Destination has the data and source is gone.
+        let bytes = throttled.get(&to).await.unwrap().bytes().await.unwrap();
+        assert_eq!(bytes.as_ref(), b"payload");
+        assert!(matches!(
+            throttled.head(&from).await,
+            Err(object_store::Error::NotFound { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_rename_if_not_exists_rejects_existing_target() {
+        let store = Arc::new(InMemory::new());
+        let config = AimdThrottleConfig::default();
+        let throttled = AimdThrottledStore::new(store, config).unwrap();
+
+        let from = Path::from("test/from.txt");
+        let to = Path::from("test/to.txt");
+        throttled
+            .put(&from, PutPayload::from_static(b"src"))
+            .await
+            .unwrap();
+        throttled
+            .put(&to, PutPayload::from_static(b"existing"))
+            .await
+            .unwrap();
+
+        // RenameTargetMode::Create must map to CopyMode::Create and reject the
+        // pre-existing destination.
+        let err = throttled
+            .rename_if_not_exists(&from, &to)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, object_store::Error::AlreadyExists { .. }),
+            "expected AlreadyExists, got {err:?}"
+        );
+
+        // The failed copy must not have deleted the source.
+        let bytes = throttled.get(&from).await.unwrap().bytes().await.unwrap();
+        assert_eq!(bytes.as_ref(), b"src");
+    }
+
+    /// A mock store that returns a configurable number of throttle errors on
+    /// `copy_opts` and `delete` independently before succeeding. Used to verify
+    /// that `rename_opts` retries the copy and the delete separately.
+    struct RenameRetryMockStore {
+        inner: InMemory,
+        copy_errors_remaining: std::sync::Mutex<usize>,
+        delete_errors_remaining: std::sync::Mutex<usize>,
+        copy_call_count: AtomicU64,
+        delete_call_count: AtomicU64,
+    }
+
+    impl RenameRetryMockStore {
+        fn new(copy_errors: usize, delete_errors: usize) -> Self {
+            Self {
+                inner: InMemory::new(),
+                copy_errors_remaining: std::sync::Mutex::new(copy_errors),
+                delete_errors_remaining: std::sync::Mutex::new(delete_errors),
+                copy_call_count: AtomicU64::new(0),
+                delete_call_count: AtomicU64::new(0),
+            }
+        }
+
+        fn should_error(counter: &std::sync::Mutex<usize>) -> bool {
+            let mut remaining = counter.lock().unwrap();
+            if *remaining > 0 {
+                *remaining -= 1;
+                true
+            } else {
+                false
+            }
+        }
+
+        fn throttle_error() -> object_store::Error {
+            object_store::Error::Generic {
+                store: "RenameRetryMock",
+                source: THROTTLE_ERROR_RESPONSE.into(),
+            }
+        }
+    }
+
+    impl Display for RenameRetryMockStore {
+        fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+            write!(f, "RenameRetryMockStore")
+        }
+    }
+
+    impl Debug for RenameRetryMockStore {
+        fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("RenameRetryMockStore").finish()
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for RenameRetryMockStore {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            bytes: PutPayload,
+            opts: PutOptions,
+        ) -> OSResult<PutResult> {
+            self.inner.put_opts(location, bytes, opts).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: PutMultipartOptions,
+        ) -> OSResult<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+        async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+        async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> OSResult<Vec<Bytes>> {
+            self.inner.get_ranges(location, ranges).await
+        }
+        // `delete` is provided by `ObjectStoreExt` and delegates to
+        // `delete_stream`, so we inject throttle errors here to exercise the
+        // separate delete-retry path in `rename_opts`.
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, OSResult<Path>>,
+        ) -> BoxStream<'static, OSResult<Path>> {
+            self.delete_call_count.fetch_add(1, Ordering::Relaxed);
+            if Self::should_error(&self.delete_errors_remaining) {
+                futures::stream::once(async { Err(Self::throttle_error()) }).boxed()
+            } else {
+                self.inner.delete_stream(locations)
+            }
+        }
+        fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, OSResult<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+        fn list_with_offset(
+            &self,
+            prefix: Option<&Path>,
+            offset: &Path,
+        ) -> BoxStream<'static, OSResult<ObjectMeta>> {
+            self.inner.list_with_offset(prefix, offset)
+        }
+        async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OSResult<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+        async fn copy_opts(&self, from: &Path, to: &Path, opts: CopyOptions) -> OSResult<()> {
+            self.copy_call_count.fetch_add(1, Ordering::Relaxed);
+            if Self::should_error(&self.copy_errors_remaining) {
+                Err(Self::throttle_error())
+            } else {
+                self.inner.copy_opts(from, to, opts).await
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_rename_if_not_exists_retries_copy_and_delete_independently() {
+        // Copy fails twice then succeeds; delete fails once then succeeds.
+        // Both are within max_retries=3, so the rename_if_not_exists should
+        // ultimately succeed, with copy and delete retried independently.
+        let mock = Arc::new(RenameRetryMockStore::new(2, 1));
+        let from = Path::from("test/from.txt");
+        let to = Path::from("test/to.txt");
+        mock.put(&from, PutPayload::from_static(b"payload"))
+            .await
+            .unwrap();
+
+        let config = AimdThrottleConfig::default();
+        let throttled =
+            AimdThrottledStore::new(mock.clone() as Arc<dyn ObjectStore>, config).unwrap();
+
+        throttled.rename_if_not_exists(&from, &to).await.unwrap();
+
+        // Copy: 2 failures + 1 success. Delete: 1 failure + 1 success.
+        assert_eq!(mock.copy_call_count.load(Ordering::Relaxed), 3);
+        assert_eq!(mock.delete_call_count.load(Ordering::Relaxed), 2);
+
+        // Source cleaned up, destination present.
+        let bytes = throttled.get(&to).await.unwrap().bytes().await.unwrap();
+        assert_eq!(bytes.as_ref(), b"payload");
+        assert!(matches!(
+            throttled.head(&from).await,
+            Err(object_store::Error::NotFound { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_rename_if_not_exists_succeeds_when_delete_throttled() {
+        // Copy succeeds, but delete is throttled beyond max_retries.
+        // The rename must still report success because the destination exists
+        // and the caller's intent has been satisfied.
+        let mock = Arc::new(RenameRetryMockStore::new(0, 10));
+        let from = Path::from("test/from.txt");
+        let to = Path::from("test/to.txt");
+        mock.put(&from, PutPayload::from_static(b"payload"))
+            .await
+            .unwrap();
+
+        let config = AimdThrottleConfig::default();
+        let throttled =
+            AimdThrottledStore::new(mock.clone() as Arc<dyn ObjectStore>, config).unwrap();
+
+        throttled.rename_if_not_exists(&from, &to).await.unwrap();
+
+        // Destination has the data.
+        let bytes = throttled.get(&to).await.unwrap().bytes().await.unwrap();
+        assert_eq!(bytes.as_ref(), b"payload");
+        // Source was not cleaned up because delete kept failing.
+        let bytes = throttled.get(&from).await.unwrap().bytes().await.unwrap();
+        assert_eq!(bytes.as_ref(), b"payload");
     }
 }

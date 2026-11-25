@@ -70,9 +70,12 @@ use super::projection::{
 };
 use super::sstable_cache::{DatasetCache, SsTableWarmer, open_sstable};
 use crate::dataset::mem_wal::index::FtsMemQuery;
+use crate::dataset::mem_wal::index::IndexStore;
+use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
 use crate::dataset::mem_wal::memtable::scanner::{MemTableScanner, local_fts_query};
-use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
-use crate::dataset::scanner::apply_dataset_planner_auto_fuzziness_compatibility_gate;
+use crate::dataset::scanner::fts::{
+    apply_dataset_planner_auto_fuzziness_compatibility_gate, zero_candidate_plan,
+};
 use crate::index::scalar::inverted::{
     indexed_fts_document_granularities, indexed_fts_index_params, resolve_fts_field,
 };
@@ -883,6 +886,11 @@ impl LsmFtsSearchPlanner {
 
         // `try_new` returns a single plan as is instead of wrapping it in a union.
         let merged = UnionExec::try_new(per_column_plans)?;
+        // A zero candidate budget is already an empty result; skip the
+        // collapse and outer truncation, which have nothing left to do.
+        if candidate_limit == Some(0) {
+            return self.sort_by_score(merged, candidate_limit);
+        }
         // Order the candidates, collapse duplicates, *then* cut to k. Cutting
         // before the collapse spends the budget on repeat hits of the same row.
         // The input is sorted by `_score` descending, so keeping the first
@@ -1195,6 +1203,9 @@ impl LsmFtsSearchPlanner {
     /// Per-partition sort with `fetch=k` so each upstream partition can
     /// early-terminate at k; the preserving merge then does a K-way heap merge
     /// also capped at k. Same pattern as `LsmVectorSearchPlanner`.
+    ///
+    /// A zero limit returns a schema-preserving empty plan instead: a zero
+    /// fetch reaches DataFusion's `TopK` heap, which asserts `k > 0`.
     fn sort_by_score(
         &self,
         merged: Arc<dyn ExecutionPlan>,
@@ -1216,6 +1227,10 @@ impl LsmFtsSearchPlanner {
         let lex_ordering = LexOrdering::new(sort_expr).ok_or_else(|| {
             Error::internal("Failed to build LexOrdering for FTS _score sort".to_string())
         })?;
+
+        if limit == Some(0) {
+            return zero_candidate_plan(merged, lex_ordering);
+        }
 
         let per_partition_sorted: Arc<dyn ExecutionPlan> = Arc::new(
             SortExec::new(lex_ordering.clone(), merged)
@@ -1554,8 +1569,9 @@ impl LsmFtsSearchPlanner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dataset::mem_wal::index::IndexStore;
+    use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
     use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
-    use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
     use crate::dataset::{Dataset, WriteParams};
     use arrow_array::builder::{ListBuilder, StringBuilder};
     use arrow_array::cast::AsArray;
@@ -1795,6 +1811,34 @@ mod tests {
                 .value(0),
             10
         );
+
+        let zero_plan = planner
+            .plan_search(
+                FullTextSearchQuery::new("lance".to_string())
+                    .with_column("text".to_string())
+                    .unwrap()
+                    .limit(Some(0)),
+                Some(0),
+                Some(&projection),
+            )
+            .await
+            .unwrap();
+        assert_eq!(meta_children(&zero_plan.schema()), vec!["a"]);
+        assert!(zero_plan.schema().column_with_name(SCORE_COLUMN).is_some());
+        let zero_schema = zero_plan.schema();
+        let batches: Vec<RecordBatch> = zero_plan
+            .execute(0, ctx.task_ctx())
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(
+            batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+            0
+        );
+        for batch in &batches {
+            assert_eq!(batch.schema(), zero_schema);
+        }
     }
 
     /// The no-source arm builds the same canonical target, so an empty result
@@ -4178,6 +4222,42 @@ mod tests {
         distinct.sort_unstable();
         distinct.dedup();
         assert_eq!(distinct.len(), 2, "rows must be distinct, got {ids:?}");
+
+        let zero_query = FullTextSearchQuery::new_query(IndexFtsQuery::MultiMatch(
+            MultiMatchQuery::try_new(
+                "lance".to_string(),
+                vec!["title".to_string(), "body".to_string()],
+            )
+            .unwrap(),
+        ))
+        .limit(Some(0));
+        let zero_plan = planner
+            .plan_search(zero_query, Some(0), Some(&["id".to_string()]))
+            .await
+            .unwrap();
+        assert_eq!(
+            zero_plan
+                .properties()
+                .output_partitioning()
+                .partition_count(),
+            1,
+            "the zero-candidate plan must keep the sort's single-partition contract"
+        );
+        assert!(zero_plan.schema().column_with_name(SCORE_COLUMN).is_some());
+        let zero_schema = zero_plan.schema();
+        let batches: Vec<RecordBatch> = zero_plan
+            .execute(0, ctx.task_ctx())
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(
+            batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+            0
+        );
+        for batch in &batches {
+            assert_eq!(batch.schema(), zero_schema);
+        }
     }
 
     /// The query is the only source of the columns to search, so an unbound one
@@ -4886,8 +4966,9 @@ mod tests {
     /// Regression for filter-before-dedup on the active FTS arm.
     #[tokio::test]
     async fn prefilter_excludes_pk_whose_newest_version_fails() {
+        use crate::dataset::mem_wal::index::IndexStore;
+        use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
         use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
-        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
         use arrow_schema::{DataType, Field};
         use datafusion::prelude::{col, lit};
 
@@ -4981,8 +5062,9 @@ mod tests {
     /// the newer active copy is archived; pk=5 must not leak from the base arm.
     #[tokio::test]
     async fn prefilter_blocks_base_hit_when_active_newest_fails() {
+        use crate::dataset::mem_wal::index::IndexStore;
+        use crate::dataset::mem_wal::memtable::batch_store::BatchStore;
         use crate::dataset::mem_wal::scanner::collector::{InMemoryMemTableRef, InMemoryMemTables};
-        use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
         use crate::index::DatasetIndexExt;
         use datafusion::prelude::{col, lit};
         use lance_index::IndexType;

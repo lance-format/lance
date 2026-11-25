@@ -3,6 +3,9 @@
 Lance can store large binary objects (images, videos, audio, model artifacts) in blob columns, where they are treated like any other column payload in the dataset.
 Blob columns support both planned full-payload reads and lazy file-like access.
 
+For the logical input contract, stored descriptors, and payload ownership rules,
+see the [Blob v2 Specification](../format/table/blob.md).
+
 !!! tip "Choosing between `read_blobs` and `take_blobs`"
     - For data loaders and batch processing that need complete byte payloads, use `read_blobs`.
     - Use `take_blobs` when you need a `BlobFile` handle for streaming, seeking, or partial reads.
@@ -15,36 +18,129 @@ If you're unsure about whether you need a blob column in the first place (and wh
 
 ## Quick Start: Blob v2
 
-This page focuses on blob workflows in Python and uses Lance file format terminology.
+The core Blob v2 write and file-like read workflows below are available in the Python, Rust, and Java SDKs (the planned batch-read helpers later on this page use the Python API).
 
 - `data_storage_version` means the Lance **file format version** of a dataset.
 - A dataset has a default file format version. Append and compaction can select
   another exact `2.x` version without rewriting existing files or changing that default.
 - File format `0.1` cannot be mixed with the `2.x` family.
 
-```python
-import lance
-import pyarrow as pa
-from lance import blob_array, blob_field
+=== "Python"
 
-schema = pa.schema([
-    pa.field("id", pa.int64()),
-    blob_field("blob"),
-])
+    ```python
+    import lance
+    import pyarrow as pa
+    from lance import blob_array, blob_field
 
-table = pa.table(
-    {
-        "id": [1],
-        "blob": blob_array([b"hello blob v2"]),
-    },
-    schema=schema,
-)
+    schema = pa.schema([
+        pa.field("id", pa.int64()),
+        blob_field("blob"),
+    ])
 
-ds = lance.write_dataset(table, "./blobs_v22.lance", data_storage_version="2.2")
+    table = pa.table(
+        {
+            "id": [1],
+            "blob": blob_array([b"hello blob v2"]),
+        },
+        schema=schema,
+    )
 
-_row_address, payload = ds.read_blobs("blob", indices=[0])[0]
-assert payload == b"hello blob v2"
-```
+    ds = lance.write_dataset(table, "./blobs_v22.lance", data_storage_version="2.2")
+
+    _row_address, payload = ds.read_blobs("blob", indices=[0])[0]
+    assert payload == b"hello blob v2"
+    ```
+
+=== "Rust"
+
+    ```rust
+    use std::sync::Arc;
+    use arrow_array::{Int64Array, RecordBatch, RecordBatchIterator};
+    use arrow_schema::{DataType, Field, Schema};
+    use lance::blob::{blob_field, BlobArrayBuilder};
+    use lance::dataset::{WriteMode, WriteParams};
+    use lance::Dataset;
+    use lance_file::version::LanceFileVersion;
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        blob_field("blob", true),
+    ]));
+    let mut blob_builder = BlobArrayBuilder::new(1);
+    blob_builder.push_bytes(b"hello blob v2")?;
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(vec![1])),
+            blob_builder.finish()?,
+        ],
+    )?;
+
+    let params = WriteParams {
+        mode: WriteMode::Overwrite,
+        data_storage_version: Some(LanceFileVersion::V2_2),
+        ..Default::default()
+    };
+    let ds = Arc::new(
+        Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            "./blobs_v22.lance",
+            Some(params),
+        )
+        .await?,
+    );
+
+    let blobs = ds.take_blobs_by_indices(&[0], "blob").await?;
+    if let Some(blob) = &blobs[0] {
+        let payload = blob.read().await?;
+        assert_eq!(payload.as_ref(), b"hello blob v2");
+    }
+    ```
+
+=== "Java"
+
+    ```java
+    import org.apache.arrow.vector.types.pojo.ArrowType;
+    import org.apache.arrow.vector.types.pojo.Field;
+    import org.apache.arrow.vector.types.pojo.FieldType;
+    import org.apache.arrow.vector.types.pojo.Schema;
+    import org.lance.BlobFile;
+    import org.lance.Dataset;
+    import org.lance.WriteParams;
+    import java.nio.charset.StandardCharsets;
+    import java.util.Arrays;
+    import java.util.List;
+    import java.util.Map;
+
+    Field blobField =
+        new Field(
+            "blob",
+            new FieldType(
+                true,
+                ArrowType.Struct.INSTANCE,
+                null,
+                Map.of("ARROW:extension:name", "lance.blob.v2")),
+            Arrays.asList(
+                Field.nullable("data", ArrowType.LargeBinary.INSTANCE),
+                Field.nullable("uri", ArrowType.Utf8.INSTANCE)));
+    Schema schema =
+        new Schema(Arrays.asList(Field.notNullable("id", new ArrowType.Int(64, true)), blobField));
+
+    try (Dataset ds =
+        Dataset.write()
+            .allocator(allocator)
+            .reader(reader) // ArrowReader matching `schema`
+            .uri("./blobs_v22.lance")
+            .mode(WriteParams.WriteMode.OVERWRITE)
+            .dataStorageVersion("2.2")
+            .execute()) {
+      List<BlobFile> blobs = ds.takeBlobsByIndices(List.of(0L), "blob");
+      try (BlobFile blob = blobs.get(0)) {
+        byte[] payload = blob.read();
+        assert Arrays.equals(payload, "hello blob v2".getBytes(StandardCharsets.UTF_8));
+      }
+    }
+    ```
 
 ## Version Compatibility
 
@@ -78,7 +174,7 @@ empty values. Historical snapshots retain their previous schema.
 
 Descriptor consumers that access fields by position or compare exact Arrow
 schemas must account for the extended structure. Interpret `position` together
-with `kind` and the object reference. See [the schema-transition discussion](https://github.com/lance-format/lance/issues/9458).
+with `kind` and the object reference.
 
 The dataset's default file version remains unchanged. Select `2.2` or newer
 explicitly when writing Blob v2 structs or compacting the mixed column into
@@ -87,17 +183,20 @@ to enable new Blob v2 writes.
 
 ### Managed objects and client compatibility
 
-Writers store out-of-line Blob v2 payloads in independently named
-`_blobs/<uuid>.blob` objects and publish the Managed Blob reader and writer
-capability on the table. This works with file formats 2.2 and 2.3; it does not
-require choosing 2.3. Clients that do not understand the capability must refuse
-to open a flagged snapshot. Updating an existing table with Blob data files can
-activate it, even if that batch contains only inline values. The capability
-remains set across later writes and restores.
+Set schema metadata `lance.blob.managed` to `"true"` to store out-of-line Blob v2
+payloads in independently named `_blobs/<uuid>.blob` objects. Without this
+opt-in, writes and compaction keep Inline/Packed/Dedicated placement, and
+prepared Managed references are rejected. This works with file formats 2.2
+and 2.3; it does not require choosing 2.3.
 
-Compaction preserves Managed payload objects and can adopt existing Packed or
-Dedicated sidecars in place. For example, compaction can replace `data/A.lance`
-with `data/B.lance` while B's Managed descriptor records the base and path of
+Committing the opt-in immediately publishes the Managed Blob reader and writer
+capability, even without new blob files. Clients that do not understand the
+capability must refuse to open a flagged snapshot. The capability remains set
+across later writes and restores, including after removing the opt-in.
+
+With the opt-in, compaction preserves Managed payload objects and can adopt
+existing Packed or Dedicated sidecars in place. For example, it can replace
+`data/A.lance` with `data/B.lance` while B's Managed descriptor records the base and path of
 the existing `data/A/0001.blob`. Cleanup can then delete `data/A.lance` without
 copying or deleting the blob that B still references. The blob's path may retain
 A's name, but resolving and retaining the blob no longer requires A's data file.
@@ -127,44 +226,50 @@ flag therefore does not protect against these old maintenance paths.
 
 ### Explicit sharing within a table
 
-Advanced writers can reuse a Managed payload through
-`BlobDescriptorArrayBuilder.append_managed(uri, offset, size, base_id=None)`.
-The builder validates the relative path and range without uploading or copying
-bytes. The new reference becomes live only when the dataset write commits.
-For example, write one payload and append two references to the same bytes:
+Advanced writers can upload a payload once and reuse the returned descriptor
+across rows and fragments. Open a `LanceFileSession` at the table root and call
+`open_managed_blob_writer()`. This writes a uniquely named `_blobs/<uuid>.blob`
+object through a `ManagedBlobWriter`, independently of data file names.
+`finish()` completes the upload and
+returns descriptors in write order; `BlobDescriptorArrayBuilder.append` can
+reuse each descriptor any number of times. No content comparison is performed.
 
 ```python
 import lance
 import pyarrow as pa
+from lance.file import LanceFileSession
 
-schema = pa.schema([lance.blob_field("blob", inline_size_threshold=0)])
-ds = lance.write_dataset(
-    pa.Table.from_arrays([lance.blob_array([b"shared"])], schema=schema),
-    "./shared_blobs.lance",
-    data_storage_version="2.2",
-)
-descriptor = ds.to_table(blob_handling="all_descriptions")["blob"][0].as_py()
-assert descriptor["kind"] == 4  # Relative to this table's primary base.
+uri = "./shared_blobs.lance"
+writer = LanceFileSession(uri).open_managed_blob_writer()
+writer.write_blob(b"shared")
+(shared,) = writer.finish()
 
 builder = lance.BlobDescriptorArrayBuilder("blob")
-for _ in range(2):
-    builder.append_managed(
-        descriptor["blob_uri"], descriptor["position"], descriptor["size"]
-    )
+for _ in range(4):
+    builder.append(shared)
 references = pa.Table.from_arrays(
-    [builder.finish()], schema=pa.schema([builder.field])
+    [builder.finish()],
+    schema=pa.schema(
+        [builder.field], metadata={"lance.blob.managed": "true"}
+    ),
 )
-ds = lance.write_dataset(references, ds.uri, mode="append")
-assert [data for _, data in ds.read_blobs("blob", indices=range(3))] == [
-    b"shared", b"shared", b"shared"
-]
+ds = lance.write_dataset(
+    references, uri, data_storage_version="2.2", max_rows_per_file=2
+)
+assert len(ds.get_fragments()) == 2
+assert [data for _, data in ds.read_blobs("blob", indices=range(4))] == [b"shared"] * 4
+
+ds.optimize.compact_files()
+assert len(ds.get_fragments()) == 1
+assert [data for _, data in ds.read_blobs("blob", indices=range(4))] == [b"shared"] * 4
 ```
 
-The three rows share one immutable payload object, including after compaction.
+The four rows share one immutable payload object, including after compaction.
 Cleanup retains the whole object while any retained snapshot references it.
-Keep the source snapshot protected, for example with a tag, until the append
-commits if concurrent updates and cleanup can otherwise retire it. An open
-dataset handle alone does not protect a snapshot from cleanup.
+When reusing an object from an existing snapshot, keep that snapshot protected,
+for example with a tag, until the append commits if concurrent updates and
+cleanup can otherwise retire it. An open dataset handle alone does not protect
+a snapshot from cleanup.
 
 Use references from the same table and preserve their base identity. Kind 5
 descriptors require their registered `blob_id` as `base_id`; for kind 4, the base
@@ -173,6 +278,42 @@ table's primary base. Do not copy an implicit reference from a shallow clone's
 source file into a destination with a different base. Cross-table sharing and
 automatic deduplication are outside this API's contract. All maintenance clients
 must support Managed Blobs as described above.
+
+For a registered base, open the session at that base's root and pass
+`open_managed_blob_writer(base_id=...)`. Register the same root under that ID
+through the existing dataset base APIs before committing the descriptors.
+This file-level API cannot check that a caller-supplied root matches a dataset's
+base registry; the caller must preserve that binding. The commit rejects unknown
+base IDs. The returned descriptors carry the object's relative path and actual
+base identity; Managed objects do not use sidecar blob IDs.
+
+An implicit reference (`base_id=None`) is interpreted relative to the destination
+data file's base. Keep these data files in primary storage as in the example.
+When writing data files to other bases, give the payload root an explicit
+registered base ID and supply that ID to the Managed writer. The same reference
+can then be used in data files written to different bases.
+
+To reuse an existing immutable object or a subrange, use
+`append_managed(uri, offset, size, base_id=None)`. Managed zero-length ranges
+represent empty values; they do not discover the object's size. Null descriptors
+remain null. `field, values = writer.finish_column(field_name)` returns the
+matching extension field and prepared array together when each uploaded payload
+corresponds to one output row. For explicit sharing, reuse the descriptors from
+`finish()` instead of uploading the payload again.
+
+The upload alone does not publish a table version. Finish it before committing
+references, and do not run cleanup with `delete_unverified=True` concurrently
+with preparation: that option may delete in-flight, uncommitted objects. Failed
+or abandoned uploads follow the existing unverified-object retention policy.
+Cleanup retains the entire packed object while any protected reference remains,
+including unused byte ranges within the same object.
+
+Rust callers use `ManagedBlobWriter::try_new(store, base_path, base_id)`,
+then `write_blob`, `finish`, and `BlobDescriptorArrayBuilder::push` / `extend`.
+Write the resulting record batches through `Dataset::write` with the same
+schema opt-in. The method's Rustdoc includes a complete write, commit, compaction
+and read example. These APIs preserve the existing Packed/Dedicated sidecar
+preparation APIs for callers preparing a specific data file.
 
 ## Blob v2: Write Patterns
 
@@ -236,7 +377,8 @@ Note:
 
 - By default, external blob URIs must map to a registered non-dataset-root base path.
 - If you need to reference external objects outside those bases, set
-  `allow_external_blob_outside_bases=True` when writing.
+  `allow_external_blob_outside_bases=True` when writing in embedded mode.
+  A controlled service can reject these references regardless of this option.
 - Blob v2 storage layout thresholds can be configured per column with
   `blob_field(..., inline_size_threshold=..., dedicated_size_threshold=...)`.
   The inline threshold controls when values move from the data file to packed
@@ -250,6 +392,43 @@ Note:
 - Blob v2 fields can be nested inside structs and variable-length lists. Blob-aware
   scans preserve the surrounding nested layout; use `blob_handling="all_binary"`
   to materialize nested blob payloads as bytes.
+
+### Service access policy and external object caches
+
+Rust services can restrict external blobs to registered storage bases when
+constructing their shared session:
+
+```rust
+use std::sync::Arc;
+use lance::session::{Session, UnregisteredExternalBlobPolicy};
+use lance_io::object_store::ObjectStoreRegistry;
+
+let registry = ObjectStoreRegistry::default()
+    .without_providers(["file", "file-object-store", "file+uring"])?;
+let session = Session::new(0, 0, Arc::new(registry))
+    .with_unregistered_external_blob_policy(UnregisteredExternalBlobPolicy::Deny);
+```
+
+Pass this session through `ReadParams.session`, `DatasetBuilder::with_session`,
+or `WriteParams.session`. Reads reject unregistered external descriptors
+(`base_id == 0`) before parsing the URI, opening a store, or probing its size.
+Logical URI writes under this policy must resolve to a registered storage base;
+the local `allow_external_blob_outside_bases` option cannot override the policy.
+The default session allows unregistered references for embedded use.
+
+`without_providers` consumes an unshared registry and discards its cached store
+bindings. Apply it before handing out sessions or store handles; it does not
+revoke handles that already exist. Registered bases still need appropriate
+credentials and deployment restrictions.
+
+Externally owned objects can change independently of table versions. Rust store
+wrappers prepare their external read view through
+`WrappingObjectStore::wrap_external_blob`, reusing the same physical store,
+credentials, endpoint, and connection pool. This hook retains the regular
+wrapper by default. A service's immutable page-cache wrapper should return the
+provided original view to bypass that cache, while retaining authorization and
+observation wrappers in the chain. Inline, Packed, Dedicated, and Managed
+payloads continue through the regular wrapping path.
 
 ### Example: packed external blobs (single container file)
 
@@ -312,6 +491,7 @@ Choose the read API based on the payload shape you want:
 | `read_blobs` | `List[Tuple[int, Optional[bytes]]]` | You need complete blob payloads in memory, such as training loaders or batch preprocessing. |
 | `read_blob_ranges` | `List[Tuple[int, int, Optional[bytes]]]` | You need selected byte ranges from multiple rows without materializing complete blobs. |
 | `take_blobs` | `List[Optional[BlobFile]]` | You need file-like objects for streaming, seeking, or partial reads. |
+| `lance.read_blob_files` / `lance.read_blob_file_ranges` | `List[Tuple[int, Optional[bytes]]]` | You already hold `BlobFile` handles and read the same blobs repeatedly, such as a shard index followed by chunk ranges. |
 | `scanner(..., blob_handling="all_binary")` | Arrow binary columns | You want blob columns in a scan result or `pyarrow.Table`. |
 
 Do not wrap `take_blobs` in your own thread pool just to call `read()` or
@@ -402,6 +582,41 @@ request, `offset + length` must fit in an unsigned 64-bit integer. A range on a
 non-null blob must not extend beyond its logical size; blob-local bounds are not
 evaluated for null blobs because they have no logical payload length.
 
+### Read through handles you already hold
+
+`read_blobs` and `read_blob_ranges` look up the selected rows' blob descriptors
+on every call before they read any payload bytes. On object storage that lookup
+is a separate request the payload reads wait for. When you read the same blobs
+repeatedly, take handles once with `take_blobs` and pass them to
+`read_blob_files` or `read_blob_file_ranges`: each call then issues only the
+payload requests, planned and coalesced the same way.
+
+```python
+import lance
+
+ds = lance.dataset("./blobs_v22.lance")
+handles = ds.take_blobs("blob", indices=[0, 1, 2])
+
+payloads = [data for _request_index, data in lance.read_blob_files(handles)]
+headers = lance.read_blob_file_ranges(
+    [(handle, 0, 16) for handle in handles]
+)
+```
+
+Each result is a `(request_index, data)` pair. A `None` handle, which
+`take_blobs` returns for a null blob, returns `None`; keep null handles in the
+request list so `request_index` still matches the original handle positions.
+Handles are not tied to a
+dataset receiver. Handles retain the object locations and byte ranges resolved
+when they were opened, including when passed alongside handles from other
+datasets or snapshots. Later dataset commits do not re-resolve those descriptors;
+cleanup must retain the referenced payloads. External objects follow their
+storage provider's consistency semantics.
+
+The first non-null handle supplies default I/O parallelism and buffer size.
+Use the positive `io_parallelism` and `io_buffer_size` keyword arguments to
+override them. Empty and all-`None` inputs issue no storage requests.
+
 ### Read blob columns as Arrow binary
 
 ```python
@@ -418,17 +633,54 @@ Sequential reads are buffered, 512 KiB by default. Pass `buffer_size=0`
 for unbuffered reads. `read_range` and `read_ranges` do not use this
 buffer.
 
-```python
-import lance
+=== "Python"
 
-ds = lance.dataset("./blobs_v22.lance")
-blobs = ds.take_blobs("blob", indices=[0, 1])
+    ```python
+    import lance
 
-blob = blobs[0]
-if blob is not None:
-    with blob as f:
-        header = f.read(1024)
-```
+    ds = lance.dataset("./blobs_v22.lance")
+    blobs = ds.take_blobs("blob", indices=[0, 1])
+
+    blob = blobs[0]
+    if blob is not None:
+        with blob as f:
+            header = f.read(1024)
+    ```
+
+=== "Rust"
+
+    ```rust
+    use std::sync::Arc;
+    use lance::Dataset;
+
+    let ds = Arc::new(Dataset::open("./blobs_v22.lance").await?);
+    let blobs = ds.take_blobs_by_indices(&[0, 1], "blob").await?;
+
+    if let Some(blob) = &blobs[0] {
+        let header = blob.read_up_to(1024).await?;
+    }
+    ```
+
+=== "Java"
+
+    ```java
+    import org.lance.BlobFile;
+    import org.lance.Dataset;
+    import java.util.List;
+
+    try (Dataset ds = Dataset.open("./blobs_v22.lance", allocator)) {
+      List<BlobFile> blobs = ds.takeBlobsByIndices(List.of(0L, 1L), "blob");
+      try {
+        if (blobs.get(0) != null) {
+          byte[] header = blobs.get(0).readUpTo(1024);
+        }
+      } finally {
+        for (BlobFile blob : blobs) {
+          if (blob != null) blob.close();
+        }
+      }
+    }
+    ```
 
 ### Example: decode video frames lazily
 

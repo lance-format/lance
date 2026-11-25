@@ -199,7 +199,7 @@ async fn run_tailer_replay(
     shard_id: Uuid,
     expected_entries: usize,
 ) -> usize {
-    let tailer = WalTailer::new(object_store, base_path, shard_id);
+    let tailer = WalTailer::new(object_store, base_path, "", shard_id);
     let mut count = 0usize;
     let mut pos = 0u64;
     loop {

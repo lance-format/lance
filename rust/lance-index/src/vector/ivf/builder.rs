@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::cast::AsArray;
+use arrow_array::types::{UInt32Type, UInt64Type};
 use arrow_array::{Array, FixedSizeListArray, UInt32Array, UInt64Array};
 use futures::TryStreamExt;
 use object_store::path::Path;
@@ -68,11 +69,12 @@ pub struct IvfBuildParams {
 
     /// Precomputed partitions file (row_id -> partition_id)
     /// mutually exclusive with `precomputed_shuffle_buffers`
+    /// requires `centroids` to be set and `retrain` to be false
     pub precomputed_partitions_file: Option<String>,
 
     /// Precomputed shuffle buffers (row_id -> partition_id, pq_code)
     /// mutually exclusive with `precomputed_partitions_file`
-    /// requires `centroids` to be set
+    /// requires `centroids` to be set and `retrain` to be false
     ///
     /// The input is expected to be (/dir/to/buffers, [buffer1.lance, buffer2.lance, ...])
     pub precomputed_shuffle_buffers: Option<(Path, Vec<String>)>,
@@ -140,6 +142,53 @@ impl IvfBuildParams {
             ..Default::default()
         })
     }
+
+    /// Check the field combinations the precomputed inputs above declare.
+    ///
+    /// Both precomputed inputs carry partition ids that were assigned against
+    /// one particular set of centroids, so neither says anything about an index
+    /// whose centroids are trained from the data instead, and supplying both at
+    /// once means one of the two assignments is silently unused.
+    pub fn validate(&self) -> Result<()> {
+        if self.precomputed_shuffle_buffers.is_some() && self.precomputed_partitions_file.is_some()
+        {
+            return Err(Error::invalid_input(
+                "precomputed_shuffle_buffers and precomputed_partitions_file are mutually \
+                 exclusive, but both were set",
+            ));
+        }
+        if self.retrain {
+            if self.precomputed_shuffle_buffers.is_some() {
+                return Err(Error::invalid_input(
+                    "precomputed_shuffle_buffers cannot be used with retrain=true: the buffers \
+                     hold partition ids assigned against the original centroids, but retraining \
+                     changes the centroids",
+                ));
+            }
+            if self.precomputed_partitions_file.is_some() {
+                return Err(Error::invalid_input(
+                    "precomputed_partitions_file cannot be used with retrain=true: the file \
+                     holds partition ids assigned against the original centroids, but retraining \
+                     changes the centroids",
+                ));
+            }
+        }
+        if self.centroids.is_none() {
+            if self.precomputed_shuffle_buffers.is_some() {
+                return Err(Error::invalid_input(
+                    "precomputed_shuffle_buffers requires centroids to be set: the buffers hold \
+                     partition ids assigned against the centroids they were built with",
+                ));
+            }
+            if self.precomputed_partitions_file.is_some() {
+                return Err(Error::invalid_input(
+                    "precomputed_partitions_file requires centroids to be set: the file holds \
+                     partition ids assigned against the centroids it was built with",
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 pub fn recommended_num_partitions(num_rows: usize, target_partition_size: usize) -> usize {
@@ -147,6 +196,18 @@ pub fn recommended_num_partitions(num_rows: usize, target_partition_size: usize)
     // bump it once we have better clustering algorithms.
     const MAX_PARTITIONS: usize = 4096;
     (num_rows / target_partition_size).clamp(1, MAX_PARTITIONS)
+}
+
+/// The error for a precomputed partitions file whose `name` column is absent or
+/// has the wrong physical type, naming what the file has instead.
+fn bad_column(schema: &arrow_schema::Schema, name: &str, expected: &str) -> Error {
+    let found = match schema.field_with_name(name) {
+        Ok(field) => format!("found {}", field.data_type()),
+        Err(_) => "no such column".to_string(),
+    };
+    Error::invalid_input(format!(
+        "malformed precomputed partitions file: expected a {expected} '{name}' column, {found}"
+    ))
 }
 
 /// Load precomputed partitions from disk.
@@ -158,25 +219,277 @@ pub async fn load_precomputed_partitions(
     size_hint: usize,
 ) -> Result<HashMap<u64, u32>> {
     let partition_lookup = stream
-        .try_fold(HashMap::with_capacity(size_hint), |mut lookup, batch| {
-            let row_ids: &UInt64Array = batch
-                .column_by_name("row_id")
-                .expect("malformed partition file: missing row_id column")
-                .as_primitive();
-            let partitions: &UInt32Array = batch
-                .column_by_name("partition")
-                .expect("malformed partition file: missing partition column")
-                .as_primitive();
-            row_ids
-                .values()
-                .iter()
-                .zip(partitions.values().iter())
-                .for_each(|(row_id, partition)| {
-                    lookup.insert(*row_id, *partition);
-                });
-            async move { Ok(lookup) }
-        })
+        .try_fold(
+            HashMap::with_capacity(size_hint),
+            |mut lookup, batch| async move {
+                let row_ids: &UInt64Array = batch
+                    .column_by_name("row_id")
+                    .and_then(|col| col.as_primitive_opt::<UInt64Type>())
+                    .ok_or_else(|| bad_column(batch.schema_ref(), "row_id", "UInt64"))?;
+                let partitions: &UInt32Array = batch
+                    .column_by_name("partition")
+                    .and_then(|col| col.as_primitive_opt::<UInt32Type>())
+                    .ok_or_else(|| bad_column(batch.schema_ref(), "partition", "UInt32"))?;
+                // Both columns are read through their values buffer, which
+                // ignores validity, so a null would be taken for whatever the
+                // buffer happens to hold there. The writer this file comes from
+                // marks the fields nullable without using nulls, so reject them
+                // rather than assign a row to an arbitrary partition.
+                if row_ids.null_count() > 0 || partitions.null_count() > 0 {
+                    return Err(Error::invalid_input(format!(
+                        "malformed precomputed partitions file: nulls are not allowed \
+                         ('row_id' has {}, 'partition' has {})",
+                        row_ids.null_count(),
+                        partitions.null_count()
+                    )));
+                }
+                lookup.extend(
+                    row_ids
+                        .values()
+                        .iter()
+                        .copied()
+                        .zip(partitions.values().iter().copied()),
+                );
+                Ok(lookup)
+            },
+        )
         .await?;
 
     Ok(partition_lookup)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_array::RecordBatch;
+    use arrow_array::{Float32Array, Int64Array, UInt32Array, UInt64Array};
+    use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+    use lance_arrow::FixedSizeListArrayExt;
+    use lance_io::stream::RecordBatchStreamAdapter;
+    use rstest::rstest;
+
+    fn centroids(num_partitions: usize) -> Arc<FixedSizeListArray> {
+        let values = Float32Array::from(vec![0.0_f32; num_partitions * 2]);
+        Arc::new(FixedSizeListArray::try_new_from_values(values, 2).unwrap())
+    }
+
+    fn buffers() -> (Path, Vec<String>) {
+        (Path::from("buffers/data"), vec!["buffer1.lance".to_owned()])
+    }
+
+    #[rstest]
+    #[case::buffers_and_partitions_file(true, true, true, false, "mutually exclusive")]
+    #[case::buffers_with_retrained_centroids(
+        true,
+        false,
+        true,
+        true,
+        "precomputed_shuffle_buffers cannot be used with retrain=true"
+    )]
+    #[case::partitions_file_with_retrained_centroids(
+        false,
+        true,
+        true,
+        true,
+        "precomputed_partitions_file cannot be used with retrain=true"
+    )]
+    #[case::buffers_without_centroids(
+        true,
+        false,
+        false,
+        false,
+        "precomputed_shuffle_buffers requires centroids"
+    )]
+    #[case::partitions_file_without_centroids(
+        false,
+        true,
+        false,
+        false,
+        "precomputed_partitions_file requires centroids"
+    )]
+    fn test_validate_rejects_precomputed_inputs(
+        #[case] with_buffers: bool,
+        #[case] with_partitions_file: bool,
+        #[case] with_centroids: bool,
+        #[case] with_retrain: bool,
+        #[case] expected: &str,
+    ) {
+        let mut params = IvfBuildParams::new(2);
+        if with_buffers {
+            params.precomputed_shuffle_buffers = Some(buffers());
+        }
+        if with_partitions_file {
+            params.precomputed_partitions_file = Some("partitions.lance".to_owned());
+        }
+        if with_centroids {
+            params.centroids = Some(centroids(2));
+        }
+        params.retrain = with_retrain;
+
+        let err = params.validate().unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidInput { .. }),
+            "expected InvalidInput, got: {err:?}"
+        );
+        assert!(
+            err.to_string().contains(expected),
+            "expected the message to mention {expected:?}, got: {err}"
+        );
+    }
+
+    #[rstest]
+    #[case::nothing_precomputed(false, false)]
+    #[case::buffers_with_centroids(true, false)]
+    #[case::partitions_file_with_centroids(false, true)]
+    fn test_validate_accepts_supported_combinations(
+        #[case] with_buffers: bool,
+        #[case] with_partitions_file: bool,
+    ) {
+        let mut params = IvfBuildParams::try_with_centroids(2, centroids(2)).unwrap();
+        if with_buffers {
+            params.precomputed_shuffle_buffers = Some(buffers());
+        }
+        if with_partitions_file {
+            params.precomputed_partitions_file = Some("partitions.lance".to_owned());
+        }
+
+        params.validate().unwrap();
+    }
+
+    fn stream_of(batches: Vec<RecordBatch>) -> impl RecordBatchStream + Unpin {
+        let schema = batches[0].schema();
+        RecordBatchStreamAdapter::new(schema, futures::stream::iter(batches.into_iter().map(Ok)))
+    }
+
+    /// A well-formed batch: `row_id` UInt64, `partition` UInt32, no nulls.
+    fn good_batch(row_ids: Vec<u64>, partitions: Vec<u32>) -> RecordBatch {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("row_id", DataType::UInt64, false),
+            Field::new("partition", DataType::UInt32, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(UInt64Array::from(row_ids)),
+                Arc::new(UInt32Array::from(partitions)),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_load_precomputed_partitions_merges_batches() {
+        let lookup = load_precomputed_partitions(
+            stream_of(vec![
+                good_batch(vec![7, 9], vec![1, 2]),
+                good_batch(vec![4], vec![3]),
+            ]),
+            4,
+        )
+        .await
+        .unwrap();
+        assert_eq!(lookup.len(), 3);
+        assert_eq!(lookup[&7], 1);
+        assert_eq!(lookup[&9], 2);
+        assert_eq!(lookup[&4], 3);
+    }
+
+    #[tokio::test]
+    async fn test_load_precomputed_partitions_rejects_wrong_row_id_type() {
+        // A file whose row_id column is Int64 used to panic in the unchecked
+        // downcast; it must surface as an input error.
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "row_id",
+            DataType::Int64,
+            false,
+        )]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1i64]))]).unwrap();
+        let err = load_precomputed_partitions(stream_of(vec![batch]), 4)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "got: {err:?}");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("row_id") && msg.contains("Int64"),
+            "got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_load_precomputed_partitions_rejects_missing_partition_column() {
+        // The branch that replaced `.expect("… missing partition column")`.
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "row_id",
+            DataType::UInt64,
+            false,
+        )]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(UInt64Array::from(vec![1u64]))]).unwrap();
+        let err = load_precomputed_partitions(stream_of(vec![batch]), 4)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "got: {err:?}");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("partition") && msg.contains("no such column"),
+            "got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_load_precomputed_partitions_rejects_wrong_partition_type() {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("row_id", DataType::UInt64, false),
+            Field::new("partition", DataType::Float32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(UInt64Array::from(vec![1u64])),
+                Arc::new(Float32Array::from(vec![0.0f32])),
+            ],
+        )
+        .unwrap();
+        let err = load_precomputed_partitions(stream_of(vec![batch]), 4)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "got: {err:?}");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("partition") && msg.contains("Float32"),
+            "got: {msg}"
+        );
+    }
+
+    /// Nulls are read through the values buffer, so a null partition would
+    /// silently land the row in whatever partition the buffer holds, and a
+    /// null row id would assign some other row.
+    #[rstest::rstest]
+    #[case::null_partition(vec![Some(1), Some(2)], vec![Some(0), None], "'partition' has 1")]
+    #[case::null_row_id(vec![None, Some(2)], vec![Some(0), Some(1)], "'row_id' has 1")]
+    #[tokio::test]
+    async fn test_load_precomputed_partitions_rejects_nulls(
+        #[case] row_ids: Vec<Option<u64>>,
+        #[case] partitions: Vec<Option<u32>>,
+        #[case] expected: &str,
+    ) {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("row_id", DataType::UInt64, true),
+            Field::new("partition", DataType::UInt32, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(UInt64Array::from(row_ids)),
+                Arc::new(UInt32Array::from(partitions)),
+            ],
+        )
+        .unwrap();
+        let err = load_precomputed_partitions(stream_of(vec![batch]), 4)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "got: {err:?}");
+        assert!(err.to_string().contains(expected), "got: {err}");
+    }
 }

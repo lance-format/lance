@@ -5,6 +5,363 @@ use super::super::posting_prewarm::ChunkPostingMode;
 use super::*;
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 
+#[rstest::rstest]
+#[case::exact(1024, 0, true)]
+#[case::alignment_tail(1088, 0, true)]
+#[case::alignment_prefix(1088, 64, true)]
+#[case::oversized_tail(1152, 0, false)]
+#[case::rare_slice(16 * 1024, 512, false)]
+fn test_shared_positions_bound_retained_allocation_and_preserve_lifetime(
+    #[case] capacity: usize,
+    #[case] offset: i64,
+    #[case] shares_backing: bool,
+    #[values(false, true)] arrow_aligned: bool,
+) {
+    let data = (0..capacity).map(|i| (i % 251) as u8).collect::<Vec<_>>();
+    let expected = data[offset as usize..offset as usize + 1024].to_vec();
+    let backing = if arrow_aligned {
+        Buffer::from(data.as_slice())
+    } else {
+        Buffer::from_vec(data)
+    };
+    assert_eq!(backing.capacity(), capacity);
+    let values = LargeBinaryArray::new(
+        arrow::buffer::OffsetBuffer::new(vec![offset, offset + 1024].into()),
+        backing,
+        None,
+    );
+    let address = values.value(0).as_ptr();
+    let stream =
+        SharedPositionStream::from_arrow(PositionStreamCodec::PackedDelta, vec![0, 512], values);
+    assert_eq!(stream.bytes().as_ptr() == address, shares_backing);
+    let retained = if shares_backing { capacity } else { 1024 };
+    assert_eq!(stream.size(), retained + 2 * std::mem::size_of::<u32>());
+    assert_eq!(stream.block(0), &expected[..512]);
+    let clone = stream.clone();
+    drop(stream);
+    assert_eq!(clone.block(1), &expected[512..]);
+    // Allocation accounting is not part of position-stream value equality.
+    assert_eq!(
+        clone,
+        SharedPositionStream::new(
+            PositionStreamCodec::PackedDelta,
+            vec![0, 512],
+            bytes::Bytes::from(expected),
+        )
+    );
+}
+
+#[test]
+fn test_shared_positions_do_not_retain_an_aliased_owned_buffer() {
+    let backing = Buffer::from_vec(vec![7_u8; 1024]);
+    let values = LargeBinaryArray::new(
+        arrow::buffer::OffsetBuffer::new(vec![0_i64, 1024].into()),
+        backing.clone(),
+        None,
+    );
+    let address = values.value(0).as_ptr();
+    let stream =
+        SharedPositionStream::from_arrow(PositionStreamCodec::PackedDelta, vec![0], values);
+    assert_ne!(stream.bytes().as_ptr(), address);
+    assert_eq!(backing.strong_count(), 1);
+    assert_eq!(stream.block(0), &[7_u8; 1024]);
+}
+
+#[rstest::rstest]
+#[case::compact(1088, true)]
+#[case::oversized(4096, false)]
+fn test_shared_positions_reuse_uniquely_owned_io_bytes(
+    #[case] capacity: usize,
+    #[case] shares_backing: bool,
+) {
+    let mut data = Vec::with_capacity(capacity);
+    data.extend((0..1088).map(|i| (i % 251) as u8));
+    let expected = data[64..].to_vec();
+    let bytes = bytes::Bytes::from(data).slice(64..1088);
+    let buffer = lance_encoding::buffer::LanceBuffer::from_bytes(bytes, 1).into_buffer();
+    let pointer = buffer.as_ptr();
+    let values = LargeBinaryArray::new(
+        arrow::buffer::OffsetBuffer::new(vec![0_i64, 1024].into()),
+        buffer,
+        None,
+    );
+    let stream =
+        SharedPositionStream::from_arrow(PositionStreamCodec::PackedDelta, vec![0], values);
+    assert_eq!(stream.bytes().as_ptr() == pointer, shares_backing);
+    assert_eq!(stream.bytes(), expected);
+    assert_eq!(
+        stream.size(),
+        (if shares_backing { capacity } else { 1024 }) + std::mem::size_of::<u32>()
+    );
+}
+
+#[test]
+fn test_shared_positions_copy_external_owner_with_hidden_capacity() {
+    struct Owner(Arc<Vec<u8>>);
+    impl AsRef<[u8]> for Owner {
+        fn as_ref(&self) -> &[u8] {
+            self.0.as_slice()
+        }
+    }
+    let parent = Arc::new((0..16 * 1024).map(|i| (i % 251) as u8).collect::<Vec<_>>());
+    let expected = parent[512..1536].to_vec();
+    let owner = Arc::downgrade(&parent);
+    let bytes = bytes::Bytes::from_owner(Owner(parent)).slice(512..1536);
+    let backing = lance_encoding::buffer::LanceBuffer::from_bytes(bytes, 1).into_buffer();
+    // Custom capacity is only the visible span, not its owner's allocation.
+    assert_eq!(backing.capacity(), 1024);
+    assert!(owner.upgrade().is_some());
+    let values = LargeBinaryArray::new(
+        arrow::buffer::OffsetBuffer::new(vec![0_i64, 1024].into()),
+        backing,
+        None,
+    );
+    let stream =
+        SharedPositionStream::from_arrow(PositionStreamCodec::PackedDelta, vec![0], values);
+    assert!(
+        owner.upgrade().is_none(),
+        "the hidden 16 KiB owner must be released"
+    );
+    assert_eq!(stream.size(), 1024 + std::mem::size_of::<u32>());
+    assert_eq!(stream.block(0), expected.as_slice());
+}
+
+#[rstest::rstest]
+#[case::zero_width(vec![2; 2048], 16 * 1024)]
+#[case::chunk_boundary(vec![3000, 1096], 5 * 1024)]
+fn test_position_blocks_keep_small_blocks_compact(
+    #[case] lengths: Vec<usize>,
+    #[case] max_bytes: usize,
+) {
+    // A token at position zero in every document produces two zero-width
+    // 128-value frames per 256-posting block. Per-block allocations must not
+    // overwhelm this payload and its 8 KiB of block offsets.
+    let mut blocks = EncodedPositionBlocks::default();
+    for len in lengths {
+        blocks.push_encoded_block(vec![0; len]).unwrap();
+    }
+    assert!(
+        blocks.size() <= max_bytes,
+        "{} retained bytes",
+        blocks.size()
+    );
+}
+
+#[test]
+fn test_position_blocks_append_without_changing_value_boundaries() {
+    let inputs = [
+        Vec::new(),
+        vec![vec![1, 2, 3], Vec::new(), vec![4, 5]],
+        vec![(0..8193).map(|i| (i % 251) as u8).collect()],
+        [3000, 1096, 0, 1, 4097, 3000, 1097, 8193, 0]
+            .into_iter()
+            .map(|len| (0..len).map(|i| (i % 251) as u8).collect())
+            .collect(),
+    ];
+    let mut bytes = LargeBinaryBuilder::new();
+    let mut offsets = ListBuilder::new(UInt32Builder::new());
+    for blocks in &inputs {
+        let mut encoded = EncodedPositionBlocks::default();
+        for block in blocks {
+            encoded.push_encoded_block(block.clone()).unwrap();
+        }
+        for (i, block) in blocks.iter().enumerate() {
+            assert_eq!(encoded.block(i), block);
+        }
+        encoded.append_to(&mut bytes, &mut offsets).unwrap();
+    }
+    let bytes = bytes.finish();
+    let offsets = offsets.finish();
+    assert_eq!(bytes.len(), inputs.len());
+    for (i, blocks) in inputs.iter().enumerate() {
+        assert_eq!(bytes.value(i), blocks.concat());
+        let mut expected_offsets = Vec::new();
+        let mut end = 0;
+        for block in blocks {
+            expected_offsets.push(end);
+            end += block.len() as u32;
+        }
+        assert_eq!(
+            offsets.value(i).as_primitive::<UInt32Type>().values(),
+            &expected_offsets
+        );
+    }
+}
+
+#[rstest::rstest]
+#[case::count_128(128, false, false)]
+#[case::count_256(256, false, false)]
+#[case::positions_128(128, true, false)]
+#[case::positions_256(256, true, false)]
+#[case::streamed_128(128, true, true)]
+#[case::streamed_256(256, true, true)]
+fn test_position_blocks_batch_roundtrip(
+    #[case] block_size: usize,
+    #[case] with_positions: bool,
+    #[case] streamed: bool,
+) {
+    let counts = [
+        0,
+        1,
+        block_size - 1,
+        block_size,
+        block_size + 1,
+        2 * block_size + 3,
+    ];
+    let mut docs = DocSet::default();
+    for doc_id in 0..*counts.last().unwrap() {
+        docs.append(doc_id as u64 * 3 + 1, 50_000);
+    }
+    let format = InvertedIndexParams::default()
+        .format_version("3".parse().unwrap())
+        .resolved_format_version();
+    let schema =
+        inverted_list_schema_for_version_with_block_size(with_positions, format, block_size);
+    let mut batch_builder =
+        PostingListBatchBuilder::new(schema, with_positions, format, counts.len());
+    // Reuse after finish, including an empty list before and after nonempty lists.
+    for counts in [counts.to_vec(), counts.into_iter().rev().collect()] {
+        let mut expected_lists = Vec::new();
+        for count in counts {
+            let mut builder = PostingListBuilder::new_with_posting_tail_codec_and_block_size(
+                with_positions,
+                format.posting_tail_codec(),
+                block_size,
+            );
+            let mut expected = Vec::new();
+            for doc_id in 0..count as u32 {
+                let frequency = if count == 1 { 32_769 } else { doc_id % 7 + 1 };
+                let positions = (0..frequency)
+                    .map(|i| i * 11 + doc_id % 5)
+                    .collect::<Vec<_>>();
+                if !with_positions {
+                    builder.add(doc_id, PositionRecorder::Count(frequency));
+                } else if streamed {
+                    for &position in &positions {
+                        builder.add_occurrence(doc_id, position).unwrap();
+                    }
+                    builder.finish_open_doc(doc_id).unwrap();
+                } else {
+                    builder.add(doc_id, PositionRecorder::Position(positions.clone().into()));
+                }
+                expected.push((doc_id, frequency, with_positions.then_some(positions)));
+            }
+            builder
+                .append_to_batch_with_docs(&docs, &mut batch_builder, format)
+                .unwrap();
+            expected_lists.push(expected);
+        }
+        let batch = batch_builder.finish().unwrap();
+        assert!(batch_builder.is_empty());
+        assert_eq!(batch.num_rows(), expected_lists.len());
+        for (row, expected) in expected_lists.into_iter().enumerate() {
+            let length = batch[LENGTH_COL].as_primitive::<UInt32Type>().value(row);
+            assert_eq!(length as usize, expected.len());
+            let max_score = batch[MAX_SCORE_COL]
+                .as_primitive::<Float32Type>()
+                .value(row);
+            let posting =
+                PostingList::from_batch(&batch.slice(row, 1), Some(max_score), Some(length))
+                    .unwrap();
+            if expected.is_empty() {
+                assert!(posting.is_empty());
+                assert_eq!(batch[POSTING_COL].as_list::<i32>().value(row).len(), 0);
+                if with_positions {
+                    assert!(
+                        batch[COMPRESSED_POSITION_COL]
+                            .as_binary::<i64>()
+                            .value(row)
+                            .is_empty()
+                    );
+                    assert_eq!(
+                        batch[POSITION_BLOCK_OFFSET_COL]
+                            .as_list::<i32>()
+                            .value(row)
+                            .len(),
+                        0
+                    );
+                }
+                continue;
+            }
+            let actual = posting
+                .iter()
+                .map(|(doc_id, frequency, positions)| {
+                    (
+                        doc_id as u32,
+                        frequency,
+                        positions.map(|p| p.collect::<Vec<_>>()),
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected);
+        }
+    }
+}
+
+#[rstest::rstest]
+#[case::block_128(128)]
+#[case::block_256(256)]
+fn test_posting_batch_payload_bytes(
+    #[case] block_size: usize,
+    #[values(false, true)] with_positions: bool,
+) {
+    let version = InvertedListFormatVersion::V3;
+    let schema =
+        inverted_list_schema_for_version_with_block_size(with_positions, version, block_size);
+    let mut batch_builder = PostingListBatchBuilder::new(schema, with_positions, version, 2);
+    assert_eq!(batch_builder.payload_bytes(), 0);
+    let mut docs = DocSet::default();
+    for doc_id in 0..block_size as u32 + 1 {
+        docs.append(u64::from(doc_id), 300);
+    }
+    let make_posting = || {
+        let mut posting = PostingListBuilder::new_with_posting_tail_codec_and_block_size(
+            with_positions,
+            version.posting_tail_codec(),
+            block_size,
+        );
+        for doc_id in 0..block_size as u32 + 1 {
+            let positions = if with_positions {
+                PositionRecorder::Position((0..600).step_by(2).collect())
+            } else {
+                PositionRecorder::Count(300)
+            };
+            posting.add(doc_id, positions);
+        }
+        posting
+    };
+    for _ in 0..2 {
+        make_posting()
+            .append_to_batch_with_docs(&docs, &mut batch_builder, version)
+            .unwrap();
+    }
+    let tracked_bytes = batch_builder.payload_bytes();
+    let batch = batch_builder.finish().unwrap();
+    let mut expected_bytes = 0;
+    for column in [POSTING_COL, IMPACT_COL] {
+        expected_bytes += batch[column]
+            .as_list::<i32>()
+            .values()
+            .as_binary::<i64>()
+            .value_data()
+            .len();
+    }
+    if with_positions {
+        expected_bytes += batch[COMPRESSED_POSITION_COL]
+            .as_binary::<i64>()
+            .value_data()
+            .len();
+    }
+    assert!(expected_bytes > 0);
+    assert_eq!(tracked_bytes, expected_bytes);
+    assert_eq!(batch.num_rows(), 2);
+    assert_eq!(batch_builder.payload_bytes(), 0);
+    make_posting()
+        .append_to_batch_with_docs(&docs, &mut batch_builder, version)
+        .unwrap();
+    assert_eq!(batch_builder.payload_bytes(), expected_bytes / 2);
+}
+
 #[derive(Debug)]
 struct ControlledPostingReads {
     started: std::sync::atomic::AtomicUsize,

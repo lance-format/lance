@@ -3,7 +3,7 @@
 
 //! Feature flags
 
-use crate::format::Manifest;
+use crate::format::{IndexMetadata, Manifest};
 use lance_core::{Error, Result, datatypes::Schema};
 
 /// Fragments may contain deletion files, which record the tombstones of
@@ -98,9 +98,9 @@ pub const FLAG_FRAGMENT_TREE: u64 = 1 << 12;
 /// The flag requires [`FLAG_COVERED_INDEX_METADATA`] in both feature words, and
 /// the two are retained together while the independent bit is set.
 ///
-/// Reserved ahead of its implementation. This build masks the bit out in
-/// `supported_flags_when`, so it cannot open a table and apply the legacy
-/// suffix contract to independent declarations.
+/// A reader decodes the index section under [`CoveringContract::Independent`]
+/// when this bit is set. A commit sets it only while some index
+/// [`requires_independent_contract`](crate::format::IndexMetadata::requires_independent_contract).
 pub const FLAG_INDEPENDENT_COVERING_FIELDS: u64 = 1 << 13;
 /// Blob v2 descriptors may independently address Lance-owned objects. Readers
 /// must resolve their explicit bases and writers/GC must preserve those references.
@@ -119,11 +119,58 @@ pub const FLAG_NON_REUSABLE_FIELD_IDS: u64 = 1 << 15;
 /// Required for data files containing version 1 zone-level statistics seeds.
 /// Their min/max exclude NaNs, which are counted separately by sign. Set in
 /// both reader and writer feature flags and preserve across commits.
-///
-/// Reserved: support for these seeds is not implemented yet.
 pub const FLAG_ZONE_WRITE_SEEDS: u64 = 1 << 16;
+
+/// Dataset config key that opts a table into version 1 zone write seeds
+/// ([`FLAG_ZONE_WRITE_SEEDS`]).
+///
+/// Valid values are `"0"` and `"1"`. When absent or `"0"`, writers continue to
+/// emit version 0 zone write seeds without setting [`FLAG_ZONE_WRITE_SEEDS`],
+/// keeping the table readable and writable by Lance `< 15`. A commit that
+/// itself writes this key as `"1"` atomically activates
+/// [`FLAG_ZONE_WRITE_SEEDS`] in both feature flag words; an inherited `"1"`
+/// alone does not, because a writer that did not know the flag could have
+/// stored it. Once activated, the capability is sticky and later writes emit
+/// version 1 seeds unless this key explicitly pins the table back to `"0"`.
+pub const ZONE_WRITE_SEEDS_VERSION_KEY: &str = "lance.zone_write_seeds.version";
+/// Writer-only protection for clustering definitions, ID allocation, references,
+/// and generic fragment/index segment metadata maintenance.
+/// Set whenever a manifest carries any of them; a writer that does not preserve
+/// them must refuse the dataset. Ordinary readers can ignore this metadata; all
+/// covered features share this one bit.
+pub const FLAG_OBJECT_METADATA: u64 = 1 << 17;
+/// A stable-row-ID table contains an index that stores physical row addresses.
+/// Older writers may treat its entries as stable row IDs and extend coverage to
+/// rewritten fragments without indexing them, silently losing query results.
+/// Readers can still skip an unsupported index version and scan the data.
+/// This writer-only flag is cleared when the last row-address index is removed.
+pub const FLAG_ROW_ADDR_INDICES: u64 = 1 << 18;
+/// Some fragment stores its deletion vector in the manifest
+/// (`DeletionFile.inline`) rather than in a file under `_deletions/`. A reader
+/// without this flag would look for a file that does not exist.
+pub const FLAG_INLINE_DELETIONS: u64 = 1 << 19;
+/// Reserved for local fragment aliases (`IndexMetadata.local_fragment_aliases`).
+/// Both reader and writer bits are required while any retained index segment
+/// has aliases. The flag is non-sticky and unsupported until reader and
+/// index maintenance support lands.
+pub const FLAG_LOCAL_FRAGMENT_ALIASES: u64 = 1 << 20;
+/// Some fragment sets `DeletionFile.path` instead of deriving the path from `fragment_id`.
+/// The reader bit is set while any fragment sets `path`, and the writer bit remains set
+/// on subsequent versions so cleanup preserves files referenced by retained versions.
+pub const FLAG_DELETION_FILE_PATHS: u64 = 1 << 21;
+/// Keeps released writers away from BTree segments whose `BTreeIndexDetails`
+/// sets `key_layout`.
+///
+/// Writer-only. The
+/// [key layout writer rules](https://lance.org/format/index/scalar/btree/#key-layout-writer-rules)
+/// say when a writer sets this bit and how it treats a `key_layout` segment
+/// from a manifest that lacks it.
+///
+/// Reserved ahead of its implementation. This build masks the bit out in
+/// `supported_flags_when`, so it refuses to write a table that sets it.
+pub const FLAG_BTREE_KEY_LAYOUT: u64 = 1 << 22;
 /// The first bit that is unknown as a feature flag
-pub const FLAG_UNKNOWN: u64 = 1 << 17;
+pub const FLAG_UNKNOWN: u64 = 1 << 23;
 
 const _: () = assert!(FLAG_COVERED_INDEX_METADATA < FLAG_UNKNOWN);
 // The fence needs a bit the current released build already refuses, which means
@@ -141,17 +188,215 @@ const _: () = assert!(FLAG_INDEPENDENT_COVERING_FIELDS < FLAG_UNKNOWN);
 
 const _: () = assert!(FLAG_MANAGED_BLOBS < FLAG_UNKNOWN);
 const _: () = assert!(FLAG_ZONE_WRITE_SEEDS < FLAG_UNKNOWN);
+const _: () = assert!(FLAG_OBJECT_METADATA < FLAG_UNKNOWN);
+const _: () = assert!(FLAG_ROW_ADDR_INDICES < FLAG_UNKNOWN);
+const _: () = assert!(FLAG_INLINE_DELETIONS < FLAG_UNKNOWN);
+const _: () = assert!(FLAG_LOCAL_FRAGMENT_ALIASES < FLAG_DELETION_FILE_PATHS);
+// Released builds refuse bit 20 and above, so they cannot read this format.
+const _: () = assert!(FLAG_DELETION_FILE_PATHS >= 1 << 20);
+const _: () = assert!(FLAG_DELETION_FILE_PATHS < FLAG_UNKNOWN);
+// Same fence for this bit: v15.0.0-beta.7 refuses bit 19 and up.
+const _: () = assert!(FLAG_BTREE_KEY_LAYOUT >= 1 << 19);
+const _: () = assert!(FLAG_BTREE_KEY_LAYOUT < FLAG_UNKNOWN);
 
 pub(crate) const STICKY_PAIRED_FLAGS: u64 = FLAG_MIXED_DATA_FILE_VERSIONS
     | FLAG_FRAGMENT_REUSE_INDEX
     | FLAG_MANAGED_BLOBS
     | FLAG_ZONE_WRITE_SEEDS;
 pub(crate) const STICKY_READER_FLAGS: u64 = STICKY_PAIRED_FLAGS;
-pub(crate) const STICKY_WRITER_FLAGS: u64 = STICKY_PAIRED_FLAGS | FLAG_NON_REUSABLE_FIELD_IDS;
+pub(crate) const STICKY_WRITER_FLAGS: u64 =
+    STICKY_PAIRED_FLAGS | FLAG_NON_REUSABLE_FIELD_IDS | FLAG_DELETION_FILE_PATHS;
+pub(crate) const COVERING_FLAGS: u64 =
+    FLAG_COVERED_INDEX_METADATA | FLAG_INDEPENDENT_COVERING_FIELDS;
+
+/// How a manifest's index section lays out each index's key and carried
+/// fields. [`FLAG_INDEPENDENT_COVERING_FIELDS`] selects it for every entry at
+/// once, so a reader picks it before it decodes any `IndexMetadata`.
+///
+/// The same entry reads differently under each:
+///
+/// ```
+/// use lance_table::feature_flags::CoveringContract;
+/// use lance_table::format::{IndexMetadata, pb};
+///
+/// let entry = pb::IndexMetadata {
+///     uuid: Some((&uuid::Uuid::new_v4()).into()),
+///     fields: vec![7, 11],
+///     covering_fields: vec![11],
+///     ..Default::default()
+/// };
+/// let suffix = IndexMetadata::from_manifest_proto(entry.clone(), CoveringContract::Suffix)?;
+/// assert_eq!(suffix.keyed_fields(), &[7]);
+/// let independent = IndexMetadata::from_manifest_proto(entry, CoveringContract::Independent)?;
+/// assert_eq!(independent.keyed_fields(), &[7, 11]);
+/// # Ok::<(), lance_core::Error>(())
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoveringContract {
+    /// The carried fields are the trailing entries of `IndexMetadata.fields`.
+    Suffix,
+    /// `IndexMetadata.fields` holds only key fields, and `covering_fields` is a
+    /// separate list that may repeat a key.
+    Independent,
+}
+
+impl CoveringContract {
+    /// The contract `manifest`'s index section uses.
+    pub fn of(manifest: &Manifest) -> Self {
+        if manifest.reader_feature_flags & FLAG_INDEPENDENT_COVERING_FIELDS != 0 {
+            Self::Independent
+        } else {
+            Self::Suffix
+        }
+    }
+}
 
 /// Environment variable that opts a release build into reading and writing data
 /// overlay files before the feature is generally released.
 pub const ENABLE_UNSTABLE_DATA_OVERLAY_FILES_ENV: &str = "LANCE_ENABLE_UNSTABLE_DATA_OVERLAY_FILES";
+
+/// Validate a change to automatic cleanup configuration.
+///
+/// Retention rules use `lance.auto_cleanup.policy_interval`; the legacy interval
+/// must be absent. Call before publishing a change to table configuration, not
+/// when rewriting inherited configuration from another client.
+///
+/// ```
+/// # use lance_table::{feature_flags::validate_auto_cleanup_config, format::Manifest};
+/// # fn check(manifest: &Manifest) -> lance_core::Result<()> {
+/// validate_auto_cleanup_config(manifest)?;
+/// # Ok(())
+/// # }
+/// ```
+pub fn validate_auto_cleanup_config(manifest: &Manifest) -> Result<()> {
+    let has_policy = manifest.config.contains_key("lance.auto_cleanup.policy");
+    let has_keep_one = manifest
+        .config
+        .keys()
+        .any(|key| key.starts_with("lance.auto_cleanup.keep_one."));
+    let has_retention_config = has_policy
+        || manifest
+            .config
+            .keys()
+            .any(|key| key.starts_with("lance.auto_cleanup.keep_one."));
+    let has_policy_interval = manifest
+        .config
+        .contains_key("lance.auto_cleanup.policy_interval");
+    if (has_retention_config || has_policy_interval)
+        && manifest.config.contains_key("lance.auto_cleanup.interval")
+    {
+        return Err(Error::invalid_input(
+            "retention rules require lance.auto_cleanup.policy_interval; remove lance.auto_cleanup.interval and lance.auto_cleanup.older_than before activating retention cleanup",
+        ));
+    }
+    if has_policy
+        && (has_keep_one
+            || manifest
+                .config
+                .contains_key("lance.auto_cleanup.older_than"))
+    {
+        return Err(Error::invalid_input(
+            "lance.auto_cleanup.policy cannot be combined with lance.auto_cleanup.older_than or keep_one settings",
+        ));
+    }
+    for key in manifest.config.keys() {
+        if key.starts_with("lance.auto_cleanup.keep_one.")
+            && key != "lance.auto_cleanup.keep_one.per_interval"
+            && key != "lance.auto_cleanup.keep_one.older_than"
+        {
+            return Err(Error::invalid_input(format!(
+                "Unknown retention configuration key: {key}"
+            )));
+        }
+    }
+    let has_rules = manifest.config.contains_key("lance.auto_cleanup.policy")
+        || manifest
+            .config
+            .contains_key("lance.auto_cleanup.keep_one.per_interval");
+    if has_policy_interval && !has_rules {
+        return Err(Error::invalid_input(
+            "lance.auto_cleanup.policy_interval requires a cleanup policy or keep_one rules",
+        ));
+    }
+    Ok(())
+}
+
+/// Validate a change to [`ZONE_WRITE_SEEDS_VERSION_KEY`].
+///
+/// Accepts absent, `"0"`, or `"1"`. Call before publishing a commit that
+/// writes or deletes this key, not when carrying inherited configuration
+/// across an unrelated commit.
+///
+/// ```
+/// # use lance_table::{feature_flags::validate_zone_write_seeds_version_config, format::Manifest};
+/// # fn check(manifest: &Manifest) -> lance_core::Result<()> {
+/// validate_zone_write_seeds_version_config(manifest)?;
+/// # Ok(())
+/// # }
+/// ```
+pub fn validate_zone_write_seeds_version_config(manifest: &Manifest) -> Result<()> {
+    if let Some(value) = manifest.config.get(ZONE_WRITE_SEEDS_VERSION_KEY) {
+        match value.as_str() {
+            "0" | "1" => {}
+            _ => {
+                return Err(Error::invalid_input(format!(
+                    "{ZONE_WRITE_SEEDS_VERSION_KEY} must be \"0\" or \"1\", got {value:?}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether the manifest's config asks for version 1 zone write seeds
+/// (`lance.zone_write_seeds.version = "1"`).
+///
+/// This only reads the resulting config. It does not activate
+/// [`FLAG_ZONE_WRITE_SEEDS`]: a table can inherit `"1"` from a build that did
+/// not know the flag (for example, a v14 `update_config`), and that inherited
+/// value must not turn an ordinary commit into an opt-in.
+pub fn zone_write_seeds_v1_enabled(manifest: &Manifest) -> bool {
+    manifest
+        .config
+        .get(ZONE_WRITE_SEEDS_VERSION_KEY)
+        .is_some_and(|value| value == "1")
+}
+
+/// Validate and apply an explicit commit write of
+/// [`ZONE_WRITE_SEEDS_VERSION_KEY`].
+///
+/// `written` must be true only when this commit itself sets or deletes the key,
+/// even if the resulting value equals the inherited one. An explicit `"1"`
+/// activates [`FLAG_ZONE_WRITE_SEEDS`] in both feature words; explicit `"0"` or
+/// deletion leaves the flag alone, so an activated table stays sticky while
+/// future writes use version 0. When `written` is false, inherited config is
+/// left untouched and never activates the flag.
+pub fn apply_zone_write_seeds_version_config(manifest: &mut Manifest, written: bool) -> Result<()> {
+    if !written {
+        return Ok(());
+    }
+    validate_zone_write_seeds_version_config(manifest)?;
+    if zone_write_seeds_v1_enabled(manifest) {
+        manifest.reader_feature_flags |= FLAG_ZONE_WRITE_SEEDS;
+        manifest.writer_feature_flags |= FLAG_ZONE_WRITE_SEEDS;
+    }
+    Ok(())
+}
+
+/// Whether writers targeting `manifest` should emit version 1 zone write seeds
+/// rather than version 0.
+///
+/// Version 1 seeds require [`FLAG_ZONE_WRITE_SEEDS`] to already be active on
+/// the snapshot. Once activated, writers emit version 1 unless
+/// [`ZONE_WRITE_SEEDS_VERSION_KEY`] explicitly pins the table back to `"0"`.
+pub fn write_v1_zone_write_seeds(manifest: &Manifest) -> bool {
+    manifest.has_zone_write_seeds()
+        && manifest
+            .config
+            .get(ZONE_WRITE_SEEDS_VERSION_KEY)
+            .map(String::as_str)
+            != Some("0")
+}
 
 /// Set the reader and writer feature flags in the manifest based on the contents of the manifest.
 pub fn apply_feature_flags(
@@ -159,14 +404,16 @@ pub fn apply_feature_flags(
     enable_stable_row_id: bool,
     disable_transaction_file: bool,
 ) -> Result<()> {
-    // Carried across the reset: a `Manifest` only points at its index section,
-    // so whether any index declares covering columns is not visible here.
-    // `build_manifest` decides it from the index list it is committing and sets
-    // the bit after calling this; without the carry the second call, from
-    // `write_manifest_file`, would clear that decision immediately before the
-    // write.
-    let covered_index_metadata = (manifest.reader_feature_flags | manifest.writer_feature_flags)
-        & FLAG_COVERED_INDEX_METADATA;
+    // A Manifest only points at its index section, so index-dependent flags
+    // cannot be derived here. Carry them across the reset so a second call from
+    // write_manifest_file preserves the flags already derived from the index list.
+    let covering_flags =
+        (manifest.reader_feature_flags | manifest.writer_feature_flags) & COVERING_FLAGS;
+    let row_addr_indices = manifest.writer_feature_flags & FLAG_ROW_ADDR_INDICES;
+    // Same carry for the index section's clustering references and generic
+    // metadata, which `build_manifest` derives from the index list.
+    let object_metadata = manifest.writer_feature_flags & FLAG_OBJECT_METADATA;
+    let deletion_file_paths_writer = manifest.writer_feature_flags & FLAG_DELETION_FILE_PATHS;
     let sticky_paired_flags = validated_sticky_paired_flags(manifest)?;
     let non_reusable_field_ids = manifest.max_allocated_field_id.is_some();
     if non_reusable_field_ids {
@@ -186,6 +433,24 @@ pub fn apply_feature_flags(
         manifest.reader_feature_flags |= FLAG_DELETION_FILES;
         manifest.writer_feature_flags |= FLAG_DELETION_FILES;
     }
+    let has_inline_deletions = manifest
+        .fragments
+        .iter()
+        .any(|frag| frag.deletion_file.as_ref().is_some_and(|f| f.is_inline()));
+    if has_inline_deletions {
+        manifest.reader_feature_flags |= FLAG_INLINE_DELETIONS;
+        manifest.writer_feature_flags |= FLAG_INLINE_DELETIONS;
+    }
+    let has_deletion_file_paths = manifest.fragments.iter().any(|frag| {
+        frag.deletion_file
+            .as_ref()
+            .is_some_and(|deletion_file| deletion_file.path.is_some())
+    });
+    if has_deletion_file_paths {
+        manifest.reader_feature_flags |= FLAG_DELETION_FILE_PATHS;
+        manifest.writer_feature_flags |= FLAG_DELETION_FILE_PATHS;
+    }
+    manifest.writer_feature_flags |= deletion_file_paths_writer;
 
     // If any fragment has row ids, they must all have row ids.
     let has_row_ids = manifest
@@ -244,12 +509,67 @@ pub fn apply_feature_flags(
         manifest.writer_feature_flags |= FLAG_NON_REUSABLE_FIELD_IDS;
     }
 
-    manifest.reader_feature_flags |= covered_index_metadata;
-    manifest.writer_feature_flags |= covered_index_metadata;
+    // Clustering definitions, the allocation high-water mark, and object
+    // references or generic metadata on fragments all need a writer that
+    // preserves them. Readers may ignore them, so this is a writer-only bit.
+    let has_object_metadata = manifest.max_clustering_id != 0
+        || !manifest.clustering.is_empty()
+        || manifest
+            .fragments
+            .iter()
+            .any(|frag| frag.clustering_id.is_some() || !frag.metadata.is_empty());
+    if has_object_metadata {
+        manifest.writer_feature_flags |= FLAG_OBJECT_METADATA;
+    }
+    manifest.writer_feature_flags |= object_metadata;
+
+    manifest.reader_feature_flags |= covering_flags;
+    manifest.writer_feature_flags |= covering_flags;
+    manifest.writer_feature_flags |= row_addr_indices;
     manifest.reader_feature_flags |= sticky_paired_flags;
     manifest.writer_feature_flags |= sticky_paired_flags;
 
     Ok(())
+}
+
+/// Derive the writer fence from the final index list, including unsupported
+/// index versions. Call after [`apply_feature_flags`] when committing indices;
+/// restore and clone must also derive it for snapshots written before the fence.
+///
+/// ```
+/// # use lance_table::format::{IndexMetadata, Manifest};
+/// # use lance_table::feature_flags::apply_row_addr_index_feature_flag;
+/// # fn prepare(manifest: &mut Manifest, indices: &[IndexMetadata]) {
+/// apply_row_addr_index_feature_flag(manifest, indices);
+/// # }
+/// ```
+pub fn apply_row_addr_index_feature_flag(manifest: &mut Manifest, indices: &[IndexMetadata]) {
+    manifest.writer_feature_flags &= !FLAG_ROW_ADDR_INDICES;
+    if manifest.uses_stable_row_ids() && indices.iter().any(IndexMetadata::results_are_row_addrs) {
+        manifest.writer_feature_flags |= FLAG_ROW_ADDR_INDICES;
+    }
+}
+
+/// Set the writer-only object-metadata bit for an index section that carries a
+/// clustering reference or generic metadata on any segment.
+///
+/// `apply_feature_flags` derives the bit from what the manifest itself holds
+/// (definitions, the allocation high-water mark, fragment references and maps),
+/// but a `Manifest` only points at its index section. Every path that publishes
+/// a manifest together with its indices calls this after `apply_feature_flags`:
+/// `build_manifest` for ordinary commits, and `write_manifest_file` for the
+/// clone and restore paths that bypass it. Readers may ignore the metadata, so
+/// the reader word is untouched.
+pub fn apply_index_object_metadata_flag(
+    manifest: &mut Manifest,
+    indices: &[crate::format::IndexMetadata],
+) {
+    if indices
+        .iter()
+        .any(|index| index.clustering_id.is_some() || !index.metadata.is_empty())
+    {
+        manifest.writer_feature_flags |= FLAG_OBJECT_METADATA;
+    }
 }
 
 /// Carry sticky capabilities from the manifest a new one is derived from.
@@ -264,8 +584,8 @@ pub fn inherit_sticky_feature_flags(destination: &mut Manifest, source: &Manifes
     let sticky_flags = validated_sticky_paired_flags(source)?;
     validate_non_reusable_field_id_flags(source)?;
     destination.reader_feature_flags |= sticky_flags;
-    destination.writer_feature_flags |=
-        sticky_flags | (source.writer_feature_flags & FLAG_NON_REUSABLE_FIELD_IDS);
+    destination.writer_feature_flags |= sticky_flags
+        | (source.writer_feature_flags & (FLAG_NON_REUSABLE_FIELD_IDS | FLAG_DELETION_FILE_PATHS));
     Ok(())
 }
 
@@ -299,6 +619,44 @@ pub fn managed_blobs_enabled(schema: &Schema) -> Result<bool> {
 /// and in release builds only when [`ENABLE_UNSTABLE_DATA_OVERLAY_FILES_ENV`] is set.
 fn data_overlay_files_enabled() -> bool {
     cfg!(debug_assertions) || std::env::var_os(ENABLE_UNSTABLE_DATA_OVERLAY_FILES_ENV).is_some()
+}
+
+/// Refuse to publish a manifest that carries data overlay files from a build that
+/// does not understand them: every later open of the dataset by this build would
+/// be refused.
+///
+/// # Examples
+///
+/// ```
+/// # use lance_core::Result;
+/// # use lance_table::feature_flags::validate_data_overlay_files;
+/// # use lance_table::format::Manifest;
+/// # fn publish(manifest: &Manifest) -> Result<()> {
+/// validate_data_overlay_files(manifest)?;
+/// // Publish the manifest only after this check succeeds.
+/// # Ok(())
+/// # }
+/// ```
+pub fn validate_data_overlay_files(manifest: &Manifest) -> Result<()> {
+    validate_data_overlay_files_when(manifest, data_overlay_files_enabled())
+}
+
+/// Split out so the release-build refusal is testable from a debug build.
+fn validate_data_overlay_files_when(manifest: &Manifest, enabled: bool) -> Result<()> {
+    if enabled
+        || manifest
+            .fragments
+            .iter()
+            .all(|fragment| fragment.overlays.is_empty())
+    {
+        return Ok(());
+    }
+    Err(Error::not_supported(format!(
+        "Cannot commit version {}: it carries data overlay files, an unreleased format that \
+         may still change; set {ENABLE_UNSTABLE_DATA_OVERLAY_FILES_ENV} to read and write \
+         them with this build of Lance",
+        manifest.version
+    )))
 }
 
 /// Debug builds only, with no environment override, until continuous recording
@@ -337,8 +695,10 @@ fn supported_flags_when(
     );
     // Reserved, not implemented: see the flag's doc comment.
     mark_supported(&mut supported, FLAG_FRAGMENT_TREE, false);
-    mark_supported(&mut supported, FLAG_INDEPENDENT_COVERING_FIELDS, false);
-    mark_supported(&mut supported, FLAG_ZONE_WRITE_SEEDS, false);
+    mark_supported(&mut supported, FLAG_LOCAL_FRAGMENT_ALIASES, false);
+    mark_supported(&mut supported, FLAG_ZONE_WRITE_SEEDS, true);
+    mark_supported(&mut supported, FLAG_OBJECT_METADATA, true);
+    mark_supported(&mut supported, FLAG_BTREE_KEY_LAYOUT, false);
     supported
 }
 
@@ -413,10 +773,24 @@ pub fn validate_paired_feature_flags(manifest: &Manifest) -> Result<()> {
         ));
     }
 
+    if (manifest.reader_feature_flags | manifest.writer_feature_flags)
+        & FLAG_INDEPENDENT_COVERING_FIELDS
+        != 0
+        && (manifest.reader_feature_flags & COVERING_FLAGS != COVERING_FLAGS
+            || manifest.writer_feature_flags & COVERING_FLAGS != COVERING_FLAGS)
+    {
+        return Err(Error::corrupt_file_named(
+            "manifest",
+            "Independent covering fields require their bit and the covered index metadata bit \
+             in both reader and writer feature flags",
+        ));
+    }
+
     for (flag, name) in [
         (FLAG_MIXED_DATA_FILE_VERSIONS, "mixed data-file-version"),
         (FLAG_MANAGED_BLOBS, "Managed Blob"),
         (FLAG_ZONE_WRITE_SEEDS, "zone write seed"),
+        (FLAG_LOCAL_FRAGMENT_ALIASES, "local fragment aliases"),
     ] {
         let reader = manifest.reader_feature_flags & flag != 0;
         let writer = manifest.writer_feature_flags & flag != 0;
@@ -428,6 +802,14 @@ pub fn validate_paired_feature_flags(manifest: &Manifest) -> Result<()> {
                 ),
             ));
         }
+    }
+    if manifest.reader_feature_flags & FLAG_DELETION_FILE_PATHS != 0
+        && manifest.writer_feature_flags & FLAG_DELETION_FILE_PATHS == 0
+    {
+        return Err(Error::corrupt_file_named(
+            "manifest",
+            "Manifest has the deletion file paths reader feature bit set without the writer feature bit",
+        ));
     }
     Ok(())
 }
@@ -463,6 +845,97 @@ fn validated_sticky_paired_flags(manifest: &Manifest) -> Result<u64> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::format::{BasePath, DeletionFile, DeletionFileType, Fragment};
+
+    #[rstest::rstest]
+    #[case::missing(None, "requires a cleanup policy")]
+    #[case::age_only(
+        Some("lance.auto_cleanup.keep_one.older_than"),
+        "requires a cleanup policy"
+    )]
+    #[case::typo(
+        Some("lance.auto_cleanup.keep_one.per_intervl"),
+        "Unknown retention configuration key"
+    )]
+    fn retention_activation_requires_valid_rule_keys(
+        #[case] key: Option<&str>,
+        #[case] message: &str,
+    ) {
+        let mut manifest = empty_manifest();
+        manifest
+            .config
+            .insert("lance.auto_cleanup.policy_interval".into(), "1".into());
+        if let Some(key) = key {
+            manifest.config.insert(key.into(), "2days".into());
+        }
+        let error = validate_auto_cleanup_config(&manifest).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains(message));
+    }
+
+    #[rstest::rstest]
+    #[case::policy(
+        "lance.auto_cleanup.policy",
+        r#"{"rules":[{"type":"remove_all","older_than":"30days"}]}"#
+    )]
+    #[case::shorthand("lance.auto_cleanup.keep_one.per_interval", "1day")]
+    fn retention_auto_cleanup_rejects_legacy_activation(#[case] key: &str, #[case] value: &str) {
+        let mut manifest = empty_manifest();
+        manifest.config.insert(key.into(), value.into());
+        manifest
+            .config
+            .insert("lance.auto_cleanup.interval".into(), "1".into());
+        let error = validate_auto_cleanup_config(&manifest).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("policy_interval"));
+        manifest.config.remove("lance.auto_cleanup.interval");
+        apply_feature_flags(&mut manifest, false, false).unwrap();
+        manifest
+            .config
+            .insert("lance.auto_cleanup.policy_interval".into(), "1".into());
+        apply_feature_flags(&mut manifest, false, false).unwrap();
+        manifest.config.remove(key);
+        let error = validate_auto_cleanup_config(&manifest).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("requires a cleanup policy"));
+    }
+
+    #[rstest::rstest]
+    #[case::older_than("lance.auto_cleanup.older_than", "7days")]
+    #[case::keep_one("lance.auto_cleanup.keep_one.per_interval", "1day")]
+    fn retention_policy_conflicts_with_legacy_filters(#[case] key: &str, #[case] value: &str) {
+        let mut manifest = empty_manifest();
+        manifest
+            .config
+            .insert("lance.auto_cleanup.policy_interval".into(), "1".into());
+        manifest.config.insert(
+            "lance.auto_cleanup.policy".into(),
+            r#"{"rules":[{"type":"remove_all","older_than":"30days"}]}"#.into(),
+        );
+        manifest.config.insert(key.into(), value.into());
+        let error = validate_auto_cleanup_config(&manifest).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("cannot be combined"));
+    }
+
+    #[test]
+    fn apply_feature_flags_accepts_inherited_mixed_cleanup_config() {
+        let mut manifest = empty_manifest();
+        manifest
+            .config
+            .insert("lance.auto_cleanup.interval".into(), "1".into());
+        manifest
+            .config
+            .insert("lance.auto_cleanup.policy_interval".into(), "1".into());
+        manifest.config.insert(
+            "lance.auto_cleanup.policy".into(),
+            r#"{"rules":[{"type":"remove_all","older_than":"30days"}]}"#.into(),
+        );
+        assert!(validate_auto_cleanup_config(&manifest).is_err());
+        apply_feature_flags(&mut manifest, false, false).unwrap();
+    }
+
     #[rstest::rstest]
     #[case::absent(None, false)]
     #[case::disabled(Some("false"), false)]
@@ -526,14 +999,96 @@ mod tests {
         // the module-level `const _` assertion keeps it at or above that boundary.
     }
 
-    use super::*;
-    use crate::format::BasePath;
+    #[test]
+    fn test_btree_key_layout_flag_fences_writes_without_blocking_reads() {
+        let mut manifest = empty_manifest();
+        manifest.writer_feature_flags = FLAG_BTREE_KEY_LAYOUT;
+        ensure_can_read_manifest(&manifest).unwrap();
+        let error = ensure_can_write_manifest(&manifest).unwrap_err();
+        assert!(matches!(error, Error::NotSupported { .. }));
+        assert!(error.to_string().contains("cannot be written"));
+        assert!(!can_read_dataset(FLAG_BTREE_KEY_LAYOUT));
+        assert!(!can_write_dataset(FLAG_BTREE_KEY_LAYOUT));
+        assert_eq!(FLAG_BTREE_KEY_LAYOUT, 1 << 22);
+    }
 
     #[test]
-    fn test_zone_write_seed_flag_is_reserved_and_sticky() {
+    fn test_object_metadata_flag_is_supported_and_derived() {
+        assert_eq!(FLAG_OBJECT_METADATA, 1 << 17);
+        assert!(can_read_dataset(FLAG_OBJECT_METADATA));
+        assert!(can_write_dataset(FLAG_OBJECT_METADATA));
+        assert_eq!(FLAG_INLINE_DELETIONS, 1 << 19);
+        assert!(can_read_dataset(FLAG_INLINE_DELETIONS));
+        assert!(can_write_dataset(FLAG_INLINE_DELETIONS));
+        assert_eq!(FLAG_UNKNOWN, 1 << 23);
+        assert!(!can_read_dataset(FLAG_UNKNOWN));
+        assert!(!can_write_dataset(FLAG_UNKNOWN));
+
+        // Nothing clustering-related: no bit, and a stale bit is cleared.
+        let mut manifest = empty_manifest();
+        manifest.writer_feature_flags = 0;
+        apply_feature_flags(&mut manifest, false, false).unwrap();
+        assert_eq!(manifest.writer_feature_flags & FLAG_OBJECT_METADATA, 0);
+        assert_eq!(manifest.reader_feature_flags & FLAG_OBJECT_METADATA, 0);
+
+        // Allocation alone (ids handed out, definitions since removed).
+        let mut manifest = empty_manifest();
+        manifest.max_clustering_id = 3;
+        apply_feature_flags(&mut manifest, false, false).unwrap();
+        assert_ne!(manifest.writer_feature_flags & FLAG_OBJECT_METADATA, 0);
+        assert_eq!(manifest.reader_feature_flags & FLAG_OBJECT_METADATA, 0);
+
+        // A definition.
+        let mut manifest = empty_manifest();
+        manifest.clustering = vec![crate::format::ClusteringDefinition {
+            id: 1,
+            columns: vec![0],
+            provider: "org.example.cluster".into(),
+            version: 1,
+        }];
+        manifest.max_clustering_id = 1;
+        apply_feature_flags(&mut manifest, false, false).unwrap();
+        assert_ne!(manifest.writer_feature_flags & FLAG_OBJECT_METADATA, 0);
+
+        // Generic metadata on a fragment with no clustering reference at all.
+        let mut manifest = empty_manifest();
+        let mut fragment = crate::format::Fragment::new(0);
+        fragment
+            .metadata
+            .insert("org.example.unknown".into(), "opaque".into());
+        manifest.fragments = std::sync::Arc::new(vec![fragment]);
+        apply_feature_flags(&mut manifest, false, false).unwrap();
+        assert_ne!(manifest.writer_feature_flags & FLAG_OBJECT_METADATA, 0);
+
+        // The bit `build_manifest` derives from the index section is carried
+        // across the reset, like the covering bit.
+        let mut manifest = empty_manifest();
+        manifest.writer_feature_flags = FLAG_OBJECT_METADATA;
+        apply_feature_flags(&mut manifest, false, false).unwrap();
+        assert_ne!(manifest.writer_feature_flags & FLAG_OBJECT_METADATA, 0);
+        assert_eq!(manifest.reader_feature_flags & FLAG_OBJECT_METADATA, 0);
+    }
+
+    #[test]
+    fn test_row_addr_index_writer_fence_is_supported() {
+        assert_eq!(FLAG_ROW_ADDR_INDICES, 1 << 18);
+        assert!(can_write_dataset(FLAG_ROW_ADDR_INDICES));
+        let mut manifest = empty_manifest();
+        manifest.writer_feature_flags = FLAG_ROW_ADDR_INDICES;
+        ensure_can_read_manifest(&manifest).unwrap();
+        ensure_can_write_manifest(&manifest).unwrap();
+        apply_feature_flags(&mut manifest, false, false).unwrap();
+        assert_eq!(manifest.reader_feature_flags & FLAG_ROW_ADDR_INDICES, 0);
+        assert_ne!(manifest.writer_feature_flags & FLAG_ROW_ADDR_INDICES, 0);
+    }
+
+    #[test]
+    fn test_zone_write_seed_flag_is_supported_and_sticky() {
         assert_eq!(FLAG_ZONE_WRITE_SEEDS, 1 << 16);
-        assert!(!can_read_dataset(FLAG_ZONE_WRITE_SEEDS));
-        assert!(!can_write_dataset(FLAG_ZONE_WRITE_SEEDS));
+        // This build implements version 1 seeds: flagged datasets stay
+        // readable and writable here, while pre-flag builds refuse them.
+        assert!(can_read_dataset(FLAG_ZONE_WRITE_SEEDS));
+        assert!(can_write_dataset(FLAG_ZONE_WRITE_SEEDS));
 
         let mut manifest = empty_manifest();
         manifest.reader_feature_flags = FLAG_ZONE_WRITE_SEEDS;
@@ -542,12 +1097,8 @@ mod tests {
         assert_eq!(manifest.reader_feature_flags, FLAG_ZONE_WRITE_SEEDS);
         assert_eq!(manifest.writer_feature_flags, FLAG_ZONE_WRITE_SEEDS);
 
-        let read_error = ensure_can_read_manifest(&manifest).unwrap_err();
-        assert!(matches!(read_error, Error::NotSupported { .. }));
-        assert!(read_error.to_string().contains("Please upgrade"));
-        let write_error = ensure_can_write_manifest(&manifest).unwrap_err();
-        assert!(matches!(write_error, Error::NotSupported { .. }));
-        assert!(write_error.to_string().contains("Please upgrade"));
+        ensure_can_read_manifest(&manifest).unwrap();
+        ensure_can_write_manifest(&manifest).unwrap();
 
         let mut destination = empty_manifest();
         inherit_sticky_feature_flags(&mut destination, &manifest).unwrap();
@@ -565,6 +1116,120 @@ mod tests {
             assert!(matches!(error, Error::CorruptFile { .. }));
             assert!(error.to_string().contains("zone write seed"));
         }
+    }
+
+    #[rstest::rstest]
+    #[case::absent(None, true)]
+    #[case::v0(Some("0"), true)]
+    #[case::v1(Some("1"), true)]
+    #[case::v2(Some("2"), false)]
+    #[case::bool_true(Some("true"), false)]
+    #[case::empty(Some(""), false)]
+    fn test_validate_zone_write_seeds_version_config(
+        #[case] value: Option<&str>,
+        #[case] valid: bool,
+    ) {
+        let mut manifest = empty_manifest();
+        if let Some(value) = value {
+            manifest
+                .config
+                .insert(ZONE_WRITE_SEEDS_VERSION_KEY.to_string(), value.to_string());
+        }
+        let result = validate_zone_write_seeds_version_config(&manifest);
+        assert_eq!(result.is_ok(), valid, "{value:?}: {result:?}");
+        if !valid {
+            let error = result.unwrap_err();
+            assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+            assert!(
+                error.to_string().contains(ZONE_WRITE_SEEDS_VERSION_KEY),
+                "{error}"
+            );
+        }
+    }
+
+    #[rstest::rstest]
+    #[case::unflagged_absent(false, None, false)]
+    #[case::unflagged_v0(false, Some("0"), false)]
+    #[case::unflagged_v1_without_flag(false, Some("1"), false)]
+    #[case::flagged_absent(true, None, true)]
+    #[case::flagged_v1(true, Some("1"), true)]
+    #[case::flagged_pinned_v0(true, Some("0"), false)]
+    fn test_write_v1_zone_write_seeds_policy(
+        #[case] flagged: bool,
+        #[case] config_value: Option<&str>,
+        #[case] expected_v1: bool,
+    ) {
+        let mut manifest = empty_manifest();
+        if flagged {
+            manifest.reader_feature_flags = FLAG_ZONE_WRITE_SEEDS;
+            manifest.writer_feature_flags = FLAG_ZONE_WRITE_SEEDS;
+        }
+        if let Some(value) = config_value {
+            manifest
+                .config
+                .insert(ZONE_WRITE_SEEDS_VERSION_KEY.to_string(), value.to_string());
+        }
+        assert_eq!(write_v1_zone_write_seeds(&manifest), expected_v1);
+        assert_eq!(
+            zone_write_seeds_v1_enabled(&manifest),
+            config_value == Some("1")
+        );
+    }
+
+    #[test]
+    fn test_local_fragment_aliases_are_paired_and_not_sticky() {
+        assert_eq!(FLAG_LOCAL_FRAGMENT_ALIASES, 1 << 20);
+        assert!(!can_read_dataset(FLAG_LOCAL_FRAGMENT_ALIASES));
+        assert!(!can_write_dataset(FLAG_LOCAL_FRAGMENT_ALIASES));
+        assert_eq!(STICKY_PAIRED_FLAGS & FLAG_LOCAL_FRAGMENT_ALIASES, 0);
+
+        for (reader, writer) in [
+            (FLAG_LOCAL_FRAGMENT_ALIASES, 0),
+            (0, FLAG_LOCAL_FRAGMENT_ALIASES),
+        ] {
+            let mut manifest = empty_manifest();
+            manifest.reader_feature_flags = reader;
+            manifest.writer_feature_flags = writer;
+            let error = validate_paired_feature_flags(&manifest).unwrap_err();
+            assert!(matches!(error, Error::CorruptFile { .. }), "{error:?}");
+            assert!(
+                error.to_string().contains("local fragment aliases"),
+                "{error}"
+            );
+        }
+
+        let mut manifest = empty_manifest();
+        manifest.reader_feature_flags = FLAG_LOCAL_FRAGMENT_ALIASES;
+        manifest.writer_feature_flags = FLAG_LOCAL_FRAGMENT_ALIASES;
+        validate_paired_feature_flags(&manifest).unwrap();
+        let error = ensure_can_read_manifest(&manifest).unwrap_err();
+        assert!(matches!(error, Error::NotSupported { .. }), "{error:?}");
+        let error = ensure_can_write_manifest(&manifest).unwrap_err();
+        assert!(matches!(error, Error::NotSupported { .. }), "{error:?}");
+
+        apply_feature_flags(&mut manifest, false, false).unwrap();
+        assert_eq!(
+            manifest.reader_feature_flags & FLAG_LOCAL_FRAGMENT_ALIASES,
+            0
+        );
+        assert_eq!(
+            manifest.writer_feature_flags & FLAG_LOCAL_FRAGMENT_ALIASES,
+            0
+        );
+
+        let mut source = empty_manifest();
+        source.reader_feature_flags = FLAG_LOCAL_FRAGMENT_ALIASES;
+        source.writer_feature_flags = FLAG_LOCAL_FRAGMENT_ALIASES;
+        let mut destination = empty_manifest();
+        inherit_sticky_feature_flags(&mut destination, &source).unwrap();
+        assert_eq!(
+            destination.reader_feature_flags & FLAG_LOCAL_FRAGMENT_ALIASES,
+            0
+        );
+        assert_eq!(
+            destination.writer_feature_flags & FLAG_LOCAL_FRAGMENT_ALIASES,
+            0
+        );
     }
 
     #[test]
@@ -605,11 +1270,65 @@ mod tests {
     }
 
     #[test]
-    fn test_independent_covering_fields_flag_is_reserved() {
+    fn test_independent_covering_fields_flag_is_supported() {
         assert_eq!(FLAG_INDEPENDENT_COVERING_FIELDS, 8192);
-        let flags = FLAG_COVERED_INDEX_METADATA | FLAG_INDEPENDENT_COVERING_FIELDS;
-        assert!(!can_read_dataset(flags));
-        assert!(!can_write_dataset(flags));
+        assert_eq!(COVERING_FLAGS & !supported_flags_when(false, false), 0);
+        let mut manifest = empty_manifest();
+        assert_eq!(CoveringContract::of(&manifest), CoveringContract::Suffix);
+        manifest.reader_feature_flags = COVERING_FLAGS;
+        manifest.writer_feature_flags = COVERING_FLAGS;
+        ensure_can_read_manifest(&manifest).unwrap();
+        ensure_can_write_manifest(&manifest).unwrap();
+        assert_eq!(
+            CoveringContract::of(&manifest),
+            CoveringContract::Independent
+        );
+    }
+
+    /// The independent bit changes how every index entry reads, so it is only
+    /// meaningful with itself and the covering bit in both words.
+    #[rstest::rstest]
+    #[case::reader_only(COVERING_FLAGS, FLAG_COVERED_INDEX_METADATA)]
+    #[case::writer_only(FLAG_COVERED_INDEX_METADATA, COVERING_FLAGS)]
+    #[case::without_covering_bit(
+        FLAG_INDEPENDENT_COVERING_FIELDS,
+        FLAG_INDEPENDENT_COVERING_FIELDS
+    )]
+    #[case::covering_bit_in_one_word(COVERING_FLAGS, FLAG_INDEPENDENT_COVERING_FIELDS)]
+    fn independent_covering_fields_require_both_bits_in_both_words(
+        #[case] reader: u64,
+        #[case] writer: u64,
+    ) {
+        let mut manifest = empty_manifest();
+        manifest.reader_feature_flags = reader;
+        manifest.writer_feature_flags = writer;
+        for error in [
+            ensure_can_read_manifest(&manifest).unwrap_err(),
+            ensure_can_write_manifest(&manifest).unwrap_err(),
+            apply_feature_flags(&mut manifest.clone(), false, false).unwrap_err(),
+        ] {
+            assert!(matches!(error, Error::CorruptFile { .. }), "{error:?}");
+            assert!(
+                error
+                    .to_string()
+                    .contains("Independent covering fields require"),
+                "{error}"
+            );
+        }
+    }
+
+    #[rstest::rstest]
+    #[case::suffix(FLAG_COVERED_INDEX_METADATA)]
+    #[case::independent(COVERING_FLAGS)]
+    fn apply_feature_flags_carries_the_covering_bits_across_its_reset(#[case] flags: u64) {
+        let mut manifest = empty_manifest();
+        manifest.reader_feature_flags = flags;
+        manifest.writer_feature_flags = flags;
+
+        apply_feature_flags(&mut manifest, false, false).unwrap();
+
+        assert_eq!(manifest.reader_feature_flags, flags);
+        assert_eq!(manifest.writer_feature_flags, flags);
     }
 
     #[test]
@@ -707,6 +1426,17 @@ mod tests {
             manifest.writer_feature_flags & FLAG_UNSTABLE_DATA_OVERLAY_FILES,
             0
         );
+
+        // A build that does not understand overlays refuses to publish them.
+        let err = validate_data_overlay_files_when(&manifest, false).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains(ENABLE_UNSTABLE_DATA_OVERLAY_FILES_ENV),
+            "{err}"
+        );
+        validate_data_overlay_files_when(&manifest, true).unwrap();
+        manifest.fragments = Arc::new(vec![Fragment::new(0)]);
+        validate_data_overlay_files_when(&manifest, false).unwrap();
     }
 
     #[test]
@@ -1087,5 +1817,109 @@ mod tests {
         assert!(can_write_dataset(FLAG_MANAGED_BLOBS));
         assert!(!can_read_dataset(FLAG_UNKNOWN));
         assert!(!can_write_dataset(FLAG_UNKNOWN));
+    }
+
+    #[test]
+    fn test_deletion_file_paths_flag() {
+        assert_eq!(FLAG_LOCAL_FRAGMENT_ALIASES, 1 << 20);
+        assert!(!can_read_dataset(FLAG_LOCAL_FRAGMENT_ALIASES));
+        assert!(!can_write_dataset(FLAG_LOCAL_FRAGMENT_ALIASES));
+        assert_eq!(FLAG_DELETION_FILE_PATHS, 1 << 21);
+        assert!(can_read_dataset(FLAG_DELETION_FILE_PATHS));
+        assert!(can_write_dataset(FLAG_DELETION_FILE_PATHS));
+        assert_eq!(FLAG_UNKNOWN, 1 << 23);
+        assert!(!can_read_dataset(FLAG_UNKNOWN));
+        assert!(!can_write_dataset(FLAG_UNKNOWN));
+    }
+
+    #[test]
+    fn test_deletion_file_paths_reader_is_conditional_and_writer_is_sticky() {
+        let deletion_file = |stored_path| DeletionFile {
+            read_version: 1,
+            id: 1,
+            file_type: DeletionFileType::Bitmap,
+            num_deleted_rows: Some(1),
+            base_id: None,
+            path: stored_path,
+            inline: None,
+        };
+        let manifest_with = |stored_path| {
+            let mut fragment = Fragment::new(1);
+            fragment.deletion_file = Some(deletion_file(stored_path));
+            let mut manifest = empty_manifest();
+            manifest.fragments = std::sync::Arc::new(vec![fragment]);
+            manifest
+        };
+
+        let mut v10 = manifest_with(None);
+        apply_feature_flags(&mut v10, false, false).unwrap();
+        assert_eq!(v10.reader_feature_flags & FLAG_DELETION_FILE_PATHS, 0);
+        assert_eq!(v10.writer_feature_flags & FLAG_DELETION_FILE_PATHS, 0);
+
+        let mut v11 = Manifest::new_from_previous(
+            &v10,
+            v10.schema.clone(),
+            manifest_with(Some("_deletions/ab/file.bin".to_string())).fragments,
+        );
+        apply_feature_flags(&mut v11, false, false).unwrap();
+        assert_eq!(
+            v11.reader_feature_flags & FLAG_DELETION_FILE_PATHS,
+            FLAG_DELETION_FILE_PATHS
+        );
+        assert_eq!(
+            v11.writer_feature_flags & FLAG_DELETION_FILE_PATHS,
+            FLAG_DELETION_FILE_PATHS
+        );
+        ensure_can_read_manifest(&v11).unwrap();
+        ensure_can_write_manifest(&v11).unwrap();
+
+        let mut v13 =
+            Manifest::new_from_previous(&v11, v11.schema.clone(), manifest_with(None).fragments);
+        apply_feature_flags(&mut v13, false, false).unwrap();
+        assert_eq!(v13.reader_feature_flags & FLAG_DELETION_FILE_PATHS, 0);
+        assert_eq!(
+            v13.writer_feature_flags & FLAG_DELETION_FILE_PATHS,
+            FLAG_DELETION_FILE_PATHS
+        );
+        ensure_can_read_manifest(&v13).unwrap();
+        ensure_can_write_manifest(&v13).unwrap();
+
+        let mut v14 =
+            Manifest::new_from_previous(&v13, v13.schema.clone(), std::sync::Arc::new(vec![]));
+        apply_feature_flags(&mut v14, false, false).unwrap();
+        assert_eq!(v14.reader_feature_flags & FLAG_DELETION_FILE_PATHS, 0);
+        assert_eq!(
+            v14.writer_feature_flags & FLAG_DELETION_FILE_PATHS,
+            FLAG_DELETION_FILE_PATHS
+        );
+
+        let mut restored = v10.clone();
+        inherit_sticky_feature_flags(&mut restored, &v13).unwrap();
+        apply_feature_flags(&mut restored, false, false).unwrap();
+        assert_eq!(restored.reader_feature_flags & FLAG_DELETION_FILE_PATHS, 0);
+        assert_eq!(
+            restored.writer_feature_flags & FLAG_DELETION_FILE_PATHS,
+            FLAG_DELETION_FILE_PATHS
+        );
+
+        let mut cloned = v13.shallow_clone(
+            Some("main".to_string()),
+            "file:///source".to_string(),
+            1,
+            None,
+            "tx.txn".to_string(),
+        );
+        apply_feature_flags(&mut cloned, false, false).unwrap();
+        assert_eq!(cloned.reader_feature_flags & FLAG_DELETION_FILE_PATHS, 0);
+        assert_eq!(
+            cloned.writer_feature_flags & FLAG_DELETION_FILE_PATHS,
+            FLAG_DELETION_FILE_PATHS
+        );
+
+        let mut invalid = empty_manifest();
+        invalid.reader_feature_flags = FLAG_DELETION_FILE_PATHS;
+        let error = validate_paired_feature_flags(&invalid).unwrap_err();
+        assert!(matches!(error, Error::CorruptFile { .. }), "{error:?}");
+        assert!(error.to_string().contains("deletion file paths"), "{error}");
     }
 }

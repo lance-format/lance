@@ -278,12 +278,14 @@ impl GenerationWrite<'_> {
             fields: field_ids,
             covering_fields: vec![],
             dataset_version: self.dataset.version().version,
-            fragment_bitmap: Some(self.dataset.fragment_bitmap.as_ref().clone()),
+            fragment_bitmap: Some(self.dataset.table_state.fragment_bitmap.as_ref().clone()),
             index_details: Some(Arc::new(index_details)),
             index_version,
             created_at: Some(chrono::Utc::now()),
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         }
     }
 }

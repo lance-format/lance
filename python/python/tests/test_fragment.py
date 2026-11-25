@@ -6,6 +6,7 @@ import multiprocessing
 import pickle
 import uuid
 from pathlib import Path
+from unittest import mock
 
 import lance
 import pandas as pd
@@ -22,8 +23,9 @@ from lance import (
 )
 from lance.debug import format_fragment
 from lance.file import LanceFileReader, LanceFileWriter
-from lance.fragment import RowIdMeta, RowIdSequence, write_fragments
+from lance.fragment import DeletionFile, RowIdMeta, RowIdSequence, write_fragments
 from lance.progress import FileSystemFragmentWriteProgress
+from pyarrow.fs import FileInfo, FileType
 
 
 def test_write_fragment(tmp_path: Path):
@@ -322,13 +324,65 @@ def test_dataset_progress(tmp_path: Path):
     assert metadata["id"] == 1
 
 
+def test_file_system_progress_clears_marker_of_last_file(tmp_path: Path):
+    progress_uri = tmp_path / "progress"
+    dataset = write_dataset(
+        pa.table({"a": range(7)}),
+        tmp_path / "dataset",
+        max_rows_per_file=5,
+        progress=FileSystemFragmentWriteProgress(progress_uri),
+    )
+
+    assert len(dataset.get_fragments()) == 2
+    assert list(progress_uri.glob("*.in_progress")) == []
+    assert (progress_uri / "fragment_0.json").exists()
+
+
+def test_file_system_progress_shared_directory(tmp_path: Path):
+    fragment = FragmentMetadata(id=0, files=[], physical_rows=0)
+    marker = tmp_path / "fragment_0.in_progress"
+    first = FileSystemFragmentWriteProgress(tmp_path)
+    second = FileSystemFragmentWriteProgress(tmp_path)
+
+    first.begin(fragment)
+    second.begin(fragment)
+    assert marker.exists()
+    first.complete(fragment)
+    assert not marker.exists()
+    # The marker is already gone: the second writer must not fail for that.
+    second.complete(fragment)
+
+
+def test_file_system_progress_tolerates_only_a_missing_marker(tmp_path: Path):
+    fragment = FragmentMetadata(id=0, files=[], physical_rows=0)
+    progress = FileSystemFragmentWriteProgress(tmp_path)
+    progress.begin(fragment)
+
+    # Another writer can recreate the marker right after this delete failed, so
+    # the error alone decides: looking at the marker afterwards would be a race.
+    progress._fs = mock.Mock(
+        delete_file=mock.Mock(side_effect=FileNotFoundError("gone")),
+        get_file_info=mock.Mock(return_value=FileInfo("marker", FileType.File)),
+    )
+    progress.complete(fragment)
+
+    progress._fs = mock.Mock(delete_file=mock.Mock(side_effect=PermissionError("no")))
+    with pytest.raises(PermissionError, match="no"):
+        progress.complete(fragment)
+
+
 def test_fragment_meta():
     # Intentionally leaving off column_indices / version fields to make sure
     # we can handle backwards compatibility (though not clear we need to)
     data = {
         "id": 0,
         "files": [
-            {"path": "0.lance", "fields": [0], "file_size_bytes": 100},
+            {
+                "path": "0.lance",
+                "fields": [0],
+                "file_size_bytes": 100,
+                "file_metadata_size_bytes": 25,
+            },
             {"path": "1.lance", "fields": [1]},
         ],
         "deletion_file": None,
@@ -340,7 +394,9 @@ def test_fragment_meta():
     assert len(meta.files) == 2
     with pytest.warns(DeprecationWarning):
         assert meta.files[0].path() == "0.lance"
+    assert meta.files[0].file_metadata_size_bytes == 25
     assert meta.files[1].path == "1.lance"
+    assert meta.files[1].file_metadata_size_bytes is None
 
     assert repr(meta) == (
         "FragmentMetadata(id=0, files=[DataFile(path='0.lance', fields=[0], "
@@ -348,7 +404,8 @@ def test_fragment_meta():
         "file_size_bytes=100), DataFile(path='1.lance', fields=[1], column_indices=[], "
         "file_major_version=0, file_minor_version=0, file_size_bytes=None)], "
         "physical_rows=100, deletion_file=None, row_id_meta=None, "
-        "created_at_version_meta=None, last_updated_at_version_meta=None, overlays=[])"
+        "created_at_version_meta=None, last_updated_at_version_meta=None, overlays=[], "
+        "clustering_id=None, metadata={})"
     )
 
 
@@ -522,20 +579,51 @@ def test_fragment_count_rows(tmp_path: Path):
     assert fragments[0].count_rows(pc.field("a") < 200) == 200
 
 
-def test_fragment_pyarrow_expression_filter(tmp_path: Path):
+@pytest.mark.parametrize("ignored_scalar_indices", [None, ["s_btree"]])
+def test_fragment_pyarrow_expression_filter(tmp_path: Path, ignored_scalar_indices):
     data = pa.table({"id": [0, 1, 2], "s": ["C:\\temp", "plain", "other"]})
     dataset = write_dataset(data, tmp_path, max_rows_per_file=2)
+    dataset.create_scalar_index("s", "BTREE", name="s_btree")
     assert len(dataset.get_fragments()) == 2
     fragment = dataset.get_fragments()[0]
     expression = pc.field("s") != "C:\\temp"
 
     assert dataset.count_rows(filter=expression) == 2
     assert fragment.count_rows(expression) == 1
-    assert fragment.scanner(filter=expression).to_table()["id"].to_pylist() == [1]
-    assert fragment.to_table(filter=expression)["id"].to_pylist() == [1]
+    scanner = fragment.scanner(
+        filter=expression, ignored_scalar_indices=ignored_scalar_indices
+    )
+    assert ("ScalarIndexQuery" in scanner.explain_plan(True)) == (
+        ignored_scalar_indices is None
+    )
+    assert scanner.to_table()["id"].to_pylist() == [1]
+    assert fragment.to_table(
+        filter=expression, ignored_scalar_indices=ignored_scalar_indices
+    )["id"].to_pylist() == [1]
     assert fragment.to_table(filter=pc.field("s").isin(["C:\\temp"]))[
         "id"
     ].to_pylist() == [0]
+
+
+def test_fragment_to_table_preserves_positional_arguments(tmp_path: Path):
+    data = pa.table({"id": [0, 1, 2], "s": ["C:\\temp", "plain", "other"]})
+    dataset = write_dataset(data, tmp_path, max_rows_per_file=2)
+    dataset.create_scalar_index("s", "BTREE", name="s_btree")
+    fragment = dataset.get_fragments()[0]
+
+    table = fragment.to_table(
+        None,
+        pc.field("s") != "C:\\temp",
+        None,
+        None,
+        False,
+        False,
+        None,
+        None,
+        None,
+        1 << 20,
+    )
+    assert table["id"].to_pylist() == [1]
 
 
 @pytest.mark.parametrize("enable_stable_row_ids", [False, True])
@@ -608,6 +696,127 @@ def test_deletion_file_with_base_id_serialization():
     assert deserialized.deletion_file.base_id == 456
 
 
+def test_deletion_file_explicit_path_json_round_trip():
+    explicit_path = f"_deletions/{uuid.uuid4()}.bin"
+    explicit = DeletionFile(
+        read_version=1,
+        id=123,
+        file_type="bitmap",
+        num_deleted_rows=1,
+        path=explicit_path,
+    )
+    assert explicit.stored_path == explicit_path
+    assert explicit.asdict()["path"] == explicit_path
+    assert explicit.path(5) == explicit.path(6) == explicit_path
+    assert (
+        explicit.path(5, "/tmp/ds")
+        == explicit.path(6, "/tmp/ds")
+        == f"tmp/ds/{explicit_path}"
+    )
+
+    fragment = FragmentMetadata(
+        id=5,
+        files=[],
+        physical_rows=10,
+        deletion_file=explicit,
+    )
+    round_tripped = FragmentMetadata.from_json(json.dumps(fragment.to_json()))
+    assert round_tripped == fragment
+    assert round_tripped.deletion_file is not None
+    assert round_tripped.deletion_file.stored_path == explicit_path
+    assert round_tripped.deletion_file.path(5) == explicit_path
+    assert round_tripped.deletion_file.path(99) == explicit_path
+
+    derived = DeletionFile(
+        read_version=1, id=123, file_type="bitmap", num_deleted_rows=1
+    )
+    assert derived.stored_path is None
+    assert derived.asdict()["path"] is None
+    derived_frag = FragmentMetadata(
+        id=5, files=[], physical_rows=10, deletion_file=derived
+    )
+    derived_rt = FragmentMetadata.from_json(json.dumps(derived_frag.to_json()))
+    assert derived_rt == derived_frag
+    assert derived_rt.deletion_file.stored_path is None
+    assert derived_rt.deletion_file.path(5) == "_deletions/5-1-123.bin"
+    assert derived_rt.deletion_file.path(99) == "_deletions/99-1-123.bin"
+
+    inline = DeletionFile(
+        read_version=1,
+        id=123,
+        file_type="bitmap",
+        num_deleted_rows=1,
+        inline=b"\x01\x02",
+    )
+    assert inline.stored_path is None
+    inline_frag = FragmentMetadata(
+        id=5, files=[], physical_rows=10, deletion_file=inline
+    )
+    inline_rt = FragmentMetadata.from_json(json.dumps(inline_frag.to_json()))
+    assert inline_rt == inline_frag
+    assert inline_rt.deletion_file.inline == b"\x01\x02"
+    assert inline_rt.deletion_file.path(5) is None
+
+    with pytest.raises(ValueError, match="both path and inline"):
+        DeletionFile(
+            read_version=1,
+            id=123,
+            file_type="bitmap",
+            num_deleted_rows=1,
+            inline=b"\x01",
+            path=explicit_path,
+        )
+    for bad_path in ("", "/_deletions/a.bin", "other/a.bin", "_deletions/a.arrow"):
+        with pytest.raises(ValueError, match="deletion file path"):
+            DeletionFile(
+                read_version=1,
+                id=123,
+                file_type="bitmap",
+                num_deleted_rows=1,
+                path=bad_path,
+            )
+
+
+def test_fragment_metadata_json_round_trips_clustering_metadata():
+    """clustering_id and the generic map survive to_json/from_json and pickle,
+    and JSON written before the fields existed reads back with defaults."""
+    from lance.fragment import FragmentMetadata
+
+    metadata = {
+        "org.example.cluster.bucket": "3",
+        "org.example.unknown": "  opaque value: 東京  ",
+        "org.example.empty": "",
+    }
+    stamped = FragmentMetadata(
+        id=0, files=[], physical_rows=1, clustering_id=7, metadata=metadata
+    )
+
+    json_data = stamped.to_json()
+    assert json_data["clustering_id"] == 7
+    assert json_data["metadata"] == metadata
+    restored = FragmentMetadata.from_json(json.dumps(json_data))
+    assert restored == stamped
+    assert restored.clustering_id == 7
+    assert restored.metadata == metadata
+    assert pickle.loads(pickle.dumps(stamped)) == stamped
+
+    # A fragment without either field writes explicit defaults and reads back.
+    plain = FragmentMetadata(id=1, files=[], physical_rows=1)
+    plain_json = plain.to_json()
+    assert plain_json["clustering_id"] is None
+    assert plain_json["metadata"] == {}
+    assert FragmentMetadata.from_json(json.dumps(plain_json)) == plain
+
+    # JSON produced before these fields existed carries neither key.
+    legacy = {
+        k: v for k, v in plain_json.items() if k not in ("clustering_id", "metadata")
+    }
+    legacy_restored = FragmentMetadata.from_json(json.dumps(legacy))
+    assert legacy_restored.clustering_id is None
+    assert legacy_restored.metadata == {}
+    assert legacy_restored == plain
+
+
 def test_fragment_update_columns_basic(tmp_path):
     """Test basic fragment update columns functionality."""
     # Create initial dataset
@@ -653,6 +862,56 @@ def test_fragment_update_columns_basic(tmp_path):
     assert result["name"] == ["Alice_Updated", "Bob", "Charlie_Updated", "David"]
     assert result["value"] == [100, 20, 300, 40]
     assert result["id"] == [1, 2, 3, 4]  # id column should remain unchanged
+
+
+@pytest.mark.parametrize("strategy", ["auto", "hash", "sort_merge"])
+def test_fragment_update_columns_join_options(tmp_path, strategy):
+    data = pa.table({"id": [1, 2, 3], "value": [10, 20, 30]})
+    dataset_uri = tmp_path / strategy
+    dataset = lance.write_dataset(data, dataset_uri)
+    updates = pa.table({"id": [1, 3], "value": [100, 300]})
+
+    fragment = dataset.get_fragment(0)
+    updated_fragment, fields_modified = fragment.update_columns(
+        updates,
+        left_on="id",
+        right_on="id",
+        strategy=strategy,
+        max_hash_rows=1,
+        max_hash_bytes=1,
+        external_memory_pool_bytes=16 * 1024 * 1024,
+        max_temp_directory_bytes=64 * 1024 * 1024,
+    )
+
+    assert updated_fragment.id == fragment.fragment_id
+    assert fields_modified
+
+    op = LanceOperation.Update(
+        updated_fragments=[updated_fragment],
+        fields_modified=fields_modified,
+    )
+    updated_dataset = lance.LanceDataset.commit(
+        str(dataset_uri), op, read_version=dataset.version
+    )
+    result = updated_dataset.to_table().to_pydict()
+    assert result["id"] == [1, 2, 3]
+    assert result["value"] == [100, 20, 300]
+
+
+def test_fragment_update_columns_rejects_invalid_join_options(tmp_path):
+    dataset = lance.write_dataset(
+        pa.table({"id": [1], "value": [10]}), tmp_path / "invalid_options"
+    )
+    updates = pa.table({"id": [1], "value": [100]})
+    fragment = dataset.get_fragment(0)
+
+    with pytest.raises(ValueError, match="strategy must be one of"):
+        fragment.update_columns(
+            updates, left_on="id", right_on="id", strategy="nested_loop"
+        )
+
+    with pytest.raises(ValueError, match="must be specified together"):
+        fragment.update_columns(updates, left_on="id", right_on="id", max_hash_rows=1)
 
 
 def test_fragment_update_columns_with_custom_join_key(tmp_path):
@@ -1039,6 +1298,98 @@ def test_fragment_update_columns_error_on_nonexistent_column(tmp_path):
     assert "does not exist" in str(exc_info.value).lower()
 
 
+def _aligned_values(fragment, batch_size):
+    """Yield new values for every live row of ``fragment``, read in scan order."""
+    for batch in fragment.to_batches(
+        columns=["id"], with_row_address=True, batch_size=batch_size
+    ):
+        yield pa.record_batch(
+            {
+                "_rowaddr": batch["_rowaddr"],
+                "value": pc.multiply(batch["id"], 100),
+                "name": pc.binary_join_element_wise(
+                    "new", pc.cast(batch["id"], pa.string()), ""
+                ),
+            }
+        )
+
+
+def test_fragment_update_columns_from_stream(tmp_path):
+    data = pa.table(
+        {
+            "id": list(range(20)),
+            "value": [-1] * 20,
+            "name": [f"old{i}" for i in range(20)],
+        }
+    )
+    dataset_uri = tmp_path / "test_dataset_update_columns_from_stream"
+    dataset = lance.write_dataset(data, dataset_uri, enable_stable_row_ids=True)
+    dataset.delete("id < 3 OR id = 11")
+    fragment = dataset.get_fragment(0)
+
+    schema = pa.schema(
+        [
+            pa.field("_rowaddr", pa.uint64()),
+            pa.field("value", pa.int64()),
+            pa.field("name", pa.string()),
+        ]
+    )
+    reader = pa.RecordBatchReader.from_batches(schema, _aligned_values(fragment, 3))
+    updated_fragment, fields_modified, offsets = fragment.update_columns_from_stream(
+        reader, batch_size=4, with_offsets=True
+    )
+
+    updated_dataset = lance.LanceDataset.commit(
+        str(dataset_uri),
+        LanceOperation.Update(
+            updated_fragments=[updated_fragment],
+            fields_modified=fields_modified,
+            update_mode="rewrite_columns",
+            updated_fragment_offsets={updated_fragment.id: offsets},
+        ),
+        read_version=dataset.version,
+    )
+    live = [i for i in range(20) if i >= 3 and i != 11]
+    result = updated_dataset.to_table(
+        columns=["id", "value", "name", "_row_last_updated_at_version"]
+    )
+    assert result["id"].to_pylist() == live
+    assert result["value"].to_pylist() == [i * 100 for i in live]
+    assert result["name"].to_pylist() == [f"new{i}" for i in live]
+    assert set(result["_row_last_updated_at_version"].to_pylist()) == {
+        updated_dataset.version
+    }
+
+
+@pytest.mark.parametrize(
+    "drift", ["swap", "skip", "extra"], ids=["swapped", "missing", "surplus"]
+)
+def test_fragment_update_columns_from_stream_rejects_misaligned_rows(tmp_path, drift):
+    data = pa.table({"id": list(range(6)), "value": [-1] * 6})
+    dataset_uri = tmp_path / "test_dataset_update_columns_from_stream_misaligned"
+    dataset = lance.write_dataset(data, dataset_uri)
+    fragment = dataset.get_fragment(0)
+
+    addrs = fragment.to_table(columns=[], with_row_address=True)["_rowaddr"]
+    addrs = addrs.to_pylist()
+    if drift == "swap":
+        addrs[1], addrs[2] = addrs[2], addrs[1]
+    elif drift == "skip":
+        del addrs[1]
+    else:
+        addrs.append(addrs[-1] + 1)
+    new_values = pa.table(
+        {
+            "_rowaddr": pa.array(addrs, pa.uint64()),
+            "value": pa.array(range(len(addrs)), pa.int64()),
+        }
+    )
+
+    with pytest.raises(ValueError):
+        fragment.update_columns_from_stream(new_values)
+    assert lance.dataset(dataset_uri).to_table()["value"].to_pylist() == [-1] * 6
+
+
 def test_fragment_update_columns_error_on_metadata_column(tmp_path):
     """Test that updating metadata columns raises an error."""
     # Create initial dataset
@@ -1134,6 +1485,63 @@ def test_fragment_take_with_json_column(tmp_path):
     assert metas[0] == '{"val":1}'
     assert metas[1] == '{"val":4}'
     assert metas[2] == '{"val":7}'
+
+
+@pytest.mark.parametrize("with_deletion", [False, True])
+def test_fragment_take_rejects_offsets_above_u32(tmp_path: Path, with_deletion: bool):
+    # Offsets above u32::MAX used to wrap modulo 2**32 and return a real row.
+    dataset = lance.write_dataset(pa.table({"a": range(10)}), tmp_path)
+    if with_deletion:
+        dataset.delete("a = 0")
+    frag = dataset.get_fragment(0)
+
+    for offset in [2**32, 2**32 + 3]:
+        with pytest.raises(ValueError, match=str(offset)):
+            frag.take([offset])
+        with pytest.raises(ValueError, match=str(offset)):
+            frag.take([1, offset], columns=["a"])
+
+    # Offsets that fit in u32 but are out of range keep the Rust-side error.
+    with pytest.raises(OSError, match=str(2**32 - 1)):
+        frag.take([2**32 - 1])
+    assert frag.take([2]).to_pydict() == {"a": [3 if with_deletion else 2]}
+
+
+@pytest.mark.parametrize("enable_stable_row_ids", [False, True])
+def test_fragment_take_system_columns(tmp_path: Path, enable_stable_row_ids: bool):
+    dataset = lance.write_dataset(
+        pa.table({"a": range(10)}),
+        tmp_path,
+        enable_stable_row_ids=enable_stable_row_ids,
+    )
+    dataset = lance.write_dataset(
+        pa.table({"a": range(10, 20)}), tmp_path, mode="append"
+    )
+    # A deletion makes fragment offsets, row addresses and row ids differ.
+    dataset.delete("a = 11")
+    frag = dataset.get_fragment(1)
+
+    columns = ["_rowaddr", "a", "_rowid"]
+    actual = frag.take([1, 2], columns=columns)
+    expected = dataset.take([11, 12], columns=columns)
+    assert actual.column_names == columns
+    assert actual == expected
+    assert actual["a"].to_pylist() == [12, 13]
+    assert actual["_rowaddr"].to_pylist() == [(1 << 32) + 2, (1 << 32) + 3]
+    if enable_stable_row_ids:
+        assert actual["_rowid"].to_pylist() == [12, 13]
+    else:
+        assert actual["_rowid"] == actual["_rowaddr"]
+
+    by_row_id = dataset._take_rows(actual["_rowid"].to_pylist(), columns=columns)
+    assert actual == by_row_id
+
+    # System columns alone, out of order and duplicated offsets.
+    for columns in (["_rowid"], ["_rowaddr"], ["_rowid", "_rowaddr"]):
+        actual = frag.take([3, 0, 3], columns=columns)
+        expected = dataset.take([13, 10, 13], columns=columns)
+        assert actual.column_names == columns
+        assert actual == expected
 
 
 def test_fragment_create_with_json_column(tmp_path):
@@ -1632,6 +2040,25 @@ def test_fragment_scanner_batch_size_bytes(tmp_path: Path):
     small_budget = list(fragment.to_batches(batch_size_bytes=64 * 1024))
     assert len(small_budget) > len(default_batches)
     assert pa.Table.from_batches(small_budget) == fragment.to_table()
+
+
+def test_fragment_scanner_scan_stats_callback(tmp_path: Path):
+    dataset = write_dataset(
+        pa.table({"a": range(200)}), tmp_path, max_rows_per_file=100
+    )
+    fragments = dataset.get_fragments()
+    assert len(fragments) == 2
+
+    calls = []
+
+    def scan_stats_callback(stats: lance.ScanStatistics):
+        calls.append(stats)
+
+    result = fragments[0].scanner(scan_stats_callback=scan_stats_callback).to_table()
+    assert result.num_rows == 100
+    assert len(calls) == 1, "Callback should have been called exactly once"
+    assert calls[0].bytes_read > 0, "Expected some bytes read"
+    assert calls[0].iops > 0, "Expected some I/O operations"
 
 
 @pytest.mark.parametrize("enable_stable_row_ids", [False, True])

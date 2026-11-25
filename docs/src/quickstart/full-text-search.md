@@ -14,7 +14,7 @@ By the end of this tutorial, you'll be able to build and use an FTS index, under
 First, install the required dependencies:
 
 ```bash
-pip install pylance pyarrow
+--8<-- "snippets/quickstart/pylance-install.sh"
 ```
 
 ## Set Up Your Environment
@@ -22,8 +22,7 @@ pip install pylance pyarrow
 Import the necessary libraries for working with Lance datasets:
 
 ```python
-import lance
-import pyarrow as pa
+--8<-- "snippets/quickstart/fts_quickstart.py:imports"
 ```
 
 ## Prepare Your Text Data
@@ -31,19 +30,7 @@ import pyarrow as pa
 In this quickstart, we'll create a simple dataset with text documents:
 
 ```python
-table = pa.table(
-    {
-        "id": [1, 2, 3],
-        "text": [
-            "I left my umbrella on the evening train to Boston",
-            "This ramen recipe simmers the broth for three hours with dried mushrooms.",
-            "This train is scheduled to leave for Edinburgh at 9:30 in the morning",
-        ],
-    }
-)
-
-# Write to a new Lance dataset
-lance.write_dataset(table, "/tmp/fts.lance", mode="overwrite")
+--8<-- "snippets/quickstart/fts_quickstart.py:prepare-data"
 ```
 
 This creates a Lance dataset with three text documents containing overlapping keywords that we'll use to demonstrate different search scenarios.
@@ -53,15 +40,13 @@ This creates a Lance dataset with three text documents containing overlapping ke
 Let's examine the structure of our dataset:
 
 ```python
-ds = lance.dataset("/tmp/fts.lance")
-print(ds.schema)
+--8<-- "snippets/quickstart/fts_quickstart.py:schema"
 ```
 
 This prints the PyArrow schema of the dataset:
 
-```
-id: int64
-text: large_string
+```output
+--8<-- "snippets/quickstart/outputs/fts_quickstart.py.schema.txt"
 ```
 
 ## Build the Full-Text Search Index
@@ -69,37 +54,20 @@ text: large_string
 Full-text search is created with an inverted scalar index on your text column. Choose the `INVERTED` index type when calling `create_scalar_index` on your Lance dataset. Lance uses the BM25 ranking algorithm for relevance scoring. Results are automatically ranked by relevance, with higher scores indicating better matches.
 
 ```python
-ds.create_scalar_index(
-    column="text",
-    index_type="INVERTED"
-)
+--8<-- "snippets/quickstart/fts_quickstart.py:build-index"
 ```
 
 The index creation process builds an efficient lookup structure that maps words to the documents containing them. This enables high-performance keyword-based search, even on large datasets.
 
 !!! warning "Index Creation Time"
-Index creation time depends on the size of your text data. For large datasets, this process may take several minutes, but the performance benefits at query time are substantial.
+    Index creation time depends on the size of your text data. For large datasets, this process may take several minutes, but the performance benefits at query time are substantial.
 
 ## Advanced Index Configuration
 
 You can customize the index creation with various parameters to optimize for your specific use case:
 
 ```python
-ds.create_scalar_index(
-    column="text",
-    index_type="INVERTED",
-    name="text_idx",              # Optional index name (if omitted, default is "text_idx")
-    with_position=False,          # Set True to enable phrase queries (stores token positions)
-    base_tokenizer="simple",      # Tokenizer: "simple", "icu", "icu/split", "whitespace", "raw", or "ngram"
-    language="English",           # Language used for stemming + stop words (only used if `stem` or `remove_stop_words` is True)
-    max_token_length=40,          # Drop tokens longer than this length
-    lower_case=True,              # Lowercase text before tokenization
-    stem=True,                    # Stem tokens (language-dependent)
-    remove_stop_words=True,       # Remove stop words (language-dependent)
-    custom_stop_words=None,       # Optional additional stop words (only used if remove_stop_words=True)
-    ascii_folding=True,           # Fold accents to ASCII when possible (e.g., "é" -> "e")
-    block_size=128,               # Posting block size: 128 or 256; 256 is experimental
-)
+--8<-- "snippets/quickstart/fts_quickstart.py:advanced-index"
 ```
 
 ### Tokenizer Options
@@ -107,6 +75,7 @@ ds.create_scalar_index(
 - **simple**: Splits tokens on whitespace and punctuation
 - **whitespace**: Splits tokens only on whitespace
 - **raw**: No tokenization (useful for exact matching)
+- **code**: Splits code-like text into identifiers and operators for source-code search. Use `analyzer="code"`, which changes the tokenizer defaults. See the [code analyzer](../guide/tokenizer.md#code-analyzer) section for its flags and its FTS format v3 requirement.
 
 Lance also supports multilingual tokenization:
 
@@ -127,24 +96,13 @@ Lance also supports multilingual tokenization:
 Now you can run FTS queries using your inverted index:
 
 ```python
-import lance
-
-# Open dataset
-ds = lance.dataset("/tmp/fts.lance")
-
-# Specify keyword phrases when calling the `to_table` method
-query_result = ds.to_table(
-    full_text_query="umbrella train"
-)
-print(query_result)
+--8<-- "snippets/quickstart/fts_quickstart.py:basic-search"
 ```
 
 This query returns documents that contain either "umbrella" or "train" (or both). The search is case-insensitive and uses the inverted index for fast retrieval.
 
-```
-id: [[1, 3]]
-text: [["I left my umbrella on the evening train to Boston", "This train is scheduled to leave for Edinburgh at 9:30 in the morning"]]
-_score: [[..., ...]]
+```output
+--8<-- "snippets/quickstart/outputs/fts_quickstart.py.basic-search.txt"
 ```
 
 ## Combining Full-Text Search with Metadata
@@ -153,42 +111,11 @@ It can be useful to combine FTS with metadata filtering in a single query to fin
 You can do this by passing a filter expression to the `filter` parameter.
 
 ```python
-import lance
-import pyarrow as pa
+--8<-- "snippets/quickstart/fts_quickstart.py:metadata-filter"
+```
 
-table = pa.table(
-    {
-        "id": [1, 2, 3],
-        "text": [
-            "I left my umbrella on the morning train to Boston",
-            "This ramen recipe simmers the broth for three hours with dried mushrooms.",
-            "This train is scheduled to leave for Edinburgh at 9:30 AM",
-        ],
-        "category": ["travel", "food", "travel"],
-    }
-)
-
-# Temp write dataset
-lance.write_dataset(table, "./fts_test_with_metadata.lance", mode="overwrite")
-
-ds = lance.dataset("./fts_test_with_metadata.lance")
-
-# Create FTS index
-ds.create_scalar_index(
-    column="text",
-    index_type="INVERTED",
-)
-
-# Run FTS query with metadata filter
-query_result = ds.to_table(
-    full_text_query="three",
-    filter='category = "food"',
-)
-
-# Returns
-# id: [[2]]
-# text: [["This ramen recipe simmers the broth for three hours with dried mushrooms."]]
-# category: [["food"]]
+```output
+--8<-- "snippets/quickstart/outputs/fts_quickstart.py.metadata-filter.txt"
 ```
 
 ## Advanced Search Features
@@ -200,27 +127,21 @@ You can use boolean search operators by constructing a structured query object.
 #### All terms: `AND`
 
 ```python
-from lance.query import FullTextOperator, MatchQuery
+--8<-- "snippets/quickstart/fts_quickstart.py:boolean-and"
+```
 
-# Require the terms 'umbrella AND train AND boston' to be present
-and_query = MatchQuery("umbrella train boston", "text", operator=FullTextOperator.AND)
-query_result = ds.to_table(full_text_query=and_query)
-
-# Returns
-# text: [["I left my umbrella on the evening train to Boston"]]
+```output
+--8<-- "snippets/quickstart/outputs/fts_quickstart.py.boolean-and.txt"
 ```
 
 #### Any terms: `OR`
 
 ```python
-from lance.query import FullTextOperator, MatchQuery
+--8<-- "snippets/quickstart/fts_quickstart.py:boolean-or"
+```
 
-# Require the terms 'morning OR evening' to be present
-or_query = MatchQuery("morning evening", "text", operator=FullTextOperator.OR)
-query_result = ds.to_table(full_text_query=or_query)
-
-# Returns the Boston document that mentions 'evening', and the Edinburgh document that mentions 'morning'
-# text: [["This train is scheduled to leave for Edinburgh at 9:30 in the morning", "I left my umbrella on the evening train to Boston"]]
+```output
+--8<-- "snippets/quickstart/outputs/fts_quickstart.py.boolean-or.txt"
 ```
 
 #### Mix `AND`/`OR` queries via operators
@@ -228,16 +149,11 @@ query_result = ds.to_table(full_text_query=or_query)
 You can mix `AND`/`OR` queries using operators in Python:
 
 ```python
-from lance.query import FullTextOperator, MatchQuery
+--8<-- "snippets/quickstart/fts_quickstart.py:boolean-mix"
+```
 
-# Combine AND and OR semantics
-# Require 'train' AND ('morning' OR 'evening')
-q1 = MatchQuery("morning evening", "text", operator=FullTextOperator.OR)
-q2 = MatchQuery("train", "text")
-query_result = ds.to_table(full_text_query=(q1 & q2))
-
-# Returns both the Boston and Edinburgh documents that mention 'train'
-# text: [["I left my umbrella on the evening train to Boston", "This train is scheduled to leave for Edinburgh at 9:30 in the morning"]]
+```output
+--8<-- "snippets/quickstart/outputs/fts_quickstart.py.boolean-mix.txt"
 ```
 
 To combine `OR` queries via operators, use the pattern `q1 | q2`.
@@ -251,42 +167,27 @@ Queries that exclude specific keywords are explicitly written using `BooleanQuer
 as shown below.
 
 ```python
-from lance.query import MatchQuery, BooleanQuery, Occur
+--8<-- "snippets/quickstart/fts_quickstart.py:boolean-not"
+```
 
-# Require that 'umbrella' be present, but 'train' NOT be present
-q = BooleanQuery(
-    [
-        (Occur.MUST, MatchQuery("umbrella", "text")),
-        (Occur.MUST_NOT, MatchQuery("train", "text")),
-    ]
-)
-query_result = ds.to_table(full_text_query=q)
-
-# Returns empty result, as no document matches this condition
-# text: []
+```output
+--8<-- "snippets/quickstart/outputs/fts_quickstart.py.boolean-not.txt"
 ```
 
 ### Phrase Search
 
-For exact phrase matching, ensure you enable `with_position=True` during index creation, which is disabled by default.
+For exact phrase matching, ensure you enable `with_position=True` during index creation (disabled by default) and wrap the phrase in double quotes (or pass a `PhraseQuery`):
 
 ```python
-# Rebuild the index with positions enabled (required for phrase queries)
-ds.create_scalar_index(
-    "text",
-    "INVERTED",
-    with_position=True,
-    remove_stop_words=False,
-)
-# Search for the exact phrase "train to boston"
-table = ds.to_table(full_text_query="'train to boston'")
+--8<-- "snippets/quickstart/fts_quickstart.py:phrase-search"
+```
 
-# If stopwords are removed, this phrase query would return an empty result
-# text: [["I left my umbrella on the evening train to Boston"]]
+```output
+--8<-- "snippets/quickstart/outputs/fts_quickstart.py.phrase-search.txt"
 ```
 
 !!! warning "Stop Words Are Removed by Default"
-Common words like "to", "the", etc. are categorized as stop words and are removed by default when creating the index. If you want to search exact phrases that include stop words, set `remove_stop_words=False` when creating the index.
+    Common words like "to", "the", etc. are categorized as stop words and are removed by default when creating the index. If you want to search exact phrases that include stop words, set `remove_stop_words=False` when creating the index.
 
 ### Substring matches with N-gram indexing
 
@@ -295,60 +196,33 @@ Common words like "to", "the", etc. are categorized as stop words and are remove
 The N-gram index creates a bitmap for each N-gram in the string. By default, Lance uses trigrams. This index can be used to speed up queries using the `contains` function in filters.
 
 ```python
-import lance
+--8<-- "snippets/quickstart/fts_quickstart.py:ngram-search"
+```
 
-ds = lance.dataset("/tmp/fts.lance")
-
-# Build an NGRAM index for substring search (speeds up `contains(...)` filters)
-# Give the index a distinct name so it won't replace your FTS index
-ds.create_scalar_index(column="text", index_type="NGRAM", name="text_ngram")
-
-# Substring search
-q1 = ds.to_table(filter="contains(text, 'ramen')")
-
-# Returns the document about ramen
-# text: [["This ramen recipe simmers the broth for three hours with dried mushrooms."]]
+```output
+--8<-- "snippets/quickstart/outputs/fts_quickstart.py.ngram-search.txt"
 ```
 
 You can explain the query plan to confirm the N-gram index's usage as shown below:
 
 ```python
-# Inspect the query plan to confirm index usage
-print(ds.scanner(filter="contains(text, 'train')").explain_plan())
+--8<-- "snippets/quickstart/fts_quickstart.py:ngram-explain"
+```
+
+```output
+--8<-- "snippets/quickstart/outputs/fts_quickstart.py.ngram-explain.txt"
 ```
 
 ### Fuzzy Search
 
-Fuzzy search is supported for FTS `MatchQuery` on `INVERTED` indexes. It uses Levenshtein edit distance to match terms with typos or slight variations.
+Fuzzy search is supported for FTS `MatchQuery` on `INVERTED` indexes. Pass a positive integer `fuzziness` (typically `1` or `2`) to specify the maximum Levenshtein edit distance used to match terms with typos or slight variations:
 
 ```python
-from lance.query import MatchQuery
-
-# Explicit edit distance (1)
-query_result = ds.to_table(
-    full_text_query=MatchQuery(
-        "rammen",  # Misspelled 'ramen'
-        "text",
-        fuzziness=1,
-        max_expansions=50,  # default: 50
-    )
-)
+--8<-- "snippets/quickstart/fts_quickstart.py:fuzzy-explicit"
 ```
 
-You can also set `fuzziness=None` to use automatic fuzziness:
-
-- `0` for term length `<= 2`
-- `1` for term length `<= 5`
-- `2` for term length `> 5`
-
-```python
-query_result = ds.to_table(
-    full_text_query=MatchQuery(
-        "rammen",
-        "text",
-        fuzziness=None,
-    )
-)
+```output
+--8<-- "snippets/quickstart/outputs/fts_quickstart.py.fuzzy-explicit.txt"
 ```
 
 To enforce exact prefixes during fuzzy matching, set `prefix_length`.
@@ -356,14 +230,11 @@ This means the first `N` characters must match exactly before fuzzy edits are al
 For example, with `prefix_length=2`, `"rammen"` can match terms starting with `"ra"` (like `"ramen"`), but not terms starting with other prefixes.
 
 ```python
-query_result = ds.to_table(
-    full_text_query=MatchQuery(
-        "rammen",
-        "text",
-        fuzziness=1,
-        prefix_length=2,  # "ra" must match exactly
-    )
-)
+--8<-- "snippets/quickstart/fts_quickstart.py:fuzzy-prefix"
+```
+
+```output
+--8<-- "snippets/quickstart/outputs/fts_quickstart.py.fuzzy-prefix.txt"
 ```
 
 ### Searching Multiple Columns
@@ -380,15 +251,11 @@ its own corpus statistics, and an optional per-column `boosts` multiplier is
 applied before taking the maximum.
 
 ```python
-from lance.query import MultiMatchQuery
+--8<-- "snippets/quickstart/fts_quickstart.py:multi-match"
+```
 
-query_result = ds.to_table(
-    full_text_query=MultiMatchQuery(
-        "albino elephant",
-        ["title", "body"],
-        boosts=[2.0, 1.0],  # weight title matches twice as much
-    )
-)
+```output
+--8<-- "snippets/quickstart/outputs/fts_quickstart.py.multi-match.txt"
 ```
 
 This works well when the columns are interchangeable and a strong match in one
@@ -402,16 +269,11 @@ comparable across columns, and a query can match with terms spread over
 different columns.
 
 ```python
-from lance.query import CombinedFieldsQuery, FullTextOperator
+--8<-- "snippets/quickstart/fts_quickstart.py:combined-fields"
+```
 
-query_result = ds.to_table(
-    full_text_query=CombinedFieldsQuery(
-        "john smith",
-        ["first_name", "last_name"],
-        boosts=[1.0, 1.0],
-        operator=FullTextOperator.AND,
-    )
-)
+```output
+--8<-- "snippets/quickstart/outputs/fts_quickstart.py.combined-fields.txt"
 ```
 
 Prefer `combined_fields` in these cases:
@@ -457,26 +319,16 @@ When you append new rows after creating an `INVERTED` index, Lance still returns
 To keep FTS latency low as new data arrives, periodically add unindexed fragments into the existing FTS index by calling `ds.optimize.optimize_indices()`:
 
 ```python
-# Append new data
-new_rows = pa.table(
-    {
-        "id": [4],
-        "text": ["The next train leaves at noon"],
-    }
-)
-ds.insert(new_rows)
+--8<-- "snippets/quickstart/fts_quickstart.py:index-maintenance"
+```
 
-# Incrementally update existing indices (including "text_idx")
-ds.optimize.optimize_indices(index_names=["text_idx"])
-
-# Optional: monitor index coverage
-stats = ds.stats.index_stats("text_idx")
-print(stats["num_unindexed_rows"], stats["num_indexed_rows"])
+```output
+--8<-- "snippets/quickstart/outputs/fts_quickstart.py.index-maintenance.txt"
 ```
 
 !!! info
-If you used a custom index name, replace `"text_idx"` with your index name.
-If you did not set `name=...` when creating the FTS index on column `"text"`, the default index name is `"text_idx"`.
+    If you used a custom index name, replace `"text_idx"` with your index name.
+    If you did not set `name=...` when creating the FTS index on column `"text"`, the default index name is `"text_idx"`.
 
 If you changed tokenizer settings (such as `with_position`, `base_tokenizer`, stop words, or stemming), rebuild the index with `create_scalar_index(..., replace=True)` so the full dataset is indexed with the new configuration.
 
@@ -502,4 +354,4 @@ For advanced usage instructions with different tokenizers and more technical det
 
 ## Next Steps
 
-Check out the **[User Guide](../guide/read_and_write.md)** and explore the Lance API in more detail.
+Continue with the **[Full-Text Search User Guide](../guide/full_text_search.md)** for index configuration, query types, and index maintenance.

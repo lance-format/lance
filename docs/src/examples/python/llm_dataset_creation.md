@@ -48,46 +48,58 @@ Now that we have set up our raw dataset and pre-processing code,
 let's define the main function that takes in the dataset, number of samples and field, and returns a pyarrow batch that will later be written into a lance dataset.
 
 ```python
-def process_samples(dataset, num_samples=100_000, field='text'):
+def process_samples(dataset, num_samples=100_000, batch_size=1024, field='text'):
     current_sample = 0
+    batch = []
     for sample in tqdm(dataset, total=num_samples):
-        # If we have added all 5M samples, stop
+        # Stop once we have collected the requested number of samples
         if current_sample == num_samples:
             break
         if not sample[field]:
             continue
         # Tokenize the current sample
         tokenized_sample = tokenize(sample, field)
+        if not tokenized_sample:
+            continue
+        batch.append(tokenized_sample)
         # Increment the counter
         current_sample += 1
-        # Yield a PyArrow RecordBatch
+        # Yield a PyArrow RecordBatch once we accumulate `batch_size` samples
+        if len(batch) == batch_size:
+            yield pa.RecordBatch.from_arrays(
+                [pa.array(batch, type=pa.list_(pa.int64()))],
+                names=["input_ids"],
+            )
+            batch = []
+
+    if batch:
         yield pa.RecordBatch.from_arrays(
-            [tokenized_sample], 
-            names=["input_ids"]
+            [pa.array(batch, type=pa.list_(pa.int64()))],
+            names=["input_ids"],
         )
 ```
 
-This function will be iterating over the huggingface dataset, one sample at a time, tokenizing the sample and yielding a pyarrow `RecordBatch`
-with all the tokens. We will do this until we have reached the `num_samples` number of samples or the end of the dataset, whichever comes first.
+This function iterates over the Hugging Face dataset, tokenizes each non-empty sample into a list of token IDs, and yields a PyArrow `RecordBatch`
+every `batch_size` samples until it reaches `num_samples` or the end of the dataset.
 
 Please note that by 'sample', we mean one example (row) in the original dataset. What one example exactly means will depend on the dataset itself as it could 
 be one line or an entire file of text. In this example, it varies in length between a line and a paragraph of text.
 
-We also need to define a schema to tell Lance what type of data we are expecting in our table. Since our dataset consists only of tokens which are long integers, `int64` is the suitable datatype.
+We also need to define a schema to tell Lance what type of data we are expecting in our table. Each row stores the token IDs for one sample as a variable-length list of 64-bit integers (`pa.list_(pa.int64())`).
 
 ```python
 schema = pa.schema([
-    pa.field("input_ids", pa.int64())
+    pa.field("input_ids", pa.list_(pa.int64()))
 ])
 ```
 
 Finally, we need to define a `reader` that will be reading a stream of record batches from our `process_samples` function that yields 
-said record batches consisting of individual tokenized samples.
+batches of tokenized samples.
 
 ```python
 reader = pa.RecordBatchReader.from_batches(
     schema, 
-    process_samples(dataset, num_samples=500_000, field='text') # For 500K samples
+    process_samples(dataset, num_samples=500_000, batch_size=1024, field='text')  # For 500K samples
 )
 ```
 

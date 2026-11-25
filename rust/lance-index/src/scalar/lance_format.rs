@@ -3,13 +3,13 @@
 
 //! Utilities for serializing and deserializing scalar indices in the lance format
 
-use super::{IndexFile, IndexReader, IndexStore, IndexWriter};
+use super::{IndexBinaryReader, IndexFile, IndexReader, IndexStore, IndexWriter};
 use arrow_array::RecordBatch;
-use arrow_schema::Schema;
+use arrow_schema::{DataType, Schema};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt};
-use lance_core::cache::{CacheKey, CacheKeySchema, KeyBuilder};
+use lance_core::cache::{CacheKey, CacheKeySchema, KeyBuilder, WeakLanceCache};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result, cache::LanceCache};
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
@@ -82,6 +82,8 @@ pub struct LanceIndexStore {
     format_version: ConcreteFileVersion,
     /// Base I/O priority for all requests this store submits to `scheduler`.
     io_priority: u64,
+    /// None preserves the normal file-writer default; Some caps its configured column cache.
+    write_buffer_size: Option<u64>,
 }
 
 impl DeepSizeOf for LanceIndexStore {
@@ -129,6 +131,7 @@ impl LanceIndexStore {
             file_sizes: Arc::default(),
             format_version,
             io_priority: 0,
+            write_buffer_size: None,
         }
     }
 
@@ -254,6 +257,13 @@ impl IndexReader for V1IndexReader {
         )))
     }
 
+    fn guarantees_byte_splitting(&self) -> bool {
+        // A batch is exactly one row group, and the V1 format bounds the
+        // offsets inside a row group, so a batch never merges rows into one
+        // oversized offset array.
+        true
+    }
+
     async fn num_batches(&self, _batch_size: u64) -> u32 {
         self.0.num_batches() as u32
     }
@@ -270,6 +280,20 @@ impl IndexReader for V1IndexReader {
 /// Newtype wrapper to allow implementing IndexReader for CurrentFileReader (a foreign type)
 struct CurrentIndexReader(CurrentFileReader);
 
+#[derive(Debug)]
+struct LanceBinaryReader(lance_encoding::encodings::physical::binary::PreparedBinaryValue);
+
+#[async_trait]
+impl IndexBinaryReader for LanceBinaryReader {
+    fn len(&self) -> u64 {
+        self.0.len()
+    }
+
+    async fn read_slices(&self, slices: &[std::ops::Range<u64>]) -> Result<Vec<Bytes>> {
+        self.0.read_slices(slices).await
+    }
+}
+
 impl CurrentIndexReader {
     /// Row range covered by batch `offset`, clamped to the end of the file.
     fn batch_bounds(&self, offset: u64, batch_size: u64) -> (usize, usize) {
@@ -282,6 +306,37 @@ impl CurrentIndexReader {
 
 #[async_trait]
 impl IndexReader for CurrentIndexReader {
+    fn metadata_cache(&self) -> Option<WeakLanceCache> {
+        Some(self.0.metadata_cache())
+    }
+
+    async fn try_prepare_binary_value(
+        &self,
+        column: &str,
+        row: u64,
+    ) -> Result<Option<Arc<dyn IndexBinaryReader>>> {
+        let schema = self.0.schema();
+        let field = schema.field(column).ok_or_else(|| {
+            Error::invalid_input(format!("binary byte read column {column:?} is missing"))
+        })?;
+        if !matches!(field.data_type(), DataType::Binary | DataType::LargeBinary) {
+            return Ok(None);
+        }
+        let projection = versions::reader_projection_from_column_names(
+            self.0.metadata().version(),
+            schema,
+            &[column],
+        )?;
+        let [column_index] = projection.column_indices.as_slice() else {
+            return Ok(None);
+        };
+        Ok(self
+            .0
+            .try_prepare_binary_value(*column_index as usize, row)
+            .await?
+            .map(|value| Arc::new(LanceBinaryReader(value)) as Arc<dyn IndexBinaryReader>))
+    }
+
     async fn read_record_batch(&self, offset: u64, batch_size: u64) -> Result<RecordBatch> {
         let (start, end) = self.batch_bounds(offset, batch_size);
         self.read_range(start..end, None).await
@@ -501,6 +556,13 @@ impl IndexReader for CurrentIndexReader {
             .await
     }
 
+    fn guarantees_byte_splitting(&self) -> bool {
+        // The V2.0 decoder splits a batch before its i32 offsets overflow
+        // (#9225). The V2.1+ structural decoder drains by row count alone, so
+        // a multi-row batch of huge rows can overflow inside one batch.
+        self.0.metadata().version() == ConcreteFileVersion::V2_0
+    }
+
     // V2 format has removed the row group concept,
     // so here we assume each batch is with 4096 rows.
     async fn num_batches(&self, batch_size: u64) -> u32 {
@@ -555,11 +617,24 @@ impl IndexStore for LanceIndexStore {
             self.format_version,
             writer,
             schema,
-            current_writer::FileWriterOptions::default(),
+            current_writer::FileWriterOptions {
+                data_cache_bytes: self.write_buffer_size,
+                ..Default::default()
+            },
         )?;
         Ok(Box::new(LanceIndexWriter {
             path: name.to_string(),
             inner: writer,
+        }))
+    }
+
+    fn with_write_buffer_size(&self, bytes: u64) -> Result<Arc<dyn IndexStore>> {
+        if bytes == 0 {
+            return Err(Error::invalid_input("writer buffer must be positive"));
+        }
+        Ok(Arc::new(Self {
+            write_buffer_size: Some(bytes),
+            ..self.clone()
         }))
     }
 
@@ -748,12 +823,12 @@ mod tests {
     use arrow_schema::Schema as ArrowSchema;
     use arrow_schema::{DataType, Field, TimeUnit};
     use arrow_select::take::TakeOptions;
-    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use datafusion_common::ScalarValue;
+    use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
     use futures::FutureExt;
+    use lance_core::ROW_ADDR;
     use lance_core::utils::row_addr_remap::RowAddrRemap;
     use lance_core::utils::tempfile::TempDir;
-    use lance_core::{ROW_ADDR, ROW_ID};
     use lance_datagen::{ArrayGeneratorExt, BatchCount, ByteCount, RowCount, array, gen_batch};
     use lance_select::{RowAddrTreeMap, RowSetOps};
 
@@ -767,6 +842,94 @@ mod tests {
             128 * 1024 * 1024,
         ));
         Arc::new(LanceIndexStore::new(object_store, test_path, cache))
+    }
+
+    #[tokio::test]
+    async fn binary_slices_index_reader_preserves_named_column_and_fallback() -> Result<()> {
+        let tempdir = TempDir::default();
+        let (_, store) = concrete_test_store(&tempdir);
+        let store = LanceIndexStore::with_format_version(
+            store.object_store.clone(),
+            store.index_dir.clone(),
+            store.metadata_cache.clone(),
+            ConcreteFileVersion::V2_3,
+        );
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::UInt32, false),
+            Field::new("payload", DataType::LargeBinary, false).with_metadata(HashMap::from([(
+                lance_encoding::constants::STRUCTURAL_ENCODING_META_KEY.to_owned(),
+                lance_encoding::constants::STRUCTURAL_ENCODING_MINIBLOCK.to_owned(),
+            )])),
+        ]));
+        let payloads = (0..4).map(|row| vec![b'a' + row; 8192]).collect::<Vec<_>>();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(arrow_array::UInt32Array::from(vec![0, 1, 2, 3])),
+                Arc::new(arrow_array::LargeBinaryArray::from_iter_values(&payloads)),
+            ],
+        )?;
+        let mut writer = store.new_index_file("bytes.lance", schema).await?;
+        writer.write_record_batch(batch.clone()).await?;
+        writer.finish().await?;
+        let reader = store.open_index_file("bytes.lance").await?;
+        let slices = [100..112, 0..0, 103..108];
+        for row in [0, 2, 3] {
+            let selected = reader
+                .try_prepare_binary_value("payload", row)
+                .await?
+                .unwrap();
+            assert_eq!(selected.len(), payloads[row as usize].len() as u64);
+            assert!(!selected.is_empty());
+            let tail = selected
+                .read_slices(&[selected.len() - 1..selected.len()])
+                .await?;
+            assert_eq!(tail[0].as_ref(), &payloads[row as usize][8191..]);
+            let selected = selected.read_slices(&slices).await?;
+            for (actual, slice) in selected.iter().zip(&slices) {
+                assert_eq!(
+                    actual.as_ref(),
+                    &payloads[row as usize][slice.start as usize..slice.end as usize]
+                );
+            }
+        }
+        assert!(reader.try_prepare_binary_value("id", 0).await?.is_none());
+        let error = reader
+            .try_prepare_binary_value("missing", 0)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("missing"));
+        assert_eq!(reader.read_range(0..4, None).await?, batch);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bounded_writer_scope_preserves_store_and_read_format() -> Result<()> {
+        let tempdir = TempDir::default();
+        let (_, store) = concrete_test_store(&tempdir);
+        let error = store.with_write_buffer_size(0).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("positive"));
+        let bounded = store.with_write_buffer_size(4096)?;
+        assert_eq!(store.write_buffer_size, None);
+        assert_eq!(
+            bounded
+                .as_any()
+                .downcast_ref::<LanceIndexStore>()
+                .unwrap()
+                .write_buffer_size,
+            Some(4096)
+        );
+        let batch = arrow_array::record_batch!(("value", Int32, [1, 2, 3]))?;
+        let mut writer = bounded
+            .new_index_file("bounded.lance", batch.schema())
+            .await?;
+        writer.write_record_batch(batch.clone()).await?;
+        writer.finish().await?;
+        let reader = store.open_index_file("bounded.lance").await?;
+        assert_eq!(reader.read_range(0..3, None).await?, batch);
+        Ok(())
     }
 
     #[tokio::test]
@@ -996,7 +1159,7 @@ mod tests {
         };
         let params = serde_json::to_string(&params).unwrap();
         let btree_plugin = BTreeIndexPlugin;
-        let data = lance_datafusion::utils::reader_to_stream(Box::new(data));
+        let data = lance_datafusion_exec::utils::reader_to_stream(Box::new(data));
         let request = btree_plugin
             .new_training_request(
                 &params,
@@ -1144,7 +1307,7 @@ mod tests {
         let updated_index_store = test_store(&updated_index_dir);
         index
             .update(
-                lance_datafusion::utils::reader_to_stream(Box::new(data)),
+                lance_datafusion_exec::utils::reader_to_stream(Box::new(data)),
                 updated_index_store.as_ref(),
                 None,
             )
@@ -1532,7 +1695,7 @@ mod tests {
             Field::new(ROW_ADDR, DataType::UInt64, false),
         ]));
         let data = RecordBatchIterator::new(batches, schema);
-        let data = lance_datafusion::utils::reader_to_stream(Box::new(data));
+        let data = lance_datafusion_exec::utils::reader_to_stream(Box::new(data));
 
         train_btree_index(
             data,
@@ -1628,7 +1791,7 @@ mod tests {
 
         let schema = Arc::new(ArrowSchema::new(vec![
             Field::new(VALUE_COLUMN_NAME, DataType::Utf8, true),
-            Field::new(ROW_ID, DataType::UInt64, false),
+            Field::new(ROW_ADDR, DataType::UInt64, false),
         ]));
 
         let batch1 = RecordBatch::try_new(
@@ -1657,7 +1820,7 @@ mod tests {
         let data = RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
         train_bitmap(&index_store, data).await;
 
-        let index = BitmapIndex::load(index_store, None, &LanceCache::no_cache())
+        let index = BitmapIndex::load(index_store, None, &LanceCache::no_cache(), true)
             .await
             .unwrap();
 
@@ -1696,10 +1859,10 @@ mod tests {
         let index_store = test_store(&tempdir);
         let data = gen_batch()
             .col(VALUE_COLUMN_NAME, array::step::<Int32Type>())
-            .col(ROW_ID, array::step::<UInt64Type>())
+            .col(ROW_ADDR, array::step::<UInt64Type>())
             .into_reader_rows(RowCount::from(4096), BatchCount::from(100));
         train_bitmap(&index_store, data).await;
-        let index = BitmapIndex::load(index_store, None, &LanceCache::no_cache())
+        let index = BitmapIndex::load(index_store, None, &LanceCache::no_cache(), true)
             .await
             .unwrap();
 
@@ -1763,21 +1926,24 @@ mod tests {
                 VALUE_COLUMN_NAME,
                 array::cycle::<Int32Type>(vec![0, 1, 4, 5]),
             )
-            .col(ROW_ID, array::cycle::<UInt64Type>(vec![0, 1, 2, 3]))
+            .col(ROW_ADDR, array::cycle::<UInt64Type>(vec![0, 1, 2, 3]))
             .into_batch_rows(RowCount::from(4));
         let batch_two = gen_batch()
             .col(
                 VALUE_COLUMN_NAME,
                 array::cycle::<Int32Type>(vec![10, 11, 11, 15]),
             )
-            .col(ROW_ID, array::cycle::<UInt64Type>(vec![40, 50, 60, 70]))
+            .col(ROW_ADDR, array::cycle::<UInt64Type>(vec![40, 50, 60, 70]))
             .into_batch_rows(RowCount::from(4));
         let batch_three = gen_batch()
             .col(
                 VALUE_COLUMN_NAME,
                 array::cycle::<Int32Type>(vec![15, 15, 15, 15]),
             )
-            .col(ROW_ID, array::cycle::<UInt64Type>(vec![400, 500, 600, 700]))
+            .col(
+                ROW_ADDR,
+                array::cycle::<UInt64Type>(vec![400, 500, 600, 700]),
+            )
             .into_batch_rows(RowCount::from(4));
         let batch_four = gen_batch()
             .col(
@@ -1785,18 +1951,18 @@ mod tests {
                 array::cycle::<Int32Type>(vec![15, 16, 20, 20]),
             )
             .col(
-                ROW_ID,
+                ROW_ADDR,
                 array::cycle::<UInt64Type>(vec![4000, 5000, 6000, 7000]),
             )
             .into_batch_rows(RowCount::from(4));
         let batches = vec![batch_one, batch_two, batch_three, batch_four];
         let schema = Arc::new(Schema::new(vec![
             Field::new(VALUE_COLUMN_NAME, DataType::Int32, false),
-            Field::new(ROW_ID, DataType::UInt64, false),
+            Field::new(ROW_ADDR, DataType::UInt64, false),
         ]));
         let data = RecordBatchIterator::new(batches, schema);
         train_bitmap(&index_store, data).await;
-        let index = BitmapIndex::load(index_store, None, &LanceCache::no_cache())
+        let index = BitmapIndex::load(index_store, None, &LanceCache::no_cache(), true)
             .await
             .unwrap();
 
@@ -1981,31 +2147,32 @@ mod tests {
         let index_store = test_store(&index_dir);
         let data = gen_batch()
             .col(VALUE_COLUMN_NAME, array::step::<Int32Type>())
-            .col(ROW_ID, array::step::<UInt64Type>())
+            .col(ROW_ADDR, array::step::<UInt64Type>())
             .into_reader_rows(RowCount::from(4096), BatchCount::from(1));
         train_bitmap(&index_store, data).await;
-        let index = BitmapIndex::load(index_store, None, &LanceCache::no_cache())
+        let index = BitmapIndex::load(index_store, None, &LanceCache::no_cache(), true)
             .await
             .unwrap();
 
         let data = gen_batch()
             .col(VALUE_COLUMN_NAME, array::step_custom::<Int32Type>(4096, 1))
-            .col(ROW_ID, array::step_custom::<UInt64Type>(4096, 1))
+            .col(ROW_ADDR, array::step_custom::<UInt64Type>(4096, 1))
             .into_reader_rows(RowCount::from(4096), BatchCount::from(1));
 
         let updated_index_dir = TempDir::default();
         let updated_index_store = test_store(&updated_index_dir);
         index
             .update(
-                lance_datafusion::utils::reader_to_stream(Box::new(data)),
+                lance_datafusion_exec::utils::reader_to_stream(Box::new(data)),
                 updated_index_store.as_ref(),
                 None,
             )
             .await
             .unwrap();
-        let updated_index = BitmapIndex::load(updated_index_store, None, &LanceCache::no_cache())
-            .await
-            .unwrap();
+        let updated_index =
+            BitmapIndex::load(updated_index_store, None, &LanceCache::no_cache(), true)
+                .await
+                .unwrap();
 
         let result = updated_index
             .search(
@@ -2027,10 +2194,10 @@ mod tests {
         let index_store = test_store(&index_dir);
         let data = gen_batch()
             .col(VALUE_COLUMN_NAME, array::step::<Int32Type>())
-            .col(ROW_ID, array::step::<UInt64Type>())
+            .col(ROW_ADDR, array::step::<UInt64Type>())
             .into_reader_rows(RowCount::from(50), BatchCount::from(1));
         train_bitmap(&index_store, data).await;
-        let index = BitmapIndex::load(index_store, None, &LanceCache::no_cache())
+        let index = BitmapIndex::load(index_store, None, &LanceCache::no_cache(), true)
             .await
             .unwrap();
 
@@ -2053,7 +2220,7 @@ mod tests {
             .remap(&RowAddrRemap::direct(mapping), remapped_store.as_ref())
             .await
             .unwrap();
-        let remapped_index = BitmapIndex::load(remapped_store, None, &LanceCache::no_cache())
+        let remapped_index = BitmapIndex::load(remapped_store, None, &LanceCache::no_cache(), true)
             .await
             .unwrap();
 
@@ -2099,7 +2266,7 @@ mod tests {
         index_store: &Arc<dyn IndexStore>,
         data: impl RecordBatchReader + Send + Sync + 'static,
     ) {
-        let data = lance_datafusion::utils::reader_to_stream(Box::new(data));
+        let data = lance_datafusion_exec::utils::reader_to_stream(Box::new(data));
         let request = LabelListIndexPlugin
             .new_training_request(
                 "{}",
@@ -2135,7 +2302,7 @@ mod tests {
                     false,
                 )))),
             )
-            .col(ROW_ID, array::step::<UInt64Type>())
+            .col(ROW_ADDR, array::step::<UInt64Type>())
             .into_batch_rows(RowCount::from(40960))
             .unwrap();
 
@@ -2251,7 +2418,7 @@ mod tests {
                 DataType::List(Arc::new(Field::new("item", DataType::UInt8, true))),
                 true,
             ),
-            Field::new(ROW_ID, DataType::UInt64, false),
+            Field::new(ROW_ADDR, DataType::UInt64, false),
         ]));
         let batch = RecordBatch::try_new(
             schema.clone(),
@@ -2313,13 +2480,13 @@ mod tests {
         let row_ids = UInt64Array::from(vec![0, 2]);
         let schema = Arc::new(Schema::new(vec![
             Field::new(VALUE_COLUMN_NAME, DataType::UInt8, true),
-            Field::new(ROW_ID, DataType::UInt64, false),
+            Field::new(ROW_ADDR, DataType::UInt64, false),
         ]));
         let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(values), Arc::new(row_ids)])
             .unwrap();
 
         BitmapIndexPlugin::train_bitmap_index(
-            lance_datafusion::utils::reader_to_stream(Box::new(RecordBatchIterator::new(
+            lance_datafusion_exec::utils::reader_to_stream(Box::new(RecordBatchIterator::new(
                 vec![Ok(batch)],
                 schema,
             ))),

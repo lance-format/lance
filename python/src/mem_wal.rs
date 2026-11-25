@@ -21,14 +21,18 @@ use lance::dataset::mem_wal::scanner::{
     LsmDataSourceCollector, LsmPointLookupPlanner, LsmVectorSearchPlanner, SsTable,
     parse_filter_expr as parse_lsm_filter_expr,
 };
-use lance::dataset::mem_wal::write::{MemTableStats, ShardMemory, WriteStatsSnapshot};
-use lance::dataset::mem_wal::{
-    LsmScanner, ShardSnapshot, ShardWriter, arrow_schema_with_field_ids, evaluate_sharding_spec,
+use lance::dataset::mem_wal::write::{
+    MemTableStats, ShardMemory, WriteBatchBuffer, WriteStatsSnapshot,
 };
+use lance::dataset::mem_wal::{
+    DatasetMemWalExt, LsmScanner, ShardSnapshot, ShardWriter, arrow_schema_with_field_ids,
+    evaluate_sharding_spec,
+};
+use lance::dataset::scanner::DatasetRecordBatchStream;
+use lance_arrow::deepcopy::deep_copy_batch;
 use lance_index::mem_wal::{
     CompactedSsTable as LanceCompactedSsTable, ShardingField, ShardingSpec,
 };
-use lance_linalg::distance::DistanceType;
 use pyo3::exceptions::{PyIOError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
@@ -36,8 +40,10 @@ use tokio::sync::Mutex as TokioMutex;
 use uuid::Uuid;
 
 use crate::dataset::Dataset as PyDataset;
+use crate::reader::LanceReader;
 use crate::rt;
 use crate::schema::LanceSchema as PyLanceSchema;
+use crate::utils::parse_distance_type;
 
 /// Evaluate a MemWAL sharding spec against one PyArrow RecordBatch.
 #[pyfunction(name = "_evaluate_sharding_spec", signature = (batch, spec, schema))]
@@ -241,12 +247,58 @@ struct ClosedShardWriterState {
     memtable_stats: MemTableStats,
 }
 
-fn collect_record_batches(data: &Bound<'_, PyAny>) -> PyResult<Vec<RecordBatch>> {
-    let reader = ArrowArrayStreamReader::from_pyarrow_bound(data)
-        .map_err(|e| PyValueError::new_err(format!("Cannot read data as Arrow: {}", e)))?;
-    reader
-        .collect::<Result<_, _>>()
-        .map_err(|e| PyIOError::new_err(format!("Failed to read batches: {}", e)))
+const DEFAULT_MAX_WRITE_BYTES: usize = 256 * 1024 * 1024;
+
+impl PyShardWriter {
+    fn collect_record_batches(
+        &self,
+        py: Python<'_>,
+        data: &Bound<'_, PyAny>,
+        max_bytes: usize,
+    ) -> PyResult<Vec<RecordBatch>> {
+        let inner = self.inner.clone();
+        let mut buffer = rt()
+            .block_on(Some(py), async move {
+                let guard = inner.lock().await;
+                let writer = guard.as_ref().ok_or_else(|| {
+                    lance_core::Error::invalid_input("ShardWriter is already closed")
+                })?;
+                WriteBatchBuffer::new(writer.config(), max_bytes)
+            })?
+            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        // Iterating Python readers directly preserves their exceptions, including
+        // KeyboardInterrupt; exporting through the C stream turns them into strings.
+        let mut reader: Box<dyn Iterator<Item = PyResult<RecordBatch>> + '_> = if data
+            .is_instance(&py.import("pyarrow")?.getattr("RecordBatchReader")?)?
+        {
+            Box::new(
+                data.try_iter()?
+                    .map(|batch| RecordBatch::from_pyarrow_bound(&batch?)),
+            )
+        } else {
+            let reader = ArrowArrayStreamReader::from_pyarrow_bound(data)
+                .map_err(|e| PyValueError::new_err(format!("Cannot read data as Arrow: {}", e)))?;
+            Box::new(reader.map(|batch| {
+                batch.map_err(|e| PyIOError::new_err(format!("Failed to read batches: {}", e)))
+            }))
+        };
+        loop {
+            py.check_signals()?;
+            let Some(batch) = reader.next() else {
+                break;
+            };
+            // FFI buffer lengths cannot reveal opaque owners such as NumPy
+            // allocations. Copy every buffer, including nulls and dictionary
+            // children, so buffered batches cannot retain those foreign owners.
+            let batch = deep_copy_batch(&batch?)
+                .map_err(|e| PyIOError::new_err(format!("Failed to copy batch: {e}")))?;
+            buffer
+                .push(batch)
+                .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        }
+        py.check_signals()?;
+        Ok(buffer.into_batches())
+    }
 }
 
 #[pymethods]
@@ -255,8 +307,9 @@ impl PyShardWriter {
     ///
     /// Accepts any PyArrow-compatible data source (RecordBatch, Table,
     /// or an Arrow stream reader).
-    pub fn put(&self, py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<()> {
-        let batches = collect_record_batches(data)?;
+    #[pyo3(signature = (data, *, max_bytes=DEFAULT_MAX_WRITE_BYTES))]
+    pub fn put(&self, py: Python<'_>, data: &Bound<'_, PyAny>, max_bytes: usize) -> PyResult<()> {
+        let batches = self.collect_record_batches(py, data, max_bytes)?;
 
         if batches.is_empty() {
             return Ok(());
@@ -280,8 +333,14 @@ impl PyShardWriter {
     /// Accepts any PyArrow-compatible data source carrying the shard's primary
     /// key column(s). Rust core validates that primary keys exist and builds the
     /// tombstone rows.
-    pub fn delete(&self, py: Python<'_>, keys: &Bound<'_, PyAny>) -> PyResult<()> {
-        let batches = collect_record_batches(keys)?;
+    #[pyo3(signature = (keys, *, max_bytes=DEFAULT_MAX_WRITE_BYTES))]
+    pub fn delete(
+        &self,
+        py: Python<'_>,
+        keys: &Bound<'_, PyAny>,
+        max_bytes: usize,
+    ) -> PyResult<()> {
+        let batches = self.collect_record_batches(py, keys, max_bytes)?;
 
         if batches.is_empty() {
             return Ok(());
@@ -393,9 +452,11 @@ impl PyShardWriter {
         memtable_stats_to_pydict(py, &stats, bytes.as_ref())
     }
 
-    /// Create an LSM scanner that includes the active MemTable for strong consistency.
+    /// Create an LSM scanner that includes this writer's in-memory MemTables
+    /// for strong consistency.
     ///
-    /// The scanner covers: base table + given SSTables + current active MemTable.
+    /// The scanner covers: base table + given SSTables + the active MemTable
+    /// and every frozen MemTable still awaiting flush.
     #[pyo3(signature = (shard_snapshots=vec![]))]
     pub fn lsm_scanner(
         &self,
@@ -412,18 +473,25 @@ impl PyShardWriter {
         let dataset = self.dataset.clone();
         let shard_id = self.shard_id;
 
-        let (active_ref, writer_snapshot) = rt()
+        let (in_memory_memtables, writer_snapshot, dir_id) = rt()
             .block_on(Some(py), async move {
                 let guard = inner.lock().await;
                 match guard.as_ref() {
                     Some(w) => {
-                        let active_ref = w.active_memtable_ref().await?;
+                        // Capture the active memtable *and* any frozen-awaiting-flush
+                        // memtables so a concurrent flush rollover cannot hide
+                        // acknowledged writes from this read-your-writes scanner.
+                        let in_memory_memtables = w.in_memory_memtable_refs().await?;
                         let writer_snapshot = w
                             .manifest()
                             .await?
                             .map(shard_snapshot_from_manifest)
                             .unwrap_or_else(|| ShardSnapshot::new(shard_id));
-                        Ok((active_ref, writer_snapshot))
+                        Ok((
+                            in_memory_memtables,
+                            writer_snapshot,
+                            w.config().dir_id.clone(),
+                        ))
                     }
                     None => Err(lance_core::Error::invalid_input(
                         "ShardWriter is already closed",
@@ -435,7 +503,8 @@ impl PyShardWriter {
         snapshots.push(writer_snapshot);
 
         let scanner = LsmScanner::new(dataset, snapshots, pk_columns)
-            .with_active_memtable(shard_id, active_ref);
+            .with_mem_wal_dir_id(dir_id)
+            .with_in_memory_memtables(shard_id, in_memory_memtables);
 
         Ok(PyLsmScanner {
             inner: Some(scanner),
@@ -571,8 +640,9 @@ impl PyLsmScanner {
             .map(|s| s.borrow().inner.clone())
             .collect();
         let pk_columns = get_pk_columns(&ds)?;
+        let dir_id = mem_wal_dir_id(&ds)?;
         Ok(Self {
-            inner: Some(LsmScanner::new(ds, snapshots, pk_columns)),
+            inner: Some(LsmScanner::new(ds, snapshots, pk_columns).with_mem_wal_dir_id(dir_id)),
         })
     }
 
@@ -687,6 +757,25 @@ impl PyLsmScanner {
         PyList::new(py, py_batches)
     }
 
+    /// Execute the scan and return a PyArrow RecordBatchReader that yields
+    /// batches as the scan produces them, instead of collecting them first.
+    pub fn to_reader(
+        &self,
+        py: Python<'_>,
+    ) -> PyResult<PyArrowType<Box<dyn RecordBatchReader + Send>>> {
+        let scanner = self
+            .inner
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("Scanner has already been consumed"))?;
+        let stream = rt()
+            .block_on(Some(py), scanner.try_into_stream())
+            .map_err(|e| PyIOError::new_err(e.to_string()))?
+            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        Ok(PyArrowType(Box::new(LanceReader::from_stream(
+            DatasetRecordBatchStream::new(stream),
+        ))))
+    }
+
     /// Return the row count without loading all data.
     pub fn count_rows(&self, py: Python<'_>) -> PyResult<u64> {
         let scanner = self
@@ -732,7 +821,8 @@ impl PyLsmPointLookupPlanner {
         // A flushed generation stores the names it was written with, so the
         // planner resolves its columns by id; `base_schema` carries none.
         let identity_schema = Arc::new(arrow_schema_with_field_ids(ds.schema()));
-        let collector = LsmDataSourceCollector::new(ds.clone(), snapshots);
+        let collector = LsmDataSourceCollector::new(ds.clone(), snapshots)
+            .with_mem_wal_dir_id(mem_wal_dir_id(&ds)?);
         let planner = LsmPointLookupPlanner::new(collector, pk_cols.clone(), base_schema.clone())
             .map_err(|e| PyIOError::new_err(e.to_string()))?
             .with_identity_schema(identity_schema);
@@ -805,7 +895,20 @@ impl PyLsmVectorSearchPlanner {
         // See the point-lookup planner: a rename moves a name and keeps the id.
         let identity_schema = Arc::new(arrow_schema_with_field_ids(ds.schema()));
 
-        let dist_type = parse_distance_type(distance_type.as_deref().unwrap_or("l2"))?;
+        let distance_type = distance_type.as_deref().unwrap_or("l2");
+        // MemWAL callers historically used `inner_product` for dot. Keep that
+        // alias here instead of broadening the shared DistanceType parser.
+        let normalized_distance_type = if distance_type.eq_ignore_ascii_case("inner_product") {
+            "dot"
+        } else {
+            distance_type
+        };
+        let dist_type = parse_distance_type(normalized_distance_type).map_err(|_| {
+            PyValueError::new_err(format!(
+                "Unknown distance_type '{}'. Valid values: 'l2', 'cosine', 'dot', 'hamming'",
+                distance_type
+            ))
+        })?;
 
         let vector_dim = get_vector_dim(&ds, &vector_column)?;
         let filter = filter
@@ -816,7 +919,8 @@ impl PyLsmVectorSearchPlanner {
             })
             .transpose()?;
 
-        let collector = LsmDataSourceCollector::new(ds.clone(), snapshots);
+        let collector = LsmDataSourceCollector::new(ds.clone(), snapshots)
+            .with_mem_wal_dir_id(mem_wal_dir_id(&ds)?);
         let mut planner = LsmVectorSearchPlanner::new(
             collector,
             pk_cols,
@@ -900,6 +1004,15 @@ impl PyLsmVectorSearchPlanner {
     }
 }
 
+/// The dataset's MemWAL `dir_id`; empty when it has no MemWAL.
+fn mem_wal_dir_id(ds: &Arc<LanceDataset>) -> PyResult<String> {
+    let ds = ds.clone();
+    let details = rt()
+        .block_on(None, async move { ds.mem_wal_index_details().await })?
+        .map_err(|e| PyIOError::new_err(e.to_string()))?;
+    Ok(details.map(|details| details.dir_id).unwrap_or_default())
+}
+
 /// Extract primary key column names from dataset schema.
 pub(crate) fn get_pk_columns(ds: &LanceDataset) -> PyResult<Vec<String>> {
     let pk_fields = ds.schema().unenforced_primary_key();
@@ -910,20 +1023,6 @@ pub(crate) fn get_pk_columns(ds: &LanceDataset) -> PyResult<Vec<String>> {
         ));
     }
     Ok(pk_fields.iter().map(|f| f.name.clone()).collect())
-}
-
-/// Parse distance type string to DistanceType enum.
-fn parse_distance_type(s: &str) -> PyResult<DistanceType> {
-    match s.to_lowercase().as_str() {
-        "l2" | "euclidean" => Ok(DistanceType::L2),
-        "cosine" => Ok(DistanceType::Cosine),
-        "dot" | "inner_product" => Ok(DistanceType::Dot),
-        "hamming" => Ok(DistanceType::Hamming),
-        _ => Err(PyValueError::new_err(format!(
-            "Unknown distance_type '{}'. Valid values: 'l2', 'cosine', 'dot', 'hamming'",
-            s
-        ))),
-    }
 }
 
 /// Get the vector dimension from the dataset schema for a given column.

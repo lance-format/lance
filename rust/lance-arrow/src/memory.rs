@@ -30,7 +30,8 @@ impl MemoryAccumulator {
 
     fn record_array_data(&mut self, data: &ArrayData) {
         for buffer in data.buffers() {
-            let ptr = buffer.as_ptr();
+            // Slices have different data addresses but retain the same allocation.
+            let ptr = buffer.data_ptr().as_ptr();
             if self.seen.insert(ptr as usize) {
                 self.total += buffer.capacity();
             }
@@ -38,7 +39,7 @@ impl MemoryAccumulator {
 
         if let Some(nulls) = data.nulls() {
             let null_buf = nulls.inner().inner();
-            let ptr = null_buf.as_ptr();
+            let ptr = null_buf.data_ptr().as_ptr();
             if self.seen.insert(ptr as usize) {
                 self.total += null_buf.capacity();
             }
@@ -64,18 +65,15 @@ impl MemoryAccumulator {
 mod tests {
     use std::sync::Arc;
 
-    use arrow_array::Int32Array;
-    use arrow_schema::{DataType, Field, Schema};
+    use arrow_array::{ArrayRef, Int32Array, StructArray, record_batch};
+    use arrow_schema::{DataType, Field};
+    use rstest::rstest;
 
     use super::*;
 
     #[test]
     fn test_memory_accumulator() {
-        let batch = RecordBatch::try_new(
-            Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)])),
-            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
-        )
-        .unwrap();
+        let batch = record_batch!(("a", Int32, vec![1, 2, 3])).unwrap();
         let slice = batch.slice(1, 2);
 
         let mut acc = MemoryAccumulator::default();
@@ -87,5 +85,64 @@ mod tests {
         // Should not double count
         acc.record_batch(&slice);
         assert_eq!(acc.total(), 3 * std::mem::size_of::<i32>());
+
+        acc.record_batch(&batch.slice(0, 1));
+        acc.record_batch(&batch);
+        assert_eq!(acc.total(), 3 * std::mem::size_of::<i32>());
+    }
+
+    #[rstest]
+    #[case::primitive(false, false)]
+    #[case::nullable(true, false)]
+    #[case::nested(true, true)]
+    fn test_memory_accumulator_shared_slices(
+        #[case] nullable: bool,
+        #[case] nested: bool,
+        #[values(false, true)] overlapping: bool,
+        #[values(false, true)] original_first: bool,
+    ) {
+        let array: ArrayRef = if nullable {
+            Arc::new(Int32Array::from(
+                (0..1024)
+                    .map(|i| (i % 3 != 0).then_some(i))
+                    .collect::<Vec<_>>(),
+            ))
+        } else {
+            Arc::new(Int32Array::from((0..1024).collect::<Vec<_>>()))
+        };
+        let array: ArrayRef = if nested {
+            Arc::new(StructArray::from(vec![(
+                Arc::new(Field::new("child", DataType::Int32, true)),
+                array,
+            )]))
+        } else {
+            array
+        };
+        let expected = array.to_data().get_buffer_memory_size();
+        let mut acc = MemoryAccumulator::default();
+        if original_first {
+            acc.record_array(array.as_ref());
+        }
+        for offset in (0..1024).step_by(64) {
+            let length = if overlapping {
+                128.min(1024 - offset)
+            } else {
+                64
+            };
+            acc.record_array(array.slice(offset, length).as_ref());
+            assert_eq!(acc.total(), expected);
+        }
+        acc.record_array(array.as_ref());
+        assert_eq!(acc.total(), expected);
+    }
+
+    #[test]
+    fn test_memory_accumulator_distinct_allocations() {
+        let first = Int32Array::from(vec![1, 2, 3]);
+        let second = Int32Array::from(vec![1, 2, 3]);
+        let mut acc = MemoryAccumulator::default();
+        acc.record_array(&first);
+        acc.record_array(&second);
+        assert_eq!(acc.total(), 6 * std::mem::size_of::<i32>());
     }
 }

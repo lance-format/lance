@@ -114,9 +114,9 @@ impl ManifestScan {
 /// this makes the result an incomplete view of what the dataset references, so
 /// a caller building a deletion predicate must leave it unset.
 pub fn scan_manifests(dataset: &Dataset, min_version: Option<u64>) -> ManifestScan {
-    let base = dataset.base.clone();
-    let object_store = dataset.object_store.clone();
-    let commit_handler = dataset.commit_handler.clone();
+    let base = dataset.table_state.base.clone();
+    let object_store = dataset.table_state.object_store.clone();
+    let commit_handler = dataset.table_state.commit_handler.clone();
 
     let (tx_manifest, rx_manifest) = tokio::sync::mpsc::channel::<Result<ScannedManifest>>(2);
     let (tx_locations, rx_locations) =
@@ -165,7 +165,7 @@ fn spawn_lister(
     total: Arc<std::sync::OnceLock<usize>>,
     tx_err: tokio::sync::mpsc::Sender<Result<ScannedManifest>>,
 ) {
-    tokio::spawn(async move {
+    lance_core::utils::tokio::spawn(async move {
         let result: Result<()> = async {
             let mut locations = commit_handler.list_manifest_locations(&base, &object_store, false);
             let mut count = 0usize;
@@ -205,7 +205,7 @@ fn spawn_reader(
     mem_notify: Arc<tokio::sync::Notify>,
 ) {
     let inflight_mem = inflight_mem.clone();
-    tokio::spawn(async move {
+    lance_core::utils::tokio::spawn(async move {
         let max_parallelism = object_store.io_parallelism();
         type ScanResult = Result<ScannedManifest>;
         let mut in_flight: FuturesUnordered<

@@ -23,7 +23,7 @@ use crate::{
     constants::PACKED_STRUCT_META_KEY,
     decoder::PageEncoding,
     encoder::{EncodeTask, EncodedColumn, EncodedPage, FieldEncoder, OutOfLineBuffers},
-    format::ProtobufUtils21,
+    format::EncodingUtils,
     repdef::{DefinitionInterpretation, RepDefBuilder},
 };
 use lance_core::datatypes::BlobKind;
@@ -87,7 +87,7 @@ impl BlobStructuralEncoder {
                         ));
                     };
 
-                    let wrapped = ProtobufUtils21::blob_layout(inner_layout, &def_meaning);
+                    let wrapped = EncodingUtils::blob_layout(inner_layout, &def_meaning);
                     Ok(EncodedPage {
                         column_idx: encoded_page.column_idx,
                         data: encoded_page.data,
@@ -640,7 +640,16 @@ mod tests {
             Some(empty),
         ]));
 
-        check_round_trip_encoding_of_data(vec![array], &TestCases::default(), blob_metadata).await;
+        check_round_trip_encoding_of_data(
+            vec![array],
+            &TestCases::default().with_encodings([
+                TestEncoding::Array,
+                TestEncoding::StructuralU16,
+                TestEncoding::StructuralU32,
+            ]),
+            blob_metadata,
+        )
+        .await;
     }
 
     #[tokio::test]

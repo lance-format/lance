@@ -3,13 +3,14 @@
 
 use arrow_array::{
     BinaryArray, FixedSizeListArray, Float32Array, Int32Array, RecordBatch, RecordBatchIterator,
-    UInt32Array,
+    UInt32Array, cast::AsArray, types::Int32Type,
 };
 use arrow_schema::{DataType, Field, FieldRef, Schema as ArrowSchema};
-use criterion::{Criterion, criterion_group, criterion_main};
+use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
 
 use futures::StreamExt;
 use lance::dataset::ProjectionRequest;
+use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::{Dataset, WriteMode, WriteParams};
 use lance_arrow::FixedSizeListArrayExt;
 use lance_core::cache::LanceCache;
@@ -23,7 +24,9 @@ use lance_io::utils::CachedFileSize;
 #[cfg(target_os = "linux")]
 use lance_testing::pprof::{Output, PProfProfiler};
 use object_store::path::Path;
-use rand::Rng;
+use rand::seq::{IteratorRandom, index};
+use rand::{Rng, SeedableRng, rngs::StdRng};
+use std::hint::black_box;
 use std::sync::Arc;
 #[cfg(target_os = "linux")]
 use std::time::Duration;
@@ -351,6 +354,51 @@ fn fragment_take(
     }
 }
 
+/// Compare selection kernels, including conversion, sorting, and consumption.
+fn bench_sample_offsets(c: &mut Criterion) {
+    let mut group = c.benchmark_group("sample_offsets");
+    let sparse = [1_000_000, 10_000_000, 100_000_000]
+        .into_iter()
+        .flat_map(|population| [0, 10, 1024, 8192].map(|size| (population, size)));
+    let dense = [50_000, 100_000, 100_001].map(|size| (100_000, size));
+    for (population, requested) in sparse.chain(dense) {
+        for direct in [false, true] {
+            let mut rng = StdRng::seed_from_u64(42);
+            let kernel = if direct { "direct" } else { "reservoir" };
+            group.bench_function(
+                BenchmarkId::new(kernel, format!("{requested}_of_{population}")),
+                |b| {
+                    b.iter(|| {
+                        let offsets: Vec<u64> = if direct {
+                            let size = requested.min(population);
+                            if size == 0 {
+                                Vec::new()
+                            } else if size == population {
+                                (0..population as u64).collect()
+                            } else {
+                                let mut offsets: Vec<u64> =
+                                    index::sample(&mut rng, population, size)
+                                        .into_iter()
+                                        .map(|offset| offset as u64)
+                                        .collect();
+                                offsets.sort_unstable();
+                                offsets
+                            }
+                        } else {
+                            let mut offsets =
+                                (0..population as u64).choose_multiple(&mut rng, requested);
+                            offsets.sort_unstable();
+                            offsets
+                        };
+                        black_box(offsets)
+                    })
+                },
+            );
+        }
+    }
+    group.finish();
+}
+
 /// Benchmarks Dataset::sample(), which is used during IVF training.
 fn bench_sample(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
@@ -383,6 +431,189 @@ fn bench_sample(c: &mut Criterion) {
     }
 }
 
+fn bench_sample_large(c: &mut Criterion) {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let mut group = c.benchmark_group("sample_dataset");
+    for num_batches in [1024, 10_240] {
+        let mut dataset = rt.block_on(create_dataset(
+            "memory://",
+            LanceFileVersion::Stable,
+            num_batches,
+            102_400,
+        ));
+        let projection = dataset.schema().project(&["i"]).unwrap();
+        let fragment_ids: Vec<u32> = dataset
+            .get_fragments()
+            .iter()
+            .step_by(2)
+            .map(|fragment| fragment.id() as u32)
+            .collect();
+        for deleted in [false, true] {
+            if deleted {
+                rt.block_on(dataset.delete("i % 10 = 0")).unwrap();
+            }
+            for selected in [false, true] {
+                let fragments = selected.then_some(fragment_ids.as_slice());
+                let live_rows = rt.block_on(async {
+                    if selected {
+                        let mut rows = 0;
+                        for fragment in dataset.get_fragments().iter().step_by(2) {
+                            rows += fragment.count_rows(None).await.unwrap();
+                        }
+                        rows
+                    } else {
+                        dataset.count_rows(None).await.unwrap()
+                    }
+                });
+                for size in [10, 1024] {
+                    group.bench_function(
+                        format!(
+                            "{size}_of_{}_live_{live_rows}_selected_{selected}_deleted_{deleted}",
+                            num_batches as u64 * BATCH_SIZE
+                        ),
+                        |b| {
+                            b.to_async(&rt).iter(|| async {
+                                black_box(
+                                    dataset.sample(size, &projection, fragments).await.unwrap(),
+                                )
+                            })
+                        },
+                    );
+                }
+            }
+        }
+    }
+    group.finish();
+}
+
+/// Sparse logical takes with a deletion vector in every fragment. Dataset opening
+/// is outside the timed region so cold and warm results measure the same operation.
+/// "cold" uses a fresh Lance session; the filesystem cache remains warm.
+fn bench_sparse_take_with_deletions(c: &mut Criterion) {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let mut group = c.benchmark_group("sparse_take_with_deletions");
+    group.sample_size(20);
+    for num_fragments in [8usize, 128, 1024] {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        rt.block_on(async {
+            let data = arrow_array::record_batch!((
+                "i",
+                Int32,
+                (0..(num_fragments * 4) as i32).collect::<Vec<_>>()
+            ))
+            .unwrap();
+            let mut dataset = Dataset::write(
+                RecordBatchIterator::new([Ok(data.clone())], data.schema()),
+                uri,
+                Some(WriteParams {
+                    max_rows_per_file: 4,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+            dataset.delete("i % 4 = 0").await.unwrap();
+            assert_eq!(dataset.get_fragments().len(), num_fragments);
+        });
+        let offset = (num_fragments * 3 - 1) as u64;
+        for cache in ["cold", "warm"] {
+            let open = || rt.block_on(DatasetBuilder::from_uri(uri).load()).unwrap();
+            let take = |dataset: &Dataset| {
+                rt.block_on(async {
+                    dataset
+                        .take(
+                            &[offset],
+                            ProjectionRequest::from_columns(["i"], dataset.schema()),
+                        )
+                        .await
+                        .unwrap()
+                })
+            };
+            let dataset = open();
+            let object_store = rt.block_on(dataset.object_store(None)).unwrap();
+            if cache == "warm" {
+                take(&dataset);
+            }
+            object_store.io_stats_incremental();
+            let batch = take(&dataset);
+            assert_eq!(batch.num_rows(), 1);
+            assert_eq!(
+                batch["i"].as_primitive::<Int32Type>().value(0),
+                (num_fragments * 4 - 1) as i32,
+                "{cache} take with {num_fragments} fragments returned the wrong value"
+            );
+            let stats = object_store.io_stats_incremental();
+            let deletion_reads: Vec<_> = stats
+                .requests
+                .iter()
+                .filter(|r| {
+                    r.path.parts().any(|part| part.as_ref() == "_deletions") && r.method != "head"
+                })
+                .collect();
+            let deletion_bytes: u64 = deletion_reads
+                .iter()
+                .map(|r| {
+                    r.range
+                        .as_ref()
+                        .map(|range| range.end - range.start)
+                        .unwrap_or_else(|| {
+                            let name = r.path.filename().unwrap();
+                            std::fs::metadata(dir.path().join("_deletions").join(name))
+                                .unwrap()
+                                .len()
+                        })
+                })
+                .sum();
+            let expected_deletion_reads = usize::from(cache == "cold");
+            assert_eq!(
+                deletion_reads.len(),
+                expected_deletion_reads,
+                "{cache} take with {num_fragments} fragments: {} deletion reads, {deletion_bytes} deletion bytes",
+                deletion_reads.len()
+            );
+            if cache == "cold" {
+                assert!(
+                    deletion_bytes > 0,
+                    "{cache} take with {num_fragments} fragments: {} deletion reads, {deletion_bytes} deletion bytes",
+                    deletion_reads.len()
+                );
+            } else {
+                assert_eq!(
+                    deletion_bytes,
+                    0,
+                    "{cache} take with {num_fragments} fragments: {} deletion reads, {deletion_bytes} deletion bytes",
+                    deletion_reads.len()
+                );
+            }
+            let id = BenchmarkId::new(cache, num_fragments);
+            group.bench_function(id, |b| {
+                if cache == "cold" {
+                    b.iter_batched_ref(
+                        open,
+                        |dataset| {
+                            take(dataset);
+                        },
+                        BatchSize::PerIteration,
+                    );
+                } else {
+                    b.iter_batched_ref(
+                        || {
+                            object_store.io_stats_incremental();
+                            dataset.clone()
+                        },
+                        |dataset| {
+                            take(dataset);
+                        },
+                        BatchSize::PerIteration,
+                    );
+                }
+            });
+        }
+    }
+    group.finish();
+}
+
 async fn create_dataset(
     path: &str,
     data_storage_version: LanceFileVersion,
@@ -404,42 +635,41 @@ async fn create_dataset(
         Field::new("blob", DataType::Binary, false),
     ]));
     let batch_size = BATCH_SIZE as i32;
-    let batches: Vec<RecordBatch> = (0..num_batches)
-        .map(|i| {
-            RecordBatch::try_new(
-                schema.clone(),
-                vec![
-                    Arc::new(Int32Array::from_iter_values(
-                        i * batch_size..(i + 1) * batch_size,
-                    )),
-                    Arc::new(Float32Array::from_iter_values(
-                        (i * batch_size..(i + 1) * batch_size)
-                            .map(|x| x as f32)
-                            .collect::<Vec<_>>(),
-                    )),
-                    Arc::new(BinaryArray::from_iter_values(
-                        (i * batch_size..(i + 1) * batch_size)
-                            .map(|x| format!("blob-{}", x).into_bytes()),
-                    )),
-                    Arc::new(
-                        FixedSizeListArray::try_new_from_values(
-                            Float32Array::from_iter_values(
-                                (i * batch_size..(i + 2) * batch_size)
-                                    .map(|x| (batch_size + (x - batch_size) / 2) as f32),
-                            ),
-                            2,
-                        )
-                        .unwrap(),
-                    ),
-                    Arc::new(BinaryArray::from_iter_values(
-                        (i * batch_size..(i + 1) * batch_size)
-                            .map(|x| format!("blob-{}", x).into_bytes()),
-                    )),
-                ],
-            )
-            .unwrap()
-        })
-        .collect();
+    let batch_schema = schema.clone();
+    let batches = (0..num_batches).map(move |i| {
+        RecordBatch::try_new(
+            batch_schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(
+                    i * batch_size..(i + 1) * batch_size,
+                )),
+                Arc::new(Float32Array::from_iter_values(
+                    (i * batch_size..(i + 1) * batch_size)
+                        .map(|x| x as f32)
+                        .collect::<Vec<_>>(),
+                )),
+                Arc::new(BinaryArray::from_iter_values(
+                    (i * batch_size..(i + 1) * batch_size)
+                        .map(|x| format!("blob-{}", x).into_bytes()),
+                )),
+                Arc::new(
+                    FixedSizeListArray::try_new_from_values(
+                        Float32Array::from_iter_values(
+                            (i * batch_size..(i + 2) * batch_size)
+                                .map(|x| (batch_size + (x - batch_size) / 2) as f32),
+                        ),
+                        2,
+                    )
+                    .unwrap(),
+                ),
+                Arc::new(BinaryArray::from_iter_values(
+                    (i * batch_size..(i + 1) * batch_size)
+                        .map(|x| format!("blob-{}", x).into_bytes()),
+                )),
+            ],
+        )
+        .unwrap()
+    });
 
     let write_params = WriteParams {
         max_rows_per_file: file_size as usize,
@@ -448,7 +678,7 @@ async fn create_dataset(
         data_storage_version: Some(data_storage_version),
         ..Default::default()
     };
-    let reader = RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
+    let reader = RecordBatchIterator::new(batches.map(Ok), schema.clone());
     Dataset::write(reader, path, Some(write_params))
         .await
         .unwrap()
@@ -462,10 +692,10 @@ criterion_group!(
         .sample_size(10000)
         .warm_up_time(Duration::from_secs_f32(3.0))
         .with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
-    targets = bench_random_take_with_dataset, bench_random_single_take_with_file_fragment, bench_random_single_take_with_file_reader, bench_random_batch_take_with_file_fragment, bench_random_batch_take_with_file_reader, bench_sample);
+    targets = bench_random_take_with_dataset, bench_random_single_take_with_file_fragment, bench_random_single_take_with_file_reader, bench_random_batch_take_with_file_fragment, bench_random_batch_take_with_file_reader, bench_sample, bench_sample_offsets, bench_sample_large, bench_sparse_take_with_deletions);
 #[cfg(not(target_os = "linux"))]
 criterion_group!(
     name=benches;
     config = Criterion::default().significance_level(0.1).sample_size(10);
-    targets = bench_random_take_with_dataset, bench_random_single_take_with_file_fragment, bench_random_single_take_with_file_reader, bench_random_batch_take_with_file_fragment, bench_random_batch_take_with_file_reader, bench_sample);
+    targets = bench_random_take_with_dataset, bench_random_single_take_with_file_fragment, bench_random_single_take_with_file_reader, bench_random_batch_take_with_file_fragment, bench_random_batch_take_with_file_reader, bench_sample, bench_sample_offsets, bench_sample_large, bench_sparse_take_with_deletions);
 criterion_main!(benches);

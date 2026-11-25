@@ -17,12 +17,13 @@ use std::{
 
 use arrow_array::{Array, ArrayRef, cast::AsArray, types::UInt8Type};
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField};
+use bytes::Bytes;
 use futures::TryStreamExt;
 use lance_arrow::FieldExt;
 use lance_core::{
     Error, Result,
     cache::LanceCache,
-    datatypes::{BLOB_V2_DESC_LANCE_FIELD, BlobHandling, BlobKind, Field, Schema},
+    datatypes::{BlobHandling, BlobKind, Schema},
 };
 use lance_encoding::decoder::{ColumnInfo, DecoderPlugins, FilterExpression, PageInfo};
 use lance_io::{ReadBatchParams, scheduler::FileScheduler, traits::Writer as ObjectWriter};
@@ -156,7 +157,7 @@ impl DataFilePart {
     ) -> Result<Self> {
         validate_blob_id_range(blob_ids.as_ref())?;
         let metadata = Arc::new(FileReader::read_all_metadata(&input.scheduler()).await?);
-        let schema = Arc::new(normalize_blob_footer_schema(metadata.file_schema.as_ref()));
+        let schema = metadata.file_schema.clone();
         if let Some(expected_num_rows) = input.expected_num_rows
             && metadata.num_rows != expected_num_rows
         {
@@ -238,67 +239,6 @@ fn descriptor_projection_schema(schema: &Schema) -> Schema {
         .map(|field| BlobHandling::BlobsDescriptions.unload_if_needed(field))
         .collect();
     projected
-}
-
-fn descriptor_child_matches(field: &Field, expected: &Field) -> bool {
-    field.id == -1
-        && field.parent_id == -1
-        && field.name == expected.name
-        && field.logical_type == expected.logical_type
-        && field.children.is_empty()
-}
-
-fn attach_blob_descriptor_children(
-    fields: &mut [Field],
-    descriptor_children: &mut VecDeque<Vec<Field>>,
-) {
-    for field in fields {
-        if field.is_blob() && field.children.is_empty() {
-            if let Some(children) = descriptor_children.pop_front() {
-                field.children = children;
-            }
-        } else {
-            attach_blob_descriptor_children(&mut field.children, descriptor_children);
-        }
-    }
-}
-
-/// Blob descriptor children historically use anonymous field IDs in the file
-/// descriptor. Reconstruct their tree shape before applying ordinary schema
-/// projection rules. This interprets the existing footer representation and
-/// does not add persisted metadata or alter the file grammar.
-fn normalize_blob_footer_schema(schema: &Schema) -> Schema {
-    let expected = &BLOB_V2_DESC_LANCE_FIELD.children;
-    let missing_descriptor_count = schema
-        .fields_pre_order()
-        .filter(|field| field.is_blob() && field.children.is_empty())
-        .count();
-    if missing_descriptor_count == 0 {
-        return schema.clone();
-    }
-    let mut normalized = schema.clone();
-    let mut descriptor_children = VecDeque::new();
-    let mut field_index = 0;
-    while descriptor_children.len() < missing_descriptor_count
-        && field_index + expected.len() <= normalized.fields.len()
-    {
-        if normalized.fields[field_index..field_index + expected.len()]
-            .iter()
-            .zip(expected)
-            .all(|(field, expected)| descriptor_child_matches(field, expected))
-        {
-            descriptor_children.push_back(
-                normalized
-                    .fields
-                    .drain(field_index..field_index + expected.len())
-                    .collect(),
-            );
-        } else {
-            field_index += 1;
-        }
-    }
-    attach_blob_descriptor_children(&mut normalized.fields, &mut descriptor_children);
-    normalized
 }
 
 fn validate_blob_id_range(blob_ids: Option<&Range<u32>>) -> Result<()> {
@@ -541,6 +481,7 @@ impl FileConcatTarget {
 #[derive(Debug, Clone)]
 pub struct FileConcatOptions {
     /// Maximum page-buffer bytes requested in one read batch.
+    /// A single page larger than this limit is read as one batch.
     pub read_batch_bytes: usize,
     /// Options passed to the exact-version footer writer.
     pub writer_options: FileWriterOptions,
@@ -805,15 +746,116 @@ fn check_compatibility(
     Ok(None)
 }
 
+struct PageBufferReader<'a> {
+    scheduler: &'a FileScheduler,
+    prefetched: Option<VecDeque<Bytes>>,
+}
+
+impl<'a> PageBufferReader<'a> {
+    async fn new(input: &'a PreparedInput<'_>, read_batch_bytes: u64) -> Result<Self> {
+        let scheduler = &input.input.scheduler;
+        let streaming = Self {
+            scheduler,
+            prefetched: None,
+        };
+        // V2.0 may omit structural header pages while copying. Keep that
+        // grammar's existing per-column read path.
+        match input.metadata.version {
+            ConcreteFileVersion::V1 | ConcreteFileVersion::V2_0 => return Ok(streaming),
+            ConcreteFileVersion::V2_1 | ConcreteFileVersion::V2_2 | ConcreteFileVersion::V2_3 => {}
+        }
+        // Include gaps and padding that a coalesced request may retain.
+        if input.metadata.file_size_bytes > read_batch_bytes {
+            return Ok(streaming);
+        }
+        let mut ranges = Vec::new();
+        let mut bytes = 0_u64;
+        for column in &input.metadata.column_infos {
+            for page in column.page_infos.iter() {
+                for (offset, size) in page.buffer_offsets_and_sizes.iter() {
+                    if *size == 0 {
+                        continue;
+                    }
+                    let Some(total) = bytes
+                        .checked_add(*size)
+                        .filter(|total| *total <= read_batch_bytes)
+                    else {
+                        return Ok(streaming);
+                    };
+                    let end = offset.checked_add(*size).ok_or_else(|| {
+                        Error::corrupt_file(
+                            scheduler.reader().path().clone(),
+                            "prefetched page buffer range overflows",
+                        )
+                    })?;
+                    ranges.push(*offset..end);
+                    bytes = total;
+                }
+            }
+        }
+        // Small parts otherwise pay a dependent round trip for every column.
+        // One request lets the scheduler coalesce/split their ranges while
+        // retaining no more payload than the existing read-batch budget.
+        let prefetched = if ranges.is_empty() {
+            VecDeque::new()
+        } else {
+            let expected = ranges.len();
+            // Columns may have interleaved pages on disk. The scheduler needs
+            // physical order; copying still needs column/page/buffer order.
+            let mut order = (0..expected).collect::<Vec<_>>();
+            order.sort_unstable_by_key(|&index| (ranges[index].start, index));
+            let requests = order.iter().map(|&index| ranges[index].clone()).collect();
+            let buffers = scheduler.submit_request(requests, 0).await?;
+            if buffers.len() != expected {
+                return Err(Error::io(format!(
+                    "prefetched input at '{}' returned {} page buffers, expected {expected}",
+                    scheduler.reader().path(),
+                    buffers.len()
+                )));
+            }
+            let mut restored = vec![Bytes::new(); expected];
+            for (index, buffer) in order.into_iter().zip(buffers) {
+                restored[index] = buffer;
+            }
+            restored.into()
+        };
+        Ok(Self {
+            scheduler,
+            prefetched: Some(prefetched),
+        })
+    }
+
+    async fn read(&mut self, ranges: Vec<Range<u64>>) -> Result<Vec<Bytes>> {
+        let scheduler = self.scheduler;
+        if let Some(prefetched) = &mut self.prefetched {
+            (0..ranges.len())
+                .map(|_| {
+                    prefetched.pop_front().ok_or_else(|| {
+                        Error::io(format!(
+                            "prefetched input at '{}' returned fewer page buffers than requested",
+                            scheduler.reader().path()
+                        ))
+                    })
+                })
+                .collect()
+        } else if ranges.is_empty() {
+            Ok(Vec::new())
+        } else {
+            self.scheduler.submit_request(ranges, 0).await
+        }
+    }
+}
+
 async fn copy_page_buffers(
     writer: &mut crate::writer::FileWriter,
-    scheduler: &FileScheduler,
+    reader: &mut PageBufferReader<'_>,
     pages: &[PageInfo],
     read_batch_bytes: u64,
     input_index: usize,
     column_index: usize,
     row_offset: u64,
 ) -> Result<Vec<PageInfo>> {
+    let scheduler = reader.scheduler;
     let mut copied = Vec::with_capacity(pages.len());
     let mut page_index = 0;
     while page_index < pages.len() {
@@ -867,11 +909,7 @@ async fn copy_page_buffers(
             page_index += 1;
         }
 
-        let batch_data = if batch_ranges.is_empty() {
-            Vec::new()
-        } else {
-            scheduler.submit_request(batch_ranges, 0).await?
-        };
+        let batch_data = reader.read(batch_ranges).await?;
         let mut batch_data = batch_data.into_iter();
         for (relative_page_index, (page, buffer_count)) in pages[batch_start..page_index]
             .iter()
@@ -974,6 +1012,8 @@ where
         let mut row_offset = 0u64;
 
         for (input_index, prepared_input) in prepared.iter().enumerate() {
+            let mut reader =
+                PageBufferReader::new(prepared_input, options.read_batch_bytes as u64).await?;
             for (column_index, column) in prepared_input.metadata.column_infos.iter().enumerate() {
                 let has_existing_pages = !output_pages[column_index].is_empty();
                 versions::copy_external_metadata_column(
@@ -984,7 +1024,7 @@ where
                     || async {
                         let pages = copy_page_buffers(
                             &mut writer,
-                            &prepared_input.input.scheduler,
+                            &mut reader,
                             &column.page_infos,
                             options.read_batch_bytes as u64,
                             input_index,
@@ -1199,7 +1239,7 @@ mod tests {
 
     use lance_core::utils::tempfile::TempObjFile;
     use lance_io::{
-        object_store::ObjectStore,
+        object_store::{ObjectStore, ObjectStoreParams},
         scheduler::{ScanScheduler, SchedulerConfig},
         traits::Writer,
         utils::CachedFileSize,
@@ -1312,12 +1352,31 @@ mod tests {
     #[case(ConcreteFileVersion::V2_2)]
     #[case(ConcreteFileVersion::V2_3)]
     #[tokio::test]
-    async fn concat_preserves_schema_metadata(#[case] version: ConcreteFileVersion) {
-        let store = Arc::new(ObjectStore::local());
+    async fn concat_preserves_values_and_schema_with_bounded_reads(
+        #[case] version: ConcreteFileVersion,
+        #[values(1, 16 * 1024 * 1024)] read_batch_bytes: usize,
+        #[values(1, 2)] batches_per_file: usize,
+    ) {
+        // Keep the small-file cache from hiding the payload read requests.
+        let (store, _) = ObjectStore::from_uri_and_params(
+            Arc::new(Default::default()),
+            "memory://",
+            &ObjectStoreParams {
+                block_size: Some(64),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
         let first_path = TempObjFile::default();
         let second_path = TempObjFile::default();
         let output_path = TempObjFile::default();
-        let batch = arrow_array::record_batch!(("value", Int32, [1, 2])).unwrap();
+        let batch = arrow_array::record_batch!(
+            ("value", Int32, [1, 2]),
+            ("text", Utf8, ["first", "second value"]),
+            ("missing", Int32, [None::<i32>, None])
+        )
+        .unwrap();
         let mut schema = Schema::try_from(batch.schema_ref().as_ref()).unwrap();
         schema
             .metadata
@@ -1329,31 +1388,69 @@ mod tests {
                 version,
                 store.create(path).await.unwrap(),
                 schema.as_ref().clone(),
-                FileWriterOptions::default(),
+                FileWriterOptions {
+                    data_cache_bytes: Some(schema.fields.len() as u64),
+                    max_page_bytes: Some(1),
+                    ..Default::default()
+                },
             )
             .unwrap();
-            writer.write_batch(&batch).await.unwrap();
+            for _ in 0..batches_per_file {
+                writer.write_batch(&batch).await.unwrap();
+            }
             writer.finish().await.unwrap();
         }
+        let rows_per_file = (batch.num_rows() * batches_per_file) as u64;
         let inputs = vec![
-            input(store.clone(), &first_path, 2).await,
-            input(store.clone(), &second_path, 2).await,
+            input(store.clone(), &first_path, rows_per_file).await,
+            input(store.clone(), &second_path, rows_per_file).await,
         ];
+        if batches_per_file > 1 && version != ConcreteFileVersion::V2_0 {
+            let metadata = FileReader::read_all_metadata(&inputs[0].scheduler)
+                .await
+                .unwrap();
+            let offsets = metadata
+                .column_infos
+                .iter()
+                .flat_map(|column| column.page_infos.iter())
+                .flat_map(|page| page.buffer_offsets_and_sizes.iter())
+                .filter(|(_, size)| *size > 0)
+                .map(|(offset, _)| *offset)
+                .collect::<Vec<_>>();
+            assert!(
+                offsets.windows(2).any(|pair| pair[0] > pair[1]),
+                "fixture must interleave physical buffers from different columns"
+            );
+        }
         let result = concat_files(
             &FileConcatTarget::new(version, schema),
             &inputs,
             {
                 let store = store.clone();
                 let output_path = output_path.clone();
-                move || async move { store.create(&output_path).await }
+                move || async move {
+                    store.io_stats_incremental();
+                    store.create(&output_path).await
+                }
             },
-            FileConcatOptions::default(),
+            FileConcatOptions {
+                read_batch_bytes,
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
         assert!(matches!(result, FileConcatResult::Written(_)));
+        let copy_reads = store.io_stats_snapshot().read_iops;
+        if version != ConcreteFileVersion::V2_0 {
+            if read_batch_bytes > 1 {
+                assert_eq!(copy_reads, 2, "small inputs should each use one read");
+            } else {
+                assert!(copy_reads > 2, "large inputs must retain bounded streaming");
+            }
+        }
 
-        let output = input(store, &output_path, 4).await;
+        let output = input(store, &output_path, rows_per_file * 2).await;
         let metadata = FileReader::read_all_metadata(&output.scheduler)
             .await
             .unwrap();
@@ -1361,6 +1458,30 @@ mod tests {
             metadata.file_schema.metadata.get("review-key"),
             Some(&"review-value".to_string())
         );
+        let reader = FileReader::try_open(
+            output.scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &LanceCache::no_cache(),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+        let mut batches = reader
+            .read_stream(
+                ReadBatchParams::RangeFull,
+                2,
+                1,
+                FilterExpression::no_filter(),
+            )
+            .await
+            .unwrap();
+        let mut rows = 0;
+        while let Some(actual) = batches.try_next().await.unwrap() {
+            assert_eq!(actual.columns(), batch.columns());
+            rows += actual.num_rows();
+        }
+        assert_eq!(rows as u64, rows_per_file * 2);
     }
 
     #[tokio::test]

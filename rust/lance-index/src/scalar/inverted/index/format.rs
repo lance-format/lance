@@ -16,17 +16,22 @@ pub const INVERT_LIST_FILE: &str = "invert.lance";
 pub const DOCS_FILE: &str = "docs.lance";
 pub const METADATA_FILE: &str = "metadata.lance";
 
+pub(super) const DEFAULT_FTS_SEARCH_CHUNK: usize = 16;
+
 /// Partitions searched per CPU-pool task. Each chunk loads concurrently and
 /// then scores sequentially so query concurrency does not flood the pool with
 /// one small task per partition. `LANCE_FTS_SEARCH_CHUNK=1` restores the
 /// per-partition task shape.
 pub(super) fn fts_search_chunk() -> usize {
-    static CHUNK: LazyLock<usize> = LazyLock::new(|| {
+    configured_fts_search_chunk().unwrap_or(DEFAULT_FTS_SEARCH_CHUNK)
+}
+
+pub(super) fn configured_fts_search_chunk() -> Option<usize> {
+    static CHUNK: LazyLock<Option<usize>> = LazyLock::new(|| {
         std::env::var("LANCE_FTS_SEARCH_CHUNK")
             .ok()
             .and_then(|value| value.parse().ok())
             .filter(|&value| value >= 1)
-            .unwrap_or(16)
     });
     *CHUNK
 }

@@ -13,9 +13,10 @@ use super::{
 };
 use crate::{
     decoder::{
-        DecodedArray, FilterExpression, LoadedPageShard, NextDecodeTask, PageEncoding,
-        ScheduledScanLine, SchedulerContext, StructuralDecodeArrayTask, StructuralFieldDecoder,
-        StructuralFieldScheduler, StructuralSchedulingJob,
+        ColumnContext, DecodedArray, DrainLimit, FilterExpression, LoadedPageShard, NextDecodeTask,
+        PageEncoding, ScheduledScanLine, SchedulerContext, StructuralDecodeArrayTask,
+        StructuralFieldDecoder, StructuralFieldScheduler, StructuralSchedulingJob,
+        with_column_context,
     },
     encoder::{EncodeTask, EncodedColumn, EncodedPage, FieldEncoder, OutOfLineBuffers},
     format::pb,
@@ -239,6 +240,8 @@ pub struct StructuralStructDecoder {
     // The root decoder is slightly different because it cannot have nulls
     is_root: bool,
     nullable: bool,
+    // Column context for top-level fields, if known.
+    column_contexts: Option<Arc<[ColumnContext]>>,
 }
 
 impl StructuralStructDecoder {
@@ -259,7 +262,14 @@ impl StructuralStructDecoder {
             child_fields: fields,
             is_root,
             nullable: !is_root && nullable,
+            column_contexts: None,
         })
+    }
+
+    /// Attach top-level column context so decode errors name the failing column.
+    pub(crate) fn with_column_contexts(mut self, contexts: Vec<ColumnContext>) -> Self {
+        self.column_contexts = Some(contexts.into());
+        self
     }
 
     fn field_to_decoder(
@@ -268,7 +278,7 @@ impl StructuralStructDecoder {
     ) -> Result<Box<dyn StructuralFieldDecoder>> {
         match field.data_type() {
             DataType::Struct(fields) => {
-                if field.is_packed_struct() || field.is_blob() {
+                if field.is_packed_struct() || field.is_blob() || fields.is_empty() {
                     let decoder =
                         StructuralPrimitiveFieldDecoder::new(&field.clone(), should_validate);
                     Ok(Box::new(decoder))
@@ -338,6 +348,31 @@ impl StructuralStructDecoder {
 }
 
 impl StructuralFieldDecoder for StructuralStructDecoder {
+    fn max_rows_to_drain(&self, num_rows: u64, byte_budget: u64) -> Result<DrainLimit> {
+        self.children.iter().try_fold(
+            DrainLimit {
+                rows: num_rows,
+                bytes: 0,
+                dictionary_rows: None,
+            },
+            |limit, child| {
+                child
+                    .max_rows_to_drain(num_rows, byte_budget)
+                    .map(|child_limit| DrainLimit {
+                        rows: limit.rows.min(child_limit.rows),
+                        bytes: limit.bytes.max(child_limit.bytes),
+                        dictionary_rows: match (limit.dictionary_rows, child_limit.dictionary_rows)
+                        {
+                            (Some(current), Some(child)) => Some(current.min(child)),
+                            (Some(current), None) => Some(current),
+                            (None, Some(child)) => Some(child),
+                            (None, None) => None,
+                        },
+                    })
+            },
+        )
+    }
+
     fn accept_page(&mut self, mut child: LoadedPageShard) -> Result<()> {
         // children with empty path should not be delivered to this method
         let child_idx = child.path.pop_front().unwrap();
@@ -355,6 +390,7 @@ impl StructuralFieldDecoder for StructuralStructDecoder {
         Ok(Box::new(RepDefStructDecodeTask {
             children: child_tasks,
             child_fields: self.child_fields.clone(),
+            column_contexts: self.column_contexts.clone(),
             is_root: self.is_root,
             num_rows,
         }))
@@ -387,6 +423,7 @@ impl StructuralFieldDecoder for StructuralStructDecoder {
 struct RepDefStructDecodeTask {
     children: Vec<Box<dyn StructuralDecodeArrayTask>>,
     child_fields: Fields,
+    column_contexts: Option<Arc<[ColumnContext]>>,
     is_root: bool,
     num_rows: u64,
 }
@@ -401,10 +438,19 @@ impl StructuralDecodeArrayTask for RepDefStructDecodeTask {
             });
         }
 
+        let contexts = self.column_contexts;
         let arrays = self
             .children
             .into_iter()
-            .map(|task| task.decode())
+            .enumerate()
+            .map(|(index, task)| {
+                task.decode().map_err(|source| {
+                    match contexts.as_ref().and_then(|contexts| contexts.get(index)) {
+                        Some(context) => with_column_context(&context.name, context.id, source),
+                        None => source,
+                    }
+                })
+            })
             .collect::<Result<Vec<_>>>()?;
         let mut children = Vec::with_capacity(arrays.len());
         let mut repdefs = Vec::with_capacity(arrays.len());
@@ -864,6 +910,29 @@ mod tests {
         .await;
     }
 
+    #[test_log::test(tokio::test)]
+    async fn test_struct_list_nulls_in_only_some_pages() {
+        // Two pages of STRUCT<LIST<INT32>>, only the second has null structs.  A batch that
+        // spans both must count the first page's struct validity per list, not per item.
+        let make_page = |nulls: Option<NullBuffer>| -> ArrayRef {
+            let list = ListArray::new(
+                Arc::new(Field::new("item", DataType::Int32, true)),
+                OffsetBuffer::from_lengths(std::iter::repeat_n(3, 1050)),
+                Arc::new(Int32Array::from_iter_values(0..3150)),
+                None,
+            );
+            let fields = Fields::from(vec![Field::new("l", list.data_type().clone(), true)]);
+            Arc::new(StructArray::new(fields, vec![Arc::new(list)], nulls))
+        };
+        let nulls = NullBuffer::from_iter((0..1050).map(|i| i % 7 != 0));
+        check_round_trip_encoding_of_data(
+            vec![make_page(None), make_page(Some(nulls))],
+            &TestCases::default().with_structural_encodings(),
+            HashMap::new(),
+        )
+        .await;
+    }
+
     #[rstest::rstest]
     #[test_log::test(tokio::test)]
     async fn test_struct_list(
@@ -1140,8 +1209,8 @@ mod tests {
         let list_array = Arc::new(list_builder.finish());
         let int_array = Arc::new(Int32Array::from_iter_values(0..10000));
         let fields = vec![
-            Field::new("", list_array.data_type().clone(), true),
-            Field::new("", int_array.data_type().clone(), true),
+            Field::new("list", list_array.data_type().clone(), true),
+            Field::new("scalar", int_array.data_type().clone(), true),
         ];
         let struct_array = Arc::new(StructArray::new(
             Fields::from(fields),

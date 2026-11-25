@@ -59,6 +59,68 @@ pub const LANCE_UNENFORCED_CLUSTERING_KEY_POSITION: &str =
 /// The value should be non-negative i32 value. Any negative value will be seen as -1.
 pub const LANCE_FIELD_ID_KEY: &str = "lance:field_id";
 
+/// Copy Lance field IDs into the metadata of an Arrow field and its children.
+///
+/// Match fields by name at each level, using the non-negative IDs in
+/// `among`. Fields with no match retain their original metadata and type.
+/// Other Arrow field metadata and nullability are preserved.
+///
+/// ```
+/// use arrow_schema::{DataType, Field as ArrowField};
+/// use lance_core::datatypes::{Field, LANCE_FIELD_ID_KEY, stamp_field_id};
+///
+/// let arrow = ArrowField::new("value", DataType::Int64, false);
+/// let mut field = Field::try_from(&arrow)?;
+/// field.id = 7;
+/// let stamped = stamp_field_id(&arrow, &[field]);
+/// assert_eq!(stamped.metadata()[LANCE_FIELD_ID_KEY], "7");
+/// # Ok::<(), lance_core::Error>(())
+/// ```
+pub fn stamp_field_id(field: &ArrowField, among: &[Field]) -> ArrowField {
+    let Some(source) = among.iter().find(|f| f.name == *field.name()) else {
+        return field.clone();
+    };
+    let field = match source.id {
+        id if id >= 0 => {
+            let mut metadata = field.metadata().clone();
+            metadata.insert(LANCE_FIELD_ID_KEY.to_string(), id.to_string());
+            field.clone().with_metadata(metadata)
+        }
+        _ => field.clone(),
+    };
+    // A container carries its children inside its own type, and each of them is
+    // a field with an id of its own: a list's element, and that element's
+    // children in turn.
+    match field.data_type() {
+        DataType::Struct(children) => {
+            let children: Vec<ArrowField> = children
+                .iter()
+                .map(|child| stamp_field_id(child, &source.children))
+                .collect();
+            field.with_data_type(DataType::Struct(children.into()))
+        }
+        DataType::List(element) => {
+            let element = stamp_field_id(element, &source.children);
+            field.with_data_type(DataType::List(Arc::new(element)))
+        }
+        DataType::LargeList(element) => {
+            let element = stamp_field_id(element, &source.children);
+            field.with_data_type(DataType::LargeList(Arc::new(element)))
+        }
+        DataType::FixedSizeList(element, size) => {
+            let size = *size;
+            let element = stamp_field_id(element, &source.children);
+            field.with_data_type(DataType::FixedSizeList(Arc::new(element), size))
+        }
+        DataType::Map(entries, sorted) => {
+            let sorted = *sorted;
+            let entries = stamp_field_id(entries, &source.children);
+            field.with_data_type(DataType::Map(Arc::new(entries), sorted))
+        }
+        _ => field,
+    }
+}
+
 const PACKED_KEYS: [&str; 2] = ["packed", "lance-encoding:packed"];
 
 fn has_blob_v2_extension(field: &ArrowField) -> bool {
@@ -694,6 +756,57 @@ impl Field {
         }
     }
 
+    /// Return a child path that can carry this field's validity in a projection.
+    ///
+    /// Prefer the narrowest fixed-width leaf among those under the fewest list
+    /// levels. Return `None` for a leaf, a field stored as one physical column
+    /// (blob, packed struct, or map), or a field without a fixed-width leaf.
+    ///
+    /// ```
+    /// # use arrow_schema::{DataType, Field as ArrowField};
+    /// # use lance_core::datatypes::Field;
+    /// let field = Field::try_from(ArrowField::new_struct(
+    ///     "outer",
+    ///     vec![ArrowField::new("child", DataType::Int32, true)],
+    ///     true,
+    /// ))?;
+    /// assert_eq!(field.validity_leaf_path(), Some(vec!["child"]));
+    /// # Ok::<(), lance_core::Error>(())
+    /// ```
+    pub fn validity_leaf_path(&self) -> Option<Vec<&str>> {
+        fn fixed_width(data_type: &DataType) -> Option<usize> {
+            match data_type {
+                DataType::Boolean => Some(1),
+                other => other.byte_width_opt(),
+            }
+        }
+        fn is_atomic(field: &Field) -> bool {
+            field.is_blob()
+                || field.is_packed_struct()
+                || matches!(field.data_type(), DataType::Map(..))
+        }
+        fn walk(field: &Field, list_depth: usize) -> Option<((usize, usize), Vec<&str>)> {
+            if is_atomic(field) {
+                return None;
+            }
+            if let Some(width) = fixed_width(&field.data_type()) {
+                return Some(((list_depth, width), vec![]));
+            }
+            let child_depth = list_depth + usize::from(!field.data_type().is_struct());
+            field
+                .children
+                .iter()
+                .filter_map(|child| {
+                    let (score, mut path) = walk(child, child_depth)?;
+                    path.insert(0, child.name.as_str());
+                    Some((score, path))
+                })
+                .min_by_key(|(score, _)| *score)
+        }
+        let (_, path) = walk(self, 0)?;
+        (!path.is_empty()).then_some(path)
+    }
+
     pub fn project(&self, path_components: &[&str]) -> Result<Self> {
         let mut f = Self {
             name: self.name.clone(),
@@ -947,6 +1060,7 @@ impl Field {
             (&self_type, &other_type),
             (DataType::Struct(_), DataType::Struct(_))
                 | (DataType::List(_), DataType::List(_))
+                | (DataType::LargeList(_), DataType::LargeList(_))
                 | (DataType::Map(_, _), DataType::Map(_, _))
         ) {
             // Blob v2 uses a struct logical type for descriptors, which differs from the logical
@@ -968,6 +1082,22 @@ impl Field {
                     }
                 })
                 .collect::<Vec<_>>();
+            // A list or map with no surviving children cannot be materialized:
+            // `data_type()` indexes children[0] for these logical types, so
+            // returning the field here would panic at the next type access. A
+            // child is dropped either because the other field has no child of
+            // that name or because the recursive intersection failed.
+            if children.is_empty()
+                && matches!(
+                    self_type,
+                    DataType::List(_) | DataType::LargeList(_) | DataType::Map(_, _)
+                )
+            {
+                return Err(Error::arrow(format!(
+                    "Attempt to intersect fields whose children do not intersect: ({}, {}) and ({}, {})",
+                    self.name, self_type, other.name, other_type
+                )));
+            }
             let f = Self {
                 name: self.name.clone(),
                 id: if self.id >= 0 { self.id } else { other.id },
@@ -1375,6 +1505,7 @@ mod tests {
     use arrow_array::{DictionaryArray, StringArray, UInt32Array};
     use arrow_schema::{Fields, TimeUnit};
     use lance_arrow::BLOB_META_KEY;
+    use rstest::rstest;
     use std::collections::HashMap;
 
     use crate::datatypes::{BLOB_V2_LOGICAL_FIELDS, BLOB_V2_LOGICAL_MINIMAL_FIELDS};
@@ -1487,6 +1618,32 @@ mod tests {
         assert_eq!(
             field.metadata.get("custom").map(String::as_str),
             Some("value")
+        );
+    }
+
+    #[test]
+    fn stamp_field_id_preserves_the_arrow_layout() {
+        let value = ArrowField::new("value", DataType::Int32, false);
+        let source = ArrowField::new_struct("parent", vec![value.clone()], false);
+        let mut source = Field::try_from(&source).unwrap();
+        source.id = 7;
+        source.children[0].id = 9;
+
+        let extra = ArrowField::new("extra", DataType::Utf8, true);
+        let mut metadata = HashMap::from([("custom".to_string(), "kept".to_string())]);
+        let target = ArrowField::new_struct(
+            "parent",
+            vec![extra.clone(), value.clone().with_metadata(metadata.clone())],
+            true,
+        );
+        metadata.insert(LANCE_FIELD_ID_KEY.to_string(), "9".to_string());
+        assert_eq!(
+            stamp_field_id(&target, &[source]),
+            ArrowField::new_struct("parent", vec![extra, value.with_metadata(metadata)], true,)
+                .with_metadata(HashMap::from([(
+                    LANCE_FIELD_ID_KEY.to_string(),
+                    "7".to_string(),
+                )]))
         );
     }
 
@@ -1794,6 +1951,93 @@ mod tests {
         .try_into()
         .unwrap();
         assert_eq!(actual, expected);
+    }
+
+    /// A struct is exempt from the no-children guard on purpose: `data_type()`
+    /// maps over the children, so `Struct([])` is representable.
+    #[test]
+    fn test_struct_field_intersection_without_shared_children() {
+        let f1: Field = ArrowField::new(
+            "a",
+            DataType::Struct(Fields::from(vec![ArrowField::new(
+                "b",
+                DataType::Int32,
+                true,
+            )])),
+            true,
+        )
+        .try_into()
+        .unwrap();
+        let f2: Field = ArrowField::new(
+            "a",
+            DataType::Struct(Fields::from(vec![ArrowField::new(
+                "c",
+                DataType::Int32,
+                true,
+            )])),
+            true,
+        )
+        .try_into()
+        .unwrap();
+
+        let actual = f1.intersection(&f2).unwrap();
+        assert!(actual.children.is_empty());
+        assert_eq!(actual.data_type(), DataType::Struct(Fields::empty()));
+    }
+
+    fn map_entries(name: &str) -> Arc<ArrowField> {
+        Arc::new(ArrowField::new(
+            name,
+            DataType::Struct(Fields::from(vec![
+                ArrowField::new("key", DataType::Int32, false),
+                ArrowField::new("value", DataType::Int32, true),
+            ])),
+            false,
+        ))
+    }
+
+    /// Arrow does not fix the name of a list's item child or a map's entries
+    /// child, so two fields can describe compatible data and still share no
+    /// child by name. `data_type()` indexes `children[0]` for these logical
+    /// types, so an intersection with no surviving child has to error rather
+    /// than return a field that panics on the next type access.
+    #[rstest]
+    #[case::list_item_name(
+        DataType::List(Arc::new(ArrowField::new("item", DataType::Int32, true))),
+        DataType::List(Arc::new(ArrowField::new("element", DataType::Int32, true)))
+    )]
+    #[case::large_list_item_name(
+        DataType::LargeList(Arc::new(ArrowField::new("item", DataType::Int32, true))),
+        DataType::LargeList(Arc::new(ArrowField::new("element", DataType::Int32, true)))
+    )]
+    // Names match but the item types conflict, so the recursive intersection
+    // errors and `.ok()?` drops the child: same zero-children result.
+    #[case::large_list_item_type(
+        DataType::LargeList(Arc::new(ArrowField::new("item", DataType::Int32, true))),
+        DataType::LargeList(Arc::new(ArrowField::new("item", DataType::Utf8, true)))
+    )]
+    #[case::map_entries_name(
+        DataType::Map(map_entries("entries"), false),
+        DataType::Map(map_entries("pairs"), false)
+    )]
+    fn test_list_field_intersection_without_shared_children(
+        #[case] self_type: DataType,
+        #[case] other_type: DataType,
+    ) {
+        let f1: Field = ArrowField::new("a", self_type, true).try_into().unwrap();
+        let f2: Field = ArrowField::new("a", other_type, true).try_into().unwrap();
+
+        let err = f1
+            .intersection(&f2)
+            .expect_err("a list or map with no shared child cannot be materialized");
+        assert!(
+            matches!(err, Error::Arrow { .. }),
+            "unexpected error: {err}"
+        );
+        assert!(
+            err.to_string().contains("children do not intersect"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

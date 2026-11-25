@@ -21,20 +21,18 @@ impl DirectoryNamespace {
     ) -> Result<DescribeTableResponse> {
         let is_root_level = request.id.as_ref().is_some_and(|id| id.len() == 1);
         let is_child_table = request.id.as_ref().is_some_and(|id| id.len() > 1);
-        let skip_manifest_for_root = self.dir_listing_enabled
-            && is_root_level
-            && !self.dir_listing_to_manifest_migration_enabled;
+        let probe_manifest_for_root = self.table_discovery_mode.uses_manifest_for_root();
+        let skip_manifest_for_root = is_root_level
+            && self.table_discovery_mode.has_directory_listing()
+            && !probe_manifest_for_root;
         // Self-heal the manifest wherever it can be authoritative: a child table
         // (no dir-listing fallback), a manifest-only namespace, or migration mode
         // (manifest-first -- it can hold registered_table -> external .lance
         // aliases that dir-listing cannot resolve, so a reader built before
         // __manifest must re-probe to see them). The bypass -- skipping the probe
-        // -- applies ONLY to migration-disabled directory-backed root reads,
+        // -- applies ONLY to directory-backed root reads without migration,
         // which are served entirely from the directory listing.
-        if is_child_table
-            || !self.dir_listing_enabled
-            || self.dir_listing_to_manifest_migration_enabled
-        {
+        if is_child_table || probe_manifest_for_root {
             self.ensure_read_manifest().await?;
         }
         if let Some(manifest_ns) = self.manifest_ns_for_read()
@@ -61,7 +59,7 @@ impl DirectoryNamespace {
                     // rather than degrading to a directory-listing view.
                     return Err(e);
                 }
-                Err(e) if self.dir_listing_enabled && is_root_level => {
+                Err(e) if self.table_discovery_mode.has_directory_listing() && is_root_level => {
                     // Only a genuinely-absent table (e.g. an unmigrated on-disk
                     // table) may fall through to the directory check; any other
                     // manifest error must propagate rather than be read as missing.
@@ -78,7 +76,7 @@ impl DirectoryNamespace {
 
         let table_name = Self::table_name_from_id(&request.id)?;
         let table_id = Self::format_table_id_from_request(&request.id);
-        if !self.dir_listing_enabled {
+        if !self.table_discovery_mode.has_directory_listing() {
             return Err(NamespaceError::TableNotFound { message: table_id }.into());
         }
 
@@ -292,6 +290,18 @@ impl DirectoryNamespace {
         version: Option<i64>,
         operation: &str,
     ) -> Result<Dataset> {
+        self.load_branch_dataset(table_uri, None, version, operation)
+            .await
+    }
+
+    /// Like [`Self::load_dataset`], on `branch` when it names one.
+    pub(super) async fn load_branch_dataset(
+        &self,
+        table_uri: &str,
+        branch: Option<&str>,
+        version: Option<i64>,
+        operation: &str,
+    ) -> Result<Dataset> {
         if let Some(version) = version
             && version < 0
         {
@@ -304,15 +314,20 @@ impl DirectoryNamespace {
             .into());
         }
 
-        let builder = self.configured_builder(table_uri);
-
-        let dataset = builder.load().await.map_err(|e| {
-            let message = format!(
-                "Failed to open table at '{}' for {}: {}",
-                table_uri, operation, e
-            );
-            Self::map_open_error(e, NamespaceError::TableNotFound { message })
-        })?;
+        let dataset = match Self::normalized_branch(branch)? {
+            Some(branch) => self.open_validated_branch(table_uri, branch).await?,
+            None => self
+                .configured_builder(table_uri)
+                .load()
+                .await
+                .map_err(|e| {
+                    let message = format!(
+                        "Failed to open table at '{}' for {}: {}",
+                        table_uri, operation, e
+                    );
+                    Self::map_open_error(e, NamespaceError::TableNotFound { message })
+                })?,
+        };
 
         if let Some(version) = version {
             return dataset.checkout_version(version as u64).await.map_err(|e| {

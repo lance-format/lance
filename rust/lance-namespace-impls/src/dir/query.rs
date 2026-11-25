@@ -3,7 +3,8 @@
 
 use std::sync::Arc;
 
-use arrow::array::Float32Array;
+use arrow::array::{ArrayRef, FixedSizeListArray, Float32Array};
+use arrow::datatypes::{DataType, Field as ArrowField};
 use lance::dataset::scanner::Scanner;
 use lance_core::{Error, Result};
 use lance_index::scalar::inverted::query::{
@@ -47,6 +48,68 @@ pub(super) fn apply_probe_bounds(
 }
 
 impl DirectoryNamespace {
+    /// Convert a request's query vector(s) into the array passed to `Scanner::nearest`.
+    ///
+    /// `single_vector` becomes a `Float32Array`. `multi_vector` becomes a
+    /// `FixedSizeListArray` with one row per vector, which the scanner runs as a
+    /// batch search against a fixed-size-list column. For a multivector column,
+    /// the rows form one multivector query while retaining the same encoding.
+    /// Positive offsets are rejected because the scanner applies an offset to the
+    /// combined batch result rather than once per query.
+    pub(super) fn query_vector_array(
+        vector: &QueryTableRequestVector,
+        offset: Option<i32>,
+    ) -> std::result::Result<Option<ArrayRef>, String> {
+        let single = vector.single_vector.as_ref().filter(|v| !v.is_empty());
+        let multi = vector.multi_vector.as_ref().filter(|mv| !mv.is_empty());
+        let rows = match (single, multi) {
+            (Some(_), Some(_)) => {
+                return Err("provide either single_vector or multi_vector, not both".to_string());
+            }
+            (Some(single), None) => return Ok(Some(Arc::new(Float32Array::from(single.clone())))),
+            (None, Some(rows)) => rows,
+            (None, None) => return Ok(None),
+        };
+        if let Some(offset) = offset.filter(|&offset| offset > 0) {
+            return Err(format!(
+                "multi_vector batch search does not support offset > 0: offset={offset}; \
+                 offset is applied to the combined result instead of once per query"
+            ));
+        }
+        if let Some(i) = rows.iter().position(|r| r.is_empty()) {
+            return Err(format!("multi_vector row {} is empty", i));
+        }
+        let dim = rows[0].len();
+        if let Some((i, row)) = rows.iter().enumerate().find(|(_, r)| r.len() != dim) {
+            return Err(format!(
+                "all multi_vector rows must have the same dimension: row 0 has {} values but row {} has {}",
+                dim,
+                i,
+                row.len()
+            ));
+        }
+        let dim_i32 = i32::try_from(dim)
+            .map_err(|_| format!("multi_vector dimension {} is too large", dim))?;
+        let total_values = rows.len().checked_mul(dim).ok_or_else(|| {
+            format!(
+                "multi_vector has too many values: {} rows of dimension {}",
+                rows.len(),
+                dim
+            )
+        })?;
+        let mut flat = Vec::with_capacity(total_values);
+        rows.iter().for_each(|row| flat.extend_from_slice(row));
+        let values = Float32Array::from(flat);
+        let list = FixedSizeListArray::try_new(
+            Arc::new(ArrowField::new("item", DataType::Float32, true)),
+            dim_i32,
+            Arc::new(values),
+            None,
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(Some(Arc::new(list)))
+    }
+
     /// Apply all query parameters from a `QueryTableRequest`-like source onto a `Scanner`.
     ///
     /// This covers vector search, filters, column projection, limits, and ANN tuning knobs so
@@ -74,7 +137,6 @@ impl DirectoryNamespace {
         upper_bound: Option<f32>,
         operation: &str,
     ) -> Result<()> {
-        // prefilter must be set before nearest() so the fragment-scan guard sees it.
         if let Some(pf) = prefilter {
             scanner.prefilter(pf);
         }
@@ -108,24 +170,14 @@ impl DirectoryNamespace {
             }
         }
 
-        // Resolve query vector: prefer single_vector, fall back to first row of multi_vector.
-        let query_vec: Option<Vec<f32>> = vector
-            .single_vector
-            .as_ref()
-            .filter(|v| !v.is_empty())
-            .cloned()
-            .or_else(|| {
-                vector
-                    .multi_vector
-                    .as_ref()
-                    .and_then(|mv| mv.first())
-                    .filter(|v| !v.is_empty())
-                    .cloned()
-            });
+        let query = Self::query_vector_array(vector, offset).map_err(|e| {
+            Error::invalid_input_source(
+                format!("Invalid vector query for {}: {}", operation, e).into(),
+            )
+        })?;
 
-        if let Some(q_vec) = query_vec {
+        if let Some(q) = query {
             let col = vector_column.unwrap_or("vector");
-            let q = Arc::new(Float32Array::from(q_vec));
             scanner
                 .nearest(col, q.as_ref(), k.max(1) as usize)
                 .map_err(|e| {

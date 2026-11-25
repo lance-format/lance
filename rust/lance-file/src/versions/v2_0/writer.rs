@@ -12,7 +12,6 @@ use futures::stream::FuturesOrdered;
 use lance_core::datatypes::Schema as LanceSchema;
 use lance_core::utils::bit::pad_bytes;
 use lance_core::{Error, Result};
-use lance_encoding::decoder::PageEncoding;
 use lance_encoding::encoder::{
     ArrayFieldEncodingStrategy, BatchEncoder, EncodeTask, EncodedBatch, EncodedPage,
     EncodingOptions, FieldEncoder, FieldEncodingStrategy, OutOfLineBuffers,
@@ -244,10 +243,7 @@ impl Writer {
             buffer_sizes.push(buffer.len() as u64);
             Self::do_write_buffer(&mut self.writer, &buffer).await?;
         }
-        let encoded_encoding = match encoded_page.description {
-            PageEncoding::Legacy(array_encoding) => Any::from_msg(&array_encoding)?.encode_to_vec(),
-            PageEncoding::Structural(page_layout) => Any::from_msg(&page_layout)?.encode_to_vec(),
-        };
+        let encoded_encoding = crate::writer::encode_page_encoding(&encoded_page.description)?;
         let page = pbfile::column_metadata::Page {
             buffer_offsets,
             buffer_sizes,
@@ -286,9 +282,24 @@ impl Writer {
         //
         // Also, there is no point in trying to make write_page parallel anyways
         // because we wouldn't want buffers getting mixed up across pages.
+        // Encoding futures can already own work in the shared CPU pool.
+        // Dropping them on the first error would detach that work. Stop writes
+        // after failure but retain and drain every accepted encoder join.
+        let mut first_error = None;
         while let Some(encoding_task) = encoding_tasks.next().await {
-            let encoded_page = encoding_task?;
-            self.write_page(encoded_page).await?;
+            if first_error.is_some() {
+                continue;
+            }
+            let result = match encoding_task {
+                Ok(page) => self.write_page(page).await,
+                Err(error) => Err(error),
+            };
+            if let Err(error) = result {
+                first_error = Some(error);
+            }
+        }
+        if let Some(error) = first_error {
+            return Err(error);
         }
         // Flushing here reaps any upload that has already failed, so the error
         // is attributed to this batch rather than to whichever later batch or
@@ -326,7 +337,13 @@ impl Writer {
     fn initialize(&mut self, mut schema: LanceSchema) -> Result<()> {
         self.options.validate()?;
         let cache_bytes_per_column = if let Some(data_cache_bytes) = self.options.data_cache_bytes {
-            data_cache_bytes / schema.fields.len() as u64
+            let cache_owners = schema
+                .fields
+                .iter()
+                .map(super::cache_owner_count)
+                .sum::<usize>()
+                .max(1);
+            data_cache_bytes / cache_owners as u64
         } else {
             8 * 1024 * 1024
         };
@@ -503,6 +520,12 @@ impl Writer {
         self.write_pages(encoding_tasks).await?;
 
         Ok(())
+    }
+
+    pub fn prepare_for_flush(&mut self) {
+        for encoder in &mut self.column_writers {
+            encoder.prepare_for_flush();
+        }
     }
 
     /// Write a single column, advancing only that column's row counter.
@@ -880,14 +903,7 @@ pub fn concat_lance_footer(batch: &EncodedBatch, write_schema: bool) -> Result<B
             .page_infos
             .iter()
             .map(|page_info| {
-                let encoded_encoding = match &page_info.encoding {
-                    PageEncoding::Legacy(array_encoding) => {
-                        Any::from_msg(array_encoding)?.encode_to_vec()
-                    }
-                    PageEncoding::Structural(page_layout) => {
-                        Any::from_msg(page_layout)?.encode_to_vec()
-                    }
-                };
+                let encoded_encoding = crate::writer::encode_page_encoding(&page_info.encoding)?;
                 let (buffer_offsets, buffer_sizes): (Vec<_>, Vec<_>) = page_info
                     .buffer_offsets_and_sizes
                     .as_ref()
@@ -949,4 +965,22 @@ pub fn concat_lance_footer(batch: &EncodedBatch, write_schema: bool) -> Result<B
     data.put(MAGIC.as_slice());
 
     Ok(data.freeze())
+}
+
+#[cfg(test)]
+mod tests {
+    #[tokio::test]
+    async fn page_encoder_failure_drains_remaining_work() {
+        let store = lance_io::object_store::ObjectStore::memory();
+        let writer = store
+            .create(&object_store::path::Path::from("failure.lance"))
+            .await
+            .unwrap();
+        let mut writer =
+            super::Writer::new_lazy(writer, crate::writer::FileWriterOptions::default());
+        crate::writer::writer_tests::assert_page_encoder_failure_drains(move |tasks| async move {
+            writer.write_pages(tasks).await
+        })
+        .await;
+    }
 }

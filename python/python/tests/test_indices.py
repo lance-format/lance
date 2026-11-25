@@ -233,6 +233,64 @@ def test_ivf_centroids_distance_type(tmpdir, small_float32_dataset):
     check("dot")
 
 
+def test_distributed_index_api_rejects_unknown_distance_type(
+    tmpdir, small_float32_dataset, small_float32_ivf
+):
+    from lance.lance import indices
+
+    codebook = pa.FixedSizeListArray.from_arrays(
+        pa.array(np.random.default_rng(42).random(DIMENSION * 256).astype(np.float32)),
+        DIMENSION,
+    )
+    message = "Metric type 'manhattan' is not supported"
+
+    with pytest.raises(ValueError, match=message):
+        indices.train_ivf_model(
+            small_float32_dataset._ds,
+            "vectors",
+            DIMENSION,
+            4,
+            "manhattan",
+            TRAINING_SAMPLE_RATE,
+            TRAINING_MAX_ITERS,
+        )
+    with pytest.raises(ValueError, match=message):
+        indices.train_pq_model(
+            small_float32_dataset._ds,
+            "vectors",
+            DIMENSION,
+            NUM_SUBVECTORS,
+            "manhattan",
+            TRAINING_SAMPLE_RATE,
+            TRAINING_MAX_ITERS,
+            small_float32_ivf.centroids,
+        )
+    with pytest.raises(ValueError, match=message):
+        indices.transform_vectors(
+            small_float32_dataset._ds,
+            "vectors",
+            DIMENSION,
+            NUM_SUBVECTORS,
+            "manhattan",
+            small_float32_ivf.centroids,
+            codebook,
+            str(tmpdir / "transformed"),
+            [],
+        )
+    with pytest.raises(ValueError, match=message):
+        indices.load_shuffled_vectors(
+            [],
+            str(tmpdir),
+            small_float32_dataset._ds,
+            "vectors",
+            small_float32_ivf.centroids,
+            codebook,
+            DIMENSION,
+            NUM_SUBVECTORS,
+            "manhattan",
+        )
+
+
 def test_num_partitions(small_float32_dataset):
     ivf = IndicesBuilder(small_float32_dataset, "vectors").train_ivf(
         sample_rate=TRAINING_SAMPLE_RATE,
@@ -574,6 +632,33 @@ def test_vector_transform_mismatched_codebook(
         builder.transform_vectors(
             small_rand_ivf, pq, str(tmpdir / "transformed"), fragments=None
         )
+
+
+def test_vector_transform_cosine(tmpdir, small_rand_dataset, small_rand_pq):
+    # A cosine IVF model used to hand Cosine to the PQ quantizer, which has no
+    # Cosine kernel and panicked on the first batch.
+    dtype = small_rand_dataset.schema.field("vectors").type.value_type.to_pandas_dtype()
+    centroids = np.random.default_rng(42).random(DIMENSION * 100).astype(dtype)
+    ivf = IvfModel(pa.FixedSizeListArray.from_arrays(centroids, DIMENSION), "cosine")
+
+    builder = IndicesBuilder(small_rand_dataset, "vectors")
+    uri = str(tmpdir / "transformed")
+    builder.transform_vectors(ivf, small_rand_pq, uri, fragments=None)
+
+    assert LanceFileReader(uri).metadata().num_rows == SMALL_NUM_ROWS
+
+
+def test_vector_transform_codebook_of_another_value_type(tmpdir, small_float32_dataset):
+    # The column is f32 and the codebook f16: the length check passed and
+    # quantization panicked reading the codebook as f32.
+    centroids = np.random.default_rng(42).random(DIMENSION * 100).astype(np.float32)
+    ivf = IvfModel(pa.FixedSizeListArray.from_arrays(centroids, DIMENSION), "l2")
+    codebook = np.random.default_rng(42).random(DIMENSION * 256).astype(np.float16)
+    pq = PqModel(NUM_SUBVECTORS, pa.FixedSizeListArray.from_arrays(codebook, DIMENSION))
+
+    builder = IndicesBuilder(small_float32_dataset, "vectors")
+    with pytest.raises(ValueError, match="PQ codebook value type"):
+        builder.transform_vectors(ivf, pq, str(tmpdir / "transformed"), fragments=None)
 
 
 @pytest.mark.cuda

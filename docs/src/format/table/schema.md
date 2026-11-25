@@ -45,8 +45,8 @@ Data types are represented as strings in the schema and can be grouped into seve
 
 | Logical Type | Arrow Type | Description |
 |---|---|---|
-| `string` | `Utf8` | Variable-length UTF-8 encoded string |
-| `binary` | `Binary` | Variable-length binary data |
+| `string` | `Utf8`, `Utf8View` | Variable-length UTF-8 encoded string |
+| `binary` | `Binary`, `BinaryView` | Variable-length binary data |
 | `large_string` | `LargeUtf8` | Variable-length UTF-8 string (supports large offsets) |
 | `large_binary` | `LargeBinary` | Variable-length binary data (supports large offsets) |
 
@@ -178,6 +178,11 @@ Lance supports custom extension types that provide semantic meaning on top of Ar
 
 #### Blob Type
 
+Blob v2 uses the `lance.blob.v2` Arrow extension marker on a struct field.
+Its accepted logical schemas and stored descriptor are defined in the
+[Blob v2 Specification](blob.md). The `blob` logical type below describes the
+earlier binary blob representation.
+
 Represents large binary data stored externally.
 
 | Logical Type | Description |
@@ -199,8 +204,23 @@ They are essential for robust schema evolution, as they allow fields to be renam
 
 ### Field ID Assignment
 
-**Initial assignment (depth-first order):**
-When a table is created, field IDs are assigned to all fields in depth-first order, starting from 0.
+**Initial assignment:**
+When a table is created, a writer either assigns every field an ID in depth-first order, starting
+from 0, or takes the IDs supplied with the input schema, such as the Arrow field metadata
+`lance:field_id`. When the input supplies IDs, a field without one receives an ID greater than the
+largest supplied ID, in depth-first order.
+
+A negative supplied ID counts as no ID. Supplied IDs must be unique across all fields including
+nested fields, and every field ID of the new table must be less than 2^30 (1073741824), which
+leaves room for about a billion fields added later. A writer that takes supplied IDs rejects input
+that breaks these rules instead of renumbering it. It cannot tell where they came from: a schema
+copied from another table carries that table's IDs, so a caller that does not intend them must not
+supply them. The limit covers IDs a caller supplies. A MemWAL generation keeps its base table's IDs,
+which can be larger because an existing table may assign IDs past the limit.
+
+These rules apply only when a table is created. A field added to an existing table receives its ID
+as described under "New field assignment", and an Overwrite assigns IDs as described in
+[Schema Evolution](#schema-evolution).
 
 Nested fields are linked via the `parent_id` field in the protobuf message. For example, if field "c" (id: 2) is a struct containing fields "x", "y", "z", those child fields will have `parent_id: 2`. Top-level fields have `parent_id: -1`.
 
@@ -231,9 +251,10 @@ Note: A `parent_id` of -1 indicates a top-level field. For nested fields, `paren
   an ID greater than `max_allocated_field_id`. It does not reuse an ID dropped or replaced after
   activation.
 
-For non-reusable field IDs, a caller cannot choose the ID of a new field. An Arrow schema may carry
-field-ID metadata, but the writer discards that metadata for new fields and assigns the IDs. The IDs
-do not have to be consecutive, which leaves room for a future reservation mechanism.
+For non-reusable field IDs, a caller cannot choose the ID of a field added to an existing table. An
+Arrow schema may carry field-ID metadata, but the writer discards that metadata for new fields and
+assigns the IDs. The IDs do not have to be consecutive, which leaves room for a future reservation
+mechanism.
 
 The first manifest that sets `max_allocated_field_id` initializes it to the largest field ID of 0
 or greater in the manifest schema, base data files, and overlay files. Earlier versions keep the
@@ -525,9 +546,9 @@ When converting between logical types and Arrow types, Lance uses the following 
 | `Arrow::Float16` | `halffloat` |
 | `Arrow::Float32` | `float` |
 | `Arrow::Float64` | `double` |
-| `Arrow::Utf8` | `string` |
+| `Arrow::Utf8`, `Arrow::Utf8View` | `string` |
 | `Arrow::LargeUtf8` | `large_string` |
-| `Arrow::Binary` | `binary` |
+| `Arrow::Binary`, `Arrow::BinaryView` | `binary` |
 | `Arrow::LargeBinary` | `large_binary` |
 | `Arrow::Decimal128(p, s)` | `decimal:128:p:s` |
 | `Arrow::Decimal256(p, s)` | `decimal:256:p:s` |

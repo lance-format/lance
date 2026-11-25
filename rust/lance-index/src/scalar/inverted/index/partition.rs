@@ -204,7 +204,10 @@ impl FuzzyAutomaton {
         if token.is_ascii() {
             let levenshtein = fst::automaton::Levenshtein::new(token, fuzzy.edit_distance)
                 .map_err(|error| {
-                    Error::index(format!("failed to construct the fuzzy query: {error}"))
+                    Error::invalid_input(format!(
+                        "failed to construct fuzzy query with fuzziness {}: {error}; reduce fuzziness or shorten the query",
+                        fuzzy.edit_distance
+                    ))
                 })?;
             Ok(Self::Ascii(AsciiFuzzyAutomaton {
                 levenshtein,
@@ -217,10 +220,27 @@ impl FuzzyAutomaton {
                 fuzzy.edit_distance,
             )
             .map_err(|error| {
-                Error::index(format!("failed to construct the fuzzy query: {error}"))
+                Error::invalid_input(format!(
+                    "failed to construct fuzzy query with fuzziness {}: {error}; reduce fuzziness or shorten the query",
+                    fuzzy.edit_distance
+                ))
             })?;
             Ok(Self::Unicode(levenshtein))
         }
+    }
+
+    /// Whether `candidate` is accepted by this fuzzy automaton (exact prefix +
+    /// bounded edit distance), matching FST dictionary traversal byte-for-byte.
+    #[inline]
+    pub(in crate::scalar::inverted) fn matches_str(&self, candidate: &str) -> bool {
+        let mut state = self.start();
+        for &byte in candidate.as_bytes() {
+            state = self.accept(&state, byte);
+            if !self.can_match(&state) {
+                return false;
+            }
+        }
+        self.is_match(&state)
     }
 }
 
@@ -474,21 +494,18 @@ struct PositionMatchSummary {
 
 #[derive(Debug, Clone, Copy)]
 pub(in super::super) struct PostingLoadOptions {
-    force_global_scorer: bool,
     read_policy: PostingReadPolicy,
 }
 
 impl PostingLoadOptions {
-    pub(super) const fn read_ahead(force_global_scorer: bool) -> Self {
+    pub(super) const fn read_ahead() -> Self {
         Self {
-            force_global_scorer,
             read_policy: PostingReadPolicy::ReadAhead,
         }
     }
 
-    pub(in super::super) const fn cache_aware_exact(force_global_scorer: bool) -> Self {
+    pub(in super::super) const fn cache_aware_exact() -> Self {
         Self {
-            force_global_scorer,
             read_policy: PostingReadPolicy::CacheAwareExact,
         }
     }
@@ -582,7 +599,10 @@ fn tokens_may_match(
     // without allocating two hash tables for every leaf in every partition.
     let mut positions = SmallVec::<[(u32, bool); 8]>::new();
     for index in 0..tokens.len() {
-        positions.push((tokens.position(index), in_dictionary(index)));
+        positions.push((
+            tokens.position_for_query(index, is_phrase_query),
+            in_dictionary(index),
+        ));
     }
     summarize_position_matches(positions).every_position_matched
 }
@@ -611,6 +631,7 @@ fn effective_posting_read_policy(
     inverted_list: &PostingListReader,
     requested_policy: PostingReadPolicy,
     group_demand_counts: &HashMap<(u32, u32), usize>,
+    has_expansions: bool,
     token_id: u32,
 ) -> PostingReadPolicy {
     if requested_policy == PostingReadPolicy::ReadAhead {
@@ -620,11 +641,16 @@ fn effective_posting_read_policy(
         return PostingReadPolicy::CacheAwareExact;
     };
     let demand_count = group_demand_counts.get(&group).copied();
-    debug_assert!(
-        demand_count.is_some(),
-        "posting group {group:?} must have a demand count for token {token_id}"
-    );
-    if demand_count == Some(1) {
+    // Prewarm may publish byte boundaries after this query counted demand
+    // using the unplanned ranges. Exact loading remains safe across that transition.
+    if demand_count.is_none() {
+        return PostingReadPolicy::CacheAwareExact;
+    }
+    // Keep alternatives coalesced, even when a fuzzy expansion covers only a
+    // small part of a group. Ordinary sparse terms need no such read ahead.
+    if demand_count.is_some_and(|count| {
+        count == 1 || (!has_expansions && count < ((group.1 - group.0) as usize).div_ceil(2))
+    }) {
         PostingReadPolicy::CacheAwareExact
     } else {
         PostingReadPolicy::ReadAhead
@@ -856,11 +882,37 @@ impl InvertedPartition {
         index_cache: &LanceCache,
         token_set_format: TokenSetFormat,
     ) -> Result<Self> {
-        let token_file = store.open_index_file(&token_file_path(id)).await?;
+        Self::load_with_paths(
+            store,
+            id,
+            &token_file_path(id),
+            &posting_file_path(id),
+            &doc_file_path(id),
+            frag_reuse_index,
+            index_cache,
+            token_set_format,
+        )
+        .await
+    }
+
+    /// Load a partition whose three files sit at explicit paths, such as a
+    /// staged partition that has not been renumbered into the final layout.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn load_with_paths(
+        store: Arc<dyn IndexStore>,
+        id: u64,
+        token_path: &str,
+        posting_path: &str,
+        docs_path: &str,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        index_cache: &LanceCache,
+        token_set_format: TokenSetFormat,
+    ) -> Result<Self> {
+        let token_file = store.open_index_file(token_path).await?;
         let tokens = TokenSet::load(token_file, token_set_format).await?;
-        let invert_list_file = store.open_index_file(&posting_file_path(id)).await?;
+        let invert_list_file = store.open_index_file(posting_path).await?;
         let mut inverted_list = PostingListReader::try_new(invert_list_file, index_cache).await?;
-        let docs_path = doc_file_path(id);
+        let docs_path = docs_path.to_string();
         let docs_reader = store.open_index_file(&docs_path).await?;
         let docs = PartitionDocuments::try_new(
             store.clone(),
@@ -922,7 +974,7 @@ impl InvertedPartition {
         })
     }
 
-    fn map(&self, token: &str) -> Option<u32> {
+    pub(super) fn map(&self, token: &str) -> Option<u32> {
         self.tokens.get(token)
     }
 
@@ -946,6 +998,7 @@ impl InvertedPartition {
     pub fn expand_fuzzy(&self, tokens: &Tokens, params: &FtsSearchParams) -> Result<Tokens> {
         let mut new_tokens = Vec::with_capacity(min(tokens.len(), params.max_expansions));
         let mut new_positions = Vec::with_capacity(new_tokens.capacity());
+        let mut new_groups = Vec::with_capacity(new_tokens.capacity());
         let mut seen = HashSet::new();
         let mut seen_source_terms = HashSet::new();
         for token_idx in 0..tokens.len() {
@@ -955,7 +1008,8 @@ impl InvertedPartition {
             }
             let token = tokens.get_token(token_idx);
             let position = tokens.position(token_idx);
-            if !seen_source_terms.insert((position, token)) {
+            let group = tokens.position_for_query(token_idx, params.phrase_slop.is_some());
+            if !seen_source_terms.insert((group, token)) {
                 continue;
             }
             let mut candidates = BTreeSet::new();
@@ -965,17 +1019,17 @@ impl InvertedPartition {
                 if new_tokens.len() >= params.max_expansions {
                     break;
                 }
-                if seen.insert((candidate.clone(), position)) {
+                if seen.insert((candidate.clone(), group)) {
                     new_tokens.push(candidate);
                     new_positions.push(position);
+                    new_groups.push(group);
                 }
             }
         }
-        Ok(Tokens::with_positions(
-            new_tokens,
-            new_positions,
-            tokens.token_type().clone(),
-        ))
+        Ok(
+            Tokens::with_positions(new_tokens, new_positions, tokens.token_type().clone())
+                .with_term_groups(new_groups),
+        )
     }
 
     /// Collect up to `limit` fuzzy candidates for one query token from this
@@ -1307,10 +1361,10 @@ impl InvertedPartition {
     // return the doc info and the doc length
     // ref: https://en.wikipedia.org/wiki/Okapi_BM25
     //
-    // `force_global_scorer` is used by compound search, where leaf scores and
-    // bounds must share corpus-level statistics before the global collector
-    // can safely propagate its threshold. Standard leaf search also routes
-    // no-impact postings through scorer-derived corpus-global upper bounds.
+    // Query weights always come from the corpus-global `impact_scorer`, so every
+    // partition scores in one space and standard and compound search can share
+    // one top-k threshold across partitions. Postings without stored impacts
+    // also take their upper bounds from that scorer.
     pub(in super::super) async fn load_posting_lists(
         &self,
         tokens: &Tokens,
@@ -1318,7 +1372,6 @@ impl InvertedPartition {
         operator: Operator,
         impact_scorer: &MemBM25Scorer,
         metrics: &dyn MetricsCollector,
-        force_global_scorer: bool,
     ) -> Result<LoadedPostings> {
         self.load_posting_lists_with_policy(
             tokens,
@@ -1326,7 +1379,7 @@ impl InvertedPartition {
             operator,
             impact_scorer,
             metrics,
-            PostingLoadOptions::read_ahead(force_global_scorer),
+            PostingLoadOptions::read_ahead(),
         )
         .await
     }
@@ -1365,18 +1418,18 @@ impl InvertedPartition {
         term_ids: Option<PartitionTermIds<'_>>,
     ) -> Result<Option<FetchedPostings>> {
         let PostingLoadOptions {
-            force_global_scorer,
             read_policy: requested_read_policy,
         } = options;
         let is_phrase_query = params.phrase_slop.is_some();
+        let read_positions = is_phrase_query;
         let is_and_query = operator == Operator::And;
-        // The caller passes final tokens after any fuzzy expansion. Positions
+        // The caller passes final tokens after any fuzzy expansion. Query groups
         // identify alternatives that must share one posting iterator,
         // including code identifier subwords and fuzzy expansions.
         let mut token_ids = Vec::with_capacity(tokens.len());
         let mut position_matches = SmallVec::<[(u32, bool); 8]>::new();
         for index in 0..tokens.len() {
-            let position = tokens.position(index);
+            let position = tokens.position_for_query(index, is_phrase_query);
             let token_id = match &term_ids {
                 Some(term_ids) => term_ids.token_id(index),
                 None => self.map(tokens.get_token(index)),
@@ -1398,6 +1451,8 @@ impl InvertedPartition {
         token_ids.sort_unstable_by_key(|(token_id, _, position)| (*position, *token_id));
         token_ids.dedup_by(|lhs, rhs| lhs.0 == rhs.0 && lhs.2 == rhs.2);
 
+        let has_expansions = token_ids.windows(2).any(|pair| pair[0].2 == pair[1].2);
+
         let group_demand_counts = if requested_read_policy == PostingReadPolicy::CacheAwareExact {
             posting_group_demand_counts(self.inverted_list.as_ref(), &token_ids)
         } else {
@@ -1413,20 +1468,21 @@ impl InvertedPartition {
                     self.inverted_list.as_ref(),
                     requested_read_policy,
                     &group_demand_counts,
+                    has_expansions,
                     token_id,
                 );
                 async move {
                     let posting = match read_policy {
                         PostingReadPolicy::ReadAhead => {
                             self.inverted_list
-                                .posting_list(token_id, is_phrase_query, metrics)
+                                .posting_list(token_id, read_positions, metrics)
                                 .await?
                         }
                         PostingReadPolicy::CacheAwareExact => {
                             self.inverted_list
                                 .posting_list_with_policy(
                                     token_id,
-                                    is_phrase_query,
+                                    read_positions,
                                     metrics,
                                     read_policy,
                                 )
@@ -1478,7 +1534,6 @@ impl InvertedPartition {
             is_and_query,
             is_phrase_query,
             exact_scoring_required,
-            force_global_scorer,
             docs_for_union,
         }))
     }
@@ -1656,12 +1711,43 @@ pub(super) struct FetchedPostings {
     is_and_query: bool,
     is_phrase_query: bool,
     exact_scoring_required: bool,
-    force_global_scorer: bool,
     /// Scoring lengths for unioning same-position postings, when any exist.
     docs_for_union: Option<LoadedDocLengths>,
 }
 
 impl FetchedPostings {
+    /// Approximate the cache-backed payload held until this partition is scored.
+    /// Group slices can retain whole Arrow allocations. Shared position streams
+    /// already track the capacity accepted by their ownership checks.
+    pub(super) fn retained_bytes(&self) -> usize {
+        let mut context = lance_core::deepsize::Context::default();
+        self.postings
+            .iter()
+            .fold(0usize, |total, (_, _, _, posting)| {
+                let bytes = match posting {
+                    PostingList::Plain(posting) => posting.deep_size_of_children(&mut context),
+                    PostingList::Compressed(posting) => {
+                        let positions = match &posting.positions {
+                            Some(CompressedPositionStorage::LegacyPerDoc(positions)) => {
+                                super::cache::retained_cache_bytes(positions, &mut context)
+                            }
+                            Some(CompressedPositionStorage::SharedStream(positions)) => {
+                                positions.size()
+                            }
+                            None => 0,
+                        };
+                        let impacts = posting.impacts.as_ref().map_or(0, |impacts| {
+                            super::cache::retained_cache_bytes(impacts.entries(), &mut context)
+                        });
+                        super::cache::retained_cache_bytes(&posting.blocks, &mut context)
+                            .saturating_add(positions)
+                            .saturating_add(impacts)
+                    }
+                };
+                total.saturating_add(bytes)
+            })
+    }
+
     /// Build the iterators; `tokens` must be the tokens these postings were
     /// fetched for.
     pub(super) fn into_loaded(
@@ -1675,7 +1761,6 @@ impl FetchedPostings {
             is_and_query,
             is_phrase_query,
             exact_scoring_required,
-            force_global_scorer,
             docs_for_union,
         } = self;
         if docs_for_union.is_none() {
@@ -1700,12 +1785,7 @@ impl FetchedPostings {
                     .map(|(token_id, token_index, position, posting)| {
                         let token = tokens.get_token(token_index);
                         let needs_scorer_upper_bound = !posting.has_impacts();
-                        let query_weight =
-                            if impact_safe || exact_scoring_required || force_global_scorer {
-                                impact_scorer.query_weight(token)
-                            } else {
-                                idf(posting.len(), num_docs)
-                            };
+                        let query_weight = impact_scorer.query_weight(token);
                         let posting = PostingIterator::with_query_weight(
                             token.to_owned(),
                             token_id,
@@ -1852,6 +1932,35 @@ mod tests {
     use super::*;
     use crate::scalar::inverted::document_tokenizer::DocType;
 
+    #[test]
+    fn fetched_postings_weight_counts_shared_backing_once() {
+        let unrelated = vec![7u8; 32 * 1024];
+        // VarintDelta tail: document 0, frequency 1. The preceding value is
+        // outside this posting but its allocation remains owned by the slice.
+        let blocks = LargeBinaryArray::from_iter_values([unrelated.as_slice(), &[0, 1]]);
+        let backing = blocks.get_buffer_memory_size();
+        let posting = PostingList::Compressed(CompressedPostingList::new(
+            blocks.slice(1, 1),
+            1.0,
+            1,
+            PostingTailCodec::VarintDelta,
+            128,
+            None,
+            None,
+        ));
+        let fetched = FetchedPostings {
+            postings: vec![(0, 0, 0, posting.clone()), (1, 1, 1, posting)],
+            num_docs: 1,
+            is_and_query: true,
+            is_phrase_query: false,
+            exact_scoring_required: false,
+            docs_for_union: None,
+        };
+        let retained = fetched.retained_bytes();
+        assert!(retained >= backing);
+        assert!(retained < 2 * backing);
+    }
+
     fn dictionary(terms: &[&str]) -> TokenSet {
         let mut dictionary = TokenSet::default();
         for term in terms {
@@ -1966,6 +2075,22 @@ mod tests {
 
         assert!(automaton_accepts(&automaton, "café".as_bytes()));
         assert!(!automaton_accepts(&automaton, "dafé".as_bytes()));
+    }
+
+    #[rstest]
+    #[case::ascii("quick")]
+    #[case::unicode("éabcdefghijklmnopqrstuvwxyz")]
+    fn excessive_fuzziness_is_an_input_error(#[case] token: &str) {
+        let params = FtsSearchParams::new().with_fuzziness(Some(10));
+        let Err(error) = FuzzyAutomaton::new(token, &DocType::Text, &params) else {
+            panic!("fuzziness=10 must exceed the automaton construction budget");
+        };
+
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        let message = error.to_string();
+        assert!(message.contains("fuzziness 10"), "{message}");
+        assert!(message.contains("10000"), "{message}");
+        assert!(message.contains("reduce fuzziness"), "{message}");
     }
 
     #[test]

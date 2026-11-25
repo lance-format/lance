@@ -35,9 +35,9 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
-use datafusion::execution::SendableRecordBatchStream;
-use datafusion::physical_plan::metrics::Time;
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion_execution::SendableRecordBatchStream;
+use datafusion_physical_plan::metrics::Time;
+use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
 use fst::{Automaton, IntoStreamer, Streamer};
 use futures::{FutureExt, Stream, StreamExt, TryStreamExt, stream};
 use itertools::{Either, Itertools};
@@ -69,7 +69,8 @@ use super::impact::{IMPACT_LEVEL1_BLOCKS, ImpactSkipData, ImpactSkipDataBuilder}
 use super::iter::PostingListIterator;
 use super::tokenizer::{LEGACY_BLOCK_SIZE, validate_block_size};
 use super::{
-    DocumentGranularity, FlatFieldStats, InvertedIndexBuilder, InvertedIndexParams, wand::*,
+    DocumentGranularity, FlatFieldStats, InvertedIndexBuilder, InvertedIndexParams,
+    PreparedBm25Query, wand::*,
 };
 use super::{
     builder::{InnerBuilder, PositionRecorder},
@@ -103,24 +104,30 @@ mod cache;
 mod doc_set;
 mod flat_search;
 mod format;
+mod grouping;
 mod inverted_index;
 mod partition;
+mod position_blocks;
 mod posting_batch_builder;
 mod posting_builder;
 mod posting_list;
 mod posting_prewarm;
 mod posting_reader;
 mod prewarm;
+mod scheduling;
 mod search;
 mod search_candidates;
 mod token_set;
+mod whole_positions;
 
 pub use cache::*;
 pub use doc_set::*;
 pub use flat_search::*;
 pub use format::*;
+use grouping::*;
 pub use inverted_index::*;
 pub use partition::*;
+use position_blocks::EncodedPositionBlocks;
 pub(super) use posting_batch_builder::*;
 pub use posting_builder::*;
 pub use posting_list::*;

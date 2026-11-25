@@ -106,25 +106,14 @@ impl CommitLease for PyCommitLease {
                     .call_method1(py, "__exit__", (py.None(), py.None(), py.None()))
                     .map_err(|err| handle_error(err, py))
             } else {
-                // If the commit failed, we pass up an exception to the
-                // context manager.
-                PyIOError::new_err("commit failed").restore(py);
-                let args = py
-                    .import("sys")
-                    .unwrap()
-                    .getattr("exc_info")
-                    .unwrap()
-                    .call0()
-                    .unwrap();
+                // Setting Python's pending error indicator would interfere
+                // with calling __exit__; pass the exception directly instead.
+                let err = PyIOError::new_err("commit failed");
                 self.inner
                     .call_method1(
                         py,
                         "__exit__",
-                        (
-                            args.get_item(0).unwrap(),
-                            args.get_item(1).unwrap(),
-                            args.get_item(2).unwrap(),
-                        ),
+                        (err.get_type(py), err.value(py), err.traceback(py)),
                     )
                     .map_err(|err| handle_error(err, py))
             }

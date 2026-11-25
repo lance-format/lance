@@ -48,7 +48,7 @@ tempfile = { workspace = true }
 tokio = { workspace = true }
 all_asserts.workspace = true
 env_logger.workspace = true
-hf-hub = "0.4.2"
-parquet = { workspace = true }
-tokenizers = "0.15.2"
+hf-hub = { version = "0.5.0", default-features = false, features = ["ureq"] }
+parquet = { workspace = true, features = ["snap"] }
+tokenizers = "0.22.2"
 rand.workspace = true

@@ -118,7 +118,7 @@ impl fmt::Debug for InternalCacheKey {
 }
 
 /// Pre-derived namespace key shared by entries in one logical cache scope.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CacheNamespace([u8; 32]);
 
 impl CacheNamespace {

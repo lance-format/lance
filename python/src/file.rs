@@ -12,8 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::blob::{PyDedicatedBlobWriter, PyPackedBlobWriter};
+use crate::blob::{PyDedicatedBlobWriter, PyManagedBlobWriter, PyPackedBlobWriter};
 use crate::namespace::extract_namespace_arc;
+use crate::session::Session;
 use crate::{error::PythonErrorExt, rt};
 use arrow::pyarrow::PyArrowType;
 use arrow_array::{RecordBatch, RecordBatchReader, UInt32Array};
@@ -467,6 +468,7 @@ pub async fn object_store_from_uri_or_path_with_provider(
 pub struct LanceFileSession {
     object_store: Arc<ObjectStore>,
     base_path: Path,
+    session: Option<Session>,
 }
 
 impl LanceFileSession {
@@ -474,6 +476,7 @@ impl LanceFileSession {
         uri_or_path: String,
         storage_options: Option<HashMap<String, String>>,
         storage_options_provider: Option<Arc<dyn lance_io::object_store::StorageOptionsProvider>>,
+        session: Option<Session>,
     ) -> PyResult<Self> {
         let (object_store, base_path) = object_store_from_uri_or_path_with_provider(
             uri_or_path,
@@ -484,6 +487,7 @@ impl LanceFileSession {
         Ok(Self {
             object_store,
             base_path,
+            session,
         })
     }
 }
@@ -491,12 +495,13 @@ impl LanceFileSession {
 #[pymethods]
 impl LanceFileSession {
     #[new]
-    #[pyo3(signature=(uri_or_path, storage_options=None, namespace_client=None, table_id=None))]
+    #[pyo3(signature=(uri_or_path, storage_options=None, namespace_client=None, table_id=None, session=None))]
     pub fn new(
         uri_or_path: String,
         storage_options: Option<HashMap<String, String>>,
         namespace_client: Option<&Bound<'_, PyAny>>,
         table_id: Option<Vec<String>>,
+        session: Option<Session>,
     ) -> PyResult<Self> {
         // Create storage options provider from namespace_client and table_id if both are provided
         let provider = if let (Some(ns_client), Some(tid)) = (&namespace_client, &table_id) {
@@ -509,7 +514,10 @@ impl LanceFileSession {
         } else {
             None
         };
-        rt().block_on(None, Self::try_new(uri_or_path, storage_options, provider))?
+        rt().block_on(
+            None,
+            Self::try_new(uri_or_path, storage_options, provider, session),
+        )?
     }
 
     #[pyo3(signature=(path, columns=None))]
@@ -521,7 +529,12 @@ impl LanceFileSession {
         let path = self.base_path.child_path(&Path::from(path));
         rt().block_on(
             None,
-            LanceFileReader::open_with_store(self.object_store.clone(), path, columns),
+            LanceFileReader::open_with_store(
+                self.object_store.clone(),
+                path,
+                columns,
+                self.session.clone(),
+            ),
         )?
     }
 
@@ -553,6 +566,26 @@ impl LanceFileSession {
                 version,
                 keep_original_array,
                 max_page_bytes,
+            ),
+        )?
+    }
+
+    /// Create an independently addressed packed object under this session's base.
+    ///
+    /// Open the session at the table root, or at a registered base's root and
+    /// pass its ``base_id``. Finish the upload before writing its descriptors
+    /// with ``lance.write_dataset`` and schema metadata
+    /// ``lance.blob.managed=true``. Reuse descriptors with
+    /// ``BlobDescriptorArrayBuilder.append`` to share payloads across rows and
+    /// fragments. This does not register bases or commit a dataset version.
+    #[pyo3(signature=(*, base_id=None))]
+    pub fn open_managed_blob_writer(&self, base_id: Option<u32>) -> PyResult<PyManagedBlobWriter> {
+        rt().block_on(
+            None,
+            PyManagedBlobWriter::try_new(
+                self.object_store.clone(),
+                self.base_path.clone(),
+                base_id,
             ),
         )?
     }
@@ -736,6 +769,32 @@ impl LanceFileSession {
         })?
     }
 
+    /// Return the size in bytes of a file in the object store.
+    ///
+    /// The path is interpreted relative to the session's `base_path`, matching
+    /// the other session methods. This issues a single metadata (HEAD) request
+    /// and reads no data. A missing object raises `OSError`, consistent with
+    /// `read_range` and `download_file`.
+    ///
+    /// Parameters
+    /// ----------
+    /// path : str
+    ///     Path relative to `base_path`.
+    ///
+    /// Returns
+    /// -------
+    /// int
+    ///     The object size in bytes.
+    pub fn size(&self, path: String) -> PyResult<u64> {
+        rt().block_on(None, async {
+            let full_path = self.base_path.child_path(&Path::from(path));
+            self.object_store
+                .size(&full_path)
+                .await
+                .map_err(|e| PyIOError::new_err(format!("Failed to get remote file size: {}", e)))
+        })?
+    }
+
     /// Read a byte range from a file in the object store.
     ///
     /// The path is interpreted relative to the session's `base_path`, matching
@@ -815,12 +874,32 @@ pub struct LanceFileReader {
     inner: Arc<FileReader>,
 }
 
+/// Unique id for cache scopes that must not be shared between readers.
+static READER_CACHE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Namespace for metadata cache entries read through `object_store`.
+///
+/// Entries are scoped to the reader and never shared with other readers. An
+/// immutable version returned by HEAD does not pin the footer and page GETs
+/// that populate the cache, S3's `"null"` version is mutable, and ETags,
+/// mtimes, and reused in-memory store addresses are not stable identities.
+/// Reader-local entries cannot poison a later reader after a concurrent
+/// replacement or version rollback.
+fn metadata_cache_namespace(object_store: &ObjectStore) -> String {
+    format!(
+        "{}/reader:{}",
+        object_store.store_prefix,
+        READER_CACHE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    )
+}
+
 impl LanceFileReader {
     async fn open(
         uri_or_path: String,
         storage_options: Option<HashMap<String, String>>,
         storage_options_provider: Option<Arc<dyn lance_io::object_store::StorageOptionsProvider>>,
         columns: Option<Vec<String>>,
+        session: Option<Session>,
     ) -> PyResult<Self> {
         let (object_store, path) = object_store_from_uri_or_path_with_provider(
             uri_or_path,
@@ -828,16 +907,36 @@ impl LanceFileReader {
             storage_options_provider,
         )
         .await?;
-        Self::open_with_store(object_store, path, columns).await
+        Self::open_with_store(object_store, path, columns, session).await
     }
 
     async fn open_with_store(
         object_store: Arc<ObjectStore>,
         path: Path,
         columns: Option<Vec<String>>,
+        session: Option<Session>,
     ) -> PyResult<Self> {
-        let scheduler =
-            ScanScheduler::new(object_store, SchedulerConfig::new(2 * 1024 * 1024 * 1024));
+        let no_cache;
+        let scoped_cache;
+        let cache = match &session {
+            Some(session) => {
+                let namespace = metadata_cache_namespace(&object_store);
+                scoped_cache = session
+                    .inner
+                    .file_metadata_cache()
+                    .with_key_prefix(&namespace);
+                &scoped_cache
+            }
+            None => {
+                no_cache = LanceCache::no_cache();
+                &no_cache
+            }
+        };
+
+        let scheduler = ScanScheduler::new(
+            object_store.clone(),
+            SchedulerConfig::new(2 * 1024 * 1024 * 1024),
+        );
         let file = scheduler
             .open_file(&path, &CachedFileSize::unknown())
             .await
@@ -864,7 +963,7 @@ impl LanceFileReader {
             base_projection,
             Arc::<DecoderPlugins>::default(),
             Arc::new(file_metadata),
-            &LanceCache::no_cache(),
+            cache,
             FileReaderOptions::default(),
         )
         .await
@@ -875,20 +974,47 @@ impl LanceFileReader {
     }
 }
 
-struct LanceReaderAdapter(Pin<Box<dyn RecordBatchStream>>);
+struct LanceReaderAdapter {
+    stream: Pin<Box<dyn RecordBatchStream>>,
+    is_finished: bool,
+}
+
+impl LanceReaderAdapter {
+    fn finish_read(
+        &mut self,
+        result: PyResult<Option<lance::Result<RecordBatch>>>,
+    ) -> Option<std::result::Result<RecordBatch, arrow::error::ArrowError>> {
+        let batch = match result {
+            Ok(batch) => batch,
+            Err(error) => {
+                self.is_finished = true;
+                return Some(Err(arrow::error::ArrowError::ComputeError(format!(
+                    "File read interrupted: {error}"
+                ))));
+            }
+        };
+        if batch.is_none() {
+            self.is_finished = true;
+        }
+        batch.map(|b| b.map_err(|e| e.into()))
+    }
+}
 
 impl Iterator for LanceReaderAdapter {
     type Item = std::result::Result<RecordBatch, arrow::error::ArrowError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let batch = rt().block_on(None, self.0.next()).ok()?;
-        batch.map(|b| b.map_err(|e| e.into()))
+        if self.is_finished {
+            return None;
+        }
+        let result = rt().block_on(None, self.stream.next());
+        self.finish_read(result)
     }
 }
 
 impl RecordBatchReader for LanceReaderAdapter {
     fn schema(&self) -> std::sync::Arc<arrow_schema::Schema> {
-        self.0.schema().clone()
+        self.stream.schema().clone()
     }
 }
 
@@ -911,20 +1037,24 @@ impl LanceFileReader {
                 .await
                 .infer_error()
         })??;
-        Ok(PyArrowType(Box::new(LanceReaderAdapter(stream))))
+        Ok(PyArrowType(Box::new(LanceReaderAdapter {
+            stream,
+            is_finished: false,
+        })))
     }
 }
 
 #[pymethods]
 impl LanceFileReader {
     #[new]
-    #[pyo3(signature=(path, storage_options=None, namespace_client=None, table_id=None, columns=None))]
+    #[pyo3(signature=(path, storage_options=None, namespace_client=None, table_id=None, columns=None, session=None))]
     pub fn new(
         path: String,
         storage_options: Option<HashMap<String, String>>,
         namespace_client: Option<&Bound<'_, PyAny>>,
         table_id: Option<Vec<String>>,
         columns: Option<Vec<String>>,
+        session: Option<Session>,
     ) -> PyResult<Self> {
         // Create storage options provider from namespace_client and table_id if both are provided
         let provider = if let (Some(ns_client), Some(tid)) = (&namespace_client, &table_id) {
@@ -937,7 +1067,10 @@ impl LanceFileReader {
         } else {
             None
         };
-        rt().block_on(None, Self::open(path, storage_options, provider, columns))?
+        rt().block_on(
+            None,
+            Self::open(path, storage_options, provider, columns, session),
+        )?
     }
 
     pub fn read_all(
@@ -1015,6 +1148,27 @@ pub fn stable_version() -> PyResult<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interrupted_file_read_is_terminal_error() {
+        Python::initialize();
+        let stream = lance_io::stream::RecordBatchStreamAdapter::new(
+            Arc::new(arrow_schema::Schema::empty()),
+            futures::stream::pending(),
+        );
+        let mut reader = LanceReaderAdapter {
+            stream: Box::pin(stream),
+            is_finished: false,
+        };
+        let error = reader
+            .finish_read(Err(pyo3::exceptions::PyKeyboardInterrupt::new_err(
+                "injected interrupt",
+            )))
+            .unwrap()
+            .unwrap_err();
+        assert!(error.to_string().contains("interrupted"));
+        assert!(reader.next().is_none());
+    }
 
     #[test]
     fn test_lance_file_statistics_repr_empty() {

@@ -1,14 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use datafusion::prelude::SessionContext;
+//! Geospatial support for Lance: bounding boxes, spatial queries and the R-tree scalar index.
 
-#[cfg(feature = "geo")]
 pub mod bbox;
-
-pub fn register_functions(ctx: &SessionContext) {
-    #[cfg(feature = "geo")]
-    geodatafusion::register(ctx);
-    #[cfg(not(feature = "geo"))]
-    let _ = ctx;
-}
+pub mod query;
+pub mod rtree;

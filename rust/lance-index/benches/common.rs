@@ -7,8 +7,9 @@ use std::sync::Arc;
 use arrow::datatypes::{Int64Type, UInt64Type};
 use arrow_array::{Int64Array, RecordBatch, StringArray, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
-use datafusion::physical_plan::SendableRecordBatchStream;
-use lance_datafusion::datagen::DatafusionDatagenExt;
+use datafusion_physical_plan::SendableRecordBatchStream;
+use lance_core::ROW_ADDR;
+use lance_datafusion_exec::datagen::DatafusionDatagenExt;
 use lance_datagen::{BatchCount, RowCount, array, gen_batch};
 
 /// Total number of rows in the dataset
@@ -54,7 +55,7 @@ pub fn generate_int_many_fragment_stream() -> SendableRecordBatchStream {
     let total_rows = many_fragment_total_rows();
     let schema = Arc::new(Schema::new(vec![
         Field::new("value", DataType::Int64, false),
-        Field::new("_rowid", DataType::UInt64, false),
+        Field::new(ROW_ADDR, DataType::UInt64, false),
     ]));
 
     let mut batches = Vec::new();
@@ -78,14 +79,14 @@ pub fn generate_int_many_fragment_stream() -> SendableRecordBatchStream {
     }
 
     let stream = futures::stream::iter(batches);
-    Box::pin(datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(schema, stream))
+    Box::pin(datafusion_physical_plan::stream::RecordBatchStreamAdapter::new(schema, stream))
 }
 
 /// Generate a stream of int64 data with unique values (sequential)
 pub fn generate_int_unique_stream() -> SendableRecordBatchStream {
     gen_batch()
         .col("value", array::step::<Int64Type>())
-        .col("_rowid", array::step::<UInt64Type>())
+        .col(ROW_ADDR, array::step::<UInt64Type>())
         .into_df_stream(
             RowCount::from(BATCH_SIZE),
             BatchCount::from(NUM_BATCHES as u32),
@@ -101,7 +102,7 @@ pub fn generate_int_low_cardinality_stream() -> SendableRecordBatchStream {
 
     let schema = Arc::new(Schema::new(vec![
         Field::new("value", DataType::Int64, false),
-        Field::new("_rowid", DataType::UInt64, false),
+        Field::new(ROW_ADDR, DataType::UInt64, false),
     ]));
 
     for value_idx in 0..LOW_CARDINALITY_COUNT {
@@ -131,7 +132,7 @@ pub fn generate_int_low_cardinality_stream() -> SendableRecordBatchStream {
     }
 
     let stream = futures::stream::iter(batches);
-    Box::pin(datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(schema, stream))
+    Box::pin(datafusion_physical_plan::stream::RecordBatchStreamAdapter::new(schema, stream))
 }
 
 /// Generate a stream of string data with unique values
@@ -142,7 +143,7 @@ pub fn generate_string_unique_stream() -> SendableRecordBatchStream {
 
     let schema = Arc::new(Schema::new(vec![
         Field::new("value", DataType::Utf8, false),
-        Field::new("_rowid", DataType::UInt64, false),
+        Field::new(ROW_ADDR, DataType::UInt64, false),
     ]));
 
     while current_row < TOTAL_ROWS {
@@ -168,7 +169,7 @@ pub fn generate_string_unique_stream() -> SendableRecordBatchStream {
     }
 
     let stream = futures::stream::iter(batches);
-    Box::pin(datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(schema, stream))
+    Box::pin(datafusion_physical_plan::stream::RecordBatchStreamAdapter::new(schema, stream))
 }
 
 /// Generate sorted string data with low cardinality (100 unique values)
@@ -179,7 +180,7 @@ pub fn generate_string_low_cardinality_stream() -> SendableRecordBatchStream {
 
     let schema = Arc::new(Schema::new(vec![
         Field::new("value", DataType::Utf8, false),
-        Field::new("_rowid", DataType::UInt64, false),
+        Field::new(ROW_ADDR, DataType::UInt64, false),
     ]));
 
     for value_idx in 0..LOW_CARDINALITY_COUNT {
@@ -209,5 +210,5 @@ pub fn generate_string_low_cardinality_stream() -> SendableRecordBatchStream {
     }
 
     let stream = futures::stream::iter(batches);
-    Box::pin(datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(schema, stream))
+    Box::pin(datafusion_physical_plan::stream::RecordBatchStreamAdapter::new(schema, stream))
 }

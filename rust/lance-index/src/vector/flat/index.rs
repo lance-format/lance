@@ -21,7 +21,7 @@ use crate::{
     metrics::{IndexTimer, IndexTiming, MetricsCollector},
     prefilter::PreFilter,
     vector::{
-        ApproxMode, DIST_COL, Query,
+        ApproxMode, DIST_COL, PartitionSearchCandidate, PartitionSearchResult, Query,
         graph::{OrderedFloat, OrderedNode},
         quantizer::{Quantization, QuantizationType, Quantizer, QuantizerMetadata},
         storage::{
@@ -34,20 +34,20 @@ use crate::{
 use super::storage::{FLAT_COLUMN, FlatBinStorage, FlatFloatStorage};
 
 #[inline(always)]
-fn push_candidate_local(
-    res: &mut BinaryHeap<OrderedNode<u64>>,
+fn push_candidate_local<T: Eq>(
+    res: &mut BinaryHeap<OrderedNode<T>>,
     k: usize,
-    row_id: u64,
+    candidate: T,
     dist: OrderedFloat,
 ) {
     if k == 0 {
         return;
     }
     if res.len() < k {
-        res.push(OrderedNode::new(row_id, dist));
+        res.push(OrderedNode::new(candidate, dist));
     } else if res.peek().is_some_and(|node| node.dist > dist) {
         res.pop();
-        res.push(OrderedNode::new(row_id, dist));
+        res.push(OrderedNode::new(candidate, dist));
     }
 }
 
@@ -91,18 +91,128 @@ pub struct FlatQueryParams {
 
 impl From<&Query> for FlatQueryParams {
     fn from(q: &Query) -> Self {
+        Self::from_query(q, q.dist_q_c)
+    }
+}
+
+impl FlatQueryParams {
+    pub(crate) fn from_query(q: &Query, dist_q_c: f32) -> Self {
         Self {
             lower_bound: q.lower_bound,
             upper_bound: q.upper_bound,
-            dist_q_c: q.dist_q_c,
+            dist_q_c,
             approx_mode: q.approx_mode,
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn search_candidates_with_scratch(
+    query: ArrayRef,
+    candidate_limit: usize,
+    params: &FlatQueryParams,
+    storage: &impl VectorStore,
+    prefilter: Arc<dyn PreFilter>,
+    metrics: &dyn MetricsCollector,
+    residual: Option<QueryResidual<'_>>,
+    scratch: &mut QueryScratch,
+) -> Result<BinaryHeap<OrderedNode<(u32, u64)>>> {
+    if storage.len() > u32::MAX as usize {
+        return Err(Error::index(format!(
+            "flat partition contains {} rows, exceeding the u32 local-offset limit",
+            storage.len()
+        )));
+    }
+
+    let is_range_query = params.lower_bound.is_some() || params.upper_bound.is_some();
+    let row_ids = storage.row_ids();
+    let dist_calc = storage.dist_calculator_with_scratch(
+        query,
+        params.dist_q_c,
+        residual,
+        &mut scratch.query_f32,
+        DistanceCalculatorOptions {
+            approx_mode: params.approx_mode,
+        },
+    );
+    let mut candidates = BinaryHeap::with_capacity(candidate_limit);
+    metrics.record_comparisons(storage.len());
+
+    if prefilter.is_empty() {
+        dist_calc.distance_all_with_scratch(
+            candidate_limit,
+            &mut scratch.distances,
+            &mut scratch.u16,
+            &mut scratch.u8,
+            &mut scratch.u32,
+        );
+        let distances = scratch.distances.iter().copied();
+        if is_range_query {
+            let lower_bound = params.lower_bound.unwrap_or(f32::MIN).into();
+            let upper_bound = params.upper_bound.unwrap_or(f32::MAX).into();
+            for (offset, (&row_id, distance)) in row_ids.zip(distances).enumerate() {
+                let distance = distance.into();
+                if distance < lower_bound || distance >= upper_bound {
+                    continue;
+                }
+                push_candidate_local(
+                    &mut candidates,
+                    candidate_limit,
+                    (offset as u32, row_id),
+                    distance,
+                );
+            }
+        } else {
+            for (offset, (&row_id, distance)) in row_ids.zip(distances).enumerate() {
+                push_candidate_local(
+                    &mut candidates,
+                    candidate_limit,
+                    (offset as u32, row_id),
+                    distance.into(),
+                );
+            }
+        }
+    } else {
+        prefilter
+            .mask()
+            .selected_offsets_into(row_ids, &mut scratch.u32);
+        if is_range_query {
+            let lower_bound = params.lower_bound.unwrap_or(f32::MIN).into();
+            let upper_bound = params.upper_bound.unwrap_or(f32::MAX).into();
+            for &offset in &scratch.u32 {
+                let distance = dist_calc.distance(offset).into();
+                if distance < lower_bound || distance >= upper_bound {
+                    continue;
+                }
+                push_candidate_local(
+                    &mut candidates,
+                    candidate_limit,
+                    (offset, storage.row_id(offset)),
+                    distance,
+                );
+            }
+        } else {
+            for &offset in &scratch.u32 {
+                push_candidate_local(
+                    &mut candidates,
+                    candidate_limit,
+                    (offset, storage.row_id(offset)),
+                    dist_calc.distance(offset).into(),
+                );
+            }
+        }
+    }
+
+    Ok(candidates)
+}
+
 impl IvfSubIndex for FlatIndex {
     type QueryParams = FlatQueryParams;
     type BuildParams = ();
+
+    fn query_params(query: &Query, _query_key: &ArrayRef, dist_q_c: f32) -> Self::QueryParams {
+        Self::QueryParams::from_query(query, dist_q_c)
+    }
 
     fn name() -> &'static str {
         "FLAT"
@@ -214,29 +324,23 @@ impl IvfSubIndex for FlatIndex {
                 }
             }
             false => {
-                let row_addr_mask = prefilter.mask();
+                prefilter
+                    .mask()
+                    .selected_offsets_into(row_ids, &mut scratch.u32);
                 if is_range_query {
                     let lower_bound = params.lower_bound.unwrap_or(f32::MIN).into();
                     let upper_bound = params.upper_bound.unwrap_or(f32::MAX).into();
-                    for (id, &row_addr) in row_ids.enumerate() {
-                        if !row_addr_mask.selected(row_addr) {
-                            continue;
-                        }
-                        let dist = dist_calc.distance(id as u32).into();
+                    for &id in &scratch.u32 {
+                        let dist = dist_calc.distance(id).into();
                         if dist < lower_bound || dist >= upper_bound {
                             continue;
                         }
-
-                        push_candidate_local(&mut res, k, row_addr, dist);
+                        push_candidate_local(&mut res, k, storage.row_id(id), dist);
                     }
                 } else {
-                    for (id, &row_addr) in row_ids.enumerate() {
-                        if !row_addr_mask.selected(row_addr) {
-                            continue;
-                        }
-
-                        let dist = dist_calc.distance(id as u32).into();
-                        push_candidate_local(&mut res, k, row_addr, dist);
+                    for &id in &scratch.u32 {
+                        let dist = dist_calc.distance(id).into();
+                        push_candidate_local(&mut res, k, storage.row_id(id), dist);
                     }
                 }
             }
@@ -246,13 +350,59 @@ impl IvfSubIndex for FlatIndex {
         let _result_timer = IndexTimer::new(metrics, IndexTiming::ResultMaterialize);
         // we don't need to sort the results by distances here
         // because there's a SortExec node in the query plan which sorts the results from all partitions
-        let (row_ids, dists): (Vec<_>, Vec<_>) = res.into_iter().map(|r| (r.id, r.dist.0)).unzip();
+        let (row_ids, dists): (Vec<_>, Vec<_>) = res
+            .into_iter()
+            .map(|candidate| (candidate.id, candidate.dist.0))
+            .unzip();
         let (row_ids, dists) = (UInt64Array::from(row_ids), Float32Array::from(dists));
 
         Ok(RecordBatch::try_new(
             ANN_SEARCH_SCHEMA.clone(),
             vec![Arc::new(dists), Arc::new(row_ids)],
         )?)
+    }
+
+    fn search_with_candidates_with_scratch(
+        &self,
+        query: ArrayRef,
+        candidate_limit: usize,
+        params: Self::QueryParams,
+        storage: &impl VectorStore,
+        prefilter: Arc<dyn PreFilter>,
+        metrics: &dyn MetricsCollector,
+        partition_id: u32,
+        residual: Option<QueryResidual<'_>>,
+        scratch: &mut QueryScratch,
+    ) -> Result<PartitionSearchResult> {
+        let results = search_candidates_with_scratch(
+            query,
+            candidate_limit,
+            &params,
+            storage,
+            prefilter,
+            metrics,
+            residual,
+            scratch,
+        )?;
+        let mut candidates = Vec::with_capacity(results.len());
+        let mut row_ids = Vec::with_capacity(results.len());
+        let mut distances = Vec::with_capacity(results.len());
+        for result in results {
+            candidates.push(PartitionSearchCandidate {
+                partition_id,
+                offset_in_partition: result.id.0,
+            });
+            row_ids.push(result.id.1);
+            distances.push(result.dist.0);
+        }
+        let batch = RecordBatch::try_new(
+            ANN_SEARCH_SCHEMA.clone(),
+            vec![
+                Arc::new(Float32Array::from(distances)),
+                Arc::new(UInt64Array::from(row_ids)),
+            ],
+        )?;
+        Ok(PartitionSearchResult { batch, candidates })
     }
 
     fn supports_global_topk_heap() -> bool {
@@ -311,36 +461,58 @@ impl IvfSubIndex for FlatIndex {
         // Filtering, distance evaluation and heap updates are fused in fast-scan paths.
         let distance_timer = IndexTimer::new(metrics, IndexTiming::DistanceTopK);
 
-        match prefilter.is_empty() {
-            true => {
-                dist_calc.accumulate_topk_with_scratch(
-                    k,
-                    params.lower_bound,
-                    params.upper_bound,
-                    |id| storage.row_id(id),
-                    res,
-                    &mut scratch.distances,
-                    &mut scratch.u16,
-                    &mut scratch.u8,
-                    &mut scratch.u32,
-                );
+        if prefilter.is_empty() {
+            dist_calc.accumulate_topk_with_scratch(
+                k,
+                params.lower_bound,
+                params.upper_bound,
+                |id| storage.row_id(id),
+                res,
+                &mut scratch.distances,
+                &mut scratch.u16,
+                &mut scratch.u8,
+                &mut scratch.u32,
+            );
+        } else if prefilter.deletions_only() {
+            // A full heap rejects most distances before they need a mask lookup.
+            // Keep dense scoring even when many rows are deleted.
+            let mask = prefilter.mask();
+            dist_calc.accumulate_topk_with_mask(
+                k,
+                params.lower_bound,
+                params.upper_bound,
+                |id| storage.row_id(id),
+                Some(&mask),
+                res,
+                &mut scratch.distances,
+                &mut scratch.u16,
+                &mut scratch.u8,
+                &mut scratch.u32,
+            );
+        } else {
+            // The selection and the calculator's candidate buffer share the
+            // u32 scratch: take it for the selection and keep the larger of
+            // the two afterwards.
+            prefilter
+                .mask()
+                .selected_offsets_into(row_ids, &mut scratch.u32);
+            let selected = std::mem::take(&mut scratch.u32);
+            dist_calc.accumulate_filtered_topk_with_scratch(
+                k,
+                params.lower_bound,
+                params.upper_bound,
+                selected.iter().map(|&id| (id, storage.row_id(id))),
+                |_| true,
+                res,
+                &mut scratch.distances,
+                &mut scratch.u16,
+                &mut scratch.u8,
+                &mut scratch.u32,
+            );
+            if selected.capacity() > scratch.u32.capacity() {
+                scratch.u32 = selected;
             }
-            false => {
-                let row_addr_mask = prefilter.mask();
-                dist_calc.accumulate_filtered_topk_with_scratch(
-                    k,
-                    params.lower_bound,
-                    params.upper_bound,
-                    row_ids.enumerate().map(|(id, &row_id)| (id as u32, row_id)),
-                    |row_id| row_addr_mask.selected(row_id),
-                    res,
-                    &mut scratch.distances,
-                    &mut scratch.u16,
-                    &mut scratch.u8,
-                    &mut scratch.u32,
-                );
-            }
-        };
+        }
         drop(distance_timer);
         Ok(())
     }
@@ -553,13 +725,23 @@ impl TryFrom<Quantizer> for FlatBinQuantizer {
 mod tests {
     use super::*;
 
-    use arrow_array::FixedSizeListArray;
+    use arrow_array::{FixedSizeListArray, UInt32Array};
     use async_trait::async_trait;
     use lance_arrow::FixedSizeListArrayExt;
     use lance_select::{RowAddrMask, RowAddrTreeMap};
+    use rstest::rstest;
 
     use crate::metrics::NoOpMetricsCollector;
     use crate::prefilter::NoFilter;
+    use crate::vector::bq::RQRotationType;
+    use crate::vector::bq::builder::RabitQuantizer;
+    use crate::vector::bq::storage::{
+        RabitQuantizationMetadata, RabitQuantizationStorage, RabitQueryEstimator,
+    };
+    use crate::vector::bq::transform::RQTransformer;
+    use crate::vector::quantizer::QuantizerStorage;
+    use crate::vector::transform::Transformer;
+    use crate::vector::{CENTROID_DIST_COLUMN, PART_ID_COLUMN};
 
     #[test]
     fn test_schema_is_initialized_once() {
@@ -572,6 +754,7 @@ mod tests {
 
     struct MaskPreFilter {
         mask: Arc<RowAddrMask>,
+        deletions_only: bool,
     }
 
     #[async_trait]
@@ -586,6 +769,10 @@ mod tests {
 
         fn mask(&self) -> Arc<RowAddrMask> {
             self.mask.clone()
+        }
+
+        fn deletions_only(&self) -> bool {
+            self.deletions_only
         }
 
         fn filter_row_ids<'a>(&self, row_ids: Box<dyn Iterator<Item = &'a u64> + 'a>) -> Vec<u64> {
@@ -678,6 +865,7 @@ mod tests {
             mask: Arc::new(RowAddrMask::from_allowed(RowAddrTreeMap::from_iter([
                 0_u64, 3, 4,
             ]))),
+            deletions_only: false,
         });
         let search_results = batch_results(
             index
@@ -710,5 +898,167 @@ mod tests {
             search_results.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
             vec![0, 3]
         );
+    }
+
+    /// Scanning past a deletions-only mask returns what the masked scan
+    /// returns, whether the deleted row misses the top k, lands in it, or the
+    /// heap already holds a row from an earlier partition.
+    #[rstest]
+    #[case::deleted_row_outside_top_k(4, vec![], vec![1, 2])]
+    #[case::deleted_row_in_top_k(2, vec![], vec![0, 1])]
+    #[case::heap_from_earlier_partition(2, vec![(100, 0.5)], vec![1, 100])]
+    fn test_accumulate_topk_past_deletions(
+        #[case] deleted: u64,
+        #[case] carried: Vec<(u64, f32)>,
+        #[case] expected: Vec<u64>,
+    ) {
+        let index = FlatIndex::default();
+        let storage = test_storage();
+        let topk = |deletions_only| {
+            let mut heap = BinaryHeap::from_iter(carried.iter().map(|(id, dist)| OrderedNode {
+                id: *id,
+                dist: OrderedFloat(*dist),
+            }));
+            let filter = Arc::new(MaskPreFilter {
+                mask: Arc::new(RowAddrMask::from_block(RowAddrTreeMap::from_iter([
+                    deleted,
+                ]))),
+                deletions_only,
+            });
+            index
+                .accumulate_topk(
+                    query(),
+                    2,
+                    FlatQueryParams::default(),
+                    &storage,
+                    filter,
+                    &mut heap,
+                    &NoOpMetricsCollector,
+                )
+                .unwrap();
+            heap_results(heap)
+        };
+
+        let past_deletions = topk(true);
+        assert_eq!(past_deletions, topk(false));
+        let row_ids = past_deletions.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+        assert_eq!(row_ids, expected);
+    }
+
+    /// A temporary deleted heap winner used to prune the nearest live row
+    /// before a third row evicted it, leaving a clean but incorrect heap.
+    #[test]
+    fn test_deleted_row_cannot_tighten_rabit_pruning_threshold() {
+        const DIM: usize = 64;
+        let identity = Float32Array::from_iter_values(
+            (0..DIM * DIM).map(|i| if i / DIM == i % DIM { 1.0 } else { 0.0 }),
+        );
+        let metadata = RabitQuantizationMetadata {
+            rotate_mat: Some(
+                FixedSizeListArray::try_new_from_values(identity, DIM as i32).unwrap(),
+            ),
+            rotate_mat_position: None,
+            fast_rotation_signs: None,
+            rotation_type: RQRotationType::Matrix,
+            code_dim: DIM as u32,
+            num_bits: 4,
+            packed: false,
+            query_estimator: RabitQueryEstimator::RawQuery,
+        };
+        let metric = DistanceType::L2;
+        let Quantizer::Rabit(rq) = RabitQuantizer::from_metadata(&metadata, metric).unwrap() else {
+            unreachable!()
+        };
+        let centroids =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(vec![0.0; DIM]), DIM as i32)
+                .unwrap();
+        let mut values = vec![0.0; 3 * DIM];
+        values[DIM..2 * DIM].fill(1.0);
+        values[DIM] = 15.0;
+        values[2 * DIM..].fill(0.25);
+        let vectors =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(values), DIM as i32)
+                .unwrap();
+        let batch = RecordBatch::try_from_iter([
+            ("vector", Arc::new(vectors) as ArrayRef),
+            (
+                PART_ID_COLUMN,
+                Arc::new(UInt32Array::from(vec![0; 3])) as ArrayRef,
+            ),
+            (
+                CENTROID_DIST_COLUMN,
+                Arc::new(Float32Array::from(vec![0.0, 288.0, 4.0])) as ArrayRef,
+            ),
+            (
+                ROW_ID_FIELD.name().as_str(),
+                Arc::new(UInt64Array::from(vec![100, 101, 102])) as ArrayRef,
+            ),
+        ])
+        .unwrap();
+        let batch = RQTransformer::new(rq, metric, centroids, "vector")
+            .unwrap()
+            .transform(&batch)
+            .unwrap();
+        let storage =
+            RabitQuantizationStorage::try_from_batch(batch, &metadata, metric, None).unwrap();
+        let mut query = vec![0.0; DIM];
+        query[0] = 15.0;
+        let query = Arc::new(Float32Array::from(query)) as ArrayRef;
+
+        // The full-code distances in index order are 225, 63, and 221.5.
+        // Row 101's sign-only lower estimate (~228.6) loses to the deleted
+        // row's 225, even though its full-code distance is the smallest.
+        for deletions_only in [false, true] {
+            let filter = Arc::new(MaskPreFilter {
+                mask: Arc::new(RowAddrMask::from_block(RowAddrTreeMap::from_iter([100]))),
+                deletions_only,
+            });
+            let mut heap = BinaryHeap::new();
+            FlatIndex::default()
+                .accumulate_topk(
+                    query.clone(),
+                    1,
+                    FlatQueryParams {
+                        dist_q_c: 225.0,
+                        ..Default::default()
+                    },
+                    &storage,
+                    filter,
+                    &mut heap,
+                    &NoOpMetricsCollector,
+                )
+                .unwrap();
+            let winner = heap.pop().unwrap();
+            assert_eq!(winner.id, 101);
+            assert!((winner.dist.0 - 63.0).abs() < 0.001);
+        }
+    }
+
+    #[test]
+    fn test_flat_candidate_search_preserves_partition_offsets() {
+        let index = FlatIndex::default();
+        let storage = test_storage();
+        let mut scratch = QueryScratch::new();
+        let result = index
+            .search_with_candidates_with_scratch(
+                query(),
+                3,
+                FlatQueryParams::default(),
+                &storage,
+                Arc::new(NoFilter),
+                &NoOpMetricsCollector,
+                7,
+                None,
+                &mut scratch,
+            )
+            .unwrap();
+
+        assert_eq!(result.batch.num_rows(), result.candidates.len());
+        let row_ids =
+            result.batch[lance_core::ROW_ID].as_primitive::<arrow_array::types::UInt64Type>();
+        for (&row_id, candidate) in row_ids.values().iter().zip(&result.candidates) {
+            assert_eq!(candidate.partition_id, 7);
+            assert_eq!(row_id, candidate.offset_in_partition as u64);
+        }
     }
 }

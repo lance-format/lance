@@ -26,7 +26,7 @@ use crate::{
         rle::{BlockRleEncoder, GENERIC_BLOCK_RLE_HEADER_BYTES},
         value::ValueEncoder,
     },
-    format::{ProtobufUtils21, pb21::CompressiveEncoding},
+    format::{EncodingUtils, metadata::CompressiveEncoding},
 };
 
 #[cfg(feature = "bitpacking")]
@@ -39,41 +39,10 @@ mod statistics;
 
 pub use decoder::{SequenceDecoder, SequenceMetadata};
 
+pub use super::cost::BlockCost;
+use super::cost::wire_bytes;
+
 use statistics::{FamilyStats, SequenceStats, analyze_family, combine};
-
-/// Container-specific serialized cost applied to every optional payload.
-#[derive(Debug, Clone, Copy)]
-pub struct BlockCost {
-    buffer_overhead_bytes: u64,
-    alignment: u64,
-}
-
-impl Default for BlockCost {
-    fn default() -> Self {
-        Self::new(0, 1)
-    }
-}
-
-impl BlockCost {
-    pub(crate) const fn new(buffer_overhead_bytes: u64, alignment: u64) -> Self {
-        Self {
-            buffer_overhead_bytes,
-            alignment: if alignment == 0 { 1 } else { alignment },
-        }
-    }
-
-    fn payload_bytes(self, has_payload: bool, payload_bytes: u64) -> u64 {
-        let aligned = payload_bytes
-            .checked_add(self.alignment - 1)
-            .map(|padded| padded / self.alignment * self.alignment)
-            .unwrap_or(u64::MAX);
-        aligned.saturating_add(if has_payload {
-            self.buffer_overhead_bytes
-        } else {
-            0
-        })
-    }
-}
 
 /// One concrete codec reused across independently decoded sequence chunks.
 #[derive(Debug)]
@@ -184,10 +153,156 @@ pub fn select_block_codec(
     cost: BlockCost,
     normalize: bool,
 ) -> Result<SequenceBlockCodec> {
+    if let Some(codec) = symbolic_family(data, ranges, normalize)? {
+        return Ok(codec);
+    }
+    // On a large standalone sequence, bound the cost of discovering that
+    // compression is ineffective. Structured samples still get full analysis;
+    // explicit codec requests always bypass this default-policy shortcut.
+    if !normalize
+        && field_params.compression.is_none()
+        && ranges.len() == 1
+        && ranges[0] == (0..data.num_values as usize)
+        && data.num_values > 64 * 1024
+        && matches!(data.bits_per_value, 32 | 64)
+    {
+        let width = data.bits_per_value as usize / 8;
+        // Only spend the flat-rejection budget on samples without an obvious
+        // compression signal in a short prefix. Bitpacking, monotonic values and repeated values
+        // already justify full analysis; probing their codecs twice adds work.
+        let mut maximum = 0;
+        let mut previous = None;
+        let mut decreases = false;
+        let mut repeats = false;
+        for bytes in data.data.as_ref()[..64 * width].chunks_exact(width) {
+            let mut value = [0; 8];
+            value[..width].copy_from_slice(bytes);
+            let value = u64::from_le_bytes(value);
+            maximum = maximum.max(value);
+            if let Some(previous) = previous {
+                decreases |= value < previous;
+                repeats |= value == previous;
+            }
+            previous = Some(value);
+        }
+        if 64 - u64::from(maximum.leading_zeros()) == data.bits_per_value && decreases && !repeats {
+            let mut sample = Vec::with_capacity(8192 * width);
+            for i in 0..8 {
+                let start = i * (data.num_values as usize - 1024) / 7 * width;
+                sample.extend_from_slice(&data.data.as_ref()[start..start + 1024 * width]);
+            }
+            let sampled = FixedWidthDataBlock {
+                data: LanceBuffer::from(sample),
+                bits_per_value: data.bits_per_value,
+                num_values: 8192,
+                block_info: BlockInfo::new(),
+            };
+            let analysis = analyze_family(&sampled, &[0..8192], true, false)?;
+            let candidate =
+                select_analyzed_codec(analysis, data.bits_per_value, field_params, cost, false)?;
+            if is_flat(candidate.expected_encoding()) {
+                let encoding = EncodingUtils::flat(data.bits_per_value, None);
+                return Ok(SequenceBlockCodec {
+                    estimated_wire_bytes: wire_bytes(
+                        &encoding,
+                        true,
+                        &[data.num_values * width as u64],
+                        cost,
+                    ),
+                    expected_encoding: encoding,
+                    compressor: Box::new(ValueEncoder::default()),
+                    has_payload: true,
+                });
+            }
+        }
+    }
     let collect_general_sample =
-        !matches!(field_params.compression.as_deref(), Some("none" | "fsst"));
+        !matches!(field_params.compression.as_deref(), Some("none" | "fsst"))
+            && (field_params.compression.is_some()
+                || ranges.iter().all(|range| {
+                    (range.end - range.start) as u64 * (data.bits_per_value / 8) > 32 * 1024
+                }));
     let analysis = analyze_family(data, ranges, collect_general_sample, normalize)?;
     select_analyzed_codec(analysis, data.bits_per_value, field_params, cost, normalize)
+}
+
+// Recognizing metadata-only sequences needs no histograms, run analysis or
+// compression samples. Validate every member before committing to one descriptor.
+fn symbolic_family(
+    data: &FixedWidthDataBlock,
+    ranges: &[Range<usize>],
+    normalize: bool,
+) -> Result<Option<SequenceBlockCodec>> {
+    fn inspect<T: Copy>(
+        values: &[T],
+        ranges: &[Range<usize>],
+        normalize: bool,
+        value: impl Fn(T) -> u64,
+    ) -> Result<Option<(u64, u64)>> {
+        let mut expected = None;
+        for range in ranges {
+            let member = values
+                .get(range.clone())
+                .ok_or_else(|| Error::invalid_input("Sequence member range is out of bounds"))?;
+            if member.len() < 2 {
+                return Ok(None);
+            }
+            let first = value(member[0]);
+            let Some(step) = value(member[1]).checked_sub(first) else {
+                return Ok(None);
+            };
+            let start = if normalize { 0 } else { first };
+            if expected.is_some_and(|expected| expected != (start, step)) {
+                return Ok(None);
+            }
+            if !member
+                .windows(2)
+                .all(|pair| value(pair[1]).checked_sub(value(pair[0])) == Some(step))
+            {
+                return Ok(None);
+            }
+            expected = Some((start, step));
+        }
+        Ok(expected)
+    }
+    let pattern = match data.bits_per_value {
+        32 => inspect(
+            &checked_fixed_values::<u32>(data, "Sequence values")?,
+            ranges,
+            normalize,
+            u64::from,
+        )?,
+        64 => inspect(
+            &checked_fixed_values::<u64>(data, "Sequence values")?,
+            ranges,
+            normalize,
+            |v| v,
+        )?,
+        _ => None,
+    };
+    let Some((start, step)) = pattern else {
+        return Ok(None);
+    };
+    let count = (ranges[0].end - ranges[0].start) as u64;
+    let (compressor, encoding): (Box<dyn BlockCompressor>, _) = if step == 0 {
+        let encoder = ConstantEncoder::new(data.bits_per_value, start);
+        let encoding = encoder.encoding(count)?;
+        (Box::new(encoder), encoding)
+    } else {
+        let encoder = RangeEncoder::new(data.bits_per_value, start, step);
+        let encoding = encoder.encoding(count)?;
+        (Box::new(encoder), encoding)
+    };
+    Ok(Some(SequenceBlockCodec {
+        compressor: if normalize {
+            Box::new(NormalizedOffsetEncoder { child: compressor })
+        } else {
+            compressor
+        },
+        estimated_wire_bytes: encoding.encoded_len() as u64,
+        expected_encoding: encoding,
+        has_payload: false,
+    }))
 }
 
 /// Select a codec for generated u64 values without allocating the input sequence.
@@ -325,7 +440,7 @@ fn direct_candidates(
         .iter()
         .map(|stats| stats.raw_bytes())
         .collect::<Vec<_>>();
-    let flat_encoding = ProtobufUtils21::flat(bits_per_value, None);
+    let flat_encoding = EncodingUtils::flat(bits_per_value, None);
     let mut candidates = vec![Candidate {
         wire_bytes: wire_bytes(&flat_encoding, true, &flat_payloads, cost),
         compressor: Box::new(ValueEncoder::default()),
@@ -341,9 +456,9 @@ fn direct_candidates(
     if combined.len > 0 && combined.required_bits() < bits_per_value {
         let compressed_bits = combined.required_bits();
         let compressor = Box::new(OutOfLineBitpacking::new(compressed_bits, bits_per_value));
-        let encoding = ProtobufUtils21::out_of_line_bitpacking(
+        let encoding = EncodingUtils::out_of_line_bitpacking(
             bits_per_value,
-            ProtobufUtils21::flat(compressed_bits, None),
+            EncodingUtils::flat(compressed_bits, None),
         );
         let payload_bytes = stats
             .iter()
@@ -365,6 +480,10 @@ fn direct_candidates(
     }
 
     if allow_general
+        // Each member is compressed independently. A large page made of tiny
+        // chunks does not justify running a general codec on every chunk.
+        && (field_params.compression.is_some()
+            || stats.iter().all(|member| member.raw_bytes() > 32 * 1024))
         && let Some(config) = general_config(&combined, field_params)?
         && config.scheme != CompressionScheme::None
     {
@@ -372,8 +491,7 @@ fn direct_candidates(
             .iter()
             .map(|stats| estimate_general_bytes(stats, config))
             .collect::<Result<Vec<_>>>()?;
-        let encoding =
-            ProtobufUtils21::wrapped(config, ProtobufUtils21::flat(bits_per_value, None))?;
+        let encoding = EncodingUtils::wrapped(config, EncodingUtils::flat(bits_per_value, None))?;
         candidates.push(Candidate {
             wire_bytes: wire_bytes(&encoding, true, &payload_bytes, cost),
             compressor: Box::new(GeneralBlockCompressor::new(
@@ -458,7 +576,7 @@ fn delta_candidate(
         .collect::<Vec<_>>();
     let child = leaf_candidate(&stats, field_params)?;
     let bits_per_value = analysis.members[0].values.bits_per_value;
-    let encoding = ProtobufUtils21::delta(bits_per_value, base, child.encoding);
+    let encoding = EncodingUtils::delta(bits_per_value, base, child.encoding);
     Ok(Some(Candidate {
         wire_bytes: wire_bytes(&encoding, child.has_payload, &child.payload_bytes, cost),
         compressor: Box::new(DeltaEncoder::new(bits_per_value, base, child.compressor)),
@@ -516,8 +634,8 @@ fn rle_candidate(
     let mut lengths = leaf_candidate(&length_stats, field_params)?;
     let lengths_are_metadata = matches!(
         lengths.encoding.compression.as_ref(),
-        Some(crate::format::pb21::compressive_encoding::Compression::Constant(_))
-            | Some(crate::format::pb21::compressive_encoding::Compression::Range(_))
+        Some(crate::format::metadata::compressive_encoding::Compression::Constant(_))
+            | Some(crate::format::metadata::compressive_encoding::Compression::Range(_))
     );
     let values_are_flat = is_flat(&values.encoding);
     if !lengths_are_metadata && !values_are_flat && !is_flat(&lengths.encoding) {
@@ -539,7 +657,7 @@ fn rle_candidate(
             }
         })
         .collect::<Vec<_>>();
-    let encoding = ProtobufUtils21::rle(values.encoding, lengths.encoding);
+    let encoding = EncodingUtils::rle(values.encoding, lengths.encoding);
     let bits_per_value = analysis.members[0].values.bits_per_value;
     let compressor =
         BlockRleEncoder::try_new(bits_per_value, values.compressor, lengths.compressor)?;
@@ -610,7 +728,7 @@ fn dictionary_candidate(
             }
         })
         .collect::<Vec<_>>();
-    let encoding = ProtobufUtils21::dictionary(
+    let encoding = EncodingUtils::dictionary(
         indices.encoding,
         dictionary_items.encoding,
         items.len() as u32,
@@ -647,7 +765,7 @@ fn flat_candidate(stats: &[&SequenceStats]) -> Result<Candidate> {
         .iter()
         .map(|stats| stats.raw_bytes())
         .collect::<Vec<_>>();
-    let encoding = ProtobufUtils21::flat(bits_per_value, None);
+    let encoding = EncodingUtils::flat(bits_per_value, None);
     Ok(Candidate {
         wire_bytes: wire_bytes(&encoding, true, &payload_bytes, BlockCost::default()),
         compressor: Box::new(ValueEncoder::default()),
@@ -744,24 +862,10 @@ fn estimate_general_bytes(stats: &SequenceStats, config: CompressionConfig) -> R
     })
 }
 
-fn wire_bytes(
-    encoding: &CompressiveEncoding,
-    has_payload: bool,
-    payload_bytes: &[u64],
-    cost: BlockCost,
-) -> u64 {
-    (encoding.encoded_len() as u64).saturating_add(
-        payload_bytes
-            .iter()
-            .map(|payload_bytes| cost.payload_bytes(has_payload, *payload_bytes))
-            .sum::<u64>(),
-    )
-}
-
 fn is_flat(encoding: &CompressiveEncoding) -> bool {
     matches!(
         encoding.compression.as_ref(),
-        Some(crate::format::pb21::compressive_encoding::Compression::Flat(_))
+        Some(crate::format::metadata::compressive_encoding::Compression::Flat(_))
     )
 }
 
@@ -825,7 +929,7 @@ mod tests {
     use super::*;
     use crate::{
         compression::create_fixed_width_block_decompressor,
-        format::pb21::compressive_encoding::Compression,
+        format::metadata::compressive_encoding::Compression,
     };
 
     #[rstest::rstest]

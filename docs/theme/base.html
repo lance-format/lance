@@ -1,10 +1,20 @@
 {#- Lance Docs custom theme — shared skeleton: head, header, footer, scripts. -#}
-{%- macro first_url(item) -%}
-  {%- if item.is_link or item.is_page -%}
-    {{- item.url -}}
-  {%- elif item.children -%}
-    {{- first_url(item.children[0]) -}}
+{%- macro find_first_page(item, found) -%}
+  {%- if not found.matched -%}
+    {%- if item.is_page -%}
+      {%- set found.matched = true -%}
+      {%- set found.url = item.url -%}
+    {%- elif item.children -%}
+      {%- for child in item.children -%}
+        {{- find_first_page(child, found) -}}
+      {%- endfor -%}
+    {%- endif -%}
   {%- endif -%}
+{%- endmacro -%}
+{%- macro first_url(item) -%}
+  {%- set found = namespace(matched=false, url=item.url) -%}
+  {{- find_first_page(item, found) -}}
+  {{- found.url -}}
 {%- endmacro -%}
 <!DOCTYPE html>
 <html lang="en">
@@ -46,7 +56,7 @@
     </a>
     <nav class="ld-topnav" aria-label="Sections">
       {%- for item in nav %}
-      <a class="ld-toptab{% if item.active %} active{% endif %}" href="{{ first_url(item) | url }}">{{ item.title }}</a>
+      <a class="ld-toptab{% if item.active %} active{% endif %}" href="{{ first_url(item) | url }}">{{ item.title | e }}</a>
       {%- endfor %}
     </nav>
     <div class="ld-header__actions">

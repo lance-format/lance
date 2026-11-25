@@ -4,18 +4,21 @@
 use bytes::Bytes;
 use futures::channel::oneshot;
 use futures::future::Either;
-use futures::{FutureExt, TryFutureExt};
+use futures::stream::FuturesUnordered;
+use futures::{FutureExt, StreamExt, TryFutureExt};
 use object_store::path::Path;
 use std::collections::BinaryHeap;
 use std::fmt::Debug;
 use std::future::Future;
-use std::num::NonZero;
+use std::num::{NonZero, NonZeroU32};
 use std::ops::Range;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 use tokio::sync::Notify;
 
+use lance_core::memory::{Component, register_component};
 use lance_core::utils::io_stats::IoStatsRecorder;
 use lance_core::utils::parse::str_is_truthy;
 use lance_core::{Error, Result};
@@ -32,6 +35,9 @@ const BACKPRESSURE_MIN: u64 = 5;
 const BACKPRESSURE_DEBOUNCE: u64 = 60;
 const SCHEDULER_STATE_EVENT_TARGET: &str = "lance_io::scheduler::state";
 
+/// Storage option used to configure scheduler error handling.
+pub(crate) const SCHEDULER_ERROR_MODE_STORAGE_OPTION: &str = "scheduler_error_mode";
+
 // Global counter of how many IOPS we have issued
 static IOPS_COUNTER: AtomicU64 = AtomicU64::new(0);
 // Global counter of how many bytes were read by the scheduler
@@ -43,6 +49,42 @@ pub fn iops_counter() -> u64 {
 
 pub fn bytes_read_counter() -> u64 {
     BYTES_READ_COUNTER.load(Ordering::Acquire)
+}
+
+#[derive(Debug)]
+struct ReadObservation {
+    stats: Arc<dyn IoStatsRecorder>,
+    timestamp: Instant,
+    started: bool,
+}
+
+impl ReadObservation {
+    fn pending(stats: Option<&Arc<dyn IoStatsRecorder>>) -> Option<Self> {
+        stats.and_then(|stats| {
+            stats.records_read_lifecycle().then(|| Self {
+                stats: stats.clone(),
+                timestamp: Instant::now(),
+                started: false,
+            })
+        })
+    }
+
+    fn start(&mut self) {
+        debug_assert!(!self.started);
+        let started_at = Instant::now();
+        self.stats
+            .record_read_started(started_at.duration_since(self.timestamp));
+        self.timestamp = started_at;
+        self.started = true;
+    }
+}
+
+impl Drop for ReadObservation {
+    fn drop(&mut self) {
+        if self.started {
+            self.stats.record_read_completed(self.timestamp.elapsed());
+        }
+    }
 }
 
 // We want to allow requests that have a lower priority than any
@@ -57,10 +99,13 @@ struct PrioritiesInFlight {
     in_flight: Vec<u128>,
 }
 
+const MAX_INITIAL_IN_FLIGHT_CAPACITY: u32 = 256;
+
 impl PrioritiesInFlight {
     fn new(capacity: u32) -> Self {
+        let initial_capacity = (capacity.min(MAX_INITIAL_IN_FLIGHT_CAPACITY) as usize) * 2;
         Self {
-            in_flight: Vec::with_capacity(capacity as usize * 2),
+            in_flight: Vec::with_capacity(initial_capacity),
         }
     }
 
@@ -337,6 +382,12 @@ impl IoQueue {
         self.notify.notify_one();
     }
 
+    /// Bytes admitted and not yet consumed, as the state event reports them.
+    fn reserved_bytes(&self) -> u64 {
+        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        (state.io_buffer_size as i64 - state.bytes_avail).max(0) as u64
+    }
+
     fn on_bytes_consumed(&self, bytes: u64, priority: u128, num_reqs: usize) {
         let event = {
             let mut state = self.state.lock().unwrap();
@@ -361,10 +412,82 @@ impl IoQueue {
         };
         emit_scheduler_state_event(event, &self.stats);
         for request in pending_requests {
-            request.cancel();
+            request.cancel(Error::internal(
+                "Scheduler closed before I/O was completed".to_string(),
+            ));
         }
 
         self.notify.notify_one();
+    }
+
+    fn cancel_pending_for_request(&self, request_cancellation: &Arc<RequestCancellation>) {
+        let (cancelled_requests, event) = {
+            let mut state = self.state.lock().unwrap();
+            let pending_requests = std::mem::take(&mut state.pending_requests);
+            let mut retained_requests = BinaryHeap::with_capacity(pending_requests.len());
+            let mut cancelled_requests = Vec::new();
+
+            for request in pending_requests {
+                if request.belongs_to(request_cancellation) {
+                    cancelled_requests.push(request);
+                } else {
+                    retained_requests.push(request);
+                }
+            }
+
+            state.pending_requests = retained_requests;
+            let event = state.scheduler_state_event();
+            (cancelled_requests, event)
+        };
+        emit_scheduler_state_event(event, &self.stats);
+
+        for request in cancelled_requests {
+            request.cancel(Error::io(
+                "I/O task cancelled because a related task failed".to_string(),
+            ));
+        }
+
+        // Removing a blocked head request may make the new head admissible.
+        self.notify.notify_one();
+    }
+}
+
+struct RequestCancellation {
+    is_cancelled: AtomicBool,
+    notify: Notify,
+}
+
+impl RequestCancellation {
+    fn new() -> Self {
+        Self {
+            is_cancelled: AtomicBool::new(false),
+            notify: Notify::new(),
+        }
+    }
+
+    fn cancel(&self) -> bool {
+        if self
+            .is_cancelled
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            self.notify.notify_waiters();
+            true
+        } else {
+            false
+        }
+    }
+
+    async fn cancelled(&self) {
+        let notified = self.notify.notified();
+        tokio::pin!(notified);
+        // Register before checking the flag so cancellation cannot occur
+        // between the check and registration and leave this task asleep.
+        let _ = notified.as_mut().enable();
+        if self.is_cancelled.load(Ordering::Acquire) {
+            return;
+        }
+        notified.await;
     }
 }
 
@@ -377,7 +500,7 @@ struct MutableBatch<F: FnOnce(Response) + Send> {
     data_buffers: Vec<Bytes>,
     num_bytes: u64,
     priority: u128,
-    num_reqs: usize,
+    num_admitted: usize,
     num_delivered: usize,
     err: Option<Error>,
     // When true, report 0 bytes consumed so the backpressure budget is unaffected
@@ -392,7 +515,6 @@ impl<F: FnOnce(Response) + Send> MutableBatch<F> {
         when_done: F,
         num_data_buffers: u32,
         priority: u128,
-        num_reqs: usize,
         bypass_backpressure: bool,
         io_queue: Arc<IoQueue>,
     ) -> Self {
@@ -401,7 +523,7 @@ impl<F: FnOnce(Response) + Send> MutableBatch<F> {
             data_buffers: vec![Bytes::default(); num_data_buffers as usize],
             num_bytes: 0,
             priority,
-            num_reqs,
+            num_admitted: 0,
             num_delivered: 0,
             err: None,
             bypass_backpressure,
@@ -443,7 +565,7 @@ impl<F: FnOnce(Response) + Send> Drop for MutableBatch<F> {
                 self.num_bytes
             },
             priority: self.priority,
-            num_reqs: self.num_reqs,
+            num_reqs: self.num_admitted,
         };
         (self.when_done.take().unwrap())(response);
     }
@@ -452,6 +574,7 @@ impl<F: FnOnce(Response) + Send> Drop for MutableBatch<F> {
 struct DataChunk {
     task_idx: usize,
     num_bytes: u64,
+    was_admitted: bool,
     data: Result<Bytes>,
 }
 
@@ -464,6 +587,7 @@ impl<F: FnOnce(Response) + Send> DataSink for MutableBatch<F> {
     fn deliver_data(&mut self, data: DataChunk) {
         self.num_bytes += data.num_bytes;
         self.num_delivered += 1;
+        self.num_admitted += usize::from(data.was_admitted);
         match data.data {
             Ok(data_bytes) => {
                 self.data_buffers[data.task_idx] = data_bytes;
@@ -479,9 +603,12 @@ impl<F: FnOnce(Response) + Send> DataSink for MutableBatch<F> {
 struct IoTask {
     reader: Arc<dyn Reader>,
     to_read: Range<u64>,
-    when_done: Box<dyn FnOnce(Result<Bytes>) + Send>,
+    when_done: Box<dyn FnOnce(Result<Bytes>, bool) + Send>,
     priority: u128,
     bypass_backpressure: bool,
+    request_cancellation: Option<Arc<RequestCancellation>>,
+    observation: Option<ReadObservation>,
+    extra_stats: Option<Arc<dyn IoStatsRecorder>>,
 }
 
 fn validate_read_length(
@@ -529,30 +656,74 @@ impl IoTask {
     fn num_bytes(&self) -> u64 {
         self.to_read.end - self.to_read.start
     }
-    fn cancel(self) {
-        (self.when_done)(Err(Error::internal(
-            "Scheduler closed before I/O was completed".to_string(),
-        )));
+    fn belongs_to(&self, request_cancellation: &Arc<RequestCancellation>) -> bool {
+        self.request_cancellation
+            .as_ref()
+            .is_some_and(|own_cancellation| Arc::ptr_eq(own_cancellation, request_cancellation))
     }
 
-    async fn run(self) {
-        let file_path = self.reader.path().as_ref();
-        let num_bytes = self.num_bytes();
-        let bytes = if self.to_read.start == self.to_read.end {
+    fn cancel(self, error: Error) {
+        (self.when_done)(Err(error), false);
+    }
+
+    async fn read(
+        reader: Arc<dyn Reader>,
+        to_read: Range<u64>,
+        extra_stats: Option<Arc<dyn IoStatsRecorder>>,
+    ) -> Result<Bytes> {
+        if to_read.start == to_read.end {
             Ok(Bytes::new())
         } else {
-            let bytes_fut = self
-                .reader
-                .get_range(self.to_read.start as usize..self.to_read.end as usize);
+            let range = to_read.start as usize..to_read.end as usize;
+            let bytes_fut = match extra_stats {
+                Some(stats) if stats.records_cloud_reader_attempts() => {
+                    reader.get_range_with_stats(range, stats)
+                }
+                None => reader.get_range(range),
+                Some(_) => reader.get_range(range),
+            };
             IOPS_COUNTER.fetch_add(1, Ordering::Release);
-            let num_bytes = self.num_bytes();
+            let num_bytes = to_read.end - to_read.start;
             bytes_fut
                 .inspect(move |_| {
                     BYTES_READ_COUNTER.fetch_add(num_bytes, Ordering::Release);
                 })
                 .await
                 .map_err(Error::from)
-                .and_then(|bytes| validate_read_length(self.reader.path(), &self.to_read, bytes))
+                .and_then(|bytes| validate_read_length(reader.path(), &to_read, bytes))
+        }
+    }
+
+    async fn run(mut self) {
+        let file_path = self.reader.path().as_ref();
+        let num_bytes = self.num_bytes();
+        let reader = self.reader.clone();
+        let to_read = self.to_read.clone();
+        let extra_stats = self.extra_stats.take();
+        let mut observation = self.observation.take();
+        let read = async move {
+            if to_read.start != to_read.end
+                && let Some(observation) = observation.as_mut()
+            {
+                observation.start();
+            }
+            let bytes = Self::read(reader, to_read, extra_stats).await;
+            // Publish completion before waking the request's caller.
+            drop(observation);
+            bytes
+        };
+        let bytes = if let Some(request_cancellation) = self.request_cancellation.clone() {
+            tokio::select! {
+                biased;
+                _ = request_cancellation.cancelled() => {
+                    Err(Error::io(
+                        "I/O task cancelled because a related task failed".to_string(),
+                    ))
+                }
+                bytes = read => bytes,
+            }
+        } else {
+            read.await
         };
         // Emit per-file I/O trace event only when tracing is enabled
         tracing::trace!(
@@ -563,7 +734,7 @@ impl IoTask {
             range_end = self.to_read.end,
             "File I/O completed"
         );
-        (self.when_done)(bytes);
+        (self.when_done)(bytes, true);
     }
 }
 
@@ -576,7 +747,7 @@ async fn run_io_loop(tasks: Arc<IoQueue>) {
         let next_task = tasks.pop().await;
         match next_task {
             Some(task) => {
-                tokio::spawn(task.run());
+                lance_core::utils::tokio::spawn(task.run());
             }
             None => {
                 // The sender has been dropped, we are done
@@ -791,6 +962,39 @@ enum IoQueueType {
     Lite(Arc<lite::IoQueue>),
 }
 
+/// Controls how a scheduler handles an error from one physical I/O task in a
+/// logical request that contains multiple tasks.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum SchedulerErrorMode {
+    /// Preserve the existing backend behavior without proactively cancelling
+    /// all tasks in the logical request as a group.
+    #[default]
+    BestEffort,
+    /// Return the first observed error and cancel the remaining tasks belonging
+    /// to the same logical request. Other requests are not cancelled.
+    FailFast,
+}
+
+struct SubmitRequestOptions {
+    bypass_backpressure: bool,
+    error_mode: SchedulerErrorMode,
+    extra_stats: Option<Arc<dyn IoStatsRecorder>>,
+}
+
+impl FromStr for SchedulerErrorMode {
+    type Err = Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "best_effort" => Ok(Self::BestEffort),
+            "fail_fast" => Ok(Self::FailFast),
+            _ => Err(Error::invalid_input(format!(
+                "Invalid {SCHEDULER_ERROR_MODE_STORAGE_OPTION} value '{value}'. Valid values are: best_effort, fail_fast"
+            ))),
+        }
+    }
+}
+
 /// An I/O scheduler which wraps an ObjectStore and throttles the amount of
 /// parallel I/O that can be run.
 ///
@@ -803,12 +1007,15 @@ pub struct ScanScheduler {
     object_store: Arc<ObjectStore>,
     io_queue: IoQueueType,
     stats: IoStats,
+    error_mode: SchedulerErrorMode,
+    io_buffer_size: u64,
 }
 
 impl Debug for ScanScheduler {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ScanScheduler")
             .field("object_store", &self.object_store)
+            .field("error_mode", &self.error_mode)
             .finish()
     }
 }
@@ -879,7 +1086,9 @@ impl SchedulerConfig {
     /// for callers that must reason about it without holding the store — to divide it between
     /// several schedulers, say.
     pub fn max_bandwidth_bytes(io_parallelism: usize) -> u64 {
-        MAX_BANDWIDTH_BYTES_PER_IO_THREAD * io_parallelism.max(1) as u64
+        MAX_BANDWIDTH_BYTES_PER_IO_THREAD
+            .saturating_mul(io_parallelism.max(1) as u64)
+            .min(i64::MAX as u64)
     }
 
     pub fn with_lite_scheduler(self) -> Self {
@@ -897,12 +1106,41 @@ impl ScanScheduler {
     ///
     /// * object_store - the store to wrap
     /// * config - configuration settings for the scheduler
+    ///
+    /// The error mode is inherited from the object store's
+    /// `scheduler_error_mode` storage option and defaults to `best_effort` when
+    /// the option is absent. Fail-fast cancellation is scoped to the physical
+    /// tasks of one logical request and does not affect other requests.
     pub fn new(object_store: Arc<ObjectStore>, config: SchedulerConfig) -> Arc<Self> {
-        let io_capacity = object_store.io_parallelism();
+        Self::new_inner(object_store, config, None)
+    }
+
+    /// Create a scheduler with a caller-supplied request concurrency limit.
+    ///
+    /// This selects the standard scheduler because the lite scheduler does not
+    /// enforce a request concurrency limit.
+    pub fn new_with_io_parallelism(
+        object_store: Arc<ObjectStore>,
+        config: SchedulerConfig,
+        io_parallelism: NonZeroU32,
+    ) -> Arc<Self> {
+        Self::new_inner(object_store, config, Some(io_parallelism))
+    }
+
+    fn new_inner(
+        object_store: Arc<ObjectStore>,
+        config: SchedulerConfig,
+        io_parallelism: Option<NonZeroU32>,
+    ) -> Arc<Self> {
+        let error_mode = object_store.scheduler_error_mode();
+        let io_capacity = io_parallelism
+            .map(|io_parallelism| io_parallelism.get() as usize)
+            .unwrap_or_else(|| object_store.io_parallelism());
         let stats = IoStats::new();
-        let use_lite = config
-            .use_lite_scheduler
-            .unwrap_or_else(|| object_store.prefers_lite_scheduler());
+        let use_lite = io_parallelism.is_none()
+            && config
+                .use_lite_scheduler
+                .unwrap_or_else(|| object_store.prefers_lite_scheduler());
         let io_queue = if use_lite {
             let io_queue = Arc::new(lite::IoQueue::new(
                 io_capacity as u64,
@@ -920,14 +1158,36 @@ impl ScanScheduler {
             // Best we can do here is fire and forget.  If the I/O loop is still running when the scheduler is
             // dropped we can't wait for it to finish or we'd block a tokio thread.  We could spawn a blocking task
             // to wait for it to finish but that doesn't seem helpful.
-            tokio::task::spawn(async move { run_io_loop(io_queue_clone).await });
+            lance_core::utils::tokio::spawn(async move { run_io_loop(io_queue_clone).await });
             IoQueueType::Standard(io_queue)
         };
-        Arc::new(Self {
+        let scheduler = Arc::new(Self {
             object_store,
             io_queue,
             stats,
-        })
+            error_mode,
+            io_buffer_size: config.io_buffer_size_bytes,
+        });
+        // The scheduler rather than its queue: a lite queue keeps the
+        // reservations of the reads its closing scheduler cancelled until
+        // their handles are dropped.
+        register_component(Component::IoScheduler, &scheduler, Self::reserved_bytes);
+        scheduler
+    }
+
+    /// Bytes this scheduler admitted for reading that its callers have not
+    /// received yet. Priority reads can take it past the I/O buffer size, and
+    /// reads that bypass backpressure are not counted. A scheduler without an
+    /// I/O buffer size applies no backpressure and reports 0: the standard
+    /// queue does not account its reads then, so neither queue reports them.
+    fn reserved_bytes(&self) -> u64 {
+        if self.io_buffer_size == 0 {
+            return 0;
+        }
+        match &self.io_queue {
+            IoQueueType::Standard(io_queue) => io_queue.reserved_bytes(),
+            IoQueueType::Lite(io_queue) => io_queue.reserved_bytes(),
+        }
     }
 
     /// Open a file for reading
@@ -967,6 +1227,7 @@ impl ScanScheduler {
             max_iop_size,
             bypass_backpressure: false,
             extra_stats: None,
+            metadata_read_size: None,
         })
     }
 
@@ -1000,19 +1261,21 @@ impl ScanScheduler {
             max_iop_size: self.object_store.max_iop_size(),
             bypass_backpressure: false,
             extra_stats: None,
+            metadata_read_size: None,
         }
     }
 
     fn do_submit_request(
-        &self,
         reader: Arc<dyn Reader>,
         request: Vec<Range<u64>>,
         tx: oneshot::Sender<Response>,
         priority: u128,
         io_queue: &Arc<IoQueue>,
-        bypass_backpressure: bool,
+        options: SubmitRequestOptions,
     ) {
         let num_iops = request.len() as u32;
+        let request_cancellation = (options.error_mode == SchedulerErrorMode::FailFast)
+            .then(|| Arc::new(RequestCancellation::new()));
 
         let when_all_io_done = move |bytes_and_permits| {
             // We don't care if the receiver has given up so discard the result
@@ -1023,30 +1286,53 @@ impl ScanScheduler {
             when_all_io_done,
             num_iops,
             priority,
-            request.len(),
-            bypass_backpressure,
+            options.bypass_backpressure,
             io_queue.clone(),
         ))));
 
         for (task_idx, iop) in request.into_iter().enumerate() {
             let dest = dest.clone();
             let io_queue_clone = io_queue.clone();
+            let task_cancellation = request_cancellation.clone();
+            let callback_cancellation = request_cancellation.clone();
             let num_bytes = iop.end - iop.start;
             let task = IoTask {
                 reader: reader.clone(),
                 to_read: iop,
                 priority,
-                bypass_backpressure,
-                when_done: Box::new(move |data| {
-                    io_queue_clone.on_iop_complete();
-                    let mut dest = dest.lock().unwrap();
-                    let chunk = DataChunk {
-                        data,
-                        task_idx,
-                        num_bytes,
-                    };
-                    dest.deliver_data(chunk);
+                bypass_backpressure: options.bypass_backpressure,
+                when_done: Box::new(move |data, was_admitted| {
+                    let has_error = data.is_err();
+                    let is_fail_fast = callback_cancellation.is_some();
+                    if was_admitted && !is_fail_fast {
+                        io_queue_clone.on_iop_complete();
+                    }
+                    {
+                        let mut dest = dest.lock().unwrap();
+                        let chunk = DataChunk {
+                            data,
+                            task_idx,
+                            num_bytes: if was_admitted { num_bytes } else { 0 },
+                            was_admitted,
+                        };
+                        dest.deliver_data(chunk);
+                    }
+
+                    if let Some(request_cancellation) = &callback_cancellation
+                        && has_error
+                        && was_admitted
+                        && request_cancellation.cancel()
+                    {
+                        io_queue_clone.cancel_pending_for_request(request_cancellation);
+                    }
+
+                    if was_admitted && is_fail_fast {
+                        io_queue_clone.on_iop_complete();
+                    }
                 }),
+                request_cancellation: task_cancellation,
+                observation: ReadObservation::pending(options.extra_stats.as_ref()),
+                extra_stats: options.extra_stats.clone(),
             };
             io_queue.push(task);
         }
@@ -1059,11 +1345,21 @@ impl ScanScheduler {
         priority: u128,
         io_queue: &Arc<IoQueue>,
         bypass_backpressure: bool,
+        extra_stats: Option<Arc<dyn IoStatsRecorder>>,
     ) -> impl Future<Output = Result<Vec<Bytes>>> + Send + use<> {
         let (tx, rx) = oneshot::channel::<Response>();
-
-        self.do_submit_request(reader, request, tx, priority, io_queue, bypass_backpressure);
-
+        Self::do_submit_request(
+            reader,
+            request,
+            tx,
+            priority,
+            io_queue,
+            SubmitRequestOptions {
+                bypass_backpressure,
+                error_mode: self.error_mode,
+                extra_stats,
+            },
+        );
         rx.map(|wrapped_rsp| {
             // A cancel error can't occur: the sender always sends before dropping.
             // The reservation is refunded on `Response` drop, so just take the data.
@@ -1079,7 +1375,9 @@ impl ScanScheduler {
         priority: u128,
         io_queue: &Arc<lite::IoQueue>,
         bypass_backpressure: bool,
+        extra_stats: Option<Arc<dyn IoStatsRecorder>>,
     ) -> impl Future<Output = Result<Vec<Bytes>>> + Send + use<> {
+        let error_mode = self.error_mode;
         // It's important that we submit all requests _before_ we await anything
         let maybe_tasks = request
             .into_iter()
@@ -1087,25 +1385,33 @@ impl ScanScheduler {
                 let reader = reader.clone();
                 let queue = io_queue.clone();
                 let requested_range = task.clone();
+                let mut observation = ReadObservation::pending(extra_stats.as_ref());
+                let task_stats = extra_stats.clone();
                 let run_fn = Box::new(move || {
-                    // An empty range asks for no bytes, which IoTask::run
-                    // answers without a request. Reaching a cloud store with
-                    // one is an InvalidGetRange error there.
                     if requested_range.start == requested_range.end {
-                        return async { Ok(Bytes::new()) }.boxed();
+                        return futures::future::ready(Ok(Bytes::new())).boxed();
                     }
-                    // IoTask::run publishes the counters behind
-                    // iops_counter()/bytes_read_counter(), so this path has to
-                    // publish the same pair the same way: the requested
-                    // length, on the error arm as well.
-                    let num_bytes = requested_range.end - requested_range.start;
+                    if let Some(observation) = observation.as_mut() {
+                        observation.start();
+                    }
+                    // Lite is the io_uring path: constructing its reader future
+                    // submits the read, so lifecycle and IOPS accounting begin at
+                    // admission even if BestEffort polls the result later.
                     IOPS_COUNTER.fetch_add(1, Ordering::Release);
-                    let bytes_fut = reader
-                        .get_range(requested_range.start as usize..requested_range.end as usize)
-                        .inspect(move |_| {
-                            BYTES_READ_COUNTER.fetch_add(num_bytes, Ordering::Release);
-                        });
+                    let num_bytes = requested_range.end - requested_range.start;
+                    let range = requested_range.start as usize..requested_range.end as usize;
+                    let bytes_fut = match task_stats {
+                        Some(stats) if stats.records_cloud_reader_attempts() => {
+                            reader.get_range_with_stats(range, stats)
+                        }
+                        None => reader.get_range(range),
+                        Some(_) => reader.get_range(range),
+                    }
+                    .inspect(move |_| {
+                        BYTES_READ_COUNTER.fetch_add(num_bytes, Ordering::Release);
+                    });
                     async move {
+                        let _observation_guard = observation;
                         let bytes = bytes_fut.await.map_err(Error::from)?;
                         validate_read_length(reader.path(), &requested_range, bytes)
                     }
@@ -1116,14 +1422,59 @@ impl ScanScheduler {
             .collect::<Result<Vec<_>>>();
         match maybe_tasks {
             Ok(tasks) => async move {
-                let mut results = Vec::with_capacity(tasks.len());
-                for task in tasks {
-                    results.push(task.await?);
+                if error_mode == SchedulerErrorMode::BestEffort {
+                    let mut results = Vec::with_capacity(tasks.len());
+                    for task in tasks {
+                        results.push(task.await?);
+                    }
+                    return Ok(results);
+                }
+
+                let mut results = vec![Bytes::new(); tasks.len()];
+                let mut pending_tasks: FuturesUnordered<_> = tasks
+                    .into_iter()
+                    .enumerate()
+                    .map(|(task_idx, task)| async move { (task_idx, task.await) })
+                    .collect();
+                while let Some((task_idx, result)) = pending_tasks.next().await {
+                    results[task_idx] = result?;
                 }
                 Ok(results)
             }
             .boxed(),
             Err(e) => async move { Err(e) }.boxed(),
+        }
+    }
+
+    fn submit_request_with_stats(
+        &self,
+        reader: Arc<dyn Reader>,
+        request: Vec<Range<u64>>,
+        priority: u128,
+        bypass_backpressure: bool,
+        extra_stats: Option<Arc<dyn IoStatsRecorder>>,
+    ) -> impl Future<Output = Result<Vec<Bytes>>> + Send + use<> {
+        match &self.io_queue {
+            IoQueueType::Standard(io_queue) => {
+                futures::future::Either::Left(self.submit_request_standard(
+                    reader,
+                    request,
+                    priority,
+                    io_queue,
+                    bypass_backpressure,
+                    extra_stats,
+                ))
+            }
+            IoQueueType::Lite(io_queue) => {
+                futures::future::Either::Right(self.submit_request_lite(
+                    reader,
+                    request,
+                    priority,
+                    io_queue,
+                    bypass_backpressure,
+                    extra_stats,
+                ))
+            }
         }
     }
 
@@ -1134,20 +1485,7 @@ impl ScanScheduler {
         priority: u128,
         bypass_backpressure: bool,
     ) -> impl Future<Output = Result<Vec<Bytes>>> + Send + use<> {
-        match &self.io_queue {
-            IoQueueType::Standard(io_queue) => {
-                futures::future::Either::Left(self.submit_request_standard(
-                    reader,
-                    request,
-                    priority,
-                    io_queue,
-                    bypass_backpressure,
-                ))
-            }
-            IoQueueType::Lite(io_queue) => futures::future::Either::Right(
-                self.submit_request_lite(reader, request, priority, io_queue, bypass_backpressure),
-            ),
-        }
+        self.submit_request_with_stats(reader, request, priority, bypass_backpressure, None)
     }
 
     pub fn stats(&self) -> ScanStats {
@@ -1193,6 +1531,7 @@ pub struct FileScheduler {
     /// through this handle is also recorded here, in addition to the
     /// scheduler's global totals.  Used to measure per-scope I/O.
     extra_stats: Option<Arc<dyn IoStatsRecorder>>,
+    metadata_read_size: Option<NonZero<usize>>,
 }
 
 fn is_close_together(range1: &Range<u64>, range2: &Range<u64>, block_size: u64) -> bool {
@@ -1280,14 +1619,15 @@ impl FileScheduler {
 
         self.root.stats.record_request(&updated_requests);
         if let Some(extra_stats) = &self.extra_stats {
-            extra_stats.record_request(&updated_requests);
+            extra_stats.record_request_transform(&request, &updated_requests);
         }
 
-        let bytes_vec_fut = self.root.submit_request(
+        let bytes_vec_fut = self.root.submit_request_with_stats(
             self.reader.clone(),
             updated_requests.clone(),
             priority,
             self.bypass_backpressure,
+            self.extra_stats.clone(),
         );
 
         let mut updated_index = 0;
@@ -1342,6 +1682,13 @@ impl FileScheduler {
         })
     }
 
+    /// The read-ahead budget in bytes of the scan scheduler this file reads
+    /// through ([`SchedulerConfig::io_buffer_size_bytes`]). 0 means the scheduler
+    /// never waits for its consumer.
+    pub fn io_buffer_size(&self) -> u64 {
+        self.root.io_buffer_size
+    }
+
     pub fn with_priority(&self, priority: u64) -> Self {
         Self {
             reader: self.reader.clone(),
@@ -1351,7 +1698,36 @@ impl FileScheduler {
             base_priority: priority,
             bypass_backpressure: self.bypass_backpressure,
             extra_stats: self.extra_stats.clone(),
+            metadata_read_size: self.metadata_read_size,
         }
+    }
+
+    /// Set the initial metadata read size without changing data I/O coalescing.
+    ///
+    /// A structural projection can read just a file footer first, so speculative
+    /// tail reads do not pull in values adjacent to that footer.
+    ///
+    /// ```
+    /// # use lance_io::scheduler::FileScheduler;
+    /// # fn example(scheduler: &FileScheduler) -> lance_core::Result<()> {
+    /// let reader = scheduler.with_metadata_read_size(40)?;
+    /// assert_eq!(reader.metadata_read_size(), 40);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn with_metadata_read_size(&self, bytes: usize) -> Result<Self> {
+        let bytes = NonZero::new(bytes)
+            .ok_or_else(|| Error::invalid_input("metadata read size must be greater than zero"))?;
+        Ok(Self {
+            metadata_read_size: Some(bytes),
+            ..self.clone()
+        })
+    }
+
+    /// Initial metadata read size, or the underlying reader's preferred block size.
+    pub fn metadata_read_size(&self) -> usize {
+        self.metadata_read_size
+            .map_or_else(|| self.reader.block_size(), NonZero::get)
     }
 
     /// Returns a copy of this scheduler that additionally records the I/O it
@@ -1423,7 +1799,11 @@ impl FileScheduler {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::VecDeque, time::Duration};
+    use std::{
+        collections::{HashMap, VecDeque},
+        io,
+        time::Duration,
+    };
 
     use futures::poll;
     use lance_core::utils::tempfile::TempObjFile;
@@ -1435,7 +1815,10 @@ mod tests {
     use url::Url;
 
     use crate::{
-        object_store::{DEFAULT_DOWNLOAD_RETRY_COUNT, DEFAULT_MAX_IOP_SIZE},
+        object_store::{
+            DEFAULT_DOWNLOAD_RETRY_COUNT, DEFAULT_MAX_IOP_SIZE, ObjectStoreParams,
+            ObjectStoreRegistry, StorageOptionsAccessor,
+        },
         testing::MockObjectStore,
     };
 
@@ -1448,10 +1831,79 @@ mod tests {
                 path: Path::parse("test").unwrap(),
             }),
             to_read: 0..1,
-            when_done: Box::new(|_| {}),
+            when_done: Box::new(|_, _| {}),
             priority,
             bypass_backpressure,
+            request_cancellation: None,
+            observation: None,
+            extra_stats: None,
         }
+    }
+
+    #[test]
+    fn fail_fast_removes_all_queued_related_tasks() {
+        let queue = Arc::new(IoQueue::new(1, 1024, IoStats::new()));
+        let request_cancellation = Arc::new(RequestCancellation::new());
+        let unrelated_cancellation = Arc::new(RequestCancellation::new());
+        let related_cancelled = Arc::new(AtomicU64::new(0));
+        let unrelated_cancelled = Arc::new(AtomicU64::new(0));
+
+        let make_pending_task = |request_cancellation: Arc<RequestCancellation>,
+                                 cancelled: Arc<AtomicU64>,
+                                 priority| IoTask {
+            reader: Arc::new(TrackingReader {
+                get_range_count: Arc::new(AtomicU64::new(0)),
+                path: Path::parse("test").unwrap(),
+            }),
+            to_read: 0..1,
+            when_done: Box::new(move |result, was_admitted| {
+                assert!(!was_admitted);
+                let error = result.unwrap_err();
+                assert!(matches!(&error, Error::IO { .. }));
+                assert!(
+                    error
+                        .to_string()
+                        .contains("cancelled because a related task failed")
+                );
+                cancelled.fetch_add(1, Ordering::Release);
+            }),
+            priority,
+            bypass_backpressure: false,
+            request_cancellation: Some(request_cancellation),
+            observation: None,
+            extra_stats: None,
+        };
+
+        queue.push(make_pending_task(
+            request_cancellation.clone(),
+            related_cancelled.clone(),
+            0,
+        ));
+        queue.push(make_pending_task(
+            request_cancellation.clone(),
+            related_cancelled.clone(),
+            1,
+        ));
+        queue.push(make_pending_task(
+            unrelated_cancellation.clone(),
+            unrelated_cancelled.clone(),
+            2,
+        ));
+
+        assert!(request_cancellation.cancel());
+        queue.cancel_pending_for_request(&request_cancellation);
+
+        assert_eq!(related_cancelled.load(Ordering::Acquire), 2);
+        assert_eq!(unrelated_cancelled.load(Ordering::Acquire), 0);
+        let state = queue.state.lock().unwrap();
+        assert_eq!(state.pending_requests.len(), 1);
+        assert!(
+            state
+                .pending_requests
+                .peek()
+                .unwrap()
+                .belongs_to(&unrelated_cancellation)
+        );
     }
 
     #[test]
@@ -1521,7 +1973,6 @@ mod tests {
             move |rsp| *response_clone.lock().unwrap() = Some(rsp),
             2, // num_data_buffers
             0, // priority
-            2, // num_reqs
             false,
             io_queue,
         );
@@ -1660,7 +2111,8 @@ mod tests {
         let reader = Arc::new(ShortReader {
             path: Path::parse("short-file").unwrap(),
         });
-        let file_scheduler = scheduler.open_reader(reader);
+        let stats = Arc::new(ReadLifecycleStats::default());
+        let file_scheduler = scheduler.open_reader(reader).with_io_stats(stats.clone());
 
         let error = file_scheduler
             .submit_request(vec![0..8], 0)
@@ -1674,6 +2126,8 @@ mod tests {
             ),
             "{error}"
         );
+        assert_eq!(stats.started.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.completed.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
@@ -1921,6 +2375,338 @@ mod tests {
         assert_eq!(global.bytes_read + 1000, global_after.bytes_read);
         assert_eq!(scoped.bytes_read, scoped_after.bytes_read);
         assert_eq!(scoped.iops, scoped_after.iops);
+    }
+
+    #[derive(Debug, Default)]
+    struct RangeTransformStats {
+        logical: Mutex<Vec<Range<u64>>>,
+        physical: Mutex<Vec<Range<u64>>>,
+    }
+
+    #[derive(Debug, Default)]
+    struct TransportCapabilityStats;
+
+    impl IoStatsRecorder for TransportCapabilityStats {
+        fn record_request(&self, _ranges: &[Range<u64>]) {}
+
+        fn records_cloud_reader_attempts(&self) -> bool {
+            true
+        }
+    }
+
+    #[derive(Debug)]
+    struct TransportSelectingReader {
+        path: Path,
+        ordinary_reads: Arc<AtomicU64>,
+        observed_reads: Arc<AtomicU64>,
+    }
+
+    impl lance_core::deepsize::DeepSizeOf for TransportSelectingReader {
+        fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
+            0
+        }
+    }
+
+    impl Reader for TransportSelectingReader {
+        fn path(&self) -> &Path {
+            &self.path
+        }
+
+        fn block_size(&self) -> usize {
+            0
+        }
+
+        fn io_parallelism(&self) -> usize {
+            2
+        }
+
+        fn size(&self) -> futures::future::BoxFuture<'_, object_store::Result<usize>> {
+            Box::pin(async { Ok(16) })
+        }
+
+        fn get_range(
+            &self,
+            range: Range<usize>,
+        ) -> futures::future::BoxFuture<'static, object_store::Result<Bytes>> {
+            self.ordinary_reads.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async move { Ok(Bytes::from(vec![0; range.end - range.start])) })
+        }
+
+        fn get_range_with_stats(
+            &self,
+            range: Range<usize>,
+            _stats: Arc<dyn IoStatsRecorder>,
+        ) -> futures::future::BoxFuture<'static, object_store::Result<Bytes>> {
+            self.observed_reads.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async move { Ok(Bytes::from(vec![0; range.end - range.start])) })
+        }
+
+        fn get_all(&self) -> futures::future::BoxFuture<'_, object_store::Result<Bytes>> {
+            Box::pin(async { Ok(Bytes::from_static(&[0; 16])) })
+        }
+    }
+
+    impl IoStatsRecorder for RangeTransformStats {
+        fn record_request(&self, ranges: &[Range<u64>]) {
+            *self.physical.lock().unwrap() = ranges.to_vec();
+        }
+
+        fn record_request_transform(
+            &self,
+            logical_ranges: &[Range<u64>],
+            physical_ranges: &[Range<u64>],
+        ) {
+            *self.logical.lock().unwrap() = logical_ranges.to_vec();
+            *self.physical.lock().unwrap() = physical_ranges.to_vec();
+        }
+    }
+
+    #[tokio::test]
+    async fn scoped_stats_can_observe_logical_to_physical_range_transform() {
+        let path = Path::parse("range-transform").unwrap();
+        let object_store = Arc::new(ObjectStore::memory());
+        object_store.put(&path, &[0_u8; 16 * 1024]).await.unwrap();
+        let scheduler = ScanScheduler::new(
+            object_store,
+            SchedulerConfig {
+                use_lite_scheduler: Some(false),
+                ..SchedulerConfig::default_for_testing()
+            },
+        );
+        let stats = Arc::new(RangeTransformStats::default());
+        let file_scheduler = scheduler
+            .open_file(&path, &CachedFileSize::unknown())
+            .await
+            .unwrap()
+            .with_io_stats(stats.clone());
+
+        file_scheduler
+            .submit_request(vec![0..100, 200..300, 8_000..8_100], 0)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            *stats.logical.lock().unwrap(),
+            vec![0..100, 200..300, 8_000..8_100]
+        );
+        assert_eq!(*stats.physical.lock().unwrap(), vec![0..300, 8_000..8_100]);
+    }
+
+    #[rstest]
+    #[case::standard(false)]
+    #[case::lite(true)]
+    #[tokio::test]
+    async fn transport_body_path_requires_recorder_capability(#[case] use_lite: bool) {
+        let scheduler = ScanScheduler::new(
+            Arc::new(ObjectStore::memory()),
+            SchedulerConfig {
+                use_lite_scheduler: Some(use_lite),
+                ..SchedulerConfig::default_for_testing()
+            },
+        );
+        let ordinary_reads = Arc::new(AtomicU64::new(0));
+        let observed_reads = Arc::new(AtomicU64::new(0));
+        let reader: Arc<dyn Reader> = Arc::new(TransportSelectingReader {
+            path: Path::from("transport-selection"),
+            ordinary_reads: ordinary_reads.clone(),
+            observed_reads: observed_reads.clone(),
+        });
+
+        scheduler
+            .open_reader(reader.clone())
+            .with_io_stats(Arc::new(StatsCollector::new()))
+            .submit_request(vec![0..8], 0)
+            .await
+            .unwrap();
+        assert_eq!(ordinary_reads.load(Ordering::Relaxed), 1);
+        assert_eq!(observed_reads.load(Ordering::Relaxed), 0);
+
+        scheduler
+            .open_reader(reader)
+            .with_io_stats(Arc::new(TransportCapabilityStats))
+            .submit_request(vec![8..16], 0)
+            .await
+            .unwrap();
+        assert_eq!(ordinary_reads.load(Ordering::Relaxed), 1);
+        assert_eq!(observed_reads.load(Ordering::Relaxed), 1);
+    }
+
+    #[derive(Debug, Default)]
+    struct ReadLifecycleStats {
+        iops: AtomicU64,
+        requests: AtomicU64,
+        started: AtomicU64,
+        completed: AtomicU64,
+        active: AtomicU64,
+        peak_active: AtomicU64,
+        max_queue_time_ns: AtomicU64,
+        max_read_time_ns: AtomicU64,
+    }
+
+    impl IoStatsRecorder for ReadLifecycleStats {
+        fn record_request(&self, ranges: &[Range<u64>]) {
+            self.requests.fetch_add(1, Ordering::Relaxed);
+            self.iops.fetch_add(ranges.len() as u64, Ordering::Relaxed);
+        }
+
+        fn records_read_lifecycle(&self) -> bool {
+            true
+        }
+
+        fn record_read_started(&self, queue_time: Duration) {
+            let active = self.active.fetch_add(1, Ordering::Relaxed) + 1;
+            self.peak_active.fetch_max(active, Ordering::Relaxed);
+            self.max_queue_time_ns.fetch_max(
+                queue_time.as_nanos().min(u64::MAX as u128) as u64,
+                Ordering::Relaxed,
+            );
+            self.started.fetch_add(1, Ordering::Release);
+        }
+
+        fn record_read_completed(&self, read_time: Duration) {
+            self.active.fetch_sub(1, Ordering::Relaxed);
+            self.max_read_time_ns.fetch_max(
+                read_time.as_nanos().min(u64::MAX as u128) as u64,
+                Ordering::Relaxed,
+            );
+            self.completed.fetch_add(1, Ordering::Release);
+        }
+    }
+
+    #[rstest]
+    #[case::standard(false)]
+    #[case::lite(true)]
+    #[tokio::test]
+    async fn concurrent_io_stats_sinks_do_not_mix(#[case] use_lite_scheduler: bool) {
+        let path = Path::parse("concurrent-stats").unwrap();
+        let object_store = Arc::new(ObjectStore::memory());
+        object_store.put(&path, &vec![0; 16_000]).await.unwrap();
+        let scheduler = ScanScheduler::new(
+            object_store,
+            SchedulerConfig {
+                use_lite_scheduler: Some(use_lite_scheduler),
+                ..SchedulerConfig::default_for_testing()
+            },
+        );
+        let file = scheduler
+            .open_file(&path, &CachedFileSize::unknown())
+            .await
+            .unwrap()
+            .with_block_size(0);
+        let first = Arc::new(ReadLifecycleStats::default());
+        let second = Arc::new(ReadLifecycleStats::default());
+
+        let first_read = file
+            .with_io_stats(first.clone())
+            .submit_request(vec![0..1_000], 0);
+        let second_read = file
+            .with_io_stats(second.clone())
+            .submit_request(vec![2_000..3_000, 10_000..11_000], 0);
+        let (first_result, second_result) = tokio::join!(first_read, second_read);
+        first_result.unwrap();
+        second_result.unwrap();
+
+        assert_eq!(first.requests.load(Ordering::Relaxed), 1);
+        assert_eq!(first.iops.load(Ordering::Relaxed), 1);
+        assert_eq!(first.started.load(Ordering::Relaxed), 1);
+        assert_eq!(first.completed.load(Ordering::Relaxed), 1);
+        assert_eq!(second.requests.load(Ordering::Relaxed), 1);
+        assert_eq!(second.iops.load(Ordering::Relaxed), 2);
+        assert_eq!(second.started.load(Ordering::Relaxed), 2);
+        assert_eq!(second.completed.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn lite_lifecycle_stays_active_until_child_read_finishes() {
+        let scheduler = ScanScheduler::new(
+            scheduler_test_object_store(),
+            SchedulerConfig {
+                io_buffer_size_bytes: 1,
+                use_lite_scheduler: Some(true),
+            },
+        );
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let admitted = Arc::new(AtomicU64::new(0));
+        let reader: Arc<dyn Reader> = Arc::new(BlockingReader {
+            semaphore: release.clone(),
+            get_range_count: admitted.clone(),
+            path: Path::parse("pending-lite-read").unwrap(),
+        });
+        let stats = Arc::new(ReadLifecycleStats::default());
+        let request =
+            scheduler.submit_request_with_stats(reader, vec![0..1], 0, false, Some(stats.clone()));
+        let request_handle = tokio::spawn(request);
+
+        wait_until("the lite read is admitted", || {
+            admitted.load(Ordering::Acquire) == 1
+        })
+        .await;
+        assert_eq!(stats.started.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.completed.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.active.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.peak_active.load(Ordering::Relaxed), 1);
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert_eq!(stats.completed.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.active.load(Ordering::Relaxed), 1);
+
+        release.add_permits(1);
+        timeout(Duration::from_secs(1), request_handle)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(stats.completed.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.active.load(Ordering::Relaxed), 0);
+        assert!(
+            stats.max_read_time_ns.load(Ordering::Relaxed)
+                >= Duration::from_millis(20).as_nanos() as u64
+        );
+    }
+
+    #[rstest]
+    #[case::standard(false)]
+    #[case::lite(true)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn read_lifecycle_balances_when_caller_is_cancelled(#[case] use_lite_scheduler: bool) {
+        let scheduler = ScanScheduler::new(
+            scheduler_test_object_store(),
+            SchedulerConfig {
+                use_lite_scheduler: Some(use_lite_scheduler),
+                ..SchedulerConfig::default_for_testing()
+            },
+        );
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(0));
+        let get_range_count = Arc::new(AtomicU64::new(0));
+        let reader: Arc<dyn Reader> = Arc::new(BlockingReader {
+            semaphore: semaphore.clone(),
+            get_range_count: get_range_count.clone(),
+            path: Path::parse("cancelled-read").unwrap(),
+        });
+        let stats = Arc::new(ReadLifecycleStats::default());
+        let file = scheduler.open_reader(reader).with_io_stats(stats.clone());
+
+        let handle = tokio::spawn(file.submit_request(vec![0..1], 0));
+        wait_until("the observed read starts", || {
+            get_range_count.load(Ordering::Acquire) == 1
+                && stats.started.load(Ordering::Acquire) == 1
+        })
+        .await;
+        handle.abort();
+        let error = handle.await.unwrap_err();
+        assert!(error.is_cancelled());
+
+        // Standard-scheduler reads outlive the caller-side future. Lite reads
+        // are dropped with it, so only the standard path needs releasing.
+        if !use_lite_scheduler {
+            semaphore.add_permits(1);
+        }
+        wait_until("the observed read completes or is dropped", || {
+            stats.completed.load(Ordering::Acquire) == 1
+        })
+        .await;
+        assert_eq!(stats.started.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.completed.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
@@ -2322,6 +3108,458 @@ mod tests {
         }
     }
 
+    struct PendingReadGuard {
+        was_cancelled: Arc<AtomicBool>,
+        is_complete: bool,
+    }
+
+    impl PendingReadGuard {
+        fn new(was_cancelled: Arc<AtomicBool>) -> Self {
+            Self {
+                was_cancelled,
+                is_complete: false,
+            }
+        }
+
+        fn complete(&mut self) {
+            self.is_complete = true;
+        }
+    }
+
+    impl Drop for PendingReadGuard {
+        fn drop(&mut self) {
+            if !self.is_complete {
+                self.was_cancelled.store(true, Ordering::Release);
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    struct ControlledFailureReader {
+        path: Path,
+        failure_range_start: usize,
+        started: Arc<tokio::sync::Semaphore>,
+        sibling_polled: Arc<tokio::sync::Semaphore>,
+        failure_finished: Arc<tokio::sync::Semaphore>,
+        failure_release: Arc<tokio::sync::Semaphore>,
+        sibling_release: Arc<tokio::sync::Semaphore>,
+        sibling_was_cancelled: Arc<AtomicBool>,
+    }
+
+    impl lance_core::deepsize::DeepSizeOf for ControlledFailureReader {
+        fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
+            0
+        }
+    }
+
+    impl Reader for ControlledFailureReader {
+        fn path(&self) -> &Path {
+            &self.path
+        }
+
+        fn block_size(&self) -> usize {
+            1
+        }
+
+        fn io_parallelism(&self) -> usize {
+            2
+        }
+
+        fn size(&self) -> futures::future::BoxFuture<'_, object_store::Result<usize>> {
+            Box::pin(async { Ok(3) })
+        }
+
+        fn get_range(
+            &self,
+            range: Range<usize>,
+        ) -> futures::future::BoxFuture<'static, object_store::Result<Bytes>> {
+            self.started.add_permits(1);
+            let num_bytes = range.end - range.start;
+            if range.start == self.failure_range_start {
+                let failure_finished = self.failure_finished.clone();
+                let failure_release = self.failure_release.clone();
+                Box::pin(async move {
+                    failure_release.acquire().await.unwrap().forget();
+                    failure_finished.add_permits(1);
+                    Err(object_store::Error::Generic {
+                        store: "controlled failure reader",
+                        source: Box::new(io::Error::other("injected range failure")),
+                    })
+                })
+            } else if range.start <= 1 {
+                let sibling_polled = self.sibling_polled.clone();
+                let sibling_release = self.sibling_release.clone();
+                let mut guard = PendingReadGuard::new(self.sibling_was_cancelled.clone());
+                Box::pin(async move {
+                    sibling_polled.add_permits(1);
+                    sibling_release.acquire().await.unwrap().forget();
+                    guard.complete();
+                    Ok(Bytes::from(vec![0_u8; num_bytes]))
+                })
+            } else {
+                Box::pin(async move { Ok(Bytes::from(vec![0_u8; num_bytes])) })
+            }
+        }
+
+        fn get_all(&self) -> futures::future::BoxFuture<'_, object_store::Result<Bytes>> {
+            Box::pin(async { Ok(Bytes::from(vec![0_u8; 3])) })
+        }
+    }
+
+    struct ControlledFailureState {
+        reader: Arc<dyn Reader>,
+        started: Arc<tokio::sync::Semaphore>,
+        sibling_polled: Arc<tokio::sync::Semaphore>,
+        failure_finished: Arc<tokio::sync::Semaphore>,
+        failure_release: Arc<tokio::sync::Semaphore>,
+        sibling_release: Arc<tokio::sync::Semaphore>,
+        sibling_was_cancelled: Arc<AtomicBool>,
+    }
+
+    fn controlled_failure_state(failure_range_start: usize) -> ControlledFailureState {
+        let started = Arc::new(tokio::sync::Semaphore::new(0));
+        let sibling_polled = Arc::new(tokio::sync::Semaphore::new(0));
+        let failure_finished = Arc::new(tokio::sync::Semaphore::new(0));
+        let failure_release = Arc::new(tokio::sync::Semaphore::new(0));
+        let sibling_release = Arc::new(tokio::sync::Semaphore::new(0));
+        let sibling_was_cancelled = Arc::new(AtomicBool::new(false));
+        let reader = Arc::new(ControlledFailureReader {
+            path: Path::parse("controlled").unwrap(),
+            failure_range_start,
+            started: started.clone(),
+            sibling_polled: sibling_polled.clone(),
+            failure_finished: failure_finished.clone(),
+            failure_release: failure_release.clone(),
+            sibling_release: sibling_release.clone(),
+            sibling_was_cancelled: sibling_was_cancelled.clone(),
+        });
+
+        ControlledFailureState {
+            reader,
+            started,
+            sibling_polled,
+            failure_finished,
+            failure_release,
+            sibling_release,
+            sibling_was_cancelled,
+        }
+    }
+
+    fn scheduler_test_object_store() -> Arc<ObjectStore> {
+        Arc::new(ObjectStore::new(
+            Arc::new(InMemory::new()),
+            Url::parse("mem://").unwrap(),
+            Some(1),
+            None,
+            false,
+            false,
+            2,
+            DEFAULT_DOWNLOAD_RETRY_COUNT,
+            None,
+        ))
+    }
+
+    async fn scheduler_test_object_store_with_error_mode(error_mode: &str) -> Arc<ObjectStore> {
+        let params = ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                HashMap::from([(
+                    SCHEDULER_ERROR_MODE_STORAGE_OPTION.to_string(),
+                    error_mode.to_string(),
+                )]),
+            ))),
+            ..Default::default()
+        };
+        ObjectStore::from_uri_and_params(
+            Arc::new(ObjectStoreRegistry::default()),
+            "memory:///",
+            &params,
+        )
+        .await
+        .unwrap()
+        .0
+    }
+
+    fn scheduler_test_object_store_from_public_constructor(error_mode: &str) -> Arc<ObjectStore> {
+        let storage_options = HashMap::from([(
+            SCHEDULER_ERROR_MODE_STORAGE_OPTION.to_string(),
+            error_mode.to_string(),
+        )]);
+        Arc::new(ObjectStore::new(
+            Arc::new(InMemory::new()),
+            Url::parse("mem://").unwrap(),
+            Some(1),
+            None,
+            false,
+            false,
+            2,
+            DEFAULT_DOWNLOAD_RETRY_COUNT,
+            Some(&storage_options),
+        ))
+    }
+
+    #[tokio::test]
+    async fn scheduler_inherits_storage_option_error_mode() {
+        let object_store = scheduler_test_object_store_with_error_mode("fail_fast").await;
+        let config = SchedulerConfig {
+            io_buffer_size_bytes: 2,
+            use_lite_scheduler: Some(false),
+        };
+
+        let scheduler = ScanScheduler::new(object_store, config);
+        assert_eq!(scheduler.error_mode, SchedulerErrorMode::FailFast);
+    }
+
+    #[rstest]
+    #[case::standard(false, false)]
+    #[case::lite(true, false)]
+    #[case::public_object_store_constructor(false, true)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fail_fast_cancels_related_tasks_and_preserves_original_error(
+        #[case] use_lite_scheduler: bool,
+        #[case] is_public_object_store_constructor: bool,
+    ) {
+        let config = SchedulerConfig {
+            io_buffer_size_bytes: 2,
+            use_lite_scheduler: Some(use_lite_scheduler),
+        };
+        let object_store = if is_public_object_store_constructor {
+            scheduler_test_object_store_from_public_constructor("fail_fast")
+        } else {
+            scheduler_test_object_store_with_error_mode("fail_fast").await
+        };
+        let scheduler = ScanScheduler::new(object_store, config);
+        let state = controlled_failure_state(1);
+        let request = scheduler.submit_request(state.reader.clone(), vec![0..1, 1..2], 0, false);
+        let request_handle = tokio::spawn(request);
+
+        timeout(Duration::from_secs(1), state.started.acquire_many(2))
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        timeout(Duration::from_secs(1), state.sibling_polled.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        state.failure_release.add_permits(1);
+        timeout(Duration::from_secs(1), state.failure_finished.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+
+        let error = timeout(Duration::from_secs(1), request_handle)
+            .await
+            .expect("fail-fast request did not return after a related task failed")
+            .unwrap()
+            .unwrap_err();
+        assert!(matches!(&error, Error::IO { .. }));
+        assert!(
+            error.to_string().contains("injected range failure"),
+            "the triggering error must be preserved: {error}"
+        );
+        assert!(
+            state.sibling_was_cancelled.load(Ordering::Acquire),
+            "the blocked sibling read was not cancelled"
+        );
+
+        let unrelated = scheduler
+            .submit_request(state.reader, vec![2..3], 1, false)
+            .await
+            .unwrap();
+        assert_eq!(unrelated, vec![Bytes::from_static(&[0])]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fail_fast_refunds_only_admitted_task_reservations() {
+        let storage_options = HashMap::from([(
+            SCHEDULER_ERROR_MODE_STORAGE_OPTION.to_string(),
+            "fail_fast".to_string(),
+        )]);
+        let object_store = Arc::new(ObjectStore::new(
+            Arc::new(InMemory::new()),
+            Url::parse("mem://").unwrap(),
+            Some(1),
+            None,
+            false,
+            false,
+            1,
+            DEFAULT_DOWNLOAD_RETRY_COUNT,
+            Some(&storage_options),
+        ));
+        let scheduler = ScanScheduler::new(
+            object_store,
+            SchedulerConfig {
+                io_buffer_size_bytes: 1024,
+                use_lite_scheduler: Some(false),
+            },
+        );
+        let io_queue = match &scheduler.io_queue {
+            IoQueueType::Standard(io_queue) => io_queue.clone(),
+            IoQueueType::Lite(_) => unreachable!("test forces the standard scheduler"),
+        };
+        let state = controlled_failure_state(1);
+        let priority = 7;
+
+        // Keep an unrelated response unconsumed so its reservation must survive
+        // the failing response's refund.
+        let unrelated = scheduler.submit_request(state.reader.clone(), vec![0..1], priority, false);
+        timeout(Duration::from_secs(1), state.started.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        timeout(Duration::from_secs(1), state.sibling_polled.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+
+        // Only one failing task can be admitted while the unrelated response is
+        // unconsumed. Its identical sibling must remain queued until cancellation.
+        let failing =
+            scheduler.submit_request(state.reader.clone(), vec![1..2, 1..2], priority, false);
+        {
+            let state = io_queue.state.lock().unwrap();
+            assert_eq!(state.pending_requests.len(), 2);
+            assert_eq!(state.priorities_in_flight.len(), 1);
+        }
+
+        state.sibling_release.add_permits(1);
+        timeout(Duration::from_secs(1), state.started.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        {
+            let state = io_queue.state.lock().unwrap();
+            assert_eq!(state.pending_requests.len(), 1);
+            assert_eq!(state.priorities_in_flight.len(), 2);
+        }
+
+        state.failure_release.add_permits(1);
+        let error = timeout(Duration::from_secs(1), failing)
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("injected range failure"),
+            "the triggering error must be preserved: {error}"
+        );
+
+        {
+            let state = io_queue.state.lock().unwrap();
+            assert!(state.pending_requests.is_empty());
+            assert_eq!(
+                state.priorities_in_flight.len(),
+                1,
+                "queued cancellation refunded the unrelated in-flight reservation"
+            );
+        }
+
+        assert_eq!(unrelated.await.unwrap(), vec![Bytes::from_static(&[0])]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn default_standard_scheduler_waits_for_sibling_after_error() {
+        let config = SchedulerConfig {
+            io_buffer_size_bytes: 2,
+            use_lite_scheduler: Some(false),
+        };
+        let scheduler = ScanScheduler::new(scheduler_test_object_store(), config);
+        let state = controlled_failure_state(1);
+        let request = scheduler.submit_request(state.reader.clone(), vec![0..1, 1..2], 0, false);
+        let mut request_handle = tokio::spawn(request);
+
+        timeout(Duration::from_secs(1), state.started.acquire_many(2))
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        timeout(Duration::from_secs(1), state.sibling_polled.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        state.failure_release.add_permits(1);
+
+        assert!(
+            timeout(Duration::from_millis(50), &mut request_handle)
+                .await
+                .is_err(),
+            "best-effort request returned before its blocked sibling finished"
+        );
+        assert!(
+            !state.sibling_was_cancelled.load(Ordering::Acquire),
+            "best-effort mode cancelled a sibling read"
+        );
+
+        state.sibling_release.add_permits(1);
+        let error = timeout(Duration::from_secs(1), request_handle)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(matches!(&error, Error::IO { .. }));
+        assert!(
+            error.to_string().contains("injected range failure"),
+            "the original error was not returned: {error}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn default_lite_scheduler_preserves_ordered_error_handling() {
+        let config = SchedulerConfig {
+            io_buffer_size_bytes: 2,
+            use_lite_scheduler: Some(true),
+        };
+        let scheduler = ScanScheduler::new(scheduler_test_object_store(), config);
+        let state = controlled_failure_state(0);
+        let stats = Arc::new(ReadLifecycleStats::default());
+        let request = scheduler.submit_request_with_stats(
+            state.reader,
+            vec![0..1, 1..2],
+            0,
+            false,
+            Some(stats.clone()),
+        );
+        let request_handle = tokio::spawn(request);
+
+        timeout(Duration::from_secs(1), state.started.acquire_many(2))
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        state.failure_release.add_permits(1);
+        timeout(Duration::from_secs(1), state.failure_finished.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+
+        let error = timeout(Duration::from_secs(1), request_handle)
+            .await
+            .expect("lite scheduler did not return the first range error")
+            .unwrap()
+            .unwrap_err();
+        assert!(matches!(&error, Error::IO { .. }));
+        assert!(
+            error.to_string().contains("injected range failure"),
+            "the original error was not returned: {error}"
+        );
+        assert!(
+            state.sibling_was_cancelled.load(Ordering::Acquire),
+            "dropping the remaining ordered task did not cancel it"
+        );
+        assert!(
+            state.sibling_polled.try_acquire().is_err(),
+            "the later sibling should not be polled before the first task completes"
+        );
+        assert_eq!(stats.started.load(Ordering::Relaxed), 2);
+        assert_eq!(stats.completed.load(Ordering::Relaxed), 2);
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn test_same_priority_chunks_continue_after_higher_priority_request() {
         let obj_store = Arc::new(ObjectStore::new(
@@ -2415,6 +3653,127 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_io_parallelism_overrides_store() {
+        let some_path = Path::parse("foo").unwrap();
+        let base_store = Arc::new(InMemory::new());
+        base_store
+            .put(&some_path, vec![0; 1000].into())
+            .await
+            .unwrap();
+
+        let in_flight = Arc::new(AtomicU64::new(0));
+        let max_in_flight = Arc::new(AtomicU64::new(0));
+        let first_two_started = Arc::new(tokio::sync::Barrier::new(2));
+        let mut obj_store = MockObjectStore::default();
+        let (in_flight_copy, max_in_flight_copy, first_two_started_copy) = (
+            in_flight.clone(),
+            max_in_flight.clone(),
+            first_two_started.clone(),
+        );
+        obj_store
+            .expect_get_opts()
+            .returning(move |location, options| {
+                let in_flight = in_flight_copy.clone();
+                let max_in_flight = max_in_flight_copy.clone();
+                let first_two_started = first_two_started_copy.clone();
+                let base_store = base_store.clone();
+                let location = location.clone();
+                async move {
+                    let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                    max_in_flight.fetch_max(now, Ordering::SeqCst);
+                    if now <= 2 {
+                        first_two_started.wait().await;
+                    }
+                    in_flight.fetch_sub(1, Ordering::SeqCst);
+                    base_store.get_opts(&location, options).await
+                }
+                .boxed()
+            });
+        // The store allows 8 requests at once; the scheduler is limited to 2.
+        let obj_store = Arc::new(ObjectStore::new(
+            Arc::new(obj_store),
+            Url::parse("mem://").unwrap(),
+            Some(10),
+            None,
+            false,
+            false,
+            8,
+            DEFAULT_DOWNLOAD_RETRY_COUNT,
+            None,
+        ));
+        // Asking for the lite scheduler too must not lift the limit.
+        let config = SchedulerConfig::default_for_testing().with_lite_scheduler();
+        let scheduler =
+            ScanScheduler::new_with_io_parallelism(obj_store, config, NonZeroU32::new(2).unwrap());
+        let file_scheduler = scheduler
+            .open_file(&some_path, &CachedFileSize::new(1000))
+            .await
+            .unwrap();
+
+        let reads = (0..8).map(|i| file_scheduler.submit_single(i * 100..i * 100 + 10, 0));
+        tokio::time::timeout(Duration::from_secs(5), futures::future::try_join_all(reads))
+            .await
+            .expect("two reads should reach the barrier")
+            .unwrap();
+        assert_eq!(max_in_flight.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn test_large_io_parallelism_caps_preallocation() {
+        assert_eq!(
+            SchedulerConfig::max_bandwidth_bytes(u32::MAX as usize),
+            MAX_BANDWIDTH_BYTES_PER_IO_THREAD * u32::MAX as u64
+        );
+        #[cfg(target_pointer_width = "64")]
+        assert_eq!(
+            SchedulerConfig::max_bandwidth_bytes(usize::MAX),
+            i64::MAX as u64
+        );
+
+        let some_path = Path::parse("foo").unwrap();
+        let base_store = Arc::new(InMemory::new());
+        base_store
+            .put(&some_path, vec![42u8; 64].into())
+            .await
+            .unwrap();
+
+        let obj_store = Arc::new(ObjectStore::new(
+            base_store,
+            Url::parse("mem://").unwrap(),
+            Some(10),
+            None,
+            false,
+            false,
+            u32::MAX as usize,
+            DEFAULT_DOWNLOAD_RETRY_COUNT,
+            None,
+        ));
+
+        // Standard scheduler with NonZeroU32::MAX must not over-allocate.
+        let config = SchedulerConfig::new(SchedulerConfig::max_bandwidth_bytes(u32::MAX as usize));
+        let scheduler =
+            ScanScheduler::new_with_io_parallelism(obj_store.clone(), config, NonZeroU32::MAX);
+        let file_scheduler = scheduler
+            .open_file(&some_path, &CachedFileSize::new(64))
+            .await
+            .unwrap();
+        let bytes = file_scheduler.submit_single(0..16, 0).await.unwrap();
+        assert_eq!(bytes.as_ref(), [42u8; 16].as_slice());
+
+        // Lite scheduler with a huge store io_parallelism must also avoid over-allocation.
+        let lite_scheduler = ScanScheduler::new(
+            obj_store,
+            SchedulerConfig::default_for_testing().with_lite_scheduler(),
+        );
+        let lite_file_scheduler = lite_scheduler
+            .open_file(&some_path, &CachedFileSize::new(64))
+            .await
+            .unwrap();
+        let lite_bytes = lite_file_scheduler.submit_single(0..16, 0).await.unwrap();
+        assert_eq!(lite_bytes.as_ref(), [42u8; 16].as_slice());
+    }
+
+    #[tokio::test]
     async fn test_lite_scheduler_submits_eagerly() {
         let obj_store = Arc::new(ObjectStore::memory());
         let config = SchedulerConfig::default_for_testing().with_lite_scheduler();
@@ -2453,34 +3812,6 @@ mod tests {
         let scheduler = ScanScheduler::new(memory_store.clone(), config);
         assert!(!scheduler.uses_lite_scheduler());
 
-        // A file+uring:// store should use the lite scheduler when config is None
-        let uring_store = Arc::new(ObjectStore::new(
-            Arc::new(InMemory::new()),
-            Url::parse("file+uring:///tmp").unwrap(),
-            None,
-            None,
-            false,
-            false,
-            8,
-            DEFAULT_DOWNLOAD_RETRY_COUNT,
-            None,
-        ));
-        assert!(uring_store.prefers_lite_scheduler());
-        let config = SchedulerConfig {
-            io_buffer_size_bytes: 256 * 1024 * 1024,
-            use_lite_scheduler: None,
-        };
-        let scheduler = ScanScheduler::new(uring_store.clone(), config);
-        assert!(scheduler.uses_lite_scheduler());
-
-        // Explicit Some(false) overrides a file+uring:// store's preference
-        let config = SchedulerConfig {
-            io_buffer_size_bytes: 256 * 1024 * 1024,
-            use_lite_scheduler: Some(false),
-        };
-        let scheduler = ScanScheduler::new(uring_store, config);
-        assert!(!scheduler.uses_lite_scheduler());
-
         // Explicit Some(true) overrides a memory:// store's preference
         let config = SchedulerConfig {
             io_buffer_size_bytes: 256 * 1024 * 1024,
@@ -2488,6 +3819,29 @@ mod tests {
         };
         let scheduler = ScanScheduler::new(memory_store, config);
         assert!(scheduler.uses_lite_scheduler());
+
+        // Only the built-in file provider declares io_uring, and it registers
+        // its file+uring:// scheme on Linux alone.
+        #[cfg(target_os = "linux")]
+        {
+            // A file+uring:// store should use the lite scheduler when config is None
+            let (uring_store, _) = ObjectStore::from_uri("file+uring:///tmp").await.unwrap();
+            assert!(uring_store.prefers_lite_scheduler());
+            let config = SchedulerConfig {
+                io_buffer_size_bytes: 256 * 1024 * 1024,
+                use_lite_scheduler: None,
+            };
+            let scheduler = ScanScheduler::new(uring_store.clone(), config);
+            assert!(scheduler.uses_lite_scheduler());
+
+            // Explicit Some(false) overrides a file+uring:// store's preference
+            let config = SchedulerConfig {
+                io_buffer_size_bytes: 256 * 1024 * 1024,
+                use_lite_scheduler: Some(false),
+            };
+            let scheduler = ScanScheduler::new(uring_store, config);
+            assert!(!scheduler.uses_lite_scheduler());
+        }
     }
 
     #[test_log::test(tokio::test(flavor = "multi_thread"))]
@@ -2523,14 +3877,17 @@ mod tests {
         }
     }
 
+    #[rstest]
+    #[case::standard(false)]
+    #[case::lite(true)]
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_zero_buffer_size_no_backpressure() {
+    async fn test_zero_buffer_size_no_backpressure(#[case] use_lite_scheduler: bool) {
         // With io_buffer_size_bytes=0 (no_backpressure=true), reads at any priority go
         // through without blocking, even though a zero budget would normally halt all I/O.
         let obj_store = Arc::new(ObjectStore::memory());
         let config = SchedulerConfig {
             io_buffer_size_bytes: 0,
-            use_lite_scheduler: Some(false),
+            use_lite_scheduler: Some(use_lite_scheduler),
         };
         let scheduler = ScanScheduler::new(obj_store, config);
 
@@ -2545,6 +3902,8 @@ mod tests {
         let fut1 = scheduler.submit_request(reader.clone(), vec![0..1000], 0, false);
         let fut2 = scheduler.submit_request(reader.clone(), vec![1000..2000], 1, false);
         let fut3 = scheduler.submit_request(reader.clone(), vec![2000..3000], 2, false);
+        // Without a budget the memory gauges have nothing to report.
+        assert_eq!(scheduler.reserved_bytes(), 0);
 
         let bytes1 = timeout(Duration::from_secs(5), fut1)
             .await
@@ -2562,6 +3921,79 @@ mod tests {
         assert_eq!(bytes2[0].len(), 1000);
         assert_eq!(bytes3[0].len(), 1000);
         assert_eq!(get_range_count.load(Ordering::Acquire), 3);
+    }
+
+    /// Waits up to five seconds for `condition`, failing with `what` otherwise.
+    async fn wait_until(what: &str, condition: impl Fn() -> bool) {
+        let waited = timeout(Duration::from_secs(5), async {
+            while !condition() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await;
+        assert!(waited.is_ok(), "timed out waiting until {what}");
+    }
+
+    /// The memory gauges count what a scheduler admitted for reading until its
+    /// caller receives it, past the I/O buffer size for chunks of a request it
+    /// already admitted.
+    #[rstest]
+    #[case::standard(false)]
+    #[case::lite(true)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_reserved_bytes_count_admitted_reads_until_received(
+        #[case] use_lite_scheduler: bool,
+    ) {
+        let scheduler = ScanScheduler::new(
+            Arc::new(ObjectStore::memory()),
+            SchedulerConfig {
+                io_buffer_size_bytes: 100,
+                use_lite_scheduler: Some(use_lite_scheduler),
+            },
+        );
+        let get_range_count = Arc::new(AtomicU64::new(0));
+        let reader: Arc<dyn Reader> = Arc::new(TrackingReader {
+            get_range_count: get_range_count.clone(),
+            path: Path::parse("test").unwrap(),
+        });
+
+        let pending = scheduler.submit_request(reader, vec![0..100, 200..250], 0, false);
+        // The standard queue admits reads on its I/O loop, after the submit.
+        wait_until("both chunks are admitted", || {
+            scheduler.reserved_bytes() == 150
+        })
+        .await;
+        if !use_lite_scheduler {
+            // The standard queue reads ahead of its caller, and a finished read
+            // stays counted until the caller receives it. A lite read only runs
+            // when its caller polls it.
+            wait_until("both chunks are read", || {
+                get_range_count.load(Ordering::Acquire) == 2
+            })
+            .await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            assert_eq!(scheduler.reserved_bytes(), 150);
+        }
+
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(0));
+        let bypass_reads = Arc::new(AtomicU64::new(0));
+        let blocking: Arc<dyn Reader> = Arc::new(BlockingReader {
+            semaphore: semaphore.clone(),
+            get_range_count: bypass_reads.clone(),
+            path: Path::parse("test").unwrap(),
+        });
+        let bypass = tokio::spawn(scheduler.submit_request(blocking, vec![300..400], 1, true));
+        wait_until("the bypass read runs", || {
+            bypass_reads.load(Ordering::Acquire) == 1
+        })
+        .await;
+        assert_eq!(scheduler.reserved_bytes(), 150);
+        semaphore.add_permits(1);
+        assert_eq!(bypass.await.unwrap().unwrap()[0].len(), 100);
+        assert_eq!(scheduler.reserved_bytes(), 150);
+
+        assert_eq!(pending.await.unwrap().len(), 2);
+        assert_eq!(scheduler.reserved_bytes(), 0);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2700,6 +4132,7 @@ mod tests {
         while get_range_count.load(Ordering::Acquire) == 0 {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
+        assert_eq!(scheduler.reserved_bytes(), 50);
 
         // Step 2: drop the caller-side future while its `rx` is still pending.
         handle.abort();
@@ -2711,6 +4144,10 @@ mod tests {
         // Give the read time to run to completion so the refund would already have
         // happened.
         tokio::time::sleep(Duration::from_millis(50)).await;
+        wait_until("the dropped request is refunded", || {
+            scheduler.reserved_bytes() == 0
+        })
+        .await;
 
         // Step 4: submit the follow-up. Add a permit up front so that, if it *is*
         // admitted, its own read can complete rather than block on the semaphore.

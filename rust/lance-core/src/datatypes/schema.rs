@@ -137,6 +137,10 @@ pub fn validate_fixed_size_list_dimensions(field_name: &str, data_type: &DataTyp
     Ok(())
 }
 
+/// Field IDs of a new table must be below this (2^30), leaving room for about a
+/// billion fields added later.
+pub const NEW_TABLE_FIELD_ID_LIMIT: i32 = 1 << 30;
+
 impl Schema {
     /// The unenforced primary key fields in the schema, ordered by position.
     ///
@@ -265,6 +269,7 @@ impl Schema {
         columns: &[T],
         err_on_missing: bool,
         preserve_system_columns: bool,
+        err_on_missing_nested: bool,
     ) -> Result<Self> {
         let mut candidates: Vec<Field> = vec![];
         // A linear scan of the fields per requested column is quadratic when
@@ -290,6 +295,10 @@ impl Schema {
             };
             if let Some(field_idx) = field_idx {
                 let split_refs: Vec<&str> = split[1..].iter().map(|s| s.as_str()).collect();
+                if err_on_missing_nested && self.fields[field_idx].sub_field(&split_refs).is_none()
+                {
+                    return Err(Error::field_not_found(col.as_ref(), self.field_paths()));
+                }
                 let projected_field = self.fields[field_idx].project(&split_refs)?;
                 if let Some(&pos) = candidate_pos.get(&field_idx) {
                     candidates[pos].merge(&projected_field)?;
@@ -298,6 +307,9 @@ impl Schema {
                     candidates.push(projected_field);
                 }
             } else if crate::is_system_column(first) {
+                if err_on_missing_nested && split.len() > 1 {
+                    return Err(Error::field_not_found(col.as_ref(), self.field_paths()));
+                }
                 if preserve_system_columns {
                     if first == ROW_ID {
                         candidates.push(Field::try_from(ROW_ID_FIELD.clone())?);
@@ -335,21 +347,25 @@ impl Schema {
     /// let projected = schema.project(&["col1", "col2.sub_col3.field4"])?;
     /// ```
     pub fn project<T: AsRef<str>>(&self, columns: &[T]) -> Result<Self> {
-        self.do_project(columns, true, false)
+        self.do_project(columns, true, false, false)
     }
 
     /// Project the columns over the schema, dropping unrecognized columns
     pub fn project_or_drop<T: AsRef<str>>(&self, columns: &[T]) -> Result<Self> {
-        self.do_project(columns, false, false)
+        self.do_project(columns, false, false, false)
     }
 
     /// Project the columns over the schema, preserving system columns.
+    ///
+    /// Unlike [`Self::project`], a nested path whose last field does not exist
+    /// is an error rather than a parent struct with no children, because the
+    /// columns usually come from a user.
     pub fn project_preserve_system_columns<T: AsRef<str>>(&self, columns: &[T]) -> Result<Self> {
-        self.do_project(columns, true, true)
+        self.do_project(columns, true, true, true)
     }
 
-    /// Check that the top level fields don't contain `.` in their names
-    /// to distinguish from nested fields.
+    /// Check field ids, sibling names, fixed-size-list dimensions, and top-level
+    /// names (which cannot contain `.` to distinguish them from nested paths).
     // TODO: pub(crate)
     pub fn validate(&self) -> Result<()> {
         let mut seen_names = HashSet::new();
@@ -367,6 +383,20 @@ impl Schema {
                     "Duplicate field name \"{}\" in schema:\n {:#?}",
                     field.name, self
                 )));
+            }
+        }
+
+        // Each child collection has its own namespace. Checking only the root
+        // makes a later sibling with the same name unreachable by field path.
+        for parent in self.fields_pre_order() {
+            let mut seen_children = HashSet::with_capacity(parent.children.len());
+            for child in &parent.children {
+                if !seen_children.insert(child.name.as_str()) {
+                    return Err(Error::schema(format!(
+                        "Duplicate field name \"{}\" under field \"{}\" in schema:\n {:#?}",
+                        child.name, parent.name, self
+                    )));
+                }
             }
         }
 
@@ -402,6 +432,130 @@ impl Schema {
             validate_fixed_size_list_dimensions(&field.name, &field.data_type())?;
         }
 
+        Ok(())
+    }
+
+    /// The blob fields nested in a Map or FixedSizeList: Blob v2 supports
+    /// nesting only under Struct, List and LargeList.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::{collections::HashMap, sync::Arc};
+    ///
+    /// use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+    /// use lance_arrow::{ARROW_EXT_NAME_KEY, BLOB_V2_EXT_NAME};
+    /// use lance_core::datatypes::Schema;
+    ///
+    /// let blob = Field::new("blob", DataType::Binary, true).with_metadata(HashMap::from([(
+    ///     ARROW_EXT_NAME_KEY.to_string(),
+    ///     BLOB_V2_EXT_NAME.to_string(),
+    /// )]));
+    /// let key = Field::new("key", DataType::Utf8, false);
+    /// let entries = Field::new("entries", DataType::Struct(vec![key, blob].into()), false);
+    /// let attrs = Field::new("attrs", DataType::Map(Arc::new(entries), false), true);
+    /// let schema = Schema::try_from(&ArrowSchema::new(vec![attrs]))?;
+    ///
+    /// let nested = schema
+    ///     .nested_blob_fields()
+    ///     .map(|field| field.name.as_str())
+    ///     .collect::<Vec<_>>();
+    /// assert_eq!(nested, ["blob"]);
+    /// let error = schema.check_blob_nesting(|field| field.is_blob_v2()).unwrap_err();
+    /// assert!(error.to_string().contains("nested in Map field 'attrs'"));
+    /// # Ok::<(), lance_core::Error>(())
+    /// ```
+    pub fn nested_blob_fields(&self) -> impl Iterator<Item = &Field> {
+        self.nested_blobs().into_iter().map(|(field, _, _)| field)
+    }
+
+    /// Reject the blob fields `rejects` selects among [`Self::nested_blob_fields`].
+    /// See [`Self::nested_blob_fields`] for an example that combines both checks.
+    pub fn check_blob_nesting(&self, rejects: impl Fn(&Field) -> bool) -> Result<()> {
+        for (field, kind, container_path) in self.nested_blobs() {
+            if rejects(field) {
+                return Err(Error::not_supported(format!(
+                    "Blob v2 fields nested in {kind} field '{container_path}' are not supported; Blob v2 can be nested only in Struct, List and LargeList"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Each blob nested in a Map or FixedSizeList, with the kind and path of
+    /// the container, in schema order.
+    fn nested_blobs(&self) -> Vec<(&Field, &'static str, String)> {
+        fn collect<'a>(
+            field: &'a Field,
+            path: &str,
+            container: Option<(&'static str, &str)>,
+            out: &mut Vec<(&'a Field, &'static str, String)>,
+        ) {
+            if let Some((kind, container_path)) = container
+                && field.is_blob()
+            {
+                out.push((field, kind, container_path.to_string()));
+            }
+            // The logical type, not `data_type()`, which rebuilds the whole subtree.
+            let container = if field.logical_type.is_map() {
+                Some(("Map", path))
+            } else if field.logical_type.is_fixed_size_list_struct() {
+                Some(("FixedSizeList", path))
+            } else {
+                container
+            };
+            for child in &field.children {
+                collect(child, &format!("{path}.{}", child.name), container, out);
+            }
+        }
+        let mut out = Vec::new();
+        for field in &self.fields {
+            collect(field, &field.name, None, &mut out);
+        }
+        out
+    }
+
+    /// Validate a schema before storing it in a dataset manifest.
+    ///
+    /// System columns are virtual on reads, so [`Self::validate`] permits their
+    /// names in projection schemas. Stored top-level fields must have nonempty
+    /// names and may not use system-column names. Nested fields may use system
+    /// names because virtual columns are added only at the schema root.
+    ///
+    /// ```
+    /// use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+    /// use lance_core::datatypes::Schema;
+    ///
+    /// let arrow = ArrowSchema::new(vec![Field::new("_rowid", DataType::UInt64, false)]);
+    /// let schema = Schema::try_from(&arrow)?;
+    /// assert!(schema.validate_writable().is_err());
+    /// let empty = ArrowSchema::new(vec![Field::new("", DataType::UInt64, false)]);
+    /// assert!(Schema::try_from(&empty)?.validate_writable().is_err());
+    ///
+    /// let nested = ArrowSchema::new(vec![Field::new(
+    ///     "outer",
+    ///     DataType::Struct(vec![Field::new("_rowid", DataType::UInt64, false)].into()),
+    ///     false,
+    /// )]);
+    /// Schema::try_from(&nested)?.validate_writable()?;
+    /// # Ok::<(), lance_core::Error>(())
+    /// ```
+    pub fn validate_writable(&self) -> Result<()> {
+        self.validate()?;
+        for (index, field) in self.fields.iter().enumerate() {
+            if field.name.is_empty() {
+                return Err(Error::invalid_input(format!(
+                    "The top-level column at index {index} has an empty name and cannot be stored in a Lance dataset"
+                )));
+            }
+            if crate::is_system_column(&field.name) {
+                return Err(Error::invalid_input(format!(
+                    "The column '{}' at path '{}' is a reserved name and cannot be stored in a Lance dataset",
+                    field.name,
+                    self.field_path_minimal(field.id)?
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -655,19 +809,30 @@ impl Schema {
 
     /// Get the sequence of fields from the root to the field with the given id.
     pub fn field_ancestry_by_id(&self, id: i32) -> Option<Vec<&Field>> {
-        let mut to_visit = self.fields.iter().map(|f| vec![f]).collect::<Vec<_>>();
-        while let Some(path) = to_visit.pop() {
-            let field = path.last().unwrap();
-            if field.id == id {
-                return Some(path);
-            }
-            for child in field.children.iter() {
-                let mut new_path = path.clone();
-                new_path.push(child);
-                to_visit.push(new_path);
+        // Keep only ancestors and their remaining siblings, rather than copying
+        // the whole path for every candidate. Preserve the reverse sibling order.
+        let mut ancestors: Vec<(&Field, &[Field])> = Vec::new();
+        let mut remaining = self.fields.as_slice();
+        loop {
+            if let Some((field, siblings)) = remaining.split_last() {
+                if field.id == id {
+                    let mut path = Vec::with_capacity(ancestors.len() + 1);
+                    path.extend(ancestors.iter().map(|(parent, _)| *parent));
+                    path.push(field);
+                    return Some(path);
+                }
+                if field.children.is_empty() {
+                    remaining = siblings;
+                } else {
+                    ancestors.push((field, siblings));
+                    remaining = &field.children;
+                }
+            } else if let Some((_, siblings)) = ancestors.pop() {
+                remaining = siblings;
+            } else {
+                return None;
             }
         }
-        None
     }
 
     pub fn mut_field_by_id(&mut self, id: impl Into<i32>) -> Option<&mut Field> {
@@ -740,6 +905,35 @@ impl Schema {
             field.try_set_id(-1, &mut current_id)?;
         }
         Ok(())
+    }
+
+    /// Assign field IDs for a new table: keep the IDs the fields carry and give
+    /// each field without one an ID above the largest.
+    ///
+    /// Fails when two fields share an ID, or when an ID is not below
+    /// [`NEW_TABLE_FIELD_ID_LIMIT`], so the table has room for fields added later.
+    pub fn try_assign_new_table_field_ids(&mut self) -> Result<()> {
+        self.try_keep_field_ids()?;
+        if let Some(max_id) = self.max_field_id()
+            && max_id >= NEW_TABLE_FIELD_ID_LIMIT
+        {
+            return Err(Error::invalid_input(format!(
+                "field ID {max_id} is too large for a new table: field IDs must be below \
+                 {NEW_TABLE_FIELD_ID_LIMIT} to leave room for fields added later"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Keep the IDs the fields carry and give each field without one an ID
+    /// above the largest. Unlike [`Self::try_assign_new_table_field_ids`] there
+    /// is no upper limit, for IDs an existing table already uses, which may be
+    /// past [`NEW_TABLE_FIELD_ID_LIMIT`].
+    ///
+    /// Fails when two fields share an ID.
+    pub fn try_keep_field_ids(&mut self) -> Result<()> {
+        self.try_set_field_id(None)?;
+        self.validate()
     }
 
     /// Replace every field ID with a fresh checked allocation.
@@ -1284,6 +1478,57 @@ impl Projection {
         }
     }
 
+    /// Resolve a requested schema against the base schema by name and type.
+    ///
+    /// Fields can select a subset of the children of a nested column. System
+    /// columns are represented by projection flags. In particular, a request
+    /// for `_rowoffset` selects the row address needed to compute it.
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use lance_core::{ROW_ADDR, datatypes::{Projection, Schema}};
+    ///
+    /// let base = Arc::new(Schema::default());
+    /// let requested = base.project_preserve_system_columns(&[ROW_ADDR])?;
+    /// let projection = Projection::from_schema(base, &requested)?;
+    /// assert!(projection.with_row_addr);
+    /// # Ok::<(), lance_core::Error>(())
+    /// ```
+    pub fn from_schema(base: Arc<dyn Projectable>, requested: &Schema) -> Result<Self> {
+        let mut projection = Self::empty(base);
+        let mut data_fields = Vec::with_capacity(requested.fields.len());
+        for field in &requested.fields {
+            match field.name.as_str() {
+                ROW_ID => projection.with_row_id = true,
+                ROW_ADDR | ROW_OFFSET => projection.with_row_addr = true,
+                ROW_LAST_UPDATED_AT_VERSION => {
+                    projection.with_row_last_updated_at_version = true;
+                }
+                ROW_CREATED_AT_VERSION => projection.with_row_created_at_version = true,
+                name => {
+                    if projection.base_schema().field(name).is_none() {
+                        return Err(Error::invalid_input(format!(
+                            "Column '{name}' not found in schema"
+                        )));
+                    }
+                    data_fields.push(field.clone());
+                }
+            }
+        }
+        // Resolve names and types first. A schema assembled independently can
+        // contain field IDs that designate different columns in this table.
+        let data_schema = Schema {
+            fields: data_fields,
+            metadata: requested.metadata.clone(),
+        };
+        let data_schema = projection.base_schema().project_by_schema(
+            &data_schema,
+            OnMissing::Error,
+            OnTypeMismatch::Error,
+        )?;
+        Ok(projection.union_schema(&data_schema))
+    }
+
     pub fn full(base: Arc<dyn Projectable>) -> Self {
         let schema = base.schema().clone();
         Self::empty(base).union_schema(&schema)
@@ -1348,7 +1593,28 @@ impl Projection {
             return Ok(self);
         }
 
-        if let Some(fields) = self.base.schema().resolve(column) {
+        let fields = self.base.schema().resolve(column).or_else(|| {
+            let path = parse_field_path(column).ok()?;
+            let (child, parent) = path.split_last()?;
+            let parent =
+                format_field_path_minimal(&parent.iter().map(String::as_str).collect::<Vec<_>>());
+            let fields = self.base.schema().resolve(parent)?;
+            let field = fields.last()?;
+            if field.is_blob_v2()
+                && self.blob_handling.returns_description(field)
+                && super::BLOB_V2_DESC_LANCE_FIELD
+                    .children
+                    .iter()
+                    .any(|descriptor| descriptor.name == *child)
+            {
+                // Descriptor children are synthesized at read time and have no stored field
+                // IDs. Select the physical blob and its ancestors, not a descriptor child.
+                Some(fields)
+            } else {
+                None
+            }
+        });
+        if let Some(fields) = fields {
             self.field_ids.extend(fields.iter().map(|f| f.id));
             if let Some(last_field) = fields.last() {
                 Self::add_field_children(&mut self.field_ids, last_field);
@@ -1813,10 +2079,65 @@ pub fn escape_field_path_for_project(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use crate::datatypes::field::LANCE_FIELD_ID_KEY;
+    use crate::datatypes::{BLOB_V2_LOGICAL_FIELDS, BLOB_V2_LOGICAL_MINIMAL_FIELDS};
     use arrow_schema::{DataType as ArrowDataType, Fields as ArrowFields};
+    use rstest::rstest;
     use std::{collections::HashMap, sync::Arc};
 
     use super::*;
+
+    #[rstest::rstest]
+    fn test_blob_v2_descriptor_subfield_projection(
+        #[values("kind", "position", "size", "blob_id", "blob_uri")] child: &str,
+        #[values(false, true)] complete: bool,
+        #[values(false, true)] nested: bool,
+    ) {
+        let blob = ArrowField::new(
+            if nested { "video.with.dot" } else { "video" },
+            DataType::Struct(if complete {
+                BLOB_V2_LOGICAL_FIELDS.clone()
+            } else {
+                BLOB_V2_LOGICAL_MINIMAL_FIELDS.clone()
+            }),
+            true,
+        )
+        .with_metadata(HashMap::from([(
+            "ARROW:extension:name".to_string(),
+            "lance.blob.v2".to_string(),
+        )]));
+        let (field, path) = if nested {
+            (
+                ArrowField::new("parent", DataType::Struct(vec![blob].into()), true),
+                "parent.`video.with.dot`",
+            )
+        } else {
+            (blob, "video")
+        };
+        let schema = Arc::new(Schema::try_from(&ArrowSchema::new(vec![field])).unwrap());
+        let expected = Projection::empty(schema.clone())
+            .union_column(path, OnMissing::Error)
+            .unwrap();
+        let actual = Projection::empty(schema.clone())
+            .union_column(format!("{path}.{child}"), OnMissing::Error)
+            .unwrap();
+        assert_eq!(actual.to_arrow_schema(), expected.to_arrow_schema());
+        assert!(actual.field_ids.iter().all(|id| *id >= 0));
+
+        for missing in [format!("{path}.missing"), format!("{path}.{child}.missing")] {
+            let error = Projection::empty(schema.clone())
+                .union_column(&missing, OnMissing::Error)
+                .unwrap_err();
+            assert!(matches!(error, Error::InvalidInput { .. }));
+            assert!(error.to_string().contains(&missing));
+            assert!(
+                Projection::empty(schema.clone())
+                    .union_column(&missing, OnMissing::Ignore)
+                    .unwrap()
+                    .field_ids
+                    .is_empty()
+            );
+        }
+    }
 
     #[rstest::rstest]
     #[case::last_id(i32::MAX - 1, 1, true)]
@@ -2026,6 +2347,96 @@ mod tests {
         assert!(error.to_string().contains("Duplicate field id 0"));
     }
 
+    #[rstest]
+    #[case::direct(false)]
+    #[case::deeply_nested(true)]
+    fn test_validate_rejects_duplicate_sibling_names(#[case] is_nested: bool) {
+        let duplicate_children = DataType::Struct(ArrowFields::from(vec![
+            ArrowField::new("x", DataType::Int32, false),
+            ArrowField::new("x", DataType::Int64, false),
+        ]));
+        let data_type = if is_nested {
+            DataType::Struct(ArrowFields::from(vec![ArrowField::new(
+                "inner",
+                duplicate_children,
+                false,
+            )]))
+        } else {
+            duplicate_children
+        };
+        let arrow = ArrowSchema::new(vec![ArrowField::new("outer", data_type, false)]);
+        let error = Schema::try_from(&arrow).unwrap_err();
+        assert!(matches!(&error, Error::Schema { .. }));
+        assert!(error.to_string().contains("Duplicate field name \"x\""));
+
+        let valid = ArrowSchema::new(vec![
+            ArrowField::new(
+                "left",
+                DataType::Struct(ArrowFields::from(vec![ArrowField::new(
+                    "x",
+                    DataType::Int32,
+                    false,
+                )])),
+                false,
+            ),
+            ArrowField::new(
+                "right",
+                DataType::Struct(ArrowFields::from(vec![ArrowField::new(
+                    "x",
+                    DataType::Int64,
+                    false,
+                )])),
+                false,
+            ),
+        ]);
+        assert!(Schema::try_from(&valid).is_ok());
+    }
+
+    #[rstest]
+    #[case::row_id(ROW_ID)]
+    #[case::row_address(ROW_ADDR)]
+    #[case::row_offset(ROW_OFFSET)]
+    #[case::last_updated(ROW_LAST_UPDATED_AT_VERSION)]
+    #[case::created(ROW_CREATED_AT_VERSION)]
+    fn test_validate_writable_rejects_system_names_only_at_root(
+        #[case] name: &str,
+        #[values(false, true)] is_nested: bool,
+    ) {
+        let field = ArrowField::new(name, DataType::UInt64, false);
+        let arrow = if is_nested {
+            ArrowSchema::new(vec![ArrowField::new(
+                "outer",
+                DataType::Struct(ArrowFields::from(vec![field])),
+                false,
+            )])
+        } else {
+            ArrowSchema::new(vec![field])
+        };
+        let schema = Schema::try_from(&arrow).unwrap();
+        schema.validate().unwrap();
+        if is_nested {
+            schema.validate_writable().unwrap();
+            return;
+        }
+        let error = schema.validate_writable().unwrap_err();
+        assert!(matches!(&error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains(&format!("path '{name}'")));
+        assert!(error.to_string().contains("reserved name"));
+    }
+
+    #[test]
+    fn test_validate_writable_rejects_empty_top_level_name() {
+        let arrow = ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("", DataType::Int32, false),
+        ]);
+        let schema = Schema::try_from(&arrow).unwrap();
+        let error = schema.validate_writable().unwrap_err();
+        assert!(matches!(&error, Error::InvalidInput { .. }), "{error}");
+        assert!(error.to_string().contains("index 1"), "{error}");
+        assert!(error.to_string().contains("empty name"), "{error}");
+    }
+
     #[test]
     fn test_validate_admits_row_lineage_ids_only_at_top_level() {
         let uint64_field = |name: &str, id: i32| {
@@ -2201,6 +2612,32 @@ mod tests {
             ArrowField::new("c", DataType::Float64, false),
         ]);
         assert_eq!(ArrowSchema::from(&projected), expected_arrow_schema);
+
+        // A missing nested field is an error, wherever the path stops resolving
+        // and whether or not another path under the same column comes first.
+        for missing in ["b.nope", "c.nope", "b.f1.nope", "nope", "_rowid.x"] {
+            for columns in [["a", missing], ["b.f1", missing]] {
+                let err = schema
+                    .project_preserve_system_columns(&columns)
+                    .unwrap_err();
+                assert!(matches!(err, Error::FieldNotFound { .. }), "{err:?}");
+                assert!(err.to_string().contains(missing), "{err}");
+            }
+        }
+
+        // A list whose projection would have no item is not merged.
+        let list_schema = Schema::try_from(&ArrowSchema::new(vec![ArrowField::new(
+            "l",
+            DataType::List(Arc::new(ArrowField::new("item", DataType::Int32, true))),
+            true,
+        )]))
+        .unwrap();
+        for columns in [["l.item", "l.nope"], ["l.nope", "l.item"]] {
+            let err = list_schema
+                .project_preserve_system_columns(&columns)
+                .unwrap_err();
+            assert!(matches!(err, Error::FieldNotFound { .. }), "{err:?}");
+        }
     }
 
     #[test]
@@ -2526,6 +2963,38 @@ mod tests {
             .intersection_ignore_types(&schema_with_list_struct)
             .unwrap();
         assert_eq!(intersection, with_missing_field);
+
+        // LargeList must narrow its item children the same way List does.
+        let schema_with_large_list_struct = ArrowSchema::new(vec![ArrowField::new(
+            "struct_list",
+            DataType::LargeList(Arc::new(ArrowField::new(
+                "item",
+                DataType::Struct(ArrowFields::from(vec![
+                    ArrowField::new("f1", DataType::Utf8, true),
+                    ArrowField::new("f2", DataType::Boolean, false),
+                ])),
+                true,
+            ))),
+            true,
+        )]);
+        let schema_with_large_list_struct =
+            Schema::try_from(&schema_with_large_list_struct).unwrap();
+
+        let with_missing_field = schema_with_large_list_struct.project_by_ids(&[1, 3], false);
+        let intersection = schema_with_large_list_struct
+            .intersection_ignore_types(&with_missing_field)
+            .unwrap();
+        assert_eq!(intersection, with_missing_field);
+        let intersection = with_missing_field
+            .intersection_ignore_types(&schema_with_large_list_struct)
+            .unwrap();
+        assert_eq!(intersection, with_missing_field);
+        // Strict mode must narrow as well: item child types are shared here,
+        // so the recursion is not gated behind ignore_types.
+        let intersection = schema_with_large_list_struct
+            .intersection(&with_missing_field)
+            .unwrap();
+        assert_eq!(intersection, with_missing_field);
     }
 
     #[test]
@@ -2600,6 +3069,56 @@ mod tests {
                 ("right_only".to_string(), "right".to_string()),
             ])
         );
+    }
+
+    fn with_field_id(field: ArrowField, id: i32) -> ArrowField {
+        field.with_metadata(HashMap::from([(
+            LANCE_FIELD_ID_KEY.to_string(),
+            id.to_string(),
+        )]))
+    }
+
+    #[test]
+    fn test_new_table_keeps_supplied_field_ids() {
+        let arrow_schema = ArrowSchema::new(vec![
+            with_field_id(ArrowField::new("a", DataType::Int32, false), 0),
+            with_field_id(
+                ArrowField::new(
+                    "s",
+                    DataType::Struct(ArrowFields::from(vec![
+                        with_field_id(ArrowField::new("x", DataType::Utf8, true), 7),
+                        ArrowField::new("y", DataType::Utf8, true),
+                    ])),
+                    true,
+                ),
+                3,
+            ),
+            ArrowField::new("b", DataType::Int64, true),
+        ]);
+        let mut schema = Schema::try_from(&arrow_schema).unwrap();
+        schema.try_assign_new_table_field_ids().unwrap();
+
+        let ids: Vec<(&str, i32)> = schema
+            .fields_pre_order()
+            .map(|field| (field.name.as_str(), field.id))
+            .collect();
+        assert_eq!(ids, vec![("a", 0), ("s", 3), ("x", 7), ("y", 8), ("b", 9)]);
+    }
+
+    #[rstest::rstest]
+    #[case::at_the_limit(vec![NEW_TABLE_FIELD_ID_LIMIT])]
+    #[case::filled_up_to_the_limit(vec![NEW_TABLE_FIELD_ID_LIMIT - 1, -1])]
+    #[case::largest_possible(vec![i32::MAX])]
+    #[case::shared(vec![1, 1])]
+    fn test_new_table_rejects_unusable_field_ids(#[case] ids: Vec<i32>) {
+        let fields: Vec<ArrowField> = (0..ids.len())
+            .map(|i| ArrowField::new(format!("f{i}"), DataType::Int32, true))
+            .collect();
+        let mut schema = Schema::try_from(&ArrowSchema::new(fields)).unwrap();
+        for (field, id) in schema.fields.iter_mut().zip(ids) {
+            field.id = id;
+        }
+        assert!(schema.try_assign_new_table_field_ids().is_err());
     }
 
     #[test]
@@ -2731,6 +3250,75 @@ mod tests {
 
         let field = schema.field_by_id(3).unwrap();
         assert_eq!(field.name, "f2");
+
+        for (id, names) in [
+            (0, vec!["a"]),
+            (1, vec!["b"]),
+            (2, vec!["b", "f1"]),
+            (3, vec!["b", "f2"]),
+            (4, vec!["b", "f3"]),
+            (5, vec!["c"]),
+        ] {
+            let path = schema.field_ancestry_by_id(id).unwrap();
+            assert_eq!(
+                path.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(),
+                names
+            );
+            assert!(std::ptr::eq(
+                *path.last().unwrap(),
+                schema.field_by_id(id).unwrap()
+            ));
+        }
+        assert!(schema.field_ancestry_by_id(-1).is_none());
+        assert!(Schema::default().field_ancestry_by_id(0).is_none());
+    }
+
+    #[test]
+    fn test_field_ancestry_backtracking_and_duplicate_ids() {
+        let mut root =
+            Field::new_arrow("root", DataType::Struct(Default::default()), true).unwrap();
+        root.id = 0;
+        let mut left = Field::new_arrow("left", DataType::Int32, true).unwrap();
+        left.id = 1;
+        let mut right =
+            Field::new_arrow("right", DataType::Struct(Default::default()), true).unwrap();
+        right.id = 2;
+        let mut leaf = Field::new_arrow("leaf", DataType::Int32, true).unwrap();
+        leaf.id = 3;
+        right.children.push(leaf);
+        root.children = vec![left, right];
+        let mut schema = Schema {
+            fields: vec![root],
+            ..Default::default()
+        };
+        let path = schema.field_ancestry_by_id(3).unwrap();
+        assert_eq!(
+            path.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(),
+            ["root", "right", "leaf"]
+        );
+        let path = schema.field_ancestry_by_id(1).unwrap();
+        assert_eq!(
+            path.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(),
+            ["root", "left"]
+        );
+        assert!(schema.field_ancestry_by_id(4).is_none());
+
+        // Preserve the original traversal's first match, even on unvalidated schemas.
+        schema.fields[0].children[1].children[0].id = 1;
+        assert_eq!(
+            schema.field_ancestry_by_id(1).unwrap().last().unwrap().name,
+            "leaf"
+        );
+        schema.fields[0].children[1].id = 1;
+        assert_eq!(
+            schema.field_ancestry_by_id(1).unwrap().last().unwrap().name,
+            "right"
+        );
+        schema.fields[0].id = 1;
+        assert_eq!(
+            schema.field_ancestry_by_id(1).unwrap().last().unwrap().name,
+            "root"
+        );
     }
 
     #[test]

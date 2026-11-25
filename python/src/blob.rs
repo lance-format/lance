@@ -10,7 +10,8 @@ use arrow_data::ArrayData;
 use arrow_schema::{DataType, Field};
 use bytes::Bytes;
 use lance::{
-    BlobDescriptor, BlobDescriptorArrayBuilder, BlobRange, DedicatedBlobWriter, PackedBlobWriter,
+    BlobDescriptor, BlobDescriptorArrayBuilder, BlobRange, DedicatedBlobWriter, ManagedBlobWriter,
+    PackedBlobWriter,
 };
 use lance_arrow::iter_binary_array;
 use pyo3::{
@@ -463,6 +464,117 @@ impl PyPackedBlobWriter {
         let array = array.to_data().to_pyarrow(py)?;
         self.field = Some(field);
         Ok(array)
+    }
+}
+
+/// Upload immutable payloads and prepare references reusable across data files.
+///
+/// Create through ``LanceFileSession.open_managed_blob_writer``. This writer
+/// completes the object upload; use a descriptor builder and a dataset write to
+/// publish the references. Maintenance clients must support Managed Blobs.
+#[pyclass(name = "ManagedBlobWriter", skip_from_py_object)]
+pub struct PyManagedBlobWriter {
+    inner: Mutex<Option<ManagedBlobWriter>>,
+}
+
+impl PyManagedBlobWriter {
+    pub(crate) async fn try_new(
+        object_store: Arc<lance_io::object_store::ObjectStore>,
+        base_path: object_store::path::Path,
+        base_id: Option<u32>,
+    ) -> PyResult<Self> {
+        let inner = ManagedBlobWriter::try_new(object_store.as_ref().clone(), base_path, base_id)
+            .await
+            .infer_error()?;
+        Ok(Self {
+            inner: Mutex::new(Some(inner)),
+        })
+    }
+}
+
+#[pymethods]
+impl PyManagedBlobWriter {
+    /// Object path in the writer's object store, available until finish.
+    #[getter]
+    pub fn path(&self) -> PyResult<String> {
+        with_writer(&self.inner, "ManagedBlobWriter", |writer| {
+            writer.path().to_string()
+        })
+    }
+
+    /// Append one payload. Reuse its completed descriptor to share it across rows.
+    pub fn write_blob(&mut self, data: Cow<'_, [u8]>) -> PyResult<()> {
+        let writer = writer_mut(&mut self.inner, "ManagedBlobWriter")?;
+        rt().block_on(None, writer.write_blob(data.as_ref()))?
+            .infer_error()
+    }
+
+    /// Append a binary Arrow array or ChunkedArray, preserving null and empty rows.
+    ///
+    /// A failed or interrupted upload cannot be reused. Each input row has one
+    /// descriptor in the result of ``finish`` or ``finish_column``.
+    pub fn write_blobs(&mut self, payloads: &Bound<'_, PyAny>) -> PyResult<()> {
+        let payloads = extract_blob_payloads(payloads)?;
+        let result = {
+            let writer = writer_mut(&mut self.inner, "ManagedBlobWriter")?;
+            rt().block_on(None, async {
+                for payload in payloads {
+                    let values = iter_binary_array(payload.as_ref())
+                        .map_err(|error| PyValueError::new_err(error.to_string()))?;
+                    writer.write_blobs(values).await.infer_error()?;
+                }
+                Ok(())
+            })
+        };
+        match result {
+            Ok(result) => result,
+            Err(error) => {
+                take_writer(&mut self.inner, "ManagedBlobWriter")?;
+                Err(error)
+            }
+        }
+    }
+
+    /// Complete the upload and return reusable Managed or null descriptors.
+    pub fn finish(&mut self) -> PyResult<Vec<PyBlobDescriptor>> {
+        let writer = take_writer(&mut self.inner, "ManagedBlobWriter")?;
+        let values = rt().block_on(None, writer.finish())?.infer_error()?;
+        Ok(values.into_iter().map(Into::into).collect())
+    }
+
+    /// Complete the upload and return a prepared field and Arrow array.
+    ///
+    /// The returned pair is ``(field, array)``. The field carries the Blob
+    /// extension metadata and ``field_name``; the array has one row per input
+    /// payload, including nulls. Use ``finish`` and a descriptor builder when
+    /// multiple rows should share one payload.
+    ///
+    /// Examples
+    /// --------
+    /// >>> import tempfile
+    /// >>> import pyarrow as pa
+    /// >>> from lance.file import LanceFileSession
+    /// >>> with tempfile.TemporaryDirectory() as uri:
+    /// ...     writer = LanceFileSession(uri).open_managed_blob_writer()
+    /// ...     writer.write_blobs(pa.array([b"value", None]))
+    /// ...     field, values = writer.finish_column("blob")
+    /// ...     table = pa.Table.from_arrays([values], schema=pa.schema([field]))
+    /// ...     table.num_rows
+    /// 2
+    pub fn finish_column<'py>(
+        &mut self,
+        py: pyo3::Python<'py>,
+        field_name: String,
+    ) -> PyResult<(Bound<'py, PyAny>, Bound<'py, PyAny>)> {
+        let writer = take_writer(&mut self.inner, "ManagedBlobWriter")?;
+        let values = rt().block_on(None, writer.finish())?.infer_error()?;
+        let mut builder = BlobDescriptorArrayBuilder::new(field_name);
+        builder.extend(values).infer_error()?;
+        let (field, array) = builder.finish().infer_error()?.into_parts();
+        Ok((
+            descriptor_field_to_pyarrow(&field, py)?,
+            array.to_data().to_pyarrow(py)?,
+        ))
     }
 }
 

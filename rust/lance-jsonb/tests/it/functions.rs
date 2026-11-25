@@ -28,8 +28,31 @@ fn test_path_exists() {
     let sources = vec![
         (r#"{"a":1,"b":2}"#, r#"$.a"#, true),
         (r#"{"a":1,"b":2}"#, r#"$.c"#, false),
+        (r#"{"1example":1}"#, r#"1example"#, true),
         (r#"{"a":1,"b":2}"#, r#"$.a ? (@ == 1)"#, true),
         (r#"{"a":1,"b":2}"#, r#"$.a ? (@ > 1)"#, false),
+        (
+            r#"[{"confidence":0.8},{"confidence":0.95}]"#,
+            r#"$[*] ? (@.confidence > 0.9)"#,
+            true,
+        ),
+        (
+            r#"[{"confidence":0.8},{"confidence":0.9}]"#,
+            r#"$[*] ? (@.confidence > 9E-1)"#,
+            false,
+        ),
+        (r#"[1234,1235]"#, r#"$[*] ? (@ > 1234.5)"#, true),
+        (r#"[-1,0]"#, r#"$[*] ? (@ < -0.5)"#, true),
+        (
+            r#"[9007199254740992,9007199254740993]"#,
+            r#"$[*] ? (@ == 9007199254740993)"#,
+            true,
+        ),
+        (
+            r#"[9007199254740992]"#,
+            r#"$[*] ? (@ == 9007199254740993)"#,
+            false,
+        ),
         (r#"{"a":1,"b":[1,2,3]}"#, r#"$.b[0]"#, true),
         (r#"{"a":1,"b":[1,2,3]}"#, r#"$.b[3]"#, false),
         (
@@ -122,7 +145,7 @@ fn test_path_exists_expr() {
 
 #[test]
 fn test_select_by_path() {
-    let source = r#"{"name":"Fred","phones":[{"type":"home","number":3720453},{"type":"work","number":5062051}],"car_no":123,"测试\"\uD83D\uDC8E":"ab","numbers":[2,3,4],"key":null}"#;
+    let source = r#"{"name":"Fred","phones":[{"type":"home","number":3720453},{"type":"work","number":5062051}],"car_no":123,"测试\"\uD83D\uDC8E":"ab","numbers":[2,3,4],"key":null,"big":18446744073709551615,"two63":9223372036854775808,"neg":-1,"neg5":-5,"neg_min":-9223372036854775808}"#;
 
     let paths = vec![
         (r#"$.name"#, vec![r#""Fred""#]),
@@ -215,6 +238,20 @@ fn test_select_by_path() {
         (r#"+$.numbers"#, vec![r#"2"#, r#"3"#, r#"4"#]),
         (r#"-$.numbers"#, vec![r#"-2"#, r#"-3"#, r#"-4"#]),
         (r#"$.numbers[1] / 2"#, vec![r#"1.5"#]),
+        (r#"$.numbers[0]+0.9"#, vec!["2.9"]),
+        (r#"9E-1+$.numbers[0]"#, vec!["2.9"]),
+        // u64 values above i64::MAX must stay exact through arithmetic:
+        // narrowing them through i64 casts wraps and returns wrong values.
+        (r#"$.big + $.neg"#, vec![r#"18446744073709551614"#]),
+        (r#"$.big - 1"#, vec![r#"18446744073709551614"#]),
+        (r#"$.two63 - 0"#, vec![r#"9223372036854775808"#]),
+        (r#"$.big % -2"#, vec![r#"1"#]),
+        (r#"$.neg5 % $.big"#, vec![r#"-5"#]),
+        (r#"$.neg_min % $.big"#, vec![r#"-9223372036854775808"#]),
+        (r#"$.neg_min % $.two63"#, vec![r#"0"#]),
+        (r#"$.two63 - $.neg"#, vec![r#"9223372036854775809"#]),
+        (r#"$.neg * $.two63"#, vec![r#"-9223372036854775808"#]),
+        (r#"-$.two63"#, vec![r#"-9223372036854775808"#]),
     ];
 
     let owned_jsonb = source.parse::<OwnedJsonb>().unwrap();
@@ -225,6 +262,57 @@ fn test_select_by_path() {
         assert!(res.is_ok());
         let owned_jsonbs = res.unwrap();
         assert_eq!(owned_jsonbs.len(), expects.len());
+        for (owned_jsonb, expect) in owned_jsonbs.into_iter().zip(expects.iter()) {
+            let expected_buf = parse_value(expect.as_bytes()).unwrap().to_vec();
+            assert_eq!(owned_jsonb.as_raw(), RawJsonb::new(&expected_buf));
+        }
+    }
+}
+
+#[test]
+fn test_select_by_filter_wildcard_compare() {
+    // A wildcard comparison (`@.x[*] == 1`) is existential: any pair
+    // comparing true selects the item. An incomparable pair (e.g. null vs
+    // number) must not abort the search, otherwise the filter result would
+    // depend on the order of elements inside the array.
+    let sources = vec![
+        // Both elements match: in the second one the incomparable null
+        // precedes the matching 1.
+        (
+            r#"{"items":[{"x":[1,null]},{"x":[null,1]}]}"#,
+            r#"$.items[*]?(@.x[*] == 1)"#,
+            vec![r#"{"x":[1,null]}"#, r#"{"x":[null,1]}"#],
+        ),
+        // Items whose arrays differ only in element order must agree.
+        (
+            r#"{"items":[{"x":[1,null]}]}"#,
+            r#"$.items[*]?(@.x[*] == 1)"#,
+            vec![r#"{"x":[1,null]}"#],
+        ),
+        (
+            r#"{"items":[{"x":[null,1]}]}"#,
+            r#"$.items[*]?(@.x[*] == 1)"#,
+            vec![r#"{"x":[null,1]}"#],
+        ),
+        // A root predicate reports the same existential result.
+        (r#"{"x":[null,1]}"#, r#"$.x[*] == 1"#, vec![r#"true"#]),
+        // No pair compares true: SQL-style unknown still filters the item
+        // out, with or without an incomparable pair present.
+        (
+            r#"{"items":[{"x":[2,null]},{"x":[null]}]}"#,
+            r#"$.items[*]?(@.x[*] == 1)"#,
+            vec![],
+        ),
+    ];
+
+    for (source, path, expects) in sources {
+        let owned_jsonb = source.parse::<OwnedJsonb>().unwrap();
+        let raw_jsonb = owned_jsonb.as_raw();
+        let json_path = parse_json_path(path.as_bytes()).unwrap();
+        let res = Selector::new(raw_jsonb).select_values(&json_path);
+        assert!(res.is_ok());
+        let owned_jsonbs = res.unwrap();
+        assert_eq!(owned_jsonbs.len(), expects.len(), "path: {path}");
         for (owned_jsonb, expect) in owned_jsonbs.into_iter().zip(expects.iter()) {
             let expected_buf = parse_value(expect.as_bytes()).unwrap().to_vec();
             assert_eq!(owned_jsonb.as_raw(), RawJsonb::new(&expected_buf));
@@ -257,6 +345,21 @@ fn test_get_by_index() {
             None => assert_eq!(owned_jsonb_opt, None),
         }
     }
+}
+
+#[test]
+fn test_array_elements_stops_after_a_decode_error() {
+    // An array header claiming two elements with no entries behind it: the
+    // first element fails to decode and the iterator ends there, rather than
+    // returning the same error on every call.
+    let owned_jsonb = OwnedJsonb::from(vec![0x80, 0, 0, 2]);
+    let raw_jsonb = owned_jsonb.as_raw();
+    assert_eq!(raw_jsonb.array_len().unwrap(), Some(2));
+
+    let mut elements = raw_jsonb.array_elements().unwrap().unwrap();
+    assert!(elements.next().unwrap().is_err());
+    assert!(elements.next().is_none());
+    assert_eq!(elements.size_hint(), (0, Some(0)));
 }
 
 #[test]

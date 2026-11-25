@@ -127,6 +127,12 @@ impl std::error::Error for CommitStatusUnknownError {
     }
 }
 
+#[derive(Debug, Snafu)]
+#[snafu(display("Append already committed at version {version}"))]
+struct AppendAlreadyCommittedError {
+    version: u64,
+}
+
 /// Allocates error on the heap and then places `e` into it.
 #[inline]
 pub fn box_error(e: impl std::error::Error + Send + Sync + 'static) -> BoxedError {
@@ -423,6 +429,14 @@ pub enum Error {
         #[snafu(implicit)]
         location: Location,
     },
+    /// A MemWAL commit names a `dir_id` the manifest it builds on no longer
+    /// carries. Never retryable. Match via [`Error::is_stale_mem_wal`].
+    #[snafu(display("Stale MemWAL: {message}, {location}"))]
+    StaleMemWal {
+        message: String,
+        #[snafu(implicit)]
+        location: Location,
+    },
     /// An error shared behind an [`Arc`] so it can be cloned cheaply without
     /// deep-copying its source (see [`CloneableError`]). Accessors that read a
     /// variant or typed source rather than the message — [`Error::external_source`],
@@ -482,7 +496,8 @@ impl Error {
             | Self::Timeout { .. }
             | Self::DiskCapExceeded { .. }
             | Self::Fenced { .. }
-            | Self::Backpressure { .. } => None,
+            | Self::Backpressure { .. }
+            | Self::StaleMemWal { .. } => None,
             // A shared error delegates to the error it wraps.
             Self::Shared { source } => source.backtrace(),
         }
@@ -588,6 +603,21 @@ impl Error {
     /// error message.
     pub fn is_backpressure(&self) -> bool {
         matches!(self.find_root(), Self::Backpressure { .. })
+    }
+
+    /// A MemWAL commit built for a MemWAL that is no longer current. See
+    /// [`Error::StaleMemWal`].
+    #[track_caller]
+    pub fn stale_mem_wal(message: impl Into<String>) -> Self {
+        StaleMemWalSnafu {
+            message: message.into(),
+        }
+        .build()
+    }
+
+    /// Whether this is [`Error::StaleMemWal`].
+    pub fn is_stale_mem_wal(&self) -> bool {
+        matches!(self.find_root(), Self::StaleMemWal { .. })
     }
 
     #[track_caller]
@@ -769,6 +799,22 @@ impl Error {
     #[track_caller]
     pub fn retryable_commit_conflict_source(version: u64, source: BoxedError) -> Self {
         RetryableCommitConflictSnafu { version }.into_error(source)
+    }
+
+    /// Report that an append with the same idempotency key already committed.
+    #[track_caller]
+    pub fn append_already_committed(version: u64) -> Self {
+        Self::wrapped(box_error(AppendAlreadyCommittedError { version }))
+    }
+
+    /// The version that committed the append with the same idempotency key, if any.
+    pub fn append_already_committed_version(&self) -> Option<u64> {
+        match self.find_root() {
+            Self::Wrapped { error, .. } => error
+                .downcast_ref::<AppendAlreadyCommittedError>()
+                .map(|error| error.version),
+            _ => None,
+        }
     }
 
     #[track_caller]

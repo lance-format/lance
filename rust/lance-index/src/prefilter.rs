@@ -12,7 +12,9 @@ use lance_select::{RowAddrMask, RowAddrTreeMap};
 /// This trait is for internal use only and has no stability guarantees.
 #[async_trait]
 pub trait FilterLoader: Send + 'static {
-    async fn load(self: Box<Self>) -> Result<RowAddrMask>;
+    /// The mask is shared so that a loader which already holds one behind an
+    /// `Arc` (a cached mask, say) hands it out without a copy.
+    async fn load(self: Box<Self>) -> Result<Arc<RowAddrMask>>;
 }
 
 /// Filter out row ids that we know are not relevant to the query.
@@ -58,6 +60,26 @@ pub trait PreFilter: Send + Sync {
     /// This method must be called after `wait_for_ready`
     fn mask(&self) -> Arc<RowAddrMask>;
 
+    /// Whether the loaded filter proves that no row at all can pass it.
+    ///
+    /// This is the opposite end of the scale from [`Self::is_empty`], which
+    /// says the filter restricts nothing. It is true only once the mask is
+    /// known to be an empty allow list, so it must be read after
+    /// `wait_for_ready`; before that, and for a block list of any size, it
+    /// is false. Index searches use it to skip candidate scoring for a
+    /// segment whose own mask selects nothing, so implementations answer
+    /// from their stored mask without scanning it.
+    fn selects_nothing(&self) -> bool {
+        false
+    }
+
+    /// Whether the mask carries no query filter, only deleted rows and index
+    /// coverage. Such a mask passes nearly every row, so a search can check it
+    /// on its candidates instead of on every row of a partition.
+    fn deletions_only(&self) -> bool {
+        false
+    }
+
     /// Check whether a slice of row ids should be included in a query.
     ///
     /// Returns a vector of indices into the input slice that should be included,
@@ -65,6 +87,28 @@ pub trait PreFilter: Send + Sync {
     ///
     /// This method must be called after `wait_for_ready`
     fn filter_row_ids<'a>(&self, row_ids: Box<dyn Iterator<Item = &'a u64> + 'a>) -> Vec<u64>;
+}
+
+/// Estimates the share of a partition's `len` rows that `mask` blocks from
+/// `samples` of them. The offsets are hashed so that deletions in a regular
+/// pattern do not line up with the sample.
+pub fn sample_blocked_share(
+    mask: &RowAddrMask,
+    len: usize,
+    samples: usize,
+    row_id: impl Fn(u32) -> u64,
+) -> f64 {
+    let samples = samples.min(len);
+    if samples == 0 {
+        return 0.0;
+    }
+    let blocked = (0..samples as u64)
+        .filter(|sample| {
+            let offset = (sample.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32) % len as u64;
+            !mask.selected(row_id(offset as u32))
+        })
+        .count();
+    blocked as f64 / samples as f64
 }
 
 /// A prefilter that does nothing

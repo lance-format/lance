@@ -17,22 +17,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use uuid::Uuid;
 
-/// The build config that `lance`'s `ManifestWriteConfig::default()` resolves to.
+/// Default build config for `lance-table` unit tests, stamped with the current system time.
 pub fn default_build_config() -> ManifestBuildConfig {
-    ManifestBuildConfig {
-        auto_set_feature_flags: true,
-        timestamp_nanos: std::time::SystemTime::now()
-            .duration_since(std::time::SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos(),
-        use_stable_row_ids: false,
-        use_legacy_format: None,
-        storage_format: None,
-        disable_transaction_file: false,
-        migration_next_row_id: None,
-        activate_non_reusable_field_ids: false,
-        spilled_row_lineage: Default::default(),
-    }
+    let now_nanos = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    ManifestBuildConfig::default().with_timestamp_nanos(now_nanos)
 }
 
 pub fn sample_manifest() -> Manifest {
@@ -58,6 +49,8 @@ pub fn sample_index_metadata(name: &str) -> IndexMetadata {
         created_at: Some(Utc::now()),
         base_id: None,
         files: None,
+        clustering_id: None,
+        metadata: Default::default(),
     }
 }
 
@@ -93,6 +86,7 @@ pub fn update_txn(new_fragments: Vec<Fragment>) -> Transaction {
             updated_fragments: vec![],
             new_fragments,
             fields_modified: vec![],
+            mem_wal_dir_id: None,
             compacted_sstables: vec![],
             fields_for_preserving_frag_bitmap: vec![],
             update_mode: None,
