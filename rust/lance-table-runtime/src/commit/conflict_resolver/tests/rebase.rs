@@ -67,7 +67,7 @@ async fn test_conflicting_rebase(
             LanceFileVersion::Stable.resolve(),
             NonZero::new(10),
         )
-        .with_physical_rows(3);
+        .with_physical_rows(1);
 
     let operations = [
         (
@@ -143,9 +143,14 @@ async fn test_conflicting_rebase(
     let affected_rows = RowAddrTreeMap::from_iter([0]);
 
     dataset.state.object_store.as_ref().io_stats_incremental(); // reset
-    let mut rebase = TransactionRebase::try_new(&dataset, txn.clone(), Some(&affected_rows))
-        .await
-        .unwrap();
+    let mut rebase = TransactionRebase::try_new_with_inserted_row_count(
+        &dataset,
+        txn.clone(),
+        Some(&affected_rows),
+        Some(0),
+    )
+    .await
+    .unwrap();
 
     let io_stats = dataset.state.object_store.as_ref().io_stats_incremental();
     assert_io_eq!(io_stats, read_iops, 0);

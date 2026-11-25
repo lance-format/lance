@@ -13,7 +13,7 @@ use std::collections::hash_map::Entry;
 #[derive(Debug)]
 pub(super) struct RowHistory {
     read: Table,
-    merge_inserted_rows: Option<u64>,
+    inserted_row_count: Option<u64>,
     latest: HashMap<u64, (u64, Option<DeletionFile>)>,
     // First mutation of fragments absent at the staged read version.
     first_new_changes: HashMap<u64, u64>,
@@ -24,10 +24,10 @@ pub(super) struct RowHistory {
 }
 
 impl RowHistory {
-    pub(super) fn new(read: &Table, merge_inserted_rows: Option<u64>) -> Box<Self> {
+    pub(super) fn new(read: &Table, inserted_row_count: Option<u64>) -> Box<Self> {
         Box::new(Self {
             read: read.clone(),
-            merge_inserted_rows,
+            inserted_row_count,
             latest: HashMap::new(),
             first_new_changes: HashMap::new(),
             superseded: Vec::new(),
@@ -57,9 +57,9 @@ pub(super) fn needs_row_history(
 impl TransactionRebase<'_> {
     /// Physical row addresses describe a row rewrite only while the retained
     /// fragments still refer to the data the writer read.
-    pub(super) fn validate_row_rewrite(&mut self, merge_inserted_rows: Option<u64>) {
+    pub(super) fn validate_row_rewrite(&mut self, inserted_row_count: Option<u64>) {
         let Operation::Update {
-            update_mode: Some(UpdateMode::RewriteRows),
+            update_mode: Some(UpdateMode::RewriteRows) | None,
             updated_fragments,
             inserted_rows_filter,
             ..
@@ -67,10 +67,10 @@ impl TransactionRebase<'_> {
         else {
             return;
         };
-        // Physical addresses cover matched rows only. Without a key filter,
-        // an insert-capable handoff still needs the fragment conflict check.
-        let untracked_inserts =
-            inserted_rows_filter.is_none() && merge_inserted_rows.is_some_and(|n| n > 0);
+        // A matched delete plus an insert can have the same physical write set
+        // and output size as a pure update. Only a known zero or a key filter
+        // makes the matched-row addresses sufficient for a row-level rebase.
+        let untracked_inserts = inserted_rows_filter.is_none() && inserted_row_count != Some(0);
         if self.affected_rows.is_some()
             && (untracked_inserts
                 || !updated_fragments.iter().all(|written| {
@@ -104,7 +104,7 @@ impl TransactionRebase<'_> {
                 &concurrent.operation,
                 keys,
                 history.read.schema(),
-                history.merge_inserted_rows,
+                history.inserted_row_count,
             ) {
                 Ok(false) => None,
                 Ok(true) => Some(Error::retryable_commit_conflict_source(
@@ -139,7 +139,7 @@ impl TransactionRebase<'_> {
             let may_revive_key = keys.is_some()
                 && match history.read.view().find_fragment(id) {
                     Some(read) => read.deletion_file.is_some(),
-                    None if history.merge_inserted_rows == Some(0) => false,
+                    None if history.inserted_row_count == Some(0) => false,
                     None => {
                         history
                             .first_new_changes
@@ -171,7 +171,7 @@ impl TransactionRebase<'_> {
             let check_keys = may_revive_key
                 && keys.is_some_and(|filter| {
                     *history.check_intermediate_keys.get_or_insert_with(|| {
-                        history.merge_inserted_rows != Some(0)
+                        history.inserted_row_count != Some(0)
                             && !proves_no_inserts(history.read.schema(), filter)
                     })
                 });
@@ -319,7 +319,7 @@ fn changes_key_domain(
     operation: &Operation,
     filter: &KeyExistenceFilter,
     read: &Schema,
-    merge_inserted_rows: Option<u64>,
+    inserted_row_count: Option<u64>,
 ) -> Result<bool> {
     let keys = &filter.field_ids;
     let affects_key = |field: &i32| *field >= 0 && field_affects_index(*field, keys, read);
@@ -332,7 +332,7 @@ fn changes_key_domain(
         } => Ok(fields_modified
             .iter()
             .any(|&field| affects_key(&(field as i32)))
-            || (merge_inserted_rows != Some(0)
+            || (inserted_row_count != Some(0)
                 && !new_fragments.is_empty()
                 && !key_filters_cover_inserts(read, filter, other))),
         Operation::DataOverlay { groups } => {

@@ -11,6 +11,26 @@ impl<'a> TransactionRebase<'a> {
         transaction: Transaction,
         affected_rows: Option<&'a RowAddrTreeMap>,
     ) -> Result<Self> {
+        Self::try_new_with_inserted_row_count(dataset, transaction, affected_rows, None).await
+    }
+
+    /// Capture a staged write with its observed number of inserted rows.
+    /// Pass `None` when the writer did not supply a count. Physical addresses
+    /// alone identify removed rows but cannot account for untracked inserts.
+    ///
+    /// ```
+    /// # use lance_table::transaction::Transaction;
+    /// # use lance_table_runtime::{Table, commit::conflict_resolver::TransactionRebase};
+    /// # async fn rebase(table: &Table, tx: Transaction, count: u64) -> lance_core::Result<()> {
+    /// let rebase = TransactionRebase::try_new_with_inserted_row_count(table, tx, None, Some(count)).await?;
+    /// # Ok(()) }
+    /// ```
+    pub async fn try_new_with_inserted_row_count(
+        dataset: &Table,
+        transaction: Transaction,
+        affected_rows: Option<&'a RowAddrTreeMap>,
+        inserted_row_count: Option<u64>,
+    ) -> Result<Self> {
         let read = if staged_update::needs_row_history(&transaction, affected_rows)
             && dataset.version_id() != transaction.read_version
         {
@@ -18,7 +38,14 @@ impl<'a> TransactionRebase<'a> {
         } else {
             Cow::Borrowed(dataset)
         };
-        Self::for_commit_attempt(&read, transaction, affected_rows, Some(&read), None).await
+        Self::for_commit_attempt(
+            &read,
+            transaction,
+            affected_rows,
+            Some(&read),
+            inserted_row_count,
+        )
+        .await
     }
 
     pub(in crate::commit) async fn for_commit_attempt(
@@ -26,7 +53,7 @@ impl<'a> TransactionRebase<'a> {
         transaction: Transaction,
         affected_rows: Option<&'a RowAddrTreeMap>,
         row_read: Option<&Table>,
-        merge_inserted_rows: Option<u64>,
+        inserted_row_count: Option<u64>,
     ) -> Result<Self> {
         match &transaction.operation {
             // These operations add new fragments or don't modify any.
@@ -100,13 +127,13 @@ impl<'a> TransactionRebase<'a> {
 
                 // A column patch that publishes no new fragments cannot insert
                 // rows, including when staged by a writer without MERGE statistics.
-                let merge_inserted_rows = match &transaction.operation {
+                let inserted_row_count = match &transaction.operation {
                     Operation::Update { new_fragments, .. } if new_fragments.is_empty() => Some(0),
-                    _ => merge_inserted_rows,
+                    _ => inserted_row_count,
                 };
                 let row_history = row_read
                     .filter(|_| staged_update::needs_row_history(&transaction, affected_rows))
-                    .map(|read| staged_update::RowHistory::new(read, merge_inserted_rows));
+                    .map(|read| staged_update::RowHistory::new(read, inserted_row_count));
 
                 // short circuit for full fragment update or delete case
                 // set affected_rows as None with non-empty modified_fragment_ids
@@ -152,7 +179,7 @@ impl<'a> TransactionRebase<'a> {
                     staged_replay: false,
                 };
                 if rebase.row_history.is_some() {
-                    rebase.validate_row_rewrite(merge_inserted_rows);
+                    rebase.validate_row_rewrite(inserted_row_count);
                 }
                 Ok(rebase)
             }

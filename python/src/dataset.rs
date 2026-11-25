@@ -3129,7 +3129,7 @@ impl Dataset {
         match transaction.getattr("_staged_merge_write") {
             Ok(write) if !write.is_none() => {
                 let (rows, count): (Option<Bound<'_, PyBytes>>, u64) = write.extract()?;
-                builder = builder.with_merge_inserted_rows(count);
+                builder = builder.with_inserted_row_count(count);
                 if let Some(rows) = rows {
                     builder = builder.with_affected_rows(
                         RowAddrTreeMap::deserialize_from(rows.as_bytes()).infer_error()?,

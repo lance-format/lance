@@ -4,6 +4,120 @@
 use super::*;
 use lance_datagen::ArrayGeneratorExt;
 
+#[rstest::rstest]
+#[case::more_output_rows(WhenMatched::UpdateAll, true, false)]
+#[case::delete_and_insert(WhenMatched::Delete, true, false)]
+#[case::known_inserts(WhenMatched::UpdateAll, true, true)]
+#[case::known_zero(WhenMatched::UpdateAll, false, true)]
+#[case::unknown_count(WhenMatched::UpdateAll, false, false)]
+#[tokio::test]
+async fn test_staged_merge_row_conflicts_unfiltered_write_set(
+    #[case] matched: WhenMatched,
+    #[case] insert: bool,
+    #[case] supply_count: bool,
+    #[values(false, true)] standalone: bool,
+    #[values(false, true)] missing_mode: bool,
+) {
+    use crate::io::commit::conflict_resolver::TransactionRebase;
+
+    let batch = |ids: Vec<u32>, value: u32| {
+        let values = vec![value; ids.len()];
+        record_batch!(("id", UInt32, ids), ("value", UInt32, values)).unwrap()
+    };
+    let read = Arc::new(
+        InsertBuilder::new("memory://")
+            .execute(vec![batch(vec![0, 1, 2], 0)])
+            .await
+            .unwrap(),
+    );
+    let stage = |id, value| {
+        let ids = if insert { vec![id, 3] } else { vec![id] };
+        MergeInsertBuilder::try_new(read.clone(), vec!["id".into()])
+            .unwrap()
+            .when_matched(matched.clone())
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .try_build()
+            .unwrap()
+            .execute_uncommitted_batches(vec![batch(ids, value)])
+    };
+    let first = stage(0, 10).await.unwrap();
+    let mut second = stage(1, 20).await.unwrap();
+    assert_eq!(second.stats.num_inserted_rows, u64::from(insert));
+    assert!(second.inserted_rows_filter.is_none());
+    let Operation::Update { update_mode, .. } = &mut second.transaction.operation else {
+        panic!("expected a row rewrite");
+    };
+    assert_eq!(
+        *update_mode,
+        Some(crate::dataset::transaction::UpdateMode::RewriteRows)
+    );
+    if missing_mode {
+        *update_mode = None;
+    }
+    let mut latest = CommitBuilder::new(read.clone())
+        .execute(first.transaction)
+        .await
+        .unwrap();
+    let rows = second.affected_rows.unwrap();
+    let result = if standalone {
+        async {
+            let mut rebase = if supply_count {
+                TransactionRebase::try_new_with_inserted_row_count(
+                    &latest,
+                    second.transaction,
+                    Some(&rows),
+                    Some(second.stats.num_inserted_rows),
+                )
+                .await?
+            } else {
+                TransactionRebase::try_new(&latest, second.transaction, Some(&rows)).await?
+            };
+            rebase.check_txn(
+                &latest.read_transaction().await?.unwrap(),
+                latest.version_id(),
+            )?;
+            let transaction = rebase.finish(&latest).await?;
+            CommitBuilder::new(read).execute(transaction).await
+        }
+        .await
+    } else {
+        let mut builder = CommitBuilder::new(read).with_affected_rows(rows);
+        if supply_count {
+            builder = builder.with_inserted_row_count(second.stats.num_inserted_rows);
+        }
+        builder.execute(second.transaction).await
+    };
+    let should_commit = supply_count && !insert;
+    if should_commit {
+        result.unwrap();
+    } else {
+        assert!(
+            matches!(result, Err(Error::RetryableCommitConflict { .. })),
+            "{result:?}"
+        );
+    }
+    latest.checkout_latest().await.unwrap();
+    assert_eq!(latest.version_id(), if should_commit { 3 } else { 2 });
+    let output = latest.scan().try_into_batch().await.unwrap();
+    let ids = output["id"].as_primitive::<UInt32Type>();
+    let values = output["value"].as_primitive::<UInt32Type>();
+    let mut actual: Vec<_> = ids
+        .values()
+        .iter()
+        .copied()
+        .zip(values.values().iter().copied())
+        .collect();
+    actual.sort_unstable();
+    let mut expected = vec![(1, if should_commit { 20 } else { 0 }), (2, 0)];
+    if !matches!(matched, WhenMatched::Delete) {
+        expected.insert(0, (0, 10));
+    }
+    if insert {
+        expected.push((3, 10));
+    }
+    assert_eq!(actual, expected);
+}
+
 #[tokio::test]
 async fn test_staged_merge_row_conflicts_standalone_json_key() {
     use crate::io::commit::conflict_resolver::TransactionRebase;
@@ -122,6 +236,7 @@ async fn test_staged_merge_row_conflicts(
     let version = dataset.manifest().version;
     let result = CommitBuilder::new(read)
         .with_affected_rows(staged.affected_rows.unwrap())
+        .with_inserted_row_count(staged.stats.num_inserted_rows)
         .execute(staged.transaction)
         .await;
     if other_id == 2 {

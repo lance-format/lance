@@ -3659,6 +3659,49 @@ def test_staged_merge_with_concurrent_insert(
     assert lance.dataset(tmp_path).to_table().sort_by("id") == table(ids, values)
 
 
+@pytest.mark.parametrize(("first", "second"), [("slot", "id"), ("id", "slot")])
+def test_staged_merge_zero_inserts_can_change_primary_key(
+    tmp_path, keyed_merge_schema, first, second
+):
+    from lance.commit import CommitConflictError
+
+    schema = keyed_merge_schema.append(pa.field("slot", pa.int32()))
+
+    def table(ids, values, slots):
+        return pa.table({"id": ids, "value": values, "slot": slots}, schema=schema)
+
+    ds = lance.write_dataset(
+        table(range(6), [0] * 6, range(6)), tmp_path, max_rows_per_file=3
+    )
+    txns = {}
+    for on, source, fragment in [
+        ("slot", table([90], [11], [1]), 0),
+        ("id", table([4, 90], [22, 22], [4, 90]), 1),
+    ]:
+        txn, stats = (
+            ds.merge_insert(on)
+            .when_matched_update_all()
+            .when_not_matched_insert_all()
+            .execute_uncommitted(source)
+        )
+        assert stats["num_inserted_rows"] == int(on == "id")
+        assert [f.id for f in txn.operation.updated_fragments] == [fragment]
+        txns[on] = pickle.loads(pickle.dumps(txn))
+
+    lance.LanceDataset.commit(tmp_path, txns[first])
+    with pytest.raises(CommitConflictError):
+        lance.LanceDataset.commit(tmp_path, txns[second])
+    current = lance.dataset(tmp_path)
+    assert current.version == ds.version + 1
+    if first == "slot":
+        expected = table([0, 90, 2, 3, 4, 5], [0, 11, 0, 0, 0, 0], range(6))
+    else:
+        expected = table(
+            [0, 1, 2, 3, 4, 5, 90], [0, 0, 0, 0, 22, 0, 22], [*range(6), 90]
+        )
+    assert current.to_table().sort_by("slot") == expected
+
+
 @pytest.mark.parametrize("inserting", [None, 0, 1])
 def test_staged_merge_indexed_column_patch_without_insert_evidence(
     tmp_path, keyed_merge_schema, inserting

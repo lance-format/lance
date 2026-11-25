@@ -2542,7 +2542,7 @@ impl RetryExecutor<Dataset> for MergeInsertJobWithProvider {
         let cleanup_dataset = dataset.clone();
         let mut commit_builder = CommitBuilder::new(dataset)
             .with_skip_auto_cleanup(self.job.params.skip_auto_cleanup)
-            .with_merge_inserted_rows(data.stats.num_inserted_rows);
+            .with_inserted_row_count(data.stats.num_inserted_rows);
         if let Some(commit_retries) = self.job.params.commit_retries {
             commit_builder = commit_builder.with_max_retries(commit_retries);
         }

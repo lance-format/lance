@@ -24,11 +24,34 @@ impl<'a> TransactionRebase<'a> {
         transaction: Transaction,
         affected_rows: Option<&'a RowAddrTreeMap>,
     ) -> Result<Self> {
+        Self::try_new_with_inserted_row_count(dataset, transaction, affected_rows, None).await
+    }
+
+    /// Capture a staged write with its writer's observed number of inserted rows.
+    /// When the count is unknown, an unfiltered row rewrite can require a retry
+    /// even if the matched rows were disjoint.
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result, dataset::write::merge_insert::UncommittedMergeInsert};
+    /// # use lance::io::commit::conflict_resolver::TransactionRebase;
+    /// # async fn rebase(dataset: &Dataset, staged: UncommittedMergeInsert) -> Result<()> {
+    /// let rebase = TransactionRebase::try_new_with_inserted_row_count(
+    ///     dataset, staged.transaction, staged.affected_rows.as_ref(), Some(staged.stats.num_inserted_rows),
+    /// ).await?;
+    /// # Ok(()) }
+    /// ```
+    pub async fn try_new_with_inserted_row_count(
+        dataset: &Dataset,
+        transaction: Transaction,
+        affected_rows: Option<&'a RowAddrTreeMap>,
+        inserted_row_count: Option<u64>,
+    ) -> Result<Self> {
         Ok(Self(
-            runtime::TransactionRebase::try_new(
+            runtime::TransactionRebase::try_new_with_inserted_row_count(
                 &dataset.table_view().to_table(),
                 transaction,
                 affected_rows,
+                inserted_row_count,
             )
             .await?,
         ))

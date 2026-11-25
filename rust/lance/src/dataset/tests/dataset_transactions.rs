@@ -1632,6 +1632,7 @@ async fn test_staged_merge_row_conflicts_retry_after_publication_race(
     let commit = CommitBuilder::new(read)
         .with_commit_handler(handler.clone())
         .with_affected_rows(staged.affected_rows.unwrap())
+        .with_inserted_row_count(staged.stats.num_inserted_rows)
         .execute(staged.transaction);
     tokio::pin!(commit);
     tokio::select! {
@@ -1755,10 +1756,11 @@ async fn test_staged_merge_row_conflicts_after_intermediate_undelete(
     let affected = supply_rows.then(|| staged.affected_rows.unwrap());
     let result = if !matches!(path, RowCommitPath::Commit) {
         async {
-            let mut rebase = crate::io::commit::conflict_resolver::TransactionRebase::try_new(
+            let mut rebase = crate::io::commit::conflict_resolver::TransactionRebase::try_new_with_inserted_row_count(
                 &read,
                 staged.transaction,
                 affected.as_ref(),
+                Some(staged.stats.num_inserted_rows),
             )
             .await?;
             let mut versions: Vec<_> = (read.version_id() + 1..=latest_version).collect();
@@ -1776,7 +1778,8 @@ async fn test_staged_merge_row_conflicts_after_intermediate_undelete(
         }
         .await
     } else {
-        let mut commit = CommitBuilder::new(read);
+        let mut commit =
+            CommitBuilder::new(read).with_inserted_row_count(staged.stats.num_inserted_rows);
         if let Some(affected) = affected {
             commit = commit.with_affected_rows(affected);
         }
@@ -1815,6 +1818,7 @@ async fn test_staged_merge_row_conflicts_out_of_bounds_deletion() {
     rows.insert(RowAddress::new_from_parts(0, 4).into());
     let result = CommitBuilder::new(read)
         .with_affected_rows(rows)
+        .with_inserted_row_count(staged.stats.num_inserted_rows)
         .execute(staged.transaction)
         .await;
     assert!(
