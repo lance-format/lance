@@ -7,7 +7,9 @@ use super::details::target_partition_size_from_details;
 use super::{
     LogicalIvfView, derive_hnsw_params,
     pq::{PQIndex, build_pq_model},
-    utils::{filter_finite_training_data, maybe_sample_training_data, sample_unseen_training_data},
+    utils::{
+        filter_finite_training_data, maybe_sample_ivf_training_data, sample_unseen_training_data,
+    },
 };
 use super::{
     builder::{ExistingIndex, IvfIndexBuilder, index_type_string},
@@ -144,6 +146,7 @@ mod compatibility;
 mod coreset_algo;
 pub mod io;
 mod partition_serde;
+mod shape;
 mod streaming_hamming;
 pub mod v2;
 
@@ -738,8 +741,8 @@ fn existing_index_sources(
         .segments()
         .map(|(metadata, index)| {
             let (Some(effective), Some(deleted)) = (
-                metadata.effective_fragment_bitmap(&dataset.fragment_bitmap),
-                metadata.deleted_fragment_bitmap(&dataset.fragment_bitmap),
+                metadata.effective_fragment_bitmap(&dataset.table_state.fragment_bitmap),
+                metadata.deleted_fragment_bitmap(&dataset.table_state.fragment_bitmap),
             ) else {
                 return ExistingIndex::unfiltered(index.clone());
             };
@@ -829,7 +832,7 @@ pub(crate) async fn optimize_vector_indices(
     }
 
     let new_uuid = Uuid::new_v4();
-    let object_store = dataset.object_store.as_ref();
+    let object_store = dataset.table_state.object_store.as_ref();
     let index_file = dataset
         .indices_dir()
         .join(new_uuid.to_string())
@@ -1776,7 +1779,7 @@ pub async fn build_ivf_model(
         sample_size_hint
     );
     let training_data =
-        maybe_sample_training_data(dataset, column, sample_size_hint, fragment_ids).await?;
+        maybe_sample_ivf_training_data(dataset, column, sample_size_hint, fragment_ids).await?;
     info!(
         "Finished loading training data in {:02} seconds",
         start.elapsed().as_secs_f32()
@@ -2037,7 +2040,7 @@ pub async fn build_ivf_pq_index(
     let precomputed_partitions = load_precomputed_partitions_if_available(ivf_params).await?;
 
     let file = write_ivf_pq_file(
-        dataset.object_store.as_ref(),
+        dataset.table_state.object_store.as_ref(),
         dataset.indices_dir(),
         column,
         index_name,
@@ -2330,7 +2333,7 @@ pub(crate) async fn remap_index_file(
     column: String,
     transforms: Vec<pb::Transform>,
 ) -> Result<IndexFile> {
-    let object_store = dataset.object_store.as_ref();
+    let object_store = dataset.table_state.object_store.as_ref();
     let old_path = dataset
         .indices_dir()
         .join(old_uuid.to_string())
@@ -2478,7 +2481,7 @@ pub async fn write_ivf_pq_file_from_existing_index(
     pq: ProductQuantizer,
     streams: Vec<impl Stream<Item = Result<RecordBatch>>>,
 ) -> Result<()> {
-    let obj_store = dataset.object_store.as_ref();
+    let obj_store = dataset.table_state.object_store.as_ref();
     let path = dataset
         .indices_dir()
         .join(index_id.to_string())
@@ -2520,7 +2523,7 @@ async fn write_ivf_hnsw_file(
     shuffle_partition_concurrency: usize,
     precomputed_shuffle_buffers: Option<(Path, Vec<String>)>,
 ) -> Result<()> {
-    let object_store = dataset.object_store.as_ref();
+    let object_store = dataset.table_state.object_store.as_ref();
     let path = dataset
         .indices_dir()
         .join(uuid.to_string())
@@ -2658,7 +2661,7 @@ pub(crate) async fn merge_segments(
         );
     }
     merge_segments_inner(
-        dataset.object_store.as_ref(),
+        dataset.table_state.object_store.as_ref(),
         &dataset.indices_dir(),
         segments,
         Some(row_filters),
@@ -2674,7 +2677,7 @@ pub(crate) async fn merge_remapped_segments(
     segments: Vec<TableIndexMetadata>,
 ) -> Result<TableIndexMetadata> {
     merge_segments_inner(
-        dataset.object_store.as_ref(),
+        dataset.table_state.object_store.as_ref(),
         &dataset.indices_dir(),
         segments,
         None,
@@ -3473,7 +3476,9 @@ async fn sample_ivf_training_chunk(
             )
             .await?
         }
-        None => maybe_sample_training_data(dataset, column, sample_size_hint, fragment_ids).await?,
+        None => {
+            maybe_sample_ivf_training_data(dataset, column, sample_size_hint, fragment_ids).await?
+        }
     };
     let (training_data, mt) = if metric_type == MetricType::Cosine {
         let training_data = normalize_fsl_owned(training_data)?;
@@ -5467,7 +5472,7 @@ async fn train_streaming_coreset_ivf_model_with_algorithm<A: StreamingCoresetAlg
         generate_fixed_training_ranges(
             selection_rows,
             selection_rows.min(requested_rows),
-            dataset.object_store.as_ref().block_size(),
+            dataset.table_state.object_store.as_ref().block_size(),
             sampler.byte_width,
         )
     });
@@ -6630,7 +6635,7 @@ mod tests {
             fields: vec![field.id],
             covering_fields: vec![],
             name: INDEX_NAME.to_string(),
-            fragment_bitmap: Some(dataset.fragment_bitmap.as_ref().clone()),
+            fragment_bitmap: Some(dataset.table_state.fragment_bitmap.as_ref().clone()),
             index_details: Some(Arc::new(vector_index_details_default())),
             index_version: VECTOR_INDEX_VERSION as i32,
             created_at: Some(chrono::Utc::now()),
@@ -6734,7 +6739,7 @@ mod tests {
             fields: vec![field.id],
             covering_fields: vec![],
             name: format!("{}_remapped", INDEX_NAME),
-            fragment_bitmap: Some(dataset_mut.fragment_bitmap.as_ref().clone()),
+            fragment_bitmap: Some(dataset_mut.table_state.fragment_bitmap.as_ref().clone()),
             index_details: Some(Arc::new(vector_index_details_default())),
             index_version: VECTOR_INDEX_VERSION as i32,
             created_at: Some(chrono::Utc::now()),
@@ -10247,11 +10252,19 @@ mod tests {
             .unwrap();
 
         // Reset IO stats after index creation
-        dataset.object_store.as_ref().io_stats_incremental();
+        dataset
+            .table_state
+            .object_store
+            .as_ref()
+            .io_stats_incremental();
 
         // Prewarm should perform IO to load all partitions into cache
         dataset.prewarm_index("my_idx").await.unwrap();
-        let stats = dataset.object_store.as_ref().io_stats_incremental();
+        let stats = dataset
+            .table_state
+            .object_store
+            .as_ref()
+            .io_stats_incremental();
         assert!(
             stats.read_iops > 0,
             "prewarm should have read from disk, but read_iops was 0"
@@ -10268,7 +10281,11 @@ mod tests {
             .try_into_batch()
             .await
             .unwrap();
-        let stats = dataset.object_store.as_ref().io_stats_incremental();
+        let stats = dataset
+            .table_state
+            .object_store
+            .as_ref()
+            .io_stats_incremental();
         assert_io_eq!(
             stats,
             read_iops,
@@ -10278,7 +10295,11 @@ mod tests {
 
         // Second prewarm should not need IO (already cached)
         dataset.prewarm_index("my_idx").await.unwrap();
-        let stats = dataset.object_store.as_ref().io_stats_incremental();
+        let stats = dataset
+            .table_state
+            .object_store
+            .as_ref()
+            .io_stats_incremental();
         assert_io_eq!(stats, read_iops, 0, "second prewarm should not perform IO");
     }
 
@@ -10400,11 +10421,19 @@ mod tests {
             .clone();
 
         // Reset IO stats after migration and sampling.
-        dataset.object_store.as_ref().io_stats_incremental();
+        dataset
+            .table_state
+            .object_store
+            .as_ref()
+            .io_stats_incremental();
 
         // Prewarm should perform IO to load all index deltas into cache.
         dataset.prewarm_index("vector_idx").await.unwrap();
-        let stats = dataset.object_store.as_ref().io_stats_incremental();
+        let stats = dataset
+            .table_state
+            .object_store
+            .as_ref()
+            .io_stats_incremental();
         assert!(
             stats.read_iops > 0,
             "prewarm should have read from disk, but read_iops was 0"
@@ -10420,7 +10449,11 @@ mod tests {
             .try_into_batch()
             .await
             .unwrap();
-        let stats = dataset.object_store.as_ref().io_stats_incremental();
+        let stats = dataset
+            .table_state
+            .object_store
+            .as_ref()
+            .io_stats_incremental();
         assert_io_eq!(
             stats,
             read_iops,
@@ -10430,7 +10463,11 @@ mod tests {
 
         // Second prewarm should not need IO (already cached).
         dataset.prewarm_index("vector_idx").await.unwrap();
-        let stats = dataset.object_store.as_ref().io_stats_incremental();
+        let stats = dataset
+            .table_state
+            .object_store
+            .as_ref()
+            .io_stats_incremental();
         assert_io_eq!(stats, read_iops, 0, "second prewarm should not perform IO");
     }
 }

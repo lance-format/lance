@@ -27,10 +27,10 @@
 //! * Every trigram requirement is produced by [`trigrams_of_string`], which runs
 //!   the *same* tokenizer the index was built with, so a string shorter than a
 //!   trigram (or with no alphanumeric run) contributes no requirement.
-//! * Character classes and case-insensitive folds are treated as a single
-//!   unknown character (`All`), because the index's normalization does not agree
-//!   with Unicode case folding (e.g. `(?i)c` also matches `ℂ`, which the index
-//!   does not fold to `c`). Literal runs -- the common case -- are fully used.
+//! * A character class (which is also how a case-insensitive letter arrives) is
+//!   enumerated only when it is small and the index spells every member as one
+//!   alphanumeric character, see [`indexed_char`]. Any other class is a single
+//!   unknown character (`All`).
 //! * When the exact / prefix / suffix string sets grow past a bound we first fold
 //!   their trigrams into the running condition and only then drop the strings, so
 //!   collapsing precision never removes a necessary trigram.
@@ -40,7 +40,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use regex_syntax::hir::{Class, Hir, HirKind};
 use roaring::RoaringTreemap;
 
-use super::{NGRAM_N, NGRAM_TOKENIZER, ngram_to_token, tokenize_visitor};
+use super::{NGRAM_N, NGRAM_TOKENIZER, ngram_to_token, token_to_ngram, tokenize_visitor};
 
 /// Maximum number of strings kept in an `exact` / `prefix` / `suffix` set before
 /// it is folded into the trigram condition and dropped.
@@ -48,6 +48,10 @@ const MAX_SET_SIZE: usize = 16;
 /// Maximum length (in characters) of a string kept in a set. Longer strings are
 /// trimmed to a sound shorter affix.
 const MAX_STRING_LEN: usize = 32;
+/// Largest character class that is enumerated rather than treated as unknown.
+const MAX_CLASS_CHARS: usize = 64;
+/// Most copies of a repeated sub-expression that are unrolled.
+const MAX_UNROLL: u32 = 8;
 
 /// A boolean condition over trigram presence that is *necessary* for a regex to
 /// match. `All` means "no constraint" and `None` means "unsatisfiable"; by
@@ -111,11 +115,33 @@ impl TrigramQuery {
     }
 }
 
+/// Spelled the way a plan shows it: `(rhi AND (hor OR nos))`.
+impl std::fmt::Display for TrigramQuery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (items, separator) = match self {
+            Self::All => return f.write_str("ALL"),
+            Self::None => return f.write_str("NONE"),
+            Self::Trigram(token) => return f.write_str(&token_to_ngram(*token, NGRAM_N)),
+            Self::And(items) => (items, " AND "),
+            Self::Or(items) => (items, " OR "),
+        };
+        f.write_str("(")?;
+        for (idx, item) in items.iter().enumerate() {
+            if idx > 0 {
+                f.write_str(separator)?;
+            }
+            item.fmt(f)?;
+        }
+        f.write_str(")")
+    }
+}
+
 /// Information about the set of strings a sub-expression can match, used to
 /// build a necessary trigram condition bottom-up. For every string `s` the
 /// sub-expression matches: `s` is in `exact` (when it is `Some`), `s` starts
 /// with some member of `prefix` and ends with some member of `suffix`, and `s`
 /// satisfies `match_q`.
+#[derive(Clone)]
 struct RegexInfo {
     /// Whether the sub-expression can match the empty string.
     emptyable: bool,
@@ -152,6 +178,17 @@ impl RegexInfo {
             prefix: set.clone(),
             suffix: set,
             match_q: trigrams_of_string(s),
+        }
+    }
+
+    /// Exactly one of `chars`, each a one-character string.
+    fn one_of(chars: BTreeSet<String>) -> Self {
+        Self {
+            emptyable: false,
+            exact: Some(chars.clone()),
+            prefix: chars.clone(),
+            suffix: chars,
+            match_q: TrigramQuery::All,
         }
     }
 
@@ -273,6 +310,50 @@ fn singleton_char(class: &Class) -> Option<char> {
     }
 }
 
+/// The character the index stores for `c`, or `None` unless that is one lowercase
+/// letter or digit, the only spellings the tokenizer leaves alone when the class
+/// is tokenized again. Rejects separators, `ß` (stored `ss`) and `ℝ` (stored `R`).
+fn indexed_char(c: char) -> Option<char> {
+    let mut tokens = Vec::new();
+    tokenize_visitor(&NGRAM_TOKENIZER, &format!("ab{c}cd"), |token| {
+        tokens.push(token.clone())
+    });
+    // One alphanumeric character in the middle yields exactly `ab?`, `b?c`, `?cd`.
+    let [first, _, _] = tokens.as_slice() else {
+        return None;
+    };
+    first
+        .chars()
+        .nth(2)
+        .filter(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+}
+
+/// The index's spelling of every character `class` matches, or `None` when the
+/// class is empty, too large, or [`indexed_char`] rejects a member.
+fn class_chars(class: &Class) -> Option<BTreeSet<String>> {
+    let ranges: Vec<(char, char)> = match class {
+        Class::Unicode(u) => u.ranges().iter().map(|r| (r.start(), r.end())).collect(),
+        Class::Bytes(b) if b.is_ascii() => b
+            .ranges()
+            .iter()
+            .map(|r| (r.start() as char, r.end() as char))
+            .collect(),
+        Class::Bytes(_) => return None,
+    };
+    let size: usize = ranges
+        .iter()
+        .map(|(start, end)| *end as usize - *start as usize + 1)
+        .sum();
+    if size == 0 || size > MAX_CLASS_CHARS {
+        return None;
+    }
+    ranges
+        .into_iter()
+        .flat_map(|(start, end)| start..=end)
+        .map(|c| indexed_char(c).map(String::from))
+        .collect()
+}
+
 /// Compute the [`RegexInfo`] for `hir` bottom-up.
 fn analyze(hir: &Hir) -> RegexInfo {
     let mut info = match hir.kind() {
@@ -285,34 +366,28 @@ fn analyze(hir: &Hir) -> RegexInfo {
         },
         HirKind::Class(class) => match singleton_char(class) {
             Some(ch) => RegexInfo::literal(ch.encode_utf8(&mut [0u8; 4])),
-            None => RegexInfo::any_char(),
+            None => class_chars(class).map_or_else(RegexInfo::any_char, RegexInfo::one_of),
+        },
+        HirKind::Repetition(rep) if rep.min == 0 => RegexInfo {
+            emptyable: true,
+            exact: None,
+            prefix: BTreeSet::new(),
+            suffix: BTreeSet::new(),
+            match_q: TrigramQuery::All,
         },
         HirKind::Repetition(rep) => {
+            // Every match starts and ends with the required copies, so unroll
+            // those; only an exact count leaves the matched set finite.
             let inner = analyze(&rep.sub);
-            let at_least_one = rep.min >= 1;
-            RegexInfo {
-                emptyable: !at_least_one || inner.emptyable,
-                // We do not unroll bounded repetitions, so the matched set is
-                // unbounded as far as we are concerned.
-                exact: None,
-                prefix: if at_least_one {
-                    inner.prefix.clone()
-                } else {
-                    BTreeSet::new()
-                },
-                suffix: if at_least_one {
-                    inner.suffix.clone()
-                } else {
-                    BTreeSet::new()
-                },
-                // Only a required occurrence (min >= 1) contributes; the single
-                // inner match is necessary, never multiplied.
-                match_q: if at_least_one {
-                    inner.match_q
-                } else {
-                    TrigramQuery::All
-                },
+            let copies = rep.min.min(MAX_UNROLL);
+            let mut info = inner.clone();
+            for _ in 1..copies {
+                info = concat_info(info, inner.clone());
             }
+            if rep.max != Some(copies) {
+                info.exact = None;
+            }
+            info
         }
         HirKind::Capture(cap) => analyze(&cap.sub),
         HirKind::Concat(subs) => analyze_concat(subs),
@@ -450,8 +525,8 @@ pub fn regex_to_trigram_query(pattern: &str) -> TrigramQuery {
 }
 
 /// Whether a regular expression yields any trigram condition the index can use
-/// to prune candidates. When it does not (e.g. `a.b`, `.*`, or a case-insensitive
-/// pattern), callers should leave the predicate to a full scan rather than route
+/// to prune candidates. When it does not (e.g. `a.b` or `.*`), callers should
+/// leave the predicate to a full scan rather than route
 /// it to the index, which would otherwise have to ask the scan to recheck every
 /// row -- a path the index result type (`AtLeast`) does not support.
 pub fn regex_can_use_index(pattern: &str) -> bool {
@@ -510,6 +585,8 @@ pub fn eval_trigram_query(
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use super::*;
 
     /// A single trigram condition, hashed the same way the index hashes it.
@@ -581,12 +658,71 @@ mod tests {
         assert_eq!(q("fo|ba"), TrigramQuery::All); // spellchecker:disable-line
     }
 
+    #[rstest]
+    // `(?i)k` and `(?i)s` also match U+212A and U+017F, which the index folds
+    // to `k` and `s`.
+    #[case::case_insensitive("(?i)KiSs", "kiss")]
+    #[case::either_case("[Rr]hino", "rhino")]
+    #[case::bytes_class("(?-u)[Rr]hino", "rhino")]
+    #[case::exact_count("ab{3}c", "abbbc")]
+    #[case::exact_count_group("(ab){2}c", "ababc")]
+    #[case::at_least("a{2,}bc", "aabc")]
+    #[case::range("a{2,5}bc", "aabc")]
+    fn test_same_condition_as_literal(#[case] pattern: &str, #[case] literal: &str) {
+        assert_eq!(q(pattern), q(literal));
+    }
+
     #[test]
-    fn test_case_insensitive_not_accelerated() {
-        // Unicode case folding (e.g. `(?i)c` also matches U+2102) does not agree
-        // with the index's normalization, so case-insensitive patterns are left
-        // unaccelerated (correct via recheck) rather than risk a false negative.
-        assert_eq!(q("(?i)Cat"), TrigramQuery::All);
+    fn test_class_is_or() {
+        assert_eq!(
+            q("ca[tb]s"),
+            TrigramQuery::and(vec![
+                TrigramQuery::or(vec![tri("cat"), tri("cab")]),
+                TrigramQuery::or(vec![
+                    TrigramQuery::and(vec![tri("cat"), tri("ats")]),
+                    TrigramQuery::and(vec![tri("cab"), tri("abs")]),
+                ]),
+            ])
+        );
+    }
+
+    #[rstest]
+    // The index stores `ß` as `ss`, two characters where the class matches one.
+    #[case::multi_char_fold("st[ßs]e")]
+    // Stored as the uppercase `R`, which tokenizing the class would lowercase.
+    #[case::uppercase_fold("[r\u{211d}]hi")]
+    #[case::separator_member("to[-o]")]
+    #[case::large_class("to[a-zA-Z0-9_]be")]
+    #[case::case_insensitive_range("(?i)x[a-z]y")]
+    #[case::optional_count("(abc){0,2}")]
+    fn test_unknown_class_yields_all(#[case] pattern: &str) {
+        assert_eq!(q(pattern), TrigramQuery::All);
+    }
+
+    /// A row holding any member of a class the query enumerates is a candidate.
+    #[test]
+    fn test_class_member_admits_its_row() {
+        let dropped: Vec<char> = ('\0'..='\u{ffff}')
+            .filter(|c| indexed_char(*c).is_some())
+            .filter(|c| {
+                let mut present = HashMap::new();
+                tokenize_visitor(&NGRAM_TOKENIZER, &format!("{c}bc"), |ngram| {
+                    // `ngram_to_token` takes nothing else.
+                    if ngram
+                        .bytes()
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+                    {
+                        present.insert(
+                            ngram_to_token(ngram, NGRAM_N),
+                            RoaringTreemap::from_iter([0u64]),
+                        );
+                    }
+                });
+                let query = q(&format!("[a\\u{{{:x}}}]bc", *c as u32));
+                query != TrigramQuery::All && !eval_trigram_query(&query, &present).contains(0)
+            })
+            .collect();
+        assert!(dropped.is_empty(), "{} dropped: {dropped:?}", dropped.len());
     }
 
     #[test]
@@ -651,6 +787,17 @@ mod tests {
             eval_trigram_query(&or_missing, &bitmaps),
             RoaringTreemap::from_iter([1u64, 2, 3])
         );
+    }
+
+    #[rstest]
+    #[case("foo", "foo")]
+    #[case(
+        "rhino.*(horn|nose)",
+        "(hin AND ino AND rhi AND ((hor AND orn) OR (nos AND ose)))"
+    )]
+    #[case("a.b", "ALL")]
+    fn test_display(#[case] pattern: &str, #[case] expected: &str) {
+        assert_eq!(q(pattern).to_string(), expected);
     }
 
     #[test]
