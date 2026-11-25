@@ -3,8 +3,6 @@
 
 //! Benchmark of building PQ distance table.
 
-use std::iter::repeat_n;
-
 use arrow_array::types::{Float16Type, Float32Type, Float64Type};
 use arrow_array::{FixedSizeListArray, UInt8Array};
 use std::hint::black_box;
@@ -141,35 +139,45 @@ fn construct_dist_table_for_type<T: ArrowFloatType>(
 }
 
 fn compute_distances(c: &mut Criterion) {
-    compute_distances_for_type::<Float16Type>(c, "f16");
-    compute_distances_for_type::<Float32Type>(c, "f32");
-    compute_distances_for_type::<Float64Type>(c, "f64");
+    compute_distances_for_type::<Float16Type>(c, "f16", TOTAL, PQ);
+    compute_distances_for_type::<Float32Type>(c, "f32", TOTAL, PQ);
+    compute_distances_for_type::<Float64Type>(c, "f64", TOTAL, PQ);
+    // Short partitions, gather dispatch and block boundaries, and wide PQ8
+    // codes exercise different scan costs without including index training.
+    for (rows, sub_vectors) in [(32, 8), (511, 32), (512, 32), (2049, 96), (65536, 96)] {
+        compute_distances_for_type::<Float32Type>(c, "f32", rows, sub_vectors);
+    }
 }
 
-fn compute_distances_for_type<T: ArrowFloatType>(c: &mut Criterion, type_name: &str)
-where
+fn compute_distances_for_type<T: ArrowFloatType>(
+    c: &mut Criterion,
+    type_name: &str,
+    rows: usize,
+    sub_vectors: usize,
+) where
     T::Native: L2 + Dot,
     T::ArrayType: FloatArray<T>,
 {
-    let codebook = generate_random_array_with_seed::<T>(256 * DIM, [88; 32]);
-    let query = generate_random_array_with_seed::<T>(DIM, [32; 32]);
+    let dimension = sub_vectors * 8;
+    let codebook = generate_random_array_with_seed::<T>(256 * dimension, [88; 32]);
+    let query = generate_random_array_with_seed::<T>(dimension, [32; 32]);
 
     let mut rnd = StdRng::from_seed([32; 32]);
-    let code = UInt8Array::from_iter_values(repeat_n(rnd.random::<u8>(), TOTAL * PQ));
+    let code = UInt8Array::from_iter_values((0..rows * sub_vectors).map(|_| rnd.random::<u8>()));
 
     for dt in [DistanceType::L2, DistanceType::Cosine, DistanceType::Dot] {
         let pq = ProductQuantizer::new(
-            PQ,
+            sub_vectors,
             8,
-            DIM,
-            FixedSizeListArray::try_new_from_values(codebook.clone(), DIM as i32).unwrap(),
+            dimension,
+            FixedSizeListArray::try_new_from_values(codebook.clone(), dimension as i32).unwrap(),
             dt,
         );
 
         c.bench_function(
             format!(
                 "compute_distances: {},{},PQ={},DIM={},type={}",
-                TOTAL, dt, PQ, DIM, type_name
+                rows, dt, sub_vectors, dimension, type_name
             )
             .as_str(),
             |b| {
