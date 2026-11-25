@@ -16,6 +16,7 @@ use object_store::{
 use object_store_opendal::OpendalStore as InnerOpendalStore;
 use opendal::{ErrorKind, Operator};
 
+use crate::object_reader::ConditionalGetSupport;
 use crate::object_store::hf_throttle::mark_huggingface_rate_limited;
 
 /// Adapts OpenDAL listing paths to the spelling used by the request.
@@ -119,12 +120,21 @@ impl OSObjectStore for OpendalStore {
         location: &Path,
         options: GetOptions,
     ) -> object_store::Result<GetResult> {
-        self.inner
+        let mut result = self
+            .inner
             .get_opts(location, options)
             .await
             .map_err(|error| {
                 maybe_mark_huggingface_rate_limit(self.marks_huggingface_rate_limit, error)
-            })
+            })?;
+        // The bridge can fall back to stat, passing the same conditions to both
+        // operations. Require support on both before using a guard to resume.
+        let capability = self.inner.info().capability();
+        result.extensions.insert(ConditionalGetSupport {
+            has_if_match: capability.read_with_if_match && capability.stat_with_if_match,
+            has_version: capability.read_with_version && capability.stat_with_version,
+        });
+        Ok(result)
     }
 
     async fn get_ranges(

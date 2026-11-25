@@ -169,6 +169,13 @@ pub trait Reader: std::fmt::Debug + Send + Sync + DeepSizeOf {
     fn get_all(&self) -> BoxFuture<'_, object_store::Result<Bytes>>;
 
     /// Read the entire object as a byte stream.
+    ///
+    /// [`CloudObjectReader`](crate::object_reader::CloudObjectReader) uses its
+    /// configured download retry budget for request and body failures. A failed
+    /// body resumes at the first undelivered byte, pinned to the initial ETag or
+    /// object version using a condition supported by the provider. Without a
+    /// supported condition and identifier, the original body error propagates
+    /// instead of risking a read that combines different objects.
     fn get_stream(&self) -> BoxFuture<'_, object_store::Result<ByteStream>> {
         Box::pin(async move {
             let bytes = self.get_all().await?;
@@ -177,6 +184,9 @@ pub trait Reader: std::fmt::Debug + Send + Sync + DeepSizeOf {
     }
 
     /// Read a byte range as a byte stream.
+    ///
+    /// Cloud readers use the same retry behavior as [`Self::get_stream`], with
+    /// resumed requests bounded by the original response range.
     fn get_range_stream(
         &self,
         range: Range<usize>,
