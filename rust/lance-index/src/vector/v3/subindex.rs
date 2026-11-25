@@ -57,17 +57,6 @@ pub trait IvfSubIndex: Send + Sync + Debug + DeepSizeOf {
         None
     }
 
-    /// Whether [`Self::search`] answers from [`PreFilter::allowed_mask`] when
-    /// the prefilter carries one.
-    ///
-    /// The IVF layer then resolves a deletion-only prefilter against each
-    /// partition once and caches the resulting mask with the partition,
-    /// instead of every query resolving it again. Sub-indexes that would not
-    /// read the mask return `false`, so no mask is built or cached for them.
-    fn uses_allowed_mask() -> bool {
-        false
-    }
-
     /// The number of storage rows a partition's sub-index addresses by
     /// position, decoded from the partition's serialized sub-index
     /// `metadata`, or `None` if the sub-index does not address storage rows

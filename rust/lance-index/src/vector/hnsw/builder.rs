@@ -33,7 +33,7 @@ use super::{
     HNSW_TYPE, HnswMetadata, VECTOR_ID_COL, VECTOR_ID_FIELD, select_neighbors_heuristic_owned,
 };
 use crate::metrics::MetricsCollector;
-use crate::prefilter::{AllowedMask, PreFilter};
+use crate::prefilter::PreFilter;
 use crate::vector::flat::storage::{FlatBinStorage, FlatFloatStorage};
 use crate::vector::graph::builder::GraphBuilderNode;
 use crate::vector::graph::{
@@ -41,8 +41,8 @@ use crate::vector::graph::{
     VisitedGenerator,
 };
 use crate::vector::graph::{
-    NodeFilter, Visited, beam_search_acorn, beam_search_borrowed, greedy_search,
-    greedy_search_borrowed, range_filter,
+    Visited, beam_search_acorn, beam_search_borrowed, greedy_search, greedy_search_borrowed,
+    range_filter,
 };
 use crate::vector::storage::{DistCalculator, VectorStore};
 use crate::vector::v3::subindex::IvfSubIndex;
@@ -388,28 +388,6 @@ impl HNSW {
         storage: &impl VectorStore,
         prefetch_distance: Option<usize>,
     ) -> Result<(Vec<OrderedNode>, usize)> {
-        self.search_inner_with(
-            query,
-            k,
-            params,
-            bitset.as_ref(),
-            visited_generator,
-            storage,
-            prefetch_distance,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn search_inner_with<F: NodeFilter>(
-        &self,
-        query: ArrayRef,
-        k: usize,
-        params: &HnswQueryParams,
-        bitset: Option<&F>,
-        visited_generator: &mut VisitedGenerator,
-        storage: &impl VectorStore,
-        prefetch_distance: Option<usize>,
-    ) -> Result<(Vec<OrderedNode>, usize)> {
         self.ensure_storage_covers_graph(storage)?;
         let dist_calc = params.dist_calculator(storage, query);
         let entry = self.inner.entry_point;
@@ -427,7 +405,7 @@ impl HNSW {
                     ep,
                     k,
                     params,
-                    bitset,
+                    bitset.as_ref(),
                     visited_generator,
                     storage.len(),
                     prefetch_distance,
@@ -442,7 +420,7 @@ impl HNSW {
                     ep,
                     k,
                     params,
-                    bitset,
+                    bitset.as_ref(),
                     visited_generator,
                     storage.len(),
                     prefetch_distance,
@@ -464,12 +442,12 @@ impl HNSW {
     /// single seam that lets the in-memory and disk-loaded backends
     /// share one search loop.
     #[allow(clippy::too_many_arguments)]
-    fn run_search<L, B, F>(
+    fn run_search<L, B>(
         &self,
         ep: OrderedNode,
         k: usize,
         params: &HnswQueryParams,
-        bitset: Option<&F>,
+        bitset: Option<&Visited>,
         visited_generator: &mut VisitedGenerator,
         storage_len: usize,
         prefetch_distance: Option<usize>,
@@ -480,7 +458,6 @@ impl HNSW {
     where
         L: BorrowingGraph,
         B: BorrowingGraph,
-        F: NodeFilter,
     {
         // Greedy descent stops at level 1 (HNSW paper, Algorithm 2): level 0
         // is searched only by the ef-bounded beam below. Greedily descending
@@ -527,23 +504,12 @@ impl HNSW {
         bitset: Option<Visited>,
         storage: &impl VectorStore,
     ) -> Result<(Vec<OrderedNode>, usize)> {
-        self.search_basic_with(query, k, params, bitset.as_ref(), storage)
-    }
-
-    fn search_basic_with<F: NodeFilter>(
-        &self,
-        query: ArrayRef,
-        k: usize,
-        params: &HnswQueryParams,
-        bitset: Option<&F>,
-        storage: &impl VectorStore,
-    ) -> Result<(Vec<OrderedNode>, usize)> {
         let mut visited_generator = self
             .inner
             .visited_generator_queue
             .pop()
             .unwrap_or_else(|| VisitedGenerator::new(storage.len()));
-        let result = self.search_inner_with(
+        let result = self.search_inner(
             query,
             k,
             params,
@@ -573,17 +539,6 @@ impl HNSW {
         k: usize,
         params: &HnswQueryParams,
         bitset: &Visited,
-        storage: &impl VectorStore,
-    ) -> Result<(Vec<OrderedNode>, usize)> {
-        self.search_acorn_with(query, k, params, bitset, storage)
-    }
-
-    fn search_acorn_with(
-        &self,
-        query: ArrayRef,
-        k: usize,
-        params: &HnswQueryParams,
-        bitset: &impl NodeFilter,
         storage: &impl VectorStore,
     ) -> Result<(Vec<OrderedNode>, usize)> {
         let mut visited_generator = self
@@ -620,7 +575,7 @@ impl HNSW {
         query: ArrayRef,
         k: usize,
         params: &HnswQueryParams,
-        bitset: &impl NodeFilter,
+        bitset: &Visited,
         visited_generator: &mut VisitedGenerator,
         expanded_generator: &mut VisitedGenerator,
         storage: &impl VectorStore,
@@ -674,7 +629,7 @@ impl HNSW {
         &self,
         ep: OrderedNode,
         params: &HnswQueryParams,
-        bitset: &impl NodeFilter,
+        bitset: &Visited,
         visited_generator: &mut VisitedGenerator,
         expanded_generator: &mut VisitedGenerator,
         storage_len: usize,
@@ -723,11 +678,11 @@ impl HNSW {
         storage: &impl VectorStore,
         query: ArrayRef,
         k: usize,
-        prefilter_bitset: &impl NodeFilter,
+        prefilter_bitset: Visited,
         params: &HnswQueryParams,
     ) -> (Vec<OrderedNode>, usize) {
         // every set bit gets exactly one distance on both branches below
-        let comparisons = prefilter_bitset.num_allowed();
+        let comparisons = prefilter_bitset.count_ones();
 
         let dist_calc = params.dist_calculator(storage, query);
         let in_range = range_filter(params, &dist_calc);
@@ -735,7 +690,7 @@ impl HNSW {
 
         match self.inner.params.prefetch_distance {
             Some(ahead) if ahead > 0 => {
-                let mut ids_iter = prefilter_bitset.allowed_ids();
+                let mut ids_iter = prefilter_bitset.iter_ones().map(|i| i as u32);
                 let mut buffer = VecDeque::with_capacity(ahead + 1);
                 for _ in 0..=ahead {
                     if let Some(id) = ids_iter.next() {
@@ -766,7 +721,7 @@ impl HNSW {
                 }
             }
             _ => {
-                for node_id in prefilter_bitset.allowed_ids() {
+                for node_id in prefilter_bitset.iter_ones().map(|i| i as u32) {
                     let dist: OrderedFloat = dist_calc.distance(node_id).into();
                     if !in_range(node_id, dist) {
                         continue;
@@ -781,112 +736,6 @@ impl HNSW {
             }
         };
         (heap.into_sorted_vec(), comparisons)
-    }
-
-    /// [`IvfSubIndex::search`] with the prefilter already resolved against
-    /// this partition into `allowed`, one bit per local id of `storage`.
-    ///
-    /// Returns exactly what [`IvfSubIndex::search`] returns for the prefilter
-    /// `allowed` was resolved from, without walking the partition's rows to
-    /// resolve it again.
-    pub fn search_with_allowed_mask(
-        &self,
-        query: ArrayRef,
-        k: usize,
-        params: HnswQueryParams,
-        storage: &impl VectorStore,
-        allowed: &AllowedMask,
-        metrics: &dyn MetricsCollector,
-    ) -> Result<RecordBatch> {
-        if params.ef < k {
-            return Err(Error::index(
-                "ef must be greater than or equal to k".to_string(),
-            ));
-        }
-        if self.is_empty() {
-            return Ok(RecordBatch::new_empty(VECTOR_RESULT_SCHEMA.clone()));
-        }
-        if allowed.len() != storage.len() {
-            return Err(Error::invalid_input(format!(
-                "allowed mask covers {} rows but the partition storage has {}",
-                allowed.len(),
-                storage.len()
-            )));
-        }
-        let rerank_query = query.clone();
-        let (results, comparisons) =
-            self.search_filtered(query, k, &params, storage, allowed, allowed.num_allowed())?;
-        metrics.record_comparisons(comparisons);
-        Self::results_batch(results, rerank_query, k, &params, storage)
-    }
-
-    /// Search through `filter`, which allows `remained` of the partition's rows.
-    ///
-    /// Returns [`HnswQueryParams::candidates`] results for a top-`k` query.
-    fn search_filtered<F: NodeFilter>(
-        &self,
-        query: ArrayRef,
-        k: usize,
-        params: &HnswQueryParams,
-        storage: &impl VectorStore,
-        filter: &F,
-        remained: usize,
-    ) -> Result<(Vec<OrderedNode>, usize)> {
-        let candidates = params.candidates(k);
-        if remained == storage.len() {
-            // mask passes every row: same as unfiltered
-            self.search_basic_with::<F>(query, candidates, params, None, storage)
-        } else if remained < self.len() * 10 / 100 {
-            // few matching rows: brute force is cheaper and exact
-            Ok(self.flat_search(storage, query, candidates, filter, params))
-        } else if params.use_acorn {
-            let (acorn_results, acorn_comparisons) =
-                self.search_acorn_with(query.clone(), candidates, params, filter, storage)?;
-            // under-delivery means the budget ran out on a fragmented
-            // mask, except range-bounded queries which return short
-            // legitimately
-            let bounded = params.lower_bound.is_some() || params.upper_bound.is_some();
-            if !bounded && acorn_results.len() < k.min(remained) {
-                // the abandoned ACORN traversal still cost its distances
-                let (results, basic_comparisons) =
-                    self.search_basic_with(query, candidates, params, Some(filter), storage)?;
-                Ok((results, acorn_comparisons + basic_comparisons))
-            } else {
-                Ok((acorn_results, acorn_comparisons))
-            }
-        } else {
-            self.search_basic_with(query, candidates, params, Some(filter), storage)
-        }
-    }
-
-    /// Reranks `results` when `params` asks for it and keeps the top `k`.
-    fn results_batch(
-        mut results: Vec<OrderedNode>,
-        query: ArrayRef,
-        k: usize,
-        params: &HnswQueryParams,
-        storage: &impl VectorStore,
-    ) -> Result<RecordBatch> {
-        if params.reranks() && storage.rerank(query, params.dist_q_c, &mut results) {
-            // The search applied the bounds to the scores rerank replaced.
-            let lower = params.lower_bound.unwrap_or(f32::MIN);
-            let upper = params.upper_bound.unwrap_or(f32::MAX);
-            results.retain(|node| node.dist.0 >= lower && node.dist.0 < upper);
-        }
-        results.truncate(k);
-
-        // need to unique by row ids in case of searching multivector
-        let (row_ids, dists): (Vec<_>, Vec<_>) = results
-            .into_iter()
-            .map(|r| (storage.row_id(r.id), r.dist.0))
-            .unique_by(|r| r.0)
-            .unzip();
-        let row_ids = Arc::new(UInt64Array::from(row_ids));
-        let distances = Arc::new(Float32Array::from(dists));
-        Ok(RecordBatch::try_new(
-            VECTOR_RESULT_SCHEMA.clone(),
-            vec![distances, row_ids],
-        )?)
     }
 
     /// Returns the metadata of this [`HNSW`].
@@ -1713,12 +1562,6 @@ impl HnswQueryParams {
         self.rq_graph_scoring == RqGraphScoring::OneBitRerank
     }
 
-    /// How many results a top-`k` search collects: a reranking search keeps
-    /// `ef` candidates on every path for [`VectorStore::rerank`].
-    fn candidates(&self, k: usize) -> usize {
-        if self.reranks() { self.ef } else { k }
-    }
-
     /// The calculator that scores the nodes a search visits.
     pub(crate) fn dist_calculator<'a, S: VectorStore>(
         &self,
@@ -1900,10 +1743,6 @@ impl IvfSubIndex for HNSW {
         HNSW_TYPE
     }
 
-    fn uses_allowed_mask() -> bool {
-        true
-    }
-
     fn metadata_key() -> &'static str {
         "lance:hnsw"
     }
@@ -1964,9 +1803,6 @@ impl IvfSubIndex for HNSW {
         prefilter: Arc<dyn PreFilter>,
         metrics: &dyn MetricsCollector,
     ) -> Result<RecordBatch> {
-        if let Some(allowed) = prefilter.allowed_mask() {
-            return self.search_with_allowed_mask(query, k, params, storage, allowed, metrics);
-        }
         if params.ef < k {
             return Err(Error::invalid_input(format!(
                 "ef must be greater than or equal to k: ef={}, k={k}",
@@ -1974,35 +1810,78 @@ impl IvfSubIndex for HNSW {
             )));
         }
 
+        let schema = VECTOR_RESULT_SCHEMA.clone();
         if self.is_empty() {
-            return Ok(RecordBatch::new_empty(VECTOR_RESULT_SCHEMA.clone()));
+            return Ok(RecordBatch::new_empty(schema));
         }
 
+        let mut prefilter_generator = self
+            .inner
+            .visited_generator_queue
+            .pop()
+            .unwrap_or_else(|| VisitedGenerator::new(storage.len()));
         let rerank_query = query.clone();
-        let (results, comparisons) = if prefilter.is_empty() {
-            self.search_basic(query, params.candidates(k), &params, None, storage)?
+        // A reranking search keeps `ef` candidates on every path for `VectorStore::rerank`.
+        let (top_k, k) = (k, if params.reranks() { params.ef } else { k });
+        let (mut results, comparisons) = if prefilter.is_empty() {
+            self.search_basic(query, k, &params, None, storage)?
         } else {
-            let mut prefilter_generator = self
-                .inner
-                .visited_generator_queue
-                .pop()
-                .unwrap_or_else(|| VisitedGenerator::new(storage.len()));
+            // the bitset must be moved into a callee on every path so its
+            // borrow of `prefilter_generator` ends before the push below
             let indices = prefilter.filter_row_ids(Box::new(storage.row_ids()));
             let mut prefilter_bitset = prefilter_generator.generate(storage.len());
             for index in indices {
                 prefilter_bitset.insert(index as u32);
             }
             let remained = prefilter_bitset.count_ones();
-            let found =
-                self.search_filtered(query, k, &params, storage, &prefilter_bitset, remained);
-            // the bitset borrows `prefilter_generator`, so it must go first
-            drop(prefilter_bitset);
-            // if the queue is full, we just don't push it back, so ignore the error here
-            let _ = self.inner.visited_generator_queue.push(prefilter_generator);
-            found?
+            if remained == storage.len() {
+                // mask passes every row: same as unfiltered
+                drop(prefilter_bitset);
+                self.search_basic(query, k, &params, None, storage)?
+            } else if remained < self.len() * 10 / 100 {
+                // few matching rows: brute force is cheaper and exact
+                self.flat_search(storage, query, k, prefilter_bitset, &params)
+            } else if params.use_acorn {
+                let (acorn_results, acorn_comparisons) =
+                    self.search_acorn(query.clone(), k, &params, &prefilter_bitset, storage)?;
+                // under-delivery means the budget ran out on a fragmented
+                // mask, except range-bounded queries which return short
+                // legitimately
+                let bounded = params.lower_bound.is_some() || params.upper_bound.is_some();
+                if !bounded && acorn_results.len() < top_k.min(remained) {
+                    // the abandoned ACORN traversal still cost its distances
+                    let (results, basic_comparisons) =
+                        self.search_basic(query, k, &params, Some(prefilter_bitset), storage)?;
+                    (results, acorn_comparisons + basic_comparisons)
+                } else {
+                    drop(prefilter_bitset);
+                    (acorn_results, acorn_comparisons)
+                }
+            } else {
+                self.search_basic(query, k, &params, Some(prefilter_bitset), storage)?
+            }
         };
         metrics.record_comparisons(comparisons);
-        Self::results_batch(results, rerank_query, k, &params, storage)
+        // if the queue is full, we just don't push it back, so ignore the error here
+        let _ = self.inner.visited_generator_queue.push(prefilter_generator);
+        if params.reranks() && storage.rerank(rerank_query, params.dist_q_c, &mut results) {
+            // The search applied the bounds to the scores rerank replaced.
+            let lower = params.lower_bound.unwrap_or(f32::MIN);
+            let upper = params.upper_bound.unwrap_or(f32::MAX);
+            results.retain(|node| node.dist.0 >= lower && node.dist.0 < upper);
+        }
+        results.truncate(top_k);
+
+        // need to unique by row ids in case of searching multivector
+        let (row_ids, dists): (Vec<_>, Vec<_>) = results
+            .into_iter()
+            .map(|r| (storage.row_id(r.id), r.dist.0))
+            .unique_by(|r| r.0)
+            .unzip();
+        let row_ids = Arc::new(UInt64Array::from(row_ids));
+        let distances = Arc::new(Float32Array::from(dists));
+
+        Ok(RecordBatch::try_new(schema, vec![distances, row_ids])?)
     }
 
     /// Given a vector storage, containing all the data for the IVF partition, build the sub index.
@@ -2169,14 +2048,14 @@ mod tests {
         ImmutableHnswLevelView, MIN_HNSW_M, random_level_with,
     };
     use crate::metrics::{LocalMetricsCollector, NoOpMetricsCollector};
-    use crate::prefilter::{AllowedMask, AllowedMaskFilter, NoFilter, PreFilter};
+    use crate::prefilter::{NoFilter, PreFilter};
     use crate::vector::Query;
     use crate::vector::graph::builder::GraphBuilderNode;
     use crate::vector::storage::{DistCalculator, VectorStore};
     use crate::vector::v3::subindex::IvfSubIndex;
     use crate::vector::{
         flat::storage::{FlatBinStorage, FlatFloatDistanceCalc, FlatFloatStorage},
-        graph::{DISTS_FIELD, NEIGHBORS_FIELD, OrderedNode, Visited, VisitedGenerator},
+        graph::{DISTS_FIELD, NEIGHBORS_FIELD, OrderedNode, VisitedGenerator},
         hnsw::{
             HNSW, HnswMetadata, VECTOR_ID_FIELD,
             builder::{DEFAULT_MIN_EF, HnswBuildParams, HnswQueryParams},
@@ -2891,7 +2770,7 @@ mod tests {
             ep.clone(),
             3,
             &query_params,
-            None::<&Visited>,
+            None,
             &mut visited_generator,
             N,
             None,
@@ -4263,122 +4142,5 @@ mod tests {
                 "results changed with prefetch_distance={prefetch_distance:?}"
             );
         }
-    }
-
-    /// A cached [`AllowedMask`] must answer exactly as resolving the same
-    /// prefilter on every query does: same row ids, same distances, same
-    /// distance count, on every search branch (unfiltered, flat, ACORN with its
-    /// fallback, filtered beam search).
-    #[rstest]
-    #[case::none(0, false)]
-    #[case::one_percent(10, false)]
-    #[case::five_percent(50, false)]
-    #[case::ten_percent(100, false)]
-    #[case::half(500, false)]
-    #[case::ninety_percent(900, false)]
-    #[case::ninety_nine_percent(990, false)]
-    #[case::all(1000, false)]
-    #[case::none_acorn(0, true)]
-    #[case::one_percent_acorn(10, true)]
-    #[case::five_percent_acorn(50, true)]
-    #[case::ten_percent_acorn(100, true)]
-    #[case::half_acorn(500, true)]
-    #[case::ninety_percent_acorn(900, true)]
-    #[case::ninety_nine_percent_acorn(990, true)]
-    #[case::all_acorn(1000, true)]
-    fn test_allowed_mask_search_matches_prefilter_search(
-        #[case] deleted_per_mille: u64,
-        #[case] use_acorn: bool,
-    ) {
-        const DIM: usize = 16;
-        const TOTAL: usize = 2000;
-        let fsl = FixedSizeListArray::try_new_from_values(
-            generate_random_array_with_seed::<Float32Type>(TOTAL * DIM, [3; 32]),
-            DIM as i32,
-        )
-        .unwrap();
-        let store = FlatFloatStorage::new(fsl.clone(), DistanceType::L2);
-        let hnsw = HNSW::index_vectors(
-            &store,
-            HnswBuildParams::default().num_edges(12).ef_construction(40),
-        )
-        .unwrap();
-
-        let mut rng = SmallRng::seed_from_u64(deleted_per_mille);
-        let allowed: Vec<u64> = (0..TOTAL as u64)
-            .filter(|_| rng.random_range(0..1000) >= deleted_per_mille)
-            .collect();
-        let prefilter = masked_prefilter(allowed);
-        let selected = prefilter.filter_row_ids(Box::new(store.row_ids()));
-        let mask = Arc::new(AllowedMask::from_selected(TOTAL, &selected).unwrap());
-        let cached: Arc<dyn PreFilter> =
-            Arc::new(AllowedMaskFilter::new(prefilter.clone(), mask.clone()));
-
-        for (k, ef) in [(1, 8), (10, 32), (10, 128)] {
-            let params = HnswQueryParams {
-                ef,
-                lower_bound: None,
-                upper_bound: None,
-                dist_q_c: 0.0,
-                use_acorn,
-                rq_graph_scoring: Default::default(),
-            };
-            for query_id in (0..TOTAL).step_by(TOTAL / 10) {
-                let query = fsl.value(query_id);
-                let search = |filter: Arc<dyn PreFilter>| {
-                    let metrics = LocalMetricsCollector::default();
-                    let batch = hnsw
-                        .search(query.clone(), k, params, &store, filter, &metrics)
-                        .unwrap();
-                    (batch, metrics.comparisons.load(Ordering::Relaxed))
-                };
-                let expected = search(prefilter.clone());
-                assert_eq!(
-                    search(cached.clone()),
-                    expected,
-                    "k={k} ef={ef} q={query_id}"
-                );
-
-                let metrics = LocalMetricsCollector::default();
-                let direct = hnsw
-                    .search_with_allowed_mask(query.clone(), k, params, &store, &mask, &metrics)
-                    .unwrap();
-                assert_eq!(
-                    (direct, metrics.comparisons.load(Ordering::Relaxed)),
-                    expected,
-                    "k={k} ef={ef} q={query_id}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn test_allowed_mask_search_rejects_mask_of_another_partition() {
-        const DIM: usize = 4;
-        let fsl =
-            FixedSizeListArray::try_new_from_values(generate_random_array(64 * DIM), 4).unwrap();
-        let store = FlatFloatStorage::new(fsl.clone(), DistanceType::L2);
-        let hnsw = HNSW::index_vectors(&store, HnswBuildParams::default()).unwrap();
-        let mask = AllowedMask::from_selected(32, &[1, 2]).unwrap();
-
-        let error = hnsw
-            .search_with_allowed_mask(
-                fsl.value(0),
-                1,
-                HnswQueryParams {
-                    ef: 8,
-                    lower_bound: None,
-                    upper_bound: None,
-                    dist_q_c: 0.0,
-                    use_acorn: false,
-                    rq_graph_scoring: Default::default(),
-                },
-                &store,
-                &mask,
-                &NoOpMetricsCollector,
-            )
-            .unwrap_err();
-        assert!(matches!(error, Error::InvalidInput { .. }));
-        assert!(error.to_string().contains("covers 32 rows"), "{error}");
     }
 }

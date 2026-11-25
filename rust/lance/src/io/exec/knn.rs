@@ -6,7 +6,7 @@ use lance_core::utils::row_addr_remap::RowAddrRemap;
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock, Mutex, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Instant;
 
 use arrow::array::{Float32Builder, Int32Builder};
@@ -55,7 +55,7 @@ use lance_datafusion::utils::{
 };
 use lance_index::IndexType;
 use lance_index::metrics::{IndexTimer, IndexTiming, MetricsCollector};
-use lance_index::prefilter::{MaskFingerprint, PreFilter};
+use lance_index::prefilter::PreFilter;
 use lance_index::vector::DIST_Q_C_COLUMN;
 use lance_index::vector::graph::OrderedFloat;
 use lance_index::vector::hnsw::builder::HnswQueryParams;
@@ -68,7 +68,6 @@ use lance_linalg::distance::DistanceType;
 use lance_linalg::kernels::normalize_arrow;
 use lance_select::{RowAddrMask, RowAddrTreeMap};
 use lance_table::format::IndexMetadata;
-use roaring::RoaringBitmap;
 use tokio::sync::Notify;
 use uuid::Uuid;
 
@@ -1819,26 +1818,15 @@ struct LatePartitionSearchControl {
 struct SegmentPreFilter {
     base: Arc<DatasetPreFilter>,
     ownership_mask: Arc<RowAddrMask>,
-    /// The fragments `ownership_mask` restricts to. The mask is the restricted
-    /// deletion mask of the base's dataset over these fragments, so they and the
-    /// base's deletion state determine it.
-    owned_fragments: RoaringBitmap,
     final_mask: Mutex<Option<Arc<RowAddrMask>>>,
-    fingerprint: OnceLock<Option<MaskFingerprint>>,
 }
 
 impl SegmentPreFilter {
-    fn new(
-        base: Arc<DatasetPreFilter>,
-        ownership_mask: Arc<RowAddrMask>,
-        owned_fragments: RoaringBitmap,
-    ) -> Self {
+    fn new(base: Arc<DatasetPreFilter>, ownership_mask: Arc<RowAddrMask>) -> Self {
         Self {
             base,
             ownership_mask,
-            owned_fragments,
             final_mask: Mutex::new(None),
-            fingerprint: OnceLock::new(),
         }
     }
 }
@@ -1892,20 +1880,6 @@ impl PreFilter for SegmentPreFilter {
 
     fn filter_row_ids<'a>(&self, row_ids: Box<dyn Iterator<Item = &'a u64> + 'a>) -> Vec<u64> {
         self.mask().selected_indices(row_ids)
-    }
-
-    fn deletion_fingerprint(&self) -> Option<MaskFingerprint> {
-        *self.fingerprint.get_or_init(|| {
-            let base = self.base.deletion_fingerprint()?;
-            let mut hasher = blake3::Hasher::new();
-            hasher.update(b"lance.segment-deletion-mask.v1");
-            hasher.update(base.as_bytes());
-            hasher.update(&self.owned_fragments.len().to_le_bytes());
-            for fragment_id in self.owned_fragments.iter() {
-                hasher.update(&fragment_id.to_le_bytes());
-            }
-            Some(MaskFingerprint::new(hasher.finalize().into()))
-        })
     }
 }
 
@@ -2008,16 +1982,8 @@ async fn prefilter_for_segment(
     index: &IndexMetadata,
     base: Arc<DatasetPreFilter>,
 ) -> Result<Arc<dyn PreFilter>> {
-    // Without a fragment bitmap the segment owns every row it holds.
-    let Some(owned_fragments) = index.fragment_bitmap.as_ref() else {
-        return Ok(base);
-    };
     match segment_ownership_mask(&dataset, index).await? {
-        Some(ownership_mask) => Ok(Arc::new(SegmentPreFilter::new(
-            base,
-            ownership_mask,
-            owned_fragments.clone(),
-        ))),
+        Some(ownership_mask) => Ok(Arc::new(SegmentPreFilter::new(base, ownership_mask))),
         None => Ok(base),
     }
 }
@@ -4121,11 +4087,8 @@ mod tests {
             DatasetPreFilter::new(dataset, &[old_segment, new_segment], None)
                 .with_overlay_block(RowAddrMask::allow_nothing()),
         );
-        let ordinary_segment = SegmentPreFilter::new(
-            ordinary_base,
-            Arc::new(RowAddrMask::all_rows()),
-            RoaringBitmap::new(),
-        );
+        let ordinary_segment =
+            SegmentPreFilter::new(ordinary_base, Arc::new(RowAddrMask::all_rows()));
         assert!(
             !ordinary_segment.needs_partition_row_ids(),
             "a user filter cannot take the no-filter fast path, so partition coverage is unused"
@@ -6241,11 +6204,7 @@ mod tests {
         let mut first_row = RowAddrTreeMap::new();
         first_row.insert(0);
         let base_allow = base(RowAddrMask::from_allowed(first_row));
-        let other = SegmentPreFilter::new(
-            base_allow.clone(),
-            owning(&[1]),
-            RoaringBitmap::from_iter([1]),
-        );
+        let other = SegmentPreFilter::new(base_allow.clone(), owning(&[1]));
         assert!(
             !other.selects_nothing(),
             "nothing is known before readiness"
@@ -6253,7 +6212,7 @@ mod tests {
         other.wait_for_ready().await.unwrap();
         assert!(other.selects_nothing());
         assert!(!base_allow.selects_nothing(), "the base filter keeps a row");
-        let owner = SegmentPreFilter::new(base_allow, owning(&[0]), RoaringBitmap::from_iter([0]));
+        let owner = SegmentPreFilter::new(base_allow, owning(&[0]));
         owner.wait_for_ready().await.unwrap();
         assert!(!owner.selects_nothing());
         let empty = base(RowAddrMask::allow_nothing());

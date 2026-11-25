@@ -13,7 +13,6 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::OnceLock;
 
 use async_trait::async_trait;
 use futures::FutureExt;
@@ -23,11 +22,9 @@ use futures::future::BoxFuture;
 use futures::stream;
 use lance_core::utils::deletion::DeletionVector;
 use lance_core::utils::tokio::spawn_cpu;
-use lance_index::prefilter::MaskFingerprint;
 use lance_select::{RowAddrMask, RowAddrTreeMap, RowSetOps};
 use lance_table::format::Fragment;
 use lance_table::format::IndexMetadata;
-use lance_table::format::{DeletionFileType, RowIdMeta};
 use lance_table::rowids::RowIdSequence;
 use roaring::RoaringBitmap;
 use tokio::join;
@@ -74,144 +71,6 @@ pub struct DatasetPreFilter {
     pub(super) overlay_block: Option<Arc<RowAddrMask>>,
     // When the tasks are finished this is the combined filter
     pub(super) final_mask: Mutex<OnceCell<Arc<RowAddrMask>>>,
-    // What `deleted_ids` is computed from, when it is the whole mask: `None` once a
-    // per-query filter, deleted fragments or an overlay block joins it, or when there
-    // is no deletion mask at all.
-    pub(super) deletion_state: Option<DeletionState>,
-}
-
-/// The inputs of a [`DatasetPreFilter`]'s deletion mask, from which
-/// [`PreFilter::deletion_fingerprint`] is derived on first use.
-pub(super) struct DeletionState {
-    dataset: Arc<Dataset>,
-    fragments: RoaringBitmap,
-    restrict_to_fragments: bool,
-    fingerprint: OnceLock<Option<MaskFingerprint>>,
-}
-
-impl DeletionState {
-    fn new(dataset: Arc<Dataset>, fragments: RoaringBitmap, restrict_to_fragments: bool) -> Self {
-        Self {
-            dataset,
-            fragments,
-            restrict_to_fragments,
-            fingerprint: OnceLock::new(),
-        }
-    }
-
-    fn fingerprint(&self) -> Option<MaskFingerprint> {
-        *self.fingerprint.get_or_init(|| {
-            deletion_fingerprint(&self.dataset, &self.fragments, self.restrict_to_fragments)
-        })
-    }
-}
-
-/// Digest of everything [`DatasetPreFilter::create_deletion_mask_impl`] reads to
-/// build the deletion mask of `dataset` over `fragments`.
-///
-/// The mask is a function of the fragment set it is built over, whether it is
-/// restricted to that set, whether row ids are stable, the highest fragment id
-/// ever allocated, and, for every fragment of the manifest, its id, physical
-/// row count, deletion file and, under stable row ids, its row id sequence.
-/// Deletion files and inline row id sequences are immutable once written, so
-/// naming them names their contents. The dataset URI and base paths pin where
-/// those files are read from.
-///
-/// Returns `None`, so the caller resolves the mask per query as before, when
-/// one of those inputs cannot be named from the manifest: a fragment without a
-/// recorded physical row count, or a manifest whose recorded counts are not
-/// trusted (no writer version, see [`FileFragment::physical_rows`]).
-fn deletion_fingerprint(
-    dataset: &Dataset,
-    fragments: &RoaringBitmap,
-    restrict_to_fragments: bool,
-) -> Option<MaskFingerprint> {
-    let manifest = dataset.manifest.as_ref();
-    manifest.writer_version.as_ref()?;
-    let uses_stable_row_ids = manifest.uses_stable_row_ids();
-
-    let mut hasher = blake3::Hasher::new();
-    let put_u64 = |hasher: &mut blake3::Hasher, value: u64| {
-        hasher.update(&value.to_le_bytes());
-    };
-    let put_str = |hasher: &mut blake3::Hasher, value: &str| {
-        hasher.update(&(value.len() as u64).to_le_bytes());
-        hasher.update(value.as_bytes());
-    };
-    hasher.update(b"lance.deletion-mask.v1");
-    put_str(&mut hasher, dataset.uri());
-    hasher.update(&[
-        u8::from(restrict_to_fragments),
-        u8::from(uses_stable_row_ids),
-    ]);
-    match manifest.max_fragment_id {
-        Some(max_fragment_id) => put_u64(&mut hasher, 1 + u64::from(max_fragment_id)),
-        None => put_u64(&mut hasher, 0),
-    }
-
-    let mut base_paths: Vec<_> = manifest.base_paths.values().collect();
-    base_paths.sort_by_key(|base| base.id);
-    put_u64(&mut hasher, base_paths.len() as u64);
-    for base in base_paths {
-        put_u64(&mut hasher, u64::from(base.id));
-        put_str(&mut hasher, &base.path);
-    }
-
-    put_u64(&mut hasher, fragments.len());
-    for fragment_id in fragments.iter() {
-        put_u64(&mut hasher, u64::from(fragment_id));
-    }
-
-    put_u64(&mut hasher, manifest.fragments.len() as u64);
-    for fragment in manifest.fragments.iter() {
-        put_u64(&mut hasher, fragment.id);
-        put_u64(&mut hasher, fragment.physical_rows? as u64);
-        match &fragment.deletion_file {
-            None => put_u64(&mut hasher, 0),
-            Some(deletion_file) => {
-                put_u64(&mut hasher, 1);
-                put_u64(&mut hasher, deletion_file.read_version);
-                put_u64(&mut hasher, deletion_file.id);
-                put_u64(
-                    &mut hasher,
-                    match deletion_file.file_type {
-                        DeletionFileType::Array => 0,
-                        DeletionFileType::Bitmap => 1,
-                    },
-                );
-                put_u64(
-                    &mut hasher,
-                    deletion_file
-                        .num_deleted_rows
-                        .map_or(0, |rows| 1 + rows as u64),
-                );
-                put_u64(
-                    &mut hasher,
-                    deletion_file.base_id.map_or(0, |id| 1 + u64::from(id)),
-                );
-            }
-        }
-        if uses_stable_row_ids {
-            match &fragment.row_id_meta {
-                None => put_u64(&mut hasher, 0),
-                Some(RowIdMeta::Inline(row_ids)) => {
-                    put_u64(&mut hasher, 1);
-                    hasher.update(row_ids.digest());
-                }
-                Some(RowIdMeta::Column) => {
-                    // The sequence lives in one of the data files, which are
-                    // immutable and named uniquely, so the file list names it.
-                    put_u64(&mut hasher, 2);
-                    put_u64(&mut hasher, fragment.files.len() as u64);
-                    for file in &fragment.files {
-                        put_str(&mut hasher, &file.path);
-                        put_u64(&mut hasher, file.base_id.map_or(0, |id| 1 + u64::from(id)));
-                    }
-                }
-            }
-        }
-    }
-    Some(MaskFingerprint::new(hasher.finalize().into()))
 }
 
 impl DatasetPreFilter {
@@ -240,8 +99,6 @@ impl DatasetPreFilter {
                 fragments |= idx.fragment_bitmap.as_ref().unwrap();
             });
         }
-        let deletion_state =
-            DeletionState::new(dataset.clone(), fragments.clone(), all_have_bitmaps);
         let deleted_ids = if all_have_bitmaps {
             Self::create_restricted_deletion_mask(dataset, fragments)
         } else {
@@ -249,15 +106,12 @@ impl DatasetPreFilter {
         }
         .map(SharedPrerequisite::spawn);
         let filtered_ids = filter.map(SharedPrerequisite::spawn);
-        let deletion_state =
-            (deleted_ids.is_some() && filtered_ids.is_none()).then_some(deletion_state);
         Self {
             deleted_ids,
             filtered_ids,
             deleted_fragments: None,
             overlay_block: None,
             final_mask: Mutex::new(OnceCell::new()),
-            deletion_state,
         }
     }
 
@@ -276,19 +130,15 @@ impl DatasetPreFilter {
         fragments: RoaringBitmap,
         filter: Option<BoxFuture<'static, Result<Arc<RowAddrMask>>>>,
     ) -> Self {
-        let deletion_state = DeletionState::new(dataset.clone(), fragments.clone(), true);
         let deleted_ids = Self::create_restricted_deletion_mask(dataset, fragments)
             .map(SharedPrerequisite::spawn);
         let filtered_ids = filter.map(SharedPrerequisite::spawn);
-        let deletion_state =
-            (deleted_ids.is_some() && filtered_ids.is_none()).then_some(deletion_state);
         Self {
             deleted_ids,
             filtered_ids,
             deleted_fragments: None,
             overlay_block: None,
             final_mask: Mutex::new(OnceCell::new()),
-            deletion_state,
         }
     }
 
@@ -460,7 +310,6 @@ impl DatasetPreFilter {
             deleted_fragments,
             overlay_block,
             final_mask: _,
-            deletion_state: _,
         } = self;
         filtered_ids.is_none() && deleted_fragments.is_none() && overlay_block.is_none()
     }
@@ -471,14 +320,12 @@ impl DatasetPreFilter {
     /// dataset but whose data is still present in the index (merge-on-read).
     pub fn set_deleted_fragments(&mut self, fragments: RoaringBitmap) {
         self.deleted_fragments = Some(fragments);
-        self.deletion_state = None;
     }
 
     /// Block specific row addresses from index results because their index entries are stale
     /// due to a data overlay committed after the index was built.
     pub fn with_overlay_block(mut self, block: RowAddrMask) -> Self {
         self.overlay_block = Some(Arc::new(block));
-        self.deletion_state = None;
         self
     }
 
@@ -737,10 +584,6 @@ impl PreFilter for DatasetPreFilter {
     #[instrument(level = "debug", skip_all)]
     fn filter_row_ids<'a>(&self, row_ids: Box<dyn Iterator<Item = &'a u64> + 'a>) -> Vec<u64> {
         self.mask().selected_indices(row_ids)
-    }
-
-    fn deletion_fingerprint(&self) -> Option<MaskFingerprint> {
-        self.deletion_state.as_ref()?.fingerprint()
     }
 }
 
@@ -1334,109 +1177,5 @@ mod test {
                 .await
                 .unwrap();
         assert_eq!(mask.allow_list().and_then(|x| x.len()), Some(0));
-    }
-
-    fn index_over(dataset: &Dataset, fragment_bitmap: Option<RoaringBitmap>) -> IndexMetadata {
-        IndexMetadata {
-            uuid: uuid::Uuid::new_v4(),
-            fields: Vec::new(),
-            covering_fields: vec![],
-            name: "vector".to_string(),
-            dataset_version: dataset.manifest.version,
-            fragment_bitmap,
-            index_details: None,
-            index_version: 0,
-            created_at: None,
-            base_id: None,
-            files: None,
-            clustering_id: None,
-            metadata: Default::default(),
-        }
-    }
-
-    fn fingerprint_of(dataset: &Arc<Dataset>) -> Option<MaskFingerprint> {
-        let index = index_over(dataset, Some(RoaringBitmap::from_iter(0..3)));
-        DatasetPreFilter::new(dataset.clone(), &[index], None).deletion_fingerprint()
-    }
-
-    /// The fingerprint keys a cached deletion mask, so it must be stable for one
-    /// deletion state and change with every delete.
-    #[rstest]
-    #[tokio::test]
-    async fn test_deletion_fingerprint_names_deletion_state(
-        #[values(false, true)] stable_row_ids: bool,
-    ) {
-        let datasets = test_datasets(stable_row_ids).await;
-        // Nothing deleted: there is no mask to cache.
-        assert_eq!(fingerprint_of(&datasets.no_deletions), None);
-
-        let first = fingerprint_of(&datasets.deletions_no_missing_frags).unwrap();
-        assert_eq!(
-            fingerprint_of(&datasets.deletions_no_missing_frags),
-            Some(first)
-        );
-        let second = fingerprint_of(&datasets.deletions_missing_frags).unwrap();
-        let third = fingerprint_of(&datasets.only_missing_frags).unwrap();
-        assert_ne!(first, second);
-        assert_ne!(second, third);
-        assert_ne!(first, third);
-
-        // The fragment set and its restriction are inputs of the mask too.
-        let dataset = &datasets.deletions_no_missing_frags;
-        let other_coverage = index_over(dataset, Some(RoaringBitmap::from_iter(0..2)));
-        let unrestricted = index_over(dataset, None);
-        let fingerprints = [
-            DatasetPreFilter::new(dataset.clone(), &[other_coverage], None).deletion_fingerprint(),
-            DatasetPreFilter::new(dataset.clone(), &[unrestricted], None).deletion_fingerprint(),
-            DatasetPreFilter::new_restricted_to_fragments(
-                dataset.clone(),
-                RoaringBitmap::from_iter(0..3),
-                None,
-            )
-            .deletion_fingerprint(),
-        ];
-        assert!(fingerprints.iter().all(Option::is_some));
-        assert_ne!(fingerprints[0], Some(first));
-        assert_ne!(fingerprints[1], Some(first));
-        assert_ne!(fingerprints[0], fingerprints[1]);
-        // Same fragment set, same restriction: the same mask.
-        assert_eq!(fingerprints[2], Some(first));
-    }
-
-    /// A mask with any input beyond the deletion state, or one whose inputs the
-    /// manifest does not name, must never be cached under a fingerprint.
-    #[tokio::test]
-    async fn test_deletion_fingerprint_absent_for_masks_it_cannot_name() {
-        let datasets = test_datasets(false).await;
-        let dataset = datasets.deletions_no_missing_frags;
-        let index = index_over(&dataset, Some(RoaringBitmap::from_iter(0..3)));
-        assert!(fingerprint_of(&dataset).is_some());
-
-        let filter = async { Ok(Arc::new(RowAddrMask::all_rows())) }.boxed();
-        let filtered = DatasetPreFilter::new_with_filter_future(
-            dataset.clone(),
-            std::slice::from_ref(&index),
-            Some(filter),
-        );
-        assert_eq!(filtered.deletion_fingerprint(), None);
-
-        let overlaid = DatasetPreFilter::new(dataset.clone(), std::slice::from_ref(&index), None)
-            .with_overlay_block(RowAddrMask::allow_nothing());
-        assert_eq!(overlaid.deletion_fingerprint(), None);
-
-        let mut with_deleted_fragments =
-            DatasetPreFilter::new(dataset.clone(), std::slice::from_ref(&index), None);
-        with_deleted_fragments.set_deleted_fragments(RoaringBitmap::from_iter([1]));
-        assert_eq!(with_deleted_fragments.deletion_fingerprint(), None);
-
-        // Physical row counts are only trusted with a writer version.
-        let mut untrusted = (*dataset).clone();
-        Arc::make_mut(&mut untrusted.manifest).writer_version = None;
-        assert_eq!(fingerprint_of(&Arc::new(untrusted)), None);
-
-        let mut uncounted = (*dataset).clone();
-        Arc::make_mut(&mut Arc::make_mut(&mut uncounted.manifest).fragments)[0].physical_rows =
-            None;
-        assert_eq!(fingerprint_of(&Arc::new(uncounted)), None);
     }
 }

@@ -283,7 +283,6 @@ mod test {
                     deleted_fragments: None,
                     overlay_block: None,
                     final_mask: Mutex::new(OnceCell::new()),
-                    deletion_state: None,
                 }),
                 &NoOpMetricsCollector,
             )

@@ -33,7 +33,6 @@ use lance_index::vector::ivf::storage::IvfModel;
 use lance_index::vector::storage::VectorStore;
 use lance_index::vector::v3::subindex::IvfSubIndex;
 
-use crate::dataset::builder::DatasetBuilder;
 use crate::dataset::{InsertBuilder, UpdateBuilder, WriteMode, WriteParams};
 use crate::index::DatasetIndexExt;
 use crate::index::loading::DatasetIndexInternalExt;
@@ -45,7 +44,6 @@ use crate::index::vector::ivf::compatibility::{VectorQueryContract, vector_segme
 use crate::index::vector::ivf::v2::{
     IVFPartitionKey, IvfFlatIndex, IvfHnswSqIndex, IvfPq, IvfStateEntryBox, PartitionEntry,
 };
-use crate::session::Session;
 use crate::session::index_caches::{DerivedIndexListingKey, QueryIndexListingKey};
 use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount, copy_test_data_to_tmp};
 use crate::{
@@ -66,7 +64,7 @@ use lance_encoding::decoder::DecoderPlugins;
 use lance_file::reader::{FileReader, FileReaderOptions};
 use lance_index::IndexType;
 use lance_index::optimize::OptimizeOptions;
-use lance_index::prefilter::{MaskFingerprint, NoFilter, PreFilter};
+use lance_index::prefilter::{NoFilter, PreFilter};
 use lance_index::progress::IndexBuildProgress;
 use lance_index::vector::DIST_COL;
 use lance_index::vector::bq::builder::RabitQuantizer;
@@ -386,190 +384,10 @@ async fn test_partition_coverage_is_only_built_for_capable_filters() {
     assert!(entry.partition_rows_accounted.load(Ordering::Acquire));
 }
 
-/// A deletion-only filter: its mask is `selected_rows`, named by `fingerprint`.
-/// `resolves` counts how often a partition is resolved against it.
-struct DeletionTestFilter {
-    selected_rows: Arc<RowAddrMask>,
-    fingerprint: Option<MaskFingerprint>,
-    resolves: Arc<AtomicUsize>,
-}
-
-impl DeletionTestFilter {
-    fn new(allowed: impl IntoIterator<Item = u64>, fingerprint: Option<u8>) -> Self {
-        Self {
-            selected_rows: Arc::new(RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(
-                allowed,
-            ))),
-            fingerprint: fingerprint.map(|byte| MaskFingerprint::new([byte; 32])),
-            resolves: Arc::new(AtomicUsize::new(0)),
-        }
-    }
-}
-
-#[async_trait::async_trait]
-impl PreFilter for DeletionTestFilter {
-    async fn wait_for_ready(&self) -> Result<()> {
-        Ok(())
-    }
-
-    fn is_empty(&self) -> bool {
-        false
-    }
-
-    fn mask(&self) -> Arc<RowAddrMask> {
-        self.selected_rows.clone()
-    }
-
-    fn filter_row_ids<'a>(&self, row_ids: Box<dyn Iterator<Item = &'a u64> + 'a>) -> Vec<u64> {
-        self.resolves.fetch_add(1, Ordering::Relaxed);
-        self.selected_rows.selected_indices(row_ids)
-    }
-
-    fn deletion_fingerprint(&self) -> Option<MaskFingerprint> {
-        self.fingerprint
-    }
-}
-
-fn hnsw_partition_entry(num_rows: usize) -> Arc<PartitionEntry<HNSW, FlatQuantizer>> {
-    let vectors = FixedSizeListArray::try_new_from_values(
-        Float32Array::from_iter_values((0..num_rows * 4).map(|i| (i % 97) as f32)),
-        4,
-    )
-    .unwrap();
-    let storage = FlatFloatStorage::new(vectors, DistanceType::L2);
-    let index = HNSW::index_vectors(&storage, HnswBuildParams::default()).unwrap();
-    Arc::new(PartitionEntry::new(index, storage))
-}
-
-async fn resolve_partition(
-    cache: &WeakLanceCache,
-    entry: &Arc<PartitionEntry<HNSW, FlatQuantizer>>,
-    filter: Arc<dyn PreFilter>,
-) -> Arc<dyn PreFilter> {
-    super::IVFIndex::<HNSW, FlatQuantizer>::prefilter_for_partition(cache, 0, entry, filter)
-        .await
-        .unwrap()
-}
-
-#[tokio::test]
-async fn test_deletion_mask_is_cached_per_fingerprint() {
-    const ROWS: u64 = 300;
-    let entry = hnsw_partition_entry(ROWS as usize);
-    let cache = LanceCache::with_capacity(1 << 24);
-    cache
-        .insert_with_key(
-            &IVFPartitionKey::<HNSW, FlatQuantizer>::new(0),
-            entry.clone(),
-        )
-        .await;
-    let weak_cache = WeakLanceCache::from(&cache);
-    let size_without_mask = entry.size_bytes();
-    let weight_without_mask = cache.size_bytes().await;
-
-    let first = DeletionTestFilter::new((0..ROWS).filter(|id| id % 3 != 0), Some(1));
-    let first_resolves = first.resolves.clone();
-    let resolved = resolve_partition(&weak_cache, &entry, Arc::new(first)).await;
-    let mask = resolved
-        .allowed_mask()
-        .expect("deletion-only filter is resolved");
-    assert_eq!(first_resolves.load(Ordering::Relaxed), 1);
-    assert_eq!(mask.num_allowed(), 200);
-    assert!((0..ROWS as u32).all(|id| mask.contains(id) == (id % 3 != 0)));
-
-    // The mask is charged to the cache, at a size `deep_size_of` agrees with.
-    assert!(entry.size_bytes() >= size_without_mask + ROWS as usize / 8);
-    assert_eq!(entry.size_bytes(), entry.as_ref().deep_size_of());
-    assert!(cache.size_bytes().await > weight_without_mask);
-    assert!(entry.deletion_mask_accounted.load(Ordering::Acquire));
-    let weight_with_mask = cache.size_bytes().await;
-
-    // Another query with the same deletion state reuses the mask unresolved.
-    let same_state = DeletionTestFilter::new((0..ROWS).filter(|id| id % 3 != 0), Some(1));
-    let same_resolves = same_state.resolves.clone();
-    let reused = resolve_partition(&weak_cache, &entry, Arc::new(same_state)).await;
-    assert_eq!(same_resolves.load(Ordering::Relaxed), 0);
-    assert!(std::ptr::eq(reused.allowed_mask().unwrap(), mask));
-
-    // A new deletion state replaces the slot, at the same size.
-    let second = DeletionTestFilter::new(0..ROWS / 2, Some(2));
-    let second_resolves = second.resolves.clone();
-    let replaced = resolve_partition(&weak_cache, &entry, Arc::new(second)).await;
-    assert_eq!(second_resolves.load(Ordering::Relaxed), 1);
-    let replaced_mask = replaced.allowed_mask().unwrap();
-    assert_eq!(replaced_mask.num_allowed(), ROWS as usize / 2);
-    assert!((0..ROWS as u32).all(|id| replaced_mask.contains(id) == (id < ROWS as u32 / 2)));
-    assert_eq!(entry.size_bytes(), entry.as_ref().deep_size_of());
-    assert_eq!(cache.size_bytes().await, weight_with_mask);
-
-    // The replaced state is resolved again rather than served stale.
-    let back = DeletionTestFilter::new((0..ROWS).filter(|id| id % 3 != 0), Some(1));
-    let back_resolves = back.resolves.clone();
-    let rebuilt = resolve_partition(&weak_cache, &entry, Arc::new(back)).await;
-    assert_eq!(back_resolves.load(Ordering::Relaxed), 1);
-    assert_eq!(rebuilt.allowed_mask().unwrap().num_allowed(), 200);
-}
-
-#[tokio::test]
-async fn test_deletion_mask_bypassed_without_fingerprint_or_mask_reader() {
-    let entry = hnsw_partition_entry(64);
-    let cache = LanceCache::with_capacity(1 << 24);
-    let weak_cache = WeakLanceCache::from(&cache);
-
-    // A filter that cannot name its mask (e.g. a user filter) is passed through.
-    let unnamed: Arc<dyn PreFilter> = Arc::new(DeletionTestFilter::new(0..32, None));
-    let returned = resolve_partition(&weak_cache, &entry, unnamed.clone()).await;
-    assert!(Arc::ptr_eq(&returned, &unnamed));
-    assert!(entry.deletion_mask.load().is_none());
-
-    // A sub-index that would not read the mask gets no mask built.
-    let vectors =
-        FixedSizeListArray::try_new_from_values(Float32Array::from(vec![0.0_f32; 16]), 4).unwrap();
-    let flat_entry = Arc::new(PartitionEntry::<FlatIndex, FlatQuantizer>::new(
-        FlatIndex::default(),
-        FlatFloatStorage::new(vectors, DistanceType::L2),
-    ));
-    let named: Arc<dyn PreFilter> = Arc::new(DeletionTestFilter::new(0..2, Some(1)));
-    let returned = super::IVFIndex::<FlatIndex, FlatQuantizer>::prefilter_for_partition(
-        &weak_cache,
-        0,
-        &flat_entry,
-        named.clone(),
-    )
-    .await
-    .unwrap();
-    assert!(Arc::ptr_eq(&returned, &named));
-    assert!(flat_entry.deletion_mask.load().is_none());
-}
-
-/// Queries that miss the slot together resolve the partition once.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_deletion_mask_is_built_once_under_concurrent_misses() {
-    const ROWS: u64 = 2000;
-    let entry = hnsw_partition_entry(ROWS as usize);
-    let cache = LanceCache::with_capacity(1 << 24);
-    let weak_cache = WeakLanceCache::from(&cache);
-    let resolves = Arc::new(AtomicUsize::new(0));
-
-    let tasks = (0..16).map(|_| {
-        let mut filter = DeletionTestFilter::new((0..ROWS).filter(|id| id % 7 != 0), Some(9));
-        filter.resolves = resolves.clone();
-        let weak_cache = weak_cache.clone();
-        let entry = entry.clone();
-        tokio::spawn(async move {
-            let resolved = resolve_partition(&weak_cache, &entry, Arc::new(filter)).await;
-            resolved.allowed_mask().unwrap().num_allowed()
-        })
-    });
-    let allowed = futures::future::try_join_all(tasks).await.unwrap();
-    let expected = (0..ROWS).filter(|id| id % 7 != 0).count();
-    assert!(allowed.iter().all(|count| *count == expected));
-    assert_eq!(resolves.load(Ordering::Relaxed), 1);
-}
-
-const DELETION_MASK_ROWS: u64 = 1200;
+const SEGMENT_DATASET_ROWS: u64 = 1200;
 
 /// A three-fragment dataset with an IVF_HNSW_FLAT index over two partitions.
-async fn deletion_mask_dataset(uri: &str, session: Arc<Session>) -> Dataset {
+async fn segment_dataset(uri: &str) -> Dataset {
     let reader = gen_batch()
         .with_seed(Seed(7))
         .col("id", array::step::<UInt64Type>())
@@ -577,13 +395,12 @@ async fn deletion_mask_dataset(uri: &str, session: Arc<Session>) -> Dataset {
             "vector",
             array::rand_vec::<Float32Type>(Dimension::from(16)),
         )
-        .into_reader_rows(RowCount::from(DELETION_MASK_ROWS), BatchCount::from(1));
+        .into_reader_rows(RowCount::from(SEGMENT_DATASET_ROWS), BatchCount::from(1));
     let mut dataset = Dataset::write(
         reader,
         uri,
         Some(WriteParams {
             max_rows_per_file: 400,
-            session: Some(session),
             ..Default::default()
         }),
     )
@@ -601,201 +418,18 @@ async fn deletion_mask_dataset(uri: &str, session: Arc<Session>) -> Dataset {
     dataset
 }
 
-/// `(id, distance)` of the 20 nearest rows to `query`, through the index.
-async fn knn_rows(dataset: &Dataset, query: &dyn Array, filter: Option<&str>) -> Vec<(u64, f32)> {
-    let mut scan = dataset.scan();
-    scan.nearest("vector", query, 20)
-        .unwrap()
-        .minimum_nprobes(2)
-        .ef(64);
-    if let Some(filter) = filter {
-        scan.filter(filter).unwrap().prefilter(true);
-    }
-    let batch = scan.try_into_batch().await.unwrap();
-    batch["id"]
-        .as_primitive::<UInt64Type>()
-        .values()
-        .iter()
-        .copied()
-        .zip(
-            batch[DIST_COL]
-                .as_primitive::<Float32Type>()
-                .values()
-                .iter()
-                .copied(),
-        )
-        .collect()
-}
-
-/// What `dataset` answers for each query when opened in a fresh session,
-/// whose index cache has never seen another deletion state.
-async fn fresh_session_rows(
-    dataset: &Dataset,
-    queries: &[ArrayRef],
-    filter: Option<&str>,
-) -> Vec<Vec<(u64, f32)>> {
-    let fresh = DatasetBuilder::from_uri(dataset.uri())
-        .with_session(Arc::new(Session::default()))
-        .with_version(dataset.version().version)
-        .load()
-        .await
-        .unwrap();
-    let mut rows = Vec::with_capacity(queries.len());
-    for query in queries {
-        rows.push(knn_rows(&fresh, query.as_ref(), filter).await);
-    }
-    rows
-}
-
-async fn session_rows(
-    dataset: &Dataset,
-    queries: &[ArrayRef],
-    filter: Option<&str>,
-) -> Vec<Vec<(u64, f32)>> {
-    let mut rows = Vec::with_capacity(queries.len());
-    for query in queries {
-        rows.push(knn_rows(dataset, query.as_ref(), filter).await);
-    }
-    rows
-}
-
-fn assert_no_deleted(rows: &[Vec<(u64, f32)>], is_deleted: impl Fn(u64) -> bool) {
-    for (id, _) in rows.iter().flatten() {
-        assert!(!is_deleted(*id), "deleted row {id} returned");
-    }
-}
-
-async fn compact(dataset: &mut Dataset, defer_index_remap: bool) {
-    compact_files(
-        dataset,
-        CompactionOptions {
-            materialize_deletions_threshold: 0.0,
-            defer_index_remap,
-            ..Default::default()
-        },
-        None,
-    )
-    .await
-    .unwrap();
-}
-
-/// A session that caches each partition's deletion mask must never serve one
-/// deletion state's mask to a query on another: every delete, reopen, filter
-/// and compaction below must answer exactly as an uncached session does.
-///
-/// Compaction changes the row ids a partition holds, either by remapping the
-/// index or, deferred, through a fragment reuse index applied at load.
-#[rstest]
-#[case::remap_on_compaction(false)]
-#[case::fragment_reuse(true)]
-#[tokio::test]
-async fn test_cached_deletion_mask_never_serves_stale_deletes(#[case] defer_index_remap: bool) {
-    let test_dir = TempStrDir::default();
-    let session = Arc::new(Session::default());
-    let mut dataset = deletion_mask_dataset(test_dir.as_str(), session.clone()).await;
-    if defer_index_remap {
-        // TODO: compacting deleted rows behind a fragment reuse index leaves an
-        // HNSW graph with more nodes than its remapped storage (a failure that
-        // predates the deletion mask cache), so this case compacts before any
-        // row is deleted.
-        compact(&mut dataset, true).await;
-        assert_eq!(dataset.get_fragments().len(), 1);
-    }
-    let vectors = dataset
-        .scan()
-        .project(&["vector"])
-        .unwrap()
-        .try_into_batch()
-        .await
-        .unwrap()["vector"]
-        .clone();
-    let queries: Vec<ArrayRef> = (0..DELETION_MASK_ROWS as usize)
-        .step_by(150)
-        .map(|row| vectors.slice(row, 1).as_fixed_size_list().value(0))
-        .collect();
-
-    dataset.delete("id % 10 = 0").await.unwrap();
-    let first_version = dataset.clone();
-    let first_rows = session_rows(&dataset, &queries, None).await;
-    assert_no_deleted(&first_rows, |id| id % 10 == 0);
-    assert_eq!(
-        first_rows,
-        fresh_session_rows(&dataset, &queries, None).await
-    );
-    // A second pass is served from the cached masks and must not change.
-    assert_eq!(session_rows(&dataset, &queries, None).await, first_rows);
-
-    // (a) Rows deleted after the masks were cached never come back.
-    dataset.delete("id % 10 = 1").await.unwrap();
-    let second_rows = session_rows(&dataset, &queries, None).await;
-    assert_no_deleted(&second_rows, |id| id % 10 <= 1);
-    assert_eq!(
-        second_rows,
-        fresh_session_rows(&dataset, &queries, None).await
-    );
-    // The older version keeps its own answer as the slot flips between states.
-    assert_eq!(
-        session_rows(&first_version, &queries, None).await,
-        first_rows
-    );
-    assert_eq!(session_rows(&dataset, &queries, None).await, second_rows);
-
-    // (b) Queries on both versions racing on the same cached partitions.
-    let tasks = (0..8).map(|task| {
-        let (dataset, expected) = if task % 2 == 0 {
-            (first_version.clone(), first_rows.clone())
-        } else {
-            (dataset.clone(), second_rows.clone())
-        };
-        let queries = queries.clone();
-        tokio::spawn(async move {
-            assert_eq!(session_rows(&dataset, &queries, None).await, expected);
-        })
-    });
-    futures::future::try_join_all(tasks).await.unwrap();
-
-    // (c) A session whose index cache keeps nothing reloads every partition.
-    let uncached = DatasetBuilder::from_uri(dataset.uri())
-        .with_session(Arc::new(Session::new(0, 1 << 20, Default::default())))
-        .load()
-        .await
-        .unwrap();
-    assert_eq!(session_rows(&uncached, &queries, None).await, second_rows);
-
-    // (d) A per-query filter bypasses the cache and is still exact.
-    let filter = Some("id % 3 = 0");
-    let filtered = session_rows(&dataset, &queries, filter).await;
-    assert_no_deleted(&filtered, |id| id % 10 <= 1 || id % 3 != 0);
-    assert_eq!(
-        filtered,
-        fresh_session_rows(&dataset, &queries, filter).await
-    );
-
-    // (e) Compaction rewrites the row addresses the cached masks were built over.
-    if !defer_index_remap {
-        compact(&mut dataset, false).await;
-    }
-    dataset.delete("id % 10 = 2").await.unwrap();
-    let compacted_rows = session_rows(&dataset, &queries, None).await;
-    assert_no_deleted(&compacted_rows, |id| id % 10 <= 2);
-    assert_eq!(
-        compacted_rows,
-        fresh_session_rows(&dataset, &queries, None).await
-    );
-}
-
 /// Narrower beams on the delta segments still find each query's own row: on an
 /// easy dataset every policy returns the same top-1 as searching every segment
 /// with the full `ef`.
 #[tokio::test]
 async fn test_segment_ef_policies_keep_top1_across_delta_segments() {
     let test_dir = TempStrDir::default();
-    let mut dataset = deletion_mask_dataset(test_dir.as_str(), Arc::new(Session::default())).await;
+    let mut dataset = segment_dataset(test_dir.as_str()).await;
     let appended = gen_batch()
         .with_seed(Seed(8))
         .col(
             "id",
-            array::step_custom::<UInt64Type>(DELETION_MASK_ROWS, 1),
+            array::step_custom::<UInt64Type>(SEGMENT_DATASET_ROWS, 1),
         )
         .col(
             "vector",

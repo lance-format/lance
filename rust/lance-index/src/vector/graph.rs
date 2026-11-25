@@ -11,7 +11,6 @@ use std::sync::Arc;
 use arrow_schema::{DataType, Field};
 use lance_core::deepsize::DeepSizeOf;
 
-use crate::prefilter::AllowedMask;
 use crate::vector::hnsw::builder::HnswQueryParams;
 
 pub mod builder;
@@ -221,59 +220,6 @@ impl Drop for Visited<'_> {
             self.visited[word_index] &= !mask;
         }
         self.recently_visited.clear();
-    }
-}
-
-/// The node ids a filtered search may return.
-///
-/// Implemented by the per-query [`Visited`] bitset a prefilter is resolved
-/// into, and by an [`AllowedMask`] resolved once and cached with a partition.
-pub trait NodeFilter {
-    fn allows(&self, node_id: u32) -> bool;
-
-    fn num_allowed(&self) -> usize;
-
-    /// Allowed ids in the order the filter was built.
-    fn allowed_ids(&self) -> impl Iterator<Item = u32> + '_;
-
-    /// The allowed ids at positions `0, stride, 2 * stride, ...` of
-    /// [`Self::allowed_ids`], at most `count` of them.
-    fn allowed_at_stride(&self, stride: usize, count: usize) -> Vec<u32> {
-        self.allowed_ids().step_by(stride).take(count).collect()
-    }
-}
-
-impl NodeFilter for Visited<'_> {
-    #[inline(always)]
-    fn allows(&self, node_id: u32) -> bool {
-        self.contains(node_id)
-    }
-
-    fn num_allowed(&self) -> usize {
-        self.count_ones()
-    }
-
-    fn allowed_ids(&self) -> impl Iterator<Item = u32> + '_ {
-        self.recently_visited.iter().copied()
-    }
-}
-
-impl NodeFilter for AllowedMask {
-    #[inline(always)]
-    fn allows(&self, node_id: u32) -> bool {
-        self.contains(node_id)
-    }
-
-    fn num_allowed(&self) -> usize {
-        Self::num_allowed(self)
-    }
-
-    fn allowed_ids(&self) -> impl Iterator<Item = u32> + '_ {
-        self.iter_allowed()
-    }
-
-    fn allowed_at_stride(&self, stride: usize, count: usize) -> Vec<u32> {
-        Self::allowed_at_stride(self, stride, count)
     }
 }
 
@@ -547,12 +493,12 @@ pub(crate) fn range_filter<'a, C: DistCalculator>(
 
 /// Like [beam_search] but over a [BorrowingGraph]. Also returns the number of
 /// distances computed.
-pub fn beam_search_borrowed<F: NodeFilter>(
+pub fn beam_search_borrowed(
     graph: &impl BorrowingGraph,
     ep: &OrderedNode,
     params: &HnswQueryParams,
     dist_calc: &impl DistCalculator,
-    bitset: Option<&F>,
+    bitset: Option<&Visited>,
     prefetch_distance: Option<usize>,
     visited: &mut Visited,
 ) -> (Vec<OrderedNode>, usize) {
@@ -592,12 +538,15 @@ pub fn beam_search_borrowed<F: NodeFilter>(
 
     let in_range = range_filter(params, dist_calc);
 
-    if bitset.map(|bitset| bitset.allows(ep.id)).unwrap_or(true) && in_range(ep.id, ep.dist) {
+    if bitset.map(|bitset| bitset.contains(ep.id)).unwrap_or(true) && in_range(ep.id, ep.dist) {
         results.push(ep.clone());
     }
 
     let accepts_result = |node_id: u32, dist: OrderedFloat| {
-        bitset.map(|bitset| bitset.allows(node_id)).unwrap_or(true) && in_range(node_id, dist)
+        bitset
+            .map(|bitset| bitset.contains(node_id))
+            .unwrap_or(true)
+            && in_range(node_id, dist)
     };
     beam_search_loop!(
         candidates,
@@ -643,14 +592,14 @@ pub fn beam_search_acorn(
     ep: &OrderedNode,
     params: &HnswQueryParams,
     dist_calc: &impl DistCalculator,
-    bitset: &impl NodeFilter,
+    bitset: &Visited,
     prefetch_distance: Option<usize>,
     visited: &mut Visited,
     expanded: &mut Visited,
 ) -> (Vec<OrderedNode>, usize) {
     let ef = params.ef;
     let in_range = range_filter(params, dist_calc);
-    let passing_total = bitset.num_allowed();
+    let passing_total = bitset.count_ones();
     let mut candidates = BinaryHeap::with_capacity(ef);
     let mut results = BinaryHeap::with_capacity(ef);
     // collected per node before scoring so prefetch targets are the ids
@@ -665,12 +614,13 @@ pub fn beam_search_acorn(
     // the entry point seeds the traversal even if it fails the mask
     visited.insert(ep.id);
     candidates.push(Reverse(ep.clone()));
-    if bitset.allows(ep.id) && in_range(ep.id, ep.dist) {
+    if bitset.contains(ep.id) && in_range(ep.id, ep.dist) {
         results.push(ep.clone());
     }
 
     let stride = (passing_total / ACORN_SEED_COUNT).max(1);
-    for seed in bitset.allowed_at_stride(stride, ACORN_SEED_COUNT) {
+    for seed in bitset.iter_ones().step_by(stride).take(ACORN_SEED_COUNT) {
+        let seed = seed as u32;
         if visited.contains(seed) {
             continue;
         }
@@ -701,7 +651,7 @@ pub fn beam_search_acorn(
                 expanded.insert(waypoint);
                 bridge_budget -= 1;
                 for &neighbor in graph.neighbors(waypoint) {
-                    if bitset.allows(neighbor) {
+                    if bitset.contains(neighbor) {
                         if !visited.contains(neighbor) {
                             visited.insert(neighbor);
                             let dist: OrderedFloat = dist_calc.distance(neighbor).into();
@@ -731,7 +681,7 @@ pub fn beam_search_acorn(
 
         passing.clear();
         for &neighbor in graph.neighbors(current.id) {
-            if bitset.allows(neighbor) {
+            if bitset.contains(neighbor) {
                 if !visited.contains(neighbor) {
                     visited.insert(neighbor);
                     passing.push(neighbor);
@@ -739,7 +689,7 @@ pub fn beam_search_acorn(
             } else if !expanded.contains(neighbor) {
                 expanded.insert(neighbor);
                 for &second_hop in graph.neighbors(neighbor) {
-                    if bitset.allows(second_hop) {
+                    if bitset.contains(second_hop) {
                         if !visited.contains(second_hop) {
                             visited.insert(second_hop);
                             passing.push(second_hop);
@@ -922,7 +872,7 @@ mod tests {
             &entry,
             &params,
             &dist_calc,
-            None::<&Visited>,
+            None,
             None,
             &mut visited_generator.generate(graph.len()),
         );

@@ -20,7 +20,6 @@ use std::{
 use crate::index::frag_reuse::ResolvedRemapping;
 use crate::index::vector::{IndexFileVersion, builder::index_type_string};
 use crate::index::{PreFilter, vector::VectorIndex};
-use arc_swap::ArcSwapOption;
 use arrow::compute::concat_batches;
 use arrow_arith::numeric::sub;
 use arrow_array::{
@@ -49,7 +48,7 @@ use lance_file::LanceEncodingsIo;
 use lance_file::reader::{CachedFileMetadata, FileReader, FileReaderOptions, ReaderProjection};
 use lance_index::cache_pb::IvfStateHeader;
 use lance_index::metrics::{IndexTimer, IndexTiming, LocalMetricsCollector, MetricsCollector};
-use lance_index::prefilter::{AllowedMask, AllowedMaskFilter, MaskFingerprint, NoFilter};
+use lance_index::prefilter::NoFilter;
 use lance_index::vector::VectorIndexCacheEntry;
 use lance_index::vector::bq::builder::RabitQuantizer;
 use lance_index::vector::bq::ex_dot::{blocked_ex_code_bytes, padded_query_len};
@@ -1382,26 +1381,6 @@ pub struct PartitionEntry<S: IvfSubIndex, Q: Quantization> {
     /// earlier query already memoized the size; folding it in later keeps
     /// [`Self::size_bytes`] equal to [`DeepSizeOf::deep_size_of`].
     coverage_bytes: OnceLock<usize>,
-    /// The partition resolved against the deletion state its fingerprint names,
-    /// built by the first query that carries a deletion-only prefilter (see
-    /// [`PreFilter::deletion_fingerprint`]). One slot: a query carrying another
-    /// fingerprint replaces it.
-    deletion_mask: ArcSwapOption<CachedDeletionMask>,
-    /// Held while a deletion mask is built, so queries that miss the slot
-    /// together build it once.
-    deletion_mask_build: tokio::sync::Mutex<()>,
-    /// Memoized size of a cached deletion mask. Every mask of this partition
-    /// covers the same rows, so it is the same size whichever deletion state it
-    /// is for; like `coverage_bytes`, it is set once the first mask exists.
-    deletion_mask_bytes: OnceLock<usize>,
-    deletion_mask_accounted: AtomicBool,
-}
-
-/// A partition's [`AllowedMask`] and the deletion state it was resolved for.
-#[derive(Debug)]
-struct CachedDeletionMask {
-    fingerprint: MaskFingerprint,
-    mask: Arc<AllowedMask>,
 }
 
 impl<S: IvfSubIndex, Q: Quantization> PartitionEntry<S, Q> {
@@ -1419,10 +1398,6 @@ impl<S: IvfSubIndex, Q: Quantization> PartitionEntry<S, Q> {
             cache_whole_partition: true,
             immutable_bytes: OnceLock::new(),
             coverage_bytes: OnceLock::new(),
-            deletion_mask: ArcSwapOption::empty(),
-            deletion_mask_build: tokio::sync::Mutex::new(()),
-            deletion_mask_bytes: OnceLock::new(),
-            deletion_mask_accounted: AtomicBool::new(false),
         }
     }
 
@@ -1436,9 +1411,7 @@ impl<S: IvfSubIndex, Q: Quantization> PartitionEntry<S, Q> {
                 + self.index.deep_size_of_children(&mut context)
                 + self.storage.deep_size_of_children(&mut context)
         });
-        immutable
-            + self.coverage_bytes.get().copied().unwrap_or_default()
-            + self.deletion_mask_bytes.get().copied().unwrap_or_default()
+        immutable + self.coverage_bytes.get().copied().unwrap_or_default()
     }
 
     /// Whether the entry's storage holds memory of a resident store, which
@@ -1458,14 +1431,6 @@ impl<S: IvfSubIndex, Q: Quantization> PartitionEntry<S, Q> {
             .get_or_init(|| rows.deep_size_of_children(&mut lance_core::deepsize::Context::new()));
         rows.clone()
     }
-
-    fn deletion_mask_for(&self, fingerprint: &MaskFingerprint) -> Option<Arc<AllowedMask>> {
-        self.deletion_mask
-            .load()
-            .as_ref()
-            .filter(|cached| cached.fingerprint == *fingerprint)
-            .map(|cached| cached.mask.clone())
-    }
 }
 
 impl<S: IvfSubIndex, Q: Quantization> DeepSizeOf for PartitionEntry<S, Q> {
@@ -1477,7 +1442,6 @@ impl<S: IvfSubIndex, Q: Quantization> DeepSizeOf for PartitionEntry<S, Q> {
                 .get()
                 .map(|rows| rows.deep_size_of_children(context))
                 .unwrap_or_default()
-            + self.deletion_mask_bytes.get().copied().unwrap_or_default()
     }
 }
 
@@ -1704,71 +1668,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         Ok(rows)
     }
 
-    /// The deletion mask of `partition` for `fingerprint`: the cached one when
-    /// it is for that fingerprint, otherwise resolved from `pre_filter`, which
-    /// carries it, and cached in its place.
-    ///
-    /// The first mask grows the entry by a fixed size, so the entry is inserted
-    /// into the index cache once more to charge it, as the partition coverage is.
-    async fn cached_deletion_mask(
-        index_cache: &WeakLanceCache,
-        partition_id: usize,
-        partition: &Arc<PartitionEntry<S, Q>>,
-        fingerprint: MaskFingerprint,
-        pre_filter: &Arc<dyn PreFilter>,
-    ) -> Result<Arc<AllowedMask>> {
-        if let Some(mask) = partition.deletion_mask_for(&fingerprint) {
-            return Ok(mask);
-        }
-        let _building = partition.deletion_mask_build.lock().await;
-        if let Some(mask) = partition.deletion_mask_for(&fingerprint) {
-            return Ok(mask);
-        }
-
-        let entry = partition.clone();
-        let filter = pre_filter.clone();
-        let started = Instant::now();
-        let mask = spawn_cpu(move || {
-            let selected = filter.filter_row_ids(Box::new(entry.storage.row_ids()));
-            AllowedMask::from_selected(entry.storage.len(), &selected).map(Arc::new)
-        })
-        .await?;
-        log::debug!(
-            "built the deletion mask of partition {partition_id} ({} of {} rows allowed) in {:?}",
-            mask.num_allowed(),
-            mask.len(),
-            started.elapsed()
-        );
-
-        partition.deletion_mask_bytes.get_or_init(|| {
-            std::mem::size_of::<CachedDeletionMask>()
-                + std::mem::size_of::<AllowedMask>()
-                + mask.heap_bytes()
-        });
-        partition
-            .deletion_mask
-            .store(Some(Arc::new(CachedDeletionMask {
-                fingerprint,
-                mask: mask.clone(),
-            })));
-        if !partition.deletion_mask_accounted.load(Ordering::Acquire) {
-            debug_assert!(
-                !partition.shares_resident_store(),
-                "partition {partition_id} would be cached with memory of a resident store"
-            );
-            let cache_key = IVFPartitionKey::<S, Q>::new(partition_id);
-            if index_cache
-                .insert_with_key(&cache_key, partition.clone())
-                .await
-            {
-                partition
-                    .deletion_mask_accounted
-                    .store(true, Ordering::Release);
-            }
-        }
-        Ok(mask)
-    }
-
     async fn prefilter_for_partition(
         index_cache: &WeakLanceCache,
         partition_id: usize,
@@ -1777,20 +1676,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
     ) -> Result<Arc<dyn PreFilter>> {
         if pre_filter.is_empty() {
             return Ok(Arc::new(NoFilter));
-        }
-        if S::uses_allowed_mask()
-            && partition.cache_whole_partition
-            && let Some(fingerprint) = pre_filter.deletion_fingerprint()
-        {
-            let allowed = Self::cached_deletion_mask(
-                index_cache,
-                partition_id,
-                partition,
-                fingerprint,
-                &pre_filter,
-            )
-            .await?;
-            return Ok(Arc::new(AllowedMaskFilter::new(pre_filter, allowed)));
         }
         if !pre_filter.needs_partition_row_ids() {
             return Ok(pre_filter);
@@ -3085,9 +2970,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> Index for IVFIndex<S, 
             (SubIndexType::Flat, QuantizationType::Rabit) => IndexType::IvfRq,
             (SubIndexType::Hnsw, QuantizationType::Product) => IndexType::IvfHnswPq,
             (SubIndexType::Hnsw, QuantizationType::Scalar) => IndexType::IvfHnswSq,
-            (SubIndexType::Hnsw, QuantizationType::Rabit) => IndexType::IvfHnswRq,
             (SubIndexType::Hnsw, QuantizationType::Flat)
             | (SubIndexType::Hnsw, QuantizationType::FlatBin) => IndexType::IvfHnswFlat,
+            (SubIndexType::Hnsw, QuantizationType::Rabit) => IndexType::IvfHnswRq,
         }
     }
 
