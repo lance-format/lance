@@ -32,6 +32,7 @@ pub struct TableSession {
     metadata_cache: GlobalMetadataCache,
     index_cache: LanceCache,
     store_registry: Arc<ObjectStoreRegistry>,
+    pub(crate) require_manifest_etag: bool,
     unregistered_external_blob_policy: UnregisteredExternalBlobPolicy,
     index_metadata_observer: Option<fn(&Manifest, &[IndexMetadata])>,
 }
@@ -51,6 +52,7 @@ impl TableSession {
             metadata_cache: GlobalMetadataCache(metadata_cache),
             index_cache,
             store_registry,
+            require_manifest_etag: false,
             unregistered_external_blob_policy: UnregisteredExternalBlobPolicy::Allow,
             index_metadata_observer: None,
         }
@@ -58,6 +60,8 @@ impl TableSession {
 
     /// Scope both caches to a snapshot identity. An unknown identity disables
     /// caching for this handle, so discovery cannot evict reusable entries.
+    /// A scoped manifest read also needs an ETag to distinguish two commits
+    /// when a namespace deletes and republishes the same version.
     ///
     /// ```
     /// use lance_table_runtime::session::TableSession;
@@ -74,6 +78,7 @@ impl TableSession {
             ),
         };
         Self {
+            require_manifest_etag: identity.is_some(),
             metadata_cache: GlobalMetadataCache(scope(
                 self.metadata_cache.cache(),
                 CacheMetricsKind::Metadata,

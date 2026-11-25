@@ -768,6 +768,57 @@ async fn test_describe_table_snapshot_selectors_recreated_branch() {
 }
 
 #[rstest]
+#[case::with_etags(None)]
+#[case::without_etags(Some(ListBehavior::WithoutEtags))]
+#[tokio::test]
+async fn test_describe_republished_branch_version(#[case] behavior: Option<ListBehavior>) {
+    use lance::dataset::ColumnAlteration;
+    use lance_namespace::models::{BatchDeleteTableVersionsRequest, VersionRange};
+
+    let (writer, temp) = create_test_namespace().await;
+    create_scalar_table(&writer, "users").await;
+    let mut main = open_dataset(&writer, "users").await;
+    let mut dev = main.create_branch("dev", 1, None).await.unwrap();
+    dev.migrate_manifest_paths_v2().await.unwrap();
+    let registry = build_failing_list_session(Arc::new(Mutex::new(behavior))).store_registry();
+    let reader = DirectoryNamespaceBuilder::new(file_object_store_uri(temp.to_str().unwrap()))
+        .session(Arc::new(Session::new(0, 1024 * 1024, registry)))
+        .manifest_enabled(false)
+        .build()
+        .await
+        .unwrap();
+    let request = DescribeTableRequest {
+        id: Some(vec!["users".into()]),
+        branch: Some("dev".into()),
+        version: Some(2),
+        load_detailed_metadata: Some(true),
+        ..Default::default()
+    };
+    let publish_and_describe = async |dev: &mut Dataset, name: &str| {
+        dev.alter_columns(&[ColumnAlteration::new("id".into()).rename(name.into())])
+            .await
+            .unwrap();
+        assert_eq!(dev.version().version, 2);
+        let result = reader.describe_table(request.clone()).await.unwrap();
+        assert_eq!(result.schema.unwrap().fields[0].name, name);
+    };
+    publish_and_describe(&mut dev, "old_id").await;
+    let deleted = writer
+        .batch_delete_table_versions(BatchDeleteTableVersionsRequest {
+            id: request.id.clone(),
+            branch: request.branch.clone(),
+            ranges: vec![VersionRange::new(2, 3)],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(deleted.deleted_count, Some(1));
+    let mut reopened = Dataset::open(dev.uri()).await.unwrap();
+    assert_eq!(reopened.version().version, 1);
+    publish_and_describe(&mut reopened, "new_id").await;
+}
+
+#[rstest]
 #[case::retarget_branch(
     ListBehavior::RetargetTagOnBranchRead,
     ErrorCode::ConcurrentModification

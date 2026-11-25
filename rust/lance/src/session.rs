@@ -534,6 +534,7 @@ impl Session {
     ///
     /// Equal identities reuse entries. Distinct identities share capacity and
     /// keep their entries separate. An unknown identity disables caching.
+    /// Scoped manifest reads require an ETag because a branch can republish a version.
     /// All handles retain the original providers and runtime settings.
     ///
     /// ```
