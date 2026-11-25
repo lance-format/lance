@@ -327,12 +327,12 @@ async fn test_list_versions_under_early_stop_bounded_consumption() {
             base_path: Url,
             params: &ObjectStoreParams,
         ) -> Result<ObjectStore> {
-            let mut store = MemoryStoreProvider.new_store(base_path, params).await?;
-            store.inner = Arc::new(EntryCountingStore {
-                target: store.inner.clone(),
+            let store = MemoryStoreProvider.new_store(base_path.clone(), params).await?;
+            let inner = Arc::new(EntryCountingStore {
+                target: store.inner,
                 entries_listed: self.entries_listed.clone(),
             });
-            Ok(store)
+            Ok(ObjectStore::new(inner, base_path, None, None, false, true, 1, 0, None))
         }
 
         fn extract_path(&self, url: &Url) -> Result<Path> {
@@ -351,13 +351,13 @@ async fn test_list_versions_under_early_stop_bounded_consumption() {
     let entries_listed = Arc::new(AtomicUsize::new(0));
     let registry = Arc::new(ObjectStoreRegistry::default());
     registry.insert(
-        "memory-object-store",
+        "s3",
         Arc::new(EntryCountingMemoryProvider {
             entries_listed: entries_listed.clone(),
         }),
     );
     let session = Arc::new(Session::new(0, 0, registry));
-    let ns = DirectoryNamespaceBuilder::new("memory-object-store://lv-count")
+    let ns = DirectoryNamespaceBuilder::new("s3://lv-count")
         .manifest_enabled(false)
         .session(session)
         .build()

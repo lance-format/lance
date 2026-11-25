@@ -376,7 +376,7 @@ impl DirectoryNamespace {
         // Only use seeks on ordered backends with native offset support. Some
         // stores implement list_with_offset by streaming from the beginning.
         if self.object_store.list_is_lexically_ordered
-            && matches!(self.object_store.scheme(), "s3" | "s3+ddb" | "memory")
+            && matches!(self.object_store.scheme(), "s3" | "s3+ddb")
             && let (Some(after), Some(limit)) = (after, limit)
             && let Some(high) = after.checked_add(limit as i64 + 1)
             && let Some(mut versions) = self
