@@ -37,8 +37,12 @@ use lance_index::vector::storage::{
 use lance_index::vector::{
     ApproxMode, PartitionSearchControl, Query, VECTOR_RESULT_SCHEMA, VectorIndex,
 };
-use lance_select::{RowAddrMask, RowAddrSelection};
+use lance_select::RowAddrMask;
 use tokio::sync::OnceCell;
+
+mod filter;
+
+use self::filter::PreparedRabitMask;
 
 use super::{
     IVFIndex, PartitionEntry, PreparedPartitionGuard, PreparedPartitionSearch,
@@ -218,7 +222,7 @@ pub(super) fn controlled_partition_stream(
 pub struct RabitScanContext {
     index: Arc<RabitIndex>,
     raw_query: Option<Arc<RabitRawQueryContext>>,
-    lookup_mask: Arc<OnceCell<Arc<RowAddrMask>>>,
+    lookup_mask: Arc<OnceCell<Arc<PreparedRabitMask>>>,
     /// Original query, before setting each partition's centroid distance.
     pub query: Query,
     /// Ordered partition identifiers, paired with `centroid_distances`.
@@ -445,7 +449,7 @@ impl RabitScanContext {
                             rows.optimize_for_lookup();
                         }
                     }
-                    Ok::<_, Error>(Arc::new(mask))
+                    Ok::<_, Error>(Arc::new(PreparedRabitMask::new(&mask)))
                 })
                 .await
             })
@@ -505,36 +509,7 @@ impl RabitScanContext {
                 || storage
                     .row_ids()
                     .any(|&row_id| row_id == RowAddress::TOMBSTONE_ROW);
-            let accept = needs_mask.then(|| {
-                let (rows, is_allow_list) = match mask.as_ref() {
-                    RowAddrMask::AllowList(rows) => (rows, true),
-                    RowAddrMask::BlockList(rows) => (rows, false),
-                };
-                let mut fragment = None;
-                let mut selection = None;
-                storage
-                    .row_ids()
-                    .map(|&row_id| {
-                        if row_id == RowAddress::TOMBSTONE_ROW {
-                            return false;
-                        }
-                        let address = RowAddress::new_from_u64(row_id);
-                        let fragment_id = address.fragment_id();
-                        if fragment != Some(fragment_id) {
-                            fragment = Some(fragment_id);
-                            selection = rows.get(&fragment_id);
-                        }
-                        let listed = match selection {
-                            None => false,
-                            Some(RowAddrSelection::Full) => true,
-                            Some(RowAddrSelection::Partial(bitmap)) => {
-                                bitmap.contains(address.row_offset())
-                            }
-                        };
-                        listed == is_allow_list
-                    })
-                    .collect()
-            });
+            let accept = needs_mask.then(|| mask.acceptance(storage.row_ids()));
             scan_stats::counters().stage1_cpu_ns.add_elapsed(computing);
             if scope == RabitScanScope::Partition {
                 // The query heap's approximate pruning can skip intermediate
