@@ -185,6 +185,47 @@ fn ensure_fixed_size_list_compatible(
     Ok(())
 }
 
+/// Each `IVF_RQ` build draws a random rotation unless one is supplied, so segments
+/// trained independently do not share a rotation and cannot be merged.
+const RQ_SHARED_ROTATION_HINT: &str = "segments are mergeable only when every one is built with the same RQ rotation model (`RQBuildParams::rotation`; `rabitq_model` in Python, `RQBuildParams.Builder.setModel` in Java)";
+
+/// Lists the RQ metadata fields on which `candidate` differs from `reference`, with both
+/// values (except the rotation signs), so a failed merge names what to align.
+fn rq_shard_mismatches(
+    reference: &RabitQuantizationMetadata,
+    candidate: &RabitQuantizationMetadata,
+) -> Vec<String> {
+    let mut mismatches = Vec::new();
+    if reference.code_dim != candidate.code_dim {
+        mismatches.push(format!(
+            "code_dim {} vs {}",
+            reference.code_dim, candidate.code_dim
+        ));
+    }
+    if reference.num_bits != candidate.num_bits {
+        mismatches.push(format!(
+            "num_bits {} vs {}",
+            reference.num_bits, candidate.num_bits
+        ));
+    }
+    if reference.rotation_type != candidate.rotation_type {
+        mismatches.push(format!(
+            "rotation_type {:?} vs {:?}",
+            reference.rotation_type, candidate.rotation_type
+        ));
+    }
+    if reference.query_estimator != candidate.query_estimator {
+        mismatches.push(format!(
+            "query_estimator {:?} vs {:?}",
+            reference.query_estimator, candidate.query_estimator
+        ));
+    }
+    if reference.fast_rotation_signs != candidate.fast_rotation_signs {
+        mismatches.push("fast_rotation_signs differ".to_string());
+    }
+    mismatches
+}
+
 async fn try_read_ivf_proto(reader: &V2Reader) -> Result<Option<pb::Ivf>> {
     let Some(ivf_idx) = reader.metadata().file_schema.metadata.get(IVF_METADATA_KEY) else {
         return Ok(None);
@@ -1179,39 +1220,38 @@ async fn merge_partial_vector_auxiliary_files_inner(
                 {
                     return Err(Error::index("Dimension mismatch across shards".to_string()));
                 }
-                if let Some(existing_rq) = rq_meta.as_ref()
-                    && (existing_rq.code_dim != rq_meta_parsed.code_dim
-                        || existing_rq.num_bits != rq_meta_parsed.num_bits
-                        || existing_rq.rotation_type != rq_meta_parsed.rotation_type
-                        || existing_rq.query_estimator != rq_meta_parsed.query_estimator
-                        || existing_rq.fast_rotation_signs != rq_meta_parsed.fast_rotation_signs)
-                {
-                    return Err(Error::index(format!(
-                        "Distributed RQ merge: structural mismatch across shards; first(code_dim={}, num_bits={}, rotation_type={:?}), current(code_dim={}, num_bits={}, rotation_type={:?})",
-                        existing_rq.code_dim,
-                        existing_rq.num_bits,
-                        existing_rq.rotation_type,
-                        rq_meta_parsed.code_dim,
-                        rq_meta_parsed.num_bits,
-                        rq_meta_parsed.rotation_type
-                    )));
-                }
                 if let Some(existing_rq) = rq_meta.as_ref() {
-                    match (&existing_rq.rotate_mat, &rq_meta_parsed.rotate_mat) {
-                        (Some(reference), Some(candidate)) => {
-                            ensure_fixed_size_list_compatible(
-                                "RQ rotation matrix",
-                                reference,
-                                candidate,
-                            )?;
-                        }
-                        (Some(_), None) | (None, Some(_)) => {
-                            return Err(Error::index(
-                                "Distributed RQ merge: rotation matrix mismatch across shards"
-                                    .to_string(),
-                            ));
-                        }
-                        (None, None) => {}
+                    let mismatches = rq_shard_mismatches(existing_rq, &rq_meta_parsed);
+                    if !mismatches.is_empty() {
+                        let hint = if existing_rq.fast_rotation_signs
+                            != rq_meta_parsed.fast_rotation_signs
+                        {
+                            format!("; {RQ_SHARED_ROTATION_HINT}")
+                        } else {
+                            String::new()
+                        };
+                        return Err(Error::index(format!(
+                            "Distributed RQ merge: source shard {idx} does not match the first shard: {}{hint}",
+                            mismatches.join(", ")
+                        )));
+                    }
+                    let rotation_matrix_matches =
+                        match (&existing_rq.rotate_mat, &rq_meta_parsed.rotate_mat) {
+                            (Some(reference), Some(candidate)) => {
+                                ensure_fixed_size_list_compatible(
+                                    "RQ rotation matrix",
+                                    reference,
+                                    candidate,
+                                )
+                                .is_ok()
+                            }
+                            (Some(_), None) | (None, Some(_)) => false,
+                            (None, None) => true,
+                        };
+                    if !rotation_matrix_matches {
+                        return Err(Error::index(format!(
+                            "Distributed RQ merge: source shard {idx} has a different rotation matrix than the first shard; {RQ_SHARED_ROTATION_HINT}"
+                        )));
                     }
                 }
                 if rq_meta.is_none() {
@@ -2671,7 +2711,14 @@ mod tests {
         )?;
         v2w.add_schema_metadata(DISTANCE_TYPE_KEY, distance_type.to_string());
 
-        let rq_meta_json = serde_json::to_string(metadata)?;
+        // Like the index writer, keep a matrix rotation in a global buffer: the JSON
+        // metadata skips it.
+        let mut stored_metadata = metadata.clone();
+        if let Some(rotate_mat) = metadata.extra_metadata()? {
+            let position = v2w.add_global_buffer(rotate_mat).await?;
+            stored_metadata.set_buffer_index(position);
+        }
+        let rq_meta_json = serde_json::to_string(&stored_metadata)?;
         v2w.add_schema_metadata(RABIT_METADATA_KEY, rq_meta_json);
 
         let ivf_meta = pb::Ivf {
@@ -3127,6 +3174,99 @@ mod tests {
                 "expected Error::Index for packed RQ source shard, got {:?}",
                 other
             ),
+        }
+    }
+
+    fn rq_test_rotation_matrix(offset: f32) -> FixedSizeListArray {
+        let values: Vec<f32> = (0..16 * 16).map(|i| i as f32 + offset).collect();
+        FixedSizeListArray::try_new_from_values(Float32Array::from(values), 16).unwrap()
+    }
+
+    /// Independently trained segments differ only in their random rotation, which the
+    /// old message did not print; the error must name the field and, for rotations,
+    /// point to the shared rotation model.
+    #[rstest::rstest]
+    #[case::fast_rotation_signs(
+        RQRotationType::Fast,
+        |m: &mut RabitQuantizationMetadata| m.fast_rotation_signs = Some(vec![0x55; 2]),
+        "fast_rotation_signs differ",
+        true
+    )]
+    #[case::rotation_matrix(
+        RQRotationType::Matrix,
+        |m: &mut RabitQuantizationMetadata| m.rotate_mat = Some(rq_test_rotation_matrix(1.0)),
+        "different rotation matrix",
+        true
+    )]
+    #[case::num_bits(
+        RQRotationType::Fast,
+        |m: &mut RabitQuantizationMetadata| m.num_bits = 2,
+        "num_bits 1 vs 2",
+        false
+    )]
+    #[tokio::test]
+    async fn test_merge_ivf_rq_names_mismatched_shard_metadata(
+        #[case] rotation_type: RQRotationType,
+        #[case] edit: fn(&mut RabitQuantizationMetadata),
+        #[case] expected: &str,
+        #[case] expects_rotation_hint: bool,
+    ) {
+        let object_store = ObjectStore::memory();
+        let index_dir = Path::from("index/uuid_rq_mismatch");
+        let first = RabitQuantizationMetadata {
+            rotate_mat: (rotation_type == RQRotationType::Matrix)
+                .then(|| rq_test_rotation_matrix(0.0)),
+            rotate_mat_position: None,
+            fast_rotation_signs: (rotation_type == RQRotationType::Fast).then(|| vec![0xAA; 2]),
+            rotation_type,
+            code_dim: 16,
+            num_bits: 1,
+            packed: false,
+            query_estimator: RabitQueryEstimator::RawQuery,
+        };
+        let mut second = first.clone();
+        edit(&mut second);
+
+        let mut aux_paths = Vec::with_capacity(2);
+        for (shard, metadata) in [&first, &second].into_iter().enumerate() {
+            let aux = index_dir
+                .clone()
+                .join(format!("partial_{shard}"))
+                .join(INDEX_AUXILIARY_FILE_NAME);
+            write_rq_partial_aux(
+                &object_store,
+                &aux,
+                metadata,
+                &[2, 1],
+                shard as u64 * 3,
+                DistanceType::L2,
+            )
+            .await
+            .unwrap();
+            aux_paths.push(aux);
+        }
+
+        let res = merge_partial_vector_auxiliary_files(
+            &object_store,
+            &aux_paths,
+            &index_dir,
+            crate::progress::noop_progress(),
+        )
+        .await;
+        match res {
+            Err(Error::Index { message, .. }) => {
+                assert!(
+                    message.contains("source shard 1"),
+                    "unexpected message: {message}"
+                );
+                assert!(message.contains(expected), "unexpected message: {message}");
+                assert_eq!(
+                    message.contains("rabitq_model"),
+                    expects_rotation_hint,
+                    "unexpected message: {message}"
+                );
+            }
+            other => panic!("expected Error::Index for mismatched RQ shards, got {other:?}"),
         }
     }
 

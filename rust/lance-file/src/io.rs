@@ -3,11 +3,59 @@
 
 use std::sync::Arc;
 
+use bytes::{Bytes, BytesMut};
 use futures::{FutureExt, future::BoxFuture};
+use lance_core::utils::tokio::spawn;
 use lance_encoding::EncodingsIo;
 use lance_io::scheduler::FileScheduler;
 
 use super::reader::DEFAULT_READ_CHUNK_SIZE;
+
+/// Bytes each task copies when a range read in chunks is put back together:
+/// small enough that a task holds its runtime thread for well under a
+/// millisecond.
+const REASSEMBLY_COPY_BYTES: usize = 1024 * 1024;
+
+/// Copies a range's chunks into one buffer, in pieces on the current runtime.
+///
+/// The copy runs when the decoder awaits the read, and the decoder awaits its
+/// pages one by one, so on a single core it bounded scans of wide rows (2 GB/s
+/// for 1,024-dim f32 vectors in memory, mostly faulting in the new buffer).
+/// It stays in the awaited future rather than in a task of its own because
+/// the read's backpressure reservation is refunded when its chunks are taken:
+/// copying ahead of the decoder would let scans read without bound. The
+/// pieces skip the CPU pool, where they would queue behind the batches an
+/// index build is computing on while that computation waits for this data.
+async fn concat_chunks(chunks: Vec<Bytes>) -> lance_core::Result<Bytes> {
+    let total_size = chunks.iter().map(Bytes::len).sum();
+    if tokio::runtime::Handle::try_current().is_err() {
+        let mut combined = Vec::with_capacity(total_size);
+        for chunk in &chunks {
+            combined.extend_from_slice(chunk);
+        }
+        return Ok(Bytes::from(combined));
+    }
+    let mut unfilled = BytesMut::with_capacity(total_size);
+    let mut copies = Vec::with_capacity(total_size.div_ceil(REASSEMBLY_COPY_BYTES) + chunks.len());
+    for chunk in &chunks {
+        for start in (0..chunk.len()).step_by(REASSEMBLY_COPY_BYTES) {
+            let src = chunk.slice(start..chunk.len().min(start + REASSEMBLY_COPY_BYTES));
+            // Each piece owns its own stretch of the buffer's capacity, so the
+            // pieces fill in parallel and rejoin without copying.
+            let rest = unfilled.split_off(src.len());
+            let mut piece = std::mem::replace(&mut unfilled, rest);
+            copies.push(spawn(async move {
+                piece.extend_from_slice(&src);
+                piece
+            }));
+        }
+    }
+    let mut combined = BytesMut::new();
+    for piece in futures::future::try_join_all(copies).await? {
+        combined.unsplit(piece);
+    }
+    Ok(combined.freeze())
+}
 
 #[derive(Debug)]
 pub struct LanceEncodingsIo {
@@ -152,15 +200,45 @@ impl EncodingsIo for LanceEncodingsIo {
                     continue;
                 }
 
-                let total_size: usize = chunks.iter().map(|c| c.len()).sum();
-                let mut combined = Vec::with_capacity(total_size);
-                for chunk in chunks {
-                    combined.extend_from_slice(&chunk);
-                }
-                reassembled.push(bytes::Bytes::from(combined));
+                reassembled.push(concat_chunks(chunks).await?);
             }
             Ok(reassembled)
         }
         .boxed()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use lance_io::utils::CachedFileSize;
+
+    use super::*;
+    use crate::testing::FsFixture;
+
+    #[tokio::test]
+    async fn test_split_range_reassembles() {
+        // Neither the range nor its chunks are whole multiples of the chunk or
+        // copy piece size, so every split boundary is exercised.
+        let data: Vec<u8> = (0..13 * 1024 * 1024 + 7).map(|i| (i % 251) as u8).collect();
+        let fs = FsFixture::default();
+        fs.object_store.put(&fs.tmp_path, &data).await.unwrap();
+        let scheduler = fs
+            .scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let io = LanceEncodingsIo::new(scheduler).with_read_chunk_size(5 * 1024 * 1024);
+
+        let ranges = vec![0..10, 10..10, 10..data.len() as u64 - 3];
+        let results = io.submit_request(ranges.clone(), 0).await.unwrap();
+
+        assert_eq!(results.len(), ranges.len());
+        for (range, bytes) in ranges.iter().zip(&results) {
+            assert_eq!(
+                bytes.as_ref(),
+                &data[range.start as usize..range.end as usize],
+                "range {range:?}"
+            );
+        }
     }
 }

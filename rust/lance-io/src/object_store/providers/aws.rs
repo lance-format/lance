@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use crate::object_store::copy_diagnostics::{
+    CopyOperationEvent, credential_lock_acquired, record_current,
+};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::{collections::HashMap, str::FromStr, sync::Arc, time::Duration};
 
 #[cfg(test)]
@@ -690,6 +694,9 @@ pub struct AwsCredentialAdapter {
     // The cached credential, if any.
     credentials: RwLock<Option<Arc<aws_credential_types::Credentials>>>,
 
+    // Process-local identity shared by all operations using this cache.
+    cache_id: u64,
+
     // Serialize refreshes without holding the cache lock during network requests.
     refresh_lock: Mutex<()>,
 
@@ -704,6 +711,10 @@ impl AwsCredentialAdapter {
     ) -> Self {
         Self {
             inner: provider,
+            cache_id: {
+                static NEXT_CACHE: AtomicU64 = AtomicU64::new(1);
+                NEXT_CACHE.fetch_add(1, Ordering::Relaxed)
+            },
             credentials: RwLock::new(None),
             refresh_lock: Mutex::new(()),
             credentials_refresh_offset,
@@ -766,7 +777,11 @@ impl AwsCredentialAdapter {
 
     /// Wait for an in-flight refresh, or fetch credentials ourselves.
     async fn must_refresh(&self) -> ObjectStoreResult<Arc<aws_credential_types::Credentials>> {
+        record_current(|| CopyOperationEvent::CredentialLockWaiting {
+            cache: self.cache_id,
+        });
         let _lock = self.refresh_lock.lock().await;
+        let _owner = credential_lock_acquired(self.cache_id);
         if let Some(credentials) = self.credentials.read().await.clone()
             && !self.check_staleness(&credentials).0
         {
@@ -783,6 +798,7 @@ impl AwsCredentialAdapter {
         let Ok(_lock) = self.refresh_lock.try_lock() else {
             return Ok(old_credentials);
         };
+        let _owner = credential_lock_acquired(self.cache_id);
         if let Some(credentials) = self.credentials.read().await.clone()
             && !Arc::ptr_eq(&credentials, &old_credentials)
             && !self.check_staleness(&credentials).0
@@ -798,11 +814,16 @@ impl AwsCredentialAdapter {
     }
 
     async fn do_refresh(&self) -> ObjectStoreResult<Arc<aws_credential_types::Credentials>> {
+        record_current(|| CopyOperationEvent::CredentialRefreshStarted {
+            cache: self.cache_id,
+        });
+        let result = self.inner.provide_credentials().await;
+        record_current(|| CopyOperationEvent::CredentialRefreshReturned {
+            cache: self.cache_id,
+            success: result.is_ok(),
+        });
         let credentials = Arc::new(
-            self.inner
-                .provide_credentials()
-                .await
-                .map_err(|e| Error::io(format!("Failed to get AWS credentials: {:?}", e)))?,
+            result.map_err(|e| Error::io(format!("Failed to get AWS credentials: {:?}", e)))?,
         );
         *self.credentials.write().await = Some(credentials.clone());
         Ok(credentials)
@@ -1086,7 +1107,42 @@ mod tests {
         let inner = Arc::new(RefreshingAwsCredentialsProvider::default());
         let provider = AwsCredentialAdapter::new(inner.clone(), Duration::from_secs(60));
 
-        let (first, second) = tokio::join!(provider.get_credential(), provider.get_credential());
+        use crate::object_store::copy_diagnostics::{CopyDiagnostics, CopyOperation};
+        let (owner, owner_events) = CopyDiagnostics::recording();
+        let (waiter, waiter_events) = CopyDiagnostics::recording();
+        let first = owner.run(CopyOperation::SourceMetadata, provider.get_credential());
+        let second = waiter.run(
+            CopyOperation::DestinationMetadata,
+            provider.get_credential(),
+        );
+        tokio::pin!(first, second);
+        assert!(futures::poll!(&mut first).is_pending());
+        assert!(futures::poll!(&mut second).is_pending());
+        {
+            let owner = owner_events.lock().unwrap();
+            let waiter = waiter_events.lock().unwrap();
+            let cache = provider.cache_id;
+            assert_ne!(owner[0].id, waiter[0].id);
+            assert!(
+                owner
+                    .iter()
+                    .any(|e| e.event == (CopyOperationEvent::CredentialRefreshStarted { cache }))
+            );
+            assert_eq!(
+                waiter.last().unwrap().event,
+                CopyOperationEvent::CredentialLockWaiting { cache }
+            );
+        }
+        let (first, second) = tokio::join!(first, second);
+        assert!(owner_events.lock().unwrap().iter().any(|e| e.event
+            == (CopyOperationEvent::CredentialRefreshReturned {
+                cache: provider.cache_id,
+                success: true
+            })));
+        assert!(waiter_events.lock().unwrap().iter().any(|e| e.event
+            == (CopyOperationEvent::CredentialLockAcquired {
+                cache: provider.cache_id
+            })));
         assert_eq!(first.unwrap().key_id, "key-0");
         assert_eq!(second.unwrap().key_id, "key-0");
         assert_eq!(inner.calls.load(Ordering::Relaxed), 1);

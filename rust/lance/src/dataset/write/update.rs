@@ -234,6 +234,8 @@ impl UpdateBuilder {
 
     /// Set the total timeout for all retries.
     ///
+    /// A commit that has already started finishes even if this timeout expires.
+    ///
     /// Default is 30 seconds.
     pub fn retry_timeout(mut self, timeout: Duration) -> Self {
         self.retry_timeout = timeout;
@@ -866,7 +868,7 @@ impl UpdateJob {
     }
 }
 
-impl RetryExecutor for UpdateJob {
+impl RetryExecutor<Dataset> for UpdateJob {
     type Data = UpdateData;
     type Result = UpdateResult;
 

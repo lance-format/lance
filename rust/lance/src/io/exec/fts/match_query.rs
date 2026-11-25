@@ -484,6 +484,33 @@ impl MatchQueryExec {
     pub fn explicit_segment_uuids(&self) -> Option<Vec<Uuid>> {
         self.segment_selection.explicit_segment_uuids()
     }
+
+    /// Re-cut this scorer at `limit`, keeping its segment selection, scorers
+    /// and masks. See [`super::CompoundQueryExec::with_limit`].
+    ///
+    /// A shared scorer is kept by identity, so the result still binds to the
+    /// enclosing corpus node and its flat producer.
+    pub fn with_limit(&self, limit: usize) -> Self {
+        let mut params = self.params.clone();
+        params.limit = Some(limit);
+        Self {
+            dataset: self.dataset.clone(),
+            query: self.query.clone(),
+            tokenized_query: self.tokenized_query.clone(),
+            params,
+            prefilter_source: self.prefilter_source.clone(),
+            base_scorer: self.base_scorer.clone(),
+            prepared_query: self.prepared_query.clone(),
+            shared_scorer: self.shared_scorer.clone(),
+            segment_selection: self.segment_selection.clone(),
+            overlay_block: self.overlay_block.clone(),
+            document_granularity: self.document_granularity,
+            schema: self.schema.clone(),
+            external_mask: self.external_mask.clone(),
+            properties: self.properties.clone(),
+            metrics: ExecutionPlanMetricsSet::new(),
+        }
+    }
 }
 
 impl ExecutionPlan for MatchQueryExec {

@@ -6,7 +6,7 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 readme = "README.md"
-description = "Open and read Lance table snapshots"
+description = "Open, read, write, and commit Lance table snapshots"
 keywords.workspace = true
 categories.workspace = true
 rust-version.workspace = true
@@ -21,34 +21,45 @@ lance-namespace.workspace = true
 lance-select.workspace = true
 lance-table.workspace = true
 arrow-array.workspace = true
+arrow-cast.workspace = true
+arrow-data.workspace = true
+arrow-ipc.workspace = true
+arrow-row.workspace = true
 arrow-buffer.workspace = true
 arrow-schema.workspace = true
 arrow-select.workspace = true
 async-trait.workspace = true
+blake3.workspace = true
 byteorder.workspace = true
 bytes.workspace = true
 chrono.workspace = true
 futures.workspace = true
+humantime.workspace = true
 itertools.workspace = true
 log.workspace = true
 object_store.workspace = true
 prost.workspace = true
+prost-types.workspace = true
+rand.workspace = true
 roaring.workspace = true
+semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+snafu.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 url.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+lance-datagen.workspace = true
 lance-io = { workspace = true, features = ["test-util"] }
-prost-types.workspace = true
 rstest.workspace = true
 tempfile.workspace = true
 
 [features]
 default = []
+test-util = []
 aws = ["lance-io/aws"]
 azure = ["lance-io/azure"]
 gcp = ["lance-io/gcp"]

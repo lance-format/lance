@@ -884,14 +884,17 @@ where
         let cluster_and_dists = match index {
             Some(index) => data
                 .par_chunks(dimension)
-                .map(|vec| {
-                    let query = PrimitiveArray::<T>::from_iter_values(vec.iter().copied());
-                    // unable to use balance_factor here because index.search returns the closest centroid
-                    index
-                        .search(Arc::new(query))
-                        .map(|(id, dist)| Some((id, dist)))
-                        .unwrap()
-                })
+                .map_init(
+                    || index.visited_generator(),
+                    |visited, vec| {
+                        let query = PrimitiveArray::<T>::from_iter_values(vec.iter().copied());
+                        // unable to use balance_factor here because index.search returns the closest centroid
+                        index
+                            .search(Arc::new(query), visited)
+                            .map(|(id, dist)| Some((id, dist)))
+                            .unwrap()
+                    },
+                )
                 .collect::<Vec<_>>(),
             None => match distance_type {
                 DistanceType::L2 => match T::as_f32_slice(centroids)

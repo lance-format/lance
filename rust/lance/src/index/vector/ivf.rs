@@ -1705,7 +1705,6 @@ fn sanity_check_params(ivf: &IvfBuildParams, pq: &PQBuildParams) -> Result<()> {
 /// - IVF model.
 ///
 /// Visibility: pub(super) for testing
-#[instrument(level = "debug", skip_all, name = "build_ivf_model")]
 pub async fn build_ivf_model(
     dataset: &Dataset,
     column: &str,
@@ -1714,6 +1713,44 @@ pub async fn build_ivf_model(
     params: &IvfBuildParams,
     fragment_ids: Option<&[u32]>,
     progress: std::sync::Arc<dyn lance_index::progress::IndexBuildProgress>,
+) -> Result<IvfModel> {
+    build_ivf_model_with_sample_loss(
+        dataset,
+        column,
+        dim,
+        metric_type,
+        params,
+        fragment_ids,
+        progress,
+        SampleLoss::Measure,
+    )
+    .await
+}
+
+/// Whether IVF training from a sample measures the k-means loss over that
+/// sample, which takes one more assignment of every sampled vector to every
+/// centroid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SampleLoss {
+    Measure,
+    /// For an index build, whose merge replaces the model's loss with the one
+    /// its shuffle measured over every row.
+    Skip,
+}
+
+/// [`build_ivf_model`] that measures the training loss only when
+/// `sample_loss` asks for it. Streaming training always reports its loss.
+#[allow(clippy::too_many_arguments)]
+#[instrument(level = "debug", skip_all, name = "build_ivf_model")]
+pub(crate) async fn build_ivf_model_with_sample_loss(
+    dataset: &Dataset,
+    column: &str,
+    dim: usize,
+    metric_type: MetricType,
+    params: &IvfBuildParams,
+    fragment_ids: Option<&[u32]>,
+    progress: std::sync::Arc<dyn lance_index::progress::IndexBuildProgress>,
+    sample_loss: SampleLoss,
 ) -> Result<IvfModel> {
     let num_partitions = params.num_partitions.unwrap();
     let centroids = params.centroids.clone();
@@ -1785,7 +1822,8 @@ pub async fn build_ivf_model(
         "Finished loading training data in {:02} seconds",
         start.elapsed().as_secs_f32()
     );
-    train_ivf_model_from_sample(training_data, metric_type, params, progress).await
+    train_ivf_model_from_sample_with_loss(training_data, metric_type, params, progress, sample_loss)
+        .await
 }
 
 /// Train an in-memory IVF model from caller-supplied vector samples.
@@ -1828,6 +1866,23 @@ pub async fn train_ivf_model_from_sample(
     metric_type: MetricType,
     params: &IvfBuildParams,
     progress: std::sync::Arc<dyn lance_index::progress::IndexBuildProgress>,
+) -> Result<IvfModel> {
+    train_ivf_model_from_sample_with_loss(
+        training_data,
+        metric_type,
+        params,
+        progress,
+        SampleLoss::Measure,
+    )
+    .await
+}
+
+async fn train_ivf_model_from_sample_with_loss(
+    training_data: FixedSizeListArray,
+    metric_type: MetricType,
+    params: &IvfBuildParams,
+    progress: std::sync::Arc<dyn lance_index::progress::IndexBuildProgress>,
+    sample_loss: SampleLoss,
 ) -> Result<IvfModel> {
     let num_partitions = params.num_partitions.filter(|&k| k > 0).ok_or_else(|| {
         Error::invalid_input(format!(
@@ -1933,6 +1988,7 @@ pub async fn train_ivf_model_from_sample(
         mt,
         params,
         progress,
+        sample_loss,
     )
     .await?;
     info!(
@@ -3403,6 +3459,7 @@ async fn do_train_ivf_model<T: ArrowPrimitiveType>(
     metric_type: MetricType,
     params: &IvfBuildParams,
     progress: std::sync::Arc<dyn lance_index::progress::IndexBuildProgress>,
+    sample_loss: SampleLoss,
 ) -> Result<IvfModel>
 where
     <T as ArrowPrimitiveType>::Native: Dot + L2 + Normalize,
@@ -3451,14 +3508,19 @@ where
     drop(progress_tx);
     progress_worker.await??;
     let kmeans = kmeans?;
-    let training_data = FixedSizeListArray::try_new_from_values(
-        Arc::new(data.clone()) as ArrayRef,
-        dimension as i32,
-    )?;
-    let loss = kmeans.compute_loss(&training_data)?;
+    let loss = match sample_loss {
+        SampleLoss::Measure => {
+            let training_data = FixedSizeListArray::try_new_from_values(
+                Arc::new(data.clone()) as ArrayRef,
+                dimension as i32,
+            )?;
+            Some(kmeans.compute_loss(&training_data)?)
+        }
+        SampleLoss::Skip => None,
+    };
     Ok(IvfModel::new(
         FixedSizeListArray::try_new_from_values(kmeans.centroids, dimension as i32)?,
-        Some(loss),
+        loss,
     ))
 }
 
@@ -5830,6 +5892,7 @@ async fn train_ivf_model(
     distance_type: DistanceType,
     params: &IvfBuildParams,
     progress: std::sync::Arc<dyn lance_index::progress::IndexBuildProgress>,
+    sample_loss: SampleLoss,
 ) -> Result<IvfModel> {
     assert!(
         distance_type != DistanceType::Cosine,
@@ -5846,6 +5909,7 @@ async fn train_ivf_model(
                 distance_type,
                 params,
                 progress.clone(),
+                sample_loss,
             )
             .await
         }
@@ -5857,6 +5921,7 @@ async fn train_ivf_model(
                 distance_type,
                 params,
                 progress.clone(),
+                sample_loss,
             )
             .await
         }
@@ -5868,6 +5933,7 @@ async fn train_ivf_model(
                 distance_type,
                 params,
                 progress.clone(),
+                sample_loss,
             )
             .await
         }
@@ -5883,6 +5949,7 @@ async fn train_ivf_model(
                 distance_type,
                 params,
                 progress.clone(),
+                sample_loss,
             )
             .await
         }
@@ -5894,6 +5961,7 @@ async fn train_ivf_model(
                 distance_type,
                 params,
                 progress.clone(),
+                sample_loss,
             )
             .await
         }
@@ -7340,6 +7408,7 @@ mod tests {
         assert_eq!(2, ivf_model.centroids.as_ref().unwrap().len());
         assert_eq!(32, ivf_model.centroids.as_ref().unwrap().value_length());
         assert_eq!(2, ivf_model.num_partitions());
+        assert!(ivf_model.loss().is_some_and(|loss| loss > 0.0));
 
         // All centroids values should be in the range [1000, 1100]
         ivf_model
@@ -7352,6 +7421,22 @@ mod tests {
             .for_each(|v| {
                 assert!((1000.0..1100.0).contains(v));
             });
+
+        // An index build skips the sample loss its shuffle replaces.
+        let without_loss = build_ivf_model_with_sample_loss(
+            &dataset,
+            "vector",
+            DIM,
+            MetricType::L2,
+            &ivf_params,
+            None,
+            lance_index::progress::noop_progress(),
+            SampleLoss::Skip,
+        )
+        .await
+        .unwrap();
+        assert_eq!(2, without_loss.num_partitions());
+        assert!(without_loss.loss().is_none());
     }
 
     #[tokio::test]
