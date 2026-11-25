@@ -55,6 +55,15 @@ pub(super) fn needs_row_history(
 }
 
 impl TransactionRebase<'_> {
+    pub(super) fn writes_key_fields(&self, fields: &[u32], keys: &KeyExistenceFilter) -> bool {
+        !fields.is_empty()
+            && self.row_history.as_ref().is_none_or(|history| {
+                fields.iter().any(|&field| {
+                    field_affects_index(field as i32, &keys.field_ids, history.read.schema())
+                })
+            })
+    }
+
     /// Physical row addresses describe a row rewrite only while the retained
     /// fragments still refer to the data the writer read.
     pub(super) fn validate_row_rewrite(&mut self, inserted_row_count: Option<u64>) {

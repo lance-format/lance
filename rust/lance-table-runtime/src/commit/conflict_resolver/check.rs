@@ -268,8 +268,10 @@ impl<'a> TransactionRebase<'a> {
                 // and strict conflict detection should be applied.
                 match (self_inserted_rows_filter, other_inserted_rows_filter) {
                     (Some(self_keys), Some(other_keys)) => {
-                        if self_keys.field_ids != other_keys.field_ids {
-                            // Different key columns - can't verify conflicts
+                        if self_keys.field_ids != other_keys.field_ids
+                            || self.writes_key_fields(self_fields_modified, other_keys)
+                        {
+                            // Filters only describe inserts in the same key domain.
                             return Err(
                                 self.retryable_conflict_err(other_transaction, other_version)
                             );
@@ -291,20 +293,12 @@ impl<'a> TransactionRebase<'a> {
                             );
                         }
                     }
-                    (Some(_), None) => {
-                        // Current transaction has primary key conflict detection but
-                        // the already committed transaction doesn't have a filter.
-                        // We can't determine what rows were inserted by the other
-                        // transaction, so we must fail to be safe.
+                    (Some(_), None) | (None, Some(_)) => {
+                        // An unfiltered update can change a key or a value read by
+                        // the other MERGE's predicate, even without inserting rows.
                         return Err(self.retryable_conflict_err(other_transaction, other_version));
                     }
-                    (None, Some(_)) if !self_new_fragments.is_empty() => {
-                        // Older MERGE writers omitted the filter when ON listed
-                        // a composite primary key in a different order. Their
-                        // output can contain the same new key in another fragment.
-                        return Err(self.retryable_conflict_err(other_transaction, other_version));
-                    }
-                    _ => {}
+                    (None, None) => {}
                 }
             }
 

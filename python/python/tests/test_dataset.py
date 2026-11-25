@@ -3660,46 +3660,79 @@ def test_staged_merge_with_concurrent_insert(
 
 
 @pytest.mark.parametrize(("first", "second"), [("slot", "id"), ("id", "slot")])
-def test_staged_merge_zero_inserts_can_change_primary_key(
-    tmp_path, keyed_merge_schema, first, second
+@pytest.mark.parametrize("patch", ["row_key", "column_key", "column_value"])
+def test_staged_merge_retries_mixed_key_filters(
+    tmp_path, keyed_merge_schema, first, second, patch
 ):
     from lance.commit import CommitConflictError
 
-    schema = keyed_merge_schema.append(pa.field("slot", pa.int32()))
+    schema = keyed_merge_schema.append(pa.field("slot", pa.int32())).append(
+        pa.field("extra", pa.int32())
+    )
 
     def table(ids, values, slots):
-        return pa.table({"id": ids, "value": values, "slot": slots}, schema=schema)
+        return pa.table(
+            {"id": ids, "value": values, "slot": slots, "extra": [0] * len(ids)},
+            schema=schema,
+        )
 
     ds = lance.write_dataset(
         table(range(6), [0] * 6, range(6)), tmp_path, max_rows_per_file=3
     )
-    txns = {}
-    for on, source, fragment in [
-        ("slot", table([90], [11], [1]), 0),
-        ("id", table([4, 90], [22, 22], [4, 90]), 1),
-    ]:
-        txn, stats = (
-            ds.merge_insert(on)
-            .when_matched_update_all()
-            .when_not_matched_insert_all()
-            .execute_uncommitted(source)
+    sources = {"slot": table([90], [77], [1]), "id": table([4, 90], [22, 22], [4, 1])}
+    if patch == "column_key":
+        sources["slot"] = sources["slot"].select(["id", "value", "slot"])
+    elif patch == "column_value":
+        sources["slot"] = sources["slot"].select(["value", "slot"])
+        sources["id"] = table([1, 4, 90], [22] * 3, [1, 4, 1])
+
+    def stage(dataset, on):
+        condition = (
+            "target.value = 77 OR target.id = 4"
+            if patch == "column_value" and on == "id"
+            else None
         )
+        builder = dataset.merge_insert(on).when_matched_update_all(condition)
+        if on == "slot" and patch != "row_key":
+            builder = builder.write_mode("rewrite_columns")
+        else:
+            builder = builder.when_not_matched_insert_all()
+        return builder.execute_uncommitted(sources[on])
+
+    txns = {}
+    for on, fragment in [("slot", 0), ("id", 1)]:
+        txn, stats = stage(ds, on)
         assert stats["num_inserted_rows"] == int(on == "id")
+        assert (txn.operation.inserted_rows_filter is not None) == (on == "id")
         assert [f.id for f in txn.operation.updated_fragments] == [fragment]
+        if on == "slot" and patch != "row_key":
+            assert txn.operation.update_mode == "rewrite_columns"
+            assert not txn.operation.new_fragments
+            assert (0 in txn.operation.fields_modified) == (patch == "column_key")
         txns[on] = pickle.loads(pickle.dumps(txn))
 
-    lance.LanceDataset.commit(tmp_path, txns[first])
+    current = lance.LanceDataset.commit(tmp_path, txns[first])
     with pytest.raises(CommitConflictError):
         lance.LanceDataset.commit(tmp_path, txns[second])
-    current = lance.dataset(tmp_path)
-    assert current.version == ds.version + 1
     if first == "slot":
-        expected = table([0, 90, 2, 3, 4, 5], [0, 11, 0, 0, 0, 0], range(6))
+        ids = range(6) if patch == "column_value" else [0, 90, 2, 3, 4, 5]
+        expected = table(ids, [0, 77, 0, 0, 0, 0], range(6))
     else:
         expected = table(
-            [0, 1, 2, 3, 4, 5, 90], [0, 0, 0, 0, 22, 0, 22], [*range(6), 90]
+            [0, 1, 2, 3, 4, 5, 90], [0, 0, 0, 0, 22, 0, 22], [*range(6), 1]
         )
-    assert current.to_table().sort_by("slot") == expected
+    reopened = lance.dataset(tmp_path)
+    assert reopened.version == current.version
+    assert reopened.to_table().sort_by("id") == expected.sort_by("id")
+    if patch == "column_value":
+        # The predicate reads id 1's value, and the slot join reads the new row.
+        # Restaging sees both dependencies in the actual publication order.
+        retry, _ = stage(reopened, second)
+        lance.LanceDataset.commit(tmp_path, retry)
+        value = 22 if first == "slot" else 77
+        assert lance.dataset(tmp_path).to_table().sort_by("id") == table(
+            [0, 1, 2, 3, 4, 5, 90], [0, value, 0, 0, 22, 0, value], [*range(6), 1]
+        )
 
 
 @pytest.mark.parametrize("inserting", [None, 0, 1])
