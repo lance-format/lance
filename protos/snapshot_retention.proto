@@ -5,13 +5,31 @@ syntax = "proto3";
 
 package lance.dataset.retention;
 
+/* Persisted identity within an authenticated retention root. It is independent
+ * of execution SnapshotRef, caller identities, URIs, credentials, and bindings.
+ */
+message RetainedSnapshot {
+  uint32 protocol_version = 1;
+  // Nonzero 16-byte UUID from the authoritative retention root's table_id.
+  bytes table_id = 2;
+  // Absent identifies main; otherwise the exact normalized branch name.
+  optional string branch = 3;
+  uint64 version = 4;
+  // Normalized root-relative manifest address, never an absolute path or URI.
+  string manifest_key = 5;
+  // Exactly 32 BLAKE3 bytes covering the complete original manifest file.
+  bytes manifest_digest = 6;
+  // Optional authoritative commit-store record identity.
+  optional string manifest_identity = 7;
+}
+
 /* Persisted explicit-release snapshot protection token, encoded as hexadecimal
  * in table-root references, reference-operation journals, and query projections.
  * Decoding does not acquire protection. See the atomic snapshot retention spec.
  */
 message SnapshotRetention {
   uint32 protocol_version = 1;
-  // Encoded compact lance.snapshot.SnapshotRef, without manifest contents.
+  // Encoded RetainedSnapshot, without manifest contents or execution context.
   bytes snapshot = 2;
   string tag_name = 3;
 }

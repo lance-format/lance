@@ -41,8 +41,8 @@ slash-separated addresses relative to the authenticated table root. The empty
 address identifies the root. In a per-manifest snapshot record,
 `identity.manifest_path` is the canonical physical object-store path including
 the root prefix; `manifest_key` is its root-relative address. Plan retirement
-identities instead use the root-relative address. Transported SnapshotRef paths
-remain resolved paths in their authenticated source store.
+identities instead use the root-relative address. Persisted release tokens also
+use the root-relative `manifest_key`; execution transport addresses are not persisted.
 Absolute paths, escaping components, and objects outside the root are rejected.
 Local aliases must resolve to the same canonical physical root and file addresses,
 including when a file was already deleted and only its parents survive. Catalog
@@ -97,12 +97,20 @@ manifest:
 
 ## Persisted snapshot and release tokens
 
-`protos/snapshot.proto` defines `lance.snapshot.SnapshotRef`, protocol version 1.
 `protos/snapshot_retention.proto` defines `lance.dataset.retention.SnapshotRetention`,
-protocol version 1. The latter embeds the encoded former in `snapshot`.
-These schemas are persisted contracts wherever tokens appear below; they are
-also used for execution transport. Neither message contains credentials,
-manifest contents, or an authorization capability.
+protocol version 1, and its independent `RetainedSnapshot`, protocol version 1.
+`SnapshotRetention.snapshot` contains the protobuf encoding of a validated
+`RetainedSnapshot`. These messages are persisted contracts. Neither contains
+credentials, manifest contents, an absolute table URI, a caller-defined table
+identity, or an authorization capability. The execution-only `SnapshotRef` is
+not embedded and this specification does not depend on its schema or implementation.
+
+`RetainedSnapshot.table_id` is the nonzero 16-byte UUID from the authoritative
+retention root. Its `manifest_key` is the normalized root-relative manifest
+address described above. Resolving that key through the authenticated root must
+identify the same manifest as the per-manifest record. A release must validate
+the table ID against the root before modifying any pin. Unknown protocol versions,
+invalid UUIDs, escaping paths, and missing identity fields are rejected.
 
 The manifest digest is 32 BLAKE3 bytes over the complete original manifest file,
 including metadata sections, dictionaries, inline transactions, length prefixes,
@@ -111,7 +119,7 @@ The optional manifest identity is the authoritative commit-store identity;
 absence means that only the digest supplies content identity. Branch absence
 identifies main. A snapshot must name an exact positive version and manifest.
 
-The snapshot ID is BLAKE3 of the protobuf encoding of its validated known fields,
+The snapshot ID is BLAKE3 of the `RetainedSnapshot` encoding of its validated known fields,
 serialized in field-number order with absent/default proto3 fields omitted. The
 retention name is `lance-query-` followed by lowercase hex BLAKE3 of the 32 snapshot
 ID bytes followed immediately by the nonempty retention ID's UTF-8 bytes. There
