@@ -3243,7 +3243,7 @@ mod tests {
         },
         index::vector::VectorIndexParams,
     };
-    use all_asserts::assert_gt;
+    use all_asserts::{assert_gt, assert_lt};
     use arrow::compute;
     use arrow_array::{
         Int32Array, RecordBatch, RecordBatchIterator, RecordBatchReader, UInt64Array,
