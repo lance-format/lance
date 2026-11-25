@@ -73,12 +73,27 @@ Reference and planned-file chunks contain at most 1,024 entries. Headers and
 chunks must belong to the same operation directory. Root IDs must match the
 referenced header IDs. Readers validate addresses before following them.
 
-`manifest_hash` is the lowercase 64-digit BLAKE3 hex digest of the normalized
-physical manifest address's UTF-8 bytes. `manifest_key` repeats that address and
-must match the addressed object. `shard` is the first four lowercase hex digits
-of BLAKE3 of a retired physical path's UTF-8 bytes. Retired-name shards store a
-set of exact path strings, not path prefixes. Their revision and mutation ID
-follow the root replacement rules; shard tombstones never expire.
+`manifest_hash` is the lowercase 64-digit BLAKE3 hex digest of the normalized,
+root-relative `manifest_key`'s UTF-8 bytes. The hash input excludes the table root,
+URI scheme, bucket, leading slash, JSON quotes, and trailing newline. Joining
+`manifest_key` to the authenticated physical root must produce
+`identity.manifest_path`. `shard` is the first four lowercase hex digits
+of BLAKE3 of a normalized, root-relative retired path's UTF-8 bytes. Retired-name
+shards store a set of exact path strings, not path prefixes. Their revision and
+mutation ID follow the root replacement rules; shard tombstones never expire.
+
+For example, a table at `s3://example-bucket/datasets/images.lance` has the
+authenticated object-store root `datasets/images.lance`. For its V2 version 1
+manifest:
+
+- `manifest_key` is `_versions/18446744073709551614.manifest`.
+- `identity.manifest_path` is
+  `datasets/images.lance/_versions/18446744073709551614.manifest`.
+- The exact UTF-8 hash input is `_versions/18446744073709551614.manifest`, without
+  quotes or a newline. Its BLAKE3 hex digest is
+  `440501a2a475eecc72625ba94bfe75c67dfff11b628b9d88665b601162a04f96`.
+- The snapshot record's object-store path is
+  `datasets/images.lance/_refs/retention/snapshots/440501a2a475eecc72625ba94bfe75c67dfff11b628b9d88665b601162a04f96.json`.
 
 ## Persisted snapshot and release tokens
 
@@ -104,8 +119,12 @@ is no separator. Retention IDs identify distinct query lifetimes and must not be
 reused after release.
 
 `protection`, `source_protection`, `old_protection`, and `new_protection` contain
-lowercase hexadecimal protobuf release-token bytes. `null` means no protection.
-Decode both protocol versions before recovery uses a token. Token validation
+lowercase hexadecimal protobuf release-token bytes. A non-null entry in the
+root's `tags` map must contain a valid, non-null `protection` token for the
+snapshot named by its `contents`. A null map entry is the tag-deletion tombstone,
+not an active tag without protection. Branch `source_protection` and operation
+journal `old_protection` and `new_protection` may be null when that side owns no
+pin. Decode both protocol versions before recovery uses a token. Token validation
 alone does not acquire, renew, release, or authorize protection.
 
 ## Tags and branches
@@ -127,8 +146,9 @@ A tag mutation writes an `operation` journal before acquiring its new source pin
 It commits against `expected_revision` and includes the new token in the root.
 Only after that decision may it release the old token. Tag deletion publishes a
 null entry before releasing old protection. `tag` names the affected reference;
-branch journals use this field for the branch name too. Missing new or old tokens
-mean that side of the mutation does not own protection.
+branch journals use this field for the branch name too. Null new or old tokens
+in a journal mean that side of the mutation does not own protection; they do not
+permit publishing an active tag without a token.
 
 A branch transitions `creating` → `active` → `retiring` → `deleted`. Creation
 holds `source_protection` until its first manifest publication is finalized. Its
@@ -187,19 +207,46 @@ from that root's already validated committed head may be reused. The exact
 predecessor observation must still win the root CAS, or be revalidated. Shard
 reads may run concurrently. A pending intent protects every recorded reference.
 
-After the immutable manifest lands, finalization conditionally advances the head
-and removes the pending publication. A verified successful commit stays
-successful if bookkeeping fails; retain the intent and recover later. A positively
-observed retired or changed incarnation still rejects the stale commit.
+After an attached immutable manifest lands, finalization may conditionally
+advance the head. Removing its pending publication additionally requires the
+write-quiescence evidence defined below. Until then the intent and every recorded
+reference remain protected, even after the head advances. A verified successful
+commit stays successful if bookkeeping fails; retain the intent and recover
+later. A positively observed retired or changed incarnation still rejects the
+stale commit, but that rejection does not establish write quiescence.
 
-Latest reads observe the root once and consider same-branch, same-incarnation
-pending publications in descending version order. Resolve each immutable slot and
-verify its stamped publication UUID before selecting a landed manifest newer
-than the recorded head. Missing slots and slots won by another publication are
-ignored. Reads perform no recovery writes. Writers, maintenance, and explicit
-recovery may finalize landed publications. A competing immutable commit proves a
-pending creation cannot win, allowing its exact intent to be removed. Absence
-alone never proves an uncertain write cannot arrive later.
+Latest reads observe the root once and select same-branch, same-incarnation
+pending publications with attached versions before sorting them in descending
+version order. An attached version satisfies `1 <= version < 2^63`; a detached
+version has bit 63 set and is excluded before this comparison. Resolve each
+eligible immutable slot and verify its stamped publication UUID before selecting
+a landed manifest newer than the recorded head. Missing slots and slots won by
+another publication are ignored only for latest selection. Detached publications still protect their
+references and participate in cleanup reachability and recovery. Reads perform
+no recovery writes. Writers, maintenance, and explicit recovery may finalize
+landed publications subject to the removal rule below.
+
+### Removing a pending publication
+
+Before removing an intent and its reference protection, establish that every
+submitted manifest or staging write, including retries, has a definitive storage
+outcome and that no further writes can be submitted under that publication.
+A storage response that definitively completes a request may establish its
+outcome. A timeout, connection loss, local cancellation, or process exit does
+not establish that a remote request has stopped. The writer must close its
+submission and retry paths before conditionally removing the intent from the
+root. That root update records established quiescence; it does not fence a
+storage request itself.
+
+Recovery needs equivalent evidence that remains valid after a crash. Version 1
+does not encode such completion evidence in the root, head, or publication
+record. When it cannot be established, recovery must retain the pending intent
+and every recorded reference, potentially indefinitely. This applies to landed,
+missing, and competing slots, and to retired or changed branch incarnations.
+Observing a competing immutable manifest establishes only its present ownership:
+cleanup can delete it while an earlier conditional write is still outstanding,
+allowing that write to land later. Registration-time retired-name checks and root
+revision changes do not prevent an already-submitted request from landing.
 
 ## Cleanup, recovery, and reuse
 
