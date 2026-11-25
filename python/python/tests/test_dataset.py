@@ -10779,6 +10779,185 @@ def test_branches(tmp_path: Path):
     assert branch1.to_table().combine_chunks() == expected_branch1.combine_chunks()
 
 
+class _SinglePassSelection:
+    def __init__(self, items):
+        self._iterator = iter(items)
+
+    def __iter__(self):
+        return self._iterator
+
+    def __len__(self):
+        raise NotImplementedError("selection length is unknown")
+
+
+@pytest.mark.parametrize(
+    ("option", "selection_form"),
+    [
+        ("fragments", "list"),
+        ("fragments", "mapping"),
+        ("fragments", "iterator"),
+        ("fragments", "single-pass"),
+        ("with_fragments", "list"),
+        ("with_fragments", "mapping"),
+    ],
+)
+def test_default_scan_options_fragment_scope(
+    tmp_path: Path, option: str, selection_form: str
+):
+    data = pa.table({"id": [0, 1, 2, 3]})
+    dataset = lance.write_dataset(data, tmp_path, max_rows_per_file=2)
+    first, second = dataset.get_fragments()
+    expected = dataset.scanner(fragments=[second]).to_table()
+    assert expected == data.slice(2)
+
+    selected = [second]
+    if selection_form == "iterator":
+        selected = iter(selected)
+    elif selection_form == "single-pass":
+        explicit = dataset.scanner(fragments=_SinglePassSelection(selected)).to_table()
+        assert explicit == expected
+        selected = _SinglePassSelection(selected)
+    elif selection_form == "mapping":
+        selected = (
+            {second: "selected"} if option == "fragments" else {"fragments": selected}
+        )
+    scoped = lance.dataset(tmp_path, default_scan_options={option: selected})
+    assert scoped.schema == expected.schema
+    assert scoped.to_table() == expected
+    assert scoped.to_table() == expected
+    assert scoped.scanner(fragments=[first]).to_table() == data.slice(0, 2)
+    assert scoped.scanner(fragments=[]).to_table() == data.slice(0, 0)
+
+
+def test_default_scan_options_empty_fragment_mapping(tmp_path: Path):
+    data = pa.table({"id": [0, 1, 2, 3]})
+    dataset = lance.write_dataset(data, tmp_path, max_rows_per_file=2)
+    expected = dataset.scanner(fragments={}).to_table()
+    assert expected == data.slice(0, 0)
+    scoped = lance.dataset(tmp_path, default_scan_options={"fragments": {}})
+    assert scoped.to_table() == expected
+
+
+@pytest.mark.parametrize(
+    ("option", "selection_form", "clone_options"),
+    [
+        pytest.param("index_segments", "list", None, id="public-list"),
+        pytest.param("index_segments", "mapping", None, id="public-mapping"),
+        pytest.param("index_segments", "iterator", None, id="public-iterator"),
+        pytest.param("index_segments", "single-pass", None, id="public-single-pass"),
+        pytest.param("with_index_segments", "list", None, id="legacy-list"),
+        pytest.param("with_index_segments", "mapping", None, id="legacy-mapping"),
+        pytest.param("index_segments", "iterator", {}, id="native-clone"),
+        pytest.param(
+            "index_segments", "iterator", {"block_size": 4096}, id="reconfigured-clone"
+        ),
+    ],
+)
+def test_default_scan_options_index_segments(
+    tmp_path: Path,
+    option: str,
+    selection_form: str,
+    clone_options: dict[str, int] | None,
+):
+    data = pa.table(
+        {
+            "id": range(6),
+            "vector": pa.array(
+                [[float(i), 0.0] for i in range(6)], type=pa.list_(pa.float32(), 2)
+            ),
+        }
+    )
+    dataset = lance.write_dataset(data.slice(0, 4), tmp_path, max_rows_per_file=2)
+    dataset = dataset.create_index(
+        "vector",
+        "IVF_FLAT",
+        num_partitions=1,
+        ivf_centroids=np.zeros((1, 2), dtype=np.float32),
+    )
+    segment = dataset.describe_indices()[0].segments[0].uuid
+    dataset = lance.write_dataset(data.slice(4), dataset, mode="append")
+    nearest = {"column": "vector", "q": [5.0, 0.0], "k": 3}
+    assert dataset.scanner(nearest=nearest).to_table()["id"].to_pylist() == [5, 4, 3]
+    expected = dataset.scanner(nearest=nearest, index_segments=[segment]).to_table()
+    assert expected["id"].to_pylist() == [3, 2, 1]
+
+    selected = [segment]
+    if selection_form == "iterator":
+        selected = iter(selected)
+    elif selection_form == "single-pass":
+        explicit = dataset.scanner(
+            nearest=nearest, index_segments=_SinglePassSelection(selected)
+        ).to_table()
+        assert explicit == expected
+        selected = _SinglePassSelection(selected)
+    elif selection_form == "mapping":
+        selected = (
+            {segment: "selected"}
+            if option == "index_segments"
+            else {"index_segments": selected}
+        )
+    options = {"nearest": nearest, option: selected}
+    if clone_options is None:
+        scoped = lance.dataset(tmp_path, default_scan_options=options)
+    else:
+        scoped = dataset.shallow_clone(
+            tmp_path / "clone",
+            reference=(None, None),
+            default_scan_options=options,
+            **clone_options,
+        )
+    assert scoped.schema == expected.schema
+    assert scoped.to_table() == expected
+    assert scoped.to_table() == expected
+
+
+def test_shallow_clone_with_failing_default_scan_options(tmp_path: Path):
+    data = pa.table({"id": [0, 1]})
+    dataset = lance.write_dataset(data, tmp_path / "source", max_rows_per_file=1)
+    target = tmp_path / "clone"
+
+    def failing_segments():
+        yield "4b9be7c9-1a8b-4f13-a5b7-68a2d39d7402"
+        raise RuntimeError("selection interrupted")
+
+    with pytest.raises(RuntimeError, match="selection interrupted"):
+        dataset.shallow_clone(
+            target,
+            reference=(None, None),
+            default_scan_options={"index_segments": failing_segments()},
+        )
+    assert not target.exists()
+
+
+@pytest.mark.parametrize("option", ["full_text_query", "full_text_search"])
+@pytest.mark.parametrize(
+    "query",
+    [
+        pytest.param("apple", id="string"),
+        pytest.param({"query": "apple", "columns": ["text"]}, id="dictionary"),
+        pytest.param(lance.query.MatchQuery("apple", column="text"), id="object"),
+    ],
+)
+def test_default_scan_options_full_text_query(tmp_path: Path, option: str, query):
+    data = pa.table({"id": [0, 1, 2, 3], "text": [None, "pear", "", "apple"]})
+    dataset = lance.write_dataset(data, tmp_path, max_rows_per_file=2)
+    dataset.create_scalar_index("text", "INVERTED")
+    expected = dataset.scanner(full_text_query=query).to_table()
+    assert expected["id"].to_pylist() == [3]
+
+    searched = lance.dataset(tmp_path, default_scan_options={option: query})
+    assert searched.to_table() == expected
+
+
+def test_default_scan_options_full_text_query_none(tmp_path: Path):
+    data = pa.table({"text": ["apple", "pear"]})
+    dataset = lance.write_dataset(data, tmp_path, max_rows_per_file=1)
+    assert dataset.scanner(full_text_query=None).to_table() == data
+
+    reopened = lance.dataset(tmp_path, default_scan_options={"full_text_query": None})
+    assert reopened.to_table() == data
+
+
 def test_default_scan_options_nearest(tmp_path: Path) -> None:
     dim = 4
     num_rows = 10

@@ -751,8 +751,22 @@ class ScannerBuilder:
         self._substrait_aggregate = None
 
     def apply_defaults(self, default_opts: Dict[str, Any]) -> ScannerBuilder:
+        scope_setters = {
+            "fragments": self.with_fragments,
+            "index_segments": self.with_index_segments,
+        }
         for key, value in default_opts.items():
-            setter = getattr(self, key, None)
+            scope_setter = scope_setters.get(key)
+            if scope_setter is not None:
+                scope_setter(value)
+                continue
+            if key == "full_text_query":
+                # The public scanner treats None as an omitted full-text query.
+                if value is None:
+                    continue
+                setter = self.full_text_search
+            else:
+                setter = getattr(self, key, None)
             if setter is None:
                 raise ValueError(f"Unknown option {key}")
             if isinstance(value, dict):
