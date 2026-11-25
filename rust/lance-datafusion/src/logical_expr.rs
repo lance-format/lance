@@ -609,4 +609,89 @@ mod tests {
         );
         assert_eq!(resolve_expr(&expr, &schema).unwrap(), expected);
     }
+
+    fn constant_expression_batch() -> arrow_array::RecordBatch {
+        use arrow_array::{Float64Array, Int8Array, UInt8Array};
+        arrow_array::RecordBatch::try_from_iter(vec![
+            (
+                "i",
+                Arc::new(Int8Array::from(vec![Some(-56), Some(50), Some(100), None]))
+                    as arrow_array::ArrayRef,
+            ),
+            (
+                "u",
+                Arc::new(UInt8Array::from(vec![Some(0), Some(10), Some(255), None])),
+            ),
+            (
+                "f",
+                Arc::new(Float64Array::from(vec![
+                    Some(3.0),
+                    Some(3.5),
+                    Some(1.0),
+                    None,
+                ])),
+            ),
+        ])
+        .unwrap()
+    }
+
+    /// A constant expression keeps its own value whichever side of the
+    /// comparison it is on: `i < 100 + 100` matches the same rows as
+    /// `100 + 100 > i` and `i < 200`, rather than adding the literals as `Int8`.
+    #[rstest::rstest]
+    #[case::sum_above_type("i < 100 + 100", [Some(true), Some(true), Some(true), None])]
+    #[case::sum_above_type_reversed("100 + 100 > i", [Some(true), Some(true), Some(true), None])]
+    #[case::gt_sum_above_type("i > 100 + 100", [Some(false), Some(false), Some(false), None])]
+    #[case::eq_sum_above_type("i = 100 + 100", [Some(false), Some(false), Some(false), None])]
+    #[case::in_sum_above_type("i IN (100 + 100)", [Some(false), Some(false), Some(false), None])]
+    #[case::between_sum_above_type(
+        "i BETWEEN 100 + 100 AND 127",
+        [Some(false), Some(false), Some(false), None]
+    )]
+    #[case::max_plus_one("i < 127 + 1", [Some(true), Some(true), Some(true), None])]
+    #[case::operand_above_type("i < 200 - 100", [Some(true), Some(true), Some(false), None])]
+    #[case::float_operand("i > 1.5 + 1", [Some(false), Some(true), Some(true), None])]
+    #[case::in_range("i = 25 * 2", [Some(false), Some(true), Some(false), None])]
+    #[case::unsigned_below_zero("u > 0 - 1", [Some(true), Some(true), Some(true), None])]
+    #[case::unsigned_difference_below_zero(
+        "u < 5 - 10",
+        [Some(false), Some(false), Some(false), None]
+    )]
+    #[case::division_as_column_type("f = 7 / 2", [Some(false), Some(true), Some(false), None])]
+    #[case::division_as_column_type_reversed(
+        "7 / 2 = f",
+        [Some(false), Some(true), Some(false), None]
+    )]
+    fn constant_expressions_keep_their_value(
+        #[case] sql: &str,
+        #[case] expected: [Option<bool>; 4],
+    ) {
+        use arrow_array::{BooleanArray, cast::AsArray};
+
+        let batch = constant_expression_batch();
+        let planner = crate::planner::Planner::new(batch.schema());
+        let expr = planner
+            .parse_filter(sql)
+            .unwrap_or_else(|error| panic!("{sql}: {error}"));
+        let expr = planner.optimize_expr(expr).unwrap();
+        let result = planner.create_physical_expr(&expr).unwrap();
+        let result = result.evaluate(&batch).unwrap().into_array(4).unwrap();
+        assert_eq!(
+            result.as_boolean(),
+            &BooleanArray::from(expected.to_vec()),
+            "{sql}"
+        );
+    }
+
+    /// A folded constant that fits the column type is still narrowed to it, so
+    /// the comparison stays on the bare column and a scalar index applies.
+    #[rstest::rstest]
+    #[case::sum("i = 25 * 2", col("i").eq(lit(50_i8)))]
+    #[case::reversed("25 * 2 = i", lit(50_i8).eq(col("i")))]
+    #[case::in_list("i IN (25 * 2)", col("i").in_list(vec![lit(50_i8)], false))]
+    fn constant_expressions_plan_on_column(#[case] sql: &str, #[case] expected: Expr) {
+        let batch = constant_expression_batch();
+        let planner = crate::planner::Planner::new(batch.schema());
+        assert_eq!(planner.parse_filter(sql).unwrap(), expected, "{sql}");
+    }
 }
