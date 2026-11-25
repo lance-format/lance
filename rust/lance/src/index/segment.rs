@@ -29,10 +29,11 @@ pub(crate) fn retain_committed_inverted_files(files: &mut Vec<IndexFile>) {
     files.retain(|file| !lance_index::scalar::inverted::builder::is_staged_path(&file.path));
 }
 
+/// Validate the segments and return the union of their stored fragment bitmaps.
 pub(crate) fn validate_segment_metadata(
     index_name: &str,
     segments: &[IndexMetadata],
-) -> Result<()> {
+) -> Result<RoaringBitmap> {
     if segments.is_empty() {
         return Err(Error::invalid_input(
             "CreateIndex: at least one index segment is required".to_string(),
@@ -60,10 +61,10 @@ pub(crate) fn validate_segment_metadata(
                 index_name
             )));
         }
-        covered_fragments |= fragment_bitmap.clone();
+        covered_fragments |= fragment_bitmap;
     }
 
-    Ok(())
+    Ok(covered_fragments)
 }
 
 /// Ask the scalar index plugin whether the parameters of `incoming` segments
