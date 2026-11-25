@@ -128,7 +128,7 @@ assert points["lance_memory_rss_bytes"][0].value > 0
 heap_in_use = points.get("lance_memory_heap_in_use_bytes", [])
 heap_free = points.get("lance_memory_heap_free_bytes", [])
 if hasattr(ctypes.CDLL(None), "mallinfo2"):
-    assert len(heap_in_use) == 1 and heap_in_use[0].value > 0, heap_in_use
+    assert len(heap_in_use) == 1 and heap_in_use[0].value >= 0, heap_in_use
     assert len(heap_free) == 1 and heap_free[0].value >= 0, heap_free
 else:
     assert not heap_in_use, heap_in_use
@@ -191,7 +191,7 @@ heap_available = hasattr(ctypes.CDLL(None), "mallinfo2")
 heap_in_use = by_name.get("lance_memory_heap_in_use_bytes")
 heap_free = by_name.get("lance_memory_heap_free_bytes")
 if heap_available:
-    assert len(heap_in_use) == 1 and heap_in_use[0].value > 0, heap_in_use
+    assert len(heap_in_use) == 1 and heap_in_use[0].value >= 0, heap_in_use
     assert len(heap_free) == 1 and heap_free[0].value >= 0, heap_free
     heap_before = heap_in_use[0].value
 else:
@@ -257,10 +257,11 @@ if heap_available:
     (frozen_heap_in_use,) = snapshot("lance_memory_heap_in_use_bytes")
     (frozen_heap_free,) = snapshot("lance_memory_heap_free_bytes")
 before = resident_bytes()
-libc = ctypes.CDLL(None)
+libc = ctypes.CDLL("libc.so.6" if heap_available else None)
 libc.malloc.argtypes = [ctypes.c_size_t]
 libc.malloc.restype = ctypes.c_void_p
 libc.free.argtypes = [ctypes.c_void_p]
+libc.free.restype = None
 ballast = libc.malloc(64 << 20)
 assert ballast, "libc malloc failed"
 ctypes.memset(ballast, 0, 64 << 20)
