@@ -387,9 +387,7 @@ impl Transaction {
     /// the only proof available: nothing maps a generation to the fragments its
     /// rows landed in, so covering the table as the transaction read it is how
     /// an index shows it covered those rows. Fragments appended since are a
-    /// later gap; live ones no newer than the read (possibly restored since)
-    /// must be covered too. Read-version progress counts only under the same
-    /// `dir_id`.
+    /// later gap. Read-version progress counts only under the same `dir_id`.
     ///
     /// Deriving rather than transmitting means no claim can go stale between
     /// inspection and commit, the answer survives rebase (`read_version` is
@@ -403,7 +401,6 @@ impl Transaction {
     /// making the table look more covered than it is.
     pub fn apply_mem_wal_index_coverage(
         final_indices: &mut [IndexMetadata],
-        final_fragments: &[Fragment],
         segments_before: &LogicalIndexSegments,
         read_version_state: Option<ReadVersionState<'_>>,
         new_version: u64,
@@ -467,18 +464,14 @@ impl Transaction {
             })
             .collect();
 
-        // Fragments live at the read, plus live ones no newer than it: ids are
-        // never reused, so those were live then or restored since.
+        // Every fragment live when the transaction read the table. An index
+        // spanning all of them holds every row compacted by then. An empty
+        // table is trivially covered: every compacted row has been deleted.
         let read_fragments: Option<RoaringBitmap> = read_version_state.map(|state| {
-            let read_max = state.manifest.max_fragment_id();
-            let restored = final_fragments
-                .iter()
-                .filter(|fragment| read_max.is_some_and(|max| fragment.id <= max));
             state
                 .manifest
                 .fragments
                 .iter()
-                .chain(restored)
                 .map(|fragment| fragment.id as u32)
                 .collect()
         });
@@ -1875,7 +1868,6 @@ impl Transaction {
         if let Some(segments_before) = mem_wal_segments_before.as_ref() {
             Self::apply_mem_wal_index_coverage(
                 &mut final_indices,
-                &final_fragments,
                 segments_before,
                 read_version_state,
                 new_version,
@@ -6898,38 +6890,16 @@ mod tests {
         }
 
         /// Drives the production path, so these exercise the real derivation.
-        /// The head carries the same fragments the transaction read.
         fn apply(
             after: &mut [IndexMetadata],
             before: &[IndexMetadata],
             read_frags: &[u32],
             read_indices: &[IndexMetadata],
         ) -> Result<()> {
-            apply_at_head(
-                after,
-                before,
-                read_frags,
-                manifest_with(read_frags),
-                read_indices,
-            )
-        }
-
-        /// [`apply`] where the head's fragments differ from the read version's.
-        fn apply_at_head(
-            after: &mut [IndexMetadata],
-            before: &[IndexMetadata],
-            head_frags: &[u32],
-            manifest: Manifest,
-            read_indices: &[IndexMetadata],
-        ) -> Result<()> {
-            let head: Vec<Fragment> = head_frags
-                .iter()
-                .map(|id| Fragment::new(*id as u64))
-                .collect();
+            let manifest = manifest_with(read_frags);
             let segments_before = Transaction::logical_index_segments(before);
             Transaction::apply_mem_wal_index_coverage(
                 after,
-                &head,
                 &segments_before,
                 Some(ReadVersionState {
                     manifest: &manifest,
@@ -7264,7 +7234,7 @@ mod tests {
             let before = table(&[0], uuid, progress_with_catchup(shard, 5, 5));
             let mut after = before.clone();
             let segments_before = Transaction::logical_index_segments(&before);
-            Transaction::apply_mem_wal_index_coverage(&mut after, &[], &segments_before, None, 2)
+            Transaction::apply_mem_wal_index_coverage(&mut after, &segments_before, None, 2)
                 .unwrap();
             assert_eq!(coverage_for(&after, "idx"), Some(compacted(shard, 5)));
         }
@@ -7285,7 +7255,8 @@ mod tests {
             assert_eq!(coverage_for(&after, "trained"), Some(compacted(shard, 10)));
         }
 
-        /// An emptied table is credited, so its SSTables can be retired.
+        /// Every row deleted leaves no fragments. Refusing to credit that
+        /// retained the SSTables forever, so a checkpoint never returned.
         #[test]
         fn an_emptied_table_is_credited() {
             let shard = Uuid::new_v4();
@@ -7293,31 +7264,6 @@ mod tests {
             let mut after = read.clone();
             apply(&mut after, &read, &[], &read).unwrap();
             assert_eq!(coverage_for(&after, "idx"), Some(compacted(shard, 5)));
-        }
-
-        /// A stale read rebased over a restore must cover the restored
-        /// fragment; one appended after the read (id 2) is a later gap.
-        #[rstest::rstest]
-        #[case::emptied_and_restored(&[], &[1], &[], None)]
-        #[case::partially_deleted_and_restored(&[0], &[0, 1], &[0], None)]
-        #[case::restored_fragment_covered(&[0], &[0, 1, 2], &[0, 1], Some(5))]
-        fn a_fragment_restored_since_the_read_must_be_covered(
-            #[case] read_frags: &[u32],
-            #[case] head_frags: &[u32],
-            #[case] idx_frags: &[u32],
-            #[case] credited: Option<u64>,
-        ) {
-            let shard = Uuid::new_v4();
-            let uuid = Uuid::new_v4();
-            let read = table(idx_frags, uuid, progress(shard, 5));
-            let mut read_manifest = manifest_with(read_frags);
-            read_manifest.max_fragment_id = Some(1);
-            let mut after = read.clone();
-            apply_at_head(&mut after, &read, head_frags, read_manifest, &read).unwrap();
-            assert_eq!(
-                coverage_for(&after, "idx"),
-                credited.map(|generation| compacted(shard, generation))
-            );
         }
 
         /// Progress read under a replaced MemWAL credits nothing, even with a
@@ -7507,7 +7453,7 @@ mod tests {
             let before = table(&[0, 1], Uuid::new_v4(), progress_with_catchup(shard, 5, 5));
             let mut after = table(&[0], Uuid::new_v4(), progress_with_catchup(shard, 5, 5));
             let segments_before = Transaction::logical_index_segments(&before);
-            Transaction::apply_mem_wal_index_coverage(&mut after, &[], &segments_before, None, 2)
+            Transaction::apply_mem_wal_index_coverage(&mut after, &segments_before, None, 2)
                 .unwrap();
             assert_eq!(coverage_for(&after, "idx"), None);
         }

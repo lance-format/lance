@@ -378,7 +378,7 @@ Two rules bound what a commit may record. It never credits more than its own `co
 
 Because the position is derived rather than transmitted, it cannot go stale between inspection and commit, and it survives rebase — `read_version` is fixed for a transaction's life, so what a commit can prove does not move, though a rebased attempt may record a different result because the head it commits against has changed. Any commit can earn a position, so an ordinary index build that happens to cover the table records catch-up as a side effect. A dedicated repair is still needed where no such commit occurs, or where an index does not yet span the table.
 
-Rows deleted by the read version do not stay deleted: a restore that lands before the commit can bring their fragments back. So the commit also requires every fragment live at the head it commits against whose id is no greater than the read version's `max_fragment_id`. Fragment ids are never reused, so such a fragment was either live at the read or restored since. A table whose rows have all been deleted is therefore credited only while nothing it read as deleted is live again.
+An index trivially covers a read version with no fragments, so a table whose rows have all been deleted is credited and its SSTables can be retired.
 
 The read version's `compacted_sstables` count only when its MemWAL index has the same `dir_id` as the one this commit publishes. A MemWAL disabled and set up again may reuse shard ids and generations, and the old WAL's progress says nothing about the new one's rows.
 
@@ -542,6 +542,10 @@ The garbage collector may remove obsolete SSTables after:
     Fencing detects a stalled writer when its put-if-not-exists for the next WAL entry collides with a newer writer's entry at the same position.
     If garbage collection has removed that WAL file, the stalled writer may write into empty space with an old `writer_epoch`.
     Implementations that garbage collect WAL files must compensate by re-checking fence state after WAL writes, partitioning WAL positions by epoch, or otherwise preventing stale writers from landing at positions that have been garbage collected.
+
+## Restore
+
+Restoring a table with a MemWAL to an earlier version is not supported. A restore rolls back the base table and the MemWAL index (`compacted_sstables`, `index_catchup`) but not shard state: SSTables, WAL entries and MemTables written since remain visible, and SSTables garbage-collected since may leave compacted rows unreadable. Catch-up credit likewise assumes rows a transaction read as deleted stay deleted.
 
 ## Reader Expectations
 

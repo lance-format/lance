@@ -387,7 +387,6 @@ impl<'a> ApplyState<'a> {
         if let Some(segments_before) = mem_wal_segments_before {
             Transaction::apply_mem_wal_index_coverage(
                 &mut indices,
-                &fragments,
                 segments_before,
                 read_version_state,
                 new_version,

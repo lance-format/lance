@@ -269,7 +269,6 @@ impl Dataset {
         let mut speculative = indices.to_vec();
         Transaction::apply_mem_wal_index_coverage(
             &mut speculative,
-            &self.manifest.fragments,
             &Transaction::logical_index_segments(indices),
             Some(ReadVersionState {
                 manifest: &self.manifest,

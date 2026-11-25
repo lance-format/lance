@@ -662,50 +662,6 @@ mod tests {
         )
     }
 
-    /// A stale handle that read the emptied table must not credit rows a
-    /// restore brought back.
-    #[tokio::test]
-    async fn a_stale_empty_read_does_not_credit_rows_restored_since() {
-        let shard = Uuid::new_v4();
-        let dataset = compacted_dataset(shard, 5).await;
-        let txn = Transaction::new(
-            dataset.manifest.version,
-            Operation::CreateIndex {
-                new_indices: vec![index_over("idx", &[])],
-                removed_indices: vec![],
-            },
-            None,
-        );
-        let mut dataset = CommitBuilder::new(Arc::new(dataset))
-            .execute(txn)
-            .await
-            .unwrap();
-        let before_delete = dataset.manifest.version;
-
-        dataset.delete("true").await.unwrap();
-        assert!(dataset.get_fragments().is_empty());
-        let stale_read = dataset.manifest.version;
-
-        let mut restored = dataset.checkout_version(before_delete).await.unwrap();
-        restored.restore().await.unwrap();
-
-        let dataset = CommitBuilder::new(Arc::new(restored))
-            .execute(update_config_txn(stale_read))
-            .await
-            .unwrap();
-        assert_eq!(dataset.count_rows(None).await.unwrap(), 10);
-        assert_eq!(catch_up_generation(&dataset, "idx").await, None);
-
-        // Without a restore, the emptied table is credited.
-        let mut emptied = dataset;
-        emptied.delete("true").await.unwrap();
-        let emptied = CommitBuilder::new(Arc::new(emptied.clone()))
-            .execute(update_config_txn(emptied.manifest.version))
-            .await
-            .unwrap();
-        assert_eq!(catch_up_generation(&emptied, "idx").await, Some(5));
-    }
-
     /// A stale handle that read under a replaced MemWAL credits nothing, even
     /// with a matching shard and generation.
     #[tokio::test]
