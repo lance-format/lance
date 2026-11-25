@@ -213,7 +213,7 @@ pub(in crate::index) async fn open_and_merge_segments(
     let remappers = segments
         .iter()
         .map(|segment| {
-            crate::index::local_fragment_addresses::LocalFragmentRemapper::compose(
+            crate::index::local_fragment_aliases::LocalFragmentRemapper::compose(
                 segment,
                 frag_reuse_index.clone(),
             )

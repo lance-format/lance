@@ -1623,4 +1623,250 @@ mod integration {
         assert_indexed_matches_full_scan(&ds, "s = 'row-3'").await;
         assert_indexed_matches_full_scan(&ds, "s = 'row-12'").await;
     }
+
+    async fn fts_query_row_addrs_and_values(
+        dataset: &Dataset,
+        query: &str,
+    ) -> Vec<(u64, i32, String)> {
+        use lance_index::scalar::FullTextSearchQuery;
+
+        let batches: Vec<RecordBatch> = dataset
+            .scan()
+            .with_row_address()
+            .full_text_search(FullTextSearchQuery::new(query.to_string()))
+            .unwrap()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let mut out = Vec::new();
+        for batch in batches {
+            let addrs = batch
+                .column_by_name(lance_core::ROW_ADDR)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<arrow_array::UInt64Array>()
+                .unwrap();
+            let is = batch
+                .column_by_name("i")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let ss = batch
+                .column_by_name("s")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            for row in 0..batch.num_rows() {
+                out.push((addrs.value(row), is.value(row), ss.value(row).to_string()));
+            }
+        }
+        out.sort();
+        out
+    }
+
+    async fn dataset_with_aliased_inverted_index(uri: &str, index_name: &str) -> Dataset {
+        use lance_index::scalar::InvertedIndexParams;
+
+        let mut ds = Dataset::write(
+            RecordBatchIterator::new(
+                vec![Ok(make_batch_with_prefix(0..5, "alpha"))],
+                test_schema(),
+            ),
+            uri,
+            None,
+        )
+        .await
+        .unwrap();
+        append_batch(&mut ds, make_batch_with_prefix(5..10, "beta")).await;
+        ds.create_index(
+            &["s"],
+            IndexType::Inverted,
+            Some(index_name.into()),
+            &InvertedIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+        let orig = idx_meta(&ds, index_name).await;
+
+        append_batch(&mut ds, make_batch_with_prefix(0..5, "alpha")).await;
+        append_batch(&mut ds, make_batch_with_prefix(5..10, "beta")).await;
+        ds.apply_commit(
+            Transaction::new(
+                ds.manifest.version,
+                Operation::Delete {
+                    updated_fragments: vec![],
+                    deleted_fragment_ids: vec![0, 1],
+                    predicate: "false".to_string(),
+                },
+                None,
+            ),
+            &Default::default(),
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+        let cur = idx_meta(&ds, index_name).await;
+        let mut aliased = orig;
+        aliased.dataset_version = ds.manifest.version;
+        aliased.fragment_bitmap = Some(RoaringBitmap::from_iter([2u32, 3]));
+        aliased.local_fragment_aliases = BTreeMap::from([(0, 2), (1, 3)]);
+        ds.apply_commit(
+            Transaction::new(
+                ds.manifest.version,
+                Operation::CreateIndex {
+                    new_indices: vec![aliased],
+                    removed_indices: vec![cur],
+                },
+                None,
+            ),
+            &Default::default(),
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+        ds
+    }
+
+    #[tokio::test]
+    async fn test_aliased_inverted_fts_query_matches_full_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let ds = dataset_with_aliased_inverted_index(uri, "s_fts").await;
+
+        let fts_rows = fts_query_row_addrs_and_values(&ds, "alpha").await;
+        let scan_rows = query_rows(&ds, Some("s LIKE 'alpha-%'"), false).await;
+        let fts_pairs: Vec<(i32, String)> =
+            fts_rows.iter().map(|(_, i, s)| (*i, s.clone())).collect();
+        assert_eq!(fts_pairs, scan_rows);
+        assert_eq!(fts_rows.len(), 5);
+        assert!(
+            fts_rows
+                .iter()
+                .all(|(addr, _, _)| RowAddress::from(*addr).fragment_id() == 2)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_aliased_inverted_non_transitive_compaction_does_not_double_translate() {
+        use lance_index::scalar::InvertedIndexParams;
+
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let mut ds = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(make_batch_with_prefix(0..5, "doc"))], test_schema()),
+            uri,
+            None,
+        )
+        .await
+        .unwrap();
+        append_batch(&mut ds, make_batch_with_prefix(0..5, "doc")).await;
+        ds.create_index(
+            &["s"],
+            IndexType::Inverted,
+            Some("s_fts".into()),
+            &InvertedIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+        let orig = idx_meta(&ds, "s_fts").await;
+
+        append_batch(&mut ds, make_batch_with_prefix(0..5, "doc")).await;
+        ds.apply_commit(
+            Transaction::new(
+                ds.manifest.version,
+                Operation::Delete {
+                    updated_fragments: vec![],
+                    deleted_fragment_ids: vec![0],
+                    predicate: "false".to_string(),
+                },
+                None,
+            ),
+            &Default::default(),
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+        let cur = idx_meta(&ds, "s_fts").await;
+        let mut chain = orig;
+        chain.dataset_version = ds.manifest.version;
+        chain.fragment_bitmap = Some(RoaringBitmap::from_iter([1u32, 2]));
+        chain.local_fragment_aliases = BTreeMap::from([(0, 1), (1, 2)]);
+        ds.apply_commit(
+            Transaction::new(
+                ds.manifest.version,
+                Operation::CreateIndex {
+                    new_indices: vec![chain],
+                    removed_indices: vec![cur],
+                },
+                None,
+            ),
+            &Default::default(),
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+
+        let before = fts_query_row_addrs_and_values(&ds, "doc").await;
+        assert_eq!(before.len(), 10);
+
+        compact_files(
+            &mut ds,
+            CompactionOptions {
+                target_rows_per_fragment: 20,
+                defer_index_remap: false,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            idx_meta(&ds, "s_fts")
+                .await
+                .local_fragment_aliases
+                .is_empty()
+        );
+        let after = fts_query_row_addrs_and_values(&ds, "doc").await;
+        assert_eq!(after.len(), 10);
+        let mut after_pairs: Vec<(i32, String)> =
+            after.iter().map(|(_, i, s)| (*i, s.clone())).collect();
+        after_pairs.sort();
+        assert_eq!(after_pairs, query_rows(&ds, None, false).await);
+    }
+
+    #[tokio::test]
+    async fn test_aliased_inverted_merge_existing_index_segments_keeps_uuid_and_aliases() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let ds = dataset_with_aliased_inverted_index(uri, "s_fts").await;
+        let before_meta = idx_meta(&ds, "s_fts").await;
+        let before_rows = fts_query_row_addrs_and_values(&ds, "alpha").await;
+
+        let merged = ds
+            .merge_existing_index_segments(vec![before_meta.clone()])
+            .await
+            .unwrap();
+        assert_eq!(merged.uuid, before_meta.uuid);
+        assert_eq!(
+            merged.local_fragment_aliases,
+            before_meta.local_fragment_aliases
+        );
+
+        let after_meta = idx_meta(&ds, "s_fts").await;
+        assert_eq!(after_meta.uuid, before_meta.uuid);
+        assert_eq!(
+            after_meta.local_fragment_aliases,
+            before_meta.local_fragment_aliases
+        );
+        let after_rows = fts_query_row_addrs_and_values(&ds, "alpha").await;
+        assert_eq!(after_rows, before_rows);
+    }
 }

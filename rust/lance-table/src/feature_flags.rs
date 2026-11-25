@@ -136,10 +136,10 @@ pub const FLAG_ROW_ADDR_INDICES: u64 = 1 << 18;
 /// (`DeletionFile.inline`) rather than in a file under `_deletions/`. A reader
 /// without this flag would look for a file that does not exist.
 pub const FLAG_INLINE_DELETIONS: u64 = 1 << 19;
-/// Reserved for local fragment aliases (`IndexMetadata.local_fragment_aliases`).
+/// Local fragment aliases (`IndexMetadata.local_fragment_aliases`).
 /// Both reader and writer bits are required while any retained index segment
-/// has aliases. The flag is non-sticky and unsupported until reader and
-/// index maintenance support lands.
+/// has aliases. The flag is non-sticky and currently supported for scalar
+/// indexes that implement batch row-id remapping.
 pub const FLAG_LOCAL_FRAGMENT_ALIASES: u64 = 1 << 20;
 /// Some fragment sets `DeletionFile.path` instead of deriving the path from `fragment_id`.
 /// The reader bit is set while any fragment sets `path`, and the writer bit remains set
@@ -609,11 +609,11 @@ fn supported_flags_when(
         FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS,
         frag_reuse_with_stable_row_ids_enabled,
     );
-    // Reserved, not implemented: see the flag's doc comment.
-    mark_supported(&mut supported, FLAG_FRAGMENT_TREE, false);
     mark_supported(&mut supported, FLAG_LOCAL_FRAGMENT_ALIASES, true);
     mark_supported(&mut supported, FLAG_ZONE_WRITE_SEEDS, true);
     mark_supported(&mut supported, FLAG_OBJECT_METADATA, true);
+    // Reserved, not implemented: see the flag's doc comment.
+    mark_supported(&mut supported, FLAG_FRAGMENT_TREE, false);
     supported
 }
 

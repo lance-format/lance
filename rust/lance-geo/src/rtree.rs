@@ -2719,4 +2719,52 @@ mod tests {
         };
         assert!(err.to_string().contains("disagree"), "{err}");
     }
+
+    #[rstest::rstest]
+    #[case::sync("sync")]
+    #[case::async_batch("async")]
+    #[tokio::test]
+    #[serial_test::serial(LANCE_DF_SPILL_POOL)]
+    async fn test_rtree_calculate_included_frags_remaps_row_addresses(#[case] remapping: &str) {
+        let point_type = PointType::new(Dimension::XY, Default::default());
+        let mut builder = PointBuilder::new(point_type);
+        builder.push_point(Some(&geo_types::point!(x: 0.0, y: 0.0)));
+        builder.push_point(Some(&geo_types::point!(x: 1.0, y: 1.0)));
+        builder.push_point(Some(&geo_types::point!(x: 2.0, y: 2.0)));
+        builder.push_point(Some(&geo_types::point!(x: 3.0, y: 3.0)));
+        let (index, _store, _tmpdir) = train_index(&builder.finish(), Some(4)).await;
+        let mut index = index.as_ref().clone();
+
+        // Without a remapper, all four points live in fragment 0.
+        assert_eq!(
+            index.calculate_included_frags().await.unwrap(),
+            RoaringBitmap::from_iter([0])
+        );
+
+        match remapping {
+            "sync" => {
+                let mapped: Vec<Option<u64>> = (0..4)
+                    .map(|id| {
+                        Some(
+                            RowAddress::new_from_parts(2 + (id / 2) as u32, (id % 2) as u32).into(),
+                        )
+                    })
+                    .collect();
+                index.frag_reuse_index = Some(Arc::new(FragReuseIndexHandle(Arc::new(
+                    FragReuseIndex::new(
+                        uuid::Uuid::new_v4(),
+                        vec![(0..4).zip(mapped).collect()],
+                        FragReuseIndexDetails { versions: vec![] },
+                    ),
+                ))));
+            }
+            "async" => index.batch_remapper = Some(Arc::new(TestRemapper)),
+            _ => unreachable!(),
+        }
+
+        assert_eq!(
+            index.calculate_included_frags().await.unwrap(),
+            RoaringBitmap::from_iter([2, 3])
+        );
+    }
 }

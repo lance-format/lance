@@ -23,7 +23,7 @@ use crate::dataset::optimize::RemappedIndex;
 use crate::dataset::optimize::remapping::RemapResult;
 use crate::index::frag_reuse;
 use crate::index::loading::DatasetIndexInternalExt;
-use crate::index::local_fragment_addresses::prepend_fragment_aliases;
+use crate::index::local_fragment_aliases::prepend_fragment_aliases;
 use crate::index::scalar::{
     IndexDetails, TrainingScanOptions, fetch_index_details, load_training_data,
 };

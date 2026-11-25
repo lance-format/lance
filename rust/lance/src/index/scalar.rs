@@ -986,20 +986,17 @@ pub(crate) async fn open_scalar_index_with_plan(
     let (frag_reuse_index, batch_remapping) = match batch_remapping {
         Some(batch_remapping) => (
             None,
-            Some(super::local_fragment_addresses::compose_batch_remapper(
+            Some(super::local_fragment_aliases::compose_batch_remapper(
                 index,
                 batch_remapping,
             )),
         ),
         None => (
-            super::local_fragment_addresses::LocalFragmentRemapper::compose(
-                index,
-                frag_reuse_index,
-            ),
+            super::local_fragment_aliases::LocalFragmentRemapper::compose(index, frag_reuse_index),
             None,
         ),
     };
-    let index_cache = match super::local_fragment_addresses::alias_cache_namespace(index) {
+    let index_cache = match super::local_fragment_aliases::alias_cache_namespace(index) {
         Some(namespace) => index_cache.with_key_prefix(&namespace),
         None => index_cache,
     };
@@ -1099,7 +1096,7 @@ pub(crate) async fn cached_scalar_index_container(
     let cache_id = super::frag_reuse::fri_cache_id(&resolved);
     let index_cache =
         super::frag_reuse::scoped_index_cache(dataset, &resolved).for_index(uuid, cache_id);
-    let index_cache = match super::local_fragment_addresses::alias_cache_namespace(index) {
+    let index_cache = match super::local_fragment_aliases::alias_cache_namespace(index) {
         Some(namespace) => index_cache.with_key_prefix(&namespace),
         None => index_cache,
     };
