@@ -11,9 +11,7 @@ use lance_namespace::models::{
 };
 use lance_table::io::commit::{ManifestNamingScheme, VERSIONS_DIR};
 use object_store::path::Path;
-use object_store::{
-    Error as ObjectStoreError, ObjectMeta, ObjectStore as _, ObjectStoreExt, PutMode, PutOptions,
-};
+use object_store::{Error as ObjectStoreError, ObjectMeta, ObjectStoreExt, PutMode, PutOptions};
 
 use super::DirectoryNamespace;
 
@@ -472,19 +470,27 @@ impl DirectoryNamespace {
         let list_is_ordered = self.object_store.list_is_lexically_ordered;
         let stream_matches_request =
             list_is_ordered && scheme == ManifestNamingScheme::V2 && descending;
-        // A V2 first entry only proves there is no V1 name sorting before the
-        // V2 names. A partly migrated table can still hold V1 names that sort
-        // after them (`19.manifest`, `2.manifest`), and those may be the
-        // newest versions, so the early stop also needs that region empty.
-        let early_stop_at = match limit.filter(|_| stream_matches_request) {
-            Some(n) if !self.has_v1_manifests_after_v2_names(table_path).await? => Some(n),
-            _ => None,
-        };
+        //
+        // A V2 first entry is taken to mean the table uses V2 names, the same
+        // assumption `resolve_version_from_listing` makes when a dataset is
+        // opened, so the latest-version lookup stays one bounded listing on
+        // every backend. A V1 manifest met while scanning (a partly migrated
+        // table, or one sorting between V2 names) drops the early stop, and
+        // the listing is collected and sorted numerically. V1 names that sort
+        // after every manifest the early stop reads are not seen; such a table
+        // should finish `migrate_manifest_paths_v2`.
+        let mut early_stop_at = limit.filter(|_| stream_matches_request);
 
         while early_stop_at.is_none_or(|n| table_versions.len() < n) {
             match stream.try_next().await.map_err(list_err)? {
-                Some((_, manifest)) if in_range(&manifest) => table_versions.push(manifest),
-                Some(_) => {}
+                Some((manifest_scheme, manifest)) => {
+                    if manifest_scheme != scheme {
+                        early_stop_at = None;
+                    }
+                    if in_range(&manifest) {
+                        table_versions.push(manifest);
+                    }
+                }
                 None => break,
             }
         }
@@ -501,45 +507,6 @@ impl DirectoryNamespace {
         }
 
         Ok(table_versions)
-    }
-
-    /// Whether a V1 manifest name sorts after every V2 name in `_versions/`.
-    ///
-    /// V2 names are 20-digit numbers no greater than `u64::MAX`, so on a
-    /// lexically ordered store the V1 names after them are the keys between
-    /// the largest V2 name and the first key that does not start with a digit
-    /// (detached manifests start with `d`). This lists from that offset and
-    /// stops at the first such key, which is a single request for a table
-    /// using only V2 names.
-    async fn has_v1_manifests_after_v2_names(&self, table_path: &Path) -> Result<bool> {
-        let versions_dir = table_path.clone().join(VERSIONS_DIR);
-        let after_v2 = ManifestNamingScheme::V2.manifest_path(table_path, 0);
-        let mut listing = self
-            .object_store
-            .inner
-            .list_with_offset(Some(&versions_dir), &after_v2);
-        while let Some(meta) = listing.try_next().await.map_err(|err| {
-            lance_core::Error::from(NamespaceError::Internal {
-                message: format!("Failed to list manifest files under '{versions_dir}': {err}"),
-            })
-        })? {
-            // Judge by the key's first segment under `_versions/`, so a nested
-            // staging key past the digit range ends the scan.
-            let entry = meta
-                .location
-                .prefix_match(&versions_dir)
-                .and_then(|mut parts| parts.next());
-            if !entry.is_some_and(|part| part.as_ref().starts_with(|c: char| c.is_ascii_digit())) {
-                return Ok(false);
-            }
-            if matches!(
-                Self::committed_manifest(table_path, &meta.location),
-                Some((ManifestNamingScheme::V1, _))
-            ) {
-                return Ok(true);
-            }
-        }
-        Ok(false)
     }
 
     /// Delete physical manifest files for the given table version ranges.

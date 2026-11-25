@@ -147,14 +147,15 @@ async fn test_list_versions_under_ordering_and_limit() {
 }
 
 /// A partly migrated table mixes V1 and V2 manifest names. On an ordered
-/// store, V1 names can sort before the V2 names (`10.manifest`) or after them
-/// (`19.manifest`, `2.manifest`), and either group may hold the newest
-/// versions. Every bounded descending walk must match the unbounded listing.
+/// store, a V1 name can sort before the V2 names (`10.manifest`), between
+/// them (a 19-digit version), or after them (`2.manifest`). Whenever the
+/// early stop can meet that V1 name, every bounded descending walk must
+/// match the unbounded listing.
 #[rstest::rstest]
 #[case::v2_prefix_v1_tail(&[2, 3], &[4, 5])]
 #[case::v1_sorts_before_v2(&[3, 10], &[11, 12])]
-// Versions 1 and 10-18 migrated; 2-9, 19 and 20 still V1.
-#[case::interrupted_migration(&[2, 3, 4, 5, 6, 7, 8, 9, 19, 20], &[1, 10, 11, 12, 13, 14, 15, 16, 17, 18])]
+// `1844674407370955161.manifest` sorts between the V2 names of 6 and 1.
+#[case::v1_between_v2_names(&[1_844_674_407_370_955_161], &[1, 6])]
 #[case::v2_only(&[], &[1, 2, 3, 4, 5])]
 #[tokio::test]
 async fn test_descending_pages_across_manifest_layouts(
@@ -386,22 +387,6 @@ async fn test_list_versions_under_early_stop_bounded_consumption() {
             let entries_listed = self.entries_listed.clone();
             self.target
                 .list(prefix)
-                .inspect(move |_| {
-                    entries_listed.fetch_add(1, Ordering::SeqCst);
-                })
-                .boxed()
-        }
-
-        // Forwarded, not left to the default (which lists everything and
-        // filters), so the count reflects what a real store returns.
-        fn list_with_offset(
-            &self,
-            prefix: Option<&Path>,
-            offset: &Path,
-        ) -> BoxStream<'static, OSResult<ObjectMeta>> {
-            let entries_listed = self.entries_listed.clone();
-            self.target
-                .list_with_offset(prefix, offset)
                 .inspect(move |_| {
                     entries_listed.fetch_add(1, Ordering::SeqCst);
                 })
