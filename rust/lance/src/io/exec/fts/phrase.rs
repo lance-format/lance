@@ -37,9 +37,8 @@ use super::corpus::SharedFtsScorer;
 use super::matches::scored_documents_batch;
 use super::query_tokens::{TokenizedQuery, fmt_tokenized_query, record_tokenized_query};
 use super::segments::{
-    cutoff_tie_unresolved, fts_row_addr_to_row_id, fts_segments_are_address_domain,
-    open_fts_segments, search_segments, segments_the_prefilter_may_match,
-    widen_limit_for_tie_rerank,
+    open_fts_segments, require_fts_address_domain, search_segments,
+    segments_the_prefilter_may_match,
 };
 use super::selection::{FtsIndexMetrics, FtsSegmentSelection};
 
@@ -533,7 +532,7 @@ impl ExecutionPlan for PhraseQueryExec {
                     &metrics.segment_bind_duration,
                 )
                 .await?;
-            let address_domain = fts_segments_are_address_domain(&ds, &segments)?;
+            require_fts_address_domain(&ds, &segments)?;
             let ds_for_scope = ds.clone();
             let indices =
                 open_fts_segments(&ds, &column, &segments, &metrics.index_metrics).await?;
@@ -549,7 +548,11 @@ impl ExecutionPlan for PhraseQueryExec {
                     external_mask,
                 },
                 &metrics_set,
-                address_domain,
+                // The whole FTS path is address domain
+                // (`require_fts_address_domain`), so the masks pushed into the
+                // index's own search are read in that domain.
+                /*address_domain=*/
+                true,
             )
             .await?;
             let deleted_fragments =
@@ -600,65 +603,22 @@ impl ExecutionPlan for PhraseQueryExec {
                 &indices,
                 &segments,
                 pre_filter.as_ref(),
-                address_domain,
                 &metrics,
             )
             .await;
-            let tokens = Arc::new(tokens);
-            let params = Arc::new(params);
-            let row_addr_to_row_id = fts_row_addr_to_row_id(&ds_for_scope, address_domain).await?;
-            // Selection ranks ties by stored row address, so any tie at the
-            // cutoff has to survive translation intact before `_rowid` order is
-            // restored; see `finalize_row_ids_and_scores`.
-            let requested_limit = params.limit;
-            let params =
-                match widen_limit_for_tie_rerank(requested_limit, row_addr_to_row_id.is_some()) {
-                    widened if widened != requested_limit => {
-                        let mut widened_params = params.as_ref().clone();
-                        widened_params.limit = widened;
-                        Arc::new(widened_params)
-                    }
-                    _ => params,
-                };
-            let mut documents = search_segments(
+            let documents = search_segments(
                 &indices,
-                tokens.clone(),
-                params.clone(),
+                Arc::new(tokens),
+                Arc::new(params),
                 lance_index::scalar::inverted::query::Operator::And,
-                pre_filter.clone(),
+                pre_filter,
                 metrics.clone(),
-                base_scorer.clone(),
+                base_scorer,
                 None,
             )
             .await?;
-            // A tie larger than the widened cap cannot be ordered from what came
-            // back, so complete it exactly.
-            let scores = documents
-                .iter()
-                .map(|document| document.score.0)
-                .collect::<Vec<_>>();
-            if cutoff_tie_unresolved(&scores, requested_limit, params.limit) {
-                let mut exact_params = params.as_ref().clone();
-                exact_params.limit = None;
-                documents = search_segments(
-                    &indices,
-                    tokens,
-                    Arc::new(exact_params),
-                    lance_index::scalar::inverted::query::Operator::And,
-                    pre_filter,
-                    metrics.clone(),
-                    base_scorer,
-                    None,
-                )
-                .await?;
-            }
             metrics.baseline_metrics.record_output(documents.len());
-            let batch = scored_documents_batch(
-                schema,
-                documents,
-                row_addr_to_row_id.as_deref(),
-                requested_limit,
-            )?;
+            let batch = scored_documents_batch(schema, documents)?;
             Ok::<_, DataFusionError>(batch)
         });
         Ok(Box::pin(RecordBatchStreamAdapter::new(

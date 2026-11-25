@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use arrow_schema::DataType;
+use arrow_schema::{DataType, Schema as ArrowSchema};
 use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::SendableRecordBatchStream;
@@ -13,7 +13,7 @@ use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use datafusion_physical_expr::{EquivalenceProperties, PhysicalExpr};
 use datafusion_physical_plan::ExecutionPlanProperties;
-use lance_core::{Error, ROW_ID, Result, datatypes::Schema as LanceSchema};
+use lance_core::{Error, ROW_ADDR, ROW_ID, Result, datatypes::Schema as LanceSchema};
 use lance_index::scalar::inverted::DocumentGranularity;
 use lance_index::scalar::registry::VALUE_COLUMN_NAME;
 
@@ -63,13 +63,17 @@ impl FtsDocumentExec {
     ) -> Result<Self> {
         let resolved = resolve_fts_field(source_schema, column, document_granularity)?;
         let input_schema = input.schema();
-        let row_id = input_schema.field_with_name(ROW_ID).map_err(|_| {
-            Error::invalid_input("FTS document input is missing _rowid".to_string())
+        let identity = fts_document_identity_column(&input_schema).ok_or_else(|| {
+            Error::invalid_input("FTS document input is missing _rowaddr or _rowid".to_string())
         })?;
-        if row_id.data_type() != &DataType::UInt64 {
+        let identity = input_schema
+            .field_with_name(identity)
+            .expect("identity column was just resolved from this schema");
+        if identity.data_type() != &DataType::UInt64 {
             return Err(Error::invalid_input(format!(
-                "FTS document input _rowid must be UInt64, got {}",
-                row_id.data_type()
+                "FTS document input {} must be UInt64, got {}",
+                identity.name(),
+                identity.data_type()
             )));
         }
         let source = source_schema
@@ -108,10 +112,16 @@ impl FtsDocumentExec {
     }
 
     pub(crate) fn new(input: Arc<dyn ExecutionPlan>, resolved: ResolvedFtsField) -> Self {
-        // This node is only used on the flat/residual query-time path
-        // (`dataset::scanner::fts`), which always scans and must keep
-        // emitting genuine row ids -- never row addresses.
-        let schema = fts_document_schema(resolved.coordinate_rank(), ROW_ID);
+        // Whichever identity the input carries is the one the output keeps, so
+        // `transform_fts_document_stream`'s choice and this declared schema
+        // cannot disagree. The flat/residual FTS path scans `_rowaddr`, since
+        // its rows are ranked against index hits on the identifier the
+        // postings store; a vector plan re-ranked by FTS reaches here with
+        // whatever identity its own take projected.
+        let schema = fts_document_schema(
+            resolved.coordinate_rank(),
+            fts_document_identity_column(&input.schema()).unwrap_or(ROW_ADDR),
+        );
         let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(schema),
             input.output_partitioning().clone(),
@@ -123,6 +133,21 @@ impl FtsDocumentExec {
             resolved,
             properties,
         }
+    }
+}
+
+/// The identity column an FTS document stream carries, preferring `_rowaddr`
+/// when a schema somehow has both; `None` when it has neither.
+///
+/// Mirrors the choice `transform_fts_document_stream` makes over the same
+/// schema, so the declared output schema matches what the stream emits.
+fn fts_document_identity_column(schema: &ArrowSchema) -> Option<&'static str> {
+    if schema.column_with_name(ROW_ADDR).is_some() {
+        Some(ROW_ADDR)
+    } else if schema.column_with_name(ROW_ID).is_some() {
+        Some(ROW_ID)
+    } else {
+        None
     }
 }
 
@@ -386,7 +411,7 @@ mod tests {
     }
 
     #[rstest]
-    #[case::missing_row_id(vec![("text", DataType::Utf8)], "missing _rowid")]
+    #[case::missing_identity(vec![("text", DataType::Utf8)], "missing _rowaddr or _rowid")]
     #[case::wrong_row_id(vec![("text", DataType::Utf8), (ROW_ID, DataType::Int64)], "_rowid must be UInt64")]
     #[case::missing_source(vec![("other", DataType::Utf8), (ROW_ID, DataType::UInt64)], "missing root column")]
     #[case::wrong_source(vec![("text", DataType::Int32), (ROW_ID, DataType::UInt64)], "must have source type")]

@@ -150,8 +150,14 @@ fn row_id(row: u32, stable: bool) -> u64 {
     if stable {
         u64::from(row)
     } else {
-        RowAddress::new_from_parts(row / 2, row % 2).into()
+        row_addr(row)
     }
+}
+
+/// The fixture's physical address for `row`, which is what an FTS node emits
+/// whether or not the dataset has stable row ids (two rows per fragment).
+fn row_addr(row: u32) -> u64 {
+    RowAddress::new_from_parts(row / 2, row % 2).into()
 }
 
 #[rstest]
@@ -240,7 +246,7 @@ async fn bm25f_plan_roundtrip_partial_coverage(
                 assert_eq!(coverage[0].fragments, RoaringBitmap::from_iter([2]));
                 assert_eq!(coverage[1].fragments, RoaringBitmap::from_iter([1, 2]));
                 let expected_stale = if overlay {
-                    RowAddrTreeMap::from_iter([row_id(1, stable), row_id(2, stable)])
+                    RowAddrTreeMap::from_iter([row_addr(1), row_addr(2)])
                 } else {
                     RowAddrTreeMap::new()
                 };
@@ -327,8 +333,8 @@ async fn bm25f_plan_roundtrip_indexed_overrides(#[values(false, true)] stable: b
     assert_eq!(actual.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
     let result = actual.iter().find(|batch| batch.num_rows() > 0).unwrap();
     assert_eq!(
-        result[ROW_ID].as_primitive::<UInt64Type>().value(0),
-        row_id(3, stable)
+        result[ROW_ADDR].as_primitive::<UInt64Type>().value(0),
+        row_addr(3)
     );
     let override_scorer = CombinedFieldsBM25Scorer::new(
         100,
@@ -357,7 +363,10 @@ async fn bm25f_plan_roundtrip_whole_corpus() {
     )
     .await;
     let mut scanner = dataset.scan();
-    scanner.project(&["title", "body"]).unwrap().with_row_id();
+    scanner
+        .project(&["title", "body"])
+        .unwrap()
+        .with_row_address();
     let flat = FlatCombinedFieldsExec::try_new(
         Arc::new(dataset),
         CombinedFieldsQuery::try_new("aa".into(), vec!["title".into(), "body".into()]).unwrap(),
@@ -382,7 +391,7 @@ async fn bm25f_plan_roundtrip_whole_corpus() {
     assert_eq!(actual.iter().map(RecordBatch::num_rows).sum::<usize>(), 4);
     for batch in actual {
         for row in 0..batch.num_rows() {
-            let address = RowAddress::from(batch[ROW_ID].as_primitive::<UInt64Type>().value(row));
+            let address = RowAddress::from(batch[ROW_ADDR].as_primitive::<UInt64Type>().value(row));
             let id = (address.fragment_id() * 2 + address.row_offset()) as usize;
             assert!(
                 (batch["_score"].as_primitive::<Float32Type>().value(row) - oracle[id].unwrap())
@@ -447,7 +456,7 @@ async fn bm25f_plan_roundtrip_list_documents() {
 
 #[rstest]
 #[case::coverage("coverage")]
-#[case::missing_rowid("missing _rowid")]
+#[case::missing_row_addr("missing _rowaddr")]
 #[case::rowid_type("must be UInt64")]
 #[case::missing_column("missing column 'body'")]
 #[case::column_type("incompatible type")]
@@ -460,7 +469,7 @@ async fn bm25f_plan_rejects_invalid_input(#[case] expected: &str) {
     )
     .await;
     let mut fields = vec![
-        ArrowField::new(ROW_ID, DataType::UInt64, true),
+        ArrowField::new(ROW_ADDR, DataType::UInt64, true),
         ArrowField::new("title", DataType::Utf8, true),
         ArrowField::new("body", DataType::Utf8, true),
     ];
@@ -469,11 +478,11 @@ async fn bm25f_plan_rejects_invalid_input(#[case] expected: &str) {
         "coverage" => {
             coverage.pop();
         }
-        "missing _rowid" => {
+        "missing _rowaddr" => {
             fields.remove(0);
         }
         "must be UInt64" => {
-            fields[0] = ArrowField::new(ROW_ID, DataType::Int32, true);
+            fields[0] = ArrowField::new(ROW_ADDR, DataType::Int32, true);
         }
         "missing column 'body'" => {
             fields.pop();
@@ -505,7 +514,7 @@ async fn row_scores(plan: Arc<dyn ExecutionPlan>) -> Vec<(u64, f32)> {
         .await
         .iter()
         .flat_map(|batch| {
-            let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>();
+            let row_ids = batch[ROW_ADDR].as_primitive::<UInt64Type>();
             let scores = batch["_score"].as_primitive::<Float32Type>();
             (0..batch.num_rows())
                 .map(|row| (row_ids.value(row), scores.value(row)))

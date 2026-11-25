@@ -31,9 +31,9 @@ use datafusion_physical_expr::expressions::{Column, Literal};
 use datafusion_physical_expr::{Partitioning, PhysicalExpr, create_physical_expr};
 use datafusion_physical_plan::empty::EmptyExec;
 use datafusion_physical_plan::projection::ProjectionExec;
-use lance_core::ROW_ID;
 use lance_core::datatypes::OnMissing;
 use lance_core::error::LanceOptionExt;
+use lance_core::{ROW_ADDR, ROW_ID};
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::scalar::expression::ScalarIndexExpr;
 use lance_index::scalar::inverted::DOC_INDEX_COL;
@@ -116,9 +116,13 @@ impl Scanner {
                     if fts_plan.schema().field_with_name(DOC_INDEX_COL).is_ok() {
                         fts_plan = self.deduplicate_fts_filter_rows(fts_plan)?;
                     }
+                    // An FTS plan identifies its hits by row address; the flat
+                    // KNN above ranks on `_rowid`, so the take that fetches the
+                    // vectors supplies one from the addresses it reads by.
                     let projection = self
                         .dataset
                         .empty_projection()
+                        .with_row_id()
                         .union_column(&query.column, OnMissing::Error)?;
                     let plan = self.take(fts_plan, projection)?;
 
@@ -1257,18 +1261,28 @@ impl Scanner {
             flat_dist
         };
 
+        // The second key only has to make the order total, so it is whichever
+        // identity the input carries: `_rowid` for a scan, `_rowaddr` for rows
+        // that reached here from an FTS plan, which ranks on the identifier its
+        // postings store.
+        let knn_schema = knn_plan.schema();
+        let identity = if knn_schema.column_with_name(ROW_ID).is_some() {
+            ROW_ID
+        } else {
+            ROW_ADDR
+        };
         // Use DataFusion's [SortExec] for Top-K search
         let sort = SortExec::new(
             [
                 PhysicalSortExpr {
-                    expr: expressions::col(DIST_COL, knn_plan.schema().as_ref())?,
+                    expr: expressions::col(DIST_COL, knn_schema.as_ref())?,
                     options: SortOptions {
                         descending: false,
                         nulls_first: false,
                     },
                 },
                 PhysicalSortExpr {
-                    expr: expressions::col(ROW_ID, knn_plan.schema().as_ref())?,
+                    expr: expressions::col(identity, knn_schema.as_ref())?,
                     options: SortOptions {
                         descending: false,
                         nulls_first: false,

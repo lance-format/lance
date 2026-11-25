@@ -44,7 +44,7 @@ async fn explicit_empty_segments_score_only_input_with_index_tokenizer(#[case] i
             Utf8,
             ["hello orange", "hello purple", "HELLO silver"]
         ),
-        ("_rowid", UInt64, [10, 11, 12])
+        ("_rowaddr", UInt64, [10, 11, 12])
     )
     .unwrap();
     let input =
@@ -67,7 +67,7 @@ async fn explicit_empty_segments_score_only_input_with_index_tokenizer(#[case] i
     for _ in 0..2 {
         let batches = collect(exec.clone(), Default::default()).await.unwrap();
         let batch = arrow::compute::concat_batches(&exec.schema(), &batches).unwrap();
-        let mut ids = batch["_rowid"]
+        let mut ids = batch["_rowaddr"]
             .as_any()
             .downcast_ref::<UInt64Array>()
             .unwrap()
@@ -157,7 +157,7 @@ async fn explicit_empty_segments_retain_complete_persisted_tokenizer(
     let corpus = RecordBatch::try_from_iter([
         ("text", text),
         (
-            "_rowid",
+            "_rowaddr",
             Arc::new(UInt64Array::from(vec![10, 11, 12])) as arrow_array::ArrayRef,
         ),
     ])
@@ -180,7 +180,7 @@ async fn explicit_empty_segments_retain_complete_persisted_tokenizer(
     for _ in 0..2 {
         let batches = collect(exec.clone(), Default::default()).await.unwrap();
         let result = arrow::compute::concat_batches(&exec.schema(), &batches).unwrap();
-        let mut actual_ids = result["_rowid"]
+        let mut actual_ids = result["_rowaddr"]
             .as_primitive::<arrow_array::types::UInt64Type>()
             .values()
             .to_vec();

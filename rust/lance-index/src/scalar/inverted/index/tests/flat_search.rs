@@ -2,23 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use super::*;
-use lance_core::ROW_ADDR;
-
-/// Training always scans row addresses now; relabel a hand-built `_rowid`
-/// fixture (shared with the flat/brute-force reference search below, whose
-/// own contract is an arbitrary caller-supplied batch literally named
-/// `_rowid`) before feeding it to the real indexed builder.
-fn as_row_addr_training_input(batch: &RecordBatch) -> RecordBatch {
-    let schema = batch.schema();
-    let row_id_idx = schema.index_of(ROW_ID).unwrap();
-    let mut fields = schema.fields().to_vec();
-    fields[row_id_idx] = Arc::new(Field::new(
-        ROW_ADDR,
-        DataType::UInt64,
-        fields[row_id_idx].is_nullable(),
-    ));
-    RecordBatch::try_new(Arc::new(Schema::new(fields)), batch.columns().to_vec()).unwrap()
-}
+use lance_core::{ROW_ADDR, ROW_ADDR_FIELD};
 
 #[rstest::rstest]
 #[case::or(Operator::Or, None, vec![0, 1, 2])]
@@ -48,7 +32,7 @@ async fn flat_bm25_batches_preserve_full_corpus_scores(
     .collect::<Vec<_>>();
     let mut batch = arrow_array::record_batch!(
         ("text", Utf8, docs),
-        ("_rowid", UInt64, vec![0_u64, 1, 2, 3, 4, 5])
+        ("_rowaddr", UInt64, vec![0_u64, 1, 2, 3, 4, 5])
     )
     .unwrap();
     if document_granularity.is_list_element() {
@@ -103,7 +87,7 @@ async fn flat_bm25_batches_preserve_full_corpus_scores(
     let mut actual_rows = Vec::new();
     for batch in batches {
         assert_eq!(batch.num_rows(), 1);
-        let row = batch[ROW_ID].as_primitive::<UInt64Type>().value(0);
+        let row = batch[ROW_ADDR].as_primitive::<UInt64Type>().value(0);
         actual_rows.push(row);
         if document_granularity.is_list_element() {
             let coordinates = batch.column(1).as_list::<i32>().value(0);
@@ -138,7 +122,7 @@ async fn flat_bm25_batches_preserve_full_corpus_scores(
 async fn flat_bm25_empty_input_preserves_base_statistics(#[values(false, true)] empty_batch: bool) {
     let batch = arrow_array::record_batch!(
         ("text", Utf8, Vec::<String>::new()),
-        ("_rowid", UInt64, Vec::<u64>::new())
+        ("_rowaddr", UInt64, Vec::<u64>::new())
     )
     .unwrap();
     let input = Box::pin(RecordBatchStreamAdapter::new(
@@ -192,7 +176,7 @@ async fn test_ngram_phrase_preserves_positions_indexed_and_flat(
         .num_workers(1);
     let batch = arrow_array::record_batch!(
         ("doc", Utf8, vec![Some("abcd"), Some("zz"), None, Some("")]),
-        ("_rowid", UInt64, vec![1_u64, 2, 3, 4])
+        ("_rowaddr", UInt64, vec![1_u64, 2, 3, 4])
     )
     .unwrap();
     let tmpdir = TempObjDir::default();
@@ -201,12 +185,11 @@ async fn test_ngram_phrase_preserves_positions_indexed_and_flat(
         tmpdir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
-    let training_batch = as_row_addr_training_input(&batch);
     InvertedIndexBuilder::new(params.clone())
         .update(
             Box::pin(RecordBatchStreamAdapter::new(
-                training_batch.schema(),
-                stream::iter(vec![Ok(training_batch.clone())]),
+                batch.schema(),
+                stream::iter(vec![Ok(batch.clone())]),
             )),
             store.as_ref(),
             None,
@@ -280,7 +263,7 @@ async fn test_ngram_phrase_preserves_positions_indexed_and_flat(
     let batches: Vec<_> = result.try_collect().await.unwrap();
     let scored_flat_rows = batches
         .iter()
-        .flat_map(|batch| batch[ROW_ID].as_primitive::<UInt64Type>().values())
+        .flat_map(|batch| batch[ROW_ADDR].as_primitive::<UInt64Type>().values())
         .copied()
         .collect::<Vec<_>>();
     assert_eq!(
@@ -327,7 +310,7 @@ async fn test_ngram_match_requires_all_terms_indexed_and_flat(
                 Some("")
             ]
         ),
-        ("_rowid", UInt64, (1..=9).collect::<Vec<u64>>())
+        ("_rowaddr", UInt64, (1..=9).collect::<Vec<u64>>())
     )
     .unwrap();
     let tmpdir = TempObjDir::default();
@@ -336,12 +319,11 @@ async fn test_ngram_match_requires_all_terms_indexed_and_flat(
         tmpdir.clone(),
         Arc::new(LanceCache::no_cache()),
     ));
-    let training_batch = as_row_addr_training_input(&batch);
     InvertedIndexBuilder::new(params.clone())
         .update(
             Box::pin(RecordBatchStreamAdapter::new(
-                training_batch.schema(),
-                stream::iter(vec![Ok(training_batch.clone())]),
+                batch.schema(),
+                stream::iter(vec![Ok(batch.clone())]),
             )),
             store.as_ref(),
             None,
@@ -423,7 +405,7 @@ async fn test_ngram_match_requires_all_terms_indexed_and_flat(
             None,
         )
         .unwrap();
-        let mut flat_row_ids = result[ROW_ID]
+        let mut flat_row_ids = result[ROW_ADDR]
             .as_primitive::<UInt64Type>()
             .values()
             .to_vec();
@@ -480,7 +462,11 @@ async fn test_document_lengths_indexed_and_flat(
     docs.extend([None, Some("")]);
     let batch = arrow_array::record_batch!(
         ("doc", Utf8, docs.clone()),
-        ("_rowid", UInt64, (0..docs.len() as u64).collect::<Vec<_>>())
+        (
+            "_rowaddr",
+            UInt64,
+            (0..docs.len() as u64).collect::<Vec<_>>()
+        )
     )
     .unwrap();
     let query_tokens = Arc::new(Tokens::new(vec!["get".to_string()], DocType::Text));
@@ -536,12 +522,11 @@ async fn test_document_lengths_indexed_and_flat(
         ));
         let mut builder =
             InvertedIndexBuilder::new(params.clone().with_position(with_position).num_workers(1));
-        let training_batch = as_row_addr_training_input(&batch);
         builder
             .update(
                 Box::pin(RecordBatchStreamAdapter::new(
-                    training_batch.schema(),
-                    stream::iter(vec![Ok(training_batch.clone())]),
+                    batch.schema(),
+                    stream::iter(vec![Ok(batch.clone())]),
                 )),
                 store.as_ref(),
                 None,
@@ -564,7 +549,7 @@ async fn flat_bm25_search_stream_with_metrics_records_elapsed_compute() {
 
     // Tiny stream of one batch containing the query term in two rows.
     let schema = Arc::new(Schema::new(vec![
-        ROW_ID_FIELD.clone(),
+        ROW_ADDR_FIELD.clone(),
         Field::new("text", DataType::Utf8, false),
     ]));
     let batch = RecordBatch::try_new(
@@ -619,7 +604,7 @@ async fn flat_bm25_search_stream_with_metrics_records_elapsed_compute() {
 async fn flat_bm25_phrase_honors_positions_slop_and_repeated_terms() {
     async fn search(query: &str, slop: u32) -> Vec<u64> {
         let schema = Arc::new(Schema::new(vec![
-            ROW_ID_FIELD.clone(),
+            ROW_ADDR_FIELD.clone(),
             Field::new("text", DataType::Utf8, false),
         ]));
         let batch = RecordBatch::try_new(
@@ -665,7 +650,7 @@ async fn flat_bm25_phrase_honors_positions_slop_and_repeated_terms() {
             .await
             .unwrap()
             .iter()
-            .flat_map(|batch| batch[ROW_ID].as_primitive::<UInt64Type>().values())
+            .flat_map(|batch| batch[ROW_ADDR].as_primitive::<UInt64Type>().values())
             .copied()
             .collect()
     }
@@ -678,7 +663,7 @@ async fn flat_bm25_phrase_honors_positions_slop_and_repeated_terms() {
 #[test]
 fn flat_full_text_search_supports_phrase_queries() {
     let schema = Arc::new(Schema::new(vec![
-        ROW_ID_FIELD.clone(),
+        ROW_ADDR_FIELD.clone(),
         Field::new("text", DataType::Utf8, false),
     ]));
     let batch = RecordBatch::try_new(
@@ -709,7 +694,7 @@ fn flat_full_text_search_supports_phrase_queries() {
 #[tokio::test]
 async fn flat_bm25_skips_zero_token_documents_from_corpus_stats() {
     let schema = Arc::new(Schema::new(vec![
-        ROW_ID_FIELD.clone(),
+        ROW_ADDR_FIELD.clone(),
         Field::new("text", DataType::Utf8, true),
     ]));
     let batch = RecordBatch::try_new(
@@ -749,7 +734,9 @@ async fn flat_bm25_skips_zero_token_documents_from_corpus_stats() {
 
     assert_eq!(counted_input.num_rows(), 1);
     assert_eq!(
-        counted_input[ROW_ID].as_primitive::<UInt64Type>().values(),
+        counted_input[ROW_ADDR]
+            .as_primitive::<UInt64Type>()
+            .values(),
         &[5]
     );
     let scorer = initialize_scorer(None, query_tokens.as_ref(), &counted_input);
@@ -768,7 +755,7 @@ async fn flat_bm25_skips_zero_token_documents_from_corpus_stats() {
 async fn flat_bm25_preserves_zero_token_list_element_documents() {
     let coordinate_column = doc_index_storage_column(0);
     let schema = Arc::new(Schema::new(vec![
-        ROW_ID_FIELD.clone(),
+        ROW_ADDR_FIELD.clone(),
         Field::new(&coordinate_column, DataType::UInt32, false),
         Field::new("text", DataType::Utf8, true),
     ]));
@@ -831,7 +818,7 @@ async fn flat_bm25_search_uses_full_document_length_for_normalization(
     #[case] long: &str,
 ) {
     let schema = Arc::new(Schema::new(vec![
-        ROW_ID_FIELD.clone(),
+        ROW_ADDR_FIELD.clone(),
         Field::new("text", DataType::Utf8, false),
     ]));
     let batch = RecordBatch::try_new(
@@ -862,7 +849,7 @@ async fn flat_bm25_search_uses_full_document_length_for_normalization(
     .unwrap();
     let batches: Vec<_> = result_stream.try_collect().await.unwrap();
     let scored = arrow::compute::concat_batches(&FTS_SCHEMA, &batches).unwrap();
-    let row_ids = scored[ROW_ID].as_primitive::<UInt64Type>();
+    let row_ids = scored[ROW_ADDR].as_primitive::<UInt64Type>();
     let scores = scored[SCORE_COL].as_primitive::<Float32Type>();
 
     assert_eq!(row_ids.values(), &[0, 1]);
@@ -897,7 +884,7 @@ async fn flat_bm25_search_treats_string_lists_as_row_documents() {
 
     let docs = Arc::new(docs_builder.finish()) as ArrayRef;
     let schema = Arc::new(Schema::new(vec![
-        ROW_ID_FIELD.clone(),
+        ROW_ADDR_FIELD.clone(),
         Field::new("text", docs.data_type().clone(), true),
     ]));
     let batch = RecordBatch::try_new(
@@ -930,7 +917,7 @@ async fn flat_bm25_search_treats_string_lists_as_row_documents() {
     .unwrap();
     let batches: Vec<_> = result_stream.try_collect().await.unwrap();
     let scored = arrow::compute::concat_batches(&FTS_SCHEMA, &batches).unwrap();
-    let row_ids = scored[ROW_ID].as_primitive::<UInt64Type>();
+    let row_ids = scored[ROW_ADDR].as_primitive::<UInt64Type>();
 
     assert_eq!(row_ids.values(), &[0]);
 }
@@ -938,7 +925,7 @@ async fn flat_bm25_search_treats_string_lists_as_row_documents() {
 #[tokio::test]
 async fn flat_bm25_search_code_and_uses_position_groups() {
     let schema = Arc::new(Schema::new(vec![
-        ROW_ID_FIELD.clone(),
+        ROW_ADDR_FIELD.clone(),
         Field::new("code", DataType::Utf8, false),
     ]));
     let batch = RecordBatch::try_new(
@@ -979,7 +966,7 @@ async fn flat_bm25_search_code_and_uses_position_groups() {
 
     let batches: Vec<_> = result_stream.try_collect().await.unwrap();
     let scored = arrow::compute::concat_batches(&FTS_SCHEMA, &batches).unwrap();
-    let mut row_ids = scored[ROW_ID]
+    let mut row_ids = scored[ROW_ADDR]
         .as_primitive::<UInt64Type>()
         .values()
         .to_vec();
@@ -1016,7 +1003,11 @@ async fn flat_phrase_code_uses_position_groups(
         Some(""),
     ];
     let batch = arrow_array::record_batch!(
-        ("_rowid", UInt64, (0..docs.len() as u64).collect::<Vec<_>>()),
+        (
+            "_rowaddr",
+            UInt64,
+            (0..docs.len() as u64).collect::<Vec<_>>()
+        ),
         ("code", Utf8, docs.to_vec())
     )
     .unwrap();
@@ -1061,7 +1052,7 @@ async fn flat_phrase_code_uses_position_groups(
     let batches = result_stream.try_collect::<Vec<_>>().await.unwrap();
     let scored = arrow::compute::concat_batches(&FTS_SCHEMA, &batches).unwrap();
     assert_eq!(
-        scored[ROW_ID].as_primitive::<UInt64Type>().values(),
+        scored[ROW_ADDR].as_primitive::<UInt64Type>().values(),
         expected
     );
 }
@@ -1069,7 +1060,7 @@ async fn flat_phrase_code_uses_position_groups(
 #[tokio::test]
 async fn flat_bm25_search_code_and_counts_repeated_subwords() {
     let schema = Arc::new(Schema::new(vec![
-        ROW_ID_FIELD.clone(),
+        ROW_ADDR_FIELD.clone(),
         Field::new("code", DataType::Utf8, false),
     ]));
     let batch = RecordBatch::try_new(
@@ -1105,7 +1096,7 @@ async fn flat_bm25_search_code_and_counts_repeated_subwords() {
 
     let batches: Vec<_> = result_stream.try_collect().await.unwrap();
     let scored = arrow::compute::concat_batches(&FTS_SCHEMA, &batches).unwrap();
-    let row_ids = scored[ROW_ID].as_primitive::<UInt64Type>().values();
+    let row_ids = scored[ROW_ADDR].as_primitive::<UInt64Type>().values();
 
     assert_eq!(row_ids, &[0]);
 }
@@ -1121,7 +1112,7 @@ async fn flat_bm25_search_fuzzy_bounded_and_exact_parity() {
         "unrelated doc",
     ];
     let schema = Arc::new(Schema::new(vec![
-        ROW_ID_FIELD.clone(),
+        ROW_ADDR_FIELD.clone(),
         Field::new("text", DataType::Utf8, false),
     ]));
     let batch = RecordBatch::try_new(
@@ -1188,7 +1179,7 @@ async fn flat_bm25_search_fuzzy_bounded_and_exact_parity() {
         .await
         .unwrap();
     assert_eq!(
-        capped[ROW_ID].as_primitive::<UInt64Type>().values(),
+        capped[ROW_ADDR].as_primitive::<UInt64Type>().values(),
         &[0, 1],
         "max_expansions=2 must keep only lex-smallest ['aapa', 'abpa']"
     );
@@ -1202,7 +1193,7 @@ async fn flat_bm25_search_fuzzy_bounded_and_exact_parity() {
         .await
         .unwrap();
     assert_eq!(
-        prefixed[ROW_ID].as_primitive::<UInt64Type>().values(),
+        prefixed[ROW_ADDR].as_primitive::<UInt64Type>().values(),
         &[3, 4]
     );
 
@@ -1211,7 +1202,7 @@ async fn flat_bm25_search_fuzzy_bounded_and_exact_parity() {
         .await
         .unwrap();
     assert_eq!(
-        and_ok[ROW_ID].as_primitive::<UInt64Type>().values(),
+        and_ok[ROW_ADDR].as_primitive::<UInt64Type>().values(),
         &[3, 4]
     );
 
@@ -1225,7 +1216,7 @@ async fn flat_bm25_search_fuzzy_bounded_and_exact_parity() {
         .await
         .unwrap();
     assert_eq!(
-        auto_res[ROW_ID].as_primitive::<UInt64Type>().values(),
+        auto_res[ROW_ADDR].as_primitive::<UInt64Type>().values(),
         &[0, 1, 2, 3, 4]
     );
 

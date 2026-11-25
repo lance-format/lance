@@ -29,7 +29,6 @@ use crate::io::exec::utils::{
     PreFilterMasks, build_prefilter_in_domain, build_prefilter_restricted_to_fragments_in_domain,
 };
 use lance_index::prefilter::PreFilter;
-use lance_index::scalar::ScalarIndex;
 use lance_index::scalar::inverted::document_tokenizer::LanceTokenizer;
 use lance_index::scalar::inverted::query::{
     CombinedFieldsQuery, FtsSearchParams, Tokens, try_collect_query_tokens,
@@ -44,9 +43,7 @@ use tracing::instrument;
 use super::corpus::SharedFtsScorer;
 use super::query_tokens::{TokenizedQuery, fmt_tokenized_query, record_tokenized_query};
 use super::segments::{
-    combined_columns_the_prefilter_may_match, cutoff_tie_unresolved, finalize_row_ids_and_scores,
-    fts_row_addr_to_row_id, fts_segments_are_address_domain, open_fts_segments,
-    widen_limit_for_tie_rerank,
+    combined_columns_the_prefilter_may_match, open_fts_segments, require_fts_address_domain,
 };
 use super::selection::{FtsIndexMetrics, FtsSegmentSelection};
 
@@ -346,8 +343,8 @@ pub(super) struct CombinedFieldsScan {
 /// participate in full tokenizer validation through bounded concurrent cached
 /// parameter loads (`load_segment_params`).
 ///
-/// `stale_rows` is empty, or one entry per target column in query column order.
-/// See [`CombinedFieldColumn::stale_rows`].
+/// `stale_rows` is empty, or one entry per target column in query column order,
+/// by row address. See [`CombinedFieldColumn::stale_rows`].
 pub(super) async fn open_combined_fields_scan(
     dataset: &Dataset,
     query: &CombinedFieldsQuery,
@@ -445,26 +442,15 @@ pub(super) async fn open_combined_fields_scan(
             }
         }
 
-        // `stale_rows` is built by the scanner in row-id domain (the
-        // convention every prefilter source and external mask follows), but
-        // it is checked here against this column's own index directly --
-        // `bm25_row_stats_for_terms` compares it to the index's stored
-        // identifiers, physical addresses for the address-domain index every
-        // fresh build now produces (see `INVERTED_ROW_ADDR_DOMAIN_VERSION`).
-        let column_stale_rows = match stale_rows.get(slot).filter(|rows| !rows.is_empty()) {
-            Some(rows)
-                if !dataset.manifest.uses_stable_row_ids()
-                    || indices
-                        .first()
-                        .is_some_and(|index| index.results_are_row_addresses()) =>
-            {
-                Some(Arc::new(
-                    crate::io::exec::utils::translate_treemap_to_row_addr_domain(dataset, rows)
-                        .await?,
-                ))
-            }
-            other => other.cloned(),
-        };
+        // The scanner builds `stale_rows` by row address, which is what
+        // `bm25_row_stats_for_terms` compares them to: it looks each one up in
+        // this column's own `docs` to subtract its pre-overlay statistics. The
+        // flat sibling allows the same set through an address-domain stats mask,
+        // so each stale row counts exactly once and neither side translates.
+        let column_stale_rows = stale_rows
+            .get(slot)
+            .filter(|rows| !rows.is_empty())
+            .cloned();
         columns.push(CombinedFieldColumn {
             column: column.to_string(),
             weight,
@@ -612,8 +598,7 @@ impl ExecutionPlan for CombinedFieldsQueryExec {
             // `all_segments` spans every target column, so this is also what
             // rejects two columns' indexes that disagree on the domain: their
             // postings are merged on the stored identifier alone.
-            let address_domain = fts_segments_are_address_domain(&ds_for_scope, &all_segments)?;
-            let row_addr_to_row_id = fts_row_addr_to_row_id(&ds_for_scope, address_domain).await?;
+            require_fts_address_domain(&ds_for_scope, &all_segments)?;
 
             if preset_base_scorer.is_some()
                 && covered_fragments
@@ -637,7 +622,11 @@ impl ExecutionPlan for CombinedFieldsQueryExec {
                         covered,
                         masks,
                         &exec_metrics,
-                        address_domain,
+                        // The whole FTS path is address domain
+                        // (`require_fts_address_domain`), so the masks pushed
+                        // into the index's own search are read in that domain.
+                        /*address_domain=*/
+                        true,
                     )
                     .await?
                 }
@@ -650,7 +639,7 @@ impl ExecutionPlan for CombinedFieldsQueryExec {
                         &all_segments,
                         masks,
                         &exec_metrics,
-                        address_domain,
+                        /*address_domain=*/ true,
                     )
                     .await?
                 }
@@ -697,57 +686,19 @@ impl ExecutionPlan for CombinedFieldsQueryExec {
                 columns,
                 &all_segments,
                 pre_filter.as_ref(),
-                address_domain,
                 &metrics,
             )
             .await;
-            // Hold a tie group at the cutoff whole so it can be ordered by
-            // row id after translation; see `finalize_row_ids_and_scores`.
-            let search_params =
-                match widen_limit_for_tie_rerank(params.limit, row_addr_to_row_id.is_some()) {
-                    widened if widened != params.limit => {
-                        let mut widened_params = params.clone();
-                        widened_params.limit = widened;
-                        widened_params
-                    }
-                    _ => params.clone(),
-                };
             let (doc_ids, scores) = combined_fields_search(
                 &columns,
                 &tokens,
-                &search_params,
+                &params,
                 query.operator(),
                 scorer.as_ref(),
-                pre_filter.clone(),
+                pre_filter,
                 metrics.as_ref(),
             )
             .await?;
-            // A tie larger than the widened cap cannot be ordered from what
-            // came back, so complete it exactly rather than truncating it at an
-            // arbitrary address.
-            let (doc_ids, scores) =
-                if cutoff_tie_unresolved(&scores, params.limit, search_params.limit) {
-                    let mut exact_params = params.clone();
-                    exact_params.limit = None;
-                    combined_fields_search(
-                        &columns,
-                        &tokens,
-                        &exact_params,
-                        query.operator(),
-                        scorer.as_ref(),
-                        pre_filter,
-                        metrics.as_ref(),
-                    )
-                    .await?
-                } else {
-                    (doc_ids, scores)
-                };
-            let (doc_ids, scores) = finalize_row_ids_and_scores(
-                doc_ids,
-                scores,
-                row_addr_to_row_id.as_deref(),
-                params.limit,
-            );
             metrics.baseline_metrics.record_output(doc_ids.len());
 
             let batch = RecordBatch::try_new(

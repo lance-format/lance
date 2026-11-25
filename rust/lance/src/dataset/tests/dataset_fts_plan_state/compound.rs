@@ -171,7 +171,7 @@ async fn compound_leaf_state_masks_and_scorer(
     assert_eq!(actual, results(Arc::new(original)).await);
     assert_eq!(
         actual.iter().map(|row| row.0).collect::<Vec<_>>(),
-        vec![row_id(2, is_stable), row_id(5, is_stable)]
+        vec![row_addr(2), row_addr(5)]
     );
 
     // Compose independent leaf scores over the selected domain using the same

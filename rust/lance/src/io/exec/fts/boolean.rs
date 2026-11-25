@@ -24,7 +24,7 @@ use datafusion_physical_plan::joins::{HashJoinExec, PartitionMode};
 use futures::stream::{self};
 use futures::{StreamExt, TryStreamExt};
 use itertools::Itertools;
-use lance_core::{ROW_ID, Result, utils::tracing::StreamTracingExt};
+use lance_core::{ROW_ADDR, Result, utils::tracing::StreamTracingExt};
 use lance_datafusion::utils::{MetricsExt, PARTITIONS_SEARCHED_METRIC};
 
 use lance_index::scalar::inverted::query::BooleanQuery;
@@ -200,7 +200,7 @@ impl ExecutionPlan for BoostQueryExec {
                 .collect::<Vec<_>>();
             metrics.baseline_metrics.record_output(documents.len());
 
-            let batch = document_key_scores_batch(schema, documents, None, None)?;
+            let batch = document_key_scores_batch(schema, documents)?;
             Ok::<_, DataFusionError>(batch)
         });
         Ok(Box::pin(RecordBatchStreamAdapter::new(
@@ -276,8 +276,8 @@ pub fn build_boolean_query_children_with_schema(
             for plan in children {
                 if let Some(left) = joined {
                     let mut on: Vec<(Arc<dyn PhysicalExpr>, Arc<dyn PhysicalExpr>)> = vec![(
-                        Arc::new(Column::new_with_schema(ROW_ID, &schema)?),
-                        Arc::new(Column::new_with_schema(ROW_ID, &schema)?),
+                        Arc::new(Column::new_with_schema(ROW_ADDR, &schema)?),
+                        Arc::new(Column::new_with_schema(ROW_ADDR, &schema)?),
                     )];
                     if schema.field_with_name(DOC_INDEX_COL).is_ok() {
                         on.push((
@@ -549,7 +549,7 @@ impl ExecutionPlan for BooleanQueryExec {
                 .take(params.limit.unwrap_or(usize::MAX))
                 .collect::<Vec<_>>();
             metrics.baseline_metrics.record_output(documents.len());
-            let batch = document_key_scores_batch(schema, documents, None, None)?;
+            let batch = document_key_scores_batch(schema, documents)?;
             Ok::<_, DataFusionError>(batch)
         });
         Ok(Box::pin(RecordBatchStreamAdapter::new(

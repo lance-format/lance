@@ -10,7 +10,7 @@ use arrow::array::{AsArray, ListBuilder, UInt32Builder};
 use arrow::datatypes::{Float32Type, UInt64Type};
 use arrow_array::{Array, Float32Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, SchemaRef};
-use lance_core::{Error, ROW_ID, Result};
+use lance_core::{Error, ROW_ADDR, Result};
 use lance_index::scalar::inverted::builder::ScoredDoc;
 use lance_index::scalar::inverted::query::{
     FtsQuery, FtsSearchParams, Operator, Tokens, uses_fuzzy_expansion,
@@ -19,7 +19,6 @@ use lance_index::scalar::inverted::{
     DOC_INDEX_COL, InvertedIndex, MemBM25Scorer, PreparedBm25Query, SCORE_COL, prepare_bm25_query,
 };
 
-use super::segments::RowAddrToRowId;
 use super::selection::FtsIndexMetrics;
 
 #[derive(Clone)]
@@ -49,36 +48,17 @@ impl PreparedMatch {
     }
 }
 
+/// The `(identity, score)` batch an FTS node emits, in
+/// [`FTS_SCHEMA`](lance_index::scalar::inverted::FTS_SCHEMA)'s `_rowaddr`
+/// domain.
+///
+/// `documents` arrive in the order selection ranked them -- `(score DESC,
+/// stored identifier ASC)` -- which is the order the plan's own sort keys on,
+/// so nothing is reordered or re-truncated here.
 pub(super) fn scored_documents_batch(
     schema: SchemaRef,
-    mut documents: Vec<ScoredDoc>,
-    row_addr_to_row_id: Option<&RowAddrToRowId>,
-    limit: Option<usize>,
+    documents: Vec<ScoredDoc>,
 ) -> Result<RecordBatch> {
-    if let Some(translate) = row_addr_to_row_id {
-        documents.retain_mut(|document| match translate(document.row_id) {
-            Some(row_id) => {
-                document.row_id = row_id;
-                true
-            }
-            None => false,
-        });
-        // Selection ranked ties by stored row address; the plan above orders by
-        // `_rowid`. Restore that order before applying the caller's limit, or
-        // paging a tie skips and repeats rows -- see
-        // `finalize_row_ids_and_scores` for the full account.
-        documents.sort_by(|left, right| {
-            right
-                .score
-                .0
-                .partial_cmp(&left.score.0)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| left.row_id.cmp(&right.row_id))
-        });
-        if let Some(limit) = limit {
-            documents.truncate(limit);
-        }
-    }
     let row_ids = UInt64Array::from_iter_values(documents.iter().map(|document| document.row_id));
     let scores = Float32Array::from_iter_values(documents.iter().map(|document| document.score.0));
     let mut columns = vec![Arc::new(row_ids) as Arc<dyn Array>];
@@ -105,7 +85,7 @@ pub(super) struct DocumentKey {
 }
 
 pub(super) fn batch_document_keys(batch: &RecordBatch) -> Result<Vec<DocumentKey>> {
-    let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>();
+    let row_ids = batch[ROW_ADDR].as_primitive::<UInt64Type>();
     let doc_indices = batch
         .column_by_name(DOC_INDEX_COL)
         .map(|column| column.as_list::<i32>());
@@ -178,8 +158,6 @@ pub(super) fn batch_scored_document_keys_sum_scores(
 pub(super) fn document_key_scores_batch(
     schema: SchemaRef,
     values: impl IntoIterator<Item = (DocumentKey, f32)>,
-    row_addr_to_row_id: Option<&RowAddrToRowId>,
-    limit: Option<usize>,
 ) -> Result<RecordBatch> {
     scored_documents_batch(
         schema,
@@ -187,8 +165,6 @@ pub(super) fn document_key_scores_batch(
             .into_iter()
             .map(|(key, score)| ScoredDoc::with_doc_index(key.row_id, key.doc_index, score))
             .collect(),
-        row_addr_to_row_id,
-        limit,
     )
 }
 

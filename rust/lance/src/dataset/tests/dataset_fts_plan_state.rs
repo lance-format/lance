@@ -14,8 +14,8 @@ use arrow_array::{
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::physical_plan::ExecutionPlan;
 use futures::TryStreamExt;
-use lance_core::ROW_ID;
 use lance_core::utils::address::RowAddress;
+use lance_core::{ROW_ADDR, ROW_ID};
 use lance_datafusion::exec::execute_plan;
 use lance_index::IndexType;
 use lance_index::metrics::NoOpMetricsCollector;
@@ -176,7 +176,12 @@ async fn results(plan: Arc<dyn ExecutionPlan>) -> Vec<(u64, Vec<u32>, f32)> {
     let mut documents: Vec<_> = batches
         .iter()
         .flat_map(|batch| {
-            let ids = batch[ROW_ID].as_primitive::<UInt64Type>();
+            // An FTS node identifies its hits by `_rowaddr`; a whole scanner
+            // plan above one projects the `_rowid` the caller asked for.
+            let ids = batch
+                .column_by_name(ROW_ADDR)
+                .unwrap_or_else(|| &batch[ROW_ID])
+                .as_primitive::<UInt64Type>();
             let scores = batch["_score"].as_primitive::<Float32Type>();
             (0..batch.num_rows())
                 .map(|row| {
@@ -206,8 +211,14 @@ fn row_id(row: u32, is_stable: bool) -> u64 {
     if is_stable {
         u64::from(row)
     } else {
-        RowAddress::new_from_parts(row / 2, row % 2).into()
+        row_addr(row)
     }
+}
+
+/// The fixture's physical address for `row`, which is what an FTS node emits
+/// (two rows per fragment).
+fn row_addr(row: u32) -> u64 {
+    RowAddress::new_from_parts(row / 2, row % 2).into()
 }
 
 async fn write(batch: RecordBatch, is_stable: bool) -> Dataset {
@@ -490,7 +501,7 @@ async fn indexed_fts_state_list_granularity(
         keys,
         expected_rows
             .into_iter()
-            .map(|(row, doc)| (row_id(row, is_stable), vec![doc]))
+            .map(|(row, doc)| (row_addr(row), vec![doc]))
             .collect::<Vec<_>>()
     );
 }

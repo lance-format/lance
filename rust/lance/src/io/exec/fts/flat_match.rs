@@ -34,6 +34,7 @@ use crate::io::exec::PreFilterSource;
 use crate::io::exec::row_addr_mask::apply_mask;
 use crate::io::exec::utils::{
     FilteredRowIdsToPrefilter, IndexMetrics, SelectionVectorToPrefilter, is_prefilter_union,
+    row_id_mask_to_row_addr_domain,
 };
 use lance_index::prefilter::FilterLoader;
 use lance_index::scalar::inverted::builder::document_input;
@@ -1216,6 +1217,12 @@ impl ExecutionPlan for FlatMatchQueryExec {
                         }
                         PreFilterSource::None => return Ok(stream),
                     };
+                    // Both sources finalize to the row-id domain every
+                    // `PreFilter` mask is expressed in, while this node emits
+                    // the row addresses the FTS path ranks on -- the same
+                    // translation `build_prefilter_in_domain` does for the
+                    // indexed sibling's masks.
+                    let mask = row_id_mask_to_row_addr_domain(&ds, mask).await?;
                     let schema = stream.schema();
                     let stream = stream.map(move |batch| {
                         let _timer = metrics.baseline_metrics.elapsed_compute().timer();

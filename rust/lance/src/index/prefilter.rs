@@ -151,16 +151,7 @@ impl DatasetPreFilter {
     /// keeps the restriction in whichever id space the indices actually store,
     /// stable row ids or row addresses, which a fragment-address block list cannot
     /// do.
-    pub(crate) fn new_restricted_to_fragments(
-        dataset: Arc<Dataset>,
-        fragments: RoaringBitmap,
-        filter: Option<BoxFuture<'static, Result<Arc<RowAddrMask>>>>,
-    ) -> Self {
-        Self::new_restricted_to_fragments_in_domain(dataset, fragments, filter, false)
-    }
-
-    /// Like [`Self::new_restricted_to_fragments`], with the same
-    /// `force_address_domain` meaning as
+    /// `force_address_domain`: see
     /// [`Self::new_with_filter_future_in_domain`].
     pub(crate) fn new_restricted_to_fragments_in_domain(
         dataset: Arc<Dataset>,
@@ -398,6 +389,17 @@ impl DatasetPreFilter {
         fragments: RoaringBitmap,
     ) -> Option<BoxFuture<'static, Result<Arc<RowAddrMask>>>> {
         Self::create_deletion_mask_impl(dataset, fragments, true, false)
+    }
+
+    /// [`Self::create_restricted_deletion_mask`] in the row-address domain, for
+    /// a caller matching the mask against physical addresses rather than row
+    /// ids (`force_address_domain`: see
+    /// [`Self::new_with_filter_future_in_domain`]).
+    pub fn create_restricted_deletion_mask_in_row_addr_domain(
+        dataset: Arc<Dataset>,
+        fragments: RoaringBitmap,
+    ) -> Option<BoxFuture<'static, Result<Arc<RowAddrMask>>>> {
+        Self::create_deletion_mask_impl(dataset, fragments, true, true)
     }
 
     /// `force_address_domain`: see [`Self::new_with_filter_future_in_domain`].
@@ -925,10 +927,11 @@ mod test {
             let block_mask = block_mask.clone();
             Some(async move { Ok(Arc::new(block_mask)) }.boxed())
         };
-        let mut prefilter = DatasetPreFilter::new_restricted_to_fragments(
+        let mut prefilter = DatasetPreFilter::new_restricted_to_fragments_in_domain(
             datasets.deletions_no_missing_frags,
             RoaringBitmap::from_iter(0..3),
             filter,
+            /*force_address_domain=*/ false,
         );
         if overlay {
             prefilter = prefilter.with_overlay_block(block_mask);
@@ -1168,10 +1171,11 @@ mod test {
     #[tokio::test]
     async fn test_deletions_only_prefilter_shares_mask() {
         let datasets = test_datasets(false).await;
-        let prefilter = DatasetPreFilter::new_restricted_to_fragments(
+        let prefilter = DatasetPreFilter::new_restricted_to_fragments_in_domain(
             datasets.deletions_no_missing_frags.clone(),
             RoaringBitmap::from_iter(0..3),
             None,
+            /*force_address_domain=*/ false,
         );
         assert!(prefilter.only_deletions());
         prefilter.wait_for_ready().await.unwrap();

@@ -28,7 +28,7 @@ use datafusion::physical_plan::{
 };
 use futures::StreamExt;
 use lance_core::error::DataFusionResult;
-use lance_core::{ROW_ID, Result};
+use lance_core::{ROW_ADDR, ROW_ID, Result};
 use lance_index::prefilter::FilterLoader;
 use lance_select::RowAddrMask;
 
@@ -146,16 +146,23 @@ impl ExecutionPlan for RowAddrMaskFilterExec {
 /// Keep rows whose `_rowid` is selected by the mask (the mask is keyed in the
 /// same `_rowid` space). Null ids are dropped; they cannot be in any allow set.
 pub(super) fn apply_mask(mask: &RowAddrMask, batch: RecordBatch) -> DataFusionResult<RecordBatch> {
-    let row_id_column = batch.column_by_name(ROW_ID).ok_or_else(|| {
-        DataFusionError::Internal(format!(
-            "RowAddrMaskFilterExec input missing {ROW_ID} column"
-        ))
-    })?;
+    // The mask is in the identity domain of the plan it filters, so take the
+    // identity column the input actually carries: an FTS plan identifies its
+    // hits by `_rowaddr`, a vector one by `_rowid`.
+    let (name, row_id_column) = batch
+        .column_by_name(ROW_ADDR)
+        .map(|column| (ROW_ADDR, column))
+        .or_else(|| batch.column_by_name(ROW_ID).map(|column| (ROW_ID, column)))
+        .ok_or_else(|| {
+            DataFusionError::Internal(format!(
+                "RowAddrMaskFilterExec input missing {ROW_ADDR} and {ROW_ID} columns"
+            ))
+        })?;
     let row_ids = row_id_column
         .as_primitive_opt::<UInt64Type>()
         .ok_or_else(|| {
             DataFusionError::Internal(format!(
-                "{ROW_ID} column must be UInt64 but was {:?}",
+                "{name} column must be UInt64 but was {:?}",
                 row_id_column.data_type()
             ))
         })?;

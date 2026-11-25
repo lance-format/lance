@@ -772,7 +772,7 @@ mod tests {
     use datafusion::physical_plan::union::UnionExec;
     use datafusion::physical_plan::{ChildrenPropertiesMode, ReplaceChildrenOptions};
     use futures::{FutureExt, TryStreamExt};
-    use lance_core::ROW_ID;
+    use lance_core::ROW_ADDR;
     use lance_datafusion::exec::{ExecutionSummaryCounts, collect_execution_metrics};
     use lance_datafusion::utils::PARTITIONS_SEARCHED_METRIC;
     use lance_index::scalar::inverted::query::{FtsSearchParams, MatchQuery};
@@ -802,7 +802,7 @@ mod tests {
             memory_input(
                 record_batch!(
                     ("text", Utf8, vec!["alpha"; 10]),
-                    (ROW_ID, UInt64, (100..110).collect::<Vec<u64>>())
+                    (ROW_ADDR, UInt64, (100..110).collect::<Vec<u64>>())
                 )
                 .unwrap(),
             ),
@@ -955,7 +955,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(
-            result[ROW_ID]
+            result[ROW_ADDR]
                 .as_any()
                 .downcast_ref::<UInt64Array>()
                 .unwrap()
@@ -976,7 +976,7 @@ mod tests {
         .unwrap();
         assert_eq!(result.num_rows(), 1);
         assert_eq!(
-            result[ROW_ID]
+            result[ROW_ADDR]
                 .as_any()
                 .downcast_ref::<UInt64Array>()
                 .unwrap()
