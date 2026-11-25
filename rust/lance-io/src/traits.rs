@@ -3,6 +3,7 @@
 
 use std::{ops::Range, sync::Arc};
 
+use crate::object_store::copy_diagnostics::{CopyDiagnostics, CopyOperation};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{StreamExt, future::BoxFuture, stream::BoxStream};
@@ -108,7 +109,7 @@ impl<W: Writer + ?Sized> WriteExt for W {
     }
 
     async fn copy_from_reader(&mut self, reader: &dyn Reader) -> Result<usize> {
-        copy_reader_with_progress(self, reader, |_| {}).await
+        copy_reader_with_progress(self, reader, &CopyDiagnostics::default(), |_| {}).await
     }
 
     async fn copy_range_from_reader(
@@ -130,13 +131,25 @@ impl<W: Writer + ?Sized> WriteExt for W {
 pub(crate) async fn copy_reader_with_progress<W: Writer + ?Sized>(
     writer: &mut W,
     reader: &dyn Reader,
+    diagnostics: &CopyDiagnostics,
     mut accepted: impl FnMut(usize) + Send,
 ) -> Result<usize> {
-    let mut stream = reader.get_stream().await?;
+    let mut stream = diagnostics
+        .run(CopyOperation::OpenStream, reader.get_stream())
+        .await?;
     let mut copied = 0;
-    while let Some(chunk) = stream.next().await {
-        let bytes = chunk?;
-        writer.write_all(&bytes).await?;
+    while let Some(bytes) = diagnostics
+        .run(CopyOperation::ReadStream { offset: copied }, async {
+            stream.next().await.transpose()
+        })
+        .await?
+    {
+        diagnostics
+            .run(
+                CopyOperation::Write { offset: copied },
+                writer.write_all(&bytes),
+            )
+            .await?;
         copied += bytes.len();
         accepted(copied);
     }
