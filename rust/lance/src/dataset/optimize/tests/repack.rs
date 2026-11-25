@@ -961,12 +961,7 @@ fn repack_skips_a_fragment_holding_a_legacy_file() {
         v2_0_file("c.lance", vec![2]),
     ];
     let plan = |fragment: &Fragment| {
-        crate::dataset::optimize::repack::plan_fragment_repack(
-            &schema,
-            fragment,
-            fragment.files.len(),
-            1,
-        )
+        runtime::repack::plan_fragment_repack(&schema, fragment, fragment.files.len(), 1)
     };
     assert_eq!(plan(&fragment), None);
     // The same layout with a V2 file in its place is repacked.
@@ -1050,13 +1045,13 @@ fn repack_keeps_the_spilled_lineage_file() {
 
     // Above the limit, the lineage file's column stays and the others move.
     assert_eq!(
-        crate::dataset::optimize::repack::plan_fragment_repack(&schema, &fragment, 3, 2),
+        runtime::repack::plan_fragment_repack(&schema, &fragment, 3, 2),
         Some(vec![vec![1, 2]])
     );
     // With a limit of 1 as well: a file a move cannot empty stays anyway, so
     // the lineage file keeps its column.
     assert_eq!(
-        crate::dataset::optimize::repack::plan_fragment_repack(&schema, &fragment, 3, 1),
+        runtime::repack::plan_fragment_repack(&schema, &fragment, 3, 1),
         Some(vec![vec![1, 2]])
     );
 }
@@ -1099,7 +1094,7 @@ fn repack_merges_around_a_blob_column() {
         v2_0_file("e.lance", vec![3]),
     ];
     assert_eq!(
-        crate::dataset::optimize::repack::plan_fragment_repack(&schema, &fragment, 3, 1),
+        runtime::repack::plan_fragment_repack(&schema, &fragment, 3, 1),
         Some(vec![vec![2, 3]])
     );
 }
@@ -1129,7 +1124,7 @@ fn repack_merges_every_movable_file_next_to_one_that_stays() {
         v2_0_file("f.lance", vec![4]),
     ];
     assert_eq!(
-        crate::dataset::optimize::repack::plan_fragment_repack(&schema, &fragment, 4, 2),
+        runtime::repack::plan_fragment_repack(&schema, &fragment, 4, 2),
         Some(vec![vec![2, 3, 4]])
     );
 }
@@ -1398,9 +1393,7 @@ fn repack_merges_around_a_blob_outside_the_kept_file() {
     fragment.row_id_meta = Some(RowIdMeta::Column);
     for max_files in [1, 2] {
         assert_eq!(
-            crate::dataset::optimize::repack::plan_fragment_repack(
-                &schema, &fragment, 4, max_files
-            ),
+            runtime::repack::plan_fragment_repack(&schema, &fragment, 4, max_files),
             Some(vec![vec![2, 3]]),
             "max_files={max_files}"
         );
@@ -1421,12 +1414,7 @@ fn repack_never_adds_a_file() {
         field
     };
     let plan = |schema: &lance_core::datatypes::Schema, fragment: &Fragment, max| {
-        crate::dataset::optimize::repack::plan_fragment_repack(
-            schema,
-            fragment,
-            fragment.files.len(),
-            max,
-        )
+        runtime::repack::plan_fragment_repack(schema, fragment, fragment.files.len(), max)
     };
 
     // Lineage in one file, a blob next to a movable column in the other.
@@ -1481,12 +1469,7 @@ fn repack_never_adds_a_file() {
 fn repack_moves_a_struct_with_its_header() {
     use arrow_schema::Fields;
     let plan = |schema: &lance_core::datatypes::Schema, fragment: &Fragment| {
-        crate::dataset::optimize::repack::plan_fragment_repack(
-            schema,
-            fragment,
-            fragment.files.len(),
-            2,
-        )
+        runtime::repack::plan_fragment_repack(schema, fragment, fragment.files.len(), 2)
     };
     let child = |name: &str| Field::new(name, DataType::Int32, true);
 
@@ -1664,12 +1647,7 @@ fn repack_merges_only_files_it_empties() {
     use lance_table::format::{ROW_ID_FIELD_ID, RowIdMeta};
     let child = |name: &str| Field::new(name, DataType::Int32, true);
     let plan = |schema: &lance_core::datatypes::Schema, fragment: &Fragment, max| {
-        crate::dataset::optimize::repack::plan_fragment_repack(
-            schema,
-            fragment,
-            fragment.files.len(),
-            max,
-        )
+        runtime::repack::plan_fragment_repack(schema, fragment, fragment.files.len(), max)
     };
 
     // s=0 {y=1, z=2}, b=3, c=4. s is split between the lineage file and
@@ -1736,12 +1714,7 @@ fn repack_keeps_the_largest_file_that_shares_a_struct() {
         file
     };
     let plan = |schema: &lance_core::datatypes::Schema, fragment: &Fragment| {
-        crate::dataset::optimize::repack::plan_fragment_repack(
-            schema,
-            fragment,
-            fragment.files.len(),
-            2,
-        )
+        runtime::repack::plan_fragment_repack(schema, fragment, fragment.files.len(), 2)
     };
     // a=0, s=1 {x=2, y=3, z=4}, b=5.
     let schema = lance_schema(Schema::new(vec![
@@ -1778,12 +1751,7 @@ fn repack_merges_all_files_when_none_can_stay() {
     use arrow_schema::Fields;
     let child = |name: &str| Field::new(name, DataType::Int32, true);
     let plan = |schema: &lance_core::datatypes::Schema, fragment: &Fragment, limit| {
-        crate::dataset::optimize::repack::plan_fragment_repack(
-            schema,
-            fragment,
-            fragment.files.len(),
-            limit,
-        )
+        runtime::repack::plan_fragment_repack(schema, fragment, fragment.files.len(), limit)
     };
 
     // s=0 {x=1, y=2, z=3}, one child per file.
@@ -1875,7 +1843,7 @@ fn repack_keeps_the_largest_file_next_to_a_header_only_file() {
         sized("bf.lance", vec![4], 10),
     ];
     assert_eq!(
-        crate::dataset::optimize::repack::plan_fragment_repack(&schema, &fragment, 4, 2),
+        runtime::repack::plan_fragment_repack(&schema, &fragment, 4, 2),
         Some(vec![vec![1, 4]])
     );
 }
@@ -1914,7 +1882,7 @@ fn repack_prefers_leaving_the_largest_file_in_place() {
     ];
     // Keeping m3 merges m1 and m2 (s and c) and leaves k holding t.
     assert_eq!(
-        crate::dataset::optimize::repack::plan_fragment_repack(&schema, &fragment, 4, 3),
+        runtime::repack::plan_fragment_repack(&schema, &fragment, 4, 3),
         Some(vec![vec![0, 7]])
     );
 }
@@ -1944,7 +1912,7 @@ fn repack_plans_nothing_for_header_only_files() {
         v2_0_file("c.lance", vec![0, 3]),
     ];
     assert_eq!(
-        crate::dataset::optimize::repack::plan_fragment_repack(&schema, &fragment, 3, 2),
+        runtime::repack::plan_fragment_repack(&schema, &fragment, 3, 2),
         None
     );
 }
@@ -1980,7 +1948,7 @@ fn repack_prefers_the_proposal_leaving_the_fewest_files() {
         sized("m3.lance", vec![5], 10),
     ];
     assert_eq!(
-        crate::dataset::optimize::repack::plan_fragment_repack(&schema, &fragment, 4, 2),
+        runtime::repack::plan_fragment_repack(&schema, &fragment, 4, 2),
         Some(vec![vec![1, 4, 5]])
     );
 }

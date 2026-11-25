@@ -1387,6 +1387,7 @@ impl ObjectStore {
                     None,
                     self.download_retry_count,
                 )?
+                .with_transport_stats(self.is_cloud())
                 .with_io_parallelism(self.io_parallelism()),
             )),
         }
@@ -1401,12 +1402,22 @@ impl ObjectStore {
         // If we know the file is really small, we can read the whole thing
         // as a single request.
         if known_size <= self.block_size {
-            return Ok(Box::new(SmallReader::new(
-                self.inner.clone(),
-                path.clone(),
-                self.download_retry_count,
-                known_size,
-            )));
+            let reader = if self.is_cloud() {
+                SmallReader::new_with_transport_stats(
+                    self.inner.clone(),
+                    path.clone(),
+                    self.download_retry_count,
+                    known_size,
+                )
+            } else {
+                SmallReader::new(
+                    self.inner.clone(),
+                    path.clone(),
+                    self.download_retry_count,
+                    known_size,
+                )
+            };
+            return Ok(Box::new(reader));
         }
 
         match self.scheme.as_str() {
@@ -1452,6 +1463,7 @@ impl ObjectStore {
                     Some(known_size),
                     self.download_retry_count,
                 )?
+                .with_transport_stats(self.is_cloud())
                 .with_io_parallelism(self.io_parallelism()),
             )),
         }

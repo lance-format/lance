@@ -112,9 +112,7 @@ message Transaction {
      */
     repeated DataFragment new_fragments = 2;
 
-    /* During a rewrite an index may be rewritten.  We only serialize the UUID
-     * since a rewrite should not change the other index parameters.
-     */
+    // Identifies the replaced index segment and records its replacement metadata.
     message RewrittenIndex {
       // The id of the index that will be replaced
       UUID old_id = 1;
@@ -199,15 +197,8 @@ message Transaction {
 
   // An operation that clones a dataset.
   message Clone {
-    /* - true:  Performs a metadata-only clone (copies manifest without data files).
-     *          The cloned dataset references original data through `base_paths`,
-     *          suitable for experimental scenarios or rapid metadata migration.
-     * - false: Performs a full deep clone using the underlying object storage's native
-     *          copy API (e.g., S3 CopyObject, GCS rewrite). This leverages server-side
-     *          bulk copy operations to bypass download/upload bottlenecks, achieving
-     *          near-linear speedup for large datasets (typically 3-10x faster than
-     *          manual file transfers). The operation maintains atomicity and data
-     *          integrity guarantees provided by the storage backend.
+    /* True for a shallow clone that references source files through `base_paths`.
+     * False for a deep clone that copies source files.
      */
     bool is_shallow = 1;
     /* the reference name in the source dataset
@@ -227,15 +218,13 @@ message Transaction {
     repeated uint32 values = 1;
   }
 
-  // An operation that updates rows but does not add or remove rows.
+  // Updates rows or applies merge-insert changes, including inserts and deletes.
   message Update {
-    /* The fragments that have been removed. These are fragments where all rows
-     * have been updated and moved to a new fragment.
-     */
+    // Fragments removed after all their rows were deleted or moved.
     repeated uint64 removed_fragment_ids = 1;
     // The fragments that have been updated.
     repeated DataFragment updated_fragments = 2;
-    // The new fragments where updated rows have been moved to.
+    // New fragments containing inserted or rewritten rows.
     repeated DataFragment new_fragments = 3;
     // The ids of the fields that have been modified.
     repeated uint32 fields_modified = 4;

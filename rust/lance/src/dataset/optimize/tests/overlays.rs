@@ -4,7 +4,7 @@
 //! Compaction tests for the overlays contract area.
 
 use super::*;
-use crate::dataset::optimize::commit::normalize_source_fragments;
+use lance_table_runtime::frag_reuse::normalize_source_fragments;
 
 #[rstest]
 #[case::default_target(LanceFileVersion::V2_2, None)]
@@ -307,7 +307,7 @@ async fn test_normalize_source_fragments_keeps_fully_deleted() {
         path: None,
         inline: None,
     });
-    let normalized = normalize_source_fragments(&dataset, &[fragment])
+    let normalized = normalize_source_fragments(&dataset.table_view().to_table(), &[fragment])
         .await
         .unwrap();
     assert_eq!(normalized.len(), 1);

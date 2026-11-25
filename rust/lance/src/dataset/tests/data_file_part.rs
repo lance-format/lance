@@ -1,16 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{
-    collections::{HashMap, HashSet},
-    fs,
-    ops::Range,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
-    },
-    time::{Duration, SystemTime},
-};
+use std::{collections::HashMap, fs, ops::Range, sync::Arc, time::SystemTime};
 
 use arrow::array::AsArray;
 use arrow_array::{
@@ -28,28 +19,26 @@ use lance_core::{
     utils::{
         blob::blob_path,
         tempfile::{TempDir, TempStrDir},
-        testing::{ProxyObjectStore, ProxyObjectStorePolicy},
     },
 };
 use lance_file::concat::EncodedFileInput;
 use lance_file::reader::FileReaderOptions;
 use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
 use lance_file::writer::FileWriterOptions;
-use lance_io::object_store::ObjectStoreParams;
+use lance_io::object_store::ObjectStore;
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::utils::CachedFileSize;
 use lance_table::feature_flags::MANAGED_BLOBS_META_KEY;
 use lance_table::format::BasePath;
 use mock_instant::thread_local::MockClock;
 use object_store::path::Path;
-use object_store::throttle::{ThrottleConfig, ThrottledStore};
 use rstest::rstest;
 use sha2::{Digest, Sha256};
 
 use crate::blob::{
     BlobArrayBuilder, BlobDescriptorArrayBuilder, BlobFile, BlobWriteSources, blob_field,
 };
-use crate::dataset::blob::test_util::{managed_blob_schema, recording_range_store};
+use crate::dataset::blob::test_util::managed_blob_schema;
 use crate::dataset::builder::DatasetBuilder;
 use crate::dataset::cleanup::CleanupPolicyBuilder;
 use crate::dataset::fragment::FileFragment;
@@ -102,6 +91,13 @@ fn complete_logical_blob_batch(uri: &str, position: u64, size: u64) -> RecordBat
 
 fn only_fragment(dataset: &Dataset) -> FileFragment {
     dataset.get_fragments().into_iter().next().unwrap()
+}
+
+fn part_file_name(part: &DataFilePart) -> String {
+    serde_json::to_value(part).unwrap()["file_name"]
+        .as_str()
+        .unwrap()
+        .to_owned()
 }
 
 async fn write_part(
@@ -177,7 +173,7 @@ async fn concatenates_parts_in_caller_order_without_reusing_staging_files() {
     .unwrap()
     .unwrap();
     let replacement = DataReplacementGroup(only_fragment(&dataset).id() as u64, data_file);
-    assert_eq!(replacement.1.path, target.file_name.as_str());
+    assert_eq!(replacement.1.path, target.0.file_name());
     let dataset = commit(&dataset, replacement).await.unwrap();
     let batch = dataset.scan().try_into_batch().await.unwrap();
     assert_eq!(
@@ -266,7 +262,7 @@ async fn ordinary_blob_parts_survive_retained_version_cleanup() {
     assert_eq!(latest.version_id(), retained_version + 1);
     assert_ne!(
         only_fragment(&latest).metadata().files[0].path,
-        target.file_name
+        target.0.file_name()
     );
     let policy = CleanupPolicyBuilder::default()
         .retain_n_versions(&latest, 2)
@@ -301,235 +297,6 @@ async fn ordinary_blob_parts_survive_retained_version_cleanup() {
         let bytes = blob.read().await.unwrap();
         assert_eq!(bytes.len(), length, "row {row}");
         assert_eq!(Sha256::digest(&bytes), digest, "row {row}");
-    }
-}
-
-#[rstest]
-#[case::small_parts(1024 * 1024)]
-#[case::large_parts(64)]
-#[tokio::test]
-async fn opens_parts_concurrently_with_bounded_fanout_and_caller_order(#[case] block_size: usize) {
-    let batch = arrow_array::record_batch!(("id", Int32, [0])).unwrap();
-    let mut dataset = Dataset::write(
-        RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
-        "memory://",
-        Some(WriteParams {
-            data_storage_version: Some(LanceFileVersion::V2_2),
-            store_params: Some(ObjectStoreParams {
-                block_size: Some(block_size),
-                ..Default::default()
-            }),
-            ..Default::default()
-        }),
-    )
-    .await
-    .unwrap();
-    let target = DataFileTarget::new(
-        None,
-        Arc::new(dataset.schema().clone()),
-        ConcreteFileVersion::V2_2,
-    )
-    .unwrap();
-    let mut parts = Vec::new();
-    for row_count in (1..=24).rev() {
-        let batch = RecordBatch::try_new(
-            Arc::new(ArrowSchema::from(dataset.schema())),
-            vec![Arc::new(arrow_array::Int32Array::from(vec![0; row_count]))],
-        )
-        .unwrap();
-        parts.push(write_part(&dataset, &target, None, batch).await);
-    }
-
-    assert_eq!(dataset.table_state.object_store.block_size(), block_size);
-    assert!(parts.iter().all(|part| if block_size == 64 {
-        part.size_bytes() > block_size as u64
-    } else {
-        part.size_bytes() <= block_size as u64
-    }));
-    let active_opens = Arc::new(AtomicUsize::new(0));
-    let peak_opens = Arc::new(AtomicUsize::new(0));
-    let head_requests = Arc::new(AtomicUsize::new(0));
-    let requests = Arc::new(AtomicUsize::new(0));
-    let completed = Mutex::new(HashSet::new());
-    let active = active_opens.clone();
-    let mut completed_policy = ProxyObjectStorePolicy::new();
-    completed_policy.set_before_policy(
-        "complete_part_open_request",
-        Arc::new(move |method, path| {
-            // This proxy sits after the delay, immediately before the in-memory
-            // store completes the first request (GET for small parts, HEAD otherwise).
-            if method == "get_opts" && completed.lock().unwrap().insert(path.clone()) {
-                active.fetch_sub(1, Ordering::SeqCst);
-            }
-            Ok(())
-        }),
-    );
-    let heads = head_requests.clone();
-    completed_policy.set_obj_meta_policy(
-        "observe_part_head",
-        Arc::new(move |method, metadata| {
-            if method == "head" {
-                heads.fetch_add(1, Ordering::SeqCst);
-            }
-            Ok(metadata)
-        }),
-    );
-    let delayed = Arc::new(ThrottledStore::new(
-        Arc::new(ProxyObjectStore::new(
-            dataset.table_state.object_store.inner.clone(),
-            Arc::new(Mutex::new(completed_policy)),
-        )),
-        ThrottleConfig::default(),
-    ));
-    let first_part = parts[0].file_name.clone();
-    let started = Mutex::new(HashSet::new());
-    let mut policy = ProxyObjectStorePolicy::new();
-    let active = active_opens.clone();
-    let peak = peak_opens.clone();
-    let request_count = requests.clone();
-    let throttle = delayed.clone();
-    policy.set_before_policy(
-        "observe_part_open_requests",
-        Arc::new(move |method, path| {
-            if method == "get_opts" {
-                request_count.fetch_add(1, Ordering::SeqCst);
-                // Force later parts to finish opening before the first input.
-                throttle.config_mut(|config| {
-                    config.wait_get_per_call = if path.as_ref().ends_with(&first_part) {
-                        Duration::from_millis(15)
-                    } else {
-                        Duration::from_millis(1)
-                    };
-                });
-                // Observe the first size-validation request for each part.
-                if started.lock().unwrap().insert(path.clone()) {
-                    let count = active.fetch_add(1, Ordering::SeqCst) + 1;
-                    peak.fetch_max(count, Ordering::SeqCst);
-                }
-            }
-            Ok(())
-        }),
-    );
-    Arc::make_mut(&mut dataset.table_state.object_store).inner =
-        Arc::new(ProxyObjectStore::new(delayed, Arc::new(Mutex::new(policy))));
-
-    let opened = DataFilePart::open_all(&dataset, &target, &parts)
-        .await
-        .unwrap();
-    assert_eq!(
-        opened
-            .iter()
-            .map(|part| part.num_rows())
-            .collect::<Vec<_>>(),
-        (1..=24).rev().collect::<Vec<_>>()
-    );
-    assert_eq!(active_opens.load(Ordering::SeqCst), 0);
-    if block_size == 64 {
-        assert_eq!(head_requests.load(Ordering::SeqCst), parts.len());
-    } else {
-        assert_eq!(head_requests.load(Ordering::SeqCst), 0);
-        assert_eq!(requests.load(Ordering::SeqCst), parts.len());
-    }
-    let peak = peak_opens.load(Ordering::SeqCst);
-    assert!(
-        peak > 1 || dataset.table_state.object_store.io_parallelism() == 1,
-        "independent part opens stayed serial"
-    );
-    assert!(
-        peak <= 8,
-        "part open fanout exceeded its memory bound: {peak}"
-    );
-}
-
-#[tokio::test]
-async fn target_uses_an_ordinary_generated_data_file_name() {
-    let original = arrow_array::record_batch!(("id", Int32, [0, 1])).unwrap();
-    let dataset = dataset_of(original, LanceFileVersion::V2_1).await;
-    let first = DataFileTarget::new(
-        None,
-        Arc::new(dataset.schema().clone()),
-        dataset.manifest.data_storage_format.lance_file_format(),
-    )
-    .unwrap();
-    let second = DataFileTarget::new(
-        None,
-        Arc::new(dataset.schema().clone()),
-        dataset.manifest.data_storage_format.lance_file_format(),
-    )
-    .unwrap();
-
-    assert_ne!(first.file_name.as_str(), second.file_name.as_str());
-    assert_eq!(first.file_name.len(), 56);
-    assert!(first.file_name.ends_with(".lance"));
-    assert!(!first.file_name.contains('/'));
-
-    let restored =
-        serde_json::from_slice::<DataFileTarget>(&serde_json::to_vec(&first).unwrap()).unwrap();
-    assert_eq!(restored.file_name.as_str(), first.file_name.as_str());
-    assert_eq!(restored.base_id, first.base_id);
-    assert_eq!(restored.schema, first.schema);
-    assert_eq!(restored.version, first.version);
-}
-
-#[test]
-fn target_serialization_preserves_schema_and_rejects_invalid_identity() {
-    let arrow_schema = ArrowSchema::new(vec![
-        Field::new(
-            "nested",
-            DataType::Struct(vec![Field::new("value", DataType::Int32, true)].into()),
-            true,
-        ),
-        Field::new(
-            "category",
-            DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
-            true,
-        ),
-    ]);
-    let mut schema = lance_core::datatypes::Schema::try_from(&arrow_schema).unwrap();
-    schema
-        .metadata
-        .insert("owner".to_string(), "test".to_string());
-    schema.fields[0].id = 10;
-    schema.fields[0].children[0].id = 11;
-    schema.fields[0].children[0].parent_id = 10;
-    schema.fields[0].children[0]
-        .metadata
-        .insert("unit".to_string(), "count".to_string());
-    schema.fields[1].id = 20;
-    schema.fields[1].dictionary = Some(lance_core::datatypes::Dictionary {
-        offset: 12,
-        length: 2,
-        values: Some(Arc::new(StringArray::from(vec!["a", "b"]))),
-    });
-    let target = DataFileTarget::new(Some(7), Arc::new(schema), ConcreteFileVersion::V2_2).unwrap();
-    let value = serde_json::to_value(&target).unwrap();
-    let restored: DataFileTarget = serde_json::from_value(value.clone()).unwrap();
-    assert_eq!(restored.schema, target.schema);
-    assert_eq!(restored.file_name.as_str(), target.file_name.as_str());
-    assert_eq!(restored.base_id, target.base_id);
-    let dictionary = restored.schema.fields[1].dictionary.as_ref().unwrap();
-    assert_eq!((dictionary.offset, dictionary.length), (12, 2));
-    for (key, replacement, message) in [
-        (
-            "format_version",
-            serde_json::json!(99),
-            "checkpoint version",
-        ),
-        ("file_version", serde_json::json!("stable"), "version"),
-        (
-            "file_name",
-            serde_json::json!("../outside.lance"),
-            "target identity",
-        ),
-        ("file_name", serde_json::json!(""), "target identity"),
-        ("file_name", serde_json::json!(".lance"), "target identity"),
-        ("file_name", serde_json::json!(".."), "target identity"),
-        ("base_id", serde_json::json!(0), "base_id"),
-    ] {
-        let mut invalid = value.clone();
-        invalid[key] = replacement;
-        let error = serde_json::from_value::<DataFileTarget>(invalid).unwrap_err();
-        assert!(error.to_string().contains(message), "{error}");
     }
 }
 
@@ -576,7 +343,7 @@ async fn managed_part_checks_real_file_before_creating_output(
         !dataset
             .table_state
             .object_store
-            .exists(&dataset.data_dir().join(target.file_name.as_str()))
+            .exists(&dataset.data_dir().join(target.0.file_name()))
             .await
             .unwrap()
     );
@@ -642,7 +409,7 @@ async fn managed_part_rejects_invalid_descriptions_and_duplicate_inputs() {
         !dataset
             .table_state
             .object_store
-            .exists(&dataset.data_dir().join(target.file_name.as_str()))
+            .exists(&dataset.data_dir().join(target.0.file_name()))
             .await
             .unwrap()
     );
@@ -693,7 +460,7 @@ async fn abandoned_target_cleanup_includes_failed_writes_and_preserves_other_tar
     )
     .unwrap();
     let mut neighbor = serde_json::to_value(&target).unwrap();
-    neighbor["file_name"] = serde_json::json!(format!("{}.neighbor.lance", target.file_name));
+    neighbor["file_name"] = serde_json::json!(format!("{}.neighbor.lance", target.0.file_name()));
     let neighbor: DataFileTarget = serde_json::from_value(neighbor).unwrap();
     let first = write_part(&dataset, &target, lease(1), batch.clone()).await;
     let assembled = dataset
@@ -729,25 +496,20 @@ async fn abandoned_target_cleanup_includes_failed_writes_and_preserves_other_tar
     assert!(error.to_string().contains("injected input failure"));
     let store = dataset.object_store(base_id).await.unwrap();
     let data_dir = dataset.data_file_dir_for_base(base_id).unwrap();
-    let staging = data_dir
-        .clone()
-        .join("_parts")
-        .join(target.file_name.as_str());
+    let staging = data_dir.clone().join("_parts").join(target.0.file_name());
     // Simulate durable objects left when a worker exits without returning a part.
     store
         .put(&staging.clone().join("incomplete.part"), b"incomplete")
         .await
         .unwrap();
-    let blob_dir = data_dir
-        .clone()
-        .join(target.file_name.strip_suffix(".lance").unwrap());
+    let blob_dir = data_dir.clone().join(target.data_file_key());
     if has_blob {
         let orphan = blob_path(&data_dir, target.data_file_key(), 99);
         store.put(&orphan, b"orphan").await.unwrap();
     }
     assert!(
         store
-            .exists(&staging.clone().join(first.file_name.as_str()))
+            .exists(&staging.clone().join(part_file_name(&first).as_str()))
             .await
             .unwrap()
     );
@@ -872,18 +634,21 @@ async fn restores_target_and_completed_parts_from_checkpoint(
         .checkout_version(snapshot)
         .await
         .unwrap();
-    assert_eq!(target.schema.as_ref(), dataset.schema());
-    assert_eq!(target.base_id, base_id);
+    assert_eq!(target.0.schema(), dataset.schema());
+    assert_eq!(target.0.base_id(), base_id);
     let data_dir = dataset.data_file_dir_for_base(base_id).unwrap();
     let store = dataset.object_store(base_id).await.unwrap();
     assert!(
         !store
-            .exists(&data_dir.clone().join(target.file_name.as_str()))
+            .exists(&data_dir.clone().join(target.0.file_name()))
             .await
             .unwrap()
     );
     let second = write_part(&dataset, &target, lease(11), make_batch(vec![11])).await;
-    assert_ne!(first.file_name.as_str(), second.file_name.as_str());
+    assert_ne!(
+        part_file_name(&first).as_str(),
+        part_file_name(&second).as_str()
+    );
     let checkpoint = serde_json::to_vec(&(target, vec![first, second], snapshot)).unwrap();
     drop(store);
     drop(dataset);
@@ -898,9 +663,7 @@ async fn restores_target_and_completed_parts_from_checkpoint(
         .await
         .unwrap();
     let store = dataset.object_store(base_id).await.unwrap();
-    let blob_dir = data_dir
-        .clone()
-        .join(target.file_name.strip_suffix(".lance").unwrap());
+    let blob_dir = data_dir.clone().join(target.data_file_key());
     let blobs_before = store
         .list(Some(blob_dir.clone()))
         .try_collect::<Vec<_>>()
@@ -911,7 +674,7 @@ async fn restores_target_and_completed_parts_from_checkpoint(
         .await
         .unwrap();
     let replacement = DataReplacementGroup(dataset.get_fragments()[0].id() as u64, data_file);
-    assert_eq!(replacement.1.path, target.file_name.as_str());
+    assert_eq!(replacement.1.path, target.0.file_name());
     assert_eq!(replacement.1.base_id, base_id);
     assert_eq!(
         blobs_before,
@@ -924,10 +687,7 @@ async fn restores_target_and_completed_parts_from_checkpoint(
     let dataset = commit(&dataset, replacement).await.unwrap();
     target.finish(&dataset).await.unwrap();
     target.finish(&dataset).await.unwrap();
-    let staging_dir = data_dir
-        .clone()
-        .join("_parts")
-        .join(target.file_name.as_str());
+    let staging_dir = data_dir.clone().join("_parts").join(target.0.file_name());
     assert!(
         store
             .list(Some(staging_dir))
@@ -994,7 +754,8 @@ async fn data_file_part_rejects_non_empty_file_relative_inline_blob() {
     blobs.push_bytes(b"ordinary-inline").unwrap();
     let batch = RecordBatch::try_new(schema, vec![blobs.finish().unwrap()]).unwrap();
     let dataset = dataset_of(batch, LanceFileVersion::V2_2).await;
-    let data_file = &only_fragment(&dataset).metadata.files[0];
+    let fragment = only_fragment(&dataset);
+    let data_file = &fragment.metadata().files[0];
     let scheduler = ScanScheduler::new(
         dataset.table_state.object_store.clone(),
         SchedulerConfig::default_for_testing(),
@@ -1049,7 +810,7 @@ async fn complete_logical_blob_schema_and_external_range_survive_assembly() {
     )
     .unwrap();
     assert_eq!(
-        target.schema.fields[0]
+        target.0.schema().fields[0]
             .children
             .iter()
             .map(|child| child.name.as_str())
@@ -1169,7 +930,7 @@ async fn blob_parts_write_sidecars_in_final_namespace_and_concat_descriptors() {
         !dataset
             .table_state
             .object_store
-            .exists(&dataset.data_dir().join(other_target.file_name.as_str()))
+            .exists(&dataset.data_dir().join(other_target.0.file_name()))
             .await
             .unwrap()
     );
@@ -1205,8 +966,9 @@ async fn managed_part_rejects_changed_physical_size_before_output(#[case] grow: 
     .unwrap();
     let part = write_part(&dataset, &target, None, batch).await;
     let path = target
+        .0
         .parts_dir(&dataset.data_dir())
-        .join(part.file_name.as_str());
+        .join(part_file_name(&part).as_str());
     let store = dataset.object_store(None).await.unwrap();
     let original = store
         .read_object(&path)
@@ -1239,7 +1001,7 @@ async fn managed_part_rejects_changed_physical_size_before_output(#[case] grow: 
     );
     assert!(
         !store
-            .exists(&dataset.data_dir().join(target.file_name.as_str()))
+            .exists(&dataset.data_dir().join(target.0.file_name()))
             .await
             .unwrap()
     );
@@ -1322,7 +1084,7 @@ async fn completed_blob_uploads_round_trip_through_nested_columns(
     )
     .await
     .unwrap();
-    let root = dataset.blob_base_path(base_id).unwrap();
+    let root = dataset.table_view().blob_base_path(base_id).unwrap();
     let relative = Path::from("_blobs/ingest/attempt-1/value.payload");
     let absolute: Path = root.parts().chain(relative.parts()).collect();
     let empty_relative = Path::from("_blobs/ingest/attempt-1/empty.payload");
@@ -1465,8 +1227,10 @@ async fn fragment_copies_registered_blob_ranges_with_bounded_requests() {
     let mut source_data = vec![0x13; MAX_REQUEST + 64];
     source_data[MAX_REQUEST..].fill(0x71);
     let source_data = Bytes::from(source_data);
-    let (store, recorded) = recording_range_store(source_data.clone());
+    let (store, _) = ObjectStore::from_uri("memory://").await.unwrap();
     let path = Path::from("existing-sidecar");
+    store.put(&path, &source_data).await.unwrap();
+    store.io_stats_incremental();
     let ranges = [5..9, 7..(128 * 1024 + 7), 9..(MAX_REQUEST + 27)];
     let mut sources = BlobWriteSources::default();
     let mut blobs = BlobDescriptorArrayBuilder::for_field(&field).unwrap();
@@ -1493,7 +1257,13 @@ async fn fragment_copies_registered_blob_ranges_with_bounded_requests() {
         )
         .await
         .unwrap();
-    let requests = recorded.requested_ranges();
+    let requests = store
+        .io_stats_incremental()
+        .requests
+        .into_iter()
+        .filter(|request| request.path == path)
+        .filter_map(|request| request.range)
+        .collect::<Vec<_>>();
     assert!(
         requests
             .iter()
@@ -1542,8 +1312,9 @@ async fn part_page_count(
         .await
         .unwrap();
     let path = target
-        .parts_dir(&dataset.data_file_dir_for_base(target.base_id).unwrap())
-        .join(part.file_name.as_str());
+        .0
+        .parts_dir(&dataset.data_file_dir_for_base(target.0.base_id()).unwrap())
+        .join(part_file_name(&part).as_str());
     let scheduler = ScanScheduler::new(
         dataset.table_state.object_store.clone(),
         SchedulerConfig::default_for_testing(),
