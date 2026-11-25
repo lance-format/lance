@@ -3373,17 +3373,22 @@ impl RowStreamRead {
         let count = requested.len();
         let has_high_container_occupancy =
             || count >= 32 * u64::from(requested.statistics().n_containers);
-        let is_dense = count >= 128
-            && requested
-                .min()
-                .zip(requested.max())
-                .is_some_and(|(start, end)| {
-                    count >= (u64::from(end) - u64::from(start) + 1).div_ceil(4)
-                });
+        let bounds = if count >= 128 {
+            requested.min().zip(requested.max())
+        } else {
+            None
+        };
+        let is_dense = bounds.is_some_and(|(start, end)| {
+            count >= (u64::from(end) - u64::from(start) + 1).div_ceil(4)
+        });
         match deletion_vector {
             None | Some(DeletionVector::NoDeletions) => bitmap_to_ranges(&requested),
             Some(DeletionVector::Bitmap(deleted)) if is_dense => {
-                bitmap_to_ranges(&(requested.as_ref() - deleted))
+                // In-place subtraction only looks up deletion containers
+                // that overlap the request.
+                let mut surviving = requested.into_owned();
+                surviving -= deleted;
+                bitmap_to_ranges(&surviving)
             }
             // A distant offset can span many empty containers. Use the
             // occupancy of the request containers to amortize copying, since
@@ -3399,21 +3404,26 @@ impl RowStreamRead {
                     Self::requested_ranges_minus_sorted_offsets(&surviving, std::iter::empty())
                 }
             }
-            Some(DeletionVector::Set(deleted)) if is_dense && deleted.len() as u64 <= count => {
-                let mut surviving = requested.into_owned();
-                for offset in deleted {
-                    surviving.remove(*offset);
-                }
-                bitmap_to_ranges(&surviving)
-            }
             // Sorting a small set once lets us apply deletions to whole runs.
-            // Well-occupied containers can amortize sorting a larger set.
-            Some(deleted @ DeletionVector::Set(offsets))
+            // Dense or well-occupied requests can amortize sorting a larger set.
+            Some(DeletionVector::Set(offsets))
                 if count >= 128
                     && (offsets.len() as u64 <= count / 8
-                        || (offsets.len() as u64 <= count && has_high_container_occupancy())) =>
+                        || (offsets.len() as u64 <= count
+                            && (is_dense || has_high_container_occupancy()))) =>
             {
-                Self::requested_ranges_minus_sorted_offsets(&requested, deleted.to_sorted_iter())
+                let mut sorted_deletions: Vec<u32> = offsets
+                    .iter()
+                    .copied()
+                    .filter(|offset| {
+                        bounds.is_some_and(|(first, last)| (first..=last).contains(offset))
+                    })
+                    .collect();
+                sorted_deletions.sort_unstable();
+                Self::requested_ranges_minus_sorted_offsets(
+                    &requested,
+                    sorted_deletions.into_iter(),
+                )
             }
             Some(deleted) => {
                 let mut ranges: Vec<Range<u64>> = Vec::new();
@@ -6203,17 +6213,46 @@ mod tests {
         );
     }
 
+    fn assert_partial_fragment_ranges(
+        requested: &RoaringBitmap,
+        physical_rows: u32,
+        deleted: &DeletionVector,
+    ) {
+        let mut expected: Vec<Range<u64>> = Vec::new();
+        for offset in requested.iter() {
+            if offset >= physical_rows || deleted.contains(offset) {
+                continue;
+            }
+            let start = u64::from(offset);
+            if let Some(last) = expected.last_mut().filter(|range| range.end == start) {
+                last.end += 1;
+            } else {
+                expected.push(start..start + 1);
+            }
+        }
+
+        assert_eq!(
+            RowStreamRead::partial_fragment_ranges(
+                requested,
+                u64::from(physical_rows),
+                Some(deleted)
+            ),
+            expected
+        );
+    }
+
     #[rstest]
-    #[case::short_run(8191, false)]
-    #[case::long_run(65_536, false)]
-    #[case::scattered_survivors(8191, true)]
-    fn test_partial_fragment_ranges_with_bitmap_deletions_and_distant_offset(
+    #[case::dense_run(128, None, false)]
+    #[case::short_run(8191, Some(900_000_001), false)]
+    #[case::long_run(65_536, Some(900_000_001), false)]
+    #[case::scattered_survivors(8191, Some(900_000_001), true)]
+    fn test_partial_fragment_ranges_with_dispersed_bitmap_deletions(
         #[case] run_len: u32,
+        #[case] distant: Option<u32>,
         #[case] delete_alternating: bool,
     ) {
-        const DISTANT: u32 = 900_000_001;
         const PHYSICAL_ROWS: u32 = 1_000_000_000;
-        let requested: RoaringBitmap = (0..run_len).chain([DISTANT, PHYSICAL_ROWS]).collect();
+        let requested: RoaringBitmap = (0..run_len).chain(distant).chain([PHYSICAL_ROWS]).collect();
         let mut bitmap: RoaringBitmap = if delete_alternating {
             (0..run_len).step_by(2).collect()
         } else {
@@ -6221,39 +6260,25 @@ mod tests {
         };
         bitmap.extend((0..(6000 - bitmap.len()) as u32).map(|index| 100_000 + index * 166_000));
         assert_eq!(bitmap.len(), 6000);
-        let expected: RoaringBitmap = requested
-            .iter()
-            .filter(|&offset| offset < PHYSICAL_ROWS && !bitmap.contains(offset))
-            .collect();
-
-        let ranges = RowStreamRead::partial_fragment_ranges(
-            &requested,
-            u64::from(PHYSICAL_ROWS),
-            Some(&DeletionVector::Bitmap(bitmap)),
-        );
-
-        assert_eq!(ranges, bitmap_to_ranges(&expected));
+        assert_partial_fragment_ranges(&requested, PHYSICAL_ROWS, &DeletionVector::Bitmap(bitmap));
     }
 
     #[rstest]
     #[case::outside_request((100_000..102_048).collect())]
     #[case::alternating_in_request((0..4096).step_by(2).collect())]
-    fn test_partial_fragment_ranges_with_large_deletion_set_and_distant_offset(
+    fn test_partial_fragment_ranges_with_large_deletion_set(
         #[case] offsets: HashSet<u32>,
+        #[values(false, true)] include_distant: bool,
     ) {
-        let requested: RoaringBitmap = (0..8191).chain([500_000]).collect();
+        let requested: RoaringBitmap = if include_distant {
+            (0..8191).chain([500_000]).collect()
+        } else {
+            let dense: RoaringBitmap = (0..4096).collect();
+            assert_eq!(dense.statistics().n_array_containers, 1);
+            dense
+        };
         assert_eq!(offsets.len(), 2048);
-        let expected: RoaringBitmap = requested
-            .iter()
-            .filter(|offset| !offsets.contains(offset))
-            .collect();
-        let ranges = RowStreamRead::partial_fragment_ranges(
-            &requested,
-            1_000_000,
-            Some(&DeletionVector::Set(offsets)),
-        );
-
-        assert_eq!(ranges, bitmap_to_ranges(&expected));
+        assert_partial_fragment_ranges(&requested, 1_000_000, &DeletionVector::Set(offsets));
     }
 
     #[test]
