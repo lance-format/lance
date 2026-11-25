@@ -106,7 +106,8 @@ identity, or an authorization capability. The execution-only `SnapshotRef` is
 not embedded and this specification does not depend on its schema or implementation.
 
 `RetainedSnapshot.table_id` is the nonzero 16-byte UUID from the authoritative
-retention root. Its `manifest_key` is the normalized root-relative manifest
+retention root, in network byte order (the UUID text's hexadecimal pairs with
+hyphens removed). Its `manifest_key` is the normalized root-relative manifest
 address described above. Resolving that key through the authenticated root must
 identify the same manifest as the per-manifest record. A release must validate
 the table ID against the root before modifying any pin. Unknown protocol versions,
@@ -115,7 +116,7 @@ invalid UUIDs, escaping paths, and missing identity fields are rejected.
 The manifest digest is 32 BLAKE3 bytes over the complete original manifest file,
 including metadata sections, dictionaries, inline transactions, length prefixes,
 and footer. Protobuf re-encoding must not substitute for the original file bytes.
-The optional manifest identity is the authoritative commit-store identity;
+The optional manifest identity is a nonempty authoritative commit-store identity;
 absence means that only the digest supplies content identity. Branch absence
 identifies main. A snapshot must name an exact positive version and manifest.
 

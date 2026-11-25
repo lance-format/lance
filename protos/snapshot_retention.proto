@@ -10,7 +10,7 @@ package lance.dataset.retention;
  */
 message RetainedSnapshot {
   uint32 protocol_version = 1;
-  // Nonzero 16-byte UUID from the authoritative retention root's table_id.
+  // Nonzero 16-byte UUID in network byte order from the retention root's table_id.
   bytes table_id = 2;
   // Absent identifies main; otherwise the exact normalized branch name.
   optional string branch = 3;
