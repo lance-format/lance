@@ -504,8 +504,8 @@ async fn test_insert_subschema() {
     // Looking at the fragments, there is no data file with the missing field
     let fragments = dataset.get_fragments();
     assert_eq!(fragments.len(), 1);
-    assert_eq!(fragments[0].metadata.files.len(), 1);
-    assert_eq!(fragments[0].metadata.files[0].fields.as_ref(), &[0]);
+    assert_eq!(fragments[0].metadata().files.len(), 1);
+    assert_eq!(fragments[0].metadata().files[0].fields.as_ref(), &[0]);
 
     // When reading back, columns that are missing are null
     let data = dataset.scan().try_into_batch().await.unwrap();
@@ -552,8 +552,8 @@ async fn test_insert_subschema() {
     dataset.validate().await.unwrap();
     let fragments = dataset.get_fragments();
     assert_eq!(fragments.len(), 1);
-    assert_eq!(fragments[0].metadata.files.len(), 1);
-    assert_eq!(fragments[0].metadata.files[0].fields.as_ref(), &[0, 1]);
+    assert_eq!(fragments[0].metadata().files.len(), 1);
+    assert_eq!(fragments[0].metadata().files[0].fields.as_ref(), &[0, 1]);
 
     // Can scan and get expected data.
     let data = dataset.scan().try_into_batch().await.unwrap();
@@ -685,10 +685,10 @@ async fn test_insert_nested_subschemas() {
     dataset.validate().await.unwrap();
     let fragments = dataset.get_fragments();
     assert_eq!(fragments.len(), 1);
-    assert_eq!(fragments[0].metadata.files.len(), 1);
-    assert_eq!(fragments[0].metadata.files[0].fields.as_ref(), &[2, 1]);
+    assert_eq!(fragments[0].metadata().files.len(), 1);
+    assert_eq!(fragments[0].metadata().files[0].fields.as_ref(), &[2, 1]);
     assert_eq!(
-        fragments[0].metadata.files[0].column_indices.as_ref(),
+        fragments[0].metadata().files[0].column_indices.as_ref(),
         &[0, 1]
     );
 
@@ -716,10 +716,10 @@ async fn test_insert_nested_subschemas() {
     dataset.validate().await.unwrap();
     let fragments = dataset.get_fragments();
     assert_eq!(fragments.len(), 2);
-    assert_eq!(fragments[1].metadata.files.len(), 1);
-    assert_eq!(fragments[1].metadata.files[0].fields.as_ref(), &[3, 2]);
+    assert_eq!(fragments[1].metadata().files.len(), 1);
+    assert_eq!(fragments[1].metadata().files[0].fields.as_ref(), &[3, 2]);
     assert_eq!(
-        fragments[1].metadata.files[0].column_indices.as_ref(),
+        fragments[1].metadata().files[0].column_indices.as_ref(),
         &[0, 1]
     );
 
@@ -927,8 +927,8 @@ async fn test_insert_balanced_subschemas() {
 
     let fragments = dataset.get_fragments();
     assert_eq!(fragments.len(), 1);
-    assert_eq!(fragments[0].metadata.files.len(), 1);
-    assert_eq!(fragments[0].metadata.files[0].fields.as_ref(), &[0]);
+    assert_eq!(fragments[0].metadata().files.len(), 1);
+    assert_eq!(fragments[0].metadata().files[0].fields.as_ref(), &[0]);
 
     // Insert right side
     let just_b = Arc::new(ArrowSchema::new(vec![field_b.clone()]));
@@ -943,8 +943,8 @@ async fn test_insert_balanced_subschemas() {
 
     let fragments = dataset.get_fragments();
     assert_eq!(fragments.len(), 2);
-    assert_eq!(fragments[1].metadata.files.len(), 1);
-    assert_eq!(fragments[1].metadata.files[0].fields.as_ref(), &[1]);
+    assert_eq!(fragments[1].metadata().files.len(), 1);
+    assert_eq!(fragments[1].metadata().files[0].fields.as_ref(), &[1]);
 
     let data = dataset
         .take(
@@ -1089,7 +1089,7 @@ async fn test_datafile_replacement() {
 
     assert_eq!(dataset.version().version, 5);
     assert_eq!(dataset.get_fragments().len(), 1);
-    assert_eq!(dataset.get_fragments()[0].metadata.files.len(), 1);
+    assert_eq!(dataset.get_fragments()[0].metadata().files.len(), 1);
 
     let batch = dataset.scan().try_into_batch().await.unwrap();
     assert_eq!(batch.num_rows(), 3);
@@ -1127,7 +1127,7 @@ async fn test_datafile_partial_replacement() {
         .await
         .unwrap();
 
-    let fragment = dataset.get_fragments().pop().unwrap().metadata;
+    let fragment = Fragment::from(dataset.get_fragments().pop().unwrap());
 
     let extended_schema = Arc::new(ArrowSchema::new(vec![
         ArrowField::new("a", DataType::Int32, true),
@@ -1209,13 +1209,17 @@ async fn test_datafile_partial_replacement() {
 
     assert_eq!(dataset.version().version, 4);
     assert_eq!(dataset.get_fragments().len(), 1);
-    assert_eq!(dataset.get_fragments()[0].metadata.files.len(), 2);
+    assert_eq!(dataset.get_fragments()[0].metadata().files.len(), 2);
     assert_eq!(
-        dataset.get_fragments()[0].metadata.files[0].fields.as_ref(),
+        dataset.get_fragments()[0].metadata().files[0]
+            .fields
+            .as_ref(),
         &[0]
     );
     assert_eq!(
-        dataset.get_fragments()[0].metadata.files[1].fields.as_ref(),
+        dataset.get_fragments()[0].metadata().files[1]
+            .fields
+            .as_ref(),
         &[1]
     );
 
@@ -1272,7 +1276,7 @@ async fn test_datafile_partial_replacement() {
 
     assert_eq!(dataset.version().version, 5);
     assert_eq!(dataset.get_fragments().len(), 1);
-    assert_eq!(dataset.get_fragments()[0].metadata.files.len(), 2);
+    assert_eq!(dataset.get_fragments()[0].metadata().files.len(), 2);
 
     let batch = dataset.scan().try_into_batch().await.unwrap();
     assert_eq!(batch.num_rows(), 3);
@@ -1319,7 +1323,7 @@ async fn test_datafile_replacement_error() {
         .await
         .unwrap();
 
-    let fragment = dataset.get_fragments().pop().unwrap().metadata;
+    let fragment = Fragment::from(dataset.get_fragments().pop().unwrap());
 
     let extended_schema = Arc::new(ArrowSchema::new(vec![
         ArrowField::new("a", DataType::Int32, true),
@@ -4508,11 +4512,11 @@ async fn multi_base_fixture(indexed: bool) -> MultiBaseFixture {
     let fragments = dataset.get_fragments();
     assert_eq!(fragments.len(), 3);
     for fragment in &fragments[..2] {
-        for file in &fragment.metadata.files {
+        for file in &fragment.metadata().files {
             assert_eq!(file.base_id, Some(1));
         }
     }
-    for file in &fragments[2].metadata.files {
+    for file in &fragments[2].metadata().files {
         assert_eq!(file.base_id, None);
     }
 
@@ -4587,7 +4591,7 @@ async fn test_merge_insert_on_multi_base_table(#[values(false, true)] indexed: b
     assert_eq!(dataset.count_rows(None).await.unwrap(), 11);
 
     for fragment in dataset.get_fragments() {
-        let metadata = &fragment.metadata;
+        let metadata = fragment.metadata();
         if metadata.id >= 3 {
             // Fragments written by the merge live in primary storage.
             for file in &metadata.files {
@@ -4649,7 +4653,7 @@ async fn test_merge_insert_route_to_target_bases(#[values(false, true)] indexed:
     // files sit directly under it.
     let mut merge_files = 0;
     for fragment in dataset.get_fragments() {
-        let metadata = &fragment.metadata;
+        let metadata = fragment.metadata();
         if metadata.id >= 3 {
             for file in &metadata.files {
                 assert_eq!(file.base_id, Some(2));
@@ -4682,7 +4686,7 @@ async fn test_merge_insert_route_to_target_bases(#[values(false, true)] indexed:
 
     let mut merge_files = 0;
     for fragment in dataset.get_fragments() {
-        let metadata = &fragment.metadata;
+        let metadata = fragment.metadata();
         if metadata.id > max_fragment_id {
             for file in &metadata.files {
                 assert_eq!(file.base_id, Some(1));
@@ -4749,7 +4753,7 @@ async fn test_merge_insert_partial_schema_multi_base() {
     assert_eq!(stats.num_inserted_rows, 2);
 
     for fragment in dataset.get_fragments() {
-        let metadata = &fragment.metadata;
+        let metadata = fragment.metadata();
         match metadata.id {
             0 | 1 => {
                 // Patched fragments: the original file in base1 plus a column
@@ -4870,8 +4874,8 @@ async fn test_merge_insert_round_robin_target_bases() {
     let merge_file_bases: Vec<_> = dataset
         .get_fragments()
         .iter()
-        .filter(|fragment| fragment.metadata.id >= 1)
-        .flat_map(|fragment| fragment.metadata.files.iter().map(|file| file.base_id))
+        .filter(|fragment| fragment.metadata().id >= 1)
+        .flat_map(|fragment| fragment.metadata().files.iter().map(|file| file.base_id))
         .collect();
     assert_eq!(merge_file_bases, vec![Some(1), Some(2)]);
 }
@@ -5048,8 +5052,8 @@ async fn test_merge_insert_target_bases_include_primary() {
     let new_files: Vec<_> = dataset
         .get_fragments()
         .iter()
-        .filter(|f| f.metadata.id >= 3)
-        .flat_map(|f| f.metadata.files.iter().map(|file| file.base_id))
+        .filter(|f| f.metadata().id >= 3)
+        .flat_map(|f| f.metadata().files.iter().map(|file| file.base_id))
         .collect();
     assert_eq!(new_files, vec![None]);
 
@@ -5071,8 +5075,8 @@ async fn test_merge_insert_target_bases_include_primary() {
     let new_files: Vec<_> = dataset
         .get_fragments()
         .iter()
-        .filter(|f| f.metadata.id > max_id)
-        .flat_map(|f| f.metadata.files.iter().map(|file| file.base_id))
+        .filter(|f| f.metadata().id > max_id)
+        .flat_map(|f| f.metadata().files.iter().map(|file| file.base_id))
         .collect();
     assert_eq!(new_files, vec![Some(2)]);
 
@@ -5094,8 +5098,8 @@ async fn test_merge_insert_target_bases_include_primary() {
     let new_files: Vec<_> = dataset
         .get_fragments()
         .iter()
-        .filter(|f| f.metadata.id > max_id)
-        .flat_map(|f| f.metadata.files.iter().map(|file| file.base_id))
+        .filter(|f| f.metadata().id > max_id)
+        .flat_map(|f| f.metadata().files.iter().map(|file| file.base_id))
         .collect();
     assert_eq!(new_files, vec![None]);
 
@@ -5167,7 +5171,7 @@ async fn test_merge_insert_conflict_retry_cleans_routed_files() {
 
     let mut referenced: HashSet<(Option<u32>, String)> = HashSet::new();
     for fragment in dataset.get_fragments() {
-        for file in &fragment.metadata.files {
+        for file in &fragment.metadata().files {
             referenced.insert((file.base_id, file.path.to_string()));
         }
     }
@@ -5227,8 +5231,8 @@ async fn test_merge_insert_target_all_bases() {
     let new_files: Vec<_> = dataset
         .get_fragments()
         .iter()
-        .filter(|f| f.metadata.id >= 3)
-        .flat_map(|f| f.metadata.files.iter().map(|file| file.base_id))
+        .filter(|f| f.metadata().id >= 3)
+        .flat_map(|f| f.metadata().files.iter().map(|file| file.base_id))
         .collect();
     assert_eq!(new_files, vec![None]);
 
@@ -5250,8 +5254,8 @@ async fn test_merge_insert_target_all_bases() {
     let new_files: Vec<_> = dataset
         .get_fragments()
         .iter()
-        .filter(|f| f.metadata.id > max_id)
-        .flat_map(|f| f.metadata.files.iter().map(|file| file.base_id))
+        .filter(|f| f.metadata().id > max_id)
+        .flat_map(|f| f.metadata().files.iter().map(|file| file.base_id))
         .collect();
     assert_eq!(new_files, vec![Some(1)]);
 

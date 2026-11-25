@@ -18,6 +18,7 @@ use lance_core::{
     utils::deletion::DeletionVector,
 };
 use lance_select::RowAddrMask;
+use lance_table::system_index::frag_reuse::{CompactFragReuseIndex, FragReuseIndexDetails};
 use lance_table::{
     format::{
         DataFile, DeletionFile, DeletionFileType, IndexMetadata, Manifest,
@@ -26,6 +27,7 @@ use lance_table::{
     rowids::{RowIdIndex, RowIdSequence},
 };
 use object_store::path::Path;
+use uuid::Uuid;
 
 use lance_table::transaction::Transaction;
 
@@ -415,6 +417,8 @@ impl CacheKey for IndexMetadataKey<'_> {
     }
 
     fn schema() -> CacheKeySchema {
+        // v4 contains only manifest data. Earlier builds could also cache
+        // inferred legacy index details under this key.
         // v3 entries carry each segment's clustering reference and metadata;
         // a v2 entry, written by a build that did not know those fields, holds
         // every segment unlabelled, and a writer trusting it would republish
@@ -423,7 +427,7 @@ impl CacheKey for IndexMetadataKey<'_> {
         // persistent backend shared with another release nothing but this
         // version stops each build from reading the other's entry as its own
         // meaning.
-        CacheKeySchema::new("lance.index.metadata-key", 3)
+        CacheKeySchema::new("lance.index.metadata-key", 4)
     }
 
     fn write_key(&self, builder: &mut KeyBuilder) {
@@ -441,6 +445,124 @@ impl CacheKey for IndexMetadataKey<'_> {
     fn codec() -> Option<lance_core::cache::CacheCodec> {
         Some(lance_table::format::index_metadata_codec())
     }
+}
+
+/// Decoded fragment reuse history with `index_version = 0`, keyed by
+/// [`crate::frag_reuse::v0_cache_identity`].
+#[derive(Debug)]
+pub struct FragReuseIndexKey<'a> {
+    pub uuid: &'a Uuid,
+}
+
+impl CacheKey for FragReuseIndexKey<'_> {
+    type ValueType = CompactFragReuseIndex;
+
+    fn key(&self) -> Cow<'_, str> {
+        Cow::Owned(format!("frag_reuse/{}", self.uuid))
+    }
+
+    fn type_name() -> &'static str {
+        "FragReuseIndex"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.index.fragment-reuse-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_fixed_bytes(self.uuid.as_bytes());
+    }
+}
+
+/// Decoded fragment reuse details of an external `details.binpb`, keyed by where the
+/// file lives: a shallow clone's entry resolves to the source dataset's file. Each file
+/// is written once, under a fresh entry UUID. A hit does not check the file still exists.
+#[derive(Debug)]
+pub struct FragReuseDetailsKey<'a> {
+    pub store_identity: &'a str,
+    pub path: &'a object_store::path::Path,
+    pub offset: u64,
+    pub size: u64,
+}
+
+impl CacheKey for FragReuseDetailsKey<'_> {
+    type ValueType = FragReuseIndexDetails;
+
+    fn key(&self) -> Cow<'_, str> {
+        Cow::Owned(format!(
+            "frag_reuse_details/{}:{}/{}/{}/{}",
+            self.store_identity.len(),
+            self.store_identity,
+            self.path,
+            self.offset,
+            self.size
+        ))
+    }
+
+    fn type_name() -> &'static str {
+        "FragReuseIndexDetails"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.index.fragment-reuse-details-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_str(self.store_identity);
+        builder.write_str(self.path.as_ref());
+        builder.write_u64(self.offset);
+        builder.write_u64(self.size);
+    }
+}
+
+/// The complete index listing with its fragment bitmaps translated through
+/// version-zero fragment reuse history.
+///
+/// This memory-only projection uses the same snapshot identity as
+/// [`IndexMetadataKey`], which stores the raw manifest entries. It contains no
+/// inferred index details or query visibility decisions.
+#[derive(Clone, Copy, Debug)]
+pub struct DerivedIndexListingKey<'a> {
+    pub version: u64,
+    pub store_identity: &'a str,
+    pub e_tag: Option<&'a str>,
+}
+
+impl CacheKey for DerivedIndexListingKey<'_> {
+    type ValueType = Vec<IndexMetadata>;
+
+    fn key(&self) -> Cow<'_, str> {
+        Cow::Owned(format!(
+            "{}:{}/{}/{}",
+            self.store_identity.len(),
+            self.store_identity,
+            self.version,
+            self.e_tag.unwrap_or("")
+        ))
+    }
+
+    fn type_name() -> &'static str {
+        "Vec<IndexMetadata>"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.index.derived-listing-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_str(self.store_identity);
+        builder.write_u64(self.version);
+        match self.e_tag {
+            Some(e_tag) => {
+                builder.write_some();
+                builder.write_str(e_tag);
+            }
+            None => builder.write_none(),
+        }
+    }
+
+    // No `codec`: memory-only. See the type doc: the derived listing is
+    // reader-capability dependent and must not be persisted across builds.
 }
 
 #[cfg(test)]

@@ -288,71 +288,11 @@ impl ProjectionPlan {
     ///
     /// This is something that cannot be done easily using expressions.
     pub fn from_schema(base: Arc<dyn Projectable>, projection: &Schema) -> Result<Self> {
-        // Separate data columns from system columns
-        // System columns (_rowid, _rowaddr, etc.) are handled via flags in Projection,
-        // not as fields in the Schema
-        let mut data_fields = Vec::new();
-        let mut with_row_id = false;
-        let mut with_row_addr = false;
-        let mut must_add_row_offset = false;
-        let mut with_row_last_updated_at_version = false;
-        let mut with_row_created_at_version = false;
-
-        for field in projection.fields.iter() {
-            if lance_core::is_system_column(&field.name) {
-                // Handle known system columns that can be included in projections
-                if field.name == ROW_ID {
-                    // Only `_rowoffset` needs `AddRowOffsetExec`. Requesting that node for
-                    // `_rowid` leaves it without the `_rowaddr` column it reads, so the scan
-                    // fails to plan with "Input plan does not have a _rowaddr column".
-                    with_row_id = true;
-                } else if field.name == ROW_ADDR {
-                    with_row_addr = true;
-                } else if field.name == ROW_OFFSET {
-                    with_row_addr = true;
-                    must_add_row_offset = true;
-                } else if field.name == ROW_LAST_UPDATED_AT_VERSION {
-                    with_row_last_updated_at_version = true;
-                } else if field.name == ROW_CREATED_AT_VERSION {
-                    with_row_created_at_version = true;
-                }
-            } else {
-                // Regular data column - validate it exists in base schema
-                if base.schema().field(&field.name).is_none() {
-                    return Err(Error::invalid_input(format!(
-                        "Column '{}' not found in schema",
-                        field.name
-                    )));
-                }
-                data_fields.push(field.clone());
-            }
-        }
-
-        // Create a schema with only data columns for the physical projection
-        let data_schema = Schema {
-            fields: data_fields,
-            metadata: projection.metadata.clone(),
-        };
-
-        // Resolve the requested fields against the base schema first.
-        // `union_schema` records any field carrying a non-negative id without
-        // checking that the base knows that id, so a schema numbered
-        // independently of the dataset -- `Schema::try_from(&ArrowSchema)` gives
-        // every field a fresh id -- yields a projection that silently resolves
-        // to fewer columns than were asked for, or to the wrong ones. Matching
-        // by name and type here reports that instead.
-        let data_schema = base.schema().project_by_schema(
-            &data_schema,
-            OnMissing::Error,
-            OnTypeMismatch::Error,
-        )?;
-
-        // Calculate the physical projection from data columns only
-        let mut physical_projection = Projection::empty(base).union_schema(&data_schema);
-        physical_projection.with_row_id = with_row_id;
-        physical_projection.with_row_addr = with_row_addr;
-        physical_projection.with_row_last_updated_at_version = with_row_last_updated_at_version;
-        physical_projection.with_row_created_at_version = with_row_created_at_version;
+        let physical_projection = Projection::from_schema(base, projection)?;
+        let must_add_row_offset = projection
+            .fields
+            .iter()
+            .any(|field| field.name == ROW_OFFSET);
 
         // Build output expressions preserving the original order (including system columns)
         let exprs = projection

@@ -234,6 +234,8 @@ impl UpdateBuilder {
 
     /// Set the total timeout for all retries.
     ///
+    /// A commit that has already started finishes even if this timeout expires.
+    ///
     /// Default is 30 seconds.
     pub fn retry_timeout(mut self, timeout: Duration) -> Self {
         self.retry_timeout = timeout;
@@ -842,7 +844,7 @@ impl UpdateJob {
                     if let Some(bitmap) = bitmaps_ref.get(&(fragment_id as u32)) {
                         match fragment.extend_deletions(*bitmap).await {
                             Ok(Some(new_fragment)) => {
-                                Ok(FragmentChange::Modified(Box::new(new_fragment.metadata)))
+                                Ok(FragmentChange::Modified(Box::new(new_fragment.into())))
                             }
                             Ok(None) => Ok(FragmentChange::Removed(fragment_id as u64)),
                             Err(e) => Err(e),
@@ -866,7 +868,7 @@ impl UpdateJob {
     }
 }
 
-impl RetryExecutor for UpdateJob {
+impl RetryExecutor<Dataset> for UpdateJob {
     type Data = UpdateData;
     type Result = UpdateResult;
 
@@ -1399,34 +1401,37 @@ mod tests {
         assert_eq!(fragments.len(), 3);
 
         // One fragment not touched (id = 0..10)
-        assert_eq!(fragments[0].metadata.id, original_fragments[0].metadata.id);
         assert_eq!(
-            fragments[0].metadata.files,
-            original_fragments[0].metadata.files
+            fragments[0].metadata().id,
+            original_fragments[0].metadata().id
         );
         assert_eq!(
-            fragments[0].metadata.physical_rows,
-            original_fragments[0].metadata.physical_rows
+            fragments[0].metadata().files,
+            original_fragments[0].metadata().files
         );
         assert_eq!(
-            fragments[0].metadata.row_id_meta,
-            original_fragments[0].metadata.row_id_meta
+            fragments[0].metadata().physical_rows,
+            original_fragments[0].metadata().physical_rows
+        );
+        assert_eq!(
+            fragments[0].metadata().row_id_meta,
+            original_fragments[0].metadata().row_id_meta
         );
         // One fragment partially modified (id = 10..15)
         assert_eq!(
-            fragments[1].metadata.files,
-            original_fragments[1].metadata.files,
+            fragments[1].metadata().files,
+            original_fragments[1].metadata().files,
         );
         assert_eq!(
             fragments[1]
-                .metadata
+                .metadata()
                 .deletion_file
                 .as_ref()
                 .and_then(|f| f.num_deleted_rows),
             Some(5)
         );
         // One fragment fully modified
-        assert_eq!(fragments[2].metadata.physical_rows, Some(15));
+        assert_eq!(fragments[2].metadata().physical_rows, Some(15));
     }
 
     #[rstest]

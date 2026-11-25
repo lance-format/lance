@@ -54,6 +54,14 @@ folder contains a `datagen.py` script that generates one or more lance datasets.
   64-dimensional vectors were divided into 14 sub-vectors. Writers at this
   version silently omitted the final eight dimensions from the PQ codebook.
   Readers should preserve that prefix-only search behavior.
+* `v0.16.1/legacy_ivf_hnsw_pq`, `v0.18.2/ivf_hnsw_pq` and
+  `v0.24.1/ivf_hnsw_pq`: IVF_HNSW_PQ indices from releases before 0.25, whose
+  PQ storage metadata names the bit width `num_bits` instead of `nbits` and has
+  no `transposed` key before 0.19.2. 0.16.1 wrote the legacy v1 file (0, 2),
+  with an L2 and a Dot index; readers refuse it and ask for a rebuild. 0.18.2
+  and 0.24.1 wrote the v3 index layout in a Lance 2.0 file (0, 3), in two
+  fragments. 0.24.1 also recorded empty index details, which readers fill in
+  from that metadata.
 * `v0.19.2/legacy_ivf_pq_4bit_unpacked` and `v0.24.1/legacy_ivf_pq_4bit`:
   Legacy (v1) IVF-PQ indices built with `num_bits=4` over the same 512 rows,
   split over four fragments so compaction has to remap the index. Before
