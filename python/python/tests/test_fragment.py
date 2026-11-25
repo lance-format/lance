@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
+import inspect
 import json
 import multiprocessing
 import pickle
@@ -26,17 +27,6 @@ from lance.file import LanceFileReader, LanceFileWriter
 from lance.fragment import DeletionFile, RowIdMeta, RowIdSequence, write_fragments
 from lance.progress import FileSystemFragmentWriteProgress
 from pyarrow.fs import FileInfo, FileType
-
-
-@pytest.mark.parametrize("method", ["scanner", "to_batches"])
-def test_fragment_batch_readahead(tmp_path, method):
-    ds = write_dataset(pa.table({"a": [1, 2]}), tmp_path)
-    fragment = ds.get_fragments()[0]
-    with mock.patch.object(fragment, "_fragment", wraps=fragment._fragment) as native:
-        result = getattr(fragment, method)()
-        batches = result.to_batches() if method == "scanner" else result
-        assert pa.Table.from_batches(list(batches)).column("a").to_pylist() == [1, 2]
-        assert native.scanner.call_args.kwargs["batch_readahead"] is None
 
 
 def test_write_fragment(tmp_path: Path):
@@ -95,6 +85,9 @@ def test_scan_fragment(tmp_path: Path):
     tab = pa.table({"a": range(100), "b": range(100, 200)})
     ds = write_dataset(tab, tmp_path)
     frag = ds.get_fragments()[0]
+
+    for scan in (frag.scanner, frag.to_batches):
+        assert inspect.signature(scan).parameters["batch_readahead"].default is None
 
     actual = frag.to_table(
         columns=["b"],

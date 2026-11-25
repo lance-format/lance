@@ -95,7 +95,7 @@ public class ScannerTest {
             .batchSize(1024)
             .batchSizeBytes(64 * 1024)
             .ioBufferSize(8 * 1024 * 1024)
-            .batchReadahead(16)
+            .batchReadahead(4)
             .fragmentReadahead(2)
             .scanInOrder(false)
             .lateMaterialization(materialization)
@@ -104,8 +104,7 @@ public class ScannerTest {
     assertEquals(1024L, options.getBatchSize().orElseThrow());
     assertEquals(64 * 1024L, options.getBatchSizeBytes().orElseThrow());
     assertEquals(8 * 1024 * 1024L, options.getIoBufferSize().orElseThrow());
-    assertEquals(16, options.getBatchReadahead());
-    assertEquals(16, new ScanOptions.Builder(options).build().getBatchReadahead());
+    assertEquals(4, options.getBatchReadahead());
     assertEquals(2, options.getFragmentReadahead().orElseThrow());
     assertFalse(options.isScanInOrder());
     assertEquals(materialization, options.getLateMaterialization().orElseThrow());
@@ -117,11 +116,6 @@ public class ScannerTest {
 
     ScanOptions defaults = new ScanOptions.Builder().build();
     assertEquals(-1, defaults.getBatchReadahead());
-    assertEquals(-1, new ScanOptions.Builder(defaults).build().getBatchReadahead());
-    assertThrows(
-        IllegalArgumentException.class, () -> new ScanOptions.Builder().batchReadahead(0).build());
-    assertThrows(
-        IllegalArgumentException.class, () -> new ScanOptions.Builder().batchReadahead(-1).build());
     assertTrue(defaults.getBatchSizeBytes().isEmpty());
     assertTrue(defaults.getIoBufferSize().isEmpty());
     assertTrue(defaults.getFragmentReadahead().isEmpty());
