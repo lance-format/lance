@@ -37,12 +37,9 @@ use lance_index::vector::storage::{
 use lance_index::vector::{
     ApproxMode, PartitionSearchControl, Query, VECTOR_RESULT_SCHEMA, VectorIndex,
 };
-use lance_select::RowAddrMask;
 use tokio::sync::OnceCell;
 
-mod filter;
-
-use self::filter::PreparedRabitMask;
+use crate::index::prefilter::lookup::PreparedRowAddrMask;
 
 use super::{
     IVFIndex, PartitionEntry, PreparedPartitionGuard, PreparedPartitionSearch,
@@ -222,7 +219,7 @@ pub(super) fn controlled_partition_stream(
 pub struct RabitScanContext {
     index: Arc<RabitIndex>,
     raw_query: Option<Arc<RabitRawQueryContext>>,
-    lookup_mask: Arc<OnceCell<Arc<PreparedRabitMask>>>,
+    lookup_mask: Arc<OnceCell<Arc<PreparedRowAddrMask>>>,
     /// Original query, before setting each partition's centroid distance.
     pub query: Query,
     /// Ordered partition identifiers, paired with `centroid_distances`.
@@ -442,14 +439,9 @@ impl RabitScanContext {
         let mask = self
             .lookup_mask
             .get_or_try_init(|| async {
-                let mut mask = self.pre_filter.mask().as_ref().clone();
+                let mask = self.pre_filter.mask();
                 lance_core::utils::tokio::spawn_cpu(move || {
-                    match &mut mask {
-                        RowAddrMask::AllowList(rows) | RowAddrMask::BlockList(rows) => {
-                            rows.optimize_for_lookup();
-                        }
-                    }
-                    Ok::<_, Error>(Arc::new(PreparedRabitMask::new(&mask)))
+                    Ok::<_, Error>(Arc::new(PreparedRowAddrMask::new(&mask)))
                 })
                 .await
             })

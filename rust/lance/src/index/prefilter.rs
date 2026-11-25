@@ -39,6 +39,8 @@ use crate::utils::future::SharedPrerequisite;
 
 pub use lance_index::prefilter::{FilterLoader, PreFilter};
 
+pub(crate) mod lookup;
+
 /// Hash of a fragment set for mask cache keys, so masks restricted to different
 /// fragment sets do not share an entry. `RoaringBitmap` doesn't implement `Hash`,
 /// so the sorted ids are hashed.

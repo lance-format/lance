@@ -9,7 +9,7 @@ use roaring::RoaringBitmap;
 
 const MAX_DENSE_EXPANSION: u64 = 16;
 
-pub(super) struct PreparedRabitMask {
+pub(crate) struct PreparedRowAddrMask {
     allow: bool,
     fragments: BTreeMap<u32, FragmentSelection>,
 }
@@ -54,12 +54,14 @@ impl FragmentSelection {
     }
 }
 
-impl PreparedRabitMask {
-    pub(super) fn new(mask: &RowAddrMask) -> Self {
-        let (rows, allow) = match mask {
+impl PreparedRowAddrMask {
+    pub(crate) fn new(mask: &RowAddrMask) -> Self {
+        let mut mask = mask.clone();
+        let (rows, allow) = match &mut mask {
             RowAddrMask::AllowList(rows) => (rows, true),
             RowAddrMask::BlockList(rows) => (rows, false),
         };
+        rows.optimize_for_lookup();
         Self {
             allow,
             fragments: rows
@@ -69,11 +71,15 @@ impl PreparedRabitMask {
         }
     }
 
-    pub(super) fn acceptance<'a>(&self, rows: impl Iterator<Item = &'a u64>) -> Vec<bool> {
+    fn selection<'a>(
+        &self,
+        rows: impl Iterator<Item = &'a u64>,
+        reject_tombstone: bool,
+    ) -> impl Iterator<Item = bool> {
         let mut fragment = None;
         let mut selection = None;
-        rows.map(|&row| {
-            if row == RowAddress::TOMBSTONE_ROW {
+        rows.map(move |&row| {
+            if reject_tombstone && row == RowAddress::TOMBSTONE_ROW {
                 return false;
             }
             let address = RowAddress::new_from_u64(row);
@@ -85,7 +91,17 @@ impl PreparedRabitMask {
             selection.is_some_and(|selection| selection.contains(address.row_offset()))
                 == self.allow
         })
-        .collect()
+    }
+
+    pub(crate) fn acceptance<'a>(&self, rows: impl Iterator<Item = &'a u64>) -> Vec<bool> {
+        self.selection(rows, true).collect()
+    }
+
+    pub(crate) fn selected_indices<'a>(&self, rows: impl Iterator<Item = &'a u64>) -> Vec<u64> {
+        self.selection(rows, false)
+            .enumerate()
+            .filter_map(|(offset, selected)| selected.then_some(offset as u64))
+            .collect()
     }
 }
 
@@ -95,7 +111,7 @@ mod tests {
     use lance_select::{RowAddrMask, RowAddrTreeMap};
     use roaring::RoaringBitmap;
 
-    use super::{FragmentSelection, PreparedRabitMask};
+    use super::{FragmentSelection, PreparedRowAddrMask};
 
     #[test]
     fn prepared_mask_preserves_membership() {
@@ -137,7 +153,7 @@ mod tests {
             RowAddrMask::AllowList(rows.clone()),
             RowAddrMask::BlockList(rows),
         ] {
-            let prepared = PreparedRabitMask::new(&mask);
+            let prepared = PreparedRowAddrMask::new(&mask);
             assert!(matches!(
                 prepared.fragments.get(&7),
                 Some(FragmentSelection::Dense { .. })
@@ -155,6 +171,10 @@ mod tests {
                 .map(|&row| row != RowAddress::TOMBSTONE_ROW && mask.selected(row))
                 .collect::<Vec<_>>();
             assert_eq!(prepared.acceptance(input.iter()), expected);
+            assert_eq!(
+                prepared.selected_indices(input.iter()),
+                mask.selected_indices(input.iter())
+            );
         }
     }
 
@@ -165,7 +185,7 @@ mod tests {
         range.insert_range(0..10_000_000);
         range.optimize();
         rows.insert_bitmap(3, range);
-        let prepared = PreparedRabitMask::new(&RowAddrMask::AllowList(rows));
+        let prepared = PreparedRowAddrMask::new(&RowAddrMask::AllowList(rows));
         assert!(matches!(
             prepared.fragments.get(&3),
             Some(FragmentSelection::Sparse(_))
@@ -176,12 +196,16 @@ mod tests {
             RowAddress::TOMBSTONE_ROW,
         ];
         for mask in [RowAddrMask::all_rows(), RowAddrMask::allow_nothing()] {
-            let prepared = PreparedRabitMask::new(&mask);
+            let prepared = PreparedRowAddrMask::new(&mask);
             let expected = input
                 .iter()
                 .map(|&row| row != RowAddress::TOMBSTONE_ROW && mask.selected(row))
                 .collect::<Vec<_>>();
             assert_eq!(prepared.acceptance(input.iter()), expected);
+            assert_eq!(
+                prepared.selected_indices(input.iter()),
+                mask.selected_indices(input.iter())
+            );
         }
     }
 }

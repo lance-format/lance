@@ -383,6 +383,54 @@ async fn test_partition_coverage_is_only_built_for_capable_filters() {
     assert!(entry.partition_rows_accounted.load(Ordering::Acquire));
 }
 
+#[tokio::test]
+async fn test_partition_coverage_cache_does_not_retain_transient_storage() {
+    let entry = |num_rows| {
+        let vectors = FixedSizeListArray::try_new_from_values(
+            Float32Array::from(vec![0.0_f32; num_rows * 4]),
+            4,
+        )
+        .unwrap();
+        let mut entry = PartitionEntry::<FlatIndex, FlatQuantizer>::new(
+            FlatIndex::default(),
+            FlatFloatStorage::new(vectors, DistanceType::L2),
+        );
+        entry.cache_whole_partition = false;
+        Arc::new(entry)
+    };
+    let cache = LanceCache::with_capacity(1 << 20);
+    let weak_cache = WeakLanceCache::from(&cache.with_key_prefix("translation-a"));
+    let first = entry(4);
+    let weak_entry = Arc::downgrade(&first);
+    let rows =
+        super::IVFIndex::<FlatIndex, FlatQuantizer>::cache_partition_rows(&weak_cache, 0, &first)
+            .await
+            .unwrap();
+    assert_eq!(rows.as_ref(), &(0..4_u64).collect::<RowAddrTreeMap>());
+    drop(first);
+    assert!(weak_entry.upgrade().is_none());
+    let second = entry(4);
+    let cached_rows =
+        super::IVFIndex::<FlatIndex, FlatQuantizer>::cache_partition_rows(&weak_cache, 0, &second)
+            .await
+            .unwrap();
+    assert!(Arc::ptr_eq(&rows, &cached_rows));
+    assert!(second.partition_rows.get().is_none());
+    let changed_cache = WeakLanceCache::from(&cache.with_key_prefix("translation-b"));
+    let changed_rows = super::IVFIndex::<FlatIndex, FlatQuantizer>::cache_partition_rows(
+        &changed_cache,
+        0,
+        &entry(2),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        changed_rows.as_ref(),
+        &(0..2_u64).collect::<RowAddrTreeMap>()
+    );
+    assert!(!Arc::ptr_eq(&rows, &changed_rows));
+}
+
 #[rstest]
 #[case::below_two_tasks(vec![600, 600], 1024, 8, vec![0..2])]
 #[case::one_partition(vec![5000], 1024, 8, vec![0..1])]
