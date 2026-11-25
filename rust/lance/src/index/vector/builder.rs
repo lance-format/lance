@@ -1439,8 +1439,19 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             {
                 continue;
             }
+            // Resolved before the partition loads, as in `take_partition_batches`.
+            let old_data_filter = source.old_data_filter().await?;
             let storage = existing_index.load_partition_storage(part_id, None).await?;
-            let storage_row_ids: Vec<u64> = storage.row_ids().copied().collect();
+            let storage_row_ids = UInt64Array::from_iter_values(storage.row_ids().copied());
+            // A stable-row-id update keeps the row id but supersedes the vector,
+            // so the filter's rows must not claim the current copy's position.
+            let owned = old_data_filter.map(|filter| filter.filter_row_ids(&storage_row_ids));
+            let row_id_at = |position: usize| {
+                owned
+                    .as_ref()
+                    .is_none_or(|owned| owned.value(position))
+                    .then(|| storage_row_ids.value(position))
+            };
             // Deferred compaction drops deleted rows while the storage loads,
             // but graph nodes keep addressing the stored rows by position.
             let row_ids = match existing_index
@@ -1449,9 +1460,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             {
                 Some(positions) => positions
                     .iter()
-                    .map(|position| position.map(|position| storage_row_ids[position as usize]))
+                    .map(|position| position.and_then(|position| row_id_at(position as usize)))
                     .collect(),
-                None => storage_row_ids.into_iter().map(Some).collect(),
+                None => (0..storage_row_ids.len()).map(row_id_at).collect(),
             };
             graphs.push(OldPartitionGraph {
                 row_ids,
@@ -4816,6 +4827,79 @@ mod tests {
             2
         );
         assert_hnsw_recall(&dataset, &[0.0, 100.0], |id| id < 2000 && id % 10 == 0).await;
+    }
+
+    /// A stable-row-id update keeps the row id but replaces the vector, so the
+    /// old graph node must not claim the replacement.
+    #[tokio::test]
+    async fn optimize_merge_reindexes_stable_row_id_updates() {
+        use crate::dataset::{MergeInsertBuilder, WhenMatched, WriteParams};
+        use crate::index::DatasetIndexExt;
+        use crate::index::vector::VectorIndexParams;
+        use lance_index::vector::hnsw::builder::HnswBuildParams;
+
+        let original = random_vectors(0, 2000, 0.0, 7);
+        let replacements = random_vectors(1400, 600, 0.0, 19);
+        let schema = original.schema();
+        let reader = arrow_array::RecordBatchIterator::new([Ok(original)], schema.clone());
+        let mut dataset = crate::Dataset::write(
+            reader,
+            "memory://",
+            Some(WriteParams {
+                enable_stable_row_ids: true,
+                max_rows_per_file: 500,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset
+            .create_index(
+                &["vec"],
+                IndexType::Vector,
+                Some("idx".into()),
+                &VectorIndexParams::ivf_hnsw(
+                    DistanceType::L2,
+                    IvfBuildParams::new(1),
+                    HnswBuildParams::default().num_edges(12).ef_construction(40),
+                ),
+                false,
+            )
+            .await
+            .unwrap();
+        let reader =
+            arrow_array::RecordBatchIterator::new([Ok(replacements.clone())], schema.clone());
+        let (dataset, _) = MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".to_owned()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .try_build()
+            .unwrap()
+            .execute(lance_datafusion::utils::reader_to_stream(Box::new(reader)))
+            .await
+            .unwrap();
+        let mut dataset = dataset.as_ref().clone();
+        dataset
+            .optimize_indices(&OptimizeOptions::merge(1))
+            .await
+            .unwrap();
+
+        // Each replaced vector finds itself.
+        let queries = replacements["vec"].as_fixed_size_list();
+        let mut found = 0;
+        for i in (0..queries.len()).step_by(6) {
+            let nearest = dataset
+                .scan()
+                .nearest("vec", queries.value(i).as_ref(), 1)
+                .unwrap()
+                .minimum_nprobes(1)
+                .ef(64)
+                .try_into_batch()
+                .await
+                .unwrap();
+            found +=
+                usize::from(nearest["id"].as_primitive::<UInt64Type>().value(0) == 1400 + i as u64);
+        }
+        assert!(found >= 90, "found {found} of 100 replaced vectors");
     }
 
     #[tokio::test]

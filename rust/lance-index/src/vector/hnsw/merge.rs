@@ -495,6 +495,19 @@ impl HNSW {
         params.validate()?;
         let total = base_len + insert_len;
         let base_levels = self.max_level() as usize;
+        // Every search descends from the top level. Graphs repaired before the
+        // entry point fix can keep their entry point below it.
+        let base_entry = if self.node_num_levels(self.entry_point()) == base_levels {
+            self.entry_point()
+        } else {
+            (0..base_len as u32)
+                .find(|id| self.node_num_levels(*id) == base_levels)
+                .ok_or_else(|| {
+                    Error::invalid_input(format!(
+                        "HNSW graph has {base_levels} levels but no node on its top level"
+                    ))
+                })?
+        };
         let insert_levels: Vec<usize> = sources
             .iter()
             .map(|(graph, id)| inserted[*graph].graph.node_num_levels(*id))
@@ -508,7 +521,7 @@ impl HNSW {
                 .expect("an inserted row has the most levels");
             (base_len + tallest) as u32
         } else {
-            self.entry_point()
+            base_entry
         };
 
         let mut nodes = self.clone_nodes(storage);
@@ -529,10 +542,8 @@ impl HNSW {
                 |visited_generator, i| {
                     let q = (base_len + i) as u32;
                     let dist_calc = storage.dist_calculator_from_id(q);
-                    let mut ep = OrderedNode::new(
-                        self.entry_point(),
-                        dist_calc.distance(self.entry_point()).into(),
-                    );
+                    let mut ep =
+                        OrderedNode::new(base_entry, dist_calc.distance(base_entry).into());
                     for level in (insert_levels[i]..base_levels).rev() {
                         let view = HnswLevelView::new(level as u16, &nodes);
                         ep = greedy_search(&view, ep, &dist_calc, params.prefetch_distance).0;
@@ -876,6 +887,51 @@ mod tests {
         let merged_store = storage(&all, 0, 601);
         let merged = insert_all(&base, &delta, &merged_store).unwrap();
         assert_eq!(merged.max_level(), delta.max_level());
+        assert_well_formed(&merged, &params);
+        assert!(recall(&merged, &all, &merged_store) >= 0.9);
+    }
+
+    #[test]
+    fn test_batched_insert_lifts_an_entry_point_below_the_top_level() {
+        use std::sync::Arc;
+
+        use arrow_array::RecordBatch;
+
+        use crate::vector::hnsw::HnswMetadata;
+        use crate::vector::hnsw::builder::HNSW_METADATA_KEY;
+
+        // Graphs repaired before the entry point fix may keep their entry point
+        // on a lower level than the graph's top level.
+        let all = vectors(BASE + DELTA);
+        let params = params();
+        let base = HNSW::index_vectors(&storage(&all, 0, BASE), params.clone()).unwrap();
+        assert!(base.max_level() > 1);
+        let batch = base.to_batch().unwrap();
+        let mut metadata: HnswMetadata =
+            serde_json::from_str(&batch.schema_ref().metadata()[HNSW_METADATA_KEY]).unwrap();
+        metadata.entry_point = (0..BASE as u32)
+            .find(|id| base.node_num_levels(*id) == 1)
+            .unwrap();
+        let mut schema_metadata = batch.schema_ref().metadata().clone();
+        schema_metadata.insert(
+            HNSW_METADATA_KEY.to_owned(),
+            serde_json::to_string(&metadata).unwrap(),
+        );
+        let schema = batch
+            .schema_ref()
+            .as_ref()
+            .clone()
+            .with_metadata(schema_metadata);
+        let batch = RecordBatch::try_new(Arc::new(schema), batch.columns().to_vec()).unwrap();
+        let base = HNSW::load(batch).unwrap();
+        let delta = HNSW::index_vectors(&storage(&all, BASE, DELTA), params.clone()).unwrap();
+
+        let merged_store = storage(&all, 0, BASE + DELTA);
+        let merged = insert_all(&base, &delta, &merged_store).unwrap();
+        assert_eq!(
+            merged.node_num_levels(merged.entry_point()),
+            merged.max_level() as usize
+        );
         assert_well_formed(&merged, &params);
         assert!(recall(&merged, &all, &merged_store) >= 0.9);
     }

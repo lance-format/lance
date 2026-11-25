@@ -475,10 +475,11 @@ mod tests {
 
     #[test]
     fn test_segment_ef_from_proto_defaults_and_rejects() {
-        // A producer that predates the field leaves the executor's default.
+        // A producer that predates the field keeps searching every segment
+        // with its explicit ef.
         assert_eq!(
-            segment_ef_from_proto(None).unwrap(),
-            SegmentEfParams::default()
+            segment_ef_from_proto(None).unwrap().policy,
+            SegmentEfPolicy::Uniform
         );
 
         let invalid = pb::SegmentEfProto {

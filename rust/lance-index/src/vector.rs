@@ -257,7 +257,8 @@ pub struct Query {
     /// When an index has a base segment and delta segments, every segment is
     /// searched and their results merged. The base segment, the one covering
     /// the most rows, is always searched with `ef`; this sets how much narrower
-    /// a delta's beam may be. Only HNSW sub-indexes read `ef`.
+    /// a delta's beam may be. The default searches every segment with `ef`.
+    /// Only HNSW sub-indexes read `ef`.
     pub segment_ef: SegmentEfParams,
     /// How an `IVF_HNSW_RQ` graph search scores visited nodes. Other index
     /// types ignore this setting.

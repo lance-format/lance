@@ -1089,9 +1089,9 @@ impl Scanner {
     /// Set how the delta segments of an HNSW index are searched relative to
     /// [`Self::ef`]; see [`SegmentEfParams`].
     ///
-    /// The base segment is always searched with the full `ef`. Pass
-    /// [`lance_index::vector::segment_ef::SegmentEfPolicy::Uniform`] to search every
-    /// segment with it.
+    /// The base segment is always searched with the full `ef`. By default every
+    /// segment is ([`lance_index::vector::segment_ef::SegmentEfPolicy::Uniform`]);
+    /// a narrowing policy trades a little recall for fewer distance computations.
     ///
     /// ```
     /// # use lance::{Dataset, Result};
@@ -1103,7 +1103,7 @@ impl Scanner {
     /// scanner
     ///     .nearest("vector", &query, 10)?
     ///     .segment_ef(SegmentEfParams {
-    ///         policy: SegmentEfPolicy::Uniform,
+    ///         policy: SegmentEfPolicy::Proportional { multiplier: 4.0 },
     ///         ..Default::default()
     ///     })?;
     /// # Ok(())

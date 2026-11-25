@@ -24,6 +24,14 @@ pub enum SegmentEfPolicy {
     Capped { divisor: usize },
     /// A delta holding a share `f` of the live rows is searched with
     /// `ef * min(1, multiplier * f)`.
+    ///
+    /// Measured on 384-d embeddings (m = 20, 1M and 4M row bases, 1 to 32
+    /// deltas holding 1.6% to 100% of the base, 0 to 50% deleted rows, ef 64 to
+    /// 256), multiplier 4 with floor 20 halves the distance computations of a
+    /// query (2.3x faster on average) while recall@10 stays within 0.009 of
+    /// [`Self::Uniform`]. The recall loss is largest when the deltas together
+    /// hold as many rows as the base; a delta holding a quarter of the live rows
+    /// or more keeps the full `ef`.
     Proportional { multiplier: f64 },
 }
 
@@ -40,18 +48,12 @@ pub struct SegmentEfParams {
     pub scale_floor_by_dead: bool,
 }
 
-/// Proportional with multiplier 4 and floor 20.
-///
-/// Measured on 384-d embeddings (m = 20, 1M and 4M row bases, 1 to 32 deltas
-/// holding 1.6% to 100% of the base, 0 to 50% deleted rows, ef 64 to 256), it
-/// halves the distance computations of a query (2.3x faster on average) while
-/// recall@10 stays within 0.009 of searching every segment with the full `ef`.
-/// The recall loss is largest when the deltas together hold as many rows as the
-/// base; a delta holding a quarter of the live rows or more keeps the full `ef`.
+/// Uniform, so narrowing delta segments is opt-in, with floor 20 for a policy
+/// that narrows.
 impl Default for SegmentEfParams {
     fn default() -> Self {
         Self {
-            policy: SegmentEfPolicy::Proportional { multiplier: 4.0 },
+            policy: SegmentEfPolicy::Uniform,
             floor: 20,
             scale_floor_by_dead: false,
         }

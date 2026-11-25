@@ -122,7 +122,7 @@ message VectorQueryProto {
    */
   VectorRqGraphScoring rq_graph_scoring = 17;
   /* Beam width of the delta segments. Absent, as from a producer that predates
-   * the field, means the executor's default policy.
+   * the field, means every segment is searched with ef (Uniform).
    */
   SegmentEfProto segment_ef = 18;
 }
