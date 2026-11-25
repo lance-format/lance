@@ -3610,6 +3610,55 @@ mod tests {
                 &mut Vec::new(),
             )
             .unwrap();
+            let mut scalar = SignStage::default();
+            calc.filtered_partition_sign_stage_with_scratch(
+                &mut scalar,
+                &mut Vec::new(),
+                &mut Vec::new(),
+                &mut Vec::new(),
+            )
+            .unwrap();
+            for pattern in 0..4 {
+                let accept = (0..storage.len())
+                    .map(|row| match pattern {
+                        0 => false,
+                        1 => true,
+                        2 => {
+                            row % 3 == 1 && storage.row_id(row as u32) != RowAddress::TOMBSTONE_ROW
+                        }
+                        _ => row + 1 == storage.len(),
+                    })
+                    .collect::<Vec<_>>();
+                let mut masked = SignStage::default();
+                calc.filtered_partition_sign_stage_for_mask(&mut masked, &accept)
+                    .unwrap();
+                for (row, &accepted) in accept.iter().enumerate() {
+                    if accepted {
+                        assert_eq!(
+                            masked.binary_ips[row].to_bits(),
+                            scalar.binary_ips[row].to_bits()
+                        );
+                        assert_eq!(
+                            masked.lower_bounds[row].to_bits(),
+                            scalar.lower_bounds[row].to_bits()
+                        );
+                    } else {
+                        assert_eq!(masked.binary_ips[row], 0.0);
+                        assert_eq!(masked.lower_bounds[row], f32::INFINITY);
+                    }
+                }
+                let before_ips = masked.binary_ips.clone();
+                let before_bounds = masked.lower_bounds.clone();
+                assert_eq!(
+                    calc.filtered_partition_sign_stage_for_mask(
+                        &mut masked,
+                        &vec![true; storage.len() + 1]
+                    ),
+                    Err("mask_length")
+                );
+                assert_eq!(masked.binary_ips, before_ips);
+                assert_eq!(masked.lower_bounds, before_bounds);
+            }
             stage
         };
         let actual = prepare(&sign);
@@ -4176,6 +4225,16 @@ mod tests {
             calc.raw_query_lower_bound_gating_disabled_reason(),
             Some("approx_mode_fast")
         );
+        let mut stage = SignStage {
+            binary_ips: vec![7.0],
+            lower_bounds: vec![8.0],
+        };
+        assert_eq!(
+            calc.filtered_partition_sign_stage_for_mask(&mut stage, &[true, false]),
+            Err("approx_mode_fast")
+        );
+        assert_eq!(stage.binary_ips, vec![7.0]);
+        assert_eq!(stage.lower_bounds, vec![8.0]);
     }
 
     #[test]

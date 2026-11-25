@@ -418,6 +418,9 @@ impl RabitScanContext {
         dist_q_c: f32,
         scope: RabitScanScope,
     ) -> Result<Option<RabitSignPartition>> {
+        if self.query.approx_mode == ApproxMode::Fast {
+            return Ok(None);
+        }
         let loading = Instant::now();
         let io_stats = self.metrics.io_stats();
         let (index, sign) = tokio::try_join!(
@@ -464,6 +467,11 @@ impl RabitScanContext {
                 context.raw_query.as_deref(),
             )?;
             let mut stage = SignStage::default();
+            let needs_mask = !pre_filter.is_empty()
+                || storage
+                    .row_ids()
+                    .any(|&row_id| row_id == RowAddress::TOMBSTONE_ROW);
+            let accept = needs_mask.then(|| mask.acceptance(storage.row_ids()));
             let gated = context.index.scratch_pool.with_scratch(|scratch| {
                 let calc = storage.dist_calculator_with_scratch(
                     context.query.key.clone(),
@@ -475,11 +483,11 @@ impl RabitScanContext {
                     },
                 );
                 if scope == RabitScanScope::Partition && !pre_filter.is_empty() {
-                    calc.filtered_partition_sign_stage_with_scratch(
+                    calc.filtered_partition_sign_stage_for_mask(
                         &mut stage,
-                        &mut scratch.u16,
-                        &mut scratch.u8,
-                        &mut scratch.u32,
+                        accept
+                            .as_deref()
+                            .expect("a non-empty prefilter prepares acceptance"),
                     )
                 } else {
                     calc.full_sign_stage_with_scratch(
@@ -495,13 +503,6 @@ impl RabitScanContext {
                 scan_stats::counters().stage1_cpu_ns.add_elapsed(computing);
                 return Ok(None);
             }
-            // FRI deletions must be excluded even when there is no query
-            // filter: their slots remain so ex gathers keep file offsets.
-            let needs_mask = !pre_filter.is_empty()
-                || storage
-                    .row_ids()
-                    .any(|&row_id| row_id == RowAddress::TOMBSTONE_ROW);
-            let accept = needs_mask.then(|| mask.acceptance(storage.row_ids()));
             scan_stats::counters().stage1_cpu_ns.add_elapsed(computing);
             if scope == RabitScanScope::Partition {
                 // The query heap's approximate pruning can skip intermediate
