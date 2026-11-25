@@ -8,7 +8,7 @@ use lance_core::utils::{address::RowAddress, row_addr_remap::RowAddrRemap};
 use lance_index::scalar::RowAddrTranslator;
 use roaring::RoaringBitmap;
 use std::sync::Arc;
-use std::{any::Any, collections::HashMap};
+use std::{any::Any, collections::HashMap, fmt::Display};
 
 mod bounded_partition_stream;
 pub mod builder;
@@ -546,6 +546,20 @@ impl VectorIndexParams {
         }
     }
 
+    pub(super) fn validate_quantizer_params(&self) -> Result<()> {
+        let index_type = self.index_type();
+        match (index_type, self.stages.last()) {
+            (IndexType::IvfPq | IndexType::IvfHnswPq, _) => {
+                reject_hamming_metric(index_type, self.metric_type)
+            }
+            (IndexType::IvfRq | IndexType::IvfHnswRq, Some(StageParams::RQ(rq_params))) => {
+                validate_supported_rq_num_bits(rq_params.num_bits)?;
+                reject_hamming_metric(index_type, self.metric_type)
+            }
+            _ => Ok(()),
+        }
+    }
+
     pub fn index_type(&self) -> IndexType {
         let len = self.stages.len();
         match (len, self.stages.get(1), self.stages.last()) {
@@ -561,6 +575,15 @@ impl VectorIndexParams {
             _ => IndexType::Vector,
         }
     }
+}
+
+fn reject_hamming_metric(index_type: impl Display, metric_type: MetricType) -> Result<()> {
+    if metric_type == MetricType::Hamming {
+        return Err(Error::invalid_input(format!(
+            "{index_type} does not support the {metric_type} metric"
+        )));
+    }
+    Ok(())
 }
 
 impl IndexParams for VectorIndexParams {
@@ -789,16 +812,8 @@ async fn prepare_vector_segment_build(
         )));
     }
 
+    params.validate_quantizer_params()?;
     let index_type = params.index_type();
-    if matches!(index_type, IndexType::IvfRq | IndexType::IvfHnswRq) {
-        let Some(StageParams::RQ(rq_params)) = stages.last() else {
-            return Err(Error::index(format!(
-                "{mode}: invalid stages: {:?}",
-                stages
-            )));
-        };
-        validate_supported_rq_num_bits(rq_params.num_bits)?;
-    }
 
     let num_partitions = match (ivf_params0.num_partitions, ivf_params0.centroids.as_ref()) {
         (Some(num_partitions), Some(centroids)) if num_partitions != centroids.len() => {
@@ -1357,17 +1372,6 @@ async fn build_vector_index_impl(
     )
     .await?;
     let stages = &params.stages;
-
-    // RaBitQ encodes against L2 or dot residuals, and its transform rejects
-    // anything else, but only after the IVF model has been trained on a sample.
-    if matches!(index_type, IndexType::IvfRq | IndexType::IvfHnswRq)
-        && params.metric_type == DistanceType::Hamming
-    {
-        return Err(Error::index(format!(
-            "Build Vector Index: {} does not support the {} metric",
-            index_type, params.metric_type
-        )));
-    }
 
     let explicit_target = ivf_params.target_partition_size;
     let num_partitions = ivf_params.num_partitions.unwrap_or(0);
@@ -2664,6 +2668,7 @@ mod tests {
     use super::*;
     use crate::dataset::{Dataset, WriteParams};
     use crate::index::DatasetIndexExt;
+    use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
     use arrow_array::types::{Float32Type, Int32Type};
     use arrow_array::{
         Array, FixedSizeListArray, Float16Array, Float32Array, Int32Array, RecordBatch,
@@ -2797,16 +2802,12 @@ mod tests {
         }
     }
 
-    /// IVF_RQ encodes residuals under L2 or dot; the RQ transform rejects other
-    /// metrics, but only once the IVF model has been trained, so the build spends
-    /// the training pass before failing. Hamming is also contradictory for RQ,
-    /// which requires float vectors while Hamming is a binary-vector metric.
     #[rstest::rstest]
     #[tokio::test]
-    async fn test_build_rejects_hamming_for_rq(#[values(false, true)] with_hnsw: bool) {
-        use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
-        use lance_index::vector::bq::RQBuildParams;
-
+    async fn test_build_rejects_hamming_for_rq(
+        #[values(false, true)] with_hnsw: bool,
+        #[values(false, true)] train: bool,
+    ) {
         let dim = 16;
         let mut dataset = lance_datagen::gen_batch()
             .col(
@@ -2826,14 +2827,106 @@ mod tests {
         };
         let index_type = params.index_type();
         let err = dataset
-            .create_index(&["vector"], IndexType::Vector, None, &params, true)
+            .create_index_builder(&["vector"], IndexType::Vector, &params)
+            .train(train)
+            .execute_uncommitted()
             .await
             .unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "{err:?}");
         assert!(
             err.to_string()
                 .contains(&format!("{index_type} does not support the hamming metric")),
             "expected the up-front metric rejection, got: {err}"
         );
+    }
+
+    #[test]
+    fn test_vector_params_reject_invalid_rq_num_bits() {
+        let params = VectorIndexParams::ivf_rq(1, 0, MetricType::L2);
+        let err = params.validate_quantizer_params().unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "{err:?}");
+        assert!(err.to_string().contains("IVF_RQ num_bits"), "{err}");
+    }
+
+    #[rstest::rstest]
+    #[case::ivf_pq(false)]
+    #[case::ivf_hnsw_pq(true)]
+    #[tokio::test]
+    async fn test_pq_index_build_rejects_hamming(#[case] with_hnsw: bool) {
+        const DIM: usize = 8;
+        let mut dataset = lance_datagen::gen_batch()
+            .col(
+                "vector",
+                array::rand_vec::<Float32Type>((DIM as u32).into()),
+            )
+            .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(16))
+            .await
+            .unwrap();
+        let fragment_id = dataset.get_fragments()[0].id() as u32;
+
+        let centroids =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(vec![0.0; DIM]), DIM as i32)
+                .unwrap();
+        let ivf = IvfBuildParams::try_with_centroids(1, Arc::new(centroids)).unwrap();
+        let codebook = Arc::new(Float32Array::from(vec![0.0; 16 * DIM]));
+        let pq = PQBuildParams::with_codebook(2, 4, codebook);
+        let params = if with_hnsw {
+            VectorIndexParams::with_ivf_hnsw_pq_params(
+                MetricType::Hamming,
+                ivf,
+                HnswBuildParams::default(),
+                pq,
+            )
+        } else {
+            VectorIndexParams::with_ivf_pq_params(MetricType::Hamming, ivf, pq)
+        };
+
+        let expected = format!(
+            "{} does not support the hamming metric",
+            params.index_type()
+        );
+        let deferred = dataset
+            .create_index_builder(&["vector"], IndexType::Vector, &params)
+            .train(false)
+            .execute_uncommitted()
+            .await
+            .map(|_| ());
+        let whole_table = build_vector_index(
+            &dataset,
+            "vector",
+            "vector_idx",
+            Uuid::new_v4(),
+            &params,
+            None,
+            noop_progress(),
+        )
+        .await
+        .map(|_| ());
+        let fragment = build_distributed_vector_index(
+            &dataset,
+            "vector",
+            "vector_idx",
+            Uuid::new_v4(),
+            &params,
+            None,
+            &[fragment_id],
+            noop_progress(),
+        )
+        .await
+        .map(|_| ());
+
+        for (mode, result) in [
+            ("deferred", deferred),
+            ("whole table", whole_table),
+            ("fragment", fragment),
+        ] {
+            let error = result.expect_err(mode);
+            assert!(
+                matches!(error, Error::InvalidInput { .. }),
+                "{mode}: {error:?}"
+            );
+            assert!(error.to_string().contains(&expected), "{mode}: {error}");
+        }
     }
 
     /// A build that was handed its codebook has nothing to fit, so the rows

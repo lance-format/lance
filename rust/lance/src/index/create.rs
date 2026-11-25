@@ -342,11 +342,13 @@ impl<'a> CreateIndexBuilder<'a> {
             is_builtin_vector_index(self.index_type, self.params)
                 .then(|| effective_vector_fragments(self.dataset, self.fragments.as_deref()))
                 .flatten();
-        let quantizer_minimum_rows = self
-            .params
-            .as_any()
-            .downcast_ref::<VectorIndexParams>()
-            .and_then(|params| super::vector::vector_quantizer_minimum_rows(&params.stages));
+        let quantizer_minimum_rows = match self.params.as_any().downcast_ref::<VectorIndexParams>() {
+            Some(params) => {
+                params.validate_quantizer_params()?;
+                super::vector::vector_quantizer_minimum_rows(&params.stages)
+            }
+            None => None,
+        };
         let train = should_train_index(
             self.dataset,
             self.train,
