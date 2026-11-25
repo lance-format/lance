@@ -2,9 +2,9 @@
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
 import copy
+import multiprocessing
 import pickle
 import shutil
-import sys
 import weakref
 from itertools import chain
 from pathlib import Path
@@ -290,23 +290,33 @@ def test_sample_batches(tmp_path: Path):
 
 @pytest.mark.parametrize("sampler_cls", [ShardedFragmentSampler, ShardedBatchSampler])
 @pytest.mark.parametrize(
-    "start_method",
+    "start_method, sharing_strategy",
     [
-        "spawn",
-        # fork is the Linux default up to Python 3.13 and the only start method
-        # that relies on the epoch being in shared memory before workers start.
-        # Forked lance workers crash on macOS (see test_fork.py).
+        ("spawn", None),
+        # A parent on file_system must still reach a worker that starts on its
+        # own default strategy (file_descriptor on Linux). forkserver is the
+        # Linux default from Python 3.14. fork is left out: forking an
+        # initialized lance runtime is unsupported.
         pytest.param(
-            "fork",
+            "forkserver",
+            "file_system",
             marks=pytest.mark.skipif(
-                sys.platform != "linux", reason="forked lance workers need Linux"
+                "forkserver" not in multiprocessing.get_all_start_methods(),
+                reason="forkserver is not available",
             ),
         ),
     ],
+    ids=["spawn", "forkserver-file_system"],
 )
 def test_set_epoch_reaches_persistent_workers(
-    tmp_path: Path, sampler_cls, start_method
+    tmp_path: Path, request, sampler_cls, start_method, sharing_strategy
 ):
+    if sharing_strategy is not None:
+        previous = torch.multiprocessing.get_sharing_strategy()
+        torch.multiprocessing.set_sharing_strategy(sharing_strategy)
+        request.addfinalizer(
+            lambda: torch.multiprocessing.set_sharing_strategy(previous)
+        )
     lance.write_dataset(pa.table({"ids": range(400)}), tmp_path, max_rows_per_file=50)
     # Non-consecutive epochs: workers must see the value set_epoch stored,
     # not a count of how many epochs they have run.
@@ -411,8 +421,10 @@ def test_set_epoch_keeps_storage_received_from_another_process(
     tmp_path: Path, monkeypatch
 ):
     # A spawn or forkserver worker unpickles the dataset with the epoch already
-    # in shared memory. Sharing it again under a different strategy (a parent
-    # that called set_sharing_strategy) would move it off the parent's storage.
+    # in shared memory. Sharing it again under a different strategy would move
+    # it off the parent's storage. test_set_epoch_reaches_persistent_workers
+    # covers this end to end where the strategies differ (Linux); this checks
+    # it on platforms with a single strategy too.
     lance.write_dataset(pa.table({"ids": range(10)}), tmp_path)
     sampler = ShardedBatchSampler(rank=0, world_size=1, randomize=True)
     dataset = LanceDataset(tmp_path, batch_size=5, sampler=sampler)
