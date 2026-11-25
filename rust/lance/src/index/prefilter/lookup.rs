@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use lance_core::utils::address::RowAddress;
 use lance_select::{RowAddrMask, RowAddrSelection};
@@ -10,9 +11,11 @@ use roaring::RoaringBitmap;
 const MAX_DENSE_EXPANSION: u64 = 16;
 const MAX_SMALL_DENSE_BYTES: u64 = 128 * 1024;
 const EXTRA_DENSE_BUDGET: u64 = 4 * 1024 * 1024;
+const MAX_PREPARATION_VALUES_PER_PROBE_ROW: u64 = 16;
 
 pub struct PreparedRowAddrMask {
     allow: bool,
+    roaring: Option<Arc<RowAddrMask>>,
     fragments: BTreeMap<u32, FragmentSelection>,
 }
 
@@ -69,7 +72,34 @@ impl FragmentSelection {
 }
 
 impl PreparedRowAddrMask {
-    pub(crate) fn new(mask: &RowAddrMask) -> Self {
+    pub(crate) fn for_probe_rows(mask: Arc<RowAddrMask>, probe_rows: usize) -> Self {
+        let rows = match mask.as_ref() {
+            RowAddrMask::AllowList(rows) | RowAddrMask::BlockList(rows) => rows,
+        };
+        let budget = (probe_rows as u64).saturating_mul(MAX_PREPARATION_VALUES_PER_PROBE_ROW);
+        let mut values = 0_u64;
+        for (_, selection) in rows.iter() {
+            values = values.saturating_add(match selection {
+                RowAddrSelection::Full => 1,
+                RowAddrSelection::Partial(bitmap) => bitmap.len().saturating_add(1),
+            });
+            if values > budget {
+                return Self {
+                    allow: false,
+                    roaring: Some(mask),
+                    fragments: BTreeMap::new(),
+                };
+            }
+        }
+        Self::new(&mask)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn original_mask(&self) -> Option<&Arc<RowAddrMask>> {
+        self.roaring.as_ref()
+    }
+
+    fn new(mask: &RowAddrMask) -> Self {
         let mut mask = mask.clone();
         let (rows, allow) = match &mut mask {
             RowAddrMask::AllowList(rows) => (rows, true),
@@ -79,6 +109,7 @@ impl PreparedRowAddrMask {
         let mut extra_dense_budget = EXTRA_DENSE_BUDGET;
         Self {
             allow,
+            roaring: None,
             fragments: rows
                 .iter()
                 .map(|(&fragment, selection)| {
@@ -114,10 +145,18 @@ impl PreparedRowAddrMask {
     }
 
     pub(crate) fn acceptance<'a>(&self, rows: impl Iterator<Item = &'a u64>) -> Vec<bool> {
+        if let Some(mask) = &self.roaring {
+            return rows
+                .map(|&row| row != RowAddress::TOMBSTONE_ROW && mask.selected(row))
+                .collect();
+        }
         self.selection(rows, true).collect()
     }
 
     pub(crate) fn selected_indices<'a>(&self, rows: impl Iterator<Item = &'a u64>) -> Vec<u64> {
+        if let Some(mask) = &self.roaring {
+            return mask.selected_indices(rows);
+        }
         self.selection(rows, false)
             .enumerate()
             .filter_map(|(offset, selected)| selected.then_some(offset as u64))
@@ -125,6 +164,10 @@ impl PreparedRowAddrMask {
     }
 
     pub(crate) fn selected_offsets_into(&self, rows: &[u64], out: &mut Vec<u32>) {
+        if let Some(mask) = &self.roaring {
+            mask.selected_offsets_into(rows.iter(), out);
+            return;
+        }
         out.clear();
         let mut start = 0;
         while start < rows.len() {
@@ -189,227 +232,4 @@ impl PreparedRowAddrMask {
 }
 
 #[cfg(test)]
-mod tests {
-    use lance_core::utils::address::RowAddress;
-    use lance_select::{RowAddrMask, RowAddrTreeMap};
-    use roaring::RoaringBitmap;
-
-    use super::{EXTRA_DENSE_BUDGET, FragmentSelection, PreparedRowAddrMask};
-
-    #[test]
-    fn prepared_mask_preserves_compact_dense_ranges() {
-        let mut range = RoaringBitmap::new();
-        range.insert_range(0..1_000_000);
-        range.optimize();
-        let mut holes = range.clone();
-        holes.remove(1);
-        holes.remove(999998);
-        holes.optimize();
-        let mut rows = RowAddrTreeMap::new();
-        rows.insert_bitmap(5, range);
-        rows.insert_bitmap(6, holes);
-        let input = (5..=6)
-            .flat_map(|fragment| {
-                [0, 1, 2, 999998, 999999, 1000000]
-                    .map(move |row| u64::from(RowAddress::new_from_parts(fragment, row)))
-            })
-            .collect::<Vec<_>>();
-        for mask in [
-            RowAddrMask::AllowList(rows.clone()),
-            RowAddrMask::BlockList(rows),
-        ] {
-            let prepared = PreparedRowAddrMask::new(&mask);
-            assert!(prepared.fragments.values().all(|selection| matches!(
-                selection,
-                FragmentSelection::Sparse(_) | FragmentSelection::Range { .. }
-            )));
-            assert_eq!(
-                prepared.selected_indices(input.iter()),
-                mask.selected_indices(input.iter())
-            );
-            let mut offsets = vec![u32::MAX];
-            prepared.selected_offsets_into(&input, &mut offsets);
-            assert_eq!(
-                offsets
-                    .iter()
-                    .map(|&offset| u64::from(offset))
-                    .collect::<Vec<_>>(),
-                mask.selected_indices(input.iter())
-            );
-            prepared.selected_offsets_into(&[], &mut offsets);
-            assert!(offsets.is_empty());
-        }
-    }
-
-    #[test]
-    fn prepared_mask_bounds_extra_dense_allocations() {
-        let mut rows = RowAddrTreeMap::new();
-        for fragment in 0..40 {
-            rows.insert_bitmap(fragment, RoaringBitmap::from_iter([0, 999999]));
-        }
-        let input = (0..40)
-            .flat_map(|fragment| {
-                [0, 1, 999998, 999999, 1000000]
-                    .map(move |row| u64::from(RowAddress::new_from_parts(fragment, row)))
-            })
-            .collect::<Vec<_>>();
-        for mask in [
-            RowAddrMask::AllowList(rows.clone()),
-            RowAddrMask::BlockList(rows),
-        ] {
-            let prepared = PreparedRowAddrMask::new(&mask);
-            let dense_bytes: usize = prepared
-                .fragments
-                .values()
-                .map(|selection| match selection {
-                    FragmentSelection::Dense { words, .. } => words.len() * 8,
-                    _ => 0,
-                })
-                .sum();
-            assert!(dense_bytes > 0 && dense_bytes as u64 <= EXTRA_DENSE_BUDGET);
-            assert!(
-                prepared
-                    .fragments
-                    .values()
-                    .any(|selection| matches!(selection, FragmentSelection::Sparse(_)))
-            );
-            assert!(matches!(
-                prepared.fragments.get(&0),
-                Some(FragmentSelection::Dense { .. })
-            ));
-            assert_eq!(
-                prepared.selected_indices(input.iter()),
-                mask.selected_indices(input.iter())
-            );
-            let mut offsets = vec![u32::MAX];
-            prepared.selected_offsets_into(&input, &mut offsets);
-            assert_eq!(
-                offsets
-                    .iter()
-                    .map(|&offset| u64::from(offset))
-                    .collect::<Vec<_>>(),
-                mask.selected_indices(input.iter())
-            );
-            prepared.selected_offsets_into(&[], &mut offsets);
-            assert!(offsets.is_empty());
-        }
-    }
-
-    #[test]
-    fn prepared_mask_preserves_membership() {
-        let mut rows = RowAddrTreeMap::new();
-        let mut runs = RoaringBitmap::from_iter((0..32768).filter(|row| row % 64 < 32));
-        runs.optimize();
-        rows.insert_bitmap(7, runs);
-        rows.insert_fragment(8);
-        rows.insert_bitmap(9, RoaringBitmap::from_iter([0, u32::MAX - 1]));
-        rows.insert_bitmap(10, RoaringBitmap::full());
-        rows.insert_bitmap(11, RoaringBitmap::from_iter([65, 67, 128, 192]));
-        let mut input = (0..33000)
-            .map(|row| u64::from(RowAddress::new_from_parts(7, row)))
-            .collect::<Vec<_>>();
-        input.extend(
-            [
-                0,
-                1,
-                63,
-                64,
-                65,
-                66,
-                67,
-                127,
-                128,
-                191,
-                192,
-                193,
-                u32::MAX - 1,
-                u32::MAX,
-            ]
-            .into_iter()
-            .flat_map(|row| {
-                (8..=12).map(move |fragment| u64::from(RowAddress::new_from_parts(fragment, row)))
-            }),
-        );
-        input.extend([input[0], RowAddress::TOMBSTONE_ROW]);
-        for mask in [
-            RowAddrMask::AllowList(rows.clone()),
-            RowAddrMask::BlockList(rows),
-        ] {
-            let prepared = PreparedRowAddrMask::new(&mask);
-            assert!(matches!(
-                prepared.fragments.get(&7),
-                Some(FragmentSelection::Dense { .. })
-            ));
-            assert!(matches!(
-                prepared.fragments.get(&9),
-                Some(FragmentSelection::Sparse(_))
-            ));
-            assert!(matches!(
-                prepared.fragments.get(&10),
-                Some(FragmentSelection::Full)
-            ));
-            let expected = input
-                .iter()
-                .map(|&row| row != RowAddress::TOMBSTONE_ROW && mask.selected(row))
-                .collect::<Vec<_>>();
-            assert_eq!(prepared.acceptance(input.iter()), expected);
-            assert_eq!(
-                prepared.selected_indices(input.iter()),
-                mask.selected_indices(input.iter())
-            );
-            let mut offsets = vec![u32::MAX];
-            prepared.selected_offsets_into(&input, &mut offsets);
-            assert_eq!(
-                offsets
-                    .iter()
-                    .map(|&offset| u64::from(offset))
-                    .collect::<Vec<_>>(),
-                mask.selected_indices(input.iter())
-            );
-            prepared.selected_offsets_into(&[], &mut offsets);
-            assert!(offsets.is_empty());
-        }
-    }
-
-    #[test]
-    fn prepared_mask_preserves_empty_masks_and_long_ranges() {
-        let mut rows = RowAddrTreeMap::new();
-        let mut range = RoaringBitmap::new();
-        range.insert_range(0..10_000_000);
-        range.optimize();
-        rows.insert_bitmap(3, range);
-        let prepared = PreparedRowAddrMask::new(&RowAddrMask::AllowList(rows));
-        assert!(matches!(
-            prepared.fragments.get(&3),
-            Some(FragmentSelection::Range { .. })
-        ));
-        let input = [
-            0,
-            u64::from(RowAddress::new_from_parts(3, 5)),
-            RowAddress::TOMBSTONE_ROW,
-        ];
-        for mask in [RowAddrMask::all_rows(), RowAddrMask::allow_nothing()] {
-            let prepared = PreparedRowAddrMask::new(&mask);
-            let expected = input
-                .iter()
-                .map(|&row| row != RowAddress::TOMBSTONE_ROW && mask.selected(row))
-                .collect::<Vec<_>>();
-            assert_eq!(prepared.acceptance(input.iter()), expected);
-            assert_eq!(
-                prepared.selected_indices(input.iter()),
-                mask.selected_indices(input.iter())
-            );
-            let mut offsets = vec![u32::MAX];
-            prepared.selected_offsets_into(&input, &mut offsets);
-            assert_eq!(
-                offsets
-                    .iter()
-                    .map(|&offset| u64::from(offset))
-                    .collect::<Vec<_>>(),
-                mask.selected_indices(input.iter())
-            );
-            prepared.selected_offsets_into(&[], &mut offsets);
-            assert!(offsets.is_empty());
-        }
-    }
-}
+pub mod tests;

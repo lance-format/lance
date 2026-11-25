@@ -480,8 +480,9 @@ impl DatasetPreFilter {
     fn prepared_lookup(&self, num_rows_lower_bound: usize) -> Option<&PreparedRowAddrMask> {
         self.lookup_mask.get().or_else(|| {
             (num_rows_lower_bound >= 65536).then(|| {
-                self.lookup_mask
-                    .get_or_init(|| PreparedRowAddrMask::new(&self.mask()))
+                self.lookup_mask.get_or_init(|| {
+                    PreparedRowAddrMask::for_probe_rows(self.mask(), num_rows_lower_bound)
+                })
             })
         })
     }
@@ -768,6 +769,38 @@ mod test {
         assert!(std::ptr::eq(prepared, filter.lookup_mask.get().unwrap()));
         filter.filter_row_offsets_into(&[], &mut offsets);
         assert!(offsets.is_empty());
+    }
+
+    #[test]
+    fn test_dataset_prepared_mask_skips_large_domain() {
+        let (mask, probes) = lookup::tests::broad_mask_and_probes();
+        let filter = DatasetPreFilter {
+            deleted_ids: None,
+            filtered_ids: None,
+            deleted_fragments: None,
+            overlay_block: Some(mask.clone()),
+            final_mask: Mutex::new(OnceCell::from(mask.clone())),
+            lookup_mask: OnceLock::new(),
+        };
+        let mut offsets = Vec::new();
+        for probe in &probes {
+            filter.filter_row_offsets_into(probe, &mut offsets);
+            assert_eq!(
+                offsets
+                    .iter()
+                    .map(|&row| u64::from(row))
+                    .collect::<Vec<_>>(),
+                mask.selected_indices(probe.iter())
+            );
+            assert_eq!(
+                filter.filter_row_ids(Box::new(probe.iter())),
+                mask.selected_indices(probe.iter())
+            );
+        }
+        assert!(Arc::ptr_eq(
+            filter.lookup_mask.get().unwrap().original_mask().unwrap(),
+            &mask
+        ));
     }
 
     async fn test_datasets(use_stable_row_id: bool) -> TestDatasets {

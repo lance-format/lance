@@ -439,12 +439,15 @@ impl RabitScanContext {
             self.pre_filter.clone(),
         )
         .await?;
+        let probe_rows = entry.storage.len();
         let mask = self
             .lookup_mask
             .get_or_try_init(|| async {
                 let mask = self.pre_filter.mask();
                 lance_core::utils::tokio::spawn_cpu(move || {
-                    Ok::<_, Error>(Arc::new(PreparedRowAddrMask::new(&mask)))
+                    Ok::<_, Error>(Arc::new(PreparedRowAddrMask::for_probe_rows(
+                        mask, probe_rows,
+                    )))
                 })
                 .await
             })

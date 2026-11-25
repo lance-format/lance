@@ -1834,8 +1834,9 @@ impl SegmentPreFilter {
     fn prepared_lookup(&self, num_rows_lower_bound: usize) -> Option<&PreparedRowAddrMask> {
         self.lookup_mask.get().or_else(|| {
             (num_rows_lower_bound >= 65536).then(|| {
-                self.lookup_mask
-                    .get_or_init(|| PreparedRowAddrMask::new(&self.mask()))
+                self.lookup_mask.get_or_init(|| {
+                    PreparedRowAddrMask::for_probe_rows(self.mask(), num_rows_lower_bound)
+                })
             })
         })
     }
@@ -3953,6 +3954,34 @@ mod tests {
             );
             assert!(!filter.needs_partition_row_ids());
         }
+    }
+
+    #[tokio::test]
+    async fn test_segment_prepared_mask_skips_large_domain() {
+        let (mask, probes) = crate::index::prefilter::lookup::tests::broad_mask_and_probes();
+        let base = prefilter_with_mask(Some(mask.as_ref().clone())).await;
+        let filter = SegmentPreFilter::new(base, Arc::new(RowAddrMask::all_rows()));
+        filter.wait_for_ready().await.unwrap();
+        let mask = filter.mask();
+        let mut offsets = Vec::new();
+        for probe in &probes {
+            filter.filter_row_offsets_into(probe, &mut offsets);
+            assert_eq!(
+                offsets
+                    .iter()
+                    .map(|&row| u64::from(row))
+                    .collect::<Vec<_>>(),
+                mask.selected_indices(probe.iter())
+            );
+            assert_eq!(
+                filter.filter_row_ids(Box::new(probe.iter())),
+                mask.selected_indices(probe.iter())
+            );
+        }
+        assert!(Arc::ptr_eq(
+            filter.lookup_mask.get().unwrap().original_mask().unwrap(),
+            &mask
+        ));
     }
 
     #[tokio::test]
