@@ -37,6 +37,7 @@ use lance_index::vector::storage::{
 use lance_index::vector::{
     ApproxMode, PartitionSearchControl, Query, VECTOR_RESULT_SCHEMA, VectorIndex,
 };
+use lance_select::{RowAddrMask, RowAddrSelection};
 
 use super::{
     IVFIndex, PartitionEntry, PreparedPartitionGuard, PreparedPartitionSearch,
@@ -487,9 +488,33 @@ impl RabitScanContext {
                     .any(|&row_id| row_id == RowAddress::TOMBSTONE_ROW);
             let accept = needs_mask.then(|| {
                 let mask = pre_filter.mask();
+                let (rows, is_allow_list) = match mask.as_ref() {
+                    RowAddrMask::AllowList(rows) => (rows, true),
+                    RowAddrMask::BlockList(rows) => (rows, false),
+                };
+                let mut fragment = None;
+                let mut selection = None;
                 storage
                     .row_ids()
-                    .map(|&row_id| row_id != RowAddress::TOMBSTONE_ROW && mask.selected(row_id))
+                    .map(|&row_id| {
+                        if row_id == RowAddress::TOMBSTONE_ROW {
+                            return false;
+                        }
+                        let address = RowAddress::new_from_u64(row_id);
+                        let fragment_id = address.fragment_id();
+                        if fragment != Some(fragment_id) {
+                            fragment = Some(fragment_id);
+                            selection = rows.get(&fragment_id);
+                        }
+                        let listed = match selection {
+                            None => false,
+                            Some(RowAddrSelection::Full) => true,
+                            Some(RowAddrSelection::Partial(bitmap)) => {
+                                bitmap.contains(address.row_offset())
+                            }
+                        };
+                        listed == is_allow_list
+                    })
                     .collect()
             });
             scan_stats::counters().stage1_cpu_ns.add_elapsed(computing);
