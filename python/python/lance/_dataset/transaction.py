@@ -355,6 +355,11 @@ class LanceOperation:
             Keys inserted by a merge-insert, used for concurrent conflict
             detection. ``might_contain`` compares stored key hashes for an
             exact set and may have false positives for a bloom filter.
+            Two staged merges must retry if only one supplies a key filter.
+            A raw Update with only ``new_fragments`` is a blind append: it
+            can publish after a keyed writer even when their keys overlap.
+            A stale keyed writer must retry after that append because the
+            appended keys are unknown.
         """
 
         removed_fragment_ids: List[int] = dataclasses.field(default_factory=list)

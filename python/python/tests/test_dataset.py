@@ -5080,30 +5080,16 @@ def test_inserted_rows_filter_rejects_invalid_payload(tmp_path, kind, payload, e
         )
 
 
-def test_inserted_rows_filter_rejects_reconstructed_conflict(tmp_path):
+def test_inserted_rows_filter_rejects_reconstructed_conflict(
+    tmp_path, keyed_merge_schema
+):
     from lance.commit import CommitConflictError
 
     base_dir = tmp_path / "inserted_rows_filter_conflict"
-    schema = pa.schema(
-        [
-            pa.field(
-                "id",
-                pa.int32(),
-                nullable=False,
-                metadata={b"lance-schema:unenforced-primary-key": b"true"},
-            ),
-            pa.field("value", pa.int32(), nullable=False),
-        ]
-    )
+    schema = keyed_merge_schema
     dataset = lance.write_dataset(
         pa.table({"id": [1, 2], "value": [10, 20]}, schema=schema), base_dir
     )
-    staged, _ = (
-        dataset.merge_insert("value")
-        .when_not_matched_insert_all()
-        .execute_uncommitted(pa.table({"id": [100], "value": [2]}, schema=schema))
-    )
-    assert staged.operation.inserted_rows_filter is None
     dataset.merge_insert("id").when_not_matched_insert_all().execute(
         pa.table({"id": [100], "value": [1]}, schema=schema)
     )
@@ -5121,8 +5107,6 @@ def test_inserted_rows_filter_rejects_reconstructed_conflict(tmp_path):
     with pytest.raises(CommitConflictError) as exc_info:
         lance.LanceDataset.commit(dataset.uri, operation, read_version=1, max_retries=0)
     assert exc_info.value.retryable is True
-    with pytest.raises(CommitConflictError):
-        lance.LanceDataset.commit(dataset.uri, staged, max_retries=0)
 
     # The same stale update succeeds without the filter, proving the failure
     # above came from the reconstructed inserted-key conflict check.
@@ -5134,6 +5118,64 @@ def test_inserted_rows_filter_rejects_reconstructed_conflict(tmp_path):
     )
     assert committed.version == 3
     assert sorted(committed.to_table(filter="id = 100")["value"].to_pylist()) == [1, 2]
+
+
+@pytest.mark.parametrize("keyed_first", [True, False])
+@pytest.mark.parametrize(
+    "other_kind", ["blind_append", "staged_merge", "disjoint_keyed"]
+)
+def test_inserted_rows_filter_commit_orders(
+    tmp_path, keyed_merge_schema, keyed_first, other_kind
+):
+    from lance.commit import CommitConflictError
+
+    def table(key, value):
+        return pa.table({"id": [key], "value": [value]}, schema=keyed_merge_schema)
+
+    ds = lance.write_dataset(table(1, 0), tmp_path)
+
+    def stage(on, key, value):
+        txn, _ = (
+            ds.merge_insert(on)
+            .when_not_matched_insert_all()
+            .execute_uncommitted(table(key, value))
+        )
+        return txn
+
+    def reconstruct(txn):
+        return lance.Transaction(
+            txn.read_version,
+            lance.LanceOperation.Update(
+                new_fragments=txn.operation.new_fragments,
+                inserted_rows_filter=pickle.loads(
+                    pickle.dumps(txn.operation.inserted_rows_filter)
+                ),
+            ),
+        )
+
+    keyed = reconstruct(stage("id", 100, 1))
+    if other_kind == "disjoint_keyed":
+        other_key = 101
+        other = reconstruct(stage("id", other_key, 2))
+        assert other.operation.inserted_rows_filter is not None
+    else:
+        other_key = 100
+        other = stage("value", other_key, 2)
+        assert other.operation.inserted_rows_filter is None
+        if other_kind == "blind_append":
+            other = reconstruct(other)
+    first, second = (keyed, other) if keyed_first else (other, keyed)
+    lance.LanceDataset.commit(tmp_path, first)
+    if other_kind == "disjoint_keyed" or (other_kind == "blind_append" and keyed_first):
+        lance.LanceDataset.commit(tmp_path, second, max_retries=0)
+        expected = [(1, 0), (100, 1), (other_key, 2)]
+    else:
+        with pytest.raises(CommitConflictError) as exc_info:
+            lance.LanceDataset.commit(tmp_path, second, max_retries=0)
+        assert exc_info.value.retryable
+        expected = [(1, 0), (100, 1 if keyed_first else 2)]
+    rows = lance.dataset(tmp_path).to_table().to_pylist()
+    assert sorted((row["id"], row["value"]) for row in rows) == expected
 
 
 def test_merge_insert_raises_without_pk_and_on_omitted(tmp_path):
