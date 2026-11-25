@@ -7947,28 +7947,20 @@ async fn test_pq_storage_backwards_compat() {
     assert!(pq_meta.buffer_index().is_some());
 }
 
-/// IVF_HNSW_PQ indices from releases before 0.25, whose PQ storage metadata
-/// names the bit width `num_bits`, has no `transposed` before 0.19.2 and no
-/// `codebook_tensor` before 0.12. 0.11.1 and 0.16.1 wrote the legacy v1 file
-/// (0,2), 0.16.1 with an L2 and a Dot index on one column; 0.18.2 and 0.24.1
-/// wrote the v3 index layout in a Lance 2.0 file (0,3). The 0.24.1 index has
-/// empty details that are filled in from this metadata, so without it the
-/// search silently scans. See `datagen.py` next to each fixture.
+/// IVF_HNSW_PQ indices that 0.18.2 and 0.24.1 wrote in the v3 index layout,
+/// whose PQ storage metadata names the bit width `num_bits` and, before
+/// 0.19.2, has no `transposed`. The 0.24.1 index has empty details that are
+/// filled in from this metadata, so without it the search silently scans. See
+/// `datagen.py` next to each fixture.
 #[rstest]
-#[case::v0_11_1_l2("v0.11.1/legacy_ivf_hnsw_pq", DistanceType::L2, "l2_idx")]
-#[case::v0_16_1_l2("v0.16.1/legacy_ivf_hnsw_pq", DistanceType::L2, "l2_idx")]
-#[case::v0_16_1_dot("v0.16.1/legacy_ivf_hnsw_pq", DistanceType::Dot, "dot_idx")]
-#[case::v0_18_2_l2("v0.18.2/ivf_hnsw_pq", DistanceType::L2, "vector_idx")]
-#[case::v0_24_1_l2("v0.24.1/ivf_hnsw_pq", DistanceType::L2, "vector_idx")]
+#[case::v0_18_2("v0.18.2/ivf_hnsw_pq")]
+#[case::v0_24_1("v0.24.1/ivf_hnsw_pq")]
 #[tokio::test]
-async fn test_pre_0_25_ivf_hnsw_pq_search(
-    #[case] fixture: &str,
-    #[case] metric: DistanceType,
-    #[case] index_name: &str,
-) {
+async fn test_pre_0_25_ivf_hnsw_pq_search(#[case] fixture: &str) {
     const K: usize = 10;
     let test_dir = copy_test_data_to_tmp(fixture).unwrap();
     let dataset = Dataset::open(&test_dir.path_str()).await.unwrap();
+    assert_eq!(dataset.get_fragments().len(), 2);
     let rows = dataset
         .scan()
         .project(&["vector"])
@@ -7992,7 +7984,6 @@ async fn test_pre_0_25_ivf_hnsw_pq_search(
                     .unwrap()
                     .nearest("vector", query.as_ref(), K)
                     .unwrap()
-                    .distance_metric(metric)
                     .use_index(use_index);
                 let plan = scanner.explain_plan(false).await.unwrap();
                 let ids = scanner.try_into_batch().await.unwrap()["i"]
@@ -8003,16 +7994,72 @@ async fn test_pre_0_25_ivf_hnsw_pq_search(
             }
         };
         let (plan, ids) = search(true).await;
-        assert!(
-            plan.contains(&format!("ANNSubIndex: name={index_name},")),
-            "{plan}"
-        );
+        assert!(plan.contains("ANNSubIndex: name=vector_idx,"), "{plan}");
         let (_, exact) = search(false).await;
         found += ids.iter().filter(|id| exact.contains(id)).count();
         expected += exact.len();
     }
     let recall = found as f32 / expected as f32;
     assert!(recall >= 0.5, "recall {recall} over {expected} neighbors");
+}
+
+/// Legacy (0,2) IVF_HNSW_PQ files from releases before 0.25 are refused with a
+/// request to rebuild. Compaction still succeeds, with or without deferred
+/// remap, leaving these indices unremapped as before, and searches keep asking
+/// for a rebuild instead of silently returning no rows.
+#[rstest]
+#[case::eager_remap(false)]
+#[case::deferred_remap(true)]
+#[tokio::test]
+async fn test_pre_0_25_legacy_ivf_hnsw_pq_asks_for_rebuild(#[case] defer_index_remap: bool) {
+    let test_dir = copy_test_data_to_tmp("v0.16.1/legacy_ivf_hnsw_pq").unwrap();
+    let mut dataset = Dataset::open(&test_dir.path_str()).await.unwrap();
+    let query = Float32Array::from(vec![0.0; 8]);
+    let search_error = |dataset: Dataset, metric: DistanceType| {
+        let query = query.clone();
+        async move {
+            let mut scanner = dataset.scan();
+            scanner
+                .nearest("vector", &query, 10)
+                .unwrap()
+                .distance_metric(metric);
+            scanner.try_into_batch().await.unwrap_err().to_string()
+        }
+    };
+    for (index_name, metric) in [("l2_idx", DistanceType::L2), ("dot_idx", DistanceType::Dot)] {
+        let index = dataset
+            .load_index_by_name(index_name)
+            .await
+            .unwrap()
+            .unwrap();
+        let err = dataset
+            .open_vector_index("vector", &index.uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, lance_core::Error::NotSupported { .. }),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("rebuild the index"), "{err}");
+        let err = search_error(dataset.clone(), metric).await;
+        assert!(err.contains("rebuild the index"), "{err}");
+    }
+
+    compact_files(
+        &mut dataset,
+        CompactionOptions {
+            defer_index_remap,
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 1);
+    for metric in [DistanceType::L2, DistanceType::Dot] {
+        let err = search_error(dataset.clone(), metric).await;
+        assert!(err.contains("rebuild the index"), "{err}");
+    }
 }
 
 #[tokio::test]

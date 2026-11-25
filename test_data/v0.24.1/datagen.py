@@ -34,7 +34,7 @@ data = pa.table(
         ),
     }
 )
-dataset = lance.write_dataset(data, name)
+dataset = lance.write_dataset(data, name, max_rows_per_file=num_rows // 2)
 dataset.create_index(
     "vector",
     index_type="IVF_HNSW_PQ",
@@ -44,6 +44,7 @@ dataset.create_index(
 )
 
 dataset = lance.dataset(name)
+assert len(dataset.get_fragments()) == 2
 assert [index["name"] for index in dataset.list_indices()] == ["vector_idx"]
 (aux,) = glob.glob(f"{name}/_indices/*/auxiliary.idx")
 with open(aux, "rb") as f:

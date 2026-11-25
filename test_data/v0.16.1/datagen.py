@@ -11,7 +11,8 @@ import pyarrow as pa
 
 # To generate the test file, we should be running this version of lance.
 # 0.16.x was the last release whose IVF_HNSW_PQ builder wrote the legacy
-# index file, a v1 Lance file with format version (0, 2).
+# index file, a v1 Lance file with format version (0, 2). Current releases
+# refuse these files and ask for a rebuild.
 assert lance.__version__ == "0.16.1"
 
 name = "legacy_ivf_hnsw_pq"
@@ -22,8 +23,7 @@ shutil.rmtree(name, ignore_errors=True)
 
 vectors = np.random.default_rng(42).normal(size=(num_rows, dimension))
 vectors = vectors.astype(np.float32)
-# Unit vectors make Dot rank neighbors the same as L2, so the Dot index reaches
-# a recall comparable to the L2 index.
+# Unit vectors make Dot rank neighbors the same as L2.
 vectors /= np.linalg.norm(vectors, axis=1, keepdims=True)
 data = pa.table(
     {
