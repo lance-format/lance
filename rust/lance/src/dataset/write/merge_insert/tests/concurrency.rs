@@ -1704,6 +1704,77 @@ fn make_nested_array(inner_lists: &[&[&str]]) -> ListArray {
     )
 }
 
+#[rstest::rstest]
+#[tokio::test]
+async fn test_staged_merge_row_conflicts_delete_missing_key(
+    #[values(false, true)] delete_first: bool,
+) {
+    let key = Field::new("id", DataType::UInt32, false).with_metadata(HashMap::from([(
+        lance_core::datatypes::LANCE_UNENFORCED_PRIMARY_KEY.to_owned(),
+        "true".to_owned(),
+    )]));
+    let schema = Arc::new(Schema::new(vec![key]));
+    let batch = |id: u32| {
+        RecordBatch::try_new(schema.clone(), vec![Arc::new(UInt32Array::from(vec![id]))]).unwrap()
+    };
+    let read = Arc::new(
+        InsertBuilder::new("memory://")
+            .execute(vec![batch(1)])
+            .await
+            .unwrap(),
+    );
+    let stage = |matched, unmatched| {
+        MergeInsertBuilder::try_new(read.clone(), vec!["id".into()])
+            .unwrap()
+            .when_matched(matched)
+            .when_not_matched(unmatched)
+            .try_build()
+            .unwrap()
+            .execute_uncommitted_batches(vec![batch(100)])
+    };
+    let delete = stage(WhenMatched::Delete, WhenNotMatched::DoNothing)
+        .await
+        .unwrap();
+    let insert = stage(WhenMatched::UpdateAll, WhenNotMatched::InsertAll)
+        .await
+        .unwrap();
+    assert_eq!(delete.stats.num_deleted_rows, 0);
+    assert!(delete.inserted_rows_filter.is_none());
+    assert!(insert.inserted_rows_filter.is_some());
+    let (first, second) = if delete_first {
+        (delete, insert)
+    } else {
+        (insert, delete)
+    };
+    let latest = CommitBuilder::new(read.clone())
+        .execute(first.transaction)
+        .await
+        .unwrap();
+    let mut commit =
+        CommitBuilder::new(read).with_inserted_row_count(second.stats.num_inserted_rows);
+    if let Some(rows) = second.affected_rows {
+        commit = commit.with_affected_rows(rows);
+    }
+    let result = commit.execute(second.transaction).await;
+    assert!(
+        matches!(result, Err(Error::RetryableCommitConflict { .. })),
+        "{result:?}"
+    );
+    let mut reopened = latest;
+    reopened.checkout_latest().await.unwrap();
+    assert_eq!(reopened.version_id(), 2);
+    let rows = reopened.scan().try_into_batch().await.unwrap();
+    let ids = rows["id"].as_primitive::<UInt32Type>();
+    assert_eq!(
+        ids.values().as_ref(),
+        if delete_first {
+            &[1][..]
+        } else {
+            &[1, 100][..]
+        }
+    );
+}
+
 /// Test that merge_insert with bloom filter fails when committing against
 /// an Update transaction that doesn't have a filter. We can't determine if
 /// the Update operation conflicted with our inserted rows.

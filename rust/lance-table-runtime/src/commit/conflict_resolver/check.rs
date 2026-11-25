@@ -256,6 +256,9 @@ impl<'a> TransactionRebase<'a> {
             update_mode: self_update_mode,
             updated_fragments: self_updated_fragments,
             fields_modified: self_fields_modified,
+            fields_for_preserving_frag_bitmap,
+            mem_wal_dir_id,
+            updated_fragment_offsets,
             ..
         } = &self.transaction.operation
         {
@@ -295,7 +298,13 @@ impl<'a> TransactionRebase<'a> {
                     }
                     (None, Some(_))
                         if self_update_mode.is_none()
+                            && !self_new_fragments.is_empty()
                             && self.modified_fragment_ids.is_empty()
+                            && self_fields_modified.is_empty()
+                            && fields_for_preserving_frag_bitmap.is_empty()
+                            && self_compacted_sstables.is_empty()
+                            && mem_wal_dir_id.is_none()
+                            && updated_fragment_offsets.is_none()
                             && self.affected_rows.is_none() =>
                     {
                         // An unfiltered raw Update that only adds fragments is
