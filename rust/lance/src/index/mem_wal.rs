@@ -648,6 +648,160 @@ mod tests {
         assert_eq!(catch_up_generation(&dataset, "idx").await, Some(5));
     }
 
+    /// A metadata-only commit.
+    fn update_config_txn(read_version: u64) -> Transaction {
+        Transaction::new(
+            read_version,
+            Operation::UpdateConfig {
+                config_updates: None,
+                table_metadata_updates: None,
+                schema_metadata_updates: None,
+                field_metadata_updates: HashMap::new(),
+            },
+            None,
+        )
+    }
+
+    /// A stale handle that read the emptied table must not credit rows a
+    /// restore brought back.
+    #[tokio::test]
+    async fn a_stale_empty_read_does_not_credit_rows_restored_since() {
+        let shard = Uuid::new_v4();
+        let dataset = compacted_dataset(shard, 5).await;
+        let txn = Transaction::new(
+            dataset.manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![index_over("idx", &[])],
+                removed_indices: vec![],
+            },
+            None,
+        );
+        let mut dataset = CommitBuilder::new(Arc::new(dataset))
+            .execute(txn)
+            .await
+            .unwrap();
+        let before_delete = dataset.manifest.version;
+
+        dataset.delete("true").await.unwrap();
+        assert!(dataset.get_fragments().is_empty());
+        let stale_read = dataset.manifest.version;
+
+        let mut restored = dataset.checkout_version(before_delete).await.unwrap();
+        restored.restore().await.unwrap();
+
+        let dataset = CommitBuilder::new(Arc::new(restored))
+            .execute(update_config_txn(stale_read))
+            .await
+            .unwrap();
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 10);
+        assert_eq!(catch_up_generation(&dataset, "idx").await, None);
+
+        // Without a restore, the emptied table is credited.
+        let mut emptied = dataset;
+        emptied.delete("true").await.unwrap();
+        let emptied = CommitBuilder::new(Arc::new(emptied.clone()))
+            .execute(update_config_txn(emptied.manifest.version))
+            .await
+            .unwrap();
+        assert_eq!(catch_up_generation(&emptied, "idx").await, Some(5));
+    }
+
+    /// A stale handle that read under a replaced MemWAL credits nothing, even
+    /// with a matching shard and generation.
+    #[tokio::test]
+    async fn a_stale_read_does_not_credit_a_reinitialized_mem_wal() {
+        let shard = Uuid::new_v4();
+        let dataset = compacted_dataset(shard, 5).await;
+        let txn = Transaction::new(
+            dataset.manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![index_over("idx", &[0])],
+                removed_indices: vec![],
+            },
+            None,
+        );
+        let dataset = CommitBuilder::new(Arc::new(dataset))
+            .execute(txn)
+            .await
+            .unwrap();
+        let stale_read = dataset.manifest.version;
+
+        let old_mem_wal = dataset
+            .load_indices()
+            .await
+            .unwrap()
+            .iter()
+            .find(|idx| idx.name == MEM_WAL_INDEX_NAME)
+            .unwrap()
+            .clone();
+        let txn = Transaction::new(
+            dataset.manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![],
+                removed_indices: vec![old_mem_wal],
+            },
+            None,
+        );
+        let dataset = CommitBuilder::new(Arc::new(dataset))
+            .execute(txn)
+            .await
+            .unwrap();
+        let details = MemWalIndexDetails {
+            dir_id: "reinitialized".to_string(),
+            ..Default::default()
+        };
+        let txn = Transaction::new(
+            dataset.manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![
+                    new_mem_wal_index_meta(dataset.manifest.version, details).unwrap(),
+                ],
+                removed_indices: vec![],
+            },
+            None,
+        );
+        let dataset = CommitBuilder::new(Arc::new(dataset))
+            .execute(txn)
+            .await
+            .unwrap();
+
+        // The new WAL's generation 5 lands in a fragment the index has not seen.
+        let data = RecordBatch::try_new(
+            Arc::new(Schema::from(dataset.schema())),
+            vec![
+                Arc::new(Int32Array::from_iter_values(10..20_i32)),
+                Arc::new(Int32Array::from_iter_values(std::iter::repeat_n(0, 10))),
+            ],
+        )
+        .unwrap();
+        let dataset = InsertBuilder::new(Arc::new(dataset))
+            .with_params(&WriteParams {
+                mode: crate::dataset::WriteMode::Append,
+                ..Default::default()
+            })
+            .execute(vec![data])
+            .await
+            .unwrap();
+        let txn = Transaction::new(
+            dataset.manifest.version,
+            Operation::UpdateMemWalState {
+                dir_id: "reinitialized".to_string(),
+                compacted_sstables: vec![CompactedSsTable::new(shard, 5)],
+            },
+            None,
+        );
+        let dataset = CommitBuilder::new(Arc::new(dataset))
+            .execute(txn)
+            .await
+            .unwrap();
+
+        let dataset = CommitBuilder::new(Arc::new(dataset))
+            .execute(update_config_txn(stale_read))
+            .await
+            .unwrap();
+        assert_eq!(catch_up_generation(&dataset, "idx").await, None);
+    }
+
     /// A user index build that races a compaction commit is rejected outright
     /// rather than rebased -- only the system index may rebase against
     /// `UpdateMemWalState`. Anything scheduling catch-up work has to expect the
