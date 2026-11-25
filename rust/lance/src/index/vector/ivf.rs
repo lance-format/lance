@@ -7305,6 +7305,61 @@ mod tests {
         );
     }
 
+    #[rstest]
+    #[case::lloyd(Some(HierarchicalNodeAlgorithm::Lloyd))]
+    #[case::default(None)]
+    #[tokio::test]
+    async fn train_ivf_from_sample_retrains_many_initial_centroids(
+        #[case] kmeans_algorithm: Option<HierarchicalNodeAlgorithm>,
+    ) {
+        // Above 256 partitions, training without seeds would build a hierarchy;
+        // supplied seeds must still get exactly one Lloyd update.
+        const NUM_PARTITIONS: usize = 257;
+        let seeds = FixedSizeListArray::try_new_from_values(
+            Float32Array::from(
+                (0..NUM_PARTITIONS)
+                    .flat_map(|i| [10.0 * i as f32, 0.0])
+                    .collect::<Vec<_>>(),
+            ),
+            2,
+        )
+        .unwrap();
+        let sample = FixedSizeListArray::try_new_from_values(
+            Float32Array::from(
+                (0..NUM_PARTITIONS)
+                    .flat_map(|i| {
+                        let x = 10.0 * i as f32;
+                        [x - 1.0, 2.0, x + 3.0, 2.0]
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+            2,
+        )
+        .unwrap();
+        let mut params =
+            IvfBuildParams::try_with_centroids(NUM_PARTITIONS, Arc::new(seeds)).unwrap();
+        params.retrain = true;
+        params.max_iters = 1;
+        params.kmeans_algorithm = kmeans_algorithm;
+        let model = train_ivf_model_from_sample(sample, MetricType::L2, &params, noop_progress())
+            .await
+            .unwrap();
+        let expected = (0..NUM_PARTITIONS)
+            .flat_map(|i| [10.0 * i as f32 + 1.0, 2.0])
+            .collect::<Vec<_>>();
+        assert_eq!(
+            model
+                .centroids
+                .as_ref()
+                .unwrap()
+                .values()
+                .as_primitive::<Float32Type>()
+                .values()
+                .as_ref(),
+            expected.as_slice()
+        );
+    }
+
     #[tokio::test]
     async fn train_ivf_from_sample_builds_searchable_index() {
         let sample = FixedSizeListArray::try_new_from_values(

@@ -115,7 +115,8 @@ pub struct KMeansParams {
     /// Default is 16. A larger fan-out makes a shallower tree with fewer
     /// sub-tree boundaries, which improves the clustering a little at a higher
     /// training cost; a smaller one is faster but loses recall.
-    /// Hierarchical k-means is enabled only if hierarchical_k > 1 and k > 256.
+    /// Hierarchical k-means is enabled only if hierarchical_k > 1, k > 256 and
+    /// no initial centroids are supplied.
     pub hierarchical_k: usize,
 
     /// The clustering each node of the hierarchy runs. Default is Lloyd.
@@ -2030,7 +2031,10 @@ impl KMeans {
         // we set 256 as the threshold because:
         // 1. PQ would run kmeans with k=256, in that case we don't want to use hierarchical clustering for accuracy
         // 2. kmeans with k=256 is small enough that we don't need to use hierarchical clustering for efficiency
-        if k > 256 && params.hierarchical_k > 1 {
+        // Supplied initial centroids train flat: the hierarchy seeds each node
+        // from its own vectors and would discard them.
+        if k > 256 && params.hierarchical_k > 1 && !matches!(params.init, KMeanInit::Incremental(_))
+        {
             log::debug!("Using hierarchical clustering for k={}", k);
             if matches!(
                 params.hierarchical_node_algorithm,
