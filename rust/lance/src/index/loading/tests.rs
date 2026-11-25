@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::utils::test::serializing_cache::SerializingCacheBackend;
-use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount, copy_test_data_to_tmp};
 use all_asserts::assert_ge;
 use arrow::array::AsArray;
 use arrow::datatypes::{Float32Type, Int32Type, UInt64Type};
@@ -24,6 +24,8 @@ use lance_index::vector::pq::PQBuildParams;
 use lance_io::object_store::{ObjectStore, ObjectStoreParams, StorageOptionsAccessor};
 use lance_linalg::distance::DistanceType;
 use rstest::rstest;
+use tracing::instrument::WithSubscriber;
+use tracing_subscriber::fmt::format::FmtSpan;
 
 use crate::index::vector::IndexFileVersion;
 use crate::index::vector::VectorIndexParams;
@@ -31,6 +33,55 @@ use crate::index::vector::ivf::v2::tests::{
     NUM_ROWS, PartitionBypassCacheBackend, append_dataset, generate_test_dataset, ground_truth,
     ivf_partition_cache_keys,
 };
+
+#[tokio::test]
+async fn test_cold_ivf_initialization_trace() {
+    let data = copy_test_data_to_tmp("v0.30.0_pre_created_at/index_without_created_at").unwrap();
+    let dataset = Dataset::open(&data.path_str()).await.unwrap();
+    let indices = dataset.load_indices().await.unwrap();
+    // This older manifest may require type inference while listing indices.
+    dataset.session().index_cache.clear().await;
+    let trace = tempfile::NamedTempFile::new().unwrap();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_env_filter("off,lance::io_events=info")
+        .with_span_events(FmtSpan::CLOSE)
+        .with_writer(trace.reopen().unwrap())
+        .finish();
+
+    async {
+        for _ in 0..2 {
+            dataset
+                .open_vector_index_from_metadata("vec", &indices[0], &NoOpMetricsCollector)
+                .await
+                .unwrap();
+        }
+    }
+    .with_subscriber(subscriber)
+    .await;
+
+    let output = std::fs::read_to_string(trace.path()).unwrap();
+    let mut opens = output
+        .lines()
+        .filter(|line| line.contains("ivf_index_initialize") && line.contains("close"));
+    let cold = opens
+        .next()
+        .expect("cold open should record initialization");
+    for field in [
+        "index_reader_us",
+        "model_read_us",
+        "model_decode_us",
+        "quantizer_open_us",
+        "resident_open_us",
+        "query_state_us",
+        "scheduler_requests",
+        "scheduler_bytes",
+    ] {
+        assert!(cold.contains(&format!("{field}=")), "{cold}");
+    }
+    assert!(opens.next().is_none(), "warm open repeated initialization");
+    assert!(output.lines().any(|line| line.contains("prepare_us=")));
+}
 
 #[tokio::test]
 async fn test_open_logical_vector_index_single_segment_quality_apis() {

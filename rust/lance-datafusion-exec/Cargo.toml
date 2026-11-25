@@ -27,6 +27,7 @@ half.workspace = true
 lance-arrow.workspace = true
 lance-core = { workspace = true, features = ["datafusion"] }
 lance-datagen = { workspace = true, optional = true }
+lance-io.workspace = true
 lance-jsonb.workspace = true
 log.workspace = true
 pin-project.workspace = true

@@ -113,7 +113,7 @@ async fn staged_page_count(dataset: &Dataset, options: FileWriterOptions) -> usi
         .unwrap();
     let path = dataset.data_dir().join(group.1.path.as_str());
     let scheduler = ScanScheduler::new(
-        dataset.object_store.clone(),
+        dataset.table_state.object_store.clone(),
         SchedulerConfig::default_for_testing(),
     );
     let file = scheduler
@@ -124,7 +124,10 @@ async fn staged_page_count(dataset: &Dataset, options: FileWriterOptions) -> usi
         file,
         None,
         Default::default(),
-        &dataset.metadata_cache.file_metadata_cache(&path),
+        &dataset
+            .table_state
+            .metadata_cache
+            .file_metadata_cache(&path),
         FileReaderOptions::default(),
     )
     .await
@@ -1203,6 +1206,7 @@ async fn test_physical_slice_read_preserves_deleted_positions() {
 
 async fn count_files(dataset: &Dataset) -> usize {
     dataset
+        .table_state
         .object_store
         .read_dir_all(&dataset.data_dir(), None)
         .try_fold(0usize, |count, _| async move { Ok(count + 1) })

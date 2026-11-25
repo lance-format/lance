@@ -128,8 +128,15 @@ providers. The `LANCE_IO_THREADS` environment variable can be used to override t
 threads. If you increase this variable you may also want to increase the `io_buffer_size`.
 
 The compute thread pool is used for performing computations on data. The number of threads in the
-compute thread pool is determined by the number of cores on the machine. The number of threads in
-the compute thread pool can be overridden by setting the `LANCE_CPU_THREADS` environment variable.
+compute thread pool is determined by the number of cores on the machine: it is the number of logical
+CPUs minus a reservation for I/O and control tasks, with a minimum of 1. The reservation defaults to
+a quarter of the logical CPUs, rounded down and capped at 2, so a 4-CPU machine gets 3 compute threads
+and a machine with 8 or more CPUs gets `num_cpus - 2`. The reservation can be set with the
+`LANCE_IO_CORE_RESERVATION` environment variable (`0` reserves nothing). Machines with 3 or fewer
+CPUs reserve nothing by default; small deployments that want dedicated I/O headroom can set
+`LANCE_IO_CORE_RESERVATION=1`, which holds one core back from the compute pool (a 3-CPU machine then
+gets 2 compute threads). The number of threads in the compute thread pool can be overridden by
+setting the `LANCE_CPU_THREADS` environment variable.
 This is commonly done when running multiple Lance processes on the same machine (e.g when working with
 tools like Ray). Keep in mind that decoding data is a compute intensive operation, even if a workload
 seems I/O bound (like scanning a table) it may still need quite a few compute threads to achieve peak
@@ -635,8 +642,9 @@ it), and writes the results into per-partition files on disk. This is a streamin
 memory.
 
 The input scan uses a 2 GiB I/O readahead buffer by default (configurable via `LANCE_DEFAULT_IO_BUFFER_SIZE`) and reads
-batches of 8,192 rows. Incoming batches are transformed in parallel, with `num_cpus - 2` batches in flight at a time
-(configurable via `LANCE_CPU_THREADS`). Each batch is sorted by partition ID and the slices are written directly to the
+batches of 8,192 rows. Incoming batches are transformed in parallel, with one batch in flight per compute thread (by
+default `num_cpus - min(2, num_cpus / 4)`; see [Threading Model](#threading-model) for the `LANCE_IO_CORE_RESERVATION`
+and `LANCE_CPU_THREADS` overrides). Each batch is sorted by partition ID and the slices are written directly to the
 corresponding partition file. The in-flight memory during this phase is roughly:
 
 ```

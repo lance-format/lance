@@ -950,9 +950,10 @@ Existing cleanup calls and defaults continue to work. The single-window shorthan
 `older_than=timedelta(days=7), keep_one=KeepOne(timedelta(days=1), timedelta(days=2))`
 is also supported. Do not combine `policy` with `older_than` or `keep_one`.
 
-Rust uses `cleanup::retention::CleanupPolicy::new(Vec<CleanupRule>)` through
-`.with_retention_policy(...)`; the legacy `cleanup::CleanupPolicy` remains
-available for version and file-cleanup filters. Java accepts
+Rust uses `cleanup::RetentionPolicy::new(Vec<CleanupRule>)` through
+`.with_retention_policy(...)`; the old `cleanup::retention::CleanupPolicy`
+name remains as a deprecated alias. The dataset-level `cleanup::CleanupPolicy`
+remains available for version and file-cleanup filters. Java accepts
 `dataset.cleanup(new CleanupPolicy(rules))`, using
 `CleanupRule.keepOne(perInterval, olderThan)` and
 `CleanupRule.removeAll(olderThan)`. Existing native policy filters still apply.

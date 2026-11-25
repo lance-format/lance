@@ -12,7 +12,7 @@ use lance_namespace::error::NamespaceError;
 use object_store::path::Path;
 use tokio::sync::OnceCell;
 
-use super::{DirectoryNamespace, OpsMetrics, manifest, manifest_feature_flags};
+use super::{DirectoryNamespace, OpsMetrics, TableDiscoveryMode, manifest, manifest_feature_flags};
 use crate::context::DynamicContextProvider;
 use crate::credentials::{create_credential_vendor_for_location, has_credential_vendor_config};
 
@@ -65,6 +65,8 @@ pub struct DirectoryNamespaceBuilder {
     /// avoiding extra object store calls.
     dir_listing_to_manifest_migration_enabled: bool,
     credential_vendor_properties: HashMap<String, String>,
+    /// Transferred to DirectoryNamespace, which retains it for its lifetime even
+    /// though it does not consume per-request context.
     context_provider: Option<Arc<dyn DynamicContextProvider>>,
     commit_retries: Option<u32>,
     /// When true, returns input storage options in describe_table/declare_table responses
@@ -143,16 +145,17 @@ impl DirectoryNamespaceBuilder {
     /// Enable or disable manifest-based listing.
     ///
     /// When enabled (default), the namespace uses a `__manifest` table to track tables.
-    /// When disabled, relies solely on directory scanning.
+    /// When disabled, table discovery relies on directory listing.
     pub fn manifest_enabled(mut self, enabled: bool) -> Self {
         self.manifest_enabled = enabled;
         self
     }
 
-    /// Enable or disable directory-based listing fallback.
+    /// Enable or disable directory-based table discovery.
     ///
-    /// When enabled (default), falls back to directory scanning for tables not in the manifest.
-    /// When disabled, only consults the manifest table.
+    /// When enabled (default), root-level tables are discovered by scanning the directory,
+    /// unless migration mode is enabled. Child namespaces still require the manifest.
+    /// When disabled, root-level discovery uses only the manifest (if enabled).
     pub fn dir_listing_enabled(mut self, enabled: bool) -> Self {
         self.dir_listing_enabled = enabled;
         self
@@ -508,8 +511,9 @@ impl DirectoryNamespaceBuilder {
     /// Set a dynamic context provider for per-request context.
     ///
     /// The provider can be used to generate additional context for operations.
-    /// For DirectoryNamespace, the context is stored but not directly used
-    /// in operations (unlike RestNamespace where it's converted to HTTP headers).
+    /// DirectoryNamespace retains the provider for the lifetime of the built
+    /// namespace but does not call it (unlike RestNamespace where it is converted
+    /// to HTTP headers).
     ///
     /// # Arguments
     ///
@@ -579,14 +583,20 @@ impl DirectoryNamespaceBuilder {
         let (object_store, base_path) =
             Self::initialize_object_store(&self.root, &self.storage_options, &self.session).await?;
 
-        let manifest_ns = if self.manifest_enabled {
+        let table_discovery_mode = TableDiscoveryMode::from_flags(
+            self.manifest_enabled,
+            self.dir_listing_enabled,
+            self.dir_listing_to_manifest_migration_enabled,
+        );
+
+        let manifest_ns = if table_discovery_mode.has_manifest() {
             match manifest::ManifestNamespace::open_from_directory(
                 self.root.clone(),
                 self.storage_options.clone(),
                 self.session.clone(),
                 object_store.clone(),
                 base_path.clone(),
-                self.dir_listing_enabled,
+                table_discovery_mode.has_directory_listing(),
                 self.inline_optimization_enabled,
                 self.commit_retries,
             )
@@ -637,15 +647,12 @@ impl DirectoryNamespaceBuilder {
             base_path,
             manifest_ns: manifest_cell,
             write_manifest_ns: OnceCell::new(),
-            manifest_enabled: self.manifest_enabled,
-            dir_listing_enabled: self.dir_listing_enabled,
+            table_discovery_mode,
             inline_optimization_enabled: self.inline_optimization_enabled,
             commit_retries: self.commit_retries,
-            dir_listing_to_manifest_migration_enabled: self
-                .dir_listing_to_manifest_migration_enabled,
             table_version_tracking_enabled: self.table_version_tracking_enabled,
             credential_vendor,
-            context_provider: self.context_provider,
+            _context_provider: self.context_provider,
             vend_input_storage_options: self.vend_input_storage_options,
             vend_input_storage_options_refresh_interval_millis: self
                 .vend_input_storage_options_refresh_interval_millis,

@@ -25,6 +25,42 @@ use crate::format::{IndexMetadata, pb};
 
 pub const MEM_WAL_INDEX_NAME: &str = "__lance_mem_wal";
 
+/// Name of the legacy MemWAL directory, used when the index carries no `dir_id`.
+const LEGACY_MEM_WAL_DIR: &str = "_mem_wal";
+
+/// Check whether a directory name is reserved for a MemWAL index.
+///
+/// Both legacy and directory-ID names are recognized case-insensitively.
+///
+/// ```
+/// # use lance_table::system_index::mem_wal::is_mem_wal_dir_name;
+/// assert!(is_mem_wal_dir_name("_mem_wal"));
+/// assert!(is_mem_wal_dir_name("_a1b2c3d4_MEM_WAL"));
+/// ```
+pub fn is_mem_wal_dir_name(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    name == LEGACY_MEM_WAL_DIR
+        || name
+            .strip_prefix('_')
+            .and_then(|name| name.strip_suffix(LEGACY_MEM_WAL_DIR))
+            .is_some_and(|dir_id| !dir_id.is_empty())
+}
+
+/// Name of the MemWAL directory for `dir_id`: `_{dir_id}_mem_wal`, or the
+/// legacy `_mem_wal` when `dir_id` is empty.
+///
+/// ```
+/// # use lance_table::system_index::mem_wal::mem_wal_dir_name;
+/// assert_eq!(mem_wal_dir_name("a1b2c3d4"), "_a1b2c3d4_mem_wal");
+/// ```
+pub fn mem_wal_dir_name(dir_id: &str) -> String {
+    if dir_id.is_empty() {
+        LEGACY_MEM_WAL_DIR.to_string()
+    } else {
+        format!("_{dir_id}{LEGACY_MEM_WAL_DIR}")
+    }
+}
+
 /// Type alias for shard identifier (UUID v4).
 pub type ShardId = Uuid;
 
