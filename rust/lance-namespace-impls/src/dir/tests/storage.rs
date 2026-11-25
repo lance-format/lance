@@ -492,6 +492,16 @@ impl OSObjectStore for FailingListStore {
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
         let behavior = *self.behavior.lock().unwrap();
+        if matches!(behavior, Some(ListBehavior::ReadUntaggedManifestOnce))
+            && let Some((root, version)) = location.as_ref().rsplit_once("/users.lance/_versions/")
+        {
+            // Manifest reads use the length from HEAD to request the data range.
+            let other = Path::from(format!("{root}/untagged.lance/_versions/{version}"));
+            if !options.head {
+                self.behavior.lock().unwrap().take();
+            }
+            return self.target.get_opts(&other, options).await;
+        }
         if !options.head {
             match behavior {
                 Some(ListBehavior::DeleteTagOnRead)
@@ -521,14 +531,6 @@ impl OSObjectStore for FailingListStore {
                             "release",
                         ))
                         .await?;
-                }
-                Some(ListBehavior::ReadUntaggedManifestOnce)
-                    if let Some((root, version)) =
-                        location.as_ref().rsplit_once("/users.lance/_versions/") =>
-                {
-                    self.behavior.lock().unwrap().take();
-                    let other = Path::from(format!("{root}/untagged.lance/_versions/{version}"));
-                    return self.target.get_opts(&other, options).await;
                 }
                 _ => {}
             }
@@ -816,7 +818,7 @@ async fn test_legacy_tag_rejects_a_manifest_from_an_untagged_table() {
         .build()
         .await
         .unwrap();
-    for (name, field) in [("users", "old_id"), ("untagged", "new_id")] {
+    for (name, field) in [("users", "old_id"), ("untagged", "untagged_table_field")] {
         create_scalar_table(&writer, name).await;
         let mut dataset = open_dataset(&writer, name).await;
         dataset
