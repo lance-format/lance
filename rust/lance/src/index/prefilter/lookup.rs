@@ -36,7 +36,10 @@ impl FragmentSelection {
         let num_words = (u64::from(max) - u64::from(base)) / 64 + 1;
         let dense_bytes = num_words * 8;
         if dense_bytes > bitmap.serialized_size() as u64 * MAX_DENSE_EXPANSION {
-            if dense_bytes > MAX_SMALL_DENSE_BYTES || dense_bytes > *extra_dense_budget {
+            if dense_bytes > MAX_SMALL_DENSE_BYTES
+                || dense_bytes > *extra_dense_budget
+                || bitmap.len() > (u64::from(max) - u64::from(min) + 1) / 2
+            {
                 return Self::Sparse(bitmap.clone());
             }
             *extra_dense_budget -= dense_bytes;
@@ -124,6 +127,42 @@ mod tests {
     use roaring::RoaringBitmap;
 
     use super::{EXTRA_DENSE_BUDGET, FragmentSelection, PreparedRowAddrMask};
+
+    #[test]
+    fn prepared_mask_preserves_compact_dense_ranges() {
+        let mut range = RoaringBitmap::new();
+        range.insert_range(0..1_000_000);
+        range.optimize();
+        let mut holes = range.clone();
+        holes.remove(1);
+        holes.remove(999998);
+        holes.optimize();
+        let mut rows = RowAddrTreeMap::new();
+        rows.insert_bitmap(5, range);
+        rows.insert_bitmap(6, holes);
+        let input = (5..=6)
+            .flat_map(|fragment| {
+                [0, 1, 2, 999998, 999999, 1000000]
+                    .map(move |row| u64::from(RowAddress::new_from_parts(fragment, row)))
+            })
+            .collect::<Vec<_>>();
+        for mask in [
+            RowAddrMask::AllowList(rows.clone()),
+            RowAddrMask::BlockList(rows),
+        ] {
+            let prepared = PreparedRowAddrMask::new(&mask);
+            assert!(
+                prepared
+                    .fragments
+                    .values()
+                    .all(|selection| matches!(selection, FragmentSelection::Sparse(_)))
+            );
+            assert_eq!(
+                prepared.selected_indices(input.iter()),
+                mask.selected_indices(input.iter())
+            );
+        }
+    }
 
     #[test]
     fn prepared_mask_bounds_extra_dense_allocations() {
