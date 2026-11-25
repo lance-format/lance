@@ -135,16 +135,16 @@ impl<'a> TransactionRebase<'a> {
                     .filter(|_| staged_update::needs_row_history(&transaction, affected_rows))
                     .map(|read| staged_update::RowHistory::new(read, inserted_row_count));
 
-                // short circuit for full fragment update or delete case
-                // set affected_rows as None with non-empty modified_fragment_ids
-                // to indicate this condition to be used in [check_delete_update_txn]
                 if updated_fragments.is_empty() && affected_rows.is_some() {
+                    // Removed fragments conflict as a whole. A fragment-only append,
+                    // however, must distinguish a supplied row map from omission.
+                    let affected_rows = affected_rows.filter(|_| deleted_fragment_ids.is_empty());
                     return Ok(Self {
                         transaction,
                         row_history,
                         initial_fragments: HashMap::new(),
                         modified_fragment_ids,
-                        affected_rows: None,
+                        affected_rows,
                         frag_reuse_base: None,
                         conflicting_mem_wal_compacted_sstables: Vec::new(),
                         current_lineage: None,

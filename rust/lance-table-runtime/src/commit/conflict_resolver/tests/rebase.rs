@@ -3,6 +3,60 @@
 
 use super::*;
 
+#[rstest::rstest]
+#[case::omitted(None, true)]
+#[case::explicit_empty(Some(RowAddrTreeMap::default()), false)]
+#[case::explicit_row(Some(RowAddrTreeMap::from_iter([0])), false)]
+#[tokio::test]
+async fn test_fragment_only_update_after_keyed_commit(
+    #[case] affected_rows: Option<RowAddrTreeMap>,
+    #[case] can_append: bool,
+) {
+    use lance_table::format::key_existence::{KeyExistenceFilterBuilder, KeyValue};
+
+    let read = Arc::new(test_dataset(1, 1).await);
+    let update = |filter| {
+        Transaction::new_from_version(
+            read.manifest.version,
+            Operation::Update {
+                new_fragments: vec![read.fragments()[0].clone()],
+                removed_fragment_ids: vec![],
+                updated_fragments: vec![],
+                fields_modified: vec![],
+                fields_for_preserving_frag_bitmap: vec![],
+                mem_wal_dir_id: None,
+                compacted_sstables: vec![],
+                update_mode: None,
+                updated_fragment_offsets: None,
+                inserted_rows_filter: filter,
+            },
+        )
+    };
+    let mut keys = KeyExistenceFilterBuilder::new(vec![0]);
+    keys.insert(KeyValue::Int64(0)).unwrap();
+    let mut latest = CommitBuilder::new(read.clone())
+        .execute(update(Some(keys.build())))
+        .await
+        .unwrap();
+
+    let mut commit = CommitBuilder::new(read.clone()).with_max_retries(0);
+    if let Some(rows) = affected_rows {
+        commit = commit.with_affected_rows(rows);
+    }
+    let result = commit.execute(update(None)).await;
+    if can_append {
+        result.unwrap();
+    } else {
+        assert!(
+            matches!(result, Err(Error::RetryableCommitConflict { .. })),
+            "{result:?}"
+        );
+    }
+    latest.checkout_latest().await.unwrap();
+    assert_eq!(latest.manifest.version, if can_append { 3 } else { 2 });
+    assert_eq!(latest.fragments().len(), if can_append { 3 } else { 2 });
+}
+
 /// The first-activation fence judges each read field by its own identity:
 /// a child added under a struct the writer read is fine, while a child of
 /// that struct renamed, retyped or moved is not.

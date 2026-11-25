@@ -339,6 +339,9 @@ class LanceOperation:
         fields_for_preserving_frag_bitmap: list[int]
             The fields that used to judge whether to preserve the new frag's id into
             the frag bitmap of the specified indices.
+        update_mode: str
+            Use ``"rewrite_rows"`` or ``"rewrite_columns"`` for a row or column
+            rewrite. The default empty string leaves the mode unspecified.
         updated_fragment_offsets: dict[int, bytes], optional
             Physical row offsets that matched the update, keyed by fragment id,
             each serialized in the portable RoaringBitmap format. Set on

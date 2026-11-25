@@ -5120,6 +5120,32 @@ def test_inserted_rows_filter_rejects_reconstructed_conflict(
     assert sorted(committed.to_table(filter="id = 100")["value"].to_pylist()) == [1, 2]
 
 
+@pytest.mark.parametrize(
+    ("options", "error"),
+    [
+        ({"update_mode": "rewrite_row"}, ValueError),
+        ({"update_mode": None}, TypeError),
+        ({"fields_for_preserving_frag_bitmap": ["wrong"]}, TypeError),
+        ({"fields_for_preserving_frag_bitmap": [-1]}, OverflowError),
+    ],
+)
+def test_raw_update_rejects_invalid_options(
+    tmp_path, keyed_merge_schema, options, error
+):
+    def table(key):
+        return pa.table({"id": [key], "value": [0]}, schema=keyed_merge_schema)
+
+    ds = lance.write_dataset(table(1), tmp_path)
+    ds.merge_insert("id").when_not_matched_insert_all().execute(table(100))
+    fragment = lance.fragment.LanceFragment.create(ds.uri, table(100))
+    update = lance.LanceOperation.Update(new_fragments=[fragment], **options)
+    with pytest.raises(error):
+        lance.LanceDataset.commit(tmp_path, update, read_version=1, max_retries=0)
+    reopened = lance.dataset(tmp_path)
+    assert reopened.version == 2
+    assert sorted(reopened.to_table()["id"].to_pylist()) == [1, 100]
+
+
 @pytest.mark.parametrize("keyed_first", [True, False])
 @pytest.mark.parametrize(
     "other_kind", ["blind_append", "staged_merge", "disjoint_keyed"]
