@@ -201,7 +201,8 @@ pub(super) async fn commit_compaction_inner(
     let repack_base = dataset.clone();
     let mut metrics = Box::pin(commit_rewrites(dataset, rewrites, options, hooks, stages)).await?;
     metrics +=
-        super::repack::commit_repacked_files(dataset, repack_base, repacks, options, hooks).await?;
+        super::repack::commit_repacked_files(dataset, repack_base, repacks, options, hooks, stages)
+            .await?;
     Ok(metrics)
 }
 

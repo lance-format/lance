@@ -31,8 +31,8 @@ use lance::dataset::optimize::{
     CompactionOptions, commit_compaction, compact_files, plan_compaction,
 };
 use lance::dataset::{
-    DeleteBuilder, InsertBuilder, MergeInsertBuilder, MergeInsertJob, UpdateBuilder, WhenMatched,
-    WhenNotMatched, WriteMode, WriteParams,
+    DeleteBuilder, InsertBuilder, MergeInsertBuilder, MergeInsertJob, NewColumnTransform,
+    UpdateBuilder, WhenMatched, WhenNotMatched, WriteMode, WriteParams,
 };
 use lance::index::optimize::{commit_optimize_indices, plan_optimize_indices};
 use lance::index::vector::VectorIndexParams;
@@ -245,11 +245,17 @@ fn test_observed_operations_report_memory_peaks() {
             Box::pin(run_maintenance()).await;
             Box::pin(run_writes()).await;
             retried.await.unwrap();
-        });
 
-    check_events(&events.0.lock().unwrap());
-    #[cfg(feature = "metrics")]
-    check_metrics(&snapshotter);
+            check_events(&events.0.lock().unwrap());
+            #[cfg(feature = "metrics")]
+            check_metrics(&snapshotter);
+
+            for mixed_plan in [false, true] {
+                for conflicting_repack in [false, true] {
+                    Box::pin(check_repack_events(&events, mixed_plan, conflicting_repack)).await;
+                }
+            }
+        });
 }
 
 #[cfg(feature = "metrics")]
@@ -468,8 +474,8 @@ fn check_events(events: &[BTreeMap<String, String>]) {
         .sum();
     assert_eq!(operations.len() - completed.len(), failed, "{events:?}");
 
-    // A maintenance operation runs each of its stages at most once, so the
-    // stages of a retried flush report into the operation of their attempt.
+    // In this workload each maintenance operation starts each stage at most once.
+    // A retried flush reports the stages of each attempt under its own operation ID.
     let mut started_stages = BTreeSet::new();
     for fields in events.iter().filter(|fields| {
         fields["event"] == "stage_start"
@@ -482,6 +488,104 @@ fn check_events(events: &[BTreeMap<String, String>]) {
             "a stage started twice in one operation: {fields:?}"
         );
     }
+}
+
+async fn check_repack_events(events: &MemoryEvents, mixed_plan: bool, conflicting_repack: bool) {
+    let data = gen_batch()
+        .col("id", array::step::<Int64Type>())
+        .into_reader_rows(RowCount::from(4), BatchCount::from(2));
+    let mut dataset = Dataset::write(
+        data,
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 4,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    dataset
+        .add_columns(
+            NewColumnTransform::SqlExpressions(vec![("extra".into(), "id + 1".into())]),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    if mixed_plan {
+        // Only the first fragment needs a rewrite. The second still needs a repack.
+        dataset.delete("id < 2").await.unwrap();
+    }
+    if conflicting_repack {
+        let mut latest = dataset.clone();
+        latest.delete("id >= 4").await.unwrap();
+    }
+    let options = CompactionOptions {
+        target_rows_per_fragment: 3,
+        max_data_files_per_fragment: Some(1),
+        ..Default::default()
+    };
+    let before = events.0.lock().unwrap().len();
+    let result = compact_files(&mut dataset, options, None).await;
+    if conflicting_repack {
+        let error = result.unwrap_err();
+        assert!(
+            matches!(error, lance::Error::RetryableCommitConflict { .. })
+                && error.to_string().contains(
+                    "DataReplacement transaction was preempted by concurrent transaction Delete"
+                ),
+            "{error}"
+        );
+    } else {
+        assert_eq!(result.unwrap().files_added, 2);
+    }
+
+    let recorded = events.0.lock().unwrap();
+    let events = &recorded[before..];
+    let operation_id = &events[0]["operation_id"];
+    assert!(
+        events
+            .iter()
+            .all(|event| event["operation"] == "compaction"
+                && &event["operation_id"] == operation_id),
+        "{events:?}"
+    );
+    let stages: Vec<_> = events
+        .iter()
+        .map(|event| {
+            (
+                event["event"].as_str(),
+                event.get("stage").map(String::as_str),
+            )
+        })
+        .filter(|(_, stage)| {
+            !(mixed_plan && matches!(stage, Some("remap_indices" | "reserve_fragments")))
+        })
+        .collect();
+    let execution = if mixed_plan {
+        "rewrite_files"
+    } else {
+        "repack_files"
+    };
+    let mut expected = vec![
+        ("operation_start", None),
+        ("stage_start", Some(execution)),
+        ("stage_complete", Some(execution)),
+    ];
+    if mixed_plan {
+        expected.extend([
+            ("stage_start", Some("commit")),
+            ("stage_complete", Some("commit")),
+        ]);
+    }
+    expected.push(("stage_start", Some("commit")));
+    if !conflicting_repack {
+        expected.extend([
+            ("stage_complete", Some("commit")),
+            ("operation_complete", None),
+        ]);
+    }
+    assert_eq!(stages, expected);
 }
 
 async fn build_indices() {

@@ -122,12 +122,11 @@ pub async fn execute_compaction_plan_with_stages(
     if plan.tasks.is_empty() {
         return Ok(CompactionMetrics::default());
     }
-    if !options.defer_index_remap
-        && plan
-            .tasks
-            .iter()
-            .any(|task| task.kind == CompactionTaskKind::RewriteFragments)
-    {
+    let has_rewrites = plan
+        .tasks
+        .iter()
+        .any(|task| task.kind == CompactionTaskKind::RewriteFragments);
+    if has_rewrites && !options.defer_index_remap {
         commit::reject_eager_remap_on_tagged_fri(table).await?;
     }
     for task in &plan.tasks {
@@ -140,7 +139,11 @@ pub async fn execute_compaction_plan_with_stages(
     let snapshot = &*table;
     let read_version = plan.read_version;
     // Concurrent tasks share a stage and still execute on the planned snapshot.
-    let rewrite_stage = stages.start("rewrite_files");
+    let execution_stage = stages.start(if has_rewrites {
+        "rewrite_files"
+    } else {
+        "repack_files"
+    });
     let results = futures::stream::iter(plan.tasks)
         .map(move |task| async move {
             execution::execute_task_inner(snapshot, read_version, &task, options, hooks).await
@@ -148,6 +151,6 @@ pub async fn execute_compaction_plan_with_stages(
         .buffer_unordered(concurrency)
         .try_collect()
         .await?;
-    rewrite_stage.complete();
+    execution_stage.complete();
     commit::commit_compaction_inner(table, results, options, hooks, stages).await
 }

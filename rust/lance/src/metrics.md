@@ -336,11 +336,11 @@ Writes report their stages too. `write` covers `InsertBuilder` and the APIs buil
 
 | Operation | Stage | Covers |
 |-----------|-------|--------|
-| `compaction` | `rewrite_files` | Reading and rewriting the data files, in one stage for all the tasks that run side by side |
-| `compaction` | `repack_files` | Rewriting one fragment's columns into new data files, leaving its rows, deletions and index coverage as they are |
+| `compaction` | `rewrite_files` | Running a fragment rewrite, or all the tasks of a local plan that includes a fragment rewrite |
+| `compaction` | `repack_files` | Repacking columns in a standalone task or across all tasks of a repack-only local plan |
 | `compaction` | `reserve_fragments` | Reserving ids for the new fragments in a commit of its own, which most compactions make before they remap the indices or commit the rewrite |
 | `compaction` | `remap_indices` | Mapping old row addresses to new ones and rewriting the indices over them, when indices are remapped right away |
-| `compaction` | `commit` | Recording the rewrite, including a fragment reuse index when one is written, and committing it |
+| `compaction` | `commit` | Publishing a fragment rewrite or a column repack. A mixed plan reports a separate commit stage for each publication |
 | `optimize_indices` | `plan` | Finding the segments to build and merge. This can train a vector model, for a split rebuild or for a `consolidate_selected` whose segments do not share one, and can build the tokenizers of full-text segments to check them |
 | `optimize_indices` | `build_segments` | Building the new segments, or re-encoding the rows a consolidation selects. Unless `max_rows_per_task` or `max_rows_per_segment` splits an index into several tasks, its merging and retraining happen here too |
 | `optimize_indices` | `merge_segments` | Merging the segments that several tasks of one index built, or that a consolidation joins without re-encoding them because they share a model; otherwise little work when the index ran as one task |
