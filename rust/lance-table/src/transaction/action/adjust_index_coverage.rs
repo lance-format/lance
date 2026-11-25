@@ -3,7 +3,7 @@
 
 //! Adjust the fragment coverage of an index segment.
 
-use super::apply::{ApplyState, reject_frag_reuse_history};
+use super::apply::{WorkingManifest, reject_frag_reuse_history};
 use super::proto::{non_empty, required};
 use super::{AddIndexSegment, Coordinate, FieldRef, Footprint, Ref};
 use crate::format::pb_actions;
@@ -107,7 +107,7 @@ impl AdjustIndexCoverage {
         self.parts
     }
 
-    pub(super) fn apply(&self, state: &mut ApplyState) -> Result<()> {
+    pub(super) fn apply(&self, state: &mut WorkingManifest) -> Result<()> {
         reject_frag_reuse_history("AdjustIndexCoverage", &self.parts.name)?;
         let added = self
             .parts

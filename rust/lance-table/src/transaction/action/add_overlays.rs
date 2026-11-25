@@ -3,7 +3,7 @@
 
 //! Append overlay files to a fragment.
 
-use super::apply::ApplyState;
+use super::apply::WorkingManifest;
 use super::proto::required;
 use super::{FieldRef, Footprint, Ref};
 use crate::format::overlay::DataOverlayFile;
@@ -61,7 +61,7 @@ impl AddOverlays {
         &self.overlays
     }
 
-    pub(super) fn apply(&self, state: &mut ApplyState) -> Result<()> {
+    pub(super) fn apply(&self, state: &mut WorkingManifest) -> Result<()> {
         // The same refusal the legacy DataOverlay meets on such a table: the
         // read path does not yet mask overlaid cells out of segments that
         // translate into the fragment.
@@ -121,7 +121,7 @@ impl AddOverlays {
             // ids, gets one. Scans read missing lineage as version 1, so that
             // keeps every uncovered row where it was, as the legacy path does.
             1,
-            spilled,
+            &spilled,
         )
     }
 

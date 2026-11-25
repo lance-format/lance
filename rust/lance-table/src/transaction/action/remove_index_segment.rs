@@ -3,7 +3,7 @@
 
 //! Remove an index segment.
 
-use super::apply::{ApplyState, reject_frag_reuse_history};
+use super::apply::{WorkingManifest, reject_frag_reuse_history};
 use super::proto::{non_empty, required};
 use super::{Coordinate, Footprint};
 use crate::format::pb_actions;
@@ -73,7 +73,7 @@ impl RemoveIndexSegment {
         &self.name
     }
 
-    pub(super) fn apply(&self, state: &mut ApplyState) -> Result<()> {
+    pub(super) fn apply(&self, state: &mut WorkingManifest) -> Result<()> {
         reject_frag_reuse_history("RemoveIndexSegment", &self.name)?;
         state.remove_index_segment(self.uuid, &self.name)
     }

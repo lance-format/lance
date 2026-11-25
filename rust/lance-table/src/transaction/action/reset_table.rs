@@ -4,7 +4,7 @@
 //! Reset the table to an empty state.
 
 use super::Footprint;
-use super::apply::ApplyState;
+use super::apply::WorkingManifest;
 use crate::format::pb_actions;
 use lance_core::Result;
 use lance_core::deepsize::DeepSizeOf;
@@ -34,9 +34,8 @@ use lance_core::deepsize::DeepSizeOf;
 pub struct ResetTable;
 
 impl ResetTable {
-    pub(super) fn apply(&self, state: &mut ApplyState) -> Result<()> {
-        state.reset();
-        Ok(())
+    pub(super) fn apply(&self, state: &mut WorkingManifest) -> Result<()> {
+        state.reset()
     }
 
     /// Emptying the table discards every row it held.

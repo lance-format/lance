@@ -3,7 +3,7 @@
 
 //! Tombstone the data-file binding of committed fields within one fragment.
 
-use super::apply::{ApplyState, TOMBSTONED_FIELD};
+use super::apply::{TOMBSTONED_FIELD, WorkingManifest};
 use super::proto::required;
 use super::{FieldRef, Footprint, Ref};
 use crate::format::pb_actions;
@@ -70,7 +70,7 @@ impl TombstoneFieldData {
         &self.field_ids
     }
 
-    pub(super) fn apply(&self, state: &mut ApplyState) -> Result<()> {
+    pub(super) fn apply(&self, state: &mut WorkingManifest) -> Result<()> {
         let fragment_id = state.resolve_fragment(self.fragment)?;
         if self.data_change {
             state.reject_data_change_to_rearranged(fragment_id, "TombstoneFieldData")?;

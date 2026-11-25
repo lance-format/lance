@@ -3,7 +3,7 @@
 
 //! Mint a new base path.
 
-use super::apply::ApplyState;
+use super::apply::WorkingManifest;
 use super::proto::required;
 use super::{Coordinate, Footprint};
 use crate::format::{BasePath, pb, pb_actions};
@@ -35,7 +35,7 @@ impl AddBase {
         &self.base
     }
 
-    pub(super) fn apply(&self, state: &mut ApplyState) -> Result<()> {
+    pub(super) fn apply(&self, state: &mut WorkingManifest) -> Result<()> {
         let id = state.mint_base(self.local)?;
 
         // Two separate uniqueness rules, reported separately: a caller that

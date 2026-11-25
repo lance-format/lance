@@ -4,7 +4,7 @@
 //! Reserve a range of fragment ids for a later writer.
 
 use super::Footprint;
-use super::apply::ApplyState;
+use super::apply::WorkingManifest;
 use crate::format::pb_actions;
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
@@ -43,7 +43,7 @@ impl ReserveFragmentIds {
         self.count
     }
 
-    pub(super) fn apply(&self, state: &mut ApplyState) -> Result<()> {
+    pub(super) fn apply(&self, state: &mut WorkingManifest) -> Result<()> {
         state.reserve_fragment_ids(self.count)
     }
 

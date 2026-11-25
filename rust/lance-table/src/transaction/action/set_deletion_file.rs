@@ -3,7 +3,7 @@
 
 //! Set (replace) a fragment's deletion file.
 
-use super::apply::ApplyState;
+use super::apply::WorkingManifest;
 use super::proto::required;
 use super::{Coordinate, Footprint, Ref};
 use crate::format::{DeletionFile, pb, pb_actions};
@@ -103,7 +103,7 @@ impl SetDeletionFile {
         self.base
     }
 
-    pub(super) fn apply(&self, state: &mut ApplyState) -> Result<()> {
+    pub(super) fn apply(&self, state: &mut WorkingManifest) -> Result<()> {
         let deletion_file = DeletionFile {
             base_id: self.base.map(|base| state.resolve_base(base)).transpose()?,
             ..self.deletion_file.clone()

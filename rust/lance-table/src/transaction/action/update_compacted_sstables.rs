@@ -4,7 +4,7 @@
 //! Record which MemWAL SSTables have been compacted into the base table.
 
 use super::Footprint;
-use super::apply::ApplyState;
+use super::apply::WorkingManifest;
 use crate::format::pb;
 use crate::format::pb_actions;
 use crate::system_index::mem_wal::{CompactedSsTable, MEM_WAL_INDEX_NAME};
@@ -55,7 +55,7 @@ impl UpdateCompactedSsTables {
         &self.compacted_sstables
     }
 
-    pub(super) fn apply(&self, state: &mut ApplyState) -> Result<()> {
+    pub(super) fn apply(&self, state: &mut WorkingManifest) -> Result<()> {
         state.update_compacted_sstables(self.compacted_sstables.clone())
     }
 

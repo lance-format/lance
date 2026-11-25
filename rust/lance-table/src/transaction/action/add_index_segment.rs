@@ -3,7 +3,7 @@
 
 //! Add an index segment.
 
-use super::apply::{ApplyState, reject_frag_reuse_history};
+use super::apply::{WorkingManifest, reject_frag_reuse_history};
 use super::footprint::IndexIdentity;
 use super::proto::{non_empty, required};
 use super::{FieldRef, Footprint, Ref};
@@ -148,7 +148,7 @@ impl AddIndexSegment {
         self.parts
     }
 
-    pub(super) fn apply(&self, state: &mut ApplyState) -> Result<()> {
+    pub(super) fn apply(&self, state: &mut WorkingManifest) -> Result<()> {
         reject_frag_reuse_history("AddIndexSegment", &self.parts.name)?;
         let fields = self
             .parts
@@ -276,7 +276,11 @@ impl AddIndexSegment {
         Ok(version)
     }
 
-    fn resolve_coverage(&self, fragments: &[Ref], state: &ApplyState) -> Result<RoaringBitmap> {
+    fn resolve_coverage(
+        &self,
+        fragments: &[Ref],
+        state: &WorkingManifest,
+    ) -> Result<RoaringBitmap> {
         fragments
             .iter()
             .map(|fragment| {

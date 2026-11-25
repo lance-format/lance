@@ -3,7 +3,7 @@
 
 //! Add a new, empty fragment.
 
-use super::apply::ApplyState;
+use super::apply::WorkingManifest;
 use super::proto::required;
 use super::{Coordinate, Footprint, Ref};
 use crate::format::{Fragment, RowIdMeta, pb, pb_actions};
@@ -104,7 +104,7 @@ impl AddFragment {
         self.parts
     }
 
-    pub(super) fn apply(&self, state: &mut ApplyState) -> Result<()> {
+    pub(super) fn apply(&self, state: &mut WorkingManifest) -> Result<()> {
         if !self.parts.data_change && state.uses_stable_row_ids() {
             self.check_carries_lineage()?;
         }

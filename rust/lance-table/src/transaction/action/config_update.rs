@@ -3,7 +3,7 @@
 
 //! Apply config and metadata updates.
 
-use super::apply::ApplyState;
+use super::apply::WorkingManifest;
 use super::footprint::UnenforcedKey;
 use super::proto::required;
 use super::{ConfigMap, Coordinate, FieldRef, Footprint};
@@ -120,7 +120,7 @@ impl ConfigUpdate {
         &self.field_metadata
     }
 
-    pub(super) fn apply(&self, state: &mut ApplyState) -> Result<()> {
+    pub(super) fn apply(&self, state: &mut WorkingManifest) -> Result<()> {
         if let Some(updates) = &self.config {
             apply_update_map(state.config_mut(), updates);
         }
@@ -229,7 +229,7 @@ impl ConfigUpdate {
     }
 }
 
-fn unenforced_primary_key(state: &ApplyState) -> Vec<i32> {
+fn unenforced_primary_key(state: &WorkingManifest) -> Vec<i32> {
     state
         .schema()
         .unenforced_primary_key()
@@ -238,7 +238,7 @@ fn unenforced_primary_key(state: &ApplyState) -> Vec<i32> {
         .collect()
 }
 
-fn unenforced_clustering_key(state: &ApplyState) -> Vec<i32> {
+fn unenforced_clustering_key(state: &WorkingManifest) -> Vec<i32> {
     state
         .schema()
         .unenforced_clustering_key()
