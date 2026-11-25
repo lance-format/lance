@@ -392,7 +392,7 @@ impl LiveRows {
                     Result::Ok((fragment_id, vector))
                 }
             })
-            .buffer_unordered(self.dataset.object_store.io_parallelism());
+            .buffer_unordered(self.dataset.table_state.object_store.io_parallelism());
         while let Some((fragment_id, vector)) = vectors.try_next().await? {
             self.deleted
                 .insert_bitmap(fragment_id, RoaringBitmap::from(vector.as_ref()));

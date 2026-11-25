@@ -7,20 +7,28 @@ use crate::index::tests::support::*;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use crate::dataset::transaction::{Operation, Transaction};
+use crate::index::field_dependencies::input_field_ids;
+use crate::utils::test::serializing_cache::SerializingCacheBackend;
+use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount, copy_test_data_to_tmp};
 use all_asserts::assert_ge;
 use arrow::array::AsArray;
 use arrow::datatypes::{Float32Type, Int32Type, UInt64Type};
 use lance_arrow::FixedSizeListArrayExt;
 use lance_core::ROW_ID;
+use lance_core::cache::CacheNamespace;
 use lance_core::utils::tempfile::TempStrDir;
 use lance_datagen::{BatchCount, RowCount, array, gen_batch};
 use lance_index::IndexType;
 use lance_index::scalar::BuiltinIndexType;
+use lance_index::scalar::ScalarIndexParams;
 use lance_index::vector::ivf::IvfBuildParams;
 use lance_index::vector::pq::PQBuildParams;
 use lance_io::object_store::{ObjectStore, ObjectStoreParams, StorageOptionsAccessor};
 use lance_linalg::distance::DistanceType;
 use rstest::rstest;
+use tracing::instrument::WithSubscriber;
+use tracing_subscriber::fmt::format::FmtSpan;
 
 use crate::index::vector::IndexFileVersion;
 use crate::index::vector::VectorIndexParams;
@@ -28,6 +36,55 @@ use crate::index::vector::ivf::v2::tests::{
     NUM_ROWS, PartitionBypassCacheBackend, append_dataset, generate_test_dataset, ground_truth,
     ivf_partition_cache_keys,
 };
+
+#[tokio::test]
+async fn test_cold_ivf_initialization_trace() {
+    let data = copy_test_data_to_tmp("v0.30.0_pre_created_at/index_without_created_at").unwrap();
+    let dataset = Dataset::open(&data.path_str()).await.unwrap();
+    let indices = dataset.load_indices().await.unwrap();
+    // This older manifest may require type inference while listing indices.
+    dataset.session().index_cache.clear().await;
+    let trace = tempfile::NamedTempFile::new().unwrap();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_env_filter("off,lance::io_events=info")
+        .with_span_events(FmtSpan::CLOSE)
+        .with_writer(trace.reopen().unwrap())
+        .finish();
+
+    async {
+        for _ in 0..2 {
+            dataset
+                .open_vector_index_from_metadata("vec", &indices[0], &NoOpMetricsCollector)
+                .await
+                .unwrap();
+        }
+    }
+    .with_subscriber(subscriber)
+    .await;
+
+    let output = std::fs::read_to_string(trace.path()).unwrap();
+    let mut opens = output
+        .lines()
+        .filter(|line| line.contains("ivf_index_initialize") && line.contains("close"));
+    let cold = opens
+        .next()
+        .expect("cold open should record initialization");
+    for field in [
+        "index_reader_us",
+        "model_read_us",
+        "model_decode_us",
+        "quantizer_open_us",
+        "resident_open_us",
+        "query_state_us",
+        "scheduler_requests",
+        "scheduler_bytes",
+    ] {
+        assert!(cold.contains(&format!("{field}=")), "{cold}");
+    }
+    assert!(opens.next().is_none(), "warm open repeated initialization");
+    assert!(output.lines().any(|line| line.contains("prepare_us=")));
+}
 
 #[tokio::test]
 async fn test_open_logical_vector_index_single_segment_quality_apis() {
@@ -208,6 +265,314 @@ async fn test_scalar_index_info_includes_covered_index() {
         index_info.get_index("a").is_some(),
         "a covered index must still be eligible for filter pushdown on its keyed column"
     );
+}
+
+async fn list_element_dependency_dataset(padding: bool) -> Dataset {
+    let element_type = DataType::Struct(
+        vec![
+            ArrowField::new("key", DataType::Int32, true),
+            ArrowField::new("other", DataType::Float32, true),
+        ]
+        .into(),
+    );
+    let mut data = gen_batch();
+    if padding {
+        data = data.col("padding", array::step::<Int32Type>());
+    }
+    let data = data
+        .col("id", array::step::<Int32Type>())
+        .col("objects", array::rand_list(&element_type, false))
+        .into_reader_rows(RowCount::from(12), BatchCount::from(1));
+    Dataset::write(
+        data,
+        "memory://",
+        Some(crate::dataset::WriteParams {
+            max_rows_per_file: 6,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn test_list_element_dependency_fields_preserve_single_input() {
+    let mut dataset = list_element_dependency_dataset(false).await;
+    let params = ScalarIndexParams::new("listelement".to_string())
+        .with_params(&serde_json::json!({"keys": ["key"]}));
+    let root = dataset.schema().field("objects").unwrap();
+    let fields = vec![root.id, root.children[0].children[0].id];
+    let untrained = dataset
+        .create_index_builder(&["objects"], IndexType::Scalar, &params)
+        .train(false)
+        .execute_uncommitted()
+        .await
+        .unwrap();
+    assert_eq!(untrained.fields, fields);
+    assert!(untrained.fragment_bitmap.unwrap().is_empty());
+    let mut builder = dataset
+        .create_index_builder(&["objects"], IndexType::Scalar, &params)
+        .name("objects_idx".to_string());
+    let staged = builder.execute_uncommitted().await.unwrap();
+    assert_eq!(staged.fields, fields);
+    dataset
+        .commit_existing_index_segments("objects_idx", "objects", vec![staged])
+        .await
+        .unwrap();
+
+    let index_info = dataset.scalar_index_info().await.unwrap();
+    assert!(index_info.get_index("objects").is_some());
+    let described = dataset
+        .describe_indices(Some(
+            lance_index::IndexCriteria::default().for_column("objects"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(described.len(), 1);
+    assert_eq!(described[0].field_ids(), [fields[0] as u32]);
+    let metadata = dataset.load_indices_by_name("objects_idx").await.unwrap();
+    let recovered = crate::index::scalar::load_scalar_segment_params(&dataset, &metadata[0])
+        .await
+        .unwrap();
+    assert!(recovered.index_type.eq_ignore_ascii_case("listelement"));
+
+    let filter = "any_element(objects, 'key >= 0')";
+    let mut scanner = dataset.scan();
+    scanner.project(&["id"]).unwrap().filter(filter).unwrap();
+    let plan = scanner.explain_plan(true).await.unwrap();
+    assert!(plan.contains("ListElement("), "{plan}");
+    scanner.fast_search();
+    let indexed = scanner.try_into_batch().await.unwrap();
+    let scanned = dataset
+        .scan()
+        .project(&["id"])
+        .unwrap()
+        .filter(filter)
+        .unwrap()
+        .use_scalar_index(false)
+        .try_into_batch()
+        .await
+        .unwrap();
+    let sorted_ids = |batch: &arrow_array::RecordBatch| {
+        let mut ids = batch["id"].as_primitive::<Int32Type>().values().to_vec();
+        ids.sort_unstable();
+        ids
+    };
+    assert_eq!(sorted_ids(&indexed), sorted_ids(&scanned));
+
+    // The declaration must pass the input-arity guard before the missing-history check.
+    let error =
+        crate::dataset::optimize::remapping::remap_column_index(&mut dataset, &["objects"], None)
+            .await
+            .unwrap_err();
+    assert!(
+        matches!(error, crate::Error::NotSupported { .. }),
+        "{error}"
+    );
+    assert!(
+        error.to_string().contains("Fragment reuse index not found"),
+        "{error}"
+    );
+    dataset
+        .optimize_indices(&lance_index::optimize::OptimizeOptions::default())
+        .await
+        .unwrap();
+    let maintained = dataset.load_indices_by_name("objects_idx").await.unwrap();
+    assert!(!maintained.is_empty());
+    assert!(maintained.iter().all(|segment| segment.fields == fields));
+    // Default naming and explicit replacement still recognize the one input.
+    let replaced = dataset
+        .create_index(&["objects"], IndexType::Scalar, None, &params, true)
+        .await
+        .unwrap();
+    assert_eq!(replaced.name, "objects_idx");
+    assert_eq!(replaced.fields, fields);
+}
+
+#[tokio::test]
+async fn test_initialize_list_element_uses_target_dependency_ids() {
+    let mut source = list_element_dependency_dataset(false).await;
+    let mut target = list_element_dependency_dataset(true).await;
+    let params = ScalarIndexParams::new("listelement".to_string())
+        .with_params(&serde_json::json!({"keys": ["key"]}));
+    source
+        .create_index(&["objects"], IndexType::Scalar, None, &params, false)
+        .await
+        .unwrap();
+    target
+        .initialize_index(&source, "objects_idx")
+        .await
+        .unwrap();
+    let root = target.schema().field("objects").unwrap();
+    let target_fields = vec![root.id, root.children[0].children[0].id];
+    let source_fields = source.load_indices_by_name("objects_idx").await.unwrap()[0]
+        .fields
+        .clone();
+    assert_ne!(source_fields, target_fields);
+    assert_eq!(
+        target.load_indices_by_name("objects_idx").await.unwrap()[0].fields,
+        target_fields,
+    );
+    assert!(
+        target
+            .scalar_index_info()
+            .await
+            .unwrap()
+            .get_index("objects")
+            .is_some()
+    );
+}
+
+/// A table with a B-tree on `id` and a list-element index on `objects` in the
+/// layout experimental releases committed: `fields` holds only the list column,
+/// while the details record the key field IDs this build declares as
+/// dependencies, so the declaration no longer resolves.
+async fn dataset_with_legacy_list_element_index() -> Dataset {
+    let mut dataset = list_element_dependency_dataset(true).await;
+    dataset
+        .create_index(
+            &["id"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::for_builtin(BuiltinIndexType::BTree),
+            false,
+        )
+        .await
+        .unwrap();
+    let params = ScalarIndexParams::new("listelement".to_string())
+        .with_params(&serde_json::json!({"keys": ["key"]}));
+    dataset
+        .create_index(&["objects"], IndexType::Scalar, None, &params, false)
+        .await
+        .unwrap();
+    let current = dataset.load_indices_by_name("objects_idx").await.unwrap();
+    let list_field = dataset.schema().field("objects").unwrap().id;
+    let legacy = current
+        .iter()
+        .map(|segment| IndexMetadata {
+            fields: vec![list_field],
+            ..segment.clone()
+        })
+        .collect::<Vec<_>>();
+    assert!(input_field_ids(&legacy[0]).is_err());
+    let transaction = Transaction::new(
+        dataset.manifest.version,
+        Operation::CreateIndex {
+            new_indices: legacy,
+            removed_indices: current,
+        },
+        None,
+    );
+    dataset
+        .apply_commit(transaction, &Default::default(), &Default::default())
+        .await
+        .unwrap();
+    dataset
+}
+
+#[tokio::test]
+async fn test_legacy_list_element_index_stays_listed_and_droppable() {
+    let mut dataset = dataset_with_legacy_list_element_index().await;
+    let schema = dataset.schema();
+    let expected = vec![
+        (
+            "id_idx".to_string(),
+            vec![schema.field("id").unwrap().id as u32],
+        ),
+        (
+            "objects_idx".to_string(),
+            vec![schema.field("objects").unwrap().id as u32],
+        ),
+    ];
+    let described = dataset.describe_indices(None).await.unwrap();
+    let described = described
+        .iter()
+        .map(|index| (index.name().to_string(), index.field_ids().to_vec()))
+        .collect::<Vec<_>>();
+    assert_eq!(described, expected);
+    let by_name = dataset
+        .describe_indices(Some(
+            lance_index::IndexCriteria::default().with_name("objects_idx"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(by_name.len(), 1);
+    // It is not offered as an index for its column.
+    let for_column = dataset
+        .describe_indices(Some(
+            lance_index::IndexCriteria::default().for_column("objects"),
+        ))
+        .await
+        .unwrap();
+    assert!(for_column.is_empty());
+
+    dataset.drop_index("objects_idx").await.unwrap();
+    let remaining = dataset.describe_indices(None).await.unwrap();
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].name(), "id_idx");
+}
+
+#[tokio::test]
+async fn test_legacy_list_element_index_does_not_block_index_creation() {
+    let mut dataset = dataset_with_legacy_list_element_index().await;
+    let btree = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree);
+    let created = dataset
+        .create_index(&["padding"], IndexType::BTree, None, &btree, false)
+        .await
+        .unwrap();
+    assert_eq!(created.name, "padding_idx");
+    // The legacy index still owns its name.
+    let error = dataset
+        .create_index(
+            &["padding"],
+            IndexType::BTree,
+            Some("objects_idx".to_string()),
+            &btree,
+            true,
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("already exists"), "{error}");
+}
+
+#[tokio::test]
+async fn test_legacy_list_element_index_does_not_block_column_lookup() {
+    let dataset = dataset_with_legacy_list_element_index().await;
+    // Lookups for other columns pass over the legacy index.
+    let unindexed = dataset
+        .load_scalar_index(lance_index::IndexCriteria::default().for_column("padding"))
+        .await
+        .unwrap();
+    assert!(unindexed.is_none());
+}
+
+#[tokio::test]
+async fn test_legacy_list_element_index_does_not_block_maintenance() {
+    let mut dataset = dataset_with_legacy_list_element_index().await;
+    let batch = dataset.scan().try_into_batch().await.unwrap();
+    dataset
+        .append(
+            arrow_array::RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+            None,
+        )
+        .await
+        .unwrap();
+    dataset
+        .optimize_indices(&lance_index::optimize::OptimizeOptions::default())
+        .await
+        .unwrap();
+    crate::dataset::optimize::compact_files(
+        &mut dataset,
+        crate::dataset::optimize::CompactionOptions::default(),
+        None,
+    )
+    .await
+    .unwrap();
+    let id_index = dataset
+        .load_scalar_index(lance_index::IndexCriteria::default().for_column("id"))
+        .await
+        .unwrap();
+    assert_eq!(id_index.map(|index| index.name), Some("id_idx".to_string()));
 }
 
 #[tokio::test]
@@ -525,7 +890,13 @@ async fn test_vector_cache_uses_current_object_store(#[case] index_version: Inde
         .unwrap();
 
     let frag_reuse_uuid = dataset_a.frag_reuse_index_uuid().await;
-    let state_cache_key = IvfIndexStateCacheKey::new(&index_meta.uuid, frag_reuse_uuid.as_ref());
+    let index_path = dataset_a
+        .indice_files_dir(&index_meta)
+        .unwrap()
+        .join(index_meta.uuid.to_string())
+        .join(INDEX_FILE_NAME);
+    let state_cache_key =
+        IvfIndexStateCacheKey::new(&index_meta.uuid, &store_a.store_prefix, index_path.as_ref());
     let cached_state = if matches!(index_version, IndexFileVersion::V3) {
         Some(
             dataset_a
@@ -1110,4 +1481,147 @@ mod multi_column_planner {
             Some("a = Int32(1) AND b > Int32(5)")
         );
     }
+}
+
+#[test]
+fn portable_state_key_preserves_physical_and_dataset_isolation() {
+    let uuid = Uuid::from_u128(1);
+    let other_uuid = Uuid::from_u128(2);
+    let digest = |dataset: &str, key: &IvfIndexStateCacheKey<'_>| {
+        let mut builder = KeyBuilder::new(
+            CacheNamespace::root().child(dataset),
+            IvfIndexStateCacheKey::stable_type_id(),
+            IvfIndexStateCacheKey::schema(),
+        );
+        key.write_key(&mut builder);
+        builder.finish()
+    };
+    let key = IvfIndexStateCacheKey::new(&uuid, "s3$bucket", "ds/_indices/1/index.idx");
+    let original = digest("dataset", &key);
+    assert_ne!(original, digest("clone", &key));
+    for candidate in [
+        IvfIndexStateCacheKey::new(&other_uuid, key.store, key.path),
+        IvfIndexStateCacheKey::new(&uuid, "s3$other-bucket", key.path),
+        IvfIndexStateCacheKey::new(&uuid, key.store, "elsewhere/_indices/1/index.idx"),
+    ] {
+        assert_ne!(original, digest("dataset", &candidate));
+    }
+    // A v1 key does not describe the physical store. Neither a plain nor a
+    // remapped v1 entry can be safely reinterpreted as the new identity.
+    for fri in [None, Some(&other_uuid)] {
+        let mut old = KeyBuilder::new(
+            CacheNamespace::root().child("dataset"),
+            "IvfIndexState",
+            CacheKeySchema::new("lance.index.ivf-state-key", 1),
+        );
+        write_index_identity(&mut old, &uuid, fri);
+        assert_ne!(original, old.finish());
+        let legacy = LegacyVectorIndexCacheKey::new(&uuid, fri);
+        let mut builder = KeyBuilder::new(
+            CacheNamespace::root().child("dataset"),
+            LegacyVectorIndexCacheKey::stable_type_id(),
+            LegacyVectorIndexCacheKey::schema(),
+        );
+        legacy.write_key(&mut builder);
+        assert_ne!(original, builder.finish());
+    }
+    assert_eq!(LegacyVectorIndexCacheKey::schema().version(), 1);
+}
+
+/// An old-key entry may be from another store binding at the same dataset URI.
+/// Keep its bytes untouched, but never promote it into the physical-file key.
+#[tokio::test]
+async fn portable_state_schema_change_does_not_promote_unqualified_state() {
+    #[derive(Debug)]
+    struct OldStateKey<'a>(&'a Uuid);
+    impl CacheKey for OldStateKey<'_> {
+        type ValueType = IvfStateEntryBox;
+        fn key(&self) -> std::borrow::Cow<'_, str> {
+            self.0.to_string().into()
+        }
+        fn type_name() -> &'static str {
+            "IvfIndexState"
+        }
+        fn schema() -> CacheKeySchema {
+            CacheKeySchema::new("lance.index.ivf-state-key", 1)
+        }
+        fn write_key(&self, builder: &mut KeyBuilder) {
+            write_index_identity(builder, self.0, None);
+        }
+        fn codec() -> Option<lance_core::cache::CacheCodec> {
+            IvfIndexStateCacheKey::codec()
+        }
+    }
+    let mut dataset = gen_batch()
+        .col("vector", array::rand_vec::<Float32Type>(4.into()))
+        .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(8))
+        .await
+        .unwrap();
+    dataset
+        .create_index(
+            &["vector"],
+            IndexType::Vector,
+            Some("vector_idx".into()),
+            &VectorIndexParams::ivf_flat(1, DistanceType::L2),
+            true,
+        )
+        .await
+        .unwrap();
+    let meta = dataset
+        .load_indices_by_name("vector_idx")
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    let store = dataset.object_store_for_index(&meta).await.unwrap();
+    let path = dataset
+        .indice_files_dir(&meta)
+        .unwrap()
+        .join(meta.uuid.to_string())
+        .join(INDEX_FILE_NAME);
+    let key = IvfIndexStateCacheKey::new(&meta.uuid, &store.store_prefix, path.as_ref());
+    dataset
+        .open_vector_index("vector", &meta.uuid, &NoOpMetricsCollector)
+        .await
+        .unwrap();
+    let state = dataset.index_cache.get_with_key(&key).await.unwrap();
+    let backend = Arc::new(SerializingCacheBackend::new());
+    dataset.index_cache = crate::session::Session::with_index_cache_backend(
+        backend.clone(),
+        1024 * 1024,
+        Arc::default(),
+    )
+    .index_cache
+    .for_dataset(dataset.uri())
+    .into();
+    let old_key = OldStateKey(&meta.uuid);
+    dataset.index_cache.insert_with_key(&old_key, state).await;
+    assert!(dataset.index_cache.get_with_key(&key).await.is_none());
+    let metrics = lance_index::metrics::LocalMetricsCollector::default();
+    dataset
+        .open_vector_index("vector", &meta.uuid, &metrics)
+        .await
+        .unwrap();
+    assert_eq!(
+        metrics
+            .index_loads
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+    assert!(dataset.index_cache.get_with_key(&key).await.is_some());
+    assert!(
+        dataset.index_cache.get_with_key(&old_key).await.is_some(),
+        "old bytes were not reinterpreted or removed"
+    );
+    let metrics = lance_index::metrics::LocalMetricsCollector::default();
+    dataset
+        .open_vector_index("vector", &meta.uuid, &metrics)
+        .await
+        .unwrap();
+    assert_eq!(
+        metrics
+            .index_loads
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
 }

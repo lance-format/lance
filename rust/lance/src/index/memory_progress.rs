@@ -151,6 +151,10 @@ impl MemoryObservingProgress {
 
 #[async_trait]
 impl IndexBuildProgress for MemoryObservingProgress {
+    fn copy_observer(&self) -> Option<&dyn lance_io::object_store::CopyObserver> {
+        self.inner.copy_observer()
+    }
+
     async fn stage_start(&self, stage: &str, total: Option<u64>, unit: &str) -> Result<()> {
         let window = self.observer.open_window();
         self.report.stage_start(stage);

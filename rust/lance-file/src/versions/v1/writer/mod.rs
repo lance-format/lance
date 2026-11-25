@@ -700,9 +700,9 @@ mod tests {
     use arrow_array::{
         BooleanArray, Decimal128Array, Decimal256Array, DictionaryArray, DurationMicrosecondArray,
         DurationMillisecondArray, DurationNanosecondArray, DurationSecondArray,
-        FixedSizeBinaryArray, FixedSizeListArray, Float32Array, Int32Array, Int64Array, ListArray,
-        NullArray, StringArray, TimestampMicrosecondArray, TimestampSecondArray, UInt8Array,
-        types::UInt32Type,
+        FixedSizeBinaryArray, FixedSizeListArray, Float32Array, Int32Array, Int64Array,
+        LargeBinaryArray, ListArray, NullArray, StringArray, TimestampMicrosecondArray,
+        TimestampSecondArray, UInt8Array, types::UInt32Type,
     };
     use arrow_buffer::i256;
     use arrow_schema::{
@@ -1147,6 +1147,83 @@ mod tests {
         ]);
 
         assert_eq!(read_stats, expected_stats);
+    }
+
+    #[tokio::test]
+    async fn test_collect_stats_bounds() {
+        let long_binary = [u8::MAX; 65];
+        let batch = RecordBatch::try_from_iter([
+            (
+                "float",
+                Arc::new(Float32Array::from(vec![Some(0.0), None, None])) as ArrayRef,
+            ),
+            (
+                "decimal",
+                Arc::new(
+                    Decimal128Array::from(vec![Some(-987), None, None])
+                        .with_precision_and_scale(7, 3)
+                        .unwrap(),
+                ),
+            ),
+            (
+                "binary",
+                Arc::new(LargeBinaryArray::from(vec![
+                    Some(long_binary.as_slice()),
+                    None,
+                    None,
+                ])),
+            ),
+        ])
+        .unwrap();
+
+        let schema = Schema::try_from(batch.schema().as_ref()).unwrap();
+        let store = ObjectStore::memory();
+        let path = Path::from("stats.lance");
+        let mut writer = FileWriter::<NotSelfDescribing>::try_new(
+            &store,
+            &path,
+            schema.clone(),
+            &FileWriterOptions::default(),
+        )
+        .await
+        .unwrap();
+        for page in [batch.slice(0, 2), batch.slice(2, 1)] {
+            writer.write(&[page]).await.unwrap();
+        }
+        writer.finish().await.unwrap();
+
+        let reader = FileReader::try_new(&store, &path, schema).await.unwrap();
+        let actual = reader.read_page_stats(&[0, 1, 2]).await.unwrap().unwrap();
+
+        let expected = stats_batch(&[
+            Stats {
+                field_id: 0,
+                null_counts: vec![1, 1],
+                min_values: Arc::new(Float32Array::from(vec![-0.0, f32::NEG_INFINITY])),
+                max_values: Arc::new(Float32Array::from(vec![0.0, f32::INFINITY])),
+            },
+            Stats {
+                field_id: 1,
+                null_counts: vec![1, 1],
+                min_values: Arc::new(
+                    Decimal128Array::from(vec![-987, i128::MIN])
+                        .with_precision_and_scale(7, 3)
+                        .unwrap(),
+                ),
+                max_values: Arc::new(
+                    Decimal128Array::from(vec![-987, i128::MAX])
+                        .with_precision_and_scale(7, 3)
+                        .unwrap(),
+                ),
+            },
+            Stats {
+                field_id: 2,
+                null_counts: vec![1, 1],
+                min_values: Arc::new(LargeBinaryArray::from(vec![Some(&long_binary[..64]), None])),
+                max_values: Arc::new(LargeBinaryArray::from(vec![None, None])),
+            },
+        ]);
+        assert_eq!(actual, expected);
     }
 
     fn stats_schema(data_fields: impl IntoIterator<Item = (i32, DataType)>) -> ArrowSchema {

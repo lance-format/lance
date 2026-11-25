@@ -146,16 +146,23 @@ impl Transformer for PartitionTransformer {
         let fsl = self.input_vectors(&batch)?;
 
         let (part_ids, dists) = match &self.index {
-            Some(index) => fsl
-                .iter()
-                .map(|vec| match vec {
-                    Some(v) => {
-                        let (id, dist) = index.search(v).unwrap();
-                        (Some(id), Some(dist))
-                    }
-                    None => (None, None),
-                })
-                .unzip(),
+            Some(index) => {
+                // One visited set for the batch: the HNSW's shared pool, taken
+                // from and returned to on every search, is contended by every
+                // thread transforming a batch.
+                let mut visited = index.visited_generator();
+                fsl.iter()
+                    .map(|vec| match vec {
+                        Some(v) => {
+                            let (id, dist) = index.search(v, &mut visited)?;
+                            Ok((Some(id), Some(dist)))
+                        }
+                        None => Ok((None, None)),
+                    })
+                    .collect::<Result<Vec<_>>>()?
+                    .into_iter()
+                    .unzip()
+            }
             None => compute_partitions_arrow_array(&self.centroids, fsl, self.distance_type)?,
         };
         let loss = dists
