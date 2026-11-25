@@ -1,160 +1,112 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Write seed collection shared by every writer that produces a data file.
-//!
-//! A [`SeedCollector`] decides which columns of a data file get a seed, feeds
-//! each written batch to the seed writers, and embeds the finished seeds in the
-//! file before it is closed. Writers that create whole fragments and writers
-//! that add or replace a column inside an existing fragment all go through it,
-//! so a seeded column keeps its seed in whichever data file serves it.
-//!
-//! Seed formats that readers must opt into declare dataset feature flags
-//! ([`IndexSeedWriter::required_feature_flags`]). The collector embeds such a
-//! seed only when the writer's snapshot already carries the flags, and the
-//! commit path sets them for every index that requests such a seed
-//! ([`apply_seed_feature_flags`]), so no manifest references a seed its flags
-//! do not announce.
-
 use std::collections::{HashMap, HashSet};
 
-use arrow_array::RecordBatch;
+use std::sync::Arc;
+
+use async_trait::async_trait;
 use lance_core::Result;
 use lance_core::datatypes::Schema;
 use lance_file::version::ConcreteFileVersion;
 use lance_index::pbold;
-use lance_index::scalar::seed::IndexSeedWriter;
-use lance_index::scalar::zonemap::ZoneMapSeedWriter;
-use lance_table::format::{IndexMetadata, Manifest};
+use lance_index::scalar::zonemap::{ZoneMapSeedVersion, ZoneMapSeedWriter};
+use lance_table::feature_flags::write_v1_zone_write_seeds;
+use lance_table::format::IndexMetadata;
+use lance_table::format::index_seed::IndexSeedWriter;
 
-use super::GenericWriter;
-use crate::Dataset;
 use crate::index::scalar::zonemap::stored_null_bitmap_policy;
 use crate::index::scalar::{IndexDetails, fetch_index_details};
 use crate::index::{loading::load_all_indices, segment::index_is_usable};
+use crate::{Dataset, session::Session};
+use lance_table_runtime::write::SeedCollector;
+use lance_table_runtime::{Table, WriteSeedHook};
 
 /// The unresolved same-column conflict is a configuration fact, so it is
 /// reported once per process and at debug level afterwards.
 static SEED_CONFLICT_WARNED: std::sync::Once = std::sync::Once::new();
 
-/// Collects write seeds for the columns of one data file.
-#[derive(Debug, Default)]
-pub struct SeedCollector {
-    writers: Vec<Box<dyn IndexSeedWriter>>,
+/// Selects seed writers using Lance's scalar index registry.
+pub struct LanceWriteSeedHook {
+    session: Arc<Session>,
 }
 
-impl SeedCollector {
-    /// A collector that writes no seeds.
-    pub fn disabled() -> Self {
-        Self::default()
+impl LanceWriteSeedHook {
+    pub(crate) fn new(session: Arc<Session>) -> Self {
+        Self { session }
     }
+}
 
-    /// Build the seed writers for the top-level columns of `write_schema`.
-    ///
-    /// A column gets a seed writer when an existing, usable index on it asks
-    /// for one through its plugin and the dataset already carries the feature
-    /// flags that seed format requires. `consult_indices` is false for writes
-    /// that discard the dataset's indices (overwrite), where seeds have no
-    /// consumer.
-    pub async fn for_write(
-        version: ConcreteFileVersion,
-        dataset: Option<&Dataset>,
-        write_schema: &Schema,
-        consult_indices: bool,
-    ) -> Result<Self> {
-        // Legacy files have no global buffers to hold a seed.
-        if version == ConcreteFileVersion::V1 || !consult_indices {
-            return Ok(Self::disabled());
-        }
-        let Some(dataset) = dataset else {
-            return Ok(Self::disabled());
+#[async_trait]
+impl WriteSeedHook for LanceWriteSeedHook {
+    async fn seed_writers(
+        &self,
+        table: &Table,
+        _: ConcreteFileVersion,
+        schema: &Schema,
+    ) -> Result<Vec<Box<dyn IndexSeedWriter>>> {
+        let dataset = Dataset::from_committed_table(table.clone(), self.session.clone());
+        let indices = load_all_indices(&dataset).await?;
+        let zone_map_seed_version = if write_v1_zone_write_seeds(table.manifest()) {
+            ZoneMapSeedVersion::V1
+        } else {
+            ZoneMapSeedVersion::V0
         };
+        seed_writers_for(&dataset, &indices, schema, zone_map_seed_version).await
+    }
 
-        let indices = load_all_indices(dataset).await?;
-        let manifest = dataset.manifest.as_ref();
-        let writers = seed_writers_for(dataset, &indices, write_schema, SeedWriterPurpose::Collect)
+    async fn index_rows_per_zone(&self, table: &Table) -> Result<HashMap<i32, u64>> {
+        let dataset = Dataset::from_committed_table(table.clone(), self.session.clone());
+        let mut rows_per_zone = HashMap::new();
+        for index in load_all_indices(&dataset)
             .await?
-            .into_iter()
-            .filter(|writer| {
-                let required = writer.required_feature_flags();
-                let activated = manifest.reader_feature_flags & required == required
-                    && manifest.writer_feature_flags & required == required;
-                if !activated {
-                    // Readers could not be told about this seed yet; the next
-                    // commit activates the flags and later writes embed it.
-                    log::debug!(
-                        "skipping write seed for column {}: dataset version {} does not \
-                         carry feature flags {:#x}",
-                        writer.column_name(),
-                        manifest.version,
-                        required
-                    );
-                }
-                activated
-            })
-            .collect();
-        Ok(Self { writers })
-    }
-
-    /// Number of columns that will receive a seed.
-    #[cfg(test)]
-    pub fn len(&self) -> usize {
-        self.writers.len()
-    }
-
-    #[cfg(test)]
-    pub fn is_empty(&self) -> bool {
-        self.writers.is_empty()
-    }
-
-    /// Feed one written batch to every seed writer whose column it contains.
-    pub fn observe(&mut self, batch: &RecordBatch) -> Result<()> {
-        for writer in self.writers.iter_mut() {
-            if let Some(column) = batch.column_by_name(writer.column_name()) {
-                writer.observe_batch(column)?;
+            .iter()
+            .filter(|index| index_is_usable(index))
+        {
+            let Some(field_id) = index.keyed_field() else {
+                continue;
+            };
+            let Some(field) = dataset
+                .schema()
+                .fields
+                .iter()
+                .find(|field| field.id == field_id)
+            else {
+                continue;
+            };
+            let Ok(details) = fetch_index_details(&dataset, &field.name, index).await else {
+                continue;
+            };
+            if let Ok(zone_map) = details.to_msg::<pbold::ZoneMapIndexDetails>()
+                && let Some(configured) = zone_map.rows_per_zone
+            {
+                rows_per_zone.insert(field_id, configured);
             }
         }
-        Ok(())
+        Ok(rows_per_zone)
     }
+}
 
-    /// Embed the finished seeds in `writer` before its `finish()` and reset
-    /// the seed writers for the next data file.
-    pub async fn flush(&mut self, writer: &mut dyn GenericWriter) -> Result<()> {
-        for seed_writer in self.writers.iter_mut() {
-            if let Some(bytes) = seed_writer.finish()? {
-                let buf_index = writer.add_global_buffer(bytes).await?;
-                let key = seed_writer.schema_metadata_key();
-                let value = seed_writer.schema_metadata_value(buf_index);
-                writer.add_schema_metadata(key, value);
-            }
-        }
-        Ok(())
-    }
+pub async fn collect_write_seeds(
+    version: ConcreteFileVersion,
+    dataset: &Dataset,
+    schema: &Schema,
+) -> Result<SeedCollector> {
+    let hook = LanceWriteSeedHook::new(dataset.session.clone());
+    let table = dataset.table_view().to_table();
+    SeedCollector::for_write(version, Some(&table), schema, Some(&hook)).await
 }
 
 /// The seed writers that the usable indices in `indices` request for the
 /// top-level columns of `schema`.
 ///
 /// `dataset` resolves index details that are not inline in the metadata; it
-/// only has to share its index store with `indices`, which may belong to a
-/// manifest that is still being built.
-/// Why seed writers are being selected.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum SeedWriterPurpose {
-    /// Embedding seeds in a file being written: each writer is fully
-    /// configured, which for a zone map includes the null-position policy
-    /// stored in its index file.
-    Collect,
-    /// Computing the feature flags the seed formats require. The flags do
-    /// not depend on the null-position policy, so no index file is read.
-    FeatureFlags,
-}
-
+/// only has to share its index store with `indices`.
 async fn seed_writers_for(
     dataset: &Dataset,
     indices: &[IndexMetadata],
     schema: &Schema,
-    purpose: SeedWriterPurpose,
+    zone_map_seed_version: ZoneMapSeedVersion,
 ) -> Result<Vec<Box<dyn IndexSeedWriter>>> {
     let mut writers: Vec<Box<dyn IndexSeedWriter>> = Vec::new();
     // Zone map requirements per column: every ZoneMap index on the column
@@ -190,21 +142,16 @@ async fn seed_writers_for(
             // The policy is optional metadata: a segment that cannot be read
             // right now costs this file its seed for that index, never the
             // write itself.
-            let positions = match purpose {
-                SeedWriterPurpose::FeatureFlags => false,
-                SeedWriterPurpose::Collect => {
-                    match stored_null_bitmap_policy(dataset, index).await {
-                        Ok(positions) => positions,
-                        Err(err) => {
-                            log::warn!(
-                                "column {}: zone map {} could not be read ({err}); no zone map \
-                                 seed is written for it in this file",
-                                field.name,
-                                index.name
-                            );
-                            continue;
-                        }
-                    }
+            let positions = match stored_null_bitmap_policy(dataset, index).await {
+                Ok(positions) => positions,
+                Err(err) => {
+                    log::warn!(
+                        "column {}: zone map {} could not be read ({err}); no zone map \
+                         seed is written for it in this file",
+                        field.name,
+                        index.name
+                    );
+                    continue;
                 }
             };
             zone_map_columns.entry(field_id).or_default().push((
@@ -253,10 +200,9 @@ async fn seed_writers_for(
             continue;
         };
         let positions = consumers.iter().any(|c| c.2);
-        if purpose == SeedWriterPurpose::Collect
-            && consumers
-                .iter()
-                .any(|c| c.1 != rows_per_zone || c.2 != positions)
+        if consumers
+            .iter()
+            .any(|c| c.1 != rows_per_zone || c.2 != positions)
         {
             log::info!(
                 "column {}: zone maps {:?} share one seed of {rows_per_zone} rows per record{}",
@@ -271,50 +217,11 @@ async fn seed_writers_for(
         }
         writers.push(Box::new(
             ZoneMapSeedWriter::new(&field.name, rows_per_zone, field.data_type())?
+                .with_version(zone_map_seed_version)
                 .with_null_positions(positions),
         ));
     }
     Ok(writers)
-}
-
-/// The feature flags the seeds of `writers` require, combined.
-fn required_seed_feature_flags(writers: &[Box<dyn IndexSeedWriter>]) -> u64 {
-    writers
-        .iter()
-        .fold(0, |flags, writer| flags | writer.required_feature_flags())
-}
-
-/// Set, in both feature words of a manifest being built, the flags required
-/// by every seed its indices request.
-///
-/// `indices` is the prepared index list of that manifest. An index that
-/// requests a flagged seed format activates the flags in the commit that
-/// publishes it (`CreateIndex` of a seeded ZoneMap), before any file carries
-/// such a seed; an index left behind by a build that did not set them
-/// activates them in the next commit of any kind. Until then the write path
-/// embeds no such seed ([`SeedCollector::for_write`]), and afterwards the
-/// flags are sticky, so no manifest references a seed its flags do not
-/// announce. Nothing is read from data files or index files; `dataset`
-/// only serves as the index store for details that are not inline.
-pub async fn apply_seed_feature_flags(
-    manifest: &mut Manifest,
-    indices: &[IndexMetadata],
-    dataset: &Dataset,
-) -> Result<()> {
-    if indices.is_empty() {
-        return Ok(());
-    }
-    let writers = seed_writers_for(
-        dataset,
-        indices,
-        &manifest.schema,
-        SeedWriterPurpose::FeatureFlags,
-    )
-    .await?;
-    let required = required_seed_feature_flags(&writers);
-    manifest.reader_feature_flags |= required;
-    manifest.writer_feature_flags |= required;
-    Ok(())
 }
 
 #[cfg(test)]
@@ -323,7 +230,7 @@ mod tests {
     use arrow_array::ArrayRef;
     use arrow_schema::DataType;
     use bytes::Bytes;
-    use lance_index::scalar::zonemap::ZoneMapSeedWriter;
+    use lance_index::scalar::zonemap::{ZoneMapSeedVersion, ZoneMapSeedWriter};
     use lance_table::feature_flags::FLAG_ZONE_WRITE_SEEDS;
 
     /// A seed format that needs no reader support.
@@ -354,17 +261,15 @@ mod tests {
 
     #[test]
     fn test_required_flags_follow_the_seed_format() {
-        let plain: Vec<Box<dyn IndexSeedWriter>> = vec![Box::new(PlainSeedWriter)];
-        assert_eq!(required_seed_feature_flags(&plain), 0);
-        assert_eq!(required_seed_feature_flags(&[]), 0);
+        assert_eq!(PlainSeedWriter.required_feature_flags(), 0);
+        let v0 = ZoneMapSeedWriter::new("val", 8, DataType::Int32)
+            .unwrap()
+            .with_version(ZoneMapSeedVersion::V0);
+        assert_eq!(v0.required_feature_flags(), 0);
 
-        let zone_map: Vec<Box<dyn IndexSeedWriter>> = vec![
-            Box::new(PlainSeedWriter),
-            Box::new(ZoneMapSeedWriter::new("val", 8, DataType::Int32).unwrap()),
-        ];
-        assert_eq!(
-            required_seed_feature_flags(&zone_map),
-            FLAG_ZONE_WRITE_SEEDS
-        );
+        let v1 = ZoneMapSeedWriter::new("val", 8, DataType::Int32)
+            .unwrap()
+            .with_version(ZoneMapSeedVersion::V1);
+        assert_eq!(v1.required_feature_flags(), FLAG_ZONE_WRITE_SEEDS);
     }
 }

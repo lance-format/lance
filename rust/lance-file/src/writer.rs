@@ -312,4 +312,4 @@ impl FileWriter {
 
 #[cfg(test)]
 #[path = "writer_tests.rs"]
-mod writer_tests;
+pub(crate) mod writer_tests;

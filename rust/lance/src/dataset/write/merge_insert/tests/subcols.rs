@@ -786,9 +786,13 @@ async fn test_merge_insert_subcols_v2_bloom_filter() {
         .transaction_file
         .clone()
         .expect("transaction file must be written");
-    let tx_read = read_transaction_file(dataset.object_store.as_ref(), &dataset.base, &tx_path)
-        .await
-        .unwrap();
+    let tx_read = read_transaction_file(
+        dataset.table_state.object_store.as_ref(),
+        &dataset.table_state.base,
+        &tx_path,
+    )
+    .await
+    .unwrap();
     match &tx_read.operation {
         Operation::Update {
             inserted_rows_filter,
@@ -1355,8 +1359,13 @@ async fn test_merge_insert_subcols_in_place_rebase_over_overlay() {
     // A concurrent overlay commits as v2, changing `tag` on key 1, which
     // the prepared merge did not match.
     let overlay_schema = ds.schema().project_by_ids(&[tag_field_id], true);
-    let path = ds.base.clone().join("data").join("overlay.lance");
-    let obj_writer = ds.object_store.create(&path).await.unwrap();
+    let path = ds
+        .table_state
+        .base
+        .clone()
+        .join("data")
+        .join("overlay.lance");
+    let obj_writer = ds.table_state.object_store.create(&path).await.unwrap();
     let mut writer = lance_file::versions::v2_1::create_writer(
         obj_writer,
         overlay_schema,

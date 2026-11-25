@@ -319,7 +319,7 @@ async fn test_add_bases_refuses_a_base_id_in_use() {
         dataset
             .get_fragments()
             .iter()
-            .flat_map(|fragment| &fragment.metadata.files)
+            .flat_map(|fragment| &fragment.metadata().files)
             .all(|file| file.base_id == Some(7))
     );
     let dataset = Arc::new(dataset);

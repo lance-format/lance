@@ -134,15 +134,22 @@ pub(super) fn tokenizer_for_match_query(
     index: &InvertedIndex,
     fuzziness: Option<u32>,
 ) -> Box<dyn LanceTokenizer> {
+    tokenizer_for_match_query_from_base(index.tokenizer().as_ref(), fuzziness)
+}
+
+pub(super) fn tokenizer_for_match_query_from_base(
+    base: &dyn LanceTokenizer,
+    fuzziness: Option<u32>,
+) -> Box<dyn LanceTokenizer> {
     // Preserve the legacy explicit-fuzzy behavior, while AUTO fuzziness uses
     // the index analyzer so its source terms share the indexed vocabulary's
     // normalization and filtering.
     if !matches!(fuzziness, Some(distance) if distance > 0) {
-        return index.tokenizer();
+        return base.box_clone();
     }
 
     let analyzer = TextAnalyzer::from(SimpleTokenizer::default());
-    match index.tokenizer().doc_type() {
+    match base.doc_type() {
         DocType::Text => Box::new(TextTokenizer::new(analyzer)),
         DocType::Json => Box::new(JsonTokenizer::new(analyzer)),
     }
