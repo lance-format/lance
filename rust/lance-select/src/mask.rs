@@ -647,7 +647,11 @@ impl RowAddrTreeMap {
                 .all(|(fragment, lhs)| lhs.is_subset_of(other.inner.get(fragment)));
         }
 
-        let mut allowed = other.inner.iter();
+        let Some((&first_fragment, _)) = self.inner.first_key_value() else {
+            return true;
+        };
+        // Stop at the first rejected row even when the probe begins far into the mask.
+        let mut allowed = other.inner.range(first_fragment..);
         let mut next_allowed = allowed.next();
         self.inner.iter().all(|(fragment, lhs)| {
             while next_allowed.is_some_and(|(id, _)| id < fragment) {
