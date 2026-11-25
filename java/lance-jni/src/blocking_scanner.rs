@@ -10,8 +10,8 @@ use crate::traits::{FromJObjectWithEnv, import_vec_from_method, import_vec_to_ru
 use arrow::array::{ArrayRef, FixedSizeListArray, Float32Array};
 use arrow::{ffi::FFI_ArrowSchema, ffi_stream::FFI_ArrowArrayStream};
 use arrow_schema::{DataType, Field, SchemaRef};
-use jni::objects::{JObject, JString, JValueGen};
-use jni::sys::{JNI_TRUE, jboolean};
+use jni::objects::{JClass, JObject, JString, JValueGen};
+use jni::sys::{JNI_TRUE, jboolean, jint};
 use jni::{JNIEnv, sys::jlong};
 use lance::dataset::scanner::{
     AggregateExpr, ColumnOrdering, DatasetRecordBatchStream, ExecutionStatsCallback,
@@ -36,6 +36,23 @@ use crate::{
     traits::IntoJava,
     utils::parse_approx_mode,
 };
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_ipc_ScanOptions_nativeDefaultBatchReadahead(
+    mut env: JNIEnv,
+    _class: JClass,
+) -> jint {
+    let count = std::panic::catch_unwind(Scanner::default_batch_readahead)
+        .map_err(|_| Error::runtime_error("Failed to resolve the default batch readahead".into()))
+        .and_then(|n| {
+            jint::try_from(n).map_err(|_| {
+                Error::input_error(format!(
+                    "Default batch readahead {n} exceeds Java's int range"
+                ))
+            })
+        });
+    ok_or_throw_with_return!(env, count, 0)
+}
 
 pub const NATIVE_SCANNER: &str = "nativeScannerHandle";
 

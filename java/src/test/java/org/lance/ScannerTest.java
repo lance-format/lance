@@ -115,7 +115,11 @@ public class ScannerTest {
     assertEquals(Collections.singletonList("name"), materialization.getColumns());
 
     ScanOptions defaults = new ScanOptions.Builder().build();
-    assertEquals(-1, defaults.getBatchReadahead());
+    int defaultReadahead = defaults.getBatchReadahead();
+    assertTrue(defaultReadahead > 0);
+    assertEquals(
+        defaultReadahead,
+        new ScanOptions.Builder().batchReadahead(defaultReadahead).build().getBatchReadahead());
     assertTrue(defaults.getBatchSizeBytes().isEmpty());
     assertTrue(defaults.getIoBufferSize().isEmpty());
     assertTrue(defaults.getFragmentReadahead().isEmpty());

@@ -13,6 +13,8 @@
  */
 package org.lance.ipc;
 
+import org.lance.JniLoader;
+
 import com.google.common.base.MoreObjects;
 import org.apache.arrow.util.Preconditions;
 
@@ -496,14 +498,19 @@ public class ScanOptions {
   }
 
   /**
-   * Gets the configured batch readahead.
+   * Gets the effective number of batches to read ahead.
    *
-   * @return the configured number of batches, or {@code -1} (equivalent to {@code null}) if unset.
-   *     The native scanner chooses its default when created.
+   * @return the configured count, or the native scanner default if unset.
    */
   public int getBatchReadahead() {
-    return batchReadahead.orElse(-1);
+    if (batchReadahead.isPresent()) {
+      return batchReadahead.get();
+    }
+    JniLoader.ensureLoaded();
+    return nativeDefaultBatchReadahead();
   }
+
+  private static native int nativeDefaultBatchReadahead();
 
   /**
    * Get the number of fragments to read ahead concurrently.
