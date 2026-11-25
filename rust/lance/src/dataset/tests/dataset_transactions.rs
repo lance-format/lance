@@ -1346,6 +1346,84 @@ async fn test_large_transaction_spills_to_external_file() {
     assert!(ds.manifest.transaction_section.is_some());
 }
 
+/// With the transaction file disabled, the inline copy is the only durable
+/// one, so a transaction above the spill threshold must still be inlined on
+/// every commit path instead of being dropped.
+#[tokio::test]
+async fn test_large_transaction_inlined_when_transaction_file_disabled() {
+    use crate::dataset::transaction::TransactionBuilder;
+    use crate::io::commit::MAX_INLINE_TRANSACTION_BYTES;
+
+    let assert_inlined = |ds: &Dataset| {
+        assert!(ds.manifest.transaction_section.is_some());
+        assert!(
+            ds.manifest
+                .transaction_file
+                .as_deref()
+                .is_none_or(str::is_empty)
+        );
+    };
+    let payload_len = |tx: Transaction| {
+        tx.transaction_properties
+            .unwrap()
+            .get("payload")
+            .unwrap()
+            .len()
+    };
+
+    let (schema, batch) = spill_test_batch();
+    let test_uri = TempStrDir::default();
+
+    // New-dataset and regular commit paths.
+    for mode in [WriteMode::Create, WriteMode::Append] {
+        Dataset::write(
+            RecordBatchIterator::new([Ok(batch.clone())], schema.clone()),
+            &test_uri,
+            Some(WriteParams {
+                mode,
+                disable_transaction_file: true,
+                transaction_properties: large_props("payload"),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let ds = reopen(&test_uri).await;
+        assert_inlined(&ds);
+        let tx = ds.read_transaction().await.unwrap().unwrap();
+        assert_eq!(payload_len(tx), 2 * MAX_INLINE_TRANSACTION_BYTES);
+    }
+
+    // Detached commit path.
+    let ds = reopen(&test_uri).await;
+    let tx = TransactionBuilder::new(
+        ds.manifest().version,
+        Operation::UpdateConfig {
+            config_updates: None,
+            table_metadata_updates: None,
+            schema_metadata_updates: None,
+            field_metadata_updates: HashMap::new(),
+        },
+    )
+    .transaction_properties(large_props("payload"))
+    .build();
+    let detached_version = CommitBuilder::new(Arc::new(ds))
+        .with_detached(true)
+        .with_disable_transaction_file(true)
+        .execute(tx)
+        .await
+        .unwrap()
+        .version_id();
+    let detached = reopen(&test_uri)
+        .await
+        .checkout_version(detached_version)
+        .await
+        .unwrap();
+    assert_inlined(&detached);
+    let tx = detached.read_transaction().await.unwrap().unwrap();
+    assert_eq!(payload_len(tx), 2 * MAX_INLINE_TRANSACTION_BYTES);
+}
+
 #[tokio::test]
 async fn test_spilled_restore_and_deep_clone_read_own_transaction() {
     // Restore and deep clone both rebuild the new manifest from an existing

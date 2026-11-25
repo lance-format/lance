@@ -461,7 +461,8 @@ impl<'a> ApplyState<'a> {
             *current = (*current).max(field_high_water);
         }
 
-        manifest.transaction_file = Some(transaction_file_path.to_string());
+        manifest.transaction_file =
+            (!transaction_file_path.is_empty()).then(|| transaction_file_path.to_string());
         if let Some(next_row_id) = next_row_id {
             manifest.next_row_id = next_row_id;
         }

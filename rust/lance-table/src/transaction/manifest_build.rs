@@ -279,7 +279,7 @@ impl Transaction {
         ensure_can_read_manifest(&manifest)?;
         ensure_can_write_manifest(&manifest)?;
         manifest.set_timestamp(config.timestamp_nanos().unwrap_or(0));
-        manifest.transaction_file = Some(tx_path.to_string());
+        manifest.transaction_file = (!tx_path.is_empty()).then(|| tx_path.to_string());
         let indices = read_manifest_indexes(object_store, &location, &manifest).await?;
         validate_flags(&manifest, &indices)?;
         manifest.max_fragment_id = manifest
@@ -2125,7 +2125,8 @@ impl Transaction {
             manifest.max_fragment_id = Some(manifest.max_fragment_id.unwrap_or(0) + num_fragments);
         }
 
-        manifest.transaction_file = Some(transaction_file_path.to_string());
+        manifest.transaction_file =
+            (!transaction_file_path.is_empty()).then(|| transaction_file_path.to_string());
 
         if let Some(next_row_id) = next_row_id {
             manifest.next_row_id = next_row_id;
