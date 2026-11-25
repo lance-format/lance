@@ -8,7 +8,7 @@
 pub struct RetainedSnapshot {
     #[prost(uint32, tag = "1")]
     pub protocol_version: u32,
-    /// Nonzero 16-byte UUID from the authoritative retention root's table_id.
+    /// Nonzero 16-byte UUID in network byte order from the retention root's table_id.
     #[prost(bytes = "bytes", tag = "2")]
     pub table_id: ::prost::bytes::Bytes,
     /// Absent identifies main; otherwise the exact normalized branch name.
