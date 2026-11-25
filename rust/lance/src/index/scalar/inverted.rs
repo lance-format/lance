@@ -917,7 +917,8 @@ impl Dataset {
     /// [`DatasetIndexExt::commit_existing_index_segments`] and retire the inputs once every
     /// attempt has stopped reading them. An abandoned result is an unreferenced index directory.
     ///
-    /// The callback reports the finalization stages for each input in order.
+    /// The callback reports each input's finalization stages followed by the stages of
+    /// the final segment merge, when one is needed. It can also observe individual file copies.
     ///
     /// ```
     /// # use lance::{Dataset, Result};
@@ -966,7 +967,8 @@ impl Dataset {
                     ..source
                 });
             }
-            self.merge_existing_index_segments(finalized).await
+            self.merge_existing_index_segments_with_fts_progress(finalized, progress)
+                .await
         }
         .await;
         for uuid in intermediates {
@@ -1076,6 +1078,7 @@ pub(crate) async fn merge_segments(
     segments: Vec<IndexMetadata>,
     staged: Option<&crate::index::frag_reuse::StagedRemappingPlans>,
     source_coverage_moved: bool,
+    progress: Arc<dyn IndexBuildProgress>,
 ) -> Result<IndexMetadata> {
     let merge = SegmentMerge::new(dataset, "Inverted", &segments)?;
     let field_id = merge.field_id();
@@ -1103,6 +1106,9 @@ pub(crate) async fn merge_segments(
 
     let mut source_indices = Vec::with_capacity(segments.len());
     let fragment_bitmap = merge.stored_coverage_union()?;
+    progress
+        .stage_start("open_fts_segments", Some(segments.len() as u64), "segments")
+        .await?;
     for segment in merge.segments() {
         finalize_segment_files_if_needed(dataset, segment).await?;
         source_indices.push(
@@ -1115,7 +1121,11 @@ pub(crate) async fn merge_segments(
             )
             .await?,
         );
+        progress
+            .stage_progress("open_fts_segments", source_indices.len() as u64)
+            .await?;
     }
+    progress.stage_complete("open_fts_segments").await?;
 
     // Like the BTree merge, each source keeps only its rows still stored in the
     // fragments it covers, so a stale posting for a row that moved into another
@@ -1128,7 +1138,7 @@ pub(crate) async fn merge_segments(
         empty_inverted_update_stream(dataset, &resolved)?,
         &new_store,
         &old_data_filters,
-        lance_index::progress::noop_progress(),
+        progress,
     )
     .await?;
 
@@ -1729,10 +1739,33 @@ mod tests {
         paused: tokio::sync::Notify,
         resume: tokio::sync::Notify,
         first_write: tokio::sync::OnceCell<()>,
+        copied_files: std::sync::Mutex<BTreeMap<object_store::path::Path, u64>>,
+        merge_progress: std::sync::Mutex<Vec<u64>>,
+        last_completed_stage: std::sync::Mutex<String>,
+    }
+
+    impl lance_io::object_store::CopyObserver for PauseBeforePartitionWrites {
+        fn observe(
+            &self,
+            dest: &object_store::path::Path,
+            total: u64,
+            event: lance_io::object_store::CopyEvent,
+        ) {
+            if event == lance_io::object_store::CopyEvent::Complete {
+                self.copied_files
+                    .lock()
+                    .unwrap()
+                    .insert(dest.clone(), total);
+            }
+        }
     }
 
     #[async_trait::async_trait]
     impl IndexBuildProgress for PauseBeforePartitionWrites {
+        fn copy_observer(&self) -> Option<&dyn lance_io::object_store::CopyObserver> {
+            Some(self)
+        }
+
         async fn stage_start(&self, stage: &str, _: Option<u64>, _: &str) -> Result<()> {
             if stage == "remap_partition_files" {
                 self.first_write
@@ -1745,10 +1778,14 @@ mod tests {
             Ok(())
         }
 
-        async fn stage_progress(&self, _: &str, _: u64) -> Result<()> {
+        async fn stage_progress(&self, stage: &str, completed: u64) -> Result<()> {
+            if stage == "merge_fts_partitions" {
+                self.merge_progress.lock().unwrap().push(completed);
+            }
             Ok(())
         }
-        async fn stage_complete(&self, _: &str) -> Result<()> {
+        async fn stage_complete(&self, stage: &str) -> Result<()> {
+            stage.clone_into(&mut self.last_completed_stage.lock().unwrap());
             Ok(())
         }
     }
@@ -1846,6 +1883,32 @@ mod tests {
         gate.resume.notify_one();
         let late = late.await.unwrap();
         assert_ne!(late.uuid, uuid);
+        // Each input has one partition whose three files were copied to private paths.
+        let copied = gate.copied_files.lock().unwrap().clone();
+        let mut expected_sizes: Vec<_> = originals
+            .iter()
+            .flat_map(|(_, files)| {
+                files
+                    .iter()
+                    .filter(|(path, _)| !path.ends_with("metadata.lance"))
+                    .map(|(_, data)| data.len() as u64)
+            })
+            .collect();
+        expected_sizes.sort_unstable();
+        let mut actual_sizes: Vec<_> = copied.values().copied().collect();
+        actual_sizes.sort_unstable();
+        assert_eq!(actual_sizes, expected_sizes);
+        let expected_partitions = if input_count == 1 { vec![] } else { vec![1, 2] };
+        assert_eq!(*gate.merge_progress.lock().unwrap(), expected_partitions);
+        let final_stage = if input_count == 1 {
+            "write_merged_metadata"
+        } else {
+            "write_metadata"
+        };
+        assert_eq!(
+            gate.last_completed_stage.lock().unwrap().as_str(),
+            final_stage
+        );
         let store = &dataset.table_state.object_store;
         store
             .remove_dir_all(dataset.indices_dir().join(late.uuid.to_string()))
