@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
+import inspect
 import json
 import logging
 import os
@@ -399,13 +400,14 @@ def dataset(tmp_path):
 def indexed_dataset(tmp_path):
     tbl = create_table()
     dataset = lance.write_dataset(tbl, tmp_path)
+    # Train on all rows to avoid the tiny partitions caused by undersampling.
     yield dataset.create_index(
         "vector",
         index_type="IVF_PQ",
         num_partitions=4,
         num_sub_vectors=16,
         max_iters=2,
-        sample_rate=2,
+        sample_rate=tbl.num_rows // 4,
     )
 
 
@@ -934,7 +936,21 @@ def test_batch_fast_search_without_index_returns_empty_with_query_index(dataset)
 
 
 def test_ann(indexed_dataset):
-    run(indexed_dataset)
+    # run() searches a single partition, so query the largest one. Every row
+    # lands in one partition, so its size is at least num_rows / num_partitions
+    # regardless of how k-means balances the data.
+    index_name = indexed_dataset.describe_indices()[0].name
+    reader = VectorIndexReader(indexed_dataset, index_name)
+    partition_sizes = [
+        reader.read_partition(part).num_rows for part in range(reader.num_partitions())
+    ]
+    largest_partition = max(
+        range(len(partition_sizes)), key=partition_sizes.__getitem__
+    )
+    assert partition_sizes[largest_partition] >= 15
+    centroids = indexed_dataset.centroids(index_name=index_name)
+    query = np.asarray(centroids[largest_partition].as_py(), dtype=np.float32)
+    run(indexed_dataset, q=query)
 
 
 def test_create_index_progress_callback_vector(tmp_path):
@@ -1272,6 +1288,52 @@ def test_torch_cosine_ivf_pq_recall(tmp_path):
         hits = 0
         for q in queries:
             gt = np.argsort(-(unit @ q))[:k]
+            res = ds.to_table(
+                columns=["id"],
+                nearest={"column": "vector", "q": q, "k": k, "nprobes": 4},
+            )
+            hits += len(set(gt.tolist()) & set(res["id"].to_pylist()))
+        return hits / (len(queries) * k)
+
+    cpu_recall = recall(None, tmp_path / "cpu")
+    torch_recall = recall(torch.device("cpu"), tmp_path / "torch")
+    assert torch_recall >= cpu_recall - 0.1, (
+        f"torch recall {torch_recall} vs cpu recall {cpu_recall}"
+    )
+
+
+def test_torch_dot_ivf_pq_recall(tmp_path):
+    """Accelerated dot IVF_PQ must be as accurate as the CPU build.
+
+    The index only uses residuals for l2 and cosine and trains the PQ codebook
+    with l2, but the torch path used to encode residuals of the IVF centroids
+    with a dot-trained codebook.
+    """
+    torch = pytest.importorskip("torch")
+
+    rng = np.random.default_rng(42)
+    num_rows, dim = 4096, 32
+    centers = rng.standard_normal((32, dim), dtype=np.float32)
+    mat = centers[rng.integers(0, 32, num_rows)]
+    mat += 0.5 * rng.standard_normal((num_rows, dim), dtype=np.float32)
+    tbl = vec_to_table(data=mat).append_column("id", pa.array(np.arange(num_rows)))
+
+    queries = mat[rng.choice(num_rows, 100, replace=False)]
+    k = 10
+
+    def recall(accelerator, uri):
+        ds = lance.write_dataset(tbl, uri)
+        ds = ds.create_index(
+            "vector",
+            index_type="IVF_PQ",
+            metric="dot",
+            num_partitions=4,
+            num_sub_vectors=16,
+            accelerator=accelerator,
+        )
+        hits = 0
+        for q in queries:
+            gt = np.argsort(-(mat @ q))[:k]
             res = ds.to_table(
                 columns=["id"],
                 nearest={"column": "vector", "q": q, "k": k, "nprobes": 4},
@@ -2077,7 +2139,7 @@ def test_create_ivf_rq_mostly_null():
     assert result.num_rows == 10
 
 
-def test_multivec_ann(indexed_multivec_dataset: lance.LanceDataset, monkeypatch):
+def test_multivec_ann(indexed_multivec_dataset: lance.LanceDataset):
     rng = np.random.default_rng(42)
     query = rng.random((5, 128))
     results = indexed_multivec_dataset.scanner(
@@ -2121,20 +2183,6 @@ def test_multivec_ann(indexed_multivec_dataset: lance.LanceDataset, monkeypatch)
             == doubled_results["_distance"][i].as_py()
         )
 
-    # Multivector routing uses Auto's configuration, including with refinement.
-    with monkeypatch.context() as overrides:
-        overrides.setenv("LANCE_AUTO_PROBE_MARGIN", "invalid")
-        for refine_factor in (None, 2):
-            with pytest.raises(pa.ArrowInvalid, match="LANCE_AUTO_PROBE_MARGIN"):
-                indexed_multivec_dataset.to_table(
-                    nearest={
-                        "column": "vector",
-                        "q": query,
-                        "k": 100,
-                        "refine_factor": refine_factor,
-                    }
-                )
-
     # query with a vector that dim not match
     query = rng.random(256)
     with pytest.raises(ValueError, match="does not match index column size"):
@@ -2148,6 +2196,49 @@ def test_multivec_ann(indexed_multivec_dataset: lance.LanceDataset, monkeypatch)
         indexed_multivec_dataset.to_table(
             nearest={"column": "vector", "q": query, "k": 100}
         )
+
+
+def test_multivec_warp(indexed_multivec_dataset: lance.LanceDataset):
+    rng = np.random.default_rng(42)
+    query = rng.random((5, 128))
+    nearest = {"column": "vector", "q": query, "k": 100, "nprobes": 1}
+    plan = indexed_multivec_dataset.scanner(nearest=nearest).explain_plan()
+    assert "Warp: k=100, nprobes=1, imputation_rank=default" in plan
+
+    nearest["warp_imputation_rank"] = 500
+    plan = indexed_multivec_dataset.scanner(nearest=nearest).explain_plan()
+    assert "Warp: k=100, nprobes=1, imputation_rank=500" in plan
+
+    results = indexed_multivec_dataset.to_table(columns=["id"], nearest=nearest)
+    assert results.num_rows == 100
+    ground_truth = indexed_multivec_dataset.to_table(
+        columns=["id"],
+        nearest={"column": "vector", "q": query, "k": 100, "use_index": False},
+    )
+    actual_ids = set(results["id"].to_pylist())
+    expected_ids = set(ground_truth["id"].to_pylist())
+    assert len(actual_ids & expected_ids) / len(expected_ids) >= 0.5
+
+
+def test_multivec_falls_back_to_xtr(tmp_path: Path, monkeypatch):
+    rng = np.random.default_rng(42)
+    vector_type = pa.list_(pa.list_(pa.float32(), 8))
+    vectors = [rng.random((3, 8)).tolist() for _ in range(300)]
+    table = pa.table({"id": range(300), "vector": pa.array(vectors, type=vector_type)})
+    dataset = lance.write_dataset(table, tmp_path / "hnsw_multivec.lance")
+    dataset.create_index(
+        "vector", index_type="IVF_HNSW_SQ", metric="cosine", num_partitions=2
+    )
+    nearest = {"column": "vector", "q": rng.random((2, 8)), "k": 10}
+    assert "Warp:" not in dataset.scanner(nearest=nearest).explain_plan()
+    assert dataset.to_table(nearest=nearest).num_rows == 10
+
+    # XTR's per-token routing uses Auto's configuration, including with
+    # refinement.
+    monkeypatch.setenv("LANCE_AUTO_PROBE_MARGIN", "invalid")
+    for refine_factor in (None, 2):
+        with pytest.raises(pa.ArrowInvalid, match="LANCE_AUTO_PROBE_MARGIN"):
+            dataset.to_table(nearest={**nearest, "refine_factor": refine_factor})
 
 
 def test_multivec_search_paths(tmp_path: Path):
@@ -2909,35 +3000,45 @@ def test_fragment_scan_allowed_on_ann_with_file_scan_prefilter(dataset):
     scanner.explain_plan(True)
 
 
-def test_fragment_scan_disallowed_on_ann_with_index_scan_prefilter(tmp_path):
+@pytest.mark.parametrize("hybrid", [False, True])
+def test_fragment_ann_with_scoped_scalar_prefilter(tmp_path, hybrid):
     tbl = create_table()
-    dataset = lance.write_dataset(tbl, tmp_path, max_rows_per_file=250)
-    dataset.create_index(
-        "vector", index_type="IVF_PQ", num_partitions=4, num_sub_vectors=16
+    dataset = lance.write_dataset(
+        tbl.slice(0, 500) if hybrid else tbl, tmp_path, max_rows_per_file=250
     )
     dataset.create_scalar_index("id", index_type="BTREE")
+    if hybrid:
+        dataset = lance.write_dataset(
+            tbl.slice(500), tmp_path, mode="append", max_rows_per_file=250
+        )
+    dataset.create_index("vector", index_type="IVF_FLAT", num_partitions=4)
 
     assert len(dataset.get_fragments()) == 4
 
-    q = np.random.randn(128)
+    q = np.random.default_rng(42).standard_normal(128)
+    selected = [dataset.get_fragment(1), dataset.get_fragment(2)]
     results = dataset.scanner(
         prefilter=True,
         filter="id > 50",
         columns=["id"],
-        nearest={"column": "vector", "q": q, "use_index": True},
-        fragments=[dataset.get_fragment(1)],
+        nearest={"column": "vector", "q": q, "k": 500, "nprobes": 4},
+        fragments=selected,
     ).to_table()
 
     results_no_scalar_index = dataset.scanner(
         prefilter=True,
         filter="id > 50",
         columns=["id"],
-        nearest={"column": "vector", "q": q, "use_index": True},
-        fragments=[dataset.get_fragment(1)],
+        nearest={"column": "vector", "q": q, "k": 500, "use_index": False},
+        fragments=selected,
         use_scalar_index=False,
     ).to_table()
 
-    assert results == results_no_scalar_index
+    actual_ids = set(results["id"].to_pylist())
+    expected_ids = set(results_no_scalar_index["id"].to_pylist())
+    assert actual_ids == expected_ids == set(range(250, 750))
+    assert len(results) == len(actual_ids)
+    assert len(actual_ids & expected_ids) / len(expected_ids) == 1.0
 
 
 def test_describe_indices(dataset):
@@ -3261,6 +3362,7 @@ def test_drop_indices(indexed_dataset):
 def test_read_partition(indexed_dataset):
     idx_name = indexed_dataset.describe_indices()[0].name
     reader = VectorIndexReader(indexed_dataset, idx_name)
+    assert reader.num_partitions() == 4
 
     num_rows = indexed_dataset.count_rows()
     row_sum = 0
@@ -3410,7 +3512,7 @@ def test_vector_search_effort(
         )
     if effort == 1:
         assert actual == ds.to_table(columns=["id"], nearest={**nearest, "nprobes": 16})
-    # Batch queries use the same effort on every per-query search.
+    # Batch queries use the same effort for every query.
     batch_stats = []
     batch = ds.scanner(
         columns=["id"],
@@ -3423,7 +3525,11 @@ def test_vector_search_effort(
         scan_stats_callback=batch_stats.append,
     ).to_table()
     assert batch["id"].to_pylist() == actual["id"].to_pylist() * 2
-    assert batch_stats[0].all_counts["partitions_searched"] == probes * 2
+    # IVF_FLAT shares one scan across the batch, so the two identical queries
+    # load each partition once. Adaptive IVF_RQ searches each query separately.
+    shared_scan = index_type == "IVF_FLAT"
+    batch_probes = probes if shared_scan else probes * 2
+    assert batch_stats[0].all_counts["partitions_searched"] == batch_probes
     if metric == "l2" and index_type == "IVF_FLAT":
         captured.clear()
         ds.create_scalar_index("text", "INVERTED")
@@ -3637,6 +3743,51 @@ def test_vector_index_invalid_approx_mode(indexed_dataset):
         )
 
 
+@pytest.mark.parametrize("rq_graph_scoring", ["multi_bit", "one_bit_rerank"])
+def test_ivf_hnsw_rq_graph_scoring(tmp_path, rq_graph_scoring):
+    rng = np.random.default_rng(7)
+    vectors = rng.standard_normal((256, 32), dtype=np.float32)
+    ds = lance.write_dataset(vec_to_table(data=vectors), tmp_path)
+    ds = ds.create_index(
+        "vector",
+        index_type="IVF_HNSW_RQ",
+        num_partitions=2,
+        num_bits=5,
+        max_iters=2,
+        sample_rate=2,
+    )
+    k = 10
+    recalls = []
+    for q in vectors[:8]:
+        expected = np.argsort(np.linalg.norm(vectors - q, axis=1))[:k]
+        result = ds.to_table(
+            nearest={
+                "column": "vector",
+                "q": q,
+                "k": k,
+                "nprobes": 2,
+                "rq_graph_scoring": rq_graph_scoring,
+            },
+            with_row_id=True,
+        )
+        assert len(result) == k
+        found = set(result["_rowid"].to_pylist())
+        recalls.append(len(found & set(expected.tolist())) / k)
+    assert np.mean(recalls) >= 0.5
+
+
+def test_vector_index_invalid_rq_graph_scoring(indexed_dataset):
+    with pytest.raises(ValueError, match="rq_graph_scoring"):
+        indexed_dataset.scanner(
+            nearest={
+                "column": "vector",
+                "q": np.random.randn(128),
+                "k": 10,
+                "rq_graph_scoring": "two_bit",
+            }
+        )
+
+
 def test_vector_index_invalid_quantized_refine_factor(indexed_dataset):
     with pytest.raises(ValueError, match="Quantized refine factor"):
         indexed_dataset.scanner(
@@ -3685,6 +3836,17 @@ def test_nearest_preserves_existing_positional_arguments(dataset):
         .to_table()
     )
     assert actual == expected
+
+    # New options are appended, so positional refinement arguments keep binding.
+    parameters = list(inspect.signature(ScannerBuilder.nearest).parameters)
+    assert parameters[parameters.index("quantized_refine_factor") :] == [
+        "quantized_refine_factor",
+        "refine_column",
+        "refine_q",
+        "refine_metric",
+        "warp_imputation_rank",
+        "rq_graph_scoring",
+    ]
 
 
 def test_knn_deleted_rows(tmp_path):
@@ -4657,6 +4819,45 @@ def test_distributed_ivf_pq_order_invariance(tmp_path: Path):
     assert ids_12 == ids_21
     for a, b in zip(dists_12, dists_21):
         assert np.allclose(a, b, atol=1e-6)
+
+
+def test_distributed_ivf_pq_dot_with_prepared_codebook(tmp_path):
+    # Dot IVF_PQ encodes raw vectors with their nearest (L2) codewords, so a
+    # prepared codebook must be trained without IVF residuals and applied with L2.
+    # Data away from the origin makes either mistake drop recall far below the
+    # single-node build.
+    rng = np.random.default_rng(0)
+    data = rng.uniform(0.5, 1.5, (4000, 8)).astype(np.float32)
+    queries = rng.uniform(-0.5, 0.5, (20, 8)).astype(np.float32)
+    table = pa.table(
+        {
+            "id": np.arange(len(data)),
+            "vector": pa.FixedSizeListArray.from_arrays(pa.array(data.ravel()), 8),
+        }
+    )
+    params = {"metric": "dot", "num_partitions": 4, "num_sub_vectors": 4}
+
+    single = lance.write_dataset(table, tmp_path / "single", max_rows_per_file=1000)
+    single.create_index("vector", "IVF_PQ", **params)
+
+    dist = lance.write_dataset(table, tmp_path / "dist", max_rows_per_file=1000)
+    pre = IndicesBuilder(dist, "vector").prepare_global_ivf_pq(
+        4, 4, distance_type="dot", sample_rate=15
+    )
+    dist = build_distributed_vector_index(dist, "vector", **pre, **params)
+
+    def recall(ds):
+        hits = 0
+        for q in queries:
+            nearest = {"column": "vector", "q": q, "k": 10, "nprobes": 4}
+            ids = ds.to_table(columns=["id"], nearest=nearest)["id"].to_numpy()
+            hits += np.isin(ids, np.argsort(-(data @ q))[:10]).sum()
+        return hits / (10 * len(queries))
+
+    single_recall, dist_recall = recall(single), recall(dist)
+    assert dist_recall >= max(0.5, single_recall - 0.1), (
+        f"distributed recall {dist_recall:.3f} vs single-node {single_recall:.3f}"
+    )
 
 
 @pytest.mark.parametrize("prefilter", [True, False])

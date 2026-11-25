@@ -15,31 +15,43 @@ use serde::{Serialize, de::DeserializeOwned};
 use super::optimize::unwrap_dataset;
 use super::*;
 
-/// The `OptimizeOptions` of the keyword options of `optimize_indices`, read
-/// as it always has: a key it does not know is ignored.
+/// The `OptimizeOptions` of the keyword options of `optimize_indices`, a
+/// `None` value leaving the option unset. A key it does not know is rejected:
+/// ignoring it would run the default optimize over every index instead.
 pub(crate) fn optimize_options(kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<OptimizeOptions> {
     let mut options = OptimizeOptions::default();
     let Some(kwargs) = kwargs else {
         return Ok(options);
     };
-    if let Some(num_indices_to_merge) = kwargs.get_item("num_indices_to_merge")? {
-        options.num_indices_to_merge = num_indices_to_merge.extract()?;
-    }
-    if let Some(retrain) = kwargs.get_item("retrain")? {
-        options.retrain = retrain.extract()?;
-    }
-    if let Some(index_names) = kwargs.get_item("index_names")? {
-        options.index_names = Some(
-            index_names
-                .extract::<Vec<String>>()
-                .map_err(|err| PyValueError::new_err(err.to_string()))?,
-        );
-    }
-    if let Some(max_rows_per_task) = kwargs.get_item("max_rows_per_task")? {
-        options.max_rows_per_task = max_rows_per_task.extract()?;
-    }
-    if let Some(max_rows_per_segment) = kwargs.get_item("max_rows_per_segment")? {
-        options.max_rows_per_segment = max_rows_per_segment.extract()?;
+    for (key, value) in kwargs.iter() {
+        let key: String = key.extract()?;
+        match key.as_str() {
+            "num_indices_to_merge" => {
+                options.num_indices_to_merge = value.extract()?;
+            }
+            "retrain" => {
+                options.retrain = value.extract::<Option<bool>>()?.unwrap_or_default();
+            }
+            "index_names" => {
+                options.index_names = value
+                    .extract::<Option<Vec<String>>>()
+                    .map_err(|err| PyValueError::new_err(err.to_string()))?;
+            }
+            "max_rows_per_task" => {
+                options.max_rows_per_task = value.extract()?;
+            }
+            "max_rows_per_segment" => {
+                options.max_rows_per_segment = value.extract()?;
+            }
+            "max_rows_to_consolidate" => {
+                options.max_rows_to_consolidate = value.extract()?;
+            }
+            _ => {
+                return Err(PyValueError::new_err(format!(
+                    "Invalid optimize_indices option: {key}"
+                )));
+            }
+        }
     }
     Ok(options)
 }
@@ -279,8 +291,21 @@ impl PyOptimizeIndices {
     /// Commit the merge ``results`` in one transaction, ``None`` entries
     /// ignored; whatever they do not cover stays unindexed for the next
     /// optimize. ``dataset`` is updated to the new version.
+    ///
+    /// ``options`` are the keyword options of
+    /// :py:meth:`lance.dataset.DatasetOptimizer.optimize_indices` the plan was
+    /// made with, for the ones that decide how the results are checked: a
+    /// consolidation (``max_rows_to_consolidate``) is checked against the
+    /// segments the dataset has now, so pass those options here as well.
+    /// Omitted, the commit uses the defaults, as it always has.
     #[staticmethod]
-    fn commit(dataset: Bound<PyAny>, results: Vec<Option<PyIndexSegmentResult>>) -> PyResult<()> {
+    #[pyo3(signature = (dataset, results, options = None))]
+    fn commit(
+        dataset: Bound<PyAny>,
+        results: Vec<Option<PyIndexSegmentResult>>,
+        options: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<()> {
+        let options = optimize_options(options)?;
         let dataset_ref = unwrap_dataset(dataset)?;
         // Taken before the commit, so a handle another thread is using is
         // refused with nothing committed, not after the commit went through.
@@ -292,7 +317,7 @@ impl PyOptimizeIndices {
             .map(|result| result.0)
             .collect();
         rt().block_on(None, async {
-            commit_optimize_indices(&mut new_ds, results, &OptimizeOptions::default()).await
+            commit_optimize_indices(&mut new_ds, results, &options).await
         })?
         .infer_error()?;
         dataset_mut.ds = Arc::new(new_ds);

@@ -18,6 +18,7 @@ on:
       - python/Cargo.lock
       - java/lance-jni/Cargo.lock
       - .cargo/config.toml
+      - .config/nextest.toml
       - clippy.toml
       - deny.toml
       - ci/check_dependency_age.py
@@ -79,8 +80,7 @@ jobs:
       # Catches manifest problems that only surface at publish time (missing
       # readme/license files, path dependencies without a version, excluded
       # files a crate needs). `--no-verify` skips building each packaged crate,
-      # which the other jobs already cover. Package the Arrow-versioned helper
-      # crates too even though releases publish them separately.
+      # which the other jobs already cover.
       - name: Package crates
         run: |
           cargo package --workspace --no-verify --all-features
@@ -186,7 +186,7 @@ jobs:
           # also run the fixtures so the check is never merged untested.
           self_changed=$(git diff --name-only "$base_sha" HEAD -- \
             rust/lance/tests/arrow_ordering.rs rust/lance/Cargo.toml ci/arrow_upgrade.py .github/workflows/rust.yml \
-            rust/arrow-scalar rust/arrow-stats)
+            rust/lance-arrow/src/scalar.rs rust/lance-arrow/src/scalar rust/lance-arrow/src/stats.rs rust/lance-arrow/src/stats)
           if [ -n "$self_changed" ]; then
             echo "fixtures or the paths they exercise changed:"
             echo "$self_changed"
@@ -309,10 +309,24 @@ jobs:
         run: |
           ALL_FEATURES=$(cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v -e protoc | sort | uniq | paste -s -d "," -)
           cargo nextest run \
+            --profile ci \
             --cargo-profile ci \
             --locked \
             --workspace \
             --features "${ALL_FEATURES}"
+      - name: Upload test timings
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: nextest-junit-linux
+          path: target/nextest/ci/junit.xml
+      - name: Upload test results to Codecov
+        if: ${{ !cancelled() }}
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          report_type: test_results
+          files: target/nextest/ci/junit.xml
 
   linux-arm:
     runs-on: ubuntu-24.04-arm64-8x

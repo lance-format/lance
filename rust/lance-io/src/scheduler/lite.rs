@@ -23,7 +23,7 @@ use std::{
     ops::Range,
     pin::Pin,
     sync::{
-        Arc, Mutex, MutexGuard,
+        Arc, Mutex, MutexGuard, PoisonError,
         atomic::{AtomicU64, Ordering},
     },
     task::{Context, Poll, Waker},
@@ -264,10 +264,13 @@ struct PrioritiesInFlight {
     in_flight: Vec<u128>,
 }
 
+const MAX_INITIAL_IN_FLIGHT_CAPACITY: u64 = 256;
+
 impl PrioritiesInFlight {
     fn new(capacity: u64) -> Self {
+        let initial_capacity = (capacity.min(MAX_INITIAL_IN_FLIGHT_CAPACITY) as usize) * 2;
         Self {
-            in_flight: Vec::with_capacity(capacity as usize * 2),
+            in_flight: Vec::with_capacity(initial_capacity),
         }
     }
 
@@ -536,6 +539,13 @@ impl IoQueue {
             state: Arc::new(Mutex::new(IoQueueState::new(max_concurrency, max_bytes))),
             stats,
         }
+    }
+
+    /// Bytes admitted and not yet released, as the state event reports them.
+    pub(super) fn reserved_bytes(&self) -> u64 {
+        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let backpressure = state.backpressure_throttle.state();
+        (backpressure.max_bytes as i64 - backpressure.bytes_available).max(0) as u64
     }
 
     fn push(&self, mut task: IoTask, mut state: MutexGuard<IoQueueState>) -> Result<()> {

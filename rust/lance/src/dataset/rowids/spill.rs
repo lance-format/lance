@@ -22,732 +22,55 @@
 //! only marks the sequence as spilled. A fragment's spilled sequences written
 //! here share one such file.
 
-use std::sync::Arc;
+use crate::{Dataset, Result};
+use lance_table::format::RowDatasetVersionSequence;
+use lance_table::rowids::RowIdSequence;
+use lance_table_runtime::rowids::{self as runtime, CarriedRowLineage};
 
-use arrow_array::{Array, ArrayRef, RecordBatch, UInt64Array};
-use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
-use futures::{FutureExt, StreamExt, TryStreamExt};
-use lance_core::datatypes::Schema;
-use lance_core::{ROW_CREATED_AT_VERSION, ROW_ID, ROW_LAST_UPDATED_AT_VERSION};
-use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
-use lance_file::LanceEncodingsIo;
-use lance_file::reader::{FileReader, ProjectedFileReader, ReaderProjection};
-use lance_file::version::ConcreteFileVersion;
-use lance_file::versions;
-use lance_file::writer::FileWriterOptions;
-use lance_io::ReadBatchParams;
-use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
-use lance_table::format::{
-    DataFile, Fragment, ROW_CREATED_AT_VERSION_FIELD_ID, ROW_ID_FIELD_ID,
-    ROW_LAST_UPDATED_AT_VERSION_FIELD_ID, RowDatasetVersionMeta, RowDatasetVersionSequence,
-    RowIdMeta,
+pub use runtime::{
+    DEFAULT_INLINE_ROW_LINEAGE_MAX_BYTES, INLINE_ROW_LINEAGE_MAX_BYTES_CONFIG_KEY,
+    PlacedRowLineage, RowLineage, SPILL_ROW_LINEAGE_CONFIG_KEY,
 };
-use lance_table::rowids::version::write_dataset_versions;
-use lance_table::rowids::{RowIdSequence, write_row_ids};
-use object_store::path::Path;
+#[cfg(test)]
+pub use runtime::{RowLineagePlan, RowLineageSpill, plan_row_lineage_spill};
 
-use super::super::Dataset;
-use crate::dataset::fragment::write::generate_random_filename;
-use crate::{Error, Result};
-
-/// Rows per batch handed to the file writer and read back from it.
-const SPILL_BATCH_ROWS: usize = 64 * 1024;
-
-/// Encoded sequences at or below this size stay in the manifest, unless
-/// [`INLINE_ROW_LINEAGE_MAX_BYTES_CONFIG_KEY`] says otherwise.
-///
-/// Matches the inline limit the format has always documented for the
-/// lineage oneofs. A `Range` row id sequence -- every appended fragment --
-/// encodes to a few dozen bytes and is nowhere near it, and so does a
-/// single-run version sequence.
-pub const DEFAULT_INLINE_ROW_LINEAGE_MAX_BYTES: usize = 200 * 1024;
-
-/// Table config key that turns spilling on: `"true"` lets compaction and
-/// update move the oversized lineage sequences they carry over from existing
-/// rows out of the manifest -- row ids and created-at versions, and at
-/// compaction last-updated-at versions too; an update's last-updated-at
-/// version is the commit's and stays inline. Absent or anything else, every
-/// sequence stays inline however large it grows. This affects new writes only;
-/// readers still load any sequences the table has already spilled.
-pub const SPILL_ROW_LINEAGE_CONFIG_KEY: &str = "lance.row_lineage.spill";
-
-/// Table config key overriding [`DEFAULT_INLINE_ROW_LINEAGE_MAX_BYTES`], as a
-/// byte count. Only consulted when [`SPILL_ROW_LINEAGE_CONFIG_KEY`] is on.
-pub const INLINE_ROW_LINEAGE_MAX_BYTES_CONFIG_KEY: &str = "lance.row_lineage.inline_max_bytes";
-
-/// The largest encoded lineage sequence `dataset` keeps inline, or `None` when
-/// the table does not spill at all.
-///
-/// Spilling needs the table's opt-in and v2 data files: the format allows the
-/// columns only there, since a legacy v1 file has no `column_indices` to locate
-/// them by.
+/// The largest encoded lineage sequence kept inline, if spilling is enabled.
 pub fn inline_row_lineage_max_bytes(dataset: &Dataset) -> Result<Option<usize>> {
-    let config = dataset.config();
-    let enabled = config
-        .get(SPILL_ROW_LINEAGE_CONFIG_KEY)
-        .is_some_and(|value| value.eq_ignore_ascii_case("true"));
-    if !enabled
-        || dataset.manifest.data_storage_format.lance_file_format() == ConcreteFileVersion::V1
-    {
-        return Ok(None);
-    }
-    let Some(value) = config.get(INLINE_ROW_LINEAGE_MAX_BYTES_CONFIG_KEY) else {
-        return Ok(Some(DEFAULT_INLINE_ROW_LINEAGE_MAX_BYTES));
-    };
-    value.parse().map(Some).map_err(|error| {
-        Error::invalid_input(format!(
-            "table config {INLINE_ROW_LINEAGE_MAX_BYTES_CONFIG_KEY}={value:?} is not a byte \
-             count: {error}"
-        ))
-    })
+    runtime::inline_row_lineage_max_bytes(&dataset.table_view().to_table())
 }
 
-/// The hidden row lineage columns by name and reserved field id, in the order
-/// a data file written by compaction stores them.
-const LINEAGE_COLUMNS: [(&str, i32); 3] = [
-    (ROW_ID, ROW_ID_FIELD_ID),
-    (ROW_CREATED_AT_VERSION, ROW_CREATED_AT_VERSION_FIELD_ID),
-    (
-        ROW_LAST_UPDATED_AT_VERSION,
-        ROW_LAST_UPDATED_AT_VERSION_FIELD_ID,
-    ),
-];
-
-/// Which of a compaction task's sequences leave the manifest as hidden columns
-/// of the data files it writes. Every file the task writes carries the same
-/// columns, so this holds for all of its output fragments.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct RowLineageSpill {
-    pub row_ids: bool,
-    pub created_at: bool,
-    pub last_updated_at: bool,
-}
-
-impl RowLineageSpill {
-    pub fn any(&self) -> bool {
-        self.row_ids || self.created_at || self.last_updated_at
-    }
-
-    /// The reserved field ids of the spilled columns, in column order.
-    pub fn field_ids(&self) -> impl Iterator<Item = i32> {
-        let flags = [self.row_ids, self.created_at, self.last_updated_at];
-        LINEAGE_COLUMNS
-            .into_iter()
-            .zip(flags)
-            .filter_map(|((_, field_id), spilled)| spilled.then_some(field_id))
-    }
-
-    /// Move the spilled sequences out of `lineages` as the values of the
-    /// hidden columns, one vector per column in column order, concatenated
-    /// over `lineages`. The spilled sequences are left empty: nothing places
-    /// them inline, and their run-length form would otherwise stay alive
-    /// through the write next to the values built from it.
-    pub fn take_columns(&self, lineages: &mut [RowLineage]) -> Vec<Vec<u64>> {
-        let total_rows = lineages
-            .iter()
-            .map(|lineage| lineage.row_ids.len() as usize)
-            .sum::<usize>();
-        self.field_ids()
-            .map(|field_id| {
-                let mut values = Vec::with_capacity(total_rows);
-                for lineage in lineages.iter_mut() {
-                    match field_id {
-                        ROW_ID_FIELD_ID => {
-                            let row_ids = std::mem::take(&mut lineage.row_ids);
-                            values.extend(row_ids.iter());
-                        }
-                        ROW_CREATED_AT_VERSION_FIELD_ID => {
-                            let created_at = std::mem::take(&mut lineage.created_at);
-                            values.extend(created_at.versions());
-                        }
-                        // The only other id `field_ids` yields.
-                        _ => {
-                            let last_updated_at = std::mem::take(&mut lineage.last_updated_at);
-                            values.extend(last_updated_at.versions());
-                        }
-                    }
-                }
-                values
-            })
-            .collect()
-    }
-
-    /// The spilled columns as write-schema fields, in column order and under
-    /// their reserved ids.
-    pub fn schema_fields(&self) -> Result<Vec<lance_core::datatypes::Field>> {
-        self.field_ids().map(lineage_field).collect()
-    }
-
-    /// The placement for one fragment whose own data file was written with
-    /// the spilled columns: those sequences are marked as spilled, the rest
-    /// are placed inline. There is no lineage file to add to the fragment.
-    pub fn place_in_file(&self, lineage: &RowLineage) -> PlacedRowLineage {
-        PlacedRowLineage {
-            row_ids: if self.row_ids {
-                RowIdMeta::Column
-            } else {
-                RowIdMeta::Inline(write_row_ids(&lineage.row_ids).into())
-            },
-            created_at: if self.created_at {
-                RowDatasetVersionMeta::Column
-            } else {
-                RowDatasetVersionMeta::Inline(write_dataset_versions(&lineage.created_at).into())
-            },
-            last_updated_at: if self.last_updated_at {
-                RowDatasetVersionMeta::Column
-            } else {
-                RowDatasetVersionMeta::Inline(
-                    write_dataset_versions(&lineage.last_updated_at).into(),
-                )
-            },
-            file: None,
-        }
-    }
-}
-
-/// The hidden column a spilled lineage sequence is stored in: a non-nullable
-/// `UInt64` named after the sequence in [`LINEAGE_COLUMNS`], under its
-/// reserved `field_id`.
-fn lineage_field(field_id: i32) -> Result<lance_core::datatypes::Field> {
-    let (name, _) = LINEAGE_COLUMNS
-        .into_iter()
-        .find(|(_, id)| *id == field_id)
-        .ok_or_else(|| {
-            Error::internal(format!(
-                "field id {field_id} is not a reserved row lineage field id"
-            ))
-        })?;
-    let mut field =
-        lance_core::datatypes::Field::try_from(&ArrowField::new(name, DataType::UInt64, false))?;
-    field.id = field_id;
-    Ok(field)
-}
-
-/// How a compaction task places the lineage of the fragments it writes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RowLineagePlan {
-    /// Each sequence type the spill names is over the inline budget in every
-    /// output fragment and is written into the data files as a hidden column;
-    /// every other type is under the budget in all of them and stays inline.
-    InFile(RowLineageSpill),
-    /// Some sequence type is over the budget in some output fragments but not
-    /// in others. A column in every file would also spill the sequences that
-    /// fit inline, and their readers would then pay a read per row for what a
-    /// few bytes of manifest hold. The task writes no hidden columns instead,
-    /// and after the write places each fragment's lineage on its own with
-    /// [`place_row_lineage`], which spills only what is over the budget, to a
-    /// separate lineage file.
-    PerFragment,
-}
-
-/// Plan how the lineage of a compaction task's output fragments, `lineages`,
-/// is placed when every encoded sequence over `limit` bytes has to leave the
-/// manifest (see [`inline_row_lineage_max_bytes`]).
-pub fn plan_row_lineage_spill(limit: usize, lineages: &[RowLineage]) -> RowLineagePlan {
-    let over = |encoded: Vec<u8>| encoded.len() > limit;
-    let row_ids = over_in_all_or_none(lineages.iter().map(|l| over(write_row_ids(&l.row_ids))));
-    let created_at = over_in_all_or_none(
-        lineages
-            .iter()
-            .map(|l| over(write_dataset_versions(&l.created_at))),
-    );
-    let last_updated_at = over_in_all_or_none(
-        lineages
-            .iter()
-            .map(|l| over(write_dataset_versions(&l.last_updated_at))),
-    );
-    match (row_ids, created_at, last_updated_at) {
-        (Some(row_ids), Some(created_at), Some(last_updated_at)) => {
-            RowLineagePlan::InFile(RowLineageSpill {
-                row_ids,
-                created_at,
-                last_updated_at,
-            })
-        }
-        _ => RowLineagePlan::PerFragment,
-    }
-}
-
-/// Whether one sequence type is over the budget in every output fragment
-/// (`Some(true)`) or in none (`Some(false)`), given each output's verdict in
-/// `over`; `None` when the outputs disagree. It stops encoding at the first
-/// disagreement.
-fn over_in_all_or_none(mut over: impl Iterator<Item = bool>) -> Option<bool> {
-    let Some(first) = over.next() else {
-        return Some(false);
-    };
-    over.all(|next| next == first).then_some(first)
-}
-
-/// The per-row lineage of one fragment, in row offset order.
-pub struct RowLineage {
-    pub row_ids: RowIdSequence,
-    pub created_at: RowDatasetVersionSequence,
-    pub last_updated_at: RowDatasetVersionSequence,
-}
-
-/// Where each of a fragment's lineage sequences ended up, and the data file
-/// the spilled ones were written to, which the fragment has to list among its
-/// files. [`Self::apply`] does both.
-pub struct PlacedRowLineage {
-    pub row_ids: RowIdMeta,
-    pub created_at: RowDatasetVersionMeta,
-    pub last_updated_at: RowDatasetVersionMeta,
-    pub file: Option<DataFile>,
-}
-
-impl PlacedRowLineage {
-    /// Put the placement on `fragment`: its three lineage arms, and the
-    /// lineage file, if any, as one more of its data files.
-    pub fn apply(self, fragment: &mut Fragment) {
-        fragment.row_id_meta = Some(self.row_ids);
-        fragment.created_at_version_meta = Some(self.created_at);
-        fragment.last_updated_at_version_meta = Some(self.last_updated_at);
-        if let Some(file) = self.file {
-            fragment.files.push(file);
-        }
-    }
-}
-
-/// Place each sequence of `lineage` either inline in the manifest or in a
-/// hidden column of a new data file, as the table's spill policy (see
-/// [`inline_row_lineage_max_bytes`]) and the sequence's encoded size call for.
-/// Every sequence that spills goes into one file, which the caller adds to the
-/// fragment's data files (see [`PlacedRowLineage::apply`]).
-///
-/// Only correct for lineage that a commit conflict cannot change: row ids and
-/// versions carried over from existing rows. Lineage assigned at commit time --
-/// an appended fragment's row ids, an inserted row's created-at version -- has
-/// to stay inline, where the commit can still rewrite it.
+/// Place carried lineage inline or in a hidden-column file using the table's spill policy.
 pub async fn place_row_lineage(
     dataset: &Dataset,
     lineage: &RowLineage,
 ) -> Result<PlacedRowLineage> {
-    let (can_spill, limit) = match inline_row_lineage_max_bytes(dataset)? {
-        Some(limit) => (true, limit),
-        None => (false, usize::MAX),
-    };
-    let inline_row_ids = write_row_ids(&lineage.row_ids);
-    let inline_created_at = write_dataset_versions(&lineage.created_at);
-    let inline_last_updated_at = write_dataset_versions(&lineage.last_updated_at);
-
-    // Materialized up front rather than streamed from the sequence iterators:
-    // `RowIdSequence::iter` returns a boxed `dyn DoubleEndedIterator`, which is
-    // not `Send`, so holding it across the write below would make this future
-    // non-`Send` and every caller of `compact_files` along with it --
-    // including the Python bindings, which spawn that future.
-    let mut columns: Vec<(i32, &str, ArrayRef)> = Vec::with_capacity(3);
-    if can_spill && inline_row_ids.len() > limit {
-        let ids = UInt64Array::from(lineage.row_ids.iter().collect::<Vec<u64>>());
-        columns.push((ROW_ID_FIELD_ID, ROW_ID, Arc::new(ids)));
-    }
-    if can_spill && inline_created_at.len() > limit {
-        let versions = UInt64Array::from(lineage.created_at.versions().collect::<Vec<u64>>());
-        columns.push((
-            ROW_CREATED_AT_VERSION_FIELD_ID,
-            ROW_CREATED_AT_VERSION,
-            Arc::new(versions),
-        ));
-    }
-    if can_spill && inline_last_updated_at.len() > limit {
-        let versions = UInt64Array::from(lineage.last_updated_at.versions().collect::<Vec<u64>>());
-        columns.push((
-            ROW_LAST_UPDATED_AT_VERSION_FIELD_ID,
-            ROW_LAST_UPDATED_AT_VERSION,
-            Arc::new(versions),
-        ));
-    }
-
-    let spilled = if columns.is_empty() {
-        None
-    } else {
-        Some(write_lineage_file(dataset, &columns).await?)
-    };
-    let holds = |field_id: i32| {
-        spilled
-            .as_ref()
-            .is_some_and(|file| file.fields.contains(&field_id))
-    };
-
-    Ok(PlacedRowLineage {
-        row_ids: if holds(ROW_ID_FIELD_ID) {
-            RowIdMeta::Column
-        } else {
-            RowIdMeta::Inline(inline_row_ids.into())
-        },
-        created_at: if holds(ROW_CREATED_AT_VERSION_FIELD_ID) {
-            RowDatasetVersionMeta::Column
-        } else {
-            RowDatasetVersionMeta::Inline(inline_created_at.into())
-        },
-        last_updated_at: if holds(ROW_LAST_UPDATED_AT_VERSION_FIELD_ID) {
-            RowDatasetVersionMeta::Column
-        } else {
-            RowDatasetVersionMeta::Inline(inline_last_updated_at.into())
-        },
-        file: spilled,
-    })
+    runtime::place_row_lineage(&dataset.table_view().to_table(), lineage).await
 }
 
-/// The lineage an update carries over into one of its new fragments, as
-/// [`place_carried_row_lineage`] placed it.
-///
-/// `pub` rather than `pub(crate)` only because `clippy::redundant_pub_crate`
-/// fires inside the private `spill` module; the crate-private re-export of
-/// [`place_carried_row_lineage`] keeps it off the public API.
-pub struct CarriedRowLineage {
-    row_ids: RowIdMeta,
-    /// `None` when neither sequence spilled: the commit then resolves the
-    /// created-at versions from the inline row ids, as on a table that has not
-    /// opted in. `Some`, inline or spilled, once either sequence spilled.
-    created_at: Option<RowDatasetVersionMeta>,
-    /// The lineage file holding the spilled sequences, `None` when nothing
-    /// spilled.
-    file: Option<DataFile>,
-}
-
-impl CarriedRowLineage {
-    /// Put the placement on `fragment`: its row ids, its created-at versions
-    /// when they were placed, and the lineage file, if any, as one more of its
-    /// data files. The last-updated-at versions are left for the commit.
-    pub fn apply(self, fragment: &mut Fragment) {
-        fragment.row_id_meta = Some(self.row_ids);
-        fragment.created_at_version_meta = self.created_at;
-        fragment.last_updated_at_version_meta = None;
-        if let Some(file) = self.file {
-            fragment.files.push(file);
-        }
-    }
-}
-
-/// Place the row ids and created-at versions that rewritten rows carry over
-/// into a new fragment, spilling each whose encoding exceeds `limit` into a
-/// hidden column of one new data file.
-///
-/// When neither exceeds `limit`, only the row ids are placed, inline, and the
-/// created-at versions are left for the commit to resolve from them, as it
-/// does on a table that has not opted in. Once either spills the commit can no
-/// longer resolve them, since it cannot read spilled row ids, so the created-at
-/// versions are placed as well, spilled or inline.
-///
-/// The last-updated-at version is never placed: it is the commit's, and a
-/// conflict retry moves it.
 pub async fn place_carried_row_lineage(
     dataset: &Dataset,
     limit: usize,
     row_ids: &RowIdSequence,
     created_at: &RowDatasetVersionSequence,
 ) -> Result<CarriedRowLineage> {
-    let inline_row_ids = write_row_ids(row_ids);
-    let inline_created_at = write_dataset_versions(created_at);
-    let spill_row_ids = inline_row_ids.len() > limit;
-    let spill_created_at = inline_created_at.len() > limit;
-    if !spill_row_ids && !spill_created_at {
-        return Ok(CarriedRowLineage {
-            row_ids: RowIdMeta::Inline(inline_row_ids.into()),
-            created_at: None,
-            file: None,
-        });
-    }
-
-    // Materialized before the write, as in `place_row_lineage`, so the future
-    // stays `Send`.
-    let mut columns: Vec<(i32, &str, ArrayRef)> = Vec::with_capacity(2);
-    if spill_row_ids {
-        let ids = UInt64Array::from(row_ids.iter().collect::<Vec<u64>>());
-        columns.push((ROW_ID_FIELD_ID, ROW_ID, Arc::new(ids)));
-    }
-    if spill_created_at {
-        let versions = UInt64Array::from(created_at.versions().collect::<Vec<u64>>());
-        columns.push((
-            ROW_CREATED_AT_VERSION_FIELD_ID,
-            ROW_CREATED_AT_VERSION,
-            Arc::new(versions),
-        ));
-    }
-    let file = write_lineage_file(dataset, &columns).await?;
-
-    Ok(CarriedRowLineage {
-        row_ids: if spill_row_ids {
-            RowIdMeta::Column
-        } else {
-            RowIdMeta::Inline(inline_row_ids.into())
-        },
-        created_at: Some(if spill_created_at {
-            RowDatasetVersionMeta::Column
-        } else {
-            RowDatasetVersionMeta::Inline(inline_created_at.into())
-        }),
-        file: Some(file),
-    })
-}
-
-/// Write `columns` as the hidden columns of one new data file and return the
-/// [`DataFile`] that locates them, listing the columns' field ids in order.
-async fn write_lineage_file(
-    dataset: &Dataset,
-    columns: &[(i32, &str, ArrayRef)],
-) -> Result<DataFile> {
-    let file_version = dataset.manifest.data_storage_format.version;
-    let filename = format!("{}.lance", generate_random_filename());
-    let full_path = dataset.data_dir().join(filename.as_str());
-
-    let arrow_schema = Arc::new(ArrowSchema::new(
-        columns
-            .iter()
-            .map(|(_, name, _)| ArrowField::new(*name, DataType::UInt64, false))
-            .collect::<Vec<_>>(),
-    ));
-    let schema = Schema::try_from(arrow_schema.as_ref())?;
-    let object_writer = dataset.object_store.create(&full_path).await?;
-    let mut writer = versions::create_writer(
-        file_version,
-        object_writer,
-        schema,
-        FileWriterOptions::default(),
-    )?;
-
-    let num_rows = columns[0].2.len();
-    for offset in (0..num_rows).step_by(SPILL_BATCH_ROWS) {
-        let len = SPILL_BATCH_ROWS.min(num_rows - offset);
-        let batch = RecordBatch::try_new(
-            arrow_schema.clone(),
-            columns
-                .iter()
-                .map(|(_, _, array)| array.slice(offset, len))
-                .collect(),
-        )?;
-        writer.write_batch(&batch).await?;
-    }
-    let summary = writer.finish().await?;
-
-    Ok(DataFile::new(
-        filename,
-        columns.iter().map(|(field_id, _, _)| *field_id).collect(),
-        (0..columns.len() as i32).collect(),
-        file_version,
-        std::num::NonZero::new(summary.size_bytes),
-        None,
-    ))
-}
-
-/// Read back `fragment`'s row id sequence from the data file that carries it.
-pub async fn read_spilled_row_ids(dataset: &Dataset, fragment: &Fragment) -> Result<RowIdSequence> {
-    let ids = read_spilled_column(dataset, fragment, ROW_ID_FIELD_ID)
-        .boxed()
-        .await?;
-    Ok(RowIdSequence::from(ids.as_slice()))
-}
-
-/// Read back one of `fragment`'s version sequences from the data file that
-/// carries it; `field_id` says which of the two it is.
-pub async fn read_spilled_versions(
-    dataset: &Dataset,
-    fragment: &Fragment,
-    field_id: i32,
-) -> Result<RowDatasetVersionSequence> {
-    let versions = read_spilled_column(dataset, fragment, field_id)
-        .boxed()
-        .await?;
-    Ok(RowDatasetVersionSequence::from_versions(&versions))
-}
-
-/// Read the hidden `UInt64` column `field_id` of `fragment` in full: one
-/// value per physical row, from the one data file that carries the id.
-///
-/// Callers box this future: it drives the data file reader, and inlined
-/// into the row id index build (reached from `take`, and from there from index
-/// builds and `optimize_indices`) it makes those futures too deep for the trait
-/// solver to prove `Send`/`Sync` (E0275).
-async fn read_spilled_column(
-    dataset: &Dataset,
-    fragment: &Fragment,
-    field_id: i32,
-) -> Result<Vec<u64>> {
-    let data_file = fragment.row_lineage_file(field_id)?.ok_or_else(|| {
-        Error::corrupt_file(
-            dataset.base.clone(),
-            format!(
-                "fragment {} marks row lineage field {field_id} as spilled but none of its \
-                 data files carries it",
-                fragment.id
-            ),
-        )
-    })?;
-    let column_index = data_file
-        .fields
-        .iter()
-        .position(|field| *field == field_id)
-        .and_then(|position| data_file.column_indices.get(position))
-        .ok_or_else(|| {
-            Error::corrupt_file_named(
-                &data_file.path,
-                format!("spilled row lineage file does not carry field id {field_id}"),
-            )
-        })?;
-    let column_index = u32::try_from(*column_index).map_err(|_| {
-        Error::corrupt_file_named(
-            &data_file.path,
-            format!("field id {field_id} has no column index in the spilled row lineage file"),
-        )
-    })?;
-
-    // The projected field is built from the reserved id rather than taken
-    // from the file schema. A column index counts physical columns -- one per
-    // leaf, and in 2.0 one per list or struct as well -- so once the lineage
-    // columns follow nested user columns, as in a compaction output, it is no
-    // longer the field's position among the file's top-level fields. Nor can
-    // the file schema be searched by id: a lineage-only file stores its
-    // fields under ids 0, 1 and 2.
-    let projection = ReaderProjection {
-        schema: Arc::new(Schema {
-            fields: vec![lineage_field(field_id)?],
-            metadata: Default::default(),
-        }),
-        column_indices: vec![column_index],
-    };
-
-    // Resolved through `data_file_dir` rather than `data_dir` so a shallow
-    // clone, which rewrites `base_id` on every referenced file, still finds it.
-    let path: Path = dataset
-        .data_file_dir(data_file)?
-        .join(data_file.path.as_str());
-    let object_store = dataset.object_store_for_data_file(data_file).await?;
-    let scheduler = ScanScheduler::new(
-        object_store.clone(),
-        SchedulerConfig::max_bandwidth(&object_store),
-    );
-    let file = scheduler
-        .open_file(&path, &data_file.file_size_bytes)
-        .await?;
-    let options = dataset
-        .file_reader_options
-        .as_deref()
-        .cloned()
-        .unwrap_or_default();
-    let cache = dataset.metadata_cache.file_metadata_cache(&path);
-    let io =
-        Arc::new(LanceEncodingsIo::new(file.clone()).with_read_chunk_size(options.read_chunk_size));
-    // An index past the file's columns means the data file entry and the file
-    // disagree. The reader would reject the projection as invalid input without
-    // naming the file, so it is checked here, once the column count is known.
-    let check_column_index = |num_columns: usize| {
-        if (column_index as usize) < num_columns {
-            Ok(())
-        } else {
-            Err(Error::corrupt_file_named(
-                &data_file.path,
-                format!(
-                    "spilled row lineage column {field_id} is at column index {column_index}, \
-                     but the file has only {num_columns} columns"
-                ),
-            ))
-        }
-    };
-    // A compaction output holds the lineage next to every user column, and
-    // decoding all their metadata to read one column would cost as much as
-    // opening the file for a scan. Past a few columns, only the one read here
-    // has its metadata fetched, by the same threshold the fragment reader uses.
-    let live_columns = data_file
-        .column_indices
-        .iter()
-        .filter(|column_index| **column_index >= 0)
-        .count();
-    let reader = versions::open_projected_reader(
-        data_file.file_version()?,
-        &projection,
-        projection.column_indices.len().saturating_mul(4) < live_columns,
-        || async {
-            let metadata_index = FileReader::read_metadata_index(&file).await?;
-            check_column_index(metadata_index.num_columns() as usize)?;
-            let reader = ProjectedFileReader::try_open_with_metadata_index(
-                io.clone(),
-                path.clone(),
-                Some(projection.clone()),
-                Arc::<DecoderPlugins>::default(),
-                Arc::new(metadata_index),
-                &cache,
-                options.clone(),
-            )
-            .await?;
-            Ok(Some(reader))
-        },
-        || async {
-            let metadata = FileReader::read_all_metadata(&file).await?;
-            check_column_index(metadata.column_infos.len())?;
-            ProjectedFileReader::try_open_with_file_metadata(
-                io.clone(),
-                path.clone(),
-                Some(projection.clone()),
-                Arc::<DecoderPlugins>::default(),
-                Arc::new(metadata),
-                &cache,
-                options.clone(),
-            )
-            .await
-        },
-    )
-    .await?;
-
-    let mut values: Vec<u64> = Vec::with_capacity(reader.num_rows() as usize);
-    let mut batches = reader
-        .read_tasks(
-            ReadBatchParams::RangeFull,
-            SPILL_BATCH_ROWS as u32,
-            None,
-            FilterExpression::no_filter(),
-        )
-        .await?
-        .map(|task| task.task)
-        .buffered(8);
-    while let Some(batch) = batches.try_next().await? {
-        let column = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .ok_or_else(|| {
-                Error::corrupt_file_named(
-                    &data_file.path,
-                    format!("spilled row lineage column {field_id} is not UInt64"),
-                )
-            })?;
-        // A null has no row id or version to stand for; the format requires a
-        // value for every physical row.
-        if column.null_count() > 0 {
-            return Err(Error::corrupt_file_named(
-                &data_file.path,
-                format!("spilled row lineage column {field_id} holds nulls"),
-            ));
-        }
-        values.extend_from_slice(column.values());
-    }
-    if let Some(physical_rows) = fragment.physical_rows
-        && values.len() != physical_rows
-    {
-        return Err(Error::corrupt_file_named(
-            &data_file.path,
-            format!(
-                "spilled row lineage column {field_id} holds {} values for a fragment of {} \
-                 physical rows",
-                values.len(),
-                physical_rows
-            ),
-        ));
-    }
-
-    Ok(values)
+    runtime::place_carried_row_lineage(&dataset.table_view().to_table(), limit, row_ids, created_at)
+        .await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Error;
     use crate::dataset::cleanup::{CleanupPolicyBuilder, cleanup_old_versions};
     use crate::dataset::fragment::FileFragment;
     use crate::dataset::optimize::{
         CompactionMode, CompactionOptions, IgnoreRemap, commit_compaction, compact_files,
         plan_compaction,
     };
-    use crate::dataset::rowids::{RowVersionKind, load_row_id_sequence, load_row_version_sequence};
+    use crate::dataset::rowids::{
+        RowVersionKind, load_row_id_sequence, load_row_version_sequence, read_spilled_row_ids,
+        read_spilled_versions,
+    };
     use crate::dataset::transaction::Operation;
     use crate::dataset::{
         ColumnAlteration, MergeInsertBuilder, MergeInsertWriteMode, NewColumnTransform,
@@ -757,8 +80,10 @@ mod tests {
     use arrow_array::builder::{ListBuilder, StringBuilder};
     use arrow_array::cast::AsArray;
     use arrow_array::types::Int32Type;
+    use arrow_array::{Array, ArrayRef, RecordBatch, UInt64Array};
     use arrow_array::{Int32Array, RecordBatchIterator, StringArray, StructArray};
     use arrow_schema::Field;
+    use arrow_schema::{DataType, Schema as ArrowSchema};
     use chrono::Utc;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_core::{ROW_CREATED_AT_VERSION, ROW_ID, ROW_LAST_UPDATED_AT_VERSION};
@@ -770,7 +95,12 @@ mod tests {
         FLAG_SPILLED_ROW_LINEAGE, frag_reuse_with_stable_row_ids_enabled,
     };
     use lance_table::format::overlay::TOMBSTONE_FIELD_ID;
+    use lance_table::format::{
+        Fragment, ROW_CREATED_AT_VERSION_FIELD_ID, ROW_ID_FIELD_ID,
+        ROW_LAST_UPDATED_AT_VERSION_FIELD_ID, RowDatasetVersionMeta, RowIdMeta,
+    };
     use rstest::rstest;
+    use std::sync::Arc;
 
     /// A sequence with no runs to exploit, which is what a globally shuffled
     /// table produces and what forces the spill path.
@@ -2206,6 +1536,7 @@ mod tests {
                 let read_version = dataset.manifest.version;
                 let operation = Operation::DataReplacement {
                     replacements: vec![replacement],
+                    data_change: true,
                 };
                 dataset = Dataset::commit(
                     Arc::new(dataset),
@@ -2680,7 +2011,10 @@ mod tests {
                     let read_version = self.dataset.manifest.version;
                     self.dataset = Dataset::commit(
                         Arc::new(self.dataset.clone()),
-                        Operation::DataReplacement { replacements },
+                        Operation::DataReplacement {
+                            replacements,
+                            data_change: true,
+                        },
                         Some(read_version),
                         None,
                         None,

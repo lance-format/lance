@@ -7,7 +7,10 @@ use std::sync::{Arc, LazyLock};
 use super::utils::{IndexMetrics, InstrumentedRecordBatchStreamAdapter};
 use crate::{
     Dataset,
-    dataset::rowids::{load_row_id_sequences, translate_addr_treemap_to_row_ids},
+    dataset::rowids::{
+        load_row_id_sequences, row_id_index_for_translation, translate_addr_treemap_to_row_ids,
+        translate_row_id_mask_to_row_addrs, translate_row_id_plain_mask_to_row_addrs,
+    },
     index::{
         prefilter::DatasetPreFilter,
         scalar_logical::{
@@ -52,8 +55,8 @@ use lance_index::{
     },
 };
 use lance_select::{
-    IndexExprResult, NullableIndexExprResult, NullableRowAddrMask, NullableRowAddrSet, RowAddrMask,
-    RowAddrTreeMap, RowSetOps, result::IndexExprResultWireFormat,
+    IndexExprResult, MaskDomain, NullableIndexExprResult, RowAddrMask, RowAddrTreeMap, RowSetOps,
+    result::IndexExprResultWireFormat,
 };
 use lance_table::format::Fragment;
 use roaring::RoaringBitmap;
@@ -70,19 +73,25 @@ impl ScalarIndexLoader for Dataset {
         open_named_scalar_index(self, column, index_name, metrics).await
     }
 
-    async fn row_addr_result_to_row_ids(
+    async fn row_id_result_to_row_addrs(
         &self,
         result: NullableIndexExprResult,
     ) -> Result<NullableIndexExprResult> {
         // Addresses and row ids only diverge under stable row ids; otherwise the
-        // address is the row id and there is nothing to translate.
-        if !self.manifest.uses_stable_row_ids() {
-            return Ok(result);
-        }
+        // id is the address and there is nothing to translate.
+        let Some(row_id_index) = row_id_index_for_translation(self).await? else {
+            return Ok(result.with_domain(MaskDomain::RowAddress));
+        };
 
         result
-            .try_map(|mask| translate_addr_mask_to_row_ids(self, mask))
+            .try_map(|mask| {
+                std::future::ready(translate_row_id_mask_to_row_addrs(
+                    row_id_index.as_ref(),
+                    mask,
+                ))
+            })
             .await
+            .map(|r| r.with_domain(MaskDomain::RowAddress))
     }
 }
 
@@ -111,73 +120,87 @@ impl ScalarIndexLoader for ScopedScalarIndexLoader<'_> {
         .await
     }
 
-    async fn row_addr_result_to_row_ids(
+    async fn row_id_result_to_row_addrs(
         &self,
         result: NullableIndexExprResult,
     ) -> Result<NullableIndexExprResult> {
-        let result = if self.dataset.manifest.uses_stable_row_ids()
-            && let Some(fragments) = self.fragments
-            && fragments != self.dataset.fragment_bitmap.as_ref()
-        {
-            let mut scope = RowAddrTreeMap::new();
-            for fragment in fragments {
-                scope.insert_fragment(fragment);
-            }
-            // A shared segment can match rows outside this scan. Restrict physical
-            // addresses before translation to avoid opening their row-id and
-            // deletion files. Scope TRUE and NULL rows together for boolean filters.
-            let restrict = |mask| match mask {
-                NullableRowAddrMask::AllowList(set) => {
-                    let (mut selected, mut nulls) = set.into_parts();
-                    selected &= &scope;
-                    nulls &= &scope;
-                    NullableRowAddrMask::AllowList(NullableRowAddrSet::new(selected, nulls))
-                }
-                mask => mask,
-            };
-            result
-                .try_map(|mask| std::future::ready(Ok::<_, Error>(restrict(mask))))
-                .await?
-        } else {
-            result
-        };
-        self.dataset.row_addr_result_to_row_ids(result).await
+        self.dataset.row_id_result_to_row_addrs(result).await
     }
 }
 
-/// Translate an address-domain [`NullableRowAddrMask`] into the row-id domain
+/// Finalize an [`IndexExprResult`] to row-address domain, converting via the
+/// dataset's row-id index if it is currently row-id domain (e.g. a lone
+/// Inverted/NGram/MinHashLSH predicate, or a legacy pre-migration BTree/Bitmap
+/// segment, with no address-domain sibling to force conversion during `And`/
+/// `Or` combination — see `ScalarIndexExpr::evaluate_with_options`). A no-op
+/// when already row-address domain, which is the common case.
+pub(crate) async fn finalize_to_row_addrs(
+    dataset: &Dataset,
+    result: IndexExprResult,
+) -> Result<IndexExprResult> {
+    if result.domain == MaskDomain::RowAddress {
+        return Ok(result);
+    }
+    let Some(row_id_index) = row_id_index_for_translation(dataset).await? else {
+        return Ok(result.with_domain(MaskDomain::RowAddress));
+    };
+    result
+        .try_map(|mask| {
+            std::future::ready(translate_row_id_plain_mask_to_row_addrs(
+                row_id_index.as_ref(),
+                mask,
+            ))
+        })
+        .await
+        .map(|r| r.with_domain(MaskDomain::RowAddress))
+}
+
+/// Finalize an [`IndexExprResult`] to row-id domain, converting via the
+/// dataset's per-fragment row-id sequences if it is currently row-address
+/// domain. A no-op when already row-id domain (including every
+/// non-stable-row-id dataset, where address and id coincide).
 ///
-/// Address-domain index results are always positive allow-lists (`AtMost`), so
-/// a block-list here would mean a boolean op was applied before translation,
-/// which is unsupported.
-async fn translate_addr_mask_to_row_ids(
+/// Unlike [`finalize_to_row_addrs`], this is the slow direction (a
+/// `RowIdSequence` scan per fragment) — it exists for [`MaterializeIndexExec`],
+/// whose take-by-id contract genuinely needs row ids, and for
+/// [`super::prefilter_union::PrefilterUnionExec`], whose `missing` branch is
+/// pinned to row-id domain (see that module); the fast path to
+/// [`super::filtered_read::FilteredReadExec`] never calls this.
+pub(crate) async fn finalize_to_row_ids(
     dataset: &Dataset,
-    mask: NullableRowAddrMask,
-) -> Result<NullableRowAddrMask> {
-    match mask {
-        NullableRowAddrMask::AllowList(set) => Ok(NullableRowAddrMask::AllowList(
-            translate_addr_set_to_row_ids(dataset, set).await?,
-        )),
-        NullableRowAddrMask::BlockList(_) => Err(Error::internal(
-            "cannot translate a block-list address mask to the row-id domain",
-        )),
+    result: IndexExprResult,
+) -> Result<IndexExprResult> {
+    if result.domain == MaskDomain::RowId || !dataset.manifest.uses_stable_row_ids() {
+        return Ok(result.with_domain(MaskDomain::RowId));
     }
-}
-
-async fn translate_addr_set_to_row_ids(
-    dataset: &Dataset,
-    set: NullableRowAddrSet,
-) -> Result<NullableRowAddrSet> {
-    let selected = translate_addr_treemap_to_row_ids(dataset, set.selected_rows()).await?;
-    let nulls = translate_addr_treemap_to_row_ids(dataset, set.null_rows()).await?;
-    Ok(NullableRowAddrSet::new(selected, nulls))
+    // `translate_addr_treemap_to_row_ids` only ever resolves the *listed*
+    // addresses to ids (dropping any with no live counterpart) — it has no
+    // notion of allow vs. block, so the same call is correct for either: a
+    // block-list's listed addresses become a block-list of their ids. This
+    // also means an empty block-list (e.g. NGram's "cannot tell, scan
+    // everything" result for an untokenizable query) translates for free,
+    // with no I/O: iterating zero addresses trivially yields zero ids.
+    result
+        .try_map(|mask| async move {
+            match mask {
+                RowAddrMask::AllowList(set) => Ok(RowAddrMask::AllowList(
+                    translate_addr_treemap_to_row_ids(dataset, &set).await?,
+                )),
+                RowAddrMask::BlockList(set) => Ok(RowAddrMask::BlockList(
+                    translate_addr_treemap_to_row_ids(dataset, &set).await?,
+                )),
+            }
+        })
+        .await
+        .map(|r| r.with_domain(MaskDomain::RowId))
 }
 
 /// An execution node that performs a scalar index search
 ///
 /// This does not actually scan any data.  We only look through the index to determine
-/// the row ids that match the query.  The output of this node is a row id mask (serialized
-/// into a record batch)
+/// the rows that match the query.  The output of this node is a row-address mask
+/// (serialized into a record batch), finalized to that domain internally before
+/// serializing.
 ///
 /// If the actual IDs are needed then use MaterializeIndexExec instead
 #[derive(Debug)]
@@ -229,16 +252,38 @@ impl ScalarIndexExec {
 
     /// Restrict which physical scalar index segments are loaded.
     ///
-    /// Address-domain results are restricted before translation to stable row ids. Native
-    /// row-id results can still cover other fragments, so the consumer remains responsible
-    /// for applying the exact fragment scope, deletion mask, and any data-level recheck.
-    pub(crate) fn with_fragment_scope(mut self, fragments: RoaringBitmap) -> Self {
+    /// This only restricts which segments of the index are searched — a result
+    /// (address- or row-id-domain alike) can still cover rows outside `fragments`
+    /// if a shared index segment matches them, so the consumer remains
+    /// responsible for applying the exact fragment scope, deletion mask, and
+    /// any data-level recheck. Codecs can inspect this setting with
+    /// [`Self::fragment_scope`].
+    ///
+    /// ```
+    /// # use lance::io::exec::scalar_index::ScalarIndexExec;
+    /// # fn scoped(exec: ScalarIndexExec) {
+    /// let exec = exec.with_fragment_scope([1].into_iter().collect());
+    /// assert!(exec.fragment_scope().unwrap().contains(1));
+    /// # }
+    /// ```
+    pub fn with_fragment_scope(mut self, fragments: RoaringBitmap) -> Self {
         self.fragment_scope = Some(Arc::new(fragments));
         self
     }
 
     /// Restrict index loading to these physical scalar index segments.
-    pub(crate) fn with_segment_uuids(mut self, segment_uuids: Arc<HashSet<uuid::Uuid>>) -> Self {
+    /// Codecs can inspect this setting with [`Self::segment_uuids`].
+    ///
+    /// ```
+    /// # use std::{collections::HashSet, sync::Arc};
+    /// # use lance::io::exec::scalar_index::ScalarIndexExec;
+    /// # use uuid::Uuid;
+    /// # fn selected(exec: ScalarIndexExec, uuid: Uuid) {
+    /// let exec = exec.with_segment_uuids(Arc::new(HashSet::from([uuid])));
+    /// assert!(exec.segment_uuids().unwrap().contains(&uuid));
+    /// # }
+    /// ```
+    pub fn with_segment_uuids(mut self, segment_uuids: Arc<HashSet<uuid::Uuid>>) -> Self {
         self.segment_uuids = Some(segment_uuids);
         self
     }
@@ -256,6 +301,20 @@ impl ScalarIndexExec {
     /// [`IndexExprResult`] output.
     pub fn result_format(&self) -> IndexExprResultWireFormat {
         self.result_format
+    }
+
+    /// Fragment scope used for index loading. `None` searches every selected
+    /// segment. A result is not otherwise bounded by this scope — see
+    /// [`Self::with_fragment_scope`] for an example.
+    pub fn fragment_scope(&self) -> Option<&RoaringBitmap> {
+        self.fragment_scope.as_deref()
+    }
+
+    /// Explicit scalar segment selection to preserve across a codec round trip.
+    /// `None` searches all committed segments whose coverage intersects the scope.
+    /// See [`Self::with_segment_uuids`] for an example.
+    pub fn segment_uuids(&self) -> Option<&Arc<HashSet<uuid::Uuid>>> {
+        self.segment_uuids.as_ref()
     }
 
     #[async_recursion]
@@ -329,6 +388,12 @@ impl ScalarIndexExec {
                 (None, None) => expr.evaluate(dataset.as_ref(), &metrics).await?,
             }
         };
+        // This node's output contract is a row-address mask (the wire format
+        // carries no domain bit, so every producer must agree): finalize here
+        // rather than inside `evaluate` so a subtree that's entirely
+        // address-domain already (the common, and now fast, case) never pays
+        // a conversion.
+        let query_result = finalize_to_row_addrs(dataset.as_ref(), query_result).await?;
         Self::record_match_bounds(&query_result, &plan_metrics);
         let mut fragments_covered_by_result =
             Self::fragments_covered_by_index_query(&expr, dataset.as_ref()).await?;
@@ -880,6 +945,11 @@ impl MapIndexExec {
             let values = std::mem::take(&mut values_per_key[idx]);
             let query = Self::build_key_query(&lookups[idx], values);
             let query_result = query.evaluate(dataset.as_ref(), metrics.as_ref()).await?;
+            // This node's contract is a list of row ids (`INDEX_LOOKUP_SCHEMA`
+            // is `ROW_ID_FIELD`, matching `deletion_mask`'s domain below), and
+            // `evaluate` answers in whichever domain its indices used, so
+            // finalize here the same way `MaterializeIndexExec` does.
+            let query_result = finalize_to_row_ids(&dataset, query_result).await?;
             if !query_result.is_exact() {
                 todo!("Support for non-exact query results as input for merge_insert")
             }
@@ -958,13 +1028,20 @@ impl ExecutionPlan for MapIndexExec {
         // stream ends, so this state is not covered by per-batch reservations.
         let candidate_reservation = MemoryConsumer::new(MAP_INDEX_CANDIDATES_MEMORY_CONSUMER)
             .register(context.memory_pool());
+        let mut metrics = IndexMetrics::new(&self.metrics, partition);
+        if let Some(scope) = context
+            .session_config()
+            .get_extension::<crate::dataset::write::merge_insert::analysis::AnalysisScope>(
+        ) {
+            metrics = metrics.with_segment_tracking(scope.segments.clone());
+        }
         let input = self.input.execute(partition, context)?;
         let stream_fut = Self::build_stream(
             input,
             partition,
             self.dataset.clone(),
             self.lookups.clone(),
-            Arc::new(IndexMetrics::new(&self.metrics, partition)),
+            Arc::new(metrics),
             self.metrics.clone(),
             candidate_reservation,
         );
@@ -977,6 +1054,10 @@ impl ExecutionPlan for MapIndexExec {
 
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
     }
 
     fn supports_limit_pushdown(&self) -> bool {
@@ -1111,7 +1192,17 @@ impl MaterializeIndexExec {
             segment_uuids: segment_uuids.as_deref(),
         };
         let needs_recheck = expr.needs_recheck();
-        let expr_result = expr.evaluate(&loader, metrics.as_ref());
+        // This node's contract is a list of row ids (`row_ids_for_mask` below
+        // treats the combined mask's values as such), matching `prefilter`'s
+        // domain (`DatasetPreFilter::create_deletion_mask` already produces a
+        // row-id-domain mask for a stable-row-id dataset). Finalize here,
+        // before combining, rather than inside `evaluate` — a subtree that's
+        // already row-id domain (e.g. built on legacy/FTS leaves only) never
+        // pays a conversion.
+        let expr_result = async {
+            let result = expr.evaluate(&loader, metrics.as_ref()).await?;
+            finalize_to_row_ids(&dataset, result).await
+        };
         let span = debug_span!("create_prefilter");
         let prefilter = span.in_scope(|| {
             let fragment_bitmap =
@@ -1200,8 +1291,11 @@ async fn row_ids_for_mask(
                     .try_collect::<Vec<_>>()
                     .await?;
 
-                let mut capacity = sequences.iter().map(|seq| seq.len() as usize).sum();
-                capacity -= block_list.len().expect("unknown block list len") as usize;
+                let capacity: usize = sequences.iter().map(|seq| seq.len() as usize).sum();
+                // The block list comes from the whole index, so it can name more
+                // rows than `fragments` holds when the scan covers a subset.
+                let capacity = capacity
+                    .saturating_sub(block_list.len().expect("unknown block list len") as usize);
                 let mut row_ids = Vec::with_capacity(capacity);
                 for sequence in sequences {
                     row_ids.extend(
@@ -1364,8 +1458,8 @@ mod tests {
         },
     };
     use lance_select::{
-        NullableIndexExprResult, NullableRowAddrMask, NullableRowAddrSet, RowAddrTreeMap,
-        RowSetOps, result::IndexExprResultWireFormat,
+        MaskDomain, NullableIndexExprResult, NullableRowAddrMask, NullableRowAddrSet,
+        RowAddrTreeMap, RowSetOps, result::IndexExprResultWireFormat,
     };
     use rstest::rstest;
 
@@ -1604,41 +1698,82 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(row_ids, vec![6, 8]);
 
-        let mut nulls = RowAddrTreeMap::new();
-        nulls.insert(RowAddress::new_from_parts(fragment_id, 3).into());
-        let mask = NullableRowAddrMask::AllowList(NullableRowAddrSet::new(partial_fragment, nulls));
+        // The opposite direction: row-id -> row-address, via
+        // `Dataset::row_id_result_to_row_addrs` (a `RowIdIndex` lookup, not a
+        // `RowIdSequence` scan). Round-trips the ids just obtained above
+        // ([6, 8], at offsets 1 and 3 of `fragment_id`) back to their
+        // addresses.
+        let addr_1 = u64::from(RowAddress::new_from_parts(fragment_id, 1));
+        let addr_3 = u64::from(RowAddress::new_from_parts(fragment_id, 3));
+
+        let id_mask = NullableRowAddrMask::AllowList(NullableRowAddrSet::new(
+            RowAddrTreeMap::from_iter([6, 8]),
+            RowAddrTreeMap::from_iter([8]),
+        ));
         let exact = dataset
-            .row_addr_result_to_row_ids(NullableIndexExprResult::exact(mask.clone()))
+            .row_id_result_to_row_addrs(
+                NullableIndexExprResult::exact(id_mask.clone()).with_domain(MaskDomain::RowId),
+            )
             .await
             .unwrap();
+        assert_eq!(exact.domain, MaskDomain::RowAddress);
         assert!(exact.is_exact());
-        assert!(exact.lower.selected(6));
-        assert!(!exact.lower.selected(8));
+        assert!(exact.lower.selected(addr_1));
+        assert!(!exact.lower.selected(addr_3));
         let NullableRowAddrMask::AllowList(set) = &exact.lower else {
             unreachable!()
         };
-        assert!(set.null_rows().contains(8));
+        assert!(set.null_rows().contains(addr_3));
 
         let interval = dataset
-            .row_addr_result_to_row_ids(NullableIndexExprResult::at_most(mask.clone()))
+            .row_id_result_to_row_addrs(
+                NullableIndexExprResult::at_most(id_mask).with_domain(MaskDomain::RowId),
+            )
             .await
             .unwrap();
+        assert_eq!(interval.domain, MaskDomain::RowAddress);
         assert!(!interval.is_exact());
-        assert!(!interval.lower.selected(6));
-        assert!(interval.upper.selected(6));
+        assert!(!interval.lower.selected(addr_1));
+        assert!(interval.upper.selected(addr_1));
 
+        // Unlike the address -> id direction, a BlockList converts cleanly:
+        // only the listed ids need a lookup, not the full id universe.
+        let block_mask = NullableRowAddrMask::BlockList(NullableRowAddrSet::new(
+            RowAddrTreeMap::from_iter([6]),
+            RowAddrTreeMap::new(),
+        ));
+        let blocked = dataset
+            .row_id_result_to_row_addrs(
+                NullableIndexExprResult::exact(block_mask).with_domain(MaskDomain::RowId),
+            )
+            .await
+            .unwrap();
+        let NullableRowAddrMask::BlockList(set) = &blocked.lower else {
+            unreachable!()
+        };
+        assert!(set.selected_rows().contains(addr_1));
+
+        // `ScopedScalarIndexLoader` just delegates for this direction — no
+        // fragment pre-scoping, since a row id has no reliable fragment
+        // component and the row-id index lookup is already dataset-wide.
         let scope = [0].into_iter().collect();
         let loader = ScopedScalarIndexLoader {
             dataset: &dataset,
             fragments: Some(&scope),
             segment_uuids: None,
         };
+        let id_mask = NullableRowAddrMask::AllowList(NullableRowAddrSet::new(
+            RowAddrTreeMap::from_iter([6]),
+            RowAddrTreeMap::new(),
+        ));
         let scoped = loader
-            .row_addr_result_to_row_ids(NullableIndexExprResult::exact(mask))
+            .row_id_result_to_row_addrs(
+                NullableIndexExprResult::exact(id_mask).with_domain(MaskDomain::RowId),
+            )
             .await
             .unwrap();
         assert!(scoped.is_exact());
-        assert_eq!(scoped.lower, NullableRowAddrMask::allow_nothing());
+        assert!(scoped.lower.selected(addr_1));
     }
 
     #[rstest]
@@ -1777,9 +1912,19 @@ mod tests {
             .await
             .unwrap();
         assert!(result.is_exact());
-        for id in 0..16 {
-            assert_eq!(result.lower.selected(id), [0, 8, 9, 10, 11].contains(&id));
-            assert_eq!(result.upper.selected(id), [0, 8, 9, 10, 11].contains(&id));
+        // The row-id-domain BTree leaf gets converted to row-address domain to
+        // combine with the address-domain ZoneMap leaf (never the reverse, see
+        // `reconcile_domains`), so the combined result is address-domain —
+        // translate the expected stable ids to their current addresses to check it.
+        assert_eq!(result.domain, MaskDomain::RowAddress);
+        let addrs =
+            crate::dataset::rowids::row_ids_to_row_addrs(&dataset, &(0..16).collect::<Vec<_>>())
+                .await
+                .unwrap();
+        for (id, addr) in (0..16).zip(addrs) {
+            let addr = addr.expect("id should resolve to a live address");
+            assert_eq!(result.lower.selected(addr), [0, 8, 9, 10, 11].contains(&id));
+            assert_eq!(result.upper.selected(addr), [0, 8, 9, 10, 11].contains(&id));
         }
     }
 

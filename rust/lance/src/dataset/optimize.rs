@@ -81,34 +81,32 @@
 //! the successful tasks can be committed. You can also commit in batches if
 //! you wish. As long as the tasks don't rewrite any of the same fragments,
 //! they can be committed in any order.
-use std::borrow::Cow;
 use std::sync::Arc;
 
-use super::index::DatasetIndexRemapperOptions;
-use crate::Dataset;
-use crate::Result;
-use futures::{StreamExt, TryStreamExt};
-use lance_core::Error;
-use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::utils::tracing::{DATASET_COMPACTING_EVENT, TRACE_DATASET_EVENTS};
+use lance_table_runtime::optimize as runtime;
+use serde::{Deserialize, Serialize};
 use tracing::info;
 
-pub(super) mod binary_copy;
-pub(crate) mod commit;
-pub(crate) mod execution;
-mod planning;
+use super::index::DatasetIndexRemapperOptions;
+use crate::{Dataset, Result};
+
+mod hooks;
+mod planner;
 pub mod remapping;
 
-pub use commit::commit_compaction;
-pub use execution::{CompactionMetrics, CompactionTask, RewriteResult};
-use execution::{refuse_stale_output_clustering, rewrite_files};
-use planning::validate_fragment_groups_preserve_index_boundaries;
-pub use planning::{
-    COMPACTION_CONFIG_PREFIX, CompactionGroup, CompactionMode, CompactionOptions, CompactionPlan,
-    CompactionPlanner, CompactionPlanningResult, DefaultCompactionPlanner, IndexRemapMode,
-    SourceBudgetLimit, SourceBudgetMode, SourceBudgetSummary, TaskData, plan_compaction,
+pub use planner::{
+    CompactionPlan, CompactionPlanner, CompactionPlanningResult, DefaultCompactionPlanner,
+    plan_compaction,
 };
 pub use remapping::{IgnoreRemap, IndexRemapper, IndexRemapperOptions, RemappedIndex};
+pub use runtime::{
+    COMPACTION_CONFIG_PREFIX, CompactionGroup, CompactionMetrics, CompactionMode,
+    CompactionOptions, CompactionScope, CompactionTaskKind, IndexRemapMode, RepackedFiles,
+    RewriteResult, SourceBudgetLimit, SourceBudgetMode, SourceBudgetSummary, TaskData,
+};
+
+use hooks::LanceCompactionHooks;
 
 /// Compacts the files in the dataset without reordering them.
 ///
@@ -116,6 +114,13 @@ pub use remapping::{IgnoreRemap, IndexRemapper, IndexRemapperOptions, RemappedIn
 ///  * Removes deleted rows from fragments.
 ///  * Removes dropped columns from fragments.
 ///  * Merges fragments that are too small.
+///
+/// With [`CompactionOptions::max_data_files_per_fragment`] set, it also
+/// repacks the columns of a fragment spread over too many data files into
+/// fewer files without moving its rows. A run that both
+/// rewrites fragments and repacks columns commits the two separately (see
+/// [`commit_compaction`]). [`CompactionOptions::scope`] limits a run to one
+/// kind of task.
 ///
 /// This method tries to preserve the insertion order of rows in the dataset.
 ///
@@ -125,7 +130,7 @@ pub async fn compact_files(
     options: CompactionOptions,
     remap_options: Option<Arc<dyn IndexRemapperOptions>>, // These will be deprecated later
 ) -> Result<CompactionMetrics> {
-    info!(target: TRACE_DATASET_EVENTS, event=DATASET_COMPACTING_EVENT, uri = &dataset.uri);
+    info!(target: TRACE_DATASET_EVENTS, event=DATASET_COMPACTING_EVENT, uri = &dataset.table_state.uri);
     let remap_options =
         remap_options.unwrap_or_else(|| Arc::new(DatasetIndexRemapperOptions::default()));
     let planner =
@@ -146,82 +151,91 @@ pub async fn compact_files_with_planner(
 ) -> Result<CompactionMetrics> {
     let remap_options =
         remap_options.unwrap_or_else(|| Arc::new(DatasetIndexRemapperOptions::default()));
-    let compaction_plan: CompactionPlan = planner.plan(dataset).await?;
-    if !remap_options.supports_vector_segment_replacement()
-        || compaction_plan.options.defer_index_remap
-        || dataset.manifest.uses_stable_row_ids()
-    {
-        validate_fragment_groups_preserve_index_boundaries(
-            dataset,
-            compaction_plan
-                .tasks
-                .iter()
-                .map(|task| task.fragments.as_slice()),
-        )
-        .await?;
-    }
+    let plan = planner.plan(dataset).await?;
+    let bindings = LanceCompactionHooks::new(dataset, Some(remap_options.as_ref()));
+    let mut table = dataset.table_view().to_table();
+    let result =
+        runtime::execute_compaction_plan(&mut table, plan.into(), &bindings.runtime()).await;
+    (dataset.table_state, dataset.manifest, dataset.refs) = table.into_parts();
+    result
+}
 
-    // `buffer_unordered(0)` below never pulls a task from the stream and
-    // returns `Pending` with nothing left to wake it, so zero threads would
-    // leave compaction waiting forever. Checked against the plan so plans from
-    // a custom planner are covered too.
-    if compaction_plan.options.num_threads == Some(0) {
-        return Err(Error::invalid_input(
-            "CompactionOptions::num_threads must be greater than 0 (use None for the default)",
-        ));
-    }
-
-    // A tagged FRI history is maintained by appending transitions to the
-    // tagged entry, which only the deferred-remap commit path does; eager
-    // remapping would rewrite provenance the tagged reader depends on.
-    // Checked before any file is rewritten (commit_compaction re-checks for
-    // callers that commit externally planned results).
-    if !compaction_plan.options.defer_index_remap
-        && dataset.manifest.writer_feature_flags
-            & lance_table::feature_flags::FLAG_FRAGMENT_REUSE_INDEX
-            != 0
-        && crate::index::loading::load_all_indices(dataset)
-            .await?
-            .iter()
-            .any(lance_table::system_index::frag_reuse::metadata::is_tagged)
-    {
-        return Err(Error::not_supported(
-            "Compacting a table with a tagged fragment reuse history requires \
-             defer_index_remap; set defer_index_remap, or upgrade to a writer that \
-             remaps tagged histories eagerly",
-        ));
-    }
-
-    // If nothing to compact, don't make a commit.
-    if compaction_plan.tasks().is_empty() {
-        return Ok(CompactionMetrics::default());
-    }
-    for task in compaction_plan.tasks() {
-        refuse_stale_output_clustering(&dataset.manifest, task)?;
-    }
-
-    let dataset_ref = &dataset.clone();
-
-    let result_stream = futures::stream::iter(compaction_plan.tasks)
-        .map(|task| rewrite_files(Cow::Borrowed(dataset_ref), task, &compaction_plan.options))
-        .buffer_unordered(
-            compaction_plan
-                .options
-                .num_threads
-                .unwrap_or_else(get_num_compute_intensive_cpus),
-        );
-
-    let completed_tasks: Vec<RewriteResult> = result_stream.try_collect().await?;
-    let metrics = commit_compaction(
-        dataset,
+/// Commit the results of file compaction.
+///
+/// It is not required that all tasks are passed to this method. If some failed,
+/// they can be omitted and the successful tasks can be committed. However, once
+/// some of the tasks have been committed, the remainder of the tasks will not
+/// be able to be committed and should be considered cancelled.
+///
+/// Fragment rewrites commit as one `Operation::Rewrite`, then column repacks
+/// as one `Operation::DataReplacement` that moves values without changing
+/// them. A fragment in both kinds of result is rejected before either commit.
+/// If the repack commit fails, the rewrite stays committed and `dataset` is
+/// left at its version; plan again rather than passing the same results back,
+/// since their rewrites would conflict with the commit that landed.
+///
+/// With stable row IDs, tasks that recorded their row-address moves (see
+/// [`CompactionOptions::defer_index_remap`]) commit them even if `options` does not
+/// set `defer_index_remap`; either all rewrite results or none must have
+/// recorded them. Results that did not record commit without recording, also
+/// on a table that has a fragment reuse index.
+pub async fn commit_compaction(
+    dataset: &mut Dataset,
+    completed_tasks: Vec<RewriteResult>,
+    remap_options: Arc<dyn IndexRemapperOptions>,
+    options: &CompactionOptions,
+) -> Result<CompactionMetrics> {
+    let mut table = dataset.table_view().to_table();
+    let bindings = LanceCompactionHooks::new(dataset, Some(remap_options.as_ref()));
+    let result = runtime::commit_compaction_with_hooks(
+        &mut table,
         completed_tasks,
-        remap_options,
-        &compaction_plan.options,
+        options,
+        &bindings.runtime(),
     )
-    .await?;
+    .await;
+    // If a later repack fails, the earlier rewrite can already be published.
+    (dataset.table_state, dataset.manifest, dataset.refs) = table.into_parts();
+    result
+}
 
-    Ok(metrics)
+/// A standalone task that can be serialized and sent to another machine for
+/// execution.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CompactionTask {
+    pub task: TaskData,
+    pub read_version: u64,
+    pub options: CompactionOptions,
+}
+
+impl CompactionTask {
+    /// Run the compaction task and return the result. A
+    /// [`CompactionTaskKind::RewriteFragments`] task rewrites its fragments
+    /// into new ones; a [`CompactionTaskKind::RepackColumns`] task writes new
+    /// data files for its fragment.
+    ///
+    /// This result should be later passed to
+    /// [`crate::dataset::optimize::commit_compaction`] to commit
+    /// the changes to the dataset.
+    ///
+    /// Note: you should pass the version of the dataset that is the same as
+    /// the read version for this task (the same version from which the
+    /// compaction was planned).
+    pub async fn execute(&self, dataset: &Dataset) -> Result<RewriteResult> {
+        let table = dataset.table_view().to_table();
+        let bindings = LanceCompactionHooks::new(dataset, None);
+        runtime::execution::execute_task(
+            &table,
+            self.read_version,
+            &self.task,
+            &self.options,
+            &bindings.runtime(),
+        )
+        .await
+    }
 }
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+use tests::rewrite_files;

@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::cell::UnsafeCell;
+use std::pin::Pin;
 use std::sync::atomic::Ordering;
-use std::sync::{LazyLock, atomic};
+use std::sync::{Arc, LazyLock, atomic};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use futures::{Future, FutureExt};
@@ -28,8 +31,8 @@ fn calculate_num_compute_intensive_cpus() -> usize {
     let cpus = num_cpus::get();
 
     if cpus <= *IO_CORE_RESERVATION {
-        // If the user is not setting a custom value for LANCE_IO_CORE_RESERVATION then we don't emit
-        // a warning because they're just on a small machine and there isn't much they can do about it.
+        // Only an explicit LANCE_IO_CORE_RESERVATION gets here. On a 1- or 2-core
+        // machine there isn't much the user can do about it, so don't warn.
         if cpus > 2 {
             log::warn!(
                 "Number of CPUs is less than or equal to the number of IO core reservations. \
@@ -62,18 +65,26 @@ fn parse_env_usize(name: &str, raw: &str, min: usize) -> Result<usize, String> {
 
 /// Number of CPU cores held back for I/O and control tasks.
 ///
-/// Overridable via the `LANCE_IO_CORE_RESERVATION` environment variable;
-/// defaults to `2` when unset. `0` is allowed (reserve nothing);
-/// [`get_num_compute_intensive_cpus`] subtracts this from the core count to
-/// size the compute pool. A non-integer value panics on first access with an
-/// error naming the variable.
+/// Overridable via the `LANCE_IO_CORE_RESERVATION` environment variable. When
+/// unset it is a quarter of the visible logical CPUs, rounded down and capped
+/// at 2: `0` on up to 3 CPUs, `1` on 4 to 7, and `2` on 8 or more. `0` is
+/// allowed (reserve nothing); [`get_num_compute_intensive_cpus`] subtracts this
+/// from the core count to size the compute pool. A non-integer value panics on
+/// first access with an error naming the variable.
 pub static IO_CORE_RESERVATION: LazyLock<usize> =
     LazyLock::new(|| match std::env::var("LANCE_IO_CORE_RESERVATION") {
         Ok(raw) => {
             parse_env_usize("LANCE_IO_CORE_RESERVATION", &raw, 0).unwrap_or_else(|e| panic!("{e}"))
         }
-        Err(_) => 2,
+        Err(_) => default_io_core_reservation(num_cpus::get()),
     });
+
+/// The I/O core reservation when `LANCE_IO_CORE_RESERVATION` is unset: a quarter
+/// of the visible cores, at most 2. A flat 2 left a 3-core machine, such as a
+/// CPU-limited pod or a small Spark executor, with a single compute thread.
+fn default_io_core_reservation(cpus: usize) -> usize {
+    (cpus / 4).min(2)
+}
 
 fn create_runtime() -> Runtime {
     Builder::new_multi_thread()
@@ -126,11 +137,209 @@ extern "C" fn atfork_tokio_child() {
 
 #[cfg(not(windows))]
 fn install_atfork() {
+    // SAFETY: `atfork_tokio_child` has the required C ABI and signature and is
+    // valid for the process lifetime. The other handlers are `None`, and the
+    // child handler performs only atomic stores.
     unsafe { libc::pthread_atfork(None, None, Some(atfork_tokio_child)) };
 }
 
 #[cfg(windows)]
 fn install_atfork() {}
+
+/// Spawn a future onto the current tokio runtime, like [`tokio::spawn`].
+///
+/// Prefer this over [`tokio::spawn`] in library code. `tokio::spawn` instantiates
+/// tokio's task machinery (task cell, harness, vtable, `catch_unwind`, drop glue,
+/// about 1.7K LLVM IR lines) once per future type, and every `async` block is its
+/// own type. This hands tokio a single non-generic future type instead, so that
+/// machinery is instantiated once for the whole program. The future and its
+/// output share one extra allocation.
+///
+/// The returned handle mirrors [`tokio::task::JoinHandle`]: awaiting it yields
+/// the task's output or a [`tokio::task::JoinError`], and it offers the same
+/// `abort`/`abort_handle`/`is_finished` controls.
+///
+/// ```
+/// # use lance_core::utils::tokio::spawn;
+/// # async fn example() -> Result<(), tokio::task::JoinError> {
+/// let output = spawn(async { 42 }).await?;
+/// assert_eq!(output, 42);
+/// # Ok(())
+/// # }
+/// ```
+#[track_caller]
+pub fn spawn<T: Send + 'static>(future: impl Future<Output = T> + Send + 'static) -> JoinHandle<T> {
+    let task = Arc::new(SpawnedTask {
+        stage: UnsafeCell::new(Stage::Running(future)),
+    });
+    JoinHandle {
+        handle: spawn_erased_task(ErasedTask(task.clone())),
+        task,
+    }
+}
+
+/// Keep tokio's generic `spawn` instantiated for one concrete future type, in
+/// this one place, instead of at every `spawn` call site.
+#[track_caller]
+fn spawn_erased_task(task: ErasedTask) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(task)
+}
+
+/// Handle to a task started with [`spawn`]. Awaiting it behaves like awaiting a
+/// [`tokio::task::JoinHandle`].
+pub struct JoinHandle<T> {
+    handle: tokio::task::JoinHandle<()>,
+    task: Arc<dyn TakeOutput<T>>,
+}
+
+impl<T> JoinHandle<T> {
+    /// See [`tokio::task::JoinHandle::abort`].
+    pub fn abort(&self) {
+        self.handle.abort();
+    }
+
+    /// See [`tokio::task::JoinHandle::is_finished`].
+    pub fn is_finished(&self) -> bool {
+        self.handle.is_finished()
+    }
+
+    /// See [`tokio::task::JoinHandle::abort_handle`].
+    pub fn abort_handle(&self) -> tokio::task::AbortHandle {
+        self.handle.abort_handle()
+    }
+}
+
+impl<T> std::fmt::Debug for JoinHandle<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.handle.fmt(f)
+    }
+}
+
+impl<T> Future for JoinHandle<T> {
+    type Output = Result<T, tokio::task::JoinError>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.handle.poll_unpin(cx).map_ok(|()| {
+            // SAFETY: `Ok` means tokio dropped the `ErasedTask` before it
+            // reported completion (see `SpawnedTask`), so this is the only
+            // remaining access to the stage.
+            unsafe { self.task.take_output() }
+                .expect("spawned task completed without storing its output")
+        })
+    }
+}
+
+/// A spawned future and, once it completes, its output.
+///
+/// The stage is shared between the task and its [`JoinHandle`] without locks.
+/// Access is sequenced by the task lifecycle rather than synchronized: while the
+/// task is alive, only tokio touches the stage, through the task's exclusive
+/// `ErasedTask` (polled or dropped by one thread at a time).
+///
+/// The handle reads the stage only after its [`tokio::task::JoinHandle`] resolved
+/// with `Ok`, and tokio drops the future before it reports that: the poll that
+/// returns `Ready` drops the `ErasedTask`, the task then transitions to complete
+/// with a release store, and the handle reads the output only after an acquire
+/// load of that state. So both the poll that wrote the stage and the drop that
+/// may touch it again happen before `take_output`.
+struct SpawnedTask<F: Future> {
+    stage: UnsafeCell<Stage<F, F::Output>>,
+}
+
+enum Stage<F, T> {
+    Running(F),
+    Finished(T),
+    Consumed,
+}
+
+// SAFETY: the stage is never accessed concurrently (see `SpawnedTask`), so
+// sharing it across threads only requires its contents to be `Send`.
+unsafe impl<F: Future + Send> Send for SpawnedTask<F> where F::Output: Send {}
+// SAFETY: shared references reach the stage only through the lifecycle-sequenced
+// paths described on `SpawnedTask`, which never access it concurrently. Both the
+// future and its output are `Send`.
+unsafe impl<F: Future + Send> Sync for SpawnedTask<F> where F::Output: Send {}
+
+trait PollErased: Send + Sync {
+    /// # Safety
+    ///
+    /// Must only be called by the owning `ErasedTask`.
+    unsafe fn poll_erased(&self, cx: &mut Context<'_>) -> Poll<()>;
+
+    /// # Safety
+    ///
+    /// Must only be called by the owning `ErasedTask`.
+    unsafe fn drop_future(&self);
+}
+
+trait TakeOutput<T>: Send + Sync {
+    /// # Safety
+    ///
+    /// Must only be called after the task's `ErasedTask` has been dropped.
+    unsafe fn take_output(&self) -> Option<T>;
+}
+
+impl<F: Future + Send> PollErased for SpawnedTask<F>
+where
+    F::Output: Send,
+{
+    unsafe fn poll_erased(&self, cx: &mut Context<'_>) -> Poll<()> {
+        // SAFETY: the caller has exclusive access to the stage.
+        let stage = unsafe { &mut *self.stage.get() };
+        let Stage::Running(future) = stage else {
+            panic!("spawned task polled after completion");
+        };
+        // SAFETY: the future lives inside an `Arc` allocation and is only ever
+        // dropped in place, never moved, so it stays pinned.
+        let output = std::task::ready!(unsafe { Pin::new_unchecked(future) }.poll(cx));
+        *stage = Stage::Finished(output);
+        Poll::Ready(())
+    }
+
+    unsafe fn drop_future(&self) {
+        // SAFETY: the caller has exclusive access to the stage.
+        let stage = unsafe { &mut *self.stage.get() };
+        if matches!(stage, Stage::Running(_)) {
+            // Drop an unfinished future now, as tokio would on abort or
+            // shutdown, rather than when the last handle goes away.
+            *stage = Stage::Consumed;
+        }
+    }
+}
+
+impl<F: Future + Send> TakeOutput<F::Output> for SpawnedTask<F>
+where
+    F::Output: Send,
+{
+    unsafe fn take_output(&self) -> Option<F::Output> {
+        // SAFETY: the caller guarantees the task side is gone.
+        match std::mem::replace(unsafe { &mut *self.stage.get() }, Stage::Consumed) {
+            Stage::Finished(output) => Some(output),
+            _ => None,
+        }
+    }
+}
+
+/// The single future type handed to `tokio::spawn`.
+struct ErasedTask(Arc<dyn PollErased>);
+
+impl Future for ErasedTask {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        // SAFETY: `ErasedTask` is the task side's only access to the stage, and
+        // tokio polls a task from one thread at a time.
+        unsafe { self.0.poll_erased(cx) }
+    }
+}
+
+impl Drop for ErasedTask {
+    fn drop(&mut self) {
+        // SAFETY: as in `poll`; the handle does not read the stage until this
+        // drop has happened.
+        unsafe { self.0.drop_future() }
+    }
+}
 
 /// Spawn a CPU intensive task
 ///
@@ -153,9 +362,9 @@ fn install_atfork() {}
 /// The CPU pool is sized to [`get_num_compute_intensive_cpus`], which is
 /// `max(1, num_cpus - LANCE_IO_CORE_RESERVATION)`. On a big host that is plenty of
 /// workers (e.g. 62 on a 64-core box), but in resource-constrained environments it can
-/// collapse to a **single blocking thread** — on machines with `<= 3` visible CPUs
-/// (1-vCPU VMs, CI runners, CPU-limited Kubernetes pods) the pool has exactly one
-/// worker. A closure passed to `spawn_cpu` occupies one of these threads for its entire
+/// collapse to a **single blocking thread** — on a 1-vCPU VM, with `LANCE_CPU_THREADS=1`,
+/// or when an explicit `LANCE_IO_CORE_RESERVATION` leaves one core, the pool has exactly
+/// one worker. A closure passed to `spawn_cpu` occupies one of these threads for its entire
 /// lifetime, including any time it spends *parked*. So the closure must only consume
 /// CPU and return; it must
 /// **never** block, wait, or park. Concretely, the closure must not, directly or
@@ -184,20 +393,23 @@ pub fn spawn_cpu<
 >(
     func: F,
 ) -> impl Future<Output = std::result::Result<R, E>> {
-    // Propagate the current span into the task
-    let span = Span::current();
-    let handle = global_cpu_runtime().spawn_blocking(move || {
-        let _span_guard = span.enter();
-        func()
+    // The closure and its output share one allocation, and only the non-generic
+    // `spawn_erased` touches tokio, so tokio's blocking-task machinery (task
+    // cell, harness, vtable, drop glue) is instantiated once rather than once
+    // per closure type in every calling crate.
+    let task = Arc::new(CpuTask {
+        func: UnsafeCell::new(Some(func)),
+        output: UnsafeCell::new(None),
     });
-    // Awaited through the join handle, not a result channel: a panic in `func`
-    // arrives as a `JoinError` still carrying its payload, so resuming it
-    // re-raises the original panic in the caller. Reporting the closure's
-    // outcome over a channel instead loses that -- the sender drops unsent and
-    // every panic in any `spawn_cpu` closure surfaces identically as an opaque
-    // `RecvError`, pointing here rather than at the fault.
-    handle.map(|res| match res {
-        Ok(result) => result,
+    spawn_erased(task.clone()).map(move |res| match res {
+        // SAFETY: the join handle resolved, so `run` has returned on the CPU
+        // thread and tokio's task-completion handoff orders its write to
+        // `output` before this read. Nothing else touches `output`.
+        Ok(()) => unsafe { (*task.output.get()).take() }
+            .expect("spawn_cpu task completed without storing its output"),
+        // Awaited through the join handle, not a result channel: a panic in
+        // `func` arrives as a `JoinError` still carrying its payload, so
+        // resuming it re-raises the original panic in the caller.
         Err(join_error) => match join_error.try_into_panic() {
             Ok(panic) => std::panic::resume_unwind(panic),
             // The CPU runtime outlives every caller, so its tasks are not
@@ -207,9 +419,70 @@ pub fn spawn_cpu<
     })
 }
 
+/// A closure and the slot for its output, shared between the caller and the
+/// CPU thread without locks. Access is sequenced by the task lifecycle rather
+/// than synchronized per field: `func` is only touched by `run`, and `output`
+/// is written by `run` and read by the caller only after the task completes.
+struct CpuTask<F, T> {
+    func: UnsafeCell<Option<F>>,
+    output: UnsafeCell<Option<T>>,
+}
+
+// SAFETY: the fields are never accessed concurrently (see `CpuTask`), so
+// sharing across threads only requires the contents to be `Send`.
+unsafe impl<F: Send, T: Send> Sync for CpuTask<F, T> {}
+
+trait RunOnce: Send + Sync {
+    /// # Safety
+    ///
+    /// Must be called at most once, and `output` must not be read until it
+    /// returns.
+    unsafe fn run(&self);
+}
+
+impl<F: FnOnce() -> T + Send, T: Send> RunOnce for CpuTask<F, T> {
+    unsafe fn run(&self) {
+        // SAFETY: upheld by the caller of `run`; see `RunOnce::run`.
+        let func = unsafe { (*self.func.get()).take() }.expect("spawn_cpu task runs once");
+        let output = func();
+        // SAFETY: `run` has exclusive access to `output` until it returns, and
+        // the caller reads the slot only after this task's join handle resolves.
+        unsafe { *self.output.get() = Some(output) };
+    }
+}
+
+fn spawn_erased(task: Arc<dyn RunOnce>) -> tokio::task::JoinHandle<()> {
+    // Propagate the current span into the task
+    let span = Span::current();
+    global_cpu_runtime().spawn_blocking(move || {
+        let _span_guard = span.enter();
+        // SAFETY: tokio runs a blocking task exactly once, and the caller in
+        // `spawn_cpu` reads `output` only after this task's join handle resolves.
+        unsafe { task.run() };
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The successful path must hand back the closure's own output.
+    ///
+    /// The output travels through an erased, type-independent task, so this
+    /// pins the typed contract: the caller receives the exact value the
+    /// closure returned, moved out of the task rather than re-created.
+    #[tokio::test]
+    async fn spawn_cpu_returns_the_closure_output() {
+        let result = spawn_cpu(|| -> std::result::Result<(u32, String), std::io::Error> {
+            Ok((7, String::from("done")))
+        })
+        .await;
+
+        assert_eq!(
+            result.expect("the closure succeeded"),
+            (7, "done".to_string())
+        );
+    }
 
     /// A panic in the closure must reach the caller intact.
     ///
@@ -239,6 +512,65 @@ mod tests {
         assert_eq!(message, "the original message");
     }
 
+    #[tokio::test]
+    async fn spawn_returns_the_future_output() {
+        let output = spawn(async { String::from("done") }).await.unwrap();
+        assert_eq!(output, "done");
+    }
+
+    /// The stage has to survive across polls: a future that is pending first
+    /// and ready later still hands back its output.
+    #[tokio::test]
+    async fn spawn_returns_the_output_after_a_pending_poll() {
+        let output = spawn(async {
+            tokio::task::yield_now().await;
+            String::from("done")
+        })
+        .await
+        .unwrap();
+        assert_eq!(output, "done");
+    }
+
+    #[tokio::test]
+    async fn spawn_reports_a_panic_with_its_payload() {
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let result = spawn(async { panic!("the original message") }).await;
+        std::panic::set_hook(hook);
+
+        let payload = result.expect_err("the panic is reported").into_panic();
+        assert_eq!(
+            payload.downcast_ref::<&str>().copied(),
+            Some("the original message")
+        );
+    }
+
+    /// Aborting must drop the in-flight future right away, as `tokio::spawn`
+    /// does, even though the handle keeps the shared allocation alive.
+    #[tokio::test]
+    async fn spawn_abort_drops_the_future_before_the_handle() {
+        struct SetOnDrop(Arc<atomic::AtomicBool>);
+        impl Drop for SetOnDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let dropped = Arc::new(atomic::AtomicBool::new(false));
+        let guard = SetOnDrop(dropped.clone());
+        let mut handle = spawn(async move {
+            let _guard = guard;
+            futures::future::pending::<()>().await;
+        });
+        handle.abort();
+        let err = (&mut handle)
+            .await
+            .expect_err("an aborted task is cancelled");
+        assert!(err.is_cancelled());
+        assert!(dropped.load(Ordering::SeqCst));
+        drop(handle);
+    }
+
     // The env vars feed process-global `LazyLock`s that read once and are read
     // in parallel by other tests, so the pure parser is tested directly rather
     // than by mutating the environment.
@@ -262,6 +594,21 @@ mod tests {
         // max_blocking_threads(0); the minimum stops it at the boundary.
         let err = parse_env_usize("LANCE_CPU_THREADS", "0", 1).unwrap_err();
         assert!(err.contains("at least 1"), "{err}");
+    }
+
+    #[rstest::rstest]
+    #[case::one_cpu(1, 0)]
+    #[case::two_cpus(2, 0)]
+    #[case::three_cpus(3, 0)]
+    #[case::four_cpus(4, 1)]
+    #[case::seven_cpus(7, 1)]
+    #[case::eight_cpus(8, 2)]
+    #[case::many_cpus(64, 2)]
+    fn default_io_core_reservation_leaves_small_machines_their_cores(
+        #[case] cpus: usize,
+        #[case] expected: usize,
+    ) {
+        assert_eq!(default_io_core_reservation(cpus), expected);
     }
 
     #[test]

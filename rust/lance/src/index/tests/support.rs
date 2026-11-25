@@ -21,6 +21,7 @@ pub async fn write_vector_segment_metadata(
         .join(uuid.to_string())
         .join(INDEX_FILE_NAME);
     dataset
+        .table_state
         .object_store
         .as_ref()
         .put(&index_path, payload)
@@ -312,6 +313,11 @@ pub async fn assert_merge_preserves_covering(
         vec![carried_field_id],
         "merge_segments must neither drop the covering declaration nor \
          produce an uncommittable one"
+    );
+    assert!(
+        !merged.requires_independent_contract(),
+        "merge_segments must keep the suffix layout; a truncated `fields` \
+         would commit as keys-only and fence older readers out of the table"
     );
 }
 
@@ -729,7 +735,7 @@ pub async fn hide_index_as(dataset: &mut Dataset, index_name: &str, kind: Unread
             unreadable[0].fields = vec![lance_table::format::ROW_ID_FIELD_ID];
         }
     }
-    unreadable[0].fragment_bitmap = Some(dataset.fragment_bitmap.as_ref().clone());
+    unreadable[0].fragment_bitmap = Some(dataset.table_state.fragment_bitmap.as_ref().clone());
     let transaction = Transaction::new(
         dataset.manifest.version,
         Operation::CreateIndex {
@@ -812,8 +818,8 @@ pub async fn dataset_with_an_index_from_a_newer_build(uri: &str, index_name: &st
 /// Indices the manifest itself carries, bypassing the usable-index filter.
 pub async fn raw_manifest_indices(dataset: &Dataset) -> Vec<IndexMetadata> {
     lance_table::io::manifest::read_manifest_indexes(
-        &dataset.object_store,
-        &dataset.manifest_location,
+        &dataset.table_state.object_store,
+        &dataset.table_state.manifest_location,
         &dataset.manifest,
     )
     .await
@@ -899,4 +905,58 @@ impl WrappingObjectStore for RequestIndexStoreWrapper {
     ) -> Option<Arc<dyn object_store::list::PaginatedListStore>> {
         None
     }
+}
+
+pub async fn write_btree_table(
+    uri: &str,
+    indexed: &[&str],
+    params: Option<WriteParams>,
+) -> Dataset {
+    let data = gen_batch()
+        .col("a", array::step::<Int32Type>())
+        .col("b", array::step::<Int32Type>())
+        .col("c", array::step::<Int32Type>())
+        .into_reader_rows(RowCount::from(20), BatchCount::from(1));
+    let mut dataset = Dataset::write(data, uri, params).await.unwrap();
+    for column in indexed {
+        dataset
+            .create_index(
+                &[column],
+                IndexType::BTree,
+                None,
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::BTree),
+                false,
+            )
+            .await
+            .unwrap();
+    }
+    dataset
+}
+
+pub fn redeclare_covering(
+    dataset: &Dataset,
+    plain: &IndexMetadata,
+    fields: Vec<i32>,
+    covering_fields: Vec<i32>,
+) -> Transaction {
+    Transaction::new(
+        dataset.manifest.version,
+        Operation::CreateIndex {
+            new_indices: vec![IndexMetadata {
+                fields,
+                covering_fields,
+                ..plain.clone()
+            }],
+            removed_indices: vec![plain.clone()],
+        },
+        None,
+    )
+}
+
+pub fn covering_bits(dataset: &Dataset) -> (u64, u64) {
+    let covering = FLAG_COVERED_INDEX_METADATA | FLAG_INDEPENDENT_COVERING_FIELDS;
+    (
+        dataset.manifest.reader_feature_flags & covering,
+        dataset.manifest.writer_feature_flags & covering,
+    )
 }

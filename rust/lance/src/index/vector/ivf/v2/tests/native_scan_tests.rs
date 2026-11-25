@@ -5,8 +5,14 @@ use super::super::IVFIndex;
 use super::native_resident_tests::open_with_session;
 use super::native_storage_tests::*;
 use super::*;
+use crate::index::frag_reuse::{
+    MissingCoverageReason, OpenPurpose, ResolvedRemapping, SegmentRemappingPlan, fri_cache_id,
+    open_row_id_remapping,
+};
+use crate::index::loading::IvfIndexStateCacheKey;
 use crate::index::vector::ivf::v2::rabit_scan::{RabitCacheLayout, RabitScanScope};
 use crate::session::Session;
+use crate::utils::test::serializing_cache::SerializingCacheBackend;
 use async_trait::async_trait;
 use datafusion::error::DataFusionError;
 use datafusion::physical_plan::{SendableRecordBatchStream, stream::RecordBatchStreamAdapter};
@@ -770,6 +776,9 @@ async fn test_native_strategy_scoring_through_fragment_reuse(
         .open_vector_index("vector", &uuid, &NoOpMetricsCollector)
         .await
         .unwrap();
+    dataset
+        .table_state
+        .set_session(session.table_session.clone());
     dataset.session = session;
     let lazy = dataset
         .open_vector_index("vector", &uuid, &NoOpMetricsCollector)
@@ -1430,4 +1439,376 @@ async fn test_partition_survivors_preserve_native_batches(
             >= 3,
         "recall must be >= 0.5"
     );
+}
+
+/// The portable state survives an actual remap, while each view retains its
+/// own translated addresses. Exercise both live and decoded state entries.
+#[rstest]
+#[case::v0_memory(false, false)]
+#[case::v0_serialized(false, true)]
+#[case::v1_memory(true, false)]
+#[case::v1_serialized(true, true)]
+#[tokio::test]
+async fn portable_state_survives_remapping(#[case] tagged: bool, #[case] serialized: bool) {
+    let dir = TempStrDir::default();
+    let (_, batch) = native_fixture(dir.as_str()).await;
+    let serial = Arc::new(SerializingCacheBackend::new());
+    let backend: Arc<dyn CacheBackend> = if serialized {
+        serial.clone()
+    } else {
+        Arc::new(QuickCacheBackend::with_capacity(4 * 1024 * 1024))
+    };
+    let make_session = |backend| {
+        Session::with_index_cache_backend(backend, LAZY_METADATA_CACHE_BYTES, Arc::default())
+            .with_rabit_scan_factory(Arc::new(NativeScanFactory::Survivors(
+                ExIndex::Identity,
+                RabitScanScope::Query,
+            )))
+    };
+    let mut dataset = open_with_session(dir.as_str(), make_session(backend)).await;
+    let uuid = dataset.load_indices().await.unwrap()[0].uuid;
+    let query = lazy_test_query(batch["vector"].as_fixed_size_list().value(7), 16, 4);
+    dataset.delete("i % 17 = 7").await.unwrap();
+    // Keep two outputs so the next compaction actually moves their rows.
+    // A 128-row target consolidates these 241 surviving rows into one file.
+    compact_files(
+        &mut dataset,
+        CompactionOptions {
+            target_rows_per_fragment: 100,
+            max_rows_per_group: 16,
+            defer_index_remap: true,
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.fragments().len(), 2);
+    let old = dataset.clone();
+    let index_meta = dataset
+        .load_indices()
+        .await
+        .unwrap()
+        .iter()
+        .find(|meta| meta.uuid == uuid)
+        .unwrap()
+        .clone();
+    let store = dataset.object_store_for_index(&index_meta).await.unwrap();
+    let index_dir = dataset
+        .indice_files_dir(&index_meta)
+        .unwrap()
+        .join(uuid.to_string());
+    let index_path = index_dir.join(lance_index::INDEX_FILE_NAME);
+    let state_key = IvfIndexStateCacheKey::new(&uuid, &store.store_prefix, index_path.as_ref());
+    let initial = dataset
+        .open_vector_index("vector", &uuid, &NoOpMetricsCollector)
+        .await
+        .unwrap();
+    initial.prewarm().await.unwrap();
+    drop(initial);
+    let state = dataset.index_cache.get_with_key(&state_key).await.unwrap();
+    let inserts = serial
+        .serialized_insert_count(IvfStateEntryBox::TYPE_ID)
+        .await;
+
+    dataset.delete("i = 8").await.unwrap();
+    if tagged {
+        let old_fragments = dataset.fragments().clone();
+        let ids = old_fragments.iter().map(|f| f.id).collect::<Vec<_>>();
+        let (transition, new_fragments) =
+            crate::index::frag_reuse_reader::tests::prepare_partition(&dataset, &ids, 10).await;
+        let fri = crate::index::frag_reuse::frag_reuse_entry_appending(&dataset, vec![transition])
+            .await
+            .unwrap();
+        let transaction = Transaction::new(
+            dataset.version().version,
+            Operation::Rewrite {
+                groups: vec![RewriteGroup {
+                    old_fragments: old_fragments.as_ref().clone(),
+                    new_fragments,
+                }],
+                rewritten_indices: vec![],
+                frag_reuse_index: Some(fri),
+            },
+            None,
+        );
+        dataset = crate::dataset::write::CommitBuilder::new(Arc::new(dataset))
+            .execute(transaction)
+            .await
+            .unwrap();
+    } else {
+        let compacted = compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 1024,
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(compacted.fragments_removed, 2);
+        assert_eq!(dataset.fragments().len(), 1);
+    }
+    // A serialized backend restart retains bytes but no live cache entries.
+    let old = if serialized {
+        dataset = open_with_session(dir.as_str(), make_session(Arc::new(serial.restart()))).await;
+        dataset
+            .checkout_version(old.version().version)
+            .await
+            .unwrap()
+    } else {
+        old
+    };
+    let mut cases = Vec::with_capacity(2);
+    let mut addresses = Vec::with_capacity(2);
+    let mut v0_id = None;
+    for (view_id, view) in [&old, &dataset].into_iter().enumerate() {
+        let metadata = view.load_indices().await.unwrap();
+        let meta = metadata.iter().find(|m| m.uuid == uuid).unwrap();
+        let mapping = open_row_id_remapping(view, meta, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        if view_id == 0 {
+            assert!(matches!(mapping, Some((_, ResolvedRemapping::V0 { .. }))));
+            v0_id = fri_cache_id(&mapping).copied();
+            assert!(v0_id.is_some());
+        } else if tagged {
+            assert!(matches!(
+                mapping,
+                Some((_, ResolvedRemapping::V1Translate { .. }))
+            ));
+        } else {
+            assert!(matches!(mapping, Some((_, ResolvedRemapping::V0 { .. }))));
+            assert_ne!(v0_id.as_ref(), fri_cache_id(&mapping));
+        }
+        let live = view
+            .scan()
+            .filter("i % 3 = 0")
+            .unwrap()
+            .with_row_id()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let mask = Arc::new(RowAddrMask::AllowList(
+            live[ROW_ID]
+                .as_primitive::<UInt64Type>()
+                .values()
+                .iter()
+                .copied()
+                .collect(),
+        ));
+        let filter: Arc<dyn PreFilter> = Arc::new(DatasetPreFilter::new_with_filter_future(
+            Arc::new(view.clone()),
+            &metadata,
+            Some(async move { Ok(mask) }.boxed()),
+        ));
+        let eager_dataset = crate::DatasetBuilder::from_uri(dir.as_str())
+            .with_version(view.version().version)
+            .load()
+            .await
+            .unwrap();
+        let eager = eager_dataset
+            .open_vector_index("vector", &uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let expected = result_bits(&search_global(&eager, &query, filter.clone()).await.unwrap());
+        // Match DatasetPreFilter: select top-k from the filtered rows, not
+        // a filtered subset of the unfiltered top-k.
+        let truth = view
+            .scan()
+            .nearest("vector", query.key.as_ref(), 16)
+            .unwrap()
+            .filter("i % 3 = 0")
+            .unwrap()
+            .prefilter(true)
+            .use_index(false)
+            .with_row_id()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(truth.num_rows(), query.k);
+        let truth: HashSet<_> = truth[ROW_ID]
+            .as_primitive::<UInt64Type>()
+            .values()
+            .iter()
+            .copied()
+            .collect();
+        let recalled = expected.0.iter().filter(|row| truth.contains(row)).count();
+        assert!(
+            recalled >= 8,
+            "recall >= 0.5: {recalled}/16 for view {view_id}"
+        );
+        let metrics = LocalMetricsCollector::default();
+        let index = view
+            .open_vector_index("vector", &uuid, &metrics)
+            .await
+            .unwrap();
+        assert_eq!(
+            metrics.index_loads.load(Ordering::Relaxed),
+            0,
+            "remapping must reuse portable state"
+        );
+        let result = search_global(&index, &query, filter.clone()).await.unwrap();
+        assert_eq!(result_bits(&result), expected);
+        let mut view_addresses = Vec::new();
+        let native = lazy_index(&index);
+        for part in 0..4 {
+            let sign = native
+                .storage
+                .load_sign_stage(part, &native.raw_cache, None)
+                .await
+                .unwrap();
+            let again = native
+                .storage
+                .load_sign_stage(part, &native.raw_cache, None)
+                .await
+                .unwrap();
+            assert_eq!(
+                sign.row_ids().next().map(std::ptr::from_ref),
+                again.row_ids().next().map(std::ptr::from_ref),
+                "repeated translation must reuse the charged address buffer"
+            );
+            view_addresses.extend(sign.row_ids().copied());
+        }
+        addresses.push(view_addresses);
+        cases.push((view, filter, expected));
+        let current_state = view.index_cache.get_with_key(&state_key).await.unwrap();
+        assert_eq!(state.deep_size_of(), current_state.deep_size_of());
+        if !serialized {
+            assert!(Arc::ptr_eq(&state, &current_state));
+        }
+    }
+    assert_ne!(
+        addresses[0], addresses[1],
+        "translated addresses must remain view-specific"
+    );
+    let check = async |i: usize| {
+        let case = &cases[i];
+        let metrics = LocalMetricsCollector::default();
+        let index = case
+            .0
+            .open_vector_index("vector", &uuid, &metrics)
+            .await
+            .unwrap();
+        assert_eq!(metrics.index_loads.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            result_bits(&search_global(&index, &query, case.1.clone()).await.unwrap()),
+            case.2
+        );
+    };
+    for _ in 0..2 {
+        check(0).await;
+        check(1).await;
+        tokio::join!(check(0), check(1));
+    }
+    if serialized {
+        assert_eq!(
+            serial
+                .serialized_insert_count(IvfStateEntryBox::TYPE_ID)
+                .await,
+            inserts,
+            "remapping and restart must not insert another serialized state"
+        );
+    }
+    if tagged {
+        // Identity requires coverage outside the FRI lineage, including its
+        // destinations. Append an untouched fragment and index only its rows.
+        let appended = batch.slice(0, 32);
+        dataset
+            .append(
+                RecordBatchIterator::new(vec![Ok(appended.clone())], appended.schema()),
+                None,
+            )
+            .await
+            .unwrap();
+        let untouched = dataset.fragments().last().unwrap().clone();
+        let meta = dataset
+            .create_index_builder(
+                &["vector"],
+                IndexType::Vector,
+                &VectorIndexParams::ivf_flat(1, DistanceType::L2),
+            )
+            .name("identity_idx".into())
+            .fragments(vec![untouched.id as u32])
+            .await
+            .unwrap();
+        let mapping = open_row_id_remapping(&dataset, &meta, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert!(
+            matches!(mapping, Some((_, ResolvedRemapping::V1Identity))),
+            "{mapping:?}"
+        );
+        let index = dataset
+            .open_vector_index("vector", &meta.uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let filter: Arc<dyn PreFilter> = Arc::new(DatasetPreFilter::new_with_filter_future(
+            Arc::new(dataset.clone()),
+            std::slice::from_ref(&meta),
+            None,
+        ));
+        let identity_query = lazy_test_query(query.key.clone(), query.k, 1);
+        let first = search_global(&index, &identity_query, filter.clone())
+            .await
+            .unwrap();
+        let truth = dataset
+            .scan()
+            .with_fragments(vec![untouched])
+            .nearest("vector", query.key.as_ref(), 16)
+            .unwrap()
+            .use_index(false)
+            .with_row_id()
+            .try_into_batch()
+            .await
+            .unwrap();
+        // Flat partition results retain heap order; the scanner sorts them.
+        // Keep `first` unchanged for the exact reconstruction comparison below.
+        let order = arrow::compute::sort_to_indices(&first[DIST_COL], None, None).unwrap();
+        let ordered = arrow::compute::take_record_batch(&first, &order).unwrap();
+        assert_eq!(result_bits(&ordered).0, result_bits(&truth).0);
+        let metrics = LocalMetricsCollector::default();
+        let reconstructed = dataset
+            .open_vector_index("vector", &meta.uuid, &metrics)
+            .await
+            .unwrap();
+        assert_eq!(metrics.index_loads.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            result_bits(&first),
+            result_bits(
+                &search_global(&reconstructed, &identity_query, filter)
+                    .await
+                    .unwrap()
+            )
+        );
+        for (reason, purpose, message) in [
+            (
+                MissingCoverageReason::NoDerivedCoverage,
+                OpenPurpose::Query,
+                "FRI query coverage is unavailable",
+            ),
+            (
+                MissingCoverageReason::Unsupported,
+                OpenPurpose::Maintenance,
+                "cannot be translated by this build",
+            ),
+        ] {
+            let result = dataset
+                .open_vector_index_from_metadata_with_plan(
+                    "vector",
+                    &meta,
+                    Some(&SegmentRemappingPlan::MissingCoverage(reason)),
+                    purpose,
+                    &NoOpMetricsCollector,
+                )
+                .await;
+            let Err(error) = result else {
+                panic!("warm state must not bypass the plan");
+            };
+            assert!(matches!(error, Error::NotSupported { .. }));
+            assert!(error.to_string().contains(message), "{error}");
+        }
+    }
 }

@@ -44,7 +44,6 @@ use crate::{
     dataset::{
         ROW_ID,
         fragment::{FileFragment, V1FragmentReader},
-        versions,
     },
     datatypes::Schema,
 };
@@ -312,8 +311,9 @@ impl FragmentScanner {
         if let Some(file_reader_options) = config.file_reader_options.clone() {
             frag_config = frag_config.with_file_reader_options(file_reader_options);
         }
-        let mut reader =
-            versions::open_v1_fragment_reader(&fragment, dataset.schema(), &frag_config).await?;
+        let mut reader = fragment
+            .open_v1_fragment_reader(dataset.schema(), &frag_config)
+            .await?;
         if config.make_deletions_null {
             reader.with_make_deletions_null();
         }
@@ -356,12 +356,14 @@ impl FragmentScanner {
             })
             .map(move |(batch_id, predicate)| {
                 let scanner_ref = scanner.clone();
-                tokio::task::spawn(async move { scanner_ref.read_batch(batch_id, predicate).await })
-                    .map(|res| match res {
-                        Ok(Ok(batch)) => Ok(batch),
-                        Ok(Err(err)) => Err(err),
-                        Err(join_err) => Err(DataFusionError::ExecutionJoin(Box::new(join_err))),
-                    })
+                lance_core::utils::tokio::spawn(async move {
+                    scanner_ref.read_batch(batch_id, predicate).await
+                })
+                .map(|res| match res {
+                    Ok(Ok(batch)) => Ok(batch),
+                    Ok(Err(err)) => Err(err),
+                    Err(join_err) => Err(DataFusionError::ExecutionJoin(Box::new(join_err))),
+                })
             });
 
         let stream = if ordered_output {

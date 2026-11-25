@@ -32,7 +32,20 @@ pub extern "system" fn Java_org_lance_Dataset_nativeMergeInsert<'a>(
 ) -> JObject<'a> {
     ok_or_throw!(
         env,
-        inner_merge_insert(&mut env, jdataset, jparam, batch_address)
+        inner_merge_insert(&mut env, jdataset, jparam, batch_address, false)
+    )
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_Dataset_nativeAnalyzeMergeInsert<'a>(
+    mut env: JNIEnv<'a>,
+    jdataset: JObject,
+    jparam: JObject,
+    batch_address: jlong,
+) -> JObject<'a> {
+    ok_or_throw!(
+        env,
+        inner_merge_insert(&mut env, jdataset, jparam, batch_address, true)
     )
 }
 
@@ -44,6 +57,7 @@ fn inner_merge_insert<'local>(
     jdataset: JObject,
     jparam: JObject,
     batch_address: jlong,
+    analyze: bool,
 ) -> Result<JObject<'local>> {
     let on = extract_on(env, &jparam)?;
     let when_matched = extract_when_matched(env, &jparam)?;
@@ -93,6 +107,23 @@ fn inner_merge_insert<'local>(
 
         let stream_ptr = batch_address as *mut FFI_ArrowArrayStream;
         let source_stream = ArrowArrayStreamReader::from_raw(stream_ptr)?;
+
+        if analyze {
+            drop(dataset);
+            let report = block_on(async move {
+                merge_insert_job
+                    .analyze_plan_report(lance_datafusion::utils::reader_to_stream(Box::new(
+                        source_stream,
+                    )))
+                    .await
+            })?;
+            let bytes = JObject::from(env.byte_array_from_slice(&report.to_bytes())?);
+            return Ok(env.new_object(
+                "org/lance/merge/MergeInsertAnalysis",
+                "([B)V",
+                &[JValueGen::Object(&bytes)],
+            )?);
+        }
 
         block_on(async move { merge_insert_job.execute_reader(source_stream).await })?
     };

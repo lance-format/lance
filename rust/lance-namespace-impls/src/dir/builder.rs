@@ -12,7 +12,7 @@ use lance_namespace::error::NamespaceError;
 use object_store::path::Path;
 use tokio::sync::OnceCell;
 
-use super::{DirectoryNamespace, OpsMetrics, manifest, manifest_feature_flags};
+use super::{DirectoryNamespace, OpsMetrics, TableDiscoveryMode, manifest, manifest_feature_flags};
 use crate::context::DynamicContextProvider;
 use crate::credentials::{create_credential_vendor_for_location, has_credential_vendor_config};
 
@@ -65,6 +65,8 @@ pub struct DirectoryNamespaceBuilder {
     /// avoiding extra object store calls.
     dir_listing_to_manifest_migration_enabled: bool,
     credential_vendor_properties: HashMap<String, String>,
+    /// Transferred to DirectoryNamespace, which retains it for its lifetime even
+    /// though it does not consume per-request context.
     context_provider: Option<Arc<dyn DynamicContextProvider>>,
     commit_retries: Option<u32>,
     /// When true, returns input storage options in describe_table/declare_table responses
@@ -143,16 +145,17 @@ impl DirectoryNamespaceBuilder {
     /// Enable or disable manifest-based listing.
     ///
     /// When enabled (default), the namespace uses a `__manifest` table to track tables.
-    /// When disabled, relies solely on directory scanning.
+    /// When disabled, table discovery relies on directory listing.
     pub fn manifest_enabled(mut self, enabled: bool) -> Self {
         self.manifest_enabled = enabled;
         self
     }
 
-    /// Enable or disable directory-based listing fallback.
+    /// Enable or disable directory-based table discovery.
     ///
-    /// When enabled (default), falls back to directory scanning for tables not in the manifest.
-    /// When disabled, only consults the manifest table.
+    /// When enabled (default), root-level tables are discovered by scanning the directory,
+    /// unless migration mode is enabled. Child namespaces still require the manifest.
+    /// When disabled, root-level discovery uses only the manifest (if enabled).
     pub fn dir_listing_enabled(mut self, enabled: bool) -> Self {
         self.dir_listing_enabled = enabled;
         self
@@ -237,7 +240,11 @@ impl DirectoryNamespaceBuilder {
     ///
     /// # Errors
     ///
-    /// Returns an error if the `root` property is missing.
+    /// Returns an error if:
+    /// - The `root` property is missing
+    /// - One of the boolean or integer directory properties (e.g.
+    ///   `manifest_enabled`, `commit_retries`) is present but its value cannot
+    ///   be parsed as the expected type
     ///
     /// # Examples
     ///
@@ -283,35 +290,30 @@ impl DirectoryNamespaceBuilder {
             Some(storage_options)
         };
 
+        // Typed properties must parse when present; absent keys keep their
+        // documented defaults. Rejecting present-but-unparsable values keeps
+        // a typo like "not-a-bool" from silently flipping a knob back to its default.
         // Extract manifest_enabled (default: true)
-        let manifest_enabled = properties
-            .get("manifest_enabled")
-            .and_then(|v| str_to_bool(v))
-            .unwrap_or(true);
+        let manifest_enabled = Self::parse_bool_property(&properties, "manifest_enabled", true)?;
 
         // Extract dir_listing_enabled (default: true)
-        let dir_listing_enabled = properties
-            .get("dir_listing_enabled")
-            .and_then(|v| str_to_bool(v))
-            .unwrap_or(true);
+        let dir_listing_enabled =
+            Self::parse_bool_property(&properties, "dir_listing_enabled", true)?;
 
         // Extract inline_optimization_enabled (default: false)
-        let inline_optimization_enabled = properties
-            .get("inline_optimization_enabled")
-            .and_then(|v| str_to_bool(v))
-            .unwrap_or(false);
+        let inline_optimization_enabled =
+            Self::parse_bool_property(&properties, "inline_optimization_enabled", false)?;
 
         // Extract table_version_tracking_enabled (default: false)
-        let table_version_tracking_enabled = properties
-            .get("table_version_tracking_enabled")
-            .and_then(|v| str_to_bool(v))
-            .unwrap_or(false);
+        let table_version_tracking_enabled =
+            Self::parse_bool_property(&properties, "table_version_tracking_enabled", false)?;
 
         // Extract dir_listing_to_manifest_migration_enabled (default: false)
-        let dir_listing_to_manifest_migration_enabled = properties
-            .get("dir_listing_to_manifest_migration_enabled")
-            .and_then(|v| str_to_bool(v))
-            .unwrap_or(false);
+        let dir_listing_to_manifest_migration_enabled = Self::parse_bool_property(
+            &properties,
+            "dir_listing_to_manifest_migration_enabled",
+            false,
+        )?;
 
         // Extract credential vendor properties (properties prefixed with "credential_vendor.")
         // The prefix is stripped to get short property names
@@ -324,26 +326,27 @@ impl DirectoryNamespaceBuilder {
             })
             .collect();
 
-        let commit_retries = properties
-            .get("commit_retries")
-            .and_then(|v| v.parse::<u32>().ok());
+        let commit_retries: Option<u32> = Self::parse_optional_property(
+            &properties,
+            "commit_retries",
+            "a non-negative integer number of retries",
+        )?;
 
         // Extract vend_input_storage_options (default: false)
-        let vend_input_storage_options = properties
-            .get("vend_input_storage_options")
-            .and_then(|v| str_to_bool(v))
-            .unwrap_or(false);
+        let vend_input_storage_options =
+            Self::parse_bool_property(&properties, "vend_input_storage_options", false)?;
 
         // Extract vend_input_storage_options_refresh_interval_millis (optional)
-        let vend_input_storage_options_refresh_interval_millis = properties
-            .get("vend_input_storage_options_refresh_interval_millis")
-            .and_then(|v| v.parse::<u64>().ok());
+        let vend_input_storage_options_refresh_interval_millis: Option<u64> =
+            Self::parse_optional_property(
+                &properties,
+                "vend_input_storage_options_refresh_interval_millis",
+                "a non-negative integer number of milliseconds",
+            )?;
 
         // Extract ops_metrics_enabled (default: false)
-        let ops_metrics_enabled = properties
-            .get("ops_metrics_enabled")
-            .and_then(|v| str_to_bool(v))
-            .unwrap_or(false);
+        let ops_metrics_enabled =
+            Self::parse_bool_property(&properties, "ops_metrics_enabled", false)?;
 
         Ok(Self {
             root: root.trim_end_matches('/').to_string(),
@@ -361,6 +364,53 @@ impl DirectoryNamespaceBuilder {
             vend_input_storage_options_refresh_interval_millis,
             ops_metrics_enabled,
         })
+    }
+
+    /// Parse a boolean property, falling back to `default` when the key is absent.
+    ///
+    /// A present value that [`str_to_bool`] cannot parse is rejected so typos
+    /// do not silently re-enable or disable a knob.
+    fn parse_bool_property(
+        properties: &HashMap<String, String>,
+        key: &str,
+        default: bool,
+    ) -> Result<bool> {
+        match properties.get(key) {
+            Some(value) => str_to_bool(value).ok_or_else(|| {
+                lance_core::Error::from(NamespaceError::InvalidInput {
+                    message: format!(
+                        "Invalid value '{value}' for property '{key}', expected a boolean \
+                         (true/false/1/0/on/off/yes/no/y/n, case-insensitive)"
+                    ),
+                })
+            }),
+            None => Ok(default),
+        }
+    }
+
+    /// Parse an optional typed property, returning `None` when the key is absent.
+    ///
+    /// A present value that cannot be parsed as `T` is rejected with the
+    /// expected format described by `expected`.
+    fn parse_optional_property<T>(
+        properties: &HashMap<String, String>,
+        key: &str,
+        expected: &str,
+    ) -> Result<Option<T>>
+    where
+        T: std::str::FromStr,
+        T::Err: std::fmt::Display,
+    {
+        match properties.get(key) {
+            Some(value) => value.parse::<T>().map(Some).map_err(|e| {
+                lance_core::Error::from(NamespaceError::InvalidInput {
+                    message: format!(
+                        "Invalid value '{value}' for property '{key}', expected {expected}: {e}"
+                    ),
+                })
+            }),
+            None => Ok(None),
+        }
     }
 
     /// Add a storage option.
@@ -461,8 +511,9 @@ impl DirectoryNamespaceBuilder {
     /// Set a dynamic context provider for per-request context.
     ///
     /// The provider can be used to generate additional context for operations.
-    /// For DirectoryNamespace, the context is stored but not directly used
-    /// in operations (unlike RestNamespace where it's converted to HTTP headers).
+    /// DirectoryNamespace retains the provider for the lifetime of the built
+    /// namespace but does not call it (unlike RestNamespace where it is converted
+    /// to HTTP headers).
     ///
     /// # Arguments
     ///
@@ -532,14 +583,20 @@ impl DirectoryNamespaceBuilder {
         let (object_store, base_path) =
             Self::initialize_object_store(&self.root, &self.storage_options, &self.session).await?;
 
-        let manifest_ns = if self.manifest_enabled {
+        let table_discovery_mode = TableDiscoveryMode::from_flags(
+            self.manifest_enabled,
+            self.dir_listing_enabled,
+            self.dir_listing_to_manifest_migration_enabled,
+        );
+
+        let manifest_ns = if table_discovery_mode.has_manifest() {
             match manifest::ManifestNamespace::open_from_directory(
                 self.root.clone(),
                 self.storage_options.clone(),
                 self.session.clone(),
                 object_store.clone(),
                 base_path.clone(),
-                self.dir_listing_enabled,
+                table_discovery_mode.has_directory_listing(),
                 self.inline_optimization_enabled,
                 self.commit_retries,
             )
@@ -590,15 +647,12 @@ impl DirectoryNamespaceBuilder {
             base_path,
             manifest_ns: manifest_cell,
             write_manifest_ns: OnceCell::new(),
-            manifest_enabled: self.manifest_enabled,
-            dir_listing_enabled: self.dir_listing_enabled,
+            table_discovery_mode,
             inline_optimization_enabled: self.inline_optimization_enabled,
             commit_retries: self.commit_retries,
-            dir_listing_to_manifest_migration_enabled: self
-                .dir_listing_to_manifest_migration_enabled,
             table_version_tracking_enabled: self.table_version_tracking_enabled,
             credential_vendor,
-            context_provider: self.context_provider,
+            _context_provider: self.context_provider,
             vend_input_storage_options: self.vend_input_storage_options,
             vend_input_storage_options_refresh_interval_millis: self
                 .vend_input_storage_options_refresh_interval_millis,

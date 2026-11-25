@@ -60,7 +60,7 @@ use tracing::{Span, info_span, instrument};
 use uuid::Uuid;
 
 use super::Dataset;
-use crate::dataset::utils::SchemaAdapter;
+use crate::dataset::utils::to_logical_stream;
 use crate::datatypes::Schema;
 use crate::index::scalar::{IndexDetails, fetch_index_details};
 use crate::io::exec::LanceFilterExec;
@@ -73,62 +73,12 @@ pub use lance_datafusion::exec::{ExecutionStatsCallback, ExecutionSummaryCounts}
 #[cfg(feature = "substrait")]
 use lance_datafusion::substrait::parse_substrait;
 
-/// Rows per output batch when neither the scan options nor
-/// `LANCE_DEFAULT_BATCH_SIZE` specify one.
-pub const BATCH_SIZE_FALLBACK: usize = 8192;
-
-pub(crate) fn validate_batch_size(batch_size: usize) -> Result<u32> {
-    let validated = u32::try_from(batch_size).map_err(|_| {
-        Error::invalid_input(format!(
-            "batch_size must be between 1 and {}, got {batch_size}",
-            u32::MAX
-        ))
-    })?;
-    if validated == 0 {
-        return Err(Error::invalid_input(format!(
-            "batch_size must be between 1 and {}, got {batch_size}",
-            u32::MAX
-        )));
-    }
-    Ok(validated)
-}
-
-/// Parse an environment variable as a specific type, logging a warning on parse failure.
-fn parse_env_var<T: std::str::FromStr>(env_var_name: &str, default_val: &str) -> Option<T>
-where
-    T::Err: std::fmt::Display,
-{
-    std::env::var(env_var_name)
-        .ok()
-        .and_then(|val| match val.parse() {
-            Ok(value) => Some(value),
-            Err(e) => {
-                log::warn!(
-                    "Failed to parse the environment variable {}='{}': {}, the default value is: {}.",
-                    env_var_name,
-                    val,
-                    e,
-                    default_val
-                );
-                None
-            }
-        })
-}
-
-// For backwards compatibility / historical reasons we re-calculate the default batch size
-// on each call
-pub fn get_default_batch_size() -> Option<usize> {
-    parse_env_var("LANCE_DEFAULT_BATCH_SIZE", &BATCH_SIZE_FALLBACK.to_string())
-}
-
-pub const LEGACY_DEFAULT_FRAGMENT_READAHEAD: usize = 4;
-
-pub static DEFAULT_FRAGMENT_READAHEAD: LazyLock<Option<usize>> = LazyLock::new(|| {
-    parse_env_var(
-        "LANCE_DEFAULT_FRAGMENT_READAHEAD",
-        &LEGACY_DEFAULT_FRAGMENT_READAHEAD.to_string(),
-    )
-});
+use lance_table_runtime::fragment::read_defaults::parse_env_var;
+pub(crate) use lance_table_runtime::fragment::read_defaults::validate_batch_size;
+pub use lance_table_runtime::fragment::read_defaults::{
+    BATCH_SIZE_FALLBACK, DEFAULT_FRAGMENT_READAHEAD, DEFAULT_IO_BUFFER_SIZE,
+    LEGACY_DEFAULT_FRAGMENT_READAHEAD, get_default_batch_size, get_default_io_buffer_size_override,
+};
 
 const DEFAULT_XTR_OVERFETCH_VALUE: u32 = 10;
 
@@ -139,31 +89,6 @@ pub static DEFAULT_XTR_OVERFETCH: LazyLock<u32> = LazyLock::new(|| {
     )
     .unwrap_or(DEFAULT_XTR_OVERFETCH_VALUE)
 });
-
-// We want to support ~256 concurrent reads to maximize throughput on cloud storage systems
-// Our typical page size is 8MiB (though not all reads are this large yet due to offset buffers, validity buffers, etc.)
-// So we want to support 256 * 8MiB ~= 2GiB of queued reads
-const DEFAULT_IO_BUFFER_SIZE_VALUE: u64 = 2 * 1024 * 1024 * 1024;
-
-pub static DEFAULT_IO_BUFFER_SIZE: LazyLock<u64> = LazyLock::new(|| {
-    parse_env_var(
-        "LANCE_DEFAULT_IO_BUFFER_SIZE",
-        &DEFAULT_IO_BUFFER_SIZE_VALUE.to_string(),
-    )
-    .unwrap_or(DEFAULT_IO_BUFFER_SIZE_VALUE)
-});
-
-/// The user-set value of `LANCE_DEFAULT_IO_BUFFER_SIZE`, or `None` if the env var
-/// is unset or unparsable. Consult this from paths that have a sensible non-fixed
-/// default (e.g. `SchedulerConfig::max_bandwidth`) so the env var still takes
-/// precedence over that default. Re-reads the env var on each call so tests can
-/// mutate it.
-pub fn get_default_io_buffer_size_override() -> Option<u64> {
-    parse_env_var(
-        "LANCE_DEFAULT_IO_BUFFER_SIZE",
-        &DEFAULT_IO_BUFFER_SIZE_VALUE.to_string(),
-    )
-}
 
 /// Defines an ordering for a single column
 ///
@@ -428,7 +353,7 @@ impl ExprFilter {
             Self::Sql(sql) => {
                 let schema = Arc::new(ArrowSchema::from(full_schema));
                 let planner = Planner::new(schema.clone());
-                let filter = planner.parse_filter(sql)?;
+                let filter = planner.parse_filter_with_schema(sql, full_schema)?;
 
                 let df_schema = DFSchema::try_from(schema)?;
                 let ret_field = filter.to_field(&df_schema)?.1;
@@ -571,6 +496,8 @@ pub struct Scanner {
     probe_params: ProbeParams,
     /// Candidate overfetch factor for RQ Fast-to-Accurate refinement.
     quantized_refine_factor: Option<u32>,
+    /// WARP's `t'`; `None` scales it with the indexed corpus.
+    warp_imputation_rank: Option<usize>,
     nearest_query_count: usize,
     /// True when the query shape represents a batch of single-vector queries
     /// (list-like query on a fixed-size vector column, or multiple concatenated vectors).
@@ -704,7 +631,7 @@ impl Dataset {
                         "fragment_ids contains duplicate fragment IDs: {fragment_ids:?}"
                     )));
                 }
-                let unknown = &fragment_set - self.fragment_bitmap.as_ref();
+                let unknown = &fragment_set - self.table_state.fragment_bitmap.as_ref();
                 if !unknown.is_empty() {
                     return Err(Error::invalid_input(format!(
                         "fragment_ids contains unknown fragment IDs: {:?}",
@@ -749,7 +676,7 @@ impl Dataset {
                         segment.name
                     )));
                 }
-                let Some(field_id) = segment.keyed_field() else {
+                let Some(&field_id) = segment.keyed_fields().first() else {
                     return Err(Error::invalid_input(format!(
                         "Scalar index '{index_name}' segment {segment_uuid} has no keyed field"
                     )));
@@ -780,7 +707,7 @@ impl Dataset {
                             "Scalar index '{index_name}' segment {segment_uuid} is missing fragment coverage"
                         ))
                     })?;
-                let current_coverage = coverage & self.fragment_bitmap.as_ref();
+                let current_coverage = coverage & self.table_state.fragment_bitmap.as_ref();
                 if current_coverage.is_empty() {
                     return Err(Error::invalid_input(format!(
                         "Scalar index '{index_name}' segment {segment_uuid} does not cover any current dataset fragments"
@@ -935,13 +862,7 @@ pub struct DatasetRecordBatchStream {
 
 impl DatasetRecordBatchStream {
     pub fn new(exec_node: SendableRecordBatchStream) -> Self {
-        let schema = exec_node.schema();
-        let adapter = SchemaAdapter::new(schema.clone());
-        let exec_node = if SchemaAdapter::requires_logical_conversion(&schema) {
-            adapter.to_logical_stream(exec_node)
-        } else {
-            exec_node
-        };
+        let exec_node = to_logical_stream(exec_node);
 
         let span = info_span!("DatasetRecordBatchStream");
         Self { exec_node, span }
@@ -1097,5 +1018,319 @@ mod tests {
             std::env::remove_var("LANCE_DEFAULT_IO_BUFFER_SIZE");
         }
         assert_eq!(get_default_io_buffer_size_override(), None);
+    }
+
+    mod multi_column_planner {
+        use arrow_array::cast::AsArray;
+        use arrow_array::types::UInt64Type;
+        use arrow_array::{Int32Array, RecordBatchIterator, StringArray};
+        use arrow_schema::{DataType, Field, Fields, Schema as ArrowSchema};
+        use async_trait::async_trait;
+        use datafusion::logical_expr::Expr;
+        use datafusion::scalar::ScalarValue;
+        use futures::TryStreamExt;
+        use lance_core::ROW_ID;
+        use lance_core::cache::LanceCache;
+        use lance_core::utils::tempfile::TempStrDir;
+        use lance_datafusion::exec::{LanceExecutionOptions, execute_plan};
+        use lance_file::version::LanceFileVersion;
+        use lance_index::IndexType;
+        use lance_index::metrics::NoOpMetricsCollector;
+        use lance_index::scalar::expression::{
+            ScalarIndexLoader, ScalarIndexPlan, ScalarIndexPlanner, ScalarIndexSearch,
+            ScalarQueryParser, create_filter_plan,
+        };
+        use lance_index::scalar::registry::ScalarIndexPlugin;
+        use lance_index::scalar::{
+            IndexStore, RowIdRemapper, ScalarIndex, ScalarIndexParams, SearchResult, TextQuery,
+        };
+        use rstest::rstest;
+
+        use super::*;
+        use crate::dataset::WriteParams;
+        use crate::dataset::transaction::{Operation, Transaction};
+        use crate::index::scalar::IndexDetails;
+
+        #[derive(Debug)]
+        struct ContainsPlugin;
+
+        #[async_trait]
+        impl ScalarIndexPlugin for ContainsPlugin {
+            fn name(&self) -> &str {
+                "Contains"
+            }
+
+            fn provides_exact_answer(&self) -> bool {
+                false
+            }
+
+            fn version(&self) -> u32 {
+                0
+            }
+
+            fn new_query_parser(
+                &self,
+                _index_name: String,
+                _index_details: &prost_types::Any,
+            ) -> Option<Box<dyn ScalarQueryParser>> {
+                None
+            }
+
+            fn new_planner(
+                &self,
+                index_name: String,
+                _index_details: &prost_types::Any,
+                keys: &Fields,
+            ) -> Option<Box<dyn ScalarIndexPlanner>> {
+                Some(Box::new(ContainsPlanner {
+                    index_name,
+                    column: keys[0].name().clone(),
+                }))
+            }
+
+            async fn load_index(
+                &self,
+                _index_store: Arc<dyn IndexStore>,
+                _index_details: &prost_types::Any,
+                _index_version: u32,
+                _frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+                _cache: &LanceCache,
+            ) -> Result<Arc<dyn ScalarIndex>> {
+                unimplemented!("scans open sb_idx through the NGram plugin")
+            }
+        }
+
+        #[derive(Debug)]
+        struct ContainsPlanner {
+            index_name: String,
+            column: String,
+        }
+
+        impl ScalarIndexPlanner for ContainsPlanner {
+            fn plan<'a>(&self, conjuncts: &'a [Expr]) -> Option<ScalarIndexPlan<'a>> {
+                conjuncts.iter().find_map(|conjunct| {
+                    let Expr::ScalarFunction(call) = conjunct else {
+                        return None;
+                    };
+                    let [
+                        Expr::Column(column),
+                        Expr::Literal(ScalarValue::Utf8(Some(needle)), _),
+                    ] = call.args.as_slice()
+                    else {
+                        return None;
+                    };
+                    (call.func.name() == "contains" && column.name == self.column).then(|| {
+                        ScalarIndexPlan {
+                            search: ScalarIndexSearch {
+                                column: self.column.clone(),
+                                index_name: self.index_name.clone(),
+                                index_type: "NGram".to_string(),
+                                query: Arc::new(TextQuery::StringContains(needle.clone())),
+                                needs_recheck: true,
+                                fragment_bitmap: None,
+                            },
+                            consumed: vec![conjunct],
+                        }
+                    })
+                })
+            }
+        }
+
+        async fn sb_dataset(version: LanceFileVersion) -> (TempStrDir, Arc<Dataset>) {
+            let schema = Arc::new(ArrowSchema::new(vec![
+                Field::new("s", DataType::Utf8, false),
+                Field::new("b", DataType::Int32, false),
+                Field::new("d", DataType::Int32, false),
+            ]));
+            let abcd_trigrams_without_abcd = "abc-bcd";
+            let words = ["abcd", abcd_trigrams_without_abcd, "xyz", "ab"];
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(StringArray::from_iter_values(
+                        (0..600).map(|row| words[row % 4]),
+                    )),
+                    Arc::new(Int32Array::from_iter_values((0..600).map(|row| row % 11))),
+                    Arc::new(Int32Array::from_iter_values((0..600).map(|row| row % 13))),
+                ],
+            )
+            .unwrap();
+            let test_dir = TempStrDir::default();
+            let mut dataset = Dataset::write(
+                RecordBatchIterator::new([Ok(batch)], schema),
+                test_dir.as_str(),
+                Some(WriteParams {
+                    max_rows_per_file: 200,
+                    data_storage_version: Some(version),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+            assert_eq!(dataset.get_fragments().len(), 3);
+            dataset
+                .create_index(
+                    &["s"],
+                    IndexType::NGram,
+                    Some("sb_idx".to_string()),
+                    &ScalarIndexParams::default(),
+                    false,
+                )
+                .await
+                .unwrap();
+            let mut sb_idx = dataset.load_indices().await.unwrap()[0].clone();
+            sb_idx.fields = ["s", "b"]
+                .map(|name| dataset.schema().field(name).unwrap().id)
+                .to_vec();
+            let transaction = Transaction::new(
+                dataset.manifest.version,
+                Operation::CreateIndex {
+                    new_indices: vec![sb_idx],
+                    removed_indices: vec![],
+                },
+                None,
+            );
+            dataset
+                .apply_commit(transaction, &Default::default(), &Default::default())
+                .await
+                .unwrap();
+            (test_dir, Arc::new(dataset))
+        }
+
+        fn row_ids(batches: &[RecordBatch]) -> Vec<u64> {
+            let mut ids = batches
+                .iter()
+                .flat_map(|batch| {
+                    batch
+                        .column_by_name(ROW_ID)
+                        .unwrap()
+                        .as_primitive::<UInt64Type>()
+                        .values()
+                        .to_vec()
+                })
+                .collect::<Vec<_>>();
+            ids.sort_unstable();
+            ids
+        }
+
+        #[rstest]
+        #[case::at_least("ab", true, "")]
+        #[case::at_least_with_row_residual("ab", true, " AND d < 7")]
+        #[case::at_most("abcd", false, "")]
+        #[case::at_most_with_row_residual("abcd", false, " AND d < 7")]
+        #[tokio::test]
+        async fn planner_results_scan_like_unindexed_reads(
+            #[values(LanceFileVersion::Legacy, LanceFileVersion::Stable)] version: LanceFileVersion,
+            #[case] needle: &str,
+            #[case] at_least: bool,
+            #[case] row_residual: &str,
+        ) {
+            let (_test_dir, dataset) = sb_dataset(version).await;
+            let index = ScalarIndexLoader::load_index(
+                dataset.as_ref(),
+                "s",
+                "sb_idx",
+                &NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+            let result = index
+                .search(
+                    &TextQuery::StringContains(needle.to_string()),
+                    &NoOpMetricsCollector,
+                )
+                .await
+                .unwrap();
+            assert!(
+                matches!(
+                    (at_least, &result),
+                    (true, SearchResult::AtLeast(_)) | (false, SearchResult::AtMost(_))
+                ),
+                "{result:?}"
+            );
+
+            // The scanner finds plugins only in the process-wide registry, so the
+            // test plans the filter itself.
+            let indices = dataset.load_indices().await.unwrap();
+            let info = dataset
+                .scalar_index_info_with_plugins(
+                    &indices,
+                    &HashSet::new(),
+                    |details: &IndexDetails| {
+                        if details.0.type_url.ends_with("NGramIndexDetails") {
+                            Ok(&ContainsPlugin as &dyn ScalarIndexPlugin)
+                        } else {
+                            details.get_plugin()
+                        }
+                    },
+                )
+                .await
+                .unwrap();
+            let filter = format!("contains(s, '{needle}'){row_residual}");
+            let planner = Planner::new(Arc::new(ArrowSchema::from(dataset.schema())));
+            let mut filter_plan = create_filter_plan(
+                planner
+                    .optimize_expr(planner.parse_filter(&filter).unwrap())
+                    .unwrap(),
+                &info,
+                true,
+            )
+            .unwrap();
+
+            let mut scanner = dataset.scan();
+            scanner.with_row_id();
+            let read = scanner
+                .filtered_read_source(&mut filter_plan, None)
+                .await
+                .unwrap();
+            let scan_plan = datafusion::physical_plan::displayable(read.plan.as_ref())
+                .indent(true)
+                .to_string();
+            let batches = execute_plan(read.plan, LanceExecutionOptions::default())
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+
+            let expected = dataset
+                .scan()
+                .filter(&filter)
+                .unwrap()
+                .use_scalar_index(false)
+                .with_row_id()
+                .try_into_batch()
+                .await
+                .unwrap();
+            assert!(expected.num_rows() > 0);
+            assert_eq!(row_ids(&batches), row_ids(&[expected]));
+            let sb_idx_search = format!("[contains(s, Utf8(\"{needle}\"))]@sb_idx(NGram)");
+            assert_eq!(
+                scan_plan.contains(&sb_idx_search),
+                version != LanceFileVersion::Legacy,
+                "{scan_plan}"
+            );
+        }
+
+        #[tokio::test]
+        async fn selected_multi_key_segment_reaches_planning() {
+            let (_test_dir, dataset) = sb_dataset(LanceFileVersion::Stable).await;
+            let segment = dataset.load_indices().await.unwrap()[0].uuid;
+            let filter = "contains(s, 'abcd')";
+            let whole = dataset
+                .count_indexed_rows("sb_idx", filter, None, None)
+                .await
+                .map_err(|error| error.to_string());
+            let selected = dataset
+                .count_indexed_rows("sb_idx", filter, Some(&[segment]), None)
+                .await
+                .map_err(|error| error.to_string());
+            assert_eq!(selected, whole);
+            // No built-in plugin returns a planner, so both calls stop at planning.
+            let error = selected.unwrap_err();
+            assert!(
+                error.contains("Filter cannot be planned using scalar index 'sb_idx'"),
+                "{error}"
+            );
+        }
     }
 }

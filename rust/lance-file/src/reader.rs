@@ -3,7 +3,7 @@
 
 use std::{
     borrow::Cow,
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     fmt::Debug,
     io::Cursor,
     ops::Range,
@@ -18,11 +18,12 @@ use byteorder::{ByteOrder, LittleEndian, ReadBytesExt};
 use bytes::{Bytes, BytesMut};
 use futures::{Stream, StreamExt, stream::BoxStream};
 use lance_core::deepsize::{Context, DeepSizeOf};
+pub use lance_encoding::decoder::FilterExpression;
 use lance_encoding::{
     EncodingsIo,
     decoder::{
-        ColumnInfo, DecoderConfig, DecoderPlugins, FilterExpression, PageEncoding, ReadBatchTask,
-        RequestedRows, SchedulerDecoderConfig, schedule_and_decode, schedule_and_decode_blocking,
+        ColumnInfo, DecoderConfig, DecoderPlugins, PageEncoding, ReadBatchTask, RequestedRows,
+        SchedulerDecoderConfig, schedule_and_decode, schedule_and_decode_blocking,
     },
     encoder::EncodedBatch,
 };
@@ -33,7 +34,7 @@ use prost::Message;
 use lance_core::{
     Error, Result,
     cache::{CacheKey, CacheKeySchema, KeyBuilder, LanceCache},
-    datatypes::{Field, Schema},
+    datatypes::{BLOB_V2_DESC_LANCE_FIELD, Field, Schema},
 };
 use lance_encoding::format::pb as pbenc;
 use lance_encoding::format::pb21 as pbenc21;
@@ -51,6 +52,7 @@ use crate::{
     versions,
 };
 
+mod binary_slices;
 pub(crate) mod structural;
 
 /// Default chunk size for reading large pages (8MiB)
@@ -589,6 +591,79 @@ pub(crate) fn verify_uniform_lengths(field_lengths: &[(&str, u64)]) -> Result<u6
     )))
 }
 
+fn descriptor_child_matches(field: &Field, expected: &Field) -> bool {
+    field.id == -1
+        && field.parent_id == -1
+        && field.name == expected.name
+        && field.logical_type == expected.logical_type
+        && field.children.is_empty()
+}
+
+/// A Blob v2 descriptor struct whose children were split off by the footer
+/// reconstruction. Legacy Blob v1 columns are stored as plain binary fields,
+/// so the struct type check keeps them from receiving Blob v2 children.
+fn is_childless_blob_v2_descriptor(field: &Field) -> bool {
+    field.is_blob()
+        && field.children.is_empty()
+        && field.logical_type == BLOB_V2_DESC_LANCE_FIELD.logical_type
+}
+
+fn attach_blob_descriptor_children(
+    fields: &mut [Field],
+    descriptor_children: &mut VecDeque<Vec<Field>>,
+) {
+    for field in fields {
+        if is_childless_blob_v2_descriptor(field) {
+            if let Some(children) = descriptor_children.pop_front() {
+                field.children = children;
+            }
+        } else {
+            attach_blob_descriptor_children(&mut field.children, descriptor_children);
+        }
+    }
+}
+
+/// Blob descriptor children historically use anonymous field IDs in the file
+/// descriptor. Reconstruct their tree shape before applying ordinary schema
+/// projection rules. This interprets the existing footer representation and
+/// does not add persisted metadata or alter the file grammar.
+///
+/// The function is idempotent: a schema whose Blob fields already have
+/// children is returned unchanged. It takes ownership so decoding a footer
+/// does not clone a schema that is about to be wrapped in an `Arc` anyway.
+pub(crate) fn normalize_blob_footer_schema(mut schema: Schema) -> Schema {
+    let expected = &BLOB_V2_DESC_LANCE_FIELD.children;
+    let missing_descriptor_count = schema
+        .fields_pre_order()
+        .filter(|field| is_childless_blob_v2_descriptor(field))
+        .count();
+    if missing_descriptor_count == 0 {
+        return schema;
+    }
+    let mut descriptor_children = VecDeque::with_capacity(missing_descriptor_count);
+    let mut field_index = 0;
+    while descriptor_children.len() < missing_descriptor_count
+        && field_index + expected.len() <= schema.fields.len()
+    {
+        if schema.fields[field_index..field_index + expected.len()]
+            .iter()
+            .zip(expected)
+            .all(|(field, expected)| descriptor_child_matches(field, expected))
+        {
+            descriptor_children.push_back(
+                schema
+                    .fields
+                    .drain(field_index..field_index + expected.len())
+                    .collect(),
+            );
+        } else {
+            field_index += 1;
+        }
+    }
+    attach_blob_descriptor_children(&mut schema.fields, &mut descriptor_children);
+    schema
+}
+
 impl FileReader {
     pub(crate) fn base_projection(&self) -> &ReaderProjection {
         &self.core.base_projection
@@ -1086,7 +1161,7 @@ impl FileReader {
             fields: Fields(pb_schema.fields),
             metadata: pb_schema.metadata,
         };
-        let schema = Schema::try_from(fields_with_meta)?;
+        let schema = normalize_blob_footer_schema(Schema::try_from(fields_with_meta)?);
         Ok((num_rows, schema))
     }
 
@@ -1214,39 +1289,84 @@ impl FileReader {
         })
     }
 
+    async fn read_schema_buffer(
+        scheduler: &FileScheduler,
+        tail: &Bytes,
+        file_len: u64,
+        buffer: &BufferDescriptor,
+    ) -> Result<(u64, Schema)> {
+        let bytes = Self::read_range_from_tail_or_scheduler(
+            tail,
+            file_len - tail.len() as u64,
+            scheduler,
+            buffer.checked_range(0, file_len)?,
+        )
+        .await?;
+        Self::decode_schema(bytes)
+    }
+
+    async fn read_current_footer(
+        scheduler: &FileScheduler,
+        tail: &Bytes,
+        file_len: u64,
+    ) -> Result<(Footer, ConcreteFileVersion, Vec<BufferDescriptor>)> {
+        let footer = Self::decode_footer(tail).map_err(|error| {
+            Error::corrupt_file(scheduler.reader().path().clone(), error.to_string())
+        })?;
+        let version = Self::current_file_version(&footer)?;
+        Self::validate_footer(&footer, file_len)?;
+        let buffers = Self::decode_gbo_table(tail, file_len, scheduler, &footer, version).await?;
+        if buffers.is_empty() {
+            return Err(Error::internal(
+                "File did not contain any global buffers, schema expected".to_string(),
+            ));
+        }
+        Ok((footer, version, buffers))
+    }
+
+    /// Reads only the file schema, without loading column metadata or user global
+    /// buffers. Returns a version conflict for a legacy file.
+    pub async fn read_schema(scheduler: &FileScheduler) -> Result<Schema> {
+        Ok(Self::read_schema_and_global_buffers(scheduler).await?.0)
+    }
+
+    /// Reads the schema and the validated locations of the global buffers in one
+    /// footer lookup. A caller can range-read part of a buffer without opening
+    /// the file's columns. Buffer zero describes the schema itself.
+    pub async fn read_schema_and_global_buffers(
+        scheduler: &FileScheduler,
+    ) -> Result<(Schema, Vec<BufferDescriptor>)> {
+        let (tail, file_len) = Self::read_tail(scheduler).await?;
+        // A short legacy file may not even have room for a current-format footer.
+        if tail.len() < FOOTER_LEN
+            && tail.ends_with(MAGIC)
+            && let (0, minor @ 0..=2) = lance_io::utils::read_version(&tail)?
+        {
+            return Err(Error::version_conflict(
+                "Cannot read a legacy file schema with the current-format reader".to_string(),
+                0,
+                minor,
+            ));
+        }
+        let (_, _, buffers) = Self::read_current_footer(scheduler, &tail, file_len).await?;
+        let (_, schema) = Self::read_schema_buffer(scheduler, &tail, file_len, &buffers[0]).await?;
+        Ok((schema, buffers))
+    }
+
     async fn read_raw_metadata_index_with_known_schema(
         scheduler: &FileScheduler,
         known_schema: Option<(Arc<Schema>, u64)>,
     ) -> Result<FileMetadataIndex> {
         let (tail_bytes, file_len) = Self::read_tail(scheduler).await?;
         let tail_offset = file_len - tail_bytes.len() as u64;
-        let footer = Self::decode_footer(&tail_bytes).map_err(|error| {
-            Error::corrupt_file(scheduler.reader().path().clone(), error.to_string())
-        })?;
-
-        let file_version = Self::current_file_version(&footer)?;
-        Self::validate_footer(&footer, file_len)?;
-
-        let gbo_table =
-            Self::decode_gbo_table(&tail_bytes, file_len, scheduler, &footer, file_version).await?;
-        if gbo_table.is_empty() {
-            return Err(Error::internal(
-                "File did not contain any global buffers, schema expected".to_string(),
-            ));
-        }
+        let (footer, file_version, gbo_table) =
+            Self::read_current_footer(scheduler, &tail_bytes, file_len).await?;
         let (file_schema, num_rows) = match known_schema {
             Some((file_schema, num_rows)) => (file_schema, num_rows),
             None => {
-                let schema_buffer = &gbo_table[0];
-                let schema_range = schema_buffer.checked_range(0, file_len)?;
-                let schema_bytes = Self::read_range_from_tail_or_scheduler(
-                    &tail_bytes,
-                    tail_offset,
-                    scheduler,
-                    schema_range,
-                )
-                .await?;
-                let (num_rows, schema) = Self::decode_schema(schema_bytes)?;
+                let (num_rows, schema) =
+                    Self::read_schema_buffer(scheduler, &tail_bytes, file_len, &gbo_table[0])
+                        .await?;
                 (Arc::new(schema), num_rows)
             }
         };
@@ -2665,10 +2785,11 @@ mod tests {
     };
 
     use arrow_array::{
-        Array, DictionaryArray, FixedSizeListArray, Float32Array, Int8Array, Int32Array, ListArray,
-        RecordBatch, RecordBatchIterator, StringArray, UInt32Array,
+        Array, DictionaryArray, FixedSizeListArray, Float32Array, Int8Array, Int32Array,
+        LargeBinaryArray, ListArray, RecordBatch, RecordBatchIterator, StringArray, StructArray,
+        UInt8Array, UInt32Array, UInt64Array,
         cast::AsArray,
-        types::{Float64Type, Int8Type, Int32Type},
+        types::{Float64Type, Int8Type, Int32Type, UInt8Type, UInt32Type, UInt64Type},
     };
     use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
     use arrow_schema::{DataType, Field, Fields, Schema as ArrowSchema};
@@ -2690,7 +2811,9 @@ mod tests {
         encoder::{EncodedBatch, EncodingOptions, encode_batch},
         format::metadata,
     };
-    use lance_io::{scheduler::IoStats, stream::RecordBatchStream, utils::CachedFileSize};
+    use lance_io::{
+        ReadBatchParams, scheduler::IoStats, stream::RecordBatchStream, utils::CachedFileSize,
+    };
     use log::debug;
     use rstest::rstest;
     use tokio::sync::mpsc;
@@ -3911,6 +4034,12 @@ mod tests {
         assert!(
             matches!(error, lance_core::Error::CorruptFile { .. }),
             "expected CorruptFile, got: {error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("failed to decode column 'category' (id 0)"),
+            "expected column context, got: {error}"
         );
         assert!(
             error.to_string().contains("out of bounds"),
@@ -5183,6 +5312,198 @@ mod tests {
     /// The writer cuts a column into many small pages when its buffer is
     /// small (or, for nested columns, when the rep/def levels of a page hit
     /// the mini-block budget). Reading them must not cost one request per page.
+    #[rstest]
+    #[tokio::test]
+    async fn binary_slices_file_reader_crosses_pages_and_preserves_fallback(
+        #[values(
+            ConcreteFileVersion::V2_0,
+            ConcreteFileVersion::V2_1,
+            ConcreteFileVersion::V2_2,
+            ConcreteFileVersion::V2_3
+        )]
+        version: ConcreteFileVersion,
+        #[values(STRUCTURAL_ENCODING_MINIBLOCK, STRUCTURAL_ENCODING_FULLZIP)] encoding: &str,
+    ) {
+        let values = (0..6).map(|row| vec![b'a' + row; 8192]).collect::<Vec<_>>();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::UInt32, false),
+            Field::new("payload", DataType::LargeBinary, false).with_metadata(HashMap::from([(
+                STRUCTURAL_ENCODING_META_KEY.to_owned(),
+                encoding.to_owned(),
+            )])),
+        ]));
+        let batches = values
+            .chunks(2)
+            .enumerate()
+            .map(|(batch, values)| {
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(UInt32Array::from(vec![
+                            batch as u32 * 2,
+                            batch as u32 * 2 + 1,
+                        ])),
+                        Arc::new(LargeBinaryArray::from_iter_values(values)),
+                    ],
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let fs = FsFixture::default();
+        write_lance_file(
+            RecordBatchIterator::new(batches.into_iter().map(Ok), schema),
+            &fs,
+            version,
+            FileWriterOptions {
+                data_cache_bytes: Some(1),
+                ..Default::default()
+            },
+        )
+        .await;
+        let scheduler = fs
+            .scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let reader = FileReader::try_open(
+            scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &test_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert!(reader.metadata().column_infos[1].page_infos.len() >= 2);
+        fs.object_store.io_stats_incremental();
+        let slices = [120..137, 0..0, 3..11, 5..9];
+        for row in [0, 2, 5] {
+            let selected = reader.try_prepare_binary_value(1, row).await.unwrap();
+            if encoding == STRUCTURAL_ENCODING_MINIBLOCK && version != ConcreteFileVersion::V2_0 {
+                let value = selected.expect("current binary mini-block must support byte reads");
+                assert_eq!(value.len(), values[row as usize].len() as u64);
+                let before = fs.object_store.io_stats_snapshot();
+                let again = reader
+                    .try_prepare_binary_value(1, row)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let after = fs.object_store.io_stats_snapshot();
+                assert_eq!(again.len(), value.len());
+                assert_eq!(
+                    before.read_iops, after.read_iops,
+                    "cached preparation must not issue metadata reads"
+                );
+                assert_eq!(before.read_bytes, after.read_bytes);
+                let selected = value.read_slices(&slices).await.unwrap();
+                let tail = value
+                    .read_slices(&[value.len() - 1..value.len()])
+                    .await
+                    .unwrap();
+                assert_eq!(tail[0].as_ref(), &values[row as usize][8191..]);
+                for (bytes, slice) in selected.iter().zip(&slices) {
+                    assert_eq!(
+                        bytes.as_ref(),
+                        &values[row as usize][slice.start as usize..slice.end as usize]
+                    );
+                }
+            } else {
+                assert!(
+                    selected.is_none(),
+                    "unsupported layouts must request ordinary decoding"
+                );
+            }
+        }
+        let stats = fs.object_store.io_stats_incremental();
+        assert!(
+            stats.read_bytes < 8192,
+            "byte selections must not read a complete value: {}",
+            stats.read_bytes
+        );
+        let error = reader.try_prepare_binary_value(2, 0).await.unwrap_err();
+        assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("physical columns"));
+        let error = reader.try_prepare_binary_value(1, 6).await.unwrap_err();
+        assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("outside physical column"));
+        // The optional reader must leave ordinary scanning and unsupported
+        // encodings intact, including values on either side of page boundaries.
+        let batches = reader
+            .read_stream(
+                ReadBatchParams::RangeFull,
+                100,
+                1,
+                FilterExpression::no_filter(),
+            )
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let actual = concat_batches(&batches[0].schema(), &batches).unwrap();
+        for (row, value) in values.iter().enumerate() {
+            assert_eq!(actual["payload"].as_binary::<i64>().value(row), value);
+        }
+    }
+
+    #[tokio::test]
+    async fn binary_slices_file_reader_uses_physical_column_row_domain() {
+        let schema = ArrowSchema::new(vec![
+            Field::new("short", DataType::Int32, false),
+            Field::new("payload", DataType::LargeBinary, false).with_metadata(HashMap::from([(
+                STRUCTURAL_ENCODING_META_KEY.to_owned(),
+                STRUCTURAL_ENCODING_MINIBLOCK.to_owned(),
+            )])),
+        ]);
+        let fs = FsFixture::default();
+        let mut writer = versions::v2_3::create_writer(
+            fs.object_store.create(&fs.tmp_path).await.unwrap(),
+            Schema::try_from(&schema).unwrap(),
+            FileWriterOptions::default(),
+        )
+        .unwrap();
+        writer
+            .write_column(0, Arc::new(Int32Array::from(vec![1])))
+            .await
+            .unwrap();
+        let values = [vec![b'a'; 1024], vec![b'b'; 1024], vec![b'c'; 1024]];
+        writer
+            .write_column(1, Arc::new(LargeBinaryArray::from_iter_values(&values)))
+            .await
+            .unwrap();
+        writer.finish().await.unwrap();
+        let scheduler = fs
+            .scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let reader = FileReader::try_open(
+            scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &test_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(reader.column_num_rows(0).unwrap(), 1);
+        assert_eq!(reader.column_num_rows(1).unwrap(), 3);
+        let error = reader.try_prepare_binary_value(0, 1).await.unwrap_err();
+        assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("outside physical column"));
+        let selected = reader
+            .try_prepare_binary_value(1, 2)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(selected.len(), 1024);
+        let selected = selected.read_slices(&[4..12]).await.unwrap();
+        assert_eq!(selected[0].as_ref(), &values[2][4..12]);
+        let error = reader.try_prepare_binary_value(1, 3).await.unwrap_err();
+        assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("outside physical column"));
+    }
+
     #[tokio::test]
     async fn test_read_batches_page_reads_into_one_request() {
         let fs = FsFixture::default();
@@ -5749,6 +6070,311 @@ mod tests {
         );
     }
 
+    fn prepared_blob_field(name: &str) -> Field {
+        Field::new(
+            name,
+            DataType::Struct(
+                vec![
+                    Field::new("kind", DataType::UInt8, true),
+                    Field::new("data", DataType::LargeBinary, true),
+                    Field::new("uri", DataType::Utf8, true),
+                    Field::new("blob_id", DataType::UInt32, true),
+                    Field::new("blob_size", DataType::UInt64, true),
+                    Field::new("position", DataType::UInt64, true),
+                ]
+                .into(),
+            ),
+            true,
+        )
+        .with_metadata(HashMap::from([(
+            lance_arrow::ARROW_EXT_NAME_KEY.to_string(),
+            lance_arrow::BLOB_V2_EXT_NAME.to_string(),
+        )]))
+    }
+
+    fn prepared_blob_array(payloads: &[Option<&'static [u8]>]) -> StructArray {
+        let blob_fields = Fields::from(vec![
+            Field::new("kind", DataType::UInt8, true),
+            Field::new("data", DataType::LargeBinary, true),
+            Field::new("uri", DataType::Utf8, true),
+            Field::new("blob_id", DataType::UInt32, true),
+            Field::new("blob_size", DataType::UInt64, true),
+            Field::new("position", DataType::UInt64, true),
+        ]);
+        let nulls = NullBuffer::from(payloads.iter().map(Option::is_some).collect::<Vec<_>>());
+        StructArray::try_new(
+            blob_fields,
+            vec![
+                Arc::new(UInt8Array::from(vec![0; payloads.len()])),
+                Arc::new(LargeBinaryArray::from(payloads.to_vec())),
+                Arc::new(StringArray::from(vec![None::<&str>; payloads.len()])),
+                Arc::new(UInt32Array::from(vec![0; payloads.len()])),
+                Arc::new(UInt64Array::from(vec![0; payloads.len()])),
+                Arc::new(UInt64Array::from(vec![0; payloads.len()])),
+            ],
+            Some(nulls),
+        )
+        .unwrap()
+    }
+
+    /// Writes a v2.2 file with two top-level Blob v2 columns and one nested Blob
+    /// v2 column (in the prepared writer layout), plus optional legacy Blob v1
+    /// and ordinary `id` columns.
+    async fn write_blob_v2_raw_file(fs: &FsFixture, has_legacy_blob: bool, has_id: bool) {
+        use arrow_array::ArrayRef;
+
+        let blob_a = prepared_blob_array(&[Some(b"first".as_ref()), None, Some(b"".as_ref())]);
+        let blob_b =
+            prepared_blob_array(&[Some(b"second".as_ref()), Some(b"third".as_ref()), None]);
+        let nested =
+            prepared_blob_array(&[Some(b"nested-0".as_ref()), None, Some(b"nested-2".as_ref())]);
+        let info = StructArray::try_new(
+            Fields::from(vec![prepared_blob_field("payload")]),
+            vec![Arc::new(nested) as ArrayRef],
+            None,
+        )
+        .unwrap();
+
+        let mut fields = Vec::new();
+        let mut columns: Vec<ArrayRef> = Vec::new();
+        if has_legacy_blob {
+            fields.push(
+                Field::new("legacy", DataType::LargeBinary, true).with_metadata(HashMap::from([(
+                    BLOB_META_KEY.to_string(),
+                    "true".to_string(),
+                )])),
+            );
+            columns.push(Arc::new(LargeBinaryArray::from(vec![
+                Some(b"legacy".as_ref()),
+                Some(b"".as_ref()),
+                None,
+            ])));
+        }
+        if has_id {
+            fields.push(Field::new("id", DataType::Int32, false));
+            columns.push(Arc::new(Int32Array::from(vec![1, 2, 3])));
+        }
+        fields.push(prepared_blob_field("blob_a"));
+        fields.push(prepared_blob_field("blob_b"));
+        fields.push(Field::new(
+            "info",
+            DataType::Struct(Fields::from(vec![prepared_blob_field("payload")])),
+            true,
+        ));
+        columns.push(Arc::new(blob_a));
+        columns.push(Arc::new(blob_b));
+        columns.push(Arc::new(info));
+        let batch = RecordBatch::try_new(Arc::new(ArrowSchema::new(fields)), columns).unwrap();
+        let schema = batch.schema();
+        write_lance_file(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            fs,
+            ConcreteFileVersion::V2_2,
+            FileWriterOptions::default(),
+        )
+        .await;
+    }
+
+    fn descriptor_sizes(descriptor: &StructArray) -> Vec<Option<u64>> {
+        descriptor
+            .column_by_name("size")
+            .unwrap()
+            .as_primitive::<UInt64Type>()
+            .iter()
+            .collect()
+    }
+
+    fn descriptor_kinds(descriptor: &StructArray) -> Vec<Option<u8>> {
+        descriptor
+            .column_by_name("kind")
+            .unwrap()
+            .as_primitive::<UInt8Type>()
+            .iter()
+            .collect()
+    }
+
+    fn descriptor_blob_ids(descriptor: &StructArray) -> Vec<Option<u32>> {
+        descriptor
+            .column_by_name("blob_id")
+            .unwrap()
+            .as_primitive::<UInt32Type>()
+            .iter()
+            .collect()
+    }
+
+    fn assert_descriptor(descriptor: &StructArray, sizes: &[Option<u64>], null_row: usize) {
+        assert_eq!(descriptor_sizes(descriptor), sizes);
+        assert_eq!(
+            descriptor_kinds(descriptor),
+            sizes.iter().map(|size| size.map(|_| 0)).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            descriptor_blob_ids(descriptor),
+            sizes.iter().map(|size| size.map(|_| 0)).collect::<Vec<_>>()
+        );
+        assert_eq!(descriptor.null_count(), 1);
+        assert!(descriptor.is_null(null_row));
+    }
+
+    #[rstest]
+    #[case::blob_only(false, false)]
+    #[case::with_ordinary_column(false, true)]
+    #[case::with_legacy_blob(true, false)]
+    #[tokio::test]
+    async fn test_raw_reader_reads_blob_v2_descriptor_children(
+        #[case] has_legacy_blob: bool,
+        #[case] has_id: bool,
+    ) {
+        let fs = FsFixture::default();
+        write_blob_v2_raw_file(&fs, has_legacy_blob, has_id).await;
+
+        let file_scheduler = fs
+            .scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let reader = FileReader::try_open(
+            file_scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &test_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        // The anonymous descriptor children must stay under their Blob parents
+        // instead of being promoted to top-level fields.
+        let schema = reader.schema();
+        let expected_top_level = 3 + usize::from(has_legacy_blob) + usize::from(has_id);
+        assert_eq!(schema.fields.len(), expected_top_level, "{schema:?}");
+        let mut expected_names = Vec::new();
+        if has_legacy_blob {
+            expected_names.push("legacy");
+        }
+        if has_id {
+            expected_names.push("id");
+        }
+        expected_names.extend(["blob_a", "blob_b", "info"]);
+        assert_eq!(
+            schema
+                .fields
+                .iter()
+                .map(|field| field.name.as_str())
+                .collect::<Vec<_>>(),
+            expected_names
+        );
+        if has_legacy_blob {
+            let legacy = schema.field("legacy").unwrap();
+            assert!(legacy.is_blob());
+            assert!(!legacy.is_blob_v2());
+            assert!(legacy.children.is_empty());
+        }
+        for name in ["blob_a", "blob_b"] {
+            let blob = schema.field(name).unwrap();
+            assert!(blob.is_blob_v2());
+            assert!(blob.parent_id == -1);
+            assert_eq!(
+                blob.children.len(),
+                lance_core::datatypes::BLOB_V2_DESC_LANCE_FIELD
+                    .children
+                    .len()
+            );
+        }
+        let info = schema.field("info").unwrap();
+        assert_eq!(info.children.len(), 1);
+        let payload = &info.children[0];
+        assert_eq!(payload.name, "payload");
+        assert_eq!(payload.parent_id, info.id);
+        assert!(payload.is_blob_v2());
+        assert_eq!(
+            payload.children.len(),
+            lance_core::datatypes::BLOB_V2_DESC_LANCE_FIELD
+                .children
+                .len()
+        );
+
+        let batches = reader
+            .read_stream(
+                lance_io::ReadBatchParams::RangeFull,
+                1024,
+                16,
+                FilterExpression::no_filter(),
+            )
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let batch = concat_batches(&batches[0].schema(), &batches).unwrap();
+        assert_eq!(batch.num_rows(), 3);
+        assert_eq!(batch.num_columns(), expected_top_level);
+        if has_legacy_blob {
+            let legacy = batch["legacy"].as_binary::<i64>();
+            assert_eq!(
+                legacy.iter().collect::<Vec<_>>(),
+                vec![Some(b"legacy".as_ref()), Some(b"".as_ref()), None]
+            );
+        }
+        if has_id {
+            assert_eq!(
+                batch["id"]
+                    .as_primitive::<Int32Type>()
+                    .iter()
+                    .collect::<Vec<_>>(),
+                vec![Some(1), Some(2), Some(3)]
+            );
+        }
+
+        let blob_a = batch["blob_a"].as_struct();
+        let blob_b = batch["blob_b"].as_struct();
+        let nested = batch["info"]
+            .as_struct()
+            .column_by_name("payload")
+            .unwrap()
+            .as_struct();
+        assert_descriptor(blob_a, &[Some(5), None, Some(0)], 1);
+        assert_descriptor(blob_b, &[Some(6), Some(5), None], 2);
+        assert_descriptor(nested, &[Some(8), None, Some(8)], 1);
+
+        // An explicit projection of a top-level Blob and the nested Blob must
+        // decode the same descriptor values as the default projection.
+        let projection = versions::reader_projection_from_column_names(
+            ConcreteFileVersion::V2_2,
+            schema,
+            &["blob_b", "info.payload"],
+        )
+        .unwrap();
+        let projected = reader
+            .read_stream_projected(
+                lance_io::ReadBatchParams::RangeFull,
+                1024,
+                16,
+                projection,
+                FilterExpression::no_filter(),
+            )
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let projected = concat_batches(&projected[0].schema(), &projected).unwrap();
+        assert_eq!(projected.num_columns(), 2);
+        assert_eq!(projected["blob_b"].to_data(), batch["blob_b"].to_data());
+        assert_eq!(
+            projected["info"]
+                .as_struct()
+                .column_by_name("payload")
+                .unwrap()
+                .to_data(),
+            batch["info"]
+                .as_struct()
+                .column_by_name("payload")
+                .unwrap()
+                .to_data()
+        );
+    }
+
     #[test]
     fn test_decode_schema_rejects_missing_schema() {
         use prost::Message;
@@ -5790,6 +6416,7 @@ mod tests {
     enum MetadataReadPath {
         Full,
         Indexed,
+        Schema,
     }
 
     #[derive(Clone, Copy, Debug)]
@@ -5800,6 +6427,11 @@ mod tests {
     }
 
     #[rstest]
+    #[case::schema_past_eof(
+        MetadataReadPath::Schema,
+        InvalidGboDescriptor::PastEof,
+        "outside file"
+    )]
     #[case::full_unaligned(MetadataReadPath::Full, InvalidGboDescriptor::Unaligned, "not aligned")]
     #[case::full_past_eof(MetadataReadPath::Full, InvalidGboDescriptor::PastEof, "outside file")]
     #[case::full_overflowing(
@@ -5859,6 +6491,7 @@ mod tests {
             .await
             .unwrap();
         let error = match read_path {
+            MetadataReadPath::Schema => FileReader::read_schema(&scheduler).await.map(|_| ()),
             MetadataReadPath::Full => FileReader::read_all_metadata(&scheduler).await.map(|_| ()),
             MetadataReadPath::Indexed => FileReader::read_metadata_index(&scheduler)
                 .await

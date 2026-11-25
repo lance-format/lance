@@ -47,9 +47,10 @@ pub struct OptimizeOptions {
     ///
     /// This is useful when the data distribution has changed significantly,
     /// and we want to retrain the index to improve the search quality.
-    /// This would be faster than re-create the index from scratch.
+    /// The index is rebuilt from the source data.
     ///
-    /// NOTE: this option is only supported for v3 vector indices.
+    /// NOTE: only vector indices are retrained; scalar and full-text search
+    /// indices are not.
     pub retrain: bool,
 
     /// Transaction properties to store with this commit.
@@ -69,7 +70,11 @@ pub struct OptimizeOptions {
     /// split (nor is a fragment); with neither set each index is one task.
     ///
     /// Setting either bound splits the build of every index that can merge
-    /// segments, in `optimize_indices` as in the distributed plan; the
+    /// segments, in `optimize_indices` as in the distributed plan, except an
+    /// index whose committed segments still store row ids from before their
+    /// type moved to the row-address domain: that cohort migrates in one task,
+    /// because a split would rebuild only the segments it absorbs and the
+    /// commit refuses a result that mixes both domains. The
     /// `lance::index::optimize` module documents how that differs.
     pub max_rows_per_task: Option<u64>,
 

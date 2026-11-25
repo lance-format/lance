@@ -9,6 +9,7 @@
 //! background task ownership and write coordination stay separate.
 
 mod backpressure;
+mod buffer;
 mod config;
 mod handlers;
 mod replay;
@@ -28,6 +29,7 @@ pub use backpressure::{
     Drain, DurabilityCell, DurabilityResult, DurabilityWatcher, LocalBackpressureController,
     ShardMemory,
 };
+pub use buffer::WriteBatchBuffer;
 pub use config::ShardWriterConfig;
 pub use stats::{MemTableStats, WalStats, WriteStats, WriteStatsSnapshot};
 pub use writer::{FreezeFence, ShardWriter, WriteResult};

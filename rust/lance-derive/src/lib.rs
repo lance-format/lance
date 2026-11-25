@@ -5,6 +5,14 @@ use proc_macro::TokenStream;
 use quote::quote;
 use syn::{Data, DeriveInput, Fields, parse_macro_input};
 
+/// Identifiers introduced by this macro are created with a mixed-site span so
+/// they resolve at the definition site for local variables. Without that, a
+/// user field literally named `__context` (an enum variant field is bound by
+/// name in the generated pattern) would shadow the `Context` parameter.
+fn internal_ident(name: &str) -> syn::Ident {
+    syn::Ident::new(name, proc_macro2::Span::mixed_site())
+}
+
 /// Derive macro for the `DeepSizeOf` trait.
 ///
 /// Generates an implementation that sums the `deep_size_of_children` of all
@@ -14,6 +22,7 @@ pub fn derive_deep_size_of(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     let name = &input.ident;
     let generics = &input.generics;
+    let context_ident = internal_ident("__lance_context");
 
     // Add DeepSizeOf bounds to all type parameters
     let mut bounded_generics = generics.clone();
@@ -28,7 +37,7 @@ pub fn derive_deep_size_of(input: TokenStream) -> TokenStream {
     let (_, ty_generics, _) = generics.split_for_impl();
 
     let body = match &input.data {
-        Data::Struct(data) => generate_struct_body(&data.fields),
+        Data::Struct(data) => generate_struct_body(&data.fields, &context_ident),
         Data::Enum(data) => {
             let arms: Vec<_> = data
                 .variants
@@ -41,15 +50,10 @@ pub fn derive_deep_size_of(input: TokenStream) -> TokenStream {
                         }
                         Fields::Unnamed(fields) => {
                             let bindings: Vec<_> = (0..fields.unnamed.len())
-                                .map(|i| {
-                                    syn::Ident::new(
-                                        &format!("__field_{}", i),
-                                        proc_macro2::Span::call_site(),
-                                    )
-                                })
+                                .map(|i| internal_ident(&format!("__lance_field_{}", i)))
                                 .collect();
                             let sum = bindings.iter().map(|b| {
-                                quote! { lance_core::deepsize::DeepSizeOf::deep_size_of_children(#b, __context) }
+                                quote! { lance_core::deepsize::DeepSizeOf::deep_size_of_children(#b, #context_ident) }
                             });
                             quote! {
                                 Self::#variant_ident(#(#bindings),*) => {
@@ -58,13 +62,27 @@ pub fn derive_deep_size_of(input: TokenStream) -> TokenStream {
                             }
                         }
                         Fields::Named(fields) => {
-                            let field_names: Vec<_> =
-                                fields.named.iter().map(|f| &f.ident).collect();
-                            let sum = field_names.iter().map(|f| {
-                                quote! { lance_core::deepsize::DeepSizeOf::deep_size_of_children(#f, __context) }
+                            // Bind each field to a macro-owned identifier instead of
+                            // using a shorthand pattern, so the user's field name never
+                            // becomes a local variable in the generated code.
+                            let field_bindings: Vec<_> = fields
+                                .named
+                                .iter()
+                                .enumerate()
+                                .map(|(i, field)| {
+                                    let field_name = field.ident.as_ref().expect("named field");
+                                    let binding = internal_ident(&format!("__lance_field_{}", i));
+                                    (field_name, binding)
+                                })
+                                .collect();
+                            let pattern_fields = field_bindings
+                                .iter()
+                                .map(|(field_name, binding)| quote! { #field_name: #binding });
+                            let sum = field_bindings.iter().map(|(_, binding)| {
+                                quote! { lance_core::deepsize::DeepSizeOf::deep_size_of_children(#binding, #context_ident) }
                             });
                             quote! {
-                                Self::#variant_ident { #(#field_names),* } => {
+                                Self::#variant_ident { #(#pattern_fields),* } => {
                                     0 #(+ #sum)*
                                 }
                             }
@@ -72,9 +90,18 @@ pub fn derive_deep_size_of(input: TokenStream) -> TokenStream {
                     }
                 })
                 .collect();
-            quote! {
-                match self {
-                    #(#arms),*
+            if arms.is_empty() {
+                // `self` is `&Self`, and references are always considered inhabited,
+                // so `match self {}` does not type-check for a zero-variant enum.
+                // Matching the place itself keeps the empty match valid.
+                quote! {
+                    match *self {}
+                }
+            } else {
+                quote! {
+                    match self {
+                        #(#arms),*
+                    }
                 }
             }
         }
@@ -87,7 +114,7 @@ pub fn derive_deep_size_of(input: TokenStream) -> TokenStream {
 
     let expanded = quote! {
         impl #impl_generics lance_core::deepsize::DeepSizeOf for #name #ty_generics #where_clause {
-            fn deep_size_of_children(&self, __context: &mut lance_core::deepsize::Context) -> usize {
+            fn deep_size_of_children(&self, #context_ident: &mut lance_core::deepsize::Context) -> usize {
                 #body
             }
         }
@@ -96,19 +123,19 @@ pub fn derive_deep_size_of(input: TokenStream) -> TokenStream {
     TokenStream::from(expanded)
 }
 
-fn generate_struct_body(fields: &Fields) -> proc_macro2::TokenStream {
+fn generate_struct_body(fields: &Fields, context_ident: &syn::Ident) -> proc_macro2::TokenStream {
     match fields {
         Fields::Named(fields) => {
             let field_sizes = fields.named.iter().map(|f| {
                 let name = &f.ident;
-                quote! { lance_core::deepsize::DeepSizeOf::deep_size_of_children(&self.#name, __context) }
+                quote! { lance_core::deepsize::DeepSizeOf::deep_size_of_children(&self.#name, #context_ident) }
             });
             quote! { 0 #(+ #field_sizes)* }
         }
         Fields::Unnamed(fields) => {
             let field_sizes = (0..fields.unnamed.len()).map(|i| {
                 let index = syn::Index::from(i);
-                quote! { lance_core::deepsize::DeepSizeOf::deep_size_of_children(&self.#index, __context) }
+                quote! { lance_core::deepsize::DeepSizeOf::deep_size_of_children(&self.#index, #context_ident) }
             });
             quote! { 0 #(+ #field_sizes)* }
         }

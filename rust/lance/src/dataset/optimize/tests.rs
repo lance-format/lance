@@ -14,6 +14,7 @@ mod index_remap;
 mod lineage;
 mod overlays;
 mod planning;
+mod repack;
 mod undeferrable_withdrawal;
 mod vector;
 use self::remapping::RemappedIndex;
@@ -50,8 +51,7 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Field as ArrowField, Schema, Schema as ArrowSchema};
 use arrow_select::concat::concat_batches;
 use async_trait::async_trait;
-use datafusion::physical_plan::SendableRecordBatchStream;
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use futures::{StreamExt, TryStreamExt};
 use lance_arrow::{BLOB_META_KEY, FixedSizeListArrayExt};
 use lance_core::Error;
 use lance_core::ROW_ID;
@@ -103,6 +103,29 @@ use std::io::Cursor;
 use std::ops::Range;
 use std::sync::Arc;
 use uuid::Uuid;
+
+pub(super) async fn rewrite_files(
+    dataset: Cow<'_, Dataset>,
+    task: TaskData,
+    options: &CompactionOptions,
+) -> Result<RewriteResult> {
+    CompactionTask {
+        task,
+        read_version: dataset.manifest.version,
+        options: options.clone(),
+    }
+    .execute(&dataset)
+    .await
+}
+
+async fn can_use_binary_copy(
+    dataset: &Dataset,
+    options: &CompactionOptions,
+    fragments: &[Fragment],
+) -> bool {
+    runtime::execution::can_use_binary_copy(&dataset.table_view().to_table(), options, fragments)
+        .await
+}
 
 fn sample_data() -> RecordBatch {
     let schema = Schema::new(vec![Field::new("a", DataType::Int64, false)]);
@@ -440,8 +463,8 @@ async fn frag_reuse_watermarks(dataset: &Dataset) -> Vec<u64> {
 
 async fn stored_index(dataset: &Dataset, name: &str) -> IndexMetadata {
     read_manifest_indexes(
-        &dataset.object_store,
-        &dataset.manifest_location,
+        &dataset.table_state.object_store,
+        &dataset.table_state.manifest_location,
         &dataset.manifest,
     )
     .await
@@ -1146,18 +1169,17 @@ enum RaceOutcome {
 enum FirstCommitSeenAs {
     /// The shared session caches the manifest under the key the rebase lists.
     InMemory,
-    /// The shared session caches the manifest only under the e_tag-less key
-    /// a `RenameCommitHandler` commit leaves.
-    InlineTransaction,
+    /// The rebase opens its own session and decodes the manifest from storage.
     SeparateSession,
 }
 
-async fn uncached_listed_manifest(rebasing: &Dataset, version: u64) -> ManifestLocation {
+async fn listed_manifest(rebasing: &Dataset, version: u64) -> ManifestLocation {
     let listed = rebasing
+        .table_state
         .commit_handler
         .list_manifest_locations_since(
-            &rebasing.base,
-            rebasing.object_store.as_ref(),
+            &rebasing.table_state.base,
+            rebasing.table_state.object_store.as_ref(),
             rebasing.manifest.version,
         )
         .try_filter(|location| std::future::ready(location.version == version))
@@ -1170,7 +1192,6 @@ async fn uncached_listed_manifest(rebasing: &Dataset, version: u64) -> ManifestL
         e_tag: listed.e_tag.as_deref(),
     };
     assert!(key.e_tag.is_some());
-    assert!(rebasing.metadata_cache.get_with_key(&key).await.is_none());
     listed
 }
 
@@ -1257,9 +1278,10 @@ async fn assert_vector_index_coverage(dataset: &Dataset) {
 /// The deletion path is the interesting one: materialized deletions drop
 /// rows from the quantization storage at load time, which shifts storage
 /// positions. Flat storage (FLAT/PQ/SQ/RQ) is scanned linearly so this is
-/// fine, but the HNSW graph addresses storage positionally and is not
-/// frag-reuse aware, so a desync would surface here as recall collapse or a
-/// resurrected/again-deleted row.
+/// fine, but the HNSW graph addresses storage positionally and is realigned
+/// as it loads, so a desync would surface here as a load error, recall
+/// collapse or a resurrected/again-deleted row. `prewarm` loads the
+/// partitions through the prewarm path before querying instead.
 /// Top-k `id`s for a KNN query against the `vec` column.
 async fn vector_knn_ids(dataset: &Dataset, query: &[f32], k: usize) -> Vec<i32> {
     use arrow_array::cast::AsArray;
@@ -1288,6 +1310,7 @@ async fn check_vector_defer_compaction(
     delete_predicate: Option<&str>,
     k: usize,
     min_overlap: usize,
+    prewarm: bool,
 ) {
     use arrow_array::cast::AsArray;
     use arrow_array::types::{Float32Type, Int32Type};
@@ -1392,6 +1415,10 @@ async fn check_vector_defer_compaction(
         "index must not be physically remapped yet (FRI window)"
     );
 
+    if prewarm {
+        dataset.prewarm_index("vec_idx").await.unwrap();
+    }
+
     // During the FRI window: no deleted rows, and stable vs the baseline.
     for (i, (_, q)) in queries.iter().enumerate() {
         let after = vector_knn_ids(&dataset, q, k).await;
@@ -1417,12 +1444,6 @@ fn small_ivf() -> lance_index::vector::ivf::IvfBuildParams {
         ..Default::default()
     }
 }
-
-// NOTE: IVF_HNSW_* under materialized deletions is a known gap (lance#3993,
-// HNSW auto-remap not implemented) — the HNSW graph isn't realigned after the
-// frag-reuse drop. Deferred remap is gated off for HNSW tables, so there is
-// no lance-level reproducer here; the gate is tested in the data plane.
-// Merge-only HNSW is covered (see the *_remap_and_trim tests).
 
 /// Merge-only deferred compaction, then a PHYSICAL remap + FRI trim. Asserts
 /// the index is rebuilt with its details kept, the fragment-reuse index
@@ -1818,8 +1839,18 @@ async fn commit_overlay(
     let read_version = dataset.version().version;
     let overlay_schema = dataset.schema().project_by_ids(fields, true);
     let filename = format!("{}.lance", Uuid::new_v4());
-    let path = dataset.base.clone().join(DATA_DIR).join(filename.as_str());
-    let obj_writer = dataset.object_store.create(&path).await.unwrap();
+    let path = dataset
+        .table_state
+        .base
+        .clone()
+        .join(DATA_DIR)
+        .join(filename.as_str());
+    let obj_writer = dataset
+        .table_state
+        .object_store
+        .create(&path)
+        .await
+        .unwrap();
     let file_version = LanceFileVersion::Stable.resolve();
     let mut writer = lance_file::versions::create_writer(
         file_version,

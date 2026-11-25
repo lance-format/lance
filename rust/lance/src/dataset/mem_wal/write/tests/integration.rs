@@ -1183,7 +1183,8 @@ async fn test_flush_and_read_with_path_bound_object_store() {
         )),
         ..Default::default()
     };
-    let dataset = dataset.with_object_store(dataset.object_store.clone(), Some(store_params));
+    let dataset =
+        dataset.with_object_store(dataset.table_state.object_store.clone(), Some(store_params));
 
     let shard_id = Uuid::new_v4();
     let writer = dataset

@@ -548,6 +548,7 @@ async fn stage_data_replacement(
         dataset.manifest.version,
         Operation::DataReplacement {
             replacements: vec![DataReplacementGroup(fragment as u64, replacement)],
+            data_change: true,
         },
     )))
 }
@@ -645,8 +646,8 @@ async fn stage_rewrite(dataset: &Arc<Dataset>, fragment: usize) -> Result<Staged
         // A rewrite carries the old rows' identities onto the new fragment.
         // Reuse compaction's own transfer rather than reimplementing it, or the
         // new fragment arrives with no row ids and the commit is rejected.
-        crate::dataset::optimize::execution::rechunk_row_lineage(
-            dataset.as_ref(),
+        lance_table_runtime::optimize::execution::rechunk_row_lineage(
+            &dataset.table_view().to_table(),
             &mut fragments,
             std::slice::from_ref(&old),
         )
@@ -686,8 +687,13 @@ async fn write_value_file(
     // only a human-readable hint: two stagings of the same scenario must not
     // collide, or the second silently overwrites the first's contents.
     let filename = format!("{name}-{}.lance", uuid::Uuid::new_v4());
-    let path = dataset.base.clone().join("data").join(filename.as_str());
-    let writer = dataset.object_store.create(&path).await?;
+    let path = dataset
+        .table_state
+        .base
+        .clone()
+        .join("data")
+        .join(filename.as_str());
+    let writer = dataset.table_state.object_store.create(&path).await?;
     let file_version = dataset.manifest.data_storage_format.lance_file_format();
     let mut writer = lance_file::versions::create_writer(
         file_version,

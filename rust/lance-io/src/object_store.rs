@@ -48,6 +48,7 @@ use crate::uring::{UringCurrentThreadReader, UringReader};
 pub(crate) mod dynamic_credentials;
 #[cfg(any(feature = "oss", feature = "huggingface", feature = "tos"))]
 pub(crate) mod dynamic_opendal;
+pub(crate) mod hf_throttle;
 mod list_retry;
 mod local_staging;
 #[cfg(feature = "metrics")]
@@ -77,6 +78,7 @@ use crate::traits::{WriteExt, Writer};
 use crate::utils::tracking_store::{IOTracker, IoStats};
 use crate::{object_reader::CloudObjectReader, object_writer::ObjectWriter, traits::Reader};
 use lance_core::{Error, Result};
+use local_staging::{LocalStagingPaths, remove_local_staging_file};
 
 // Local disks tend to do fine with a few threads
 // Note: the number of threads here also impacts the number of files
@@ -192,6 +194,22 @@ pub(crate) fn canonicalize_local_io_result(
     }
 }
 
+/// Preserve "already gone" across the stream's error type.
+///
+/// An absent staging file is the outcome the caller wanted, but the generic
+/// [`Error`]-to-[`object_store::Error`] conversion erases that, so report it as
+/// [`object_store::Error::NotFound`] with the location the caller asked to delete.
+fn staging_delete_error(location: &Path, error: Error) -> object_store::Error {
+    if error.is_not_found() {
+        object_store::Error::NotFound {
+            path: location.to_string(),
+            source: Box::new(error),
+        }
+    } else {
+        error.into()
+    }
+}
+
 #[async_trait]
 impl<O: OSObjectStore + ?Sized> ObjectStoreExt for O {
     fn read_dir_all<'a, 'b>(
@@ -218,11 +236,37 @@ impl<O: OSObjectStore + ?Sized> ObjectStoreExt for O {
     }
 }
 
+struct ExternalBlobStore {
+    inner: Arc<dyn OSObjectStore>,
+    view: std::sync::Mutex<std::sync::Weak<ObjectStore>>,
+}
+
+impl ExternalBlobStore {
+    fn new(inner: Arc<dyn OSObjectStore>) -> Self {
+        Self {
+            inner,
+            view: Default::default(),
+        }
+    }
+}
+
+impl Clone for ExternalBlobStore {
+    fn clone(&self) -> Self {
+        // A cloned ObjectStore is a separate binding and must derive its own view.
+        Self::new(self.inner.clone())
+    }
+}
+
 /// Wraps [ObjectStore](object_store::ObjectStore)
 #[derive(Clone)]
 pub struct ObjectStore {
     // Inner object store
     pub inner: Arc<dyn OSObjectStore>,
+    // The same physical store with external-blob wrapping rules.
+    external_blob_inner: Option<ExternalBlobStore>,
+    // Keep the registry's weak binding alive while only an external view is held.
+    _external_blob_origin: Option<Arc<Self>>,
+    direct_local_io: bool,
     // Provider-owned native directory operations for rooted local stores.
     local_dir_operations: Option<Arc<dyn LocalDirOperations>>,
     // Whether local writes sync file data and directory entries before returning.
@@ -298,6 +342,41 @@ pub trait WrappingObjectStore: std::fmt::Debug + Send + Sync {
     /// store being wrapped.
     fn wrap(&self, store_prefix: &str, original: Arc<dyn OSObjectStore>) -> Arc<dyn OSObjectStore>;
 
+    /// Wrap a store used to read mutable, externally owned blob payloads.
+    ///
+    /// The default retains `wrapped`, including authorization and observation.
+    /// `original` is the external view before this wrapper; `wrapped` is after
+    /// applying the regular wrapper to that view. Immutable caches should return
+    /// `original`, or apply a cache with explicit freshness validation.
+    /// Managed payloads continue through [`Self::wrap`].
+    fn wrap_external_blob(
+        &self,
+        _store_prefix: &str,
+        _original: Arc<dyn OSObjectStore>,
+        wrapped: Arc<dyn OSObjectStore>,
+    ) -> Arc<dyn OSObjectStore> {
+        wrapped
+    }
+
+    /// Apply a wrapper to the regular and external views of one physical store.
+    /// Shared inputs are wrapped once. Chains preserve each component's policy.
+    #[doc(hidden)]
+    fn wrap_with_external_blobs(
+        &self,
+        store_prefix: &str,
+        original: Arc<dyn OSObjectStore>,
+        external: Arc<dyn OSObjectStore>,
+    ) -> (Arc<dyn OSObjectStore>, Arc<dyn OSObjectStore>) {
+        let wrapped = self.wrap(store_prefix, original.clone());
+        let external_wrapped = if Arc::ptr_eq(&original, &external) {
+            wrapped.clone()
+        } else {
+            self.wrap(store_prefix, external.clone())
+        };
+        let external = self.wrap_external_blob(store_prefix, external, external_wrapped);
+        (wrapped, external)
+    }
+
     /// Wrap the paginated listing API that goes with the store, if it has one.
     ///
     /// [`ObjectStore::read_dir_page`] pushes the page size and the resume position into
@@ -347,6 +426,19 @@ impl WrappingObjectStore for ChainedWrappingObjectStore {
         self.wrappers
             .iter()
             .fold(original, |acc, wrapper| wrapper.wrap(store_prefix, acc))
+    }
+
+    fn wrap_with_external_blobs(
+        &self,
+        store_prefix: &str,
+        original: Arc<dyn OSObjectStore>,
+        external: Arc<dyn OSObjectStore>,
+    ) -> (Arc<dyn OSObjectStore>, Arc<dyn OSObjectStore>) {
+        self.wrappers
+            .iter()
+            .fold((original, external), |(original, external), wrapper| {
+                wrapper.wrap_with_external_blobs(store_prefix, original, external)
+            })
     }
 
     // One wrapper giving up the pushdown gives it up for the chain: the listing has to go
@@ -645,43 +737,222 @@ fn local_path_to_url(str_path: &str) -> Result<Url> {
     })
 }
 
+/// Repository type prefixes accepted by Hugging Face URLs, mapped to the
+/// singular names OpenDAL expects.
 #[cfg(feature = "huggingface")]
-fn parse_hf_repo_id(url: &Url) -> Result<String> {
-    // Accept forms with repo type prefix (models/datasets/spaces) or legacy without.
-    let mut segments: Vec<String> = Vec::new();
-    if let Some(host) = url.host_str() {
-        segments.push(host.to_string());
-    }
-    segments.extend(
-        url.path()
-            .trim_start_matches('/')
-            .split('/')
-            .map(|s| s.to_string()),
-    );
+const HF_REPO_TYPE_PREFIXES: [(&str, &str); 8] = [
+    ("datasets", "dataset"),
+    ("dataset", "dataset"),
+    ("models", "model"),
+    ("model", "model"),
+    ("spaces", "space"),
+    ("space", "space"),
+    ("buckets", "bucket"),
+    ("bucket", "bucket"),
+];
 
-    if segments.len() < 2 {
-        return Err(Error::invalid_input(
-            "Huggingface URL must contain at least owner and repo",
-        ));
-    }
+#[cfg(feature = "huggingface")]
+pub(crate) fn is_hf_repo_type_prefix(host: &str) -> bool {
+    HF_REPO_TYPE_PREFIXES
+        .iter()
+        .any(|(prefix, _)| *prefix == host)
+}
 
-    let repo_type_candidates = ["models", "datasets", "spaces"];
-    let (owner, repo_with_rev) = if repo_type_candidates.contains(&segments[0].as_str()) {
-        if segments.len() < 3 {
-            return Err(Error::invalid_input(
-                "Huggingface URL missing owner/repo after repo type",
-            ));
+/// The components of an `hf://` URL.
+///
+/// The supported form is
+/// `hf://(datasets|models|spaces|buckets)/<owner>/<repo>@<revision>/<path>`,
+/// where `@<revision>` is optional and singular repository type aliases are
+/// accepted. The legacy `hf://<owner>/<repo>/<path>` form is accepted and
+/// treated as a model repository. Only the repository segment is split on `@`,
+/// so an `@` in the path remains part of the path.
+#[cfg(feature = "huggingface")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ParsedHfUrl {
+    pub repo_type: String,
+    pub repo_id: String,
+    pub revision: Option<String>,
+    pub relative_path: String,
+}
+
+#[cfg(feature = "huggingface")]
+pub(crate) fn parse_hf_url(url: &Url) -> Result<ParsedHfUrl> {
+    let host = url.host_str().ok_or_else(|| {
+        Error::invalid_input("Huggingface URL must contain a repository type or owner")
+    })?;
+    let mut segments = url.path().trim_start_matches('/').split('/');
+
+    let (repo_type, owner, repo_with_revision) = match HF_REPO_TYPE_PREFIXES
+        .iter()
+        .find(|(prefix, _)| *prefix == host)
+    {
+        Some((_, canonical)) => {
+            let owner = segments
+                .next()
+                .filter(|segment| !segment.is_empty())
+                .ok_or_else(|| Error::invalid_input("Huggingface URL must contain owner"))?;
+            let repo = segments
+                .next()
+                .filter(|segment| !segment.is_empty())
+                .ok_or_else(|| {
+                    Error::invalid_input("Huggingface URL must contain repository name")
+                })?;
+            (canonical.to_string(), owner, repo)
         }
-        (segments[1].as_str(), segments[2].as_str())
-    } else {
-        (segments[0].as_str(), segments[1].as_str())
+        // A host that is not a known repository type is the legacy owner form.
+        None => {
+            let repo = segments
+                .next()
+                .filter(|segment| !segment.is_empty())
+                .ok_or_else(|| {
+                    Error::invalid_input("Huggingface URL must contain repository name")
+                })?;
+            ("model".to_string(), host, repo)
+        }
     };
 
-    let repo = repo_with_rev
-        .split_once('@')
-        .map(|(r, _)| r)
-        .unwrap_or(repo_with_rev);
-    Ok(format!("{owner}/{repo}"))
+    let relative_path = segments.collect::<Vec<_>>().join("/");
+    // Bucket repositories have no revision and use `namespace/name` before the
+    // path. Keep `@` literal there, matching how bucket URLs resolved before
+    // this parser was centralized.
+    if repo_type == "bucket" {
+        return Ok(ParsedHfUrl {
+            repo_type,
+            repo_id: format!("{owner}/{repo_with_revision}"),
+            revision: None,
+            relative_path,
+        });
+    }
+
+    let (repo_name, revision) = match repo_with_revision.split_once('@') {
+        Some((repo_name, revision)) => {
+            if repo_name.is_empty() {
+                return Err(Error::invalid_input(
+                    "Huggingface URL must contain repository name before '@'",
+                ));
+            }
+            validate_hf_url_revision(revision)?;
+            (repo_name, Some(revision.to_string()))
+        }
+        None => (repo_with_revision, None),
+    };
+
+    Ok(ParsedHfUrl {
+        repo_type,
+        repo_id: format!("{owner}/{repo_name}"),
+        revision,
+        relative_path,
+    })
+}
+
+/// Reject revisions that cannot be represented unambiguously in an `hf://`
+/// path. A revision that needs a slash or URL escaping can still be selected
+/// with the `hf_revision` or `revision` storage option.
+#[cfg(feature = "huggingface")]
+fn validate_hf_url_revision(revision: &str) -> Result<()> {
+    if revision.is_empty() {
+        return Err(Error::invalid_input(
+            "Huggingface URL revision must not be empty; write '<repo>@<revision>/<path>' or omit '@'",
+        ));
+    }
+    if let Some(character) = revision
+        .chars()
+        .find(|character| !character.is_ascii_graphic() || matches!(character, '@' | '/' | '%'))
+    {
+        return Err(Error::invalid_input(format!(
+            "Invalid Huggingface URL revision {revision:?}: character {character:?} is not supported; pass the revision through the hf_revision or revision storage option instead"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "huggingface")]
+pub(crate) fn validate_hf_revision_option(key: &str, revision: &str) -> Result<()> {
+    if revision.is_empty() || revision.chars().all(char::is_whitespace) {
+        return Err(Error::invalid_input(format!(
+            "Huggingface storage option {key} must not be empty"
+        )));
+    }
+    if revision.chars().any(char::is_control) {
+        return Err(Error::invalid_input(format!(
+            "Huggingface storage option {key} contains control characters: {revision:?}"
+        )));
+    }
+    Ok(())
+}
+
+/// The revision selected for one `hf://` base, or the option that contradicts
+/// a revision in the URL.
+#[cfg(feature = "huggingface")]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum HfRevisionResolution {
+    Selected(Option<String>),
+    Conflict {
+        key: &'static str,
+        option_revision: String,
+        url_revision: String,
+    },
+}
+
+/// Select the revision used by an `hf://` base.
+///
+/// A revision in the URL wins over storage options. Supplying the same revision
+/// under either option name is accepted, while a different revision is
+/// reported as a conflict so a pin cannot silently change. Without a URL
+/// revision, `hf_revision` keeps precedence over `revision`, matching the
+/// documented option aliases.
+#[cfg(feature = "huggingface")]
+pub(crate) fn resolve_hf_revision_inner(
+    url_revision: Option<&str>,
+    storage_options: Option<&HashMap<String, String>>,
+) -> Result<HfRevisionResolution> {
+    let prefixed = storage_options.and_then(|options| options.get("hf_revision"));
+    let unprefixed = storage_options.and_then(|options| options.get("revision"));
+
+    if let Some(revision) = prefixed {
+        validate_hf_revision_option("hf_revision", revision)?;
+    }
+    if let Some(revision) = unprefixed {
+        validate_hf_revision_option("revision", revision)?;
+    }
+
+    if let Some(url_revision) = url_revision {
+        for (key, option_revision) in [("hf_revision", prefixed), ("revision", unprefixed)] {
+            if let Some(option_revision) = option_revision
+                && option_revision != url_revision
+            {
+                return Ok(HfRevisionResolution::Conflict {
+                    key,
+                    option_revision: option_revision.clone(),
+                    url_revision: url_revision.to_string(),
+                });
+            }
+        }
+        return Ok(HfRevisionResolution::Selected(Some(
+            url_revision.to_string(),
+        )));
+    }
+
+    Ok(HfRevisionResolution::Selected(
+        prefixed.or(unprefixed).cloned(),
+    ))
+}
+
+#[cfg(feature = "huggingface")]
+pub(crate) fn resolve_hf_revision(
+    url_revision: Option<&str>,
+    storage_options: Option<&HashMap<String, String>>,
+) -> Result<Option<String>> {
+    match resolve_hf_revision_inner(url_revision, storage_options)? {
+        HfRevisionResolution::Selected(revision) => Ok(revision),
+        HfRevisionResolution::Conflict {
+            key,
+            option_revision,
+            url_revision,
+        } => Err(Error::invalid_input(format!(
+            "Huggingface storage option {key}={option_revision:?} conflicts with revision {url_revision:?} in the URL"
+        ))),
+    }
 }
 
 impl ObjectStore {
@@ -741,15 +1012,23 @@ impl ObjectStore {
                 &metrics_base(&store_prefix, path),
             );
 
-            if let Some(wrapper) = params.object_store_wrapper.as_ref() {
-                inner = wrapper.wrap(&store_prefix, inner);
-            }
+            let external_blob_inner = if let Some(wrapper) = params.object_store_wrapper.as_ref() {
+                let (wrapped, external) =
+                    wrapper.wrap_with_external_blobs(&store_prefix, inner.clone(), inner);
+                inner = wrapped;
+                Some(ExternalBlobStore::new(io_tracker.wrap("", external)))
+            } else {
+                None
+            };
 
             // Always wrap with IO tracking
             let tracked_store = io_tracker.wrap("", inner);
 
             let store = Self {
                 inner: tracked_store,
+                external_blob_inner,
+                _external_blob_origin: None,
+                direct_local_io: false,
                 local_dir_operations: None,
                 local_fsync: false,
                 scheme: path.scheme().to_string(),
@@ -844,7 +1123,15 @@ impl ObjectStore {
     /// Local stores rooted below the filesystem root, such as UNC-backed stores, use
     /// their inner object-store implementation instead of direct filesystem access.
     pub fn has_direct_local_paths(&self) -> bool {
-        self.is_local() && self.store_prefix == self.scheme
+        self.has_absolute_local_mapping() && self.is_local() && !self.has_wrapper()
+    }
+
+    fn has_absolute_local_mapping(&self) -> bool {
+        self.direct_local_io && self.store_prefix == self.scheme
+    }
+
+    fn has_wrapper(&self) -> bool {
+        self.external_blob_inner.is_some() || self._external_blob_origin.is_some()
     }
 
     /// Canonicalize a local object path, resolving rooted and UNC stores through
@@ -868,7 +1155,7 @@ impl ObjectStore {
         if let Some(local_dir_operations) = &self.local_dir_operations {
             return local_dir_operations.canonicalize(path).await;
         }
-        if self.has_direct_local_paths() || self.scheme == "file-object-store" {
+        if self.has_absolute_local_mapping() {
             return canonicalize_local_io_result(
                 tokio::fs::canonicalize(super::local::to_local_path(path)).await,
             );
@@ -888,7 +1175,7 @@ impl ObjectStore {
     /// The lite scheduler is designed for backends like io_uring where
     /// tasks should only be polled when the consumer polls them.
     pub fn prefers_lite_scheduler(&self) -> bool {
-        self.scheme == "file+uring"
+        self.scheme == "file+uring" && self.has_direct_local_paths()
     }
 
     pub fn scheme(&self) -> &str {
@@ -910,6 +1197,16 @@ impl ObjectStore {
 
     pub fn max_iop_size(&self) -> u64 {
         self.max_iop_size
+    }
+
+    /// Return this store with a different block-size hint.
+    ///
+    /// The backing object store and I/O tracker are shared. Only the block size
+    /// used to plan reads changes.
+    pub fn with_block_size(&self, block_size: usize) -> Self {
+        let mut cloned = self.clone();
+        cloned.block_size = block_size;
+        cloned
     }
 
     /// The amount of parallelism to use for I/O operations.
@@ -990,11 +1287,56 @@ impl ObjectStore {
     /// [`WrappingObjectStore::wrap_paginated`] clears the lister so that
     /// [`Self::read_dir_page`] falls back through the (already-wrapped) `inner`.
     pub fn apply_wrapper(&mut self, wrapper: &dyn WrappingObjectStore) {
-        self.inner = wrapper.wrap(&self.store_prefix, self.inner.clone());
+        let external = self
+            .external_blob_inner
+            .as_ref()
+            .map(|external| &external.inner)
+            .unwrap_or(&self.inner)
+            .clone();
+        let (inner, external) =
+            wrapper.wrap_with_external_blobs(&self.store_prefix, self.inner.clone(), external);
+        self.inner = inner;
+        self.external_blob_inner = Some(ExternalBlobStore::new(external));
         self.paginated_lister = self
             .paginated_lister
             .take()
             .and_then(|lister| wrapper.wrap_paginated(&self.store_prefix, lister));
+    }
+
+    /// Derive an external-blob read view without reopening the provider.
+    ///
+    /// The physical store, credentials, endpoint, and connection pool are retained.
+    /// Only wrapper behavior changes through [`WrappingObjectStore::wrap_external_blob`].
+    /// Managed blobs must keep using the original store. Repeated calls reuse the
+    /// same view while it is held by a reader or scheduler. The cached reference
+    /// is weak so the view can retain this registry binding without a cycle.
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use lance_io::object_store::ObjectStore;
+    /// let store = Arc::new(ObjectStore::memory());
+    /// let external = store.for_external_blobs();
+    /// assert_eq!(external.store_prefix, store.store_prefix);
+    /// ```
+    pub fn for_external_blobs(self: &Arc<Self>) -> Arc<Self> {
+        let Some(external) = self.external_blob_inner.as_ref() else {
+            return self.clone();
+        };
+        let mut view = external
+            .view
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(store) = view.upgrade() {
+            return store;
+        }
+        let mut store = self.as_ref().clone();
+        store.inner = external.inner.clone();
+        store.paginated_lister = None;
+        store.external_blob_inner = None;
+        store._external_blob_origin = Some(self.clone());
+        let store = Arc::new(store);
+        *view = Arc::downgrade(&store);
+        store
     }
 
     /// Open a file for path.
@@ -1013,7 +1355,7 @@ impl ObjectStore {
                 .await
             }
             #[cfg(target_os = "linux")]
-            "file+uring" => {
+            "file+uring" if self.has_direct_local_paths() => {
                 // Check if current-thread mode enabled
                 let use_current_thread = std::env::var("LANCE_URING_CURRENT_THREAD")
                     .map(|v| str_is_truthy(&v))
@@ -1045,6 +1387,7 @@ impl ObjectStore {
                     None,
                     self.download_retry_count,
                 )?
+                .with_transport_stats(self.is_cloud())
                 .with_io_parallelism(self.io_parallelism()),
             )),
         }
@@ -1059,12 +1402,22 @@ impl ObjectStore {
         // If we know the file is really small, we can read the whole thing
         // as a single request.
         if known_size <= self.block_size {
-            return Ok(Box::new(SmallReader::new(
-                self.inner.clone(),
-                path.clone(),
-                self.download_retry_count,
-                known_size,
-            )));
+            let reader = if self.is_cloud() {
+                SmallReader::new_with_transport_stats(
+                    self.inner.clone(),
+                    path.clone(),
+                    self.download_retry_count,
+                    known_size,
+                )
+            } else {
+                SmallReader::new(
+                    self.inner.clone(),
+                    path.clone(),
+                    self.download_retry_count,
+                    known_size,
+                )
+            };
+            return Ok(Box::new(reader));
         }
 
         match self.scheme.as_str() {
@@ -1078,7 +1431,7 @@ impl ObjectStore {
                 .await
             }
             #[cfg(target_os = "linux")]
-            "file+uring" => {
+            "file+uring" if self.has_direct_local_paths() => {
                 // Check if current-thread mode enabled
                 let use_current_thread = std::env::var("LANCE_URING_CURRENT_THREAD")
                     .map(|v| str_is_truthy(&v))
@@ -1110,6 +1463,7 @@ impl ObjectStore {
                     Some(known_size),
                     self.download_retry_count,
                 )?
+                .with_transport_stats(self.is_cloud())
                 .with_io_parallelism(self.io_parallelism()),
             )),
         }
@@ -1220,6 +1574,69 @@ impl ObjectStore {
         }
     }
 
+    /// Read an object directly, preserving request and body errors separately.
+    pub async fn read_object(&self, path: &Path) -> object_store::Result<object_store::GetResult> {
+        self.inner.get(path).await
+    }
+
+    /// Publish a payload without buffering it through a Lance writer.
+    pub async fn put_payload(
+        &self,
+        path: &Path,
+        payload: PutPayload,
+    ) -> object_store::Result<WriteResult> {
+        self.put_payload_opts(path, payload, Default::default())
+            .await
+    }
+
+    /// Publish a payload with the caller's preconditions.
+    pub async fn put_payload_opts(
+        &self,
+        path: &Path,
+        payload: PutPayload,
+        options: object_store::PutOptions,
+    ) -> object_store::Result<WriteResult> {
+        let size = payload.content_length();
+        let result = self.inner.put_opts(path, payload, options).await?;
+        Ok(WriteResult {
+            size,
+            e_tag: result.e_tag,
+        })
+    }
+
+    /// List objects with a single backend stream.
+    pub fn list_objects(
+        &self,
+        prefix: Option<&Path>,
+    ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    /// Read one byte range in a single backend request.
+    pub async fn read_range(&self, path: &Path, range: Range<u64>) -> object_store::Result<Bytes> {
+        self.inner.get_range(path, range).await
+    }
+
+    /// Read metadata without fetching the object body.
+    pub async fn stat(&self, path: &Path) -> object_store::Result<ObjectMeta> {
+        self.inner.head(path).await
+    }
+
+    /// Rename an object using the provider's replacement semantics.
+    pub async fn rename(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+        self.inner.rename(from, to).await
+    }
+
+    /// Publish by rename only if the destination is absent.
+    pub async fn rename_if_not_exists(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+        self.inner.rename_if_not_exists(from, to).await
+    }
+
+    /// Copy only if the destination is absent.
+    pub async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+        self.inner.copy_if_not_exists(from, to).await
+    }
+
     /// A helper function to create a file and write content to it.
     pub async fn put(&self, path: &Path, content: &[u8]) -> Result<WriteResult> {
         let mut writer = self.create(path).await?;
@@ -1249,8 +1666,8 @@ impl ObjectStore {
         }
 
         if self.is_local() {
-            let staging_path =
-                Path::from(format!("{}.tmp.{}", path, uuid::Uuid::new_v4().simple()));
+            let name = format!("lance-io.staging.{}", uuid::Uuid::new_v4().simple());
+            let staging_path = path.parent().unwrap_or_default().join(name.as_str());
             self.inner.put(&staging_path, content).await?;
             let result = self.inner.rename_if_not_exists(&staging_path, path).await;
             if result.is_err()
@@ -1285,22 +1702,56 @@ impl ObjectStore {
     pub async fn delete(&self, path: &Path) -> Result<()> {
         if let Some(local_path) = self.local_staging_path(path)? {
             // LocalFileSystem rejects its reserved staging names, even for deletion.
-            let metrics = self.io_tracker.begin_io("delete");
-            let result = tokio::fs::remove_file(&local_path).await.map_err(|error| {
-                if error.kind() == ErrorKind::NotFound {
-                    Error::not_found(path.to_string())
-                } else {
-                    Error::io(format!(
-                        "Failed to remove local staging file {}: {error}",
-                        local_path.display()
-                    ))
-                }
-            });
-            metrics.record(&result, 0);
-            return result;
+            return remove_local_staging_file(path, &local_path, &self.io_tracker).await;
         }
         self.inner.delete(path).await?;
         Ok(())
+    }
+
+    /// Delete every location in `locations`, using the backend's bulk delete when it
+    /// has one.
+    ///
+    /// The returned stream reports locations the backend removed; order is not
+    /// preserved. A backend may coalesce paths into one request (S3: up to 1000 paths
+    /// per `DeleteObjects`), and some report a failed request as one error that ends
+    /// the stream, so inputs after it and inputs omitted from a partial response are
+    /// never reported. Callers must therefore treat an input without a reported
+    /// outcome as failed, and not as removed. Paths that were already absent are
+    /// reported as not-found errors.
+    ///
+    /// Hidden local staging files (see [`Self::read_local_staging_files`]) are removed
+    /// through the same local filesystem path as [`Self::delete`], because the backend
+    /// rejects their names. Those stores have no bulk request to coalesce into, so
+    /// every location is dispatched individually.
+    pub fn delete_stream(
+        &self,
+        locations: BoxStream<'static, object_store::Result<Path>>,
+    ) -> BoxStream<'static, object_store::Result<Path>> {
+        let Some(staging_paths) = LocalStagingPaths::for_store(self) else {
+            return self.inner.delete_stream(locations);
+        };
+        let inner = Arc::clone(&self.inner);
+        let io_tracker = self.io_tracker.clone();
+        locations
+            .map(move |location| {
+                let staging_paths = staging_paths.clone();
+                let inner = Arc::clone(&inner);
+                let io_tracker = io_tracker.clone();
+                async move {
+                    let location = location?;
+                    match staging_paths.resolve(&location)? {
+                        Some(local_path) => {
+                            remove_local_staging_file(&location, &local_path, &io_tracker)
+                                .await
+                                .map_err(|error| staging_delete_error(&location, error))?;
+                        }
+                        None => inner.delete(&location).await?,
+                    }
+                    Ok(location)
+                }
+            })
+            .buffer_unordered(self.io_parallelism())
+            .boxed()
     }
 
     /// AWS S3 and GCS reject a single-shot server-side copy whose source is
@@ -1469,7 +1920,7 @@ impl ObjectStore {
     ///
     /// This uses the provider's native conditional copy. An existing destination
     /// with the same size is treated as a successful retry.
-    pub async fn copy_if_not_exists(
+    pub async fn copy_if_not_exists_or_same_size(
         &self,
         source_path: &Path,
         destination_path: &Path,
@@ -1807,7 +2258,7 @@ impl ObjectStore {
             metrics.record(&result, 0);
             return result;
         }
-        if self.has_direct_local_paths() {
+        if self.has_absolute_local_mapping() && self.is_local() {
             // The local file system provider needs to delete both files and directories.
             // Counted as a single delete request, matching how `delete_stream`
             // counts one batched request regardless of how many paths it removes.
@@ -1842,7 +2293,7 @@ impl ObjectStore {
         for location in deferred {
             self.inner.delete(&location).await?;
         }
-        if self.scheme == "file-object-store" {
+        if self.has_absolute_local_mapping() && self.scheme == "file-object-store" {
             // file-object-store tries to do everything as similarly as possible to the remote
             // object stores. But we still have to delete the directory entries afterwards.
             return super::local::remove_dir_all(&path);
@@ -1882,7 +2333,7 @@ impl ObjectStore {
         verified_dirs: HashSet<Path>,
         unmodified_since: Option<DateTime<Utc>>,
     ) -> Result<()> {
-        if !self.has_direct_local_paths() && self.scheme != "file-object-store" {
+        if !self.has_absolute_local_mapping() {
             return Ok(());
         }
 
@@ -2352,9 +2803,16 @@ impl ObjectStore {
             &metrics_base(&store_prefix, &location),
         );
 
-        let store = match wrapper {
-            Some(wrapper) => wrapper.wrap(&store_prefix, store),
-            None => store,
+        let (store, external_blob_inner) = match wrapper {
+            Some(wrapper) => {
+                let (store, external) =
+                    wrapper.wrap_with_external_blobs(&store_prefix, store.clone(), store);
+                (
+                    store,
+                    Some(ExternalBlobStore::new(io_tracker.wrap("", external))),
+                )
+            }
+            None => (store, None),
         };
 
         // Always wrap with IO tracking
@@ -2362,6 +2820,9 @@ impl ObjectStore {
 
         Self {
             inner: tracked_store,
+            external_blob_inner,
+            _external_blob_origin: None,
+            direct_local_io: false,
             local_dir_operations: None,
             local_fsync: false,
             scheme: scheme.into(),
@@ -2577,7 +3038,9 @@ mod tests {
     #[tokio::test]
     async fn test_put_if_absent() {
         let temp_dir = TempStrDir::default();
-        let path = Path::from(format!("{}/atomic-create", temp_dir.as_str()));
+        let parent = Path::from(temp_dir.as_str()).join("目录");
+        let basename = format!(".{}", "x".repeat(240));
+        let path = parent.join(basename.as_str());
         let store = ObjectStore::local();
         store
             .put_if_absent(&path, Bytes::from_static(b"first").into())
@@ -3213,6 +3676,141 @@ mod tests {
         assert!(!path.join("verified").exists());
     }
 
+    #[rstest]
+    #[tokio::test]
+    async fn test_external_view_counts_reads_once(#[values(false, true)] apply_late: bool) {
+        let wrapper = Arc::new(IOTracker::default());
+        let params = ObjectStoreParams {
+            object_store_wrapper: (!apply_late)
+                .then(|| wrapper.clone() as Arc<dyn WrappingObjectStore>),
+            ..Default::default()
+        };
+        let (store, _) = ObjectStore::from_uri_and_params(
+            Arc::new(ObjectStoreRegistry::default()),
+            "memory:///",
+            &params,
+        )
+        .await
+        .unwrap();
+        let mut store = store.as_ref().clone();
+        if apply_late {
+            store.apply_wrapper(wrapper.as_ref());
+        }
+        let store = Arc::new(store);
+        let path = Path::from("payload");
+        store.put(&path, b"blob").await.unwrap();
+        for view in [store.clone(), store.for_external_blobs()] {
+            store.io_stats_incremental();
+            wrapper.incremental_stats();
+            assert_eq!(
+                view.inner.get_range(&path, 0..4).await.unwrap(),
+                b"blob".as_slice()
+            );
+            let stats = store.io_stats_snapshot();
+            assert_eq!(stats.read_iops, 1);
+            assert_eq!(stats.read_bytes, 4);
+            assert_eq!(wrapper.stats().read_iops, 1);
+        }
+    }
+
+    #[rstest]
+    #[case::file("file")]
+    #[case::storage("file-object-store")]
+    #[cfg_attr(target_os = "linux", case::uring("file+uring"))]
+    #[tokio::test]
+    async fn test_local_io_uses_wrapped_backend(
+        #[case] scheme: &str,
+        #[values(false, true)] apply_late: bool,
+    ) {
+        let directory = TempStdDir::default();
+        std::fs::write(directory.join("source"), b"disk").unwrap();
+        let file_url = Url::from_directory_path(&directory).unwrap();
+        let mut url = Url::parse(&format!("{scheme}:///")).unwrap();
+        url.set_path(file_url.path());
+        let replacement = Arc::new(InMemory::new());
+        let wrapper = Arc::new(TestWrapper {
+            called: AtomicBool::new(false),
+            return_value: replacement.clone(),
+        });
+        let params = ObjectStoreParams {
+            object_store_wrapper: (!apply_late)
+                .then(|| wrapper.clone() as Arc<dyn WrappingObjectStore>),
+            ..Default::default()
+        };
+        let (store, base) = ObjectStore::from_uri_and_params(
+            Arc::new(ObjectStoreRegistry::default()),
+            url.as_ref(),
+            &params,
+        )
+        .await
+        .unwrap();
+        let store = if apply_late {
+            let mut store = store.as_ref().clone();
+            store.apply_wrapper(wrapper.as_ref());
+            Arc::new(store)
+        } else {
+            store
+        };
+        assert!(!store.has_direct_local_paths());
+        let source = base.clone().join("source");
+        replacement
+            .put(&source, Bytes::from_static(b"wrapped").into())
+            .await
+            .unwrap();
+
+        // Both ordinary and external views must reach the selected backend,
+        // including the known-size reader and local copy shortcuts.
+        for view in [store.clone(), store.for_external_blobs()] {
+            assert_eq!(
+                view.open(&source).await.unwrap().get_all().await.unwrap(),
+                b"wrapped".as_slice()
+            );
+            assert_eq!(
+                view.open_with_size(&source, 7)
+                    .await
+                    .unwrap()
+                    .get_all()
+                    .await
+                    .unwrap(),
+                b"wrapped".as_slice()
+            );
+            let destination = base.clone().join("copy");
+            view.copy(&source, &destination).await.unwrap();
+            assert_eq!(
+                replacement
+                    .get(&destination)
+                    .await
+                    .unwrap()
+                    .bytes()
+                    .await
+                    .unwrap(),
+                b"wrapped".as_slice()
+            );
+            view.copy_via_stream(&source, &view, &base.clone().join("streamed"))
+                .await
+                .unwrap();
+            view.put(&base.clone().join("new"), b"new").await.unwrap();
+            assert_eq!(
+                replacement
+                    .get(&base.clone().join("new"))
+                    .await
+                    .unwrap()
+                    .bytes()
+                    .await
+                    .unwrap(),
+                b"new".as_slice()
+            );
+        }
+        assert_eq!(std::fs::read(directory.join("source")).unwrap(), b"disk");
+        for name in ["copy", "streamed", "new"] {
+            assert!(
+                !directory.join(name).exists(),
+                "wrapper was bypassed for {name}"
+            );
+        }
+        assert!(wrapper.called());
+    }
+
     #[derive(Debug)]
     struct TestWrapper {
         called: AtomicBool,
@@ -3366,6 +3964,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_external_view_retains_the_registry_binding() {
+        let registry = Arc::new(ObjectStoreRegistry::default());
+        let params = ObjectStoreParams {
+            object_store_wrapper: Some(Arc::new(IOTracker::default())),
+            ..Default::default()
+        };
+        let (store, path) =
+            ObjectStore::from_uri_and_params(registry.clone(), "memory://payload", &params)
+                .await
+                .unwrap();
+        store.put(&path, b"live").await.unwrap();
+        let weak = Arc::downgrade(&store);
+        let external = store.for_external_blobs();
+        assert!(Arc::ptr_eq(&external, &store.for_external_blobs()));
+        assert!(Arc::ptr_eq(&external, &external.for_external_blobs()));
+        let cloned = Arc::new(store.as_ref().clone());
+        assert!(!Arc::ptr_eq(&external, &cloned.for_external_blobs()));
+        drop(cloned);
+        drop(store);
+        let (reopened, _) = ObjectStore::from_uri_and_params(registry, "memory://payload", &params)
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&reopened, &weak.upgrade().unwrap()));
+        assert_eq!(
+            external
+                .open(&path)
+                .await
+                .unwrap()
+                .get_range(0..4)
+                .await
+                .unwrap()
+                .as_ref(),
+            b"live"
+        );
+        drop(reopened);
+        drop(external);
+        assert!(
+            weak.upgrade().is_none(),
+            "derived views must not form an Arc cycle"
+        );
+    }
+
+    #[tokio::test]
     async fn test_wrapper_identity_is_stable_across_tasks() {
         let wrapper = Arc::new(TestWrapper {
             called: AtomicBool::new(false),
@@ -3396,8 +4037,11 @@ mod tests {
         );
     }
 
+    #[rstest]
     #[tokio::test]
-    async fn test_wrapping_object_store_option_is_used() {
+    async fn test_wrapping_object_store_option_is_used(
+        #[values(false, true)] is_custom_store: bool,
+    ) {
         // Make a store for the inner store first
         let mock_inner_store: Arc<dyn OSObjectStore> = Arc::new(InMemory::new());
         let registry = Arc::new(ObjectStoreRegistry::default());
@@ -3409,8 +4053,15 @@ mod tests {
             return_value: mock_inner_store.clone(),
         });
 
+        #[allow(deprecated)]
         let params = ObjectStoreParams {
             object_store_wrapper: Some(wrapper.clone()),
+            object_store: is_custom_store.then(|| {
+                (
+                    Arc::new(InMemory::new()) as Arc<dyn OSObjectStore>,
+                    Url::parse("memory:///").unwrap(),
+                )
+            }),
             ..ObjectStoreParams::default()
         };
 
@@ -3919,7 +4570,7 @@ mod tests {
         store.put(&destination, b"old").await.unwrap();
 
         let result = store
-            .copy_if_not_exists(&source, &destination)
+            .copy_if_not_exists_or_same_size(&source, &destination)
             .await
             .unwrap();
 
@@ -3948,7 +4599,7 @@ mod tests {
         observations.part_count.store(0, Ordering::SeqCst);
 
         let result = store
-            .copy_if_not_exists(&source, &destination)
+            .copy_if_not_exists_or_same_size(&source, &destination)
             .await
             .unwrap();
 
@@ -4040,6 +4691,31 @@ mod tests {
             observations.delete_max_in_flight.load(Ordering::SeqCst) > 1,
             "deletions ran one at a time; remove_stream must overlap them"
         );
+    }
+
+    #[tokio::test]
+    async fn test_delete_stream_removes_every_path() {
+        let store = ObjectStore::memory();
+        let paths: Vec<Path> = (0..64).map(|i| Path::from(format!("obj-{i:03}"))).collect();
+        for path in &paths {
+            store.put(path, b"x").await.unwrap();
+        }
+
+        let to_remove = futures::stream::iter(paths.clone().into_iter().map(Ok)).boxed();
+        let mut reported = store
+            .delete_stream(to_remove)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        // Bulk deletion does not preserve order.
+        reported.sort_unstable();
+        let mut expected = paths.clone();
+        expected.sort_unstable();
+        assert_eq!(reported, expected);
+        for path in &paths {
+            assert!(!store.exists(path).await.unwrap(), "{path} still present");
+        }
     }
 
     #[tokio::test]

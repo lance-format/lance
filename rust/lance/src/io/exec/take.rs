@@ -466,7 +466,7 @@ impl TakeStream {
                 let batch = batch?;
                 let this = self.clone();
                 Ok(
-                    tokio::task::spawn(this.map_batch(batch, batch_index as u32))
+                    lance_core::utils::tokio::spawn(this.map_batch(batch, batch_index as u32))
                         .map(|res| res.unwrap()),
                 )
             })
@@ -804,7 +804,7 @@ impl ExecutionPlan for TakeExec {
         // We aren't allowed to do work in `execute` and so we defer creation of the
         // TakeStream until the stream is polled.
         let lazy_take_stream = futures::stream::once(async move {
-            let obj_store = dataset.object_store.clone();
+            let obj_store = dataset.table_state.object_store.clone();
             let scheduler_config = SchedulerConfig::max_bandwidth(&obj_store);
             // unwrap is safe since SchedulerConfig::max_bandwidth is always valid
             let scan_scheduler = ScanScheduler::new(obj_store, scheduler_config);
@@ -1297,8 +1297,8 @@ mod tests {
         .unwrap()
         .unwrap();
         let scheduler = ScanScheduler::new(
-            dataset.object_store.clone(),
-            SchedulerConfig::max_bandwidth(&dataset.object_store),
+            dataset.table_state.object_store.clone(),
+            SchedulerConfig::max_bandwidth(&dataset.table_state.object_store),
         );
         let mut stream = TakeStream::new(
             dataset,
