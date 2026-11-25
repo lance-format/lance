@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use super::*;
+use lance_table::io::commit::ManifestNamingScheme::{V1, V2};
 
 /// The early-stop path (ordered stores) and the collect-then-sort path
 /// must return the same results for every descending/limit combination.
@@ -143,6 +144,69 @@ async fn test_list_versions_under_ordering_and_limit() {
     let (ns_fs, _tmp) = create_test_namespace().await;
     assert!(!ns_fs.object_store.list_is_lexically_ordered);
     seed_and_check(&ns_fs).await;
+}
+
+/// A partly migrated table mixes V1 and V2 manifest names. On an ordered
+/// store, V1 names can sort before the V2 names (`10.manifest`) or after them
+/// (`19.manifest`, `2.manifest`), and either group may hold the newest
+/// versions. Every bounded descending walk must match the unbounded listing.
+#[rstest::rstest]
+#[case::v2_prefix_v1_tail(&[2, 3], &[4, 5])]
+#[case::v1_sorts_before_v2(&[3, 10], &[11, 12])]
+// Versions 1 and 10-18 migrated; 2-9, 19 and 20 still V1.
+#[case::interrupted_migration(&[2, 3, 4, 5, 6, 7, 8, 9, 19, 20], &[1, 10, 11, 12, 13, 14, 15, 16, 17, 18])]
+#[case::v2_only(&[], &[1, 2, 3, 4, 5])]
+#[tokio::test]
+async fn test_descending_pages_across_manifest_layouts(
+    #[case] v1_versions: &[u64],
+    #[case] v2_versions: &[u64],
+) {
+    let ns = DirectoryNamespaceBuilder::new("memory://mixed-layout-pages")
+        .manifest_enabled(false)
+        .build()
+        .await
+        .unwrap();
+    assert!(ns.object_store.list_is_lexically_ordered);
+    let table = ns.table_path("events");
+    let manifests = v1_versions
+        .iter()
+        .map(|v| (V1, *v))
+        .chain(v2_versions.iter().map(|v| (V2, *v)));
+    for (scheme, version) in manifests {
+        ns.object_store
+            .put(&scheme.manifest_path(&table, version), b"m")
+            .await
+            .unwrap();
+    }
+    let request = ListTableVersionsRequest {
+        id: Some(vec!["events".into()]),
+        descending: Some(true),
+        ..Default::default()
+    };
+    let numbers = |rows: &[TableVersion]| rows.iter().map(|row| row.version).collect::<Vec<_>>();
+    let unbounded = ns.list_table_versions(request.clone()).await.unwrap();
+    let expected = numbers(&unbounded.versions);
+    let total = v1_versions.len() + v2_versions.len();
+    assert_eq!(expected.len(), total);
+    assert!(expected.windows(2).all(|pair| pair[0] > pair[1]));
+
+    for limit in 1..=total as i32 {
+        let mut page_request = ListTableVersionsRequest {
+            limit: Some(limit),
+            ..request.clone()
+        };
+        let mut walked = Vec::new();
+        loop {
+            let page = ns.list_table_versions(page_request.clone()).await.unwrap();
+            walked.extend(numbers(&page.versions));
+            match page.page_token {
+                Some(token) => page_request.page_token = Some(token),
+                None => break,
+            }
+            assert!(walked.len() <= total, "walk did not terminate");
+        }
+        assert_eq!(walked, expected, "limit = {limit}");
+    }
 }
 
 #[tokio::test]
@@ -322,6 +386,22 @@ async fn test_list_versions_under_early_stop_bounded_consumption() {
             let entries_listed = self.entries_listed.clone();
             self.target
                 .list(prefix)
+                .inspect(move |_| {
+                    entries_listed.fetch_add(1, Ordering::SeqCst);
+                })
+                .boxed()
+        }
+
+        // Forwarded, not left to the default (which lists everything and
+        // filters), so the count reflects what a real store returns.
+        fn list_with_offset(
+            &self,
+            prefix: Option<&Path>,
+            offset: &Path,
+        ) -> BoxStream<'static, OSResult<ObjectMeta>> {
+            let entries_listed = self.entries_listed.clone();
+            self.target
+                .list_with_offset(prefix, offset)
                 .inspect(move |_| {
                     entries_listed.fetch_add(1, Ordering::SeqCst);
                 })
