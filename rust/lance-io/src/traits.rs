@@ -108,14 +108,7 @@ impl<W: Writer + ?Sized> WriteExt for W {
     }
 
     async fn copy_from_reader(&mut self, reader: &dyn Reader) -> Result<usize> {
-        let mut stream = reader.get_stream().await?;
-        let mut copied = 0usize;
-        while let Some(chunk) = stream.next().await {
-            let bytes = chunk?;
-            copied += bytes.len();
-            self.write_all(&bytes).await?;
-        }
-        Ok(copied)
+        copy_reader_with_progress(self, reader, |_| {}).await
     }
 
     async fn copy_range_from_reader(
@@ -132,6 +125,22 @@ impl<W: Writer + ?Sized> WriteExt for W {
         }
         Ok(copied)
     }
+}
+
+pub(crate) async fn copy_reader_with_progress<W: Writer + ?Sized>(
+    writer: &mut W,
+    reader: &dyn Reader,
+    mut accepted: impl FnMut(usize) + Send,
+) -> Result<usize> {
+    let mut stream = reader.get_stream().await?;
+    let mut copied = 0;
+    while let Some(chunk) = stream.next().await {
+        let bytes = chunk?;
+        writer.write_all(&bytes).await?;
+        copied += bytes.len();
+        accepted(copied);
+    }
+    Ok(copied)
 }
 
 pub trait Reader: std::fmt::Debug + Send + Sync + DeepSizeOf {

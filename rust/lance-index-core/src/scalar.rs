@@ -483,6 +483,18 @@ pub trait IndexStore: std::fmt::Debug + Send + Sync + DeepSizeOf {
         }
     }
 
+    /// Copy a named file and report observable transfer boundaries. Stores without
+    /// byte-level visibility use their ordinary copy operation.
+    async fn copy_index_file_to_with_observer(
+        &self,
+        name: &str,
+        new_name: &str,
+        dest_store: &dyn IndexStore,
+        _observer: Option<&dyn lance_io::object_store::CopyObserver>,
+    ) -> Result<IndexFile> {
+        self.copy_index_file_to(name, new_name, dest_store).await
+    }
+
     /// Rename an index file
     async fn rename_index_file(&self, name: &str, new_name: &str) -> Result<IndexFile>;
 

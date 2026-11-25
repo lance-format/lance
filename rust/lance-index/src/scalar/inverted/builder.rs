@@ -389,6 +389,14 @@ impl InvertedIndexBuilder {
         let memory_limit_bytes = resolve_worker_memory_limit_bytes(&self.params, num_workers);
         let mut merged: Option<InnerBuilder> = None;
         let mut files = Vec::new();
+        let total = old_segments
+            .iter()
+            .map(|index| index.partitions.len() as u64)
+            .sum();
+        self.progress
+            .stage_start("merge_fts_partitions", Some(total), "partitions")
+            .await?;
+        let mut processed = 0;
         for (index, old_data_filter) in old_segments.iter().zip(old_data_filters) {
             if old_data_filter.is_none() {
                 self.deleted_fragments
@@ -399,49 +407,55 @@ impl InvertedIndexBuilder {
                 if let Some(filter) = old_data_filter {
                     partition_builder.filter_old_data(filter).await?;
                 }
-                if partition_builder.is_empty() {
-                    continue;
-                }
-                match merged.take() {
-                    Some(mut accumulated) => {
-                        let would_exceed_memory = accumulated
-                            .memory_size()
-                            .saturating_add(partition_builder.memory_size())
-                            >= memory_limit_bytes;
-                        let would_exceed_doc_ids = accumulated
-                            .docs
-                            .len()
-                            .saturating_add(partition_builder.docs.len())
-                            > u32::MAX as usize;
-                        if would_exceed_memory || would_exceed_doc_ids {
-                            merged = Some(partition_builder);
-                            files.extend(self.write_new_partition(dest_store, accumulated).await?);
-                        } else {
-                            // `merge_from` remaps token ids into a unified
-                            // dictionary and concatenates posting lists across
-                            // builders holding up to LANCE_FTS_PARTITION_SIZE of
-                            // state, so it runs for seconds at a time. Inline it
-                            // would occupy a runtime worker for that whole span,
-                            // starving the tasks driving in-flight uploads; the
-                            // upload's whole-request timeout keeps running while
-                            // its task waits to be polled. The builder is moved
-                            // in and handed back so ownership survives the hop.
-                            accumulated = spawn_cpu(move || {
-                                accumulated.merge_from(partition_builder)?;
-                                Result::Ok(accumulated)
-                            })
-                            .await?;
-                            merged = Some(accumulated);
+                if !partition_builder.is_empty() {
+                    match merged.take() {
+                        Some(mut accumulated) => {
+                            let would_exceed_memory = accumulated
+                                .memory_size()
+                                .saturating_add(partition_builder.memory_size())
+                                >= memory_limit_bytes;
+                            let would_exceed_doc_ids = accumulated
+                                .docs
+                                .len()
+                                .saturating_add(partition_builder.docs.len())
+                                > u32::MAX as usize;
+                            if would_exceed_memory || would_exceed_doc_ids {
+                                merged = Some(partition_builder);
+                                files.extend(
+                                    self.write_new_partition(dest_store, accumulated).await?,
+                                );
+                            } else {
+                                // `merge_from` remaps token ids into a unified
+                                // dictionary and concatenates posting lists across
+                                // builders holding up to LANCE_FTS_PARTITION_SIZE of
+                                // state, so it runs for seconds at a time. Inline it
+                                // would occupy a runtime worker for that whole span,
+                                // starving the tasks driving in-flight uploads; the
+                                // upload's whole-request timeout keeps running while
+                                // its task waits to be polled. The builder is moved
+                                // in and handed back so ownership survives the hop.
+                                accumulated = spawn_cpu(move || {
+                                    accumulated.merge_from(partition_builder)?;
+                                    Result::Ok(accumulated)
+                                })
+                                .await?;
+                                merged = Some(accumulated);
+                            }
                         }
+                        None => merged = Some(partition_builder),
                     }
-                    None => merged = Some(partition_builder),
                 }
+                processed += 1;
+                self.progress
+                    .stage_progress("merge_fts_partitions", processed)
+                    .await?;
             }
         }
 
         if let Some(builder) = merged {
             files.extend(self.write_new_partition(dest_store, builder).await?);
         }
+        self.progress.stage_complete("merge_fts_partitions").await?;
         Ok(files)
     }
 
@@ -936,10 +950,11 @@ impl InvertedIndexBuilder {
                     for suffix in PARTITION_FILE_SUFFIXES {
                         files.push(
                             source
-                                .copy_index_file_to(
+                                .copy_index_file_to_with_observer(
                                     &partition_file_path(*part, suffix),
                                     &target.file_path(*part, suffix),
                                     dest_store,
+                                    self.progress.copy_observer(),
                                 )
                                 .await?,
                         );
@@ -1002,7 +1017,14 @@ impl InvertedIndexBuilder {
                 // previous copy path to obtain exact sizes for planning.
                 for suffix in PARTITION_FILE_SUFFIXES {
                     let path = partition_file_path(id, suffix);
-                    let file = source.copy_index_file_to(&path, &path, dest_store).await?;
+                    let file = source
+                        .copy_index_file_to_with_observer(
+                            &path,
+                            &path,
+                            dest_store,
+                            self.progress.copy_observer(),
+                        )
+                        .await?;
                     input_files.push(file.clone());
                     files.push(file);
                 }
@@ -1030,7 +1052,16 @@ impl InvertedIndexBuilder {
                     .ok_or_else(|| Error::internal("existing partitions require a source store"))?;
                 for suffix in PARTITION_FILE_SUFFIXES {
                     let path = partition_file_path(id, suffix);
-                    files.push(source.copy_index_file_to(&path, &path, dest_store).await?);
+                    files.push(
+                        source
+                            .copy_index_file_to_with_observer(
+                                &path,
+                                &path,
+                                dest_store,
+                                self.progress.copy_observer(),
+                            )
+                            .await?,
+                    );
                 }
                 copied += 1;
                 self.progress
@@ -3179,7 +3210,12 @@ async fn finalize_staged_partitions(
                 let final_path = partition_file_path(new_id, suffix);
                 files.push(
                     source
-                        .copy_index_file_to(&staged_path, &final_path, dest.as_ref())
+                        .copy_index_file_to_with_observer(
+                            &staged_path,
+                            &final_path,
+                            dest.as_ref(),
+                            file_progress.progress.copy_observer(),
+                        )
                         .await?,
                 );
                 file_progress.advance(1).await?;
