@@ -3409,10 +3409,22 @@ impl RowStreamRead {
             }
             // Point removal avoids sorting when every removal is a bit clear.
             Some(DeletionVector::Set(offsets))
-                if count.saturating_sub(offsets.len() as u64) > ROARING_ARRAY_LIMIT
-                    && bounds
-                        .is_some_and(|(first, last)| first >> u16::BITS == last >> u16::BITS)
-                    && requested.statistics().n_bitset_containers == 1 =>
+                if count > ROARING_ARRAY_LIMIT
+                    && bounds.is_some_and(|(first, last)| {
+                        if first >> u16::BITS != last >> u16::BITS
+                            || requested.statistics().n_bitset_containers != 1
+                        {
+                            return false;
+                        }
+                        let max_point_deletions = (count - ROARING_ARRAY_LIMIT - 1) as usize;
+                        // The span bounds the number of removals even when it has gaps.
+                        offsets.len() <= max_point_deletions
+                            || offsets
+                                .iter()
+                                .filter(|offset| (first..=last).contains(*offset))
+                                .nth(max_point_deletions)
+                                .is_none()
+                    }) =>
             {
                 let mut surviving = requested.into_owned();
                 for &offset in offsets {
@@ -6309,6 +6321,21 @@ mod tests {
             .flat_map(|run| run * 10..run * 10 + 4)
             .chain((0..extra_deletions).map(|run| run * 10 + 4))
             .collect();
+
+        assert_partial_fragment_ranges(&requested, 1_000_000, &DeletionVector::Set(offsets));
+    }
+
+    #[rstest]
+    #[case::unpadded(0..0)]
+    #[case::padding_in_bitset(11_000..12_000)]
+    #[case::padding_in_other_container(100_000..101_000)]
+    fn test_partial_fragment_ranges_with_set_deletions_outside_bitset_span(
+        #[case] padding: Range<u32>,
+    ) {
+        let requested: RoaringBitmap = (0..10_920).filter(|offset| offset % 12 < 9).collect();
+        assert_eq!(requested.len(), 8190);
+        assert_eq!(requested.statistics().n_bitset_containers, 1);
+        let offsets = (0..10_920).step_by(3).chain(padding).collect();
 
         assert_partial_fragment_ranges(&requested, 1_000_000, &DeletionVector::Set(offsets));
     }
