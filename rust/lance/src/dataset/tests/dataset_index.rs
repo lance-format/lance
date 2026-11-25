@@ -7844,7 +7844,11 @@ async fn test_fts_prewarm_with_serializing_backend_serves_query_with_no_io() {
         .unwrap();
 
     // Reset IO counters to isolate prewarm + query traffic from open/load.
-    dataset.object_store.as_ref().io_stats_incremental();
+    dataset
+        .table_state
+        .object_store
+        .as_ref()
+        .io_stats_incremental();
 
     dataset
         .prewarm_index_with_options(
@@ -7868,7 +7872,11 @@ async fn test_fts_prewarm_with_serializing_backend_serves_query_with_no_io() {
     // After prewarm, a phrase query (which exercises both posting lists and
     // positions, deserializing them from bytes via the codec) must not hit
     // disk.
-    dataset.object_store.as_ref().io_stats_incremental();
+    dataset
+        .table_state
+        .object_store
+        .as_ref()
+        .io_stats_incremental();
 
     // Project `_rowid` so the scan does not need to read a data column from
     // the dataset's parquet/lance files; the index path alone determines
@@ -7890,7 +7898,11 @@ async fn test_fts_prewarm_with_serializing_backend_serves_query_with_no_io() {
         "phrase query should still return correct results after deserialization"
     );
 
-    let stats = dataset.object_store.as_ref().io_stats_incremental();
+    let stats = dataset
+        .table_state
+        .object_store
+        .as_ref()
+        .io_stats_incremental();
     assert_io_eq!(
         stats,
         read_iops,
@@ -7959,7 +7971,11 @@ async fn test_btree_prewarm_with_serializing_backend_serves_query_with_no_io() {
         .unwrap();
 
     // Reset IO counters to isolate prewarm + query traffic from open/load.
-    dataset.object_store.as_ref().io_stats_incremental();
+    dataset
+        .table_state
+        .object_store
+        .as_ref()
+        .io_stats_incremental();
 
     dataset.prewarm_index("value_idx").await.unwrap();
 
@@ -7999,7 +8015,11 @@ async fn test_btree_prewarm_with_serializing_backend_serves_query_with_no_io() {
     // After recreating the backend, an indexed-filter query must reconstruct
     // the index and every page it touches from serialized bytes, with no disk
     // IO. Project only `_rowid` so the scan does not read a data column.
-    dataset.object_store.as_ref().io_stats_incremental();
+    dataset
+        .table_state
+        .object_store
+        .as_ref()
+        .io_stats_incremental();
 
     let result = dataset
         .scan()
@@ -8016,7 +8036,11 @@ async fn test_btree_prewarm_with_serializing_backend_serves_query_with_no_io() {
         "indexed filter should still return correct results after deserialization"
     );
 
-    let stats = dataset.object_store.as_ref().io_stats_incremental();
+    let stats = dataset
+        .table_state
+        .object_store
+        .as_ref()
+        .io_stats_incremental();
     assert_io_eq!(
         stats,
         read_iops,
@@ -8082,7 +8106,11 @@ async fn test_bitmap_prewarm_with_serializing_backend_serves_query_with_no_io() 
         .await
         .unwrap();
 
-    dataset.object_store.as_ref().io_stats_incremental();
+    dataset
+        .table_state
+        .object_store
+        .as_ref()
+        .io_stats_incremental();
     dataset.prewarm_index("value_idx").await.unwrap();
 
     let serialized_after_prewarm = backend.serialized_entry_count().await;
@@ -8092,7 +8120,11 @@ async fn test_bitmap_prewarm_with_serializing_backend_serves_query_with_no_io() 
          CacheCodec, but the serializing store was empty"
     );
 
-    dataset.object_store.as_ref().io_stats_incremental();
+    dataset
+        .table_state
+        .object_store
+        .as_ref()
+        .io_stats_incremental();
     let result = dataset
         .scan()
         .project(&[ROW_ID])
@@ -8109,7 +8141,11 @@ async fn test_bitmap_prewarm_with_serializing_backend_serves_query_with_no_io() 
         "indexed bitmap filter should return correct results after deserialization"
     );
 
-    let stats = dataset.object_store.as_ref().io_stats_incremental();
+    let stats = dataset
+        .table_state
+        .object_store
+        .as_ref()
+        .io_stats_incremental();
     assert_io_eq!(
         stats,
         read_iops,
@@ -8338,7 +8374,11 @@ async fn test_label_list_prewarm_with_serializing_backend_serves_query_with_no_i
         .await
         .unwrap();
 
-    dataset.object_store.as_ref().io_stats_incremental();
+    dataset
+        .table_state
+        .object_store
+        .as_ref()
+        .io_stats_incremental();
     dataset.prewarm_index("labels_idx").await.unwrap();
 
     let serialized_after_prewarm = backend.serialized_entry_count().await;
@@ -8348,7 +8388,11 @@ async fn test_label_list_prewarm_with_serializing_backend_serves_query_with_no_i
          CacheCodec, but the serializing store was empty"
     );
 
-    dataset.object_store.as_ref().io_stats_incremental();
+    dataset
+        .table_state
+        .object_store
+        .as_ref()
+        .io_stats_incremental();
     let result = dataset
         .scan()
         .project(&[ROW_ID])
@@ -8364,7 +8408,11 @@ async fn test_label_list_prewarm_with_serializing_backend_serves_query_with_no_i
         "indexed label-list filter should return correct results after deserialization"
     );
 
-    let stats = dataset.object_store.as_ref().io_stats_incremental();
+    let stats = dataset
+        .table_state
+        .object_store
+        .as_ref()
+        .io_stats_incremental();
     assert_io_eq!(
         stats,
         read_iops,
@@ -10487,8 +10535,8 @@ async fn test_index_inherits_dataset_file_version() {
     // Open the index file and check its version
     let index_path = index_dir.clone().join("index.idx");
     let scheduler = ScanScheduler::new(
-        dataset.object_store.clone(),
-        SchedulerConfig::max_bandwidth(&dataset.object_store),
+        dataset.table_state.object_store.clone(),
+        SchedulerConfig::max_bandwidth(&dataset.table_state.object_store),
     );
 
     let file_handle = scheduler
@@ -10516,6 +10564,7 @@ async fn test_index_inherits_dataset_file_version() {
     // Also check the auxiliary file if it exists
     let aux_path = index_dir.clone().join("auxiliary.idx");
     if dataset
+        .table_state
         .object_store
         .exists(&aux_path)
         .await
@@ -10595,8 +10644,8 @@ async fn test_legacy_dataset_uses_v2_0_for_indexes() {
     // Open the index file and check its version
     let index_path = index_dir.clone().join("index.idx");
     let scheduler = ScanScheduler::new(
-        dataset.object_store.clone(),
-        SchedulerConfig::max_bandwidth(&dataset.object_store),
+        dataset.table_state.object_store.clone(),
+        SchedulerConfig::max_bandwidth(&dataset.table_state.object_store),
     );
 
     let file_handle = scheduler
@@ -10671,7 +10720,7 @@ async fn test_manifest_read_recovers_from_stale_size() {
 
     let session = Session::default();
     let manifest = Dataset::load_manifest(
-        dataset.object_store.as_ref(),
+        dataset.table_state.object_store.as_ref(),
         &stale_location,
         test_uri.as_ref(),
         &session,
@@ -10680,9 +10729,13 @@ async fn test_manifest_read_recovers_from_stale_size() {
     .expect("load_manifest should recover from a stale manifest size");
     assert_eq!(manifest.version, real_location.version);
 
-    let indices = read_manifest_indexes(dataset.object_store.as_ref(), &stale_location, &manifest)
-        .await
-        .expect("read_manifest_indexes should recover from a stale manifest size");
+    let indices = read_manifest_indexes(
+        dataset.table_state.object_store.as_ref(),
+        &stale_location,
+        &manifest,
+    )
+    .await
+    .expect("read_manifest_indexes should recover from a stale manifest size");
     assert_eq!(indices.len(), 1);
     assert_eq!(indices[0].name, "id_idx");
 
@@ -10692,7 +10745,7 @@ async fn test_manifest_read_recovers_from_stale_size() {
         ..real_location.clone()
     };
     let manifest = Dataset::load_manifest(
-        dataset.object_store.as_ref(),
+        dataset.table_state.object_store.as_ref(),
         &short_location,
         test_uri.as_ref(),
         &session,

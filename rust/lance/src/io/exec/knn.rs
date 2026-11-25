@@ -1872,12 +1872,21 @@ impl PreFilter for SegmentPreFilter {
             .is_some_and(|mask| mask_selects_nothing(mask))
     }
 
+    // A deletions-only base may still restrict rows to the selected segments'
+    // fragments, so it is not `is_empty` when a scan selects one segment out of
+    // several. Its final mask is the ownership mask either way (see
+    // `wait_for_ready`), so a partition the ownership mask fully selects can still
+    // take the no-filter fast path.
     fn needs_partition_row_ids(&self) -> bool {
-        self.base.is_empty()
+        self.base.only_deletions()
+    }
+
+    fn deletions_only(&self) -> bool {
+        self.base.only_deletions()
     }
 
     fn is_empty_for(&self, rows: &RowAddrTreeMap) -> bool {
-        self.base.is_empty() && self.ownership_mask.selects_all(rows)
+        self.base.only_deletions() && self.ownership_mask.selects_all(rows)
     }
 
     fn mask(&self) -> Arc<RowAddrMask> {
@@ -1906,8 +1915,8 @@ async fn segment_ownership_mask(
     let key = SegmentOwnershipMaskKey {
         uuid: &index.uuid,
         version: dataset.manifest.version,
-        store_identity: &dataset.object_store.store_prefix,
-        e_tag: dataset.manifest_location.e_tag.as_deref(),
+        store_identity: &dataset.table_state.object_store.store_prefix,
+        e_tag: dataset.table_state.manifest_location.e_tag.as_deref(),
     };
     let loader_dataset = dataset.clone();
     let mask = dataset
@@ -3873,7 +3882,7 @@ mod tests {
             .unwrap();
         let first_index = dataset.load_indices_by_name("vector_idx").await.unwrap();
         let first_version = dataset.manifest.version;
-        let first_fragments = dataset.fragment_bitmap.as_ref().clone();
+        let first_fragments = dataset.table_state.fragment_bitmap.as_ref().clone();
         let field_id = dataset.schema().field("vector").unwrap().id;
 
         let second = lance_datagen::gen_batch()
@@ -3884,7 +3893,7 @@ mod tests {
             .into_reader_rows(RowCount::from(20), BatchCount::from(1));
         assert_eq!(second.schema(), first_schema);
         dataset.append(second, None).await.unwrap();
-        let appended_fragments = dataset.fragment_bitmap.as_ref() - &first_fragments;
+        let appended_fragments = dataset.table_state.fragment_bitmap.as_ref() - &first_fragments;
         let dataset = Arc::new(dataset);
         let old_segment = IndexMetadata {
             uuid: first_index[0].uuid,
@@ -3948,8 +3957,8 @@ mod tests {
             .get_with_key(&SegmentOwnershipMaskKey {
                 uuid: &old_segment.uuid,
                 version: dataset.manifest.version,
-                store_identity: &dataset.object_store.store_prefix,
-                e_tag: dataset.manifest_location.e_tag.as_deref(),
+                store_identity: &dataset.table_state.object_store.store_prefix,
+                e_tag: dataset.table_state.manifest_location.e_tag.as_deref(),
             })
             .await
             .expect("the ownership mask is cached under the segment's key");
@@ -3975,6 +3984,41 @@ mod tests {
         assert!(
             segment_prefilter.is_empty_for(&old_partition_rows),
             "an append-only segment must preserve the unfiltered partition fast path"
+        );
+
+        // A scan that selects only the old segment builds its base from that segment's
+        // fragments alone. The base then restricts rows to those fragments and is no
+        // longer empty, but every row of the segment's partition still passes, so the
+        // partition must keep the fast path (#11166).
+        let single_segment_base = Arc::new(DatasetPreFilter::new(
+            dataset.clone(),
+            std::slice::from_ref(&old_segment),
+            None,
+        ));
+        single_segment_base.wait_for_ready().await.unwrap();
+        assert!(
+            !single_segment_base.is_empty(),
+            "one selected segment restricts the base to its fragments"
+        );
+        let single_segment_prefilter =
+            prefilter_for_segment(dataset.clone(), &old_segment, single_segment_base)
+                .await
+                .unwrap();
+        single_segment_prefilter.wait_for_ready().await.unwrap();
+        assert!(single_segment_prefilter.needs_partition_row_ids());
+        assert!(
+            single_segment_prefilter.is_empty_for(&old_partition_rows),
+            "a segment-scoped scan must keep the unfiltered partition fast path"
+        );
+        let appended_partition_rows = appended_fragments
+            .iter()
+            .flat_map(|fragment_id| {
+                (0..20_u64).map(move |offset| (u64::from(fragment_id) << 32) | offset)
+            })
+            .collect::<RowAddrTreeMap>();
+        assert!(
+            !single_segment_prefilter.is_empty_for(&appended_partition_rows),
+            "rows outside the segment's fragments must still be filtered"
         );
 
         let appended_fragment_id = appended_fragments.iter().next().unwrap();
@@ -4071,7 +4115,7 @@ mod tests {
         let dataset = Dataset::write(vectors(), "memory://", Some(params))
             .await
             .unwrap();
-        let first_fragments = dataset.fragment_bitmap.as_ref().clone();
+        let first_fragments = dataset.table_state.fragment_bitmap.as_ref().clone();
         let segment = IndexMetadata {
             uuid: Uuid::new_v4(),
             fields: vec![dataset.schema().field("vector").unwrap().id],
@@ -4094,8 +4138,8 @@ mod tests {
             SegmentOwnershipMaskKey {
                 uuid: &segment.uuid,
                 version: dataset.manifest.version,
-                store_identity: &dataset.object_store.store_prefix,
-                e_tag: dataset.manifest_location.e_tag.as_deref(),
+                store_identity: &dataset.table_state.object_store.store_prefix,
+                e_tag: dataset.table_state.manifest_location.e_tag.as_deref(),
             }
         }
 
@@ -4119,7 +4163,7 @@ mod tests {
         let mut appended = (*dataset).clone();
         appended.append(vectors(), None).await.unwrap();
         let appended = Arc::new(appended);
-        let new_fragment = (appended.fragment_bitmap.as_ref() - &first_fragments)
+        let new_fragment = (appended.table_state.fragment_bitmap.as_ref() - &first_fragments)
             .iter()
             .next()
             .unwrap();

@@ -32,7 +32,9 @@ use crate::index::scalar::inverted::{
 };
 use crate::io::exec::PreFilterSource;
 use crate::io::exec::row_addr_mask::apply_mask;
-use crate::io::exec::utils::{FilteredRowIdsToPrefilter, IndexMetrics, SelectionVectorToPrefilter};
+use crate::io::exec::utils::{
+    FilteredRowIdsToPrefilter, IndexMetrics, SelectionVectorToPrefilter, is_prefilter_union,
+};
 use lance_index::prefilter::FilterLoader;
 use lance_index::scalar::inverted::builder::document_input;
 use lance_index::scalar::inverted::document_tokenizer::LanceTokenizer;
@@ -951,6 +953,31 @@ impl FlatMatchQueryExec {
     pub fn preset_segments(&self) -> Option<&[IndexMetadata]> {
         self.preset_segments.as_deref()
     }
+
+    /// Record `limit` in this node's params, keeping its input, candidate filter
+    /// and scorers. Flat matching still emits every match, since a later row may
+    /// score higher; the enclosing relevance `SortExec.fetch` makes the top-k cut.
+    pub fn with_limit(&self, limit: usize) -> Self {
+        let mut params = self.params.clone();
+        params.limit = Some(limit);
+        Self {
+            dataset: self.dataset.clone(),
+            query: self.query.clone(),
+            tokenized_query: self.tokenized_query.clone(),
+            params,
+            unindexed_input: self.unindexed_input.clone(),
+            candidate_filter: self.candidate_filter.clone(),
+            base_scorer: self.base_scorer.clone(),
+            prepared_query: self.prepared_query.clone(),
+            shared_scorer: self.shared_scorer.clone(),
+            preset_segments: self.preset_segments.clone(),
+            document_granularity: self.document_granularity,
+            document_column: self.document_column.clone(),
+            schema: self.schema.clone(),
+            properties: self.properties.clone(),
+            metrics: ExecutionPlanMetricsSet::new(),
+        }
+    }
 }
 
 impl ExecutionPlan for FlatMatchQueryExec {
@@ -1201,9 +1228,14 @@ impl ExecutionPlan for FlatMatchQueryExec {
                             .await?
                         }
                         PreFilterSource::ScalarIndexQuery(input) => {
-                            Box::new(SelectionVectorToPrefilter(
-                                input.execute(partition, context)?,
-                            ))
+                            let already_row_id_domain = is_prefilter_union(&input);
+                            Box::new(
+                                SelectionVectorToPrefilter::new(
+                                    input.execute(partition, context)?,
+                                    ds.clone(),
+                                )
+                                .with_already_row_id_domain(already_row_id_domain),
+                            )
                             .load()
                             .await?
                         }
