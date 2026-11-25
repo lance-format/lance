@@ -145,6 +145,11 @@ pub(crate) struct IvfIndexState<Q: Quantization> {
     pub(crate) aux_file_size: u64,
     /// Runtime-only cache, intentionally excluded from the CacheCodec wire format.
     pub(crate) rq_search_cache: RabitSearchCacheCell,
+    /// Runtime-only: the quantizer with its prepared targets, shared by every
+    /// reconstruction of this entry, for the storages that retain one (PQ).
+    /// It is a plain value, set when the state is built, so the cache charges
+    /// for it on admission. Excluded from the CacheCodec wire format.
+    pub(crate) quantizer: Option<Quantizer>,
 }
 
 /// Number of prepared partitions handed to a single `spawn_cpu` dispatch on the
@@ -1040,7 +1045,20 @@ impl<Q: Quantization> DeepSizeOf for IvfIndexState<Q> {
                 .and_then(|cache| cache.as_ref().and_then(|cache| cache.as_ref().cloned()))
                 .map(|cache| cache.rotated_centroids.len() * std::mem::size_of::<f32>())
                 .unwrap_or_default()
+            + self.quantizer.deep_size_of_children(context)
     }
+}
+
+/// The quantizer a decoded state keeps for its partition storages: only the
+/// storages that retain one (PQ) get it built, so an RQ entry does not carry
+/// its rotation matrices for nothing.
+fn build_retained_quantizer<Q: Quantization>(
+    metadata: &<Q::Storage as QuantizerStorage>::Metadata,
+    distance_type: DistanceType,
+) -> Option<Quantizer> {
+    Q::retain_quantizer_for_partition_storage()
+        .then(|| Q::from_metadata(metadata, distance_type).ok())
+        .flatten()
 }
 
 /// Object-safe interface for a type-erased `IvfIndexState<Q>`.
@@ -1060,6 +1078,10 @@ pub(crate) trait IvfStateEntry: DeepSizeOf + Send + Sync + 'static {
         frag_reuse_index: Option<ResolvedRemapping>,
         context: IvfOpenContext,
     ) -> BoxFuture<'a, Result<Arc<dyn VectorIndex>>>;
+
+    /// Whether the state carries a prebuilt quantizer for its reconstructions.
+    #[cfg(test)]
+    fn has_quantizer(&self) -> bool;
 }
 
 /// Sized wrapper around `Arc<dyn IvfStateEntry>` for use as a cache value.
@@ -1135,6 +1157,7 @@ impl CacheCodecImpl for IvfStateEntryBox {
             if !extra_bytes.is_empty() {
                 metadata.parse_buffer(extra_bytes)?;
             }
+            let quantizer = build_retained_quantizer::<Q>(&metadata, distance_type);
             Ok(IvfStateEntryBox(Arc::new(IvfIndexState::<Q> {
                 index_file_path: header.index_file_path,
                 uuid: header.uuid,
@@ -1148,6 +1171,7 @@ impl CacheCodecImpl for IvfStateEntryBox {
                 index_file_size: header.index_file_size,
                 aux_file_size: header.aux_file_size,
                 rq_search_cache: empty_rabit_search_cache_cell(),
+                quantizer,
             })))
         }
 
@@ -1202,6 +1226,11 @@ impl CacheCodecImpl for IvfStateEntryBox {
 }
 
 impl<Q: Quantization + 'static> IvfStateEntry for IvfIndexState<Q> {
+    #[cfg(test)]
+    fn has_quantizer(&self) -> bool {
+        self.quantizer.is_some()
+    }
+
     fn serialize_state(&self, w: &mut CacheEntryWriter<'_>) -> Result<()> {
         let quantizer_metadata_json = serde_json::to_string(&self.metadata)
             .map_err(|e| lance_core::Error::io(format!("IvfIndexState metadata: {e}")))?;
@@ -1943,6 +1972,14 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
     }
 
     /// Create a new IVF index.
+    #[instrument(
+        name = "ivf_index_initialize",
+        target = TRACE_IO_EVENTS,
+        level = "info",
+        skip_all,
+        fields(index_reader_us, model_read_us, model_decode_us, quantizer_open_us,
+            resident_open_us, query_state_us, scheduler_requests, scheduler_bytes)
+    )]
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn try_new(
         object_store: Arc<ObjectStore>,
@@ -1954,6 +1991,25 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         file_sizes: HashMap<String, u64>,
         context: IvfOpenContext,
     ) -> Result<Self> {
+        // Consecutive wall intervals include time awaiting their futures. Keep counters
+        // on the initialization span so segment fanout does not multiply phase spans.
+        // A filtered instrumented future runs in its caller's span.
+        let span = Some(tracing::Span::current()).filter(|span| {
+            span.metadata().is_some_and(|meta| {
+                meta.target() == TRACE_IO_EVENTS && meta.name() == "ivf_index_initialize"
+            })
+        });
+        let mut checkpoint = span.as_ref().map(|_| Instant::now());
+        let mut finish_phase = |field: &'static str| {
+            if let (Some(span), Some(last)) = (&span, &mut checkpoint) {
+                let now = Instant::now();
+                span.record(
+                    field,
+                    i64::try_from((now - *last).as_micros()).unwrap_or(i64::MAX),
+                );
+                *last = now;
+            }
+        };
         let io_parallelism = object_store.io_parallelism();
         let origin_latency =
             Self::origin_latency_at_open(&object_store, context.origin_latency_hint)?;
@@ -2012,7 +2068,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             .ok_or(Error::index(format!("{} not found", IVF_METADATA_KEY)))?
             .parse()
             .map_err(|e| Error::index(format!("Failed to decode IVF position: {}", e)))?;
+        finish_phase("index_reader_us");
         let ivf_pb_bytes = index_reader.read_global_buffer(ivf_pos).await?;
+        finish_phase("model_read_us");
         let ivf = IvfModel::try_from(pb::Ivf::decode(ivf_pb_bytes)?)?;
 
         let sub_index_metadata = index_reader
@@ -2022,6 +2080,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             .ok_or(Error::index(format!("{} not found", S::metadata_key())))?;
         let sub_index_metadata: Vec<String> = serde_json::from_str(sub_index_metadata)?;
 
+        finish_phase("model_decode_us");
         let aux_cached_size = file_sizes
             .get(INDEX_AUXILIARY_FILE_NAME)
             .map(|&size| CachedFileSize::new(size))
@@ -2050,6 +2109,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
                 IvfQuantizationStorage::try_new_with_remapper(storage_reader, None).await?
             }
         };
+        finish_phase("quantizer_open_us");
         let resident_columns = Self::resident_columns_at_open(
             &storage,
             context.file_cache.as_ref(),
@@ -2077,6 +2137,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         // load's requests with the rest of the open's I/O, so the load adds
         // them to no other stats.
         storage.load_resident_store(None).await?;
+        finish_phase("resident_open_us");
 
         // Cache file metadata so reconstructions from IvfIndexState can skip
         // footer reads.
@@ -2102,6 +2163,17 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         let open_io_stats = scheduler.stats();
 
         let read_projection = Self::read_projection(&index_reader)?;
+        finish_phase("query_state_us");
+        if let Some(span) = span {
+            span.record(
+                "scheduler_requests",
+                i64::try_from(open_io_stats.requests).unwrap_or(i64::MAX),
+            );
+            span.record(
+                "scheduler_bytes",
+                i64::try_from(open_io_stats.bytes_read).unwrap_or(i64::MAX),
+            );
+        }
         Ok(Self {
             uri: to_local_path(&uri),
             index_path: uri.as_ref().to_string(),
@@ -2536,16 +2608,89 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         partition_id: usize,
         io_stats: Option<IoStats>,
     ) -> Result<PartitionEntry<S, Q>> {
-        let batch = self
-            .read_sub_index_batch(
-                partition_id,
-                self.read_projection.as_ref(),
-                io_stats.clone(),
-            )
+        let storage = self
+            .load_partition_storage(partition_id, io_stats.clone())
             .await?;
-        let idx = S::load(batch)?;
-        let storage = self.load_partition_storage(partition_id, io_stats).await?;
+        let idx = match self
+            .dropped_row_positions(partition_id, storage.len(), io_stats.as_ref())
+            .await?
+        {
+            Some(new_ids) => {
+                self.load_realigned_sub_index(partition_id, &new_ids, &storage, io_stats)
+                    .await?
+            }
+            None => {
+                let batch = self
+                    .read_sub_index_batch(partition_id, self.read_projection.as_ref(), io_stats)
+                    .await?;
+                S::load(batch)?
+            }
+        };
         Ok(PartitionEntry::new(idx, storage))
+    }
+
+    /// The positions [`IvfSubIndex::remap_positions`] realigns a partition's
+    /// sub-index with, or `None` when it needs no realignment: the sub-index
+    /// does not address storage rows by position, or the loaded storage, of
+    /// `storage_rows` rows, dropped none of the stored ones.
+    ///
+    /// Drops are detected against the stored row count rather than the
+    /// sub-index's, since a graph may cover only a prefix of its storage. Only
+    /// a row-ID remapping drops rows, so this reads the partition's row IDs
+    /// again only while deferred compaction has deleted some of them.
+    pub(crate) async fn dropped_row_positions(
+        &self,
+        partition_id: usize,
+        storage_rows: usize,
+        io_stats: Option<&IoStats>,
+    ) -> Result<Option<Vec<Option<u32>>>> {
+        let Some(sub_index_rows) = S::positional_rows(&self.sub_index_metadata[partition_id])?
+        else {
+            return Ok(None);
+        };
+        let stored_rows = self.storage.partition_size(partition_id);
+        if storage_rows == stored_rows {
+            return Ok(None);
+        }
+        let mut new_ids = self
+            .storage
+            .partition_row_positions(partition_id, io_stats)
+            .await?;
+        let num_kept = new_ids.iter().flatten().count();
+        if new_ids.len() != stored_rows || num_kept != storage_rows || sub_index_rows > stored_rows
+        {
+            return Err(Error::internal(format!(
+                "partition {partition_id} of index {}: the sub-index addresses {sub_index_rows} of \
+                 {stored_rows} stored rows and the loaded storage holds {storage_rows}, but the \
+                 row-ID remapping keeps {num_kept} of {} rows",
+                self.uuid,
+                new_ids.len()
+            )));
+        }
+        new_ids.truncate(sub_index_rows);
+        Ok(Some(new_ids))
+    }
+
+    /// Load a partition's sub-index realigned with `storage`, which dropped
+    /// rows. [`IvfSubIndex::remap_positions`] needs every column, so this
+    /// bypasses the narrowed search projection.
+    async fn load_realigned_sub_index(
+        &self,
+        partition_id: usize,
+        new_ids: &[Option<u32>],
+        storage: &Q::Storage,
+        io_stats: Option<IoStats>,
+    ) -> Result<S> {
+        let batch = self
+            .read_sub_index_batch(partition_id, None, io_stats)
+            .await?;
+        // Scoring rows pairwise needs storage staged from the centroid, as a
+        // graph build does.
+        let staged = match self.ivf.centroid(partition_id) {
+            Some(centroid) => storage.clone().with_centroid(centroid.as_ref())?,
+            None => storage.clone(),
+        };
+        S::load(S::remap_positions(batch, new_ids, &staged)?)
     }
 
     async fn load_plane_partition_entry(
@@ -2666,6 +2811,18 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             .storage
             .materialize_partition_for_prewarm(batches.storage);
         let (index, storage) = tokio::try_join!(index, storage)?;
+        // The prewarm read uses the search projection, which a realignment
+        // cannot use, so a partition that dropped rows reads its sub-index again.
+        let index = match self
+            .dropped_row_positions(partition_id, storage.len(), None)
+            .await?
+        {
+            Some(new_ids) => {
+                self.load_realigned_sub_index(partition_id, &new_ids, &storage, None)
+                    .await?
+            }
+            None => index,
+        };
         Ok(PartitionEntry::new(index, storage))
     }
 
@@ -2812,6 +2969,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             index_file_size: self.reader.metadata().file_size(),
             aux_file_size: self.storage.reader().metadata().file_size(),
             rq_search_cache: rabit_search_cache_cell(self.rq_search_cache.clone()),
+            // The storage's own copy, when it retains one: building another
+            // would widen the codebook and prepare its targets a second time.
+            quantizer: self.storage.retained_quantizer().cloned(),
         }))
     }
 }
@@ -3874,6 +4034,7 @@ async fn reconstruct_typed<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
     )
     .await?;
 
+    let quantizer = state.quantizer.clone();
     let make_storage = |legacy| {
         IvfQuantizationStorage::from_cached_with_remapper(
             aux_reader,
@@ -3881,6 +4042,7 @@ async fn reconstruct_typed<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
             state.metadata.clone(),
             state.distance_type,
             legacy,
+            quantizer,
         )
     };
     let storage = match frag_reuse_index {

@@ -68,7 +68,7 @@ pub struct DatasetPreFilter {
     // Row addresses whose index entries are stale due to a newer data overlay committed after
     // the index was built. Computed synchronously at plan time and ANDead into the final mask
     // so the index never returns those rows.
-    pub(super) overlay_block: Option<RowAddrMask>,
+    pub(super) overlay_block: Option<Arc<RowAddrMask>>,
     // When the tasks are finished this is the combined filter
     pub(super) final_mask: Mutex<OnceCell<Arc<RowAddrMask>>>,
 }
@@ -79,11 +79,7 @@ impl DatasetPreFilter {
         indices: &[IndexMetadata],
         filter: Option<Box<dyn FilterLoader>>,
     ) -> Self {
-        let filter = filter.map(|filter| {
-            async move { filter.load().await.map(Arc::new) }
-                .in_current_span()
-                .boxed()
-        });
+        let filter = filter.map(|filter| filter.load().in_current_span().boxed());
         Self::new_with_filter_future(dataset, indices, filter)
     }
 
@@ -172,7 +168,7 @@ impl DatasetPreFilter {
         .collect::<Vec<_>>()
         .await;
         let mut frag_id_deletion_vectors = stream::iter(frag_id_deletion_vectors)
-            .buffer_unordered(dataset.object_store.io_parallelism());
+            .buffer_unordered(dataset.table_state.object_store.io_parallelism());
 
         let mut deleted_ids = RowAddrTreeMap::new();
         while let Some((id, deletion_vector)) = frag_id_deletion_vectors.try_next().await? {
@@ -210,7 +206,7 @@ impl DatasetPreFilter {
             }
             Ok::<_, crate::Error>((id, live_rows))
         })
-        .buffer_unordered(dataset.object_store.io_parallelism());
+        .buffer_unordered(dataset.table_state.object_store.io_parallelism());
         let mut allowed = RowAddrTreeMap::new();
         while let Some((id, rows)) = fragment_rows.try_next().await? {
             allowed.insert_bitmap(id, rows);
@@ -252,7 +248,7 @@ impl DatasetPreFilter {
                     let (row_ids, deletion_vector) = join!(row_ids, deletion_vector);
                     Ok::<_, crate::Error>((row_ids?, deletion_vector?))
                 })
-                .buffer_unordered(dataset.object_store.as_ref().io_parallelism())
+                .buffer_unordered(dataset.table_state.object_store.as_ref().io_parallelism())
                 .try_collect::<Vec<_>>()
                 .await
         }
@@ -297,6 +293,7 @@ impl DatasetPreFilter {
             restrict_hash,
         };
         dataset
+            .table_state
             .metadata_cache
             .as_ref()
             .get_or_insert_with_key(key, load_mask)
@@ -329,7 +326,7 @@ impl DatasetPreFilter {
     /// Block specific row addresses from index results because their index entries are stale
     /// due to a data overlay committed after the index was built.
     pub fn with_overlay_block(mut self, block: RowAddrMask) -> Self {
-        self.overlay_block = Some(block);
+        self.overlay_block = Some(Arc::new(block));
         self
     }
 
@@ -437,6 +434,7 @@ impl DatasetPreFilter {
                     };
                     let loader_dataset = dataset.clone();
                     dataset
+                        .table_state
                         .metadata_cache
                         .as_ref()
                         .get_or_insert_with_key(key, move || async move {
@@ -521,30 +519,33 @@ impl PreFilter for DatasetPreFilter {
         }
         let final_mask = self.final_mask.lock().unwrap();
         final_mask.get_or_init(|| {
-            // Deletions only: `RowAddrMask::default()` selects every row, so the
-            // combined mask is the deletion mask itself. Share it instead of copying.
-            if self.only_deletions()
-                && let Some(deleted_ids) = &self.deleted_ids
-            {
-                return deleted_ids.get_ready();
-            }
-            let mut combined = RowAddrMask::default();
-            if let Some(filtered_ids) = &self.filtered_ids {
-                combined = combined & filtered_ids.get_ready().as_ref().clone();
-            }
-            if let Some(deleted_ids) = &self.deleted_ids {
-                combined = combined & (*deleted_ids.get_ready()).clone();
-            }
-            if let Some(deleted) = &self.deleted_fragments {
+            // Every mask is shared (with its cache or with this prefilter), so
+            // they are intersected by reference and only the result is
+            // allocated; a lone mask is handed out as is.
+            let deleted_fragments = self.deleted_fragments.as_ref().map(|deleted| {
                 let mut block_list = RowAddrTreeMap::new();
                 for frag_id in deleted.iter() {
                     block_list.insert_fragment(frag_id);
                 }
-                combined = combined & RowAddrMask::from_block(block_list);
-            }
-            if let Some(overlay_block) = &self.overlay_block {
-                combined = combined & overlay_block.clone();
-            }
+                Arc::new(RowAddrMask::from_block(block_list))
+            });
+            let mut masks = [
+                self.filtered_ids.as_ref().map(|ids| ids.get_ready()),
+                self.deleted_ids.as_ref().map(|ids| ids.get_ready()),
+                deleted_fragments,
+                self.overlay_block.clone(),
+            ]
+            .into_iter()
+            .flatten();
+            let Some(first) = masks.next() else {
+                return Arc::new(RowAddrMask::default());
+            };
+            let Some(second) = masks.next() else {
+                return first;
+            };
+            let combined = masks.fold(first.intersect_ref(&second), |combined, mask| {
+                combined.intersect_with(&mask)
+            });
             Arc::new(combined)
         });
 
@@ -556,6 +557,10 @@ impl PreFilter for DatasetPreFilter {
             && self.filtered_ids.is_none()
             && self.deleted_fragments.is_none()
             && self.overlay_block.is_none()
+    }
+
+    fn deletions_only(&self) -> bool {
+        self.only_deletions()
     }
 
     /// Get the row id mask for this prefilter
@@ -1013,7 +1018,7 @@ mod test {
     ) {
         let datasets = test_datasets(use_stable_row_id).await;
         let mut dataset = (*datasets.deletions_no_missing_frags).clone();
-        dataset.manifest_location.e_tag = None;
+        dataset.table_state.manifest_location.e_tag = None;
         let dataset = Arc::new(dataset);
 
         let load_mask = || {
@@ -1096,7 +1101,8 @@ mod test {
         // A recreated dataset restarts its version history, so an entry from
         // the same version under a different e-tag must not be reused.
         let mut other_generation = (*dataset).clone();
-        other_generation.manifest_location.e_tag = Some("second-generation".to_string());
+        other_generation.table_state.manifest_location.e_tag =
+            Some("second-generation".to_string());
         let other_generation_mask =
             DatasetPreFilter::create_deletion_mask_impl(Arc::new(other_generation), covered, false)
                 .expect("deletion mask")

@@ -1282,8 +1282,8 @@ pub mod geo {
 pub async fn data_file_schema(dataset: &Dataset, path: &str) -> Schema {
     let file_path = dataset.data_dir().join(path);
     let scheduler = lance_io::scheduler::ScanScheduler::new(
-        dataset.object_store.clone(),
-        lance_io::scheduler::SchedulerConfig::max_bandwidth(&dataset.object_store),
+        dataset.table_state.object_store.clone(),
+        lance_io::scheduler::SchedulerConfig::max_bandwidth(&dataset.table_state.object_store),
     );
     let file = scheduler
         .open_file(&file_path, &lance_io::utils::CachedFileSize::unknown())

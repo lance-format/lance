@@ -18,7 +18,6 @@ use lance_io::object_store::{ObjectStore, ObjectStoreParams};
 use lance_table::format::IndexMetadata;
 use lance_table::io::commit::write_manifest_file_to_path;
 use lance_table::io::deletion::write_deletion_file;
-use object_store::ObjectStoreExt;
 use object_store::path::Path;
 use roaring::RoaringBitmap;
 use tracing::{debug, info, instrument, warn};
@@ -533,11 +532,11 @@ impl MemTableFlusher {
         if !deleted.is_empty() {
             let dv = DeletionVector::from(deleted.clone());
             let deletion_file = write_deletion_file(
-                &dataset.base,
+                &dataset.table_state.base,
                 0, // 1 fragment per SSTable
                 dataset.version().version,
                 &dv,
-                dataset.object_store.as_ref(),
+                dataset.table_state.object_store.as_ref(),
                 dataset.inline_deletions_max_bytes()?,
             )
             .await?;
@@ -571,8 +570,7 @@ impl MemTableFlusher {
     ) -> Result<()> {
         let data = bloom.to_bytes();
         self.object_store
-            .inner
-            .put(path, Bytes::from(data).into())
+            .put_payload(path, Bytes::from(data).into())
             .await
             .map_err(|e| Error::io(format!("Failed to write bloom filter: {}", e)))?;
         Ok(())

@@ -421,6 +421,7 @@ async fn test_vector_filter_fts_search() {
         query_parallelism: DEFAULT_QUERY_PARALLELISM,
         dist_q_c: 0.0,
         approx_mode: Default::default(),
+        rq_graph_scoring: Default::default(),
     };
 
     // Refine the approximate IVF-PQ distances so adjacent vectors have a
@@ -1226,8 +1227,8 @@ async fn test_scan_miniblock_dictionary_out_of_line_bitpacking_does_not_panic() 
 
     let file_path = dataset.data_dir().join(data_file.path.as_str());
     let scheduler = ScanScheduler::new(
-        dataset.object_store.clone(),
-        SchedulerConfig::max_bandwidth(&dataset.object_store),
+        dataset.table_state.object_store.clone(),
+        SchedulerConfig::max_bandwidth(&dataset.table_state.object_store),
     );
     let file_scheduler = scheduler
         .open_file(&file_path, &CachedFileSize::unknown())
@@ -2351,4 +2352,288 @@ async fn test_lambda_filter_rejects_unsupported_forms(#[case] filter: &str, #[ca
         .await
         .unwrap_err();
     assert!(err.to_string().contains(reason), "{err}");
+}
+
+/// A nested struct can be NULL in the scanner's input while one of its children
+/// still holds a live value. A normal write pushes a struct's NULL down into its
+/// children, so this fixture uses the overlay read path: the overlay stages
+/// `info.details.label` while `info.details` has only `label`, then schema
+/// evolution adds `tag`. On read, the overlay restores `details`' NULL validity
+/// and splices the staged `label` into the base struct, leaving the base `tag`
+/// live below the NULL struct.
+///
+/// `any_element` evaluates its predicate against that input, so a field below a
+/// NULL struct must read as NULL. Before `any_element` pushed each struct's
+/// nulls down recursively, `details.tag = 'car'` selected row 0 even though
+/// `details` is NULL, and `details.tag IS NULL` missed it.
+#[tokio::test]
+async fn test_any_element_nested_hidden_values_under_null_struct() {
+    use crate::dataset::transaction::{DataOverlayGroup, Operation};
+    use crate::dataset::{NewColumnTransform, WriteDestination};
+    use arrow_array::UInt64Array;
+    use lance_core::ROW_ADDR;
+    use lance_core::utils::address::RowAddress;
+
+    let label = ArrowField::new("label", DataType::Utf8, true);
+    let details_fields = Fields::from(vec![label.clone()]);
+    let info_fields = Fields::from(vec![ArrowField::new(
+        "details",
+        DataType::Struct(details_fields.clone()),
+        true,
+    )]);
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, false),
+        ArrowField::new("info", DataType::Struct(info_fields.clone()), true),
+    ]));
+    // Rows 0..4 are fragment 0 and 4..8 are fragment 1. `tag` is added after the
+    // overlay, so the overlay file holds only `label`.
+    let labels = ["car", "car", "car", "car", "x", "x", "x", "x"];
+    let tags: [Option<&str>; 8] = [
+        Some("car"),
+        Some("car"),
+        Some("car"),
+        Some("truck"),
+        Some("car"),
+        Some("dog"),
+        Some("car"),
+        None,
+    ];
+    let details = StructArray::try_new(
+        details_fields,
+        vec![Arc::new(StringArray::from(labels.to_vec())) as ArrayRef],
+        None,
+    )
+    .unwrap();
+    let info =
+        StructArray::try_new(info_fields, vec![Arc::new(details) as ArrayRef], None).unwrap();
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from_iter_values(0..8)) as ArrayRef,
+            Arc::new(info) as ArrayRef,
+        ],
+    )
+    .unwrap();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 4,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 2);
+
+    // Nulls at each level for the overlaid rows: row 0 has a NULL `details`
+    // under a valid `info`; row 1 has a NULL `info`; row 2 has only `label`
+    // NULL, leaving `tag` visible.
+    let label_id = dataset.schema().field("info.details.label").unwrap().id;
+    let overlay_schema = dataset.schema().project_by_ids(&[label_id], true);
+    let fragment = dataset.get_fragment(0).unwrap();
+    let mut writer = fragment.write_overlay(&overlay_schema).await.unwrap();
+    let overlay_label = ArrowField::new("label", DataType::Utf8, true);
+    let overlay_details = StructArray::try_new(
+        Fields::from(vec![overlay_label.clone()]),
+        vec![Arc::new(StringArray::from(vec![None::<&str>, None, None])) as ArrayRef],
+        Some(NullBuffer::from(vec![false, false, true])),
+    )
+    .unwrap();
+    let overlay_info = StructArray::try_new(
+        Fields::from(vec![ArrowField::new(
+            "details",
+            DataType::Struct(Fields::from(vec![overlay_label])),
+            true,
+        )]),
+        vec![Arc::new(overlay_details) as ArrayRef],
+        Some(NullBuffer::from(vec![true, false, true])),
+    )
+    .unwrap();
+    let addresses: ArrayRef = Arc::new(UInt64Array::from_iter_values(
+        (0..3).map(|offset| u64::from(RowAddress::new_from_parts(0, offset))),
+    ));
+    writer
+        .write_batch(
+            &RecordBatch::try_from_iter_with_nullable([
+                (ROW_ADDR, addresses, false),
+                ("info", Arc::new(overlay_info) as ArrayRef, true),
+            ])
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let group = writer.finish().await.unwrap().unwrap();
+    let read_version = dataset.version().version;
+    dataset = Dataset::commit(
+        WriteDestination::Dataset(Arc::new(dataset)),
+        Operation::DataOverlay {
+            groups: vec![DataOverlayGroup {
+                fragment_id: 0,
+                overlays: group.overlays,
+            }],
+        },
+        Some(read_version),
+        None,
+        None,
+        Arc::new(Default::default()),
+        false,
+    )
+    .await
+    .unwrap();
+
+    // Add the sibling `tag` after the overlay. The overlay file still holds only
+    // `label`; the base read supplies `tag` for the scanner's `info` column.
+    let tag = ArrowField::new("tag", DataType::Utf8, true);
+    let new_details_fields = Fields::from(vec![tag]);
+    let new_info_fields = Fields::from(vec![ArrowField::new(
+        "details",
+        DataType::Struct(new_details_fields.clone()),
+        true,
+    )]);
+    let new_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "info",
+        DataType::Struct(new_info_fields.clone()),
+        true,
+    )]));
+    let new_details = StructArray::try_new(
+        new_details_fields,
+        vec![Arc::new(StringArray::from(tags.to_vec())) as ArrayRef],
+        None,
+    )
+    .unwrap();
+    let new_info = StructArray::try_new(
+        new_info_fields,
+        vec![Arc::new(new_details) as ArrayRef],
+        None,
+    )
+    .unwrap();
+    let new_batch =
+        RecordBatch::try_new(new_schema.clone(), vec![Arc::new(new_info) as ArrayRef]).unwrap();
+    dataset
+        .add_columns(
+            NewColumnTransform::Reader(Box::new(RecordBatchIterator::new(
+                vec![Ok(new_batch)],
+                new_schema,
+            ))),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 2);
+    assert_eq!(
+        dataset.get_fragment(0).unwrap().metadata().overlays.len(),
+        1
+    );
+
+    // Prove the scanner input carries `tag` below a NULL `details` and a NULL
+    // `info`: the filter below can only tell the fix from the bug if it does.
+    let mut scanner = dataset.scan();
+    scanner.project(&["id", "info"]).unwrap();
+    let out = scanner.try_into_batch().await.unwrap();
+    let infos = out["info"].as_struct();
+    let details = infos.column(0).as_struct();
+    let tag_column = details.column(1).as_string::<i32>();
+    assert!(infos.is_valid(0) && infos.is_null(1));
+    assert!(details.is_null(0) && details.is_null(1) && details.is_valid(2));
+    assert!(tag_column.is_valid(0) && tag_column.value(0) == "car");
+    assert!(tag_column.is_valid(1) && tag_column.value(1) == "car");
+    assert!(details.column(0).as_string::<i32>().is_null(0));
+
+    // `any_element` needs a list; `make_array` wraps the scanned struct as a
+    // one-element list without rebuilding it, so the hidden `tag` stays live.
+    //
+    // Expected ids by hand: hidden `tag` under NULL `details` (row 0) and NULL
+    // `info` (row 1) must not match `= 'car'`; row 2's `tag` is visible; row 3
+    // is a truck; rows 4 and 6 are cars in the second fragment; row 5 is a dog;
+    // row 7's `tag` is NULL. For `IS NULL`, a NULL element reads as NULL in every
+    // field, so row 1 matches, as does row 0's hidden `tag` and row 7's NULL.
+    for (filter, expected) in [
+        (
+            r#"any_element(make_array(info), 'details.tag = ''car''')"#,
+            vec![2, 4, 6],
+        ),
+        (
+            r#"any_element(make_array(info), 'details.tag IS NULL')"#,
+            vec![0, 1, 7],
+        ),
+        (
+            r#"any_element(make_array(info), 'details.label IS NULL')"#,
+            vec![0, 1, 2],
+        ),
+        (
+            r#"any_element(make_array(info), 'details IS NULL')"#,
+            vec![0, 1],
+        ),
+    ] {
+        assert!(!expected.is_empty(), "`{filter}` should match some rows");
+        let mut scanner = dataset.scan();
+        scanner.project(&["id"]).unwrap().filter(filter).unwrap();
+        let batch = scanner.try_into_batch().await.unwrap();
+        let mut ids = batch["id"].as_primitive::<Int32Type>().values().to_vec();
+        ids.sort_unstable();
+        assert_eq!(ids, expected, "`{filter}`");
+        assert_eq!(
+            dataset.count_rows(Some(filter.to_string())).await.unwrap(),
+            expected.len(),
+            "count_rows(`{filter}`)"
+        );
+    }
+}
+
+/// A fragment-scoped flat (unindexed) full-text search with a scoped BTree
+/// scalar-index prefilter combines through `PrefilterUnionExec`, whose output
+/// is row-id domain. The flat FTS node (`FlatMatchQueryExec`) must recognize
+/// that and skip re-converting it, or it misreads stable row ids as physical
+/// offsets and fails a live fragment.
+#[tokio::test]
+async fn test_stable_flat_fts_scoped_scalar_prefilter() {
+    let batch = record_batch!(
+        ("id", Int32, (0..9).collect::<Vec<_>>()),
+        ("text", Utf8, vec!["token"; 9])
+    )
+    .unwrap();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+        "memory://",
+        Some(WriteParams {
+            enable_stable_row_ids: true,
+            max_rows_per_file: 3,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    dataset
+        .create_index(
+            &["id"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+
+    let query = FullTextSearchQuery::new("token".to_owned())
+        .with_column("text".to_owned())
+        .unwrap();
+    let mut baseline = dataset.scan();
+    baseline
+        .with_fragments(vec![dataset.fragments()[1].clone()])
+        .use_scalar_index(false)
+        .filter("id >= 3 AND id < 6")
+        .unwrap();
+    baseline.full_text_search(query.clone()).unwrap();
+    assert_eq!(baseline.try_into_batch().await.unwrap().num_rows(), 3);
+
+    let mut scanner = dataset.scan();
+    scanner
+        .with_fragments(vec![dataset.fragments()[1].clone()])
+        .prefilter(true)
+        .filter("id >= 3 AND id < 6")
+        .unwrap();
+    scanner.full_text_search(query).unwrap();
+    assert_eq!(scanner.try_into_batch().await.unwrap().num_rows(), 3);
 }

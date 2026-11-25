@@ -17,7 +17,8 @@ import textwrap
 import threading
 import time
 import uuid
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone, tzinfo
+from enum import Enum
 from pathlib import Path
 from types import SimpleNamespace
 from typing import List, Optional
@@ -36,6 +37,7 @@ import pyarrow.parquet as pq
 import pytest
 from helper import ProgressForTest
 from lance._dataset.optimize import AutoCleanupConfig
+from lance._dataset.refs import _convert_version_timestamp
 from lance._dataset.sharded_batch_iterator import ShardedBatchIterator
 from lance.bitmap import Bitmap
 from lance.dataset import LANCE_COMMIT_MESSAGE_KEY
@@ -115,6 +117,70 @@ def test_from_pydantic_model(tmp_path: Path):
     assert table.schema.names == ["name", "score"]
     assert table.column("name").to_pylist() == ["alice", "bob"]
     assert table.column("score").to_pylist() == [0.9, 0.8]
+
+
+class _Color(Enum):
+    RED = "red"
+    BLUE = "blue"
+
+
+class _Priority(Enum):
+    LOW = 1
+    HIGH = 2
+
+
+class _Tag(BaseModel):
+    color: _Color
+
+
+class _EnumRecord(BaseModel):
+    color: _Color
+    priority: _Priority
+    tags: List[_Tag]
+    colors: List[_Color]
+    vector: List[float]
+
+
+@pytest.mark.parametrize("entry_point", ["write_dataset", "from_pydantic_model"])
+def test_pydantic_enum_fields_store_enum_values(tmp_path: Path, entry_point):
+    data = [
+        _EnumRecord(
+            color=_Color.BLUE,
+            priority=_Priority.HIGH,
+            tags=[],
+            colors=[],
+            vector=[0.5, 1.5],
+        ),
+        _EnumRecord(
+            color=_Color.RED,
+            priority=_Priority.LOW,
+            tags=[_Tag(color=_Color.BLUE)],
+            colors=[_Color.RED, _Color.BLUE],
+            vector=[2.5, 3.5],
+        ),
+    ]
+    uri = str(tmp_path / "enum_record")
+    if entry_point == "from_pydantic_model":
+        ds = lance.LanceDataset.from_pydantic_model(_EnumRecord, data, uri=uri)
+    else:
+        ds = lance.write_dataset(data, uri)
+
+    assert ds.to_table().to_pylist() == [
+        {
+            "color": "blue",
+            "priority": 2,
+            "tags": [],
+            "colors": [],
+            "vector": [0.5, 1.5],
+        },
+        {
+            "color": "red",
+            "priority": 1,
+            "tags": [{"color": "blue"}],
+            "colors": ["red", "blue"],
+            "vector": [2.5, 3.5],
+        },
+    ]
 
 
 def test_from_pydantic_model_rejects_non_model_class(tmp_path: Path):
@@ -670,11 +736,45 @@ def test_asof_checkout(tmp_path: Path):
     assert ds.version == 3
     assert len(ds.to_table()) == 9
 
+    # Aware cutoffs name the same instants in any zone.
+    for offset in (timedelta(hours=-12), timedelta(hours=14)):
+        aware_ts_1 = ts_1.astimezone(timezone(offset))
+        assert lance.dataset(base_dir, asof=aware_ts_1).version == 1
+        assert lance.dataset(base_dir, asof=pd.Timestamp(aware_ts_1)).version == 1
+        aware_ts_2 = ts_2.astimezone(timezone(offset))
+        assert lance.dataset(base_dir, asof=aware_ts_2.isoformat()).version == 2
+
     with pytest.raises(ValueError, match="NaT is not a valid version timestamp"):
         lance.dataset(base_dir, asof=pd.NaT)
 
     # An explicit version takes precedence over the timestamp cutoff.
     assert lance.dataset(base_dir, version=1, asof=pd.NaT).version == 1
+
+
+class _NoOffsetTzInfo(tzinfo):
+    """A tzinfo without a UTC offset; Python treats such datetimes as naive."""
+
+    def utcoffset(self, dt):
+        return None
+
+    def dst(self, dt):
+        return None
+
+    def tzname(self, dt):
+        return None
+
+
+def test_asof_cutoff_without_utc_offset_is_naive(tmp_path: Path):
+    lance.write_dataset(pa.table({"x": [1]}), tmp_path)
+    version_ts = lance.dataset(tmp_path).versions()[0]["timestamp"]
+    cutoff = (version_ts + timedelta(days=1)).replace(tzinfo=_NoOffsetTzInfo())
+    assert cutoff.tzinfo is not None
+    assert cutoff.utcoffset() is None
+
+    # Python compares this as a naive local time, so it keeps the pre-existing
+    # behavior for naive cutoffs instead of treating it as an aware instant.
+    assert lance.dataset(tmp_path, asof=cutoff).version == 1
+    assert lance.dataset(tmp_path, asof=cutoff.replace(tzinfo=None)).version == 1
 
 
 @pytest.mark.parametrize("cleanup", ["explicit", "branch", "tag", "all_older"])
@@ -715,6 +815,37 @@ def test_asof_checkout_after_cleanup(tmp_path: Path, cleanup):
         after_cleanup = lance.dataset(tmp_path, asof=cutoff)
         assert after_cleanup.version == 1
         assert after_cleanup.to_table()["x"].to_pylist() == [1]
+
+
+@pytest.mark.skipif(not hasattr(time, "tzset"), reason="time.tzset is Unix-only")
+def test_asof_aware_cutoff_in_repeated_local_hour(tmp_path: Path, monkeypatch):
+    # In New York, 05:30Z and 06:30Z are both 01:30 local time on 2026-11-01.
+    monkeypatch.setenv("TZ", "America/New_York")
+    time.tzset()
+    try:
+        lance.write_dataset(pa.table({"x": [1]}), tmp_path)
+        for x in (2, 3):
+            lance.write_dataset(pa.table({"x": [x]}), tmp_path, mode="append")
+        versions = [
+            _convert_version_timestamp(
+                {"version": version, "timestamp": int(instant.timestamp()) * 10**9}
+            )
+            for version, instant in enumerate(
+                [
+                    datetime(2026, 11, 1, 5, 0, tzinfo=timezone.utc),
+                    datetime(2026, 11, 1, 5, 30, tzinfo=timezone.utc),
+                    datetime(2026, 11, 1, 6, 30, tzinfo=timezone.utc),
+                ],
+                start=1,
+            )
+        ]
+        monkeypatch.setattr(lance.LanceDataset, "versions", lambda self: versions)
+
+        cutoff = datetime(2026, 11, 1, 5, 45, tzinfo=timezone.utc)
+        assert lance.dataset(tmp_path, asof=cutoff).version == 2
+    finally:
+        monkeypatch.undo()
+        time.tzset()
 
 
 @pytest.mark.parametrize(
@@ -1090,6 +1221,25 @@ def test_take(tmp_path: Path):
 
     assert isinstance(table2, pa.Table)
     assert table2 == table1
+
+
+def test_take_with_io_parallelism(tmp_path: Path):
+    table = pa.table({"a": range(8), "b": [str(i) for i in range(8)]})
+    dataset = lance.write_dataset(table, tmp_path, max_rows_per_file=1)
+    indices = [7, 0, 4, 2]
+
+    expected = dataset.take(indices)
+    assert dataset.take(indices, io_parallelism=None) == expected
+    assert dataset.take(indices, io_parallelism=1) == expected
+    assert dataset.take(indices, io_parallelism=np.int64(1)) == expected
+
+    for invalid in (0, -1):
+        with pytest.raises(ValueError, match="io_parallelism must be greater than 0"):
+            dataset.take(indices, io_parallelism=invalid)
+
+    for invalid in (True, False, 0.0, -1.5):
+        with pytest.raises(TypeError, match="io_parallelism must be an integer"):
+            dataset.take(indices, io_parallelism=invalid)
 
 
 @pytest.mark.parametrize("columns", [["a", "nope"], ["s.nope"], ["a.b"]])
@@ -1789,6 +1939,26 @@ def test_count_rows(tmp_path: Path):
     assert count_rows == 100
 
     assert dataset.count_rows(filter="a < 50") == 50
+
+
+@pytest.mark.parametrize(
+    ("predicate", "expected"),
+    [(None, [3, 3]), ("a < 4", [3, 1]), (pc.field("a") < 4, [3, 1])],
+    ids=["unfiltered", "sql", "arrow"],
+)
+def test_count_rows_selected_fragments(tmp_path: Path, predicate, expected):
+    ds = lance.write_dataset(pa.table({"a": range(6)}), tmp_path, max_rows_per_file=3)
+    fragments = ds.get_fragments()
+    with pytest.raises(TypeError, match=r"LanceFragment\.count_rows"):
+        ds.count_rows(filter=predicate, fragments=fragments[:1])
+    assert [fragment.count_rows(filter=predicate) for fragment in fragments] == expected
+
+
+def test_count_rows_selected_fragments_empty(tmp_path: Path):
+    ds = lance.write_dataset(pa.table({"a": range(3)}), tmp_path)
+    with pytest.raises(TypeError, match=r"LanceFragment\.count_rows"):
+        ds.count_rows(fragments=[])
+    assert ds.count_rows(fragments=None, use_threads=False) == 3
 
 
 def test_count_rows_via_scanner(tmp_path: Path):
@@ -7224,6 +7394,160 @@ def test_default_scan_options(tmp_path: Path):
     assert dataset.schema.names == ["a", "b", "_rowaddr"]
 
 
+@pytest.mark.parametrize("selection_form", ["list", "iterator", "mapping"])
+def test_default_scan_options_fragments(tmp_path: Path, selection_form: str):
+    data = pa.table({"id": [0, 1, 2, 3]})
+    dataset = lance.write_dataset(data, tmp_path, max_rows_per_file=2)
+    first, second = dataset.get_fragments()
+    selected = [second]
+    if selection_form == "iterator":
+        selected = iter(selected)
+    elif selection_form == "mapping":
+        selected = {second: "selected"}
+    scoped = lance.dataset(tmp_path, default_scan_options={"fragments": selected})
+
+    expected = dataset.scanner(fragments=[second]).to_table()
+    assert expected == data.slice(2)
+    assert scoped.schema == expected.schema
+    assert scoped.to_table() == expected
+    assert scoped.to_table() == expected
+    assert scoped.scanner(fragments=[first]).to_table() == data.slice(0, 2)
+    assert scoped.scanner(fragments=[]).to_table() == data.slice(0, 0)
+
+
+@pytest.mark.parametrize("fragments", [None, [], {}], ids=["none", "empty", "mapping"])
+def test_default_scan_options_empty_fragments(tmp_path: Path, fragments):
+    data = pa.table({"id": [0, 1]})
+    dataset = lance.write_dataset(data, tmp_path, max_rows_per_file=1)
+    scoped = lance.dataset(tmp_path, default_scan_options={"fragments": fragments})
+    assert scoped.to_table() == dataset.scanner(fragments=fragments).to_table()
+
+
+@pytest.mark.parametrize(
+    ("selection_form", "clone_options"),
+    [
+        pytest.param("string", None, id="string"),
+        pytest.param("uuid", None, id="uuid"),
+        pytest.param("iterator", None, id="iterator"),
+        pytest.param("mapping", None, id="mapping"),
+        pytest.param("iterator", {}, id="native-clone"),
+        pytest.param("iterator", {"block_size": 4096}, id="reconfigured-clone"),
+    ],
+)
+def test_default_scan_options_index_segments(
+    tmp_path: Path, selection_form: str, clone_options
+):
+    data = pa.table(
+        {
+            "id": range(6),
+            "vector": pa.array(
+                [[float(i), 0.0] for i in range(6)], type=pa.list_(pa.float32(), 2)
+            ),
+        }
+    )
+    dataset = lance.write_dataset(data.slice(0, 4), tmp_path, max_rows_per_file=2)
+    dataset = dataset.create_index(
+        "vector",
+        "IVF_FLAT",
+        num_partitions=1,
+        ivf_centroids=np.zeros((1, 2), dtype=np.float32),
+    )
+    segment = dataset.describe_indices()[0].segments[0].uuid
+    dataset = lance.write_dataset(data.slice(4), dataset, mode="append")
+    nearest = {"column": "vector", "q": [5.0, 0.0], "k": 3}
+    assert dataset.scanner(nearest=nearest).to_table()["id"].to_pylist() == [5, 4, 3]
+    expected = dataset.scanner(nearest=nearest, index_segments=[segment]).to_table()
+    expected_ids = [3, 2, 1]
+    ids = expected["id"].to_pylist()
+    assert len(set(ids) & set(expected_ids)) / len(expected_ids) == 1.0
+    assert ids == expected_ids
+
+    selected = [str(segment)]
+    if selection_form == "uuid":
+        selected = [uuid.UUID(str(segment))]
+    elif selection_form == "iterator":
+        selected = iter(selected)
+    elif selection_form == "mapping":
+        selected = {str(segment): "selected"}
+    options = {"nearest": nearest, "index_segments": selected}
+    if clone_options is None:
+        scoped = lance.dataset(tmp_path, default_scan_options=options)
+    else:
+        scoped = dataset.shallow_clone(
+            tmp_path / "clone",
+            reference=(None, None),
+            default_scan_options=options,
+            **clone_options,
+        )
+    assert scoped.schema == expected.schema
+    assert scoped.to_table() == expected
+    assert scoped.to_table() == expected
+    assert scoped.scanner(index_segments=None).to_table() == expected
+
+
+@pytest.mark.parametrize(
+    "segments",
+    [str(uuid.UUID(int=0)), uuid.UUID(int=0), [123]],
+    ids=["bare-string", "bare-uuid", "invalid-element"],
+)
+def test_default_scan_options_invalid_index_segments(tmp_path: Path, segments):
+    lance.write_dataset(pa.table({"id": [0]}), tmp_path)
+    with pytest.raises(TypeError, match="index_segments must be an iterable"):
+        lance.dataset(tmp_path, default_scan_options={"index_segments": segments})
+
+
+def test_shallow_clone_with_failing_default_scope(tmp_path: Path):
+    dataset = lance.write_dataset(pa.table({"id": [0]}), tmp_path / "source")
+    target = tmp_path / "clone"
+
+    def failing_segments():
+        yield str(uuid.UUID(int=0))
+        raise RuntimeError("selection interrupted")
+
+    with pytest.raises(RuntimeError, match="selection interrupted"):
+        dataset.shallow_clone(
+            target,
+            reference=(None, None),
+            default_scan_options={"index_segments": failing_segments()},
+        )
+    assert not target.exists()
+
+
+@pytest.mark.parametrize("option", ["full_text_query", "full_text_search"])
+@pytest.mark.parametrize(
+    "query",
+    [
+        pytest.param("apple", id="string"),
+        pytest.param({"query": "apple", "columns": ["text"]}, id="dictionary"),
+        pytest.param(lance.query.MatchQuery("apple", column="text"), id="object"),
+    ],
+)
+def test_default_scan_options_full_text_query(tmp_path: Path, option: str, query):
+    data = pa.table({"id": [0, 1, 2, 3], "text": [None, "pear", "", "apple"]})
+    dataset = lance.write_dataset(data, tmp_path, max_rows_per_file=2)
+    dataset.create_scalar_index("text", "INVERTED")
+    expected = dataset.scanner(full_text_query=query).to_table()
+    assert expected["id"].to_pylist() == [3]
+
+    searched = lance.dataset(tmp_path, default_scan_options={option: query})
+    assert searched.to_table() == expected
+    assert searched.scanner(full_text_query="pear").to_table()["id"].to_pylist() == [1]
+
+
+def test_default_scan_options_full_text_query_none(tmp_path: Path):
+    data = pa.table({"text": ["apple", "pear"]})
+    lance.write_dataset(data, tmp_path, max_rows_per_file=1)
+    dataset = lance.dataset(tmp_path, default_scan_options={"full_text_query": None})
+    assert dataset.to_table() == data
+
+
+def test_default_scan_options_unknown(tmp_path: Path):
+    lance.write_dataset(pa.table({"id": [0]}), tmp_path)
+    dataset = lance.dataset(tmp_path, default_scan_options={"unknown_option": True})
+    with pytest.raises(ValueError, match="Unknown option unknown_option"):
+        dataset.scanner()
+
+
 def test_inline_deletions(tmp_path: Path):
     import json
 
@@ -7770,6 +8094,33 @@ def test_late_materialization_batch_size(tmp_path: Path):
         late_materialization=True,
     ):
         assert batch.num_rows == 32
+
+
+@pytest.mark.parametrize("batch_size", [7, 10, 20])
+@pytest.mark.parametrize("late_materialization", [None, True])
+def test_late_materialization_max_batch_size(
+    tmp_path: Path, batch_size: int, late_materialization
+):
+    n = 300
+    table = pa.table(
+        {
+            "id": pa.array(range(n), pa.int64()),
+            "v": pa.array([i % 5 for i in range(n)], pa.int64()),
+            "s": pa.array([str(i) * 3 for i in range(n)]),
+        }
+    )
+    dataset = lance.write_dataset(table, tmp_path, max_rows_per_file=100)
+    sizes = [
+        batch.num_rows
+        for batch in dataset.to_batches(
+            columns=["s"],
+            filter="v = 2",
+            batch_size=batch_size,
+            late_materialization=late_materialization,
+        )
+    ]
+    assert sum(sizes) == n // 5
+    assert all(rows <= batch_size for rows in sizes), sizes
 
 
 def test_batch_size_bytes_chopping_fallback(tmp_path: Path):

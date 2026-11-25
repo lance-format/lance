@@ -278,11 +278,19 @@ async fn test_deferred_compaction_recognizes_ambiguous_commit_as_own() {
         .as_deref()
         .expect("the landed manifest records its transaction file");
     let path = dataset
+        .table_state
         .base
         .clone()
         .join(crate::dataset::TRANSACTIONS_DIR)
         .join(transaction_file);
-    assert!(dataset.object_store.exists(&path).await.unwrap());
+    assert!(
+        dataset
+            .table_state
+            .object_store
+            .exists(&path)
+            .await
+            .unwrap()
+    );
 }
 #[rstest]
 #[case::address_style(false, true)]

@@ -80,8 +80,7 @@ jobs:
       # Catches manifest problems that only surface at publish time (missing
       # readme/license files, path dependencies without a version, excluded
       # files a crate needs). `--no-verify` skips building each packaged crate,
-      # which the other jobs already cover. Package the Arrow-versioned helper
-      # crates too even though releases publish them separately.
+      # which the other jobs already cover.
       - name: Package crates
         run: |
           cargo package --workspace --no-verify --all-features
@@ -187,7 +186,7 @@ jobs:
           # also run the fixtures so the check is never merged untested.
           self_changed=$(git diff --name-only "$base_sha" HEAD -- \
             rust/lance/tests/arrow_ordering.rs rust/lance/Cargo.toml ci/arrow_upgrade.py .github/workflows/rust.yml \
-            rust/arrow-scalar rust/arrow-stats)
+            rust/lance-arrow/src/scalar.rs rust/lance-arrow/src/scalar rust/lance-arrow/src/stats.rs rust/lance-arrow/src/stats)
           if [ -n "$self_changed" ]; then
             echo "fixtures or the paths they exercise changed:"
             echo "$self_changed"

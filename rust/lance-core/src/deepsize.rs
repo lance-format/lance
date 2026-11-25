@@ -464,4 +464,43 @@ mod tests {
         // Must be at least the stack size + heap allocations for label + values
         assert!(size >= std::mem::size_of::<Outer>() + 5 + 3 * std::mem::size_of::<u32>());
     }
+
+    #[test]
+    fn test_derive_empty_enum_compiles() {
+        use lance_derive::DeepSizeOf;
+
+        // A zero-variant enum has no constructible value, so this only checks
+        // that the derived impl type-checks.
+        #[derive(DeepSizeOf)]
+        enum EmptyEnum {}
+
+        fn assert_deep_size_of<T: DeepSizeOf>() {}
+        assert_deep_size_of::<EmptyEnum>();
+    }
+
+    #[test]
+    fn test_derive_enum_fields_do_not_shadow_macro_locals() {
+        use lance_derive::DeepSizeOf;
+
+        // `__context` used to collide with the macro's context parameter, and
+        // `__lance_field_0` guards the renamed internal bindings.
+        #[derive(DeepSizeOf)]
+        enum ShadowEnum {
+            Named { __context: u32 },
+            Tuple(String, Vec<u32>),
+            Prefixed { __lance_field_0: String },
+        }
+
+        let mut context = Context::new();
+        let named = ShadowEnum::Named { __context: 7 };
+        assert_eq!(named.deep_size_of_children(&mut context), 0);
+
+        let tuple = ShadowEnum::Tuple(String::from("hello"), vec![1, 2, 3]);
+        assert!(tuple.deep_size_of_children(&mut context) >= 5);
+
+        let prefixed = ShadowEnum::Prefixed {
+            __lance_field_0: String::from("abc"),
+        };
+        assert!(prefixed.deep_size_of_children(&mut context) >= 3);
+    }
 }
