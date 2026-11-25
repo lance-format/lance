@@ -20,6 +20,8 @@ use lance_core::{
     datatypes::{Field, LogicalType, Schema, format_field_path, parse_field_path},
 };
 use lance_index::pbold::InvertedIndexDetails;
+use lance_index::progress::IndexBuildProgress;
+use lance_index::scalar::inverted::builder::{FinalizeOptions, finalize_staged_index_to};
 use lance_index::scalar::inverted::{
     DocumentGranularity, InvertedIndex, InvertedIndexParams, doc_index_storage_column,
 };
@@ -908,6 +910,79 @@ fn empty_inverted_update_stream(
     )))
 }
 
+impl Dataset {
+    /// Merge fragment-scoped, staged FTS builds into an uncommitted segment with a fresh UUID.
+    /// Concurrent attempts can share the same inputs. Each attempt reads the staged files and
+    /// writes its own finalized partitions. The coordinator can commit the selected result with
+    /// [`DatasetIndexExt::commit_existing_index_segments`] and retire the inputs once every
+    /// attempt has stopped reading them. An abandoned result is an unreferenced index directory.
+    ///
+    /// The callback reports the finalization stages for each input in order.
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result};
+    /// # use lance_table::format::IndexMetadata;
+    /// # async fn worker(dataset: &Dataset, inputs: Vec<IndexMetadata>) -> Result<IndexMetadata> {
+    /// dataset.merge_staged_fts_segments(inputs, lance_index::progress::noop_progress()).await
+    /// # }
+    /// ```
+    pub async fn merge_staged_fts_segments(
+        &self,
+        sources: Vec<IndexMetadata>,
+        progress: Arc<dyn IndexBuildProgress>,
+    ) -> Result<IndexMetadata> {
+        crate::index::segment::validate_segment_metadata("staged FTS merge", &sources)?;
+        if let Some(segment) = sources
+            .iter()
+            .find(|segment| !crate::index::segment::segment_has_inverted_details(segment))
+        {
+            return Err(Error::invalid_input(format!(
+                "Segment {} does not declare FTS index details",
+                segment.uuid
+            )));
+        }
+        // Only UUIDs allocated by this call are eligible for intermediate cleanup.
+        let mut intermediates = Vec::with_capacity(sources.len());
+        let result = async {
+            let mut finalized = Vec::with_capacity(sources.len());
+            for source in sources {
+                let source_store =
+                    LanceIndexStore::from_dataset_for_existing(self, &source).await?;
+                let uuid = Uuid::new_v4();
+                let destination = LanceIndexStore::from_dataset_for_new(self, &uuid)?;
+                intermediates.push(uuid);
+                let files = finalize_staged_index_to(
+                    self.table_state.object_store.as_ref(),
+                    Arc::new(source_store),
+                    Arc::new(destination),
+                    FinalizeOptions::default(),
+                    progress.clone(),
+                )
+                .await?;
+                finalized.push(IndexMetadata {
+                    uuid,
+                    base_id: None,
+                    files: Some(index_files_to_table(files)),
+                    ..source
+                });
+            }
+            self.merge_existing_index_segments(finalized).await
+        }
+        .await;
+        for uuid in intermediates {
+            // A single input can be promoted as the result of this attempt.
+            if result.as_ref().is_ok_and(|segment| segment.uuid == uuid) {
+                continue;
+            }
+            let dir = self.indices_dir().join(uuid.to_string());
+            if let Err(error) = self.table_state.object_store.remove_dir_all(dir).await {
+                log::warn!("Failed to remove intermediate FTS index {uuid}: {error}");
+            }
+        }
+        result
+    }
+}
+
 /// Finalize a staged segment in place. Returns the final index files, or
 /// `None` when the segment already had its root metadata.
 pub(crate) async fn finalize_segment_files_if_needed(
@@ -1647,6 +1722,168 @@ mod tests {
                 .then(a.0.cmp(&b.0))
         });
         hits
+    }
+
+    #[derive(Debug, Default)]
+    struct PauseBeforePartitionWrites {
+        paused: tokio::sync::Notify,
+        resume: tokio::sync::Notify,
+        first_write: tokio::sync::OnceCell<()>,
+    }
+
+    #[async_trait::async_trait]
+    impl IndexBuildProgress for PauseBeforePartitionWrites {
+        async fn stage_start(&self, stage: &str, _: Option<u64>, _: &str) -> Result<()> {
+            if stage == "remap_partition_files" {
+                self.first_write
+                    .get_or_init(|| async {
+                        self.paused.notify_one();
+                        self.resume.notified().await;
+                    })
+                    .await;
+            }
+            Ok(())
+        }
+
+        async fn stage_progress(&self, _: &str, _: u64) -> Result<()> {
+            Ok(())
+        }
+        async fn stage_complete(&self, _: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    async fn index_file_contents(dataset: &Dataset, uuid: Uuid) -> BTreeMap<String, bytes::Bytes> {
+        let dir = dataset.indices_dir().join(uuid.to_string());
+        let store = &dataset.table_state.object_store;
+        let mut entries = store.read_dir_all(&dir, None);
+        let mut files = BTreeMap::new();
+        while let Some(entry) = entries.next().await {
+            let location = entry.unwrap().location;
+            let path = object_store::path::Path::from_iter(location.prefix_match(&dir).unwrap())
+                .to_string();
+            files.insert(path, store.read_one_all(&location).await.unwrap());
+        }
+        files
+    }
+
+    #[rstest::rstest]
+    #[case::single(1)]
+    #[case::multiple(2)]
+    #[tokio::test]
+    async fn staged_fts_attempts_preserve_shared_files(#[case] input_count: usize) {
+        use lance_core::utils::tempfile::TempStrDir;
+        use lance_index::progress::noop_progress;
+        use lance_index::scalar::FullTextSearchQuery;
+
+        let dir = TempStrDir::default();
+        let batch =
+            arrow_array::record_batch!(("text", Utf8, ["one match", "skip", "two match", "other"]))
+                .unwrap();
+        let reader = RecordBatchIterator::new([Ok(batch.clone())], batch.schema());
+        let mut dataset = Dataset::write(
+            reader,
+            &dir,
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                max_rows_per_group: 2,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let params = InvertedIndexParams::default().num_workers(1);
+        let mut sources = Vec::new();
+        let mut originals = Vec::new();
+        for fragments in [0, 1].chunks(2 / input_count) {
+            let segment = dataset
+                .create_index_builder(&["text"], lance_index::IndexType::Inverted, &params)
+                .fragments(fragments.to_vec())
+                .name("text_idx".into())
+                .execute_uncommitted()
+                .await
+                .unwrap();
+            let files = index_file_contents(&dataset, segment.uuid).await;
+            assert!(!files.is_empty() && files.keys().all(|path| path.starts_with("staging/")));
+            originals.push((segment.uuid, files));
+            sources.push(segment);
+        }
+        let read_snapshot = dataset.clone();
+        let gate = Arc::new(PauseBeforePartitionWrites::default());
+        let late = read_snapshot.merge_staged_fts_segments(sources.clone(), gate.clone());
+        tokio::pin!(late);
+        tokio::select! {
+            _ = gate.paused.notified() => {},
+            result = &mut late => panic!("attempt finished before partition writes: {result:?}"),
+        }
+        let winner = read_snapshot
+            .merge_staged_fts_segments(sources.clone(), noop_progress())
+            .await
+            .unwrap();
+        let uuid = winner.uuid;
+        assert!(sources.iter().all(|source| source.uuid != uuid));
+        let published = index_file_contents(&dataset, uuid).await;
+        let reported: BTreeMap<_, _> = winner
+            .files
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|file| (file.path.clone(), file.size_bytes))
+            .collect();
+        assert_eq!(
+            reported,
+            published
+                .iter()
+                .map(|(path, bytes)| (path.clone(), bytes.len() as u64))
+                .collect()
+        );
+        dataset
+            .commit_existing_index_segments("text_idx", "text", vec![winner])
+            .await
+            .unwrap();
+
+        // The late worker already planned its writes against the shared input.
+        gate.resume.notify_one();
+        let late = late.await.unwrap();
+        assert_ne!(late.uuid, uuid);
+        let store = &dataset.table_state.object_store;
+        store
+            .remove_dir_all(dataset.indices_dir().join(late.uuid.to_string()))
+            .await
+            .unwrap();
+        for (source, files) in originals {
+            assert_eq!(index_file_contents(&dataset, source).await, files);
+            store
+                .remove_dir_all(dataset.indices_dir().join(source.to_string()))
+                .await
+                .unwrap();
+        }
+        assert_eq!(index_file_contents(&dataset, uuid).await, published);
+        let reopened = Dataset::open(&dir).await.unwrap();
+        assert_eq!(
+            reopened.load_indices_by_name("text_idx").await.unwrap()[0].uuid,
+            uuid
+        );
+        let mut scan = reopened.scan();
+        scan.full_text_search(
+            FullTextSearchQuery::new("match".into())
+                .with_column("text".into())
+                .unwrap(),
+        )
+        .unwrap();
+        let plan = scan.explain_plan(true).await.unwrap();
+        assert!(
+            plan.contains("MatchQuery") && !plan.contains("FlatMatchQuery"),
+            "{plan}"
+        );
+        let result = scan.try_into_batch().await.unwrap();
+        let mut texts = result["text"]
+            .as_string::<i32>()
+            .iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        texts.sort_unstable();
+        assert_eq!(texts, ["one match", "two match"]);
     }
 
     /// A single staged intermediate covering every fragment is finalized in
