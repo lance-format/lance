@@ -1359,9 +1359,57 @@ pub trait FixedPerValueDecompressor: std::fmt::Debug + Send + Sync {
     }
 }
 
+/// Destination offsets for a variable-width decode, including the initial zero.
+#[derive(Debug)]
+pub enum VariableWidthOffsets {
+    /// Offsets for Binary and Utf8.
+    U32(Vec<u32>),
+    /// Offsets for LargeBinary and LargeUtf8.
+    U64(Vec<u64>),
+}
+
 pub trait VariablePerValueDecompressor: std::fmt::Debug + Send + Sync {
     /// Decompress one or more values
     fn decompress(&self, data: VariableWidthBlock) -> Result<DataBlock>;
+
+    /// Returns the exact number of bytes that [`Self::decompress_into`] will append
+    /// to `out_data` for the values delimited by `offsets` in `data`.
+    ///
+    /// `offsets` must contain 0-based little-endian `bits_per_offset`-bit offsets
+    /// (`32` or `64`) into `data`.
+    ///
+    /// Returns `None` when direct append is unsupported or when an exact output size
+    /// cannot be determined without decompressing.
+    ///
+    /// Implementations returning `Some` must also implement [`Self::decompress_into`]
+    /// and append the exact reported byte count.
+    fn appended_size(&self, _data: &[u8], _offsets: &[u8], _bits_per_offset: u8) -> Option<u64> {
+        None
+    }
+
+    /// Decompresses the values in `data` into `out_data` and appends their end offsets,
+    /// measured from the start of `out_data`, to `out_offsets`.
+    ///
+    /// Callers must pass an `out_offsets` variant matching `data.bits_per_offset`
+    /// that already contains the initial starting offset, and `data.offsets` must
+    /// contain 0-based offsets into `data.data`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotSupported` when direct append is unsupported,
+    /// `Error::InvalidInput` if `out_offsets` does not match `data.bits_per_offset`,
+    /// or a corruption/decompression error if `data` is invalid. On error,
+    /// `out_data` and `out_offsets` may be partially modified.
+    fn decompress_into(
+        &self,
+        _data: VariableWidthBlock,
+        _out_data: &mut Vec<u8>,
+        _out_offsets: &mut VariableWidthOffsets,
+    ) -> Result<()> {
+        Err(lance_core::Error::not_supported(
+            "Direct variable-width decompression is not supported".to_string(),
+        ))
+    }
 
     /// Whether every buffer returned by `decompress` is newly allocated, never a
     /// view of the input, on all paths.

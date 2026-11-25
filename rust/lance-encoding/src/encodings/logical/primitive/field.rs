@@ -22,13 +22,17 @@ use lance_core::error::{Error, LanceOptionExt};
 use log::{debug, trace};
 
 use crate::EncodingsIo;
-use crate::compression::DecompressionStrategy;
-use crate::data::{concat_decoded_arrays, dictionary_batch_limit};
+use crate::buffer::LanceBuffer;
+use crate::compression::{DecompressionStrategy, VariableWidthOffsets};
+use crate::data::{
+    BlockInfo, DataBlock, VariableWidthBlock, concat_decoded_arrays, dictionary_batch_limit,
+};
 use crate::decoder::{
     ColumnInfo, DecodePageTask, DecodedArray, DrainLimit, FilterExpression, IO_REQUEST_BATCH_BYTES,
     ListReadMode, LoadedPageShard, MessageType, PageEncoding, PageInfo, RequestBatch,
     ScheduledScanLine, SchedulerContext, StructuralDecodeArrayTask, StructuralFieldDecoder,
     StructuralFieldScheduler, StructuralPageDecoder, StructuralSchedulingJob, UnloadedPageShard,
+    VariablePageDecodePlan,
 };
 use crate::encodings::logical::primitive::blob::{BlobDescriptionPageScheduler, BlobPageScheduler};
 use crate::format::metadata::PageLayout;
@@ -926,6 +930,142 @@ pub struct StructuralCompositeDecodeArrayTask {
 }
 
 impl StructuralCompositeDecodeArrayTask {
+    fn variable_decode_plan(&self) -> Option<(VariablePageDecodePlan, Vec<(u64, u64)>)> {
+        if self.tasks.len() <= 1 {
+            return None;
+        }
+        let bits_per_offset = match self.data_type {
+            DataType::Utf8 | DataType::Binary => 32,
+            DataType::LargeUtf8 | DataType::LargeBinary => 64,
+            _ => return None,
+        };
+        let mut num_values = 0u64;
+        let mut decompressed_bytes = 0u64;
+        let mut page_plans = Vec::with_capacity(self.tasks.len());
+        for task in &self.tasks {
+            let plan = task.variable_decode_plan()?;
+            if plan.bits_per_offset != bits_per_offset {
+                return None;
+            }
+            num_values = num_values.checked_add(plan.num_values)?;
+            decompressed_bytes = decompressed_bytes.checked_add(plan.decompressed_bytes)?;
+            page_plans.push((plan.num_values, plan.decompressed_bytes));
+        }
+        if bits_per_offset == 32 && decompressed_bytes > i32::MAX as u64 {
+            // Let Arrow's existing concatenation path handle an overflowing offset.
+            return None;
+        }
+        Some((
+            VariablePageDecodePlan {
+                num_values,
+                decompressed_bytes,
+                bits_per_offset,
+            },
+            page_plans,
+        ))
+    }
+
+    fn decode_variable(
+        self,
+        plan: VariablePageDecodePlan,
+        page_plans: Vec<(u64, u64)>,
+    ) -> Result<DecodedArray> {
+        fn reserve<T>(len: u64) -> Result<Vec<T>> {
+            let capacity = usize::try_from(len).map_err(|_| {
+                Error::invalid_input(format!("Decode buffer length {len} exceeds usize"))
+            })?;
+            let mut buffer = Vec::new();
+            buffer.try_reserve_exact(capacity).map_err(|err| {
+                Error::invalid_input(format!(
+                    "Cannot reserve {capacity} decode buffer elements: {err}"
+                ))
+            })?;
+            Ok(buffer)
+        }
+
+        fn offsets_len(offsets: &VariableWidthOffsets) -> usize {
+            match offsets {
+                VariableWidthOffsets::U32(offsets) => offsets.len(),
+                VariableWidthOffsets::U64(offsets) => offsets.len(),
+            }
+        }
+
+        let mut data = reserve(plan.decompressed_bytes)?;
+        let num_offsets = plan.num_values.checked_add(1).ok_or_else(|| {
+            Error::invalid_input(format!(
+                "Offset count overflowed for {} values",
+                plan.num_values
+            ))
+        })?;
+        let mut offsets = if plan.bits_per_offset == 32 {
+            let mut offsets = reserve(num_offsets)?;
+            offsets.push(0);
+            VariableWidthOffsets::U32(offsets)
+        } else {
+            let mut offsets = reserve(num_offsets)?;
+            offsets.push(0);
+            VariableWidthOffsets::U64(offsets)
+        };
+        let mut unravelers = Vec::with_capacity(self.tasks.len());
+        for (page_idx, (task, (expected_values, expected_bytes))) in
+            self.tasks.into_iter().zip(page_plans).enumerate()
+        {
+            let data_start = data.len();
+            let offsets_start = offsets_len(&offsets);
+            unravelers.push(task.decode_variable_into(&mut data, &mut offsets)?);
+            let produced_bytes = data.len().checked_sub(data_start).ok_or_else(|| {
+                Error::corrupt_file_named(
+                    "variable_full_zip",
+                    format!("page {page_idx} shortened the shared data buffer"),
+                )
+            })? as u64;
+            if produced_bytes != expected_bytes {
+                return Err(Error::corrupt_file_named(
+                    "variable_full_zip",
+                    format!(
+                        "page {page_idx} produced {produced_bytes} bytes, expected {expected_bytes}"
+                    ),
+                ));
+            }
+            let produced_offsets = offsets_len(&offsets)
+                .checked_sub(offsets_start)
+                .ok_or_else(|| {
+                    Error::corrupt_file_named(
+                        "variable_full_zip",
+                        format!("page {page_idx} shortened the shared offsets buffer"),
+                    )
+                })? as u64;
+            if produced_offsets != expected_values {
+                return Err(Error::corrupt_file_named(
+                    "variable_full_zip",
+                    format!(
+                        "page {page_idx} produced {produced_offsets} offsets, expected {expected_values}"
+                    ),
+                ));
+            }
+        }
+        let offsets = match offsets {
+            VariableWidthOffsets::U32(offsets) => LanceBuffer::reinterpret_vec(offsets),
+            VariableWidthOffsets::U64(offsets) => LanceBuffer::reinterpret_vec(offsets),
+        };
+        let data = DataBlock::VariableWidth(VariableWidthBlock {
+            bits_per_offset: plan.bits_per_offset,
+            data: LanceBuffer::from(data),
+            offsets,
+            num_values: plan.num_values,
+            block_info: BlockInfo::new(),
+        });
+        let data_size = data.data_size();
+        let array = make_array(data.into_arrow(self.data_type, self.should_validate)?);
+        let mut repdef = CompositeRepDefUnraveler::new(unravelers);
+        let array = Self::restore_validity(array, &mut repdef)?;
+        Ok(DecodedArray {
+            array,
+            repdef,
+            data_size,
+        })
+    }
+
     fn restore_validity(
         array: Arc<dyn Array>,
         unraveler: &mut CompositeRepDefUnraveler,
@@ -976,6 +1116,9 @@ impl StructuralCompositeDecodeArrayTask {
 
 impl StructuralDecodeArrayTask for StructuralCompositeDecodeArrayTask {
     fn decode(self: Box<Self>) -> Result<DecodedArray> {
+        if let Some((plan, page_plans)) = self.variable_decode_plan() {
+            return self.decode_variable(plan, page_plans);
+        }
         let mut arrays = Vec::with_capacity(self.tasks.len());
         let mut unravelers = Vec::with_capacity(self.tasks.len());
         let mut data_size = 0u64;
@@ -1196,18 +1339,30 @@ mod tests {
     use std::ops::Range;
     use std::sync::Arc;
 
+    #[cfg(any(feature = "zstd", feature = "lz4"))]
+    use arrow_array::StringArray;
     use arrow_array::{Array, ArrayRef, Int32Array, StructArray, cast::AsArray};
     use arrow_schema::{DataType, Field as ArrowField};
     use bytes::Bytes;
+    use lance_core::{Error, Result};
 
     use crate::EncodingsIo;
+    use crate::buffer::LanceBuffer;
+    use crate::compression::VariableWidthOffsets;
     use crate::decoder::{
-        FilterExpression, RequestBatch, SchedulerContext, StructuralFieldDecoder,
-        StructuralFieldScheduler,
+        DecodePageTask, DecodedPage, FilterExpression, RequestBatch, SchedulerContext,
+        StructuralDecodeArrayTask, StructuralFieldDecoder, StructuralFieldScheduler,
+        VariablePageDecodePlan,
+    };
+    use crate::encodings::logical::primitive::fullzip_decode::tests::{
+        variable_bridge_raw_task, variable_bridge_test_page,
     };
     use crate::encodings::logical::primitive::{
         CachedPage, CachedPageData, PageCacheView, PageDataCacheKey, SimpleAllNullScheduler,
         StructuralPageScheduler,
+    };
+    use crate::encodings::physical::block::{
+        CompressedBufferEncoder, CompressionConfig, CompressionScheme,
     };
     use crate::format::metadata;
     use crate::repdef::{CompositeRepDefUnraveler, DefinitionInterpretation, RepDefUnraveler};
@@ -1220,6 +1375,532 @@ mod tests {
 
     #[derive(Debug)]
     struct CacheMarker(u8);
+
+    #[derive(Debug)]
+    struct MockVariablePageTask {
+        plan: Option<VariablePageDecodePlan>,
+        append_bytes: Vec<u8>,
+        append_offsets: Vec<u64>,
+    }
+
+    impl DecodePageTask for MockVariablePageTask {
+        fn decode(self: Box<Self>) -> Result<DecodedPage> {
+            Err(Error::not_supported("mock decode unused".to_string()))
+        }
+
+        fn variable_decode_plan(&self) -> Option<VariablePageDecodePlan> {
+            self.plan
+        }
+
+        fn decode_variable_into(
+            self: Box<Self>,
+            out_data: &mut Vec<u8>,
+            out_offsets: &mut VariableWidthOffsets,
+        ) -> Result<RepDefUnraveler> {
+            let num_rows = self.plan.map_or(0, |p| p.num_values);
+            out_data.extend_from_slice(&self.append_bytes);
+            match out_offsets {
+                VariableWidthOffsets::U32(offsets) => {
+                    offsets.extend(self.append_offsets.iter().map(|&v| v as u32));
+                }
+                VariableWidthOffsets::U64(offsets) => {
+                    offsets.extend(self.append_offsets.iter().copied());
+                }
+            }
+            Ok(RepDefUnraveler::new(
+                None,
+                None,
+                vec![DefinitionInterpretation::AllValidItem].into(),
+                num_rows,
+            ))
+        }
+    }
+
+    fn mock_variable_page_with_plan(plan: VariablePageDecodePlan) -> Box<MockVariablePageTask> {
+        Box::new(MockVariablePageTask {
+            plan: Some(plan),
+            append_bytes: Vec::new(),
+            append_offsets: Vec::new(),
+        })
+    }
+
+    fn mock_variable_composite(
+        data_type: DataType,
+        tasks: Vec<Box<dyn DecodePageTask>>,
+    ) -> StructuralCompositeDecodeArrayTask {
+        StructuralCompositeDecodeArrayTask {
+            tasks,
+            should_validate: true,
+            data_type,
+        }
+    }
+
+    #[rstest::rstest]
+    #[case::i32_bytes(DataType::Utf8, 32, 1, i32::MAX as u64, 1)]
+    #[case::u64_bytes(DataType::LargeBinary, 64, 1, u64::MAX, 1)]
+    #[case::u64_values(DataType::LargeBinary, 64, u64::MAX, 0, 0)]
+    fn test_variable_decode_plan_returns_none_on_overflow(
+        #[case] data_type: DataType,
+        #[case] bits_per_offset: u8,
+        #[case] first_values: u64,
+        #[case] first_bytes: u64,
+        #[case] second_bytes: u64,
+    ) {
+        let task = mock_variable_composite(
+            data_type,
+            vec![
+                mock_variable_page_with_plan(VariablePageDecodePlan {
+                    num_values: first_values,
+                    decompressed_bytes: first_bytes,
+                    bits_per_offset,
+                }),
+                mock_variable_page_with_plan(VariablePageDecodePlan {
+                    num_values: 1,
+                    decompressed_bytes: second_bytes,
+                    bits_per_offset,
+                }),
+            ],
+        );
+        assert_eq!(task.variable_decode_plan(), None);
+    }
+
+    #[rstest::rstest]
+    #[case::extra_offsets(vec![1], vec![1, 2], 1)]
+    #[case::missing_offsets(vec![1], vec![], 1)]
+    #[case::balanced_total(vec![1, 1], vec![], 0)]
+    fn test_decode_variable_rejects_mismatched_offset_count(
+        #[case] first_offsets: Vec<u64>,
+        #[case] second_offsets: Vec<u64>,
+        #[case] error_page: usize,
+    ) {
+        let plan = VariablePageDecodePlan {
+            num_values: 1,
+            decompressed_bytes: 1,
+            bits_per_offset: 32,
+        };
+        let task = Box::new(mock_variable_composite(
+            DataType::Binary,
+            vec![
+                Box::new(MockVariablePageTask {
+                    plan: Some(plan),
+                    append_bytes: vec![b'a'],
+                    append_offsets: first_offsets,
+                }),
+                Box::new(MockVariablePageTask {
+                    plan: Some(plan),
+                    append_bytes: vec![b'b'],
+                    append_offsets: second_offsets,
+                }),
+            ],
+        ));
+        let Err(err) = task.decode() else {
+            panic!("expected decode error");
+        };
+        assert!(
+            matches!(err, Error::CorruptFile { .. }),
+            "unexpected: {err}"
+        );
+        assert!(
+            err.to_string().contains(&format!("page {error_page}")),
+            "unexpected: {err}"
+        );
+        assert!(err.to_string().contains("offsets"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn test_variable_fullzip_plan_rejects_bad_offsets_and_nonzero_start() {
+        let none_encoder = Arc::new(
+            CompressedBufferEncoder::try_new(CompressionConfig::new(CompressionScheme::None, None))
+                .unwrap(),
+        );
+        for offsets in [
+            vec![0_u32, 3],
+            vec![0_u32, 3, 3, 3, 3],
+            vec![1_u32, 3, 3, 3],
+        ] {
+            let task = variable_bridge_raw_task(
+                none_encoder.clone(),
+                b"abc".to_vec(),
+                LanceBuffer::reinterpret_vec(offsets),
+                32,
+                3,
+                vec![0_u16, 1, 0],
+            );
+            assert_eq!(task.variable_decode_plan(), None);
+        }
+
+        let composite = StructuralCompositeDecodeArrayTask {
+            tasks: vec![
+                variable_bridge_test_page("left", 32, Some(CompressionScheme::None)),
+                variable_bridge_raw_task(
+                    none_encoder,
+                    b"xxright".to_vec(),
+                    LanceBuffer::reinterpret_vec(vec![2_u32, 7, 7, 7]),
+                    32,
+                    3,
+                    vec![0_u16, 1, 0],
+                ),
+            ],
+            should_validate: true,
+            data_type: DataType::Utf8,
+        };
+        assert_eq!(composite.variable_decode_plan(), None);
+    }
+
+    #[cfg(any(feature = "zstd", feature = "lz4"))]
+    fn assert_variable_bridging_case(
+        data_type: DataType,
+        bits_per_offset: u8,
+        scheme: CompressionScheme,
+        compress_second_page: bool,
+    ) {
+        let second_scheme = compress_second_page.then_some(scheme);
+        let task = Box::new(StructuralCompositeDecodeArrayTask {
+            tasks: vec![
+                variable_bridge_test_page("left", bits_per_offset, Some(scheme)),
+                variable_bridge_test_page("β", bits_per_offset, second_scheme),
+            ],
+            should_validate: true,
+            data_type: data_type.clone(),
+        });
+        let plan = task.variable_decode_plan().map(|(plan, _)| plan);
+        assert_eq!(plan.is_some(), compress_second_page);
+        if let Some(plan) = plan {
+            assert_eq!(plan.num_values, 6);
+            assert_eq!(plan.decompressed_bytes, 6);
+            assert_eq!(plan.bits_per_offset, bits_per_offset);
+        }
+
+        let result = task.decode().unwrap().array;
+        let expected = StringArray::from(vec![
+            Some("left"),
+            None,
+            Some(""),
+            Some("β"),
+            None,
+            Some(""),
+        ]);
+        let expected = arrow_cast::cast(&expected, &data_type).unwrap();
+        assert_eq!(result.as_ref(), expected.as_ref());
+    }
+
+    #[cfg(feature = "zstd")]
+    mod zstd {
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        use arrow_array::{Array, LargeBinaryArray, ListArray, StringArray};
+        use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
+        use arrow_schema::{DataType, Field as ArrowField};
+        use rstest::rstest;
+
+        use crate::buffer::LanceBuffer;
+        use crate::constants::{
+            COMPRESSION_META_KEY, DICT_DIVISOR_META_KEY, DICT_SIZE_RATIO_META_KEY,
+            STRUCTURAL_ENCODING_FULLZIP, STRUCTURAL_ENCODING_META_KEY,
+        };
+        use crate::decoder::StructuralDecodeArrayTask;
+        use crate::encodings::logical::primitive::fullzip_decode::tests::variable_bridge_raw_task;
+        use crate::encodings::physical::block::{
+            CompressedBufferEncoder, CompressionConfig, CompressionScheme,
+        };
+        use crate::testing::{TestCases, check_round_trip_encoding_of_data};
+
+        use super::{StructuralCompositeDecodeArrayTask, assert_variable_bridging_case};
+
+        fn zstd_fullzip_metadata() -> HashMap<String, String> {
+            HashMap::from([
+                (COMPRESSION_META_KEY.to_string(), "zstd".to_string()),
+                (
+                    STRUCTURAL_ENCODING_META_KEY.to_string(),
+                    STRUCTURAL_ENCODING_FULLZIP.to_string(),
+                ),
+                (DICT_DIVISOR_META_KEY.to_string(), "100000".to_string()),
+                (DICT_SIZE_RATIO_META_KEY.to_string(), "0.0001".to_string()),
+            ])
+        }
+
+        #[rstest]
+        #[case::utf8(DataType::Utf8, 32, true)]
+        #[case::large_utf8(DataType::LargeUtf8, 64, true)]
+        #[case::binary(DataType::Binary, 32, true)]
+        #[case::large_binary(DataType::LargeBinary, 64, true)]
+        #[case::mixed_compression(DataType::Utf8, 32, false)]
+        fn test_variable_fullzip_page_bridging(
+            #[case] data_type: DataType,
+            #[case] bits_per_offset: u8,
+            #[case] compress_second_page: bool,
+        ) {
+            assert_variable_bridging_case(
+                data_type,
+                bits_per_offset,
+                CompressionScheme::Zstd,
+                compress_second_page,
+            );
+        }
+
+        #[test]
+        fn test_variable_fullzip_raw_zstd_falls_back() {
+            let encoder = Arc::new(
+                CompressedBufferEncoder::try_new(CompressionConfig::new(
+                    CompressionScheme::Zstd,
+                    Some(0),
+                ))
+                .unwrap(),
+            );
+            let make_raw_page = |val: &str| {
+                let raw = ::zstd::bulk::compress(val.as_bytes(), 0).unwrap();
+                let end = raw.len() as u32;
+                variable_bridge_raw_task(
+                    encoder.clone(),
+                    raw,
+                    LanceBuffer::reinterpret_vec(vec![0_u32, end, end]),
+                    32,
+                    2,
+                    vec![0_u16, 1],
+                )
+            };
+            let task = Box::new(StructuralCompositeDecodeArrayTask {
+                tasks: vec![make_raw_page("raw-left"), make_raw_page("raw-right")],
+                should_validate: true,
+                data_type: DataType::Utf8,
+            });
+            assert_eq!(task.variable_decode_plan(), None);
+            let result = task.decode().unwrap().array;
+            let expected = StringArray::from(vec![Some("raw-left"), None, Some("raw-right"), None]);
+            assert_eq!(result.as_ref(), &expected);
+        }
+
+        #[test]
+        fn test_variable_fullzip_zstd_longer_than_declared_errors() {
+            let encoder = Arc::new(
+                CompressedBufferEncoder::try_new(CompressionConfig::new(
+                    CompressionScheme::Zstd,
+                    Some(0),
+                ))
+                .unwrap(),
+            );
+            let mut bad_data = Vec::new();
+            encoder
+                .per_value_compress(b"ten-bytes!", &[0, 10], &mut bad_data)
+                .unwrap();
+            bad_data[..8].copy_from_slice(&4_u64.to_le_bytes());
+            let bad_end = bad_data.len() as u32;
+            let page0 = variable_bridge_raw_task(
+                encoder.clone(),
+                bad_data,
+                LanceBuffer::reinterpret_vec(vec![0_u32, bad_end]),
+                32,
+                1,
+                vec![0_u16],
+            );
+
+            let mut ok_data = Vec::new();
+            encoder
+                .per_value_compress(b"twenty-bytes-payload", &[0, 20], &mut ok_data)
+                .unwrap();
+            let ok_end = ok_data.len() as u32;
+            let page1 = variable_bridge_raw_task(
+                encoder,
+                ok_data,
+                LanceBuffer::reinterpret_vec(vec![0_u32, ok_end]),
+                32,
+                1,
+                vec![0_u16],
+            );
+
+            let task = Box::new(StructuralCompositeDecodeArrayTask {
+                tasks: vec![page0, page1],
+                should_validate: true,
+                data_type: DataType::Utf8,
+            });
+            assert!(task.variable_decode_plan().is_some());
+            let Err(err) = task.decode() else {
+                panic!("expected decode error");
+            };
+            assert!(
+                matches!(err, lance_core::Error::CorruptFile { .. }),
+                "unexpected: {err}"
+            );
+            assert!(
+                err.to_string()
+                    .contains("Zstd produced 10 bytes, expected 4"),
+                "unexpected: {err}"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_variable_fullzip_zstd_multipage_round_trip() {
+            let repeated = "zstd-bridged-payload-".repeat(160);
+            let make_utf8_chunk = |page_idx: usize| -> Arc<dyn Array> {
+                let mut rows = Vec::with_capacity(16);
+                for row_idx in 0..16 {
+                    if row_idx == 2 {
+                        rows.push(None);
+                    } else if row_idx == 5 {
+                        rows.push(Some(String::new()));
+                    } else {
+                        rows.push(Some(format!("{repeated}p{page_idx}-r{row_idx}")));
+                    }
+                }
+                Arc::new(StringArray::from(rows))
+            };
+            let utf8_chunks = vec![make_utf8_chunk(0), make_utf8_chunk(1), make_utf8_chunk(2)];
+            let test_cases = TestCases::default()
+                .with_structural_encodings()
+                .with_page_sizes(vec![1])
+                .with_slicing_modes([false, true])
+                .with_ingest_batch_counts([1])
+                .with_batch_size(10)
+                .with_range(5..42)
+                .with_indices(vec![2, 18, 35, 46])
+                .with_expected_encoding("zstd");
+            check_round_trip_encoding_of_data(utf8_chunks, &test_cases, zstd_fullzip_metadata())
+                .await;
+
+            let make_large_binary_chunk = |page_idx: usize| -> Arc<dyn Array> {
+                let mut rows = Vec::with_capacity(16);
+                for row_idx in 0..16 {
+                    if row_idx == 3 {
+                        rows.push(None);
+                    } else if row_idx == 7 {
+                        rows.push(Some(Vec::new()));
+                    } else {
+                        rows.push(Some(
+                            format!("{repeated}bin-p{page_idx}-r{row_idx}").into_bytes(),
+                        ));
+                    }
+                }
+                let refs: Vec<Option<&[u8]>> = rows.iter().map(|r| r.as_deref()).collect();
+                Arc::new(LargeBinaryArray::from(refs))
+            };
+            let binary_chunks = vec![
+                make_large_binary_chunk(0),
+                make_large_binary_chunk(1),
+                make_large_binary_chunk(2),
+            ];
+            check_round_trip_encoding_of_data(binary_chunks, &test_cases, zstd_fullzip_metadata())
+                .await;
+
+            let item_field = Arc::new(
+                ArrowField::new("item", DataType::Utf8, true)
+                    .with_metadata(zstd_fullzip_metadata()),
+            );
+            let make_list_chunk = |page_idx: usize| -> Arc<dyn Array> {
+                let mut list_validity = Vec::with_capacity(16);
+                let mut list_offsets = Vec::with_capacity(17);
+                let mut items: Vec<Option<String>> = Vec::new();
+                list_offsets.push(0_i32);
+                for row_idx in 0..16 {
+                    if row_idx == 1 {
+                        list_validity.push(false);
+                    } else if row_idx == 4 {
+                        list_validity.push(true);
+                    } else if row_idx == 8 {
+                        list_validity.push(true);
+                        items.push(None);
+                        items.push(Some(format!("{repeated}list-p{page_idx}-r{row_idx}")));
+                    } else {
+                        list_validity.push(true);
+                        items.push(Some(format!("{repeated}list-p{page_idx}-r{row_idx}-a")));
+                        items.push(Some(format!("{repeated}list-p{page_idx}-r{row_idx}-b")));
+                    }
+                    list_offsets.push(items.len() as i32);
+                }
+                let values = Arc::new(StringArray::from(items));
+                Arc::new(ListArray::new(
+                    item_field.clone(),
+                    OffsetBuffer::new(ScalarBuffer::from(list_offsets)),
+                    values,
+                    Some(NullBuffer::from(list_validity)),
+                ))
+            };
+            let list_chunks = vec![make_list_chunk(0), make_list_chunk(1), make_list_chunk(2)];
+            check_round_trip_encoding_of_data(list_chunks, &test_cases, HashMap::new()).await;
+        }
+    }
+
+    #[cfg(feature = "lz4")]
+    mod lz4 {
+        use std::sync::Arc;
+
+        use arrow_schema::DataType;
+        use rstest::rstest;
+
+        use crate::buffer::LanceBuffer;
+        use crate::decoder::StructuralDecodeArrayTask;
+        use crate::encodings::logical::primitive::fullzip_decode::tests::variable_bridge_raw_task;
+        use crate::encodings::physical::block::{
+            CompressedBufferEncoder, CompressionConfig, CompressionScheme,
+        };
+
+        use super::{StructuralCompositeDecodeArrayTask, assert_variable_bridging_case};
+
+        #[rstest]
+        #[case::utf8(DataType::Utf8, 32, true)]
+        #[case::large_utf8(DataType::LargeUtf8, 64, true)]
+        #[case::binary(DataType::Binary, 32, true)]
+        #[case::large_binary(DataType::LargeBinary, 64, true)]
+        #[case::mixed_compression(DataType::Utf8, 32, false)]
+        fn test_variable_fullzip_page_bridging(
+            #[case] data_type: DataType,
+            #[case] bits_per_offset: u8,
+            #[case] compress_second_page: bool,
+        ) {
+            assert_variable_bridging_case(
+                data_type,
+                bits_per_offset,
+                CompressionScheme::Lz4,
+                compress_second_page,
+            );
+        }
+
+        #[test]
+        fn test_variable_fullzip_lz4_forged_prefix_skips_bridging_and_errors() {
+            let encoder = Arc::new(
+                CompressedBufferEncoder::try_new(CompressionConfig::new(
+                    CompressionScheme::Lz4,
+                    None,
+                ))
+                .unwrap(),
+            );
+            let mut forged = Vec::new();
+            encoder
+                .per_value_compress(b"lz4-value", &[0, 9], &mut forged)
+                .unwrap();
+            forged[..4].copy_from_slice(&u32::MAX.to_le_bytes());
+            let end = forged.len() as u64;
+
+            let make_bad_page = || {
+                variable_bridge_raw_task(
+                    encoder.clone(),
+                    forged.clone(),
+                    LanceBuffer::reinterpret_vec(vec![0_u64, end]),
+                    64,
+                    1,
+                    vec![0_u16],
+                )
+            };
+            let task = Box::new(StructuralCompositeDecodeArrayTask {
+                tasks: vec![make_bad_page(), make_bad_page()],
+                should_validate: true,
+                data_type: DataType::LargeBinary,
+            });
+            assert_eq!(task.variable_decode_plan(), None);
+            let Err(err) = task.decode() else {
+                panic!("expected decode error");
+            };
+            assert!(
+                matches!(err, lance_core::Error::InvalidInput { .. }),
+                "unexpected: {err}"
+            );
+            assert!(
+                err.to_string()
+                    .contains("LZ4 declares 4294967295 output bytes"),
+                "unexpected: {err}"
+            );
+        }
+    }
 
     #[test]
     fn test_packed_struct_restores_child_validity() {
