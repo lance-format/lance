@@ -18,6 +18,7 @@ pub(crate) struct PreparedRowAddrMask {
 
 enum FragmentSelection {
     Full,
+    Range { min: u32, max: u32 },
     Sparse(RoaringBitmap),
     Dense { base: u32, words: Vec<u64> },
 }
@@ -32,6 +33,9 @@ impl FragmentSelection {
         let Some((min, max)) = bitmap.min().zip(bitmap.max()) else {
             return Self::Sparse(bitmap.clone());
         };
+        if bitmap.len() == u64::from(max) - u64::from(min) + 1 {
+            return Self::Range { min, max };
+        }
         let base = min / 64 * 64;
         let num_words = (u64::from(max) - u64::from(base)) / 64 + 1;
         let dense_bytes = num_words * 8;
@@ -54,6 +58,7 @@ impl FragmentSelection {
     fn contains(&self, row: u32) -> bool {
         match self {
             Self::Full => true,
+            Self::Range { min, max } => (*min..=*max).contains(&row),
             Self::Sparse(bitmap) => bitmap.contains(row),
             Self::Dense { base, words } => row
                 .checked_sub(*base)
@@ -119,17 +124,67 @@ impl PreparedRowAddrMask {
             .collect()
     }
 
-    pub(crate) fn selected_offsets_into<'a>(
-        &self,
-        rows: impl Iterator<Item = &'a u64>,
-        out: &mut Vec<u32>,
-    ) {
+    pub(crate) fn selected_offsets_into(&self, rows: &[u64], out: &mut Vec<u32>) {
         out.clear();
-        out.extend(
-            self.selection(rows, false)
-                .enumerate()
-                .filter_map(|(offset, selected)| selected.then_some(offset as u32)),
-        );
+        let mut start = 0;
+        while start < rows.len() {
+            let fragment = RowAddress::new_from_u64(rows[start]).fragment_id();
+            let end = start
+                + 1
+                + rows[start + 1..]
+                    .iter()
+                    .position(|&row| RowAddress::new_from_u64(row).fragment_id() != fragment)
+                    .unwrap_or(rows.len() - start - 1);
+            let run = &rows[start..end];
+            match self.fragments.get(&fragment) {
+                None => {
+                    if !self.allow {
+                        out.extend((start..end).map(|offset| offset as u32));
+                    }
+                }
+                Some(FragmentSelection::Full) => {
+                    if self.allow {
+                        out.extend((start..end).map(|offset| offset as u32));
+                    }
+                }
+                Some(FragmentSelection::Range { min, max }) => {
+                    self.extend_offsets(run, start, out, |row| (*min..=*max).contains(&row));
+                }
+                Some(FragmentSelection::Sparse(bitmap)) => {
+                    self.extend_offsets(run, start, out, |row| bitmap.contains(row));
+                }
+                Some(FragmentSelection::Dense { base, words }) => {
+                    self.extend_offsets(run, start, out, |row| {
+                        row.checked_sub(*base)
+                            .and_then(|offset| words.get(offset as usize / 64))
+                            .is_some_and(|word| word & (1u64 << (row % 64)) != 0)
+                    });
+                }
+            }
+            start = end;
+        }
+    }
+
+    fn extend_offsets(
+        &self,
+        run: &[u64],
+        start: usize,
+        out: &mut Vec<u32>,
+        contains: impl Fn(u32) -> bool,
+    ) {
+        if self.allow {
+            for (offset, &row) in run.iter().enumerate() {
+                if contains(RowAddress::new_from_u64(row).row_offset()) {
+                    out.push((start + offset) as u32);
+                }
+            }
+        } else {
+            for (offset, &row) in run.iter().enumerate() {
+                if !contains(RowAddress::new_from_u64(row).row_offset()) {
+                    out.push((start + offset) as u32);
+                }
+            }
+        }
     }
 }
 
@@ -164,18 +219,16 @@ mod tests {
             RowAddrMask::BlockList(rows),
         ] {
             let prepared = PreparedRowAddrMask::new(&mask);
-            assert!(
-                prepared
-                    .fragments
-                    .values()
-                    .all(|selection| matches!(selection, FragmentSelection::Sparse(_)))
-            );
+            assert!(prepared.fragments.values().all(|selection| matches!(
+                selection,
+                FragmentSelection::Sparse(_) | FragmentSelection::Range { .. }
+            )));
             assert_eq!(
                 prepared.selected_indices(input.iter()),
                 mask.selected_indices(input.iter())
             );
             let mut offsets = vec![u32::MAX];
-            prepared.selected_offsets_into(input.iter(), &mut offsets);
+            prepared.selected_offsets_into(&input, &mut offsets);
             assert_eq!(
                 offsets
                     .iter()
@@ -183,7 +236,7 @@ mod tests {
                     .collect::<Vec<_>>(),
                 mask.selected_indices(input.iter())
             );
-            prepared.selected_offsets_into(std::iter::empty(), &mut offsets);
+            prepared.selected_offsets_into(&[], &mut offsets);
             assert!(offsets.is_empty());
         }
     }
@@ -229,7 +282,7 @@ mod tests {
                 mask.selected_indices(input.iter())
             );
             let mut offsets = vec![u32::MAX];
-            prepared.selected_offsets_into(input.iter(), &mut offsets);
+            prepared.selected_offsets_into(&input, &mut offsets);
             assert_eq!(
                 offsets
                     .iter()
@@ -237,7 +290,7 @@ mod tests {
                     .collect::<Vec<_>>(),
                 mask.selected_indices(input.iter())
             );
-            prepared.selected_offsets_into(std::iter::empty(), &mut offsets);
+            prepared.selected_offsets_into(&[], &mut offsets);
             assert!(offsets.is_empty());
         }
     }
@@ -305,7 +358,7 @@ mod tests {
                 mask.selected_indices(input.iter())
             );
             let mut offsets = vec![u32::MAX];
-            prepared.selected_offsets_into(input.iter(), &mut offsets);
+            prepared.selected_offsets_into(&input, &mut offsets);
             assert_eq!(
                 offsets
                     .iter()
@@ -313,7 +366,7 @@ mod tests {
                     .collect::<Vec<_>>(),
                 mask.selected_indices(input.iter())
             );
-            prepared.selected_offsets_into(std::iter::empty(), &mut offsets);
+            prepared.selected_offsets_into(&[], &mut offsets);
             assert!(offsets.is_empty());
         }
     }
@@ -328,7 +381,7 @@ mod tests {
         let prepared = PreparedRowAddrMask::new(&RowAddrMask::AllowList(rows));
         assert!(matches!(
             prepared.fragments.get(&3),
-            Some(FragmentSelection::Sparse(_))
+            Some(FragmentSelection::Range { .. })
         ));
         let input = [
             0,
@@ -347,7 +400,7 @@ mod tests {
                 mask.selected_indices(input.iter())
             );
             let mut offsets = vec![u32::MAX];
-            prepared.selected_offsets_into(input.iter(), &mut offsets);
+            prepared.selected_offsets_into(&input, &mut offsets);
             assert_eq!(
                 offsets
                     .iter()
@@ -355,7 +408,7 @@ mod tests {
                     .collect::<Vec<_>>(),
                 mask.selected_indices(input.iter())
             );
-            prepared.selected_offsets_into(std::iter::empty(), &mut offsets);
+            prepared.selected_offsets_into(&[], &mut offsets);
             assert!(offsets.is_empty());
         }
     }

@@ -92,12 +92,8 @@ pub trait PreFilter: Send + Sync {
     ///
     /// Call after [`Self::wait_for_ready`] with fewer than `u32::MAX` rows.
     /// Implementations can reuse query-local lookup state across partitions.
-    fn filter_row_offsets_into<'a>(
-        &self,
-        row_ids: Box<dyn Iterator<Item = &'a u64> + 'a>,
-        out: &mut Vec<u32>,
-    ) {
-        self.mask().selected_offsets_into(row_ids, out);
+    fn filter_row_offsets_into(&self, row_ids: &[u64], out: &mut Vec<u32>) {
+        self.mask().selected_offsets_into(row_ids.iter(), out);
     }
 }
 

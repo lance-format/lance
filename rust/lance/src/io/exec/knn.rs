@@ -1904,14 +1904,10 @@ impl PreFilter for SegmentPreFilter {
         self.mask().selected_indices(row_ids)
     }
 
-    fn filter_row_offsets_into<'a>(
-        &self,
-        row_ids: Box<dyn Iterator<Item = &'a u64> + 'a>,
-        out: &mut Vec<u32>,
-    ) {
-        match self.prepared_lookup(row_ids.size_hint().0) {
+    fn filter_row_offsets_into(&self, row_ids: &[u64], out: &mut Vec<u32>) {
+        match self.prepared_lookup(row_ids.len()) {
             Some(mask) => mask.selected_offsets_into(row_ids, out),
-            None => self.mask().selected_offsets_into(row_ids, out),
+            None => self.mask().selected_offsets_into(row_ids.iter(), out),
         }
     }
 }
@@ -3890,7 +3886,7 @@ mod tests {
             let mut rows = (0..70000_u64).rev().collect::<Vec<_>>();
             rows.extend([3, 7, u64::MAX, 3_u64 << 32]);
             let mut offsets = vec![u32::MAX];
-            base.filter_row_offsets_into(Box::new(rows[..8].iter()), &mut offsets);
+            base.filter_row_offsets_into(&rows[..8], &mut offsets);
             assert_eq!(
                 offsets
                     .iter()
@@ -3898,7 +3894,7 @@ mod tests {
                     .collect::<Vec<_>>(),
                 base.mask().selected_indices(rows[..8].iter())
             );
-            base.filter_row_offsets_into(Box::new(rows.iter()), &mut offsets);
+            base.filter_row_offsets_into(&rows, &mut offsets);
             assert_eq!(
                 offsets
                     .iter()
@@ -3919,7 +3915,7 @@ mod tests {
                 filter.mask().selected_indices(rows[..8].iter())
             );
             let mut offsets = vec![u32::MAX];
-            filter.filter_row_offsets_into(Box::new(rows[..8].iter()), &mut offsets);
+            filter.filter_row_offsets_into(&rows[..8], &mut offsets);
             assert_eq!(
                 offsets
                     .iter()
@@ -3929,7 +3925,7 @@ mod tests {
             );
             assert!(filter.lookup_mask.get().is_none());
             if offsets_first {
-                filter.filter_row_offsets_into(Box::new(rows.iter()), &mut offsets);
+                filter.filter_row_offsets_into(&rows, &mut offsets);
                 assert_eq!(
                     offsets
                         .iter()
@@ -3941,7 +3937,7 @@ mod tests {
             }
             assert_eq!(filter.filter_row_ids(Box::new(rows.iter())), expected);
             assert!(filter.lookup_mask.get().is_some());
-            filter.filter_row_offsets_into(Box::new(rows.iter()), &mut offsets);
+            filter.filter_row_offsets_into(&rows, &mut offsets);
             assert_eq!(
                 offsets
                     .iter()
@@ -3949,7 +3945,7 @@ mod tests {
                     .collect::<Vec<_>>(),
                 expected
             );
-            filter.filter_row_offsets_into(Box::new(std::iter::empty()), &mut offsets);
+            filter.filter_row_offsets_into(&[], &mut offsets);
             assert!(offsets.is_empty());
             assert_eq!(
                 filter.filter_row_ids(Box::new(rows[..8].iter())),

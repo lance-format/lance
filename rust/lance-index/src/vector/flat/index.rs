@@ -173,7 +173,13 @@ fn search_candidates_with_scratch(
             }
         }
     } else {
-        prefilter.filter_row_offsets_into(Box::new(row_ids), &mut scratch.u32);
+        if let Some(rows) = storage.row_ids_slice() {
+            prefilter.filter_row_offsets_into(rows, &mut scratch.u32);
+        } else {
+            prefilter
+                .mask()
+                .selected_offsets_into(row_ids, &mut scratch.u32);
+        }
         if is_range_query {
             let lower_bound = params.lower_bound.unwrap_or(f32::MIN).into();
             let upper_bound = params.upper_bound.unwrap_or(f32::MAX).into();
@@ -322,7 +328,13 @@ impl IvfSubIndex for FlatIndex {
                 }
             }
             false => {
-                prefilter.filter_row_offsets_into(Box::new(row_ids), &mut scratch.u32);
+                if let Some(rows) = storage.row_ids_slice() {
+                    prefilter.filter_row_offsets_into(rows, &mut scratch.u32);
+                } else {
+                    prefilter
+                        .mask()
+                        .selected_offsets_into(row_ids, &mut scratch.u32);
+                }
                 if is_range_query {
                     let lower_bound = params.lower_bound.unwrap_or(f32::MIN).into();
                     let upper_bound = params.upper_bound.unwrap_or(f32::MAX).into();
@@ -489,7 +501,13 @@ impl IvfSubIndex for FlatIndex {
             // The selection and the calculator's candidate buffer share the
             // u32 scratch: take it for the selection and keep the larger of
             // the two afterwards.
-            prefilter.filter_row_offsets_into(Box::new(row_ids), &mut scratch.u32);
+            if let Some(rows) = storage.row_ids_slice() {
+                prefilter.filter_row_offsets_into(rows, &mut scratch.u32);
+            } else {
+                prefilter
+                    .mask()
+                    .selected_offsets_into(row_ids, &mut scratch.u32);
+            }
             let selected = std::mem::take(&mut scratch.u32);
             dist_calc.accumulate_filtered_topk_with_scratch(
                 k,
@@ -776,13 +794,9 @@ mod tests {
             self.mask.selected_indices(row_ids)
         }
 
-        fn filter_row_offsets_into<'a>(
-            &self,
-            row_ids: Box<dyn Iterator<Item = &'a u64> + 'a>,
-            out: &mut Vec<u32>,
-        ) {
+        fn filter_row_offsets_into(&self, row_ids: &[u64], out: &mut Vec<u32>) {
             self.offset_calls.fetch_add(1, Ordering::Relaxed);
-            self.mask.selected_offsets_into(row_ids, out);
+            self.mask.selected_offsets_into(row_ids.iter(), out);
         }
     }
 

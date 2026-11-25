@@ -679,6 +679,12 @@ pub trait VectorStore: Send + Sync + Sized + Clone {
 
     fn row_ids(&self) -> impl Iterator<Item = &u64>;
 
+    /// Borrow row IDs in storage order when they occupy one contiguous buffer.
+    /// `None` keeps iterator-based filtering for other storage layouts.
+    fn row_ids_slice(&self) -> Option<&[u64]> {
+        None
+    }
+
     /// Append Raw [RecordBatch] into the Storage.
     /// The storage implement will perform quantization if necessary.
     fn append_batch(&self, batch: RecordBatch, vector_column: &str) -> Result<Self>;

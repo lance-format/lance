@@ -612,14 +612,10 @@ impl PreFilter for DatasetPreFilter {
         }
     }
 
-    fn filter_row_offsets_into<'a>(
-        &self,
-        row_ids: Box<dyn Iterator<Item = &'a u64> + 'a>,
-        out: &mut Vec<u32>,
-    ) {
-        match self.prepared_lookup(row_ids.size_hint().0) {
+    fn filter_row_offsets_into(&self, row_ids: &[u64], out: &mut Vec<u32>) {
+        match self.prepared_lookup(row_ids.len()) {
             Some(mask) => mask.selected_offsets_into(row_ids, out),
-            None => self.mask().selected_offsets_into(row_ids, out),
+            None => self.mask().selected_offsets_into(row_ids.iter(), out),
         }
     }
 }
@@ -739,7 +735,7 @@ mod test {
             lookup_mask: OnceLock::new(),
         };
         let mut offsets = vec![u32::MAX];
-        filter.filter_row_offsets_into(Box::new(rows[..8].iter()), &mut offsets);
+        filter.filter_row_offsets_into(&rows[..8], &mut offsets);
         assert!(filter.lookup_mask.get().is_none());
         assert_eq!(
             offsets
@@ -748,7 +744,7 @@ mod test {
                 .collect::<Vec<_>>(),
             mask.selected_indices(rows[..8].iter())
         );
-        filter.filter_row_offsets_into(Box::new(rows.iter()), &mut offsets);
+        filter.filter_row_offsets_into(&rows, &mut offsets);
         let prepared = filter.lookup_mask.get().unwrap();
         assert_eq!(
             offsets
@@ -761,7 +757,7 @@ mod test {
             filter.filter_row_ids(Box::new(rows.iter())),
             mask.selected_indices(rows.iter())
         );
-        filter.filter_row_offsets_into(Box::new(rows[..8].iter()), &mut offsets);
+        filter.filter_row_offsets_into(&rows[..8], &mut offsets);
         assert_eq!(
             offsets
                 .iter()
@@ -770,7 +766,7 @@ mod test {
             mask.selected_indices(rows[..8].iter())
         );
         assert!(std::ptr::eq(prepared, filter.lookup_mask.get().unwrap()));
-        filter.filter_row_offsets_into(Box::new(std::iter::empty()), &mut offsets);
+        filter.filter_row_offsets_into(&[], &mut offsets);
         assert!(offsets.is_empty());
     }
 
