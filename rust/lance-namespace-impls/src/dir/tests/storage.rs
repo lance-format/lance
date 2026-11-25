@@ -808,8 +808,11 @@ async fn test_describe_table_snapshot_selectors_racing_tag(
     assert_eq!(mutation_error_code(error), expected, "{event:?}");
 }
 
+#[rstest]
+#[case::modern(false)]
+#[case::legacy(true)]
 #[tokio::test]
-async fn test_legacy_tag_rejects_a_manifest_from_an_untagged_table() {
+async fn test_tag_rejects_a_manifest_from_an_untagged_table(#[case] legacy: bool) {
     use lance::dataset::ColumnAlteration;
 
     let (reader, temp, toggle) = failing_list_namespace().await;
@@ -828,14 +831,16 @@ async fn test_legacy_tag_rejects_a_manifest_from_an_untagged_table() {
     }
     let main = open_dataset(&writer, "users").await;
     main.tags().create("release", 2).await.unwrap();
-    let mut legacy = main.tags().get("release").await.unwrap();
-    legacy.created_at = None;
-    legacy.updated_at = None;
-    std::fs::write(
-        temp.as_ref().join("users.lance/_refs/tags/release.json"),
-        serde_json::to_vec(&legacy).unwrap(),
-    )
-    .unwrap();
+    if legacy {
+        let mut tag = main.tags().get("release").await.unwrap();
+        tag.created_at = None;
+        tag.updated_at = None;
+        std::fs::write(
+            temp.as_ref().join("users.lance/_refs/tags/release.json"),
+            serde_json::to_vec(&tag).unwrap(),
+        )
+        .unwrap();
+    }
     let request = DescribeTableRequest {
         id: Some(vec!["users".into()]),
         tag: Some("release".into()),

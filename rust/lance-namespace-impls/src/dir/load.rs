@@ -404,22 +404,19 @@ impl DirectoryNamespace {
             }
             .into());
         }
-        // Dropping and recreating a table can reuse the same main manifest URI.
+        // Restoring a table can bring back the original tag, including its timestamp.
+        // Compare the manifests on both sides of the confirming tag read.
         confirm_target().await?;
-        if target.created_at.is_none() {
-            // Legacy tags can be byte-identical across table recreations. Check
-            // the actual manifest on both sides of the confirming tag read.
-            let current = self
-                .open_directory_version(table_uri, Some(target.version), SnapshotCache::Isolated)
-                .await?;
-            if current.manifest() != snapshot.manifest() {
-                return Err(NamespaceError::ConcurrentModification {
-                    message: format!(
-                        "Tagged manifest changed while describing '{tag}' at '{table_uri}'"
-                    ),
-                }
-                .into());
+        let current = self
+            .open_directory_version(table_uri, Some(target.version), SnapshotCache::Isolated)
+            .await?;
+        if current.manifest() != snapshot.manifest() {
+            return Err(NamespaceError::ConcurrentModification {
+                message: format!(
+                    "Tagged manifest changed while describing '{tag}' at '{table_uri}'"
+                ),
             }
+            .into());
         }
         Ok(snapshot)
     }
