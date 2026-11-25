@@ -229,14 +229,14 @@ impl Tags<'_> {
         let root_location = self.refs.root()?;
         let tag_file = tag_path(&root_location.path, tag);
 
-        if !self.object_store().exists(&tag_file).await? {
-            return Err(Error::RefNotFound {
-                message: format!("tag {} does not exist", tag),
-            });
-        }
-
-        let tag_contents = TagContents::from_path(&tag_file, self.object_store()).await?;
-        Ok(tag_contents)
+        TagContents::from_path(&tag_file, self.object_store())
+            .await
+            .map_err(|error| match error {
+                error if error.is_not_found() => Error::RefNotFound {
+                    message: format!("tag {tag} does not exist"),
+                },
+                error => error,
+            })
     }
 
     pub async fn create(&self, tag: &str, reference: impl Into<Ref>) -> Result<()> {

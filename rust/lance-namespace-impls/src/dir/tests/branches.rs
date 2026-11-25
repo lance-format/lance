@@ -26,8 +26,19 @@ async fn test_describe_table_snapshot_selectors() {
     dev.alter_columns(&[ColumnAlteration::new("dev_id".into()).rename("new_id".into())])
         .await
         .unwrap();
-    main.tags()
-        .create("release", main.version().version)
+    for (tag, branch) in [("release", None), ("dev-release", Some("dev"))] {
+        namespace
+            .create_table_tag(CreateTableTagRequest {
+                id: Some(vec!["users".into()]),
+                tag: tag.to_owned(),
+                branch: branch.map(str::to_owned),
+                version: 2,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+    }
+    main.alter_columns(&[ColumnAlteration::new("main_id".into()).rename("latest".into())])
         .await
         .unwrap();
 
@@ -64,18 +75,22 @@ async fn test_describe_table_snapshot_selectors() {
         .await
         .unwrap()
         .location;
-    light.branch = Some("missing".into());
-    let sparse = namespace.describe_table(light).await.unwrap();
-    assert_eq!(sparse.location, location);
-    assert!(sparse.schema.is_none() && sparse.version.is_none());
+    for (tag, branch) in [(Some("missing"), None), (None, Some("missing"))] {
+        light.tag = tag.map(str::to_owned);
+        light.branch = branch.map(str::to_owned);
+        let sparse = namespace.describe_table(light.clone()).await.unwrap();
+        assert_eq!(sparse.location, location);
+        assert!(sparse.schema.is_none() && sparse.version.is_none());
+    }
 
     for (tag, branch, version, expected, field) in [
-        (None, None, None, 2, "main_id"),
+        (None, None, None, 3, "latest"),
         (None, Some("dev"), None, 3, "new_id"),
         (None, Some("dev"), Some(2), 2, "dev_id"),
         (None, Some("main"), Some(2), 2, "main_id"),
         (None, Some(""), Some(2), 2, "main_id"),
         (Some("release"), None, None, 2, "main_id"),
+        (Some("dev-release"), None, None, 2, "dev_id"),
     ] {
         let described = namespace
             .describe_table(request(tag, branch, version))
@@ -100,6 +115,10 @@ async fn test_describe_table_snapshot_selectors() {
             request(None, None, Some(1)),
             ErrorCode::TableVersionNotFound,
         ),
+        (
+            request(Some("missing"), None, None),
+            ErrorCode::TableTagNotFound,
+        ),
     ] {
         selected.id = declared_id.clone();
         let error = namespace.describe_table(selected).await.unwrap_err();
@@ -109,6 +128,8 @@ async fn test_describe_table_snapshot_selectors() {
         (None, Some("absent"), None, ErrorCode::TableBranchNotFound),
         (None, Some("dev"), Some(99), ErrorCode::TableVersionNotFound),
         (None, None, Some(-1), ErrorCode::InvalidInput),
+        (Some("missing"), None, None, ErrorCode::TableTagNotFound),
+        (Some(""), None, None, ErrorCode::InvalidInput),
     ] {
         let err = namespace
             .describe_table(request(tag, branch, version))
@@ -169,6 +190,8 @@ async fn test_describe_table_snapshot_selectors() {
         (None, Some("dev"), None, "new_id"),
         (None, Some("dev"), Some(2), "dev_id"),
         (None, None, Some(1), "id"),
+        (Some("release"), None, None, "main_id"),
+        (Some("dev-release"), None, None, "dev_id"),
     ] {
         let response = namespace
             .describe_table(request(tag, branch, version))
@@ -183,7 +206,16 @@ async fn test_describe_table_snapshot_selectors_discovered_branch() {
     let (ns, _temp) = create_test_namespace().await;
     create_scalar_table(&ns, "users").await;
     let mut main = open_dataset(&ns, "users").await;
-    let dev = main.create_branch("dev.lance", 1, None).await.unwrap();
+    let mut dev = main.create_branch("dev.lance", 1, None).await.unwrap();
+    dev.tags().create("dev-tag", 1).await.unwrap();
+    main.tags().create("main-tag", 1).await.unwrap();
+    let sibling = main.create_branch("other", 1, None).await.unwrap();
+    sibling.tags().create("other-tag", 1).await.unwrap();
+    dev.alter_columns(
+        &[lance::dataset::ColumnAlteration::new("id".into()).rename("new_id".into())],
+    )
+    .await
+    .unwrap();
     let path = uri_to_url(dev.uri()).unwrap().to_file_path().unwrap();
     let listing = DirectoryNamespaceBuilder::new(path.parent().unwrap().to_str().unwrap())
         .manifest_enabled(false)
@@ -197,7 +229,7 @@ async fn test_describe_table_snapshot_selectors_discovered_branch() {
         ..Default::default()
     };
     let local = listing.describe_table(request.clone()).await.unwrap();
-    assert_eq!(local.version, Some(1));
+    assert_eq!(local.version, Some(2));
     assert_eq!(
         uri_to_url(&local.location.unwrap())
             .unwrap()
@@ -205,6 +237,33 @@ async fn test_describe_table_snapshot_selectors_discovered_branch() {
             .unwrap(),
         path
     );
+    for (tag, expected_error) in [
+        ("dev-tag", None),
+        ("main-tag", Some(ErrorCode::Unsupported)),
+        ("other-tag", Some(ErrorCode::Unsupported)),
+        ("missing", Some(ErrorCode::TableTagNotFound)),
+    ] {
+        let tagged = listing
+            .describe_table(DescribeTableRequest {
+                tag: Some(tag.to_owned()),
+                ..request.clone()
+            })
+            .await;
+        if let Some(code) = expected_error {
+            assert_eq!(namespace_code(&tagged.unwrap_err()), Some(code));
+        } else {
+            let tagged = tagged.unwrap();
+            assert_eq!(tagged.version, Some(1));
+            assert_eq!(tagged.schema.unwrap().fields[0].name, "id");
+            assert_eq!(
+                uri_to_url(&tagged.location.unwrap())
+                    .unwrap()
+                    .to_file_path()
+                    .unwrap(),
+                path
+            );
+        }
+    }
     for branch in ["", "main"] {
         request.branch = Some(branch.into());
         let error = listing.describe_table(request.clone()).await.unwrap_err();
@@ -269,9 +328,11 @@ async fn test_describe_table_snapshot_selectors_in_tree_named_directory() {
     create_scalar_table(&ns, "events").await;
     let mut table = open_dataset(&ns, "events").await;
     let mut dev = table.create_branch("dev", 1, None).await.unwrap();
+    table.tags().create("old", 1).await.unwrap();
     dev.alter_columns(&[ColumnAlteration::new("id".into()).rename("dev_id".into())])
         .await
         .unwrap();
+    dev.tags().create("dev-tag", 2).await.unwrap();
     table
         .alter_columns(&[ColumnAlteration::new("id".into()).rename("new_id".into())])
         .await
@@ -300,6 +361,20 @@ async fn test_describe_table_snapshot_selectors_in_tree_named_directory() {
     let described = ns.describe_table(request.clone()).await.unwrap();
     assert_eq!(described.version, Some(2));
     assert_eq!(described.schema.unwrap().fields[0].name, "dev_id");
+    for (tag, version, field) in [("old", 1, "id"), ("dev-tag", 2, "dev_id")] {
+        let tagged = ns
+            .describe_table(DescribeTableRequest {
+                tag: Some(tag.into()),
+                branch: None,
+                version: None,
+                ..request.clone()
+            })
+            .await
+            .unwrap();
+        assert_eq!(tagged.version, Some(version));
+        assert_eq!(tagged.schema.unwrap().fields[0].name, field);
+        assert_eq!(tagged.location, described.location);
+    }
     // Only a readable selected manifest can establish whether this table is a branch.
     for (version, expected) in [
         (1, ErrorCode::TableBranchNotFound),

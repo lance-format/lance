@@ -3,7 +3,7 @@
 
 use lance::dataset::Dataset;
 use lance::dataset::builder::DatasetBuilder;
-use lance::dataset::refs::{BRANCH_DIR, BranchIdentifier, BranchLocation, Refs};
+use lance::dataset::refs::{BRANCH_DIR, BranchIdentifier, BranchLocation, Refs, check_valid_tag};
 use lance_core::{Error, Result};
 use lance_namespace::LanceNamespace;
 use lance_namespace::error::NamespaceError;
@@ -11,6 +11,12 @@ use lance_namespace::models::{DescribeTableRequest, DescribeTableResponse};
 use lance_namespace::schema::arrow_schema_to_json;
 
 use super::{DirectoryNamespace, manifest, manifest_feature_flags};
+
+enum SnapshotCache<'a> {
+    Default,
+    Isolated,
+    Branch(&'a BranchIdentifier),
+}
 
 impl DirectoryNamespace {
     /// Internal describe_table implementation that doesn't record metrics.
@@ -134,6 +140,13 @@ impl DirectoryNamespace {
             })
             .transpose()?;
         if load_detailed_metadata && is_only_declared == Some(true) {
+            if let Some(tag) = request.tag.as_deref() {
+                check_valid_tag(tag).map_err(|err| Self::map_tag_error(err, tag, &table_uri))?;
+                return Err(NamespaceError::TableTagNotFound {
+                    message: format!("Tag '{tag}' does not exist on declared table '{table_name}'"),
+                }
+                .into());
+            }
             if let Some(branch) = branch {
                 return Err(NamespaceError::TableBranchNotFound {
                     message: format!(
@@ -177,14 +190,15 @@ impl DirectoryNamespace {
             });
         }
 
-        let dataset = match branch {
-            Some(name) => {
-                // Keep branch store resolution out of the future used by shallow location lookups.
+        let dataset = match (request.tag.as_deref(), branch) {
+            (Some(tag), _) => Box::pin(self.open_directory_tag(&table_uri, tag)).await?,
+            (None, Some(name)) => {
+                // Keep ref resolution out of the future used by shallow location lookups.
                 Box::pin(self.open_directory_branch(&table_uri, name, version)).await?
             }
-            None => {
+            (None, None) => {
                 let dataset = self
-                    .open_directory_version(&table_uri, version, None, None)
+                    .open_directory_version(&table_uri, version, SnapshotCache::Default)
                     .await?;
                 match dataset.manifest().branch.as_deref() {
                     Some(_) if request.branch.is_some() => {
@@ -255,25 +269,27 @@ impl DirectoryNamespace {
         &self,
         uri: &str,
         version: Option<u64>,
-        branch: Option<&str>,
-        identifier: Option<&BranchIdentifier>,
+        cache: SnapshotCache<'_>,
     ) -> Result<Dataset> {
         let mut builder = self.configured_builder(uri);
         if let Some(session) = &self.session
-            && (branch.is_some()
+            && (!matches!(cache, SnapshotCache::Default)
                 || self
                     .base_path
                     .parts()
                     .any(|part| part.as_ref() == BRANCH_DIR))
         {
             // An ordinary table and a branch can successively occupy the same
-            // path below a tree directory. Until the manifest establishes its
-            // owner, a cached schema from an earlier occupant cannot be trusted.
-            // Legacy refs (parent version zero) also lack a generation UUID.
-            let generation = identifier
-                .and_then(|id| id.version_mapping.last())
-                .filter(|(version, _)| *version > 0)
-                .map(|(_, uuid)| uuid.as_str());
+            // path below a tree directory. Main tags and legacy branch refs
+            // also have no generation UUID to distinguish earlier occupants.
+            let generation = match cache {
+                SnapshotCache::Branch(id) => id
+                    .version_mapping
+                    .last()
+                    .filter(|(version, _)| *version > 0)
+                    .map(|(_, uuid)| uuid.as_str()),
+                SnapshotCache::Default | SnapshotCache::Isolated => None,
+            };
             builder = builder.with_session(session.with_cache_identity(generation).into());
         }
         let builder = match version {
@@ -286,14 +302,7 @@ impl DirectoryNamespace {
         })
     }
 
-    /// Resolve the branch ref before opening its snapshot. The default branch's
-    /// latest manifest may require reader features that the selected branch does not.
-    async fn open_directory_branch(
-        &self,
-        table_uri: &str,
-        branch: &str,
-        version: Option<u64>,
-    ) -> Result<Dataset> {
+    async fn directory_refs(&self, table_uri: &str) -> Result<(BranchLocation, Refs)> {
         let (store, path, handler) = self
             .configured_builder(table_uri)
             .build_object_store()
@@ -304,6 +313,111 @@ impl DirectoryNamespace {
             branch: None,
         };
         let refs = Refs::new(store, handler, root.clone());
+        Ok((root, refs))
+    }
+
+    async fn open_directory_tag(&self, table_uri: &str, tag: &str) -> Result<Dataset> {
+        let (root, refs) = self.directory_refs(table_uri).await?;
+        let tag_error = |err| match err {
+            Error::IO { .. } => Self::classify_storage_error(err),
+            _ => Self::map_tag_error(err, tag, table_uri),
+        };
+        let target = match refs.tags().get(tag).await {
+            Ok(target) => target,
+            Err(missing @ Error::RefNotFound { .. })
+                if self
+                    .base_path
+                    .parts()
+                    .any(|part| part.as_ref() == BRANCH_DIR) =>
+            {
+                // A directly listed branch stores its tags at the owning table's root.
+                // Establish ownership from its manifest before looking outside the listing.
+                let listed = self
+                    .open_directory_version(table_uri, None, SnapshotCache::Isolated)
+                    .await?;
+                let Some(owner) = listed.manifest().branch.as_deref() else {
+                    return Err(tag_error(missing));
+                };
+                let expected = listed
+                    .branch_identifier()
+                    .await
+                    .map_err(|err| Self::describe_branch_error(err, owner, table_uri))?;
+                let target = listed.tags().get(tag).await.map_err(tag_error)?;
+                if target.branch.as_deref() != Some(owner) {
+                    return Err(NamespaceError::Unsupported {
+                        message: format!(
+                            "Tag '{tag}' points outside the directory-listed branch '{owner}'"
+                        ),
+                    }
+                    .into());
+                }
+                return self
+                    .open_verified_directory_branch(
+                        table_uri,
+                        owner,
+                        Some(target.version),
+                        &expected,
+                    )
+                    .await;
+            }
+            Err(err) => return Err(tag_error(err)),
+        };
+        let confirm_target = async || {
+            let current = refs.tags().get(tag).await.map_err(tag_error)?;
+            if current.branch != target.branch
+                || current.version != target.version
+                || current.created_at != target.created_at
+            {
+                return Err(Error::from(NamespaceError::ConcurrentModification {
+                    message: format!("Tag '{tag}' changed while describing '{table_uri}'"),
+                }));
+            }
+            Ok(())
+        };
+        if let Some(branch) = Self::normalized_branch(target.branch.as_deref())? {
+            let expected = refs
+                .branches()
+                .get_identifier(Some(branch))
+                .await
+                .map_err(|err| Self::describe_branch_error(err, branch, table_uri))?;
+            // A tag stores a branch name and version, without a generation.
+            // Confirm the target while the captured branch generation is live.
+            confirm_target().await?;
+            let location = root.find_branch(Some(branch))?;
+            return self
+                .open_verified_directory_branch(
+                    &location.uri,
+                    branch,
+                    Some(target.version),
+                    &expected,
+                )
+                .await;
+        }
+        let snapshot = self
+            .open_directory_version(table_uri, Some(target.version), SnapshotCache::Isolated)
+            .await?;
+        if snapshot.manifest().branch.is_some() {
+            return Err(NamespaceError::Unsupported {
+                message: format!(
+                    "Tag '{tag}' refers to main outside the directory-listed table '{table_uri}'"
+                ),
+            }
+            .into());
+        }
+        // Dropping and recreating a table can reuse the same main manifest URI.
+        confirm_target().await?;
+        Ok(snapshot)
+    }
+
+    /// Resolve the branch ref before opening its snapshot. The default branch's
+    /// latest manifest may require reader features that the selected branch does not.
+    async fn open_directory_branch(
+        &self,
+        table_uri: &str,
+        branch: &str,
+        version: Option<u64>,
+    ) -> Result<Dataset> {
+        let (root, refs) = self.directory_refs(table_uri).await?;
         let map_error = |err| Self::describe_branch_error(err, branch, table_uri);
         let (location, expected) = match refs.branches().get_identifier(Some(branch)).await {
             Ok(identifier) => (root.find_branch(Some(branch))?, identifier),
@@ -319,7 +433,7 @@ impl DirectoryNamespace {
                     return Err(map_error(err));
                 }
                 let selected = self
-                    .open_directory_version(table_uri, version, Some(branch), None)
+                    .open_directory_version(table_uri, version, SnapshotCache::Isolated)
                     .await?;
                 if selected.manifest().branch.as_deref() != Some(branch) {
                     return Err(map_error(err));
@@ -341,7 +455,7 @@ impl DirectoryNamespace {
         expected: &BranchIdentifier,
     ) -> Result<Dataset> {
         let dataset = self
-            .open_directory_version(uri, version, Some(branch), Some(expected))
+            .open_directory_version(uri, version, SnapshotCache::Branch(expected))
             .await?;
         let actual = dataset
             .branch_identifier()
