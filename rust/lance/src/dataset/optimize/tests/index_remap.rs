@@ -25,9 +25,10 @@ async fn compaction_propagates_index_open_error(#[case] fail_after_planning: boo
         .await
         .unwrap();
     create_scalar_index(&mut original, "i", false).await;
+    let object_store = original.object_store(None).await.unwrap();
     let indices = read_manifest_indexes(
-        &original.object_store,
-        &original.manifest_location,
+        &object_store,
+        original.manifest_location(),
         &original.manifest,
     )
     .await
@@ -71,7 +72,7 @@ async fn compaction_propagates_index_open_error(#[case] fail_after_planning: boo
             .indices_dir()
             .join(index.uuid.to_string())
             .join(BTREE_LOOKUP_NAME);
-        original.object_store.delete(&lookup).await.unwrap();
+        object_store.delete(&lookup).await.unwrap();
         let error = compact_files(&mut dataset, options, None)
             .await
             .unwrap_err();
@@ -80,13 +81,9 @@ async fn compaction_propagates_index_open_error(#[case] fail_after_planning: boo
     }
 
     let latest = Dataset::open(&uri).await.unwrap();
-    let stored = read_manifest_indexes(
-        &latest.object_store,
-        &latest.manifest_location,
-        &latest.manifest,
-    )
-    .await
-    .unwrap();
+    let stored = read_manifest_indexes(&object_store, latest.manifest_location(), &latest.manifest)
+        .await
+        .unwrap();
     assert_eq!(latest.fragments(), original.fragments());
     assert_eq!(stored, indices);
 }
