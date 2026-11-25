@@ -1373,9 +1373,10 @@ mod tests {
     }
 
     /// pylance 0.24.1 appended a packed delta segment to the 0.19.2 index, see
-    /// `test_data/v0.24.1/datagen.py`. A default optimize with new rows merges
-    /// only that delta, but search still fails on the older segment, so it
-    /// asks for a rebuild, as an append does.
+    /// `test_data/v0.24.1/datagen.py`. Merging both segments asks for a
+    /// rebuild. A default optimize with new rows would merge only the delta,
+    /// but search still fails on the older segment, so it asks for a rebuild
+    /// too, as an append does.
     #[tokio::test]
     async fn test_legacy_4bit_ivf_pq_delta_on_unpacked_index_asks_for_rebuild() {
         let (test_dir, mut dataset) =
@@ -1397,6 +1398,7 @@ mod tests {
         assert_search_asks_for_rebuild(&dataset).await;
 
         let uri = test_dir.path_str();
+        assert_optimize_asks_for_rebuild(&uri, &mut dataset, &OptimizeOptions::merge(2)).await;
         append_legacy_4bit_rows(&mut dataset, 576..640).await;
         for options in [OptimizeOptions::default(), OptimizeOptions::append()] {
             assert_optimize_asks_for_rebuild(&uri, &mut dataset, &options).await;
