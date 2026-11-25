@@ -3971,6 +3971,13 @@ mod tests {
             segment_prefilter.is_empty_for(&old_partition_rows),
             "an append-only segment must preserve the unfiltered partition fast path"
         );
+        let old_fragment_id = first_fragments.iter().next().unwrap();
+        let mut rows_past_fragment_end = old_partition_rows.clone();
+        rows_past_fragment_end.insert((u64::from(old_fragment_id) << 32) | 20);
+        assert!(
+            !segment_prefilter.is_empty_for(&rows_past_fragment_end),
+            "even owned fragments are bounded by their current physical row count"
+        );
 
         // A scan that selects only the old segment builds its base from that segment's
         // fragments alone. The base then restricts rows to those fragments and is no
