@@ -4175,7 +4175,7 @@ mod tests {
         let retired = Arc::new(retired);
         let retired_base = Arc::new(DatasetPreFilter::new(
             retired.clone(),
-            &[new_segment.clone()],
+            std::slice::from_ref(&new_segment),
             None,
         ));
         retired_base.wait_for_ready().await.unwrap();

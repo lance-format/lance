@@ -11,7 +11,7 @@ const MAX_DENSE_EXPANSION: u64 = 16;
 const MAX_SMALL_DENSE_BYTES: u64 = 128 * 1024;
 const EXTRA_DENSE_BUDGET: u64 = 4 * 1024 * 1024;
 
-pub(crate) struct PreparedRowAddrMask {
+pub struct PreparedRowAddrMask {
     allow: bool,
     fragments: BTreeMap<u32, FragmentSelection>,
 }
@@ -42,7 +42,7 @@ impl FragmentSelection {
         if dense_bytes > bitmap.serialized_size() as u64 * MAX_DENSE_EXPANSION {
             if dense_bytes > MAX_SMALL_DENSE_BYTES
                 || dense_bytes > *extra_dense_budget
-                || bitmap.len() > (u64::from(max) - u64::from(min) + 1) / 2
+                || bitmap.len() > (u64::from(max) - u64::from(min)).div_ceil(2)
             {
                 return Self::Sparse(bitmap.clone());
             }
