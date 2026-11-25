@@ -142,9 +142,22 @@ pub(crate) async fn remap_index(
 
     let new_id = Uuid::new_v4();
 
-    let generic = dataset
+    let generic = match dataset
         .open_generic_index(&field_path, index_id, &NoOpMetricsCollector)
-        .await?;
+        .await
+    {
+        Ok(g) => g,
+        Err(e @ Error::NotSupported { .. }) => {
+            log::warn!(
+                "Cannot open index '{}' on '{}': {}, so it is not remapped. Rebuild the index.",
+                index_id,
+                field_path,
+                e
+            );
+            return Ok(RemapResult::Drop);
+        }
+        Err(e) => return Err(e),
+    };
 
     let created_index = match generic.index_type() {
         it if it.is_scalar() => {
