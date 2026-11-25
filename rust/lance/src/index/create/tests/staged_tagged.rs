@@ -465,13 +465,8 @@ async fn staged_segments_merge_across_deferred_compaction_on_tagged_table() {
     }
 }
 
-/// A staged inverted segment whose metadata is still only under `staging/`:
-/// the fragment-masked distributed build writes partition metadata there and
-/// the root `metadata.lance` is published by the finalize that the commit
-/// runs. Reading that absence as the LEGACY layout makes the staged replay's
-/// withdrawal selector treat a modern segment as untranslatable, so a
-/// deferred compaction committed in the build's window withdraws exactly the
-/// coverage the merge is about to claim.
+/// An independent FTS segment can be merged after deferred compaction and
+/// must retain its original analyzer and translated coverage.
 #[tokio::test]
 #[serial_test::serial(frag_reuse_maintenance)]
 async fn staged_inverted_segments_merge_across_deferred_compaction_on_tagged_table() {
@@ -506,14 +501,13 @@ async fn staged_inverted_segments_merge_across_deferred_compaction_on_tagged_tab
         .collect();
     assert_eq!(appended.len(), 2, "{appended:?}");
 
-    // The distributed build: one fragment-masked worker segment each, never
-    // finalized, so neither has a root metadata file yet.
+    // Each worker publishes its complete segment before the manifest commit.
     let s1 = staged_inverted_segment(&mut dataset, "text", vec![appended[0]]).await;
     let s2 = staged_inverted_segment(&mut dataset, "text", vec![appended[1]]).await;
     for segment in [&s1, &s2] {
         assert!(
-            !root_metadata_exists(&dataset, segment).await,
-            "the staged build must not have published a root metadata file yet"
+            root_metadata_exists(&dataset, segment).await,
+            "the uncommitted segment must already have root metadata"
         );
     }
 
@@ -578,7 +572,7 @@ async fn staged_inverted_segments_merge_across_deferred_compaction_on_tagged_tab
         merged.fragment_bitmap.as_ref().unwrap(),
         &destination,
         "the staged replay must not withdraw a modern segment's coverage for \
-         a root metadata file the build has not published yet"
+         an earlier compaction"
     );
     dataset
         .commit_existing_index_segments("staged", "text", vec![merged])
@@ -595,12 +589,11 @@ async fn staged_inverted_segments_merge_across_deferred_compaction_on_tagged_tab
          {replayed_plan}"
     );
 
-    // Finalization happened at commit time, so the committed segment now has
-    // its root metadata and the reader derives the compacted coverage.
+    // A reader derives the compacted coverage from the committed segment.
     let dataset = Dataset::open(dir.as_str()).await.unwrap();
     assert!(
         root_metadata_exists(&dataset, &stored_segment(&dataset, "staged").await).await,
-        "the commit must have finalized the staged segment"
+        "the committed segment must have root metadata"
     );
     assert_eq!(
         derived_coverage(&dataset, "staged").await,
@@ -641,8 +634,7 @@ fn analyzed_params() -> InvertedIndexParams {
 /// forms, so only the index's own analyzer finds them.
 const ANALYZER_SENSITIVE_QUERY: &str = "running";
 
-/// A fragment-masked uncommitted inverted build, as a distributed worker
-/// produces it.
+/// Build an uncommitted inverted segment as a distributed worker would.
 async fn staged_inverted_segment(
     dataset: &mut Dataset,
     column: &str,
@@ -681,8 +673,7 @@ async fn fts_ids(dataset: &Dataset, column: &str, query: &str) -> (Vec<i32>, Str
     (ids, plan)
 }
 
-/// Whether the segment has published the root metadata file that marks a
-/// finalized inverted index.
+/// Whether the segment has published its root metadata file.
 async fn root_metadata_exists(dataset: &Dataset, segment: &IndexMetadata) -> bool {
     let path = dataset
         .indices_dir()

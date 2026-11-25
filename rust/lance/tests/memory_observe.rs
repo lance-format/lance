@@ -26,7 +26,6 @@ use lance_core::utils::tracing::TRACE_MEMORY;
 use lance_datagen::{BatchCount, Dimension, RowCount, array, gen_batch};
 use lance_index::IndexType;
 use lance_index::optimize::OptimizeOptions;
-use lance_index::progress::NoopIndexBuildProgress;
 use lance_index::scalar::inverted::tokenizer::InvertedIndexParams;
 use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
 use lance_linalg::distance::MetricType;
@@ -35,7 +34,6 @@ use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
 use tracing_subscriber::Layer;
 use tracing_subscriber::filter::Targets;
 use tracing_subscriber::layer::SubscriberExt;
-use uuid::Uuid;
 
 #[cfg(feature = "metrics")]
 type Recorded = Vec<(String, Vec<(String, String)>, DebugValue)>;
@@ -77,18 +75,11 @@ const STAGES: &[(&str, &str, &str)] = &[
     ("create_index", "fm", "load_data"),
     ("create_index", "inverted", "tokenize_docs"),
     ("create_index", "inverted", "write_metadata"),
-    (
-        "merge_index_metadata",
-        "inverted",
-        "read_partition_metadata",
-    ),
-    ("merge_index_metadata", "inverted", "remap_partition_files"),
-    ("merge_index_metadata", "inverted", "write_merged_metadata"),
 ];
 
 /// Observed builds below, as `(operation, index_type, started, completed)`.
-/// The inverted index is built once whole and once as one segment per
-/// fragment, which the merge then joins. The FM-Index builds one segment per
+/// The inverted index is built once whole and once as one independent segment
+/// per fragment. The FM-Index builds one segment per
 /// fragment and commits them together. One BTREE and one FM-Index build fail
 /// at their commit, so they start and never complete. The untrained BTREE and
 /// the retraining inside `optimize_indices` add nothing.
@@ -97,7 +88,6 @@ const BUILDS: &[(&str, &str, usize, usize)] = &[
     ("create_index", "btree", 2, 1),
     ("create_index", "bitmap", 1, 1),
     ("create_index", "inverted", 3, 3),
-    ("merge_index_metadata", "inverted", 1, 1),
     ("create_index", "fm", 2, 1),
 ];
 
@@ -409,9 +399,7 @@ async fn build_indices() {
         .await
         .unwrap();
 
-    // The distributed workflow: one uncommitted segment per fragment, then a
-    // merge of their metadata.
-    let segment_uuid = Uuid::new_v4();
+    // The distributed build writes one independent segment per fragment.
     let fragment_ids: Vec<u32> = dataset
         .get_fragments()
         .iter()
@@ -426,20 +414,10 @@ async fn build_indices() {
         )
         .name("text_segments".to_string())
         .fragments(vec![fragment_id])
-        .index_uuid(segment_uuid)
         .execute_uncommitted()
         .await
         .unwrap();
     }
-    dataset
-        .merge_index_metadata(
-            &segment_uuid,
-            IndexType::Inverted,
-            None,
-            Arc::new(NoopIndexBuildProgress),
-        )
-        .await
-        .unwrap();
 
     // Retraining rebuilds the vector index as one step of another operation.
     dataset

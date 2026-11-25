@@ -88,10 +88,6 @@ impl InvertedIndex {
     }
 
     fn to_builder(&self) -> InvertedIndexBuilder {
-        self.to_builder_with_offset(None)
-    }
-
-    fn to_builder_with_offset(&self, fragment_mask: Option<u64>) -> InvertedIndexBuilder {
         if self.is_legacy() {
             // for legacy format, we re-create the index in the new format
             InvertedIndexBuilder::from_existing_index(
@@ -99,30 +95,19 @@ impl InvertedIndex {
                 None,
                 Vec::new(),
                 self.token_set_format,
-                fragment_mask,
+                None,
                 self.deleted_fragments.clone(),
             )
             .with_posting_tail_codec(self.posting_tail_codec())
         } else {
-            let partitions = match fragment_mask {
-                Some(fragment_mask) => self
-                    .partitions
-                    .iter()
-                    // Filter partitions that belong to the specified fragment
-                    // The mask contains fragment_id in high 32 bits, we check if partition's
-                    // fragment_id matches by comparing the masked result with the original mask
-                    .filter(|part| part.belongs_to_fragment(fragment_mask))
-                    .map(|part| part.id())
-                    .collect(),
-                None => self.partitions.iter().map(|part| part.id()).collect(),
-            };
+            let partitions = self.partitions.iter().map(|part| part.id()).collect();
 
             InvertedIndexBuilder::from_existing_index(
                 self.params.clone(),
                 Some(self.store.clone()),
                 partitions,
                 self.token_set_format,
-                fragment_mask,
+                None,
                 self.deleted_fragments.clone(),
             )
             .with_format_version(self.format_version())

@@ -21,13 +21,12 @@ use lance_core::{
 };
 use lance_index::pbold::InvertedIndexDetails;
 use lance_index::progress::IndexBuildProgress;
-use lance_index::scalar::inverted::builder::{FinalizeOptions, finalize_staged_index_to};
 use lance_index::scalar::inverted::{
     DocumentGranularity, InvertedIndex, InvertedIndexParams, doc_index_storage_column,
 };
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::registry::VALUE_COLUMN_NAME;
-use lance_index::scalar::{IndexFile, IndexStore, index_files_to_table};
+use lance_index::scalar::{IndexStore, index_files_to_table};
 use lance_table::format::IndexMetadata;
 use prost::Message;
 use roaring::RoaringBitmap;
@@ -910,117 +909,7 @@ fn empty_inverted_update_stream(
     )))
 }
 
-impl Dataset {
-    /// Merge fragment-scoped, staged FTS builds into an uncommitted segment with a fresh UUID.
-    /// Concurrent attempts can share the same inputs. Each attempt reads the staged files and
-    /// writes its own finalized partitions. The coordinator can commit the selected result with
-    /// [`DatasetIndexExt::commit_existing_index_segments`] and retire the inputs once every
-    /// attempt has stopped reading them. An abandoned result is an unreferenced index directory.
-    ///
-    /// The callback reports each input's finalization stages followed by the stages of
-    /// the final segment merge, when one is needed. It can also observe individual file copies.
-    ///
-    /// ```
-    /// # use lance::{Dataset, Result};
-    /// # use lance_table::format::IndexMetadata;
-    /// # async fn worker(dataset: &Dataset, inputs: Vec<IndexMetadata>) -> Result<IndexMetadata> {
-    /// dataset.merge_staged_fts_segments(inputs, lance_index::progress::noop_progress()).await
-    /// # }
-    /// ```
-    pub async fn merge_staged_fts_segments(
-        &self,
-        sources: Vec<IndexMetadata>,
-        progress: Arc<dyn IndexBuildProgress>,
-    ) -> Result<IndexMetadata> {
-        crate::index::segment::validate_segment_metadata("staged FTS merge", &sources)?;
-        if let Some(segment) = sources
-            .iter()
-            .find(|segment| !crate::index::segment::segment_has_inverted_details(segment))
-        {
-            return Err(Error::invalid_input(format!(
-                "Segment {} does not declare FTS index details",
-                segment.uuid
-            )));
-        }
-        // Only UUIDs allocated by this call are eligible for intermediate cleanup.
-        let mut intermediates = Vec::with_capacity(sources.len());
-        let result = async {
-            let mut finalized = Vec::with_capacity(sources.len());
-            for source in sources {
-                let source_store =
-                    LanceIndexStore::from_dataset_for_existing(self, &source).await?;
-                let uuid = Uuid::new_v4();
-                let destination = LanceIndexStore::from_dataset_for_new(self, &uuid)?;
-                intermediates.push(uuid);
-                let files = finalize_staged_index_to(
-                    self.table_state.object_store.as_ref(),
-                    Arc::new(source_store),
-                    Arc::new(destination),
-                    FinalizeOptions::default(),
-                    progress.clone(),
-                )
-                .await?;
-                finalized.push(IndexMetadata {
-                    uuid,
-                    base_id: None,
-                    files: Some(index_files_to_table(files)),
-                    ..source
-                });
-            }
-            self.merge_existing_index_segments_with_fts_progress(finalized, progress)
-                .await
-        }
-        .await;
-        for uuid in intermediates {
-            // A single input can be promoted as the result of this attempt.
-            if result.as_ref().is_ok_and(|segment| segment.uuid == uuid) {
-                continue;
-            }
-            let dir = self.indices_dir().join(uuid.to_string());
-            if let Err(error) = self.table_state.object_store.remove_dir_all(dir).await {
-                log::warn!("Failed to remove intermediate FTS index {uuid}: {error}");
-            }
-        }
-        result
-    }
-}
-
-/// Finalize a staged segment in place. Returns the final index files, or
-/// `None` when the segment already had its root metadata.
-pub(crate) async fn finalize_segment_files_if_needed(
-    dataset: &Dataset,
-    segment: &IndexMetadata,
-) -> Result<Option<Vec<IndexFile>>> {
-    let index_dir = dataset.indices_dir().join(segment.uuid.to_string());
-    let metadata_path = index_dir
-        .clone()
-        .join(lance_index::scalar::inverted::METADATA_FILE);
-    if dataset
-        .table_state
-        .object_store
-        .as_ref()
-        .exists(&metadata_path)
-        .await?
-    {
-        return Ok(None);
-    }
-
-    let store = Arc::new(LanceIndexStore::from_dataset_for_new(
-        dataset,
-        &segment.uuid,
-    )?);
-    let files = lance_index::scalar::inverted::builder::merge_index_files_with_options(
-        dataset.table_state.object_store.as_ref(),
-        &index_dir,
-        store,
-        lance_index::scalar::inverted::builder::FinalizeOptions::default(),
-        lance_index::progress::noop_progress(),
-    )
-    .await?;
-    Ok(Some(files))
-}
-
-/// A lone staged segment is the merged segment as it stands only while its
+/// A lone segment is the merged segment as it stands only while its
 /// files hold live row addresses: no reuse mapping moved its coverage and no
 /// tagged plan asks to translate it. Anything else must be rewritten.
 fn single_segment_keeps_row_addresses(
@@ -1039,26 +928,24 @@ fn single_segment_keeps_row_addresses(
     }
 }
 
-/// Promote a lone staged segment under its own uuid: finalize its files in
-/// place and return its metadata with the final file list, with no second
-/// copy of the index.
-async fn promote_finalized_segment(
+/// Reuse a complete segment under its own UUID when its row addresses still apply.
+async fn promote_segment(
     dataset: &Dataset,
     segment: &IndexMetadata,
     details: InvertedIndexDetails,
 ) -> Result<IndexMetadata> {
-    let files = match finalize_segment_files_if_needed(dataset, segment).await? {
-        Some(files) => files,
-        None => {
-            let store = LanceIndexStore::from_dataset_for_new(dataset, &segment.uuid)?;
-            store
-                .list_files_with_sizes()
-                .await?
-                .into_iter()
-                .filter(|file| !lance_index::scalar::inverted::builder::is_staged_path(&file.path))
-                .collect()
-        }
-    };
+    let store = LanceIndexStore::from_dataset_for_existing(dataset, segment).await?;
+    let mut files = index_files_to_table(store.list_files_with_sizes().await?);
+    if !files
+        .iter()
+        .any(|file| file.path == lance_index::scalar::inverted::METADATA_FILE)
+    {
+        return Err(Error::invalid_input(format!(
+            "FTS segment {} has no root metadata. Rebuild it as an independent segment.",
+            segment.uuid
+        )));
+    }
+    crate::index::segment::retain_committed_inverted_files(&mut files);
     let details_any = prost_types::Any::from_msg(&details).map_err(|error| {
         Error::io(format!(
             "failed to encode InvertedIndexDetails payload: {error}"
@@ -1067,7 +954,7 @@ async fn promote_finalized_segment(
     Ok(IndexMetadata {
         dataset_version: dataset.manifest.version,
         index_details: Some(Arc::new(details_any)),
-        files: Some(index_files_to_table(files)),
+        files: Some(files),
         ..segment.clone()
     })
 }
@@ -1101,7 +988,7 @@ pub(crate) async fn merge_segments(
     if let [segment] = segments.as_slice()
         && single_segment_keeps_row_addresses(staged, &segment.uuid, source_coverage_moved)
     {
-        return promote_finalized_segment(dataset, segment, details).await;
+        return promote_segment(dataset, segment, details).await;
     }
 
     let mut source_indices = Vec::with_capacity(segments.len());
@@ -1110,7 +997,6 @@ pub(crate) async fn merge_segments(
         .stage_start("open_fts_segments", Some(segments.len() as u64), "segments")
         .await?;
     for segment in merge.segments() {
-        finalize_segment_files_if_needed(dataset, segment).await?;
         source_indices.push(
             open_source::<InvertedIndex>(
                 dataset,
@@ -1734,224 +1620,7 @@ mod tests {
         hits
     }
 
-    #[derive(Debug, Default)]
-    struct PauseBeforePartitionWrites {
-        paused: tokio::sync::Notify,
-        resume: tokio::sync::Notify,
-        first_write: tokio::sync::OnceCell<()>,
-        copied_files: std::sync::Mutex<BTreeMap<object_store::path::Path, u64>>,
-        merge_progress: std::sync::Mutex<Vec<u64>>,
-        last_completed_stage: std::sync::Mutex<String>,
-    }
-
-    impl lance_io::object_store::CopyObserver for PauseBeforePartitionWrites {
-        fn observe(
-            &self,
-            dest: &object_store::path::Path,
-            total: u64,
-            event: lance_io::object_store::CopyEvent,
-        ) {
-            if event == lance_io::object_store::CopyEvent::Complete {
-                self.copied_files
-                    .lock()
-                    .unwrap()
-                    .insert(dest.clone(), total);
-            }
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl IndexBuildProgress for PauseBeforePartitionWrites {
-        fn copy_observer(&self) -> Option<&dyn lance_io::object_store::CopyObserver> {
-            Some(self)
-        }
-
-        async fn stage_start(&self, stage: &str, _: Option<u64>, _: &str) -> Result<()> {
-            if stage == "remap_partition_files" {
-                self.first_write
-                    .get_or_init(|| async {
-                        self.paused.notify_one();
-                        self.resume.notified().await;
-                    })
-                    .await;
-            }
-            Ok(())
-        }
-
-        async fn stage_progress(&self, stage: &str, completed: u64) -> Result<()> {
-            if stage == "merge_fts_partitions" {
-                self.merge_progress.lock().unwrap().push(completed);
-            }
-            Ok(())
-        }
-        async fn stage_complete(&self, stage: &str) -> Result<()> {
-            stage.clone_into(&mut self.last_completed_stage.lock().unwrap());
-            Ok(())
-        }
-    }
-
-    async fn index_file_contents(dataset: &Dataset, uuid: Uuid) -> BTreeMap<String, bytes::Bytes> {
-        let dir = dataset.indices_dir().join(uuid.to_string());
-        let store = &dataset.table_state.object_store;
-        let mut entries = store.read_dir_all(&dir, None);
-        let mut files = BTreeMap::new();
-        while let Some(entry) = entries.next().await {
-            let location = entry.unwrap().location;
-            let path = object_store::path::Path::from_iter(location.prefix_match(&dir).unwrap())
-                .to_string();
-            files.insert(path, store.read_one_all(&location).await.unwrap());
-        }
-        files
-    }
-
-    #[rstest::rstest]
-    #[case::single(1)]
-    #[case::multiple(2)]
-    #[tokio::test]
-    async fn staged_fts_attempts_preserve_shared_files(#[case] input_count: usize) {
-        use lance_core::utils::tempfile::TempStrDir;
-        use lance_index::progress::noop_progress;
-        use lance_index::scalar::FullTextSearchQuery;
-
-        let dir = TempStrDir::default();
-        let batch =
-            arrow_array::record_batch!(("text", Utf8, ["one match", "skip", "two match", "other"]))
-                .unwrap();
-        let reader = RecordBatchIterator::new([Ok(batch.clone())], batch.schema());
-        let mut dataset = Dataset::write(
-            reader,
-            &dir,
-            Some(WriteParams {
-                max_rows_per_file: 2,
-                max_rows_per_group: 2,
-                ..Default::default()
-            }),
-        )
-        .await
-        .unwrap();
-        let params = InvertedIndexParams::default().num_workers(1);
-        let mut sources = Vec::new();
-        let mut originals = Vec::new();
-        for fragments in [0, 1].chunks(2 / input_count) {
-            let segment = dataset
-                .create_index_builder(&["text"], lance_index::IndexType::Inverted, &params)
-                .fragments(fragments.to_vec())
-                .name("text_idx".into())
-                .execute_uncommitted()
-                .await
-                .unwrap();
-            let files = index_file_contents(&dataset, segment.uuid).await;
-            assert!(!files.is_empty() && files.keys().all(|path| path.starts_with("staging/")));
-            originals.push((segment.uuid, files));
-            sources.push(segment);
-        }
-        let read_snapshot = dataset.clone();
-        let gate = Arc::new(PauseBeforePartitionWrites::default());
-        let late = read_snapshot.merge_staged_fts_segments(sources.clone(), gate.clone());
-        tokio::pin!(late);
-        tokio::select! {
-            _ = gate.paused.notified() => {},
-            result = &mut late => panic!("attempt finished before partition writes: {result:?}"),
-        }
-        let winner = read_snapshot
-            .merge_staged_fts_segments(sources.clone(), noop_progress())
-            .await
-            .unwrap();
-        let uuid = winner.uuid;
-        assert!(sources.iter().all(|source| source.uuid != uuid));
-        let published = index_file_contents(&dataset, uuid).await;
-        let reported: BTreeMap<_, _> = winner
-            .files
-            .as_ref()
-            .unwrap()
-            .iter()
-            .map(|file| (file.path.clone(), file.size_bytes))
-            .collect();
-        assert_eq!(
-            reported,
-            published
-                .iter()
-                .map(|(path, bytes)| (path.clone(), bytes.len() as u64))
-                .collect()
-        );
-        dataset
-            .commit_existing_index_segments("text_idx", "text", vec![winner])
-            .await
-            .unwrap();
-
-        // The late worker already planned its writes against the shared input.
-        gate.resume.notify_one();
-        let late = late.await.unwrap();
-        assert_ne!(late.uuid, uuid);
-        // Each input has one partition whose three files were copied to private paths.
-        let copied = gate.copied_files.lock().unwrap().clone();
-        let mut expected_sizes: Vec<_> = originals
-            .iter()
-            .flat_map(|(_, files)| {
-                files
-                    .iter()
-                    .filter(|(path, _)| !path.ends_with("metadata.lance"))
-                    .map(|(_, data)| data.len() as u64)
-            })
-            .collect();
-        expected_sizes.sort_unstable();
-        let mut actual_sizes: Vec<_> = copied.values().copied().collect();
-        actual_sizes.sort_unstable();
-        assert_eq!(actual_sizes, expected_sizes);
-        let expected_partitions = if input_count == 1 { vec![] } else { vec![1, 2] };
-        assert_eq!(*gate.merge_progress.lock().unwrap(), expected_partitions);
-        let final_stage = if input_count == 1 {
-            "write_merged_metadata"
-        } else {
-            "write_metadata"
-        };
-        assert_eq!(
-            gate.last_completed_stage.lock().unwrap().as_str(),
-            final_stage
-        );
-        let store = &dataset.table_state.object_store;
-        store
-            .remove_dir_all(dataset.indices_dir().join(late.uuid.to_string()))
-            .await
-            .unwrap();
-        for (source, files) in originals {
-            assert_eq!(index_file_contents(&dataset, source).await, files);
-            store
-                .remove_dir_all(dataset.indices_dir().join(source.to_string()))
-                .await
-                .unwrap();
-        }
-        assert_eq!(index_file_contents(&dataset, uuid).await, published);
-        let reopened = Dataset::open(&dir).await.unwrap();
-        assert_eq!(
-            reopened.load_indices_by_name("text_idx").await.unwrap()[0].uuid,
-            uuid
-        );
-        let mut scan = reopened.scan();
-        scan.full_text_search(
-            FullTextSearchQuery::new("match".into())
-                .with_column("text".into())
-                .unwrap(),
-        )
-        .unwrap();
-        let plan = scan.explain_plan(true).await.unwrap();
-        assert!(
-            plan.contains("MatchQuery") && !plan.contains("FlatMatchQuery"),
-            "{plan}"
-        );
-        let result = scan.try_into_batch().await.unwrap();
-        let mut texts = result["text"]
-            .as_string::<i32>()
-            .iter()
-            .flatten()
-            .collect::<Vec<_>>();
-        texts.sort_unstable();
-        assert_eq!(texts, ["one match", "two match"]);
-    }
-
-    /// A single staged intermediate covering every fragment is finalized in
-    /// place and committed under its own uuid (ENT-1419 kept: the root
-    /// metadata exists), with no second copy of the index.
+    /// An independent segment keeps its UUID and files when merged on its own.
     #[tokio::test]
     async fn test_single_intermediate_is_promoted_in_place() {
         use futures::TryStreamExt;
@@ -1966,7 +1635,7 @@ mod tests {
             .iter()
             .map(|fragment| fragment.id() as u32)
             .collect::<Vec<_>>();
-        // A tiny worker budget leaves several small staged partitions.
+        // A small budget exercises the partitioned writer.
         let params = InvertedIndexParams::default()
             .num_workers(2)
             .memory_limit_mb(1);
@@ -1978,7 +1647,7 @@ mod tests {
             .await
             .unwrap();
         let index_dir = dataset.indices_dir().join(segment.uuid.to_string());
-        let staged_paths = dataset
+        let built_paths = dataset
             .table_state
             .object_store
             .read_dir_all(&index_dir, None)
@@ -1986,13 +1655,13 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            staged_paths
+            built_paths
                 .iter()
-                .any(|meta| meta.location.as_ref().contains("/staging/")),
-            "an uncommitted fragment-scoped build must be staged"
+                .all(|meta| !meta.location.as_ref().contains("/staging/")),
+            "an uncommitted segment already has its final files"
         );
         assert!(
-            !dataset
+            dataset
                 .table_state
                 .object_store
                 .exists(&index_dir.clone().join(METADATA_FILE))
@@ -2013,7 +1682,7 @@ mod tests {
                 .exists(&index_dir.clone().join(METADATA_FILE))
                 .await
                 .unwrap(),
-            "finalize publishes the root metadata"
+            "the merge reuses the root metadata"
         );
         let final_paths = dataset
             .table_state
@@ -2026,7 +1695,7 @@ mod tests {
             final_paths
                 .iter()
                 .all(|meta| !meta.location.as_ref().contains("/staging/")),
-            "staging is cleared after the root metadata is published"
+            "the merge does not create staging files"
         );
         let listed = final_paths
             .iter()

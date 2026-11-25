@@ -418,7 +418,6 @@ pub(super) struct FinalMerge {
     budget: u64,
     target_bytes: Option<u64>,
     ids: Arc<AtomicU64>,
-    fragment_mask: u64,
     token_format: TokenSetFormat,
     with_position: bool,
     block_size: usize,
@@ -441,7 +440,6 @@ impl FinalMerge {
             target_bytes,
             stop,
             ids: builder.partition_id_allocator(),
-            fragment_mask: builder.fragment_mask.unwrap_or(0),
             token_format: builder.token_set_format,
             with_position: builder.params.with_position,
             block_size: builder.params.block_size,
@@ -779,8 +777,7 @@ impl FinalMerge {
         let id = self
             .ids
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
-            .map_err(|_| Error::invalid_input("FTS partition id allocator overflow"))?
-            | self.fragment_mask;
+            .map_err(|_| Error::invalid_input("FTS partition id allocator overflow"))?;
         let mut writer = self
             .store
             .new_index_file(&self.target.posting_path(id), schema.clone())

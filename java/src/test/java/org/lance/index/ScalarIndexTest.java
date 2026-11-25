@@ -78,8 +78,10 @@ import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class ScalarIndexTest {
@@ -2018,172 +2020,42 @@ public class ScalarIndexTest {
   }
 
   @Test
-  public void testMergeInvertedIndexMetadataReportsProgress(@TempDir Path tempDir)
-      throws Exception {
-    String datasetPath = tempDir.resolve("inverted_merge_progress").toString();
+  public void testSharedInvertedIndexBuildIsRetired(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("inverted_shared_uuid").toString();
     try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
       TestUtils.SimpleTestDataset testDataset =
           new TestUtils.SimpleTestDataset(allocator, datasetPath);
       testDataset.createEmptyDataset().close();
       testDataset.write(1, 10).close();
       try (Dataset dataset = testDataset.write(2, 10)) {
-        String indexUuid = createDistributedInvertedIndex(dataset);
-        RecordingIndexBuildProgress progress = new RecordingIndexBuildProgress();
+        String indexUuid = UUID.randomUUID().toString();
+        IndexOptions sharedOptions =
+            IndexOptions.builder(
+                    Collections.singletonList("name"),
+                    IndexType.INVERTED,
+                    createInvertedIndexParams())
+                .withIndexUUID(indexUuid)
+                .withFragmentIds(Collections.singletonList(dataset.getFragments().get(0).getId()))
+                .build();
+        IllegalArgumentException buildError =
+            assertThrows(IllegalArgumentException.class, () -> dataset.createIndex(sharedOptions));
+        assertTrue(buildError.getMessage().contains("index_uuid is no longer accepted for FTS"));
 
-        dataset.mergeIndexMetadata(indexUuid, IndexType.INVERTED, Optional.empty(), progress);
+        IllegalArgumentException mergeError =
+            assertThrows(
+                IllegalArgumentException.class,
+                () -> dataset.mergeIndexMetadata(indexUuid, IndexType.INVERTED, Optional.empty()));
+        assertTrue(mergeError.getMessage().contains("commit_existing_index_segments"));
 
-        List<String> events = progress.snapshot();
-        assertEventsInOrder(
-            events,
-            "start:read_partition_metadata:",
-            "complete:read_partition_metadata",
-            "start:remap_partition_files:",
-            "complete:remap_partition_files",
-            "start:write_merged_metadata:",
-            "complete:write_merged_metadata");
-        assertTrue(
-            events.contains("progress:read_partition_metadata:2"),
-            "Expected metadata progress to reach both fragments, got: " + events);
-        assertTrue(
-            events.stream().anyMatch(event -> event.startsWith("progress:remap_partition_files:")),
-            "Expected remap progress, got: " + events);
-        assertTrue(
-            events.contains("progress:write_merged_metadata:1"),
-            "Expected merged metadata write progress, got: " + events);
+        List<Index> segments = new ArrayList<>();
+        for (Fragment fragment : dataset.getFragments()) {
+          segments.add(dataset.createIndex(createInvertedSegmentOptions(fragment.getId())));
+        }
+        assertEquals(2, segments.size());
+        assertNotEquals(segments.get(0).uuid(), segments.get(1).uuid());
+        assertEquals(2, dataset.commitExistingIndexSegments("fts_idx", "name", segments).size());
       }
     }
-  }
-
-  @Test
-  public void testMergeInvertedIndexMetadataPropagatesProgressFailure(@TempDir Path tempDir)
-      throws Exception {
-    String datasetPath = tempDir.resolve("inverted_merge_progress_failure").toString();
-    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
-      TestUtils.SimpleTestDataset testDataset =
-          new TestUtils.SimpleTestDataset(allocator, datasetPath);
-      testDataset.createEmptyDataset().close();
-      testDataset.write(1, 10).close();
-      try (Dataset dataset = testDataset.write(2, 10)) {
-        String indexUuid = createDistributedInvertedIndex(dataset);
-
-        RuntimeException failure =
-            Assertions.assertThrows(
-                RuntimeException.class,
-                () ->
-                    dataset.mergeIndexMetadata(
-                        indexUuid,
-                        IndexType.INVERTED,
-                        Optional.empty(),
-                        new FailingProgressIndexBuildProgress()));
-
-        assertFalse(
-            failure instanceof IllegalArgumentException,
-            "Progress callback failures should not be reported as invalid input: " + failure);
-        assertTrue(
-            causeChainContains(failure, "stageProgress")
-                && causeChainContains(failure, "read_partition_metadata")
-                && causeChainContains(failure, "java.lang.IllegalStateException")
-                && causeChainContains(failure, "progress callback failure"),
-            "Expected callback context and original Java exception details, got: " + failure);
-      }
-    }
-  }
-
-  @Test
-  public void testMergeInvertedIndexMetadataIgnoresCompleteFailure(@TempDir Path tempDir)
-      throws Exception {
-    String datasetPath = tempDir.resolve("inverted_merge_complete_failure").toString();
-    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
-      TestUtils.SimpleTestDataset testDataset =
-          new TestUtils.SimpleTestDataset(allocator, datasetPath);
-      testDataset.createEmptyDataset().close();
-      testDataset.write(1, 10).close();
-      try (Dataset dataset = testDataset.write(2, 10)) {
-        String indexUuid = createDistributedInvertedIndex(dataset);
-        FailingCompleteIndexBuildProgress progress = new FailingCompleteIndexBuildProgress();
-
-        dataset.mergeIndexMetadata(indexUuid, IndexType.INVERTED, Optional.empty(), progress);
-
-        assertTrue(
-            progress.recorder.snapshot().contains("complete:write_merged_metadata"),
-            "Expected merge to continue after stageComplete callback failures");
-      }
-    }
-  }
-
-  @Test
-  @Timeout(value = 60, unit = TimeUnit.SECONDS)
-  public void testMergeInvertedIndexMetadataAllowsReentrantDatasetAccess(@TempDir Path tempDir)
-      throws Exception {
-    String datasetPath = tempDir.resolve("inverted_merge_reentrant_dataset").toString();
-    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
-      TestUtils.SimpleTestDataset testDataset =
-          new TestUtils.SimpleTestDataset(allocator, datasetPath);
-      testDataset.createEmptyDataset().close();
-      testDataset.write(1, 10).close();
-      try (Dataset dataset = testDataset.write(2, 10)) {
-        String indexUuid = createDistributedInvertedIndex(dataset);
-        ReentrantDatasetIndexBuildProgress progress =
-            new ReentrantDatasetIndexBuildProgress(dataset);
-
-        dataset.mergeIndexMetadata(indexUuid, IndexType.INVERTED, Optional.empty(), progress);
-
-        assertTrue(
-            progress.reentries.get() > 0,
-            "Expected progress callbacks to re-enter Dataset JNI methods");
-        assertTrue(
-            progress.recorder.snapshot().contains("complete:write_merged_metadata"),
-            "Expected merge to finish after re-entrant Dataset access, got: "
-                + progress.recorder.snapshot());
-      }
-    }
-  }
-
-  @Test
-  @Timeout(value = 5, unit = TimeUnit.SECONDS)
-  public void testMergeInvertedIndexMetadataRejectsWriteReentryPromptly(@TempDir Path tempDir)
-      throws Exception {
-    String datasetPath = tempDir.resolve("inverted_merge_write_reentry").toString();
-    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
-      TestUtils.SimpleTestDataset testDataset =
-          new TestUtils.SimpleTestDataset(allocator, datasetPath);
-      testDataset.createEmptyDataset().close();
-      testDataset.write(1, 10).close();
-      try (Dataset dataset = testDataset.write(2, 10)) {
-        String indexUuid = createDistributedInvertedIndex(dataset);
-        WriteReentrantIndexBuildProgress progress = new WriteReentrantIndexBuildProgress(dataset);
-
-        dataset.mergeIndexMetadata(indexUuid, IndexType.INVERTED, Optional.empty(), progress);
-
-        RuntimeException failure = progress.writeFailure.get();
-        assertNotNull(failure, "Expected write re-entry to be rejected");
-        assertTrue(
-            failure.getMessage().contains("busy in an index progress callback"),
-            "Unexpected write re-entry failure: " + failure.getMessage());
-        assertTrue(progress.reentries.get() > 0, "Expected callback to attempt a write lock");
-        assertTrue(
-            progress.recorder.snapshot().contains("complete:write_merged_metadata"),
-            "Expected merge to finish after rejected write re-entry, got: "
-                + progress.recorder.snapshot());
-      }
-    }
-  }
-
-  private static String createDistributedInvertedIndex(Dataset dataset) {
-    String indexUuid = UUID.randomUUID().toString();
-    for (Fragment fragment : dataset.getFragments()) {
-      dataset.createIndex(
-          IndexOptions.builder(
-                  Collections.singletonList("name"),
-                  IndexType.INVERTED,
-                  createInvertedIndexParams())
-              .replace(true)
-              .withIndexName("inverted_progress_idx")
-              .withIndexUUID(indexUuid)
-              .withFragmentIds(Collections.singletonList(fragment.getId()))
-              .build());
-    }
-    return indexUuid;
   }
 
   private static IndexOptions createInvertedSegmentOptions(int fragmentId) {

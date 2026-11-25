@@ -629,12 +629,19 @@ pub(super) async fn build_scalar_index(
     };
     progress.stage_complete("load_data").await?;
 
+    // The FTS scanner has already applied the fragment selection. The trainer
+    // owns a complete segment, so no shard arguments are passed to it.
+    let trainer_fragment_ids = if resolved_fts_field.is_some() {
+        None
+    } else {
+        fragment_ids
+    };
     let mut created_index = trainer
         .train_index(
             training_data,
             &index_store,
             training_request,
-            fragment_ids,
+            trainer_fragment_ids,
             progress,
         )
         .await?;

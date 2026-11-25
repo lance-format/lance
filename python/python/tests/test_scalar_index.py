@@ -450,49 +450,21 @@ def test_create_inverted_index_progress_callback(tmp_path):
     assert "start:merge_partitions" not in tags
 
 
-def test_merge_index_metadata_inverted_index_progress_callback(tmp_path):
-    ds = generate_multi_fragment_dataset(
-        tmp_path, num_fragments=3, rows_per_fragment=60
-    )
+def test_legacy_fts_build_rejects_shared_uuid(tmp_path):
+    ds = generate_multi_fragment_dataset(tmp_path, num_fragments=2, rows_per_fragment=5)
+    index_uuid = str(uuid.uuid4())
+    fragment_ids = [ds.get_fragments()[0].fragment_id]
 
-    inverted_index_id = str(uuid.uuid4())
-    for fragment in ds.get_fragments():
+    with pytest.raises(ValueError, match="create_index_uncommitted"):
         ds.create_scalar_index(
-            column="text",
-            index_type="INVERTED",
-            name="text_inverted_progress_idx",
-            replace=False,
-            index_uuid=inverted_index_id,
-            fragment_ids=[fragment.fragment_id],
-            remove_stop_words=False,
+            "text", "INVERTED", index_uuid=index_uuid, fragment_ids=fragment_ids
         )
-
-    progress_recorder = ProgressRecorder()
-    ds.merge_index_metadata(
-        inverted_index_id,
-        index_type="INVERTED",
-        progress_callback=progress_recorder,
-    )
-
-    tags = progress_event_tags(progress_recorder.events)
-    expected_order = [
-        "start:read_partition_metadata",
-        "complete:read_partition_metadata",
-        "start:remap_partition_files",
-        "complete:remap_partition_files",
-        "start:write_merged_metadata",
-        "complete:write_merged_metadata",
-    ]
-    positions = [tags.index(tag) for tag in expected_order]
-    assert positions == sorted(positions)
-
-    metadata_progress = stage_progress_values(
-        progress_recorder.events, "read_partition_metadata"
-    )
-    assert metadata_progress
-    assert metadata_progress[-1] == len(ds.get_fragments())
-    assert "progress:remap_partition_files" in tags
-    assert "progress:write_merged_metadata" in tags
+    with pytest.raises(ValueError, match="index_uuid is no longer accepted for FTS"):
+        ds.create_index_uncommitted(
+            "text", "FTS", index_uuid=index_uuid, fragment_ids=fragment_ids
+        )
+    with pytest.raises(ValueError, match="commit_existing_index_segments"):
+        ds.merge_index_metadata(index_uuid, index_type="INVERTED")
 
 
 def test_create_inverted_index_progress_callback_error_after_completion_is_ignored(
@@ -4464,7 +4436,7 @@ def build_distributed_fts_index(
     index_name : str, optional
         Name for the index. If not provided, will use f"{column}_distributed_idx"
     **index_params
-        Additional parameters to pass to create_scalar_index()
+        Additional parameters to pass to create_index_uncommitted()
         (e.g., with_position, remove_stop_words, base_tokenizer, etc.)
 
     Returns
@@ -4483,58 +4455,18 @@ def build_distributed_fts_index(
     >>> # Now compare with single-machine index results
     >>> results_distributed = ds_distributed.scanner(full_text_query="test").to_table()
     """
-    import uuid
-
-    from lance._dataset.index import Index
-
-    # Generate unique index ID for distributed indexing
-    index_id = str(uuid.uuid4())
     index_name = index_name or f"{column}_distributed_idx"
-
-    # Get all fragments from the dataset
-    fragments = dataset.get_fragments()
-    fragment_ids = [fragment.fragment_id for fragment in fragments]
-
-    # Build index on each fragment individually
-    for fragment_id in fragment_ids:
-        dataset.create_scalar_index(
+    segments = [
+        dataset.create_index_uncommitted(
             column=column,
             index_type="INVERTED",
             name=index_name,
-            replace=False,
-            index_uuid=index_id,
-            fragment_ids=[fragment_id],
+            fragment_ids=[fragment.fragment_id],
             **index_params,
         )
-
-    # Merge the inverted index metadata
-    dataset.merge_index_metadata(index_id, index_type="INVERTED")
-
-    # Create Index object for commit
-    field_id = dataset.schema.get_field_index(column)
-    index = Index(
-        uuid=index_id,
-        name=index_name,
-        fields=[field_id],
-        dataset_version=dataset.version,
-        fragment_ids=set(fragment_ids),
-        index_version=0,
-    )
-
-    # Create and commit the index operation
-    create_index_op = lance.LanceOperation.CreateIndex(
-        new_indices=[index],
-        removed_indices=[],
-    )
-
-    # Commit the distributed index
-    committed_dataset = lance.LanceDataset.commit(
-        dataset.uri,
-        create_index_op,
-        read_version=dataset.version,
-    )
-
-    return committed_dataset
+        for fragment in dataset.get_fragments()
+    ]
+    return dataset.commit_existing_index_segments(index_name, column, segments)
 
 
 def compare_fts_results(
@@ -5424,62 +5356,9 @@ def test_distribute_fts_index_build(tmp_path):
         tmp_path, num_fragments=4, rows_per_fragment=250
     )
 
-    import uuid
-
-    index_id = str(uuid.uuid4())
     index_name = "multiple_fragment_idx"
-
-    fragments = ds.get_fragments()
-    fragment_ids = [fragment.fragment_id for fragment in fragments]
-
-    for fragment in ds.get_fragments():
-        fragment_id = fragment.fragment_id
-
-        # Use the new fragment_ids and index_uuid parameters
-        ds.create_scalar_index(
-            column="text",
-            index_type="INVERTED",
-            name=index_name,
-            replace=False,
-            index_uuid=index_id,
-            fragment_ids=[fragment_id],
-            remove_stop_words=False,
-        )
-
-        # For fragment-level indexing, we expect the method to return successfully
-        # but not commit the index yet
-        print(f"Fragment {fragment_id} index created successfully")
-
-    # Merge the inverted index metadata
-    ds.merge_index_metadata(index_id, index_type="INVERTED")
-
-    # Create an Index object using the new dataclass format
-    from lance._dataset.index import Index
-
-    # Get the schema field for the indexed column
-    # Only use for non nested struct schema
-    field_id = ds.schema.get_field_index("text")
-
-    index = Index(
-        uuid=index_id,
-        name=index_name,
-        fields=[field_id],  # Use field index instead of field object
-        dataset_version=ds.version,
-        fragment_ids=set(fragment_ids),
-        index_version=0,
-    )
-
-    # Create the index operation
-    create_index_op = lance.LanceOperation.CreateIndex(
-        new_indices=[index],
-        removed_indices=[],
-    )
-
-    # Commit the index
-    ds_committed = lance.LanceDataset.commit(
-        ds.uri,
-        create_index_op,
-        read_version=ds.version,
+    ds_committed = build_distributed_fts_index(
+        ds, "text", index_name=index_name, remove_stop_words=False
     )
 
     # Verify the index was created and is functional
@@ -5504,36 +5383,17 @@ def test_distribute_fts_index_build(tmp_path):
 
 
 def test_fragment_ids_parameter_validation(tmp_path):
-    """
-    Test validation of fragment_ids parameter.
-    """
     ds = generate_multi_fragment_dataset(
-        tmp_path, num_fragments=2, rows_per_fragment=100
+        tmp_path, num_fragments=2, rows_per_fragment=10
     )
-
-    # Test with valid fragment IDs
-    fragments = ds.get_fragments()
-    valid_fragment_id = fragments[0].fragment_id
-
-    # This should work without errors
-    ds.create_scalar_index(
-        column="text",
-        index_type="INVERTED",
-        fragment_ids=[valid_fragment_id],
+    fragment_id = ds.get_fragments()[0].fragment_id
+    segment = ds.create_index_uncommitted(
+        "text", "INVERTED", fragment_ids=[fragment_id]
     )
+    assert set(segment.fragment_ids) == {fragment_id}
 
-    # Test with invalid fragment ID (should handle gracefully)
-    # Note: The exact behavior for invalid fragment IDs may vary
-    # This test ensures the parameter is properly passed through
-    try:
-        ds.create_scalar_index(
-            column="text",
-            index_type="INVERTED",
-            fragment_ids=[999999],  # Non-existent fragment ID
-        )
-    except Exception as e:
-        # It's acceptable for this to fail with an appropriate error
-        print(f"Expected error for invalid fragment ID: {e}")
+    with pytest.raises(ValueError, match="No fragment with id 999999"):
+        ds.create_index_uncommitted("text", "INVERTED", fragment_ids=[999999])
 
 
 def test_backward_compatibility_no_fragment_ids(tmp_path):

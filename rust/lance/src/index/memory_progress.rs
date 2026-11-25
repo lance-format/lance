@@ -21,14 +21,12 @@ use crate::Result;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ObservedOperation {
     CreateIndex,
-    MergeIndexMetadata,
 }
 
 impl ObservedOperation {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::CreateIndex => "create_index",
-            Self::MergeIndexMetadata => "merge_index_metadata",
         }
     }
 }
