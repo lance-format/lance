@@ -13,8 +13,6 @@
  */
 package org.lance.ipc;
 
-import org.lance.JniLoader;
-
 import com.google.common.base.MoreObjects;
 import org.apache.arrow.util.Preconditions;
 
@@ -43,7 +41,7 @@ public class ScanOptions {
   private final boolean prefilter;
   private final boolean withRowId;
   private final boolean withRowAddress;
-  private final Optional<Integer> batchReadahead;
+  final Optional<Integer> batchReadahead;
   private final Optional<Integer> fragmentReadahead;
   private final boolean scanInOrder;
   private final Optional<MaterializationStyle> lateMaterialization;
@@ -498,23 +496,13 @@ public class ScanOptions {
   }
 
   /**
-   * Get the batch readahead.
+   * Gets the configured batch readahead.
    *
-   * @return the configured number of batches, or the native scanner default if unset.
+   * @return the configured number of batches, or {@code -1} (equivalent to {@code null}) if unset.
+   *     The native scanner chooses its default when created.
    */
   public int getBatchReadahead() {
-    if (batchReadahead.isPresent()) {
-      return batchReadahead.get();
-    }
-    JniLoader.ensureLoaded();
-    return Math.toIntExact(nativeDefaultBatchReadahead());
-  }
-
-  private static native long nativeDefaultBatchReadahead();
-
-  // JNI uses zero to leave the native scanner default in place.
-  int batchReadaheadForNativeScan() {
-    return batchReadahead.orElse(0);
+    return batchReadahead.orElse(-1);
   }
 
   /**
