@@ -50,7 +50,7 @@ pub async fn vector_segment_merge_groups_for_compaction<'a>(
                     .map(|index| (segment, index))
             }
         })
-        .buffered(dataset.object_store.io_parallelism())
+        .buffered(dataset.table_state.object_store.io_parallelism())
         .collect::<Vec<_>>()
         .await;
     let opened = opened

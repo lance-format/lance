@@ -23,11 +23,13 @@ use lance_core::cache::{
     CacheKey, CacheKeySchema, CacheNamespace, InternalCacheKey, KeyBuilder, LanceCache,
 };
 use lance_core::deepsize::{Context, DeepSizeOf};
-use lance_index::frag_reuse::{CompactFragReuseIndex, FragReuseIndexDetails};
+use lance_index::scalar::inverted::InvertedIndexParams;
 use lance_index::vector::{ApproxMode, DIST_COL, Query, RqGraphScoring, VECTOR_RESULT_SCHEMA};
 use lance_linalg::distance::DistanceType;
 use lance_select::RowAddrMask;
-use lance_table::{format::IndexMetadata, rowids::RowIdIndex};
+use lance_table::format::IndexMetadata;
+
+pub use lance_table_runtime::caches::{IndexMetadataKey, RowIdIndexKey};
 use uuid::Uuid;
 
 /// Owned partition results only: no resident buffers, prefilters or dataset handles.
@@ -374,120 +376,7 @@ pub(crate) fn write_index_identity(builder: &mut KeyBuilder, uuid: &Uuid, fri_uu
 
 // Cache key types for type-safe cache access
 
-/// Whole-dataset row-id lookup for one manifest and deletion mode.
-#[derive(Debug)]
-pub(crate) struct RowIdIndexKey<'a> {
-    pub version: u64,
-    /// Whether the index knows the deleted rows (it then maps them to `None`).
-    /// An index built without deletion vectors reads no deletion file.
-    pub with_deletions: bool,
-    /// A dataset dropped and recreated at the same URI restarts its version
-    /// history at 1, so a long-lived session's cache can otherwise return the
-    /// previous incarnation's index for a version number the new incarnation
-    /// now also holds. The e-tag disambiguates generations the same way
-    /// [`super::caches::ManifestKey::e_tag`] does. Callers without one must not
-    /// share the cached index at all (see `get_row_id_index`).
-    pub e_tag: Option<&'a str>,
-}
-
-impl CacheKey for RowIdIndexKey<'_> {
-    type ValueType = RowIdIndex;
-    fn key(&self) -> Cow<'_, str> {
-        Cow::Owned(format!(
-            "row_id_index/{}/{}/{}",
-            self.version,
-            self.with_deletions,
-            self.e_tag.unwrap_or("")
-        ))
-    }
-    fn type_name() -> &'static str {
-        "RowIdIndex"
-    }
-
-    fn schema() -> CacheKeySchema {
-        CacheKeySchema::new("lance.dataset.row-id-index-key", 1)
-    }
-
-    fn write_key(&self, builder: &mut KeyBuilder) {
-        builder.write_u64(self.version);
-        builder.write_u64(self.with_deletions as u64);
-        match self.e_tag {
-            Some(e_tag) => {
-                builder.write_some();
-                builder.write_str(e_tag);
-            }
-            None => builder.write_none(),
-        }
-    }
-}
-
-/// Decoded fragment reuse history with `index_version = 0`, keyed by
-/// `index::frag_reuse::v0_cache_identity`.
-#[derive(Debug)]
-pub struct FragReuseIndexKey<'a> {
-    pub uuid: &'a Uuid,
-}
-
-impl CacheKey for FragReuseIndexKey<'_> {
-    type ValueType = CompactFragReuseIndex;
-
-    fn key(&self) -> Cow<'_, str> {
-        Cow::Owned(format!("frag_reuse/{}", self.uuid))
-    }
-
-    fn type_name() -> &'static str {
-        "FragReuseIndex"
-    }
-
-    fn schema() -> CacheKeySchema {
-        CacheKeySchema::new("lance.index.fragment-reuse-key", 1)
-    }
-
-    fn write_key(&self, builder: &mut KeyBuilder) {
-        builder.write_fixed_bytes(self.uuid.as_bytes());
-    }
-}
-
-/// Decoded fragment reuse details of an external `details.binpb`, keyed by where the
-/// file lives: a shallow clone's entry resolves to the source dataset's file. Each file
-/// is written once, under a fresh entry UUID. A hit does not check the file still exists.
-#[derive(Debug)]
-pub struct FragReuseDetailsKey<'a> {
-    pub store_identity: &'a str,
-    pub path: &'a object_store::path::Path,
-    pub offset: u64,
-    pub size: u64,
-}
-
-impl CacheKey for FragReuseDetailsKey<'_> {
-    type ValueType = FragReuseIndexDetails;
-
-    fn key(&self) -> Cow<'_, str> {
-        Cow::Owned(format!(
-            "frag_reuse_details/{}:{}/{}/{}/{}",
-            self.store_identity.len(),
-            self.store_identity,
-            self.path,
-            self.offset,
-            self.size
-        ))
-    }
-
-    fn type_name() -> &'static str {
-        "FragReuseIndexDetails"
-    }
-
-    fn schema() -> CacheKeySchema {
-        CacheKeySchema::new("lance.index.fragment-reuse-details-key", 1)
-    }
-
-    fn write_key(&self, builder: &mut KeyBuilder) {
-        builder.write_str(self.store_identity);
-        builder.write_str(self.path.as_ref());
-        builder.write_u64(self.offset);
-        builder.write_u64(self.size);
-    }
-}
+pub use lance_table_runtime::caches::{FragReuseDetailsKey, FragReuseIndexKey};
 
 /// Restricted deletion mask of a vector index segment at one dataset version
 /// (`None`: the segment needs no restriction). Building it walks every
@@ -536,84 +425,7 @@ impl CacheKey for SegmentOwnershipMaskKey<'_> {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct IndexMetadataKey<'a> {
-    pub version: u64,
-    pub store_identity: &'a str,
-    pub e_tag: Option<&'a str>,
-}
-
-impl CacheKey for IndexMetadataKey<'_> {
-    type ValueType = Vec<IndexMetadata>;
-
-    fn key(&self) -> Cow<'_, str> {
-        Cow::Owned(format!(
-            "{}:{}/{}/{}",
-            self.store_identity.len(),
-            self.store_identity,
-            self.version,
-            self.e_tag.unwrap_or("")
-        ))
-    }
-
-    fn type_name() -> &'static str {
-        "Vec<IndexMetadata>"
-    }
-
-    fn schema() -> CacheKeySchema {
-        // v3 entries carry each segment's clustering reference and metadata;
-        // a v2 entry, written by a build that did not know those fields, holds
-        // every segment unlabelled, and a writer trusting it would republish
-        // the index section without the labels. v2 in turn holds every index
-        // the manifest names where v1 held only the readable ones. On a
-        // persistent backend shared with another release nothing but this
-        // version stops each build from reading the other's entry as its own
-        // meaning.
-        CacheKeySchema::new("lance.index.metadata-key", 3)
-    }
-
-    fn write_key(&self, builder: &mut KeyBuilder) {
-        builder.write_str(self.store_identity);
-        builder.write_u64(self.version);
-        match self.e_tag {
-            Some(e_tag) => {
-                builder.write_some();
-                builder.write_str(e_tag);
-            }
-            None => builder.write_none(),
-        }
-    }
-
-    fn codec() -> Option<lance_core::cache::CacheCodec> {
-        Some(lance_table::format::index_metadata_codec())
-    }
-}
-
-/// Cache key for the listing `load_all_indices` remaps through a v0 FRI: the
-/// fragment bitmaps rewritten so query planning sees live fragments. A snapshot
-/// carries one FRI entry, so one key per snapshot.
-///
-/// Separate namespace from [`IndexMetadataKey`], which caches the raw manifest
-/// listing. Query loading records its own value under `QueryIndexListingKey`,
-/// which also tracks whether an incomplete listing needs another inference or
-/// format-verification attempt. Keyed by the same snapshot identity: a different
-/// table (`store_identity`), a different snapshot (`version`), or any index
-/// add/replace (which commits a new manifest and bumps `version`/`e_tag`) yields
-/// a different key, so a stale remapped listing is never reused.
-///
-/// This cache is MEMORY-ONLY (no `codec`): the remapped listing depends on the
-/// READER's translation capability, not only on the snapshot. Different builds
-/// admit different segments for the same snapshot (a build that cannot translate
-/// a segment excludes it; one that can includes it), so a persisted entry
-/// reused across builds could serve a listing the current reader must not use.
-/// Snapshot identity does not capture reader capability, so we never persist
-/// this value; it is cheap to recompute per process.
-#[derive(Clone, Copy, Debug)]
-pub struct DerivedIndexListingKey<'a> {
-    pub version: u64,
-    pub store_identity: &'a str,
-    pub e_tag: Option<&'a str>,
-}
+pub use lance_table_runtime::caches::DerivedIndexListingKey;
 
 /// Query-visible metadata and whether a later call should retry derivation.
 #[derive(Debug)]
@@ -626,43 +438,6 @@ impl DeepSizeOf for QueryIndexListing {
     fn deep_size_of_children(&self, context: &mut Context) -> usize {
         self.indices.deep_size_of_children(context)
     }
-}
-
-impl CacheKey for DerivedIndexListingKey<'_> {
-    type ValueType = Vec<IndexMetadata>;
-
-    fn key(&self) -> Cow<'_, str> {
-        Cow::Owned(format!(
-            "{}:{}/{}/{}",
-            self.store_identity.len(),
-            self.store_identity,
-            self.version,
-            self.e_tag.unwrap_or("")
-        ))
-    }
-
-    fn type_name() -> &'static str {
-        "Vec<IndexMetadata>"
-    }
-
-    fn schema() -> CacheKeySchema {
-        CacheKeySchema::new("lance.index.derived-listing-key", 1)
-    }
-
-    fn write_key(&self, builder: &mut KeyBuilder) {
-        builder.write_str(self.store_identity);
-        builder.write_u64(self.version);
-        match self.e_tag {
-            Some(e_tag) => {
-                builder.write_some();
-                builder.write_str(e_tag);
-            }
-            None => builder.write_none(),
-        }
-    }
-
-    // No `codec`: memory-only. See the type doc: the derived listing is
-    // reader-capability dependent and must not be persisted across builds.
 }
 
 /// Cache the complete query listing using the same snapshot identity as the
@@ -732,9 +507,38 @@ impl CacheKey for ScalarIndexDetailsKey<'_> {
     }
 }
 
+/// Complete persisted inverted-index tokenizer parameters, independent of row
+/// remapping. Stored in the metadata cache so parameter checks never populate
+/// the index partition cache.
+#[derive(Debug)]
+pub(crate) struct InvertedIndexParamsKey<'a> {
+    pub uuid: &'a Uuid,
+}
+
+impl CacheKey for InvertedIndexParamsKey<'_> {
+    type ValueType = InvertedIndexParams;
+
+    fn key(&self) -> Cow<'_, str> {
+        Cow::Owned(format!("inverted_params/{}", self.uuid))
+    }
+
+    fn type_name() -> &'static str {
+        "InvertedIndexParams"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.dataset.inverted-params-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_fixed_bytes(self.uuid.as_bytes());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lance_table::rowids::RowIdIndex;
 
     use arrow_array::record_batch;
     use lance_core::cache::{MokaCacheBackend, QuickCacheBackend};

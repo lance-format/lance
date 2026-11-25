@@ -34,6 +34,7 @@ lance-namespace = { workspace = true }
 lance-select = { workspace = true }
 lance-tokenizer = { workspace = true }
 lance-table = { workspace = true }
+lance-table-runtime = { workspace = true }
 lance-bitpacking = { workspace = true }
 blake3 = { workspace = true }
 arrow-arith = { workspace = true }
@@ -119,12 +120,14 @@ all_asserts.workspace = true
 mock_instant.workspace = true
 lance-testing = { workspace = true }
 lance-io = { workspace = true, features = ["test-util"] }
+lance-table-runtime = { workspace = true, features = ["test-util"] }
 lance-index = { workspace = true, features = ["test-oracle"] }
 tracing-subscriber = { version = "0.3.17", features = ["env-filter"] }
 tracing-mock.workspace = true
 env_logger.workspace = true
 tempfile.workspace = true
 test-log.workspace = true
+sha2.workspace = true
 tracing-chrome = "0.7.1"
 rstest = { workspace = true }
 serial_test = { workspace = true }
@@ -162,19 +165,19 @@ backtrace = ["lance-core/backtrace"]
 fp16kernels = ["lance-linalg/fp16kernels"]
 # Prevent dynamic linking of lzma, which comes from datafusion
 cli = ["dep:clap", "lzma-sys/static"]
-dynamodb = ["lance-table/dynamodb", "dep:aws-sdk-dynamodb"]
+dynamodb = ["lance-table-runtime/dynamodb", "dep:aws-sdk-dynamodb"]
 dynamodb_tests = ["dynamodb"]
 substrait = ["lance-datafusion/substrait"]
 # Retained for compatibility and forwarded to optional upstream protobuf code.
 protoc = ["lance-datafusion/protoc"]
-aws = ["lance-io/aws"]
-gcp = ["lance-io/gcp"]
-azure = ["lance-io/azure"]
-oss = ["lance-io/oss"]
-tencent = ["lance-io/tencent"]
-goosefs = ["lance-io/goosefs"]
-tos = ["lance-io/tos"]
-huggingface = ["lance-io/huggingface"]
+aws = ["lance-io/aws", "lance-table-runtime/aws"]
+gcp = ["lance-io/gcp", "lance-table-runtime/gcp"]
+azure = ["lance-io/azure", "lance-table-runtime/azure"]
+oss = ["lance-io/oss", "lance-table-runtime/oss"]
+tencent = ["lance-io/tencent", "lance-table-runtime/tencent"]
+goosefs = ["lance-io/goosefs", "lance-table-runtime/goosefs"]
+tos = ["lance-io/tos", "lance-table-runtime/tos"]
+huggingface = ["lance-io/huggingface", "lance-table-runtime/huggingface"]
 # Publish object store and memory metrics via the `metrics` crate.
 metrics = ["lance-core/metrics", "lance-io/metrics"]
 geo = ["dep:lance-geo", "lance-datafusion/geo"]

@@ -516,7 +516,7 @@ pub async fn infer_vector_index_details(
     let index_file = file_dir.clone().join(INDEX_FILE_NAME);
     let file_sizes = index.file_size_map();
     let reader: Arc<dyn Reader> = super::open_index_file(
-        dataset.object_store.as_ref(),
+        dataset.table_state.object_store.as_ref(),
         &index_file,
         INDEX_FILE_NAME,
         &file_sizes,
@@ -725,8 +725,8 @@ async fn open_lance_file(
     path: &object_store::path::Path,
 ) -> Result<lance_file::reader::FileReader> {
     let scheduler = ScanScheduler::new(
-        dataset.object_store.clone(),
-        SchedulerConfig::max_bandwidth(&dataset.object_store),
+        dataset.table_state.object_store.clone(),
+        SchedulerConfig::max_bandwidth(&dataset.table_state.object_store),
     );
     let file = scheduler
         .open_file(path, &CachedFileSize::unknown())
@@ -735,7 +735,7 @@ async fn open_lance_file(
         file,
         None,
         Default::default(),
-        &dataset.metadata_cache.file_metadata_cache(path),
+        &dataset.table_state.metadata_cache.file_metadata_cache(path),
         FileReaderOptions::default(),
     )
     .await

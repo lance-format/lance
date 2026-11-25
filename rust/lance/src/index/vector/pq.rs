@@ -548,7 +548,8 @@ impl VectorIndex for PQIndex {
 /// - `dim`: The dimension of the vectors.
 /// - `metric_type`: The metric type of the vectors.
 /// - `params`: The parameters to train the PQ model.
-/// - `ivf`: If provided, the IVF model to compute the residual for PQ training.
+/// - `ivf`: Optional IVF model for computing residuals. The model must contain nonempty centroids
+///   when training a new codebook.
 pub async fn build_pq_model(
     dataset: &Dataset,
     column: &str,
@@ -603,6 +604,18 @@ pub async fn build_pq_model_in_fragments(
             ))),
         };
     }
+
+    let ivf_centroids = ivf
+        .map(|model| {
+            model
+                .centroids_array()
+                .filter(|centroids| !centroids.values().is_empty())
+                .ok_or_else(|| {
+                    Error::invalid_input("PQ residual training requires nonempty IVF centroids")
+                })
+        })
+        .transpose()?;
+
     info!(
         "Start to train PQ code: PQ{}, bits={}",
         params.num_sub_vectors, params.num_bits
@@ -634,12 +647,12 @@ pub async fn build_pq_model_in_fragments(
         training_data = normalize_fsl_owned(training_data)?;
     }
 
-    let training_data = if let Some(ivf) = ivf {
+    let training_data = if let Some(centroids) = ivf_centroids {
         // Compute residual for PQ training.
         //
         // TODO: consolidate IVF models to `lance_index`.
         let ivf2 = lance_index::vector::ivf::new_ivf_transformer(
-            ivf.centroids.clone().unwrap(),
+            centroids.clone(),
             MetricType::L2,
             vec![],
         );
@@ -823,6 +836,22 @@ mod tests {
             .for_each(|v| {
                 assert!((99.0..121.0).contains(v));
             });
+    }
+
+    #[tokio::test]
+    async fn test_build_pq_model_rejects_empty_ivf_centroids() {
+        let (dataset, vectors) = generate_dataset("memory://", 100.0..120.0).await;
+        let ivf = IvfModel::new(vectors.as_ref().slice(0, 0), None);
+        let params = PQBuildParams::new(16, 8);
+        let err = build_pq_model(&dataset, "vector", DIM, MetricType::L2, &params, Some(&ivf))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, Error::InvalidInput { .. }), "got {err:?}");
+        assert!(
+            err.to_string().contains("nonempty IVF centroids"),
+            "got {err}"
+        );
     }
 
     #[tokio::test]

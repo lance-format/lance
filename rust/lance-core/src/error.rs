@@ -127,6 +127,12 @@ impl std::error::Error for CommitStatusUnknownError {
     }
 }
 
+#[derive(Debug, Snafu)]
+#[snafu(display("Append already committed at version {version}"))]
+struct AppendAlreadyCommittedError {
+    version: u64,
+}
+
 /// Allocates error on the heap and then places `e` into it.
 #[inline]
 pub fn box_error(e: impl std::error::Error + Send + Sync + 'static) -> BoxedError {
@@ -793,6 +799,22 @@ impl Error {
     #[track_caller]
     pub fn retryable_commit_conflict_source(version: u64, source: BoxedError) -> Self {
         RetryableCommitConflictSnafu { version }.into_error(source)
+    }
+
+    /// Report that an append with the same idempotency key already committed.
+    #[track_caller]
+    pub fn append_already_committed(version: u64) -> Self {
+        Self::wrapped(box_error(AppendAlreadyCommittedError { version }))
+    }
+
+    /// The version that committed the append with the same idempotency key, if any.
+    pub fn append_already_committed_version(&self) -> Option<u64> {
+        match self.find_root() {
+            Self::Wrapped { error, .. } => error
+                .downcast_ref::<AppendAlreadyCommittedError>()
+                .map(|error| error.version),
+            _ => None,
+        }
     }
 
     #[track_caller]

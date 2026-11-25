@@ -284,7 +284,7 @@ impl CountFromMaskExec {
             .filter(|f| fragments_covered.contains(f.id() as u32));
         let counts = stream::iter(frags)
             .map(|f| async move { f.count_rows(None).await })
-            .buffer_unordered(dataset.object_store.as_ref().io_parallelism())
+            .buffer_unordered(dataset.table_state.object_store.as_ref().io_parallelism())
             .try_collect::<Vec<_>>()
             .await?;
         Ok(counts.iter().sum::<usize>() as i64)

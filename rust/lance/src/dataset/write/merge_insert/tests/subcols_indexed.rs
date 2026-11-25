@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use super::*;
+use arrow_array::LargeBinaryArray;
 
 /// Four rows keyed by `interval_idx` with `cells` (a `list<struct>`) null,
 /// and a BTree index on the key so the merge takes the indexed join path.
@@ -255,142 +256,237 @@ async fn test_indexed_partial_update_if_same_type_column_order() {
         assert_eq!(durations.value(row), expected, "row {row}");
     }
 }
-/// The indexed take projects `cells` to the children the source supplies, so
-/// the joined `target_cells` is `list<struct<idx, data>>` while the dataset
-/// holds `list<struct<idx, timestamp, data>>`. The condition must be planned
-/// against the type the join emits.
+/// A partial list source must fail before committing, including when an all-null
+/// target would let the reader silently choose the wrong list structure.
 #[rstest::rstest]
-#[case::update_all(false)]
-#[case::with_condition(true)]
+#[case::grows("list", Some(1), Some(2))]
+#[case::shrinks("list", Some(2), Some(1))]
+#[case::empty_to_value("list", Some(0), Some(1))]
+#[case::null_to_value("list", None, Some(1))]
+#[case::value_to_null("list", Some(1), None)]
+#[case::same_length("list", Some(1), Some(1))]
+#[case::large_list("large_list", Some(1), Some(2))]
+#[case::under_struct("struct", Some(1), Some(2))]
+#[case::nested_list("nested_list", Some(1), Some(2))]
+#[case::fixed_size_list("fixed_size_list", Some(1), Some(1))]
 #[tokio::test]
-async fn test_indexed_partial_update_if_nested_subset(#[case] with_condition: bool) {
-    let ds = nested_subset_dataset(&[0, 1, 2, 3], &[], &[]).await;
-    let source = nested_subset_source();
-    let when_matched = if with_condition {
-        WhenMatched::update_if(&ds, "target.cells IS NULL").unwrap()
-    } else {
-        WhenMatched::UpdateAll
-    };
-    let (ds, stats) = merge_indexed(ds, source, when_matched, true).await.unwrap();
-    assert_eq!(stats.num_updated_rows, 2);
-    assert_cells_filled(&ds).await;
-}
-/// Tests merge_insert on a table whose rows span both indexed and unindexed
-/// fragments. Key 0 is in a fragment the index covers, so the plan finds it
-/// through the index (the indexed take). Key 1 is in a fragment appended after
-/// the index was built, so the plan finds it by scanning that fragment. The
-/// target's `cells` carries the `idx`, `timestamp` and `data` children, but the
-/// source's `cells` carries only `idx` and `data`. So the indexed take and the
-/// unindexed scan must both emit `cells` narrowed to `idx` and `data`;
-/// otherwise the plan cannot combine them.
-///
-/// The update must patch only the children the source supplies and keep the
-/// rest: key 0 starts with null `cells`, so its `timestamp` stays null, while
-/// key 1 keeps its stored `timestamp` of 42. The `update_if` condition reads
-/// `target.cells`, so for key 1 it is evaluated on the row from the unindexed
-/// scan.
-#[tokio::test]
-async fn test_indexed_partial_update_if_nested_subset_unindexed_fragment() {
-    let ds = nested_subset_dataset(&[0, 2, 3], &[1, 4], &[1]).await;
-    let when_matched = WhenMatched::update_if(
-        &ds,
-        "target.interval_idx = 0 OR array_length(target.cells) = 1",
-    )
-    .unwrap();
-    let (ds, stats) = merge_indexed(ds, nested_subset_source(), when_matched, true)
-        .await
-        .unwrap();
-    assert_eq!(stats.num_updated_rows, 2);
-    assert_cells_filled(&ds).await;
-
-    let after = ds
-        .scan()
-        .project(&["interval_idx", "cells"])
-        .unwrap()
-        .try_into_batch()
-        .await
-        .unwrap();
-    let keys = after["interval_idx"].as_primitive::<arrow_array::types::Int64Type>();
-    let cells = after["cells"].as_list::<i32>();
-    for row in 0..after.num_rows() {
-        let key = keys.value(row);
-        if key < 2 {
-            let cell = cells.value(row);
-            let cell = cell.as_struct();
-            let idx = cell["idx"].as_primitive::<Int32Type>();
-            assert_eq!(idx.value(0), key as i32 + 1, "row {row} key {key}");
-            let timestamp = cell["timestamp"].as_primitive::<arrow_array::types::Int64Type>();
-            if key == 0 {
-                assert!(timestamp.is_null(0), "row {row} key {key}");
-            } else {
-                assert!(timestamp.is_valid(0), "row {row} key {key}");
-                assert_eq!(timestamp.value(0), 42, "row {row} key {key}");
-            }
+async fn test_merge_insert_partial_list_struct(
+    #[case] shape: &str,
+    #[case] stored_length: Option<usize>,
+    #[case] source_length: Option<usize>,
+    #[values(false, true)] use_index: bool,
+    #[values(MergeInsertWriteMode::Auto, MergeInsertWriteMode::RewriteColumns)]
+    mode: MergeInsertWriteMode,
+    #[values(false, true)] full_source: bool,
+) {
+    let cells = |lengths: &[Option<usize>], full: bool| -> ArrayRef {
+        let num_items = if shape == "fixed_size_list" {
+            lengths.len()
+        } else {
+            lengths.iter().flatten().sum()
+        };
+        let mut fields = vec![Field::new("idx", DataType::Int32, true)];
+        let mut columns: Vec<ArrayRef> = vec![Arc::new(Int32Array::from(vec![1; num_items]))];
+        if full {
+            fields.push(Field::new("timestamp", DataType::Int64, true));
+            columns.push(Arc::new(Int64Array::from(vec![42; num_items])));
         }
-    }
-}
-
-/// Dataset keyed by `interval_idx` whose `cells` is
-/// `list<struct<idx, timestamp, data>>`, with a BTree index over
-/// `indexed_keys`. `unindexed_keys`, when non-empty, are appended as a
-/// fragment the index does not cover. Rows keyed by `stored_cell_keys` hold
-/// the single cell `{idx: -1, timestamp: 42, data: "old"}`; every other row's
-/// `cells` is null.
-async fn nested_subset_dataset(
-    indexed_keys: &[i64],
-    unindexed_keys: &[i64],
-    stored_cell_keys: &[i64],
-) -> Dataset {
-    use arrow_array::LargeBinaryArray;
-    let item_fields: arrow_schema::Fields = vec![
-        Field::new("idx", DataType::Int32, true),
-        Field::new("timestamp", DataType::Int64, true),
-        Field::new("data", DataType::LargeBinary, true),
-    ]
-    .into();
-    let item = Arc::new(Field::new(
-        "item",
-        DataType::Struct(item_fields.clone()),
-        true,
-    ));
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("interval_idx", DataType::Int64, true),
-        Field::new("t_start", DataType::Int64, true),
-        Field::new("cells", DataType::List(item.clone()), true),
-    ]));
-    let target_rows = |keys: &[i64]| {
-        let has_stored_cell: Vec<bool> = keys
-            .iter()
-            .map(|key| stored_cell_keys.contains(key))
-            .collect();
-        let num_stored = has_stored_cell.iter().filter(|stored| **stored).count();
-        let items = StructArray::new(
-            item_fields.clone(),
-            vec![
-                Arc::new(Int32Array::from(vec![-1; num_stored])),
-                Arc::new(Int64Array::from(vec![42i64; num_stored])),
-                Arc::new(LargeBinaryArray::from(vec![&b"old"[..]; num_stored])),
-            ],
+        let items = Arc::new(StructArray::new(fields.into(), columns, None));
+        let field = Arc::new(Field::new("item", items.data_type().clone(), true));
+        let nulls = Some(arrow_buffer::NullBuffer::from(
+            lengths.iter().map(Option::is_some).collect::<Vec<_>>(),
+        ));
+        let list: ArrayRef = match shape {
+            "large_list" => Arc::new(arrow_array::LargeListArray::new(
+                field,
+                OffsetBuffer::from_lengths(lengths.iter().map(|n| n.unwrap_or(0))),
+                items,
+                nulls,
+            )),
+            "fixed_size_list" => Arc::new(FixedSizeListArray::new(field, 1, items, nulls)),
+            _ => Arc::new(ListArray::new(
+                field,
+                OffsetBuffer::from_lengths(lengths.iter().map(|n| n.unwrap_or(0))),
+                items,
+                nulls,
+            )),
+        };
+        match shape {
+            "struct" => Arc::new(StructArray::from(vec![(
+                Arc::new(Field::new("inner", list.data_type().clone(), true)),
+                list,
+            )])),
+            "nested_list" => Arc::new(ListArray::new(
+                Arc::new(Field::new("item", list.data_type().clone(), true)),
+                OffsetBuffer::from_lengths(vec![1; lengths.len()]),
+                list,
+                None,
+            )),
+            _ => list,
+        }
+    };
+    // Two fragments with both populated and null rows, so the result cannot
+    // depend on the reader's batch boundaries or all-null placeholder handling.
+    let target = RecordBatch::try_from_iter_with_nullable([
+        (
+            "key",
+            Arc::new(Int64Array::from(vec![0, 1, 2, 3])) as ArrayRef,
+            true,
+        ),
+        (
+            "t_start",
+            Arc::new(Int64Array::from(vec![0; 4])) as ArrayRef,
+            true,
+        ),
+        (
+            "cells",
+            cells(&[stored_length, Some(1), None, Some(1)], true),
+            true,
+        ),
+    ])
+    .unwrap();
+    let mut ds = Dataset::write(
+        RecordBatchIterator::new([Ok(target.clone())], target.schema()),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 2,
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(ds.get_fragments().len(), 2);
+    if use_index {
+        ds.create_index(
+            &["key"],
+            IndexType::BTree,
             None,
-        );
-        let cells = ListArray::new(
-            item.clone(),
-            OffsetBuffer::from_lengths(has_stored_cell.iter().map(|stored| *stored as usize)),
-            Arc::new(items),
-            Some(has_stored_cell.into()),
-        );
-        RecordBatch::try_new(
-            schema.clone(),
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+    }
+    // As in Python table schemas, keep fields nullable even if this batch has
+    // no nulls: the fragment rewrite also carries unchanged null target rows.
+    let source = RecordBatch::try_from_iter_with_nullable([
+        (
+            "key",
+            Arc::new(Int64Array::from(vec![0, 2])) as ArrayRef,
+            true,
+        ),
+        ("cells", cells(&[source_length, Some(1)], full_source), true),
+    ])
+    .unwrap();
+    let version = ds.version().version;
+    let result = MergeInsertBuilder::try_new(Arc::new(ds.clone()), vec!["key".into()])
+        .unwrap()
+        .when_matched(WhenMatched::UpdateAll)
+        .when_not_matched(WhenNotMatched::DoNothing)
+        .write_mode(mode)
+        .use_index(use_index)
+        .try_build()
+        .unwrap()
+        .execute_reader(RecordBatchIterator::new(
+            [Ok(source.clone())],
+            source.schema(),
+        ))
+        .await;
+    if full_source {
+        let (updated, stats) = result.unwrap();
+        assert_eq!(stats.num_updated_rows, 2);
+        let expected = RecordBatch::try_new(
+            target.schema(),
             vec![
-                Arc::new(Int64Array::from(keys.to_vec())),
-                Arc::new(Int64Array::from(vec![0i64; keys.len()])),
-                Arc::new(cells),
+                target["key"].clone(),
+                target["t_start"].clone(),
+                cells(&[source_length, Some(1), Some(1), Some(1)], true),
             ],
         )
-        .unwrap()
+        .unwrap();
+        let actual = updated
+            .scan()
+            .order_by(Some(vec![ColumnOrdering::asc_nulls_first("key".into())]))
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(actual, expected);
+        return;
+    }
+    let error = result.unwrap_err();
+    assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+    let path = if shape == "struct" {
+        "cells.inner"
+    } else {
+        "cells"
+    };
+    assert!(
+        error.to_string().contains(&format!("list field '{path}'")),
+        "{error}"
+    );
+    assert!(
+        error.to_string().contains("Supply all item fields"),
+        "{error}"
+    );
+    assert_eq!(ds.latest_version_id().await.unwrap(), version);
+    assert_eq!(ds.scan().try_into_batch().await.unwrap(), target);
+}
+
+/// Both the indexed take and the unindexed scan must project the same struct
+/// children. Lists require complete items, so use a struct to exercise supported
+/// partial updates while preserving the omitted timestamp child.
+#[rstest::rstest]
+#[case::indexed_update_all(false, false)]
+#[case::indexed_update_if(false, true)]
+#[case::mixed_update_all(true, false)]
+#[case::mixed_update_if(true, true)]
+#[tokio::test]
+async fn test_indexed_partial_update_if_nested_subset(
+    #[case] unindexed_fragment: bool,
+    #[case] with_condition: bool,
+) {
+    let cells = StructArray::new(
+        vec![
+            Field::new("idx", DataType::Int32, true),
+            Field::new("timestamp", DataType::Int64, true),
+            Field::new("data", DataType::LargeBinary, true),
+        ]
+        .into(),
+        vec![
+            Arc::new(Int32Array::from(vec![None, None, Some(-1), None])),
+            Arc::new(Int64Array::from(vec![None, None, Some(42), None])),
+            Arc::new(LargeBinaryArray::from(vec![
+                None,
+                None,
+                Some(&b"old"[..]),
+                None,
+            ])),
+        ],
+        Some(vec![false, false, true, false].into()),
+    );
+    let target = RecordBatch::try_from_iter_with_nullable([
+        (
+            "interval_idx",
+            Arc::new(Int64Array::from(vec![0, 2, 1, 3])) as ArrayRef,
+            true,
+        ),
+        (
+            "t_start",
+            Arc::new(Int64Array::from(vec![0; 4])) as ArrayRef,
+            true,
+        ),
+        ("cells", Arc::new(cells) as ArrayRef, true),
+    ])
+    .unwrap();
+    let indexed = if unindexed_fragment {
+        target.slice(0, 2)
+    } else {
+        target.clone()
     };
     let mut ds = Dataset::write(
-        RecordBatchIterator::new([Ok(target_rows(indexed_keys))], schema.clone()),
+        RecordBatchIterator::new([Ok(indexed)], target.schema()),
         "memory://",
         Some(WriteParams {
             data_storage_version: Some(LanceFileVersion::V2_2),
@@ -408,45 +504,73 @@ async fn nested_subset_dataset(
     )
     .await
     .unwrap();
-    if !unindexed_keys.is_empty() {
+    if unindexed_fragment {
         ds.append(
-            RecordBatchIterator::new([Ok(target_rows(unindexed_keys))], schema.clone()),
+            RecordBatchIterator::new([Ok(target.slice(2, 2))], target.schema()),
             None,
         )
         .await
         .unwrap();
     }
-    ds
-}
-/// Source for keys 0 and 1 whose `cells` carries only the `idx` and `data`
-/// children: `[{idx: 1, data: "a"}]` and `[{idx: 2, data: "bb"}]`.
-fn nested_subset_source() -> RecordBatch {
-    use arrow_array::LargeBinaryArray;
-    let subset = StructArray::new(
-        vec![
-            Field::new("idx", DataType::Int32, true),
-            Field::new("data", DataType::LargeBinary, true),
-        ]
-        .into(),
-        vec![
-            Arc::new(Int32Array::from(vec![1, 2])),
-            Arc::new(LargeBinaryArray::from(vec![&b"a"[..], &b"bb"[..]])),
-        ],
-        None,
+    assert_eq!(
+        ds.get_fragments().len(),
+        if unindexed_fragment { 2 } else { 1 }
     );
-    let cells = ListArray::new(
-        Arc::new(Field::new("item", subset.data_type().clone(), true)),
-        OffsetBuffer::new(ScalarBuffer::from(vec![0i32, 1, 2])),
-        Arc::new(subset),
-        None,
+    let cells = StructArray::from(
+        record_batch!(
+            ("idx", Int32, [1, 2]),
+            ("data", LargeBinary, [&b"a"[..], &b"bb"[..]])
+        )
+        .unwrap(),
     );
-    let source_schema = Arc::new(Schema::new(vec![
-        Field::new("interval_idx", DataType::Int64, true),
-        Field::new("cells", cells.data_type().clone(), true),
-    ]));
-    RecordBatch::try_new(
-        source_schema,
-        vec![Arc::new(Int64Array::from(vec![0i64, 1])), Arc::new(cells)],
-    )
-    .unwrap()
+    let source = RecordBatch::try_from_iter_with_nullable([
+        (
+            "interval_idx",
+            Arc::new(Int64Array::from(vec![0, 1])) as ArrayRef,
+            true,
+        ),
+        ("cells", Arc::new(cells) as ArrayRef, true),
+    ])
+    .unwrap();
+    let when_matched = if with_condition {
+        WhenMatched::update_if(&ds, "target.interval_idx = 0 OR target.cells.idx = -1").unwrap()
+    } else {
+        WhenMatched::UpdateAll
+    };
+    let (ds, stats) = merge_indexed(ds, source, when_matched, true).await.unwrap();
+    assert_eq!(stats.num_updated_rows, 2);
+    let after = ds
+        .scan()
+        .order_by(Some(vec![ColumnOrdering::asc_nulls_first(
+            "interval_idx".into(),
+        )]))
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(after.num_rows(), 4);
+    assert_eq!(
+        after["interval_idx"].as_primitive::<arrow_array::types::Int64Type>(),
+        &Int64Array::from(vec![0, 1, 2, 3])
+    );
+    assert_eq!(
+        after["t_start"].as_primitive::<arrow_array::types::Int64Type>(),
+        target["t_start"].as_primitive::<arrow_array::types::Int64Type>()
+    );
+    let cells = after["cells"].as_struct();
+    for row in 0..4 {
+        assert_eq!(cells.is_valid(row), row < 2, "row {row}");
+    }
+    assert_eq!(
+        cells["idx"].as_primitive::<Int32Type>(),
+        &Int32Array::from(vec![Some(1), Some(2), None, None])
+    );
+    assert_eq!(
+        cells["timestamp"].as_primitive::<arrow_array::types::Int64Type>(),
+        &Int64Array::from(vec![None, Some(42), None, None])
+    );
+    assert_eq!(
+        cells["data"].as_binary::<i64>(),
+        &LargeBinaryArray::from(vec![Some(&b"a"[..]), Some(&b"bb"[..]), None, None])
+    );
 }

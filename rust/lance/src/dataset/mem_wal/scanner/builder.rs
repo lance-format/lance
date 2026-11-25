@@ -34,7 +34,7 @@ use super::vector_search::ProbeBounds;
 use super::{SearchQuery, SearchState, validate_nearest_query};
 use crate::dataset::Dataset;
 use crate::dataset::mem_wal::util::derived_store_params;
-use crate::dataset::utils::SchemaAdapter;
+use crate::dataset::utils::to_logical_stream;
 use crate::session::Session;
 use lance_io::object_store::ObjectStoreParams;
 
@@ -824,7 +824,7 @@ impl LsmScanner {
     /// [`crate::dataset::scanner::Scanner::try_into_stream`] does.
     pub async fn try_into_stream(&self) -> Result<SendableRecordBatchStream> {
         let stream = self.execute_plan().await?;
-        Ok(SchemaAdapter::new(stream.schema()).to_logical_stream(stream))
+        Ok(to_logical_stream(stream))
     }
 
     /// Execute the scan without converting Lance JSON columns to Arrow JSON.
@@ -1270,9 +1270,9 @@ mod tests {
         let scanner = LsmScanner::new(base.clone(), vec![], vec!["id".to_string()])
             .project(&["vector"])
             .unwrap();
-        let _ = base.object_store.io_stats_incremental(); // reset
+        let _ = base.table_state.object_store.io_stats_incremental(); // reset
         let count = scanner.count_rows().await.unwrap();
-        let stats = base.object_store.io_stats_incremental();
+        let stats = base.table_state.object_store.io_stats_incremental();
 
         assert_eq!(count, ROWS as u64, "count must match the base row count");
         assert!(
@@ -1823,6 +1823,51 @@ mod tests {
             vec![2],
             "query-level FTS limit=2 plus offset=1 must page within the top 2; got {out:?}"
         );
+
+        // A zero inner candidate budget stays empty even with a positive outer
+        // limit, and keeps the projected schema of the same scanner.
+        let positive = LsmScanner::new(base.clone(), vec![], vec!["id".to_string()])
+            .full_text_search(
+                FullTextSearchQuery::new("lance".to_string())
+                    .with_column("text".to_string())
+                    .unwrap()
+                    .limit(Some(1)),
+            )
+            .unwrap()
+            .limit(Some(2), None)
+            .unwrap();
+        let expected_schema = positive.create_plan().await.unwrap().schema();
+
+        let zero = LsmScanner::new(base.clone(), vec![], vec!["id".to_string()])
+            .full_text_search(
+                FullTextSearchQuery::new("lance".to_string())
+                    .with_column("text".to_string())
+                    .unwrap()
+                    .limit(Some(0)),
+            )
+            .unwrap()
+            .limit(Some(2), None)
+            .unwrap();
+        let plan = zero.create_plan().await.unwrap();
+        assert_eq!(plan.schema(), expected_schema);
+        assert_eq!(
+            plan.properties().output_partitioning().partition_count(),
+            1,
+            "the zero-candidate plan must keep the sort's single-partition contract"
+        );
+        let batches: Vec<RecordBatch> = plan
+            .execute(0, datafusion::prelude::SessionContext::new().task_ctx())
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(
+            batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+            0
+        );
+        for batch in &batches {
+            assert_eq!(batch.schema(), expected_schema);
+        }
 
         let scanner = LsmScanner::new(base, vec![], vec!["id".to_string()])
             .full_text_search(

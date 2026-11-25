@@ -1228,8 +1228,8 @@ async fn test_scan_miniblock_dictionary_out_of_line_bitpacking_does_not_panic() 
 
     let file_path = dataset.data_dir().join(data_file.path.as_str());
     let scheduler = ScanScheduler::new(
-        dataset.object_store.clone(),
-        SchedulerConfig::max_bandwidth(&dataset.object_store),
+        dataset.table_state.object_store.clone(),
+        SchedulerConfig::max_bandwidth(&dataset.table_state.object_store),
     );
     let file_scheduler = scheduler
         .open_file(&file_path, &CachedFileSize::unknown())
@@ -2523,7 +2523,10 @@ async fn test_any_element_nested_hidden_values_under_null_struct() {
         .await
         .unwrap();
     assert_eq!(dataset.get_fragments().len(), 2);
-    assert_eq!(dataset.get_fragment(0).unwrap().metadata.overlays.len(), 1);
+    assert_eq!(
+        dataset.get_fragment(0).unwrap().metadata().overlays.len(),
+        1
+    );
 
     // Prove the scanner input carries `tag` below a NULL `details` and a NULL
     // `info`: the filter below can only tell the fix from the bug if it does.

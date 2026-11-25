@@ -1297,7 +1297,7 @@ impl Scanner {
         if let Some(fragments) = &self.fragments {
             RoaringBitmap::from_iter(fragments.iter().map(|f| f.id as u32))
         } else {
-            self.dataset.fragment_bitmap.as_ref().clone()
+            self.dataset.table_state.fragment_bitmap.as_ref().clone()
         }
     }
 
@@ -1367,7 +1367,7 @@ impl Scanner {
     ) -> Result<PreFilterSource> {
         if filter_plan.is_empty() && !indices.is_empty() {
             let excluded_fragments =
-                self.dataset.fragment_bitmap.as_ref() - &self.get_fragments_as_bitmap();
+                self.dataset.table_state.fragment_bitmap.as_ref() - &self.get_fragments_as_bitmap();
             let has_full_index_coverage = indices.iter().all(|index| {
                 index
                     .fragment_bitmap
@@ -1408,7 +1408,8 @@ impl Scanner {
                         && self.fragments.is_none()
                         && self.index_segments.is_none()
                         && self.physical_row_addr_prefilter.is_none()
-                        && self.get_indexed_frags(index) == *self.dataset.fragment_bitmap
+                        && self.get_indexed_frags(index)
+                            == *self.dataset.table_state.fragment_bitmap
                 })
                 .map(|query| QuantizedRefinementOptions {
                     result_count: query.k,

@@ -101,7 +101,7 @@ impl PartialEq for MergeInsertWriteNode {
             && self.source_blob_columns == other.source_blob_columns
             && self.deferred == other.deferred
             && self.input == other.input
-            && self.dataset.base == other.dataset.base
+            && self.dataset.table_state.base == other.dataset.table_state.base
     }
 }
 
@@ -114,7 +114,7 @@ impl std::hash::Hash for MergeInsertWriteNode {
         self.source_blob_columns.hash(state);
         self.deferred.hash(state);
         self.input.hash(state);
-        self.dataset.base.hash(state);
+        self.dataset.table_state.base.hash(state);
     }
 }
 
