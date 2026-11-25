@@ -603,6 +603,19 @@ fn inner_commit_existing_index_segments<'local>(
     let committed = {
         let mut dataset_guard =
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(&java_dataset, NATIVE_DATASET) }?;
+        let existing_indices = block_on(dataset_guard.inner.load_indices())?;
+        for segment in &segments {
+            if segment.local_fragment_aliases.is_empty()
+                && existing_indices.iter().any(|existing| {
+                    existing.uuid == segment.uuid && !existing.local_fragment_aliases.is_empty()
+                })
+            {
+                return Err(Error::unsupported_error(format!(
+                    "Cannot republish aliased index segment {} through Java commitExistingIndexSegments: Java Index does not carry local_fragment_aliases",
+                    segment.uuid
+                )));
+            }
+        }
         block_on(dataset_guard.inner.commit_existing_index_segments(
             &index_name,
             &column,

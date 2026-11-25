@@ -1869,4 +1869,43 @@ mod integration {
         let after_rows = fts_query_row_addrs_and_values(&ds, "alpha").await;
         assert_eq!(after_rows, before_rows);
     }
+
+    #[tokio::test]
+    async fn test_ivf_merge_rejects_aliased_second_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let ds = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(make_batch(0..5))], test_schema()),
+            uri,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let seg1 = IndexMetadata {
+            uuid: uuid::Uuid::new_v4(),
+            name: "vec_idx".into(),
+            fields: vec![0],
+            covering_fields: vec![],
+            dataset_version: ds.manifest.version,
+            fragment_bitmap: Some(RoaringBitmap::from_iter([0u32])),
+            index_details: None,
+            index_version: 0,
+            created_at: None,
+            base_id: None,
+            files: None,
+            clustering_id: None,
+            metadata: Default::default(),
+            local_fragment_aliases: Default::default(),
+        };
+        let mut seg2 = seg1.clone();
+        seg2.uuid = uuid::Uuid::new_v4();
+        seg2.fragment_bitmap = Some(RoaringBitmap::from_iter([42u32]));
+        seg2.local_fragment_aliases = BTreeMap::from([(17, 42)]);
+
+        let err = crate::index::vector::ivf::merge_segments(&ds, vec![seg1, seg2])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::NotSupported { .. }), "{err:?}");
+    }
 }

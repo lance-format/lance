@@ -2786,6 +2786,15 @@ async fn merge_segments_inner(
     if segments.is_empty() {
         return Err(Error::index("No segment metadata was provided".to_string()));
     }
+    if let Some(aliased) = segments
+        .iter()
+        .find(|segment| !segment.local_fragment_aliases.is_empty())
+    {
+        return Err(Error::not_supported(format!(
+            "Vector index segment '{}' carries local_fragment_aliases, which IVF merge does not support yet",
+            aliased.uuid
+        )));
+    }
     if segments.len() == 1 {
         return Ok(segments.into_iter().next().unwrap());
     }
