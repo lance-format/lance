@@ -410,10 +410,11 @@ message IndexMetadata {
    */
   google.protobuf.Any index_details = 6;
 
-  // Index format version for this segment. If unset, use version 0.
-  // For lance.table.InvertedIndexDetails with a declared version >= 3,
-  // the manifest must carry writer feature flag 1 << 23. This version is
-  // independent of InvertedIndexDetails.posting_format_version.
+  /* Index format version for this segment. If unset, use version 0.
+   * For lance.table.InvertedIndexDetails with a declared version >= 3,
+   * the manifest must carry writer feature flag 1 << 23. This version is
+   * independent of InvertedIndexDetails.posting_format_version.
+   */
   optional int32 index_version = 7;
 
   /* Timestamp when the index was created (UTC timestamp in milliseconds since epoch)
