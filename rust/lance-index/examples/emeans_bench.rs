@@ -67,7 +67,7 @@ struct Args {
     max_iters: u32,
     balance_factor: f32,
     node_algorithm: String,
-    epochs: u32,
+    epochs: f64,
     batch_scale: f64,
     pca: Option<PathBuf>,
     dim: Option<usize>,

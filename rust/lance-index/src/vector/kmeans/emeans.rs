@@ -26,6 +26,7 @@
 //! For cosine similarity, normalize the vectors to unit length first.
 
 use std::f64::consts::PI;
+use std::iter::repeat_n;
 use std::sync::Arc;
 
 use arrow_array::types::{ArrowPrimitiveType, Float16Type, Float32Type, Float64Type};
@@ -93,9 +94,14 @@ impl Default for BatchSize {
 /// Parameters of [`train_emeans`].
 #[derive(Debug, Clone)]
 pub struct EMeansParams {
-    /// Passes over the training vectors. The paper reaches the loss of 25
+    /// Passes over the training vectors, finite and in `(0, u32::MAX]`.
+    /// Fractional passes round to the nearest row (ties to even); a budget
+    /// that rounds to zero rows is rejected. For budgets of at least one
+    /// epoch, the fractional pass precedes the final full pass, so final
+    /// centroids use assignments from every training vector. Smaller budgets
+    /// finalize from just the sampled rows. The paper reaches the loss of 25
     /// Lloyd iterations in about 2 epochs.
-    pub epochs: u32,
+    pub epochs: f64,
     /// Vectors per mini-batch. Defaults to the paper's batch law.
     pub batch_size: BatchSize,
     /// Peak EMA step `alpha_0 = 1 - decay`, in `(0, 1]`. `None` uses the
@@ -112,7 +118,7 @@ pub struct EMeansParams {
 impl Default for EMeansParams {
     fn default() -> Self {
         Self {
-            epochs: 3,
+            epochs: 3.0,
             batch_size: BatchSize::default(),
             peak_step: None,
             revival_threshold: 0.1,
@@ -124,8 +130,8 @@ impl Default for EMeansParams {
 /// Train `k` L2 centroids over `data` with e-means.
 ///
 /// Returns a [`KMeans`] whose `loss` is the sum of squared distances measured
-/// while assigning the last epoch, as Lloyd's `loss` is measured while
-/// assigning its last iteration.
+/// while assigning the final pass (which is partial for budgets below one
+/// epoch), as Lloyd's `loss` is measured while assigning its last iteration.
 ///
 /// ```
 /// # use arrow_array::{FixedSizeListArray, Float32Array};
@@ -135,6 +141,7 @@ impl Default for EMeansParams {
 /// let values = Float32Array::from_iter_values((0..4_000).map(|i| (i % 97) as f32));
 /// let data = FixedSizeListArray::try_new_from_values(values, 4)?;
 /// let params = EMeansParams {
+///     epochs: 2.5,
 ///     seed: Some(42),
 ///     ..Default::default()
 /// };
@@ -159,10 +166,12 @@ pub fn train_emeans(data: &FixedSizeListArray, k: usize, params: &EMeansParams) 
             "e-means: vectors must have a positive dimension, got 0",
         ));
     }
-    if params.epochs == 0 {
-        return Err(Error::invalid_input(
-            "e-means: epochs must be positive, got 0",
-        ));
+    if !params.epochs.is_finite() || params.epochs <= 0.0 || params.epochs > f64::from(u32::MAX) {
+        return Err(Error::invalid_input(format!(
+            "e-means: epochs must be finite and in (0, {}], got {}",
+            u32::MAX,
+            params.epochs
+        )));
     }
     if !(0.0..1.0).contains(&params.revival_threshold) {
         return Err(Error::invalid_input(format!(
@@ -213,28 +222,25 @@ pub fn train_emeans(data: &FixedSizeListArray, k: usize, params: &EMeansParams) 
 
 /// The paper's batch law (Equation 7, Table 2) times `scale`, rounded to the
 /// nearest power of two and capped at `n`.
-fn batch_size_law(n: usize, k: usize, epochs: u32, scale: f64) -> usize {
+fn batch_size_law(n: usize, k: usize, epochs: f64, scale: f64) -> usize {
     let coefficient = if n > LARGE_DATASET_ROWS {
         0.0044
     } else {
         0.035
     };
-    let batch_size = scale
-        * coefficient
-        * (k as f64).powf(0.13)
-        * (n as f64).powf(0.88)
-        * f64::from(epochs).powf(0.81);
+    let batch_size =
+        scale * coefficient * (k as f64).powf(0.13) * (n as f64).powf(0.88) * epochs.powf(0.81);
     let rounded = 2f64.powi(batch_size.max(1.0).log2().round() as i32) as usize;
     rounded.min(n)
 }
 
 /// The paper's peak-step law (Equation 6, Table 2), capped at 1.
-fn peak_step_law(n: usize, k: usize, batch_size: usize, epochs: u32) -> f64 {
+fn peak_step_law(n: usize, k: usize, batch_size: usize, epochs: f64) -> f64 {
     let step = 0.824
         * (k as f64).powf(-0.46)
         * (batch_size as f64).powf(0.90)
         * (n as f64).powf(-0.45)
-        * f64::from(epochs).powf(-0.11);
+        * epochs.powf(-0.11);
     step.min(1.0)
 }
 
@@ -268,6 +274,24 @@ impl Trainer<'_> {
         } = *self;
         let values = data.values().as_primitive::<T>().values();
         let n = data.len();
+        let full_epochs = params.epochs.floor() as usize;
+        let partial_rows = (params.epochs.fract() * n as f64).round_ties_even() as usize;
+        let total_updates = full_epochs
+            .checked_mul(n.div_ceil(batch_size))
+            .and_then(|updates| updates.checked_add(partial_rows.div_ceil(batch_size)))
+            .ok_or_else(|| Error::invalid_input("e-means: update count overflows usize"))?;
+        if total_updates == 0 {
+            return Err(Error::invalid_input(format!(
+                "e-means: epochs={} rounds to zero training rows for n={n}",
+                params.epochs
+            )));
+        }
+        // Reserve a complete closing pass whenever the budget allows it. A
+        // partial closing pass would discard most rows from finalization.
+        let mut epoch_rows = repeat_n(n, full_epochs.saturating_sub(1))
+            .chain((partial_rows > 0).then_some(partial_rows))
+            .chain((full_epochs > 0).then_some(n))
+            .peekable();
         let mut rng = match params.seed {
             Some(seed) => SmallRng::seed_from_u64(seed),
             None => SmallRng::from_os_rng(),
@@ -285,22 +309,18 @@ impl Trainer<'_> {
             .map(|value| to_f64(*value) * INITIAL_COUNT)
             .collect();
 
-        let batches_per_epoch = n / batch_size;
-        let total_updates = params.epochs as usize * batches_per_epoch;
         let mut order: Vec<usize> = (0..n).collect();
         // Every vector of the last epoch, summed per cluster, for the
         // last-epoch-mean finalization.
         let mut last_epoch_stats = BatchStats::zeros(k, dimension);
         let mut t = 0;
         drop(init_busy);
-        for epoch in 0..params.epochs {
-            let is_last_epoch = epoch + 1 == params.epochs;
+        while let Some(rows) = epoch_rows.next() {
+            let is_last_epoch = epoch_rows.peek().is_none();
             let shuffle_busy = profile::work(Work::Gather);
             order.shuffle(&mut rng);
             drop(shuffle_busy);
-            // The tail that does not fill a batch is skipped; the next shuffle
-            // puts other vectors there.
-            for batch in order.chunks_exact(batch_size) {
+            for batch in order[..rows].chunks(batch_size) {
                 let assign_phase = profile::phase(Phase::EMeansAssign);
                 let batch_stats = assign_batch(values, dimension, &centroids, k, batch);
                 drop(assign_phase);
@@ -637,6 +657,65 @@ mod tests {
         );
     }
 
+    #[rstest]
+    #[case::one_epoch(1.0)]
+    #[case::fractional_epoch(1.5)]
+    #[case::multiple_epochs(3.0)]
+    #[case::multiple_fractional_epochs(2.5)]
+    fn test_emeans_final_mean_includes_every_row(
+        #[case] epochs: f64,
+        #[values(2, 3)] batch_size: usize,
+    ) {
+        // The global mean is 4, but no subset of two, three or four rows has
+        // that mean. Dropping the tail or finalizing a fractional pass fails.
+        let data = FixedSizeListArray::try_new_from_values(
+            Float32Array::from(vec![0.0, 1.0, 2.0, 3.0, 14.0]),
+            1,
+        )
+        .unwrap();
+        let params = EMeansParams {
+            epochs,
+            batch_size: BatchSize::Fixed(batch_size),
+            ..seeded()
+        };
+        let model = train_emeans(&data, 1, &params).unwrap();
+        assert_eq!(model.centroids.as_primitive::<Float32Type>().value(0), 4.0);
+        assert_eq!(model.compute_loss(&data).unwrap(), 130.0);
+    }
+
+    #[rstest]
+    #[case::one_row(0.125, 1)]
+    #[case::half_epoch_with_tail(0.5, 4)]
+    #[case::ties_round_down(0.3125, 2)]
+    #[case::ties_round_up(0.4375, 4)]
+    fn test_emeans_sub_epoch_uses_only_sampled_rows(
+        #[case] epochs: f64,
+        #[case] expected_rows: usize,
+    ) {
+        let values = vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 80.0];
+        let mut rng = SmallRng::seed_from_u64(42);
+        // Initialization consumes randomness before the first shuffle.
+        let _ = sample(&mut rng, values.len(), 1);
+        let mut order: Vec<usize> = (0..values.len()).collect();
+        order.shuffle(&mut rng);
+        let expected_mean = order[..expected_rows]
+            .iter()
+            .map(|&row| values[row])
+            .sum::<f32>()
+            / expected_rows as f32;
+        let data = FixedSizeListArray::try_new_from_values(Float32Array::from(values), 1).unwrap();
+        let params = EMeansParams {
+            epochs,
+            batch_size: BatchSize::Fixed(3),
+            ..seeded()
+        };
+        let model = train_emeans(&data, 1, &params).unwrap();
+        assert_eq!(
+            model.centroids.as_primitive::<Float32Type>().value(0),
+            expected_mean
+        );
+    }
+
     #[test]
     fn test_emeans_trains_float16() {
         let data = blobs(8, 128, 8, 50.0);
@@ -686,7 +765,12 @@ mod tests {
     #[rstest]
     #[case::zero_k(0, EMeansParams::default())]
     #[case::k_above_n(1_000, EMeansParams::default())]
-    #[case::zero_epochs(4, EMeansParams { epochs: 0, ..Default::default() })]
+    #[case::zero_epochs(4, EMeansParams { epochs: 0.0, ..Default::default() })]
+    #[case::negative_epochs(4, EMeansParams { epochs: -1.0, ..Default::default() })]
+    #[case::nan_epochs(4, EMeansParams { epochs: f64::NAN, ..Default::default() })]
+    #[case::infinite_epochs(4, EMeansParams { epochs: f64::INFINITY, ..Default::default() })]
+    #[case::excessive_epochs(4, EMeansParams { epochs: f64::from(u32::MAX) + 1.0, ..Default::default() })]
+    #[case::zero_rows(4, EMeansParams { epochs: 0.001, ..Default::default() })]
     #[case::zero_batch(4, EMeansParams { batch_size: BatchSize::Fixed(0), ..Default::default() })]
     #[case::batch_above_n(4, EMeansParams { batch_size: BatchSize::Fixed(1_000), ..Default::default() })]
     #[case::zero_batch_scale(4, EMeansParams { batch_size: BatchSize::Law { scale: 0.0 }, ..Default::default() })]
@@ -699,6 +783,7 @@ mod tests {
     fn test_emeans_rejects_invalid_input(#[case] k: usize, #[case] params: EMeansParams) {
         let data = blobs(4, 16, 4, 50.0);
         let err = train_emeans(&data, k, &params).unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "{err}");
         assert!(err.to_string().contains("e-means"), "{err}");
     }
 
@@ -808,13 +893,14 @@ mod tests {
     }
 
     #[rstest]
-    #[case::small(100_000, 1_024, 3)]
-    #[case::large(10_000_000, 65_536, 2)]
-    #[case::capped(1_000, 16, 25)]
+    #[case::small(100_000, 1_024, 3.0)]
+    #[case::large(10_000_000, 65_536, 2.0)]
+    #[case::capped(1_000, 16, 25.0)]
+    #[case::fractional(8_192, 16, 2.5)]
     fn test_batch_size_law_is_power_of_two_within_n(
         #[case] n: usize,
         #[case] k: usize,
-        #[case] epochs: u32,
+        #[case] epochs: f64,
     ) {
         let batch_size = batch_size_law(n, k, epochs, 1.0);
         assert!(batch_size <= n);
@@ -823,17 +909,17 @@ mod tests {
 
     #[test]
     fn test_batch_size_law_scale_moves_by_powers_of_two() {
-        let law = batch_size_law(8_192, 16, 3, 1.0);
-        assert_eq!(batch_size_law(8_192, 16, 3, 4.0), 4 * law);
-        assert_eq!(batch_size_law(8_192, 16, 3, 0.25), law / 4);
+        let law = batch_size_law(8_192, 16, 3.0, 1.0);
+        assert_eq!(batch_size_law(8_192, 16, 3.0, 4.0), 4 * law);
+        assert_eq!(batch_size_law(8_192, 16, 3.0, 0.25), law / 4);
         // A scale that would overshoot the training vectors is capped there.
-        assert_eq!(batch_size_law(8_192, 16, 3, 1e6), 8_192);
+        assert_eq!(batch_size_law(8_192, 16, 3.0, 1e6), 8_192);
     }
 
     #[test]
     fn test_peak_step_law_is_capped_at_one() {
-        assert_eq!(peak_step_law(1_000, 16, 1_000, 1), 1.0);
-        let step = peak_step_law(1_000_000, 1_024, 1_024, 4);
+        assert_eq!(peak_step_law(1_000, 16, 1_000, 1.0), 1.0);
+        let step = peak_step_law(1_000_000, 1_024, 1_024, 4.0);
         assert!(step > 0.0 && step < 1.0);
     }
 
