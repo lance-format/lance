@@ -14,7 +14,10 @@ use object_store::{
     RenameOptions,
 };
 use object_store_opendal::OpendalStore as InnerOpendalStore;
-use opendal::Operator;
+use opendal::{ErrorKind, Operator};
+
+use crate::object_reader::ConditionalGetSupport;
+use crate::object_store::hf_throttle::mark_huggingface_rate_limited;
 
 /// Adapts OpenDAL listing paths to the spelling used by the request.
 ///
@@ -26,14 +29,46 @@ use opendal::Operator;
 #[derive(Debug, Clone)]
 pub(super) struct OpendalStore {
     inner: InnerOpendalStore,
+    /// Mark rate-limit errors so Hugging Face's outer retry loops stop repeating
+    /// requests that OpenDAL has already retried.
+    marks_huggingface_rate_limit: bool,
 }
 
 impl OpendalStore {
     pub(super) fn new(operator: Operator) -> Self {
         Self {
             inner: InnerOpendalStore::new(operator),
+            marks_huggingface_rate_limit: false,
         }
     }
+
+    #[cfg(feature = "huggingface")]
+    pub(super) fn new_huggingface(operator: Operator) -> Self {
+        Self {
+            inner: InnerOpendalStore::new(operator),
+            marks_huggingface_rate_limit: true,
+        }
+    }
+}
+
+fn maybe_mark_huggingface_rate_limit(
+    mark: bool,
+    error: object_store::Error,
+) -> object_store::Error {
+    if mark && is_opendal_rate_limited(&error) {
+        mark_huggingface_rate_limited(error)
+    } else {
+        error
+    }
+}
+
+fn is_opendal_rate_limited(error: &object_store::Error) -> bool {
+    let object_store::Error::Generic { source, .. } = error else {
+        return false;
+    };
+    source
+        .downcast_ref::<opendal::Error>()
+        .is_some_and(|error| error.kind() == ErrorKind::RateLimited)
 }
 
 impl fmt::Display for OpendalStore {
@@ -85,7 +120,21 @@ impl OSObjectStore for OpendalStore {
         location: &Path,
         options: GetOptions,
     ) -> object_store::Result<GetResult> {
-        self.inner.get_opts(location, options).await
+        let mut result = self
+            .inner
+            .get_opts(location, options)
+            .await
+            .map_err(|error| {
+                maybe_mark_huggingface_rate_limit(self.marks_huggingface_rate_limit, error)
+            })?;
+        // The bridge can fall back to stat, passing the same conditions to both
+        // operations. Require support on both before using a guard to resume.
+        let capability = self.inner.info().capability();
+        result.extensions.insert(ConditionalGetSupport {
+            has_if_match: capability.read_with_if_match && capability.stat_with_if_match,
+            has_version: capability.read_with_version && capability.stat_with_version,
+        });
+        Ok(result)
     }
 
     async fn get_ranges(
@@ -93,7 +142,12 @@ impl OSObjectStore for OpendalStore {
         location: &Path,
         ranges: &[Range<u64>],
     ) -> object_store::Result<Vec<Bytes>> {
-        self.inner.get_ranges(location, ranges).await
+        self.inner
+            .get_ranges(location, ranges)
+            .await
+            .map_err(|error| {
+                maybe_mark_huggingface_rate_limit(self.marks_huggingface_rate_limit, error)
+            })
     }
 
     fn delete_stream(
@@ -106,8 +160,13 @@ impl OSObjectStore for OpendalStore {
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
         let listed = self.inner.list(prefix);
         let prefix = prefix.cloned();
+        let mark = self.marks_huggingface_rate_limit;
         listed
-            .map(move |result| result.and_then(|meta| normalize_object_meta(meta, prefix.as_ref())))
+            .map(move |result| {
+                result
+                    .map_err(|error| maybe_mark_huggingface_rate_limit(mark, error))
+                    .and_then(|meta| normalize_object_meta(meta, prefix.as_ref()))
+            })
             .boxed()
     }
 
@@ -119,9 +178,12 @@ impl OSObjectStore for OpendalStore {
         if self.inner.info().capability().list_with_start_after {
             let listed = self.inner.list_with_offset(prefix, offset);
             let prefix = prefix.cloned();
+            let mark = self.marks_huggingface_rate_limit;
             listed
                 .map(move |result| {
-                    result.and_then(|meta| normalize_object_meta(meta, prefix.as_ref()))
+                    result
+                        .map_err(|error| maybe_mark_huggingface_rate_limit(mark, error))
+                        .and_then(|meta| normalize_object_meta(meta, prefix.as_ref()))
                 })
                 .boxed()
         } else {
@@ -135,7 +197,13 @@ impl OSObjectStore for OpendalStore {
     }
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
-        let mut result = self.inner.list_with_delimiter(prefix).await?;
+        let mut result = self
+            .inner
+            .list_with_delimiter(prefix)
+            .await
+            .map_err(|error| {
+                maybe_mark_huggingface_rate_limit(self.marks_huggingface_rate_limit, error)
+            })?;
         for object in &mut result.objects {
             object.location = normalize_location(&object.location, prefix)?;
         }

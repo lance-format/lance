@@ -2600,7 +2600,7 @@ async fn test_committing_a_segment_beside_an_unsupported_index_replaces_it() {
     // overlap branch rather than the empty-bitmap shortcut. Set by hand
     // because training it would take 40 MB of the shared pool to sort ten
     // rows - see `dataset_with_an_index_from_a_newer_build`.
-    segment.fragment_bitmap = Some(dataset.fragment_bitmap.as_ref().clone());
+    segment.fragment_bitmap = Some(dataset.table_state.fragment_bitmap.as_ref().clone());
     dataset
         .commit_existing_index_segments("id_idx", "id", vec![segment])
         .await
@@ -2641,7 +2641,7 @@ async fn test_committing_a_segment_on_disjoint_fragments_keeps_the_existing_one(
     // See `dataset_with_an_index_from_a_newer_build` for why nothing here trains.
     let untrained = manifest_index(&dataset, "id_idx").await;
     let mut existing = untrained.clone();
-    existing.fragment_bitmap = Some(dataset.fragment_bitmap.as_ref().clone());
+    existing.fragment_bitmap = Some(dataset.table_state.fragment_bitmap.as_ref().clone());
     dataset
         .apply_commit(
             Transaction::new(
@@ -2670,7 +2670,7 @@ async fn test_committing_a_segment_on_disjoint_fragments_keeps_the_existing_one(
     )
     .await
     .unwrap();
-    let appended = dataset.fragment_bitmap.as_ref() - &covered;
+    let appended = dataset.table_state.fragment_bitmap.as_ref() - &covered;
     assert!(!appended.is_empty());
 
     let mut segment = dataset
@@ -2754,7 +2754,7 @@ async fn test_committing_a_plain_segment_beside_a_covered_unsupported_one_is_rej
     )
     .await
     .unwrap();
-    let appended = dataset.fragment_bitmap.as_ref() - &covered_fragments;
+    let appended = dataset.table_state.fragment_bitmap.as_ref() - &covered_fragments;
     assert!(!appended.is_empty());
 
     let btree_params = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree);
@@ -3221,8 +3221,8 @@ async fn test_covering_bits_follow_the_committed_declarations(
     assert_eq!(covering_bits(&dataset), (expected, expected));
     assert_eq!(row_addr_fence(&dataset), stable_row_ids);
     let stored = read_manifest_indexes(
-        &dataset.object_store,
-        &dataset.manifest_location,
+        &dataset.table_state.object_store,
+        &dataset.table_state.manifest_location,
         &dataset.manifest,
     )
     .await
@@ -3285,8 +3285,8 @@ async fn test_commit_existing_index_segments_reads_keys_like_the_manifest(
     }
     committed.unwrap();
     let stored = read_manifest_indexes(
-        &dataset.object_store,
-        &dataset.manifest_location,
+        &dataset.table_state.object_store,
+        &dataset.table_state.manifest_location,
         &dataset.manifest,
     )
     .await
@@ -3352,8 +3352,8 @@ async fn test_commit_existing_index_segments_accepts_one_index_in_both_layouts()
         .unwrap();
 
     let stored = read_manifest_indexes(
-        &dataset.object_store,
-        &dataset.manifest_location,
+        &dataset.table_state.object_store,
+        &dataset.table_state.manifest_location,
         &dataset.manifest,
     )
     .await
@@ -3406,8 +3406,8 @@ async fn test_commit_existing_index_segments_retains_a_sibling_in_the_other_layo
     }
     committed.unwrap();
     let stored = read_manifest_indexes(
-        &dataset.object_store,
-        &dataset.manifest_location,
+        &dataset.table_state.object_store,
+        &dataset.table_state.manifest_location,
         &dataset.manifest,
     )
     .await
@@ -3455,8 +3455,9 @@ async fn test_retry_stores_the_winners_suffix_entry_as_its_keys() {
     assert_eq!(covering_bits(&dataset), (covering, covering));
 
     let reader = dataset
+        .table_state
         .object_store
-        .open(&dataset.manifest_location.path)
+        .open(&dataset.table_state.manifest_location.path)
         .await
         .unwrap();
     let section: lance_table::format::pb::IndexSection =
@@ -3478,8 +3479,8 @@ async fn test_retry_stores_the_winners_suffix_entry_as_its_keys() {
     );
 
     let decoded = read_manifest_indexes(
-        &dataset.object_store,
-        &dataset.manifest_location,
+        &dataset.table_state.object_store,
+        &dataset.table_state.manifest_location,
         &dataset.manifest,
     )
     .await
@@ -3572,8 +3573,8 @@ async fn test_shallow_clone_keeps_the_independent_covering_contract() {
     let covering = FLAG_COVERED_INDEX_METADATA | FLAG_INDEPENDENT_COVERING_FIELDS;
     assert_eq!(covering_bits(&cloned), (covering, covering));
     let stored = read_manifest_indexes(
-        &cloned.object_store,
-        &cloned.manifest_location,
+        &cloned.table_state.object_store,
+        &cloned.table_state.manifest_location,
         &cloned.manifest,
     )
     .await

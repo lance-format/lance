@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import copy
 import json
+import operator
 import os
 import random
 import re
@@ -142,6 +143,24 @@ def _resolve_blob_selection(
     raise ValueError("Either ids, addresses, or indices must be specified")
 
 
+def _snapshot_scan_scope_defaults(
+    options: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    if options is None:
+        return None
+    # Schema access and subsequent scans must not exhaust a scope iterator.
+    for key in ("fragments", "index_segments"):
+        scope = options.get(key)
+        if scope is not None:
+            selection = (
+                _normalize_index_segment_ids(scope)
+                if key == "index_segments"
+                else tuple(item for item in scope)
+            )
+            options = {**options, key: selection}
+    return options
+
+
 class LanceDataset(pa.dataset.Dataset):
     """A Lance Dataset in Lance format where the data is stored at the given uri."""
 
@@ -205,7 +224,7 @@ class LanceDataset(pa.dataset.Dataset):
             namespace_client_managed_versioning=namespace_client_managed_versioning,
             base_store_params=base_store_params,
         )
-        self._default_scan_options = default_scan_options
+        self._default_scan_options = _snapshot_scan_scope_defaults(default_scan_options)
         self._read_params = read_params
 
     @classmethod
@@ -857,11 +876,6 @@ class LanceDataset(pa.dataset.Dataset):
         """
         builder = ScannerBuilder(self)
         builder = self._apply_default_scan_options(builder)
-
-        if order_by is not None:
-            order_by = [
-                ColumnOrdering(o) if isinstance(o, str) else o for o in order_by
-            ]
 
         # Calls the setter if the user provided a non-None value
         # We need to avoid calling the setter with a None value so
@@ -1718,6 +1732,8 @@ class LanceDataset(pa.dataset.Dataset):
         self,
         indices: Union[List[int], pa.Array],
         columns: Optional[Union[List[str], Dict[str, str]]] = None,
+        *,
+        io_parallelism: Optional[int] = None,
     ) -> pa.Table:
         """Select rows of data by index.
 
@@ -1729,17 +1745,42 @@ class LanceDataset(pa.dataset.Dataset):
             List of column names to be fetched.
             Or a dictionary of column names to SQL expressions.
             All columns are fetched if None or unspecified.
+        io_parallelism: int, optional
+            Maximum active fragment-reader data and overlay reads in the
+            primary base for this take. This overrides the store's
+            per-scheduler default and caps fragment-reader fanout at
+            ``min(store_parallelism, io_parallelism)``, without increasing
+            fanout above the store default, so actual concurrency may be lower.
+            Legacy v1 files, additional-base per-file schedulers, and auxiliary
+            metadata or lineage reads (such as deletion vectors and spilled
+            row-ID or row-version sequences) keep their existing schedulers.
 
         Returns
         -------
         table : pyarrow.Table
         """
+        if io_parallelism is not None:
+            if isinstance(io_parallelism, bool):
+                raise TypeError("io_parallelism must be an integer, not bool")
+            try:
+                io_parallelism = operator.index(io_parallelism)
+            except TypeError as err:
+                raise TypeError("io_parallelism must be an integer") from err
+            if io_parallelism <= 0:
+                raise ValueError("io_parallelism must be greater than 0")
         columns_with_transform = None
         if isinstance(columns, dict):
             columns_with_transform = list(columns.items())
             columns = None
         return pa.Table.from_batches(
-            [self._ds.take(indices, columns, columns_with_transform)]
+            [
+                self._ds.take(
+                    indices,
+                    columns,
+                    columns_with_transform,
+                    io_parallelism=io_parallelism,
+                )
+            ]
         )
 
     def _take_rows(
@@ -2051,19 +2092,27 @@ class LanceDataset(pa.dataset.Dataset):
     def count_rows(
         self, filter: Optional[Union[str, Expression]] = None, **kwargs: Any
     ) -> int:
-        """Count rows matching the scanner filter.
+        """Count rows in the dataset matching the filter.
 
         Parameters
         ----------
+        filter : str or pyarrow.compute.Expression, optional
+            Count only rows matching this predicate.
         **kwargs : dict, optional
-            See py:method:`scanner` method for full parameter description.
+            PyArrow scan tuning arguments are accepted for compatibility.
+            To count rows in a selected fragment, use :meth:`LanceFragment.count_rows`.
 
         Returns
         -------
         count : int
-            The total number of rows in the dataset.
+            The number of matching rows.
 
         """
+        if kwargs.get("fragments") is not None:
+            raise TypeError(
+                "LanceDataset.count_rows() does not support fragments. "
+                "Call LanceFragment.count_rows() on the selected fragments."
+            )
         if isinstance(filter, pa.compute.Expression):
             # TODO: consolidate all to use scanner
             return self.scanner(
@@ -2098,7 +2147,16 @@ class LanceDataset(pa.dataset.Dataset):
 
         Column types can be upcasted (such as int32 to int64) or downcasted
         (such as int64 to int32). However, downcasting will fail if there are
-        any values that cannot be represented in the new type. In general,
+        any values that cannot be represented in the new type, such as an
+        integer out of range, a timestamp with more precision than the new
+        unit, a timestamp that is not at midnight in its time zone when
+        casting to a date, a date64 value that is not a whole number of days
+        when casting to date32, or a decimal with digits beyond the new scale.
+        Casting a timestamp to time32 or time64 keeps only the time of day, so
+        it can discard the date and any subsecond precision without failing.
+        Floats can be downcasted with a loss of precision, but a finite value
+        that is too large for the new type fails rather than becoming
+        infinity. In general,
         columns can be casted to same general type: integers to integers,
         floats to floats, and strings to strings. However, strings, binary, and
         list columns can be casted between their size variants. For example,
@@ -5029,7 +5087,9 @@ class LanceDataset(pa.dataset.Dataset):
         else:
             target_uri = target_path
 
-        default_scan_options = kwargs.pop("default_scan_options", None)
+        default_scan_options = _snapshot_scan_scope_defaults(
+            kwargs.pop("default_scan_options", None)
+        )
         read_params = kwargs.pop("read_params", None)
 
         if storage_options is None:

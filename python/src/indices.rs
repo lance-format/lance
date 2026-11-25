@@ -35,7 +35,7 @@ use pyo3::{
 use lance::index::DatasetIndexInternalExt;
 
 use crate::fragment::FileFragment;
-use crate::utils::{PyJson, PyLance};
+use crate::utils::{PyJson, PyLance, parse_distance_type};
 use crate::{
     dataset::Dataset, error::PythonErrorExt, file::object_store_from_uri_or_path_no_options, rt,
 };
@@ -207,13 +207,11 @@ async fn do_train_ivf_model(
     column: &str,
     dimension: usize,
     num_partitions: u32,
-    distance_type: &str,
+    distance_type: DistanceType,
     sample_rate: u32,
     max_iters: u32,
     fragment_ids: Option<Vec<u32>>,
 ) -> PyResult<ArrayData> {
-    // We verify distance_type earlier so can unwrap here
-    let distance_type = DistanceType::try_from(distance_type).unwrap();
     let params = IvfBuildParams {
         max_iters: max_iters as usize,
         sample_rate: sample_rate as usize,
@@ -249,6 +247,7 @@ fn train_ivf_model<'py>(
     max_iters: u32,
     fragment_ids: Option<Vec<u32>>,
 ) -> PyResult<Bound<'py, PyAny>> {
+    let distance_type = parse_distance_type(distance_type)?;
     let centroids = rt().block_on(
         Some(py),
         do_train_ivf_model(
@@ -271,15 +270,13 @@ async fn do_train_pq_model(
     column: &str,
     dimension: usize,
     num_subvectors: u32,
-    distance_type: &str,
+    distance_type: DistanceType,
     sample_rate: u32,
     max_iters: u32,
     num_bits: u32,
     ivf_model: IvfModel,
     fragment_ids: Option<Vec<u32>>,
 ) -> PyResult<ArrayData> {
-    // We verify distance_type earlier so can unwrap here
-    let distance_type = DistanceType::try_from(distance_type).unwrap();
     let params = PQBuildParams {
         num_sub_vectors: num_subvectors as usize,
         num_bits: num_bits as usize,
@@ -326,6 +323,7 @@ fn train_pq_model<'py>(
         lengths: vec![],
         loss: None,
     };
+    let distance_type = parse_distance_type(distance_type)?;
     let codebook = rt().block_on(
         Some(py),
         do_train_pq_model(
@@ -474,7 +472,7 @@ pub fn transform_vectors(
         lance::index::vector::utils::get_vector_type(dataset.ds.schema(), column).infer_error()?;
     lance_index::vector::pq::validate_codebook_value_type(&codebook.value_type(), &value_type)
         .infer_error()?;
-    let distance_type = DistanceType::try_from(distance_type).unwrap();
+    let distance_type = parse_distance_type(distance_type)?;
     // The IVF transform normalizes the vectors for Cosine, so the codes are
     // computed with L2, as every other PQ build does.
     let pq_distance_type = match distance_type {
@@ -658,7 +656,7 @@ pub fn load_shuffled_vectors(
     lance_index::vector::pq::validate_codebook_value_type(&codebook.value_type(), &value_type)
         .infer_error()?;
 
-    let distance_type = DistanceType::try_from(distance_type).unwrap();
+    let distance_type = parse_distance_type(distance_type)?;
     let pq_model = ProductQuantizer::new(
         num_subvectors as usize,
         num_bits,

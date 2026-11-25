@@ -20,6 +20,7 @@
 mod index_kind;
 mod test_dataset;
 
+use lance_core::Error;
 use rstest::rstest;
 
 use index_kind::IndexKind;
@@ -93,6 +94,7 @@ async fn test_eager_compaction_over_a_pending_history_matches_the_table(
         IndexKind::ZoneMap,
         IndexKind::BloomFilter,
         IndexKind::LabelList,
+        IndexKind::ListElement,
         IndexKind::NGram,
         IndexKind::Inverted,
         IndexKind::IvfFlat
@@ -113,6 +115,7 @@ async fn test_indexed_queries_match_the_table_through_fragment_reuse(
         IndexKind::ZoneMap,
         IndexKind::BloomFilter,
         IndexKind::LabelList,
+        IndexKind::ListElement,
         IndexKind::NGram,
         IndexKind::IvfFlat
     )]
@@ -141,4 +144,69 @@ async fn test_full_text_search_matches_the_table_through_tagged_fragment_reuse(
     #[case] form: HistoryForm,
 ) {
     Box::pin(run_contract(IndexKind::Inverted, form)).await;
+}
+
+/// A listelement index on a stable-row-ID table, where the history is a v0
+/// one loaded through `load_index`: through an eager compaction over a
+/// pending history, and through history cleanup.
+async fn run_list_element_on_stable_row_ids() {
+    let mut table = TestDataset::new(IndexKind::ListElement, HistoryForm::V0WithStableRowIds).await;
+    // Deleting before the compaction shifts the survivors' offsets when it
+    // packs them, so translation must map offsets, not just fragment ids.
+    table.delete_where(|row| row.i % 5 == 0).await;
+    table.append(ROWS_PER_FRAGMENT).await;
+    table.create_index().await;
+    table.check("build").await;
+
+    let before = TestDataset::fragment_ids(table.dataset()).await;
+    table
+        .deferred_compaction(2 * ROWS_PER_FRAGMENT as usize)
+        .await;
+    let after = TestDataset::fragment_ids(table.dataset()).await;
+    assert!(
+        before.iter().any(|(i, fragment)| after[i] != *fragment),
+        "no covered live row moved, so the checks would not exercise translation"
+    );
+    table.check("deferred compaction").await;
+    let history = table.history_len().await;
+    assert!(history > 0);
+
+    // The index still holds pre-compaction addresses, and an eager remap
+    // does not compose them with the pending history, so it is refused.
+    let version = table.dataset().version().version;
+    let error = table.try_eager_compaction().await.unwrap_err();
+    assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+    assert!(error.to_string().contains("pending remaps"), "{error}");
+    assert_eq!(table.dataset().version().version, version);
+    table.check("refused eager compaction").await;
+
+    // The index has not caught up, so nothing may be trimmed yet.
+    table.trim().await;
+    assert_eq!(table.history_len().await, history, "trim before remap");
+    table.check("trim before remap").await;
+
+    table.optimize().await;
+    table.check("optimize_indices").await;
+    table.remap().await;
+    table.check("remap").await;
+
+    table.trim().await;
+    assert!(
+        table.history_len().await < history,
+        "trim after remap left the history at {history} versions"
+    );
+    table.check("trim after remap").await;
+
+    let metrics = table.try_eager_compaction().await.unwrap();
+    assert!(
+        metrics.fragments_removed > 0,
+        "the eager compaction did nothing"
+    );
+    table.check("eager compaction after cleanup").await;
+}
+
+#[tokio::test]
+async fn test_list_element_on_stable_row_ids_through_eager_compaction_and_cleanup() {
+    // Boxed for CI clippy `large_futures`.
+    Box::pin(run_list_element_on_stable_row_ids()).await;
 }

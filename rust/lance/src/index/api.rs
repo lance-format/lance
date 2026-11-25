@@ -153,7 +153,9 @@ impl IndexSegment {
     }
 
     /// Return the single column this segment is keyed on, or `None` when it is
-    /// keyed on several -- a genuinely composite index -- or on none at all.
+    /// keyed on several fields or on none at all. This reads the metadata
+    /// declaration; additional plugin dependencies can require further input
+    /// resolution before deciding whether its query inputs are composite.
     ///
     /// Reads the keys as [`IndexMetadata::keyed_field`] does, so a segment
     /// commits under the column its manifest entry is read back keyed on.

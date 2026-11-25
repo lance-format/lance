@@ -502,7 +502,7 @@ async fn destination_coverage_requires_every_contributing_segment(#[case] scenar
     for segment in &usable {
         assert_eq!(
             segment.fragment_bitmap.as_ref().unwrap(),
-            dataset.fragment_bitmap.as_ref()
+            dataset.table_state.fragment_bitmap.as_ref()
         );
     }
     for value in 0..8 {
@@ -617,12 +617,12 @@ async fn projected_coverage_does_not_skip_address_translation() {
         .iter_mut()
         .find(|index| index.name == "i_idx")
         .unwrap();
-    index.fragment_bitmap = Some(dataset.fragment_bitmap.as_ref().clone());
+    index.fragment_bitmap = Some(dataset.table_state.fragment_bitmap.as_ref().clone());
     dataset.index_cache.clear().await;
     let key = IndexMetadataKey {
         version: dataset.manifest.version,
-        store_identity: &dataset.object_store.store_prefix,
-        e_tag: dataset.manifest_location.e_tag.as_deref(),
+        store_identity: &dataset.table_state.object_store.store_prefix,
+        e_tag: dataset.table_state.manifest_location.e_tag.as_deref(),
     };
     dataset
         .index_cache
@@ -667,7 +667,7 @@ async fn scalar_queries_translate_deleted_sources_and_lazy_blocks(
     let index = dataset.load_index_by_name("i_idx").await.unwrap().unwrap();
     assert_eq!(
         index.fragment_bitmap.as_ref().unwrap(),
-        dataset.fragment_bitmap.as_ref()
+        dataset.table_state.fragment_bitmap.as_ref()
     );
 
     let plan = dataset
@@ -702,8 +702,12 @@ async fn scalar_queries_translate_deleted_sources_and_lazy_blocks(
     // by the manifest snapshot: a snapshot whose path differs but whose
     // coverage, exclusions and mapping path are unchanged is a cache hit.
     let mut other_snapshot = dataset.clone();
-    other_snapshot.manifest_location.path =
-        dataset.base.clone().join("_versions").join("999.manifest");
+    other_snapshot.table_state.manifest_location.path = dataset
+        .table_state
+        .base
+        .clone()
+        .join("_versions")
+        .join("999.manifest");
     crate::index::scalar::open_scalar_index(&other_snapshot, "i", &index, &metrics)
         .await
         .unwrap();
@@ -803,7 +807,7 @@ async fn text_indices_translate_through_the_shared_remapper(#[case] index_type: 
         .unwrap();
     assert_eq!(
         index.fragment_bitmap.as_ref().unwrap(),
-        dataset.fragment_bitmap.as_ref()
+        dataset.table_state.fragment_bitmap.as_ref()
     );
     for _ in 0..2 {
         let mut scan = dataset.scan();
@@ -1098,7 +1102,7 @@ async fn v0_history_keeps_remapped_segments_warm_through_trim() {
         let index = indices.iter().find(|index| index.name == name).unwrap();
         let metrics = lance_index::metrics::LocalMetricsCollector::default();
         if column == "vector" {
-            // The generic open's probe misses on a per-segment key.
+            // The generic open must also reuse portable state after a remap.
             dataset
                 .open_generic_index(column, &index.uuid, &metrics)
                 .await
@@ -1198,8 +1202,8 @@ async fn v0_history_keeps_remapped_segments_warm_through_trim() {
     for (column, name) in segments {
         assert_eq!(
             index_loads(&dataset, column, name).await,
-            1,
-            "{name} reloads"
+            usize::from(column != "vector"),
+            "portable vector state survives; scalar decoded content still reloads: {name}"
         );
         assert_eq!(
             index_loads(&dataset, column, name).await,
@@ -1313,7 +1317,12 @@ async fn externalize_legacy_history(dataset: &mut Dataset) {
     fri.uuid = Uuid::new_v4();
     let name = "legacy-external.binpb";
     let path = dataset.indices_dir().join(fri.uuid.to_string()).join(name);
-    let mut writer = dataset.object_store.create(&path).await.unwrap();
+    let mut writer = dataset
+        .table_state
+        .object_store
+        .create(&path)
+        .await
+        .unwrap();
     writer.write_all(&bytes).await.unwrap();
     writer.shutdown().await.unwrap();
     details.content = Some(pb::fragment_reuse_index_details::Content::External(
@@ -2062,8 +2071,8 @@ async fn unsupported_scalar_type_is_not_advertised_for_rewritten_fragments() {
     dataset.index_cache.clear().await;
     let key = IndexMetadataKey {
         version: dataset.manifest.version,
-        store_identity: &dataset.object_store.store_prefix,
-        e_tag: dataset.manifest_location.e_tag.as_deref(),
+        store_identity: &dataset.table_state.object_store.store_prefix,
+        e_tag: dataset.table_state.manifest_location.e_tag.as_deref(),
     };
     dataset
         .index_cache
@@ -2203,7 +2212,7 @@ async fn tagged_remapping_plans_coverage_once_per_snapshot() {
 
     let plan_cache = dataset
         .index_cache
-        .with_key_prefix(dataset.manifest_location.path.as_ref());
+        .with_key_prefix(dataset.table_state.manifest_location.path.as_ref());
     let key = FriQueryPlanKey {
         fri_uuid: &fri.uuid,
     };
@@ -2315,8 +2324,8 @@ async fn tagged_remapping_plans_coverage_once_per_snapshot() {
     // sibling would fail. The open must still succeed from the cached plan.
     let metadata_key = IndexMetadataKey {
         version: dataset.manifest.version,
-        store_identity: &dataset.object_store.store_prefix,
-        e_tag: dataset.manifest_location.e_tag.as_deref(),
+        store_identity: &dataset.table_state.object_store.store_prefix,
+        e_tag: dataset.table_state.manifest_location.e_tag.as_deref(),
     };
     dataset
         .index_cache
@@ -2324,8 +2333,8 @@ async fn tagged_remapping_plans_coverage_once_per_snapshot() {
         .await;
     let query_key = QueryIndexListingKey(DerivedIndexListingKey {
         version: dataset.manifest.version,
-        store_identity: &dataset.object_store.store_prefix,
-        e_tag: dataset.manifest_location.e_tag.as_deref(),
+        store_identity: &dataset.table_state.object_store.store_prefix,
+        e_tag: dataset.table_state.manifest_location.e_tag.as_deref(),
     });
     dataset
         .index_cache
@@ -2992,7 +3001,7 @@ async fn selected_segment_recluster_requires_every_contributor() {
         .unwrap();
     assert_eq!(
         selected.fragment_bitmap.as_ref(),
-        Some(dataset.fragment_bitmap.as_ref())
+        Some(dataset.table_state.fragment_bitmap.as_ref())
     );
 
     let message = dataset
@@ -3124,12 +3133,12 @@ async fn projected_bitmap_with_dropped_transition_scans_not_drops() {
         .iter_mut()
         .find(|index| index.name == "i_idx")
         .unwrap();
-    index.fragment_bitmap = Some(dataset.fragment_bitmap.as_ref().clone());
+    index.fragment_bitmap = Some(dataset.table_state.fragment_bitmap.as_ref().clone());
     dataset.index_cache.clear().await;
     let key = IndexMetadataKey {
         version: dataset.manifest.version,
-        store_identity: &dataset.object_store.store_prefix,
-        e_tag: dataset.manifest_location.e_tag.as_deref(),
+        store_identity: &dataset.table_state.object_store.store_prefix,
+        e_tag: dataset.table_state.manifest_location.e_tag.as_deref(),
     };
     dataset
         .index_cache
@@ -3343,7 +3352,7 @@ async fn fts_prefilter_scopes_to_subset_with_fri_translation() {
             .unwrap();
             let index_dir = dataset.indices_dir().join(direct.uuid.to_string());
             lance_index::scalar::inverted::builder::merge_index_files(
-                dataset.object_store.as_ref(),
+                dataset.table_state.object_store.as_ref(),
                 &index_dir,
                 Arc::new(store),
                 Arc::new(crate::index::NoopIndexBuildProgress),
@@ -3659,9 +3668,9 @@ async fn coverage_change_misses_without_new_fri() {
         .collect();
     persist_live(&mut dataset, live).await;
     assert!(
-        !dataset.fragment_bitmap.contains(10),
+        !dataset.table_state.fragment_bitmap.contains(10),
         "{:?}",
-        dataset.fragment_bitmap
+        dataset.table_state.fragment_bitmap
     );
     let fri_after = fri_entry(
         &crate::index::loading::load_all_indices(&dataset)
@@ -3881,10 +3890,21 @@ async fn legacy_layout_fts_on_tagged_table_is_excluded_and_scans() {
     for name in ["tokens.lance", "invert.lance", "docs.lance"] {
         let from = index_dir.clone().join(format!("part_0_{name}"));
         let to = index_dir.clone().join(name);
-        dataset.object_store.copy(&from, &to).await.unwrap();
-        dataset.object_store.delete(&from).await.unwrap();
+        dataset
+            .table_state
+            .object_store
+            .copy(&from, &to)
+            .await
+            .unwrap();
+        dataset
+            .table_state
+            .object_store
+            .delete(&from)
+            .await
+            .unwrap();
     }
     dataset
+        .table_state
         .object_store
         .delete(&index_dir.clone().join("metadata.lance"))
         .await
@@ -4085,7 +4105,10 @@ async fn vector_merge_keeps_translated_coverage_on_tagged_tables() {
         .filter(|index| index.name == "vector_idx")
         .filter_map(|index| index.fragment_bitmap.clone())
         .fold(RoaringBitmap::new(), |acc, b| acc | b);
-    assert_eq!(derived, dataset.fragment_bitmap.as_ref().clone());
+    assert_eq!(
+        derived,
+        dataset.table_state.fragment_bitmap.as_ref().clone()
+    );
     let (plan, found) = nearest(dataset.clone(), true).await;
     assert!(plan.contains("ANN"), "{plan}");
     assert_eq!(found, truth);
@@ -4213,7 +4236,7 @@ async fn vector_rebalance_keeps_translated_coverage_on_tagged_tables() {
         .unwrap();
     assert_eq!(
         derived(&dataset).await,
-        dataset.fragment_bitmap.as_ref().clone()
+        dataset.table_state.fragment_bitmap.as_ref().clone()
     );
     dataset
         .optimize_indices(&OptimizeOptions::default())
@@ -4221,7 +4244,7 @@ async fn vector_rebalance_keeps_translated_coverage_on_tagged_tables() {
         .unwrap();
     assert_eq!(
         derived(&dataset).await,
-        dataset.fragment_bitmap.as_ref().clone(),
+        dataset.table_state.fragment_bitmap.as_ref().clone(),
         "the rebalance keeps the translated coverage"
     );
     let (plan, found) = nearest(&dataset).await;
@@ -4314,7 +4337,7 @@ async fn inverted_merge_keeps_translated_coverage_on_tagged_tables() {
         .unwrap();
     assert_eq!(
         derived(&dataset).await,
-        dataset.fragment_bitmap.as_ref().clone()
+        dataset.table_state.fragment_bitmap.as_ref().clone()
     );
     assert_eq!(hits(&dataset).await, 12);
     dataset
@@ -4336,7 +4359,7 @@ async fn inverted_merge_keeps_translated_coverage_on_tagged_tables() {
     );
     assert_eq!(
         derived(&dataset).await,
-        dataset.fragment_bitmap.as_ref().clone(),
+        dataset.table_state.fragment_bitmap.as_ref().clone(),
         "the merge keeps the translated coverage"
     );
     assert_eq!(hits(&dataset).await, 12);
@@ -4467,7 +4490,7 @@ async fn retrain_rebuilds_a_tagged_index_with_nothing_unindexed() {
     );
     assert!(before.iter().all(|segment| {
         segment
-            .effective_fragment_bitmap(&dataset.fragment_bitmap)
+            .effective_fragment_bitmap(&dataset.table_state.fragment_bitmap)
             .is_some_and(|bitmap| bitmap.is_empty())
     }));
 
@@ -4728,6 +4751,16 @@ async fn legacy_vector_format_on_tagged_table_is_excluded_and_scans() {
         )
         .await
         .unwrap();
+    let uuid = dataset
+        .load_index_by_name("vector_idx")
+        .await
+        .unwrap()
+        .unwrap()
+        .uuid;
+    assert_eq!(
+        dataset.vector_index_types("vector", &[uuid]).await.unwrap(),
+        [IndexType::IvfPq]
+    );
     let original = dataset
         .scan()
         .filter("i = 6")
@@ -4748,6 +4781,10 @@ async fn legacy_vector_format_on_tagged_table_is_excluded_and_scans() {
     .encode_to_vec();
     install(&mut dataset, content, destinations, false).await;
 
+    assert!(matches!(
+        dataset.vector_index_types("vector", &[uuid]).await,
+        Err(Error::IndexNotFound { .. })
+    ));
     // Excluded from the query listing: no coverage the reader can honor.
     assert!(
         !dataset
@@ -4778,7 +4815,11 @@ async fn fri_read_cost(dataset: &Dataset, value: i32) -> (usize, u64) {
         .await
         .unwrap();
     assert!(plan.contains("ScalarIndexQuery"), "{plan}");
-    dataset.object_store.as_ref().io_stats_incremental();
+    dataset
+        .table_state
+        .object_store
+        .as_ref()
+        .io_stats_incremental();
     let batch = dataset
         .scan()
         .filter(&filter)
@@ -4786,7 +4827,11 @@ async fn fri_read_cost(dataset: &Dataset, value: i32) -> (usize, u64) {
         .try_into_batch()
         .await
         .unwrap();
-    let stats = dataset.object_store.as_ref().io_stats_incremental();
+    let stats = dataset
+        .table_state
+        .object_store
+        .as_ref()
+        .io_stats_incremental();
     assert_eq!(batch.num_rows(), 1, "{filter}");
     assert_eq!(
         batch

@@ -43,6 +43,11 @@ use pyo3::{
     types::PyIterator,
 };
 
+/// Parse a user-supplied distance metric with the shared Rust parser.
+pub(crate) fn parse_distance_type(distance_type: &str) -> PyResult<DistanceType> {
+    DistanceType::try_from(distance_type).map_err(|e| PyValueError::new_err(e.to_string()))
+}
+
 /// A wrapper around a JSON string that converts to a Python object
 /// using json.loads when marshalling to Python.
 #[derive(Debug, Clone)]
@@ -258,8 +263,7 @@ impl Hnsw {
         let vectors = concat(&array_refs).map_err(|e| PyIOError::new_err(e.to_string()))?;
         std::mem::drop(data);
 
-        let dt = DistanceType::try_from(distance_type)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let dt = parse_distance_type(distance_type)?;
 
         let hnsw = rt()
             .runtime

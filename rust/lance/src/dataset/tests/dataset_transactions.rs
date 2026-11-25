@@ -8,8 +8,8 @@ use std::vec;
 use crate::dataset::builder::DatasetBuilder;
 use crate::dataset::transaction::{Operation, Transaction, UpdateMode, UpdatedFragmentOffsets};
 use crate::dataset::{
-    ColumnAlteration, ManifestWriteConfig, NewColumnTransform, ReadParams, TRANSACTIONS_DIR,
-    UpdateBuilder, write_manifest_file,
+    ColumnAlteration, NewColumnTransform, ReadParams, TRANSACTIONS_DIR, UpdateBuilder,
+    write_manifest_file,
 };
 use crate::io::ObjectStoreParams;
 use crate::session::Session;
@@ -206,8 +206,8 @@ async fn test_session_store_registry() {
         .unwrap();
     assert_eq!(registry.active_stores().len(), 1);
     assert_eq!(
-        Arc::as_ptr(&dataset.object_store.as_ref().inner),
-        Arc::as_ptr(&dataset2.object_store.as_ref().inner)
+        Arc::as_ptr(&dataset.table_state.object_store.as_ref().inner),
+        Arc::as_ptr(&dataset2.table_state.object_store.as_ref().inner)
     );
 
     // If we create another with **different parameters**, it should create a new store.
@@ -226,8 +226,8 @@ async fn test_session_store_registry() {
         .unwrap();
     assert_eq!(registry.active_stores().len(), 2);
     assert_ne!(
-        Arc::as_ptr(&dataset.object_store.as_ref().inner),
-        Arc::as_ptr(&dataset3.object_store.as_ref().inner)
+        Arc::as_ptr(&dataset.table_state.object_store.as_ref().inner),
+        Arc::as_ptr(&dataset3.table_state.object_store.as_ref().inner)
     );
 
     // Remove both datasets
@@ -236,37 +236,6 @@ async fn test_session_store_registry() {
     drop(dataset2);
     drop(dataset);
     assert_eq!(registry.active_stores().len(), 0);
-}
-
-#[test]
-fn test_decode_inline_transaction_tolerates_unknown_operations() {
-    use crate::dataset::decode_inline_transaction;
-    use lance_table::format::pb;
-    use prost::Message;
-
-    // A transaction written by a newer version of Lance may carry an operation
-    // this version cannot decode; prost surfaces it as a missing oneof. It
-    // decodes as `Operation::Unknown` rather than failing.
-    let unknown_operation = pb::Transaction {
-        read_version: 1,
-        uuid: "test".to_string(),
-        ..Default::default()
-    };
-    let decoded = decode_inline_transaction(&unknown_operation.encode_to_vec(), 42).unwrap();
-    assert!(matches!(decoded.operation, Operation::Unknown { .. }));
-
-    // Corrupt bytes are likewise tolerated.
-    assert!(decode_inline_transaction(&[0xff, 0xff, 0xff], 42).is_none());
-
-    // A decodable transaction is returned.
-    let known = pb::Transaction::try_from(&Transaction::new(
-        1,
-        Operation::Append { fragments: vec![] },
-        None,
-    ))
-    .unwrap();
-    let decoded = decode_inline_transaction(&known.encode_to_vec(), 42).unwrap();
-    assert!(matches!(decoded.operation, Operation::Append { .. }));
 }
 
 /// A transaction as a future Lance might write it: the `operation` oneof holds
@@ -306,7 +275,7 @@ async fn rewrite_inline_transaction(
 
     assert!(dataset.manifest.index_section.is_none());
     let path = &dataset.manifest_location().path;
-    let mut writer = ObjectWriter::new(dataset.object_store.as_ref(), path)
+    let mut writer = ObjectWriter::new(dataset.table_state.object_store.as_ref(), path)
         .await
         .unwrap();
     let tx_pos = writer.write_protobuf(inline_tx).await.unwrap() as u64;
@@ -393,6 +362,7 @@ async fn test_inline_transaction_written_to_new_field() {
     let test_uri = TempStrDir::default();
     let dataset = two_version_dataset(&test_uri).await;
     let bytes = dataset
+        .table_state
         .object_store
         .read_one_all(&dataset.manifest_location().path)
         .await
@@ -420,11 +390,18 @@ async fn test_read_inline_transaction_from_deprecated_field() {
     .await;
     // Remove the external copy so only field 21 can supply the transaction.
     let tx_path = dataset
+        .table_state
         .base
         .clone()
         .join(TRANSACTIONS_DIR)
         .join(dataset.manifest.transaction_file.as_deref().unwrap());
-    dataset.object_store.inner.delete(&tx_path).await.unwrap();
+    dataset
+        .table_state
+        .object_store
+        .inner
+        .delete(&tx_path)
+        .await
+        .unwrap();
 
     let dataset = Dataset::open(&test_uri).await.unwrap();
     assert!(dataset.manifest.transaction_section.is_some());
@@ -449,13 +426,16 @@ async fn test_read_inline_transaction_from_released_deprecated_field() {
 
 #[test]
 fn test_distinct_unknown_transactions_are_not_equal() {
-    use crate::dataset::decode_inline_transaction;
+    use lance_table::format::pb;
     use prost::Message;
 
     // Commit-outcome detection compares transactions for equality; two
     // unknown operations must not be mistaken for the same commit.
     let decode = |uuid: &str| {
-        decode_inline_transaction(&future_transaction(uuid).encode_to_vec(), 2).unwrap()
+        Transaction::try_from(
+            pb::Transaction::decode(future_transaction(uuid).encode_to_vec().as_slice()).unwrap(),
+        )
+        .unwrap()
     };
     assert_eq!(decode("a"), decode("a"));
     assert_ne!(decode("a"), decode("b"));
@@ -594,11 +574,12 @@ async fn test_inline_transaction() {
     async fn delete_external_tx_file(ds: &Dataset) {
         if let Some(tx_file) = ds.manifest.transaction_file.as_ref() {
             let tx_path = ds
+                .table_state
                 .base
                 .clone()
                 .join(TRANSACTIONS_DIR)
                 .join(tx_file.as_str());
-            let _ = ds.object_store.inner.delete(&tx_path).await; // ignore errors
+            let _ = ds.table_state.object_store.inner.delete(&tx_path).await; // ignore errors
         }
     }
 
@@ -617,17 +598,25 @@ async fn test_inline_transaction() {
     assert_eq!(read_tx, tx.clone());
 
     // Case 2: reading small manifest caches transaction data, eliminating transaction reading IO.
-    let read_ds2 = DatasetBuilder::from_uri(ds2.uri.clone())
+    let read_ds2 = DatasetBuilder::from_uri(ds2.table_state.uri.clone())
         .with_session(session.clone())
         .load()
         .await
         .unwrap();
-    let stats = read_ds2.object_store.as_ref().io_stats_incremental(); // Reset
+    let stats = read_ds2
+        .table_state
+        .object_store
+        .as_ref()
+        .io_stats_incremental(); // Reset
     assert!(stats.read_bytes < 64 * 1024);
     // Because the manifest is so small, we should have opportunistically
     // cached the transaction in memory already.
     let inline_tx = read_ds2.read_transaction().await.unwrap().unwrap();
-    let stats = read_ds2.object_store.as_ref().io_stats_incremental();
+    let stats = read_ds2
+        .table_state
+        .object_store
+        .as_ref()
+        .io_stats_incremental();
     assert_eq!(stats.read_iops, 0);
     assert_eq!(stats.read_bytes, 0);
     assert_eq!(inline_tx, tx);
@@ -636,32 +625,34 @@ async fn test_inline_transaction() {
     let ds = create_dataset(2).await;
     let tx = make_tx(ds.manifest().version);
     let tx_file = crate::io::commit::write_transaction_file(
-        ds.object_store.as_ref(),
-        &ds.base,
+        ds.table_state.object_store.as_ref(),
+        &ds.table_state.base,
         &lance_table::format::pb::Transaction::try_from(&tx).unwrap(),
+        None,
     )
     .await
     .unwrap();
+    let build_config = lance_table::format::ManifestBuildConfig::default();
     let (mut manifest, indices) = tx
         .build_manifest(
             Some(ds.manifest.as_ref()),
             ds.load_indices().await.unwrap().as_ref().clone(),
             &tx_file,
-            &ManifestWriteConfig::default().to_build_config(),
+            &build_config,
         )
         .unwrap();
     let location = write_manifest_file(
-        ds.object_store.as_ref(),
-        ds.commit_handler.as_ref(),
-        &ds.base,
+        ds.table_state.object_store.as_ref(),
+        ds.table_state.commit_handler.as_ref(),
+        &ds.table_state.base,
         &mut manifest,
         if indices.is_empty() {
             None
         } else {
             Some(indices.clone())
         },
-        &ManifestWriteConfig::default(),
-        ds.manifest_location.naming_scheme,
+        &build_config,
+        ds.table_state.manifest_location.naming_scheme,
         None,
         // Previously classified from a None inline copy, which validated.
         true,
@@ -674,12 +665,12 @@ async fn test_inline_transaction() {
 
     // The handle's own version takes the same external-file fallback without
     // touching the manifest again.
-    ds_new.object_store.io_stats_incremental();
+    ds_new.table_state.object_store.io_stats_incremental();
     let version_transaction = ds_new
         .read_version_transaction(location.version)
         .await
         .unwrap();
-    let stats = ds_new.object_store.io_stats_incremental();
+    let stats = ds_new.table_state.object_store.io_stats_incremental();
     assert_eq!(version_transaction.transaction, Some(tx.clone()));
     assert!(
         stats.read_iops >= 1,
@@ -811,7 +802,8 @@ fn ranged_read_bytes(stats: &IoStats) -> u64 {
 
 /// Manifest body bytes of the dataset handle's current version.
 async fn manifest_size(ds: &Dataset) -> u64 {
-    ds.object_store
+    ds.table_state
+        .object_store
         .stat(&ds.manifest_location().path)
         .await
         .unwrap()
@@ -861,15 +853,15 @@ async fn test_read_version_transaction_same_version_skips_manifest_read() {
         .load()
         .await
         .unwrap();
-    yardstick.object_store.io_stats_incremental();
+    yardstick.table_state.object_store.io_stats_incremental();
     let expected_transaction = yardstick.read_transaction().await.unwrap();
-    let yardstick_stats = yardstick.object_store.io_stats_incremental();
+    let yardstick_stats = yardstick.table_state.object_store.io_stats_incremental();
 
     // Same version as the handle: no resolve, no manifest body, just the
     // transaction message (one block).
-    ds.object_store.io_stats_incremental();
+    ds.table_state.object_store.io_stats_incremental();
     let same_version = ds.read_version_transaction(latest).await.unwrap();
-    let stats = ds.object_store.io_stats_incremental();
+    let stats = ds.table_state.object_store.io_stats_incremental();
     assert_eq!(stats.read_iops, yardstick_stats.read_iops);
     assert_eq!(stats.read_bytes, yardstick_stats.read_bytes);
     assert!(
@@ -885,7 +877,7 @@ async fn test_read_version_transaction_same_version_skips_manifest_read() {
     // The session transaction cache is keyed only by version, so it is not
     // populated: `read_transaction()` still pays its own storage read.
     assert_eq!(ds.read_transaction().await.unwrap(), expected_transaction);
-    let stats = ds.object_store.io_stats_incremental();
+    let stats = ds.table_state.object_store.io_stats_incremental();
     assert_eq!(stats.read_iops, yardstick_stats.read_iops);
     assert_eq!(stats.read_bytes, yardstick_stats.read_bytes);
 
@@ -897,9 +889,9 @@ async fn test_read_version_transaction_same_version_skips_manifest_read() {
         .load()
         .await
         .unwrap();
-    historical.object_store.io_stats_incremental();
+    historical.table_state.object_store.io_stats_incremental();
     let via_fallback = historical.read_version_transaction(latest).await.unwrap();
-    let stats = historical.object_store.io_stats_incremental();
+    let stats = historical.table_state.object_store.io_stats_incremental();
     assert!(
         ranged_read_bytes(&stats) > MANIFEST_PADDING_BYTES as u64,
         "fallback should read the manifest body: {:#?}",
@@ -920,9 +912,9 @@ async fn test_read_version_transaction_same_version_skips_manifest_read() {
     // and still resolves latest through the fallback.
     let old_version = 3;
     let old = ds.checkout_version(old_version).await.unwrap();
-    old.object_store.io_stats_incremental();
+    old.table_state.object_store.io_stats_incremental();
     let old_transaction = old.read_version_transaction(old_version).await.unwrap();
-    let stats = old.object_store.io_stats_incremental();
+    let stats = old.table_state.object_store.io_stats_incremental();
     assert!(
         stats.read_bytes <= 4 * 1024,
         "expected at most one 4 KiB block, read {} bytes",
@@ -950,9 +942,9 @@ async fn test_read_version_transaction_same_version_skips_manifest_read() {
         .unwrap();
     assert_eq!(other.version().version, latest);
     let metadata_stats_before = session.metadata_cache_stats().await;
-    other.object_store.io_stats_incremental();
+    other.table_state.object_store.io_stats_incremental();
     let via_cached_manifest = other.read_version_transaction(old_version).await.unwrap();
-    let stats = other.object_store.io_stats_incremental();
+    let stats = other.table_state.object_store.io_stats_incremental();
     // Resolving the location still costs a HEAD, but the manifest body is not
     // fetched.
     assert!(
@@ -976,12 +968,12 @@ async fn test_read_version_transaction_same_version_skips_manifest_read() {
         .load()
         .await
         .unwrap();
-    uncached.object_store.io_stats_incremental();
+    uncached.table_state.object_store.io_stats_incremental();
     let via_uncached_manifest = uncached
         .read_version_transaction(old_version)
         .await
         .unwrap();
-    let stats = uncached.object_store.io_stats_incremental();
+    let stats = uncached.table_state.object_store.io_stats_incremental();
     assert!(
         ranged_read_bytes(&stats) > MANIFEST_PADDING_BYTES as u64,
         "uncached manifest should be read in full: {:#?}",
@@ -1043,8 +1035,8 @@ async fn test_read_version_transaction_after_recreate_at_same_uri() {
         .unwrap();
     assert_eq!(reopened.version().version, 1);
     assert_ne!(
-        reopened.manifest_location.e_tag,
-        old_reader.manifest_location.e_tag
+        reopened.table_state.manifest_location.e_tag,
+        old_reader.table_state.manifest_location.e_tag
     );
 
     let actual = reopened.read_version_transaction(1).await.unwrap();
@@ -1065,6 +1057,7 @@ async fn test_read_transaction_recovers_from_stale_manifest_size() {
     let mut stale = ds.manifest_location().clone();
     stale.size = Some(1);
     let recovered = ds
+        .table_state
         .read_transaction_from_storage(&manifest, &stale)
         .await
         .unwrap();
@@ -2845,12 +2838,16 @@ mod composite {
     use crate::dataset::{CommitBuilder, InsertBuilder, WriteParams};
     use crate::index::DatasetIndexExt;
     use crate::index::loading::load_all_indices;
+    use crate::index::vector::VectorIndexParams;
     use crate::{Dataset, Error, Result};
     use arrow_array::cast::AsArray;
     use arrow_array::types::{Int32Type, UInt64Type};
-    use arrow_array::{Int32Array, RecordBatch, StructArray};
+    use arrow_array::{
+        Array, FixedSizeListArray, Float32Array, Int32Array, RecordBatch, StructArray,
+    };
     use arrow_schema::{DataType, Field, Schema};
     use futures::{TryStreamExt, stream};
+    use lance_arrow::FixedSizeListArrayExt;
     use lance_core::datatypes::Field as LanceField;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_file::version::LanceFileVersion;
@@ -2858,6 +2855,10 @@ mod composite {
     use lance_index::pb::vector_index_details::{Compression, FlatCompression};
     use lance_index::pb::{VectorIndexDetails, VectorMetricType};
     use lance_index::scalar::ScalarIndexParams;
+    use lance_index::vector::{
+        hnsw::builder::HnswBuildParams, ivf::IvfBuildParams, sq::builder::SQBuildParams,
+    };
+    use lance_linalg::distance::DistanceType;
     use lance_table::feature_flags::{
         FLAG_COVERED_INDEX_METADATA, FLAG_MANAGED_BLOBS, MANAGED_BLOBS_META_KEY,
     };
@@ -5108,18 +5109,32 @@ mod composite {
         }
     }
 
-    /// Two vector segments under one name are unioned by the query path, so
-    /// an L2 segment beside a Dot segment would rank one half of the dataset by
-    /// the wrong distance. Concurrent writers conflict on the differing
-    /// details, so the loser retries against the version holding the L2
-    /// segment, where the segment commit API refuses the Dot one.
+    /// Raw actions must compare the files of all coexisting vector segments,
+    /// including retained ones, before publishing either kind of manifest.
+    #[rstest::rstest]
+    #[case::metric(VectorIndexParams::ivf_flat(1, DistanceType::Dot), "Dot")]
+    #[case::quantization(
+        VectorIndexParams::with_ivf_sq_params(
+            DistanceType::L2,
+            IvfBuildParams::new(1),
+            SQBuildParams::default()
+        ),
+        "IVF_SQ"
+    )]
+    #[case::sub_index(
+        VectorIndexParams::ivf_hnsw(
+            DistanceType::L2,
+            IvfBuildParams::new(1),
+            HnswBuildParams::default()
+        ),
+        "IVF_HNSW_FLAT"
+    )]
     #[tokio::test]
-    async fn test_vector_segments_with_different_metrics_cannot_join_one_index() {
-        use crate::index::vector::VectorIndexParams;
-        use arrow_array::{Array, FixedSizeListArray, Float32Array};
-        use lance_arrow::FixedSizeListArrayExt;
-        use lance_linalg::distance::DistanceType;
-
+    async fn test_vector_segments_must_share_query_contract(
+        #[case] incoming_params: VectorIndexParams,
+        #[case] mismatch: &str,
+        #[values(false, true)] detached: bool,
+    ) {
         let vectors = FixedSizeListArray::try_new_from_values(
             Float32Array::from(vec![
                 2.0, 0.0, 3.0, 0.0, 4.0, 0.0, 5.0, 0.0, 100.0, 0.0, 101.0, 0.0, 102.0, 0.0, 103.0,
@@ -5153,14 +5168,10 @@ mod composite {
         async fn build(
             dataset: &mut Dataset,
             fragment: u32,
-            metric: DistanceType,
+            params: &VectorIndexParams,
         ) -> IndexMetadata {
             let staged = dataset
-                .create_index_builder(
-                    &["vector"],
-                    IndexType::Vector,
-                    &VectorIndexParams::ivf_flat(1, metric),
-                )
+                .create_index_builder(&["vector"], IndexType::Vector, params)
                 .name(format!("staged_{fragment}"))
                 .fragments(vec![fragment])
                 .execute_uncommitted()
@@ -5171,36 +5182,127 @@ mod composite {
                 ..staged
             }
         }
-        let l2 = build(&mut dataset, 0, DistanceType::L2).await;
-        let dot = build(&mut dataset, 1, DistanceType::Dot).await;
+        let l2_params = VectorIndexParams::ivf_flat(1, DistanceType::L2);
+        let l2 = build(&mut dataset, 0, &l2_params).await;
+        let incoming = build(&mut dataset, 1, &incoming_params).await;
+        let assert_mismatch = |error: Error| {
+            assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+            let message = error.to_string();
+            assert!(message.contains("'shared'"), "{message}");
+            assert!(message.contains(mismatch), "{message}");
+        };
 
-        // The legacy segment commit rejects the pair; the action path must too.
-        let error = dataset
-            .commit_existing_index_segments("shared", "vector", vec![l2.clone(), dot.clone()])
+        // Two additions in a single transaction must be checked together.
+        let transaction = composite_txn(
+            dataset.version_id(),
+            vec![
+                add_built_segment(l2.clone()),
+                add_built_segment(incoming.clone()),
+            ],
+        );
+        let error = CommitBuilder::new(Arc::new(dataset.clone()))
+            .with_experimental_composite_operations(true)
+            .with_detached(detached)
+            .execute(transaction)
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("metric"), "{error}");
+        assert_mismatch(error);
 
-        // Concurrently: both writers read the same version.
-        let stale = Arc::new(dataset.clone());
-        let mut dataset = commit(dataset, vec![add_built_segment(l2)]).await;
-        let error = commit_from_stale(stale, vec![add_built_segment(dot)])
+        // The vector column may itself be introduced by these actions.
+        let mut field = dataset.schema().field("vector").unwrap().clone();
+        field.name = "new_vector".into();
+        field.nullable = true;
+        let mut actions = vec![Action::AddField(AddField {
+            local: 0,
+            parent: None,
+            def: field,
+        })];
+        for segment in [l2.clone(), incoming.clone()] {
+            let Action::AddIndexSegment(mut addition) = add_built_segment(segment) else {
+                unreachable!();
+            };
+            addition.fields = vec![FieldRef::Local(0)];
+            actions.push(Action::AddIndexSegment(addition));
+        }
+        let error = CommitBuilder::new(Arc::new(dataset.clone()))
+            .with_experimental_composite_operations(true)
+            .with_detached(detached)
+            .execute(composite_txn(dataset.version_id(), actions))
             .await
-            .expect_err("a Dot segment cannot join an L2 index");
+            .unwrap_err();
+        assert_mismatch(error);
+
+        // Concurrent writers still conflict on their differing details.
+        let stale = Arc::new(dataset.clone());
+        let mut dataset = commit(dataset, vec![add_built_segment(l2.clone())]).await;
+        let error = commit_from_stale(stale, vec![add_built_segment(incoming)])
+            .await
+            .expect_err("incompatible segments cannot join one index");
         assert!(
             matches!(error, Error::RetryableCommitConflict { .. }),
             "{error:?}"
         );
 
-        // Sequentially, from the version holding the L2 segment. A raw action
-        // commit is not checked here, as on main:
-        // https://github.com/lance-format/lance/issues/10728
-        let dot = build(&mut dataset, 1, DistanceType::Dot).await;
-        let error = dataset
-            .commit_existing_index_segments("shared", "vector", vec![dot])
+        // A sequential addition must compare the retained segment's file,
+        // even when the incoming segment claims exactly the same details.
+        let mut incoming = build(&mut dataset, 1, &incoming_params).await;
+        incoming.index_details = l2.index_details.clone();
+        let error = CommitBuilder::new(Arc::new(dataset.clone()))
+            .with_experimental_composite_operations(true)
+            .with_detached(detached)
+            .execute(composite_txn(
+                dataset.version_id(),
+                vec![add_built_segment(incoming)],
+            ))
             .await
-            .expect_err("a Dot segment cannot join an L2 index");
-        assert!(error.to_string().contains("metric"), "{error}");
+            .unwrap_err();
+        assert_mismatch(error);
+        let mut latest = dataset.clone();
+        latest.checkout_latest().await.unwrap();
+        assert_eq!(latest.version_id(), dataset.version_id());
+        assert_eq!(load_all_indices(&latest).await.unwrap().len(), 1);
+
+        // Adding compatible segments while removing the old contract is an
+        // atomic replacement, even when the additions precede the removal.
+        let first = build(&mut dataset, 0, &incoming_params).await;
+        let second = build(&mut dataset, 1, &incoming_params).await;
+        let dataset = CommitBuilder::new(Arc::new(dataset.clone()))
+            .with_experimental_composite_operations(true)
+            .with_detached(detached)
+            .execute(composite_txn(
+                dataset.version_id(),
+                vec![
+                    add_built_segment(first),
+                    add_built_segment(second),
+                    Action::RemoveIndexSegment(RemoveIndexSegment {
+                        uuid: l2.uuid,
+                        name: "shared".into(),
+                        data_change: false,
+                    }),
+                ],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(load_all_indices(&dataset).await.unwrap().len(), 2);
+        let mut scan = dataset.scan();
+        scan.nearest("vector", &Float32Array::from(vec![4.0, 0.0]), 4)
+            .unwrap()
+            .distance_metric(incoming_params.metric_type);
+        assert!(scan.explain_plan(true).await.unwrap().contains("ANN"));
+        let result = scan.try_into_batch().await.unwrap();
+        let expected = if incoming_params.metric_type == DistanceType::Dot {
+            [4, 5, 6, 7]
+        } else {
+            [0, 1, 2, 3]
+        };
+        let actual = result["id"].as_primitive::<Int32Type>();
+        let recalled = actual
+            .values()
+            .iter()
+            .filter(|id| expected.contains(id))
+            .count();
+        let recall = recalled as f64 / expected.len() as f64;
+        assert!(recall >= 0.5, "expected recall >= 0.5, got {recall}");
     }
 
     #[tokio::test]

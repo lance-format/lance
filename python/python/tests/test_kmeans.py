@@ -22,6 +22,19 @@ def test_invalid_inputs():
         kmeans.fit(data)
 
 
+def test_low_level_kmeans_invalid_metric_diagnostic():
+    from lance.lance import _KMeans
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            "Invalid metric_type: Invalid argument error: "
+            "Metric type 'manhattan' is not supported"
+        ),
+    ):
+        _KMeans(2, metric_type="manhattan")
+
+
 def test_kmeans_dot():
     kmeans = lance.util.KMeans(32, metric_type="dot")
     data = np.random.randn(1000, 128).astype(np.float32)

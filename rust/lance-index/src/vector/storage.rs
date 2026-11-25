@@ -40,6 +40,7 @@ use lance_io::object_store::ObjectStore;
 use lance_io::scheduler::IoStats;
 use lance_io::spill::SpillStore;
 use lance_linalg::distance::DistanceType;
+use lance_select::RowAddrMask;
 use prost::Message;
 use std::{
     any::Any,
@@ -195,12 +196,42 @@ pub trait DistCalculator {
         u8_scratch: &mut Vec<u8>,
         u32_scratch: &mut Vec<u32>,
     ) {
+        self.accumulate_topk_with_mask(
+            k,
+            lower_bound,
+            upper_bound,
+            row_id,
+            None,
+            res,
+            dists,
+            u16_scratch,
+            u8_scratch,
+            u32_scratch,
+        );
+    }
+
+    /// Accumulate a dense scan. A masked-out row must never contribute to the
+    /// heap or to any threshold used to prune future candidates.
+    #[allow(clippy::too_many_arguments)]
+    fn accumulate_topk_with_mask(
+        &self,
+        k: usize,
+        lower_bound: Option<f32>,
+        upper_bound: Option<f32>,
+        row_id: impl Fn(u32) -> u64,
+        mask: Option<&RowAddrMask>,
+        res: &mut BinaryHeap<OrderedNode<u64>>,
+        dists: &mut Vec<f32>,
+        u16_scratch: &mut Vec<u16>,
+        u8_scratch: &mut Vec<u8>,
+        u32_scratch: &mut Vec<u32>,
+    ) {
         if k == 0 {
             return;
         }
 
         self.distance_all_with_scratch(k, dists, u16_scratch, u8_scratch, u32_scratch);
-        accumulate_distances_into_heap(k, lower_bound, upper_bound, row_id, res, dists);
+        accumulate_distances_into_heap(k, lower_bound, upper_bound, row_id, mask, res, dists);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -254,6 +285,7 @@ pub(crate) fn accumulate_distances_into_heap(
     lower_bound: Option<f32>,
     upper_bound: Option<f32>,
     row_id: impl Fn(u32) -> u64,
+    mask: Option<&RowAddrMask>,
     res: &mut BinaryHeap<OrderedNode<u64>>,
     dists: &[f32],
 ) {
@@ -272,14 +304,18 @@ pub(crate) fn accumulate_distances_into_heap(
         if dist < lower_bound || dist >= upper_bound {
             continue;
         }
+        let row_id = row_id(id as u32);
+        if mask.is_some_and(|mask| !mask.selected(row_id)) {
+            continue;
+        }
         if res.len() < k {
-            res.push(OrderedNode::new(row_id(id as u32), dist));
+            res.push(OrderedNode::new(row_id, dist));
             if res.len() == k {
                 max_dist = res.peek().map(|node| node.dist);
             }
         } else if max_dist.is_some_and(|max_dist| max_dist > dist) {
             res.pop();
-            res.push(OrderedNode::new(row_id(id as u32), dist));
+            res.push(OrderedNode::new(row_id, dist));
             max_dist = res.peek().map(|node| node.dist);
         }
     }
@@ -1787,6 +1823,64 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         } else {
             Ok((batch, self.frag_reuse_index.clone()))
         }
+    }
+
+    /// Where each stored row of partition `part_id` sits in the storage
+    /// [`Self::load_partition`] builds: `Some(position)` for a row the
+    /// row-ID remapping keeps, `None` for one it drops. Surviving rows keep
+    /// their stored order, as every quantizer storage keeps them.
+    ///
+    /// Reads only the row-ID column. Errors if the storage has no remapping,
+    /// since no row is dropped then.
+    pub async fn partition_row_positions(
+        &self,
+        part_id: usize,
+        io_stats: Option<&IoStats>,
+    ) -> Result<Vec<Option<u32>>> {
+        let batch = self
+            .read_file_columns(self.ivf.row_range(part_id), &[ROW_ID], io_stats)
+            .await?;
+        let row_ids = batch
+            .column_by_name(ROW_ID)
+            .and_then(|ids| ids.as_primitive_opt::<UInt64Type>())
+            .ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "partition {part_id} storage needs a uint64 {ROW_ID} column"
+                ))
+            })?;
+        let is_kept: Vec<bool> = if let Some(remapper) = &self.batch_remapper {
+            // Null addresses are dropped as tombstones by the batch remapping.
+            let ids: Vec<u64> = row_ids
+                .iter()
+                .map(|id| id.unwrap_or(RowAddress::TOMBSTONE_ROW))
+                .collect();
+            remap_row_ids_async(remapper.as_ref(), &ids)
+                .await?
+                .into_iter()
+                .map(|id| id.is_some_and(|id| id != RowAddress::TOMBSTONE_ROW))
+                .collect()
+        } else if let Some(remapper) = &self.frag_reuse_index {
+            row_ids
+                .values()
+                .iter()
+                .map(|&id| remapper.remap_row_id(id).is_some())
+                .collect()
+        } else {
+            return Err(Error::internal(format!(
+                "partition {part_id} storage has no row-ID remapping to drop rows"
+            )));
+        };
+        let mut num_kept = 0u32;
+        Ok(is_kept
+            .into_iter()
+            .map(|is_kept| {
+                is_kept.then(|| {
+                    let position = num_kept;
+                    num_kept += 1;
+                    position
+                })
+            })
+            .collect())
     }
 
     /// Load a partition's quantization storage, optionally measuring the exact

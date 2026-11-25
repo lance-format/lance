@@ -182,7 +182,7 @@ pub async fn commit_synthetic_covered_index(
         fields: vec![keyed_id, carried_id],
         covering_fields: vec![carried_id],
         dataset_version: dataset.manifest.version,
-        fragment_bitmap: Some(dataset.fragment_bitmap.as_ref().clone()),
+        fragment_bitmap: Some(dataset.table_state.fragment_bitmap.as_ref().clone()),
         index_details: None,
         index_version: 0,
         created_at: Some(chrono::Utc::now()),

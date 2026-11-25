@@ -15,8 +15,10 @@ pub(crate) mod minhash_lsh;
 pub(crate) mod ngram;
 #[cfg(feature = "geo")]
 pub(crate) mod rtree;
+pub(crate) mod segment_merge;
 pub(crate) mod zonemap;
 
+use super::field_dependencies::input_field_ids;
 use super::frag_reuse::ResolvedRemapping;
 pub use inverted::{load_segment_details, load_segment_params, load_segments};
 
@@ -50,7 +52,6 @@ use lance_datafusion::exec::LanceExecutionOptions;
 use lance_index::metrics::{MetricsCollector, NoOpMetricsCollector};
 use lance_index::pb::{
     BloomFilterIndexDetails, FmIndexDetails, MinHashLshIndexDetails, RTreeIndexDetails,
-    VectorIndexDetails,
 };
 use lance_index::pbold::{
     BTreeIndexDetails, BitmapIndexDetails, InvertedIndexDetails, LabelListIndexDetails,
@@ -80,7 +81,7 @@ use lance_index::scalar::{
 use lance_index::{IndexCriteria, IndexType};
 use lance_table::format::{Fragment, IndexMetadata};
 use log::info;
-use prost::{Message, Name};
+use prost::Message;
 use tracing::instrument;
 
 // Log an update every TRAINING_UPDATE_FREQ million rows processed
@@ -336,6 +337,7 @@ pub(crate) async fn load_fts_training_data(
     let mut dataset = dataset.clone();
     Arc::make_mut(
         dataset
+            .table_state
             .file_reader_options
             .get_or_insert_with(Default::default),
     )
@@ -411,23 +413,6 @@ impl IndexDetails {
     /// Returns the plugin for the index
     pub fn get_plugin(&self) -> Result<&dyn ScalarIndexPlugin> {
         SCALAR_INDEX_PLUGIN_REGISTRY.get_plugin_by_details(self.0.as_ref())
-    }
-
-    /// Returns whether this build has a reader for the complete declared type.
-    pub(crate) fn has_reader(&self) -> bool {
-        let Some((_, details_type_name)) = self.0.type_url.rsplit_once('/') else {
-            return false;
-        };
-        if details_type_name.is_empty() || details_type_name.starts_with('.') {
-            return false;
-        }
-
-        details_type_name.eq_ignore_ascii_case(&VectorIndexDetails::full_name())
-            // MemWAL flush briefly wrote this pre-`pb` package name. Keep that
-            // exact historical native identity readable without accepting any
-            // other message that merely shares the VectorIndexDetails suffix.
-            || details_type_name.eq_ignore_ascii_case("lance.index.VectorIndexDetails")
-            || SCALAR_INDEX_PLUGIN_REGISTRY.supports_details(self.0.as_ref())
     }
 
     /// Returns the index version
@@ -838,14 +823,19 @@ pub async fn load_scalar_segment_params(
     dataset: &Dataset,
     segment: &IndexMetadata,
 ) -> Result<ScalarIndexParams> {
-    let field_id = segment.keyed_field().ok_or_else(|| {
-        Error::invalid_input(format!(
-            "Scalar index {} ({}) must have one keyed field, got {:?}",
-            segment.name,
-            segment.uuid,
-            segment.keyed_fields()
-        ))
-    })?;
+    let inputs = input_field_ids(segment)?;
+    let field_id = inputs
+        .first()
+        .copied()
+        .filter(|_| inputs.len() == 1)
+        .ok_or_else(|| {
+            Error::invalid_input(format!(
+                "Scalar index {} ({}) must have one keyed field, got {:?}",
+                segment.name,
+                segment.uuid,
+                segment.keyed_fields()
+            ))
+        })?;
     let column = dataset.schema().field_path(field_id)?;
     let details = IndexDetails(fetch_index_details(dataset, &column, segment).await?);
     if details.is_vector() {
@@ -1212,15 +1202,14 @@ pub fn index_matches_criteria(
     }
 
     if let Some(for_column) = criteria.for_column {
-        // A covered index lists its carried columns in `fields` too. Only the
-        // keyed prefix decides which column this index answers for, and there
-        // must be exactly one of it.
-        if index.keyed_field().is_none() {
+        // Carried columns and additional dependencies do not add query inputs.
+        // An index whose declaration does not resolve answers for no column.
+        if !input_field_ids(index).is_ok_and(|inputs| inputs.len() == 1) {
             return Ok(false);
         }
         if fields.len() != 1 {
-            // Callers must resolve `fields` from the keyed prefix alone. A caller
-            // that passes all of `index.fields` -- carried columns included --
+            // Callers must resolve `fields` from the query inputs alone. A caller
+            // that passes all of `index.fields` -- dependencies included --
             // lands here for every covered index and silently gets "no match"
             // rather than an error, which is how `describe_indices` came to omit
             // them.
@@ -1431,34 +1420,6 @@ mod tests {
             clustering_id: None,
             metadata: Default::default(),
             local_fragment_aliases: Default::default(),
-        }
-    }
-
-    #[test]
-    fn test_has_reader_matches_complete_type_name_case_insensitively() {
-        let has_reader = |type_url: &str| {
-            IndexDetails(Arc::new(prost_types::Any {
-                type_url: type_url.to_string(),
-                value: Vec::new(),
-            }))
-            .has_reader()
-        };
-
-        for type_url in [
-            "/lance.index.pb.VectorIndexDetails",
-            "type.googleapis.com/LANCE.INDEX.PB.VECTORINDEXDETAILS",
-            "type.googleapis.com/lance.index.VectorIndexDetails",
-            "type.googleapis.com/LANCE.TABLE.BTREEINDEXDETAILS",
-        ] {
-            assert!(has_reader(type_url), "expected a reader for {type_url}");
-        }
-
-        for type_url in [
-            "type.googleapis.com/example.MyVectorIndexDetails",
-            "type.googleapis.com/example.BTreeIndexDetails",
-            "VectorIndexDetails",
-        ] {
-            assert!(!has_reader(type_url), "unexpected reader for {type_url}");
         }
     }
 
@@ -1953,11 +1914,12 @@ mod tests {
             .await
             .unwrap();
         if let Some(byte_target) = byte_target {
-            dataset.file_reader_options = Some(Arc::new(lance_file::reader::FileReaderOptions {
-                batch_size_bytes: Some(byte_target),
-                read_chunk_size: 1024 * 1024,
-                ..Default::default()
-            }));
+            dataset.table_state.file_reader_options =
+                Some(Arc::new(lance_file::reader::FileReaderOptions {
+                    batch_size_bytes: Some(byte_target),
+                    read_chunk_size: 1024 * 1024,
+                    ..Default::default()
+                }));
         }
         assert!(largest_original_batch(&dataset).await >= 40);
         let params = InvertedIndexParams::default().num_workers(workers);
@@ -1989,10 +1951,10 @@ mod tests {
         assert_eq!(batch_rows.iter().sum::<usize>(), 80);
         if byte_target.is_none() {
             assert!(batch_rows.iter().all(|&rows| rows < 40), "{batch_rows:?}");
-            assert!(dataset.file_reader_options.is_none());
+            assert!(dataset.table_state.file_reader_options.is_none());
         } else {
             assert!(batch_rows.iter().any(|&rows| rows >= 40), "{batch_rows:?}");
-            let options = dataset.file_reader_options.as_ref().unwrap();
+            let options = dataset.table_state.file_reader_options.as_ref().unwrap();
             assert_eq!(options.batch_size_bytes, byte_target);
             assert_eq!(options.read_chunk_size, 1024 * 1024);
         }

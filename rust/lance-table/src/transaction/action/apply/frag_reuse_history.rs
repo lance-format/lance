@@ -160,9 +160,17 @@ impl ApplyState<'_> {
 
         if changes.trim && current.is_some() {
             let elements = split_trim_elements(&content)?;
+            // The fragments this operation publishes, so the verdict matches
+            // the manifest the trimmed history lands in.
+            let live: RoaringBitmap = self
+                .fragments
+                .iter()
+                .filter_map(|fragment| u32::try_from(fragment.id).ok())
+                .collect();
             let retained = compute_tagged_retention(
                 &elements,
                 &self.indices,
+                &live,
                 self.frag_reuse_inputs.index_is_usable,
             );
             if retained.iter().any(|kept| !kept) {
