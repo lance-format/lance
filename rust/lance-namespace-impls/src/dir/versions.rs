@@ -292,6 +292,61 @@ impl DirectoryNamespace {
             .await
     }
 
+    /// Seek to a dense window of V2 versions on an ordered store. The caller
+    /// falls back to numeric selection if cleanup left holes or V1 keys could
+    /// contribute to the window (including a duplicate at a page boundary).
+    async fn dense_version_window(
+        &self,
+        table_path: &Path,
+        low: u64,
+        high: u64,
+    ) -> object_store::Result<Option<Vec<TableVersion>>> {
+        let dir = table_path.clone().join(VERSIONS_DIR);
+        let low_digits = low.to_string();
+        if low_digits.len() != high.to_string().len() {
+            // V1 lexical and numeric order agree only within one digit width.
+            return Ok(None);
+        }
+        let v1_start = dir.clone().join(low_digits);
+        let v1_end = ManifestNamingScheme::V1.manifest_path(table_path, high);
+        if self
+            .object_store
+            .inner
+            .list_with_offset(Some(&dir), &v1_start)
+            .try_next()
+            .await?
+            .is_some_and(|meta| meta.location <= v1_end)
+        {
+            return Ok(None);
+        }
+
+        // A bare number sorts just before the corresponding ".manifest" key.
+        // This also works when cleanup has removed either endpoint.
+        let start = dir.clone().join(format!("{:020}", u64::MAX - high));
+        let end = ManifestNamingScheme::V2.manifest_path(table_path, low);
+        let mut objects = self.object_store.inner.list_with_offset(Some(&dir), &start);
+        let mut versions = Vec::new();
+        let mut expected = high;
+        while let Some(meta) = objects.try_next().await? {
+            if meta.location > end {
+                break;
+            }
+            if let Some((ManifestNamingScheme::V2, version)) =
+                Self::committed_manifest(table_path, &meta.location)
+            {
+                if version != expected {
+                    break;
+                }
+                versions.push(table_version(version, meta));
+                if version == low {
+                    return Ok(Some(versions));
+                }
+                expected -= 1;
+            }
+        }
+        Ok(None)
+    }
+
     /// Page by logical version so cleanup or a manifest naming migration does
     /// not invalidate the last version returned to a client.
     pub(super) async fn list_ascending_version_page(
@@ -318,6 +373,27 @@ impl DirectoryNamespace {
         }
         let table_path = self.object_store_path_from_uri(table_uri)?;
         let versions_dir = table_path.clone().join(VERSIONS_DIR);
+        // Only use seeks on ordered backends with native offset support. Some
+        // stores implement list_with_offset by streaming from the beginning.
+        if self.object_store.list_is_lexically_ordered
+            && matches!(self.object_store.scheme(), "s3" | "s3+ddb" | "memory")
+            && let (Some(after), Some(limit)) = (after, limit)
+            && let Some(high) = after.checked_add(limit as i64 + 1)
+            && let Some(mut versions) = self
+                .dense_version_window(&table_path, after as u64 + 1, high as u64)
+                .await
+                .map_err(|err| NamespaceError::Internal {
+                    message: format!("Failed to list manifest files under '{versions_dir}': {err}"),
+                })?
+        {
+            versions.reverse();
+            versions.truncate(limit);
+            return Ok(ListTableVersionsResponse {
+                page_token: versions.last().map(|v| v.version.to_string()),
+                versions,
+                ..Default::default()
+            });
+        }
         let mut manifests = self.object_store.list_objects(Some(&versions_dir));
         let mut versions = Vec::new();
         let keep = limit.map(|n| n + 1);
