@@ -4219,6 +4219,13 @@ mod tests {
             .collect::<RowAddrTreeMap>();
         assert!(retired_segment.needs_partition_row_ids());
         assert!(retired_segment.is_empty_for(&live_rows));
+        let live_ids = (1..20_u64)
+            .map(|offset| deleted_row | offset)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            retired_segment.filter_row_ids(Box::new(live_ids.iter())),
+            (0..live_ids.len() as u64).collect::<Vec<_>>()
+        );
         let mut stale_rows = live_rows;
         stale_rows.insert(deleted_row);
         assert!(!retired_segment.is_empty_for(&stale_rows));
