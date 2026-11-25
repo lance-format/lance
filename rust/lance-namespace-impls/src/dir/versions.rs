@@ -300,18 +300,7 @@ impl DirectoryNamespace {
         limit: Option<i32>,
         page_token: Option<&str>,
     ) -> Result<ListTableVersionsResponse> {
-        let after = page_token
-            .filter(|token| !token.is_empty())
-            .map(|token| {
-                token
-                    .parse::<i64>()
-                    .ok()
-                    .filter(|v| *v >= 0 && v.to_string() == token)
-                    .ok_or_else(|| NamespaceError::InvalidInput {
-                        message: format!("Invalid table version page_token '{token}'"),
-                    })
-            })
-            .transpose()?;
+        let after = parse_version_page_token(page_token)?;
         let limit = limit.and_then(|n| usize::try_from(n).ok());
         if limit == Some(0) {
             return Ok(ListTableVersionsResponse::default());
@@ -376,6 +365,46 @@ impl DirectoryNamespace {
         })
     }
 
+    /// Newest-first counterpart of [`Self::list_ascending_version_page`]. The
+    /// token is the last (oldest) version returned, and the next page holds
+    /// the versions below it. Ordered V2 stores keep the early stop, so the
+    /// `get_latest_version` hot path still reads only `limit + 1` manifests.
+    pub(super) async fn list_descending_version_page(
+        &self,
+        table_uri: &str,
+        limit: Option<i32>,
+        page_token: Option<&str>,
+    ) -> Result<ListTableVersionsResponse> {
+        let before = parse_version_page_token(page_token)?;
+        let limit = limit.and_then(|n| usize::try_from(n).ok());
+        if limit == Some(0) {
+            return Ok(ListTableVersionsResponse::default());
+        }
+        let table_path = self.object_store_path_from_uri(table_uri)?;
+        // One extra row tells whether another page follows.
+        let mut versions = self
+            .list_versions_below(
+                &table_path,
+                true,
+                limit.map(|n| n.saturating_add(1)),
+                before.map(|v| v as u64),
+            )
+            .await?;
+        let page_token = if let Some(limit) = limit
+            && versions.len() > limit
+        {
+            versions.truncate(limit);
+            versions.last().map(|last| last.version.to_string())
+        } else {
+            None
+        };
+        Ok(ListTableVersionsResponse {
+            versions,
+            page_token,
+            ..Default::default()
+        })
+    }
+
     /// List committed manifest versions under `table_path/_versions/`.
     /// `table_path` must be an object-store `Path`; converting a URI to a path
     /// can miss manifests on Windows.
@@ -386,6 +415,18 @@ impl DirectoryNamespace {
         limit: Option<i32>,
     ) -> Result<Vec<TableVersion>> {
         let limit = limit.and_then(|limit| usize::try_from(limit).ok());
+        self.list_versions_below(table_path, descending, limit, None)
+            .await
+    }
+
+    /// [`Self::list_versions_under`], keeping only versions below `before`.
+    pub(super) async fn list_versions_below(
+        &self,
+        table_path: &Path,
+        descending: bool,
+        limit: Option<usize>,
+        before: Option<u64>,
+    ) -> Result<Vec<TableVersion>> {
         if limit == Some(0) {
             return Ok(Vec::new());
         }
@@ -410,7 +451,13 @@ impl DirectoryNamespace {
         let Some((scheme, first)) = stream.try_next().await.map_err(list_err)? else {
             return Ok(Vec::new());
         };
-        let mut table_versions = vec![first];
+        // Bounded after the scheme is read: the order check below depends on
+        // the first manifest listed, not the first one kept.
+        let in_range = |v: &TableVersion| before.is_none_or(|before| (v.version as u64) < before);
+        let mut table_versions = Vec::new();
+        if in_range(&first) {
+            table_versions.push(first);
+        }
 
         // Only V2 names may be trusted to match stream order: V2 filenames
         // invert and zero-pad the version, so a lexically-ordered stream
@@ -427,7 +474,8 @@ impl DirectoryNamespace {
 
         while early_stop_at.is_none_or(|n| table_versions.len() < n) {
             match stream.try_next().await.map_err(list_err)? {
-                Some((_, manifest)) => table_versions.push(manifest),
+                Some((_, manifest)) if in_range(&manifest) => table_versions.push(manifest),
+                Some(_) => {}
                 None => break,
             }
         }
@@ -514,4 +562,21 @@ impl DirectoryNamespace {
         }
         Ok(deleted_count)
     }
+}
+
+/// Parse a table version `page_token`: the canonical decimal form of a
+/// non-negative version. Empty or absent means the first page.
+fn parse_version_page_token(page_token: Option<&str>) -> Result<Option<i64>> {
+    Ok(page_token
+        .filter(|token| !token.is_empty())
+        .map(|token| {
+            token
+                .parse::<i64>()
+                .ok()
+                .filter(|v| *v >= 0 && v.to_string() == token)
+                .ok_or_else(|| NamespaceError::InvalidInput {
+                    message: format!("Invalid table version page_token '{token}'"),
+                })
+        })
+        .transpose()?)
 }

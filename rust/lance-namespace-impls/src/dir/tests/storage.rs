@@ -82,6 +82,24 @@ async fn test_list_versions_under_ordering_and_limit() {
             .await
             .unwrap();
         assert_eq!(versions(&got), vec![7, 6, 5, 4, 3, 2, 1]);
+
+        // A descending page bound keeps the early stop and skips the
+        // versions at or above it.
+        let got = ns
+            .list_versions_below(&table_path, true, Some(2), Some(5))
+            .await
+            .unwrap();
+        assert_eq!(versions(&got), vec![4, 3]);
+        let got = ns
+            .list_versions_below(&table_path, true, Some(3), Some(100))
+            .await
+            .unwrap();
+        assert_eq!(versions(&got), vec![7, 6, 5]);
+        let got = ns
+            .list_versions_below(&table_path, true, None, Some(1))
+            .await
+            .unwrap();
+        assert!(got.is_empty());
     }
 
     /// V1 manifest names are unpadded (`10.manifest` sorts lexically before
@@ -185,6 +203,24 @@ async fn test_list_table_versions_pagination_mixed_manifests_and_cleanup() {
     assert_eq!(numbers(&history.versions), [20, 12, 11, 10, 7, 5, 2]);
     let latest = ns.list_table_versions(descending(Some(1))).await.unwrap();
     assert_eq!(numbers(&latest.versions), [20]);
+    assert_eq!(latest.page_token.as_deref(), Some("20"));
+    // Descending pages continue below the last version returned.
+    let mut pages = Vec::new();
+    let mut page_request = descending(Some(3));
+    loop {
+        let page = ns.list_table_versions(page_request.clone()).await.unwrap();
+        pages.push(numbers(&page.versions));
+        match page.page_token {
+            Some(token) => page_request.page_token = Some(token),
+            None => break,
+        }
+    }
+    assert_eq!(pages, [vec![20, 12, 11], vec![10, 7, 5], vec![2]]);
+    let invalid = ListTableVersionsRequest {
+        page_token: Some("01".into()),
+        ..descending(Some(3))
+    };
+    ns.list_table_versions(invalid).await.unwrap_err();
     let first = ns.list_table_versions(request.clone()).await.unwrap();
     assert_eq!(numbers(&first.versions), [2, 5]);
     let deleted = ns

@@ -772,24 +772,14 @@ impl LanceNamespace for DirectoryNamespace {
             Some(b) => self.resolve_branch_location(&table_uri, b).await?,
             None => table_uri,
         };
-        if request.descending != Some(true) {
-            return self
-                .list_ascending_version_page(
-                    &table_uri,
-                    request.limit,
-                    request.page_token.as_deref(),
-                )
-                .await;
+        let page_token = request.page_token.as_deref();
+        if request.descending == Some(true) {
+            self.list_descending_version_page(&table_uri, request.limit, page_token)
+                .await
+        } else {
+            self.list_ascending_version_page(&table_uri, request.limit, page_token)
+                .await
         }
-        let table_versions = self
-            .list_table_versions_from_storage(&table_uri, true, request.limit)
-            .await?;
-
-        Ok(ListTableVersionsResponse {
-            versions: table_versions,
-            page_token: None,
-            ..Default::default()
-        })
     }
 
     async fn create_table_version(
