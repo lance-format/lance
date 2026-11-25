@@ -477,8 +477,7 @@ message IndexMetadata {
    *
    * Requires flag 1 << 20 (FLAG_LOCAL_FRAGMENT_ALIASES) in both reader and
    * writer feature flags while nonempty. Both bits are cleared when no
-   * retained segment has a nonempty map. Reserved until readers and index
-   * maintenance support aliases.
+   * retained segment has a nonempty map.
    */
   map<uint32, uint32> local_fragment_aliases = 14;
 }

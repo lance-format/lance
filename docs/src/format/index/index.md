@@ -293,8 +293,9 @@ when the segment also stores 42 and leaves 42 unmapped.
 A nonempty map requires `FLAG_LOCAL_FRAGMENT_ALIASES` (`2^20`) in both reader
 and writer [feature flags](../table/versioning.md#feature-flags). Both bits
 are set while any retained segment has a nonempty map, including when
-`fragment_bitmap` is empty, and cleared when none do. The flag is reserved.
-Readers and writers reject it until alias support lands.
+`fragment_bitmap` is empty, and cleared when none do. Current readers support
+aliases on scalar indexes with batch row address remapping and reject aliased
+vector segments.
 
 ### Index Segment Metadata
 
