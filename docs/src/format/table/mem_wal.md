@@ -545,7 +545,7 @@ The garbage collector may remove obsolete SSTables after:
 
 ## Restore
 
-Restoring a table with a MemWAL to an earlier version is not supported. A restore rolls back the base table and the MemWAL index (`compacted_sstables`, `index_catchup`) but not shard state: SSTables, WAL entries and MemTables written since remain visible, and SSTables garbage-collected since may leave compacted rows unreadable. Catch-up credit likewise assumes rows a transaction read as deleted stay deleted.
+Restoring a table with a MemWAL to an earlier version is not supported: a restore is rejected when the current or the target version has a MemWAL. A restore rolls back the base table and the MemWAL index (`compacted_sstables`, `index_catchup`) but not shard state: SSTables, WAL entries and MemTables written since remain visible, and SSTables garbage-collected since may leave compacted rows unreadable. Catch-up credit likewise assumes rows a transaction read as deleted stay deleted.
 
 ## Reader Expectations
 

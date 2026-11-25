@@ -252,6 +252,43 @@ impl Transaction {
         Ok(version.map(DataStorageFormat::new).unwrap_or_default())
     }
 
+    /// Refuse a restore when the target or the current version has a MemWAL.
+    ///
+    /// A restore rolls back the base table and the MemWAL index but not shard
+    /// state (SSTables, WAL entries, MemTables), so the result matches no
+    /// point in time. Returns [`Error::NotSupported`].
+    async fn refuse_mem_wal_restore(
+        object_store: &ObjectStore,
+        commit_handler: &dyn CommitHandler,
+        base_path: &Path,
+        version: u64,
+        target_indices: &[IndexMetadata],
+        current_manifest: &Manifest,
+    ) -> Result<()> {
+        let has_mem_wal =
+            |indices: &[IndexMetadata]| indices.iter().any(|idx| idx.name == MEM_WAL_INDEX_NAME);
+        let holder = if has_mem_wal(target_indices) {
+            Some("target")
+        } else if current_manifest.index_section.is_some() {
+            let location = commit_handler
+                .resolve_version_location(base_path, current_manifest.version, &object_store.inner)
+                .await?;
+            let current_indices =
+                read_manifest_indexes(object_store, &location, current_manifest).await?;
+            has_mem_wal(&current_indices).then_some("current")
+        } else {
+            None
+        };
+        match holder {
+            Some(holder) => Err(Error::not_supported(format!(
+                "Cannot restore version {version}: the {holder} version (current is {}) has a \
+                 MemWAL, and restore cannot roll back MemWAL shard state",
+                current_manifest.version
+            ))),
+            None => Ok(()),
+        }
+    }
+
     pub async fn restore_old_manifest(
         object_store: &ObjectStore,
         commit_handler: &dyn CommitHandler,
@@ -282,6 +319,15 @@ impl Transaction {
         manifest.transaction_file = Some(tx_path.to_string());
         let indices = read_manifest_indexes(object_store, &location, &manifest).await?;
         validate_flags(&manifest, &indices)?;
+        Self::refuse_mem_wal_restore(
+            object_store,
+            commit_handler,
+            base_path,
+            version,
+            &indices,
+            current_manifest,
+        )
+        .await?;
         manifest.max_fragment_id = manifest
             .max_fragment_id
             .max(current_manifest.max_fragment_id);

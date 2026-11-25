@@ -662,6 +662,133 @@ mod tests {
         )
     }
 
+    /// A table whose rows have all been deleted under the same MemWAL is
+    /// credited by the next commit.
+    #[tokio::test]
+    async fn an_emptied_table_earns_catch_up() {
+        let shard = Uuid::new_v4();
+        let dataset = compacted_dataset(shard, 5).await;
+        let txn = Transaction::new(
+            dataset.manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![index_over("idx", &[])],
+                removed_indices: vec![],
+            },
+            None,
+        );
+        let mut dataset = CommitBuilder::new(Arc::new(dataset))
+            .execute(txn)
+            .await
+            .unwrap();
+        dataset.delete("true").await.unwrap();
+        assert!(dataset.get_fragments().is_empty());
+        assert_eq!(catch_up_generation(&dataset, "idx").await, None);
+
+        let read_version = dataset.manifest.version;
+        let dataset = CommitBuilder::new(Arc::new(dataset))
+            .execute(update_config_txn(read_version))
+            .await
+            .unwrap();
+        assert_eq!(catch_up_generation(&dataset, "idx").await, Some(5));
+    }
+
+    /// Drops the MemWAL system index, as disabling the MemWAL does.
+    async fn without_mem_wal(dataset: crate::Dataset) -> crate::Dataset {
+        let mem_wal = dataset
+            .load_indices()
+            .await
+            .unwrap()
+            .iter()
+            .find(|idx| idx.name == MEM_WAL_INDEX_NAME)
+            .unwrap()
+            .clone();
+        let txn = Transaction::new(
+            dataset.manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![],
+                removed_indices: vec![mem_wal],
+            },
+            None,
+        );
+        CommitBuilder::new(Arc::new(dataset))
+            .execute(txn)
+            .await
+            .unwrap()
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum MemWalAt {
+        Neither,
+        Current,
+        Target,
+    }
+
+    /// Restore cannot roll back MemWAL shard state, so it is refused when
+    /// either version has a MemWAL and leaves the table unchanged.
+    #[rstest::rstest]
+    #[case::neither(MemWalAt::Neither)]
+    #[case::current(MemWalAt::Current)]
+    #[case::target(MemWalAt::Target)]
+    #[tokio::test]
+    async fn restore_is_refused_when_either_version_has_a_mem_wal(#[case] mem_wal_at: MemWalAt) {
+        let (dataset, target) = match mem_wal_at {
+            MemWalAt::Neither => {
+                let dataset = test_dataset().await;
+                let target = dataset.manifest.version;
+                let txn = update_config_txn(target);
+                let dataset = CommitBuilder::new(Arc::new(dataset))
+                    .execute(txn)
+                    .await
+                    .unwrap();
+                (dataset, target)
+            }
+            MemWalAt::Current => {
+                let dataset = test_dataset().await;
+                let target = dataset.manifest.version;
+                let mem_wal_index =
+                    new_mem_wal_index_meta(target, MemWalIndexDetails::default()).unwrap();
+                let txn = Transaction::new(
+                    target,
+                    Operation::CreateIndex {
+                        new_indices: vec![mem_wal_index],
+                        removed_indices: vec![],
+                    },
+                    None,
+                );
+                let dataset = CommitBuilder::new(Arc::new(dataset))
+                    .execute(txn)
+                    .await
+                    .unwrap();
+                (dataset, target)
+            }
+            MemWalAt::Target => {
+                let dataset = test_dataset_with_mem_wal().await;
+                let target = dataset.manifest.version;
+                (without_mem_wal(dataset).await, target)
+            }
+        };
+        let latest = dataset.manifest.version;
+
+        let mut restoring = dataset.checkout_version(target).await.unwrap();
+        let result = restoring.restore().await;
+
+        match mem_wal_at {
+            MemWalAt::Neither => {
+                result.unwrap();
+                assert_eq!(dataset.latest_version_id().await.unwrap(), latest + 1);
+            }
+            MemWalAt::Current | MemWalAt::Target => {
+                let err = result.unwrap_err();
+                assert!(
+                    matches!(err, crate::Error::NotSupported { .. }),
+                    "expected NotSupported, got {err:?}"
+                );
+                assert!(err.to_string().contains("MemWAL"), "{err}");
+                assert_eq!(dataset.latest_version_id().await.unwrap(), latest);
+            }
+        }
+    }
+
     /// A stale handle that read under a replaced MemWAL credits nothing, even
     /// with a matching shard and generation.
     #[tokio::test]
