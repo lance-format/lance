@@ -385,7 +385,7 @@ async fn test_partition_coverage_is_only_built_for_capable_filters() {
 
 #[tokio::test]
 async fn test_partition_coverage_cache_does_not_retain_transient_storage() {
-    let entry = |num_rows| {
+    let entry = |num_rows: usize| {
         let vectors = FixedSizeListArray::try_new_from_values(
             Float32Array::from(vec![0.0_f32; num_rows * 4]),
             4,
