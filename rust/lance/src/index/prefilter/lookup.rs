@@ -118,6 +118,19 @@ impl PreparedRowAddrMask {
             .filter_map(|(offset, selected)| selected.then_some(offset as u64))
             .collect()
     }
+
+    pub(crate) fn selected_offsets_into<'a>(
+        &self,
+        rows: impl Iterator<Item = &'a u64>,
+        out: &mut Vec<u32>,
+    ) {
+        out.clear();
+        out.extend(
+            self.selection(rows, false)
+                .enumerate()
+                .filter_map(|(offset, selected)| selected.then_some(offset as u32)),
+        );
+    }
 }
 
 #[cfg(test)]
@@ -161,6 +174,17 @@ mod tests {
                 prepared.selected_indices(input.iter()),
                 mask.selected_indices(input.iter())
             );
+            let mut offsets = vec![u32::MAX];
+            prepared.selected_offsets_into(input.iter(), &mut offsets);
+            assert_eq!(
+                offsets
+                    .iter()
+                    .map(|&offset| u64::from(offset))
+                    .collect::<Vec<_>>(),
+                mask.selected_indices(input.iter())
+            );
+            prepared.selected_offsets_into(std::iter::empty(), &mut offsets);
+            assert!(offsets.is_empty());
         }
     }
 
@@ -204,6 +228,17 @@ mod tests {
                 prepared.selected_indices(input.iter()),
                 mask.selected_indices(input.iter())
             );
+            let mut offsets = vec![u32::MAX];
+            prepared.selected_offsets_into(input.iter(), &mut offsets);
+            assert_eq!(
+                offsets
+                    .iter()
+                    .map(|&offset| u64::from(offset))
+                    .collect::<Vec<_>>(),
+                mask.selected_indices(input.iter())
+            );
+            prepared.selected_offsets_into(std::iter::empty(), &mut offsets);
+            assert!(offsets.is_empty());
         }
     }
 
@@ -269,6 +304,17 @@ mod tests {
                 prepared.selected_indices(input.iter()),
                 mask.selected_indices(input.iter())
             );
+            let mut offsets = vec![u32::MAX];
+            prepared.selected_offsets_into(input.iter(), &mut offsets);
+            assert_eq!(
+                offsets
+                    .iter()
+                    .map(|&offset| u64::from(offset))
+                    .collect::<Vec<_>>(),
+                mask.selected_indices(input.iter())
+            );
+            prepared.selected_offsets_into(std::iter::empty(), &mut offsets);
+            assert!(offsets.is_empty());
         }
     }
 
@@ -300,6 +346,17 @@ mod tests {
                 prepared.selected_indices(input.iter()),
                 mask.selected_indices(input.iter())
             );
+            let mut offsets = vec![u32::MAX];
+            prepared.selected_offsets_into(input.iter(), &mut offsets);
+            assert_eq!(
+                offsets
+                    .iter()
+                    .map(|&offset| u64::from(offset))
+                    .collect::<Vec<_>>(),
+                mask.selected_indices(input.iter())
+            );
+            prepared.selected_offsets_into(std::iter::empty(), &mut offsets);
+            assert!(offsets.is_empty());
         }
     }
 }

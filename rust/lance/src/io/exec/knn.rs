@@ -1830,6 +1830,15 @@ impl SegmentPreFilter {
             lookup_mask: OnceLock::new(),
         }
     }
+
+    fn prepared_lookup(&self, num_rows_lower_bound: usize) -> Option<&PreparedRowAddrMask> {
+        self.lookup_mask.get().or_else(|| {
+            (num_rows_lower_bound >= 65536).then(|| {
+                self.lookup_mask
+                    .get_or_init(|| PreparedRowAddrMask::new(&self.mask()))
+            })
+        })
+    }
 }
 
 #[async_trait::async_trait]
@@ -1889,16 +1898,21 @@ impl PreFilter for SegmentPreFilter {
     }
 
     fn filter_row_ids<'a>(&self, row_ids: Box<dyn Iterator<Item = &'a u64> + 'a>) -> Vec<u64> {
-        if let Some(mask) = self.lookup_mask.get() {
+        if let Some(mask) = self.prepared_lookup(row_ids.size_hint().0) {
             return mask.selected_indices(row_ids);
         }
-        if row_ids.size_hint().0 >= 65536 {
-            return self
-                .lookup_mask
-                .get_or_init(|| PreparedRowAddrMask::new(&self.mask()))
-                .selected_indices(row_ids);
-        }
         self.mask().selected_indices(row_ids)
+    }
+
+    fn filter_row_offsets_into<'a>(
+        &self,
+        row_ids: Box<dyn Iterator<Item = &'a u64> + 'a>,
+        out: &mut Vec<u32>,
+    ) {
+        match self.prepared_lookup(row_ids.size_hint().0) {
+            Some(mask) => mask.selected_offsets_into(row_ids, out),
+            None => self.mask().selected_offsets_into(row_ids, out),
+        }
     }
 }
 
@@ -3858,8 +3872,13 @@ mod tests {
         prefilter
     }
 
+    #[rstest]
+    #[case::indices_first(false)]
+    #[case::offsets_first(true)]
     #[tokio::test]
-    async fn test_segment_prepared_mask_preserves_ownership_and_offsets() {
+    async fn test_segment_prepared_mask_preserves_ownership_and_offsets(
+        #[case] offsets_first: bool,
+    ) {
         let selected = (0..70000_u64)
             .filter(|row| row % 3 == 0)
             .collect::<RowAddrTreeMap>();
@@ -3868,19 +3887,72 @@ mod tests {
             RowAddrMask::from_block(selected),
         ] {
             let base = prefilter_with_mask(Some(query_mask)).await;
+            let mut rows = (0..70000_u64).rev().collect::<Vec<_>>();
+            rows.extend([3, 7, u64::MAX, 3_u64 << 32]);
+            let mut offsets = vec![u32::MAX];
+            base.filter_row_offsets_into(Box::new(rows[..8].iter()), &mut offsets);
+            assert!(base.lookup_mask.get().is_none());
+            assert_eq!(
+                offsets
+                    .iter()
+                    .map(|&offset| u64::from(offset))
+                    .collect::<Vec<_>>(),
+                base.mask().selected_indices(rows[..8].iter())
+            );
+            base.filter_row_offsets_into(Box::new(rows.iter()), &mut offsets);
+            assert!(base.lookup_mask.get().is_some());
+            assert_eq!(
+                offsets
+                    .iter()
+                    .map(|&offset| u64::from(offset))
+                    .collect::<Vec<_>>(),
+                base.mask().selected_indices(rows.iter())
+            );
+            assert_eq!(
+                base.filter_row_ids(Box::new(rows.iter())),
+                base.mask().selected_indices(rows.iter())
+            );
             let ownership = Arc::new(RowAddrMask::from_block([3, 4, 6, 7].into_iter().collect()));
             let filter = SegmentPreFilter::new(base, ownership);
             filter.wait_for_ready().await.unwrap();
-            let mut rows = (0..70000_u64).rev().collect::<Vec<_>>();
-            rows.extend([3, 7, u64::MAX, 3_u64 << 32]);
             let expected = filter.mask().selected_indices(rows.iter());
             assert_eq!(
                 filter.filter_row_ids(Box::new(rows[..8].iter())),
                 filter.mask().selected_indices(rows[..8].iter())
             );
+            let mut offsets = vec![u32::MAX];
+            filter.filter_row_offsets_into(Box::new(rows[..8].iter()), &mut offsets);
+            assert_eq!(
+                offsets
+                    .iter()
+                    .map(|&offset| u64::from(offset))
+                    .collect::<Vec<_>>(),
+                filter.mask().selected_indices(rows[..8].iter())
+            );
             assert!(filter.lookup_mask.get().is_none());
+            if offsets_first {
+                filter.filter_row_offsets_into(Box::new(rows.iter()), &mut offsets);
+                assert_eq!(
+                    offsets
+                        .iter()
+                        .map(|&offset| u64::from(offset))
+                        .collect::<Vec<_>>(),
+                    expected
+                );
+                assert!(filter.lookup_mask.get().is_some());
+            }
             assert_eq!(filter.filter_row_ids(Box::new(rows.iter())), expected);
             assert!(filter.lookup_mask.get().is_some());
+            filter.filter_row_offsets_into(Box::new(rows.iter()), &mut offsets);
+            assert_eq!(
+                offsets
+                    .iter()
+                    .map(|&offset| u64::from(offset))
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            filter.filter_row_offsets_into(Box::new(std::iter::empty()), &mut offsets);
+            assert!(offsets.is_empty());
             assert_eq!(
                 filter.filter_row_ids(Box::new(rows[..8].iter())),
                 filter.mask().selected_indices(rows[..8].iter())

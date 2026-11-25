@@ -13,6 +13,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::OnceLock;
 
 use async_trait::async_trait;
 use futures::FutureExt;
@@ -36,6 +37,7 @@ use crate::Result;
 use crate::dataset::fragment::FileFragment;
 use crate::dataset::rowids::load_row_id_sequence;
 use crate::utils::future::SharedPrerequisite;
+use lookup::PreparedRowAddrMask;
 
 pub use lance_index::prefilter::{FilterLoader, PreFilter};
 
@@ -73,6 +75,7 @@ pub struct DatasetPreFilter {
     pub(super) overlay_block: Option<Arc<RowAddrMask>>,
     // When the tasks are finished this is the combined filter
     pub(super) final_mask: Mutex<OnceCell<Arc<RowAddrMask>>>,
+    pub(super) lookup_mask: OnceLock<PreparedRowAddrMask>,
 }
 
 impl DatasetPreFilter {
@@ -114,6 +117,7 @@ impl DatasetPreFilter {
             deleted_fragments: None,
             overlay_block: None,
             final_mask: Mutex::new(OnceCell::new()),
+            lookup_mask: OnceLock::new(),
         }
     }
 
@@ -141,6 +145,7 @@ impl DatasetPreFilter {
             deleted_fragments: None,
             overlay_block: None,
             final_mask: Mutex::new(OnceCell::new()),
+            lookup_mask: OnceLock::new(),
         }
     }
 
@@ -313,6 +318,7 @@ impl DatasetPreFilter {
             deleted_fragments,
             overlay_block,
             final_mask: _,
+            lookup_mask: _,
         } = self;
         filtered_ids.is_none() && deleted_fragments.is_none() && overlay_block.is_none()
     }
@@ -470,6 +476,15 @@ impl DatasetPreFilter {
             Self::do_create_deletion_mask(dataset, missing_frags, frags_with_deletion_files).boxed()
         }
     }
+
+    fn prepared_lookup(&self, num_rows_lower_bound: usize) -> Option<&PreparedRowAddrMask> {
+        self.lookup_mask.get().or_else(|| {
+            (num_rows_lower_bound >= 65536).then(|| {
+                self.lookup_mask
+                    .get_or_init(|| PreparedRowAddrMask::new(&self.mask()))
+            })
+        })
+    }
 }
 
 /// Whether `mask` is known to pass no row: an empty allow list. Block lists
@@ -591,7 +606,21 @@ impl PreFilter for DatasetPreFilter {
     /// This method must be called after `wait_for_ready`
     #[instrument(level = "debug", skip_all)]
     fn filter_row_ids<'a>(&self, row_ids: Box<dyn Iterator<Item = &'a u64> + 'a>) -> Vec<u64> {
-        self.mask().selected_indices(row_ids)
+        match self.prepared_lookup(row_ids.size_hint().0) {
+            Some(mask) => mask.selected_indices(row_ids),
+            None => self.mask().selected_indices(row_ids),
+        }
+    }
+
+    fn filter_row_offsets_into<'a>(
+        &self,
+        row_ids: Box<dyn Iterator<Item = &'a u64> + 'a>,
+        out: &mut Vec<u32>,
+    ) {
+        match self.prepared_lookup(row_ids.size_hint().0) {
+            Some(mask) => mask.selected_offsets_into(row_ids, out),
+            None => self.mask().selected_offsets_into(row_ids, out),
+        }
     }
 }
 
