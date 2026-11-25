@@ -456,6 +456,7 @@ enum ListBehavior {
     RetargetTagOnBranchRead,
     DeleteTagOnRead,
     DeleteTagOnManifestRead,
+    ReadUntaggedManifestOnce,
 }
 
 #[derive(Debug)]
@@ -521,6 +522,14 @@ impl OSObjectStore for FailingListStore {
                         ))
                         .await?;
                 }
+                Some(ListBehavior::ReadUntaggedManifestOnce)
+                    if let Some((root, version)) =
+                        location.as_ref().rsplit_once("/users.lance/_versions/") =>
+                {
+                    self.behavior.lock().unwrap().take();
+                    let other = Path::from(format!("{root}/untagged.lance/_versions/{version}"));
+                    return self.target.get_opts(&other, options).await;
+                }
                 _ => {}
             }
         }
@@ -567,7 +576,8 @@ impl OSObjectStore for FailingListStore {
                 ListBehavior::WithoutEtags
                 | ListBehavior::RetargetTagOnBranchRead
                 | ListBehavior::DeleteTagOnRead
-                | ListBehavior::DeleteTagOnManifestRead,
+                | ListBehavior::DeleteTagOnManifestRead
+                | ListBehavior::ReadUntaggedManifestOnce,
             ) => self.target.list_with_delimiter(prefix).await,
             Some(ListBehavior::EmptyListing) => Ok(ListResult {
                 common_prefixes: Vec::new(),
@@ -794,6 +804,49 @@ async fn test_describe_table_snapshot_selectors_racing_tag(
     *toggle.lock().unwrap() = Some(event);
     let error = reader.describe_table(request).await.unwrap_err();
     assert_eq!(mutation_error_code(error), expected, "{event:?}");
+}
+
+#[tokio::test]
+async fn test_legacy_tag_rejects_a_manifest_from_an_untagged_table() {
+    use lance::dataset::ColumnAlteration;
+
+    let (reader, temp, toggle) = failing_list_namespace().await;
+    let writer = DirectoryNamespaceBuilder::new(temp.to_str().unwrap())
+        .manifest_enabled(false)
+        .build()
+        .await
+        .unwrap();
+    for (name, field) in [("users", "old_id"), ("untagged", "new_id")] {
+        create_scalar_table(&writer, name).await;
+        let mut dataset = open_dataset(&writer, name).await;
+        dataset
+            .alter_columns(&[ColumnAlteration::new("id".into()).rename(field.into())])
+            .await
+            .unwrap();
+    }
+    let main = open_dataset(&writer, "users").await;
+    main.tags().create("release", 2).await.unwrap();
+    let mut legacy = main.tags().get("release").await.unwrap();
+    legacy.created_at = None;
+    legacy.updated_at = None;
+    std::fs::write(
+        temp.as_ref().join("users.lance/_refs/tags/release.json"),
+        serde_json::to_vec(&legacy).unwrap(),
+    )
+    .unwrap();
+    let request = DescribeTableRequest {
+        id: Some(vec!["users".into()]),
+        tag: Some("release".into()),
+        load_detailed_metadata: Some(true),
+        ..Default::default()
+    };
+    // The tag reads agree, but the intervening manifest GET sees a different table.
+    *toggle.lock().unwrap() = Some(ListBehavior::ReadUntaggedManifestOnce);
+    let err = reader.describe_table(request.clone()).await.unwrap_err();
+    assert_eq!(mutation_error_code(err), ErrorCode::ConcurrentModification);
+    let stable = reader.describe_table(request).await.unwrap();
+    assert_eq!(stable.version, Some(2));
+    assert_eq!(stable.schema.unwrap().fields[0].name, "old_id");
 }
 
 #[tokio::test]
