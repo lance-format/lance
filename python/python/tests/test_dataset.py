@@ -3387,6 +3387,31 @@ def composite_merge_schema():
     )
 
 
+@pytest.mark.parametrize("columns", [["user-id", "part"], ["part", "user-id"]])
+def test_merge_insert_explicit_primary_key_names(
+    tmp_path, composite_merge_schema, columns
+):
+    schema = composite_merge_schema.set(
+        0, composite_merge_schema.field(0).with_name("user-id")
+    )
+
+    def table(ids, values):
+        return pa.table(
+            {"user-id": ids, "part": [7] * len(ids), "value": values}, schema
+        )
+
+    ds = lance.write_dataset(table([1, 2, 3], [0, 0, 0]), tmp_path, max_rows_per_file=2)
+    txn, _ = (
+        ds.merge_insert(columns)
+        .when_matched_update_all()
+        .when_not_matched_insert_all()
+        .execute_uncommitted(table([1, 90], [4, 5]))
+    )
+    assert txn.operation.inserted_rows_filter.field_ids == [0, 1]
+    result = lance.LanceDataset.commit(tmp_path, txn)
+    assert result.to_table().sort_by("user-id") == table([1, 2, 3, 90], [4, 0, 0, 5])
+
+
 @pytest.mark.parametrize("reverse_commit", [False, True])
 @pytest.mark.parametrize(
     "same_key,old_writer", [(False, False), (True, False), (True, True)]

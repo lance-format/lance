@@ -45,7 +45,7 @@ impl MergeInsertBuilder {
         } else {
             // Resolve column names using case-insensitive matching to handle
             // lowercased column names from SQL parsing or user input
-            let columns = on
+            let mut columns = on
                 .iter()
                 .map(|col| {
                     schema.field_case_insensitive(col).ok_or_else(|| {
@@ -66,13 +66,12 @@ impl MergeInsertBuilder {
                 && primary_key.len() == columns.len()
                 && columns.iter().map(|field| field.id).all_unique()
             {
-                primary_key
-                    .iter()
-                    .map(|field| schema.field_path(field.id))
-                    .collect::<Result<Vec<_>>>()?
-            } else {
-                columns.iter().map(|field| field.name.clone()).collect()
+                columns = primary_key;
             }
+            columns
+                .into_iter()
+                .map(|field| field.name.clone())
+                .collect()
         };
 
         Ok(Self {
