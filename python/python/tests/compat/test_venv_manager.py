@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
+import os
 import subprocess
 
 import pytest
@@ -78,3 +79,57 @@ def test_pip_install_succeeds_first_try_without_sleeping(monkeypatch, no_sleep):
     _pip_install("python", ["pytest"])
     assert calls == [["python", "-m", "pip", "install", "--quiet", "pytest"]]
     assert no_sleep == []
+
+
+class _FakeRunner:
+    """Stands in for the runner subprocess; `returncode` None means alive."""
+
+    def __init__(self, *args, **kwargs):
+        self.stdin = open(os.devnull, "wb")
+        self.returncode = None
+
+    def poll(self):
+        return self.returncode
+
+    def terminate(self):
+        self.returncode = -15
+
+    def wait(self, timeout=None):
+        return self.returncode
+
+    def kill(self):
+        self.returncode = -9
+
+
+@pytest.fixture
+def fake_runner(monkeypatch, tmp_path):
+    monkeypatch.setattr(venv_manager.subprocess, "Popen", _FakeRunner)
+    venv_path = tmp_path / "venv"
+    venv_path.mkdir()
+    return venv_manager.VenvExecutor("0.0.0", venv_path)
+
+
+def test_cleanup_closes_runner_stderr_handle(fake_runner):
+    fake_runner._ensure_subprocess()
+    handle = fake_runner._stderr_file
+    assert not handle.closed
+
+    fake_runner.cleanup()
+    assert handle.closed
+    assert fake_runner._stderr_file is None
+    assert not fake_runner.venv_path.exists()
+
+    # A second cleanup is a no-op.
+    fake_runner.cleanup()
+
+
+def test_restarting_a_crashed_runner_closes_its_old_stderr_handle(fake_runner):
+    fake_runner._ensure_subprocess()
+    old_handle = fake_runner._stderr_file
+    fake_runner._subprocess.returncode = 1  # the runner crashed
+
+    fake_runner._ensure_subprocess()
+    assert old_handle.closed
+    assert not fake_runner._stderr_file.closed
+
+    fake_runner.cleanup()

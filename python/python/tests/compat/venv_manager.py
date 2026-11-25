@@ -340,6 +340,8 @@ class VenvExecutor:
         # Capture stderr to a file so a Rust panic (which crashes the runner) can be
         # surfaced in the error instead of an opaque "broken pipe".
         self._stderr_path = self.venv_path / ".runner_stderr.log"
+        # A runner that crashed is restarted here; release its old handle first.
+        self._close_stderr_file()
         self._stderr_file = open(self._stderr_path, "w")
         self._subprocess = subprocess.Popen(
             [str(self.python_path), "-u", str(runner_script)],
@@ -348,6 +350,12 @@ class VenvExecutor:
             stderr=self._stderr_file,
             env=env,
         )
+
+    def _close_stderr_file(self):
+        """Close the runner's stderr log handle, if one is open."""
+        if self._stderr_file is not None:
+            self._stderr_file.close()
+            self._stderr_file = None
 
     def _recent_stderr(self, max_lines: int = 200) -> str:
         """Return the tail of the runner's captured stderr, if any.
@@ -503,6 +511,9 @@ class VenvExecutor:
                 self._subprocess.kill()
             finally:
                 self._subprocess = None
+        # The handle must be closed before the venv is removed: Windows cannot
+        # delete a file that is still open.
+        self._close_stderr_file()
 
         # Remove venv directory
         if self.venv_path.exists():
