@@ -327,12 +327,16 @@ async fn test_list_versions_under_early_stop_bounded_consumption() {
             base_path: Url,
             params: &ObjectStoreParams,
         ) -> Result<ObjectStore> {
-            let store = MemoryStoreProvider.new_store(base_path.clone(), params).await?;
+            let store = MemoryStoreProvider
+                .new_store(base_path.clone(), params)
+                .await?;
             let inner = Arc::new(EntryCountingStore {
                 target: store.inner,
                 entries_listed: self.entries_listed.clone(),
             });
-            Ok(ObjectStore::new(inner, base_path, None, None, false, true, 1, 0, None))
+            Ok(ObjectStore::new(
+                inner, base_path, None, None, false, true, 1, 0, None,
+            ))
         }
 
         fn extract_path(&self, url: &Url) -> Result<Path> {
