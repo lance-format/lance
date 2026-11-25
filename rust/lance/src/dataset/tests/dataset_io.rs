@@ -4561,6 +4561,59 @@ async fn compaction_merges_rewritten_fragments_whose_dictionaries_fit(
     dataset.validate().await.unwrap();
 }
 
+/// Only the boundary between two rewritten fragments whose dictionaries cannot share a
+/// file is held back: each of them can still merge with its other neighbor.
+#[rstest]
+#[tokio::test]
+async fn compaction_merges_across_boundaries_dictionary_does_not_split(
+    #[values(LanceFileVersion::V2_1, LanceFileVersion::V2_2)] version: LanceFileVersion,
+) {
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "d",
+        DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+        true,
+    )]));
+    let reader = |start: usize, rows: usize| {
+        let values = StringArray::from_iter_values((start..start + 100).map(|i| format!("v{i}")));
+        let keys = Int8Array::from_iter_values((0..100).cycle().take(rows));
+        let dictionary = Int8DictionaryArray::try_new(keys, Arc::new(values)).unwrap();
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(dictionary)]).unwrap();
+        RecordBatchIterator::new([Ok(batch)], schema.clone())
+    };
+    let params = WriteParams {
+        data_storage_version: Some(version),
+        ..Default::default()
+    };
+    // Fragments A, B, C, A over three disjoint sets of 100 values; C is already full.
+    let mut dataset = Dataset::write(reader(0, 1000), "memory://", Some(params))
+        .await
+        .unwrap();
+    for (start, rows) in [(100, 1000), (200, 2000), (0, 1000)] {
+        dataset.append(reader(start, rows), None).await.unwrap();
+    }
+    let mut compact = async || {
+        let options = CompactionOptions {
+            target_rows_per_fragment: 2000,
+            ..Default::default()
+        };
+        let metrics = compact_files(&mut dataset, options, None).await.unwrap();
+        (metrics.fragments_removed, metrics.fragments_added)
+    };
+
+    // The rewrite leaves the fragments in the order C, A, A, B.
+    assert_eq!(compact().await, (2, 2));
+    // The two A fragments merge; only the boundary between A and B is held back.
+    assert_eq!(compact().await, (2, 1));
+    assert_eq!(compact().await, (0, 0));
+    let mut fragment_rows = Vec::new();
+    for fragment in dataset.get_fragments() {
+        fragment_rows.push(fragment.count_rows(None).await.unwrap());
+    }
+    assert_eq!(fragment_rows, [2000, 1000, 2000]);
+    assert_eq!(dataset.count_rows(None).await.unwrap(), 5000);
+    dataset.validate().await.unwrap();
+}
+
 /// A file finished early for its dictionary leaves the input's row-limit cuts out of line
 /// with the files. The next file must still stop at `max_rows_per_file` rows.
 #[rstest]
