@@ -8,6 +8,8 @@ use lance_select::{RowAddrMask, RowAddrSelection};
 use roaring::RoaringBitmap;
 
 const MAX_DENSE_EXPANSION: u64 = 16;
+const MAX_SMALL_DENSE_BYTES: u64 = 128 * 1024;
+const EXTRA_DENSE_BUDGET: u64 = 4 * 1024 * 1024;
 
 pub(crate) struct PreparedRowAddrMask {
     allow: bool,
@@ -21,7 +23,7 @@ enum FragmentSelection {
 }
 
 impl FragmentSelection {
-    fn prepare(selection: &RowAddrSelection) -> Self {
+    fn prepare(selection: &RowAddrSelection, extra_dense_budget: &mut u64) -> Self {
         let bitmap = match selection {
             RowAddrSelection::Full => return Self::Full,
             RowAddrSelection::Partial(bitmap) if bitmap.is_full() => return Self::Full,
@@ -32,8 +34,12 @@ impl FragmentSelection {
         };
         let base = min / 64 * 64;
         let num_words = (u64::from(max) - u64::from(base)) / 64 + 1;
-        if num_words * 8 > bitmap.serialized_size() as u64 * MAX_DENSE_EXPANSION {
-            return Self::Sparse(bitmap.clone());
+        let dense_bytes = num_words * 8;
+        if dense_bytes > bitmap.serialized_size() as u64 * MAX_DENSE_EXPANSION {
+            if dense_bytes > MAX_SMALL_DENSE_BYTES || dense_bytes > *extra_dense_budget {
+                return Self::Sparse(bitmap.clone());
+            }
+            *extra_dense_budget -= dense_bytes;
         }
         let mut words = vec![0; num_words as usize];
         for row in bitmap {
@@ -62,11 +68,17 @@ impl PreparedRowAddrMask {
             RowAddrMask::BlockList(rows) => (rows, false),
         };
         rows.optimize_for_lookup();
+        let mut extra_dense_budget = EXTRA_DENSE_BUDGET;
         Self {
             allow,
             fragments: rows
                 .iter()
-                .map(|(&fragment, selection)| (fragment, FragmentSelection::prepare(selection)))
+                .map(|(&fragment, selection)| {
+                    (
+                        fragment,
+                        FragmentSelection::prepare(selection, &mut extra_dense_budget),
+                    )
+                })
                 .collect(),
         }
     }
@@ -111,7 +123,50 @@ mod tests {
     use lance_select::{RowAddrMask, RowAddrTreeMap};
     use roaring::RoaringBitmap;
 
-    use super::{FragmentSelection, PreparedRowAddrMask};
+    use super::{EXTRA_DENSE_BUDGET, FragmentSelection, PreparedRowAddrMask};
+
+    #[test]
+    fn prepared_mask_bounds_extra_dense_allocations() {
+        let mut rows = RowAddrTreeMap::new();
+        for fragment in 0..40 {
+            rows.insert_bitmap(fragment, RoaringBitmap::from_iter([0, 999999]));
+        }
+        let input = (0..40)
+            .flat_map(|fragment| {
+                [0, 1, 999998, 999999, 1000000]
+                    .map(move |row| u64::from(RowAddress::new_from_parts(fragment, row)))
+            })
+            .collect::<Vec<_>>();
+        for mask in [
+            RowAddrMask::AllowList(rows.clone()),
+            RowAddrMask::BlockList(rows),
+        ] {
+            let prepared = PreparedRowAddrMask::new(&mask);
+            let dense_bytes: usize = prepared
+                .fragments
+                .values()
+                .map(|selection| match selection {
+                    FragmentSelection::Dense { words, .. } => words.len() * 8,
+                    _ => 0,
+                })
+                .sum();
+            assert!(dense_bytes > 0 && dense_bytes as u64 <= EXTRA_DENSE_BUDGET);
+            assert!(
+                prepared
+                    .fragments
+                    .values()
+                    .any(|selection| matches!(selection, FragmentSelection::Sparse(_)))
+            );
+            assert!(matches!(
+                prepared.fragments.get(&0),
+                Some(FragmentSelection::Dense { .. })
+            ));
+            assert_eq!(
+                prepared.selected_indices(input.iter()),
+                mask.selected_indices(input.iter())
+            );
+        }
+    }
 
     #[test]
     fn prepared_mask_preserves_membership() {
