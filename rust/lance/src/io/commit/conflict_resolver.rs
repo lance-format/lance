@@ -85,9 +85,13 @@ impl<'a> TransactionRebase<'a> {
         dataset: &Dataset,
     ) -> Result<(Transaction, Option<Arc<TaggedRewriteAssembly>>)> {
         let hook = LanceCommitHook::new(dataset.session.clone());
-        self.0
-            .finish_with_index_hook(&dataset.table_view().to_table(), Some(&hook))
-            .await
+        // Staged index replay also awaits this method. Keep the row-history
+        // and index-rebase I/O state out of its caller's future.
+        Box::pin(
+            self.0
+                .finish_with_index_hook(&dataset.table_view().to_table(), Some(&hook)),
+        )
+        .await
     }
 }
 

@@ -293,6 +293,14 @@ impl<'a> TransactionRebase<'a> {
                             );
                         }
                     }
+                    (None, Some(_))
+                        if self_update_mode.is_none()
+                            && self.modified_fragment_ids.is_empty()
+                            && self.affected_rows.is_none() =>
+                    {
+                        // An unfiltered raw Update that only adds fragments is
+                        // a blind append and does not opt into key checks.
+                    }
                     (Some(_), None) | (None, Some(_)) => {
                         // An unfiltered update can change a key or a value read by
                         // the other MERGE's predicate, even without inserting rows.

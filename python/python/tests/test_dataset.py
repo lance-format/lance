@@ -5098,6 +5098,12 @@ def test_inserted_rows_filter_rejects_reconstructed_conflict(tmp_path):
     dataset = lance.write_dataset(
         pa.table({"id": [1, 2], "value": [10, 20]}, schema=schema), base_dir
     )
+    staged, _ = (
+        dataset.merge_insert("value")
+        .when_not_matched_insert_all()
+        .execute_uncommitted(pa.table({"id": [100], "value": [2]}, schema=schema))
+    )
+    assert staged.operation.inserted_rows_filter is None
     dataset.merge_insert("id").when_not_matched_insert_all().execute(
         pa.table({"id": [100], "value": [1]}, schema=schema)
     )
@@ -5115,6 +5121,8 @@ def test_inserted_rows_filter_rejects_reconstructed_conflict(tmp_path):
     with pytest.raises(CommitConflictError) as exc_info:
         lance.LanceDataset.commit(dataset.uri, operation, read_version=1, max_retries=0)
     assert exc_info.value.retryable is True
+    with pytest.raises(CommitConflictError):
+        lance.LanceDataset.commit(dataset.uri, staged, max_retries=0)
 
     # The same stale update succeeds without the filter, proving the failure
     # above came from the reconstructed inserted-key conflict check.
@@ -5125,6 +5133,7 @@ def test_inserted_rows_filter_rejects_reconstructed_conflict(tmp_path):
         max_retries=0,
     )
     assert committed.version == 3
+    assert sorted(committed.to_table(filter="id = 100")["value"].to_pylist()) == [1, 2]
 
 
 def test_merge_insert_raises_without_pk_and_on_omitted(tmp_path):
