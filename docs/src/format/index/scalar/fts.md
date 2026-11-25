@@ -288,10 +288,14 @@ Performance tips:
 
 ### Distributed Training
 
-Each distributed worker writes a complete segment in its own index directory,
-including the root `metadata.lance`. A coordinator commits the segment metadata
-to publish the logical index. See the [migration guide](../../../guide/migration.md#distributed-fts-builds)
-for the retired shared-directory workflow.
+The FTS index supports distributed training where different worker nodes each index a subset of the data and the results are assembled afterward.
+
+1. Each distributed worker is assigned a **fragment mask** (`(fragment_id as u64) << 32`) that is OR'd into the partition IDs it generates, ensuring globally unique IDs across workers.
+2. Workers set `skip_merge: true` so they write their part files directly without running the merge phase.
+3. Instead of a single `metadata.lance`, each worker writes per-partition metadata files named `part_<id>_metadata.lance`.
+4. After all workers finish, a coordinator merges the metadata files: it collects all partition IDs, remaps them to a sequential range starting from 0 (renaming the corresponding data files), and writes the final unified `metadata.lance`.
+
+This allows each worker to operate independently during the tokenization phase. Only the final metadata merge requires a single-node step, and it is lightweight since it only renames files and writes a small metadata file.
 
 ## Accelerated Queries
 
