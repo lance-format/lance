@@ -1226,7 +1226,9 @@ pub struct IndexMetadata {
     pub index_details: ::core::option::Option<::prost_types::Any>,
     /// Index format version for this segment. If unset, use version 0.
     /// For lance.table.InvertedIndexDetails with a declared version >= 3,
-    /// the manifest must carry writer feature flag 1 << 23. This version is
+    /// writers implementing FLAG_VERSIONED_INVERTED_INDEX must set writer
+    /// feature flag 1 << 23 when publishing a new manifest; historical
+    /// unflagged manifests remain valid on read. This version is
     /// independent of InvertedIndexDetails.posting_format_version.
     #[prost(int32, optional, tag = "7")]
     pub index_version: ::core::option::Option<i32>,
