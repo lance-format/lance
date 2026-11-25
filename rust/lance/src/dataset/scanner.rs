@@ -978,7 +978,7 @@ mod tests {
         assert_eq!(get_default_io_buffer_size_override(), expected);
         assert_eq!(
             *DEFAULT_IO_BUFFER_SIZE,
-            expected.unwrap_or(DEFAULT_IO_BUFFER_SIZE_VALUE)
+            expected.unwrap_or(2 * 1024 * 1024 * 1024)
         );
     }
 
