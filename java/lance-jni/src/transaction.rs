@@ -749,9 +749,40 @@ impl FromJObjectWithEnv<IndexMetadata> for JObject<'_> {
                 })
                 .transpose()?,
             metadata: crate::fragment::extract_metadata_map(env, self, "metadata")?,
-            local_fragment_aliases: Default::default(),
+            local_fragment_aliases: extract_local_fragment_aliases(env, self)?,
         })
     }
+}
+
+fn extract_local_fragment_aliases(
+    env: &mut JNIEnv<'_>,
+    index_obj: &JObject<'_>,
+) -> Result<std::collections::BTreeMap<u32, u32>> {
+    let map_obj = env
+        .call_method(index_obj, "localFragmentAliases", "()Ljava/util/Map;", &[])?
+        .l()?;
+    if map_obj.is_null() {
+        return Ok(std::collections::BTreeMap::new());
+    }
+    let jmap = env.get_map(&map_obj)?;
+    let mut iter = jmap.iter(env)?;
+    let mut aliases = std::collections::BTreeMap::new();
+    while let Some((key_obj, val_obj)) = iter.next(env)? {
+        let key_long = env.call_method(&key_obj, "longValue", "()J", &[])?.j()?;
+        let val_long = env.call_method(&val_obj, "longValue", "()J", &[])?.j()?;
+        let local_id = u32::try_from(key_long).map_err(|_| {
+            Error::input_error(format!(
+                "index.localFragmentAliases key {key_long} is outside the unsigned 32-bit range"
+            ))
+        })?;
+        let committed_id = u32::try_from(val_long).map_err(|_| {
+            Error::input_error(format!(
+                "index.localFragmentAliases value {val_long} is outside the unsigned 32-bit range"
+            ))
+        })?;
+        aliases.insert(local_id, committed_id);
+    }
+    Ok(aliases)
 }
 
 impl FromJObjectWithEnv<DataReplacementGroup> for JObject<'_> {
@@ -1778,10 +1809,7 @@ fn convert_to_rust_operation(
     read_version: u64,
 ) -> Result<Operation> {
     let op_name = env.get_string_from_method(java_operation, "name")?;
-    let read_dataset = if matches!(
-        op_name.as_str(),
-        "Project" | "Overwrite" | "Merge" | "CreateIndex"
-    ) {
+    let read_dataset = if matches!(op_name.as_str(), "Project" | "Overwrite" | "Merge") {
         match dataset {
             Some(dataset) if dataset.inner.version().version != read_version => {
                 Some(dataset.checkout_version(read_version)?)
@@ -2188,24 +2216,6 @@ fn convert_to_rust_operation(
                 import_vec_from_method(env, java_operation, "getRemovedIndices", |env, index| {
                     index.extract_object(env)
                 })?;
-            if !new_indices.is_empty()
-                && let Some(dataset) = read_dataset.as_ref()
-            {
-                let existing_indices = dataset.list_indexes()?;
-                for new_index in &new_indices {
-                    if new_index.local_fragment_aliases.is_empty()
-                        && existing_indices.iter().any(|existing| {
-                            existing.uuid == new_index.uuid
-                                && !existing.local_fragment_aliases.is_empty()
-                        })
-                    {
-                        return Err(Error::unsupported_error(format!(
-                            "Cannot republish aliased index segment {} through Java CreateIndex: Java Index does not carry local_fragment_aliases",
-                            new_index.uuid
-                        )));
-                    }
-                }
-            }
             Operation::CreateIndex {
                 new_indices,
                 removed_indices,

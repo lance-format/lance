@@ -550,27 +550,6 @@ pub extern "system" fn Java_org_lance_Dataset_nativeMergeExistingIndexSegments<'
     )
 }
 
-fn reject_aliased_java_index_segments(
-    dataset: &Dataset,
-    segments: &[lance_table::format::IndexMetadata],
-    op: &str,
-) -> Result<()> {
-    let existing_indices = block_on(dataset.load_indices())?;
-    for segment in segments {
-        if segment.local_fragment_aliases.is_empty()
-            && existing_indices.iter().any(|existing| {
-                existing.uuid == segment.uuid && !existing.local_fragment_aliases.is_empty()
-            })
-        {
-            return Err(Error::unsupported_error(format!(
-                "Cannot pass aliased index segment {} through Java {op}: Java Index does not carry local_fragment_aliases",
-                segment.uuid
-            )));
-        }
-    }
-    Ok(())
-}
-
 fn inner_merge_existing_index_segments<'local>(
     env: &mut JNIEnv<'local>,
     java_dataset: JObject,
@@ -580,11 +559,6 @@ fn inner_merge_existing_index_segments<'local>(
     let merged_segment = {
         let dataset_guard =
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
-        reject_aliased_java_index_segments(
-            &dataset_guard.inner,
-            &segments,
-            "mergeExistingIndexSegments",
-        )?;
         block_on(dataset_guard.inner.merge_existing_index_segments(segments))?
     };
     (&merged_segment).into_java(env)
@@ -629,11 +603,6 @@ fn inner_commit_existing_index_segments<'local>(
     let committed = {
         let mut dataset_guard =
             unsafe { env.get_rust_field::<_, _, BlockingDataset>(&java_dataset, NATIVE_DATASET) }?;
-        reject_aliased_java_index_segments(
-            &dataset_guard.inner,
-            &segment_metadata,
-            "commitExistingIndexSegments",
-        )?;
         block_on(dataset_guard.inner.commit_existing_index_segments(
             &index_name,
             &column,

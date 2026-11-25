@@ -45,6 +45,7 @@ public class Index {
   private final IndexType indexType;
   private final Long clusteringId;
   private final Map<String, String> metadata;
+  private final Map<Long, Long> localFragmentAliases;
 
   private Index(
       UUID uuid,
@@ -61,12 +62,17 @@ public class Index {
       List<IndexFile> files,
       IndexType indexType,
       Long clusteringId,
-      Map<String, String> metadata) {
+      Map<String, String> metadata,
+      Map<Long, Long> localFragmentAliases) {
     this.clusteringId = clusteringId;
     this.metadata =
         metadata == null
             ? Collections.emptyMap()
             : Collections.unmodifiableMap(new HashMap<>(metadata));
+    this.localFragmentAliases =
+        localFragmentAliases == null
+            ? Collections.emptyMap()
+            : Collections.unmodifiableMap(new HashMap<>(localFragmentAliases));
     this.uuid = uuid;
     this.fields = fields;
     this.coveringFields = coveringFields;
@@ -237,6 +243,11 @@ public class Index {
     return metadata;
   }
 
+  /** Local fragment aliases mapping stored fragment ids to committed fragment ids. */
+  public Map<Long, Long> localFragmentAliases() {
+    return localFragmentAliases;
+  }
+
   @Override
   public boolean equals(Object o) {
     if (this == o) return true;
@@ -256,7 +267,8 @@ public class Index {
         && Objects.equals(files, index.files)
         && indexType == index.indexType
         && Objects.equals(clusteringId, index.clusteringId)
-        && Objects.equals(metadata, index.metadata);
+        && Objects.equals(metadata, index.metadata)
+        && Objects.equals(localFragmentAliases, index.localFragmentAliases);
   }
 
   @Override
@@ -276,7 +288,8 @@ public class Index {
             fragments,
             indexType,
             clusteringId,
-            metadata);
+            metadata,
+            localFragmentAliases);
     result = 31 * result + Arrays.hashCode(indexDetails);
     return result;
   }
@@ -297,6 +310,7 @@ public class Index {
         .add("files", files)
         .add("clusteringId", clusteringId)
         .add("metadata", metadata)
+        .add("localFragmentAliases", localFragmentAliases)
         .toString();
   }
 
@@ -326,6 +340,7 @@ public class Index {
     private IndexType indexType;
     private Long clusteringId;
     private Map<String, String> metadata = Collections.emptyMap();
+    private Map<Long, Long> localFragmentAliases = Collections.emptyMap();
 
     private Builder() {}
 
@@ -409,6 +424,12 @@ public class Index {
       return this;
     }
 
+    /** Local fragment aliases attached to this segment. Null is treated as empty. */
+    public Builder localFragmentAliases(Map<Long, Long> localFragmentAliases) {
+      this.localFragmentAliases = localFragmentAliases;
+      return this;
+    }
+
     public Index build() {
       return new Index(
           uuid,
@@ -425,7 +446,8 @@ public class Index {
           files,
           indexType,
           clusteringId,
-          metadata);
+          metadata,
+          localFragmentAliases);
     }
   }
 }
