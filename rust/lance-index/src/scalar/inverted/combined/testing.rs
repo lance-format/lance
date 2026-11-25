@@ -211,7 +211,7 @@ pub(super) async fn modern_identity_docs(
     .unwrap()
 }
 
-/// `_rowid` plus one `Utf8` document column per entry of `docs`
+/// `_rowaddr` plus one `Utf8` document column per entry of `docs`
 /// (`docs[column][row]`), delivered as `num_batches` equal batches.
 pub(super) fn flat_input(
     row_ids: &[u64],
@@ -221,7 +221,7 @@ pub(super) fn flat_input(
     use arrow_array::StringArray;
     use arrow_schema::{DataType, Field, Schema};
 
-    let mut fields = vec![lance_core::ROW_ID_FIELD.clone()];
+    let mut fields = vec![lance_core::ROW_ADDR_FIELD.clone()];
     let mut arrays: Vec<ArrayRef> = vec![Arc::new(UInt64Array::from(row_ids.to_vec()))];
     for (slot, column) in docs.iter().enumerate() {
         fields.push(Field::new(format!("doc{slot}"), DataType::Utf8, true));

@@ -37,7 +37,7 @@ async fn execute(exec: Arc<dyn ExecutionPlan>) -> datafusion::error::Result<Vec<
     Ok(batches
         .iter()
         .flat_map(|batch| {
-            let ids = batch[ROW_ID].as_primitive::<UInt64Type>();
+            let ids = batch[lance_core::ROW_ADDR].as_primitive::<UInt64Type>();
             let scores = batch[SCORE_COL].as_primitive::<Float32Type>();
             (0..batch.num_rows())
                 .map(|row| (ids.value(row), scores.value(row)))

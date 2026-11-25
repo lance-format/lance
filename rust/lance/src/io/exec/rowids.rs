@@ -1058,3 +1058,257 @@ mod test {
         );
     }
 }
+
+/// Add a `_rowid` column to a stream of record batches that have a `_rowaddr`.
+///
+/// The inverse of [`AddRowAddrExec`], and needed for the same reason in the
+/// other direction: a plan that identifies its rows physically -- full-text
+/// search ranks and pages on the row address its postings store -- still has to
+/// hand back the logical row id when the caller projected one. Translating here,
+/// above the plan's own ordering and fetch, keeps the identifier the plan ranks
+/// on out of it: the row id is an output column, not a sort key.
+///
+/// A dataset without stable row ids needs no translation at all, since a row id
+/// *is* a row address there; the `_rowaddr` column is then copied under its
+/// other name.
+#[derive(Clone)]
+pub struct AddRowIdExec {
+    input: Arc<dyn ExecutionPlan>,
+    dataset: Arc<Dataset>,
+    /// Resolved on first `execute`, like [`AddRowAddrExec`]'s index: building it
+    /// reads every live fragment's row id sequence and deletion vector.
+    lookup: Arc<OnceLock<SharedRowAddrToRowIdLookup>>,
+    rowaddr_pos: usize,
+    rowid_pos: usize,
+    output_schema: SchemaRef,
+    properties: Arc<PlanProperties>,
+    metrics: ExecutionPlanMetricsSet,
+}
+
+type RowAddrToRowIdLookup = Box<dyn Fn(u64) -> Option<u64> + Send + Sync>;
+/// `None` on a dataset without stable row ids, where no translation is needed.
+type SharedRowAddrToRowIdLookup = Arc<SharedPrerequisite<Arc<Option<RowAddrToRowIdLookup>>>>;
+
+impl AddRowIdExec {
+    /// `rowid_pos` is where the new column lands in the output schema.
+    ///
+    /// # Errors
+    ///
+    /// If the input schema has no `_rowaddr` column.
+    pub fn try_new(
+        input: Arc<dyn ExecutionPlan>,
+        dataset: Arc<Dataset>,
+        rowid_pos: usize,
+    ) -> Result<Self> {
+        let input_schema = input.schema();
+        let rowaddr_pos = input_schema
+            .fields()
+            .iter()
+            .position(|field| field.name() == ROW_ADDR)
+            .ok_or_else(|| {
+                DataFusionError::Internal("rowaddr field not found in input schema".into())
+            })?;
+        let mut fields = input_schema.fields().iter().cloned().collect::<Vec<_>>();
+        fields.insert(rowid_pos, Arc::new(lance_core::ROW_ID_FIELD.clone()));
+        let output_schema = Arc::new(Schema::new_with_metadata(
+            fields,
+            input_schema.metadata().clone(),
+        ));
+        let properties = Arc::new(
+            input
+                .properties()
+                .as_ref()
+                .clone()
+                .with_eq_properties(EquivalenceProperties::new(output_schema.clone())),
+        );
+        Ok(Self {
+            input,
+            dataset,
+            lookup: Arc::new(OnceLock::new()),
+            rowaddr_pos,
+            rowid_pos,
+            output_schema,
+            properties,
+            metrics: ExecutionPlanMetricsSet::new(),
+        })
+    }
+
+    fn compute_row_ids(
+        row_addrs: &ArrayRef,
+        lookup: Option<&RowAddrToRowIdLookup>,
+    ) -> Result<ArrayRef> {
+        let Some(lookup) = lookup else {
+            // No stable row ids: the address is the row id.
+            return Ok(row_addrs.clone());
+        };
+        let values = row_addrs.as_primitive_opt::<UInt64Type>().ok_or_else(|| {
+            DataFusionError::Internal("AddRowIdExec: rowaddr column is not a UInt64Array".into())
+        })?;
+        let mut builder = arrow::array::UInt64Builder::with_capacity(values.len());
+        for row_addr in values.iter() {
+            // An address with no live row id is one the dataset no longer
+            // stores; a null row id reports that rather than inventing one.
+            match row_addr.and_then(lookup) {
+                Some(row_id) => builder.append_value(row_id),
+                None => builder.append_null(),
+            }
+        }
+        Ok(Arc::new(builder.finish()))
+    }
+
+    fn do_execute(
+        &self,
+        partition: usize,
+        context: Arc<datafusion::execution::context::TaskContext>,
+    ) -> Result<SendableRecordBatchStream> {
+        let lookup_prereq = self
+            .lookup
+            .get_or_init(|| {
+                let dataset = self.dataset.clone();
+                let fut = async move {
+                    if !dataset.manifest.uses_stable_row_ids() {
+                        return LanceResult::Ok(Arc::new(None));
+                    }
+                    let fragment_ids = dataset
+                        .manifest
+                        .fragments
+                        .iter()
+                        .map(|fragment| fragment.id as u32)
+                        .collect::<Vec<_>>();
+                    let lookup = crate::dataset::rowids::live_row_addr_to_row_id_lookup(
+                        &dataset,
+                        fragment_ids,
+                    )
+                    .await?;
+                    LanceResult::Ok(Arc::new(Some(Box::new(lookup) as RowAddrToRowIdLookup)))
+                };
+                SharedPrerequisite::spawn(fut)
+            })
+            .clone();
+
+        let input_stream = self.input.execute(partition, context)?;
+        let rowaddr_pos = self.rowaddr_pos;
+        let rowid_pos = self.rowid_pos;
+        let output_schema = self.output_schema.clone();
+        let baseline = BaselineMetrics::new(&self.metrics, partition);
+        let elapsed_compute = baseline.elapsed_compute().clone();
+        let stream = input_stream.then(move |batch_result| {
+            let output_schema = output_schema.clone();
+            let lookup_prereq = lookup_prereq.clone();
+            let elapsed_compute = elapsed_compute.clone();
+            async move {
+                let batch = batch_result?;
+                lookup_prereq.wait_ready().await?;
+                let lookup = lookup_prereq.get_ready();
+
+                let _t = elapsed_compute.timer();
+                let row_ids =
+                    Self::compute_row_ids(batch.column(rowaddr_pos), lookup.as_ref().as_ref())?;
+
+                let mut columns = Vec::with_capacity(batch.num_columns() + 1);
+                let existing_columns = batch.columns();
+                columns.extend_from_slice(&existing_columns[..rowid_pos]);
+                columns.push(row_ids);
+                columns.extend_from_slice(&existing_columns[rowid_pos..]);
+                Ok(RecordBatch::try_new(output_schema.clone(), columns)?)
+            }
+        });
+        let stream = stream.map(move |batch| {
+            let poll = baseline.record_poll(std::task::Poll::Ready(Some(batch)));
+            match poll {
+                std::task::Poll::Ready(Some(b)) => b,
+                _ => unreachable!("record_poll preserves Ready(Some) input"),
+            }
+        });
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            self.output_schema.clone(),
+            stream,
+        )))
+    }
+}
+
+impl std::fmt::Debug for AddRowIdExec {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.debug_struct("AddRowIdExec")
+            .field("rowaddr_pos", &self.rowaddr_pos)
+            .field("rowid_pos", &self.rowid_pos)
+            .finish()
+    }
+}
+
+impl DisplayAs for AddRowIdExec {
+    fn fmt_as(
+        &self,
+        _format_type: DisplayFormatType,
+        f: &mut std::fmt::Formatter,
+    ) -> std::fmt::Result {
+        write!(f, "AddRowIdExec")
+    }
+}
+
+impl ExecutionPlan for AddRowIdExec {
+    fn name(&self) -> &str {
+        "AddRowIdExec"
+    }
+
+    fn schema(&self) -> SchemaRef {
+        self.output_schema.clone()
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
+    }
+
+    fn benefits_from_input_partitioning(&self) -> Vec<bool> {
+        vec![false]
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+    ) -> Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        if children.len() != 1 {
+            return Err(DataFusionError::Internal(
+                "AddRowIdExec: invalid number of children".into(),
+            ));
+        }
+        Ok(Arc::new(Self::try_new(
+            children.into_iter().next().unwrap(),
+            self.dataset.clone(),
+            self.rowid_pos,
+        )?))
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<datafusion::execution::context::TaskContext>,
+    ) -> Result<SendableRecordBatchStream> {
+        let schema = self.schema();
+        let this = self.clone();
+        let stream = futures::stream::once(async move { this.do_execute(partition, context) });
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            stream.try_flatten(),
+        )))
+    }
+
+    fn cardinality_effect(&self) -> CardinalityEffect {
+        CardinalityEffect::Equal
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
+        &self.properties
+    }
+}

@@ -68,7 +68,7 @@ mod tests {
     use futures::{TryStreamExt, stream};
     use lance_core::utils::futures::StreamOnDropExt;
     use lance_core::utils::tempfile::TempStrDir;
-    use lance_core::{ROW_ID, utils::address::RowAddress};
+    use lance_core::{ROW_ADDR, ROW_ID, utils::address::RowAddress};
     use lance_datafusion::datagen::DatafusionDatagenExt;
     use lance_datafusion::exec::{ExecutionStatsCallback, ExecutionSummaryCounts};
     use lance_datafusion::utils::INDEX_SEGMENTS_SKIPPED_METRIC;
@@ -216,7 +216,9 @@ mod tests {
         let dataset = Arc::new(dataset);
         let mut scanner = dataset.scan();
         scanner.project(&["text"]).unwrap();
-        scanner.with_row_id().with_fragments(vec![tail]);
+        // The hybrid node ranks its residual rows against the indexed arm's
+        // hits, so they carry the row addresses that arm ranks on.
+        scanner.with_row_address().with_fragments(vec![tail]);
         let residual = scanner.create_plan().await.unwrap();
         let query = FtsQuery::Match(
             MatchQuery::new(term.to_string())
@@ -312,7 +314,7 @@ mod tests {
         let mut scanner = hybrid.dataset().scan();
         scanner.project(&[hybrid.column()]).unwrap();
         scanner
-            .with_row_id()
+            .with_row_address()
             .with_fragments(vec![hybrid.dataset().fragments().last().unwrap().clone()]);
         let mut children = replaced.children().into_iter().cloned().collect::<Vec<_>>();
         children[0] = scanner.create_plan().await.unwrap();
@@ -488,7 +490,7 @@ mod tests {
             let mut scan = dataset.scan();
             scan.project(&["text"])
                 .unwrap()
-                .with_row_id()
+                .with_row_address()
                 .with_fragments(vec![dataset.fragments().last().unwrap().clone()]);
             scan.create_plan().await.unwrap()
         };
@@ -631,7 +633,7 @@ mod tests {
             .await?;
         let mut results = Vec::new();
         for batch in batches {
-            let row_ids = batch[ROW_ID]
+            let row_ids = batch[ROW_ADDR]
                 .as_any()
                 .downcast_ref::<UInt64Array>()
                 .unwrap();
@@ -761,7 +763,7 @@ mod tests {
         let corpus = memory_input(
             record_batch!(
                 (document_column, Utf8, ["alpha", "beta", "alpha"]),
-                (ROW_ID, UInt64, [100, 101, 102])
+                (ROW_ADDR, UInt64, [100, 101, 102])
             )
             .unwrap(),
         );
@@ -833,7 +835,7 @@ mod tests {
         let expanded_corpus = memory_input(
             record_batch!(
                 (document_column, Utf8, ["alpha", "beta", "alpha", "beta"]),
-                (ROW_ID, UInt64, [100, 101, 102, 103])
+                (ROW_ADDR, UInt64, [100, 101, 102, 103])
             )
             .unwrap(),
         );
@@ -997,7 +999,7 @@ mod tests {
         let dataset = indexed_match_dataset().await;
         let input = Arc::new(FailingResidualExec::new(
             memory_input(
-                record_batch!(("text", Utf8, ["alpha"]), (ROW_ID, UInt64, [100])).unwrap(),
+                record_batch!(("text", Utf8, ["alpha"]), (ROW_ADDR, UInt64, [100])).unwrap(),
             ),
             failure,
         ));
@@ -1443,7 +1445,7 @@ mod tests {
         // statistics. An empty input isolates those reads: the scanned rows
         // contribute none, so the count is absolute rather than a delta.
         let flat_schema = Arc::new(arrow_schema::Schema::new(vec![
-            lance_core::ROW_ID_FIELD.clone(),
+            lance_core::ROW_ADDR_FIELD.clone(),
             arrow_schema::Field::new("title", DataType::Utf8, true),
             arrow_schema::Field::new("body", DataType::Utf8, true),
         ]));
@@ -2021,8 +2023,8 @@ mod tests {
         // Sanity check on FTS schema before extracting columns above.
         for batch in baseline_batches.iter().chain(override_batches.iter()) {
             assert!(
-                batch.column_by_name(ROW_ID).is_some(),
-                "FTS output is expected to carry a row id column"
+                batch.column_by_name(ROW_ADDR).is_some(),
+                "FTS output is expected to carry a row address column"
             );
             assert_eq!(
                 batch.column_by_name(SCORE_COL).unwrap().data_type(),
@@ -2177,7 +2179,7 @@ mod tests {
             let mut out: Vec<(u64, f32)> = Vec::new();
             for batch in batches {
                 let row_ids = batch
-                    .column_by_name(ROW_ID)
+                    .column_by_name(ROW_ADDR)
                     .unwrap()
                     .as_any()
                     .downcast_ref::<UInt64Array>()

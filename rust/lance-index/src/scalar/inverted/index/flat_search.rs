@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use super::*;
+use lance_core::ROW_ADDR;
 
 pub fn doc_index_storage_column(rank: usize) -> String {
     format!("{DOC_INDEX_STORAGE_PREFIX}{rank}")
@@ -65,7 +66,7 @@ pub(super) fn do_flat_full_text_search<Offset: OffsetSizeTrait>(
     let query_tokens = try_collect_query_tokens(query, &mut tokenizer)?;
 
     for batch in batches {
-        let row_id_array = batch[ROW_ID].as_primitive::<UInt64Type>();
+        let row_id_array = batch[ROW_ADDR].as_primitive::<UInt64Type>();
         let doc_array = batch[doc_col].as_string::<Offset>();
         for i in 0..row_id_array.len() {
             let doc = doc_array.value(i);
@@ -91,7 +92,7 @@ pub(super) fn do_flat_full_text_search_list<ListOffset: OffsetSizeTrait>(
     let query_tokens = try_collect_query_tokens(query, &mut tokenizer)?;
 
     for batch in batches {
-        let row_id_array = batch[ROW_ID].as_primitive::<UInt64Type>();
+        let row_id_array = batch[ROW_ADDR].as_primitive::<UInt64Type>();
         let doc_array = batch[doc_col].as_list::<ListOffset>();
         match doc_array.value_type() {
             DataType::Utf8 | DataType::LargeUtf8 => {}
@@ -241,7 +242,7 @@ pub(super) fn tokenize_and_count(
     phrase_slop: Option<u32>,
 ) -> SendableRecordBatchStream {
     let discount_overlaps = tokenizer.discount_overlaps();
-    let mut output_fields: Vec<Arc<Field>> = vec![ROW_ID_SCHEMA.fields()[0].clone()];
+    let mut output_fields: Vec<Arc<Field>> = vec![ROW_ADDR_SCHEMA.fields()[0].clone()];
     output_fields.extend((0..coordinate_rank).map(|rank| {
         Arc::new(Field::new(
             doc_index_storage_column(rank),
@@ -284,7 +285,7 @@ pub(super) fn tokenize_and_count(
                 // thread is invisible to the caller's poll timer otherwise).
                 let start = std::time::Instant::now();
                 let batch = batch?;
-                let row_id_array = batch[ROW_ID].as_primitive::<UInt64Type>();
+                let row_id_array = batch[ROW_ADDR].as_primitive::<UInt64Type>();
                 let input_doc_indices = (0..coordinate_rank)
                     .map(|rank| {
                         let column_name = doc_index_storage_column(rank);
@@ -590,7 +591,7 @@ pub(in super::super) async fn tokenize_and_blend_multi(
                 let start = std::time::Instant::now();
                 let batch = batch?;
                 let num_rows = batch.num_rows();
-                let row_id_array = batch[ROW_ID].as_primitive::<UInt64Type>();
+                let row_id_array = batch[ROW_ADDR].as_primitive::<UInt64Type>();
 
                 // Dense `(row, column)`-strided scratch, freed with the batch:
                 // whether a row is retained depends on all of its columns, so every
@@ -723,7 +724,7 @@ pub(in super::super) async fn collect_flat_stats_multi(
                 let start = std::time::Instant::now();
                 let batch = batch?;
                 let num_rows = batch.num_rows();
-                let row_id_array = batch[ROW_ID].as_primitive::<UInt64Type>();
+                let row_id_array = batch[ROW_ADDR].as_primitive::<UInt64Type>();
 
                 let mut all_tokens = vec![0u64; num_rows * num_columns];
                 let mut counts = vec![0u64; num_rows * num_columns * num_terms];
@@ -802,7 +803,7 @@ pub(in super::super) fn tokenize_blend_and_score_multi(
                 let start = std::time::Instant::now();
                 let batch = batch?;
                 let num_rows = batch.num_rows();
-                let row_id_array = batch[ROW_ID].as_primitive::<UInt64Type>();
+                let row_id_array = batch[ROW_ADDR].as_primitive::<UInt64Type>();
 
                 let mut all_tokens = vec![0u64; num_rows * num_columns];
                 let mut counts = vec![0u64; num_rows * num_columns * num_terms];
@@ -1055,7 +1056,7 @@ pub(super) fn flat_bm25_score(
     });
     let query_groups = query_position_groups(query_tokens, phrase_slop.is_some());
 
-    let mut row_ids_iter = counted_input[ROW_ID]
+    let mut row_ids_iter = counted_input[ROW_ADDR]
         .as_primitive::<UInt64Type>()
         .values()
         .iter()
@@ -1541,7 +1542,7 @@ pub async fn flat_bm25_search_stream_with_fuzzy_and_scorer(
                 spawn_cpu(move || {
                     let start = std::time::Instant::now();
                     let batch = batch?;
-                    let row_id_array = batch[ROW_ID].as_primitive::<UInt64Type>();
+                    let row_id_array = batch[ROW_ADDR].as_primitive::<UInt64Type>();
                     let input_doc_indices = (0..coordinate_rank)
                         .map(|rank| {
                             let column_name = doc_index_storage_column(rank);

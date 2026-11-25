@@ -25,8 +25,8 @@ use arrow_array::{
 };
 use arrow_buffer::{OffsetBuffer, ScalarBuffer};
 use arrow_schema::{DataType, Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema};
-use lance_core::ROW_ID;
 use lance_core::utils::tempfile::TempStrDir;
+use lance_core::{ROW_ADDR, ROW_ID};
 use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::FullTextSearchQuery;
 use lance_index::scalar::inverted::{
@@ -210,6 +210,68 @@ async fn fts_result_id_scores(
     (0..batch.num_rows())
         .map(|i| (ids.value(i), scores.value(i)))
         .collect()
+}
+
+/// Page through `query` one row at a time, `pages` pages deep, and return the
+/// ids each page yielded in page order.
+async fn fts_single_row_pages(dataset: &Dataset, query: FtsQuery, pages: i64) -> Vec<i32> {
+    let mut ids = Vec::new();
+    for offset in 0..pages {
+        let batch = dataset
+            .scan()
+            .project(&["id"])
+            .unwrap()
+            .full_text_search(FullTextSearchQuery::new_query(query.clone()))
+            .unwrap()
+            .limit(Some(1), Some(offset))
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        ids.extend(
+            batch["id"]
+                .as_primitive::<Int32Type>()
+                .values()
+                .iter()
+                .copied(),
+        );
+    }
+    ids
+}
+
+/// The pagination contract for a tied FTS result: every one-row page visits a
+/// row the earlier pages did not, and the pages agree with the order the same
+/// query returns unpaginated.
+///
+/// It deliberately does not pin a particular id sequence. Ties are ordered by
+/// the identifier the index stores -- a physical row address -- which a rewrite
+/// moves, so the sequence is not stable across compaction and Lance does not
+/// promise that it is. What ties do need is same-version determinism and pages
+/// that neither skip nor repeat, which is what this asserts. (Nothing stronger
+/// is available anyway: a delete shifts `docCount`/`avgdl`/`docFreq` and so
+/// moves the scores themselves.)
+async fn assert_tied_pages_visit_each_row_once(
+    dataset: &Dataset,
+    query: FtsQuery,
+    pages: i64,
+    context: &str,
+) {
+    let paged = fts_single_row_pages(dataset, query.clone(), pages).await;
+    let distinct = paged.iter().copied().collect::<HashSet<_>>();
+    assert_eq!(
+        distinct.len(),
+        paged.len(),
+        "{context}: one-row pages repeated a row: {paged:?}"
+    );
+    let unpaginated = fts_result_id_scores(dataset, query, Some(pages))
+        .await
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        paged, unpaginated,
+        "{context}: paging disagrees with the unpaginated order of the same query"
+    );
 }
 
 /// Assert an explicit zero candidate budget returns no rows and keeps the
@@ -2784,11 +2846,13 @@ async fn fts_query_error(ds: &Dataset, query: FtsQuery) -> String {
 }
 
 /// Rebuilding one column's FTS index after the row-address migration leaves
-/// its sibling column on the older domain. A multi-column query merges the two
-/// columns' postings on the stored identifier alone, so row id `2` from one
-/// index and row address `1 << 32` from the other would score as two unrelated
-/// documents and an AND query would silently return nothing. Both query shapes
-/// that span columns have to reject the mix instead.
+/// its sibling column on the older domain. The whole FTS path ranks and pages
+/// on the identifier the postings store, so a row-id-domain segment cannot
+/// answer at all under stable row ids -- and a multi-column query merges two
+/// columns' postings on that identifier alone, so row id `2` from one index and
+/// row address `1 << 32` from the other would score as two unrelated documents
+/// and an AND query would silently return nothing. Both query shapes that span
+/// columns have to reject the stale index instead.
 #[rstest]
 #[case::combined_fields(false)]
 #[case::cross_column_compound(true)]
@@ -2824,13 +2888,42 @@ async fn test_fts_mixed_domain_across_columns_is_rejected(#[case] compound: bool
     };
 
     let err = fts_query_error(&ds, query).await;
+    assert!(err.contains("stores row ids"), "unexpected error: {err}");
     assert!(
-        err.contains("disagree on the identity domain"),
-        "unexpected error: {err}"
+        err.contains("title_idx"),
+        "error should name the index to rebuild: {err}"
     );
     assert!(
-        err.contains("title_idx") && err.contains("body_idx"),
-        "error should name both disagreeing indexes: {err}"
+        err.contains("create_index"),
+        "error should say how to fix it: {err}"
+    );
+}
+
+/// A single-column query over a row-id-domain segment is refused too, not just
+/// a multi-column one. The whole FTS execution path carries the identifier the
+/// postings store -- the plan sorts and pages on it, and the take above reads
+/// by it -- so a segment holding row ids has nothing the path can rank on once
+/// row ids and row addresses diverge. The fixture is two fragments with stable
+/// row ids on purpose: on one fragment, or without stable row ids, a row id
+/// *is* a row address and there would be nothing to reject.
+#[tokio::test]
+async fn test_fts_row_id_domain_segment_is_rejected_under_stable_row_ids() {
+    let dir = TempStrDir::default();
+    let mut ds = two_fragment_domain_fixture(&dir).await;
+    let legacy =
+        legacy_row_id_segment(&ds, "title_idx", "title", second_fragment_addr_to_row_id()).await;
+    ds.commit_existing_index_segments("title_idx", "title", vec![legacy])
+        .await
+        .unwrap();
+
+    let query: FtsQuery = MatchQuery::new("alpha".into())
+        .with_column(Some("title".into()))
+        .into();
+    let err = fts_query_error(&ds, query).await;
+    assert!(err.contains("stores row ids"), "unexpected error: {err}");
+    assert!(
+        err.contains("title_idx") && err.contains("create_index"),
+        "error should name the index and how to rebuild it: {err}"
     );
 }
 
@@ -2868,14 +2961,15 @@ async fn test_fts_mixed_domain_within_one_index_is_rejected_at_commit() {
     );
 }
 
-/// The same pagination guarantee for a tie larger than the re-rank budget.
-/// Equal scores across many short documents are an ordinary FTS case, so a
-/// fixed margin is not enough on its own: 131 identical rows exceed it, and
-/// truncating them at an arbitrary address made the one-row pages return
-/// `[1, 2, 2]`. The cutoff tie has to be completed exactly instead.
+/// The same pagination guarantee for a large tie. Equal scores across many
+/// short documents are an ordinary FTS case, not a corner one, so the
+/// guarantee cannot rest on holding a bounded number of tied candidates: 131
+/// identical rows would exceed any fixed margin. It holds instead because
+/// top-k selection and the plan's sort rank on the same identifier, so no tie
+/// group has to be held at all.
 #[rstest]
-#[case::within_budget(8)]
-#[case::exceeds_budget(131)]
+#[case::small_tie(8)]
+#[case::large_tie(131)]
 #[tokio::test]
 async fn test_fts_combined_fields_tied_pagination_completes_large_ties(#[case] rows: i32) {
     let dir = TempStrDir::default();
@@ -2913,44 +3007,23 @@ async fn test_fts_combined_fields_tied_pagination_completes_large_ties(#[case] r
     )
     .await;
 
-    let mut pages = Vec::new();
-    for offset in 0..3 {
-        let batch = ds
-            .scan()
-            .project(&["id"])
-            .unwrap()
-            .full_text_search(FullTextSearchQuery::new_query(combined_query(
-                "alpha beta",
-                Operator::And,
-            )))
-            .unwrap()
-            .limit(Some(1), Some(offset))
-            .unwrap()
-            .try_into_batch()
-            .await
-            .unwrap();
-        pages.extend(
-            batch["id"]
-                .as_primitive::<Int32Type>()
-                .values()
-                .iter()
-                .copied(),
-        );
-    }
-    assert_eq!(
-        pages,
-        vec![0, 1, 2],
-        "one-row pages over a {rows}-row tie must walk every row once, in row-id order"
-    );
+    // Page through every matching row, not just the first few: a tie that
+    // straddles the cutoff is only visible at the page boundary it crosses.
+    assert_tied_pages_visit_each_row_once(
+        &ds,
+        combined_query("alpha beta", Operator::And),
+        i64::from(rows) + 1,
+        &format!("{rows}-row tie"),
+    )
+    .await;
 }
 
-/// Top-k selection ranks ties by the identifier the index stores, which is now
-/// a row address, while the plan above sorts by `_rowid`. An update moves a
-/// row's address without moving its row id, so the two orders disagree and
-/// paging through a tie skipped row 0 and returned row 1 twice. Each page must
-/// be the page the plan's own `(score DESC, _rowid ASC)` order implies.
+/// Paging a tie on a dataset whose row ids and row addresses deliberately
+/// disagree: the update below rewrites row id 0 into a new fragment, so its
+/// address sorts after row id 1's while its row id still sorts before. A
+/// single-fragment fixture would pass under either domain and prove nothing.
 #[tokio::test]
-async fn test_fts_combined_fields_tied_pagination_follows_row_id_order() {
+async fn test_fts_combined_fields_tied_pagination_visits_each_row_once() {
     let dir = TempStrDir::default();
     let ds = write_fts_dataset(
         &dir,
@@ -2982,48 +3055,28 @@ async fn test_fts_combined_fields_tied_pagination_follows_row_id_order() {
     )
     .await;
 
-    let page = async |offset: i64| -> Vec<i32> {
-        let batch = ds
-            .scan()
-            .project(&["id"])
-            .unwrap()
-            .full_text_search(FullTextSearchQuery::new_query(combined_query(
-                "alpha beta",
-                Operator::And,
-            )))
-            .unwrap()
-            .limit(Some(1), Some(offset))
-            .unwrap()
-            .try_into_batch()
-            .await
-            .unwrap();
-        batch["id"].as_primitive::<Int32Type>().values().to_vec()
-    };
+    assert_tied_pages_visit_each_row_once(
+        &ds,
+        combined_query("alpha beta", Operator::And),
+        3,
+        "moved row address",
+    )
+    .await;
 
-    let mut pages = Vec::new();
-    for offset in 0..3 {
-        pages.extend(page(offset).await);
-    }
-    assert_eq!(
-        pages,
-        vec![0, 1, 2],
-        "one-row pages over a tie must walk every row once, in row-id order"
-    );
-
-    // The same rows, unpaginated, in the same order.
+    // The same three rows come back whichever order they are in, so a reader
+    // that pages the whole tie sees the whole tie.
     let all = fts_result_id_scores(&ds, combined_query("alpha beta", Operator::And), Some(10))
         .await
         .into_iter()
         .map(|(id, _)| id)
-        .collect::<Vec<_>>();
-    assert_eq!(all, vec![0, 1, 2]);
+        .collect::<HashSet<_>>();
+    assert_eq!(all, HashSet::from([0, 1, 2]));
 }
 
 /// The same large-tie guarantee for the query shapes that do not go through
 /// `combined_fields`: a cross-column MUST query, a single-column boolean, and
-/// a bare Match. Each reaches a different collector, and `cross_column`'s
-/// rejects an unbounded limit outright -- so completing its cutoff tie needs a
-/// bound no result set can exceed rather than "no limit".
+/// a bare Match. Each reaches a different collector, so each needs its own
+/// check that selection and the sort above it rank on the same identifier.
 #[rstest]
 #[case::cross_column_must(true, false)]
 #[case::single_column_boolean(false, true)]
@@ -3057,47 +3110,26 @@ async fn test_fts_large_tie_pagination_across_query_shapes(
     let mut ds = updated.new_dataset.as_ref().clone();
     create_inverted_indices(&mut ds, &["title", "body"], &combined_fields_test_params()).await;
 
-    let mut pages = Vec::new();
-    for offset in 0..3 {
-        let title: FtsQuery = MatchQuery::new("alpha".into())
-            .with_column(Some("title".into()))
-            .into();
-        let query: FtsQuery = if cross_column {
-            BooleanQuery::new([
-                (Occur::Must, title),
-                (
-                    Occur::Must,
-                    MatchQuery::new("beta".into())
-                        .with_column(Some("body".into()))
-                        .into(),
-                ),
-            ])
-            .into()
-        } else if single_boolean {
-            BooleanQuery::new([(Occur::Must, title.clone()), (Occur::Should, title)]).into()
-        } else {
-            title
-        };
-        let batch = ds
-            .scan()
-            .project(&["id"])
-            .unwrap()
-            .full_text_search(FullTextSearchQuery::new_query(query))
-            .unwrap()
-            .limit(Some(1), Some(offset))
-            .unwrap()
-            .try_into_batch()
-            .await
-            .unwrap();
-        pages.extend(
-            batch["id"]
-                .as_primitive::<Int32Type>()
-                .values()
-                .iter()
-                .copied(),
-        );
-    }
-    assert_eq!(pages, vec![0, 1, 2]);
+    let title: FtsQuery = MatchQuery::new("alpha".into())
+        .with_column(Some("title".into()))
+        .into();
+    let query: FtsQuery = if cross_column {
+        BooleanQuery::new([
+            (Occur::Must, title),
+            (
+                Occur::Must,
+                MatchQuery::new("beta".into())
+                    .with_column(Some("body".into()))
+                    .into(),
+            ),
+        ])
+        .into()
+    } else if single_boolean {
+        BooleanQuery::new([(Occur::Must, title.clone()), (Occur::Should, title)]).into()
+    } else {
+        title
+    };
+    assert_tied_pages_visit_each_row_once(&ds, query, 131, "131-row tie").await;
 }
 
 /// The identity column in `docs.lance` has to be named for the domain the
@@ -3305,10 +3337,10 @@ async fn test_fts_whole_fragment_mask_without_stable_row_ids(#[case] allow: bool
     assert_eq!(ids, expected);
 }
 
-/// `HybridCompoundQueryExec` widens its limit for tie re-ranking, so its final
-/// truncation has to use the limit the caller asked for. With a mixed
-/// indexed/residual plan and no outer scanner limit, truncating to the widened
-/// bound returned up to the whole tie margin past `k`.
+/// `HybridCompoundQueryExec` merges an indexed arm with a residual one, each
+/// holding up to `k` rows, so its own truncation is the only thing bounding the
+/// result when there is no outer scanner limit: without it a `k = 1` query
+/// returns both arms' candidates.
 #[tokio::test]
 async fn test_fts_hybrid_compound_respects_requested_limit() {
     use lance_index::scalar::inverted::query::{BooleanQuery, Occur};

@@ -37,6 +37,18 @@ use crate::{Error, Result};
 
 use super::{FilterPlan, PlannedFilteredScan, Scanner};
 
+/// Which identity column [`Scanner::plan_uncovered_rows_scan`] projects, and
+/// so which domain the rows it reads are ranked and merged in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum UncoveredRowIdentity {
+    /// `_rowid`, for a branch whose index hits are translated to row ids
+    /// before they meet these rows.
+    RowId,
+    /// `_rowaddr`, for a branch that ranks on the identifier its postings
+    /// store and leaves translation to the take above the plan.
+    RowAddr,
+}
+
 impl Scanner {
     /// The source plan of a scan whose `nearest` is a MinHash search.
     ///
@@ -210,14 +222,22 @@ impl Scanner {
 
     /// One plan over the rows an index does not cover: whole unindexed
     /// fragments (filtered while reading) and stale rows of a data overlay
-    /// (taken by address, then filtered), projected to `_rowid` plus
+    /// (taken by address, then filtered), projected to `identity` plus
     /// `columns` and the filter's columns.
+    ///
+    /// `identity` is the column the caller's index branch identifies hits by,
+    /// so that the flat and indexed sides of one search can be unioned and
+    /// ranked against each other: MinHash translates its index hits to row ids
+    /// and so wants [`UncoveredRowIdentity::RowId`], while FTS keeps its whole
+    /// path in the row-address domain and wants
+    /// [`UncoveredRowIdentity::RowAddr`].
     pub(super) async fn plan_uncovered_rows_scan(
         &self,
         fragments: Vec<Fragment>,
         stale_rows: IndexVisibility,
         mut columns: Vec<String>,
         filter_plan: &ExprFilterPlan,
+        identity: UncoveredRowIdentity,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let filter_expr = if stale_rows.is_empty() {
             filter_plan.refine_expr.as_ref()
@@ -227,11 +247,11 @@ impl Scanner {
         if let Some(filter_expr) = filter_expr {
             columns.extend(Planner::column_names_in_expr(filter_expr));
         }
-        let scan_projection = self
-            .dataset
-            .empty_projection()
-            .with_row_id()
-            .union_columns(&columns, OnMissing::Error)?;
+        let scan_projection = match identity {
+            UncoveredRowIdentity::RowId => self.dataset.empty_projection().with_row_id(),
+            UncoveredRowIdentity::RowAddr => self.dataset.empty_projection().with_row_addr(),
+        }
+        .union_columns(&columns, OnMissing::Error)?;
 
         let mut inputs = Vec::with_capacity(2);
         if !fragments.is_empty() {
@@ -294,6 +314,7 @@ impl Scanner {
                 stale_rows,
                 vec![query.column.clone()],
                 filter_plan,
+                UncoveredRowIdentity::RowId,
             )
             .await?;
         let mut plan = self.ensure_column_alias(plan, &query.column)?;

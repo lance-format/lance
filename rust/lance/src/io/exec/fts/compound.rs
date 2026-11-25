@@ -23,7 +23,7 @@ use futures::future::try_join_all;
 use futures::stream::{self, FuturesUnordered};
 use futures::{StreamExt, TryStreamExt};
 use lance_core::{
-    Error, ROW_ID, Result,
+    Error, ROW_ADDR, Result,
     utils::{
         tokio::{get_num_compute_intensive_cpus, spawn_cpu},
         tracing::StreamTracingExt,
@@ -63,9 +63,8 @@ use super::query_tokens::{
     tokenize_cross_column_compound_query, tokenizer_for_match_query,
 };
 use super::segments::{
-    cutoff_tie_unresolved, exhaustive_limit, finalize_row_ids_and_scores, fts_row_addr_to_row_id,
-    fts_segments_are_address_domain, open_fts_segments, search_prepared_segments,
-    segments_the_prefilter_may_match, widen_limit_for_tie_rerank,
+    open_fts_segments, require_fts_address_domain, search_prepared_segments,
+    segments_the_prefilter_may_match,
 };
 use super::selection::{FtsIndexMetrics, FtsSegmentSelection};
 
@@ -337,10 +336,10 @@ async fn index_query_local_residual_batch(
 ) -> Result<QueryLocalResidualShard> {
     spawn_cpu(move || {
         let row_ids = batch
-            .column_by_name(ROW_ID)
+            .column_by_name(ROW_ADDR)
             .ok_or_else(|| {
                 Error::invalid_input(
-                    "hybrid compound FTS residual input is missing _rowid".to_string(),
+                    "hybrid compound FTS residual input is missing _rowaddr".to_string(),
                 )
             })?
             .as_primitive::<UInt64Type>();
@@ -747,20 +746,7 @@ impl ExecutionPlan for HybridCompoundQueryExec {
             let indices =
                 open_fts_segments(&dataset, &column, segments_to_open, &metrics.index_metrics)
                     .await?;
-            let address_domain = fts_segments_are_address_domain(&dataset, segments_to_open)?;
-            let row_addr_to_row_id = fts_row_addr_to_row_id(&dataset, address_domain).await?;
-            // Hold a tie group at the cutoff whole so it survives to be ordered by
-            // row id after translation; see `finalize_row_ids_and_scores`.
-            let requested_limit = params.limit;
-            let params =
-                match widen_limit_for_tie_rerank(requested_limit, row_addr_to_row_id.is_some()) {
-                    widened if widened != requested_limit => {
-                        let mut widened_params = params.clone();
-                        widened_params.limit = widened;
-                        widened_params
-                    }
-                    _ => params.clone(),
-                };
+            require_fts_address_domain(&dataset, segments_to_open)?;
             let first_index = indices.first().ok_or_else(|| {
                 DataFusionError::Execution(format!(
                     "FTS index for column {column} has no committed segments"
@@ -778,8 +764,7 @@ impl ExecutionPlan for HybridCompoundQueryExec {
             let terms = residual_seed.exact_query_terms(&query)?;
             if terms.is_empty() {
                 metrics.baseline_metrics.record_output(0);
-                return scored_documents_batch(schema, Vec::new(), None, None)
-                    .map_err(DataFusionError::from);
+                return scored_documents_batch(schema, Vec::new()).map_err(DataFusionError::from);
             }
             let allowed_terms = Arc::new(terms.iter().cloned().collect::<FxHashSet<_>>());
             let query_tokens = Tokens::new(terms.clone(), doc_type);
@@ -834,45 +819,23 @@ impl ExecutionPlan for HybridCompoundQueryExec {
                         external_mask: None,
                     },
                     &metrics_set,
-                    address_domain,
+                    // The whole FTS path is address domain
+                    // (`require_fts_address_domain`), so the masks pushed into
+                    // the index's own search are read in that domain.
+                    /*address_domain=*/
+                    true,
                 )
                 .await?;
-                let (row_ids, scores) = compound_search_with_base_scorer(
+                compound_search_with_base_scorer(
                     &indices,
                     &query,
                     &params,
-                    prefilter.clone(),
+                    prefilter,
                     metrics.clone(),
-                    committed_scorer.clone(),
+                    committed_scorer,
                 )
                 .await
-                .map_err(DataFusionError::from)?;
-                // A tie larger than the widened cap cannot be ordered from what
-                // came back; complete it exactly instead of cutting it at an
-                // arbitrary address.
-                let (row_ids, scores) =
-                    if cutoff_tie_unresolved(&scores, requested_limit, params.limit) {
-                        let mut exact_params = params.clone();
-                        exact_params.limit = None;
-                        compound_search_with_base_scorer(
-                            &indices,
-                            &query,
-                            &exact_params,
-                            prefilter,
-                            metrics.clone(),
-                            committed_scorer,
-                        )
-                        .await
-                        .map_err(DataFusionError::from)?
-                    } else {
-                        (row_ids, scores)
-                    };
-                DataFusionResult::Ok(finalize_row_ids_and_scores(
-                    row_ids,
-                    scores,
-                    row_addr_to_row_id.as_deref(),
-                    requested_limit,
-                ))
+                .map_err(DataFusionError::from)
             };
             let residual_query = query.clone();
             let residual_search = async move {
@@ -904,13 +867,12 @@ impl ExecutionPlan for HybridCompoundQueryExec {
                     .total_cmp(&left.score.0)
                     .then_with(|| left.row_id.cmp(&right.row_id))
             });
-            // `limit` is the widened search bound (see `widen_limit_for_tie_rerank`);
-            // what the caller asked for is `requested_limit`. Truncating to the
-            // widened one would return up to the whole tie margin past `k` on a
-            // mixed indexed/residual plan with no outer scanner limit.
-            documents.truncate(requested_limit.unwrap_or(limit));
+            // Both arms selected their own top-k on `(score DESC, row address
+            // ASC)`, the same key this merge orders by, so the merged prefix is
+            // the exact top-k of their union.
+            documents.truncate(limit);
             metrics.baseline_metrics.record_output(documents.len());
-            scored_documents_batch(schema, documents, None, None).map_err(DataFusionError::from)
+            scored_documents_batch(schema, documents).map_err(DataFusionError::from)
         });
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             self.schema(),
@@ -940,9 +902,11 @@ async fn collect_bounded_fts_input(
             )));
         }
         let ids = batch
-            .column_by_name(ROW_ID)
+            .column_by_name(ROW_ADDR)
             .ok_or_else(|| {
-                DataFusionError::Execution("hybrid indexed input is missing row IDs".to_string())
+                DataFusionError::Execution(
+                    "hybrid indexed input is missing row addresses".to_string(),
+                )
             })?
             .as_primitive::<UInt64Type>();
         let values = batch
@@ -1199,26 +1163,8 @@ impl ExecutionPlan for CompoundQueryExec {
             let dataset_for_scope = dataset.clone();
             let indices =
                 open_fts_segments(&dataset, column, &segments, &metrics.index_metrics).await?;
-            let address_domain = fts_segments_are_address_domain(&dataset_for_scope, &segments)?;
-            let row_addr_to_row_id =
-                fts_row_addr_to_row_id(&dataset_for_scope, address_domain).await?;
-            // Candidates have to be ordered by row id after translation (see
-            // `finalize_row_ids_and_scores`), which needs any tie at the cutoff
-            // held whole. The siblings widen the limit and complete an
-            // over-large tie by re-running the search; this one cannot, because
-            // the branch structure below consumes its prefilter and candidate
-            // set, so it searches exhaustively and lets `finalize` apply the
-            // limit. Teaching the collectors to keep ties at the k-th score in
-            // one pass would remove both this and the siblings' second search.
-            let requested_limit = params.limit;
-            let params = match (requested_limit, row_addr_to_row_id.is_some()) {
-                (Some(_), true) => {
-                    let mut exact_params = params.clone();
-                    exact_params.limit = None;
-                    exact_params
-                }
-                _ => params.clone(),
-            };
+            require_fts_address_domain(&dataset_for_scope, &segments)?;
+            let params = params.clone();
             if let Some(first_index) = indices.first() {
                 let snapshot = tokenize_compound_query(&query, first_index.as_ref())?;
                 tokenized_query.get_or_init(|| snapshot);
@@ -1234,7 +1180,11 @@ impl ExecutionPlan for CompoundQueryExec {
                     external_mask,
                 },
                 &metrics_set,
-                address_domain,
+                // The whole FTS path is address domain
+                // (`require_fts_address_domain`), so the masks pushed into the
+                // index's own search are read in that domain.
+                /*address_domain=*/
+                true,
             )
             .await?;
             let deleted_fragments =
@@ -1338,7 +1288,6 @@ impl ExecutionPlan for CompoundQueryExec {
                         &indices,
                         &segments,
                         prefilter.as_ref(),
-                        address_domain,
                         &metrics,
                     )
                     .await;
@@ -1363,7 +1312,6 @@ impl ExecutionPlan for CompoundQueryExec {
                         &indices,
                         &segments,
                         prefilter.as_ref(),
-                        address_domain,
                         &metrics,
                     )
                     .await;
@@ -1479,7 +1427,6 @@ impl ExecutionPlan for CompoundQueryExec {
                             &indices,
                             &segments,
                             prefilter.as_ref(),
-                            address_domain,
                             &metrics,
                         )
                         .await,
@@ -1525,12 +1472,6 @@ impl ExecutionPlan for CompoundQueryExec {
                     }
                 }
             };
-            let (row_ids, scores) = finalize_row_ids_and_scores(
-                row_ids,
-                scores,
-                row_addr_to_row_id.as_deref(),
-                requested_limit,
-            );
             metrics.baseline_metrics.record_output(row_ids.len());
             Ok::<_, DataFusionError>(RecordBatch::try_new(
                 FTS_SCHEMA.clone(),
@@ -1848,7 +1789,7 @@ impl ExecutionPlan for CrossColumnCompoundQueryExec {
                 .collect::<Vec<_>>();
             // `selected_segments` spans every target column of a cross-column
             // query, so this also rejects columns whose indexes disagree.
-            let address_domain = fts_segments_are_address_domain(&dataset, &selected_segments)?;
+            require_fts_address_domain(&dataset, &selected_segments)?;
             // DatasetPreFilter starts its deletion and filter prerequisites in
             // the background. Construct it before opening index segments so
             // both I/O paths can make progress concurrently.
@@ -1863,7 +1804,11 @@ impl ExecutionPlan for CrossColumnCompoundQueryExec {
                     external_mask,
                 },
                 &metrics_set,
-                address_domain,
+                // The whole FTS path is address domain
+                // (`require_fts_address_domain`), so the masks pushed into the
+                // index's own search are read in that domain.
+                /*address_domain=*/
+                true,
             )
             .await?;
             let opened_columns = try_join_all(columns.iter().cloned().map(|selection| {
@@ -1889,19 +1834,6 @@ impl ExecutionPlan for CrossColumnCompoundQueryExec {
                 }
             }))
             .await?;
-            let row_addr_to_row_id = fts_row_addr_to_row_id(&dataset, address_domain).await?;
-            // Hold a tie group at the cutoff whole so it survives to be ordered by
-            // row id after translation; see `finalize_row_ids_and_scores`.
-            let requested_limit = params.limit;
-            let params =
-                match widen_limit_for_tie_rerank(requested_limit, row_addr_to_row_id.is_some()) {
-                    widened if widened != requested_limit => {
-                        let mut widened_params = params.clone();
-                        widened_params.limit = widened;
-                        widened_params
-                    }
-                    _ => params.clone(),
-                };
 
             let mut tokenizer_indices = HashMap::with_capacity(opened_columns.len());
             let mut partition_counts = HashMap::with_capacity(opened_columns.len());
@@ -1960,33 +1892,10 @@ impl ExecutionPlan for CrossColumnCompoundQueryExec {
                 &search_columns,
                 &query,
                 &params,
-                prefilter.clone(),
+                prefilter,
                 metrics.clone(),
             )
             .await?;
-            let (row_ids, scores) = if cutoff_tie_unresolved(&scores, requested_limit, params.limit)
-            {
-                let mut exact_params = params.clone();
-                // This collector rejects an unbounded limit, so bound the
-                // replay by every row the dataset holds instead.
-                exact_params.limit = Some(exhaustive_limit(&dataset));
-                cross_column_compound_search(
-                    &search_columns,
-                    &query,
-                    &exact_params,
-                    prefilter,
-                    metrics.clone(),
-                )
-                .await?
-            } else {
-                (row_ids, scores)
-            };
-            let (row_ids, scores) = finalize_row_ids_and_scores(
-                row_ids,
-                scores,
-                row_addr_to_row_id.as_deref(),
-                requested_limit,
-            );
             metrics.baseline_metrics.record_output(row_ids.len());
             Ok::<_, DataFusionError>(RecordBatch::try_new(
                 FTS_SCHEMA.clone(),
@@ -2252,7 +2161,7 @@ mod tests {
             );
             let batches = collect(sub_exec, task_ctx.clone()).await.unwrap();
             for b in batches {
-                let ids = b["_rowid"].as_primitive::<arrow_array::types::UInt64Type>();
+                let ids = b["_rowaddr"].as_primitive::<arrow_array::types::UInt64Type>();
                 let scores = b["_score"].as_primitive::<arrow_array::types::Float32Type>();
                 for (&id, &score) in ids.values().iter().zip(scores.values().iter()) {
                     combined.insert(id, score);
@@ -2262,7 +2171,7 @@ mod tests {
 
         let mut baseline_map = BTreeMap::<u64, f32>::new();
         for b in baseline_batches {
-            let ids = b["_rowid"].as_primitive::<arrow_array::types::UInt64Type>();
+            let ids = b["_rowaddr"].as_primitive::<arrow_array::types::UInt64Type>();
             let scores = b["_score"].as_primitive::<arrow_array::types::Float32Type>();
             for (&id, &score) in ids.values().iter().zip(scores.values().iter()) {
                 baseline_map.insert(id, score);

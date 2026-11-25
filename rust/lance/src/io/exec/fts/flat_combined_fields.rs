@@ -17,7 +17,7 @@ use datafusion_physical_expr::{Distribution, EquivalenceProperties, Partitioning
 use futures::stream::{self};
 use futures::{StreamExt, TryStreamExt};
 use lance_arrow::json::JsonEncoding;
-use lance_core::{Error, ROW_ID, Result, utils::tracing::StreamTracingExt};
+use lance_core::{Error, ROW_ADDR, Result, utils::tracing::StreamTracingExt};
 use lance_select::RowAddrMask;
 
 use crate::Dataset;
@@ -26,7 +26,7 @@ use crate::index::scalar::inverted::{
     ResolvedFtsField, flatten_fts_document_column, resolve_fts_field,
 };
 use crate::io::exec::PreFilterSource;
-use crate::io::exec::utils::{PreFilterMasks, build_prefilter_restricted_to_fragments};
+use crate::io::exec::utils::{PreFilterMasks, build_prefilter_restricted_to_fragments_in_domain};
 use lance_index::prefilter::PreFilter;
 use lance_index::scalar::inverted::builder::document_input;
 use lance_index::scalar::inverted::query::{CombinedFieldsQuery, FtsSearchParams};
@@ -57,11 +57,11 @@ use super::selection::FtsIndexMetrics;
 pub struct FlatStatsCoverage {
     /// Fragments this column's index does not cover at all.
     pub fragments: roaring::RoaringBitmap,
-    /// Rows it does cover, but whose entries a newer overlay made stale, in the id
-    /// domain the scan's `_rowid` uses. Their current values are folded in, and
-    /// their pre-overlay values are subtracted from the index statistics (see
-    /// [`lance_index::scalar::inverted::CombinedFieldColumn::stale_rows`]), so
-    /// each counts once.
+    /// Rows it does cover, but whose entries a newer overlay made stale, by row
+    /// address. Their current values are folded in, and their pre-overlay values
+    /// are subtracted from the index statistics (see
+    /// [`lance_index::scalar::inverted::CombinedFieldColumn::stale_rows`], which
+    /// looks each one up in `docs` by address), so each counts once.
     pub stale_rows: Arc<RowAddrTreeMap>,
 }
 
@@ -179,13 +179,13 @@ impl FlatCombinedFieldsExec {
             .map(|column| resolve_fts_field(dataset.schema(), column, DocumentGranularity::Row))
             .collect::<Result<Vec<_>>>()?;
         let input_schema = unindexed_input.schema();
-        let row_id = input_schema
-            .field_with_name(ROW_ID)
-            .map_err(|_| Error::invalid_input("combined_fields flat input is missing _rowid"))?;
-        if row_id.data_type() != &DataType::UInt64 {
+        let row_addr = input_schema
+            .field_with_name(ROW_ADDR)
+            .map_err(|_| Error::invalid_input("combined_fields flat input is missing _rowaddr"))?;
+        if row_addr.data_type() != &DataType::UInt64 {
             return Err(Error::invalid_input(format!(
-                "combined_fields flat input _rowid must be UInt64, got {}",
-                row_id.data_type()
+                "combined_fields flat input _rowaddr must be UInt64, got {}",
+                row_addr.data_type()
             )));
         }
         for (column, resolved) in query.column_names().zip(&resolved_fields) {
@@ -455,7 +455,7 @@ impl ExecutionPlan for FlatCombinedFieldsExec {
                     .collect::<std::result::Result<Vec<_>, _>>()?;
 
                 let emit_mask = {
-                    let pre_filter = build_prefilter_restricted_to_fragments(
+                    let pre_filter = build_prefilter_restricted_to_fragments_in_domain(
                         prefilter_context,
                         partition,
                         &emit_prefilter,
@@ -466,7 +466,13 @@ impl ExecutionPlan for FlatCombinedFieldsExec {
                         // node, so it stays out of the corpus statistics.
                         PreFilterMasks::default(),
                         &metrics_set,
-                    )?;
+                        // This node emits the row addresses the FTS path ranks
+                        // on, so the mask deciding which of its rows count is
+                        // read in that domain too.
+                        /*address_domain=*/
+                        true,
+                    )
+                    .await?;
                     pre_filter.wait_for_ready().await?;
                     pre_filter.mask()
                 };
@@ -488,14 +494,16 @@ impl ExecutionPlan for FlatCombinedFieldsExec {
                     return Ok::<_, DataFusionError>((scored_stream, scorer));
                 }
 
-                // One mask per target column over the rows it may fold. Built through
-                // `create_restricted_deletion_mask` so the fragment restriction lands in
-                // the id space the scan's `_rowid` uses; a hand-rolled fragment-address
-                // allow list would match nothing under stable row ids.
+                // One mask per target column over the rows it may fold, in the
+                // row-address domain the scan's `_rowaddr` uses -- the same
+                // domain `coverage.stale_rows` below is already expressed in,
+                // so the two compose.
                 let fragment_mask = |fragments: roaring::RoaringBitmap| {
                     let ds = stats_mask_ds.clone();
                     async move {
-                        match DatasetPreFilter::create_restricted_deletion_mask(ds, fragments) {
+                        match DatasetPreFilter::create_restricted_deletion_mask_in_row_addr_domain(
+                            ds, fragments,
+                        ) {
                             Some(mask) => mask.await,
                             None => Ok(Arc::new(RowAddrMask::all_rows())),
                         }

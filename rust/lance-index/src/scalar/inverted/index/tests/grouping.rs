@@ -609,7 +609,7 @@ async fn test_grouped_bm25_search_correct_and_cache_stable() {
 #[tokio::test]
 async fn flat_bm25_search_stop_word_query_over_unindexed_rows_returns_empty() {
     let schema = Arc::new(Schema::new(vec![
-        ROW_ID_FIELD.clone(),
+        lance_core::ROW_ADDR_FIELD.clone(),
         Field::new("text", DataType::Utf8, false),
     ]));
     let batch = RecordBatch::try_new(

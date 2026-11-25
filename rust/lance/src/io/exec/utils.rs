@@ -551,7 +551,7 @@ pub(crate) async fn translate_treemap_to_row_addr_domain(
 /// [`SelectionVectorToPrefilter`], id -> address here) for a scalar-index
 /// prefilter source. Teaching that conversion to stop at the domain its
 /// consumer wants is a follow-up, not a correctness concern.
-async fn row_id_mask_to_row_addr_domain(
+pub(crate) async fn row_id_mask_to_row_addr_domain(
     dataset: &Dataset,
     mask: Arc<RowAddrMask>,
 ) -> Result<Arc<RowAddrMask>> {
@@ -655,34 +655,9 @@ pub(crate) async fn build_prefilter_in_domain(
 }
 
 /// Build a prefilter restricted to `fragments` rather than to the union of
-/// `index_meta`'s fragment bitmaps. See
-/// [`DatasetPreFilter::new_restricted_to_fragments`].
-pub(crate) fn build_prefilter_restricted_to_fragments(
-    context: Arc<datafusion::execution::TaskContext>,
-    partition: usize,
-    prefilter_source: &PreFilterSource,
-    ds: Arc<Dataset>,
-    fragments: RoaringBitmap,
-    masks: PreFilterMasks,
-    metrics: &ExecutionPlanMetricsSet,
-) -> Result<Arc<DatasetPreFilter>> {
-    let filter = prefilter_mask_future(
-        context,
-        partition,
-        prefilter_source,
-        masks.external_mask,
-        metrics,
-        ds.clone(),
-    )?;
-    let mut prefilter = DatasetPreFilter::new_restricted_to_fragments(ds, fragments, filter);
-    if let Some(overlay_block) = masks.overlay_block {
-        prefilter = prefilter.with_overlay_block(overlay_block);
-    }
-    Ok(Arc::new(prefilter))
-}
-
-/// Like [`build_prefilter_restricted_to_fragments`], with the same
-/// `address_domain` meaning as [`build_prefilter_in_domain`].
+/// `index_meta`'s fragment bitmaps, with the same `address_domain` meaning as
+/// [`build_prefilter_in_domain`]. See
+/// [`DatasetPreFilter::new_restricted_to_fragments_in_domain`].
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn build_prefilter_restricted_to_fragments_in_domain(
     context: Arc<datafusion::execution::TaskContext>,

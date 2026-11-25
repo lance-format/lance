@@ -188,7 +188,7 @@ impl ScoredPartitionDoc {
 
 impl PartialEq for ScoredPartitionDoc {
     fn eq(&self, other: &Self) -> bool {
-        self.score == other.score
+        self.cmp(other).is_eq()
     }
 }
 
@@ -200,9 +200,32 @@ impl PartialOrd for ScoredPartitionDoc {
     }
 }
 
+/// Greater compares better: higher score, then the earlier `(partition, doc
+/// id)` coordinate.
+///
+/// The coordinate tiebreak is what makes this a total order. Score alone left a
+/// tie to heap and arrival order, and partitions are searched concurrently, so
+/// which of two equal-scoring documents a bounded search kept was not stable
+/// run to run -- and a bounded search's result has to be a *prefix* of the
+/// order the plan above emits in or paging through a tie skips and repeats
+/// rows.
+///
+/// Candidates are still coordinates here, not addresses, so the tiebreak is the
+/// coordinate rather than the address the caller finally emits. The two agree
+/// for an index built the only way `InvertedIndexBuilder` builds one: its
+/// partitions are filled in scan order, which is ascending row address, so
+/// `(partition ordinal, doc id)` ascends with the address.
 impl Ord for ScoredPartitionDoc {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.score.cmp(&other.score)
+        self.score
+            .cmp(&other.score)
+            .then_with(|| {
+                other
+                    .document
+                    .partition_ordinal
+                    .cmp(&self.document.partition_ordinal)
+            })
+            .then_with(|| other.document.doc_id.cmp(&self.document.doc_id))
     }
 }
 
@@ -221,18 +244,27 @@ pub(super) fn address_read_concurrency(io_parallelism: usize, largest_read_bytes
     )
 }
 
+/// Admit `(key, score)` into a bounded best-`limit` heap, keyed on `(score
+/// DESC, key ASC)` -- the order the plan above emits in.
+///
+/// `ScoredDoc`'s own `Ord` compares the score alone, so ties would otherwise be
+/// resolved by heap and arrival order; `key` is the stored identifier the
+/// caller emits, so comparing it makes the retained set a prefix of that order
+/// and the result stable run to run.
 pub(super) fn push_scored_key(
     candidates: &mut BinaryHeap<Reverse<ScoredDoc>>,
     limit: usize,
     key: u64,
     score: f32,
 ) {
+    let beats_worst = |worst: &Reverse<ScoredDoc>| match worst.0.score.0.partial_cmp(&score) {
+        Some(std::cmp::Ordering::Less) => true,
+        Some(std::cmp::Ordering::Equal) => key < worst.0.row_id,
+        _ => false,
+    };
     if candidates.len() < limit {
         candidates.push(Reverse(ScoredDoc::new(key, score)));
-    } else if candidates
-        .peek()
-        .is_some_and(|candidate| candidate.0.score.0 < score)
-    {
+    } else if candidates.peek().is_some_and(beats_worst) {
         candidates.pop();
         candidates.push(Reverse(ScoredDoc::new(key, score)));
     }

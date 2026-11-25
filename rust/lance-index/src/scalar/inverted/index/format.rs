@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use super::*;
+use lance_core::ROW_ADDR_FIELD;
 
 // Version 0: Arrow TokenSetFormat (legacy)
 // Version 1: Fst TokenSetFormat with per-doc compressed positions
@@ -90,11 +91,26 @@ pub static DOC_INDEX_FIELD: LazyLock<Field> = LazyLock::new(|| {
         false,
     )
 });
-pub static FTS_SCHEMA: LazyLock<SchemaRef> =
-    LazyLock::new(|| Arc::new(Schema::new(vec![ROW_ID_FIELD.clone(), SCORE_FIELD.clone()])));
+/// The schema every FTS execution node emits.
+///
+/// The document identity is `_rowaddr`, not `_rowid`: an FTS search ranks on the
+/// identifier its postings store, which from
+/// [`INVERTED_ROW_ADDR_DOMAIN_VERSION`](super::INVERTED_ROW_ADDR_DOMAIN_VERSION)
+/// is a physical row address, and nothing between the postings and the take
+/// above the plan translates it. Naming it for its domain is what lets
+/// `TakeExec` read it by address instead of resolving it through the row-id
+/// index, and what keeps the plan's `(score DESC, identity ASC)` sort keyed on
+/// the same identifier top-k selection ranks by -- a tie then survives paging
+/// without the plan having to hold the whole tie group.
+pub static FTS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    Arc::new(Schema::new(vec![
+        ROW_ADDR_FIELD.clone(),
+        SCORE_FIELD.clone(),
+    ]))
+});
 pub static ELEMENT_FTS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     Arc::new(Schema::new(vec![
-        ROW_ID_FIELD.clone(),
+        ROW_ADDR_FIELD.clone(),
         DOC_INDEX_FIELD.clone(),
         SCORE_FIELD.clone(),
     ]))
@@ -107,8 +123,18 @@ pub fn fts_schema(document_granularity: DocumentGranularity) -> SchemaRef {
         FTS_SCHEMA.clone()
     }
 }
+/// The bare identity schema of a generic [`ScalarIndex::search`] result, whose
+/// column is `_rowid` by the scalar-index convention even when the values are
+/// addresses; `ScalarIndexExec` translates on `results_are_row_addrs`. FTS
+/// execution nodes do not go through it -- they emit [`FTS_SCHEMA`].
 pub(super) static ROW_ID_SCHEMA: LazyLock<SchemaRef> =
     LazyLock::new(|| Arc::new(Schema::new(vec![ROW_ID_FIELD.clone()])));
+
+/// The identity schema of the flat (unindexed) FTS tokenize-and-count stream,
+/// whose rows come from a scan projecting `_rowaddr` so they share
+/// [`FTS_SCHEMA`]'s domain.
+pub(super) static ROW_ADDR_SCHEMA: LazyLock<SchemaRef> =
+    LazyLock::new(|| Arc::new(Schema::new(vec![ROW_ADDR_FIELD.clone()])));
 
 pub fn resolve_fts_format_version(
     value: Option<&str>,

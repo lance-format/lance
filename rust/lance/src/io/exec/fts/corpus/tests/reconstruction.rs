@@ -66,7 +66,7 @@ fn query() -> MatchQuery {
 }
 
 fn residual_batch() -> RecordBatch {
-    record_batch!(("text", Utf8, ["alpha"]), (ROW_ID, UInt64, [100])).unwrap()
+    record_batch!(("text", Utf8, ["alpha"]), (ROW_ADDR, UInt64, [100])).unwrap()
 }
 
 fn assert_binding_error(result: DataFusionResult<SharedFtsScorerExec>, message: &str) {
@@ -474,7 +474,7 @@ async fn shared_corpus_binding_rejects_different_resolved_granularity() {
         memory_input(
             record_batch!(
                 ("text", Utf8, ["alpha"]),
-                (ROW_ID, UInt64, [100]),
+                (ROW_ADDR, UInt64, [100]),
                 ("_doc_index_0", UInt32, [0])
             )
             .unwrap(),
@@ -484,7 +484,7 @@ async fn shared_corpus_binding_rejects_different_resolved_granularity() {
     ));
     // A projection can make the output schemas agree while the statistical
     // document units still differ. The owner must validate the actual leaves.
-    let expressions: Vec<_> = [ROW_ID, SCORE_COL]
+    let expressions: Vec<_> = [ROW_ADDR, SCORE_COL]
         .into_iter()
         .map(|name| {
             (

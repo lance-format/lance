@@ -47,7 +47,7 @@ pub use prefilter_union::PrefilterUnionExec;
 pub use projection::project;
 pub use pushdown_scan::{LancePushdownScanExec, ScanConfig};
 pub use row_addr_mask::RowAddrMaskFilterExec;
-pub use rowids::{AddRowAddrExec, AddRowOffsetExec};
+pub use rowids::{AddRowAddrExec, AddRowIdExec, AddRowOffsetExec};
 pub(crate) use scan::LanceStream;
 pub use scan::{LanceScanConfig, LanceScanExec};
 pub use take::TakeExec;

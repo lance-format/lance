@@ -1792,13 +1792,15 @@ ScalarIndexQuery: query=[i > 10]@i_idx(BTree)"
     dataset.make_fts_index().await?;
     log::info!("Test case: Full text search (match query)");
     let expected = if data_storage_version == LanceFileVersion::Legacy {
-        r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
-  Take: columns="_rowid, _score, (s)"
+        r#"ProjectionExec: expr=[s@3 as s, _score@2 as _score, _rowid@0 as _rowid]
+  AddRowIdExec
+  Take: columns="_rowaddr, _score, (s)"
 CoalesceBatchesExec: target_batch_size=8192
   MatchQuery: column=s, query=[hello]"#
     } else {
-        r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
-  LanceRead: uri=..., projection=[s], source=stream(_rowid)
+        r#"ProjectionExec: expr=[s@3 as s, _score@2 as _score, _rowid@0 as _rowid]
+  AddRowIdExec
+  LanceRead: uri=..., projection=[s], source=stream(_rowaddr)
 MatchQuery: column=s, query=[hello]"#
     };
     assert_plan_equals(
@@ -1814,13 +1816,15 @@ MatchQuery: column=s, query=[hello]"#
 
     log::info!("Test case: Full text search (phrase query)");
     let expected = if data_storage_version == LanceFileVersion::Legacy {
-        r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
-  Take: columns="_rowid, _score, (s)"
+        r#"ProjectionExec: expr=[s@3 as s, _score@2 as _score, _rowid@0 as _rowid]
+  AddRowIdExec
+  Take: columns="_rowaddr, _score, (s)"
 CoalesceBatchesExec: target_batch_size=8192
   PhraseQuery: column=s, query=hello world"#
     } else {
-        r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
-  LanceRead: uri=..., projection=[s], source=stream(_rowid)
+        r#"ProjectionExec: expr=[s@3 as s, _score@2 as _score, _rowid@0 as _rowid]
+  AddRowIdExec
+  LanceRead: uri=..., projection=[s], source=stream(_rowaddr)
 PhraseQuery: column=s, query=hello world"#
     };
     assert_plan_equals(
@@ -1837,13 +1841,15 @@ PhraseQuery: column=s, query=hello world"#
 
     log::info!("Test case: Full text search (boost query)");
     let expected = if data_storage_version == LanceFileVersion::Legacy {
-        r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
-  Take: columns="_rowid, _score, (s)"
+        r#"ProjectionExec: expr=[s@3 as s, _score@2 as _score, _rowid@0 as _rowid]
+  AddRowIdExec
+  Take: columns="_rowaddr, _score, (s)"
 CoalesceBatchesExec: target_batch_size=8192
   CompoundFtsScorer: query=Boosting(positive=Match(MatchQuery { column: Some("s"), terms: "hello", ... }), negative=Match(MatchQuery { column: Some("s"), terms: "world", ... }), negative_boost=1)"#
     } else {
-        r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
-  LanceRead: uri=..., projection=[s], source=stream(_rowid)
+        r#"ProjectionExec: expr=[s@3 as s, _score@2 as _score, _rowid@0 as _rowid]
+  AddRowIdExec
+  LanceRead: uri=..., projection=[s], source=stream(_rowaddr)
 CompoundFtsScorer: query=Boosting(positive=Match(MatchQuery { column: Some("s"), terms: "hello", ... }), negative=Match(MatchQuery { column: Some("s"), terms: "world", ... }), negative_boost=1)"#
     };
     assert_plan_equals(
@@ -1862,8 +1868,9 @@ CompoundFtsScorer: query=Boosting(positive=Match(MatchQuery { column: Some("s"),
 
     log::info!("Test case: Full text search with prefilter");
     let expected = if data_storage_version == LanceFileVersion::Legacy {
-        r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
-  Take: columns="_rowid, _score, (s)"
+        r#"ProjectionExec: expr=[s@3 as s, _score@2 as _score, _rowid@0 as _rowid]
+  AddRowIdExec
+  Take: columns="_rowaddr, _score, (s)"
 CoalesceBatchesExec: target_batch_size=8192
   MatchQuery: column=s, query=[hello]
     CoalescePartitionsExec
@@ -1873,8 +1880,9 @@ CoalesceBatchesExec: target_batch_size=8192
           FilterExec: i@0 > 10
             LanceScan: uri=..., projection=[i], row_id=true, row_addr=false, ordered=false, range=None"#
     } else {
-        r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
-  LanceRead: uri=..., projection=[s], source=stream(_rowid)
+        r#"ProjectionExec: expr=[s@3 as s, _score@2 as _score, _rowid@0 as _rowid]
+  AddRowIdExec
+  LanceRead: uri=..., projection=[s], source=stream(_rowaddr)
 MatchQuery: column=s, query=[hello]
   PrefilterUnion: scalar_fragments=4, evaluated_fragments=5
     ScalarIndexQuery: query=[i > 10]@i_idx(BTree)
@@ -1898,8 +1906,9 @@ MatchQuery: column=s, query=[hello]
     // candidates. The flat input reads through FilteredReadExec: legacy emits
     // a LanceScan, v2 emits a LanceRead with empty filters.
     let expected = if data_storage_version == LanceFileVersion::Legacy {
-        r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
-  Take: columns="_rowid, _score, (s)"
+        r#"ProjectionExec: expr=[s@3 as s, _score@2 as _score, _rowid@0 as _rowid]
+  AddRowIdExec
+  Take: columns="_rowaddr, _score, (s)"
 CoalesceBatchesExec: target_batch_size=8192
   MatchCorpus
     SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
@@ -1907,17 +1916,18 @@ CoalesceBatchesExec: target_batch_size=8192
         UnionExec
           MatchQuery: column=s, query=[hello]
           FlatMatchQuery: column=s, query=hello
-            LanceScan: uri=..., projection=[s], row_id=true, row_addr=false, ordered=true, range=None"#
+            LanceScan: uri=..., projection=[s], row_id=false, row_addr=true, ordered=true, range=None"#
     } else {
-        r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
-  LanceRead: uri=..., projection=[s], source=stream(_rowid)
+        r#"ProjectionExec: expr=[s@3 as s, _score@2 as _score, _rowid@0 as _rowid]
+  AddRowIdExec
+  LanceRead: uri=..., projection=[s], source=stream(_rowaddr)
 MatchCorpus
   SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
     CoalescePartitionsExec
       UnionExec
         MatchQuery: column=s, query=[hello]
         FlatMatchQuery: column=s, query=hello
-          LanceRead: uri=..., projection=[s], num_fragments=1, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=--, refine_filter=--"#
+          LanceRead: uri=..., projection=[s], num_fragments=1, range_before=None, range_after=None, row_id=false, row_addr=true, full_filter=--, refine_filter=--"#
     };
     dataset.append_new_data().await?;
     assert_plan_equals(
@@ -1933,13 +1943,15 @@ MatchCorpus
 
     log::info!("Test case: Full text search with unindexed rows and fast_search");
     let expected = if data_storage_version == LanceFileVersion::Legacy {
-        r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
-  Take: columns="_rowid, _score, (s)"
+        r#"ProjectionExec: expr=[s@3 as s, _score@2 as _score, _rowid@0 as _rowid]
+  AddRowIdExec
+  Take: columns="_rowaddr, _score, (s)"
 CoalesceBatchesExec: target_batch_size=8192
   MatchQuery: column=s, query=[hello]"#
     } else {
-        r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
-  LanceRead: uri=..., projection=[s], source=stream(_rowid)
+        r#"ProjectionExec: expr=[s@3 as s, _score@2 as _score, _rowid@0 as _rowid]
+  AddRowIdExec
+  LanceRead: uri=..., projection=[s], source=stream(_rowaddr)
 MatchQuery: column=s, query=[hello]"#
     };
     assert_plan_equals(
@@ -1961,8 +1973,9 @@ MatchQuery: column=s, query=[hello]"#
     // Keep the BTree prefilter in separate candidate inputs so it restricts
     // emitted matches without changing corpus statistics.
     let expected = if data_storage_version == LanceFileVersion::Legacy {
-        r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
-  Take: columns="_rowid, _score, (s)"
+        r#"ProjectionExec: expr=[s@3 as s, _score@2 as _score, _rowid@0 as _rowid]
+  AddRowIdExec
+  Take: columns="_rowaddr, _score, (s)"
 CoalesceBatchesExec: target_batch_size=8192
   MatchCorpus
     SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
@@ -1976,7 +1989,7 @@ CoalesceBatchesExec: target_batch_size=8192
                   FilterExec: i@0 > 10
                     LanceScan: uri=..., projection=[i], row_id=true, row_addr=false, ordered=false, range=None
           FlatMatchQuery: column=s, query=hello
-            LanceScan: uri=..., projection=[s], row_id=true, row_addr=false, ordered=true, range=None
+            LanceScan: uri=..., projection=[s], row_id=false, row_addr=true, ordered=true, range=None
             CoalescePartitionsExec
               UnionExec
                 MaterializeIndex: query=[i > 10]@i_idx(BTree)
@@ -1984,8 +1997,9 @@ CoalesceBatchesExec: target_batch_size=8192
                   FilterExec: i@0 > 10
                     LanceScan: uri=..., projection=[i], row_id=true, row_addr=false, ordered=false, range=None"#
     } else {
-        r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
-  LanceRead: uri=..., projection=[s], source=stream(_rowid)
+        r#"ProjectionExec: expr=[s@3 as s, _score@2 as _score, _rowid@0 as _rowid]
+  AddRowIdExec
+  LanceRead: uri=..., projection=[s], source=stream(_rowaddr)
 MatchCorpus
   SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
     CoalescePartitionsExec
@@ -1995,7 +2009,7 @@ MatchCorpus
             ScalarIndexQuery: query=[i > 10]@i_idx(BTree)
             LanceRead: uri=..., projection=[], num_fragments=1, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=i > Int32(10), refine_filter=i > Int32(10)
         FlatMatchQuery: column=s, query=hello
-          LanceRead: uri=..., projection=[s], num_fragments=1, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=--, refine_filter=--
+          LanceRead: uri=..., projection=[s], num_fragments=1, range_before=None, range_after=None, row_id=false, row_addr=true, full_filter=--, refine_filter=--
           LanceRead: uri=..., projection=[], num_fragments=1, range_before=None, range_after=None, row_id=true, row_addr=false, full_filter=i > Int32(10), refine_filter=i > Int32(10)"#
     };
     assert_plan_equals(

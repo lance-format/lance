@@ -10,6 +10,7 @@
 //! query semantics. Tests live below and in
 //! `dataset/tests/dataset_scanner_plans.rs`.
 
+use crate::io::exec::AddRowAddrExec;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -31,8 +32,8 @@ use datafusion_physical_plan::empty::EmptyExec;
 use datafusion_physical_plan::joins::{HashJoinExec, PartitionMode};
 use datafusion_physical_plan::projection::ProjectionExec;
 use lance_arrow::SchemaExt as ArrowSchemaExt;
-use lance_core::ROW_ID;
 use lance_core::datatypes::OnMissing;
+use lance_core::{ROW_ADDR, ROW_ID};
 use lance_index::IndexCriteria;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::pbold::InvertedIndexDetails;
@@ -75,6 +76,7 @@ use crate::io::exec::{
 };
 use crate::{Error, Result};
 
+use super::minhash::UncoveredRowIdentity;
 use super::{FilterPlan, PlannedFilteredScan, Scanner, fts_indexed_columns};
 
 enum FtsOverlayPlan {
@@ -693,8 +695,8 @@ impl Scanner {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let schema = input.schema();
         let group_expr = vec![(
-            expressions::col(ROW_ID, schema.as_ref())?,
-            ROW_ID.to_string(),
+            expressions::col(ROW_ADDR, schema.as_ref())?,
+            ROW_ADDR.to_string(),
         )];
         let input = Arc::new(RepartitionExec::try_new(
             input,
@@ -1363,10 +1365,13 @@ impl Scanner {
                 } else {
                     resolved.canonical_path.clone()
                 };
+                // The residual rows are ranked against the indexed arm's
+                // hits on the identifier its postings store, so they are read
+                // by address too (see `fts_score_sort_exprs`).
                 let scan_projection = self
                     .dataset
                     .empty_projection()
-                    .with_row_id()
+                    .with_row_addr()
                     .union_columns(&[scan_column], OnMissing::Error)?;
                 let PlannedFilteredScan { plan, .. } = self
                     .filtered_read(
@@ -1548,8 +1553,8 @@ impl Scanner {
 
                 let schema = children[0].schema();
                 let group_expr = vec![(
-                    expressions::col(ROW_ID, schema.as_ref())?,
-                    ROW_ID.to_string(),
+                    expressions::col(ROW_ADDR, schema.as_ref())?,
+                    ROW_ADDR.to_string(),
                 )];
 
                 let fts_node = UnionExec::try_new(children)?;
@@ -2369,7 +2374,13 @@ impl Scanner {
             tail_scan.batch_size_bytes(16 * 1024 * 1024);
         }
         let mut plan = tail_scan
-            .plan_uncovered_rows_scan(fragments, stale_rows, vec![scan_column], filter_plan)
+            .plan_uncovered_rows_scan(
+                fragments,
+                stale_rows,
+                vec![scan_column],
+                filter_plan,
+                UncoveredRowIdentity::RowAddr,
+            )
             .await?;
         if resolved.has_lists() {
             plan = Arc::new(FtsDocumentExec::new(plan, resolved.clone()));
@@ -2404,14 +2415,30 @@ impl Scanner {
     /// Sort keys for an FTS plan whose scores come from more than one source, or
     /// from a source that does not sort.
     ///
-    /// `row_id ASC` is a required second key, not a nicety: a score-only sort over
-    /// concurrently read sources breaks ties by arrival order, so equal-scoring
-    /// documents would come back in a different order run to run and
-    /// `limit`/`offset` pagination could skip and repeat rows. `combined_fields`
-    /// needs it for the same reason: `combined_fields_search` visits candidates in
-    /// ascending row-id order, so its top-k is reproducible, but it does not order
-    /// ties itself (`ScoredDoc` compares on score alone), so this sort is what
-    /// decides which of two equal-scoring rows comes first.
+    /// `_rowaddr ASC` is a required second key, not a nicety: a score-only sort
+    /// over concurrently read sources breaks ties by arrival order, so
+    /// equal-scoring documents would come back in a different order run to run
+    /// and `limit`/`offset` pagination could skip and repeat rows.
+    /// `combined_fields` needs it for the same reason: `combined_fields_search`
+    /// visits candidates in ascending stored-identifier order, so its top-k is
+    /// reproducible, but it does not order ties itself (`ScoredDoc` compares on
+    /// score alone), so this sort is what decides which of two equal-scoring
+    /// rows comes first.
+    ///
+    /// The second key is the row *address* because that is the identifier every
+    /// FTS source ranks on -- the one its postings store, and the one the flat
+    /// siblings project (see
+    /// [`FTS_SCHEMA`](lance_index::scalar::inverted::FTS_SCHEMA)). Keying the
+    /// sort on anything else would reorder ties *after* each source had already
+    /// cut its own top-k on them, which is how paging a tie skips and repeats
+    /// rows: each source keeps the lowest-address members of the tie group
+    /// while the sort promotes different ones.
+    ///
+    /// What this does *not* promise is a tie order that survives compaction for
+    /// a reader that does not pin a dataset version: a row's address moves when
+    /// it is rewritten. Same-version determinism and pagination consistency are
+    /// the contract, and they are what ties need (any delete already shifts
+    /// `docCount`/`avgdl`/`docFreq` and so moves the scores themselves).
     fn fts_score_sort_exprs(schema: &ArrowSchema) -> Result<[PhysicalSortExpr; 2]> {
         Ok([
             PhysicalSortExpr {
@@ -2422,7 +2449,7 @@ impl Scanner {
                 },
             },
             PhysicalSortExpr {
-                expr: expressions::col(ROW_ID, schema)?,
+                expr: expressions::col(ROW_ADDR, schema)?,
                 options: SortOptions {
                     descending: false,
                     nulls_first: false,
@@ -2526,7 +2553,11 @@ impl Scanner {
             {
                 FtsOverlayPlan::Unchanged(_) => {}
                 FtsOverlayPlan::RowLevel { stale_rows, .. } => {
-                    column_stale_rows = stale_rows.result_rows().await?.clone();
+                    // Addresses, not the overlay's own result domain: both
+                    // consumers key by address -- the index side looks each row
+                    // up in `docs` to subtract its pre-overlay statistics, and
+                    // the flat side allows it through a row-address stats mask.
+                    column_stale_rows = stale_rows.physical_selection();
                     for (&fragment_id, offsets) in stale_rows.physical_rows() {
                         *stale_addresses.entry(fragment_id).or_default() |= offsets;
                     }
@@ -2755,7 +2786,13 @@ impl Scanner {
         let mut corpus_scanner = self.clone();
         corpus_scanner.external_row_mask = None;
         let mut plan = corpus_scanner
-            .plan_uncovered_rows_scan(fragments, stale_rows, columns, &ExprFilterPlan::default())
+            .plan_uncovered_rows_scan(
+                fragments,
+                stale_rows,
+                columns,
+                &ExprFilterPlan::default(),
+                UncoveredRowIdentity::RowAddr,
+            )
             .await?;
         // A nested target column needs a flat alias so the exec can resolve it by
         // name in the batch schema. A list-bearing one gets its flat column from
@@ -2939,6 +2976,15 @@ impl Scanner {
                 } else {
                     input
                 };
+                // The flat scorer identifies its documents the way every FTS
+                // node does, by row address, so vector candidates carrying only
+                // a `_rowid` get one derived before they are scored.
+                let input = if input.schema().column_with_name(ROW_ADDR).is_none() {
+                    Arc::new(AddRowAddrExec::try_new(input, self.dataset.clone(), 0)?)
+                        as Arc<dyn ExecutionPlan>
+                } else {
+                    input
+                };
                 let input = if resolved.has_lists() {
                     Arc::new(FtsDocumentExec::new(input, resolved)) as Arc<dyn ExecutionPlan>
                 } else {
@@ -2958,12 +3004,23 @@ impl Scanner {
                 let default_filter = ExprFilterPlan::default();
                 let fts_plan = self.fts(&default_filter, q, q.params()).await?;
 
-                let vector_row_id = Column::new_with_schema(ROW_ID, input.schema().as_ref())?;
-                let fts_row_id = Column::new_with_schema(ROW_ID, fts_plan.schema().as_ref())?;
+                // An FTS plan identifies its hits by row address, so the vector
+                // candidates it re-ranks have to carry one to join on. A vector
+                // scan already projecting `_rowaddr` keeps the column it has;
+                // otherwise one is derived from its `_rowid` here and dropped
+                // again below, so the join is the only thing that sees it.
+                let vector_carries_row_addr = input.schema().column_with_name(ROW_ADDR).is_some();
+                let input = if vector_carries_row_addr {
+                    input
+                } else {
+                    Arc::new(AddRowAddrExec::try_new(input, self.dataset.clone(), 0)?)
+                };
+                let vector_row_addr = Column::new_with_schema(ROW_ADDR, input.schema().as_ref())?;
+                let fts_row_addr = Column::new_with_schema(ROW_ADDR, fts_plan.schema().as_ref())?;
                 let join = HashJoinExec::try_new(
                     input,
                     fts_plan,
-                    vec![(Arc::new(vector_row_id), Arc::new(fts_row_id))],
+                    vec![(Arc::new(vector_row_addr), Arc::new(fts_row_addr))],
                     None,
                     &JoinType::Inner,
                     None,
@@ -2974,13 +3031,22 @@ impl Scanner {
 
                 let schema = join.schema();
                 let mut projection_exprs = Vec::new();
-                let mut contain_rowid = false;
+                let mut seen_row_id = false;
+                let mut seen_row_addr = false;
                 for field in schema.fields() {
                     if field.name() == ROW_ID {
-                        if contain_rowid {
+                        if seen_row_id {
                             continue;
                         }
-                        contain_rowid = true;
+                        seen_row_id = true;
+                    }
+                    if field.name() == ROW_ADDR {
+                        // Both sides joined on it; keep at most the one the
+                        // caller asked for, and none if it was only derived.
+                        if seen_row_addr || !vector_carries_row_addr {
+                            continue;
+                        }
+                        seen_row_addr = true;
                     }
                     projection_exprs.push((
                         Arc::new(Column::new_with_schema(field.name(), schema.as_ref())?)

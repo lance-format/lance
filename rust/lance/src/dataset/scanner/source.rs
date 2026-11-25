@@ -51,8 +51,9 @@ use crate::io::exec::filtered_read::{
 };
 use crate::io::exec::scalar_index::{MaterializeIndexExec, ScalarIndexExec};
 use crate::io::exec::{
-    AddRowAddrExec, FilterPlan as ExprFilterPlan, LanceFilterExec, LancePushdownScanExec,
-    LanceScanConfig, LanceScanExec, Planner, RowAddrMaskFilterExec, ScanConfig, TakeExec, project,
+    AddRowAddrExec, AddRowIdExec, FilterPlan as ExprFilterPlan, LanceFilterExec,
+    LancePushdownScanExec, LanceScanConfig, LanceScanExec, Planner, RowAddrMaskFilterExec,
+    ScanConfig, TakeExec, project,
 };
 use crate::{Error, Result};
 
@@ -316,7 +317,11 @@ impl Scanner {
             let scan = self.scan_fragments(
                 ScanOptions {
                     with_row_id: projection.with_row_id,
-                    with_row_address: self.projection_plan.physical_projection.with_row_addr,
+                    // Either the caller's own projection (an FTS flat scan asks
+                    // for `_rowaddr` so its rows rank against index hits) or the
+                    // scan's output projection can call for the address.
+                    with_row_address: projection.with_row_addr
+                        || self.projection_plan.physical_projection.with_row_addr,
                     with_row_last_updated_at_version: self
                         .projection_plan
                         .physical_projection
@@ -1228,23 +1233,46 @@ impl Scanner {
         input: Arc<dyn ExecutionPlan>,
         output_projection: Projection,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let fields_to_take = output_projection
-            .clone()
-            .subtract_arrow_schema(input.schema().as_ref(), OnMissing::Ignore)?;
-        if fields_to_take.is_empty() {
-            // No new columns needed
-            return Ok(input);
+        // A plan that identifies its rows physically (an FTS node ranks and
+        // pages on the row address its postings store) still owes the caller a
+        // `_rowid` when one was projected. The take itself reads by address and
+        // the row id is derived from it afterwards, so the identifier the plan
+        // ranks on stays out of the read, the row id costs one lookup per output
+        // row, and `TakeExec` -- which cannot insert an identity column -- never
+        // has to.
+        let input_schema = input.schema();
+        let derive_row_id = output_projection.with_row_id
+            && input_schema.column_with_name(ROW_ID).is_none()
+            && input_schema.column_with_name(ROW_ADDR).is_some();
+        let mut take_projection = output_projection;
+        if derive_row_id {
+            take_projection.with_row_id = false;
         }
-
-        versions::take(
-            self.dataset
-                .manifest()
-                .data_storage_format
-                .lance_file_format(),
-            self,
-            input,
-            output_projection,
-        )
+        let fields_to_take = take_projection
+            .clone()
+            .subtract_arrow_schema(input_schema.as_ref(), OnMissing::Ignore)?;
+        let taken = if fields_to_take.is_empty() {
+            // No new columns needed
+            input
+        } else {
+            versions::take(
+                self.dataset
+                    .manifest()
+                    .data_storage_format
+                    .lance_file_format(),
+                self,
+                input,
+                take_projection,
+            )?
+        };
+        if derive_row_id {
+            return Ok(Arc::new(AddRowIdExec::try_new(
+                taken,
+                self.dataset.clone(),
+                /*rowid_pos=*/ 0,
+            )?));
+        }
+        Ok(taken)
     }
 
     pub(in crate::dataset) fn take_current(
