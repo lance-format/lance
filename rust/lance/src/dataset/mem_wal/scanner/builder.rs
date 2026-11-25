@@ -26,7 +26,7 @@ use uuid::Uuid;
 
 use super::collector::{InMemoryMemTableRef, InMemoryMemTables, LsmDataSourceCollector};
 use super::data_source::{FreshTierWatermark, ShardSnapshot};
-use super::planner::LsmScanPlanner;
+use super::planner::{LsmScanPlanner, sort_top_k};
 use super::point_lookup::LsmPointLookupPlanner;
 use super::projection::validate_projection_names;
 use super::sstable_cache::{DatasetCache, SsTableWarmer};
@@ -34,6 +34,7 @@ use super::vector_search::ProbeBounds;
 use super::{SearchQuery, SearchState, validate_nearest_query};
 use crate::dataset::Dataset;
 use crate::dataset::mem_wal::util::derived_store_params;
+use crate::dataset::scanner::ColumnOrdering;
 use crate::dataset::utils::to_logical_stream;
 use crate::session::Session;
 use lance_io::object_store::ObjectStoreParams;
@@ -215,6 +216,10 @@ pub struct LsmScanner {
     filter: Option<Expr>,
     limit: Option<usize>,
     offset: Option<usize>,
+    /// Sort keys for a plain scan, applied above the union so the top-k is
+    /// taken over live rows. Only the scan path honors it; the vector and FTS
+    /// planners rank by `_distance` / `_score` instead.
+    ordering: Option<Vec<ColumnOrdering>>,
     /// Vector KNN and full-text search; mutually exclusive at plan time.
     search: SearchState<LsmVectorQuery, FullTextSearchQuery>,
 
@@ -279,6 +284,7 @@ impl LsmScanner {
             filter: None,
             limit: None,
             offset: None,
+            ordering: None,
             search: SearchState::new(),
             with_row_address: false,
             with_memtable_gen: false,
@@ -326,6 +332,7 @@ impl LsmScanner {
             filter: None,
             limit: None,
             offset: None,
+            ordering: None,
             search: SearchState::new(),
             with_row_address: false,
             with_memtable_gen: false,
@@ -490,6 +497,30 @@ impl LsmScanner {
         Ok(self)
     }
 
+    /// Sort the scan by `ordering`, mirroring
+    /// [`crate::dataset::scanner::Scanner::order_by`]. Every key must be a
+    /// top-level column in the scan's projection. An empty list clears it.
+    ///
+    /// Ordering applies to the plain scan only; it is rejected alongside a
+    /// vector or full-text query, which rank by `_distance` / `_score`.
+    pub fn order_by(mut self, ordering: Option<Vec<ColumnOrdering>>) -> Result<Self> {
+        let ordering = ordering.filter(|o| !o.is_empty());
+        if let Some(ordering) = &ordering {
+            for column in ordering {
+                self.schema
+                    .field_with_name(&column.column_name)
+                    .map_err(|_| {
+                        Error::invalid_input(format!(
+                            "order_by column '{}' not found",
+                            column.column_name
+                        ))
+                    })?;
+            }
+        }
+        self.ordering = ordering;
+        Ok(self)
+    }
+
     /// Find the `k` nearest neighbors of `key` in `column`. Routes `create_plan`
     /// through the LSM vector planner (base ∪ SSTables ∪ in-memory). Mirrors
     /// [`crate::dataset::scanner::Scanner::nearest`]; the LSM path supports a
@@ -601,13 +632,21 @@ impl LsmScanner {
         // then the (point-lookup or union) plain scan. The LSM path has no
         // hybrid mode, so `SearchState` rejects a combined search rather than
         // silently dropping the full-text query under the vector dispatch.
+        if self.ordering.is_some() && self.search.has_search() {
+            return Err(Error::invalid_input(
+                "LSM scanner does not support order_by with vector or full-text search".to_string(),
+            ));
+        }
         match self
             .search
             .resolve("LSM scanner does not support combined vector and full-text search")?
         {
             SearchQuery::Vector(query) => self.plan_vector(query).await,
             SearchQuery::FullText(query) => self.plan_fts(query).await,
-            SearchQuery::Scan => self.plan_scan(self.projection.as_deref()).await,
+            SearchQuery::Scan => {
+                self.plan_scan(self.projection.as_deref(), self.ordering.as_deref())
+                    .await
+            }
         }
     }
 
@@ -729,8 +768,13 @@ impl LsmScanner {
     ///
     /// `projection` is what the plan returns: the caller's projection, or an
     /// empty one for `count_rows`. Validation and routing follow the caller's
-    /// projection either way.
-    async fn plan_scan(&self, projection: Option<&[String]>) -> Result<Arc<dyn ExecutionPlan>> {
+    /// projection either way. `ordering` is the builder's sort keys, or `None`
+    /// for `count_rows`, which needs no ranking and projects no sort column.
+    async fn plan_scan(
+        &self,
+        projection: Option<&[String]>,
+        ordering: Option<&[ColumnOrdering]>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
         let collector = self.build_collector();
         let base_schema = self.schema();
         validate_projection_names(self.projection.as_deref(), &base_schema, &[])?;
@@ -751,9 +795,12 @@ impl LsmScanner {
             && let Some(keys) =
                 extract_pk_point_keys(filter, &self.pk_columns[0], pk_field.data_type())
         {
-            let mut planner =
-                LsmPointLookupPlanner::new(collector, self.pk_columns.clone(), base_schema)?
-                    .with_identity_schema(Arc::clone(&self.identity_schema));
+            let mut planner = LsmPointLookupPlanner::new(
+                collector,
+                self.pk_columns.clone(),
+                base_schema.clone(),
+            )?
+            .with_identity_schema(Arc::clone(&self.identity_schema));
             if let Some(session) = &self.session {
                 planner = planner.with_session(session.clone());
             }
@@ -766,7 +813,12 @@ impl LsmScanner {
             if let Some(warmer) = &self.warmer {
                 planner = planner.with_warmer(warmer.clone());
             }
-            let plan = planner.plan_point_lookup(&keys, projection).await?;
+            let mut plan = planner.plan_point_lookup(&keys, projection).await?;
+            // `pk IN (..)` can return many rows, so an ordering still has to be
+            // applied — and above the lookup, before the limit trims it.
+            if let Some(ordering) = ordering {
+                plan = sort_top_k(plan, ordering, &base_schema, self.limit, 0)?;
+            }
             return Ok(match self.limit {
                 Some(n) => Arc::new(GlobalLimitExec::new(plan, 0, Some(n))),
                 None => plan,
@@ -799,6 +851,7 @@ impl LsmScanner {
                 self.filter.as_ref(),
                 self.limit,
                 self.offset,
+                ordering,
                 self.with_memtable_gen,
                 self.with_row_address,
             )
@@ -868,7 +921,7 @@ impl LsmScanner {
         let plan = if self.search.has_search() {
             self.create_plan().await?
         } else {
-            self.plan_scan(Some(&[])).await?
+            self.plan_scan(Some(&[]), None).await?
         };
         Self::execute_created_plan(plan)?
             .try_fold(0u64, |count, batch| async move {
