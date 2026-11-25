@@ -116,8 +116,16 @@ public class ScannerTest {
     assertEquals(Collections.singletonList("name"), materialization.getColumns());
 
     ScanOptions defaults = new ScanOptions.Builder().build();
-    assertEquals(0, defaults.getBatchReadahead());
-    assertEquals(0, new ScanOptions.Builder(defaults).build().getBatchReadahead());
+    int defaultReadahead = defaults.getBatchReadahead();
+    assertTrue(defaultReadahead > 0);
+    String cpuThreads = System.getenv("LANCE_CPU_THREADS");
+    if (cpuThreads != null) {
+      assertEquals(Integer.parseInt(cpuThreads), defaultReadahead);
+    }
+    assertEquals(defaultReadahead, new ScanOptions.Builder(defaults).build().getBatchReadahead());
+    assertEquals(
+        defaultReadahead,
+        new ScanOptions.Builder().batchReadahead(defaultReadahead).build().getBatchReadahead());
     assertThrows(
         IllegalArgumentException.class, () -> new ScanOptions.Builder().batchReadahead(0).build());
     assertTrue(defaults.getBatchSizeBytes().isEmpty());

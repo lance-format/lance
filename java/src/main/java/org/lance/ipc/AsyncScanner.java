@@ -84,7 +84,7 @@ public class AsyncScanner implements AutoCloseable {
               options.isPrefilter(),
               options.isWithRowId(),
               options.isWithRowAddress(),
-              options.getBatchReadahead(),
+              options.batchReadaheadForNativeScan(),
               options.getFragmentReadahead(),
               options.isScanInOrder(),
               options.getLateMaterialization(),

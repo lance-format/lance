@@ -80,7 +80,7 @@ public class LanceScanner implements org.apache.arrow.dataset.scanner.Scanner {
               options.isPrefilter(),
               options.isWithRowId(),
               options.isWithRowAddress(),
-              options.getBatchReadahead(),
+              options.batchReadaheadForNativeScan(),
               options.getFragmentReadahead(),
               options.isScanInOrder(),
               options.getLateMaterialization(),

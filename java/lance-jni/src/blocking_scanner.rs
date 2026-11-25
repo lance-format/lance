@@ -37,6 +37,18 @@ use crate::{
     utils::parse_approx_mode,
 };
 
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_ipc_ScanOptions_nativeDefaultBatchReadahead(
+    mut env: JNIEnv,
+    _class: jni::objects::JClass,
+) -> jlong {
+    let default =
+        std::panic::catch_unwind(lance_core::utils::tokio::get_num_compute_intensive_cpus)
+            .map_err(|_| Error::runtime_error("Failed to resolve Lance CPU parallelism".into()))
+            .and_then(|n| jlong::try_from(n).map_err(|e| Error::input_error(e.to_string())));
+    ok_or_throw_with_return!(env, default, 0)
+}
+
 pub const NATIVE_SCANNER: &str = "nativeScannerHandle";
 
 #[derive(Clone)]
