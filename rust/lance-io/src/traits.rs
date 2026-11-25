@@ -173,7 +173,8 @@ pub trait Reader: std::fmt::Debug + Send + Sync + DeepSizeOf {
     /// [`CloudObjectReader`](crate::object_reader::CloudObjectReader) uses its
     /// configured download retry budget for request and body failures. A failed
     /// body resumes at the first undelivered byte, pinned to the initial ETag or
-    /// object version. If neither identifier is available, body errors propagate
+    /// object version using a condition supported by the provider. Without a
+    /// supported condition and identifier, the original body error propagates
     /// instead of risking a read that combines different objects.
     fn get_stream(&self) -> BoxFuture<'_, object_store::Result<ByteStream>> {
         Box::pin(async move {

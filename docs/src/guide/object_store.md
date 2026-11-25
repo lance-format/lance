@@ -78,8 +78,9 @@ These options apply to all object stores.
 
 Streaming downloads resume from the first undelivered byte using the original
 ETag or object version, including when copying a whole object or a byte range.
-Body errors propagate if neither identifier is available. Resumed responses
-with a different object identity, size, or byte range are rejected.
+Body errors propagate if no identifier can be used with a conditional request
+supported by the provider. Resumed responses with a different object identity,
+size, or byte range are rejected.
 
 An engine can apply `scheduler_error_mode` to every operation in a session by
 adding it to the storage options used for every dataset open. For example, a

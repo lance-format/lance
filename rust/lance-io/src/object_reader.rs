@@ -35,6 +35,14 @@ use crate::{
 
 mod streaming;
 
+/// GetResult extension for adapters whose conditional options differ from the
+/// object_store API. Returning an identifier does not imply support for using it.
+#[derive(Clone, Copy)]
+pub(crate) struct ConditionalGetSupport {
+    pub(crate) has_if_match: bool,
+    pub(crate) has_version: bool,
+}
+
 trait StaticGetRange {
     fn path(&self) -> &Path;
     fn get_range(&self) -> BoxFuture<'static, OSResult<GetResult>>;
@@ -1116,7 +1124,7 @@ mod tests {
             Some((offset as u64..requested.end as u64).into())
         );
         assert_eq!(options[1].if_match.as_deref(), Some("original-etag"));
-        assert_eq!(options[1].version.as_deref(), Some("original-version"));
+        assert!(options[1].version.is_none());
     }
 
     #[rstest]
@@ -1305,13 +1313,58 @@ mod tests {
         } else {
             let error = result.unwrap_err();
             assert!(matches!(error, object_store::Error::Generic { .. }));
-            assert!(
-                error.to_string().contains("without an ETag or version"),
-                "{error}"
-            );
+            assert!(error.to_string().contains("connection reset"), "{error}");
             assert_eq!(store.requests.load(Ordering::SeqCst), 1);
         }
         assert!(stream.next().await.is_none());
+    }
+
+    #[rstest]
+    #[case::version_fallback(false, true)]
+    #[case::neither_supported(false, false)]
+    #[case::unsupported_request(true, true)]
+    #[tokio::test]
+    async fn streaming_resume_obeys_conditional_support(
+        #[case] has_if_match: bool,
+        #[case] has_version: bool,
+    ) {
+        let mut initial = stream_response(0..16, vec![Err(connection_reset())]).unwrap();
+        initial.extensions.insert(ConditionalGetSupport {
+            has_if_match,
+            has_version,
+        });
+        let resumed = if has_if_match {
+            Err(object_store::Error::NotSupported {
+                source: "conditional requests unavailable".into(),
+            })
+        } else {
+            stream_response(0..16, vec![Ok(Bytes::from_static(b"abcdefghijklmnop"))])
+        };
+        let store = streaming_store(vec![Ok(initial), resumed]);
+        let reader = reader(store.clone(), 3);
+        let mut stream = reader.get_stream().await.unwrap();
+        let result = stream.next().await.unwrap();
+        assert!(stream.next().await.is_none());
+        let options = store.request_options.lock().unwrap();
+        if !has_if_match && has_version {
+            assert_eq!(result.unwrap(), "abcdefghijklmnop");
+            assert!(options[1].if_match.is_none());
+            assert_eq!(options[1].version.as_deref(), Some("original-version"));
+        } else {
+            let error = result.unwrap_err();
+            assert!(matches!(
+                error,
+                object_store::Error::Generic {
+                    store: "PartialBodyStore",
+                    ..
+                }
+            ));
+            assert!(error.to_string().contains("connection reset"), "{error}");
+        }
+        assert_eq!(
+            options.len(),
+            if has_if_match || has_version { 2 } else { 1 }
+        );
     }
 
     #[rstest]
@@ -1440,8 +1493,11 @@ mod tests {
         assert_eq!(actual.as_ref(), data);
     }
 
+    #[rstest]
     #[tokio::test]
-    async fn streaming_does_not_retry_after_delivering_the_complete_body() {
+    async fn streaming_does_not_retry_after_delivering_the_complete_body(
+        #[values(0, 3)] retry_count: usize,
+    ) {
         let store = streaming_store(vec![stream_response(
             0..16,
             vec![
@@ -1449,9 +1505,12 @@ mod tests {
                 Err(connection_reset()),
             ],
         )]);
-        let reader = reader(store.clone(), 0);
+        let reader = reader(store.clone(), retry_count);
         let mut stream = reader.get_stream().await.unwrap();
         assert_eq!(stream.next().await.unwrap().unwrap(), "abcdefghijklmnop");
+        let error = stream.next().await.unwrap().unwrap_err();
+        assert!(matches!(error, object_store::Error::Generic { .. }));
+        assert!(error.to_string().contains("connection reset"), "{error}");
         assert!(stream.next().await.is_none());
         assert_eq!(store.requests.load(Ordering::SeqCst), 1);
     }
