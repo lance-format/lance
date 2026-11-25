@@ -33,7 +33,7 @@ use lance_linalg::distance::MetricType;
 use lance_select::RowSetOps;
 use lance_table::feature_flags::FLAG_FRAGMENT_REUSE_INDEX;
 use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
-use lance_table::format::{DataFile, IndexMetadata};
+use lance_table::format::{DataFile, IndexMetadata, ROW_ID_FIELD_ID};
 use roaring::RoaringBitmap;
 use rstest::rstest;
 
@@ -43,6 +43,9 @@ use lance_file::writer::FileWriterOptions;
 
 use crate::Dataset;
 use crate::dataset::optimize::{CompactionOptions, compact_files, remapping};
+use crate::dataset::rowids::{
+    INLINE_ROW_LINEAGE_MAX_BYTES_CONFIG_KEY, SPILL_ROW_LINEAGE_CONFIG_KEY,
+};
 use crate::dataset::scanner::{RowAddrMask, RowAddrTreeMap};
 use crate::dataset::transaction::{DataOverlayGroup, Operation};
 use crate::dataset::{UpdateBuilder, WriteDestination, WriteParams};
@@ -200,6 +203,7 @@ fn scalar_params(index_type: IndexType) -> ScalarIndexParams {
     match index_type {
         IndexType::Bitmap => ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap),
         IndexType::ZoneMap => ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap),
+        IndexType::BloomFilter => ScalarIndexParams::for_builtin(BuiltinIndexType::BloomFilter),
         IndexType::NGram => ScalarIndexParams::for_builtin(BuiltinIndexType::NGram),
         _ => ScalarIndexParams::default(),
     }
@@ -294,7 +298,7 @@ async fn assert_optimize_is_noop(
 
 /// Rows the index files themselves hold for `query`, before the scanner applies coverage or
 /// masks: what the merge wrote, not what a query returns.
-async fn scalar_index_hits(
+pub(super) async fn scalar_index_hits(
     dataset: &Dataset,
     column: &str,
     index_name: &str,
@@ -2579,9 +2583,7 @@ async fn test_label_list_update_rescans_overlay_stale_fragment() {
 }
 
 /// Bounded optimize keeps the old LabelList segment in the merge stage while a
-/// task builds the appended fragment. The pure merge must not hide the overlay
-/// mask: stale value and list-null postings stay excluded from index results and
-/// their rows are re-evaluated against the current values on the flat path.
+/// task builds the appended fragment. The merge must refresh both the labels and list-null rows.
 #[tokio::test]
 async fn test_label_list_bounded_merge_preserves_overlay_masking() {
     let mut dataset = create_tags_dataset().await;
@@ -2627,6 +2629,7 @@ async fn test_label_list_bounded_merge_preserves_overlay_masking() {
         .await
         .unwrap();
 
+    let read_version = dataset.manifest.version;
     let options = OptimizeOptions::merge(1).max_rows_per_task(Some(3));
     let plan = plan_optimize_indices(&dataset, &options).await.unwrap();
     assert_eq!(plan.tasks.len(), 1);
@@ -2648,6 +2651,7 @@ async fn test_label_list_bounded_merge_preserves_overlay_masking() {
         .unwrap();
 
     let committed = dataset.load_indices_by_name("tags_idx").await.unwrap();
+    assert_eq!(committed[0].dataset_version, read_version);
     assert_eq!(committed.len(), 1);
     assert_eq!(
         committed[0].fragment_bitmap,
@@ -2822,44 +2826,49 @@ async fn test_remapping_merge_reads_only_overlaid_rows() {
     assert_ids_match_oracle(&dataset, "age = 400050", &[40_005]).await;
 }
 
+#[rstest]
+#[case::btree(IndexType::BTree)]
+#[case::bitmap(IndexType::Bitmap)]
+#[case::zonemap(IndexType::ZoneMap)]
+#[case::bloomfilter(IndexType::BloomFilter)]
 #[tokio::test]
-async fn test_btree_physical_merge_preserves_overlay_staleness() {
-    let mut dataset = create_base_dataset().await;
-    let params = ScalarIndexParams::default();
-    let mut segments = Vec::new();
-    for fragment in dataset.get_fragments() {
-        segments.push(
-            CreateIndexBuilder::new(&mut dataset, &["age"], IndexType::BTree, &params)
-                .name("age_btree".to_string())
-                .fragments(vec![fragment.id() as u32])
-                .execute_uncommitted()
-                .await
-                .unwrap(),
-        );
-    }
-    let source_version = segments[0].dataset_version;
-    let mut dataset = commit_overlay(
-        dataset,
-        "btree_before_merge",
-        0,
-        &[1],
-        OverlayCoverage::dense(RoaringBitmap::from_iter([1])),
-        vec![i32_array([Some(999)])],
-    )
-    .await;
-
+async fn test_scalar_physical_merge_refreshes_overlay(
+    #[case] index_type: IndexType,
+    #[values(false, true)] stable_ids: bool,
+) {
+    let mut dataset = create_base_dataset_with(stable_ids).await;
+    let params = scalar_params(index_type);
+    let old = CreateIndexBuilder::new(&mut dataset, &["age"], index_type, &params)
+        .name("age_idx".into())
+        .fragments(vec![0])
+        .execute_uncommitted()
+        .await
+        .unwrap();
+    dataset = overlay_age(dataset, "old_segment", 0, &[(1, Some(999))]).await;
+    dataset = overlay_age(dataset, "new_segment", 1, &[(1, Some(999))]).await;
+    let fresh = CreateIndexBuilder::new(&mut dataset, &["age"], index_type, &params)
+        .name("age_idx".into())
+        .fragments(vec![1])
+        .execute_uncommitted()
+        .await
+        .unwrap();
     let merged = dataset
-        .merge_existing_index_segments(segments)
+        .merge_existing_index_segments(vec![old, fresh])
         .await
         .unwrap();
-    assert_eq!(merged.dataset_version, source_version);
+    assert_eq!(merged.dataset_version, dataset.manifest.version);
+    assert_eq!(merged.fragment_bitmap, Some([0, 1].into_iter().collect()));
     dataset
-        .commit_existing_index_segments("age_btree", "age", vec![merged])
+        .commit_existing_index_segments("age_idx", "age", vec![merged])
         .await
         .unwrap();
-
-    assert_eq!(ids_matching(&dataset, "age = 10").await, Vec::<i32>::new());
-    assert_eq!(ids_matching(&dataset, "age = 999").await, vec![1]);
+    assert_ids_match_oracle(&dataset, "age = 999", &[1, 7]).await;
+    assert_ids_match_oracle(&dataset, "age = 10 OR age = 70", &[]).await;
+    if matches!(index_type, IndexType::BTree | IndexType::Bitmap) {
+        assert_eq!(age_hits(&dataset, 999).await, 2);
+        assert_eq!(age_hits(&dataset, 10).await, 0);
+        assert_eq!(age_hits(&dataset, 70).await, 0);
+    }
 }
 
 #[tokio::test]
@@ -3417,7 +3426,7 @@ async fn test_list_element_fts_overlay_uses_exact_index_and_flat_fallback() {
         .create_index(
             &["tags"],
             IndexType::Inverted,
-            None,
+            Some("tag_elements".into()),
             &InvertedIndexParams::default()
                 .with_position(true)
                 .document_granularity(DocumentGranularity::ListElement),
@@ -3436,7 +3445,7 @@ async fn test_list_element_fts_overlay_uses_exact_index_and_flat_fallback() {
         .await
         .unwrap();
 
-    let dataset = commit_overlay(
+    let mut dataset = commit_overlay(
         dataset,
         "list_element_text_overlay",
         0,
@@ -3472,6 +3481,26 @@ async fn test_list_element_fts_overlay_uses_exact_index_and_flat_fallback() {
     assert_eq!(
         fts_ids(&dataset, list_element_phrase("new phrase")).await,
         vec![0, 2]
+    );
+    // Each old element shares its parent's row ID. Refresh all documents
+    // for that row, preserving the element coordinates used by phrase search.
+    let sources = dataset.load_indices_by_name("tag_elements").await.unwrap();
+    let merged = dataset
+        .merge_existing_index_segments(sources)
+        .await
+        .unwrap();
+    dataset
+        .commit_existing_index_segments("tag_elements", "tags", vec![merged])
+        .await
+        .unwrap();
+    assert_eq!(
+        fast_fts_ids(&dataset, list_element_phrase("new phrase")).await,
+        vec![0, 2]
+    );
+    assert!(
+        fast_fts_ids(&dataset, list_element_match("old"))
+            .await
+            .is_empty()
     );
 }
 
@@ -4766,26 +4795,114 @@ async fn append_age_fragment(dataset: &mut Dataset, ids: std::ops::Range<i32>) {
         .unwrap();
 }
 
-// `OptimizeIndices` merges an index's delta segments. A type that can remap through the
-// fragment-reuse index (BTree, Bitmap) is stamped with the manifest the merge read and
-// re-reads the overlaid rows, so the merged file holds current values. One that cannot
-// (ZoneMap) carries the pre-overlay entries and keeps them masked by stamping the oldest
-// source's `dataset_version`, which keeps the mask's version gate on. Either way the overlaid
-// value must win end to end; the following tests pin it down per index type.
+async fn compact_indexed_pair(dataset: &mut Dataset) -> u32 {
+    // A committed index spanning both inputs makes compaction record the deferred mapping.
+    dataset
+        .create_index(
+            &["id"],
+            IndexType::BTree,
+            Some("id_idx".into()),
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+    compact_files(
+        dataset,
+        CompactionOptions {
+            target_rows_per_fragment: 12,
+            defer_index_remap: true,
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    let [fragment] = dataset.fragments().as_slice() else {
+        panic!("expected one compaction output")
+    };
+    fragment.id as u32
+}
 
-/// Scalar (BTree, Bitmap, ZoneMap): a range query over the indexed column after an overlay +
-/// optimize must still drop the stale value and surface the overlaid one.
-///
-/// ZoneMap is the case worth having: it ignores `OldIndexDataFilter`, so nothing scrubs the
-/// pre-overlay zone summaries out of the merged segment. Breaking the version gate shows up here
-/// as a false *negative* -- the stale zone prunes the overlaid value -- rather than the resurfaced
-/// stale entry the other two produce.
-///
-/// With one segment and nothing unindexed the optimize is a no-op and the overlay stays masked.
+#[rstest]
+#[case::zonemap(IndexType::ZoneMap, false)]
+#[case::compacted_zonemap(IndexType::ZoneMap, true)]
+#[case::compacted_btree(IndexType::BTree, true)]
+#[tokio::test]
+async fn test_merge_filters_each_source_by_its_coverage(
+    #[case] index_type: IndexType,
+    #[case] compact: bool,
+) {
+    let mut restored = overlay_age(
+        create_base_dataset().await,
+        "original_null",
+        0,
+        &[(0, None)],
+    )
+    .await;
+    let mut deleted = restored.clone();
+    deleted.delete("id = 1").await.unwrap();
+    let params = scalar_params(index_type);
+    let old = deleted
+        .create_index_builder(&["age"], index_type, &params)
+        .name("age_idx".into())
+        .fragments(vec![0, 1])
+        .execute_uncommitted()
+        .await
+        .unwrap();
+
+    // Restoring row 1 withdraws F0 from this segment's coverage, but its file still contains F0.
+    restored.restore().await.unwrap();
+    restored
+        .commit_existing_index_segments("age_idx", "age", vec![old])
+        .await
+        .unwrap();
+    let mut sources = restored.load_indices_by_name("age_idx").await.unwrap();
+    assert_eq!(sources[0].fragment_bitmap, Some([1].into_iter().collect()));
+
+    let mut dataset = overlay_age(restored, "replace_null", 0, &[(0, Some(999))]).await;
+    let fresh = dataset
+        .create_index_builder(&["age"], index_type, &params)
+        .name("age_idx".into())
+        .replace(true)
+        .fragments(vec![0])
+        .execute_uncommitted()
+        .await
+        .unwrap();
+    sources.push(fresh);
+    if compact {
+        dataset.drop_index("age_idx").await.unwrap();
+        compact_indexed_pair(&mut dataset).await;
+    }
+    let merged = dataset
+        .merge_existing_index_segments(sources)
+        .await
+        .unwrap();
+    let uuid = merged.uuid;
+    dataset
+        .commit_existing_index_segments("age_idx", "age", vec![merged])
+        .await
+        .unwrap();
+
+    assert_answered_by_index(&dataset, "age IS NULL").await;
+    assert_ids_match_oracle(&dataset, "age IS NULL", &[]).await;
+    assert_ids_match_oracle(&dataset, "age IS NOT NULL", &(0..12).collect::<Vec<_>>()).await;
+    if index_type == IndexType::ZoneMap && !compact {
+        let index = dataset
+            .open_scalar_index("age", &uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert_eq!(index.statistics().unwrap()["num_zones"], 2);
+    }
+}
+
+/// An actual merge refreshes both row indices and fragment summaries. A single segment
+/// with no new fragments still follows the normal no-op optimize policy.
 #[rstest]
 #[case::btree(IndexType::BTree)]
 #[case::bitmap(IndexType::Bitmap)]
 #[case::zonemap(IndexType::ZoneMap)]
+#[case::bloomfilter(IndexType::BloomFilter)]
 #[tokio::test]
 async fn test_optimize_preserves_scalar_overlay_masking(
     #[case] index_type: IndexType,
@@ -4829,8 +4946,6 @@ async fn test_optimize_preserves_scalar_overlay_masking(
         .await
         .unwrap();
 
-    // Still correct, whether the merge kept the old stamp (ZoneMap) or re-read the overlaid
-    // row (BTree, Bitmap).
     assert_eq!(
         ids_matching(&dataset, "age = 10").await,
         Vec::<i32>::new(),
@@ -4878,28 +4993,14 @@ async fn test_optimize_preserves_scalar_overlay_masking(
         merged[0].fragment_bitmap,
         Some(RoaringBitmap::from_iter([0u32, 1, 2]))
     );
-    if index_type == IndexType::ZoneMap {
-        assert_eq!(
-            merged[0].dataset_version, source.dataset_version,
-            "a type that cannot remap keeps the oldest source's stamp"
-        );
-    } else {
-        assert_eq!(merged[0].dataset_version, built_from);
+    assert_eq!(merged[0].dataset_version, built_from);
+    if matches!(index_type, IndexType::BTree | IndexType::Bitmap) {
         assert_eq!(age_hits(&dataset, 999).await, 1);
         assert_eq!(age_hits(&dataset, 10).await, 0);
     }
 }
 
-/// ZoneMap seed path: an *unindexed* fragment carrying an overlay gets folded into the merged
-/// segment from its data file's seed buffer. A seed is a zone summary captured while the base
-/// data file was written, so it describes pre-overlay values -- the merged segment ends up
-/// holding zones that never saw the overlay.
-///
-/// That is only safe because the merge keeps the old `dataset_version`, so the mask still covers
-/// those rows. Stamp the current version (or teach the seed path to claim freshness) and the
-/// overlaid value becomes unfindable, since its stale zone prunes it.
-///
-/// `name` is Utf8, for which seeds are on by default (`default_use_seeds`).
+/// An overlay on an appended fragment supersedes the ZoneMap seed in its base file.
 #[tokio::test]
 async fn test_optimize_seed_path_respects_overlay() {
     use crate::index::DatasetIndexExt;
@@ -5050,10 +5151,646 @@ async fn test_column_value_range_none_under_overlay() {
     );
 }
 
+async fn fast_fts_ids(dataset: &Dataset, query: FullTextSearchQuery) -> Vec<i32> {
+    let mut scan = dataset.scan();
+    scan.fast_search()
+        .full_text_search(query)
+        .unwrap()
+        .project(&["id"])
+        .unwrap();
+    let batch = scan.try_into_batch().await.unwrap();
+    let mut ids = ids_from_batches(&[batch]);
+    ids.sort_unstable();
+    ids
+}
+
+#[rstest]
+#[case::explicit(true, true)]
+#[case::optimize(false, true)]
+#[case::already_indexed(true, false)]
+#[tokio::test]
+async fn test_fts_merge_refreshes_overlay(
+    #[case] explicit: bool,
+    #[case] refresh_old: bool,
+    #[values(false, true)] stable_row_ids: bool,
+) {
+    let mut dataset = create_text_dataset(stable_row_ids).await;
+    let params = InvertedIndexParams::default().num_workers(1);
+    let old = CreateIndexBuilder::new(&mut dataset, &["text"], IndexType::Inverted, &params)
+        .name("text_idx".into())
+        .fragments(vec![0])
+        .execute_uncommitted()
+        .await
+        .unwrap();
+    if refresh_old {
+        dataset = commit_overlay(
+            dataset,
+            "old_segment",
+            0,
+            &[1],
+            OverlayCoverage::dense([0, 1].into_iter().collect()),
+            vec![Arc::new(StringArray::from(vec![None, Some("ripe guava")]))],
+        )
+        .await;
+    }
+    dataset = commit_overlay(
+        dataset,
+        "fresh_segment",
+        1,
+        &[1],
+        OverlayCoverage::dense([0].into_iter().collect()),
+        vec![Arc::new(StringArray::from(vec!["ripe plum"]))],
+    )
+    .await;
+    let fresh = CreateIndexBuilder::new(&mut dataset, &["text"], IndexType::Inverted, &params)
+        .name("text_idx".into())
+        .fragments(vec![1])
+        .execute_uncommitted()
+        .await
+        .unwrap();
+
+    if explicit {
+        let merged = dataset
+            .merge_existing_index_segments(vec![old, fresh])
+            .await
+            .unwrap();
+        assert_eq!(merged.dataset_version, dataset.manifest.version);
+        dataset
+            .commit_existing_index_segments("text_idx", "text", vec![merged])
+            .await
+            .unwrap();
+    } else {
+        dataset
+            .commit_existing_index_segments("text_idx", "text", vec![old, fresh])
+            .await
+            .unwrap();
+        assert_eq!(
+            fast_fts_ids(&dataset, FullTextSearchQuery::new("ripe".into())).await,
+            vec![6]
+        );
+        optimize_into_one_segment(
+            &mut dataset,
+            "text_idx",
+            &OptimizeOptions::merge(2),
+            &[0, 1],
+        )
+        .await;
+    }
+
+    // The new posting from the old segment and the one already indexed by the
+    // fresh segment must both be visible without scanning overlay rows.
+    let (ripe, apple, banana) = if refresh_old {
+        (vec![1, 6], vec![], vec![3])
+    } else {
+        (vec![6], vec![0, 1], vec![1, 3])
+    };
+    for (term, expected) in [("ripe", ripe), ("apple", apple), ("banana", banana)] {
+        assert_eq!(
+            fast_fts_ids(&dataset, FullTextSearchQuery::new(term.into())).await,
+            expected
+        );
+    }
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_fts_merge_rebuild_keeps_tokenizer(#[values(false, true)] finalized: bool) {
+    let mut dataset = create_text_dataset(true).await;
+    let params = InvertedIndexParams::default()
+        .remove_stop_words(true)
+        .custom_stop_words(Some(vec!["plain".into()]))
+        .num_workers(1);
+    let mut source = dataset
+        .create_index_builder(&["text"], IndexType::Inverted, &params)
+        .name("text_idx".into())
+        .fragments(vec![0])
+        .execute_uncommitted()
+        .await
+        .unwrap();
+    if finalized {
+        source = dataset
+            .merge_existing_index_segments(vec![source])
+            .await
+            .unwrap();
+    }
+    // Every indexed row is replaced. The source contributes its configuration and no postings.
+    dataset = commit_overlay(
+        dataset,
+        "replace_all",
+        0,
+        &[1],
+        OverlayCoverage::dense((0..6).collect()),
+        vec![Arc::new(StringArray::from(vec!["plain the"; 6]))],
+    )
+    .await;
+    // A retained sibling with different stop words cannot supply that configuration either.
+    let sibling = dataset
+        .create_index_builder(
+            &["text"],
+            IndexType::Inverted,
+            &params.custom_stop_words(None),
+        )
+        .name("text_idx".into())
+        .fragments(vec![1])
+        .execute_uncommitted()
+        .await
+        .unwrap();
+    let err = dataset
+        .merge_existing_index_segments(vec![sibling, source.clone()])
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, lance_core::Error::InvalidInput { .. }),
+        "{err}"
+    );
+    assert!(
+        err.to_string().contains("inconsistent tokenization"),
+        "{err}"
+    );
+    let merged = dataset
+        .merge_existing_index_segments(vec![source])
+        .await
+        .unwrap();
+    dataset
+        .commit_existing_index_segments("text_idx", "text", vec![merged])
+        .await
+        .unwrap();
+    assert!(
+        fast_fts_ids(&dataset, FullTextSearchQuery::new("plain".into()))
+            .await
+            .is_empty()
+    );
+    assert_eq!(
+        fast_fts_ids(&dataset, FullTextSearchQuery::new("the".into())).await,
+        (0..6).collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn test_fts_merge_cannot_refresh_carried_values_from_text_only() {
+    let mut dataset = create_text_dataset(false).await;
+    build_text_fts_index(&mut dataset).await;
+    let mut segments = dataset.load_indices().await.unwrap().as_ref().clone();
+    segments[0].covering_fields = vec![dataset.schema().field("id").unwrap().id];
+    let dataset = commit_overlay(
+        dataset,
+        "carried_id",
+        0,
+        &[0],
+        OverlayCoverage::dense([1].into_iter().collect()),
+        vec![i32_array([Some(42)])],
+    )
+    .await;
+    let error = dataset
+        .merge_existing_index_segments(segments)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, crate::Error::NotSupported { .. }),
+        "{error}"
+    );
+    assert!(error.to_string().contains("covering fields"));
+}
+
+#[tokio::test]
+async fn test_fts_single_segment_promotion_skips_deletion_vector_reads() {
+    let mut dataset = create_text_dataset(true).await;
+    let staged = dataset
+        .create_index_builder(
+            &["text"],
+            IndexType::Inverted,
+            &InvertedIndexParams::default().num_workers(1),
+        )
+        .name("text_idx".into())
+        .fragments(vec![0, 1])
+        .execute_uncommitted()
+        .await
+        .unwrap();
+    let uuid = staged.uuid;
+    dataset.delete("id = 1").await.unwrap();
+    dataset.table_state.object_store.io_stats_incremental();
+
+    let merged = dataset
+        .merge_existing_index_segments(vec![staged])
+        .await
+        .unwrap();
+    assert_eq!(merged.uuid, uuid);
+    let requests = dataset
+        .table_state
+        .object_store
+        .io_stats_incremental()
+        .requests;
+    assert!(
+        !requests
+            .iter()
+            .any(|request| request.path.as_ref().contains("_deletions/")),
+        "promoting the same index files read a deletion vector: {requests:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_fts_single_segment_merge_survives_remap_cleanup() {
+    let dir = lance_core::utils::tempfile::TempStrDir::default();
+    let batch =
+        arrow_array::record_batch!(("id", Int32, [0, 1]), ("text", Utf8, ["apple", "mango"]))
+            .unwrap();
+    let schema = batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch)], schema),
+        dir.as_str(),
+        Some(WriteParams {
+            max_rows_per_file: 1,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    build_text_fts_index(&mut dataset).await;
+    compact_files(
+        &mut dataset,
+        CompactionOptions {
+            target_rows_per_fragment: 2,
+            defer_index_remap: true,
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    let [dest] = dataset.fragments().as_slice() else {
+        panic!("expected one compacted fragment")
+    };
+    let sources = dataset.load_indices_by_name("text_idx").await.unwrap();
+    assert_eq!(
+        sources[0].fragment_bitmap,
+        Some([dest.id as u32].into_iter().collect())
+    );
+    let merged = dataset
+        .merge_existing_index_segments(sources)
+        .await
+        .unwrap();
+    dataset
+        .commit_existing_index_segments("text_idx", "text", vec![merged])
+        .await
+        .unwrap();
+    crate::dataset::index::frag_reuse::cleanup_frag_reuse_index(&mut dataset)
+        .await
+        .unwrap();
+    let dataset = Dataset::open(dir.as_str()).await.unwrap();
+    assert!(
+        dataset
+            .frag_reuse_index()
+            .await
+            .unwrap()
+            .unwrap()
+            .details
+            .versions
+            .is_empty()
+    );
+    assert_eq!(
+        fast_fts_ids(&dataset, FullTextSearchQuery::new("mango".into())).await,
+        vec![1]
+    );
+}
+
+#[rstest]
+#[case::overlay_before_compaction(true, false)]
+#[case::overlay_after_compaction(false, false)]
+#[case::restored_overlay(false, true)]
+#[tokio::test]
+async fn test_fts_merge_indexes_each_compacted_document_once(
+    #[case] overlay_before_compaction: bool,
+    #[case] restore: bool,
+) {
+    let mut dataset = create_text_dataset(false).await;
+    let params = InvertedIndexParams::default().num_workers(1);
+    let old = dataset
+        .create_index_builder(&["text"], IndexType::Inverted, &params)
+        .name("text_idx".into())
+        .fragments(vec![0, 1])
+        .execute_uncommitted()
+        .await
+        .unwrap();
+    let overlaid = if overlay_before_compaction {
+        0
+    } else {
+        compact_indexed_pair(&mut dataset).await
+    };
+    let before_overlay = dataset.version_id();
+    dataset = commit_overlay(
+        dataset,
+        "fresh_text",
+        u64::from(overlaid),
+        &[1],
+        OverlayCoverage::dense([0].into_iter().collect()),
+        vec![Arc::new(StringArray::from(vec!["guava"]))],
+    )
+    .await;
+    let destination = if overlay_before_compaction {
+        compact_indexed_pair(&mut dataset).await
+    } else {
+        overlaid
+    };
+    let fresh = dataset
+        .create_index_builder(&["text"], IndexType::Inverted, &params)
+        .name("text_idx".into())
+        .fragments(vec![destination])
+        .execute_uncommitted()
+        .await
+        .unwrap();
+    if restore {
+        dataset = dataset.checkout_version(before_overlay).await.unwrap();
+        dataset.restore().await.unwrap();
+    }
+    let excluded_uuid = if restore { fresh.uuid } else { old.uuid }.to_string();
+    dataset.table_state.object_store.io_stats_incremental();
+    let merged = dataset
+        .merge_existing_index_segments(vec![old, fresh])
+        .await
+        .unwrap();
+    let requests = dataset
+        .table_state
+        .object_store
+        .io_stats_incremental()
+        .requests;
+    assert!(
+        !requests
+            .iter()
+            .any(|r| r.path.as_ref().contains(&excluded_uuid)
+                && r.path.as_ref().ends_with("_invert.lance")),
+        "merge read postings from a superseded segment: {requests:?}"
+    );
+    assert_eq!(
+        merged.fragment_bitmap,
+        Some([destination].into_iter().collect())
+    );
+    let uuid = merged.uuid;
+    dataset
+        .commit_existing_index_segments("text_idx", "text", vec![merged])
+        .await
+        .unwrap();
+
+    for (term, expected) in [
+        ("guava", if restore { vec![] } else { vec![0] }),
+        ("mango", vec![6]),
+    ] {
+        assert_eq!(
+            fast_fts_ids(&dataset, FullTextSearchQuery::new(term.into())).await,
+            expected
+        );
+    }
+    let index = dataset
+        .open_scalar_index("text", &uuid, &NoOpMetricsCollector)
+        .await
+        .unwrap();
+    assert_eq!(index.statistics().unwrap()["num_docs"], 12);
+}
+
+#[tokio::test]
+async fn test_fts_merge_after_restore_withdraws_removed_overlay() {
+    let original = create_text_dataset(false).await;
+    let mut updated = commit_overlay(
+        original.clone(),
+        "removed_text",
+        0,
+        &[1],
+        OverlayCoverage::dense([0].into_iter().collect()),
+        vec![Arc::new(StringArray::from(vec!["obsolete"]))],
+    )
+    .await;
+    let staged = updated
+        .create_index_builder(
+            &["text"],
+            IndexType::Inverted,
+            &InvertedIndexParams::default().num_workers(1),
+        )
+        .name("text_idx".into())
+        .fragments(vec![0, 1])
+        .execute_uncommitted()
+        .await
+        .unwrap();
+    let mut restored = original;
+    restored.restore().await.unwrap();
+    let merged = restored
+        .merge_existing_index_segments(vec![staged])
+        .await
+        .unwrap();
+    assert_eq!(merged.fragment_bitmap, Some([1].into_iter().collect()));
+    restored
+        .commit_existing_index_segments("text_idx", "text", vec![merged])
+        .await
+        .unwrap();
+    assert!(
+        fast_fts_ids(&restored, FullTextSearchQuery::new("obsolete".into()))
+            .await
+            .is_empty()
+    );
+    assert_eq!(fts_ids_matching(&restored, "apple").await, vec![0, 1]);
+}
+
+#[tokio::test]
+async fn test_fts_overlay_commit_after_restore_rejects_merged_file() {
+    let mut original = create_text_dataset(false).await;
+    let staged = original
+        .create_index_builder(
+            &["text"],
+            IndexType::Inverted,
+            &InvertedIndexParams::default().num_workers(1),
+        )
+        .name("text_idx".into())
+        .fragments(vec![0, 1])
+        .execute_uncommitted()
+        .await
+        .unwrap();
+    let updated = commit_overlay(
+        original.clone(),
+        "rolled_back",
+        0,
+        &[1],
+        OverlayCoverage::dense([0].into_iter().collect()),
+        vec![Arc::new(StringArray::from(vec!["obsolete"]))],
+    )
+    .await;
+    let merged = updated
+        .merge_existing_index_segments(vec![staged])
+        .await
+        .unwrap();
+    let uuid = merged.uuid;
+    original.restore().await.unwrap();
+    let restored_version = original.manifest.version;
+    let error = original
+        .commit_existing_index_segments("text_idx", "text", vec![merged])
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains(&uuid.to_string()) && error.contains("fragment 0"),
+        "{error}"
+    );
+    assert_eq!(original.manifest.version, restored_version);
+    assert!(
+        original
+            .load_indices_by_name("text_idx")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn test_fts_overlay_distributed_merge_after_cleanup() {
+    let mut dataset = create_text_dataset(false).await;
+    let build_version = dataset.manifest.version;
+    build_per_fragment_fts_index(&mut dataset, "text").await;
+    dataset = commit_overlay(
+        dataset,
+        "new_term",
+        0,
+        &[1],
+        OverlayCoverage::dense([0].into_iter().collect()),
+        vec![Arc::new(StringArray::from(vec!["guava"]))],
+    )
+    .await;
+    let policy = crate::dataset::cleanup::CleanupPolicyBuilder::default()
+        .versions(vec![build_version])
+        .unwrap()
+        .build();
+    dataset.cleanup_with_policy(policy).await.unwrap();
+    assert!(dataset.checkout_version(build_version).await.is_err());
+    assert_eq!(
+        fast_fts_ids(&dataset, FullTextSearchQuery::new("mango".into())).await,
+        [6]
+    );
+    let options = OptimizeOptions::merge(2).max_rows_per_task(Some(12));
+    let plan = plan_optimize_indices(&dataset, &options).await.unwrap();
+    assert!(plan.tasks.is_empty());
+    assert_eq!(plan.merges.len(), 1);
+    let merge: crate::index::optimize::OptimizeIndexMerge =
+        serde_json::from_slice(&serde_json::to_vec(&plan.merges[0]).unwrap()).unwrap();
+    let merged = merge.execute(&dataset, &[]).await.unwrap().unwrap();
+    assert_eq!(
+        merged.segment.fragment_bitmap,
+        Some([0, 1].into_iter().collect())
+    );
+    commit_optimize_indices(&mut dataset, vec![merged], &options)
+        .await
+        .unwrap();
+    for (term, expected) in [("mango", vec![6]), ("apple", vec![1]), ("guava", vec![0])] {
+        assert_eq!(
+            fast_fts_ids(&dataset, FullTextSearchQuery::new(term.into())).await,
+            expected
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_fts_overlay_merge_reads_only_live_rows_of_unindexed_fragment() {
+    let mut dataset = create_text_dataset(true).await;
+    dataset
+        .update_config([
+            (SPILL_ROW_LINEAGE_CONFIG_KEY, "true"),
+            (INLINE_ROW_LINEAGE_MAX_BYTES_CONFIG_KEY, "0"),
+        ])
+        .await
+        .unwrap();
+    let update = UpdateBuilder::new(Arc::new(dataset))
+        .update_where("id = 6")
+        .unwrap()
+        .set("text", "'moved'")
+        .unwrap()
+        .build()
+        .unwrap()
+        .execute()
+        .await
+        .unwrap();
+    let mut dataset = update.new_dataset.as_ref().clone();
+    // F1 retains row 6's deleted physical slot. Its live copy now belongs to F2.
+    let mut full = RowAddrTreeMap::new();
+    full.insert_fragment(1);
+    let mut partial = RowAddrTreeMap::new();
+    partial.insert_bitmap(1, (0..6).collect());
+    let expected: RowAddrTreeMap = (7..12).collect();
+    for selection in [full, partial] {
+        assert_eq!(
+            crate::dataset::rowids::translate_addr_treemap_to_row_ids(&dataset, &selection)
+                .await
+                .unwrap(),
+            expected
+        );
+    }
+    let params = InvertedIndexParams::default().num_workers(1);
+    let mut segments = Vec::new();
+    for fragment in [2, 0] {
+        segments.push(
+            dataset
+                .create_index_builder(&["text"], IndexType::Inverted, &params)
+                .name("text_idx".into())
+                .fragments(vec![fragment])
+                .execute_uncommitted()
+                .await
+                .unwrap(),
+        );
+    }
+    dataset
+        .commit_existing_index_segments("text_idx", "text", segments)
+        .await
+        .unwrap();
+    dataset = commit_overlay(
+        dataset,
+        "reindex_text",
+        0,
+        &[1],
+        OverlayCoverage::dense([0].into_iter().collect()),
+        vec![Arc::new(StringArray::from(vec!["guava"]))],
+    )
+    .await;
+    // F2 owns its own segment. Reading F0's overlay and F1's live rows needs no F2 row IDs.
+    let carrier = dataset
+        .find_fragment(2)
+        .unwrap()
+        .row_lineage_file(ROW_ID_FIELD_ID)
+        .unwrap()
+        .unwrap()
+        .path
+        .clone();
+    dataset.table_state.metadata_cache.clear().await;
+    dataset.table_state.object_store.io_stats_incremental();
+    dataset
+        .optimize_indices(&OptimizeOptions::merge(1))
+        .await
+        .unwrap();
+    let requests = dataset
+        .table_state
+        .object_store
+        .io_stats_incremental()
+        .requests;
+    assert!(
+        !requests
+            .iter()
+            .any(|read| read.path.as_ref().ends_with(&carrier)),
+        "merge read unrelated fragment 2's row-ID file {carrier}: {requests:?}"
+    );
+    let segments = dataset.load_indices_by_name("text_idx").await.unwrap();
+    let merged = segments
+        .iter()
+        .find(|s| s.fragment_bitmap.as_ref() == Some(&[0, 1].into_iter().collect()))
+        .unwrap();
+    let fts = dataset
+        .open_scalar_index("text", &merged.uuid, &NoOpMetricsCollector)
+        .await
+        .unwrap();
+    assert_eq!(fts.statistics().unwrap()["num_docs"], 11);
+    assert_eq!(
+        fast_fts_ids(&dataset, FullTextSearchQuery::new("moved".into())).await,
+        [6]
+    );
+}
+
 /// FTS: after an overlay replaces a row's text and the index is optimized, searching for the old
 /// terms must not return the stale row, and the new terms must find it.
+#[rstest]
 #[tokio::test]
-async fn test_optimize_preserves_fts_overlay_masking() {
+async fn test_optimize_preserves_fts_overlay_masking(#[values(false, true)] bounded: bool) {
     use crate::index::DatasetIndexExt;
     use lance_index::optimize::OptimizeOptions;
 
@@ -5098,7 +5835,7 @@ async fn test_optimize_preserves_fts_overlay_masking() {
         .await
         .unwrap();
     dataset
-        .optimize_indices(&OptimizeOptions::merge(10))
+        .optimize_indices(&OptimizeOptions::merge(10).max_rows_per_task(bounded.then_some(6)))
         .await
         .unwrap();
 
@@ -5113,9 +5850,16 @@ async fn test_optimize_preserves_fts_overlay_masking() {
         vec![0],
         "stale FTS posting for id=1 (apple) resurfaced after optimize"
     );
-    // The overlaid terms are found via the flat path.
-    assert!(fts_ids_matching(&dataset, "cherry").await.contains(&1));
-    assert!(fts_ids_matching(&dataset, "mango").await.contains(&1));
+    for (term, expected) in [
+        ("cherry", vec![1, 2]),
+        ("mango", vec![1, 6]),
+        ("kiwi", vec![12]),
+    ] {
+        assert_eq!(
+            fast_fts_ids(&dataset, FullTextSearchQuery::new(term.into())).await,
+            expected
+        );
+    }
 }
 
 /// Vector (IVF): after an overlay moves a row's vector and the index is optimized, the ANN must
@@ -5190,6 +5934,68 @@ async fn test_optimize_preserves_vector_overlay_masking() {
     );
 }
 
+#[rstest]
+#[case::minhash(IndexType::MinHashLsh, BuiltinIndexType::MinHashLsh)]
+#[case::ngram(IndexType::NGram, BuiltinIndexType::NGram)]
+#[case::fm(IndexType::Fm, BuiltinIndexType::Fm)]
+#[tokio::test]
+async fn test_explicit_text_index_merge_refreshes_overlay(
+    #[case] index_type: IndexType,
+    #[case] builtin: BuiltinIndexType,
+    #[values(false, true)] stable_ids: bool,
+) {
+    let mut dataset = create_text_dataset(stable_ids).await;
+    let mut params = ScalarIndexParams::for_builtin(builtin);
+    if index_type == IndexType::MinHashLsh {
+        params = params
+            .with_params(&serde_json::json!({"num_hashes": 32, "num_bands": 8, "shingle_size": 1}));
+    }
+    let staged = CreateIndexBuilder::new(&mut dataset, &["text"], index_type, &params)
+        .name("text_idx".into())
+        .fragments(vec![0, 1])
+        .execute_uncommitted()
+        .await
+        .unwrap();
+    dataset = commit_overlay(
+        dataset,
+        "row_replaced",
+        0,
+        &[1],
+        OverlayCoverage::dense([1].into_iter().collect()),
+        vec![Arc::new(StringArray::from(vec!["unique apricot"]))],
+    )
+    .await;
+    let merged = dataset
+        .merge_existing_index_segments(vec![staged])
+        .await
+        .unwrap();
+    assert_eq!(merged.dataset_version, dataset.manifest.version);
+    dataset
+        .commit_existing_index_segments("text_idx", "text", vec![merged])
+        .await
+        .unwrap();
+    if index_type == IndexType::MinHashLsh {
+        assert_eq!(
+            minhash_ids(&dataset, "unique apricot", true).await.unwrap()[0],
+            1
+        );
+        assert!(
+            !minhash_ids(&dataset, "apple banana", true)
+                .await
+                .unwrap()
+                .contains(&1)
+        );
+    } else {
+        for (term, count) in [("apricot", 1), ("banana", 1)] {
+            let query = TextQuery::StringContains(term.to_owned());
+            assert_eq!(
+                scalar_index_hits(&dataset, "text", "text_idx", &query).await,
+                count
+            );
+        }
+    }
+}
+
 /// Ids returned by a MinHash search for `text`, or the error it raises.
 async fn minhash_ids(dataset: &Dataset, text: &str, fast_search: bool) -> crate::Result<Vec<i32>> {
     let mut scan = dataset.scan();
@@ -5225,7 +6031,6 @@ async fn test_minhash_overlay_rows_are_rescored_unless_fast_search(
         1
     );
 
-    let source_version = dataset.load_indices_by_name(index_name).await.unwrap()[0].dataset_version;
     let dataset = commit_overlay(
         dataset,
         "minhash_row_level",
@@ -5288,8 +6093,6 @@ async fn test_minhash_overlay_rows_are_rescored_unless_fast_search(
         vec![8]
     );
 
-    // The single task refreshes old signatures as it absorbs the source.
-    // Multiple tasks pass the source to a physical merge that preserves its version.
     let schema = Arc::new(ArrowSchema::from(dataset.schema()));
     let added = RecordBatch::try_new(
         schema.clone(),
@@ -5314,36 +6117,50 @@ async fn test_minhash_overlay_rows_are_rescored_unless_fast_search(
         .await
         .unwrap();
     assert_eq!(plan.tasks.len(), task_count);
-    let single_task = task_count == 1;
-    dataset.table_state.object_store.io_stats_incremental();
     dataset.optimize_indices(&options).await.unwrap();
     let merged = dataset.load_indices_by_name(index_name).await.unwrap();
     assert_eq!(merged.len(), 1);
-    assert_eq!(
-        merged[0].dataset_version,
-        if single_task {
-            plan.read_version
-        } else {
-            source_version
-        }
-    );
-    if !single_task {
-        let requests = dataset
-            .table_state
-            .object_store
-            .io_stats_incremental()
-            .requests;
-        assert!(
-            !requests
-                .iter()
-                .any(|request| request.path.as_ref().ends_with("minhash_row_level.lance"))
-        );
-    }
+    assert_eq!(merged[0].dataset_version, plan.read_version);
 
     let ids = minhash_ids(&dataset, "apple banana", false).await.unwrap();
     assert!(!ids.contains(&1), "{ids:?}");
-    let hits = minhash_ids(&dataset, "cherry mango", single_task)
+    let hits = minhash_ids(&dataset, "cherry mango", true).await.unwrap();
+    assert_eq!(hits.first(), Some(&1), "{hits:?}");
+}
+
+#[tokio::test]
+async fn test_fts_merge_trains_from_a_shared_destination() {
+    let mut dataset = create_text_dataset(false).await;
+    let params = InvertedIndexParams::default().num_workers(1);
+    let mut segments = Vec::new();
+    for fragment in [0, 1] {
+        segments.push(
+            dataset
+                .create_index_builder(&["text"], IndexType::Inverted, &params)
+                .name("text_idx".into())
+                .fragments(vec![fragment])
+                .execute_uncommitted()
+                .await
+                .unwrap(),
+        );
+    }
+    let destination = compact_indexed_pair(&mut dataset).await;
+    let merged = dataset
+        .merge_existing_index_segments(segments)
         .await
         .unwrap();
-    assert_eq!(hits.first(), Some(&1), "{hits:?}");
+    assert_eq!(
+        merged.fragment_bitmap,
+        Some([destination].into_iter().collect())
+    );
+    dataset
+        .commit_existing_index_segments("text_idx", "text", vec![merged])
+        .await
+        .unwrap();
+    for (term, expected) in [("apple", vec![0, 1]), ("mango", vec![6])] {
+        assert_eq!(
+            fast_fts_ids(&dataset, FullTextSearchQuery::new(term.into())).await,
+            expected
+        );
+    }
 }

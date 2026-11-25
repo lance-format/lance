@@ -13,6 +13,7 @@ use lance_index::scalar::{
     BuiltinIndexType, CreatedIndex, IndexStore, OldIndexDataFilter, RowIdRemapper,
     ScalarIndexParams,
 };
+use lance_index::scalar::{TrainingCriteria, TrainingOrdering};
 use lance_table::format::IndexMetadata;
 use uuid::Uuid;
 
@@ -39,23 +40,20 @@ pub(in crate::index) async fn merge_segments(
     dataset: &Dataset,
     segments: Vec<IndexMetadata>,
     staged: Option<&crate::index::frag_reuse::StagedRemappingPlans>,
+    refresh: &super::merge::MergeRefresh,
+    has_unmapped_retired_coverage: bool,
 ) -> Result<IndexMetadata> {
     let merge = SegmentMerge::new(dataset, "NGram", &segments)?;
     let field_path = merge.field_path();
 
     let frag_reuse_index = dataset.open_frag_reuse_index(&NoOpMetricsCollector).await?;
-    let has_retired_coverage = merge.segments().iter().any(|segment| {
-        segment
-            .deleted_fragment_bitmap(&dataset.table_state.fragment_bitmap)
-            .is_some_and(|retired| !retired.is_empty())
-    });
     let requires_rebuild = frag_reuse_index.as_ref().is_some_and(|frag_reuse_index| {
         crate::index::append::fragment_reuse_affects_segments(
             frag_reuse_index,
             merge.segments().iter().copied(),
         )
     });
-    if has_retired_coverage && !requires_rebuild {
+    if has_unmapped_retired_coverage && !requires_rebuild {
         return Err(Error::invalid_input(
             "NGram merge_segments: source segments cover retired fragments but no applicable \
              fragment-reuse mapping is available; rebuild the affected segments from the current \
@@ -63,8 +61,8 @@ pub(in crate::index) async fn merge_segments(
                 .to_string(),
         ));
     }
-    let (new_uuid, created_index, dataset_version, fragment_bitmap) = if requires_rebuild {
-        let mut fragment_bitmap = merge.stored_coverage_union()?;
+    let (new_uuid, created_index, fragment_bitmap) = if requires_rebuild {
+        let mut fragment_bitmap = merge.stored_coverage_union()? | refresh.fragments();
         frag_reuse_index
             .as_ref()
             .expect("requires_rebuild implies a fragment-reuse index")
@@ -84,33 +82,36 @@ pub(in crate::index) async fn merge_segments(
                 Arc::new(NoopIndexBuildProgress),
             )
             .await?,
-            dataset.manifest.version,
             fragment_bitmap,
         )
     } else {
         // `open_and_merge_segments` refuses a row-id-domain segment on a
         // stable-row-id dataset, and without stable row ids the two domains
         // coincide, so the filters can always be address-domain.
-        let (fragment_bitmap, old_data_filters) =
-            merge.per_segment_filters(dataset, staged, true).await?;
+        let (fragment_bitmap, old_data_filters, new_data) = merge
+            .staged_row_inputs(
+                dataset,
+                refresh,
+                TrainingCriteria::new(TrainingOrdering::None).with_row_addr(),
+            )
+            .await?;
         let (new_uuid, new_store) = merge.new_store(dataset)?;
         (
             new_uuid,
             open_and_merge_segments(
                 dataset,
                 merge.segments(),
-                None,
+                new_data,
                 &new_store,
                 &old_data_filters,
                 staged,
             )
             .await?,
-            merge.dataset_version(),
             fragment_bitmap,
         )
     };
 
-    Ok(merge.build_metadata(new_uuid, dataset_version, fragment_bitmap, created_index))
+    Ok(merge.build_metadata(new_uuid, fragment_bitmap, created_index))
 }
 
 /// Merge the given NGram segments with optional newly appended data into a single

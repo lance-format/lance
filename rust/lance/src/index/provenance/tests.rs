@@ -86,27 +86,18 @@ async fn test_a_compaction_is_dated_by_its_own_commit_record() {
     let reader = RecordBatchIterator::new(vec![Ok(batch(4..6))], schema);
     dataset.append(reader, None).await.unwrap();
 
-    let history = History::new(&dataset).await.unwrap();
+    let mut history = History::new(&dataset).await.unwrap();
     assert_eq!(
-        history
-            .rewrite_commit(recorded, produced.iter().copied())
-            .await
-            .unwrap(),
+        history.rewrite_commit(recorded, &produced).await.unwrap(),
         Some(committed)
     );
     assert_eq!(
-        history
-            .rewrite_commit(recorded, sources.iter().copied())
-            .await
-            .unwrap(),
+        history.rewrite_commit(recorded, &sources).await.unwrap(),
         None,
         "the commit is a rewrite, but not the one that produced these fragments"
     );
     assert_eq!(
-        history
-            .rewrite_commit(committed, produced.iter().copied())
-            .await
-            .unwrap(),
+        history.rewrite_commit(committed, &produced).await.unwrap(),
         None,
         "the commit after this version is an append, not a rewrite"
     );
@@ -963,15 +954,15 @@ impl ModelTable {
     }
 
     /// A `val` segment over `fragments` built at the current version, and the
-    /// values it indexed for each row.
-    fn stage(&self, fragments: &RoaringBitmap) -> (IndexMetadata, HashMap<u32, u32>) {
+    /// build version and value it indexed for each row.
+    fn stage(&self, fragments: &RoaringBitmap) -> (IndexMetadata, HashMap<u32, (u64, u32)>) {
         let indexed = self
             .current()
             .fragments
             .iter()
             .filter(|fragment| fragments.contains(fragment.id as u32))
             .flat_map(ModelFragment::live_rows)
-            .map(|row| (row.token, row.val))
+            .map(|row| (row.token, (self.version, row.val)))
             .collect();
         let segment = IndexMetadata {
             uuid: Uuid::new_v4(),
@@ -1031,7 +1022,7 @@ async fn carry_under_workload(seed: u64) -> u64 {
     let len = table.next(6);
     table.run(len);
 
-    let segments = [first, second];
+    let mut segments = [first, second];
     let staged_coverage = segments
         .iter()
         .filter_map(|segment| segment.fragment_bitmap.clone())
@@ -1050,23 +1041,37 @@ async fn carry_under_workload(seed: u64) -> u64 {
         history: Arc::new(table.history),
         version,
     };
-    let carried = carry_coverage(
+    let remap = carry_coverage(
         &latest,
         "val_idx",
         &frag_reuse_index,
-        &segments,
+        &mut segments,
         &staged_coverage,
     )
     .await
     .unwrap();
 
+    let carried = segments
+        .iter()
+        .filter_map(|s| s.fragment_bitmap.as_ref())
+        .fold(remap.rescan, |acc, coverage| acc | coverage);
     for fragment in fragments
         .iter()
         .filter(|fragment| carried.contains(fragment.id as u32))
     {
+        // Model the replacements from this fragment's surviving overlays. Each
+        // row may only be refreshed from an overlay newer than its own source.
+        for overlay in &fragment.overlays {
+            let token = fragment.rows[overlay.offset as usize].token;
+            if let Some((built_at, indexed_value)) = indexed.get_mut(&token)
+                && overlay.committed_version > *built_at
+            {
+                *indexed_value = overlay.val;
+            }
+        }
         for row in fragment.live_rows() {
             assert_eq!(
-                indexed.get(&row.token),
+                indexed.get(&row.token).map(|(_, val)| val),
                 Some(&row.val),
                 "seed {seed} {ops:?}: fragment {} stayed covered, but its row {} changed",
                 fragment.id,
@@ -1078,10 +1083,9 @@ async fn carry_under_workload(seed: u64) -> u64 {
 }
 
 /// Many short workloads of writes, overlays, restores, cleanups and recorded
-/// compactions: coverage carried to the latest version only stays on
-/// fragments whose rows the segments indexed with the values they hold now.
+/// compactions: after applying live overlays, every covered row must match the snapshot.
 #[tokio::test]
-async fn test_carried_coverage_holds_only_unchanged_rows() {
+async fn test_carried_coverage_matches_the_snapshot_after_overlay_refresh() {
     let mut covered = 0;
     for seed in 0..1000 {
         covered += carry_under_workload(seed).await;

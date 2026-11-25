@@ -9,7 +9,6 @@ use arrow_schema::DataType;
 use futures::future::BoxFuture;
 use futures::stream::BoxStream;
 use futures::{FutureExt, StreamExt, TryStreamExt};
-use itertools::Itertools;
 use lance_index::progress::{IndexBuildProgress, NoopIndexBuildProgress};
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::zonemap::{
@@ -21,9 +20,11 @@ use lance_index::scalar::{CreatedIndex, IndexStore, ScalarIndex, TrainingCriteri
 use lance_select::RowAddrTreeMap;
 use lance_table::format::{Fragment, IndexMetadata};
 
-use super::segment_merge::{SegmentMerge, downcast_sources, open_dyn_sources};
+use super::segment_merge::{SegmentMerge, downcast_sources, effective_coverage, open_dyn_sources};
 use crate::index::append::SeedHarvester;
-use crate::index::scalar::{TrainingRows, TrainingScanOptions, scan_training_data};
+use crate::index::scalar::{
+    TrainingRows, TrainingScanOptions, fragments_by_id, scan_training_data,
+};
 use crate::{Dataset, Error, Result, dataset::index::LanceIndexStoreExt};
 
 /// Merge one caller-defined group of source ZoneMap segments into a single segment.
@@ -31,27 +32,59 @@ pub(in crate::index) async fn merge_segments(
     dataset: &Dataset,
     segments: Vec<IndexMetadata>,
     staged: Option<&crate::index::frag_reuse::StagedRemappingPlans>,
+    refresh: &super::merge::MergeRefresh,
 ) -> Result<IndexMetadata> {
     let merge = SegmentMerge::new(dataset, "ZoneMap", &segments)?;
-    let (fragment_bitmap, _) = merge.coverage_union(dataset)?;
+    let refreshed = refresh.fragments();
+    let mut fragment_bitmap = refreshed.clone();
+    let mut retained = effective_coverage(dataset, merge.segments())?;
+    for coverage in &mut retained {
+        fragment_bitmap |= &*coverage;
+        *coverage -= &refreshed;
+    }
 
     let opened = open_dyn_sources(dataset, merge.field_path(), merge.segments(), staged).await?;
     let source_indices = downcast_sources::<ZoneMapIndex>(&opened, merge.segments(), "ZoneMap")?;
 
+    let source_indices = source_indices
+        .into_iter()
+        .zip(&retained)
+        .collect::<Vec<_>>();
     let (new_uuid, new_store) = merge.new_store(dataset)?;
-    let created_index = lance_index::scalar::zonemap::merge_zonemap_indices(
+    let (reference, _) = source_indices[0];
+    let mut scanned = ScannedZones::default();
+    if !refreshed.is_empty() {
+        let fragments = fragments_by_id(dataset, refreshed.iter().collect())?;
+        let mut counts = HashMap::with_capacity(fragments.len());
+        for fragment in &fragments {
+            counts.insert(fragment.id, physical_rows(dataset, fragment).await?);
+        }
+        let data = scan_training_data(
+            dataset,
+            merge.field_path(),
+            &reference.update_criteria().data_criteria,
+            Some(TrainingRows::Fragments(fragments)),
+            TrainingScanOptions::default(),
+        )
+        .await?;
+        scanned = train_zonemap_scan(
+            reference.value_type(),
+            reference.rows_per_zone(),
+            reference.store_null_bitmap(),
+            counts,
+            data,
+        )
+        .await?;
+    }
+    let created_index = lance_index::scalar::zonemap::merge_zonemap_indices_with_scan(
         &source_indices,
         &new_store,
-        &fragment_bitmap,
+        &refreshed,
+        scanned,
     )
     .await?;
 
-    Ok(merge.build_metadata(
-        new_uuid,
-        dataset.manifest.version,
-        fragment_bitmap,
-        created_index,
-    ))
+    Ok(merge.build_metadata(new_uuid, fragment_bitmap, created_index))
 }
 
 /// What a seed-aware segment build reused and scanned, recorded for tests.
@@ -291,7 +324,7 @@ fn scan_batch<'a>(
                     masked = true;
                 }
             }
-            fragments.push(plan.fragment.clone());
+            fragments.push(plan.fragment);
             physical_rows.insert(plan.fragment.id, plan.physical_rows);
             batch_rows += plan.scanned_rows;
         }
@@ -309,9 +342,12 @@ fn scan_batch<'a>(
             dataset,
             column,
             criteria,
-            Some(TrainingRows::Fragments(fragments)),
+            Some(if masked {
+                TrainingRows::RowAddrs(mask)
+            } else {
+                TrainingRows::Fragments(fragments.into_iter().cloned().collect())
+            }),
             TrainingScanOptions {
-                physical_rows: masked.then_some(mask),
                 expected_rows: Some(batch_rows),
                 ..Default::default()
             },
@@ -457,19 +493,6 @@ async fn assemble_segment(
         write_zonemap_segment(base, data_type, reused, scanned, &refreshed, store).await?;
     progress.stage_complete("write_zonemap_index").await?;
     Ok(created)
-}
-
-/// The fragments with these ids, in id order, erroring on an unknown id.
-fn fragments_by_id(dataset: &Dataset, ids: Vec<u32>) -> Result<Vec<Fragment>> {
-    let ids: Vec<u32> = ids.into_iter().sorted().dedup().collect();
-    ids.iter()
-        .zip(dataset.get_frags_from_ordered_ids(&ids))
-        .map(|(id, fragment)| {
-            fragment.map(|f| f.metadata().clone()).ok_or_else(|| {
-                Error::invalid_input_source(format!("No fragment with id {}", id).into())
-            })
-        })
-        .collect()
 }
 
 /// Train a new ZoneMap segment over `fragment_ids` (all fragments when

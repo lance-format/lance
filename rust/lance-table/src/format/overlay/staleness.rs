@@ -101,17 +101,34 @@ fn stale_offsets_for_fragment(
     overlay_exclusion_offsets(&fragment.overlays, fields, index_version, schema)
 }
 
-// A missing `fragment_bitmap` means the index predates fragment-bitmap tracking; treat it as
-// covering every fragment (matching `lance::index::prefilter::DatasetPreFilter::new`) so
-// overlay-stale rows can't slip through unmasked. Only skip fragments explicitly absent from a
-// present bitmap.
-fn covers_fragment(coverage: Option<&RoaringBitmap>, frag_id: u32) -> bool {
-    coverage.is_none_or(|c| c.contains(frag_id))
+/// Visit the intersection from the smaller side. A missing legacy bitmap covers all fragments.
+fn for_each_covered_overlay_fragment(
+    coverage: Option<&RoaringBitmap>,
+    overlaid: &HashMap<u32, &Fragment>,
+    mut visit: impl FnMut(u32, &Fragment) -> Result<()>,
+) -> Result<()> {
+    // RoaringBitmap::len walks all containers. Looking for the (n + 1)th id
+    // also bounds the cost of choosing a side when only n fragments have overlays.
+    if let Some(coverage) = coverage
+        && coverage.iter().nth(overlaid.len()).is_none()
+    {
+        for id in coverage {
+            if let Some(fragment) = overlaid.get(&id) {
+                visit(id, fragment)?;
+            }
+        }
+    } else {
+        for (&id, &fragment) in overlaid {
+            if coverage.is_none_or(|coverage| coverage.contains(id)) {
+                visit(id, fragment)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Index by fragment id the fragments that carry at least one overlay. Overlays are rare, so
-/// this is empty on the common path, letting callers skip index loading entirely; when non-empty
-/// it bounds the stale-collection loops to `O(overlaid fragments)`.
+/// this is empty on the common path, letting callers skip index loading entirely.
 pub fn overlaid_fragments(fragments: &[Fragment]) -> HashMap<u32, &Fragment> {
     fragments
         .iter()
@@ -123,28 +140,26 @@ pub fn overlaid_fragments(fragments: &[Fragment]) -> HashMap<u32, &Fragment> {
 /// Insert into `stale` the ids of fragments covered by `segment` whose index entries may be
 /// stale because an overlay committed after the segment was built touches a field the segment
 /// indexes. Field-aware and version-gated via [`overlay_exclusion_offsets`].
-///
-/// `overlaid_frags` holds only the fragments that actually carry overlays (rare), so the loop is
-/// `O(overlaid_frags)` rather than `O(fragments the segment covers)`.
 pub fn collect_overlay_stale_frags(
     segment: &IndexMetadata,
     overlaid_frags: &HashMap<u32, &Fragment>,
     stale: &mut RoaringBitmap,
     schema: &Schema,
 ) -> Result<()> {
-    let coverage = segment.fragment_bitmap.as_ref();
     let fields = segment.dependency_fields();
-    for (&frag_id, fragment) in overlaid_frags {
-        if stale.contains(frag_id) || !covers_fragment(coverage, frag_id) {
-            continue;
-        }
-        if !stale_offsets_for_fragment(fragment, &fields, segment.dataset_version, schema)?
-            .is_empty()
-        {
-            stale.insert(frag_id);
-        }
-    }
-    Ok(())
+    for_each_covered_overlay_fragment(
+        segment.fragment_bitmap.as_ref(),
+        overlaid_frags,
+        |id, fragment| {
+            if !stale.contains(id)
+                && !stale_offsets_for_fragment(fragment, &fields, segment.dataset_version, schema)?
+                    .is_empty()
+            {
+                stale.insert(id);
+            }
+            Ok(())
+        },
+    )
 }
 
 /// Like [`collect_overlay_stale_frags`] but with row-level granularity: instead of marking the
@@ -160,19 +175,19 @@ pub fn collect_overlay_stale_rows_for_segment(
     stale: &mut HashMap<u32, RoaringBitmap>,
     schema: &Schema,
 ) -> Result<()> {
-    let coverage = segment.fragment_bitmap.as_ref();
     let fields = segment.dependency_fields();
-    for (&frag_id, fragment) in overlaid_frags {
-        if !covers_fragment(coverage, frag_id) {
-            continue;
-        }
-        let excluded =
-            stale_offsets_for_fragment(fragment, &fields, segment.dataset_version, schema)?;
-        if !excluded.is_empty() {
-            *stale.entry(frag_id).or_default() |= &excluded;
-        }
-    }
-    Ok(())
+    for_each_covered_overlay_fragment(
+        segment.fragment_bitmap.as_ref(),
+        overlaid_frags,
+        |id, fragment| {
+            let excluded =
+                stale_offsets_for_fragment(fragment, &fields, segment.dataset_version, schema)?;
+            if !excluded.is_empty() {
+                *stale.entry(id).or_default() |= &excluded;
+            }
+            Ok(())
+        },
+    )
 }
 
 /// Remove from `coverage` every fragment with an overlay that makes `index`
@@ -409,10 +424,10 @@ mod tests {
             "fragment absent from bitmap is not covered"
         );
 
-        // A present bitmap that includes fragment 3 marks it stale.
+        // Even when coverage is broader than the set of overlays, only their intersection is stale.
         let mut stale = RoaringBitmap::new();
         collect_overlay_stale_frags(
-            &segment(vec![3], 1, Some(bitmap([3]))),
+            &segment(vec![3], 1, Some(bitmap([1, 3]))),
             &overlaid,
             &mut stale,
             &schema,

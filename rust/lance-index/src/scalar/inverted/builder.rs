@@ -11,9 +11,9 @@ use crate::scalar::inverted::tokenizer::LEGACY_BLOCK_SIZE;
 use crate::scalar::inverted::tokenizer::document_tokenizer::LanceTokenizer;
 #[cfg(test)]
 use crate::scalar::lance_format::LanceIndexStore;
-use crate::scalar::{IndexFile, IndexStore, OldIndexDataFilter};
+use crate::scalar::{CreatedIndex, IndexFile, IndexStore, OldIndexDataFilter};
 use crate::vector::graph::OrderedFloat;
-use crate::{progress::IndexBuildProgress, progress::noop_progress};
+use crate::{pbold, progress::IndexBuildProgress, progress::noop_progress};
 use arrow::array::AsArray;
 use arrow::datatypes;
 use arrow_array::{Array, BinaryArray, RecordBatch};
@@ -296,6 +296,22 @@ impl InvertedIndexBuilder {
         self
     }
 
+    pub(super) fn into_created_index(
+        self,
+        files: Vec<IndexFile>,
+        index_version: u32,
+    ) -> Result<CreatedIndex> {
+        // The stored tokenizer parameters omit the posting format. Report the version
+        // this builder wrote, including when it preserved a non-default source format.
+        let params = self.params.format_version(self.format_version);
+        let details = pbold::InvertedIndexDetails::try_from(&params)?;
+        Ok(CreatedIndex {
+            index_details: prost_types::Any::from_msg(&details)?,
+            index_version,
+            files,
+        })
+    }
+
     pub async fn update(
         &mut self,
         new_data: SendableRecordBatchStream,
@@ -390,6 +406,12 @@ impl InvertedIndexBuilder {
         let mut merged: Option<InnerBuilder> = None;
         let mut files = Vec::new();
         for (index, old_data_filter) in old_segments.iter().zip(old_data_filters) {
+            if old_data_filter
+                .as_ref()
+                .is_some_and(OldIndexDataFilter::has_empty_allowlist)
+            {
+                continue;
+            }
             if old_data_filter.is_none() {
                 self.deleted_fragments
                     .extend(index.deleted_fragments().iter());
@@ -2922,14 +2944,15 @@ async fn list_index_files(object_store: &ObjectStore, index_dir: &Path) -> Resul
     Ok(index_files)
 }
 
+pub(super) fn is_staged_metadata(path: &str) -> bool {
+    path.strip_prefix(STAGED_PARTITION_DIR)
+        .is_some_and(|name| name.starts_with("/part_") && name.ends_with("_metadata.lance"))
+}
+
 fn metadata_files(index_files: &[IndexFile]) -> Vec<String> {
     index_files
         .iter()
-        .filter(|file| {
-            file.path
-                .starts_with(&format!("{}/part_", STAGED_PARTITION_DIR))
-                && file.path.ends_with("_metadata.lance")
-        })
+        .filter(|file| is_staged_metadata(&file.path))
         .map(|file| file.path.clone())
         .collect()
 }

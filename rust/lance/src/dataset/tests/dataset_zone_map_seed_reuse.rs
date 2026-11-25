@@ -24,7 +24,7 @@ use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::pbold;
 use lance_index::scalar::seed::SEED_META_KEY_PREFIX;
-use lance_index::scalar::zonemap::{ZoneMapIndex, ZoneSummary};
+use lance_index::scalar::zonemap::{ZoneMapIndex, ZoneMapIndexVersion, ZoneSummary};
 use lance_index::scalar::{BuiltinIndexType, SargableQuery, ScalarIndexParams};
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::utils::CachedFileSize;
@@ -1374,14 +1374,21 @@ async fn test_overlaid_fragment_is_scanned_instead_of_reused() {
 /// `store_null_bitmap = false` (a legacy segment, or one updated or merged
 /// from a legacy segment) keeps the default policy, so the seeds written
 /// for it carry null positions.
+#[rstest::rstest]
+#[case::version_upgrade(ZoneMapIndexVersion::V0)]
+#[case::overlay_replaces_source(ZoneMapIndexVersion::V1)]
 #[tokio::test]
-async fn test_historical_index_without_bitmap_still_collects_seed_positions() {
+async fn test_historical_index_without_bitmap_still_collects_seed_positions(
+    #[case] version: ZoneMapIndexVersion,
+) {
     use std::collections::HashMap;
 
     use arrow_array::{UInt32Array, UInt64Array};
+    use lance_arrow::RecordBatchExt;
     use lance_index::scalar::lance_format::LanceIndexStore;
     use lance_index::scalar::zonemap::ZONEMAP_INDEX_FILENAME;
     use lance_index::scalar::{IndexStore, index_files_to_table};
+    use lance_table::format::overlay::OverlayCoverage;
     use uuid::Uuid;
 
     use crate::dataset::index::LanceIndexStoreExt;
@@ -1423,8 +1430,18 @@ async fn test_historical_index_without_bitmap_still_collects_seed_positions() {
         ],
     )
     .unwrap();
+    let batch = if version == ZoneMapIndexVersion::V1 {
+        batch
+            .try_with_column(
+                ArrowField::new("negative_nan_count", DataType::UInt32, false),
+                Arc::new(UInt32Array::from(vec![0])),
+            )
+            .unwrap()
+    } else {
+        batch
+    };
     let mut file = store
-        .new_index_file(ZONEMAP_INDEX_FILENAME, file_schema)
+        .new_index_file(ZONEMAP_INDEX_FILENAME, batch.schema())
         .await
         .unwrap();
     file.write_record_batch(batch).await.unwrap();
@@ -1443,7 +1460,7 @@ async fn test_historical_index_without_bitmap_still_collects_seed_positions() {
         dataset_version: dataset.version().version,
         fragment_bitmap: Some(RoaringBitmap::from_iter([0u32])),
         index_details: Some(Arc::new(legacy_details)),
-        index_version: 0,
+        index_version: version as i32,
         created_at: Some(chrono::Utc::now()),
         base_id: None,
         files: Some(index_files_to_table(vec![index_file])),
@@ -1471,9 +1488,19 @@ async fn test_historical_index_without_bitmap_still_collects_seed_positions() {
         (0..N).filter(|i| val(N + i).is_none()).count()
     );
 
-    // Maintenance rebuilds the version 0 segment as version 1 from source
-    // data: fragment 1 comes from its seed (positions included), fragment 0
-    // is scanned, and the default policy regains the bitmap.
+    if version == ZoneMapIndexVersion::V1 {
+        let field_id = dataset.schema().field("val").unwrap().id;
+        dataset = super::dataset_overlay_index_masking::commit_overlay(
+            dataset,
+            "replace_null",
+            0,
+            &[field_id],
+            OverlayCoverage::dense([0].into_iter().collect()),
+            vec![Arc::new(Int64Array::from(vec![42]))],
+        )
+        .await;
+    }
+    // In both cases all of F0 is reread and F1's seed supplies its exact positions.
     let (_, reports) = with_reports(async {
         dataset
             .optimize_indices(&OptimizeOptions::default())
