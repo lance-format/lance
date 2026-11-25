@@ -66,6 +66,8 @@ pub const PQ_METADATA_KEY: &str = "lance:pq";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProductQuantizationMetadata {
     pub codebook_position: usize,
+    /// Releases before 0.25 wrote this key as `num_bits`.
+    #[serde(alias = "num_bits")]
     pub nbits: u32,
     pub num_sub_vectors: usize,
     pub dimension: usize,
@@ -73,10 +75,12 @@ pub struct ProductQuantizationMetadata {
     #[serde(skip)]
     pub codebook: Option<FixedSizeListArray>,
 
-    // empty for v1 format
-    // used for v3 format
-    // deprecated in later version
+    /// The codebook as an encoded `pb::Tensor`. v3 writers from 0.12 and v1
+    /// writers from 0.14 filled it until 0.30; later ones leave it empty.
     pub codebook_tensor: Vec<u8>,
+    /// Releases before 0.19.2 did not write this key; their codes are not
+    /// transposed.
+    #[serde(default)]
     pub transposed: bool,
 }
 
@@ -150,10 +154,27 @@ impl QuantizerMetadata for ProductQuantizationMetadata {
                 "Reading PQ storage: metadata key {} not found",
                 PQ_METADATA_KEY
             )))?;
-        let mut metadata: Self = serde_json::from_str(metadata)
+        let value: serde_json::Value = serde_json::from_str(metadata)
+            .map_err(|_| Error::index(format!("Failed to parse PQ metadata: {}", metadata)))?;
+        // Legacy IVF_HNSW_PQ files written before 0.25 name the bit width
+        // `num_bits`. This reader does not support them: it subtracts the
+        // partition centroid from Dot queries, which those writers did not,
+        // and compaction cannot remap them.
+        if value.get("nbits").is_none() && value.get("num_bits").is_some() {
+            return Err(Error::not_supported(format!(
+                "IVF_HNSW_PQ index file {} was written before Lance 0.25 (its {} metadata \
+                 has `num_bits`, not `nbits`) and is no longer supported; rebuild the index",
+                reader.object_reader.path(),
+                PQ_METADATA_KEY
+            )));
+        }
+        let mut metadata: Self = serde_json::from_value(value)
             .map_err(|_| Error::index(format!("Failed to parse PQ metadata: {}", metadata)))?;
 
         debug_assert!(metadata.codebook.is_none());
+        // Holds for the (0,2) files that 0.17 and later releases write: their
+        // `create_index` no longer writes this layout, and the current legacy
+        // writer leaves `codebook_tensor` empty.
         debug_assert!(metadata.codebook_tensor.is_empty());
 
         let codebook_tensor: pb::Tensor =
@@ -1797,6 +1818,42 @@ mod tests {
     const DIM: usize = 32;
     const TOTAL: usize = 512;
     const NUM_SUB_VECTORS: usize = 16;
+
+    /// The JSON shapes v3 writers produced before 0.25 parse, and the current
+    /// shape still serializes as `nbits`, which every release since 0.25 requires.
+    #[rstest]
+    #[case::before_0_19_2("num_bits", vec![1, 2, 3], None)]
+    #[case::before_0_25("num_bits", vec![1, 2, 3], Some(true))]
+    #[case::current("nbits", vec![], Some(true))]
+    fn test_pq_metadata_compatibility(
+        #[case] bits_key: &str,
+        #[case] codebook_tensor: Vec<u8>,
+        #[case] transposed: Option<bool>,
+    ) {
+        let mut json = serde_json::json!({
+            "codebook_position": 123,
+            bits_key: 8,
+            "num_sub_vectors": 2,
+            "dimension": 8,
+            "codebook_tensor": codebook_tensor,
+        });
+        if let Some(transposed) = transposed {
+            json["transposed"] = serde_json::json!(transposed);
+        }
+
+        let metadata: ProductQuantizationMetadata = serde_json::from_value(json).unwrap();
+        assert_eq!(metadata.codebook_position, 123);
+        assert_eq!(metadata.nbits, 8);
+        assert_eq!(metadata.num_sub_vectors, 2);
+        assert_eq!(metadata.dimension, 8);
+        assert!(metadata.codebook.is_none());
+        assert_eq!(metadata.codebook_tensor, codebook_tensor);
+        assert_eq!(metadata.transposed, transposed.unwrap_or_default());
+
+        let serialized = serde_json::to_value(&metadata).unwrap();
+        assert_eq!(serialized["nbits"], 8);
+        assert!(serialized.get("num_bits").is_none());
+    }
 
     async fn create_pq_storage() -> ProductQuantizationStorage {
         create_pq_storage_with_distance(DistanceType::Dot).await
