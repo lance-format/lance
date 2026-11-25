@@ -456,6 +456,8 @@ enum ListBehavior {
     RetargetTagOnBranchRead,
     DeleteTagOnRead,
     DeleteTagOnManifestRead,
+    DeleteBranchTagAfterLookup,
+    DeleteBranchTagOnManifestRead,
     ReadUntaggedManifestOnce,
 }
 
@@ -504,6 +506,26 @@ impl OSObjectStore for FailingListStore {
         }
         if !options.head {
             match behavior {
+                Some(ListBehavior::DeleteBranchTagAfterLookup)
+                    if location
+                        .as_ref()
+                        .ends_with("/users.lance/_refs/tags/release.json") =>
+                {
+                    *self.behavior.lock().unwrap() =
+                        Some(ListBehavior::DeleteBranchTagOnManifestRead);
+                }
+                Some(ListBehavior::DeleteBranchTagOnManifestRead)
+                    if let Some((root, _)) =
+                        location.as_ref().rsplit_once("/tree/dev.lance/_versions/") =>
+                {
+                    self.target
+                        .delete(&lance::dataset::refs::tag_path(
+                            &Path::from(root),
+                            "release",
+                        ))
+                        .await?;
+                    self.behavior.lock().unwrap().take();
+                }
                 Some(ListBehavior::DeleteTagOnRead)
                     if location.as_ref().ends_with("/_refs/tags/release.json") =>
                 {
@@ -579,6 +601,8 @@ impl OSObjectStore for FailingListStore {
                 | ListBehavior::RetargetTagOnBranchRead
                 | ListBehavior::DeleteTagOnRead
                 | ListBehavior::DeleteTagOnManifestRead
+                | ListBehavior::DeleteBranchTagAfterLookup
+                | ListBehavior::DeleteBranchTagOnManifestRead
                 | ListBehavior::ReadUntaggedManifestOnce,
             ) => self.target.list_with_delimiter(prefix).await,
             Some(ListBehavior::EmptyListing) => Ok(ListResult {
@@ -857,6 +881,47 @@ async fn test_describe_table_snapshot_selectors_racing_tag(
     *toggle.lock().unwrap() = Some(event);
     let error = reader.describe_table(request).await.unwrap_err();
     assert_eq!(mutation_error_code(error), expected, "{event:?}");
+}
+
+#[rstest]
+#[case::table_root(false)]
+#[case::direct_branch(true)]
+#[tokio::test]
+async fn test_branch_tag_deleted_during_snapshot_open(#[case] direct: bool) {
+    let (reader, temp, toggle) = failing_list_namespace().await;
+    let writer = DirectoryNamespaceBuilder::new(temp.to_str().unwrap())
+        .manifest_enabled(false)
+        .build()
+        .await
+        .unwrap();
+    create_scalar_table(&writer, "users").await;
+    let mut main = open_dataset(&writer, "users").await;
+    let dev = main.create_branch("dev.lance", 1, None).await.unwrap();
+    dev.tags().create("release", 1).await.unwrap();
+    let (namespace, table) = if direct {
+        let tree = temp.as_ref().join("users.lance/tree");
+        let listed = DirectoryNamespaceBuilder::new(file_object_store_uri(tree.to_str().unwrap()))
+            .session(reader.session.clone().unwrap())
+            .manifest_enabled(false)
+            .build()
+            .await
+            .unwrap();
+        (listed, "dev")
+    } else {
+        (reader, "users")
+    };
+    *toggle.lock().unwrap() = Some(ListBehavior::DeleteBranchTagAfterLookup);
+    let error = namespace
+        .describe_table(DescribeTableRequest {
+            id: Some(vec![table.into()]),
+            tag: Some("release".into()),
+            load_detailed_metadata: Some(true),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert!(toggle.lock().unwrap().is_none());
+    assert_eq!(mutation_error_code(error), ErrorCode::TableTagNotFound);
 }
 
 #[rstest]

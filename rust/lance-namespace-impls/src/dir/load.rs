@@ -3,7 +3,9 @@
 
 use lance::dataset::Dataset;
 use lance::dataset::builder::DatasetBuilder;
-use lance::dataset::refs::{BRANCH_DIR, BranchIdentifier, BranchLocation, Refs, check_valid_tag};
+use lance::dataset::refs::{
+    BRANCH_DIR, BranchIdentifier, BranchLocation, Refs, TagContents, check_valid_tag,
+};
 use lance_core::{Error, Result};
 use lance_namespace::LanceNamespace;
 use lance_namespace::error::NamespaceError;
@@ -322,6 +324,21 @@ impl DirectoryNamespace {
             Error::IO { .. } => Self::classify_storage_error(err),
             _ => Self::map_tag_error(err, tag, table_uri),
         };
+        // The namespace can prune and republish a version within a live branch.
+        // Confirm the tag through the opened snapshot's owner after reading the manifest.
+        let confirm_target = async |snapshot: &Dataset, target: &TagContents| {
+            let current = snapshot.tags().get(tag).await.map_err(tag_error)?;
+            if current.branch != target.branch
+                || current.version != target.version
+                || current.created_at != target.created_at
+                || current.updated_at != target.updated_at
+            {
+                return Err(Error::from(NamespaceError::ConcurrentModification {
+                    message: format!("Tag '{tag}' changed while describing '{table_uri}'"),
+                }));
+            }
+            Ok(())
+        };
         let target = match refs.tags().get(tag).await {
             Ok(target) => target,
             Err(missing @ Error::RefNotFound { .. })
@@ -351,28 +368,18 @@ impl DirectoryNamespace {
                     }
                     .into());
                 }
-                return self
+                let snapshot = self
                     .open_verified_directory_branch(
                         table_uri,
                         owner,
                         Some(target.version),
                         &expected,
                     )
-                    .await;
+                    .await?;
+                confirm_target(&snapshot, &target).await?;
+                return Ok(snapshot);
             }
             Err(err) => return Err(tag_error(err)),
-        };
-        let confirm_target = async || {
-            let current = refs.tags().get(tag).await.map_err(tag_error)?;
-            if current.branch != target.branch
-                || current.version != target.version
-                || current.created_at != target.created_at
-            {
-                return Err(Error::from(NamespaceError::ConcurrentModification {
-                    message: format!("Tag '{tag}' changed while describing '{table_uri}'"),
-                }));
-            }
-            Ok(())
         };
         if let Some(branch) = Self::normalized_branch(target.branch.as_deref())? {
             let expected = refs
@@ -380,18 +387,17 @@ impl DirectoryNamespace {
                 .get_identifier(Some(branch))
                 .await
                 .map_err(|err| Self::describe_branch_error(err, branch, table_uri))?;
-            // A tag stores a branch name and version, without a generation.
-            // Confirm the target while the captured branch generation is live.
-            confirm_target().await?;
             let location = root.find_branch(Some(branch))?;
-            return self
+            let snapshot = self
                 .open_verified_directory_branch(
                     &location.uri,
                     branch,
                     Some(target.version),
                     &expected,
                 )
-                .await;
+                .await?;
+            confirm_target(&snapshot, &target).await?;
+            return Ok(snapshot);
         }
         let snapshot = self
             .open_directory_version(table_uri, Some(target.version), SnapshotCache::Isolated)
@@ -406,7 +412,7 @@ impl DirectoryNamespace {
         }
         // Restoring a table can bring back the original tag, including its timestamp.
         // Compare the manifests on both sides of the confirming tag read.
-        confirm_target().await?;
+        confirm_target(&snapshot, &target).await?;
         let current = self
             .open_directory_version(table_uri, Some(target.version), SnapshotCache::Isolated)
             .await?;
