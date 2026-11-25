@@ -69,6 +69,7 @@ class IndicesBuilder:
         sample_rate: int = 256,
         max_iters: int = 50,
         fragment_ids: Optional[list[int]] = None,
+        e_means_epochs: Optional[float] = None,
     ) -> IvfModel:
         """
         Train IVF centroids for the given vector column.
@@ -111,12 +112,21 @@ class IndicesBuilder:
             max_iters parameter defines a cutoff at which we terminate training.
         fragment_ids: list[int], optional
             If provided, train using only the specified fragments from the dataset.
+        e_means_epochs: float, optional
+            Select native Rust e-means for IVF training with this many passes
+            over the sample, instead of k-means. Fractional passes are supported;
+            5 is the reference default budget. Supports L2 and cosine on CPU.
+            Batch size and initial step follow the FAISS 1.16.0 scaling laws.
+            ``max_iters`` only applies to k-means. No FAISS dependency is needed.
         """
         num_rows = self._count_rows(fragment_ids)
         num_partitions = self._determine_num_partitions(num_partitions, num_rows)
         self._verify_ivf_sample_rate(sample_rate, num_partitions, num_rows)
         distance_type = self._normalize_distance_type(distance_type)
         self._verify_ivf_params(num_partitions)
+
+        if e_means_epochs is not None and accelerator is not None:
+            raise ValueError("Native e-means does not support accelerator training")
 
         if accelerator is None:
             from lance.lance import indices
@@ -130,6 +140,7 @@ class IndicesBuilder:
                 sample_rate,
                 max_iters,
                 fragment_ids,
+                e_means_epochs,
             )
             return IvfModel(ivf_centroids, distance_type)
         else:

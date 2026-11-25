@@ -53,6 +53,9 @@ use {
 use crate::vector::utils::SimpleIndex;
 use lance_core::{Error, Result};
 
+mod e_means;
+pub use e_means::EMeansParams;
+
 /// KMean initialization method.
 #[derive(Debug, Clone, PartialEq)]
 pub enum KMeanInit {
@@ -63,6 +66,9 @@ pub enum KMeanInit {
 /// KMean Training Parameters
 #[derive(Clone)]
 pub struct KMeansParams {
+    /// Use mini-batch e-means instead of Lloyd/hierarchical training. `None`
+    /// preserves the default algorithm. See [`EMeansParams`].
+    pub e_means: Option<EMeansParams>,
     /// Max number of iterations.
     pub max_iters: u32,
 
@@ -115,6 +121,7 @@ pub struct KMeansParams {
 impl std::fmt::Debug for KMeansParams {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("KMeansParams")
+            .field("e_means", &self.e_means)
             .field("max_iters", &self.max_iters)
             .field("tolerance", &self.tolerance)
             .field("redos", &self.redos)
@@ -132,6 +139,7 @@ impl std::fmt::Debug for KMeansParams {
 impl Default for KMeansParams {
     fn default() -> Self {
         Self {
+            e_means: None,
             max_iters: 50,
             tolerance: 1e-4,
             redos: 1,
@@ -147,6 +155,13 @@ impl Default for KMeansParams {
 }
 
 impl KMeansParams {
+    /// Select e-means and disable the Lloyd-specific balance penalty.
+    pub fn with_e_means(mut self, params: EMeansParams) -> Self {
+        self.e_means = Some(params);
+        self.balance_factor = 0.0;
+        self
+    }
+
     pub fn new(
         centroids: Option<Arc<FixedSizeListArray>>,
         max_iters: u32,
@@ -1745,6 +1760,9 @@ impl KMeans {
         k: usize,
         params: &KMeansParams,
     ) -> arrow::error::Result<Self> {
+        if let Some(e_means) = &params.e_means {
+            return e_means::train(data, k, params, e_means);
+        }
         let n = data.len();
         if n < k {
             return Err(ArrowError::InvalidArgumentError(format!(

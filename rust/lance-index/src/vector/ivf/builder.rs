@@ -12,6 +12,7 @@ use arrow_array::{Array, FixedSizeListArray, UInt32Array, UInt64Array};
 use futures::TryStreamExt;
 use object_store::path::Path;
 
+use crate::vector::kmeans::EMeansParams;
 use lance_core::error::{Error, Result};
 use lance_io::stream::RecordBatchStream;
 
@@ -30,6 +31,11 @@ pub struct IvfBuildParams {
     // ---- kmeans parameters
     /// Max number of iterations to train kmeans.
     pub max_iters: usize,
+
+    /// Select native e-means for IVF centroid training. `None` uses the default
+    /// k-means trainer. Applies to L2 and normalized cosine vectors; streaming
+    /// coreset training cannot be combined with this option.
+    pub e_means: Option<EMeansParams>,
 
     /// Use provided IVF centroids.
     pub centroids: Option<Arc<FixedSizeListArray>>,
@@ -93,6 +99,7 @@ impl Default for IvfBuildParams {
             num_partitions: None,
             target_partition_size: None,
             max_iters: 50,
+            e_means: None,
             centroids: None,
             retrain: false,
             sample_rate: 256, // See faiss
@@ -109,6 +116,13 @@ impl Default for IvfBuildParams {
 }
 
 impl IvfBuildParams {
+    /// Train IVF centroids with native e-means. The epoch budget comes from
+    /// `params`, independently of `max_iters` used by other quantizers.
+    pub fn with_e_means(mut self, params: EMeansParams) -> Self {
+        self.e_means = Some(params);
+        self
+    }
+
     /// Create a new instance of `IvfBuildParams`.
     pub fn new(num_partitions: usize) -> Self {
         Self {
@@ -150,6 +164,24 @@ impl IvfBuildParams {
     /// whose centroids are trained from the data instead, and supplying both at
     /// once means one of the two assignments is silently unused.
     pub fn validate(&self) -> Result<()> {
+        if let Some(params) = &self.e_means {
+            params
+                .validate()
+                .map_err(|error| Error::invalid_input(error.to_string()))?;
+            if self.streaming_sample_rate.is_some()
+                || self.streaming_coreset_rate.is_some()
+                || self.streaming_refine_passes != 0
+            {
+                return Err(Error::invalid_input(
+                    "e-means cannot be combined with streaming IVF training",
+                ));
+            }
+            if self.centroids.is_some() && !self.retrain {
+                return Err(Error::invalid_input(
+                    "e-means with supplied centroids requires retrain=true",
+                ));
+            }
+        }
         if self.precomputed_shuffle_buffers.is_some() && self.precomputed_partitions_file.is_some()
         {
             return Err(Error::invalid_input(
