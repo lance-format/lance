@@ -87,7 +87,13 @@ impl AssertCellsUnchanged {
         for selection in &self.rows {
             let fragment_id =
                 state.resolve_fragment(Ref::Committed(u64::from(selection.fragment_id)))?;
-            state.fragment_mut(fragment_id, "AssertCellsUnchanged")?;
+            // A read-only lookup, so an assertion neither copies the fragment
+            // nor marks it as written by the step.
+            if !state.has_live_fragment(fragment_id) {
+                return Err(Error::invalid_input(format!(
+                    "AssertCellsUnchanged targets fragment {fragment_id}, which does not exist"
+                )));
+            }
         }
         Ok(())
     }

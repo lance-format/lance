@@ -38,7 +38,7 @@ const MAX_STABLE_PARTITION_DESTINATIONS: usize = 1 << 16;
 const DETAILS_TYPE_URL: &str = "/lance.table.FragmentReuseIndexDetails";
 
 /// A transition as an action staged it, with its fragments resolved.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct StagedTransition {
     sources: Vec<u64>,
     destinations: Vec<u64>,
@@ -46,7 +46,7 @@ struct StagedTransition {
 }
 
 /// What an operation asks of the fragment reuse history.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub(super) struct FragReuseChanges {
     transitions: Vec<StagedTransition>,
     trim: bool,
@@ -79,7 +79,7 @@ pub(super) fn set_feature_flags(manifest: &mut Manifest, indices: &[IndexMetadat
     manifest.writer_feature_flags |= flags;
 }
 
-impl ApplyState<'_> {
+impl ApplyState {
     pub(in crate::transaction::action) fn stage_frag_reuse_transition(
         &mut self,
         sources: Vec<u64>,
@@ -102,12 +102,20 @@ impl ApplyState<'_> {
         self.indices.iter().any(is_tagged)
     }
 
+    /// Whether finishing reads the stored history. These are the two cases
+    /// [`Self::finish_frag_reuse_history`] decodes it in, so validation cannot
+    /// judge such an operation from the fragments a step touched.
+    pub(super) fn has_frag_reuse_history_work(&self) -> bool {
+        !self.frag_reuse.is_empty()
+            || (!self.rebound_fields.is_empty() && self.carries_tagged_history())
+    }
+
     /// Append the staged transitions to the current history, trim it if
     /// asked, and withdraw coverage an in-place rewrite invalidated along the
     /// lineage. Whether the operation published a changed history.
     pub(super) fn finish_frag_reuse_history(&mut self) -> Result<bool> {
         let changes = std::mem::take(&mut self.frag_reuse);
-        let rebound_fields = std::mem::take(&mut self.rebound_fields);
+        let rebound_fields = Arc::unwrap_or_clone(std::mem::take(&mut self.rebound_fields));
         let position = self
             .indices
             .iter()
@@ -179,7 +187,7 @@ impl ApplyState<'_> {
         }
 
         if let Some(position) = position {
-            self.indices.remove(position);
+            Arc::make_mut(&mut self.indices).remove(position);
         }
         if content.is_empty() {
             // Trimmed to nothing. The capability flags are sticky, so the table
@@ -223,7 +231,7 @@ impl ApplyState<'_> {
         if is_tagged(&entry) && !rebound_fields.is_empty() {
             self.withdraw_along_lineage(&entry, ledger, rebound_fields);
         }
-        self.indices.push(entry);
+        Arc::make_mut(&mut self.indices).push(entry);
         Ok(true)
     }
 
@@ -272,12 +280,11 @@ impl ApplyState<'_> {
     ) {
         let lineage = TaggedLineage::new(entry, Some(ledger));
         let live: RoaringBitmap = self
-            .fragments
-            .iter()
-            .filter_map(|fragment| u32::try_from(fragment.id).ok())
+            .live_fragment_ids()
+            .filter_map(|id| u32::try_from(id).ok())
             .collect();
         Transaction::withdraw_in_place_rewrites(
-            &mut self.indices,
+            Arc::make_mut(&mut self.indices),
             rebound_fields,
             &self.schema,
             &live,
@@ -400,17 +407,12 @@ impl ApplyState<'_> {
             .sources
             .iter()
             .map(|&id| {
-                let fragment = self
-                    .current_manifest
-                    .fragments
-                    .iter()
-                    .find(|fragment| fragment.id == id)
-                    .ok_or_else(|| {
-                        Error::invalid_input(format!(
-                            "AppendFragReuseTransition consumes fragment {id}, which the version \
-                             being committed on top of does not have"
-                        ))
-                    })?;
+                let fragment = self.base_fragment(id).ok_or_else(|| {
+                    Error::invalid_input(format!(
+                        "AppendFragReuseTransition consumes fragment {id}, which the version \
+                         being committed on top of does not have"
+                    ))
+                })?;
                 source_digest(fragment)
             })
             .collect::<Result<Vec<_>>>()?;
@@ -418,17 +420,13 @@ impl ApplyState<'_> {
             .destinations
             .iter()
             .map(|&id| {
-                let fragment = self
-                    .fragments
-                    .iter()
-                    .find(|fragment| fragment.id == id)
-                    .ok_or_else(|| {
-                        Error::invalid_input(format!(
-                            "AppendFragReuseTransition produces fragment {id}, which the \
-                             operation removes again"
-                        ))
-                    })?;
-                destination_digest(fragment)
+                let fragment = self.live_fragment(id)?.ok_or_else(|| {
+                    Error::invalid_input(format!(
+                        "AppendFragReuseTransition produces fragment {id}, which the \
+                         operation removes again"
+                    ))
+                })?;
+                destination_digest(&fragment)
             })
             .collect::<Result<Vec<_>>>()?;
 

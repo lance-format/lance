@@ -51,7 +51,7 @@ impl RemoveFragment {
 
     pub(super) fn apply(&self, state: &mut ApplyState) -> Result<()> {
         let fragment_id = state.resolve_fragment(self.fragment)?;
-        if !state.remove_fragment(fragment_id, self.data_change) {
+        if !state.remove_fragment(fragment_id, self.data_change)? {
             return Err(Error::invalid_input(format!(
                 "RemoveFragment targets fragment {fragment_id}, which does not exist"
             )));

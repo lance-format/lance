@@ -19,6 +19,7 @@ use crate::dataset::builder::DatasetBuilder;
 /// Includes the dataset's latest storage options (if any) so the remote executor
 /// can open or cache the dataset with the correct storage configuration.
 pub async fn table_identifier_from_dataset(dataset: &Dataset) -> Result<pb::TableIdentifier> {
+    dataset.ensure_published()?;
     Ok(pb::TableIdentifier {
         uri: dataset.uri().to_string(),
         version: dataset.manifest.version,
@@ -38,6 +39,7 @@ pub async fn table_identifier_from_dataset(dataset: &Dataset) -> Result<pb::Tabl
 pub async fn table_identifier_from_dataset_with_manifest(
     dataset: &Dataset,
 ) -> Result<pb::TableIdentifier> {
+    dataset.ensure_published()?;
     let manifest_proto = lance_table::format::pb::Manifest::from(dataset.manifest.as_ref());
     Ok(pb::TableIdentifier {
         uri: dataset.uri().to_string(),
@@ -89,10 +91,20 @@ pub async fn resolve_dataset(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::RecordBatchIterator;
+    use arrow_array::cast::AsArray;
     use arrow_array::types::UInt32Type;
+    use arrow_array::{RecordBatchIterator, record_batch};
+    use datafusion::prelude::SessionContext;
     use lance_datagen::{array, gen_batch};
+    use rstest::rstest;
     use std::collections::HashMap;
+
+    use crate::dataset::{InsertBuilder, WriteMode, WriteParams};
+    use crate::io::exec::filtered_read::{FilteredReadExec, FilteredReadOptions};
+    use crate::io::exec::filtered_read_proto::{
+        filtered_read_exec_to_proto, filtered_read_exec_to_proto_v2,
+        filtered_read_exec_to_proto_with_table, filtered_read_exec_to_proto_with_table_v2,
+    };
 
     async fn make_test_dataset() -> (Arc<Dataset>, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
@@ -110,6 +122,99 @@ mod tests {
         .await
         .unwrap();
         (Arc::new(ds), dir)
+    }
+
+    async fn staged_dataset_after_competing_append() -> (Arc<Dataset>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let dataset = Arc::new(
+            InsertBuilder::new(dir.path().to_str().unwrap())
+                .execute(vec![record_batch!(("x", UInt32, [0])).unwrap()])
+                .await
+                .unwrap(),
+        );
+        let mut transaction = dataset.begin_transaction().await.unwrap();
+        transaction
+            .append(vec![record_batch!(("x", UInt32, [1])).unwrap()])
+            .await
+            .unwrap();
+        let scanner = transaction.scan().unwrap();
+        let mut plans = vec![scanner.create_plan().await.unwrap()];
+        let staged_dataset = loop {
+            let plan = plans.pop().expect("scan must contain a FilteredReadExec");
+            if let Some(read) = plan.downcast_ref::<FilteredReadExec>() {
+                break read.dataset().clone();
+            }
+            plans.extend(plan.children().into_iter().cloned());
+        };
+        InsertBuilder::new(dataset)
+            .with_params(&WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            })
+            .execute(vec![record_batch!(("x", UInt32, [2])).unwrap()])
+            .await
+            .unwrap();
+        let staged_rows = scanner.try_into_batch().await.unwrap();
+        assert_eq!(
+            staged_rows["x"].as_primitive::<UInt32Type>().values(),
+            &[0, 1]
+        );
+        (staged_dataset, dir)
+    }
+
+    #[rstest]
+    #[case::identifier(false)]
+    #[case::embedded_manifest(true)]
+    #[tokio::test]
+    async fn test_staged_dataset_serialization_is_rejected(#[case] include_manifest: bool) {
+        let (staged_dataset, _dir) = staged_dataset_after_competing_append().await;
+        let error = if include_manifest {
+            table_identifier_from_dataset_with_manifest(&staged_dataset).await
+        } else {
+            table_identifier_from_dataset(&staged_dataset).await
+        }
+        .unwrap_err();
+        assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("staged"));
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum ScanEncoder {
+        V1,
+        V1WithTable,
+        V2,
+        V2WithTable,
+    }
+
+    #[rstest]
+    #[case::v1(ScanEncoder::V1)]
+    #[case::v1_with_table(ScanEncoder::V1WithTable)]
+    #[case::v2(ScanEncoder::V2)]
+    #[case::v2_with_table(ScanEncoder::V2WithTable)]
+    #[tokio::test]
+    async fn test_staged_dataset_scan_serialization_is_rejected(#[case] encoder: ScanEncoder) {
+        let (staged_dataset, _dir) = staged_dataset_after_competing_append().await;
+        let options = FilteredReadOptions::basic_full_read(&staged_dataset);
+        let exec = FilteredReadExec::try_new(staged_dataset.clone(), options, None).unwrap();
+        let state = SessionContext::new().state();
+        let prebuilt_identifier = pb::TableIdentifier {
+            uri: staged_dataset.uri().to_string(),
+            version: staged_dataset.version().version,
+            ..Default::default()
+        };
+        let error = match encoder {
+            ScanEncoder::V1 => filtered_read_exec_to_proto(&exec, &state).await.err(),
+            ScanEncoder::V1WithTable => {
+                filtered_read_exec_to_proto_with_table(&exec, &state, prebuilt_identifier).err()
+            }
+            ScanEncoder::V2 => filtered_read_exec_to_proto_v2(&exec, &state).await.err(),
+            ScanEncoder::V2WithTable => {
+                filtered_read_exec_to_proto_with_table_v2(&exec, &state, prebuilt_identifier).err()
+            }
+        }
+        .unwrap();
+        assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("uncommitted staged dataset"));
     }
 
     #[test]
