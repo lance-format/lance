@@ -79,7 +79,7 @@ use futures::{
 };
 use lance_core::{
     Error, Result,
-    datatypes::SchemaCompareOptions,
+    datatypes::{BlobV2Layout, SchemaCompareOptions},
     error::{InvalidInputSnafu, box_error},
 };
 use lance_datafusion::exec::{ExecutionAnalysis, LanceExecutionOptions, OneShotPartitionStream};
@@ -87,6 +87,7 @@ use lance_file::version::ConcreteFileVersion;
 use lance_index::mem_wal::CompactedSsTable;
 use lance_select::RowAddrTreeMap;
 use lance_table::format::Fragment;
+use lance_table_runtime::blob::blob_v2_layout;
 use snafu::ResultExt;
 use std::{
     collections::HashSet,
@@ -116,10 +117,11 @@ fn check_source_schema(
     source: &lance_core::datatypes::Schema,
     target: &lance_core::datatypes::Schema,
     options: &SchemaCompareOptions,
+    version: ConcreteFileVersion,
 ) -> Result<()> {
     source.check_compatible(target, options).or_else(|err| {
-        let source = super::promote_legacy_blob_schema(source)?;
-        let target = super::promote_legacy_blob_schema(target)?;
+        let (source, target) =
+            lance_table_runtime::write::blob_write_comparison_schemas(source, target, version)?;
         source.check_compatible(&target, options).map_err(|_| err)
     })
 }
@@ -134,6 +136,12 @@ pub(crate) fn canonical_source_schema(
     fn canonical_field(source: &Field, target: &Field) -> std::result::Result<Field, ArrowError> {
         let data_type = match (source.data_type(), target.data_type()) {
             (DataType::Struct(source_fields), DataType::Struct(target_fields)) => {
+                if blob_v2_layout(source) == Some(BlobV2Layout::Logical)
+                    && blob_v2_layout(target) == Some(BlobV2Layout::Logical)
+                {
+                    // The source may carry an external range absent from the target schema.
+                    return Ok(source.clone());
+                }
                 let fields = target_fields
                     .iter()
                     .map(|target_field| {

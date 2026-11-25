@@ -3,7 +3,7 @@
 
 use arrow_schema::Schema as ArrowSchema;
 use futures::StreamExt;
-use lance_core::datatypes::Schema;
+use lance_core::datatypes::{Field, Schema};
 use lance_core::{Error, Result};
 use lance_file::version::{ConcreteFileVersion, stable_file_version};
 use lance_file::versions::v1::writer::FileWriter as V1FileWriter;
@@ -16,11 +16,11 @@ use std::borrow::Cow;
 use uuid::Uuid;
 
 use crate::paths::DATA_DIR;
-use crate::write::schema::promote_legacy_blob_schema;
 use crate::write::{
     SeedCollector, WriteMode, WriteParams, WriterOptions, blob_v2_external_base_resolver,
-    open_writer, validate_and_resolve_target_bases_with_primary, validate_row_limits,
-    write_fragments_direct, writes_blob_v2,
+    blob_write_comparison_schemas, open_writer, promote_legacy_blob_schema,
+    validate_and_resolve_target_bases_with_primary, validate_row_limits, write_fragments_direct,
+    writes_blob_v2,
 };
 use crate::{Table, TableBuilder};
 
@@ -74,6 +74,25 @@ fn promote_legacy_blobs(version: ConcreteFileVersion, schema: Schema) -> Result<
     } else {
         Ok(schema)
     }
+}
+
+// Blob promotion replaces a field's type with a struct. Require a Blob on
+// both sides before accepting that change, even when another field legitimately
+// needs Blob list normalization.
+fn can_promote_matched_blobs(actual: &Field, expected: &Field) -> bool {
+    let actual_is_blob = actual.is_blob();
+    let expected_is_blob = expected.is_blob();
+    if actual_is_blob && expected_is_blob {
+        return true;
+    }
+    if (actual_is_blob && !actual.is_blob_v2()) || (expected_is_blob && !expected.is_blob_v2()) {
+        return false;
+    }
+    actual
+        .children
+        .iter()
+        .zip(&expected.children)
+        .all(|(actual, expected)| can_promote_matched_blobs(actual, expected))
 }
 
 /// Builder for writing a new fragment.
@@ -153,7 +172,7 @@ impl<'a> FragmentCreateBuilder<'a> {
         let params = self.write_params.map(Cow::Borrowed).unwrap_or_default();
         let progress = params.progress.as_ref();
 
-        Self::validate_schema(&schema, stream.schema().as_ref())?;
+        Self::validate_schema(&schema, stream.schema().as_ref(), version)?;
         let schema = promote_legacy_blobs(version, schema)?;
 
         let (object_store, base_path) = ObjectStore::from_uri_and_params(
@@ -212,9 +231,8 @@ impl<'a> FragmentCreateBuilder<'a> {
     ) -> Result<Vec<Fragment>> {
         let mut params = self.write_params.cloned().unwrap_or_default();
 
-        Self::validate_schema(&schema, stream.schema().as_ref())?;
-
         let version = params.storage_version_or_default();
+        Self::validate_schema(&schema, stream.schema().as_ref(), version)?;
         let schema = promote_legacy_blobs(version, schema)?;
         let needs_existing_dataset = params.target_base_names_or_paths.is_some()
             || params.target_bases.is_some()
@@ -274,7 +292,7 @@ impl<'a> FragmentCreateBuilder<'a> {
         let params = self.write_params.map(Cow::Borrowed).unwrap_or_default();
         let progress = params.progress.as_ref();
 
-        Self::validate_schema(&schema, stream.schema().as_ref())?;
+        Self::validate_schema(&schema, stream.schema().as_ref(), ConcreteFileVersion::V1)?;
 
         let (object_store, base_path) = ObjectStore::from_uri_and_params(
             params.store_registry(),
@@ -370,13 +388,30 @@ impl<'a> FragmentCreateBuilder<'a> {
         builder.load().await
     }
 
-    fn validate_schema(expected: &Schema, actual: &ArrowSchema) -> Result<()> {
+    fn validate_schema(
+        expected: &Schema,
+        actual: &ArrowSchema,
+        version: ConcreteFileVersion,
+    ) -> Result<()> {
         if actual.fields().is_empty() {
             return Err(Error::invalid_input("Cannot write with an empty schema."));
         }
         let actual_lance = Schema::try_from(actual)?;
-        actual_lance.check_compatible(expected, &Default::default())?;
-
-        Ok(())
+        actual_lance
+            .check_compatible(expected, &Default::default())
+            .or_else(|error| {
+                if !writes_blob_v2(version)
+                    || !actual_lance
+                        .fields
+                        .iter()
+                        .zip(&expected.fields)
+                        .all(|(actual, expected)| can_promote_matched_blobs(actual, expected))
+                {
+                    return Err(error);
+                }
+                let (actual, expected) =
+                    blob_write_comparison_schemas(&actual_lance, expected, version)?;
+                actual.check_compatible(&expected, &Default::default())
+            })
     }
 }

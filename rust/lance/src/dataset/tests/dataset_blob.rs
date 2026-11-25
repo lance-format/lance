@@ -15,6 +15,7 @@ use crate::{
     dataset::{
         CommitBuilder, ExternalBlobMode, WriteMode, WriteParams,
         builder::DatasetBuilder,
+        fragment::FileFragment,
         transaction::{DataReplacementGroup, Operation, Transaction},
     },
 };
@@ -2867,6 +2868,54 @@ async fn test_write_and_scan_struct_nested_list_blob_v2(
     assert!(values.is_null(1));
 }
 
+fn blob_list_batch(payload: &[u8], item: Field) -> RecordBatch {
+    fn list<O: OffsetSizeTrait>(item: Arc<Field>, values: ArrayRef) -> ArrayRef {
+        Arc::new(GenericListArray::<O>::new(
+            item,
+            OffsetBuffer::from_lengths([3, 0, 0]),
+            values,
+            Some(NullBuffer::from(vec![true, false, true])),
+        ))
+    }
+
+    let values: ArrayRef = if item.data_type() == &DataType::LargeBinary {
+        Arc::new(LargeBinaryArray::from(vec![
+            Some(payload),
+            None,
+            Some(b"".as_slice()),
+        ]))
+    } else {
+        let mut builder = BlobArrayBuilder::new(3);
+        builder.push_bytes(payload).unwrap();
+        builder.push_null().unwrap();
+        builder.push_empty().unwrap();
+        builder.finish().unwrap()
+    };
+    let item = Arc::new(item);
+    RecordBatch::try_from_iter([
+        ("list_blobs", list::<i32>(item.clone(), values.clone())),
+        ("large_list_blobs", list::<i64>(item, values)),
+    ])
+    .unwrap()
+}
+
+fn check_blob_lists<O: OffsetSizeTrait>(column: &dyn Array, expected: &[&[u8]]) {
+    let lists = column.as_list::<O>();
+    assert_eq!(lists.len(), expected.len() * 3);
+    for (group, payload) in expected.iter().enumerate() {
+        let row = group * 3;
+        assert!(lists.is_valid(row));
+        let items = lists.value(row);
+        assert_eq!(
+            items.as_binary::<i64>().iter().collect::<Vec<_>>(),
+            [Some(*payload), None, Some(b"".as_slice())]
+        );
+        assert!(lists.is_null(row + 1));
+        assert!(lists.is_valid(row + 2));
+        assert!(lists.value(row + 2).is_empty());
+    }
+}
+
 #[rstest]
 #[case::native_table(false, LanceFileVersion::V2_2, true)]
 #[case::promoted_by_release(true, LanceFileVersion::V2_2, true)]
@@ -2878,56 +2927,16 @@ async fn test_append_legacy_blob_lists(
     #[case] initial_version: LanceFileVersion,
     #[case] legacy_upgrade_input: bool,
 ) {
-    fn list<O: OffsetSizeTrait>(item: Arc<Field>, values: ArrayRef) -> ArrayRef {
-        Arc::new(GenericListArray::<O>::new(
-            item,
-            OffsetBuffer::from_lengths([3, 0, 0]),
-            values,
-            Some(NullBuffer::from(vec![true, false, true])),
-        ))
-    }
-
-    fn check_lists<O: OffsetSizeTrait>(column: &dyn Array, expected: &[&[u8]]) {
-        let lists = column.as_list::<O>();
-        assert_eq!(lists.len(), expected.len() * 3);
-        for (group, payload) in expected.iter().enumerate() {
-            let row = group * 3;
-            assert!(lists.is_valid(row));
-            let items = lists.value(row);
-            assert_eq!(
-                items.as_binary::<i64>().iter().collect::<Vec<_>>(),
-                [Some(*payload), None, Some(b"".as_slice())]
-            );
-            assert!(lists.is_null(row + 1));
-            assert!(lists.is_valid(row + 2));
-            assert!(lists.value(row + 2).is_empty());
-        }
-    }
-
     let batch = |payload: &[u8], legacy: bool| {
-        let (item, values) = if legacy {
-            let item = Field::new("item", DataType::LargeBinary, true).with_metadata(
-                HashMap::from([(BLOB_META_KEY.to_string(), "true".to_string())]),
-            );
-            let values: ArrayRef = Arc::new(LargeBinaryArray::from(vec![
-                Some(payload),
-                None,
-                Some(b"".as_slice()),
-            ]));
-            (item, values)
+        let item = if legacy {
+            Field::new("item", DataType::LargeBinary, true).with_metadata(HashMap::from([(
+                BLOB_META_KEY.to_string(),
+                "true".to_string(),
+            )]))
         } else {
-            let mut builder = BlobArrayBuilder::new(3);
-            builder.push_bytes(payload).unwrap();
-            builder.push_null().unwrap();
-            builder.push_empty().unwrap();
-            (blob_field("item", true), builder.finish().unwrap())
+            blob_field("item", true)
         };
-        let item = Arc::new(item);
-        RecordBatch::try_from_iter([
-            ("list_blobs", list::<i32>(item.clone(), values.clone())),
-            ("large_list_blobs", list::<i64>(item, values)),
-        ])
-        .unwrap()
+        blob_list_batch(payload, item)
     };
 
     let test_dir = if promoted_by_release {
@@ -3026,8 +3035,151 @@ async fn test_append_legacy_blob_lists(
     let mut scanner = dataset.scan();
     scanner.blob_handling(BlobHandling::AllBinary);
     let result = scanner.try_into_batch().await.unwrap();
-    check_lists::<i32>(result["list_blobs"].as_ref(), &expected);
-    check_lists::<i64>(result["large_list_blobs"].as_ref(), &expected);
+    check_blob_lists::<i32>(result["list_blobs"].as_ref(), &expected);
+    check_blob_lists::<i64>(result["large_list_blobs"].as_ref(), &expected);
+}
+
+#[rstest]
+#[case::single_native(false, false)]
+#[case::multiple_legacy(true, true)]
+#[tokio::test]
+async fn test_fragment_append_accepts_promoted_blob_lists(
+    #[case] multiple: bool,
+    #[case] legacy: bool,
+) {
+    let test_dir =
+        crate::utils::test::copy_test_data_to_tmp("v14.0.3/blobs/promoted_lists.lance").unwrap();
+    let uri = test_dir.path_str();
+    let dataset = Dataset::open(&uri).await.unwrap();
+    let original_schema = dataset.schema().clone();
+    let original_fragment = dataset.manifest.fragments[0].clone();
+    let read_version = dataset.version_id();
+    let input = if legacy {
+        let legacy_item = Field::new("item", DataType::LargeBinary, true).with_metadata(
+            HashMap::from([(BLOB_META_KEY.to_string(), "true".to_string())]),
+        );
+        blob_list_batch(b"fragment", legacy_item)
+    } else {
+        let arrow_schema = Schema::from(&original_schema);
+        let native_item = match arrow_schema
+            .field_with_name("list_blobs")
+            .unwrap()
+            .data_type()
+        {
+            DataType::List(item) => item.as_ref().clone(),
+            other => panic!("Expected a Blob list, got {other}"),
+        };
+        let batch = blob_list_batch(b"fragment", native_item);
+        assert_eq!(batch.schema().as_ref(), &arrow_schema);
+        let round_tripped = lance_core::datatypes::Schema::try_from(&arrow_schema).unwrap();
+        assert_ne!(
+            round_tripped.field("list_blobs").unwrap().logical_type,
+            original_schema.field("list_blobs").unwrap().logical_type
+        );
+        batch
+    };
+    let params = WriteParams {
+        mode: WriteMode::Append,
+        data_storage_version: Some(LanceFileVersion::V2_2),
+        max_rows_per_file: 2,
+        ..Default::default()
+    };
+    let create_fragments = |batch: RecordBatch| {
+        let uri = &uri;
+        let params = Some(params.clone());
+        let schema = batch.schema();
+        let source = RecordBatchIterator::new([Ok(batch)], schema);
+        async move {
+            if multiple {
+                FileFragment::create_fragments(uri, source, params).await
+            } else {
+                FileFragment::create(uri, 1, source, params)
+                    .await
+                    .map(|fragment| vec![fragment])
+            }
+        }
+    };
+
+    if !multiple {
+        let wrong_width = RecordBatch::try_from_iter([
+            ("list_blobs", input["large_list_blobs"].clone()),
+            ("large_list_blobs", input["large_list_blobs"].clone()),
+        ])
+        .unwrap();
+        let unmarked_binary =
+            blob_list_batch(b"fragment", Field::new("item", DataType::LargeBinary, true));
+        for invalid in [wrong_width, unmarked_binary] {
+            let error = create_fragments(invalid).await.unwrap_err();
+            assert!(
+                matches!(&error, Error::SchemaMismatch { difference, .. } if difference.contains("`list_blobs`")),
+                "{error}"
+            );
+        }
+    }
+
+    let fragments = create_fragments(input).await.unwrap();
+    assert_eq!(fragments.len(), if multiple { 2 } else { 1 });
+    for fragment in &fragments {
+        assert_eq!(fragment.files[0].fields, original_fragment.files[0].fields);
+    }
+    CommitBuilder::new(Arc::new(dataset))
+        .execute(Transaction::new(
+            read_version,
+            Operation::Append { fragments },
+            None,
+        ))
+        .await
+        .unwrap();
+    let dataset = Dataset::open(&uri).await.unwrap();
+    assert_eq!(dataset.schema(), &original_schema);
+    assert_eq!(dataset.manifest.fragments[0], original_fragment);
+    let mut scanner = dataset.scan();
+    scanner.blob_handling(BlobHandling::AllBinary);
+    let result = scanner.try_into_batch().await.unwrap();
+    let expected: &[&[u8]] = &[b"before", b"fragment"];
+    check_blob_lists::<i32>(result["list_blobs"].as_ref(), expected);
+    check_blob_lists::<i64>(result["large_list_blobs"].as_ref(), expected);
+}
+
+#[tokio::test]
+async fn test_fragment_append_rejects_unmarked_struct_as_legacy_blob() {
+    let legacy_item = Field::new("item", DataType::LargeBinary, true).with_metadata(HashMap::from(
+        [(BLOB_META_KEY.to_string(), "true".to_string())],
+    ));
+    let legacy = blob_list_batch(b"before", legacy_item.clone());
+    let expected = Schema::new(vec![
+        legacy
+            .schema()
+            .field_with_name("list_blobs")
+            .unwrap()
+            .clone(),
+        legacy_item.with_name("blob"),
+    ]);
+    let expected = lance_core::datatypes::Schema::try_from(&expected).unwrap();
+
+    let native = blob_list_batch(b"after", blob_field("item", true));
+    let plain_struct = native["list_blobs"].as_list::<i32>().values().clone();
+    let input = RecordBatch::try_from_iter_with_nullable([
+        ("list_blobs", native["list_blobs"].clone(), true),
+        ("blob", plain_struct, true),
+    ])
+    .unwrap();
+    let params = WriteParams {
+        mode: WriteMode::Append,
+        data_storage_version: Some(LanceFileVersion::V2_2),
+        ..Default::default()
+    };
+    let test_dir = TempStrDir::default();
+    let builder = crate::dataset::fragment::write::FragmentCreateBuilder::new(&test_dir)
+        .schema(&expected)
+        .write_params(&params);
+    let schema = input.schema();
+    let source = RecordBatchIterator::new([Ok(input)], schema);
+    let error = builder.write(source, None).await.unwrap_err();
+    assert!(
+        matches!(&error, Error::SchemaMismatch { difference, .. } if difference.contains("`blob`")),
+        "{error}"
+    );
 }
 
 #[tokio::test]

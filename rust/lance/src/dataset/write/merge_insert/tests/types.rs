@@ -2,6 +2,12 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use super::*;
+use crate::dataset::blob::test_util::{complete_blob_v2_array, complete_blob_v2_field};
+use crate::{BlobArrayBuilder, blob_field};
+use arrow_array::{GenericListArray, LargeBinaryArray, OffsetSizeTrait};
+use arrow_buffer::NullBuffer;
+use lance_arrow::BLOB_META_KEY;
+use lance_core::datatypes::BlobHandling;
 
 #[tokio::test]
 async fn test_merge_insert_full_fragment_rewrite_with_json_columns() {
@@ -282,9 +288,8 @@ async fn test_merge_insert_subschema_with_json_columns() {
     }
 }
 
-/// A legacy blob source merges into a 2.1 table, and into a 2.2 table whose
-/// column is Blob v2. Partial + indexed patches the blob column in place,
-/// which fails for Blob v2 sources too, so it is not covered here.
+/// A legacy blob source merges into either a 2.1 table or a 2.2 table with a
+/// Blob v2 column.
 #[rstest::rstest]
 #[case::full(false, false)]
 #[case::full_indexed(true, false)]
@@ -398,6 +403,342 @@ async fn test_merge_insert_with_blob_v1_source_provides_blob(
         expected.insert(0, (0, b"foo".to_vec()));
     }
     assert_eq!(actual, expected);
+}
+
+#[rstest::rstest]
+#[case::full(false, false, false, false, false)]
+#[case::full_indexed(true, false, false, false, true)]
+#[case::partial_indexed_with_struct(true, true, false, true, false)]
+#[case::partial_indexed_insert_only(true, true, true, false, true)]
+#[tokio::test]
+async fn test_merge_insert_legacy_blob_lists(
+    #[case] indexed: bool,
+    #[case] partial: bool,
+    #[case] insert_only: bool,
+    #[case] with_struct: bool,
+    #[case] large_list: bool,
+) {
+    fn list<O: OffsetSizeTrait>(item: Arc<Field>, values: ArrayRef, initial: bool) -> ArrayRef {
+        let lengths: &[usize] = if initial { &[3, 1, 0] } else { &[3, 0, 1] };
+        Arc::new(GenericListArray::<O>::new(
+            item,
+            OffsetBuffer::from_lengths(lengths.iter().copied()),
+            values,
+            initial.then(|| NullBuffer::from(vec![true, true, false])),
+        ))
+    }
+
+    fn read_list<O: OffsetSizeTrait>(array: &ArrayRef, row: usize) -> Option<Vec<Option<Vec<u8>>>> {
+        let lists = array.as_list::<O>();
+        lists.is_valid(row).then(|| {
+            lists
+                .value(row)
+                .as_binary::<i64>()
+                .iter()
+                .map(|value| value.map(<[u8]>::to_vec))
+                .collect()
+        })
+    }
+
+    let make_batch = |initial: bool, legacy: bool, large_list: bool| {
+        let values: Vec<Option<&[u8]>> = if initial {
+            vec![Some(b"keep"), None, Some(b""), Some(b"replace")]
+        } else {
+            vec![Some(b"updated"), None, Some(b""), Some(b"inserted")]
+        };
+        let (item, values) = if legacy {
+            (
+                Field::new("item", DataType::LargeBinary, true).with_metadata(HashMap::from([(
+                    BLOB_META_KEY.to_string(),
+                    "true".to_string(),
+                )])),
+                Arc::new(LargeBinaryArray::from(values)) as ArrayRef,
+            )
+        } else {
+            let mut builder = BlobArrayBuilder::new(values.len());
+            for value in values {
+                match value {
+                    Some(bytes) => builder.push_bytes(bytes).unwrap(),
+                    None => builder.push_null().unwrap(),
+                }
+            }
+            (blob_field("item", true), builder.finish().unwrap())
+        };
+        let item = Arc::new(item);
+        let blobs = if large_list {
+            list::<i64>(item, values, initial)
+        } else {
+            list::<i32>(item, values, initial)
+        };
+        let ids = if initial {
+            vec![0, 1, 2]
+        } else {
+            vec![1, 3, 4]
+        };
+        let others = if initial {
+            vec![10, 20, 30]
+        } else {
+            vec![200, 400, 500]
+        };
+        let others: ArrayRef = Arc::new(Int64Array::from(others));
+        let mut columns = vec![
+            ("id", Arc::new(Int64Array::from(ids)) as ArrayRef, false),
+            ("blobs", blobs, true),
+            ("other", others.clone(), true),
+        ];
+        if with_struct {
+            // The source uses a non-nullable child where the target is nullable.
+            let flag = Arc::new(Field::new("flag", DataType::Int64, initial));
+            let attrs = StructArray::from(vec![(flag, others)]);
+            columns.push(("attrs", Arc::new(attrs), true));
+        }
+        RecordBatch::try_from_iter_with_nullable(columns).unwrap()
+    };
+    let target = make_batch(true, false, large_list);
+    let target_schema = target.schema();
+    let test_dir = TempStrDir::default();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(target)], target_schema),
+        &test_dir,
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    if indexed {
+        dataset
+            .create_index(
+                &["id"],
+                IndexType::Scalar,
+                None,
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+    }
+    let original_schema = dataset.schema().clone();
+    let dataset = Arc::new(dataset);
+    let source = make_batch(false, true, large_list);
+    let source = if partial {
+        source
+            .project(if with_struct { &[0, 1, 3] } else { &[0, 1] })
+            .unwrap()
+    } else {
+        source
+    };
+    let make_job = || {
+        MergeInsertBuilder::try_new(dataset.clone(), vec!["id".to_string()])
+            .unwrap()
+            .when_matched(if insert_only {
+                WhenMatched::DoNothing
+            } else {
+                WhenMatched::UpdateAll
+            })
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .try_build()
+            .unwrap()
+    };
+    if !partial && !indexed {
+        let wrong_width = make_batch(false, true, !large_list);
+        let error = make_job()
+            .execute_reader(RecordBatchIterator::new(
+                [Ok(wrong_width.clone())],
+                wrong_width.schema(),
+            ))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, Error::SchemaMismatch { difference, .. } if difference.contains("blobs")),
+            "{error}"
+        );
+    }
+    let job = make_job();
+    if insert_only {
+        let report = job
+            .analyze_plan_report_batches(vec![source.clone()])
+            .await
+            .unwrap();
+        assert!(
+            report.execution.error.is_none(),
+            "{:?}",
+            report.execution.error
+        );
+        assert_eq!(report.index_used, Some(true));
+    }
+    let (_, stats) = job
+        .execute_reader(RecordBatchIterator::new(
+            [Ok(source.clone())],
+            source.schema(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(stats.num_updated_rows, if insert_only { 0 } else { 1 });
+    assert_eq!(stats.num_inserted_rows, 2);
+    let dataset = Dataset::open(test_dir.as_ref()).await.unwrap();
+    assert_eq!(dataset.schema(), &original_schema);
+    assert!(dataset.get_fragments().len() > 1);
+
+    let mut scanner = dataset.scan();
+    scanner.blob_handling(BlobHandling::AllBinary);
+    let batch = scanner.try_into_batch().await.unwrap();
+    let ids = batch["id"].as_primitive::<arrow_array::types::Int64Type>();
+    if with_struct {
+        let attrs = batch["attrs"].as_struct();
+        let flags = attrs
+            .column(0)
+            .as_primitive::<arrow_array::types::Int64Type>();
+        let mut actual: Vec<_> = ids.iter().zip(flags.iter()).collect();
+        actual.sort_unstable();
+        assert_eq!(
+            actual,
+            [(0, 10), (1, 200), (2, 30), (3, 400), (4, 500)]
+                .map(|(id, flag)| (Some(id), Some(flag)))
+        );
+    }
+
+    let others = batch["other"].as_primitive::<arrow_array::types::Int64Type>();
+    let mut actual = (0..batch.num_rows())
+        .map(|row| {
+            let blobs = if large_list {
+                read_list::<i64>(&batch["blobs"], row)
+            } else {
+                read_list::<i32>(&batch["blobs"], row)
+            };
+            (
+                ids.value(row),
+                others.is_valid(row).then(|| others.value(row)),
+                blobs,
+            )
+        })
+        .collect::<Vec<_>>();
+    actual.sort_unstable_by_key(|(id, _, _)| *id);
+    assert_eq!(
+        actual,
+        vec![
+            (
+                0,
+                Some(10),
+                Some(vec![Some(b"keep".to_vec()), None, Some(vec![])])
+            ),
+            (
+                1,
+                Some(if partial { 20 } else { 200 }),
+                if insert_only {
+                    Some(vec![Some(b"replace".to_vec())])
+                } else {
+                    Some(vec![Some(b"updated".to_vec()), None, Some(vec![])])
+                },
+            ),
+            (2, Some(30), None),
+            (3, if partial { None } else { Some(400) }, Some(vec![])),
+            (
+                4,
+                if partial { None } else { Some(500) },
+                Some(vec![Some(b"inserted".to_vec())]),
+            ),
+        ]
+    );
+}
+
+#[rstest::rstest]
+#[tokio::test]
+async fn test_merge_insert_preserves_range_in_promoted_blob_list(
+    #[values(false, true)] indexed: bool,
+) {
+    let make_batch = |item: Field, values: ArrayRef| {
+        let blobs: ArrayRef = Arc::new(ListArray::new(
+            Arc::new(item),
+            OffsetBuffer::from_lengths([1]),
+            values,
+            None,
+        ));
+        RecordBatch::try_from_iter([
+            ("id", Arc::new(Int64Array::from(vec![1])) as ArrayRef),
+            ("blobs", blobs),
+        ])
+        .unwrap()
+    };
+
+    let test_dir = TempStrDir::default();
+    let uri = format!("{test_dir}/table.lance");
+    let object = format!("{test_dir}/object.bin");
+    std::fs::write(&object, b"0123456789").unwrap();
+
+    let legacy_item = Field::new("item", DataType::LargeBinary, true).with_metadata(HashMap::from(
+        [(BLOB_META_KEY.to_string(), "true".to_string())],
+    ));
+    let target = make_batch(
+        legacy_item,
+        Arc::new(LargeBinaryArray::from(vec![b"old".as_slice()])),
+    );
+    let target_schema = target.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(target)], target_schema),
+        &uri,
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let target_field = dataset.schema().field("blobs").unwrap();
+    // Promoting the item leaves the historical list tag and a minimal Blob v2 schema.
+    assert_eq!(target_field.logical_type.to_string(), "list");
+    assert!(target_field.children[0].is_blob_v2());
+    assert_eq!(target_field.children[0].children.len(), 2);
+    if indexed {
+        dataset
+            .create_index(
+                &["id"],
+                IndexType::Scalar,
+                None,
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+    }
+
+    let external_uri = Url::from_file_path(&object).unwrap().to_string();
+    let source = make_batch(
+        complete_blob_v2_field("item", true),
+        complete_blob_v2_array(
+            vec![None],
+            vec![Some(external_uri)],
+            vec![Some(2)],
+            vec![Some(3)],
+            None,
+        ),
+    );
+    let source_schema = source.schema();
+    let (_, stats) = MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".to_string()])
+        .unwrap()
+        .when_matched(WhenMatched::UpdateAll)
+        .with_params(&WriteParams {
+            allow_external_blob_outside_bases: true,
+            ..Default::default()
+        })
+        .try_build()
+        .unwrap()
+        .execute_reader(RecordBatchIterator::new([Ok(source)], source_schema))
+        .await
+        .unwrap();
+    assert_eq!(stats.num_updated_rows, 1);
+
+    let dataset = Dataset::open(&uri).await.unwrap();
+    let batch = dataset
+        .scan()
+        .blob_handling(BlobHandling::AllBinary)
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(batch.num_rows(), 1);
+    let blobs = batch["blobs"].as_list::<i32>().value(0);
+    assert_eq!(blobs.as_binary::<i64>().value(0), b"234");
 }
 
 #[tokio::test]

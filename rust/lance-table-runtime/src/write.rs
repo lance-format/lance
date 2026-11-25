@@ -41,7 +41,10 @@ pub(crate) use fragments::write_fragments_direct;
 pub use parts::{DataFilePart, DataFileTarget};
 pub use progress::{WriteProgressFn, WriteStats};
 #[doc(hidden)]
-pub use schema::{promote_legacy_blob_schema, schema_compare_options, validate_row_limits};
+pub use schema::{
+    blob_write_comparison_schemas, promote_legacy_blob_schema, schema_compare_options,
+    validate_row_limits,
+};
 #[doc(hidden)]
 pub use schema_adapter::SchemaAdapter;
 #[doc(hidden)]

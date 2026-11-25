@@ -84,6 +84,7 @@ use lance_index::IndexCriteria;
 use lance_select::{RowAddrMask, RowAddrTreeMap};
 use lance_table::format::{Fragment, IndexMetadata, RowIdMeta};
 use lance_table::io::deletion::deletion_file_path;
+use lance_table_runtime::write::{blob_write_comparison_schemas, writes_blob_v2};
 use log::info;
 use roaring::RoaringTreemap;
 use std::{
@@ -169,17 +170,17 @@ impl MergeInsertJob {
         options.ignore_field_order = true;
 
         // Try full schema match first.
-        if check_source_schema(&lance_schema, target_schema, &options).is_ok() {
+        if check_source_schema(&lance_schema, target_schema, &options, version).is_ok() {
             return Ok(SchemaComparison::FullCompatible);
         }
 
         // If full match fails, try subschema match.
         options.allow_subschema = true;
 
-        check_source_schema(&lance_schema, target_schema, &options)?;
+        check_source_schema(&lance_schema, target_schema, &options, version)?;
         options.allow_subschema = false;
-        let lance_schema = super::super::promote_legacy_blob_schema(&lance_schema)?;
-        let target_schema = super::super::promote_legacy_blob_schema(target_schema)?;
+        let (lance_schema, target_schema) =
+            blob_write_comparison_schemas(&lance_schema, target_schema, version)?;
         for source_field in &lance_schema.fields {
             if let Some(target_field) = target_schema.field(&source_field.name) {
                 check_complete_list_fields(
@@ -1351,8 +1352,8 @@ impl MergeInsertJob {
     /// Check if the merge insert operation can use the fast path (create_plan).
     ///
     /// The fast path is available when:
-    /// - `when_matched` is `UpdateAll`, `UpdateIf`, `Fail`, `Delete`, or `DoNothing`
-    /// - Either `use_index` is false OR there's no scalar index on the join key
+    /// - `when_matched` is `UpdateAll`, `UpdateIf`, `UpdateIfExpr`, `Fail`, `Delete`, or `DoNothing`
+    /// - The planner selects a join without a scalar-index probe
     /// - The source schema is either (a) the full dataset schema, or (b) a
     ///   subset of it (partial-schema upsert), or (c) just the key columns for
     ///   delete-only operations
@@ -1366,34 +1367,57 @@ impl MergeInsertJob {
         // Convert to lance schema for comparison
         let lance_schema = lance_core::datatypes::Schema::try_from(source_schema)?;
         let full_schema = self.dataset.schema();
-        let is_full_schema = check_source_schema(
-            &lance_schema,
-            full_schema,
-            &SchemaCompareOptions {
-                compare_metadata: false,
-                // Allow nullable source fields for non-nullable targets.
-                compare_nullability: NullabilityComparison::Ignore,
-                // Allow columns to be in a different order; they will be matched by name.
-                ignore_field_order: true,
-                ..Default::default()
-            },
-        )
-        .is_ok();
+        let version = self.params.write_version(&self.dataset);
+        let options = SchemaCompareOptions {
+            compare_metadata: false,
+            // Merge columns match by name and accept nullable source fields.
+            compare_nullability: NullabilityComparison::Ignore,
+            ignore_field_order: true,
+            ..Default::default()
+        };
+        let is_full_schema =
+            check_source_schema(&lance_schema, full_schema, &options, version).is_ok();
 
         // Partial-schema upsert: every source field must exist in the target
         // and have a compatible data type (legacy blob input matches Blob v2,
         // as in `check_source_schema`). Missing target columns will be
         // filled from the target side of the join in `create_plan`.
-        let is_subset_schema = !is_full_schema
-            && lance_schema.fields.iter().all(|sf| {
-                full_schema
-                    .field(&sf.name)
-                    .map(|tf| {
-                        tf.data_type() == sf.data_type()
-                            || (tf.is_blob_v2() && sf.is_blob() && !sf.is_blob_v2())
+        let is_subset_schema = if is_full_schema {
+            false
+        } else {
+            let mismatches: Vec<_> = lance_schema
+                .fields
+                .iter()
+                .filter(|source| {
+                    full_schema.field(&source.name).is_none_or(|target| {
+                        target.data_type() != source.data_type()
+                            && !(target.is_blob_v2() && source.is_blob() && !source.is_blob_v2())
                     })
-                    .unwrap_or(false)
-            });
+                })
+                .collect();
+            if mismatches.is_empty() {
+                true
+            } else if writes_blob_v2(version)
+                && mismatches.iter().any(|field| subtree_has_blob(field))
+            {
+                let (source, target) =
+                    blob_write_comparison_schemas(&lance_schema, full_schema, version)?;
+                // Use the normalized schemas for mismatched columns whose input
+                // contains Blobs. Compare the remaining columns as supplied.
+                mismatches.into_iter().all(|field| {
+                    let (source, target) = if subtree_has_blob(field) {
+                        (source.field(&field.name), target.field(&field.name))
+                    } else {
+                        (Some(field), full_schema.field(&field.name))
+                    };
+                    source.zip(target).is_some_and(|(source, target)| {
+                        source.compare_with_options(target, &options)
+                    })
+                })
+            } else {
+                false
+            }
+        };
 
         // If the user is inserting unmatched rows with a partial source, any
         // target column missing from the source would receive NULL for those
@@ -1546,6 +1570,7 @@ impl MergeInsertJob {
                 ignore_field_order: true,
                 ..Default::default()
             },
+            self.params.write_version(&self.dataset),
         )
         .is_ok();
         let source_projection = if is_full_schema {

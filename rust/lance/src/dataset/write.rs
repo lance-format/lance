@@ -47,8 +47,7 @@ pub use lance_table_runtime::write::{
     AutoCleanupParams, ExternalBlobMode, GenericWriter, PRIMARY_BASE_ID, TargetBaseInfo, WriteMode,
 };
 pub(crate) use lance_table_runtime::write::{
-    cleanup_data_fragments, dictionary_budget, promote_legacy_blob_schema,
-    validate_and_resolve_target_bases_with_primary,
+    cleanup_data_fragments, dictionary_budget, validate_and_resolve_target_bases_with_primary,
 };
 
 /// Dataset write parameters with a Lance session.

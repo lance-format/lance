@@ -104,7 +104,9 @@ pub fn promote_legacy_blob_schema(schema: &Schema) -> Result<Schema> {
     Ok(schema)
 }
 
-pub(super) fn blob_write_comparison_schemas(
+/// Return promoted copies of the input and target schemas for compatibility
+/// checks, reconciling equivalent Blob list tags for Blob v2 writes.
+pub fn blob_write_comparison_schemas(
     input: &Schema,
     existing_schema: &Schema,
     write_version: ConcreteFileVersion,
