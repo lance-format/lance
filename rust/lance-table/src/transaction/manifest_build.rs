@@ -57,11 +57,6 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use uuid::Uuid;
 
-/// First Lance release whose empty manifests are known to be genuinely empty:
-/// #8438 (carry fragments through `UpdateMemWalState`) shipped in 11.1, and the
-/// next major leaves no doubt about pre-release ordering.
-const EMPTY_MANIFEST_TRUSTED_FROM: semver::Version = semver::Version::new(12, 0, 0);
-
 /// Table config key that opts a table into writing clustered deletions as
 /// `Range` segments (`U64Segment::Ranges`). Set it to `true` with
 /// `update_config`.
@@ -331,7 +326,8 @@ impl Transaction {
             .collect();
 
         // Every fragment live when the transaction read the table. An index
-        // spanning all of them holds every row compacted by then.
+        // spanning all of them holds every row compacted by then. An empty
+        // table is trivially covered: every compacted row has been deleted.
         let read_fragments: Option<RoaringBitmap> = read_version_state.map(|state| {
             state
                 .manifest
@@ -340,30 +336,11 @@ impl Transaction {
                 .map(|fragment| fragment.id as u32)
                 .collect()
         });
-        // An empty fragment list is what an emptied table looks like, but also
-        // what a manifest written before #8438 looks like, where
-        // UpdateMemWalState published no fragments at all and the SSTables are
-        // the last copy of the rows. A writer with that fix cannot produce the
-        // latter, so only its empty manifests are known to be genuinely empty.
-        let read_emptiness_is_genuine = read_version_state.is_some_and(|state| {
-            state
-                .manifest
-                .writer_version
-                .as_ref()
-                .and_then(|writer| writer.lance_lib_version())
-                .is_some_and(|version| version >= EMPTY_MANIFEST_TRUSTED_FROM)
-        });
 
         let covers_read_version = |segments: &[CoverageIdentity]| -> bool {
             let Some(required) = read_fragments.as_ref() else {
                 return false;
             };
-            if required.is_empty() {
-                // Subset-of-empty is trivially true. Without it an emptied
-                // table retains its SSTables forever, and a checkpoint waiting
-                // on their trim never returns.
-                return read_emptiness_is_genuine;
-            }
             let mut covered = RoaringBitmap::new();
             for segment in segments {
                 match segment.fragment_bitmap.as_ref() {
@@ -5551,7 +5528,6 @@ mod tests {
 
     mod mem_wal_index_coverage {
         use super::*;
-        use crate::format::WriterVersion;
         use crate::system_index::mem_wal::{
             CompactedSsTable, IndexCatchupProgress, MEM_WAL_INDEX_NAME, MemWalIndexDetails,
         };
@@ -5972,62 +5948,15 @@ mod tests {
             assert_eq!(coverage_for(&after, "trained"), Some(compacted(shard, 10)));
         }
 
-        fn apply_on_empty_read(writer: Option<WriterVersion>) -> Vec<IndexMetadata> {
-            let shard = Uuid::new_v4();
-            let read = table(&[], Uuid::new_v4(), progress(shard, 5));
-            let mut after = read.clone();
-            let mut manifest = manifest_with(&[]);
-            manifest.writer_version = writer;
-            Transaction::apply_mem_wal_index_coverage(
-                &mut after,
-                &Transaction::logical_index_segments(&read),
-                Some(ReadVersionState {
-                    manifest: &manifest,
-                    indices: &read,
-                }),
-                2,
-            )
-            .unwrap();
-            after
-        }
-
-        fn lance_writer(version: &str) -> Option<WriterVersion> {
-            Some(WriterVersion {
-                library: "lance".to_string(),
-                version: version.to_string(),
-                prerelease: None,
-                build_metadata: None,
-            })
-        }
-
         /// Every row deleted leaves no fragments. Refusing to credit that
         /// retained the SSTables forever, so a checkpoint never returned.
         #[test]
-        fn an_emptied_table_from_a_current_writer_is_credited() {
-            let after = apply_on_empty_read(lance_writer("14.0.0"));
-            let coverage = coverage_for(&after, "idx").expect("credited");
-            assert_eq!(coverage.len(), 1);
-            assert_eq!(coverage[0].generation, 5);
-        }
-
-        /// Before #8438 an `UpdateMemWalState` commit published no fragments,
-        /// leaving the SSTables as the last copy of the rows.
-        #[test]
-        fn an_empty_manifest_from_a_pre_fix_writer_is_not_credited() {
-            let after = apply_on_empty_read(lance_writer("11.0.0"));
-            assert_eq!(coverage_for(&after, "idx"), None);
-        }
-
-        #[test]
-        fn an_empty_manifest_from_an_unknown_writer_is_not_credited() {
-            assert_eq!(coverage_for(&apply_on_empty_read(None), "idx"), None);
-            let other = Some(WriterVersion {
-                library: "pylance-fork".to_string(),
-                version: "99.0.0".to_string(),
-                prerelease: None,
-                build_metadata: None,
-            });
-            assert_eq!(coverage_for(&apply_on_empty_read(other), "idx"), None);
+        fn an_emptied_table_is_credited() {
+            let shard = Uuid::new_v4();
+            let read = table(&[], Uuid::new_v4(), progress(shard, 5));
+            let mut after = read.clone();
+            apply(&mut after, &read, &[], &read).unwrap();
+            assert_eq!(coverage_for(&after, "idx"), Some(compacted(shard, 5)));
         }
 
         /// Shards move independently within one index: one advances on this
