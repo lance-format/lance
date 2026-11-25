@@ -532,7 +532,7 @@ impl<'a> RabitDistCalculator<'a> {
             self.accumulate_raw_query_multi_bit_row(
                 &ctx,
                 row.ex_index as usize,
-                row.row_id,
+                || Some(row.row_id),
                 row.binary_ip,
                 row.lower_bound,
                 res,

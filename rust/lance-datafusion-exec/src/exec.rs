@@ -540,15 +540,28 @@ impl LanceExecutionOptions {
     }
 }
 
+/// Session-config extension holding the `target_partitions` a session was left
+/// with because [`LanceExecutionOptions::target_partition`] was not set.
+///
+/// The default equals the core count, so the value alone cannot tell an
+/// implicit default from an explicit limit of that size. A config whose
+/// `target_partitions` differs from the held value was changed afterwards.
+#[derive(Debug)]
+pub struct DefaultTargetPartitions(pub usize);
+
 /// Builds the session config for executing plans with `options`.
 ///
 /// This ignores [`LanceExecutionOptions::batch_size`], which applies to one
 /// execution rather than to a session.
 pub fn new_session_config(options: &LanceExecutionOptions) -> SessionConfig {
     let mut session_config = SessionConfig::new();
-    if let Some(target_partition) = options.target_partition {
-        session_config = session_config.with_target_partitions(target_partition);
-    }
+    session_config = match options.target_partition {
+        Some(target_partition) => session_config.with_target_partitions(target_partition),
+        None => {
+            let default = DefaultTargetPartitions(session_config.target_partitions());
+            session_config.with_extension(Arc::new(default))
+        }
+    };
     if options.use_spilling() {
         // Reserve sort/merge headroom for each spillable sort, using up to 40 MiB
         // instead of DataFusion's 10 MiB default. Limit it to one third of the pool
@@ -1404,6 +1417,19 @@ mod tests {
         ));
         // The batch size applies to one execution, not to the session config.
         assert_ne!(new_session_config(&options).batch_size(), 17);
+        // Only a session whose target_partitions nobody set is marked as default.
+        assert!(
+            new_session_config(&options)
+                .get_extension::<DefaultTargetPartitions>()
+                .is_none()
+        );
+        let default_config = new_session_config(&LanceExecutionOptions::default());
+        assert_eq!(
+            default_config
+                .get_extension::<DefaultTargetPartitions>()
+                .map(|default| default.0),
+            Some(default_config.target_partitions())
+        );
 
         let zero_batch_size = LanceExecutionOptions {
             batch_size: Some(0),

@@ -112,10 +112,18 @@ async fn test_load_indices() {
         )
         .await
         .unwrap();
-    dataset.object_store.as_ref().io_stats_incremental(); // Reset
+    dataset
+        .table_state
+        .object_store
+        .as_ref()
+        .io_stats_incremental(); // Reset
 
     let indices = dataset.load_indices().await.unwrap();
-    let stats = dataset.object_store.as_ref().io_stats_incremental();
+    let stats = dataset
+        .table_state
+        .object_store
+        .as_ref()
+        .io_stats_incremental();
     // We should already have this cached since we just wrote it.
     assert_io_eq!(stats, read_iops, 0);
     assert_io_eq!(stats, read_bytes, 0);
@@ -130,13 +138,21 @@ async fn test_load_indices() {
         .load()
         .await
         .unwrap();
-    let stats = dataset2.object_store.as_ref().io_stats_incremental(); // Reset
+    let stats = dataset2
+        .table_state
+        .object_store
+        .as_ref()
+        .io_stats_incremental(); // Reset
     assert_io_lt!(stats, read_bytes, 64 * 1024);
 
     // Because the manifest is so small, we should have opportunistically
     // cached the indices in memory already.
     let indices2 = dataset2.load_indices().await.unwrap();
-    let stats = dataset2.object_store.as_ref().io_stats_incremental();
+    let stats = dataset2
+        .table_state
+        .object_store
+        .as_ref()
+        .io_stats_incremental();
     assert_io_eq!(stats, read_iops, 0);
     assert_io_eq!(stats, read_bytes, 0);
     assert_eq!(indices2.len(), 1);
@@ -213,8 +229,8 @@ async fn test_index_metadata_cache_does_not_survive_drop_recreate_same_uri() {
     assert_eq!(second_dataset.version().version, 2);
 
     let raw_second_indices = read_manifest_indexes(
-        second_dataset.object_store.as_ref(),
-        &second_dataset.manifest_location,
+        second_dataset.table_state.object_store.as_ref(),
+        &second_dataset.table_state.manifest_location,
         second_dataset.manifest(),
     )
     .await
@@ -395,8 +411,8 @@ async fn test_legacy_vector_index_details_inferred_on_load_and_migration() {
     dataset.index_cache.clear().await;
     let metadata_key = crate::session::index_caches::IndexMetadataKey {
         version: dataset.version().version,
-        store_identity: &dataset.object_store.store_prefix,
-        e_tag: dataset.manifest_location.e_tag.as_deref(),
+        store_identity: &dataset.table_state.object_store.store_prefix,
+        e_tag: dataset.table_state.manifest_location.e_tag.as_deref(),
     };
     dataset
         .index_cache
@@ -496,9 +512,13 @@ async fn test_auto_heal_persists_cleaned_bitmap() {
 
     // Sanity: the on-disk fixture has at least one straddling segment.
     let pre = Dataset::open(&uri).await.unwrap();
-    let raw_pre = read_manifest_indexes(&pre.object_store, &pre.manifest_location, &pre.manifest)
-        .await
-        .unwrap();
+    let raw_pre = read_manifest_indexes(
+        &pre.table_state.object_store,
+        &pre.table_state.manifest_location,
+        &pre.manifest,
+    )
+    .await
+    .unwrap();
     let cleaned = pre.load_indices().await.unwrap();
     let any_changed = raw_pre
         .iter()
@@ -517,8 +537,8 @@ async fn test_auto_heal_persists_cleaned_bitmap() {
     // Reopen and read raw manifest indices: cleaned bitmaps now persisted.
     let healed = Dataset::open(&uri).await.unwrap();
     let raw_post = read_manifest_indexes(
-        &healed.object_store,
-        &healed.manifest_location,
+        &healed.table_state.object_store,
+        &healed.table_state.manifest_location,
         &healed.manifest,
     )
     .await
@@ -598,7 +618,7 @@ async fn test_a_pre_rotation_cache_entry_is_not_consulted() {
         .insert_with_key(
             &PreRotationIndexMetadataKey {
                 version: dataset.version().version,
-                store_identity: &dataset.object_store.store_prefix,
+                store_identity: &dataset.table_state.object_store.store_prefix,
             },
             Arc::new(as_a_released_build_would_cache_it),
         )
@@ -674,8 +694,8 @@ async fn test_query_listing_retries_failed_legacy_inference() {
     dataset.index_cache.clear().await;
     let raw_key = IndexMetadataKey {
         version: dataset.manifest.version,
-        store_identity: &dataset.object_store.store_prefix,
-        e_tag: dataset.manifest_location.e_tag.as_deref(),
+        store_identity: &dataset.table_state.object_store.store_prefix,
+        e_tag: dataset.table_state.manifest_location.e_tag.as_deref(),
     };
     dataset
         .index_cache
@@ -730,7 +750,7 @@ async fn test_query_listing_is_not_cached_without_a_generation_token() {
         )
         .await
         .unwrap();
-    dataset.manifest_location.e_tag = None;
+    dataset.table_state.manifest_location.e_tag = None;
 
     let first = dataset.load_indices().await.unwrap();
     let second = dataset.load_indices().await.unwrap();
@@ -739,7 +759,7 @@ async fn test_query_listing_is_not_cached_without_a_generation_token() {
     assert_eq!(first[0].uuid, second[0].uuid);
     let query_key = QueryIndexListingKey(DerivedIndexListingKey {
         version: dataset.manifest.version,
-        store_identity: &dataset.object_store.store_prefix,
+        store_identity: &dataset.table_state.object_store.store_prefix,
         e_tag: None,
     });
     assert!(
@@ -776,7 +796,7 @@ async fn test_query_listing_ignores_stale_entry_without_a_generation_token() {
         .await
         .unwrap();
     let expected_uuid = dataset.load_indices().await.unwrap()[0].uuid;
-    dataset.manifest_location.e_tag = None;
+    dataset.table_state.manifest_location.e_tag = None;
     // Warm the raw metadata layer so the entry count below isolates the query
     // listing: that lower cache is keyed independently and is not this test's
     // subject.
@@ -786,7 +806,7 @@ async fn test_query_listing_ignores_stale_entry_without_a_generation_token() {
 
     let query_key = QueryIndexListingKey(DerivedIndexListingKey {
         version: dataset.manifest.version,
-        store_identity: &dataset.object_store.store_prefix,
+        store_identity: &dataset.table_state.object_store.store_prefix,
         e_tag: None,
     });
     dataset

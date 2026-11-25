@@ -248,6 +248,7 @@ impl DatasetIndexRemapper {
             let intermediate_dir = self.dataset.indices_dir().join(remapped.new_id.to_string());
             if let Err(error) = self
                 .dataset
+                .table_state
                 .object_store
                 .remove_dir_all(intermediate_dir)
                 .await
@@ -397,10 +398,13 @@ pub(crate) fn dataset_format_version(dataset: &Dataset) -> ConcreteFileVersion {
 impl LanceIndexStoreExt for LanceIndexStore {
     fn from_dataset_for_new(dataset: &Dataset, uuid: &Uuid) -> Result<Self> {
         let index_dir = dataset.indices_dir().join(uuid.to_string());
-        let cache = dataset.metadata_cache.file_metadata_cache(&index_dir);
+        let cache = dataset
+            .table_state
+            .metadata_cache
+            .file_metadata_cache(&index_dir);
         let format_version = dataset_format_version(dataset);
         Ok(Self::with_format_version(
-            dataset.object_store.clone(),
+            dataset.table_state.object_store.clone(),
             index_dir,
             Arc::new(cache),
             format_version,
@@ -411,7 +415,10 @@ impl LanceIndexStoreExt for LanceIndexStore {
         let index_dir = dataset
             .indice_files_dir(index)?
             .join(index.uuid.to_string());
-        let cache = dataset.metadata_cache.file_metadata_cache(&index_dir);
+        let cache = dataset
+            .table_state
+            .metadata_cache
+            .file_metadata_cache(&index_dir);
         let format_version = dataset_format_version(dataset);
         let object_store = dataset.object_store_for_index(index).await?;
         let store =
@@ -587,6 +594,7 @@ mod tests {
         let second_segment_dir = dataset.indices_dir().join(second_segment_uuid.to_string());
         for file_name in ["index.idx", "auxiliary.idx"] {
             dataset
+                .table_state
                 .object_store
                 .as_ref()
                 .copy(
@@ -816,8 +824,8 @@ mod tests {
         dataset.index_cache.clear().await;
         let metadata_key = crate::session::index_caches::IndexMetadataKey {
             version: dataset.version().version,
-            store_identity: &dataset.object_store.store_prefix,
-            e_tag: dataset.manifest_location.e_tag.as_deref(),
+            store_identity: &dataset.table_state.object_store.store_prefix,
+            e_tag: dataset.table_state.manifest_location.e_tag.as_deref(),
         };
         dataset
             .index_cache

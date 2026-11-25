@@ -87,7 +87,11 @@ impl MergeInsertBuilder {
         })
     }
 
-    /// Specify what should happen when a target row matches a row in the source
+    /// Specify what should happen when a target row matches a row in the source.
+    ///
+    /// Updates may omit target fields, but any supplied list must include all
+    /// of its item fields. Partial list item schemas are rejected because their
+    /// offsets and validity cannot safely be updated independently.
     pub fn when_matched(&mut self, behavior: WhenMatched) -> &mut Self {
         self.params.when_matched = behavior;
         self
@@ -149,9 +153,9 @@ impl MergeInsertBuilder {
     ///
     /// This is the maximum time to spend on the operation before giving up. At
     /// least one attempt will be made, regardless of how long it takes to complete.
-    /// Subsequent attempts will be cancelled once this timeout is reached. If
-    /// the timeout has been reached during the first attempt, the operation
-    /// will be cancelled immediately.
+    /// On later attempts, execution and backoff are cancelled once this timeout
+    /// is reached and no new commit is started, but a commit that has already
+    /// started finishes and its result is returned.
     ///
     /// The default is 30 seconds.
     pub fn retry_timeout(&mut self, timeout: Duration) -> &mut Self {

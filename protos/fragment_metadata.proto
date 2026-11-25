@@ -36,7 +36,7 @@ message DataFragment {
    * first row is row 1, the second row is row 42, and the third row is row 3.
    */
   oneof row_id_sequence {
-    // Current Lance writers store row ids inline regardless of encoded size.
+    // Serialized row IDs stored directly in the fragment metadata.
     bytes inline_row_ids = 5;
     /* The row ids are a hidden column of one of this fragment's `files`: the
      * entry whose `fields` carries the reserved id -3. See RowLineageColumn.
@@ -50,7 +50,7 @@ message DataFragment {
   } // row_id_sequence
 
   oneof last_updated_at_version_sequence {
-    // Current Lance writers store last-updated versions inline regardless of encoded size.
+    // Serialized last-updated versions stored directly in the fragment metadata.
     bytes inline_last_updated_at_versions = 7;
     /* The versions are a hidden column of one of this fragment's `files`: the
      * entry whose `fields` carries the reserved id -5. Gated like
@@ -60,7 +60,7 @@ message DataFragment {
   } // last_updated_at_version_sequence
 
   oneof created_at_version_sequence {
-    // Current Lance writers store created-at versions inline regardless of encoded size.
+    // Serialized created-at versions stored directly in the fragment metadata.
     bytes inline_created_at_versions = 9;
     /* The versions are a hidden column of one of this fragment's `files`: the
      * entry whose `fields` carries the reserved id -4. Gated like
@@ -292,7 +292,7 @@ message DeletionFile {
    * are densely deleted rows, then BITMAP is the most efficient.
    */
   enum DeletionFileType {
-    /* A single Int32Array of deleted row offsets, stored as an Arrow IPC file with one batch and
+    /* A single UInt32Array of deleted row offsets, stored as an Arrow IPC file with one batch and
      * one column. Has a .arrow extension.
      */
     ARROW_ARRAY = 0;

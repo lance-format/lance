@@ -251,8 +251,9 @@ impl Scanner {
         }
         if !stale_rows.is_empty() {
             // A take by address applies no filter, so the whole plan runs here
-            let mut plan =
-                self.row_ids_take(stale_rows.result_rows().await?.clone(), scan_projection)?;
+            let mut plan = self
+                .row_addrs_take(stale_rows.physical_selection(), scan_projection)
+                .await?;
             if let Some(filter) = filter_plan.full_expr.as_ref() {
                 let planner = Planner::new(plan.schema());
                 let filter = planner.optimize_expr(filter.clone())?;
