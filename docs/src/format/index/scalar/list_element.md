@@ -32,8 +32,13 @@ byte strings in an ordinary [BTree](btree.md) over a `Binary` column, the
 %%% proto.message.ListElementIndexDetails %%%
 ```
 
-`IndexMetadata.fields` holds the single `list<struct>` field the index is built
-on, which may be a `List` or a `LargeList` of a `Struct`.
+`IndexMetadata.fields` holds the `list<struct>` field the index is built on,
+which may be a `List` or a `LargeList` of a `Struct`, followed by the IDs in
+`key_field_ids` in the same order. The list field is the index's only query
+input. The key fields are recorded as dependencies, so a schema change that
+drops a key field removes the index, as it does for any indexed field. A reader
+must not use an index whose `IndexMetadata.fields` does not list every key
+field.
 
 `key_field_ids` identifies the key fields, in key order, by their field IDs
 (`file.Field.id`), following the [field-reference
@@ -60,12 +65,12 @@ have one of these logical types:
 
 Before using the index, a reader resolves each ID in `key_field_ids` against
 the current schema. The field must exist, must be a direct child of the element
-struct of the column in `IndexMetadata.fields`, and must have the logical type
-recorded in `key_types`. The reader then refers to each key field by its
-current name, so the index follows a rename, including one that gives a key's
-old name to another field. If any key field fails these checks, because it was
-dropped, moved or changed type, the reader must not use the index and evaluates
-the filter on the data instead.
+struct of the list field, the first entry of `IndexMetadata.fields`, and must
+have the logical type recorded in `key_types`. The reader then refers to each
+key field by its current name, so the index follows a rename, including one that
+gives a key's old name to another field. If any key field fails these checks,
+because it was dropped, moved or changed type, the reader must not use the index
+and evaluates the filter on the data instead.
 
 `key_encoding` is `LIST_ELEMENT_KEY_ENCODING_ARROW_ROW_V1`, the encoding
 defined in [Key Encoding](#key-encoding). A reader must not use an index whose

@@ -16,6 +16,7 @@ use roaring::RoaringBitmap;
 
 use crate::dataset::cleanup::auto_cleanup_hook;
 use crate::dataset::index::frag_reuse::derive_superseded_segments;
+use crate::index::field_dependencies::input_field_ids;
 use crate::index::frag_reuse_reader::segment_supports_batch_remapping;
 use crate::index::frag_reuse_with_stable_row_ids::validate_stable_row_id_user_indices;
 use crate::index::loading::DatasetIndexInternalExt;
@@ -69,15 +70,19 @@ impl CommitIndexHook for LanceCommitHook {
         table: &Table,
         index: &IndexMetadata,
     ) -> Result<RoaringBitmap> {
-        let field = index
-            .keyed_field()
-            .and_then(|id| table.schema().field_by_id(id))
-            .ok_or_else(|| {
-                Error::internal(format!(
-                    "Cannot recover coverage of index {} with keyed fields {:?}",
-                    index.uuid, index.fields,
-                ))
-            })?;
+        // Additional dependencies and carried columns do not change the one
+        // query input used to recover the bitmap.
+        let inputs = input_field_ids(index)?;
+        let field = match inputs.as_ref() {
+            [id] => table.schema().field_by_id(*id),
+            _ => None,
+        }
+        .ok_or_else(|| {
+            Error::internal(format!(
+                "Cannot recover coverage of index {} with keyed fields {:?}",
+                index.uuid, index.fields,
+            ))
+        })?;
         let dataset = self.dataset(table);
         let index = dataset
             .open_generic_index(&field.name, &index.uuid, &NoOpMetricsCollector)
