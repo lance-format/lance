@@ -7,6 +7,8 @@ use crate::index::tests::support::*;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use crate::dataset::transaction::{Operation, Transaction};
+use crate::index::field_dependencies::input_field_ids;
 use crate::utils::test::serializing_cache::SerializingCacheBackend;
 use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount, copy_test_data_to_tmp};
 use all_asserts::assert_ge;
@@ -419,6 +421,158 @@ async fn test_initialize_list_element_uses_target_dependency_ids() {
             .get_index("objects")
             .is_some()
     );
+}
+
+/// A table with a B-tree on `id` and a list-element index on `objects` in the
+/// layout experimental releases committed: `fields` holds only the list column,
+/// while the details record the key field IDs this build declares as
+/// dependencies, so the declaration no longer resolves.
+async fn dataset_with_legacy_list_element_index() -> Dataset {
+    let mut dataset = list_element_dependency_dataset(true).await;
+    dataset
+        .create_index(
+            &["id"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::for_builtin(BuiltinIndexType::BTree),
+            false,
+        )
+        .await
+        .unwrap();
+    let params = ScalarIndexParams::new("listelement".to_string())
+        .with_params(&serde_json::json!({"keys": ["key"]}));
+    dataset
+        .create_index(&["objects"], IndexType::Scalar, None, &params, false)
+        .await
+        .unwrap();
+    let current = dataset.load_indices_by_name("objects_idx").await.unwrap();
+    let list_field = dataset.schema().field("objects").unwrap().id;
+    let legacy = current
+        .iter()
+        .map(|segment| IndexMetadata {
+            fields: vec![list_field],
+            ..segment.clone()
+        })
+        .collect::<Vec<_>>();
+    assert!(input_field_ids(&legacy[0]).is_err());
+    let transaction = Transaction::new(
+        dataset.manifest.version,
+        Operation::CreateIndex {
+            new_indices: legacy,
+            removed_indices: current,
+        },
+        None,
+    );
+    dataset
+        .apply_commit(transaction, &Default::default(), &Default::default())
+        .await
+        .unwrap();
+    dataset
+}
+
+#[tokio::test]
+async fn test_legacy_list_element_index_stays_listed_and_droppable() {
+    let mut dataset = dataset_with_legacy_list_element_index().await;
+    let schema = dataset.schema();
+    let expected = vec![
+        (
+            "id_idx".to_string(),
+            vec![schema.field("id").unwrap().id as u32],
+        ),
+        (
+            "objects_idx".to_string(),
+            vec![schema.field("objects").unwrap().id as u32],
+        ),
+    ];
+    let described = dataset.describe_indices(None).await.unwrap();
+    let described = described
+        .iter()
+        .map(|index| (index.name().to_string(), index.field_ids().to_vec()))
+        .collect::<Vec<_>>();
+    assert_eq!(described, expected);
+    let by_name = dataset
+        .describe_indices(Some(
+            lance_index::IndexCriteria::default().with_name("objects_idx"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(by_name.len(), 1);
+    // It is not offered as an index for its column.
+    let for_column = dataset
+        .describe_indices(Some(
+            lance_index::IndexCriteria::default().for_column("objects"),
+        ))
+        .await
+        .unwrap();
+    assert!(for_column.is_empty());
+
+    dataset.drop_index("objects_idx").await.unwrap();
+    let remaining = dataset.describe_indices(None).await.unwrap();
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].name(), "id_idx");
+}
+
+#[tokio::test]
+async fn test_legacy_list_element_index_does_not_block_index_creation() {
+    let mut dataset = dataset_with_legacy_list_element_index().await;
+    let btree = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree);
+    let created = dataset
+        .create_index(&["padding"], IndexType::BTree, None, &btree, false)
+        .await
+        .unwrap();
+    assert_eq!(created.name, "padding_idx");
+    // The legacy index still owns its name.
+    let error = dataset
+        .create_index(
+            &["padding"],
+            IndexType::BTree,
+            Some("objects_idx".to_string()),
+            &btree,
+            true,
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("already exists"), "{error}");
+}
+
+#[tokio::test]
+async fn test_legacy_list_element_index_does_not_block_column_lookup() {
+    let dataset = dataset_with_legacy_list_element_index().await;
+    // Lookups for other columns pass over the legacy index.
+    let unindexed = dataset
+        .load_scalar_index(lance_index::IndexCriteria::default().for_column("padding"))
+        .await
+        .unwrap();
+    assert!(unindexed.is_none());
+}
+
+#[tokio::test]
+async fn test_legacy_list_element_index_does_not_block_maintenance() {
+    let mut dataset = dataset_with_legacy_list_element_index().await;
+    let batch = dataset.scan().try_into_batch().await.unwrap();
+    dataset
+        .append(
+            arrow_array::RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+            None,
+        )
+        .await
+        .unwrap();
+    dataset
+        .optimize_indices(&lance_index::optimize::OptimizeOptions::default())
+        .await
+        .unwrap();
+    crate::dataset::optimize::compact_files(
+        &mut dataset,
+        crate::dataset::optimize::CompactionOptions::default(),
+        None,
+    )
+    .await
+    .unwrap();
+    let id_index = dataset
+        .load_scalar_index(lance_index::IndexCriteria::default().for_column("id"))
+        .await
+        .unwrap();
+    assert_eq!(id_index.map(|index| index.name), Some("id_idx".to_string()));
 }
 
 #[tokio::test]

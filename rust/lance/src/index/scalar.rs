@@ -1161,7 +1161,8 @@ pub fn index_matches_criteria(
 
     if let Some(for_column) = criteria.for_column {
         // Carried columns and additional dependencies do not add query inputs.
-        if input_field_ids(index)?.len() != 1 {
+        // An index whose declaration does not resolve answers for no column.
+        if !input_field_ids(index).is_ok_and(|inputs| inputs.len() == 1) {
             return Ok(false);
         }
         if fields.len() != 1 {

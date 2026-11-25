@@ -242,10 +242,6 @@ impl<'a> CreateIndexBuilder<'a> {
         // manifest carries: one this build cannot read still owns its name, and
         // handing that name out again commits two indices under it.
         let indices = load_all_indices(self.dataset).await?;
-        let input_fields = indices
-            .iter()
-            .map(|index| Ok((index.uuid, input_field_ids(index)?.into_owned())))
-            .collect::<Result<HashMap<_, _>>>()?;
         // These always store row ids, so refuse them before training.
         let index_kind = if self.index_type.is_vector() {
             Some("vector")
@@ -414,11 +410,10 @@ impl<'a> CreateIndexBuilder<'a> {
             let mut candidate = base_name.clone();
             let mut counter = 2; // Start with no suffix, then use _2, _3, ...
             while indices.iter().any(|idx| {
-                // A covered index still names the same column by its keyed
-                // prefix; only that prefix decides whether this is "the same
-                // field", not the full `fields` vector including carried
-                // columns.
-                let different_field = input_fields[&idx.uuid].as_slice() != [field.id];
+                // Only the query inputs decide whether this is "the same
+                // field", not the full `fields` vector including dependencies
+                // and carried columns.
+                let different_field = !indexes_field(idx, field.id);
                 idx.name == candidate
                     && (different_field || !index_matches_type(idx, self.index_type, self.params))
             }) {
@@ -432,9 +427,9 @@ impl<'a> CreateIndexBuilder<'a> {
             .filter(|idx| idx.name == index_name)
             .collect::<Vec<_>>();
         if existing_named_indices.iter().any(|idx| {
-            // Same rule as above: the keyed prefix decides identity, not the
+            // Same rule as above: the query inputs decide identity, not the
             // full `fields` vector.
-            input_fields[&idx.uuid].as_slice() != [field.id]
+            !indexes_field(idx, field.id)
         }) {
             return Err(Error::index(format!(
                 "Index name '{index_name}' already exists with different fields, \
@@ -853,10 +848,6 @@ impl<'a> CreateIndexBuilder<'a> {
         };
 
         let indices = load_all_indices(self.dataset).await?;
-        let input_fields = indices
-            .iter()
-            .map(|index| Ok((index.uuid, input_field_ids(index)?.into_owned())))
-            .collect::<Result<HashMap<_, _>>>()?;
         // Matches execute_uncommitted. Unobservable here, since the only caller
         // consumes the builder.
         let index_name = if let Some(name) = self.name.as_deref() {
@@ -869,7 +860,7 @@ impl<'a> CreateIndexBuilder<'a> {
             while indices.iter().any(|idx| {
                 // Same name-collision rule as `execute_uncommitted_impl`'s
                 // default-name loop above in this file.
-                let different_field = input_fields[&idx.uuid].as_slice() != [field.id];
+                let different_field = !indexes_field(idx, field.id);
                 idx.name == candidate
                     && (different_field || !index_matches_type(idx, self.index_type, self.params))
             }) {
@@ -883,9 +874,9 @@ impl<'a> CreateIndexBuilder<'a> {
             .filter(|idx| idx.name == index_name)
             .collect::<Vec<_>>();
         if existing_named_indices.iter().any(|idx| {
-            // Same rule as above: the keyed prefix decides identity, not the
+            // Same rule as above: the query inputs decide identity, not the
             // full `fields` vector.
-            input_fields[&idx.uuid].as_slice() != [field.id]
+            !indexes_field(idx, field.id)
         }) {
             return Err(Error::index(format!(
                 "Index name '{index_name}' already exists with different fields, \
@@ -1068,6 +1059,13 @@ impl<'a> CreateIndexBuilder<'a> {
         observed.finish();
         Ok(committed)
     }
+}
+
+/// Whether `index` answers queries on `field_id` alone. An index whose
+/// declaration this build cannot resolve answers for no field, but it still
+/// holds its name.
+fn indexes_field(index: &IndexMetadata, field_id: i32) -> bool {
+    input_field_ids(index).is_ok_and(|inputs| inputs.as_ref() == [field_id])
 }
 
 /// Returns true if an existing `IndexMetadata` matches the given type

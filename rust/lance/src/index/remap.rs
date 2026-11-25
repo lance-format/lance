@@ -116,7 +116,18 @@ pub(crate) async fn remap_index(
 
     // Additional dependency fields do not make an index composite. Remapping
     // still requires one operational input after resolving the plugin declaration.
-    let input_fields = input_field_ids(matched)?;
+    // A declaration that does not resolve is withdrawn like an index that cannot
+    // be opened below, rather than blocking compaction of the whole table.
+    let input_fields = match input_field_ids(matched) {
+        Ok(fields) => fields,
+        Err(error) => {
+            log::warn!(
+                "Index '{}' cannot be used: {error}, so it is not remapped. Rebuild the index.",
+                matched.name,
+            );
+            return Ok(RemapResult::Drop);
+        }
+    };
     if input_fields.len() > 1 {
         return Err(Error::index(format!(
             "Remapping index '{}' is not supported: it has {} keyed fields {:?}; \

@@ -3,7 +3,7 @@
 
 //! Index descriptions and serialized index statistics.
 
-use super::field_dependencies::input_field_ids;
+use super::field_dependencies::described_field_ids;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
@@ -189,7 +189,7 @@ impl IndexDescriptionImpl {
         // `_default_vector_index_for_column` matches on membership of it, so
         // including a carried column here would hand back the keyed column's IVF
         // model for a query about the carried one.
-        let field_ids_vec: Vec<u32> = input_field_ids(example_metadata)?
+        let field_ids_vec: Vec<u32> = described_field_ids(example_metadata)
             .iter()
             .map(|id| *id as u32)
             .collect();

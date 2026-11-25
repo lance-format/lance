@@ -5,6 +5,11 @@
 //!
 //! Transactions use the persisted declaration without consulting plugins. Only
 //! operations that route index input columns use the resolver below.
+//!
+//! A declaration can fail to resolve, for example one committed by an
+//! experimental release before dependencies were persisted. Operations on that
+//! index fail, but table-wide operations pass over it: it answers for no
+//! column, still holds its name, and stays listed so that it can be dropped.
 
 use std::borrow::Cow;
 use std::collections::HashSet;
@@ -25,6 +30,19 @@ pub fn input_field_ids(index: &IndexMetadata) -> Result<Cow<'_, [i32]>> {
         &index.covering_fields,
         index.index_details.as_deref(),
     )
+}
+
+/// The fields an index is listed under: its query inputs or, when its
+/// declaration does not resolve, the keyed fields it was committed with.
+pub fn described_field_ids(index: &IndexMetadata) -> Cow<'_, [i32]> {
+    input_field_ids(index).unwrap_or_else(|error| {
+        log::warn!(
+            "Index '{}' ({}) cannot be used, so it is described by its declared fields: {error}",
+            index.name,
+            index.uuid,
+        );
+        Cow::Borrowed(index.keyed_fields())
+    })
 }
 
 /// Resolve a staged segment's declaration using the same rules as its metadata.

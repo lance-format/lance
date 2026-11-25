@@ -8,7 +8,7 @@
 //! optimize entry. Low-level source freshness lives in `provenance`; opening
 //! and cache behavior lives in `loading`.
 
-use super::field_dependencies::{input_field_ids, input_field_ids_for};
+use super::field_dependencies::{described_field_ids, input_field_ids, input_field_ids_for};
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
@@ -779,14 +779,7 @@ impl DatasetIndexExt for Dataset {
                 // passing the carried columns too would push its length past one
                 // and silently drop every covered index from a filtered
                 // describe.
-                let input_fields = match input_field_ids(idx) {
-                    Ok(fields) => fields,
-                    Err(error) => {
-                        log::warn!("Could not describe index {}: {error}", idx.name);
-                        return false;
-                    }
-                };
-                let fields = input_fields
+                let fields = described_field_ids(idx)
                     .iter()
                     .filter_map(|id| self.schema().field_by_id(*id))
                     .collect::<Vec<_>>();
