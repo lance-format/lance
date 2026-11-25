@@ -105,6 +105,7 @@ public class ScannerTest {
     assertEquals(64 * 1024L, options.getBatchSizeBytes().orElseThrow());
     assertEquals(8 * 1024 * 1024L, options.getIoBufferSize().orElseThrow());
     assertEquals(4, options.getBatchReadahead());
+    assertEquals(4, new ScanOptions.Builder(options).build().getBatchReadahead());
     assertEquals(2, options.getFragmentReadahead().orElseThrow());
     assertFalse(options.isScanInOrder());
     assertEquals(materialization, options.getLateMaterialization().orElseThrow());
@@ -115,6 +116,10 @@ public class ScannerTest {
     assertEquals(Collections.singletonList("name"), materialization.getColumns());
 
     ScanOptions defaults = new ScanOptions.Builder().build();
+    assertEquals(0, defaults.getBatchReadahead());
+    assertEquals(0, new ScanOptions.Builder(defaults).build().getBatchReadahead());
+    assertThrows(
+        IllegalArgumentException.class, () -> new ScanOptions.Builder().batchReadahead(0).build());
     assertTrue(defaults.getBatchSizeBytes().isEmpty());
     assertTrue(defaults.getIoBufferSize().isEmpty());
     assertTrue(defaults.getFragmentReadahead().isEmpty());

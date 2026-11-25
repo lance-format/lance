@@ -568,7 +568,10 @@ pub(crate) fn build_scanner_with_options<'a>(
         scanner.fast_search();
     }
 
-    scanner.batch_readahead(options.batch_readahead as usize);
+    // Java passes zero when the caller leaves readahead to the native scanner.
+    if options.batch_readahead > 0 {
+        scanner.batch_readahead(options.batch_readahead as usize);
+    }
 
     let fragment_readahead_opt = env.get_int_opt(&options.fragment_readahead_obj)?;
     if let Some(fragment_readahead) = fragment_readahead_opt {

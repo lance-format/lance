@@ -28,6 +28,18 @@ from lance.progress import FileSystemFragmentWriteProgress
 from pyarrow.fs import FileInfo, FileType
 
 
+@pytest.mark.parametrize("options, expected", [({}, None), ({"batch_readahead": 3}, 3)])
+@pytest.mark.parametrize("method", ["scanner", "to_batches"])
+def test_fragment_batch_readahead(tmp_path, method, options, expected):
+    ds = write_dataset(pa.table({"a": [1, 2]}), tmp_path)
+    fragment = ds.get_fragments()[0]
+    with mock.patch.object(fragment, "_fragment", wraps=fragment._fragment) as native:
+        result = getattr(fragment, method)(**options)
+        batches = result.to_batches() if method == "scanner" else result
+        assert pa.Table.from_batches(list(batches)).column("a").to_pylist() == [1, 2]
+        assert native.scanner.call_args.kwargs["batch_readahead"] == expected
+
+
 def test_write_fragment(tmp_path: Path):
     with pytest.raises(OSError):
         LanceFragment.create(tmp_path, pd.DataFrame([]))
