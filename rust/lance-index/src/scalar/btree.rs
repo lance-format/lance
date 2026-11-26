@@ -1207,12 +1207,16 @@ impl BTreeLookup {
         };
         // Bounds become 1-row arrays of the column type so arrow's type-dispatched
         // comparator can compare them against the `min`/`max` columns. The bounds
-        // of a LIKE prefix on a dictionary column are plain strings, so they are
-        // cast to the dictionary type of the statistics.
+        // of a LIKE prefix on a dictionary column are plain values of the
+        // dictionary's value type, so only those are wrapped in the dictionary
+        // type of the statistics. Any other mismatched bound is left as is and
+        // the comparator rejects it.
         let bound_array = |value: &OrderableScalarValue| -> Result<ArrayRef> {
             let array = value.0.to_array_of_size(1)?;
             match mins.data_type() {
-                DataType::Dictionary(_, _) if array.data_type() != mins.data_type() => {
+                DataType::Dictionary(_, value_type)
+                    if !value.0.is_null() && array.data_type() == value_type.as_ref() =>
+                {
                     Ok(cast(&array, mins.data_type())?)
                 }
                 _ => Ok(array),
@@ -5914,21 +5918,15 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_like_prefix_search_dictionary() {
-        use arrow_array::{DictionaryArray, types::Int16Type};
-
+    /// Trains a BTree index with two values per page over sorted dictionary values.
+    async fn train_dictionary_btree(values: ArrayRef) -> (TempObjDir, Arc<BTreeIndex>) {
         let tmpdir = TempObjDir::default();
         let test_store = Arc::new(LanceIndexStore::new(
             Arc::new(ObjectStore::local()),
             tmpdir.clone(),
             Arc::new(LanceCache::no_cache()),
         ));
-
-        // Sorted, with two values per page, so the prefix prunes pages.
-        let values: DictionaryArray<Int16Type> = vec!["app", "apple", "application", "banana"]
-            .into_iter()
-            .collect();
+        let num_rows = values.len();
         let schema = Arc::new(Schema::new(vec![
             Field::new("value", values.data_type().clone(), false),
             Field::new("_rowaddr", DataType::UInt64, false),
@@ -5936,21 +5934,37 @@ mod tests {
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
-                Arc::new(values),
-                Arc::new(arrow_array::UInt64Array::from_iter_values(0..4)),
+                values,
+                Arc::new(arrow_array::UInt64Array::from_iter_values(
+                    0..num_rows as u64,
+                )),
             ],
         )
         .unwrap();
-        let stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
-            schema,
-            stream::iter(vec![Ok(batch.slice(0, 2)), Ok(batch.slice(2, 2))]),
-        ));
+        let batches = (0..num_rows)
+            .step_by(2)
+            .map(|offset| Ok(batch.slice(offset, 2.min(num_rows - offset))))
+            .collect::<Vec<_>>();
+        let stream: SendableRecordBatchStream =
+            Box::pin(RecordBatchStreamAdapter::new(schema, stream::iter(batches)));
         train_btree_index(stream, test_store.as_ref(), 2, None, None)
             .await
             .unwrap();
         let index = BTreeIndex::load(test_store, None, &LanceCache::no_cache(), true)
             .await
             .unwrap();
+        (tmpdir, index)
+    }
+
+    #[tokio::test]
+    async fn test_like_prefix_search_dictionary() {
+        use arrow_array::{DictionaryArray, types::Int16Type};
+
+        // Sorted, with two values per page, so the prefix prunes pages.
+        let values: DictionaryArray<Int16Type> = vec!["app", "apple", "application", "banana"]
+            .into_iter()
+            .collect();
+        let (_tmpdir, index) = train_dictionary_btree(Arc::new(values)).await;
 
         // The planner passes the LIKE pattern of a dictionary column as a plain string.
         let query = SargableQuery::LikePrefix(ScalarValue::Utf8(Some("appl".to_string())));
@@ -5966,6 +5980,50 @@ mod tests {
             }
             _ => panic!("Expected Exact result"),
         }
+
+        // A range bound of another type is still rejected instead of being cast.
+        let query = SargableQuery::Range(
+            Bound::Included(ScalarValue::Int64(Some(5))),
+            Bound::Unbounded,
+        );
+        assert!(index.search(&query, &NoOpMetricsCollector).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_range_search_dictionary_rejects_unrepresentable_bound() {
+        use arrow_array::{DictionaryArray, types::Int16Type};
+
+        let values: DictionaryArray<Int16Type> = DictionaryArray::new(
+            arrow_array::Int16Array::from(vec![0, 1, 2, 3]),
+            Arc::new(arrow_array::Int32Array::from(vec![1, 2, 3, 4])),
+        );
+        let (_tmpdir, index) = train_dictionary_btree(Arc::new(values)).await;
+
+        // A matching bound type is wrapped in the dictionary type and searched.
+        let query = SargableQuery::Range(
+            Bound::Included(ScalarValue::Int32(Some(3))),
+            Bound::Unbounded,
+        );
+        match index.search(&query, &NoOpMetricsCollector).await.unwrap() {
+            SearchResult::Exact(row_ids) => {
+                let ids: Vec<u64> = row_ids
+                    .true_rows()
+                    .row_addrs()
+                    .unwrap()
+                    .map(u64::from)
+                    .collect();
+                assert_eq!(ids, vec![2, 3]);
+            }
+            _ => panic!("Expected Exact result"),
+        }
+
+        // i64::MAX does not fit in Int32. A cast would turn it into NULL, which
+        // sorts first and would match every page, so the bound must be rejected.
+        let query = SargableQuery::Range(
+            Bound::Included(ScalarValue::Int64(Some(i64::MAX))),
+            Bound::Unbounded,
+        );
+        assert!(index.search(&query, &NoOpMetricsCollector).await.is_err());
     }
 
     #[tokio::test]
