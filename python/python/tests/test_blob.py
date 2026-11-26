@@ -3287,7 +3287,7 @@ def test_scanner_to_pandas_blob_alias(dataset_for_pandas_blob_tests):
 
 
 @pytest.mark.parametrize("mutation", ["append", "delete"])
-@pytest.mark.parametrize("scope", ["dataset", "fragments", "fragment"])
+@pytest.mark.parametrize("scope", ["dataset", "fragments", "fragment", "fragment_id"])
 def test_scanner_to_pandas_blob_pins_snapshot(tmp_path, mutation, scope):
     payloads = {i: f"payload-{i}".encode() for i in range(1, 9)}
     schema = pa.schema([pa.field("id", pa.int64()), lance.blob_field("blob")])
@@ -3314,6 +3314,9 @@ def test_scanner_to_pandas_blob_pins_snapshot(tmp_path, mutation, scope):
     }
     if scope == "fragment":
         scanner = fragments[1].scanner(**scan_options)
+        expected_ids = [3, 4]
+    elif scope == "fragment_id":
+        scanner = LanceFragment(ds, fragments[1].fragment_id).scanner(**scan_options)
         expected_ids = [3, 4]
     elif scope == "fragments":
         scanner = ds.scanner(fragments=fragments[1:], **scan_options)
@@ -3374,15 +3377,15 @@ def test_fragment_lookup_pins_blob_snapshot(tmp_path, monkeypatch, lookup, blob_
 
     wrapping = threading.Event()
     resume = threading.Event()
-    original_new = LanceFragment.__new__
+    original_init = LanceFragment.__init__
 
-    def pause_wrapping(cls, *args, **kwargs):
+    def pause_wrapping(self, *args, **kwargs):
         wrapping.set()
         assert resume.wait(timeout=10), "fragment wrapping did not resume"
-        return original_new(cls)
+        original_init(self, *args, **kwargs)
 
     with monkeypatch.context() as patch, ThreadPoolExecutor(max_workers=1) as pool:
-        patch.setattr(LanceFragment, "__new__", staticmethod(pause_wrapping))
+        patch.setattr(LanceFragment, "__init__", pause_wrapping)
         if lookup == "get_fragment":
             pending = pool.submit(ds.get_fragment, 0)
         else:
@@ -3396,6 +3399,7 @@ def test_fragment_lookup_pins_blob_snapshot(tmp_path, monkeypatch, lookup, blob_
         result = pending.result(timeout=10)
 
     fragments = [result] if lookup == "get_fragment" else result
+    assert all(fragment._ds is fragments[0]._ds for fragment in fragments)
     expected_ids = ids[:2] if lookup == "get_fragment" else ids
     actual = []
     for fragment in fragments:

@@ -1534,7 +1534,7 @@ class LanceDataset(pa.dataset.Dataset):
             raise ValueError("get_fragments() does not support filter yet")
         snapshot = copy.copy(self)
         return [
-            LanceFragment._from_snapshot(snapshot, fragment)
+            LanceFragment(snapshot, None, fragment=fragment, _dataset_is_snapshot=True)
             for fragment in snapshot._ds.get_fragments()
         ]
 
@@ -1563,7 +1563,9 @@ class LanceDataset(pa.dataset.Dataset):
         raw_fragment = snapshot._ds.get_fragment(fragment_id)
         if raw_fragment is None:
             return None
-        return LanceFragment._from_snapshot(snapshot, raw_fragment)
+        return LanceFragment(
+            snapshot, None, fragment=raw_fragment, _dataset_is_snapshot=True
+        )
 
     def io_stats_snapshot(self) -> IOStats:
         """

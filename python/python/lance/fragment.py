@@ -369,10 +369,11 @@ class LanceFragment(pa.dataset.Fragment):
         fragment_id: Optional[int],
         *,
         fragment: Optional[_Fragment] = None,
+        _dataset_is_snapshot: bool = False,
     ):
-        # The native fragment keeps its own snapshot. Keep the same version for
-        # scanner replay and blob lookups even when the caller mutates the dataset.
-        self._ds = copy.copy(dataset)
+        # Scanner replay and blob lookups need the same snapshot as the native
+        # fragment. Dataset lookups can share a snapshot captured before lookup.
+        self._ds = dataset if _dataset_is_snapshot else copy.copy(dataset)
         if fragment is None:
             if fragment_id is None:
                 raise ValueError("Either fragment or fragment_id must be specified")
@@ -380,16 +381,6 @@ class LanceFragment(pa.dataset.Fragment):
             if fragment is None:
                 raise ValueError(f"Fragment id does not exist: {fragment_id}")
         self._fragment: _Fragment = fragment
-
-    @classmethod
-    def _from_snapshot(
-        cls, snapshot: LanceDataset, fragment: _Fragment
-    ) -> LanceFragment:
-        """Wrap a native fragment looked up on the supplied dataset snapshot."""
-        instance = cls.__new__(cls)
-        instance._ds = snapshot
-        instance._fragment = fragment
-        return instance
 
     def __repr__(self):
         return self._fragment.__repr__()
