@@ -771,7 +771,10 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
     use futures::TryStreamExt;
     use lance_index::scalar::InvertedIndexParams;
+    use lance_index::scalar::inverted::query::Operator;
     use lance_index::scalar::inverted::{DOC_INDEX_COL, DocumentGranularity};
+
+    use crate::dataset::mem_wal::index::FtsQueryExpr;
 
     fn create_test_schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec![
@@ -943,5 +946,135 @@ mod tests {
     #[test]
     fn test_score_column_name() {
         assert_eq!(SCORE_COLUMN, "_score");
+    }
+
+    /// Scan a one-batch memtable over `texts` and return the `id` column in
+    /// result order.
+    async fn memtable_fts_ids(
+        texts: &[&'static str],
+        params: InvertedIndexParams,
+        query: FtsQuery,
+    ) -> Vec<i32> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("text", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(
+                    (0..texts.len() as i32).collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(texts.to_vec())),
+            ],
+        )
+        .unwrap();
+        let batch_store = Arc::new(BatchStore::with_capacity(100));
+        let mut registry = IndexStore::new();
+        registry
+            .add_fts_with_params("text_idx".to_string(), 1, "text".to_string(), params)
+            .unwrap();
+        registry.insert(&batch, 0).unwrap();
+        batch_store.append(batch).unwrap();
+
+        let exec = FtsIndexExec::new(
+            batch_store,
+            Arc::new(registry),
+            query,
+            1,
+            None,
+            schema,
+            false,
+        )
+        .unwrap();
+        let batches: Vec<RecordBatch> = exec
+            .execute(0, Arc::new(TaskContext::default()))
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        batches
+            .iter()
+            .flat_map(|batch| {
+                let ids = batch["id"].as_primitive::<arrow::datatypes::Int32Type>();
+                (0..batch.num_rows()).map(move |row| ids.value(row))
+            })
+            .collect()
+    }
+
+    /// Texts whose BM25 score for the query term falls with row position, so a
+    /// cut on the index's own score keeps the last rows.
+    const SCORE_DIFFERING_TEXTS: [&str; 4] = [
+        "common bb cc dd ee",
+        "common bb cc dd",
+        "common bb cc",
+        "common bb",
+    ];
+
+    /// A code tokenizer splits `getUserName` into terms sharing one query term
+    /// group, so an AND search over them scores per group.
+    const SCORE_DIFFERING_IDENTIFIERS: [&str; 4] = [
+        "getUserName alpha beta gamma",
+        "getUserName alpha beta",
+        "getUserName alpha",
+        "getUserName",
+    ];
+
+    fn zero_boost_match(term: &str, operator: Operator, limit: usize) -> FtsQuery {
+        FtsQuery {
+            limit: Some(limit),
+            ..FtsQuery::new(
+                "text",
+                FtsQueryExpr::Match {
+                    column: None,
+                    query: term.to_string(),
+                    operator,
+                    boost: 0.0,
+                },
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn test_zero_boost_or_top_k_keeps_the_lowest_row_positions() {
+        // The index ranks an OR search by its own BM25 score. A zero boost maps
+        // every hit onto 0.0, so the kept rows are the lowest row positions.
+        for limit in [1, 2, 3] {
+            let ids = memtable_fts_ids(
+                &SCORE_DIFFERING_TEXTS,
+                InvertedIndexParams::default(),
+                zero_boost_match("common", Operator::Or, limit),
+            )
+            .await;
+            assert_eq!(ids, (0..limit as i32).collect::<Vec<_>>(), "limit={limit}");
+        }
+        // The same fixture at boost 1.0 ranks by score, so a score cut keeps
+        // rows a zero-boost limit 2 does not.
+        let scored = memtable_fts_ids(
+            &SCORE_DIFFERING_TEXTS,
+            InvertedIndexParams::default(),
+            FtsQuery {
+                limit: Some(2),
+                ..FtsQuery::new("text", FtsQueryExpr::match_query("common"))
+            },
+        )
+        .await;
+        assert_eq!(scored, vec![3, 2]);
+    }
+
+    #[tokio::test]
+    async fn test_zero_boost_grouped_and_top_k_keeps_the_lowest_row_positions() {
+        // Grouped AND terms score a document as the sum of its per-group scores
+        // and truncate that sum, so the cut runs on the index's own score.
+        let params = InvertedIndexParams::code().split_identifiers(true);
+        for limit in [1, 2, 3] {
+            let ids = memtable_fts_ids(
+                &SCORE_DIFFERING_IDENTIFIERS,
+                params.clone(),
+                zero_boost_match("getUserName", Operator::And, limit),
+            )
+            .await;
+            assert_eq!(ids, (0..limit as i32).collect::<Vec<_>>(), "limit={limit}");
+        }
     }
 }

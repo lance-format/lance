@@ -388,6 +388,22 @@ fn normalize_fts_zero_boosts(query: &mut FtsQuery) {
     }
 }
 
+/// Search parameters for a Match leaf, with no pushed limit when the boost is
+/// not positive.
+///
+/// The collector ranks hits by its own BM25 score and cuts its top-k there,
+/// while `MatchQueryExec` multiplies the emitted scores by `MatchQuery::boost`.
+/// A boost of 0.0 puts every hit at 0.0, so a collector-side cut drops rows the
+/// final order keeps. Such a leaf returns every match and the plan sorts them.
+/// `validate_fts_query_contract` admits no other non-positive boost.
+fn match_leaf_params(query: &MatchQuery, params: &FtsSearchParams) -> FtsSearchParams {
+    if query.boost > 0.0 {
+        params.clone()
+    } else {
+        params.clone().with_limit(None)
+    }
+}
+
 /// Keep AUTO fuzziness exact at the public dataset-planning boundary.
 ///
 /// Low-level index preparation already understands `fuzziness=None`, but a
@@ -1185,14 +1201,47 @@ impl Scanner {
             .plan_corpus_query(query, &params, filter_plan, &prefilter_source)
             .await?
         {
-            return Ok(plan);
+            return self.fts_page_order(plan, &params);
         }
         // Data overlay masking blocks stale rows from indexed leaves and re-evaluates only those
         // rows from their current values on the flat-text path.
         let fts_exec = self
             .plan_fts(query, &params, filter_plan, &prefilter_source)
             .await?;
-        Ok(fts_exec)
+        self.fts_page_order(fts_exec, &params)
+    }
+
+    /// Sort an FTS source when the scan skips rows without a fetch.
+    ///
+    /// With an offset and no limit, `fts_page_params` pushes no candidate budget
+    /// into the leaves, so each leaf emits its own order and `GlobalLimitExec`
+    /// skips into a stream the scan did not order. Pages then repeat some rows
+    /// and drop others. Sorting before the skip fixes the stream; offset 0 sorts
+    /// too, so pages of one query share an order.
+    ///
+    /// A scan with no offset, or one with `order_by`, keeps the leaf order: the
+    /// first is not paged, and the second is re-sorted by the caller's ordering.
+    fn fts_page_order(
+        &self,
+        plan: Arc<dyn ExecutionPlan>,
+        params: &FtsSearchParams,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        if params.limit.is_some() || self.offset.is_none() || self.ordering.is_some() {
+            return Ok(plan);
+        }
+        let sort_exprs = Self::fts_score_sort_exprs(plan.schema().as_ref())?;
+        if plan
+            .properties()
+            .equivalence_properties()
+            .ordering_satisfy(sort_exprs.clone())?
+        {
+            return Ok(plan);
+        }
+        let plan = Arc::new(RepartitionExec::try_new(
+            plan,
+            Partitioning::RoundRobinBatch(1),
+        )?);
+        Ok(Arc::new(SortExec::new(sort_exprs, plan)))
     }
 
     async fn plan_compound_scorer(
@@ -1873,7 +1922,7 @@ impl Scanner {
         // their positions, as `plan_phrase_query` does.
         let (phrase, match_query, match_params) = match query {
             FtsQuery::Match(query) if query.fuzziness == Some(0) => {
-                (None, query.clone(), params.clone())
+                (None, query.clone(), match_leaf_params(query, params))
             }
             FtsQuery::Phrase(query)
                 if query.document_granularity == Some(DocumentGranularity::Row) =>
@@ -2006,7 +2055,7 @@ impl Scanner {
                         MatchQueryExec::new_with_segments_and_document_granularity(
                             self.dataset.clone(),
                             match_query.clone(),
-                            params.clone(),
+                            match_params.clone(),
                             prefilter_source.clone(),
                             segments,
                             DocumentGranularity::Row,
@@ -2078,6 +2127,7 @@ impl Scanner {
         }
 
         let is_fuzzy = uses_fuzzy_expansion(query.fuzziness);
+        let search_params = match_leaf_params(query, params);
         let (match_plan, flat_match_plan, shared_scorer) = match &index {
             Some(index) => {
                 let all_unindexed = self.dataset.unindexed_fragments(&index.name).await?;
@@ -2185,7 +2235,7 @@ impl Scanner {
                     Some(segments) => MatchQueryExec::new_with_segments_and_document_granularity(
                         self.dataset.clone(),
                         query.clone(),
-                        params.clone(),
+                        search_params,
                         prefilter_source.clone(),
                         segments,
                         document_granularity,
@@ -2193,7 +2243,7 @@ impl Scanner {
                     None => MatchQueryExec::new_with_document_granularity(
                         self.dataset.clone(),
                         query.clone(),
-                        params.clone(),
+                        search_params,
                         prefilter_source.clone(),
                         document_granularity,
                     ),
@@ -2294,7 +2344,11 @@ impl Scanner {
             (Some(indexed_plan), Some(flat_plan)) => {
                 UnionExec::try_new(vec![indexed_plan, flat_plan])?
             }
-            (Some(indexed_plan), None) => return Ok(indexed_plan),
+            // The indexed leaf orders hits by the index's own score, so a bounded
+            // scan re-sorts into the final score space. Scans that skip rows
+            // without a fetch are sorted by `fts_page_order`.
+            (Some(indexed_plan), None) if params.limit.is_none() => return Ok(indexed_plan),
+            (Some(indexed_plan), None) => indexed_plan,
             (None, Some(flat_plan)) if params.limit.is_none() => return Ok(flat_plan),
             (None, Some(flat_plan)) => flat_plan,
             (None, None) => {

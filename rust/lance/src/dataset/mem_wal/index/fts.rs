@@ -131,6 +131,17 @@ fn public_doc_index(coordinates: &[u32]) -> Option<Vec<u32>> {
     (!coordinates.is_empty()).then(|| coordinates.to_vec())
 }
 
+/// Memtable hit order: score descending, then row position, then document
+/// coordinate. The hits arrive in `HashMap` order, so a score-only comparator
+/// picks the truncated top-k at random.
+fn compare_fts_hits(a: &FtsEntry, b: &FtsEntry) -> std::cmp::Ordering {
+    b.score
+        .partial_cmp(&a.score)
+        .unwrap_or(std::cmp::Ordering::Equal)
+        .then_with(|| a.row_position.cmp(&b.row_position))
+        .then_with(|| a.doc_index.cmp(&b.doc_index))
+}
+
 /// Full-text search query expression for composable queries.
 #[derive(Debug, Clone)]
 pub enum FtsQueryExpr {
@@ -2555,11 +2566,7 @@ impl FtsMemIndex {
             })
             .collect::<Vec<_>>();
         if let Some(limit) = limit {
-            results.sort_by(|a, b| {
-                b.score
-                    .partial_cmp(&a.score)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
+            results.sort_by(compare_fts_hits);
             results.truncate(limit);
         }
         results
@@ -2899,8 +2906,14 @@ impl FtsMemIndex {
                 ..
             } => {
                 let tokens = self.analyze_for_search(query);
+                // `search_match` cuts on its own BM25 score, so a boost of 0.0
+                // makes that cut disagree with the boosted order. Without a limit
+                // the cut happens in `search_with_options`, after `apply_boost`.
+                // An unbounded leaf is bounded by `max_memtable_rows`, 100_000 by
+                // default.
+                let leaf_limit = if *boost > 0.0 { limit } else { None };
                 let mut results =
-                    self.search_match(st, &tokens, *operator, limit, include_tail, tail_skip);
+                    self.search_match(st, &tokens, *operator, leaf_limit, include_tail, tail_skip);
                 apply_boost(&mut results, *boost);
                 results
             }
@@ -2960,11 +2973,7 @@ impl FtsMemIndex {
             options.include_tail,
             options.tail_skip,
         );
-        results.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        results.sort_by(compare_fts_hits);
         if options.wand_factor < 1.0 {
             if let Some(limit) = options.limit {
                 if results.len() > limit {
@@ -8298,6 +8307,82 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_tied_hits_sort_by_row_position() {
+        // Six identical documents tie on BM25 score, so only the tie key orders
+        // them. The hit list reaches the sort from a `HashMap`.
+        let index = FtsMemIndex::new(1, "description".to_string());
+        let batch = RecordBatch::try_new(
+            create_test_schema(),
+            vec![
+                Arc::new(Int32Array::from(vec![0; 6])),
+                Arc::new(StringArray::from(vec!["hello world"; 6])),
+            ],
+        )
+        .unwrap();
+        index.insert(&batch, 0).unwrap();
+
+        let entries = index.search_with_options(
+            &FtsQueryExpr::match_query("hello"),
+            SearchOptions::new().with_tail_skip(false),
+        );
+        assert_eq!(entries.len(), 6, "every document matches");
+        let top = entries[0].score;
+        assert!(
+            entries.iter().all(|e| (e.score - top).abs() < 1e-6),
+            "premise: identical documents tie on score"
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.row_position)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2, 3, 4, 5],
+            "tied hits must come back in row position order"
+        );
+    }
+
+    #[test]
+    fn test_grouped_and_top_k_keeps_the_lowest_row_positions() {
+        // The code analyzer splits `getUserName` into three term groups, so an
+        // And query runs `search_groups_and`, which truncates its own candidate
+        // list. Twelve identical documents tie on score, so only the tie key
+        // decides which two survive.
+        let index = FtsMemIndex::with_params(
+            1,
+            "description".to_string(),
+            InvertedIndexParams::code().split_identifiers(true),
+        );
+        let batch = RecordBatch::try_new(
+            create_test_schema(),
+            vec![
+                Arc::new(Int32Array::from(vec![0; 12])),
+                Arc::new(StringArray::from(vec!["get user name"; 12])),
+            ],
+        )
+        .unwrap();
+        index.insert(&batch, 0).unwrap();
+
+        let entries = index.search_with_options(
+            &FtsQueryExpr::match_query_with_operator("getUserName", Operator::And),
+            SearchOptions::new().with_limit(2).with_tail_skip(false),
+        );
+        assert_eq!(entries.len(), 2, "the limit cuts the tied hits");
+        let top = entries[0].score;
+        assert!(
+            entries.iter().all(|entry| (entry.score - top).abs() < 1e-6),
+            "premise: identical documents tie on score"
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.row_position)
+                .collect::<Vec<_>>(),
+            vec![0, 1],
+            "the grouped-AND truncate must keep the lowest row positions"
+        );
     }
 
     #[test]

@@ -4243,6 +4243,209 @@ async fn test_match_query_tie_is_a_stable_prefix_with_unindexed_rows() {
 }
 
 #[tokio::test]
+async fn test_match_query_zero_score_tie_is_a_stable_prefix_when_all_rows_are_indexed() {
+    // With every row indexed the indexed leaf is the whole plan, so its order is
+    // the index collector's order over pre-boost scores. A zero boost makes the
+    // final scores equal, so the plan has to order the kept rows by row_id.
+    let batch =
+        arrow_array::record_batch!(("text", Utf8, vec!["common filler filler filler", "common"]))
+            .unwrap();
+    let schema = batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema),
+        "memory://",
+        None,
+    )
+    .await
+    .unwrap();
+    create_fragmented_fts_index(&mut dataset, "text", false).await;
+
+    let row_ids = |hits: &[(u64, f32)]| hits.iter().map(|(row_id, _)| *row_id).collect::<Vec<_>>();
+    let query = compound_match_query("common", "text", 0.0);
+
+    let top_two = compound_fts_results(&dataset, query.clone(), Some(2)).await;
+    assert_tied_scores(&top_two, |(_, score)| *score);
+    assert_eq!(row_ids(&top_two), vec![0, 1]);
+
+    let top_one = compound_fts_results(&dataset, query.clone(), Some(1)).await;
+    assert_eq!(
+        top_one,
+        top_two[..1],
+        "top-1 must be the first hit of top-2"
+    );
+
+    let mut paged = Vec::new();
+    for offset in 0..2 {
+        let mut scan = dataset.scan();
+        scan.with_row_id()
+            .full_text_search(FullTextSearchQuery::new_query(query.clone()))
+            .unwrap()
+            .limit(Some(1), Some(offset))
+            .unwrap();
+        let batch = scan.try_into_batch().await.unwrap();
+        paged.extend(
+            batch[ROW_ID]
+                .as_primitive::<UInt64Type>()
+                .values()
+                .iter()
+                .copied(),
+        );
+    }
+    assert_eq!(
+        paged,
+        vec![0, 1],
+        "pages of one row tile the ordered result"
+    );
+}
+
+/// An offset with no limit gives the leaves no candidate budget, so the plan has
+/// to order the source before `GlobalLimitExec` skips into it. A zero boost puts
+/// the leaf order and the final order apart, and the pages then overlap.
+#[rstest]
+#[case::zero_boost(0.0)]
+#[case::unit_boost(1.0)]
+#[tokio::test]
+async fn test_match_query_offset_only_pages_tile_an_ordered_result(#[case] boost: f32) {
+    let batch =
+        arrow_array::record_batch!(("text", Utf8, vec!["common filler filler filler", "common"]))
+            .unwrap();
+    let schema = batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema),
+        "memory://",
+        None,
+    )
+    .await
+    .unwrap();
+    create_fragmented_fts_index(&mut dataset, "text", false).await;
+
+    let query = compound_match_query("common", "text", boost);
+    let ordered = compound_fts_results(&dataset, query.clone(), Some(2)).await;
+    if boost == 0.0 {
+        assert_tied_scores(&ordered, |(_, score)| *score);
+        assert_eq!(
+            ordered
+                .iter()
+                .map(|(row_id, _)| *row_id)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+    }
+
+    for offset in 0..2 {
+        let mut scan = dataset.scan();
+        scan.with_row_id()
+            .full_text_search(FullTextSearchQuery::new_query(query.clone()))
+            .unwrap()
+            .limit(None, Some(offset))
+            .unwrap();
+        let batch = scan.try_into_batch().await.unwrap();
+        let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().values();
+        let scores = batch[SCORE_COL].as_primitive::<Float32Type>().values();
+        let page = (0..batch.num_rows())
+            .map(|row| (row_ids[row], scores[row]))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            scored_row_bits(&page),
+            scored_row_bits(&ordered[offset as usize..]),
+            "the page from offset {offset} must be the tail of the ordered result"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_match_query_zero_score_tie_is_a_stable_prefix_with_an_unindexed_row() {
+    // A zero boost leaves every hit at score 0.0, so the tiebreak alone orders
+    // them. The appended row is scored outside the index, so top-k merges an
+    // indexed arm with an unindexed one.
+    let indexed =
+        arrow_array::record_batch!(("text", Utf8, vec!["common filler filler filler", "common"]))
+            .unwrap();
+    let schema = indexed.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![indexed].into_iter().map(Ok), schema.clone()),
+        "memory://",
+        None,
+    )
+    .await
+    .unwrap();
+    create_fragmented_fts_index(&mut dataset, "text", false).await;
+    let appended = arrow_array::record_batch!(("text", Utf8, vec!["common"])).unwrap();
+    dataset
+        .append(
+            RecordBatchIterator::new(vec![appended].into_iter().map(Ok), schema),
+            None,
+        )
+        .await
+        .unwrap();
+
+    // A row id combines its fragment id with the row offset in that fragment,
+    // so the appended row's id is not its position in the dataset. Read it.
+    let appended_row_id = {
+        let mut scan = dataset.scan();
+        scan.with_row_id();
+        let rows = scan.try_into_batch().await.unwrap();
+        rows[ROW_ID].as_primitive::<UInt64Type>().value(2)
+    };
+    let expected = vec![0, 1, appended_row_id];
+
+    let query = compound_match_query("common", "text", 0.0);
+    let row_ids = |hits: &[(u64, f32)]| hits.iter().map(|(row_id, _)| *row_id).collect::<Vec<_>>();
+
+    let top_two = compound_fts_results(&dataset, query.clone(), Some(2)).await;
+    assert_tied_scores(&top_two, |(_, score)| *score);
+    assert_eq!(row_ids(&top_two), expected[..2]);
+
+    let top_three = compound_fts_results(&dataset, query.clone(), Some(3)).await;
+    assert_eq!(row_ids(&top_three), expected);
+
+    let mut paged = Vec::new();
+    for offset in 0..3 {
+        let mut scan = dataset.scan();
+        scan.with_row_id()
+            .full_text_search(FullTextSearchQuery::new_query(query.clone()))
+            .unwrap()
+            .limit(Some(1), Some(offset))
+            .unwrap();
+        let batch = scan.try_into_batch().await.unwrap();
+        paged.extend(
+            batch[ROW_ID]
+                .as_primitive::<UInt64Type>()
+                .values()
+                .iter()
+                .copied(),
+        );
+    }
+    assert_eq!(
+        paged, expected,
+        "pages of one row must tile the ordered result"
+    );
+
+    // The same dataset with an offset and no fetch: each page is the tail of the
+    // ordered result from its offset.
+    for offset in 0..3 {
+        let mut scan = dataset.scan();
+        scan.with_row_id()
+            .full_text_search(FullTextSearchQuery::new_query(query.clone()))
+            .unwrap()
+            .limit(None, Some(offset))
+            .unwrap();
+        let batch = scan.try_into_batch().await.unwrap();
+        let page = batch[ROW_ID]
+            .as_primitive::<UInt64Type>()
+            .values()
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            page,
+            expected[offset as usize..],
+            "the page from offset {offset} must be the tail of the ordered result"
+        );
+    }
+}
+
+#[tokio::test]
 async fn test_match_query_tie_is_a_stable_prefix_without_an_index() {
     // With no FTS index every hit is scored on the flat path, and the leaf top-k
     // is a `SortExec` over an unordered scan. Limits 9 and 33 span more than one
