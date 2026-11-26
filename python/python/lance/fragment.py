@@ -553,6 +553,7 @@ class LanceFragment(pa.dataset.Fragment):
         stored in more than one data file is returned once, with the sizes
         added together. Pairs are sorted by field id. Summing these across
         :meth:`LanceDataset.get_fragments` matches :meth:`LanceStats.data_stats`.
+        V1 datasets return those zeros without reading data files.
         """
         return self._fragment.storage_stats()
 

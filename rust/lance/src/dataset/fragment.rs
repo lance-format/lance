@@ -270,7 +270,29 @@ impl FileFragment {
     /// tombstoned slots still stored in a data file, are omitted. A field that
     /// appears in more than one data file is summed, including bytes in data
     /// overlays. The pairs are sorted by field id.
+    ///
+    /// V1 datasets do not record per-field sizes. This returns the initialized
+    /// zeros and does not open data files, the same as dataset statistics.
     pub async fn storage_stats(&self) -> Result<Vec<(u32, u64)>> {
+        // V1 files have no per-field byte statistics. Dataset statistics leave
+        // the initialized zeros in place and skip the data files.
+        if self
+            .dataset
+            .manifest
+            .data_storage_format
+            .lance_file_format()
+            == ConcreteFileVersion::V1
+        {
+            let mut totals: Vec<(u32, u64)> = self
+                .dataset
+                .schema()
+                .field_ids()
+                .into_iter()
+                .map(|id| (id as u32, 0))
+                .collect();
+            totals.sort_unstable_by_key(|(field_id, _)| *field_id);
+            return Ok(totals);
+        }
         let scan_scheduler = ScanScheduler::new(
             self.dataset.table_state.object_store.clone(),
             SchedulerConfig::max_bandwidth(self.dataset.table_state.object_store.as_ref()),
@@ -5996,6 +6018,53 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(stats.len(), num_columns as usize);
         assert!(stats.iter().all(|(_, size)| *size > 0));
+    }
+
+    #[tokio::test]
+    async fn v1_fragment_storage_stats_skip_data_files() {
+        use crate::dataset::statistics::DatasetStatisticsExt;
+
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
+        let dataset = create_dataset(test_uri, LanceFileVersion::Legacy).await;
+        let mut expected: Vec<(u32, u64)> = dataset
+            .schema()
+            .field_ids()
+            .into_iter()
+            .map(|id| (id as u32, 0))
+            .collect();
+        expected.sort_unstable_by_key(|(field_id, _)| *field_id);
+
+        dataset
+            .table_state
+            .object_store
+            .as_ref()
+            .io_stats_incremental();
+        let stats = dataset
+            .get_fragment(0)
+            .unwrap()
+            .storage_stats()
+            .await
+            .unwrap();
+        let io_stats = dataset
+            .table_state
+            .object_store
+            .as_ref()
+            .io_stats_incremental();
+        assert_eq!(
+            io_stats.read_iops, 0,
+            "v1 fragment stats should not open data files, read {} bytes",
+            io_stats.read_bytes
+        );
+        assert_eq!(stats, expected);
+
+        let data_stats = Arc::new(dataset).calculate_data_stats().await.unwrap();
+        let data_pairs: Vec<(u32, u64)> = data_stats
+            .fields
+            .iter()
+            .map(|field| (field.id, field.bytes_on_disk))
+            .collect();
+        assert_eq!(data_pairs, stats);
     }
 
     #[test]

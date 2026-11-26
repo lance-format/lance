@@ -157,6 +157,35 @@ def test_fragment_storage_stats_after_drop_and_aligned_rewrite(tmp_path: Path):
     assert {field.id: field.bytes_on_disk for field in data_stats.fields} == stats_map
 
 
+def test_fragment_storage_stats_v1_skips_data_files(tmp_path: Path):
+    """V1 has no per-field sizes, so fragment stats stay at the initialized zeros.
+
+    Dataset statistics already return those zeros without opening data files.
+    Removing the data file makes an accidental open fail.
+    """
+    dataset = write_dataset(
+        pa.table({"x": [1, 2], "y": ["a", "b"]}),
+        tmp_path / "v1",
+        data_storage_version="legacy",
+    )
+    data_dir = tmp_path / "v1" / "data"
+    removed = 0
+    for path in data_dir.glob("*.lance"):
+        path.unlink()
+        removed += 1
+    assert removed > 0
+
+    fragment = dataset.get_fragments()[0]
+    stats = fragment.storage_stats()
+    schema_ids = _schema_field_ids(dataset)
+    assert stats == sorted(stats)
+    assert [field_id for field_id, _ in stats] == sorted(schema_ids)
+    assert all(nbytes == 0 for _, nbytes in stats)
+
+    data_stats = dataset.stats.data_stats()
+    assert {field.id: field.bytes_on_disk for field in data_stats.fields} == dict(stats)
+
+
 def test_fragment_storage_stats_refreshes_expired_namespace_credentials(tmp_path: Path):
     """Expired Python namespace credentials must not deadlock fragment stats.
 

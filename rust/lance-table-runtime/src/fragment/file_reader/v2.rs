@@ -187,12 +187,12 @@ pub(super) struct Reader {
     reader: Arc<ProjectedFileReader>,
     projection: Arc<Schema>,
     field_id_to_column_idx: Arc<BTreeMap<u32, u32>>,
-    /// Column index to the field that owns that column's bytes.
+    /// Manifest `(field_id, column_index)` slots for byte attribution.
     ///
-    /// Keyed by column, not field id, so repeated tombstone slots stay
-    /// distinct boundaries. A column missing from the map extends the previous
-    /// field.
-    column_idx_to_field_id: BTreeMap<u32, u32>,
+    /// `None` on an ordinary projected open. Repeated tombstones share a field
+    /// id, so the read map cannot reconstruct those column boundaries, and
+    /// only storage statistics need them.
+    stats_field_slots: Option<Arc<[(i32, i32)]>>,
     /// The blob fields this file stores in the legacy layout.
     legacy_blobs: Arc<HashSet<i32>>,
     default_priority: u32,
@@ -204,7 +204,7 @@ impl Reader {
         reader: Arc<ProjectedFileReader>,
         projection: Arc<Schema>,
         mut field_id_to_column_idx: Arc<BTreeMap<u32, u32>>,
-        field_slots: &[(i32, i32)],
+        stats_field_slots: Option<Arc<[(i32, i32)]>>,
         legacy_blobs: Arc<HashSet<i32>>,
         default_priority: u32,
         file_scheduler: FileScheduler,
@@ -235,13 +235,11 @@ impl Reader {
                 );
             }
         }
-        let column_idx_to_field_id =
-            column_byte_owners(field_slots, field_id_to_column_idx.as_ref());
         Self {
             reader,
             projection,
             field_id_to_column_idx,
-            column_idx_to_field_id,
+            stats_field_slots,
             legacy_blobs,
             default_priority,
             file_scheduler,
@@ -422,15 +420,19 @@ impl GenericFileReader for Reader {
         let file_statistics = self.reader.file_statistics().ok_or_else(|| {
             Error::internal("storage_stats requires full file metadata".to_string())
         })?;
+        // The owner map is built here and not stored on the reader, so cloning
+        // a reader does not copy it. Ordinary projected opens never allocate
+        // the slots this uses.
+        let slots = self.stats_field_slots.as_deref().ok_or_else(|| {
+            Error::internal("storage_stats requires full file metadata".to_string())
+        })?;
+        let owners = column_byte_owners(slots, self.field_id_to_column_idx.as_ref());
         let column_sizes = file_statistics
             .columns
             .iter()
             .map(|col| col.size_bytes)
             .collect::<Vec<_>>();
-        Ok(attribute_column_bytes(
-            &self.column_idx_to_field_id,
-            &column_sizes,
-        ))
+        Ok(attribute_column_bytes(&owners, &column_sizes))
     }
 
     fn projection(&self) -> &Arc<Schema> {
