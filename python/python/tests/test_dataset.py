@@ -8332,6 +8332,33 @@ def test_stats(tmp_path: Path):
     assert data_stats.fields[2].bytes_on_disk > 0
 
 
+def test_column_value_range(tmp_path: Path):
+    table = pa.table({"x": list(range(100)), "y": ["a"] * 100})
+    dataset = lance.write_dataset(table, tmp_path)
+    dataset.create_scalar_index("x", index_type="ZONEMAP", name="x_zonemap")
+
+    value_range = dataset.stats.column_value_range("x")
+    assert value_range == (0, 99)
+    assert dataset.stats.column_value_range("y") is None
+
+    dataset.insert(pa.table({"x": [1000], "y": ["b"]}))
+    # The new fragment is not covered by the index built before the insert.
+    assert dataset.stats.column_value_range("x") is None
+
+    with pytest.raises(ValueError, match="not found"):
+        dataset.stats.column_value_range("missing")
+
+
+def test_column_value_range_time64_ns_keeps_live_values(tmp_path: Path):
+    values = pa.array([1, 2, 3], type=pa.time64("ns"))
+    dataset = lance.write_dataset(pa.table({"x": values}), tmp_path)
+    dataset.create_scalar_index("x", index_type="ZONEMAP")
+    value_range = dataset.stats.column_value_range("x")
+    assert value_range is not None
+    _, hi = value_range
+    assert not pc.any(pc.greater(values, pa.scalar(hi, type=values.type))).as_py()
+
+
 def test_column_layout_stats(tmp_path: Path):
     table = pa.table({"x": range(8), "y": range(8)})
     dataset = lance.write_dataset(table, tmp_path, max_rows_per_file=4)
