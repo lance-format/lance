@@ -85,20 +85,10 @@ impl SnapshotReader<'_> {
             return Ok(DescribeTableResponse::default());
         }
 
-        // Shallow location lookups do not need a snapshot reader future.
-        Box::pin(self.describe_snapshot(table_uri, request, branch, version)).await
-    }
-
-    async fn describe_snapshot(
-        &self,
-        table_uri: &str,
-        request: &DescribeTableRequest,
-        branch: Option<&str>,
-        version: Option<u64>,
-    ) -> Result<DescribeTableResponse> {
         let dataset = match (request.tag.as_deref(), branch) {
-            (Some(tag), _) => self.open_tag(table_uri, tag).await?,
-            (None, Some(name)) => self.open_branch(table_uri, name, version).await?,
+            // Keep named-reference resolution out of shallow and ordinary version lookups.
+            (Some(tag), _) => Box::pin(self.open_tag(table_uri, tag)).await?,
+            (None, Some(name)) => Box::pin(self.open_branch(table_uri, name, version)).await?,
             (None, None) => {
                 let dataset = self
                     .open_version(table_uri, version, SnapshotCache::Default)
