@@ -11177,3 +11177,30 @@ def test_commit_lock_conflict_error_keeps_type(tmp_path: Path, retryable):
     assert exc_info.value.retryable is retryable
     assert len(lock_calls) == (3 if retryable else 1)
     assert lance.dataset(tmp_path / "data").version == 1
+
+
+def test_commit_lock_release_conflict_is_not_a_commit_conflict(tmp_path: Path):
+    # A lock that raises CommitConflictError on release does so after the manifest
+    # was written. That must not be treated as a rejected commit.
+    commit_module = importlib.import_module("lance.commit")
+    lock_calls = []
+
+    @contextlib.contextmanager
+    def releasing_lock(version: int):
+        lock_calls.append(version)
+        yield
+        raise commit_module.CommitConflictError("release failed", retryable=False)
+
+    dataset = lance.write_dataset(pa.table({"a": range(10)}), tmp_path / "data")
+    fragment = dataset.get_fragments()[0]
+
+    with pytest.raises(OSError, match="Error from commit handler") as exc_info:
+        lance.LanceDataset.commit(
+            str(tmp_path / "data"),
+            lance.LanceOperation.Append([fragment.metadata]),
+            read_version=dataset.version,
+            commit_lock=releasing_lock,
+            max_retries=3,
+        )
+    assert not isinstance(exc_info.value, commit_module.CommitConflictError)
+    assert len(lock_calls) == 1

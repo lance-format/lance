@@ -57,11 +57,17 @@ fn handle_error(py_err: PyErr, py: Python) -> CommitError {
             ))
         }
     } else {
-        CommitError::OtherError(Error::internal(format!(
-            "Error from commit handler: {}",
-            py_err
-        )))
+        handler_error(py_err)
     }
+}
+
+/// Errors from releasing a lock are not conflicts: the commit may already have
+/// landed, so they must not trigger a retry or report the commit as rejected.
+fn handler_error(py_err: PyErr) -> CommitError {
+    CommitError::OtherError(Error::internal(format!(
+        "Error from commit handler: {}",
+        py_err
+    )))
 }
 
 pub struct PyCommitLock {
@@ -118,7 +124,7 @@ impl CommitLease for PyCommitLease {
             if success {
                 self.inner
                     .call_method1(py, "__exit__", (py.None(), py.None(), py.None()))
-                    .map_err(|err| handle_error(err, py))
+                    .map_err(handler_error)
             } else {
                 // Setting Python's pending error indicator would interfere
                 // with calling __exit__; pass the exception directly instead.
@@ -129,7 +135,7 @@ impl CommitLease for PyCommitLease {
                         "__exit__",
                         (err.get_type(py), err.value(py), err.traceback(py)),
                     )
-                    .map_err(|err| handle_error(err, py))
+                    .map_err(handler_error)
             }
         })?;
         Ok(())
