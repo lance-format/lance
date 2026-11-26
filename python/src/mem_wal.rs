@@ -237,6 +237,8 @@ impl PyShardSnapshot {
 pub struct PyShardWriter {
     inner: Arc<TokioMutex<Option<ShardWriter>>>,
     closed_state: Arc<TokioMutex<Option<ClosedShardWriterState>>>,
+    /// The error of a `close()` that failed after taking the writer.
+    close_error: Arc<TokioMutex<Option<String>>>,
     shard_id: Uuid,
     dataset: Arc<LanceDataset>,
 }
@@ -366,9 +368,17 @@ impl PyShardWriter {
     pub fn close(&self, py: Python<'_>) -> PyResult<()> {
         let inner = self.inner.clone();
         let closed_state = self.closed_state.clone();
+        let close_error = self.close_error.clone();
         rt().block_on(Some(py), async move {
             let mut guard = inner.lock().await;
-            if let Some(writer) = guard.take() {
+            let Some(writer) = guard.take() else {
+                // A failed close() already gave the writer up, so report its error again.
+                return match close_error.lock().await.clone() {
+                    Some(message) => Err(message),
+                    None => Ok(()),
+                };
+            };
+            let result: lance::Result<()> = async {
                 let stats_handle = writer.stats_handle();
                 // Snapshot stats before close so the captured state reflects
                 // what was written, not any internal bookkeeping done by close().
@@ -382,11 +392,16 @@ impl PyShardWriter {
                     memtable_stats: closed_memtable_stats,
                 });
                 Ok(())
-            } else {
-                Ok(())
             }
+            .await;
+            if let Err(err) = result {
+                let message = err.to_string();
+                *close_error.lock().await = Some(message.clone());
+                return Err(message);
+            }
+            Ok(())
         })?
-        .map_err(|e: lance::Error| PyIOError::new_err(e.to_string()))
+        .map_err(PyIOError::new_err)
     }
 
     /// Return a snapshot of current write statistics.
@@ -539,6 +554,7 @@ impl PyShardWriter {
         Self {
             inner: Arc::new(TokioMutex::new(Some(writer))),
             closed_state: Arc::new(TokioMutex::new(None)),
+            close_error: Arc::new(TokioMutex::new(None)),
             shard_id,
             dataset,
         }

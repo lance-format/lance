@@ -1030,3 +1030,29 @@ def test_evaluate_sharding_spec_python_binding_column_parameter():
 def test_mem_wal_index_details_none_before_init(tmp_path):
     ds = _mem_wal_dataset(tmp_path)
     assert ds.mem_wal_index_details() is None
+
+
+def test_shard_writer_close_failure_is_reported_again(tmp_path):
+    # A close() that fails gives the writer up. A later close() must report the same
+    # failure instead of returning as if the rows had been flushed.
+    ds = lance.write_dataset(_lookup_table([0], "base"), tmp_path / "ds")
+    ds.initialize_mem_wal()
+    shard_id = str(uuid.uuid4())
+    fenced = ds.mem_wal_writer(shard_id, durable_write=False)
+    fenced.put(_lookup_table([1], "input"))
+    # A second writer on the same shard fences the first one.
+    successor = ds.mem_wal_writer(shard_id)
+
+    for _ in range(2):
+        with pytest.raises(OSError, match="Writer fenced"):
+            fenced.close()
+    successor.close()
+
+
+def test_shard_writer_close_after_clean_close_returns(tmp_path):
+    ds = lance.write_dataset(_lookup_table([0], "base"), tmp_path / "ds")
+    ds.initialize_mem_wal()
+    writer = ds.mem_wal_writer(str(uuid.uuid4()))
+    writer.put(_lookup_table([1], "input"))
+    writer.close()
+    writer.close()
