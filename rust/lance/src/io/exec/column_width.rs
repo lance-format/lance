@@ -245,6 +245,7 @@ pub async fn resolve<'a>(
 
 #[cfg(test)]
 mod tests {
+    use crate::session::Session;
     use std::sync::Arc;
 
     use arrow_array::{Int32Array, StringArray};
@@ -348,7 +349,11 @@ mod tests {
     async fn a_measured_width_is_not_shared_across_generations() {
         use futures::TryStreamExt;
 
-        let cache = Arc::new(DSMetadataCache(LanceCache::with_capacity(1024 * 1024)));
+        let cache = Arc::new(
+            Session::new(0, 1024 * 1024, Default::default())
+                .metadata_cache()
+                .for_dataset("memory://"),
+        );
         let batch = test_batch();
         let schema = batch.schema();
         let field = schema.field_with_name("name").unwrap().clone();
@@ -422,7 +427,11 @@ mod tests {
     #[tokio::test]
     async fn a_narrow_observation_does_not_shrink_a_wider_one() {
         use futures::TryStreamExt;
-        let cache = Arc::new(DSMetadataCache(LanceCache::with_capacity(1024 * 1024)));
+        let cache = Arc::new(
+            Session::new(0, 1024 * 1024, Default::default())
+                .metadata_cache()
+                .for_dataset("memory://"),
+        );
         let field = arrow_schema::Field::new("text", DataType::Utf8, false);
         let schema = Arc::new(ArrowSchema::new(vec![field.clone()]));
         let wide = "x".repeat(4_096);

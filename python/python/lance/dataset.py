@@ -143,6 +143,24 @@ def _resolve_blob_selection(
     raise ValueError("Either ids, addresses, or indices must be specified")
 
 
+def _snapshot_scan_scope_defaults(
+    options: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    if options is None:
+        return None
+    # Schema access and subsequent scans must not exhaust a scope iterator.
+    for key in ("fragments", "index_segments"):
+        scope = options.get(key)
+        if scope is not None:
+            selection = (
+                _normalize_index_segment_ids(scope)
+                if key == "index_segments"
+                else tuple(item for item in scope)
+            )
+            options = {**options, key: selection}
+    return options
+
+
 class LanceDataset(pa.dataset.Dataset):
     """A Lance Dataset in Lance format where the data is stored at the given uri."""
 
@@ -206,7 +224,7 @@ class LanceDataset(pa.dataset.Dataset):
             namespace_client_managed_versioning=namespace_client_managed_versioning,
             base_store_params=base_store_params,
         )
-        self._default_scan_options = default_scan_options
+        self._default_scan_options = _snapshot_scan_scope_defaults(default_scan_options)
         self._read_params = read_params
 
     @classmethod
@@ -858,11 +876,6 @@ class LanceDataset(pa.dataset.Dataset):
         """
         builder = ScannerBuilder(self)
         builder = self._apply_default_scan_options(builder)
-
-        if order_by is not None:
-            order_by = [
-                ColumnOrdering(o) if isinstance(o, str) else o for o in order_by
-            ]
 
         # Calls the setter if the user provided a non-None value
         # We need to avoid calling the setter with a None value so
@@ -2079,19 +2092,27 @@ class LanceDataset(pa.dataset.Dataset):
     def count_rows(
         self, filter: Optional[Union[str, Expression]] = None, **kwargs: Any
     ) -> int:
-        """Count rows matching the scanner filter.
+        """Count rows in the dataset matching the filter.
 
         Parameters
         ----------
+        filter : str or pyarrow.compute.Expression, optional
+            Count only rows matching this predicate.
         **kwargs : dict, optional
-            See py:method:`scanner` method for full parameter description.
+            PyArrow scan tuning arguments are accepted for compatibility.
+            To count rows in a selected fragment, use :meth:`LanceFragment.count_rows`.
 
         Returns
         -------
         count : int
-            The total number of rows in the dataset.
+            The number of matching rows.
 
         """
+        if kwargs.get("fragments") is not None:
+            raise TypeError(
+                "LanceDataset.count_rows() does not support fragments. "
+                "Call LanceFragment.count_rows() on the selected fragments."
+            )
         if isinstance(filter, pa.compute.Expression):
             # TODO: consolidate all to use scanner
             return self.scanner(
@@ -5066,7 +5087,9 @@ class LanceDataset(pa.dataset.Dataset):
         else:
             target_uri = target_path
 
-        default_scan_options = kwargs.pop("default_scan_options", None)
+        default_scan_options = _snapshot_scan_scope_defaults(
+            kwargs.pop("default_scan_options", None)
+        )
         read_params = kwargs.pop("read_params", None)
 
         if storage_options is None:

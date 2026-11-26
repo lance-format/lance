@@ -74,9 +74,7 @@ enum RepDefLayer {
  * expensive.  As a result, we do not transpose the buffers but compress the data into small
  * chunks (called mini blocks) which are roughly the size of a disk sector.
  *
- * The end result is a small amount of read amplification (since we must read an entire page
- * at a time) but we have more flexibility in compression and do less work per value when
- * compressing and decompressing in bulk.
+ * Readers can load individual mini-blocks.
  */
 message MiniBlockLayout {
   /* Description of the compression of repetition levels (e.g. how many bits per rep)

@@ -332,8 +332,8 @@ async fn test_remap_index_after_compaction() {
 
     // Compare against original index
     let indices = read_manifest_indexes(
-        &dataset.object_store,
-        &dataset.manifest_location,
+        &dataset.table_state.object_store,
+        &dataset.table_state.manifest_location,
         &dataset.manifest,
     )
     .await

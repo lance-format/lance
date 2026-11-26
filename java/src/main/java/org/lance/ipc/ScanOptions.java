@@ -13,6 +13,8 @@
  */
 package org.lance.ipc;
 
+import org.lance.JniLoader;
+
 import com.google.common.base.MoreObjects;
 import org.apache.arrow.util.Preconditions;
 
@@ -41,7 +43,7 @@ public class ScanOptions {
   private final boolean prefilter;
   private final boolean withRowId;
   private final boolean withRowAddress;
-  private final int batchReadahead;
+  final Optional<Integer> batchReadahead;
   private final Optional<Integer> fragmentReadahead;
   private final boolean scanInOrder;
   private final Optional<MaterializationStyle> lateMaterialization;
@@ -241,7 +243,7 @@ public class ScanOptions {
         prefilter,
         withRowId,
         withRowAddress,
-        batchReadahead,
+        Optional.of(batchReadahead),
         Optional.empty(),
         true,
         Optional.empty(),
@@ -273,7 +275,7 @@ public class ScanOptions {
       boolean prefilter,
       boolean withRowId,
       boolean withRowAddress,
-      int batchReadahead,
+      Optional<Integer> batchReadahead,
       Optional<Integer> fragmentReadahead,
       boolean scanInOrder,
       Optional<MaterializationStyle> lateMaterialization,
@@ -289,8 +291,10 @@ public class ScanOptions {
     Preconditions.checkArgument(
         !(filter.isPresent() && substraitFilter.isPresent()),
         "cannot set both substrait filter and string filter");
-    Preconditions.checkArgument(
-        batchReadahead > 0, "batchReadahead must be greater than 0, got %s", batchReadahead);
+    batchReadahead.ifPresent(
+        value ->
+            Preconditions.checkArgument(
+                value > 0, "batchReadahead must be greater than 0, got %s", value));
     batchSizeBytes.ifPresent(
         value ->
             Preconditions.checkArgument(
@@ -494,13 +498,19 @@ public class ScanOptions {
   }
 
   /**
-   * Get the batch readahead.
+   * Gets the effective number of batches to read ahead.
    *
-   * @return the number of batches to read ahead.
+   * @return the configured count, or the native scanner default if unset.
    */
   public int getBatchReadahead() {
-    return batchReadahead;
+    if (batchReadahead.isPresent()) {
+      return batchReadahead.get();
+    }
+    JniLoader.ensureLoaded();
+    return nativeDefaultBatchReadahead();
   }
+
+  private static native int nativeDefaultBatchReadahead();
 
   /**
    * Get the number of fragments to read ahead concurrently.
@@ -657,7 +667,7 @@ public class ScanOptions {
     private boolean prefilter = false;
     private boolean withRowId = false;
     private boolean withRowAddress = false;
-    private int batchReadahead = 16;
+    private Optional<Integer> batchReadahead = Optional.empty();
     private Optional<Integer> fragmentReadahead = Optional.empty();
     private boolean scanInOrder = true;
     private Optional<MaterializationStyle> lateMaterialization = Optional.empty();
@@ -695,7 +705,7 @@ public class ScanOptions {
       this.prefilter = options.isPrefilter();
       this.withRowId = options.isWithRowId();
       this.withRowAddress = options.isWithRowAddress();
-      this.batchReadahead = options.getBatchReadahead();
+      this.batchReadahead = options.batchReadahead;
       this.fragmentReadahead = options.getFragmentReadahead();
       this.scanInOrder = options.isScanInOrder();
       this.lateMaterialization = options.getLateMaterialization();
@@ -918,7 +928,7 @@ public class ScanOptions {
      * @return Builder instance for method chaining.
      */
     public Builder batchReadahead(int batchReadahead) {
-      this.batchReadahead = batchReadahead;
+      this.batchReadahead = Optional.of(batchReadahead);
       return this;
     }
 

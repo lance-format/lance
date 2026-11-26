@@ -216,7 +216,8 @@ pub struct InvertedIndexParams {
     ///
     /// This is a build-time only parameter and is not persisted with the index.
     /// By default Lance uses roughly `num_cpus / 2` workers.
-    /// The effective worker count is clamped to `[1, num_cpus - 2]`.
+    /// The effective worker count is clamped to between 1 and the number of
+    /// compute threads (`num_cpus - 2` on 8 or more CPUs).
     #[serde(rename = "num_workers", skip_serializing, default)]
     pub(crate) num_workers: Option<usize>,
 
@@ -976,7 +977,8 @@ impl InvertedIndexParams {
     /// Set the number of workers to use for this build.
     ///
     /// By default Lance uses roughly `num_cpus / 2` workers.
-    /// The effective worker count is clamped to `[1, num_cpus - 2]`.
+    /// The effective worker count is clamped to between 1 and the number of
+    /// compute threads (`num_cpus - 2` on 8 or more CPUs).
     pub fn num_workers(mut self, num_workers: usize) -> Self {
         self.num_workers = Some(num_workers);
         self

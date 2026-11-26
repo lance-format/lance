@@ -576,7 +576,7 @@ mod test {
         assert_eq!(target.version().version, 3);
 
         let latest = external
-            .get_latest_version(target.base.as_ref())
+            .get_latest_version(target.table_state.base.as_ref())
             .await
             .unwrap()
             .unwrap();
@@ -720,20 +720,20 @@ mod test {
             .join(format!("6.manifest-{}", uuid::Uuid::new_v4()));
         localfs
             .rename(
-                &ManifestNamingScheme::V1.manifest_path(&ds.base, 6),
+                &ManifestNamingScheme::V1.manifest_path(&ds.table_state.base, 6),
                 &version_six_staging_location,
             )
             .await
             .unwrap();
         {
             inner_store.lock().await.insert(
-                (ds.base.to_string(), 6),
+                (ds.table_state.base.to_string(), 6),
                 version_six_staging_location.to_string(),
             );
         }
         // set the store back to dataset path with -{uuid} suffix
         let mut version_six = localfs
-            .list(Some(&ds.base))
+            .list(Some(&ds.table_state.base))
             .try_filter(|p| {
                 let p = p.clone();
                 async move { p.location.filename().unwrap().starts_with("6.manifest-") }
@@ -745,7 +745,7 @@ mod test {
         let version_six_staging_location = version_six.pop().unwrap().unwrap().location;
         {
             inner_store.lock().await.insert(
-                (ds.base.to_string(), 6),
+                (ds.table_state.base.to_string(), 6),
                 version_six_staging_location.to_string(),
             );
         }
@@ -765,14 +765,17 @@ mod test {
         assert_eq!(ds.count_rows(None).await.unwrap(), 60);
 
         {
-            inner_store.lock().await.remove(&(ds.base.to_string(), 6));
+            inner_store
+                .lock()
+                .await
+                .remove(&(ds.table_state.base.to_string(), 6));
         }
         assert!(
             handler
                 .version_exists(
-                    &ds.base,
+                    &ds.table_state.base,
                     6,
-                    ds.object_store.inner.as_ref(),
+                    ds.table_state.object_store.inner.as_ref(),
                     ds.manifest_location().naming_scheme,
                 )
                 .await
@@ -781,9 +784,9 @@ mod test {
         assert!(
             !handler
                 .version_exists(
-                    &ds.base,
+                    &ds.table_state.base,
                     7,
-                    ds.object_store.inner.as_ref(),
+                    ds.table_state.object_store.inner.as_ref(),
                     ds.manifest_location().naming_scheme,
                 )
                 .await
@@ -848,17 +851,22 @@ mod test {
         let orphan_staging_manifest =
             Path::parse(format!("{}-{}", canonical_manifest, uuid::Uuid::new_v4())).unwrap();
         dataset
+            .table_state
             .object_store
             .copy(&canonical_manifest, &authoritative_staging_manifest)
             .await
             .unwrap();
         dataset
+            .table_state
             .object_store
             .copy(&canonical_manifest, &orphan_staging_manifest)
             .await
             .unwrap();
         manifest_records.lock().await.insert(
-            (dataset.base.to_string(), dataset.version().version),
+            (
+                dataset.table_state.base.to_string(),
+                dataset.version().version,
+            ),
             authoritative_staging_manifest.to_string(),
         );
 
@@ -874,6 +882,7 @@ mod test {
 
         assert!(
             dataset
+                .table_state
                 .object_store
                 .exists(&authoritative_staging_manifest)
                 .await
@@ -882,6 +891,7 @@ mod test {
         );
         assert!(
             !dataset
+                .table_state
                 .object_store
                 .exists(&orphan_staging_manifest)
                 .await

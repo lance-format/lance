@@ -9,6 +9,8 @@
 //! plugin only sees Arrow fields, which carry no IDs, so Lance records the IDs
 //! when a segment is trained and, whenever it hands the details back, resolves
 //! them to the names the fields have now.
+//! The same IDs are declared as metadata dependencies so ordinary schema
+//! maintenance handles field removal without consulting this adapter.
 
 use std::sync::Arc;
 
@@ -121,8 +123,8 @@ fn indexed_column<'a>(
 
 /// The details to open a list-element segment with: bound to the current schema
 /// when its keys still resolve, so an update reads the right children after a
-/// rename, and the stored ones otherwise. A segment that no longer resolves is
-/// never queried, but it can still be remapped by compaction.
+/// rename, and the stored ones otherwise. Schema commits decide segment
+/// retention from the complete metadata field dependencies.
 pub fn details_for_open(
     schema: &lance_core::datatypes::Schema,
     index: &IndexMetadata,
@@ -137,8 +139,8 @@ pub fn details_for_open(
     })
 }
 
-/// Whether the key fields of list-element segment `index` still resolve in
-/// `schema`. One that does not is never queried, so it is not worth updating.
+/// Whether the recorded key IDs still resolve to children of the expected types
+/// in `schema`. Renames preserve the IDs and continue to resolve.
 pub fn key_fields_resolve(
     schema: &lance_core::datatypes::Schema,
     index: &IndexMetadata,

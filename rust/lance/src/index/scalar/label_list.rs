@@ -1,31 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::scalar::IndexStore;
-use lance_index::scalar::index_files_to_table;
 use lance_index::scalar::label_list::{
     BITMAP_LOOKUP_NAME, LABEL_LIST_NULLS_METADATA_KEY, LABEL_LIST_NULLS_MIN_VERSION, LabelListIndex,
 };
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_table::format::IndexMetadata;
-use roaring::RoaringBitmap;
-use std::sync::Arc;
-use uuid::Uuid;
 
+use super::segment_merge::{SegmentMerge, open_source};
 use crate::{Dataset, Error, Result, dataset::index::LanceIndexStoreExt};
-
-fn ensure_label_list_details(segment: &IndexMetadata) -> Result<()> {
-    if let Some(details) = segment.index_details.as_ref()
-        && !details.type_url.ends_with("LabelListIndexDetails")
-    {
-        return Err(Error::invalid_input(format!(
-            "Segment '{}' is not a LabelList segment (details type_url = '{}')",
-            segment.uuid, details.type_url
-        )));
-    }
-    Ok(())
-}
 
 async fn validate_nullable_segment_for_merge(
     dataset: &Dataset,
@@ -77,60 +61,11 @@ pub(in crate::index) async fn merge_segments(
     segments: Vec<IndexMetadata>,
     staged: Option<&crate::index::frag_reuse::StagedRemappingPlans>,
 ) -> Result<IndexMetadata> {
-    if segments.is_empty() {
-        return Err(Error::index("No segment metadata was provided".to_string()));
-    }
+    let merge = SegmentMerge::new(dataset, "LabelList", &segments)?;
+    merge.reject_legacy_segments_on_stable(dataset, "LabelList")?;
+    let field_id = merge.field_id();
 
-    for segment in &segments {
-        ensure_label_list_details(segment)?;
-    }
-
-    // A pre-migration segment stores row ids directly, which on a
-    // stable-row-id dataset are a different domain than the row addresses a
-    // modern segment stores; merging the two into one segment would silently
-    // combine incompatible values in the postings column. This path never
-    // rescans the dataset to repair that, so refuse rather than corrupt --
-    // the caller should fully rebuild the legacy segment first (e.g. via
-    // `create_index(..., replace: true)`).
-    if dataset.manifest.uses_stable_row_ids() {
-        for segment in &segments {
-            if !segment.results_are_row_addrs() {
-                return Err(Error::invalid_input(format!(
-                    "LabelList merge_segments: segment {} predates row-address-domain support \
-                     and cannot be merged on a dataset with stable row IDs; rebuild it first \
-                     (e.g. with create_index(..., replace: true))",
-                    segment.uuid,
-                )));
-            }
-        }
-    }
-
-    let field_id = *segments[0].fields.first().ok_or_else(|| {
-        Error::invalid_input(format!(
-            "CreateIndex: segment {} is missing field ids",
-            segments[0].uuid
-        ))
-    })?;
-    let field_path = dataset.schema().field_path(field_id)?;
-
-    let dataset_fragments = dataset.fragment_bitmap.as_ref();
-    let mut effective_old_frags = RoaringBitmap::new();
-    let mut deleted_old_frags = RoaringBitmap::new();
-    for segment in &segments {
-        if segment.fragment_bitmap.is_none() {
-            return Err(Error::invalid_input(format!(
-                "CreateIndex: segment {} is missing fragment coverage",
-                segment.uuid
-            )));
-        }
-        if let Some(effective) = segment.effective_fragment_bitmap(dataset_fragments) {
-            effective_old_frags |= effective;
-        }
-        if let Some(deleted) = segment.deleted_fragment_bitmap(dataset_fragments) {
-            deleted_old_frags |= deleted;
-        }
-    }
-
+    let (effective_old_frags, deleted_old_frags) = merge.coverage_union(dataset)?;
     let fragment_bitmap = effective_old_frags.clone();
     // A live fragment can have deleted rows even when no whole fragment was
     // retired. Clean both value postings and list-null rows in that case too.
@@ -152,32 +87,21 @@ pub(in crate::index) async fn merge_segments(
     };
 
     let mut source_indices = Vec::with_capacity(segments.len());
-    for segment in &segments {
+    for segment in merge.segments() {
         validate_nullable_segment_for_merge(dataset, field_id, segment).await?;
-        let scalar_index = super::open_scalar_index_with_plan(
-            dataset,
-            &field_path,
-            segment,
-            staged.and_then(|plans| plans.get(&segment.uuid)),
-            crate::index::frag_reuse::OpenPurpose::Maintenance,
-            &NoOpMetricsCollector,
-        )
-        .await?;
-        let label_list_index = scalar_index
-            .as_any()
-            .downcast_ref::<LabelListIndex>()
-            .ok_or_else(|| {
-                Error::index(format!(
-                    "merge_existing_index_segments: expected label list segment {}, got {:?}",
-                    segment.uuid,
-                    scalar_index.index_type()
-                ))
-            })?;
-        source_indices.push(Arc::new(label_list_index.clone()));
+        source_indices.push(
+            open_source::<LabelListIndex>(
+                dataset,
+                merge.field_path(),
+                segment,
+                staged.and_then(|plans| plans.get(&segment.uuid)),
+                "LabelList",
+            )
+            .await?,
+        );
     }
 
-    let new_uuid = Uuid::new_v4();
-    let new_store = LanceIndexStore::from_dataset_for_new(dataset, &new_uuid)?;
+    let (new_uuid, new_store) = merge.new_store(dataset)?;
     let created_index = lance_index::scalar::label_list::merge_label_list_indices(
         &source_indices,
         &new_store,
@@ -186,17 +110,10 @@ pub(in crate::index) async fn merge_segments(
     )
     .await?;
 
-    Ok(IndexMetadata {
-        uuid: new_uuid,
-        dataset_version: dataset.manifest.version,
-        fragment_bitmap: Some(fragment_bitmap),
-        index_details: Some(Arc::new(created_index.index_details)),
-        index_version: created_index.index_version as i32,
-        created_at: Some(chrono::Utc::now()),
-        base_id: None,
-        files: Some(index_files_to_table(created_index.files)),
-        clustering_id: None,
-        metadata: Default::default(),
-        ..segments[0].clone()
-    })
+    Ok(merge.build_metadata(
+        new_uuid,
+        dataset.manifest.version,
+        fragment_bitmap,
+        created_index,
+    ))
 }
