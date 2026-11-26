@@ -63,7 +63,7 @@ impl Dataset {
                 "The filter {expr} does not return a boolean"
             )));
         }
-        let all_fragments = self.fragment_bitmap.as_ref();
+        let all_fragments = self.fragment_bitmap().as_ref();
         if all_fragments.is_empty()
             || self.manifest.data_storage_format.lance_file_format() == ConcreteFileVersion::V1
         {
@@ -100,7 +100,7 @@ impl Dataset {
         expr: &Expr,
         indices: &OnceCell<(Vec<IndexMetadata>, ScalarIndexInfo)>,
     ) -> Result<RoaringBitmap> {
-        let all_fragments = self.fragment_bitmap.as_ref();
+        let all_fragments = self.fragment_bitmap().as_ref();
         let columns = expr.column_refs();
         if columns.iter().any(|column| column.name == ROW_ADDR) {
             // Keep address and scalar predicates in the same boolean tree so a
@@ -170,13 +170,13 @@ impl Dataset {
             }
             ScalarIndexExpr::Or(left, right) => {
                 let left = self.evaluate_fragment_query(left, indices).await?;
-                if &left == self.fragment_bitmap.as_ref() {
+                if &left == self.fragment_bitmap().as_ref() {
                     return Ok(left);
                 }
                 left | self.evaluate_fragment_query(right, indices).await?
             }
             // A fragment may contain both matching and nonmatching rows.
-            ScalarIndexExpr::Not(_) => self.fragment_bitmap.as_ref().clone(),
+            ScalarIndexExpr::Not(_) => self.fragment_bitmap().as_ref().clone(),
         })
     }
 
@@ -189,7 +189,7 @@ impl Dataset {
             .iter()
             .filter(|index| index.name == search.index_name)
             .collect();
-        let all_fragments = self.fragment_bitmap.as_ref();
+        let all_fragments = self.fragment_bitmap().as_ref();
         let overlaid = overlaid_fragments(self.fragments());
         let mut covered = RoaringBitmap::new();
         let mut hits = RoaringBitmap::new();
@@ -394,13 +394,14 @@ mod tests {
             .await
             .unwrap();
 
-        dataset.object_store.io_stats_incremental();
+        let object_store = dataset.object_store(None).await.unwrap();
+        object_store.io_stats_incremental();
         let candidates = dataset
             .candidate_fragment_ids(ExprFilter::Sql("price > 90".into()))
             .await
             .unwrap();
         assert_eq!(candidates, RoaringBitmap::from_iter([3]));
-        let stats = dataset.object_store.io_stats_incremental();
+        let stats = object_store.io_stats_incremental();
         for request in &stats.requests {
             assert!(
                 !request.path.parts().any(|part| part.as_ref() == "data"),
@@ -430,20 +431,15 @@ mod tests {
         )
         .await;
 
-        dataset.object_store.io_stats_incremental();
+        let object_store = dataset.object_store(None).await.unwrap();
+        object_store.io_stats_incremental();
         let absent = u64::from(RowAddress::first_row(99));
         let candidates = dataset
             .candidate_fragment_ids(ExprFilter::Sql(format!("_rowaddr = {absent}")))
             .await
             .unwrap();
         assert!(candidates.is_empty());
-        assert!(
-            dataset
-                .object_store
-                .io_stats_incremental()
-                .requests
-                .is_empty()
-        );
+        assert!(object_store.io_stats_incremental().requests.is_empty());
     }
 
     #[rstest]
