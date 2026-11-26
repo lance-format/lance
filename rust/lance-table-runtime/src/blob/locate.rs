@@ -218,13 +218,16 @@ pub(super) async fn collect_blob_files_v1(
             .data_file_dir(&data_file)?
             .join(data_file.path.as_str());
         let store = table.object_store(data_file.base_id).await?;
-        files.push(Some(BlobFile::with_source(
-            shared_blob_source(&mut source_cache, store, &data_file_path),
-            position,
-            size,
-            BlobKind::Inline,
-            None,
-        )));
+        files.push(Some(
+            BlobFile::with_source(
+                shared_blob_source(&mut source_cache, store, &data_file_path),
+                position,
+                size,
+                BlobKind::Inline,
+                None,
+            )
+            .with_base_id(data_file.base_id),
+        ));
     }
     Ok(files)
 }
@@ -405,7 +408,9 @@ impl<'a> BlobLocator<'a> {
                     self.external_sizes.insert((base_id, uri.to_string()), size);
                     size
                 };
-                Ok(self.file(store, &path, position, size, BlobKind::External, Some(uri)))
+                Ok(self
+                    .file(store, &path, position, size, BlobKind::External, Some(uri))
+                    .with_base_id((base_id != 0).then_some(base_id)))
             }
             StoredBlob::Managed {
                 base_id,
@@ -417,7 +422,9 @@ impl<'a> BlobLocator<'a> {
                 let root = self.base_root(base_id)?;
                 let store = self.store(base_id).await?;
                 let path = join_base_and_relative_path(&root, uri)?;
-                Ok(self.file(store, &path, position, size, BlobKind::Managed, Some(uri)))
+                Ok(self
+                    .file(store, &path, position, size, BlobKind::Managed, Some(uri))
+                    .with_base_id(base_id))
             }
         }
     }
@@ -448,14 +455,16 @@ impl<'a> BlobLocator<'a> {
     async fn locate_inline(&mut self, row_addr: u64, position: u64, size: u64) -> Result<BlobFile> {
         let location = self.data_file(row_addr)?.clone();
         let store = self.store(location.base_id).await?;
-        Ok(self.file(
-            store,
-            &location.data_file_path,
-            position,
-            size,
-            BlobKind::Inline,
-            None,
-        ))
+        Ok(self
+            .file(
+                store,
+                &location.data_file_path,
+                position,
+                size,
+                BlobKind::Inline,
+                None,
+            )
+            .with_base_id(location.base_id))
     }
 
     async fn locate_sidecar(
@@ -469,7 +478,9 @@ impl<'a> BlobLocator<'a> {
         let location = self.data_file(row_addr)?.clone();
         let store = self.store(location.base_id).await?;
         let path = blob_path(&location.data_file_dir, &location.data_file_key, blob_id);
-        Ok(self.file(store, &path, position, size, kind, None))
+        Ok(self
+            .file(store, &path, position, size, kind, None)
+            .with_base_id(location.base_id))
     }
 
     fn file(

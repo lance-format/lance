@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use arrow::array::ArrayData;
 use arrow::datatypes::DataType;
 use arrow_array::new_empty_array;
+use arrow_array::types::{Float16Type, Float32Type, Float64Type};
 use arrow_array::{Array, ArrayRef, FixedSizeListArray, RecordBatch, cast::AsArray};
 use arrow_buffer::{Buffer, MutableBuffer};
 use futures::{Stream, StreamExt, TryStreamExt, stream};
@@ -18,6 +19,7 @@ use log::{info, warn};
 use rand::rngs::SmallRng;
 use rand::seq::{IteratorRandom, SliceRandom};
 use rand::{Rng, SeedableRng};
+use rayon::prelude::*;
 use roaring::RoaringTreemap;
 use tokio::sync::Mutex;
 
@@ -26,6 +28,25 @@ use crate::{Error, Result};
 
 // Target the vector payload size, independently of the storage block size.
 const TRAINING_SAMPLE_BATCH_BYTES: usize = 64 * 1024 * 1024;
+
+/// Bytes of the column [`sample_fsl_uniform`] may scan per sampled row to read
+/// the sample with one scan instead of `take`, see [`sample_fsl_by_scan`].
+///
+/// `take` pays for every sampled row, a scan for every byte of the column, so
+/// the narrower the rows the sparser the sample a scan wins at. With the data
+/// in memory on a 96-vCPU host, taking a row costs as long as scanning 63 KiB
+/// of 1,024-dim and 44 KiB of 128-dim `f32` vectors; this stays below both.
+const DENSE_SAMPLE_SCAN_BYTES_PER_ROW: usize = 32 * 1024;
+
+/// Rows of a training sample one parallel task checks for non-finite values.
+const FINITE_CHECK_ROWS: usize = 8192;
+
+/// Whether to read `sample_rows` of `num_rows` rows `byte_width` wide with one
+/// scan rather than `take`.
+fn samples_by_scan(num_rows: usize, sample_rows: usize, byte_width: usize) -> bool {
+    num_rows.saturating_mul(byte_width)
+        <= sample_rows.saturating_mul(DENSE_SAMPLE_SCAN_BYTES_PER_ROW)
+}
 
 /// Bound each training read to about 64 MiB of fixed-width vector values.
 /// A vector wider than the target still needs one complete row per batch.
@@ -494,6 +515,18 @@ pub(crate) async fn sample_unseen_training_data(
 pub fn filter_finite_training_data(
     training_data: FixedSizeListArray,
 ) -> Result<FixedSizeListArray> {
+    // A sample can hold many GB and is almost always all finite, so confirm
+    // that in parallel before building the per-row mask.
+    let num_rows = training_data.len();
+    let all_finite = (0..num_rows.div_ceil(FINITE_CHECK_ROWS))
+        .into_par_iter()
+        .all(|chunk| {
+            let start = chunk * FINITE_CHECK_ROWS;
+            all_vectors_finite(&training_data.slice(start, FINITE_CHECK_ROWS.min(num_rows - start)))
+        });
+    if all_finite {
+        return Ok(training_data);
+    }
     let finite_mask = lance_index::vector::utils::is_finite(&training_data);
     if finite_mask.true_count() == training_data.len() {
         Ok(training_data)
@@ -501,6 +534,32 @@ pub fn filter_finite_training_data(
         let filtered = arrow::compute::filter(&training_data, &finite_mask)?;
         Ok(filtered.as_fixed_size_list().clone())
     }
+}
+
+/// Whether every vector and value is non-null and every float value is finite:
+/// [`lance_index::vector::utils::is_finite`] for all rows, without a per-row array.
+fn all_vectors_finite(vectors: &FixedSizeListArray) -> bool {
+    fn all_finite<T: Copy>(values: &[T], is_finite: impl Fn(T) -> bool) -> bool {
+        // No early exit, so the check vectorizes.
+        values
+            .iter()
+            .fold(true, |all, &value| all & is_finite(value))
+    }
+    let values = vectors.values();
+    vectors.null_count() == 0
+        && values.null_count() == 0
+        && match values.data_type() {
+            DataType::Float16 => all_finite(values.as_primitive::<Float16Type>().values(), |v| {
+                v.is_finite()
+            }),
+            DataType::Float32 => all_finite(values.as_primitive::<Float32Type>().values(), |v| {
+                v.is_finite()
+            }),
+            DataType::Float64 => all_finite(values.as_primitive::<Float64Type>().values(), |v| {
+                v.is_finite()
+            }),
+            _ => true,
+        }
 }
 
 #[derive(Debug)]
@@ -1031,6 +1090,9 @@ async fn sample_fsl_uniform(
     vector_field: &lance_core::datatypes::Field,
 ) -> Result<FixedSizeListArray> {
     let indices = generate_random_indices(num_rows, sample_size_hint);
+    if samples_by_scan(num_rows, indices.len(), byte_width) {
+        return sample_fsl_by_scan(dataset, column, &indices, byte_width, vector_field).await;
+    }
     let projection = Arc::new(dataset.schema().project(&[column])?);
 
     let batch_rows = training_sample_batch_rows(byte_width)?;
@@ -1078,6 +1140,64 @@ async fn sample_fsl_uniform(
         total_rows,
     );
 
+    fsl_values_to_array(vector_field, values_buf, total_rows)
+}
+
+/// Read the rows at sorted `indices` with one sequential scan of `column`
+/// instead of `take`: the same uniform sample, read at scan speed.
+///
+/// `take` of a dense sample is bound by the latency of one small read per row,
+/// while a scan streams whole pages, so once the sample is dense enough (see
+/// [`DENSE_SAMPLE_SCAN_BYTES_PER_ROW`]) reading every row and keeping the
+/// sampled ones is faster.
+async fn sample_fsl_by_scan(
+    dataset: &Dataset,
+    column: &str,
+    indices: &[u64],
+    byte_width: usize,
+    vector_field: &lance_core::datatypes::Field,
+) -> Result<FixedSizeListArray> {
+    let mut scanner = dataset.scan();
+    scanner.project(&[column])?.scan_in_order(true);
+    let mut stream = scanner.try_into_stream().await?;
+    let mut values_buf = MutableBuffer::with_capacity(indices.len() * byte_width);
+    let mut total_rows = 0;
+    let mut batch_start = 0u64;
+    let mut remaining = indices;
+    while let Some(batch) = stream.try_next().await? {
+        let batch_end = batch_start + batch.num_rows() as u64;
+        let in_batch = remaining.partition_point(|&index| index < batch_end);
+        if in_batch > 0 {
+            // Copy each sampled row straight into the sample: a `take` first
+            // would copy it twice, once into a fresh array per batch.
+            let array = get_column_from_batch(&batch, column)?;
+            let fsl = array.as_fixed_size_list();
+            let values = fsl.values().to_data();
+            let elem_size = byte_width / fsl.value_length() as usize;
+            let bytes = &values.buffers()[0].as_slice()[values.offset() * elem_size..];
+            for &index in &remaining[..in_batch] {
+                let start = (index - batch_start) as usize * byte_width;
+                values_buf.extend_from_slice(&bytes[start..start + byte_width]);
+            }
+            total_rows += in_batch;
+            remaining = &remaining[in_batch..];
+        }
+        if remaining.is_empty() {
+            break;
+        }
+        batch_start = batch_end;
+    }
+    if !remaining.is_empty() {
+        return Err(Error::internal(format!(
+            "Sample training data: the scan of column {column} ended at row {batch_start} \
+             before sampled row {}",
+            remaining[0]
+        )));
+    }
+    info!(
+        "Sample training data: retrieved {} rows by uniform random sampling over a scan",
+        total_rows
+    );
     fsl_values_to_array(vector_field, values_buf, total_rows)
 }
 
@@ -1920,6 +2040,57 @@ mod tests {
         assert_eq!(training_data.value_length(), dims as i32);
     }
 
+    /// A dense sample read with one scan holds exactly the rows `take` returns
+    /// for the same offsets, across fragments and around deleted rows.
+    #[tokio::test]
+    async fn test_dense_sample_scan_matches_take() {
+        let data = gen_batch()
+            .col("vec", array::rand_vec::<Float32Type>(Dimension::from(8)))
+            .col("id", array::step::<arrow_array::types::Int32Type>())
+            .into_batch_rows(RowCount::from(3_000))
+            .unwrap();
+        let mut dataset = InsertBuilder::new("memory://dense_sample_scan")
+            .with_params(&WriteParams {
+                max_rows_per_file: 700,
+                max_rows_per_group: 100,
+                ..Default::default()
+            })
+            .execute(vec![data])
+            .await
+            .unwrap();
+        dataset.delete("id % 7 = 3").await.unwrap();
+        assert!(dataset.get_fragments().len() > 1);
+
+        let num_rows = dataset.count_rows(None).await.unwrap();
+        let indices = generate_random_indices(num_rows, num_rows / 2);
+        let field = dataset.schema().field("vec").unwrap().clone();
+        let scanned = sample_fsl_by_scan(&dataset, "vec", &indices, 8 * 4, &field)
+            .await
+            .unwrap();
+
+        let projection = dataset.schema().project(&["vec"]).unwrap();
+        let taken = dataset.take(&indices, projection).await.unwrap();
+        let values =
+            |fsl: &FixedSizeListArray| fsl.values().as_primitive::<Float32Type>().values().to_vec();
+        assert_eq!(scanned.len(), indices.len());
+        assert_eq!(values(&scanned), values(taken["vec"].as_fixed_size_list()));
+    }
+
+    #[rstest::rstest]
+    #[case::wide_sparse(16 << 20, 1 << 20, 4096, false)]
+    #[case::wide_dense(16 << 20, 4 << 20, 4096, true)]
+    #[case::narrow_sparse(64 << 20, 65_536, 512, false)]
+    #[case::narrow_moderate(64 << 20, 4 << 20, 512, true)]
+    #[case::overflowing_column(usize::MAX, 1, 4096, false)]
+    fn test_samples_by_scan(
+        #[case] num_rows: usize,
+        #[case] sample_rows: usize,
+        #[case] byte_width: usize,
+        #[case] expected: bool,
+    ) {
+        assert_eq!(samples_by_scan(num_rows, sample_rows, byte_width), expected);
+    }
+
     #[rstest::rstest]
     #[case::sparse(1_000_000, 100)]
     #[case::dense(100, 80)]
@@ -1981,6 +2152,45 @@ mod tests {
         assert_eq!(filtered.len(), 2);
         let vals = filtered.values().as_primitive::<Float32Type>();
         assert_eq!(vals.values(), &[1.0, 2.0, 3.0, 4.0]);
+    }
+
+    /// Rows past the first parallel check chunk are filtered too, whether a
+    /// value is not finite, a value is null, or the whole vector is null.
+    #[rstest::rstest]
+    #[case::all_finite(None)]
+    #[case::nan(Some(f32::NAN))]
+    #[case::infinite(Some(f32::INFINITY))]
+    fn test_filter_finite_training_data_across_chunks(#[case] bad_value: Option<f32>) {
+        let num_rows = 2 * FINITE_CHECK_ROWS + 5;
+        let bad_value_row = num_rows - 1;
+        let null_value_row = FINITE_CHECK_ROWS + 3;
+        let null_vector_row = FINITE_CHECK_ROWS + 4;
+        let values = Float32Array::from_iter((0..num_rows * 2).map(|i| match (i / 2, bad_value) {
+            (row, Some(value)) if row == bad_value_row => Some(value),
+            (row, Some(_)) if row == null_value_row && i % 2 == 0 => None,
+            _ => Some(i as f32),
+        }));
+        let vector_validity = NullBuffer::from_iter(
+            (0..num_rows).map(|row| bad_value.is_none() || row != null_vector_row),
+        );
+        let field = Arc::new(Field::new("item", DataType::Float32, true));
+        let training_data =
+            FixedSizeListArray::try_new(field, 2, Arc::new(values), Some(vector_validity)).unwrap();
+
+        let filtered = filter_finite_training_data(training_data.clone()).unwrap();
+        let removed = [null_value_row, null_vector_row, bad_value_row];
+        let expected_rows: Vec<usize> = (0..num_rows)
+            .filter(|row| bad_value.is_none() || !removed.contains(row))
+            .collect();
+        assert_eq!(filtered.len(), expected_rows.len());
+        let expected_values: Vec<f32> = expected_rows
+            .iter()
+            .flat_map(|&row| [(2 * row) as f32, (2 * row + 1) as f32])
+            .collect();
+        assert_eq!(
+            filtered.values().as_primitive::<Float32Type>().values(),
+            &expected_values[..]
+        );
     }
 
     #[tokio::test]
