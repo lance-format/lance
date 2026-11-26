@@ -105,6 +105,7 @@ impl Scanner {
             autoproject_scoring_columns: true,
             relational_algebra_version: LANCE_RELATIONAL_ALGEBRA_VERSION,
             target_parallelism: None,
+            filter_schemas: Default::default(),
         };
         scanner.apply_blob_handling();
         scanner
