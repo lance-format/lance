@@ -578,7 +578,8 @@ public class Dataset implements Closeable {
   }
 
   /**
-   * Create a new version of dataset. Use {@link Transaction} instead
+   * Create a new version of the dataset. The returned dataset borrows the caller's allocator. Use
+   * {@link Transaction} instead.
    *
    * @param allocator the buffer allocator
    * @param path The file path of the dataset to open.
@@ -608,21 +609,72 @@ public class Dataset implements Closeable {
     Preconditions.checkNotNull(operation);
     Preconditions.checkNotNull(readVersion);
     Dataset dataset = operation.commit(allocator, path, readVersion, storageOptions);
-    dataset.allocator = allocator;
+    if (dataset.allocator != allocator) {
+      // A custom FragmentOperation can return a dataset with its own allocator.
+      dataset.releaseOwnedAllocator();
+      dataset.allocator = allocator;
+      dataset.separateDerivedAllocators = false;
+    }
     return dataset;
   }
 
-  /** Use {@link Transaction} instead */
+  /**
+   * Append fragments and return a dataset that owns its allocator and session. Use {@link
+   * Transaction} instead.
+   */
   @Deprecated
-  public static native Dataset commitAppend(
+  public static Dataset commitAppend(
+      String path,
+      Optional<Long> readVersion,
+      List<FragmentMetadata> fragmentsMetadata,
+      Map<String, String> storageOptions) {
+    return commitAppend(null, path, readVersion, fragmentsMetadata, storageOptions);
+  }
+
+  static Dataset commitAppend(
+      BufferAllocator allocator,
+      String path,
+      Optional<Long> readVersion,
+      List<FragmentMetadata> fragmentsMetadata,
+      Map<String, String> storageOptions) {
+    return nativeCommitAppend(path, readVersion, fragmentsMetadata, storageOptions)
+        .initializeFragmentCommit(allocator);
+  }
+
+  private static native Dataset nativeCommitAppend(
       String path,
       Optional<Long> readVersion,
       List<FragmentMetadata> fragmentsMetadata,
       Map<String, String> storageOptions);
 
-  /** Use {@link Transaction} instead */
+  /**
+   * Overwrite with fragments and return a dataset that owns its allocator and session. Use {@link
+   * Transaction} instead.
+   */
   @Deprecated
-  public static native Dataset commitOverwrite(
+  public static Dataset commitOverwrite(
+      String path,
+      long arrowSchemaMemoryAddress,
+      Optional<Long> readVersion,
+      List<FragmentMetadata> fragmentsMetadata,
+      Map<String, String> storageOptions) {
+    return commitOverwrite(
+        null, path, arrowSchemaMemoryAddress, readVersion, fragmentsMetadata, storageOptions);
+  }
+
+  static Dataset commitOverwrite(
+      BufferAllocator allocator,
+      String path,
+      long arrowSchemaMemoryAddress,
+      Optional<Long> readVersion,
+      List<FragmentMetadata> fragmentsMetadata,
+      Map<String, String> storageOptions) {
+    return nativeCommitOverwrite(
+            path, arrowSchemaMemoryAddress, readVersion, fragmentsMetadata, storageOptions)
+        .initializeFragmentCommit(allocator);
+  }
+
+  private static native Dataset nativeCommitOverwrite(
       String path,
       long arrowSchemaMemoryAddress,
       Optional<Long> readVersion,
@@ -631,6 +683,21 @@ public class Dataset implements Closeable {
 
   public BufferAllocator allocator() {
     return allocator;
+  }
+
+  private Dataset initializeFragmentCommit(BufferAllocator callerAllocator) {
+    try {
+      if (callerAllocator == null) {
+        ownAllocator(new RootAllocator(Long.MAX_VALUE));
+      } else {
+        allocator = callerAllocator;
+      }
+      initializeSession();
+      return this;
+    } catch (RuntimeException | Error e) {
+      close();
+      throw e;
+    }
   }
 
   /** Package-private setter for allocator, used by {@link CommitBuilder}. */
@@ -643,6 +710,16 @@ public class Dataset implements Closeable {
     allocatorOwners = new AtomicInteger(1);
   }
 
+  private void releaseOwnedAllocator() {
+    if (allocatorOwners != null) {
+      AtomicInteger owners = allocatorOwners;
+      allocatorOwners = null;
+      if (owners.decrementAndGet() == 0) {
+        allocator.close();
+      }
+    }
+  }
+
   void shareAllocator(Dataset source) {
     allocator = source.allocator;
     allocatorOwners = source.allocatorOwners;
@@ -652,7 +729,11 @@ public class Dataset implements Closeable {
   }
 
   void initializeDerivedAllocator(Dataset source) {
-    if (source.separateDerivedAllocators) {
+    initializeDerivedAllocator(source, source.separateDerivedAllocators);
+  }
+
+  private void initializeDerivedAllocator(Dataset source, boolean separateAllocator) {
+    if (separateAllocator) {
       ownAllocator(new RootAllocator(Long.MAX_VALUE));
     } else {
       shareAllocator(source);
@@ -2218,13 +2299,7 @@ public class Dataset implements Closeable {
         session = null;
         ownsSession = false;
       }
-      if (allocatorOwners != null) {
-        AtomicInteger owners = allocatorOwners;
-        allocatorOwners = null;
-        if (owners.decrementAndGet() == 0) {
-          allocator.close();
-        }
-      }
+      releaseOwnedAllocator();
     }
   }
 
@@ -2513,11 +2588,7 @@ public class Dataset implements Closeable {
     try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
       Dataset created = nativeCreateBranch(branch, ref, storageOptions);
-      if (allocatorOwners != null || allocator == null) {
-        created.ownAllocator(new RootAllocator(Long.MAX_VALUE));
-      } else {
-        created.shareAllocator(this);
-      }
+      created.initializeDerivedAllocator(this, allocatorOwners != null);
       created.initializeSession();
       return created;
     }

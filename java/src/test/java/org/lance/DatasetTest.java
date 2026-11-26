@@ -39,6 +39,7 @@ import org.lance.schema.LanceField;
 import org.lance.schema.SqlExpressions;
 
 import org.apache.arrow.c.ArrowArrayStream;
+import org.apache.arrow.c.ArrowSchema;
 import org.apache.arrow.c.Data;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
@@ -2317,6 +2318,84 @@ public class DatasetTest {
           assertThrows(IllegalStateException.class, branchAllocator::assertOpen);
         }
       }
+    }
+  }
+
+  @ParameterizedTest
+  @CsvSource({"false,false", "true,false", "false,true", "true,true"})
+  void testFragmentCommitDataset(boolean overwrite, boolean callerOwnsAllocator, @TempDir Path dir)
+      throws Exception {
+    String path = dir.resolve("table").toString();
+    try (BufferAllocator allocator = new RootAllocator()) {
+      TestUtils.SimpleTestDataset suite = new TestUtils.SimpleTestDataset(allocator, path);
+      suite.createEmptyDataset().close();
+      List<FragmentMetadata> fragments = suite.createNewFragment(4, 2);
+      Optional<Long> version = Optional.of(1L);
+      Dataset committed;
+      if (callerOwnsAllocator) {
+        FragmentOperation operation =
+            overwrite
+                ? new FragmentOperation.Overwrite(fragments, suite.getSchema())
+                : new FragmentOperation.Append(fragments);
+        committed = Dataset.commit(allocator, path, operation, version);
+      } else if (overwrite) {
+        try (ArrowSchema schema = ArrowSchema.allocateNew(allocator)) {
+          Data.exportSchema(allocator, suite.getSchema(), null, schema);
+          committed =
+              Dataset.commitOverwrite(path, schema.memoryAddress(), version, fragments, Map.of());
+        }
+      } else {
+        committed = Dataset.commitAppend(path, version, fragments, Map.of());
+      }
+      BufferAllocator resultAllocator = committed.allocator();
+      Session session = committed.session();
+      try (committed) {
+        assertEquals(suite.getSchema(), committed.getSchema());
+        assertNotNull(session);
+        assertFalse(session.isClosed());
+        if (callerOwnsAllocator) {
+          assertSame(allocator, resultAllocator);
+        }
+        try (LanceScanner scanner = committed.newScan()) {
+          suite.validateScanResults(committed, scanner, 4, 2, 0);
+        }
+      }
+      assertTrue(session.isClosed());
+      allocator.assertOpen();
+      if (!callerOwnsAllocator) {
+        assertThrows(IllegalStateException.class, resultAllocator::assertOpen);
+      }
+    }
+  }
+
+  @Test
+  void testCustomFragmentCommitAllocator(@TempDir Path dir) {
+    String path = dir.resolve("table").toString();
+    try (BufferAllocator allocator = new RootAllocator()) {
+      TestUtils.SimpleTestDataset suite = new TestUtils.SimpleTestDataset(allocator, path);
+      suite.createEmptyDataset().close();
+      List<FragmentMetadata> fragments = suite.createNewFragment(2, 1);
+      class DirectAppend extends FragmentOperation {
+        BufferAllocator commitAllocator;
+
+        @Override
+        public Dataset commit(
+            BufferAllocator caller,
+            String uri,
+            Optional<Long> version,
+            Map<String, String> options) {
+          Dataset result = Dataset.commitAppend(uri, version, fragments, options);
+          commitAllocator = result.allocator();
+          return result;
+        }
+      }
+      DirectAppend operation = new DirectAppend();
+      try (Dataset result = Dataset.commit(allocator, path, operation, Optional.of(1L))) {
+        assertThrows(IllegalStateException.class, operation.commitAllocator::assertOpen);
+        assertSame(allocator, result.allocator());
+        assertEquals(suite.getSchema(), result.getSchema());
+      }
+      allocator.assertOpen();
     }
   }
 

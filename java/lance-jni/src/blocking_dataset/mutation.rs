@@ -66,7 +66,7 @@ impl BlockingDataset {
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_org_lance_Dataset_commitAppend<'local>(
+pub extern "system" fn Java_org_lance_Dataset_nativeCommitAppend<'local>(
     mut env: JNIEnv<'local>,
     _obj: JObject,
     path: JString,
@@ -107,7 +107,7 @@ pub fn inner_commit_append<'local>(
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_org_lance_Dataset_commitOverwrite<'local>(
+pub extern "system" fn Java_org_lance_Dataset_nativeCommitOverwrite<'local>(
     mut env: JNIEnv<'local>,
     _obj: JObject,
     path: JString,
