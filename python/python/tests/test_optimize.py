@@ -1726,34 +1726,31 @@ def test_read_transaction_of_a_compaction_that_rewrites_an_index(tmp_path: Path)
     assert rewritten.new_index_version == index.segments[0].index_version
 
 
-def test_compaction_with_concurrent_reader(tmp_path: Path):
-    # Compaction that commits while another thread reads through the same handle must
-    # not raise after the commit has landed.
+def test_compaction_while_the_handle_is_borrowed(tmp_path: Path):
+    # Compaction that commits while another call is using the same handle must not
+    # raise after the commit has landed. `take_scan` holds the handle while it calls
+    # `__iter__` on its argument, so the compaction always commits inside that borrow.
     uri = tmp_path / "data"
-    for i in range(8):
+    for i in range(4):
         lance.write_dataset(
             pa.table({"a": range(i * 10, i * 10 + 10)}),
             uri,
             mode="append" if i else "create",
         )
     ds = lance.dataset(uri)
-    stop = threading.Event()
-    reader_errors = []
+    version_before = ds.version
+    metrics = []
 
-    def read_concurrently():
-        try:
-            while not stop.is_set():
-                ds.count_rows()
-        except BaseException as err:
-            reader_errors.append(err)
+    class CompactOnIter:
+        def __iter__(self):
+            metrics.append(ds.optimize.compact_files())
+            return iter([])
 
-    reader = threading.Thread(target=read_concurrently)
-    reader.start()
-    try:
-        metrics = ds.optimize.compact_files()
-    finally:
-        stop.set()
-        reader.join()
-    assert reader_errors == []
-    assert metrics.fragments_removed == 8
-    assert len(lance.dataset(uri).get_fragments()) == 1
+    ds._ds.take_scan(CompactOnIter())
+
+    assert metrics[0].fragments_removed == 4
+    assert ds.version == version_before
+    ds.checkout_latest()
+    assert ds.version > version_before
+    assert len(ds.get_fragments()) == 1
+    assert sorted(ds.to_table()["a"].to_pylist()) == list(range(40))

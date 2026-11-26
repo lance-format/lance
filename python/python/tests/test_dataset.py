@@ -11137,37 +11137,26 @@ class TestLanceScannerTake:
         assert scanner.take(pa.array([0, 2]))["id"].to_pylist() == [4, 6]
 
 
-def test_merge_insert_with_concurrent_reader(tmp_path: Path):
-    # A merge committed while another thread was reading through the same handle used
-    # to raise PanicException ("Already borrowed") after the commit had landed. It now
-    # returns its stats; the handle may stay at the previous version.
+def test_merge_insert_while_the_handle_is_borrowed(tmp_path: Path):
+    # A merge that committed while another call was using the same handle used to
+    # raise PanicException ("Already borrowed") after the commit had landed.
+    # `take_scan` holds the handle while it calls `__iter__` on its argument, so the
+    # merge below always commits inside that borrow.
     uri = tmp_path / "data"
-    ds = lance.write_dataset(pa.table({"id": range(256)}), uri)
-    stop = threading.Event()
-    reader_errors = []
+    ds = lance.write_dataset(pa.table({"id": range(10), "value": [0] * 10}), uri)
+    stats = []
 
-    def read_concurrently():
-        try:
-            while not stop.is_set():
-                ds.count_rows()
-        except BaseException as err:
-            reader_errors.append(err)
+    class MergeOnIter:
+        def __iter__(self):
+            new_rows = pa.table({"id": range(10), "value": [1] * 10})
+            merge = ds.merge_insert("id").when_matched_update_all()
+            stats.append(merge.execute(new_rows))
+            return iter([])
 
-    reader = threading.Thread(target=read_concurrently)
-    reader.start()
-    new_table = pa.table({"id": range(256)})
-    try:
-        for _ in range(3):
-            version_before = lance.dataset(uri).version
-            stats = ds.merge_insert("id").when_matched_update_all().execute(new_table)
-            assert stats["num_updated_rows"] == len(new_table)
-            assert lance.dataset(uri).version == version_before + 1
-            assert ds.version <= version_before + 1
-    finally:
-        stop.set()
-        reader.join()
-    assert reader_errors == []
+    ds._ds.take_scan(MergeOnIter())
 
-    # With the reader gone, the handle moves to each new commit again.
-    ds.merge_insert("id").when_matched_update_all().execute(new_table)
-    assert ds.version == lance.dataset(uri).version
+    assert stats[0]["num_updated_rows"] == 10
+    assert ds.version == 1
+    ds.checkout_latest()
+    assert ds.version == 2
+    assert ds.to_table()["value"].to_pylist() == [1] * 10
