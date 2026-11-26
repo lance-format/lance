@@ -140,10 +140,7 @@ pub fn exact_batch(schema: &SchemaRef, batches: &[RecordBatch], copy: bool) -> R
 
 /// Materialize whole IVF partition columns. Only a freshly allocated buffer
 /// from the fixed-width copier has a known, exclusive allocation owner here.
-pub(crate) fn exact_partition_batch(
-    schema: &SchemaRef,
-    batches: &[RecordBatch],
-) -> Result<RecordBatch> {
+pub fn exact_partition_batch(schema: &SchemaRef, batches: &[RecordBatch]) -> Result<RecordBatch> {
     let Some(mut observation) = IvfPartitionCopies::start() else {
         return exact_batch(schema, batches, false);
     };
