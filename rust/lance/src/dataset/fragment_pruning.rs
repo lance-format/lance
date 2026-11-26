@@ -239,9 +239,10 @@ impl Dataset {
 #[cfg(test)]
 mod tests {
     use arrow_array::{
-        ArrayRef, RecordBatch, RecordBatchIterator, TimestampMillisecondArray, UInt64Array,
-        record_batch,
+        ArrayRef, Int32Array, RecordBatch, RecordBatchIterator, StructArray,
+        TimestampMillisecondArray, UInt64Array, record_batch,
     };
+    use arrow_schema::Field;
     use lance_index::IndexType;
     use lance_index::scalar::{BuiltinIndexType, ScalarIndexParams};
     use rstest::rstest;
@@ -468,6 +469,53 @@ mod tests {
             expected,
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn test_fragment_pruning_matches_nested_field_path() {
+        let values: ArrayRef = Arc::new(Int32Array::from(vec![None, Some(5)]));
+        let structs: ArrayRef = Arc::new(StructArray::from(vec![(
+            Arc::new(Field::new("x", DataType::Int32, true)),
+            values,
+        )]));
+        let batch = RecordBatch::try_from_iter_with_nullable([("s", structs, true)]).unwrap();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 1,
+                max_rows_per_group: 1,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        build_segments(&mut dataset, "s", BuiltinIndexType::ZoneMap, &[&[0, 1]]).await;
+
+        let predicate = "s.x IS NULL";
+        assert_candidates(&dataset, predicate, &[0, 1]).await;
+        assert_candidates(&dataset, "s IS NULL", &[]).await;
+
+        let indexed = dataset
+            .scan()
+            .filter(predicate)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let full = dataset
+            .scan()
+            .use_scalar_index(false)
+            .filter(predicate)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(indexed, full);
+        assert_eq!(full.num_rows(), 1);
+
+        build_segments(&mut dataset, "s.x", BuiltinIndexType::ZoneMap, &[&[0, 1]]).await;
+        assert_candidates(&dataset, predicate, &[0]).await;
     }
 
     #[tokio::test]
