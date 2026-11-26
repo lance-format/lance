@@ -2192,6 +2192,33 @@ def test_explain_cleanup_old_versions(tmp_path):
     assert stats.old_versions == explanation.stats.old_versions
 
 
+# About 290,000 years: it fits in i64 microseconds, but subtracting it from now
+# reaches past the earliest timestamp chrono can represent.
+UNREPRESENTABLE_AGE = timedelta(days=106_000_000)
+
+
+def test_explain_cleanup_old_versions_unrepresentable_age(tmp_path):
+    base_dir = tmp_path / "test"
+    lance.write_dataset(pa.table({"a": range(10)}), base_dir)
+    lance.write_dataset(pa.table({"a": range(10)}), base_dir, mode="overwrite")
+    dataset = lance.dataset(base_dir)
+
+    with pytest.raises(ValueError, match="earliest representable timestamp"):
+        dataset.explain_cleanup_old_versions(older_than=UNREPRESENTABLE_AGE)
+    assert len(dataset.versions()) == 2
+
+
+def test_explain_expire_versions_unrepresentable_age(tmp_path):
+    base_dir = tmp_path / "test"
+    lance.write_dataset(pa.table({"a": range(10)}), base_dir)
+    lance.write_dataset(pa.table({"a": range(10)}), base_dir, mode="overwrite")
+    dataset = lance.dataset(base_dir)
+
+    with pytest.raises(ValueError, match="earliest representable timestamp"):
+        dataset.explain_expire_versions(before=UNREPRESENTABLE_AGE)
+    assert len(dataset.versions()) == 2
+
+
 def test_expire_versions(tmp_path):
     table = pa.Table.from_pydict({"a": range(100), "b": range(100)})
     base_dir = tmp_path / "test"
