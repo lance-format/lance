@@ -262,10 +262,14 @@ impl FileFragment {
         Ok(frag)
     }
 
-    /// On-disk bytes for each field in this fragment.
+    /// On-disk bytes for each field of the current dataset schema.
     ///
-    /// Field ids that appear in more than one data file are summed, including
-    /// bytes in data overlays. The pairs are sorted by field id.
+    /// The ids are the schema's fields, the same set as
+    /// [`DatasetStatisticsExt::calculate_data_stats`](crate::dataset::statistics::DatasetStatisticsExt::calculate_data_stats).
+    /// A field with no bytes in this fragment is included as `0`. Ids that have been dropped, and
+    /// tombstoned slots still stored in a data file, are omitted. A field that
+    /// appears in more than one data file is summed, including bytes in data
+    /// overlays. The pairs are sorted by field id.
     pub async fn storage_stats(&self) -> Result<Vec<(u32, u64)>> {
         let scan_scheduler = ScanScheduler::new(
             self.dataset.table_state.object_store.clone(),
@@ -274,9 +278,17 @@ impl FileFragment {
         let pairs = self
             .storage_stats_with(self.dataset.schema(), scan_scheduler)
             .await?;
-        let mut totals = HashMap::<u32, u64>::new();
+        let mut totals = HashMap::<u32, u64>::from_iter(
+            self.dataset
+                .schema()
+                .field_ids()
+                .into_iter()
+                .map(|id| (id as u32, 0)),
+        );
         for (field_id, bytes) in pairs {
-            *totals.entry(field_id).or_default() += bytes;
+            if let Some(total) = totals.get_mut(&field_id) {
+                *total += bytes;
+            }
         }
         let mut totals: Vec<(u32, u64)> = totals.into_iter().collect();
         totals.sort_unstable_by_key(|(field_id, _)| *field_id);

@@ -56,6 +56,107 @@ def test_fragment_storage_stats(tmp_path: Path):
     assert {field.id: field.bytes_on_disk for field in data_stats.fields} == totals
 
 
+def _schema_field_ids(dataset: LanceDataset) -> list[int]:
+    ids: list[int] = []
+
+    def walk(fields) -> None:
+        for field in fields:
+            ids.append(field.id())
+            walk(field.children())
+
+    walk(dataset.lance_schema.fields())
+    return ids
+
+
+def test_fragment_storage_stats_after_drop_and_aligned_rewrite(tmp_path: Path):
+    """Dropped ids stay out, and a rewritten neighbor does not absorb tombstones.
+
+    The untouched column's byte count is the value measured before the rewrite.
+    Comparing the two statistics APIs is not enough: they share one reader.
+    """
+    nrows = 32
+    table = pa.table(
+        {
+            "kept": list(range(nrows)),
+            "replaced_a": list(range(100, 100 + nrows)),
+            "replaced_b": list(range(200, 200 + nrows)),
+            "dropped": [f"row-{i}" for i in range(nrows)],
+        }
+    )
+    dataset_uri = tmp_path / "stats-rewrite"
+    dataset = write_dataset(
+        table,
+        dataset_uri,
+        data_storage_version="2.1",
+    )
+    fragment = dataset.get_fragments()[0]
+    assert len(fragment.data_files()) == 1
+    kept_id = dataset.lance_schema.field("kept").id()
+    replaced_a_id = dataset.lance_schema.field("replaced_a").id()
+    replaced_b_id = dataset.lance_schema.field("replaced_b").id()
+    dropped_id = dataset.lance_schema.field("dropped").id()
+    assert list(fragment.data_files()[0].fields) == [
+        kept_id,
+        replaced_a_id,
+        replaced_b_id,
+        dropped_id,
+    ]
+    kept_bytes = dict(fragment.storage_stats())[kept_id]
+    assert kept_bytes > 0
+
+    dataset.drop_columns(["dropped"])
+    fragment = dataset.get_fragments()[0]
+    # The shared file still stores the dropped id.
+    assert dropped_id in fragment.data_files()[0].fields
+
+    rows = fragment.to_table(
+        columns=["replaced_a", "replaced_b"], with_row_address=True
+    )
+    new_values = pa.table(
+        {
+            "_rowaddr": rows["_rowaddr"],
+            "replaced_a": pa.array([7] * rows.num_rows, pa.int64()),
+            "replaced_b": pa.array([8] * rows.num_rows, pa.int64()),
+        }
+    )
+    updated_fragment, fields_modified = fragment.update_columns_from_stream(new_values)
+    dataset = lance.LanceDataset.commit(
+        str(dataset_uri),
+        LanceOperation.Update(
+            updated_fragments=[updated_fragment],
+            fields_modified=fields_modified,
+            update_mode="rewrite_columns",
+        ),
+        read_version=dataset.version,
+    )
+    fragment = dataset.get_fragments()[0]
+    shared = next(
+        data_file
+        for data_file in fragment.data_files()
+        if dropped_id in data_file.fields
+    )
+    assert list(shared.fields) == [kept_id, -2, -2, dropped_id]
+
+    dataset.add_columns(pa.schema([pa.field("empty", pa.int64())]))
+    fragment = dataset.get_fragments()[0]
+    empty_id = dataset.lance_schema.field("empty").id()
+    stats = fragment.storage_stats()
+    stats_map = dict(stats)
+    schema_ids = _schema_field_ids(dataset)
+
+    assert stats == sorted(stats)
+    assert [field_id for field_id, _ in stats] == sorted(schema_ids)
+    assert dropped_id not in stats_map
+    assert (2**32 - 2) not in stats_map
+    assert stats_map[kept_id] == kept_bytes
+    assert stats_map[empty_id] == 0
+    assert stats_map[replaced_a_id] > 0
+    assert stats_map[replaced_b_id] > 0
+
+    data_stats = dataset.stats.data_stats()
+    assert {field.id: field.bytes_on_disk for field in data_stats.fields} == stats_map
+
+
 def test_fragment_storage_stats_refreshes_expired_namespace_credentials(tmp_path: Path):
     """Expired Python namespace credentials must not deadlock fragment stats.
 

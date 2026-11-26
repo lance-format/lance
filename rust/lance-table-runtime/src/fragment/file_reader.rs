@@ -231,16 +231,19 @@ impl FileFragment {
         };
         let path = file_scheduler.reader().path().clone();
         let metadata_cache = self.table.state.metadata_cache.file_metadata_cache(&path);
-        let field_id_to_column_idx = Arc::new(BTreeMap::from_iter(
-            data_file
-                .fields
-                .iter()
-                .copied()
-                .zip(data_file.column_indices.iter().copied())
-                .filter_map(|(field_id, column_index)| {
-                    (column_index >= 0).then_some((field_id as u32, column_index as u32))
-                }),
-        ));
+        // Keep every slot. The read map is keyed by field id, so repeated
+        // tombstones collapse there; byte attribution needs each column.
+        let field_slots: Vec<(i32, i32)> = data_file
+            .fields
+            .iter()
+            .copied()
+            .zip(data_file.column_indices.iter().copied())
+            .collect();
+        let field_id_to_column_idx = Arc::new(BTreeMap::from_iter(field_slots.iter().filter_map(
+            |(field_id, column_index)| {
+                (*column_index >= 0).then_some((*field_id as u32, *column_index as u32))
+            },
+        )));
         let file_version = data_file.file_version()?;
         // Blob projections always open the reader with the full footer. A 2.2 file reads
         // it first, to see which of its blob columns keep the legacy layout.
@@ -339,6 +342,7 @@ impl FileFragment {
             Arc::new(reader),
             schema_per_file,
             field_id_to_column_idx,
+            &field_slots,
             Arc::new(legacy_blobs),
             reader_priority,
             file_scheduler,

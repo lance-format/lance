@@ -244,10 +244,12 @@ impl FileFragment {
         })
     }
 
-    /// On-disk bytes for each field, as ``(field_id, bytes)`` sorted by field id.
+    /// On-disk bytes for each current-schema field, as ``(field_id, bytes)``
+    /// sorted by field id.
     ///
-    /// A field stored in more than one data file is reported once, with the
-    /// sizes added together.
+    /// Fields with no bytes in this fragment are included as ``0``. Dropped
+    /// ids and tombstoned slots are omitted. A field stored in more than one
+    /// data file is reported once, with the sizes added together.
     fn storage_stats(&self) -> PyResult<Vec<(u32, u64)>> {
         // Release the GIL before waiting. A Python namespace refreshes expired
         // credentials on a worker via `Python::attach`; holding the GIL here
