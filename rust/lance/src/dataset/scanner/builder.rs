@@ -33,6 +33,7 @@ use lance_datafusion::projection::ProjectionPlan;
 use lance_file::reader::FileReaderOptions;
 use lance_index::scalar::FullTextSearchQuery;
 use lance_index::scalar::minhash_lsh::MinHashQuery;
+use lance_index::vector::segment_ef::SegmentEfParams;
 use lance_index::vector::{
     ApproxMode, DEFAULT_QUERY_PARALLELISM, ProbeParams, Query, RqGraphScoring,
 };
@@ -947,6 +948,7 @@ impl Scanner {
             dist_q_c: 0.0,
             approx_mode: Default::default(),
             rq_graph_scoring: Default::default(),
+            segment_ef: Default::default(),
         });
         self.quantized_refine_factor = None;
         self.nearest_refine = None;
@@ -1087,6 +1089,39 @@ impl Scanner {
             log::warn!("ef is not set because nearest has not been called yet");
         }
         self
+    }
+
+    /// Set how the delta segments of an HNSW index are searched relative to
+    /// [`Self::ef`]; see [`SegmentEfParams`].
+    ///
+    /// The base segment is always searched with the full `ef`. By default every
+    /// segment is ([`lance_index::vector::segment_ef::SegmentEfPolicy::Uniform`]);
+    /// a narrowing policy trades a little recall for fewer distance computations.
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result};
+    /// # use arrow_array::Float32Array;
+    /// # use lance_index::vector::segment_ef::{SegmentEfParams, SegmentEfPolicy};
+    /// # async fn test(dataset: &Dataset) -> Result<()> {
+    /// let query = Float32Array::from(vec![0.0_f32; 8]);
+    /// let mut scanner = dataset.scan();
+    /// scanner
+    ///     .nearest("vector", &query, 10)?
+    ///     .segment_ef(SegmentEfParams {
+    ///         policy: SegmentEfPolicy::Proportional { multiplier: 4.0 },
+    ///         ..Default::default()
+    ///     })?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn segment_ef(&mut self, params: SegmentEfParams) -> Result<&mut Self> {
+        params.validate()?;
+        if let Some(q) = self.nearest.as_mut() {
+            q.segment_ef = params;
+        } else {
+            log::warn!("segment_ef is not set because nearest has not been called yet");
+        }
+        Ok(self)
     }
 
     /// Only search indexed data, skipping flat fallback (default: false).

@@ -57,6 +57,31 @@ message CoveringProjection {
   repeated int32 field_ids = 1;
 }
 
+// How a delta segment's beam width is derived from the query's ef.
+enum SegmentEfPolicyKind {
+  // Every segment is searched with the query's ef.
+  Uniform = 0;
+  // Delta segments are searched with ef / divisor.
+  Capped = 1;
+  // A delta holding a share f of the live rows is searched with ef * min(1, multiplier * f).
+  Proportional = 2;
+}
+
+/* Beam width of the delta segments of an index relative to the query's ef. The
+ * base segment, the one covering the most rows, is always searched with ef.
+ */
+message SegmentEfProto {
+  SegmentEfPolicyKind policy = 1;
+  // Divisor of the Capped policy; unused by the others.
+  uint32 divisor = 2;
+  // Multiplier of the Proportional policy; unused by the others.
+  double multiplier = 3;
+  // Smallest ef a delta is searched with, before raising it to k * refine_factor.
+  uint32 floor = 4;
+  // Whether the floor grows by 1 / (1 - dead fraction) of each segment.
+  bool scale_floor_by_dead = 5;
+}
+
 // Serialized vector query parameters.
 message VectorQueryProto {
   // Query vector as Arrow IPC bytes (supports Float16, Float32, Float64, UInt8, etc.)
@@ -96,6 +121,10 @@ message VectorQueryProto {
    * ignore this setting.
    */
   VectorRqGraphScoring rq_graph_scoring = 17;
+  /* Beam width of the delta segments. Absent, as from a producer that predates
+   * the field, means every segment is searched with ef (Uniform).
+   */
+  SegmentEfProto segment_ef = 18;
 }
 
 /* Serializable form of ANNIvfSubIndexExec — the IVF sub-index search node.

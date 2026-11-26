@@ -59,7 +59,7 @@ use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::tempfile::TempStrDir;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{ROW_ID, Result};
-use lance_datagen::{Dimension, RowCount, Seed, array, gen_batch};
+use lance_datagen::{BatchCount, Dimension, RowCount, Seed, array, gen_batch};
 use lance_encoding::decoder::DecoderPlugins;
 use lance_file::reader::{FileReader, FileReaderOptions};
 use lance_index::IndexType;
@@ -76,6 +76,7 @@ use lance_index::vector::ivf::IvfBuildParams;
 use lance_index::vector::kmeans::{KMeansParams, train_kmeans};
 use lance_index::vector::pq::{PQBuildParams, ProductQuantizer};
 use lance_index::vector::quantizer::{Quantization, QuantizerMetadata};
+use lance_index::vector::segment_ef::{SegmentEfParams, SegmentEfPolicy};
 use lance_index::vector::sq::ScalarQuantizer;
 use lance_index::vector::sq::builder::SQBuildParams;
 use lance_index::vector::{
@@ -383,6 +384,122 @@ async fn test_partition_coverage_is_only_built_for_capable_filters() {
     assert!(entry.partition_rows_accounted.load(Ordering::Acquire));
 }
 
+const SEGMENT_DATASET_ROWS: u64 = 1200;
+
+/// A three-fragment dataset with an IVF_HNSW_FLAT index over two partitions.
+async fn segment_dataset(uri: &str) -> Dataset {
+    let reader = gen_batch()
+        .with_seed(Seed(7))
+        .col("id", array::step::<UInt64Type>())
+        .col(
+            "vector",
+            array::rand_vec::<Float32Type>(Dimension::from(16)),
+        )
+        .into_reader_rows(RowCount::from(SEGMENT_DATASET_ROWS), BatchCount::from(1));
+    let mut dataset = Dataset::write(
+        reader,
+        uri,
+        Some(WriteParams {
+            max_rows_per_file: 400,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let params = VectorIndexParams::ivf_hnsw(
+        DistanceType::L2,
+        IvfBuildParams::new(2),
+        HnswBuildParams::default().num_edges(12).ef_construction(40),
+    );
+    dataset
+        .create_index(&["vector"], IndexType::Vector, None, &params, true)
+        .await
+        .unwrap();
+    dataset
+}
+
+/// Narrower beams on the delta segments still find each query's own row: on an
+/// easy dataset every policy returns the same top-1 as searching every segment
+/// with the full `ef`.
+#[tokio::test]
+async fn test_segment_ef_policies_keep_top1_across_delta_segments() {
+    let test_dir = TempStrDir::default();
+    let mut dataset = segment_dataset(test_dir.as_str()).await;
+    let appended = gen_batch()
+        .with_seed(Seed(8))
+        .col(
+            "id",
+            array::step_custom::<UInt64Type>(SEGMENT_DATASET_ROWS, 1),
+        )
+        .col(
+            "vector",
+            array::rand_vec::<Float32Type>(Dimension::from(16)),
+        )
+        .into_reader_rows(RowCount::from(200), BatchCount::from(2));
+    dataset.append(appended, None).await.unwrap();
+    dataset
+        .optimize_indices(&OptimizeOptions::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        dataset
+            .load_indices_by_name("vector_idx")
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+
+    let vectors = dataset
+        .scan()
+        .project(&["id", "vector"])
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let ids = vectors["id"].as_primitive::<UInt64Type>().clone();
+    let vectors = vectors["vector"].as_fixed_size_list().clone();
+    let top1 = |params: SegmentEfParams, row: usize| {
+        let dataset = dataset.clone();
+        let query = vectors.value(row);
+        async move {
+            let mut scan = dataset.scan();
+            scan.nearest("vector", query.as_ref(), 1)
+                .unwrap()
+                .minimum_nprobes(2)
+                .ef(64)
+                .segment_ef(params)
+                .unwrap();
+            let batch = scan.try_into_batch().await.unwrap();
+            batch["id"].as_primitive::<UInt64Type>().value(0)
+        }
+    };
+    let policies = [
+        SegmentEfPolicy::Capped { divisor: 4 },
+        SegmentEfPolicy::Proportional { multiplier: 4.0 },
+    ];
+    // Rows from the base segment and from the delta segment.
+    for row in (0..ids.len()).step_by(97) {
+        let full = top1(
+            SegmentEfParams {
+                policy: SegmentEfPolicy::Uniform,
+                ..Default::default()
+            },
+            row,
+        )
+        .await;
+        assert_eq!(full, ids.value(row));
+        for policy in policies {
+            let params = SegmentEfParams {
+                policy,
+                floor: 10,
+                scale_floor_by_dead: false,
+            };
+            assert_eq!(top1(params, row).await, full, "{policy:?} row {row}");
+        }
+    }
+}
+
 #[rstest]
 #[case::below_two_tasks(vec![600, 600], 1024, 8, vec![0..2])]
 #[case::one_partition(vec![5000], 1024, 8, vec![0..1])]
@@ -555,6 +672,7 @@ async fn test_batch_partition_prefilter_preserves_bulk_scoring(#[case] bits: Opt
         query_parallelism: DEFAULT_QUERY_PARALLELISM,
         dist_q_c: 0.0,
         approx_mode: Default::default(),
+        segment_ef: Default::default(),
         rq_graph_scoring: Default::default(),
     };
     let mut dataset = Dataset::write(
@@ -5745,6 +5863,7 @@ async fn test_score_partition_candidates_matches_accurate_native_search(
         dist_q_c: f32::NAN,
         approx_mode: ApproxMode::Fast,
         rq_graph_scoring: Default::default(),
+        segment_ef: Default::default(),
     };
     let (partition_ids, centroid_distances) = index.find_partitions(&query).unwrap();
     let partition_position = (0..partition_ids.len())
@@ -5955,6 +6074,7 @@ async fn test_selected_scoring_excludes_null_and_non_finite_stored_vectors(#[cas
         dist_q_c: 0.0,
         approx_mode: ApproxMode::Accurate,
         rq_graph_scoring: Default::default(),
+        segment_ef: Default::default(),
     };
     let scored = index
         .score_partition_candidates(0, &query, &[0, 1, 2, 3], &NoOpMetricsCollector)
@@ -7310,6 +7430,7 @@ async fn test_global_topk_search_bounds_in_flight_prepared_partitions() {
         query_parallelism: DEFAULT_QUERY_PARALLELISM,
         dist_q_c: 0.0,
         approx_mode: Default::default(),
+        segment_ef: Default::default(),
         rq_graph_scoring: Default::default(),
     };
     let (partitions, q_c_dists) = index.find_partitions(&query).unwrap();

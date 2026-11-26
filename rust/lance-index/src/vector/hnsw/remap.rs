@@ -637,9 +637,15 @@ pub fn remap_graph_repair<S: VectorStore + Sync>(
         }
         levels.push(adj);
     }
+    // The entry point must sit on the highest level that still has nodes. A replacement drawn from the old
+    // entry point's surviving neighbors can be on a lower level when that level kept nodes the entry point
+    // was not linked to.
+    let top = levels.iter().rposition(|level| !level.order.is_empty());
     let entry_point = parsed
         .new_entry
-        .or(entry_replacement.map(|(id, _)| id))
+        .or(entry_replacement
+            .map(|(id, _)| id)
+            .filter(|id| top.is_some_and(|top| levels[top].on_level[*id as usize])))
         .or(highest_first)
         .ok_or_else(|| Error::internal("HNSW repair kept nodes on no level".to_string()))?;
     let ef = parsed.metadata.params.ef_construction.min(kept.max(1));
@@ -1113,6 +1119,84 @@ mod tests {
         let top_ids =
             &ids.values()[new_metadata.level_offsets[top]..new_metadata.level_offsets[top + 1]];
         assert!(top_ids.contains(&new_metadata.entry_point));
+    }
+
+    /// A removed entry point is replaced by its closest surviving neighbor on the highest level where
+    /// it still has one. When none of its neighbors survives on the top level but other nodes do, that
+    /// neighbor sits on a lower level and cannot be the entry point.
+    #[test]
+    fn test_repair_keeps_entry_point_on_top_level() {
+        let (vectors, hnsw) = build(TOTAL);
+        let batch = hnsw.to_batch().unwrap();
+        let old_metadata = metadata(&batch);
+        let entry_point = old_metadata.entry_point;
+        let ids = batch[VECTOR_ID_COL].as_primitive::<UInt32Type>();
+        let neighbors = batch[NEIGHBORS_COL].as_list::<i32>();
+        let levels = old_metadata
+            .level_offsets
+            .iter()
+            .tuple_windows()
+            .map(|(&start, &end)| (start..end).map(|row| ids.value(row)).collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        let entry_neighbors = (0..batch.num_rows())
+            .filter(|&row| ids.value(row) == entry_point)
+            .flat_map(|row| {
+                neighbors
+                    .value(row)
+                    .as_primitive::<UInt32Type>()
+                    .values()
+                    .to_vec()
+            })
+            .collect::<HashSet<_>>();
+
+        // Empty every level above `top`, and on `top` remove the entry point and each of its
+        // neighbors, at the highest level where another node survives.
+        let (top, removed) = (1..levels.len())
+            .rev()
+            .find_map(|top| {
+                let removed = levels[top + 1..]
+                    .iter()
+                    .flatten()
+                    .chain(
+                        levels[top]
+                            .iter()
+                            .filter(|id| **id == entry_point || entry_neighbors.contains(*id)),
+                    )
+                    .copied()
+                    .collect::<HashSet<_>>();
+                levels[top]
+                    .iter()
+                    .any(|id| !removed.contains(id))
+                    .then_some((top, removed))
+            })
+            .expect("some level keeps a node outside the entry point's neighbors");
+
+        let mut new_ids = Vec::with_capacity(TOTAL);
+        let mut kept_idx = Vec::new();
+        for old_id in 0..TOTAL as u32 {
+            if removed.contains(&old_id) {
+                new_ids.push(None);
+            } else {
+                new_ids.push(Some(kept_idx.len() as u32));
+                kept_idx.push(old_id);
+            }
+        }
+        let kept = take(&vectors, &UInt32Array::from(kept_idx), None).unwrap();
+        let kept = kept.as_fixed_size_list().clone();
+        let store = FlatFloatStorage::new(kept.clone(), DistanceType::L2);
+        let repaired = remap_graph_repair(&batch, &new_ids, &store).unwrap();
+
+        let new_metadata = metadata(&repaired);
+        let new_ids_col = repaired[VECTOR_ID_COL].as_primitive::<UInt32Type>();
+        let top_ids = &new_ids_col.values()
+            [new_metadata.level_offsets[top]..new_metadata.level_offsets[top + 1]];
+        assert!(
+            top_ids.contains(&new_metadata.entry_point),
+            "entry point {} is not on top level {top}",
+            new_metadata.entry_point
+        );
+        let recall = recall(&HNSW::load(repaired).unwrap(), &kept, &kept.slice(0, 50));
+        assert!(recall >= 0.5, "recall {recall}");
     }
 
     #[test]

@@ -238,6 +238,7 @@ impl QuantizedRefinementKey {
             dist_q_c: _,
             approx_mode,
             rq_graph_scoring,
+            segment_ef,
             column: _,
             key: _,
         } = query;
@@ -272,6 +273,7 @@ impl QuantizedRefinementKey {
             RqGraphScoring::MultiBit => 0,
             RqGraphScoring::OneBitRerank => 1,
         });
+        builder.write_str(&format!("{segment_ef:?}"));
         builder.finish()
     }
 }
@@ -601,6 +603,7 @@ mod tests {
             dist_q_c: 0.0,
             approx_mode: ApproxMode::Normal,
             rq_graph_scoring: Default::default(),
+            segment_ef: Default::default(),
         }
     }
 

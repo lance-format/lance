@@ -597,6 +597,7 @@ async fn run_checkpoint(
                     query_parallelism: 1,
                     dist_q_c: 0.0,
                     approx_mode: Default::default(),
+                    segment_ef: Default::default(),
                     rq_graph_scoring: Default::default(),
                 };
                 // IVFIndex::search is intentionally unimplemented (top-level does

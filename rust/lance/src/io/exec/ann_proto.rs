@@ -16,6 +16,7 @@ use arrow_array::RecordBatch;
 use arrow_schema::{Field, Schema as ArrowSchema};
 use lance_core::{Error, Result};
 use lance_index::pb as index_pb;
+use lance_index::vector::segment_ef::{SegmentEfParams, SegmentEfPolicy};
 use lance_index::vector::{ApproxMode, DEFAULT_QUERY_PARALLELISM, Query, RqGraphScoring};
 use lance_linalg::distance::DistanceType;
 use lance_table::format::IndexMetadata;
@@ -141,7 +142,55 @@ pub fn query_to_proto(query: &Query) -> Result<pb::VectorQueryProto> {
         // No planner narrows the covering projection yet, so this is always absent:
         // "materialize every covering column declared". See `CoveringProjection`.
         covering_projection: None,
+        segment_ef: Some(segment_ef_to_proto(&query.segment_ef)),
     })
+}
+
+fn segment_ef_to_proto(params: &SegmentEfParams) -> pb::SegmentEfProto {
+    let (policy, divisor, multiplier) = match params.policy {
+        SegmentEfPolicy::Uniform => (pb::SegmentEfPolicyKind::Uniform, 0, 0.0),
+        SegmentEfPolicy::Capped { divisor } => {
+            (pb::SegmentEfPolicyKind::Capped, divisor as u32, 0.0)
+        }
+        SegmentEfPolicy::Proportional { multiplier } => {
+            (pb::SegmentEfPolicyKind::Proportional, 0, multiplier)
+        }
+    };
+    pb::SegmentEfProto {
+        policy: policy as i32,
+        divisor,
+        multiplier,
+        floor: params.floor as u32,
+        scale_floor_by_dead: params.scale_floor_by_dead,
+    }
+}
+
+fn segment_ef_from_proto(proto: Option<pb::SegmentEfProto>) -> Result<SegmentEfParams> {
+    let Some(proto) = proto else {
+        return Ok(SegmentEfParams::default());
+    };
+    let policy = match pb::SegmentEfPolicyKind::try_from(proto.policy) {
+        Ok(pb::SegmentEfPolicyKind::Uniform) => SegmentEfPolicy::Uniform,
+        Ok(pb::SegmentEfPolicyKind::Capped) => SegmentEfPolicy::Capped {
+            divisor: proto.divisor as usize,
+        },
+        Ok(pb::SegmentEfPolicyKind::Proportional) => SegmentEfPolicy::Proportional {
+            multiplier: proto.multiplier,
+        },
+        Err(_) => {
+            return Err(Error::invalid_input(format!(
+                "invalid SegmentEfPolicyKind value: {}",
+                proto.policy
+            )));
+        }
+    };
+    let params = SegmentEfParams {
+        policy,
+        floor: proto.floor as usize,
+        scale_floor_by_dead: proto.scale_floor_by_dead,
+    };
+    params.validate()?;
+    Ok(params)
 }
 
 pub fn query_from_proto(proto: pb::VectorQueryProto) -> Result<Query> {
@@ -172,6 +221,7 @@ pub fn query_from_proto(proto: pb::VectorQueryProto) -> Result<Query> {
         query_parallelism: proto.query_parallelism.unwrap_or(DEFAULT_QUERY_PARALLELISM),
         dist_q_c: proto.dist_q_c.unwrap_or(0.0),
         approx_mode: approx_mode_from_proto(proto.approx_mode),
+        segment_ef: segment_ef_from_proto(proto.segment_ef)?,
         rq_graph_scoring: rq_graph_scoring_from_proto(proto.rq_graph_scoring)?,
     };
     query.validate_search_effort()?;
@@ -382,6 +432,7 @@ mod tests {
             query_parallelism: -1,
             dist_q_c: 0.42,
             approx_mode: ApproxMode::Accurate,
+            segment_ef: Default::default(),
             rq_graph_scoring: RqGraphScoring::OneBitRerank,
         };
 
@@ -408,6 +459,49 @@ mod tests {
         assert_eq!(query.key.data_type(), back.key.data_type());
     }
 
+    #[rstest::rstest]
+    #[case::uniform(SegmentEfPolicy::Uniform)]
+    #[case::capped(SegmentEfPolicy::Capped { divisor: 4 })]
+    #[case::proportional(SegmentEfPolicy::Proportional { multiplier: 4.0 })]
+    fn test_segment_ef_roundtrip(#[case] policy: SegmentEfPolicy) {
+        let params = SegmentEfParams {
+            policy,
+            floor: 48,
+            scale_floor_by_dead: true,
+        };
+        let back = segment_ef_from_proto(Some(segment_ef_to_proto(&params))).unwrap();
+        assert_eq!(back, params);
+    }
+
+    #[test]
+    fn test_segment_ef_from_proto_defaults_and_rejects() {
+        // A producer that predates the field keeps searching every segment
+        // with its explicit ef.
+        assert_eq!(
+            segment_ef_from_proto(None).unwrap().policy,
+            SegmentEfPolicy::Uniform
+        );
+
+        let invalid = pb::SegmentEfProto {
+            policy: pb::SegmentEfPolicyKind::Capped as i32,
+            divisor: 0,
+            ..Default::default()
+        };
+        let error = segment_ef_from_proto(Some(invalid)).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("divisor"), "{error}");
+
+        let unknown = pb::SegmentEfProto {
+            policy: 7,
+            ..Default::default()
+        };
+        let error = segment_ef_from_proto(Some(unknown)).unwrap_err();
+        assert!(
+            error.to_string().contains("SegmentEfPolicyKind value: 7"),
+            "{error}"
+        );
+    }
+
     #[test]
     fn test_query_roundtrip_none_metric() {
         let key: ArrayRef = Arc::new(Float32Array::from(vec![1.0]));
@@ -427,6 +521,7 @@ mod tests {
             query_parallelism: DEFAULT_QUERY_PARALLELISM,
             dist_q_c: 0.0,
             approx_mode: ApproxMode::Normal,
+            segment_ef: Default::default(),
             rq_graph_scoring: Default::default(),
         };
 
@@ -528,6 +623,7 @@ mod tests {
             query_parallelism: DEFAULT_QUERY_PARALLELISM,
             dist_q_c: 0.0,
             approx_mode: ApproxMode::Normal,
+            segment_ef: Default::default(),
             rq_graph_scoring: Default::default(),
         };
 
@@ -578,6 +674,7 @@ mod tests {
             query_parallelism: DEFAULT_QUERY_PARALLELISM,
             dist_q_c: 0.0,
             approx_mode: ApproxMode::Normal,
+            segment_ef: Default::default(),
             rq_graph_scoring: Default::default(),
         };
 
@@ -644,6 +741,7 @@ mod tests {
             query_parallelism: DEFAULT_QUERY_PARALLELISM,
             dist_q_c: 0.0,
             approx_mode: ApproxMode::Normal,
+            segment_ef: Default::default(),
             rq_graph_scoring: Default::default(),
         };
         let input: Arc<dyn datafusion::physical_plan::ExecutionPlan> =

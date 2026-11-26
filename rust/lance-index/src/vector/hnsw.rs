@@ -17,6 +17,7 @@ use super::storage::VectorStore;
 
 pub mod builder;
 pub mod index;
+pub mod merge;
 pub mod online;
 pub mod remap;
 

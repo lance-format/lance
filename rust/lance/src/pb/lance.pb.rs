@@ -27,6 +27,35 @@ impl ::prost::Name for CoveringProjection {
         "/lance.pb.CoveringProjection".into()
     }
 }
+/// Beam width of the delta segments of an index relative to the query's ef. The
+/// base segment, the one covering the most rows, is always searched with ef.
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct SegmentEfProto {
+    #[prost(enumeration = "SegmentEfPolicyKind", tag = "1")]
+    pub policy: i32,
+    /// Divisor of the Capped policy; unused by the others.
+    #[prost(uint32, tag = "2")]
+    pub divisor: u32,
+    /// Multiplier of the Proportional policy; unused by the others.
+    #[prost(double, tag = "3")]
+    pub multiplier: f64,
+    /// Smallest ef a delta is searched with, before raising it to k * refine_factor.
+    #[prost(uint32, tag = "4")]
+    pub floor: u32,
+    /// Whether the floor grows by 1 / (1 - dead fraction) of each segment.
+    #[prost(bool, tag = "5")]
+    pub scale_floor_by_dead: bool,
+}
+impl ::prost::Name for SegmentEfProto {
+    const NAME: &'static str = "SegmentEfProto";
+    const PACKAGE: &'static str = "lance.pb";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lance.pb.SegmentEfProto".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lance.pb.SegmentEfProto".into()
+    }
+}
 /// Serialized vector query parameters.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct VectorQueryProto {
@@ -84,6 +113,10 @@ pub struct VectorQueryProto {
     /// ignore this setting.
     #[prost(enumeration = "VectorRqGraphScoring", tag = "17")]
     pub rq_graph_scoring: i32,
+    /// Beam width of the delta segments. Absent, as from a producer that predates
+    /// the field, means every segment is searched with ef (Uniform).
+    #[prost(message, optional, tag = "18")]
+    pub segment_ef: ::core::option::Option<SegmentEfProto>,
 }
 impl ::prost::Name for VectorQueryProto {
     const NAME: &'static str = "VectorQueryProto";
@@ -242,6 +275,39 @@ impl VectorRqGraphScoring {
         match value {
             "MultiBit" => Some(Self::MultiBit),
             "OneBitRerank" => Some(Self::OneBitRerank),
+            _ => None,
+        }
+    }
+}
+/// How a delta segment's beam width is derived from the query's ef.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum SegmentEfPolicyKind {
+    /// Every segment is searched with the query's ef.
+    Uniform = 0,
+    /// Delta segments are searched with ef / divisor.
+    Capped = 1,
+    /// A delta holding a share f of the live rows is searched with ef * min(1, multiplier * f).
+    Proportional = 2,
+}
+impl SegmentEfPolicyKind {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Uniform => "Uniform",
+            Self::Capped => "Capped",
+            Self::Proportional => "Proportional",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "Uniform" => Some(Self::Uniform),
+            "Capped" => Some(Self::Capped),
+            "Proportional" => Some(Self::Proportional),
             _ => None,
         }
     }

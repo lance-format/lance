@@ -58,6 +58,8 @@ use lance_index::metrics::{IndexTimer, IndexTiming, MetricsCollector};
 use lance_index::prefilter::PreFilter;
 use lance_index::vector::DIST_Q_C_COLUMN;
 use lance_index::vector::graph::OrderedFloat;
+use lance_index::vector::hnsw::builder::HnswQueryParams;
+use lance_index::vector::segment_ef::{SegmentEfPolicy, SegmentRows, segment_efs};
 use lance_index::vector::{
     ApproxMode, DIST_COL, INDEX_UUID_COLUMN, PART_ID_COLUMN, PartitionSearchControl, Query,
     VectorIndex, flat::compute_distance,
@@ -1921,6 +1923,69 @@ async fn segment_ownership_mask(
     Ok((*mask).clone())
 }
 
+/// The `ef` of each segment of `indices` that `query.segment_ef` searches with
+/// less than the query's `ef`, by segment uuid.
+///
+/// Empty, so every segment keeps the query's `ef`, for a single segment, the
+/// uniform policy, or when the manifest cannot tell how many rows (or deleted
+/// rows) some segment covers: a segment without a fragment bitmap, or a fragment
+/// without a recorded row count.
+fn delta_segment_efs(
+    dataset: &Dataset,
+    indices: &[IndexMetadata],
+    query: &Query,
+) -> DataFusionResult<HashMap<Uuid, usize>> {
+    if indices.len() < 2 || query.segment_ef.policy == SegmentEfPolicy::Uniform {
+        return Ok(HashMap::new());
+    }
+    let fragments: HashMap<u64, _> = dataset
+        .manifest
+        .fragments
+        .iter()
+        .map(|fragment| (fragment.id, fragment))
+        .collect();
+    let mut segments = Vec::with_capacity(indices.len());
+    for index in indices {
+        let Some(bitmap) = index.fragment_bitmap.as_ref() else {
+            return Ok(HashMap::new());
+        };
+        let mut segment = SegmentRows {
+            rows: 0,
+            dead_rows: 0,
+        };
+        for fragment_id in bitmap.iter() {
+            // A fragment retired from the dataset holds no live rows.
+            let Some(fragment) = fragments.get(&u64::from(fragment_id)) else {
+                continue;
+            };
+            let deleted = match &fragment.deletion_file {
+                None => Some(0),
+                Some(deletion_file) => deletion_file.num_deleted_rows,
+            };
+            let (Some(rows), Some(deleted)) = (fragment.physical_rows, deleted) else {
+                return Ok(HashMap::new());
+            };
+            segment.rows += rows;
+            segment.dead_rows += deleted.min(rows);
+        }
+        segments.push(segment);
+    }
+
+    let ef = HnswQueryParams::from(query).ef;
+    let k = query.k * query.refine_factor.unwrap_or(1) as usize;
+    if ef < k {
+        // The search itself rejects this ef; leave every segment to report it.
+        return Ok(HashMap::new());
+    }
+    let efs = segment_efs(ef, k, &segments, &query.segment_ef)?;
+    Ok(indices
+        .iter()
+        .zip(efs)
+        .filter(|(_, segment_ef)| *segment_ef != ef)
+        .map(|(index, segment_ef)| (index.uuid, segment_ef))
+        .collect())
+}
+
 async fn prefilter_for_segment(
     dataset: Arc<Dataset>,
     index: &IndexMetadata,
@@ -2741,6 +2806,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
         );
 
         let state = Arc::new(ANNIvfEarlySearchResults::new(indices.len(), query.k));
+        let delta_efs = Arc::new(delta_segment_efs(ds.as_ref(), &indices, &query)?);
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             schema,
@@ -2755,6 +2821,9 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                     let restricted_segments = restricted_segments.clone();
                     let quantized_refine_factor = quantized_refine_factor;
                     let mut query = query.clone();
+                    if let Some(ef) = delta_efs.get(&index_uuid) {
+                        query.ef = Some(*ef);
+                    }
                     async move {
                         let index_metadata = indices_by_uuid.get(&index_uuid).ok_or_else(|| {
                             DataFusionError::Execution(format!(
@@ -3105,6 +3174,7 @@ mod tests {
     use crate::index::vector::VectorIndexParams;
     use crate::index::vector::ivf::v2::STREAMING_SEARCH_BATCH_SIZE;
     use crate::io::exec::testing::TestingExec;
+    use lance_index::vector::segment_ef::SegmentEfParams;
 
     pub(super) fn base_query() -> Query {
         Query {
@@ -3123,6 +3193,7 @@ mod tests {
             query_parallelism: DEFAULT_QUERY_PARALLELISM,
             dist_q_c: 0.0,
             approx_mode: Default::default(),
+            segment_ef: Default::default(),
             rq_graph_scoring: Default::default(),
         }
     }
@@ -5226,6 +5297,7 @@ mod tests {
             query_parallelism: DEFAULT_QUERY_PARALLELISM,
             dist_q_c: 0.0,
             approx_mode: Default::default(),
+            segment_ef: Default::default(),
             rq_graph_scoring: Default::default(),
         };
 
@@ -5964,6 +6036,99 @@ mod tests {
         );
         assert_find_partitions_elapsed_recorded(&stats);
         assert_eq!(results.num_rows(), 10000);
+    }
+
+    fn segment_over(dataset: &Dataset, fragments: Option<RoaringBitmap>) -> IndexMetadata {
+        IndexMetadata {
+            uuid: Uuid::new_v4(),
+            fields: vec![],
+            covering_fields: vec![],
+            name: "vector_idx".to_string(),
+            dataset_version: dataset.manifest.version,
+            fragment_bitmap: fragments,
+            index_details: None,
+            index_version: 0,
+            created_at: None,
+            base_id: None,
+            files: None,
+            clustering_id: None,
+            metadata: Default::default(),
+        }
+    }
+
+    /// The delta segments' `ef` comes from the rows the manifest records for
+    /// each segment's fragments; the base keeps the query's `ef`.
+    #[tokio::test]
+    async fn test_delta_segment_efs_from_manifest_rows() {
+        let reader = lance_datagen::gen_batch()
+            .col("x", array::step::<arrow_array::types::Int32Type>())
+            .into_reader_rows(RowCount::from(100), BatchCount::from(10));
+        let mut dataset = Dataset::write(
+            reader,
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 100,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset.delete("x >= 950").await.unwrap();
+        assert_eq!(dataset.get_fragments().len(), 10);
+
+        let base = segment_over(&dataset, Some(RoaringBitmap::from_iter(0..8)));
+        let small = segment_over(&dataset, Some(RoaringBitmap::from_iter([8])));
+        // Half of this fragment is deleted.
+        let half_dead = segment_over(&dataset, Some(RoaringBitmap::from_iter([9])));
+        let indices = [small.clone(), base.clone(), half_dead.clone()];
+
+        let mut query = base_query();
+        query.ef = Some(128);
+        query.segment_ef = SegmentEfParams {
+            policy: SegmentEfPolicy::Proportional { multiplier: 4.0 },
+            floor: 20,
+            scale_floor_by_dead: false,
+        };
+        // Live shares: 100 / 950 and 50 / 950 of the rows.
+        let efs = delta_segment_efs(&dataset, &indices, &query).unwrap();
+        assert_eq!(efs, HashMap::from([(small.uuid, 54), (half_dead.uuid, 27)]));
+
+        // The default ef (1.5 * k, floored) is what the deltas scale from.
+        query.ef = None;
+        let default_ef = HnswQueryParams::from(&query).ef;
+        let efs = delta_segment_efs(&dataset, &indices, &query).unwrap();
+        assert!(efs.values().all(|ef| *ef < default_ef));
+        assert!(!efs.contains_key(&base.uuid));
+
+        // Nothing changes under the uniform policy or a single segment.
+        query.segment_ef.policy = SegmentEfPolicy::Uniform;
+        assert!(
+            delta_segment_efs(&dataset, &indices, &query)
+                .unwrap()
+                .is_empty()
+        );
+        query.segment_ef.policy = SegmentEfPolicy::Capped { divisor: 4 };
+        assert!(
+            delta_segment_efs(&dataset, std::slice::from_ref(&base), &query)
+                .unwrap()
+                .is_empty()
+        );
+
+        // Without a fragment bitmap the segment's rows are unknown.
+        let unknown = segment_over(&dataset, None);
+        assert!(
+            delta_segment_efs(&dataset, &[base, unknown], &query)
+                .unwrap()
+                .is_empty()
+        );
+        let mut uncounted = dataset.clone();
+        Arc::make_mut(&mut Arc::make_mut(&mut uncounted.manifest).fragments)[8].physical_rows =
+            None;
+        assert!(
+            delta_segment_efs(&uncounted, &indices, &query)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     struct FixedPreFilter(Arc<RowAddrMask>);

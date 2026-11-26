@@ -4,6 +4,7 @@
 //! Vector Index
 //!
 
+use self::segment_ef::SegmentEfParams;
 use crate::scalar::{RowAddrTranslator, materialize_remap};
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 use std::any::Any;
@@ -40,6 +41,7 @@ pub mod pq;
 pub mod pretransform;
 pub mod quantizer;
 pub mod residual;
+pub mod segment_ef;
 pub mod shared;
 pub mod sq;
 pub mod storage;
@@ -250,6 +252,14 @@ pub struct Query {
     /// index types ignore this setting.
     pub approx_mode: ApproxMode,
 
+    /// How each delta segment of an index is searched relative to `ef`.
+    ///
+    /// When an index has a base segment and delta segments, every segment is
+    /// searched and their results merged. The base segment, the one covering
+    /// the most rows, is always searched with `ef`; this sets how much narrower
+    /// a delta's beam may be. The default searches every segment with `ef`.
+    /// Only HNSW sub-indexes read `ef`.
+    pub segment_ef: SegmentEfParams,
     /// How an `IVF_HNSW_RQ` graph search scores visited nodes. Other index
     /// types ignore this setting.
     pub rq_graph_scoring: RqGraphScoring,

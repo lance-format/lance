@@ -613,6 +613,7 @@ fn partition_query(
         dist_q_c,
         approx_mode: selection.approx_mode,
         rq_graph_scoring: Default::default(),
+        segment_ef: Default::default(),
     }
 }
 

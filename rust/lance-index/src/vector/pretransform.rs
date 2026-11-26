@@ -621,6 +621,7 @@ mod tests {
             query_parallelism: 4,
             dist_q_c: 1.25,
             approx_mode: super::super::ApproxMode::Accurate,
+            segment_ef: Default::default(),
             rq_graph_scoring: Default::default(),
         }
     }

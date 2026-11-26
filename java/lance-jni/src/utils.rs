@@ -393,6 +393,7 @@ pub fn get_query(env: &mut JNIEnv, query_obj: JObject) -> Result<Option<Query>> 
             dist_q_c: 0.0,
             query_parallelism,
             approx_mode,
+            segment_ef: Default::default(),
             // Java does not expose `rq_graph_scoring` yet.
             rq_graph_scoring: Default::default(),
         };

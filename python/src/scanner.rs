@@ -667,6 +667,7 @@ impl PySearchFilter {
             approx_mode,
             rq_graph_scoring,
             search_effort,
+            segment_ef: Default::default(),
         };
         vector_query
             .validate_search_effort()

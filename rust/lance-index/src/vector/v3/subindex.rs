@@ -287,6 +287,7 @@ mod tests {
             query_parallelism: 0,
             dist_q_c: 0.0,
             approx_mode: ApproxMode::Normal,
+            segment_ef: Default::default(),
             rq_graph_scoring: Default::default(),
         };
 

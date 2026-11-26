@@ -20,7 +20,7 @@ use arrow_array::{
     RecordBatch, UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, Field, Fields};
-use futures::{FutureExt, SinkExt, stream, stream::BoxStream};
+use futures::{FutureExt, SinkExt, future::BoxFuture, stream, stream::BoxStream};
 use futures::{
     Stream,
     prelude::stream::{StreamExt, TryStreamExt},
@@ -41,6 +41,9 @@ use lance_index::progress::{IndexBuildProgress, NoopIndexBuildProgress};
 use lance_index::scalar::RowIdRemapper;
 use lance_index::vector::bq::storage::{RABIT_CODE_COLUMN, unpack_codes};
 use lance_index::vector::hnsw::HNSW;
+use lance_index::vector::hnsw::merge::{
+    DeltaMergeStrategy, PartitionGraph, choose_merge_strategy, merge_deltas_with,
+};
 use lance_index::vector::hnsw::remap::{remap_graph_batch, remap_graph_repair};
 use lance_index::vector::kmeans::KMeansParams;
 use lance_index::vector::pq::storage::transpose;
@@ -107,6 +110,7 @@ use super::{
 
 // the number of partitions to evaluate for reassigning
 const REASSIGN_RANGE: usize = 64;
+
 /// Training vectors sampled per centroid when a partition is split.
 const SPLIT_SAMPLE_RATE: usize = 256;
 /// Upper bound on the number of partitions one oversized partition is split into
@@ -423,11 +427,21 @@ type BuildStream = Pin<Box<dyn Stream<Item = Result<Budgeted<PartitionBuildResul
 type FreshWindowBuildStream =
     Pin<Box<dyn Stream<Item = Result<(PartitionBuildResult, OwnedSemaphorePermit)>> + Send>>;
 
-/// Builds one partition's storage and sub-index from its input rows and loss,
-/// or `None` when there are no rows. This is the only `S × Q`-specific step of
-/// partition building, so the scheduling around it is compiled once.
-type BuildPartitionFn =
-    Arc<dyn Fn(usize, Vec<RecordBatch>, f64) -> Result<Option<BuiltPartition>> + Send + Sync>;
+/// Builds one partition's storage and sub-index from its input rows, loss and
+/// the existing graphs it may reuse, or `None` when there are no rows. This is
+/// the only `S × Q`-specific step of partition building, so the scheduling
+/// around it is compiled once.
+type BuildPartitionFn = Arc<
+    dyn Fn(usize, Vec<RecordBatch>, f64, Vec<OldPartitionGraph>) -> Result<Option<BuiltPartition>>
+        + Send
+        + Sync,
+>;
+/// Loads the existing HNSW graphs of a partition that a merge reuses.
+type LoadPartitionGraphsFn = Arc<
+    dyn Fn(usize, Arc<Vec<ExistingIndex>>) -> BoxFuture<'static, Result<Vec<OldPartitionGraph>>>
+        + Send
+        + Sync,
+>;
 type PartitionInputAdmissionStream<T> =
     Pin<Box<dyn Stream<Item = Result<(T, OwnedSemaphorePermit)>> + Send>>;
 
@@ -511,6 +525,13 @@ struct MergeLayout {
 struct QuantizerMetadataWriter {
     extra_buffer: Option<bytes::Bytes>,
     serialize: Box<dyn FnOnce(Option<u32>) -> Result<String> + Send>,
+}
+
+/// One existing HNSW graph of a partition, with the row id of each node:
+/// `None` for a node whose row a fragment reuse index dropped.
+struct OldPartitionGraph {
+    row_ids: Vec<Option<u64>>,
+    graph: RecordBatch,
 }
 
 struct FreshPartitionInput {
@@ -1307,12 +1328,32 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 FreshPartitionBuildLimits::default(),
             );
         }
+        // Splits, joins and explicit merges reuse each partition's existing
+        // HNSW graphs instead of rebuilding it. A retrain moves every centroid,
+        // so old graphs would hold unrelated rows. RQ graph builds score rows
+        // staged from the partition centroid, which the graph merge does not
+        // stage.
+        let is_retrain = self
+            .optimize_options
+            .as_ref()
+            .is_some_and(|options| options.retrain);
+        let reuse_graphs = S::name() == HNSW::name()
+            && Q::quantization_type() != QuantizationType::Rabit
+            && !is_retrain
+            && !merge_indices.is_empty();
+        let load_partition_graphs = reuse_graphs.then(|| {
+            Arc::new(|partition, indices: Arc<Vec<ExistingIndex>>| {
+                async move { Self::load_partition_graphs(partition, indices.as_ref()).await }
+                    .boxed()
+            }) as LoadPartitionGraphsFn
+        });
         Ok(build_merged_partitions(
             reader,
             num_partitions,
             merge_indices,
             partition_adjustment,
             build_partition,
+            load_partition_graphs,
         ))
     }
 
@@ -1324,20 +1365,32 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         frag_reuse_index: Option<Arc<CompactFragReuseIndex>>,
         centroids: Option<FixedSizeListArray>,
     ) -> BuildPartitionFn {
-        Arc::new(move |partition_id, batches, loss| {
+        Arc::new(move |partition_id, batches, loss, old_graphs| {
             let num_rows = batches.iter().map(|b| b.num_rows()).sum::<usize>();
             if num_rows == 0 {
                 return Ok(None);
             }
-            let (storage, sub_index) = Self::build_index(
-                distance_type,
-                quantizer.clone(),
-                sub_index_params.clone(),
-                batches,
-                column.clone(),
-                frag_reuse_index.clone(),
-                centroids.as_ref().map(|c| c.value(partition_id)),
-            )?;
+            let (storage, sub_index) = if old_graphs.is_empty() {
+                Self::build_index(
+                    distance_type,
+                    quantizer.clone(),
+                    sub_index_params.clone(),
+                    batches,
+                    column.clone(),
+                    frag_reuse_index.clone(),
+                    centroids.as_ref().map(|c| c.value(partition_id)),
+                )?
+            } else {
+                Self::merge_partition_graphs(
+                    distance_type,
+                    quantizer.clone(),
+                    sub_index_params.clone(),
+                    batches,
+                    column.clone(),
+                    frag_reuse_index.clone(),
+                    old_graphs,
+                )?
+            };
             BuiltPartition::new::<S, Q>(storage, sub_index, loss).map(Some)
         })
     }
@@ -1368,6 +1421,233 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         };
 
         Ok((storage, sub_index))
+    }
+
+    /// The HNSW graph of partition `part_id` in each of `existing_indices` that
+    /// holds rows of it, with the row id of each graph node.
+    async fn load_partition_graphs(
+        part_id: usize,
+        existing_indices: &[ExistingIndex],
+    ) -> Result<Vec<OldPartitionGraph>> {
+        let mut graphs = Vec::new();
+        for source in existing_indices {
+            let existing_index = source
+                .index
+                .as_any()
+                .downcast_ref::<IVFIndex<S, Q>>()
+                .ok_or(Error::invalid_input("existing index is not IVF index"))?;
+            if part_id >= existing_index.ivf_model().num_partitions()
+                || existing_index.ivf_model().partition_size(part_id) == 0
+            {
+                continue;
+            }
+            // Resolved before the partition loads, as in `take_partition_batches`.
+            let old_data_filter = source.old_data_filter().await?;
+            let storage = existing_index.load_partition_storage(part_id, None).await?;
+            let storage_row_ids = UInt64Array::from_iter_values(storage.row_ids().copied());
+            // A stable-row-id update keeps the row id but supersedes the vector,
+            // so the filter's rows must not claim the current copy's position.
+            let owned = old_data_filter.map(|filter| filter.filter_row_ids(&storage_row_ids));
+            let row_id_at = |position: usize| {
+                owned
+                    .as_ref()
+                    .is_none_or(|owned| owned.value(position))
+                    .then(|| storage_row_ids.value(position))
+            };
+            // Deferred compaction drops deleted rows while the storage loads,
+            // but graph nodes keep addressing the stored rows by position.
+            let row_ids = match existing_index
+                .dropped_row_positions(part_id, storage.len(), None)
+                .await?
+            {
+                Some(positions) => positions
+                    .iter()
+                    .map(|position| position.and_then(|position| row_id_at(position as usize)))
+                    .collect(),
+                None => (0..storage_row_ids.len()).map(row_id_at).collect(),
+            };
+            graphs.push(OldPartitionGraph {
+                row_ids,
+                graph: existing_index
+                    .read_sub_index_batch(part_id, None, None)
+                    .await?,
+            });
+        }
+        Ok(graphs)
+    }
+
+    /// Build a partition holding the rows of `batches` from its `old_graphs`.
+    ///
+    /// Old graph nodes whose rows are not in `batches`, because a split moved
+    /// them away or their segment may no longer contribute them, count as
+    /// deleted, and rows of `batches` in no old graph are indexed as one more
+    /// delta graph. [`choose_merge_strategy`] then either rebuilds the partition
+    /// from scratch or repairs the deleted nodes out of the largest old graph and
+    /// batch inserts the live rows of the others into it.
+    ///
+    /// Row ids of `batches` and `old_graphs` are translated through
+    /// `frag_reuse_index` first, as [`Self::build_index`] does, so a row it
+    /// drops counts as deleted.
+    fn merge_partition_graphs(
+        distance_type: DistanceType,
+        quantizer: Q,
+        sub_index_params: S::BuildParams,
+        batches: Vec<RecordBatch>,
+        column: String,
+        frag_reuse_index: Option<Arc<CompactFragReuseIndex>>,
+        old_graphs: Vec<OldPartitionGraph>,
+    ) -> Result<(Q::Storage, S)> {
+        let rebuild = |batches| {
+            Self::build_index(
+                distance_type,
+                quantizer.clone(),
+                sub_index_params.clone(),
+                batches,
+                column.clone(),
+                frag_reuse_index.clone(),
+                None,
+            )
+        };
+        let remapper = frag_reuse_index
+            .clone()
+            .map(|index| Arc::new(CompactFragReuseIndexHandle(index)) as Arc<dyn RowIdRemapper>);
+        let mut rows = arrow::compute::concat_batches(batches[0].schema_ref(), &batches)?;
+        if let Some(remapper) = &remapper {
+            let row_id_idx = rows.schema().index_of(ROW_ID)?;
+            rows = remapper.remap_row_ids_record_batch(rows, row_id_idx)?;
+            if rows.num_rows() == 0 {
+                return rebuild(batches);
+            }
+        }
+        let storage_builder = StorageBuilder::new_with_remapper(
+            column.clone(),
+            distance_type,
+            quantizer.clone(),
+            None,
+        )?;
+        let storage_of = |positions: &[u32]| {
+            let positions = UInt32Array::from(positions.to_vec());
+            storage_builder.build(vec![arrow::compute::take_record_batch(&rows, &positions)?])
+        };
+
+        let row_positions: HashMap<u64, u32> = rows[ROW_ID]
+            .as_primitive::<UInt64Type>()
+            .values()
+            .iter()
+            .enumerate()
+            .map(|(position, row_id)| (*row_id, position as u32))
+            .collect();
+        if row_positions.len() != rows.num_rows() {
+            log::warn!("Rebuilding a partition whose rows repeat a row id");
+            return rebuild(batches);
+        }
+
+        // Node `i` of graph `g` holds row `positions[g][i]` of `rows`; deleted
+        // nodes keep a placeholder so node ids stay aligned.
+        let mut claimed = vec![false; rows.num_rows()];
+        let mut graphs = Vec::with_capacity(old_graphs.len() + 1);
+        let mut positions: Vec<Vec<u32>> = Vec::with_capacity(old_graphs.len() + 1);
+        let mut deleted = Vec::with_capacity(old_graphs.len() + 1);
+        for old in &old_graphs {
+            let graph = HNSW::load(old.graph.clone())?;
+            if graph.len() != old.row_ids.len() {
+                log::warn!(
+                    "Rebuilding a partition whose old graph has {} nodes for {} rows",
+                    graph.len(),
+                    old.row_ids.len()
+                );
+                return rebuild(batches);
+            }
+            let mut graph_deleted = RoaringBitmap::new();
+            let graph_positions = old
+                .row_ids
+                .iter()
+                .enumerate()
+                .map(|(node, row_id)| {
+                    let row_id = match &remapper {
+                        Some(remapper) => row_id.and_then(|id| remapper.remap_row_id(id)),
+                        None => *row_id,
+                    };
+                    match row_id.and_then(|id| row_positions.get(&id)) {
+                        Some(&position) if !claimed[position as usize] => {
+                            claimed[position as usize] = true;
+                            position
+                        }
+                        _ => {
+                            graph_deleted.insert(node as u32);
+                            u32::MAX
+                        }
+                    }
+                })
+                .collect();
+            graphs.push(graph);
+            positions.push(graph_positions);
+            deleted.push(graph_deleted);
+        }
+        let new_positions: Vec<u32> = (0..rows.num_rows() as u32)
+            .filter(|position| !claimed[*position as usize])
+            .collect();
+        if !new_positions.is_empty() {
+            let new_graph = S::index_vectors(&storage_of(&new_positions)?, sub_index_params)?;
+            graphs.push(HNSW::load(new_graph.to_batch()?)?);
+            positions.push(new_positions);
+            deleted.push(RoaringBitmap::new());
+        }
+
+        // The old graph with the most live rows is the base.
+        let base = (0..old_graphs.len())
+            .max_by_key(|g| graphs[*g].len() - deleted[*g].len() as usize)
+            .expect("old_graphs is not empty");
+        graphs.swap(0, base);
+        positions.swap(0, base);
+        deleted.swap(0, base);
+
+        let partition: Vec<PartitionGraph<'_>> = graphs
+            .iter()
+            .zip(&deleted)
+            .map(|(graph, deleted)| PartitionGraph { graph, deleted })
+            .collect();
+        let strategy = choose_merge_strategy(&partition[0], &partition[1..], &mut rand::rng())?;
+
+        // A batched insert keeps the base's deleted nodes, but these rows are
+        // gone from the partition, so they are repaired out first.
+        let (repaired, base_positions) = if strategy == DeltaMergeStrategy::BatchedInsert
+            && !deleted[0].is_empty()
+        {
+            let mut kept = Vec::with_capacity(positions[0].len());
+            let new_ids: Vec<Option<u32>> = positions[0]
+                .iter()
+                .enumerate()
+                .map(|(node, position)| {
+                    (!deleted[0].contains(node as u32)).then(|| {
+                        kept.push(*position);
+                        (kept.len() - 1) as u32
+                    })
+                })
+                .collect();
+            let graph = remap_graph_repair(&old_graphs[base].graph, &new_ids, &storage_of(&kept)?)?;
+            (Some(HNSW::load(graph)?), kept)
+        } else {
+            (None, std::mem::take(&mut positions[0]))
+        };
+        let no_deleted = RoaringBitmap::new();
+        let base = match &repaired {
+            Some(graph) => PartitionGraph {
+                graph,
+                deleted: &no_deleted,
+            },
+            None => partition[0],
+        };
+        positions[0] = base_positions;
+
+        let merged = merge_deltas_with(strategy, &base, &partition[1..], |rows| {
+            let rows: Vec<u32> = rows
+                .iter()
+                .map(|row| positions[row.graph][row.row as usize])
+                .collect();
+            storage_of(&rows)
+        })?;
+        Ok((merged.storage, S::load(merged.graph.to_batch()?)?))
     }
 
     async fn merge_partitions(&mut self, build_stream: BuildStream) -> Result<Vec<IndexFile>> {
@@ -1468,6 +1748,7 @@ fn build_merged_partitions(
     merge_indices: Arc<Vec<ExistingIndex>>,
     partition_adjustment: Option<PartitionAdjustment>,
     build_partition: BuildPartitionFn,
+    load_partition_graphs: Option<LoadPartitionGraphsFn>,
 ) -> BuildStream {
     let partition_adjustment = Arc::new(partition_adjustment);
     let build_iter = (0..num_partitions).map(move |partition| {
@@ -1475,6 +1756,7 @@ fn build_merged_partitions(
         let reader = reader.clone();
         let indices = merge_indices.clone();
         let build_partition = build_partition.clone();
+        let load_partition_graphs = load_partition_graphs.clone();
         let partition_adjustment = partition_adjustment.clone();
         async move {
             let (is_affected, split_reindexed_row_ids, split_reader) =
@@ -1542,10 +1824,15 @@ fn build_merged_partitions(
                 loss += extra_loss;
             }
 
+            let old_graphs = match load_partition_graphs {
+                Some(load) => load(partition, indices).await?,
+                None => Vec::new(),
+            };
+
             spawn_cpu(move || {
                 Ok(Budgeted::untracked(PartitionBuildResult {
                     partition_id: output_partition_id,
-                    built: build_partition(output_partition_id, batches, loss)?,
+                    built: build_partition(output_partition_id, batches, loss, old_graphs)?,
                 }))
             })
             .await
@@ -1703,7 +1990,7 @@ fn build_fresh_partitions_windowed(
                                         )
                                     })?;
                                 let built =
-                                    spawn_cpu(move || build_partition(partition_id, input.batches, loss))
+                                    spawn_cpu(move || build_partition(partition_id, input.batches, loss, Vec::new()))
                                 .await?;
                                 Ok::<_, Error>((
                                     PartitionBuildResult {
@@ -4220,6 +4507,470 @@ mod tests {
             err.to_string().contains("precomputed partition ids"),
             "unexpected error: {err}"
         );
+    }
+
+    /// `n` random 8-d vectors around `center`, with ids from `first_id`.
+    fn random_vectors(first_id: u64, n: usize, center: f32, seed: u64) -> RecordBatch {
+        use rand::{Rng, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+        let values: Vec<f32> = (0..n * 8)
+            .map(|_| center + rng.random_range(-1.0..1.0))
+            .collect();
+        let vectors =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(values), 8).unwrap();
+        let schema = Arc::new(arrow_schema::Schema::new(vec![
+            Field::new("id", DataType::UInt64, false),
+            Field::new("vec", vectors.data_type().clone(), false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(UInt64Array::from_iter_values(first_id..first_id + n as u64)),
+                Arc::new(vectors),
+            ],
+        )
+        .unwrap()
+    }
+
+    /// The `batch` rows at `ids`, keyed by row id as an index stores them.
+    fn partition_rows(batch: &RecordBatch, ids: impl Iterator<Item = u64>) -> RecordBatch {
+        let ids: Vec<u64> = ids.collect();
+        let taken =
+            arrow::compute::take(batch["vec"].as_ref(), &UInt64Array::from(ids.clone()), None)
+                .unwrap();
+        RecordBatch::try_new(
+            Arc::new(arrow_schema::Schema::new(vec![
+                ROW_ID_FIELD.clone(),
+                Field::new("vec", taken.data_type().clone(), false),
+            ])),
+            vec![Arc::new(UInt64Array::from(ids)), taken],
+        )
+        .unwrap()
+    }
+
+    #[rstest::rstest]
+    // 50 of the old graph's 500 rows moved out and 100 rows moved in.
+    #[case::rows_moved(50..600, 0..500)]
+    // Nothing changed: the old graph is reused as is.
+    #[case::unchanged(0..500, 0..500)]
+    // Most old rows moved out: rebuilt.
+    #[case::mostly_moved(400..600, 0..500)]
+    // No old row survives: rebuilt from the new rows alone.
+    #[case::no_old_row_left(500..600, 0..500)]
+    fn test_merge_partition_graphs(
+        #[case] final_rows: std::ops::Range<u64>,
+        #[case] old_rows: std::ops::Range<u64>,
+    ) {
+        use lance_index::vector::hnsw::builder::HnswBuildParams;
+
+        type Builder = IvfIndexBuilder<HNSW, FlatQuantizer>;
+        let all = random_vectors(0, 600, 0.0, 7);
+        let params = HnswBuildParams::default().num_edges(12).ef_construction(40);
+        let build = |rows: std::ops::Range<u64>| {
+            Builder::build_index(
+                DistanceType::L2,
+                FlatQuantizer::new(8, DistanceType::L2),
+                params.clone(),
+                vec![partition_rows(&all, rows)],
+                "vec".to_owned(),
+                None,
+                None,
+            )
+            .unwrap()
+        };
+        let (old_storage, old_graph) = build(old_rows);
+        let old_graphs = vec![OldPartitionGraph {
+            row_ids: old_storage.row_ids().copied().map(Some).collect(),
+            graph: old_graph.to_batch().unwrap(),
+        }];
+
+        let (storage, graph) = Builder::merge_partition_graphs(
+            DistanceType::L2,
+            FlatQuantizer::new(8, DistanceType::L2),
+            params.clone(),
+            vec![partition_rows(&all, final_rows.clone())],
+            "vec".to_owned(),
+            None,
+            old_graphs,
+        )
+        .unwrap();
+
+        let mut row_ids: Vec<u64> = storage.row_ids().copied().collect();
+        row_ids.sort_unstable();
+        assert_eq!(row_ids, final_rows.clone().collect::<Vec<_>>());
+        assert_eq!(graph.len(), storage.len());
+
+        // Each partition row finds itself.
+        let query_params = lance_index::vector::hnsw::builder::HnswQueryParams {
+            ef: 64,
+            lower_bound: None,
+            upper_bound: None,
+            dist_q_c: 0.0,
+            use_acorn: false,
+            rq_graph_scoring: Default::default(),
+        };
+        let found = final_rows
+            .clone()
+            .step_by(10)
+            .filter(|id| {
+                let query = all["vec"].as_fixed_size_list().value(*id as usize);
+                let (nearest, _) = graph
+                    .search_basic(query, 1, &query_params, None, &storage)
+                    .unwrap();
+                storage.row_id(nearest[0].id) == *id
+            })
+            .count();
+        let queries = final_rows.step_by(10).count();
+        assert!(found * 10 >= queries * 9, "found {found} of {queries}");
+    }
+
+    /// A dataset of `clusters` (first id, rows, center) with an IVF_HNSW_FLAT
+    /// index "idx" whose partitions are fixed at the cluster centers and whose
+    /// target partition size is 500, so partitions split above 2000 rows and
+    /// join below 125.
+    async fn hnsw_dataset(uri: &str, clusters: &[(u64, usize, f32)]) -> crate::Dataset {
+        use crate::index::DatasetIndexExt;
+        use crate::index::vector::VectorIndexParams;
+        use lance_index::vector::hnsw::builder::HnswBuildParams;
+
+        let batches: Vec<RecordBatch> = clusters
+            .iter()
+            .map(|(first_id, rows, center)| random_vectors(*first_id, *rows, *center, *first_id))
+            .collect();
+        let schema = batches[0].schema();
+        let reader = arrow_array::RecordBatchIterator::new(batches.into_iter().map(Ok), schema);
+        let mut dataset = crate::Dataset::write(reader, uri, None).await.unwrap();
+
+        let centers: Vec<f32> = clusters
+            .iter()
+            .flat_map(|(_, _, center)| [*center; 8])
+            .collect();
+        let centroids =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(centers), 8).unwrap();
+        let params = VectorIndexParams::ivf_hnsw(
+            DistanceType::L2,
+            IvfBuildParams {
+                target_partition_size: Some(500),
+                ..IvfBuildParams::try_with_centroids(clusters.len(), Arc::new(centroids)).unwrap()
+            },
+            HnswBuildParams::default().num_edges(12).ef_construction(40),
+        );
+        dataset
+            .create_index(
+                &["vec"],
+                IndexType::Vector,
+                Some("idx".into()),
+                &params,
+                false,
+            )
+            .await
+            .unwrap();
+        dataset
+    }
+
+    async fn append_vectors(
+        dataset: crate::Dataset,
+        first_id: u64,
+        rows: usize,
+        center: f32,
+    ) -> crate::Dataset {
+        use crate::dataset::{InsertBuilder, WriteMode, WriteParams};
+        InsertBuilder::new(Arc::new(dataset))
+            .with_params(&WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            })
+            .execute(vec![random_vectors(first_id, rows, center, first_id)])
+            .await
+            .unwrap()
+    }
+
+    /// Recall@10 of the index against a flat scan, probing every partition, for
+    /// queries around each of `centers`; no row with an id in `deleted` may
+    /// come back.
+    async fn assert_hnsw_recall(
+        dataset: &crate::Dataset,
+        centers: &[f32],
+        deleted: impl Fn(u64) -> bool,
+    ) {
+        let index = open_single_segment(dataset).await;
+        let ids = |batch: RecordBatch| -> HashSet<u64> {
+            batch["id"]
+                .as_primitive::<UInt64Type>()
+                .values()
+                .iter()
+                .copied()
+                .collect()
+        };
+        let mut hits = 0;
+        let mut total = 0;
+        for (i, center) in centers.iter().enumerate() {
+            let queries = random_vectors(0, 10, *center, 1000 + i as u64);
+            for q in 0..queries.num_rows() {
+                let query = queries["vec"].as_fixed_size_list().value(q);
+                let truth = ids(dataset
+                    .scan()
+                    .nearest("vec", query.as_ref(), 10)
+                    .unwrap()
+                    .use_index(false)
+                    .try_into_batch()
+                    .await
+                    .unwrap());
+                let found = ids(dataset
+                    .scan()
+                    .nearest("vec", query.as_ref(), 10)
+                    .unwrap()
+                    .minimum_nprobes(index.ivf_model().num_partitions())
+                    .ef(100)
+                    .try_into_batch()
+                    .await
+                    .unwrap());
+                assert!(
+                    found.iter().all(|id| !deleted(*id)),
+                    "a deleted row came back: {found:?}"
+                );
+                hits += truth.intersection(&found).count();
+                total += truth.len();
+            }
+        }
+        assert!(hits * 10 >= total * 8, "recall {hits} / {total}");
+    }
+
+    #[tokio::test]
+    async fn optimize_split_reuses_hnsw_graphs_and_keeps_recall() {
+        use crate::index::DatasetIndexExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let uri = tmp.path().to_str().unwrap();
+        let dataset = hnsw_dataset(uri, &[(0, 1200, 0.0), (1200, 600, 100.0)]).await;
+
+        // A delta segment, then tombstones, then enough rows to split partition 0.
+        let mut dataset = append_vectors(dataset, 1800, 300, 0.0).await;
+        dataset
+            .optimize_indices(&OptimizeOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(dataset.load_indices_by_name("idx").await.unwrap().len(), 2);
+        dataset.delete("id % 10 = 0").await.unwrap();
+        let mut dataset = append_vectors(dataset, 2100, 1000, 0.0).await;
+        dataset
+            .optimize_indices(&OptimizeOptions::default())
+            .await
+            .unwrap();
+
+        assert!(
+            open_single_segment(&dataset)
+                .await
+                .ivf_model()
+                .num_partitions()
+                > 2
+        );
+        // Rows appended after the delete reuse no deleted id below 2100.
+        assert_hnsw_recall(&dataset, &[0.0, 100.0], |id| id < 2100 && id % 10 == 0).await;
+    }
+
+    #[tokio::test]
+    async fn optimize_join_reuses_hnsw_graphs_and_keeps_recall() {
+        use crate::index::DatasetIndexExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let uri = tmp.path().to_str().unwrap();
+        // Partition 2 holds 100 rows, under the 125-row join threshold.
+        let dataset = hnsw_dataset(
+            uri,
+            &[(0, 1200, 0.0), (1200, 600, 100.0), (1800, 100, -100.0)],
+        )
+        .await;
+        let mut dataset = append_vectors(dataset, 1900, 50, 0.0).await;
+        dataset.delete("id % 10 = 0").await.unwrap();
+        dataset
+            .optimize_indices(&OptimizeOptions::default())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            open_single_segment(&dataset)
+                .await
+                .ivf_model()
+                .num_partitions(),
+            2
+        );
+        assert_hnsw_recall(&dataset, &[0.0, 100.0, -100.0], |id| id % 10 == 0).await;
+    }
+
+    #[tokio::test]
+    async fn optimize_merge_reuses_hnsw_graphs_and_keeps_recall() {
+        use crate::index::DatasetIndexExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let uri = tmp.path().to_str().unwrap();
+        let mut dataset = hnsw_dataset(uri, &[(0, 1000, 0.0), (1000, 600, 100.0)]).await;
+        // Two delta segments, tombstones, then rows no segment indexes yet.
+        for (first_id, center) in [(1600, 0.0), (1800, 100.0)] {
+            dataset = append_vectors(dataset, first_id, 200, center).await;
+            dataset
+                .optimize_indices(&OptimizeOptions::default())
+                .await
+                .unwrap();
+        }
+        assert_eq!(dataset.load_indices_by_name("idx").await.unwrap().len(), 3);
+        dataset.delete("id % 10 = 0").await.unwrap();
+        let mut dataset = append_vectors(dataset, 2000, 100, 0.0).await;
+        dataset
+            .optimize_indices(&OptimizeOptions::merge(3))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            open_single_segment(&dataset)
+                .await
+                .ivf_model()
+                .num_partitions(),
+            2
+        );
+        assert_hnsw_recall(&dataset, &[0.0, 100.0], |id| id < 2000 && id % 10 == 0).await;
+    }
+
+    /// A stable-row-id update keeps the row id but replaces the vector, so the
+    /// old graph node must not claim the replacement.
+    #[tokio::test]
+    async fn optimize_merge_reindexes_stable_row_id_updates() {
+        use crate::dataset::{MergeInsertBuilder, WhenMatched, WriteParams};
+        use crate::index::DatasetIndexExt;
+        use crate::index::vector::VectorIndexParams;
+        use lance_index::vector::hnsw::builder::HnswBuildParams;
+
+        let original = random_vectors(0, 2000, 0.0, 7);
+        let replacements = random_vectors(1400, 600, 0.0, 19);
+        let schema = original.schema();
+        let reader = arrow_array::RecordBatchIterator::new([Ok(original)], schema.clone());
+        let mut dataset = crate::Dataset::write(
+            reader,
+            "memory://",
+            Some(WriteParams {
+                enable_stable_row_ids: true,
+                max_rows_per_file: 500,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset
+            .create_index(
+                &["vec"],
+                IndexType::Vector,
+                Some("idx".into()),
+                &VectorIndexParams::ivf_hnsw(
+                    DistanceType::L2,
+                    IvfBuildParams::new(1),
+                    HnswBuildParams::default().num_edges(12).ef_construction(40),
+                ),
+                false,
+            )
+            .await
+            .unwrap();
+        let reader =
+            arrow_array::RecordBatchIterator::new([Ok(replacements.clone())], schema.clone());
+        let (dataset, _) = MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".to_owned()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .try_build()
+            .unwrap()
+            .execute(lance_datafusion::utils::reader_to_stream(Box::new(reader)))
+            .await
+            .unwrap();
+        let mut dataset = dataset.as_ref().clone();
+        dataset
+            .optimize_indices(&OptimizeOptions::merge(1))
+            .await
+            .unwrap();
+
+        // Each replaced vector finds itself.
+        let queries = replacements["vec"].as_fixed_size_list();
+        let mut found = 0;
+        for i in (0..queries.len()).step_by(6) {
+            let nearest = dataset
+                .scan()
+                .nearest("vec", queries.value(i).as_ref(), 1)
+                .unwrap()
+                .minimum_nprobes(1)
+                .ef(64)
+                .try_into_batch()
+                .await
+                .unwrap();
+            found +=
+                usize::from(nearest["id"].as_primitive::<UInt64Type>().value(0) == 1400 + i as u64);
+        }
+        assert!(found >= 90, "found {found} of 100 replaced vectors");
+    }
+
+    #[tokio::test]
+    async fn optimize_merge_reuses_hnsw_graphs_under_deferred_remap() {
+        use crate::dataset::optimize::{CompactionOptions, compact_files};
+        use crate::index::DatasetIndexExt;
+        use crate::index::loading::DatasetIndexInternalExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let uri = tmp.path().to_str().unwrap();
+        let dataset = hnsw_dataset(uri, &[(0, 1000, 0.0), (1000, 600, 100.0)]).await;
+        let mut dataset = append_vectors(dataset, 1600, 200, 0.0).await;
+        dataset
+            .optimize_indices(&OptimizeOptions::default())
+            .await
+            .unwrap();
+        dataset.delete("id % 5 = 0").await.unwrap();
+        // Compaction drops the deleted rows and moves the rest, so both
+        // segments now translate their rows through the fragment reuse index.
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            dataset
+                .open_frag_reuse_index(&NoOpMetricsCollector)
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        let mut existing = Vec::new();
+        for segment in dataset.load_indices_by_name("idx").await.unwrap() {
+            let index = dataset
+                .open_vector_index("vec", &segment.uuid, &NoOpMetricsCollector)
+                .await
+                .unwrap();
+            existing.push(ExistingIndex::unfiltered(index));
+        }
+        // Partition 0 holds ids 0..1000 and the delta's 1600..1800; one node in
+        // five lost its row.
+        let graphs = IvfIndexBuilder::<HNSW, FlatQuantizer>::load_partition_graphs(0, &existing)
+            .await
+            .unwrap();
+        assert_eq!(graphs.len(), 2);
+        for graph in &graphs {
+            assert_eq!(
+                HNSW::load(graph.graph.clone()).unwrap().len(),
+                graph.row_ids.len()
+            );
+        }
+        let dropped = graphs
+            .iter()
+            .flat_map(|graph| &graph.row_ids)
+            .filter(|row_id| row_id.is_none())
+            .count();
+        assert_eq!(dropped, 240);
+
+        dataset
+            .optimize_indices(&OptimizeOptions::merge(2))
+            .await
+            .unwrap();
+        assert_hnsw_recall(&dataset, &[0.0, 100.0], |id| id % 5 == 0).await;
     }
 
     fn cluster_schema() -> Arc<arrow_schema::Schema> {
