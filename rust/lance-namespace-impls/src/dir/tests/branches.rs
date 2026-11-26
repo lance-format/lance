@@ -3,18 +3,32 @@
 
 use super::*;
 
+#[rstest]
+#[case::directory(false)]
+#[case::manifest(true)]
 #[tokio::test]
-async fn test_describe_table_snapshot_selectors() {
+async fn test_describe_table_snapshot_selectors(#[case] manifest_enabled: bool) {
     use lance::dataset::ColumnAlteration;
 
     let temp = TempStdDir::default();
     let namespace = DirectoryNamespaceBuilder::new(temp.to_str().unwrap())
-        .manifest_enabled(false)
-        .dir_listing_enabled(true)
+        .manifest_enabled(manifest_enabled)
+        .dir_listing_enabled(!manifest_enabled)
         .build()
         .await
         .unwrap();
-    create_scalar_table(&namespace, "users").await;
+    let properties = manifest_enabled.then(|| HashMap::from([("owner".into(), "catalog".into())]));
+    namespace
+        .create_table(
+            CreateTableRequest {
+                id: Some(vec!["users".into()]),
+                properties: properties.clone(),
+                ..Default::default()
+            },
+            Bytes::from(create_scalar_table_ipc_data()),
+        )
+        .await
+        .unwrap();
     let mut main = open_dataset(&namespace, "users").await;
     let mut dev = main.create_branch("dev", 1, None).await.unwrap();
     for (dataset, name) in [(&mut main, "main_id"), (&mut dev, "dev_id")] {
@@ -105,6 +119,7 @@ async fn test_describe_table_snapshot_selectors() {
             "DescribeTable must resolve the selected snapshot: {tag:?} {branch:?} {version:?}"
         );
         assert_eq!(described.location, location);
+        assert_eq!(described.properties, properties);
     }
     for (mut selected, expected) in [
         (
@@ -150,21 +165,7 @@ async fn test_describe_table_snapshot_selectors() {
     }
 
     // A newer main manifest need not be readable to serve an older snapshot or another branch.
-    let (store, base, _) = namespace
-        .configured_builder(main.uri())
-        .build_object_store()
-        .await
-        .unwrap();
-    let mut future = main.manifest().clone();
-    future.version += 1;
-    future.reader_feature_flags |= lance_table::feature_flags::FLAG_UNKNOWN;
-    let path = main
-        .manifest_location()
-        .naming_scheme
-        .manifest_path(&base, future.version);
-    lance_table::io::commit::write_manifest_file_to_path(&store, &mut future, None, &path, None)
-        .await
-        .unwrap();
+    let future_version = Some(append_unreadable_manifest(&namespace, &main).await);
     assert!(
         namespace
             .describe_table(request(None, None, None))
@@ -173,7 +174,6 @@ async fn test_describe_table_snapshot_selectors() {
             .to_string()
             .contains("Please upgrade")
     );
-    let future_version = Some(i64::try_from(future.version).unwrap());
     for selected in [
         request(None, None, future_version),
         request(None, Some("main"), future_version),
@@ -198,6 +198,15 @@ async fn test_describe_table_snapshot_selectors() {
             .await
             .unwrap();
         assert_eq!(response.schema.unwrap().fields[0].name, field);
+    }
+    append_unreadable_manifest(&namespace, &dev).await;
+    for selected in [
+        request(Some("dev-release"), None, None),
+        request(None, Some("dev"), Some(2)),
+    ] {
+        let response = namespace.describe_table(selected).await.unwrap();
+        assert_eq!(response.version, Some(2));
+        assert_eq!(response.schema.unwrap().fields[0].name, "dev_id");
     }
 }
 
