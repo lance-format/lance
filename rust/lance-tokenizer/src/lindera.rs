@@ -153,22 +153,24 @@ mod tests {
 
     #[test]
     fn token_stream_drains_in_linear_time() {
-        // Draining the stream must not depend on removing tokens from the front of
-        // the buffer, which made it quadratic: 100k tokens took about ten seconds
-        // that way, against well under a second for a linear drain.
+        // Only the drain is timed. Removing tokens from the front of the buffer made it
+        // quadratic, far past the bound below.
         let text = "東京 ".repeat(100_000);
         let mut tokenizer = tiny_tokenizer();
-        let start = std::time::Instant::now();
         let mut stream = tokenizer.token_stream(&text);
+        let start = std::time::Instant::now();
         let mut count = 0;
         while stream.advance() {
+            let token = stream.token();
+            assert_eq!(token.text, "東京");
+            assert_eq!(token.offset_from, count * "東京 ".len());
             count += 1;
         }
+        let elapsed = start.elapsed();
         assert_eq!(count, 100_000);
         assert!(
-            start.elapsed() < std::time::Duration::from_secs(2),
-            "{:?}",
-            start.elapsed()
+            elapsed < std::time::Duration::from_secs(2),
+            "draining 100k tokens took {elapsed:?}"
         );
     }
 
