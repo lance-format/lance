@@ -101,6 +101,43 @@ impl CacheKey for DocRowIdsKey {
     }
 }
 
+/// One partition's element coordinate columns, one per coordinate rank.
+///
+/// Cached like [`CachedDocRowIds`], because the final top-k resolves the same
+/// documents repeatedly: the cross-partition merge compacts its tie band against
+/// resolved keys and then resolves the survivors again at the end.
+#[derive(Debug)]
+pub(super) struct CachedDocCoordinates {
+    pub(crate) coordinates: Vec<Arc<UInt32Array>>,
+}
+
+impl DeepSizeOf for CachedDocCoordinates {
+    fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
+        self.coordinates
+            .iter()
+            .map(|column| column.len() * std::mem::size_of::<u32>())
+            .sum()
+    }
+}
+
+/// Cache key for one partition's [`CachedDocCoordinates`].
+#[derive(Debug, Clone)]
+pub(super) struct DocCoordinatesKey {
+    pub(crate) partition_id: u64,
+}
+
+impl CacheKey for DocCoordinatesKey {
+    type ValueType = CachedDocCoordinates;
+
+    fn key(&self) -> Cow<'_, str> {
+        format!("doc-coordinates-{}", self.partition_id).into()
+    }
+
+    fn type_name() -> &'static str {
+        "DocCoordinates"
+    }
+}
+
 /// Exact document lengths plus the optional quantized scoring representation.
 #[derive(Debug)]
 pub(super) struct DocLengths {
@@ -2067,62 +2104,72 @@ impl PartitionDocuments {
                 .collect());
         }
 
-        let ranges = doc_ids
-            .iter()
-            .map(|doc_id| {
-                let index = doc_id.as_usize();
-                index..index + 1
-            })
-            .collect::<Vec<_>>();
-        let coordinate_names = (0..self.coordinate_rank)
-            .map(doc_index_storage_column)
-            .collect::<Vec<_>>();
-        let projection = coordinate_names
-            .iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>();
-        let batch = self
-            .reader()
-            .await?
-            .read_ranges(&ranges, Some(&projection))
-            .await?;
-        if batch.num_rows() != row_ids.len() {
-            return Err(corrupt_docs(
-                &self.path,
-                format!(
-                    "document coordinate projection returned {} rows for {} candidates",
-                    batch.num_rows(),
-                    row_ids.len()
-                ),
-            ));
-        }
-        let coordinate_columns = coordinate_names
-            .iter()
-            .map(|name| {
-                let column = required_u32_column(&batch, name, &self.path)?;
-                if column.null_count() != 0 {
-                    return Err(corrupt_docs(
-                        &self.path,
-                        format!("document coordinate column {name} contains null values"),
-                    ));
-                }
-                Ok(column)
-            })
-            .collect::<Result<Vec<_>>>()?;
-
+        let coordinates = self.coordinate_columns().await?;
         Ok(row_ids
             .into_iter()
-            .enumerate()
-            .map(|(index, row_id)| {
+            .zip(doc_ids)
+            .map(|(row_id, doc_id)| {
                 (
                     row_id,
-                    coordinate_columns
+                    coordinates
                         .iter()
-                        .map(|column| column.value(index))
+                        .map(|column| column.value(doc_id.as_usize()))
                         .collect(),
                 )
             })
             .collect())
+    }
+
+    /// One partition's element coordinate columns, read once and cached.
+    ///
+    /// Reading whole columns rather than the candidate rows keeps repeated
+    /// resolutions of the same documents off the object store: the merge resolves
+    /// its tie band once per compaction and once more for the final ranking.
+    async fn coordinate_columns(&self) -> Result<Vec<Arc<UInt32Array>>> {
+        let store = self.store.clone();
+        let path = self.path.clone();
+        let num_docs = self.num_docs;
+        let coordinate_rank = self.coordinate_rank;
+        let cached = self
+            .index_cache
+            .get_or_insert_with_key(
+                DocCoordinatesKey {
+                    partition_id: self.partition_id,
+                },
+                || async move {
+                    let names = (0..coordinate_rank)
+                        .map(doc_index_storage_column)
+                        .collect::<Vec<_>>();
+                    let projection = names.iter().map(String::as_str).collect::<Vec<_>>();
+                    let reader = store.open_index_file(&path).await?;
+                    let batch = reader.read_range(0..num_docs, Some(&projection)).await?;
+                    let coordinates = names
+                        .iter()
+                        .map(|name| {
+                            let column = required_u32_column(&batch, name, &path)?;
+                            if column.null_count() != 0 {
+                                return Err(corrupt_docs(
+                                    &path,
+                                    format!("document coordinate column {name} contains null values"),
+                                ));
+                            }
+                            if column.len() != num_docs {
+                                return Err(corrupt_docs(
+                                    &path,
+                                    format!(
+                                        "document coordinate column {name} has {} rows but the file footer reports {num_docs}",
+                                        column.len()
+                                    ),
+                                ));
+                            }
+                            Ok(Arc::new(column.clone()))
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    Ok(CachedDocCoordinates { coordinates })
+                },
+            )
+            .await?;
+        Ok(cached.coordinates.clone())
     }
 
     fn validate_doc_ids(&self, doc_ids: &[DocId]) -> Result<()> {

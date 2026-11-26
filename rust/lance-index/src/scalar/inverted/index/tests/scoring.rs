@@ -783,10 +783,11 @@ async fn search_test_impact_partition(
     let documents = partition.docs.modern().unwrap();
     let lengths = documents.lengths().await.unwrap();
     let visibility = documents.visibility(NoFilter.mask(), false).await.unwrap();
-    partition
+    let (candidates, band) = partition
         .bm25_search_modern(
             lengths.as_ref(),
             &visibility,
+            None,
             params,
             Operator::Or,
             postings,
@@ -795,7 +796,9 @@ async fn search_test_impact_partition(
             &NoOpMetricsCollector,
             shared_threshold,
         )
-        .unwrap()
+        .unwrap();
+    assert!(!band.score_floor_overflow);
+    candidates
 }
 
 async fn load_no_impact_bulk_conjunction_test_index(
@@ -941,6 +944,7 @@ async fn assert_no_impact_bulk_conjunction_preserves_winner(with_phrase: bool) {
                 .bm25_search_modern(
                     lengths.as_ref(),
                     &visibility,
+                    None,
                     params.as_ref(),
                     Operator::And,
                     postings,
@@ -949,7 +953,8 @@ async fn assert_no_impact_bulk_conjunction_preserves_winner(with_phrase: bool) {
                     &NoOpMetricsCollector,
                     shared_threshold.clone(),
                 )
-                .unwrap(),
+                .unwrap()
+                .0,
         );
         published_floors.push(f32::from_bits(shared_threshold.load(Ordering::Relaxed)));
     }
@@ -958,8 +963,15 @@ async fn assert_no_impact_bulk_conjunction_preserves_winner(with_phrase: bool) {
     assert!(published_floors[0] > 0.0);
     let winner_score = 2.0 * scorer.query_weight("lead") * scorer.doc_weight(63, 126);
     assert!(winner_score > published_floors[0]);
-    assert_eq!(results[1].len(), 1);
-    assert_eq!(results[1][0].document, DocId::new(0));
+    // All 100 winner-partition documents tie. Without resident addresses the
+    // walk cannot rank them, so it retains the whole k-th-score band and the
+    // merge settles it once addresses are resolved.
+    assert_eq!(results[1].len(), 100);
+    assert!(
+        results[1]
+            .iter()
+            .any(|candidate| candidate.document == DocId::new(0))
+    );
 }
 
 #[tokio::test]

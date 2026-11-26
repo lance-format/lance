@@ -100,6 +100,10 @@ impl WandDocuments for CostOnlyDocuments {
     fn flat_doc_length(&self, _doc_id: u64, _document_key: u64, _compressed: bool) -> u32 {
         1
     }
+
+    fn orders_ties_by_address(&self) -> bool {
+        true
+    }
 }
 
 struct UnitScorer;

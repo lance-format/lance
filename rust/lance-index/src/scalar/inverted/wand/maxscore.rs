@@ -206,7 +206,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         let mut acc = WindowAccumulator::new(clauses.len());
         let mut essential_chunk = Vec::with_capacity(MAX_POSTING_BLOCK_SIZE);
         let mut soa_scratch = MaxScoreSoaScratch::new();
-        let mut candidates = TopKCollector::new(limit, std::cmp::min(limit, BLOCK_SIZE * 10));
+        let mut candidates = self.new_collector(limit, std::cmp::min(limit, BLOCK_SIZE * 10));
         let norm_k = self.norm_k_cache();
         let norm_k_ref = norm_k
             .as_ref()
@@ -497,6 +497,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                                             self.documents.scoring_num_tokens(doc as u32);
                                         if candidates.insert(
                                             ScoredDoc::new(document_key, canonical_score),
+                                            self.documents.tie_order_key(document_key),
                                             doc_length,
                                             doc,
                                             std::iter::once((essential_term, freq)).chain(
@@ -827,6 +828,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                             }
                             if candidates.insert(
                                 ScoredDoc::new(document_key, score),
+                                self.documents.tie_order_key(document_key),
                                 doc_length,
                                 doc,
                                 clauses.iter().enumerate().filter_map(|(i, clause)| {
@@ -862,6 +864,10 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         }
 
         metrics.record_comparisons(num_comparisons);
+
+        self.score_floor_overflow = candidates.score_floor_overflow();
+
+        self.band_truncated = candidates.band_truncated();
 
         candidates.into_candidates(|key| self.documents.candidate_from_key(key))
     }
@@ -1527,6 +1533,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 }
                 if candidates.insert(
                     ScoredDoc::new(document_key, canonical),
+                    self.documents.tie_order_key(document_key),
                     doc_length,
                     scratch.docs[i],
                     freqs.into_iter(),
@@ -1573,6 +1580,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             }
             if candidates.insert(
                 ScoredDoc::new(document_key, canonical),
+                self.documents.tie_order_key(document_key),
                 doc_length,
                 scratch.docs[i],
                 freqs.into_iter(),

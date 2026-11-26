@@ -33,7 +33,7 @@ use arrow_array::{ArrayRef, Float32Array, RecordBatch, StringArray, UInt32Array,
 use arrow_schema::{DataType, Field, Schema};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use crate::scalar::inverted::tokenizer::document_tokenizer::TextTokenizer;
 use lance_tokenizer::{Language, SimpleTokenizer, StopWordFilter, TextAnalyzer};
@@ -153,3 +153,4 @@ mod prewarm_cache;
 mod query;
 mod scoring;
 mod stats;
+mod topk_tiebreak;

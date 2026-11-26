@@ -635,10 +635,8 @@ fn phrase_skips_position_confirm_when_complete_score_cannot_beat_floor(
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].posting_doc_id, phrase_doc as u64);
     assert_eq!(wand.bulk_and_searches, usize::from(mode == BulkAndMode::On));
-    let expected_checks = if phrase_first && limit == 1 {
-        1
-    } else {
-        num_docs
-    };
-    assert_eq!(wand.phrase_position_checks.get(), expected_checks);
+    // Every document ties on its complete score. A tie at the k-th score can
+    // still win on row address, so the floor admits it and its positions are
+    // confirmed even after the phrase document filled a `limit == 1` heap.
+    assert_eq!(wand.phrase_position_checks.get(), num_docs);
 }

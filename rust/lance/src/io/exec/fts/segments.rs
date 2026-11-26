@@ -198,6 +198,32 @@ pub(super) async fn combined_columns_the_prefilter_may_match(
     retained
 }
 
+/// Merge one segment's document into the cross-segment top-k.
+///
+/// Segments complete in whatever order `buffer_unordered` yields, so the merge
+/// evicts on the full `(score DESC, row_id ASC, doc_index ASC)` key: a score tie
+/// with a lower row_id wins whichever segment produced it. A NaN score is
+/// rejected first, because the total order ranks NaN above every real score. A
+/// zero `limit` keeps nothing.
+fn push_top_k_document(
+    candidates: &mut std::collections::BinaryHeap<std::cmp::Reverse<ScoredDoc>>,
+    limit: usize,
+    document: ScoredDoc,
+) {
+    if document.score.0.is_nan() {
+        return;
+    }
+    if candidates.len() < limit {
+        candidates.push(std::cmp::Reverse(document));
+    } else if candidates
+        .peek()
+        .is_some_and(|std::cmp::Reverse(worst)| *worst < document)
+    {
+        candidates.pop();
+        candidates.push(std::cmp::Reverse(document));
+    }
+}
+
 pub(super) async fn search_prepared_segments(
     indices: &[Arc<InvertedIndex>],
     prepared: Arc<PreparedMatch>,
@@ -245,12 +271,7 @@ pub(super) async fn search_prepared_segments(
 
     while let Some(documents) = searches.try_next().await? {
         for document in documents {
-            if candidates.len() < limit {
-                candidates.push(std::cmp::Reverse(document));
-            } else if candidates.peek().unwrap().0.score < document.score {
-                candidates.pop();
-                candidates.push(std::cmp::Reverse(document));
-            }
+            push_top_k_document(&mut candidates, limit, document);
         }
     }
 
@@ -316,12 +337,7 @@ pub(super) async fn search_segments(
 
     while let Some(documents) = searches.try_next().await? {
         for document in documents {
-            if candidates.len() < limit {
-                candidates.push(std::cmp::Reverse(document));
-            } else if candidates.peek().unwrap().0.score < document.score {
-                candidates.pop();
-                candidates.push(std::cmp::Reverse(document));
-            }
+            push_top_k_document(&mut candidates, limit, document);
         }
     }
 

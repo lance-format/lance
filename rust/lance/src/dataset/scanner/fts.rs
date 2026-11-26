@@ -42,7 +42,7 @@ use lance_index::scalar::inverted::query::{
     fill_fts_query_column, uses_fuzzy_expansion,
 };
 use lance_index::scalar::inverted::{
-    CombinedFieldsBM25Scorer, DocumentGranularity, INVERTED_INDEX_VERSION_V2,
+    CombinedFieldsBM25Scorer, DOC_INDEX_COL, DocumentGranularity, INVERTED_INDEX_VERSION_V2,
     INVERTED_INDEX_VERSION_V3, PreparedFtsQueryLeaf, SCORE_COL, SCORE_FIELD, fts_schema,
     prepare_fts_global_statistics,
 };
@@ -1574,14 +1574,17 @@ impl Scanner {
                     fts_node,
                     schema,
                 )?);
+                // The aggregate above groups on `_rowid` alone, collapsing a
+                // row's elements into one `max(_score)`, so its output carries no
+                // coordinate for the sort key to pick up.
                 let sort_exprs = Self::fts_score_sort_exprs(fts_node.schema().as_ref())?;
                 if params.limit == Some(0) {
-                    return zero_candidate_plan(fts_node, sort_exprs.into());
+                    return zero_candidate_plan(fts_node, sort_exprs);
                 }
 
                 // `params.limit` is the recursive planning contract. Compound
                 // parents pass `None` when they require every candidate.
-                Arc::new(SortExec::new(sort_exprs.into(), fts_node).with_fetch(params.limit))
+                Arc::new(SortExec::new(sort_exprs, fts_node).with_fetch(params.limit))
             }
             FtsQuery::CombinedFields(query) => {
                 self.plan_combined_fields_query(query, params, filter_plan, prefilter_source)
@@ -2301,23 +2304,19 @@ impl Scanner {
                 ));
             }
         };
+        let sort_exprs = Self::fts_score_sort_exprs(plan.schema().as_ref())?;
         if params.limit == Some(0) {
-            let sort_exprs = Self::fts_score_sort_exprs(plan.schema().as_ref())?;
-            return zero_candidate_plan(plan, sort_exprs.into());
+            return zero_candidate_plan(plan, sort_exprs);
         }
         let plan = Arc::new(RepartitionExec::try_new(
             plan,
             Partitioning::RoundRobinBatch(1),
         )?);
-        let sort_expr = PhysicalSortExpr {
-            expr: expressions::col(SCORE_COL, plan.schema().as_ref())?,
-            options: SortOptions {
-                descending: true,
-                nulls_first: false,
-            },
-        };
+        // A `SortExec` top-k is not stable, so it sorts on the full FTS key rather
+        // than on score alone. Both inputs need that: the union interleaves two
+        // independent plans, and a flat-only scan interleaves its fragments.
         Ok(Arc::new(
-            SortExec::new([sort_expr].into(), plan).with_fetch(params.limit),
+            SortExec::new(sort_exprs, plan).with_fetch(params.limit),
         ))
     }
 
@@ -2407,13 +2406,16 @@ impl Scanner {
     /// `row_id ASC` is a required second key, not a nicety: a score-only sort over
     /// concurrently read sources breaks ties by arrival order, so equal-scoring
     /// documents would come back in a different order run to run and
-    /// `limit`/`offset` pagination could skip and repeat rows. `combined_fields`
-    /// needs it for the same reason: `combined_fields_search` visits candidates in
-    /// ascending row-id order, so its top-k is reproducible, but it does not order
-    /// ties itself (`ScoredDoc` compares on score alone), so this sort is what
-    /// decides which of two equal-scoring rows comes first.
-    fn fts_score_sort_exprs(schema: &ArrowSchema) -> Result<[PhysicalSortExpr; 2]> {
-        Ok([
+    /// `limit`/`offset` pagination could skip and repeat rows.
+    ///
+    /// For list-element granularity one row address covers every element of that
+    /// row, so `doc_index ASC` is appended when the schema carries it.
+    fn fts_score_sort_exprs(schema: &ArrowSchema) -> Result<LexOrdering> {
+        let ascending = SortOptions {
+            descending: false,
+            nulls_first: false,
+        };
+        let mut sort_exprs = vec![
             PhysicalSortExpr {
                 expr: expressions::col(SCORE_COL, schema)?,
                 options: SortOptions {
@@ -2423,12 +2425,17 @@ impl Scanner {
             },
             PhysicalSortExpr {
                 expr: expressions::col(ROW_ID, schema)?,
-                options: SortOptions {
-                    descending: false,
-                    nulls_first: false,
-                },
+                options: ascending,
             },
-        ])
+        ];
+        if schema.field_with_name(DOC_INDEX_COL).is_ok() {
+            sort_exprs.push(PhysicalSortExpr {
+                expr: expressions::col(DOC_INDEX_COL, schema)?,
+                options: ascending,
+            });
+        }
+        LexOrdering::new(sort_exprs)
+            .ok_or_else(|| Error::internal("FTS result ordering is unexpectedly empty".to_string()))
     }
 
     /// Plan a cross-field (BM25F) `combined_fields` query.
@@ -2692,11 +2699,11 @@ impl Scanner {
         };
         let plan: Arc<dyn ExecutionPlan> = if params.limit == Some(0) {
             let sort_exprs = Self::fts_score_sort_exprs(scored_plan.schema().as_ref())?;
-            zero_candidate_plan(scored_plan, sort_exprs.into())?
+            zero_candidate_plan(scored_plan, sort_exprs)?
         } else {
             Arc::new(
                 SortExec::new(
-                    Self::fts_score_sort_exprs(scored_plan.schema().as_ref())?.into(),
+                    Self::fts_score_sort_exprs(scored_plan.schema().as_ref())?,
                     scored_plan,
                 )
                 .with_fetch(params.limit),

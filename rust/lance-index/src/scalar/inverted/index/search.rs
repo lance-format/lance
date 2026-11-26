@@ -984,13 +984,15 @@ impl InvertedIndex {
         &self,
         request: ModernSearchRequest<'_>,
     ) -> Result<Vec<ScoredDoc>> {
+        let limit = request.limit;
         let ranked = self.bm25_search_modern_candidates(request).await?;
         if let Some(result) = self.resolve_resident_modern_candidates(&ranked)? {
-            return Ok(result);
+            return Ok(rank_resolved_documents(result, limit));
         }
         self.document_projections_resident
             .store(false, Ordering::Release);
-        self.resolve_deferred_modern_candidates(ranked).await
+        let resolved = self.resolve_deferred_modern_candidates(&ranked).await?;
+        Ok(rank_resolved_documents(resolved, limit))
     }
 
     async fn bm25_search_modern_deferred(
@@ -1034,14 +1036,16 @@ impl InvertedIndex {
                 .try_collect::<Vec<_>>()
                 .await?;
         }
+        let limit = request.limit;
         let ranked = self.bm25_search_modern_candidates(request).await?;
-        self.resolve_deferred_modern_candidates(ranked).await
+        let resolved = self.resolve_deferred_modern_candidates(&ranked).await?;
+        Ok(rank_resolved_documents(resolved, limit))
     }
 
     async fn bm25_search_modern_candidates(
         &self,
         request: ModernSearchRequest<'_>,
-    ) -> Result<Vec<Reverse<ScoredPartitionDoc>>> {
+    ) -> Result<Vec<ScoredPartitionDoc>> {
         let ModernSearchRequest {
             tokens,
             params,
@@ -1094,6 +1098,15 @@ impl InvertedIndex {
             workers,
             io_parallelism,
         );
+        let context = ModernScoringContext {
+            tokens: tokens.clone(),
+            params: params.clone(),
+            operator,
+            metrics: metrics.clone(),
+            impact_scorer: impact_scorer.clone(),
+            impact_shared_threshold: impact_shared_threshold.clone(),
+            shared_norm_addends: shared_norm_addends.clone(),
+        };
         let parts = searched_partitions
             .chunks(chunk_size)
             .map(|chunk| {
@@ -1101,72 +1114,28 @@ impl InvertedIndex {
                     .iter()
                     .map(|&(partition_ordinal, part)| (partition_ordinal, Arc::clone(part)))
                     .collect::<Vec<_>>();
-                let tokens = tokens.clone();
-                let params = params.clone();
                 let mask = mask.clone();
-                let metrics = metrics.clone();
-                let impact_scorer = impact_scorer.clone();
-                let impact_shared_threshold = impact_shared_threshold.clone();
-                let shared_norm_addends = shared_norm_addends.clone();
+                let context = context.clone();
                 async move {
-                    let load_tokens = tokens.clone();
-                    let load_params = params.clone();
-                    let load_mask = mask.clone();
-                    let load_metrics = metrics.clone();
+                    let load_context = context.clone();
                     let loads = chunk.into_iter().map(move |(partition_ordinal, part)| {
-                        let tokens = load_tokens.clone();
-                        let params = load_params.clone();
-                        let mask = load_mask.clone();
-                        let metrics = load_metrics.clone();
+                        let context = load_context.clone();
+                        let mask = mask.clone();
                         let partition_term_ids =
                             term_ids.map(|term_ids| term_ids.partition(partition_ordinal));
                         async move {
-                            let documents = part.docs.modern().ok_or_else(|| {
-                                Error::internal("modern index contains legacy partition documents")
-                            })?;
-                            let materialize_selected = operator == Operator::Or
-                                && mask.max_len().is_some_and(|selected| {
-                                    u128::from(selected).saturating_mul(100)
-                                        <= u128::from(*FLAT_SEARCH_PERCENT_THRESHOLD)
-                                            .saturating_mul(documents.len() as u128)
-                                });
-                            let visibility = match documents
-                                .immediate_visibility(mask.clone(), materialize_selected)
-                            {
-                                Some(visibility) => visibility,
-                                None => {
-                                    documents
-                                        .visibility(mask.clone(), materialize_selected)
-                                        .await?
-                                }
-                            };
-                            if !visibility.may_match().await? {
-                                return Result::Ok(None);
-                            }
-                            let Some(postings) = part
-                                .fetch_posting_lists(
-                                    tokens.as_ref(),
-                                    params.as_ref(),
-                                    operator,
-                                    metrics.as_ref(),
-                                    PostingLoadOptions::cache_aware_exact(),
-                                    partition_term_ids,
-                                )
-                                .await?
-                            else {
-                                return Result::Ok(None);
-                            };
-                            let lengths = match documents.cached_lengths() {
-                                Some(lengths) => lengths,
-                                None => documents.lengths().await?,
-                            };
-                            Result::Ok(Some((
+                            load_modern_partition(
                                 partition_ordinal,
                                 part,
-                                lengths,
-                                visibility,
-                                postings,
-                            )))
+                                context.tokens.as_ref(),
+                                context.params.as_ref(),
+                                context.operator,
+                                &mask,
+                                context.metrics.as_ref(),
+                                partition_term_ids,
+                                false,
+                            )
+                            .await
                         }
                     });
                     let loads = stream::iter(loads)
@@ -1179,53 +1148,12 @@ impl InvertedIndex {
                     let results = super::scheduling::score_ready_partitions(
                         loads,
                         chunk_size,
-                        |(_, _, _, _, postings)| postings.retained_bytes(),
+                        |loaded| loaded.postings.retained_bytes(),
                         move |loaded| {
                             let mut results = Vec::with_capacity(loaded.len());
-                            for (partition_ordinal, part, lengths, visibility, postings) in loaded {
-                                let LoadedPostings {
-                                    postings,
-                                    grouped_expansions,
-                                    impact_safe,
-                                    exact_scoring_required,
-                                    ..
-                                } = postings
-                                    .into_loaded(tokens.as_ref(), impact_scorer.as_ref())?;
-                                if postings.is_empty() {
-                                    continue;
-                                }
-                                let use_global_scorer = impact_safe || exact_scoring_required;
-                                let threshold = if use_global_scorer {
-                                    impact_shared_threshold.clone()
-                                } else {
-                                    Arc::new(AtomicU32::new(f32::NEG_INFINITY.to_bits()))
-                                };
-                                let wand_scorer = use_global_scorer.then(|| impact_scorer.clone());
-                                let idf_by_position =
-                                    idf_by_position(&postings, impact_scorer.as_ref());
-                                let candidates = part.bm25_search_modern(
-                                    lengths.as_ref(),
-                                    &visibility,
-                                    params.as_ref(),
-                                    operator,
-                                    postings,
-                                    wand_scorer,
-                                    shared_norm_addends.clone(),
-                                    metrics.as_ref(),
-                                    threshold,
-                                )?;
-                                // Rescore here too, so each candidate's frequency
-                                // list is freed by the thread that allocated it.
-                                let scored = rescore_partition_candidates(
-                                    PartitionCandidates {
-                                        idf_by_position,
-                                        grouped_expansions,
-                                        candidates,
-                                    },
-                                    impact_scorer.as_ref(),
-                                );
-                                if !scored.is_empty() {
-                                    results.push((partition_ordinal, scored));
+                            for loaded in loaded {
+                                if let Some(outcome) = score_modern_partition(loaded, &context)? {
+                                    results.push(outcome);
                                 }
                             }
                             Result::Ok(results)
@@ -1237,28 +1165,135 @@ impl InvertedIndex {
             })
             .collect::<Vec<_>>();
 
-        let mut ranked = BinaryHeap::new();
+        let mut ranked = ModernCandidates::default();
+        // Partitions whose k-th-score tie band outgrew the collector's buffer.
+        // Their candidates are not the exact top-k, so they are searched again
+        // below with row addresses attached instead of being merged here.
+        let mut retries = Vec::new();
         let mut parts = stream::iter(parts)
             .buffer_unordered(buffered_chunks)
             .map_ok(|results| stream::iter(results.into_iter().map(Result::Ok)))
             .try_flatten();
-        while let Some((partition_ordinal, scored)) = parts.try_next().await? {
-            for (doc_id, score) in scored {
-                push_scored_partition_doc(
-                    &mut ranked,
-                    limit,
-                    PartitionDocId::try_new(partition_ordinal, doc_id)?,
-                    score,
-                );
+        while let Some(outcome) = parts.try_next().await? {
+            match outcome {
+                ModernPartitionOutcome::Scored {
+                    partition_ordinal,
+                    scored,
+                } => {
+                    self.merge_modern_partition(&mut ranked, limit, partition_ordinal, scored)
+                        .await?;
+                }
+                ModernPartitionOutcome::Overflow {
+                    partition_ordinal,
+                    part,
+                } => retries.push((partition_ordinal, part)),
             }
         }
 
-        Ok(ranked.into_sorted_vec())
+        // Retries repeat a partition's posting load and WAND walk, so they run
+        // concurrently instead of serially behind the main pass. A broad tied
+        // query can overflow every partition at once.
+        let mut retried = stream::iter(retries.into_iter().map(|(partition_ordinal, part)| {
+            let context = context.clone();
+            let mask = mask.clone();
+            let partition_term_ids = term_ids.map(|term_ids| term_ids.partition(partition_ordinal));
+            async move {
+                let Some(loaded) = load_modern_partition(
+                    partition_ordinal,
+                    part,
+                    context.tokens.as_ref(),
+                    context.params.as_ref(),
+                    context.operator,
+                    &mask,
+                    context.metrics.as_ref(),
+                    partition_term_ids,
+                    true,
+                )
+                .await?
+                else {
+                    return Result::Ok(None);
+                };
+                spawn_cpu(move || score_modern_partition(loaded, &context)).await
+            }
+        }))
+        .buffer_unordered(io_parallelism.min(workers));
+        while let Some(outcome) = retried.try_next().await? {
+            match outcome {
+                Some(ModernPartitionOutcome::Scored {
+                    partition_ordinal,
+                    scored,
+                }) => {
+                    self.merge_modern_partition(&mut ranked, limit, partition_ordinal, scored)
+                        .await?;
+                }
+                Some(ModernPartitionOutcome::Overflow { .. }) => {
+                    return Err(Error::internal(
+                        "an address-ordered FTS partition search overflowed its score floor",
+                    ));
+                }
+                None => {}
+            }
+        }
+
+        Ok(ranked.into_vec())
+    }
+
+    /// Merge one partition's rescored candidates into the global top-k, then
+    /// keep the retained tie band bounded.
+    async fn merge_modern_partition(
+        &self,
+        ranked: &mut ModernCandidates,
+        limit: usize,
+        partition_ordinal: usize,
+        scored: Vec<(DocId, f32)>,
+    ) -> Result<()> {
+        for (doc_id, score) in scored {
+            ranked.push(
+                limit,
+                PartitionDocId::try_new(partition_ordinal, doc_id)?,
+                score,
+            );
+        }
+        self.compact_modern_candidates(ranked, limit).await
+    }
+
+    /// Keep the cross-partition tie band bounded.
+    ///
+    /// The merge retains every candidate tied at the k-th score, and with enough
+    /// partitions contributing to one tie group that band is the only unbounded
+    /// buffer on this path. Once it passes `limit + SCORE_FLOOR_BUFFER` the merge
+    /// resolves what it holds, keeps the exact top-k by
+    /// `(score DESC, row_id ASC, doc_index ASC)` and starts a fresh band. That is
+    /// still exact: every later candidate is compared against a k-th entry that is
+    /// now the true k-th of everything seen so far.
+    ///
+    /// The resolution costs address reads for partitions that may not survive, so
+    /// it only runs past the bound. A no-tie query never reaches it.
+    async fn compact_modern_candidates(
+        &self,
+        ranked: &mut ModernCandidates,
+        limit: usize,
+    ) -> Result<()> {
+        if ranked.buffered() <= limit.saturating_add(SCORE_FLOOR_BUFFER) {
+            return Ok(());
+        }
+        let candidates = std::mem::take(ranked).into_vec();
+        let resolved = self.resolve_deferred_modern_candidates(&candidates).await?;
+        let mut order = (0..candidates.len()).collect::<Vec<_>>();
+        order.sort_unstable_by(|&left, &right| resolved[right].cmp(&resolved[left]));
+        order.truncate(limit);
+        *ranked = ModernCandidates::from_ranked(
+            order
+                .into_iter()
+                .map(|rank| candidates[rank].clone())
+                .collect(),
+        );
+        Ok(())
     }
 
     fn resolve_resident_modern_candidates(
         &self,
-        ranked: &[Reverse<ScoredPartitionDoc>],
+        ranked: &[ScoredPartitionDoc],
     ) -> Result<Option<Vec<ScoredDoc>>> {
         if self.partitions.iter().any(|partition| {
             partition
@@ -1270,10 +1305,10 @@ impl InvertedIndex {
         }
         let mut resolved_documents = ranked
             .iter()
-            .map(|Reverse(candidate)| ScoredDoc::new(0, candidate.score.0))
+            .map(|candidate| ScoredDoc::new(0, candidate.score.0))
             .collect::<Vec<_>>();
         let mut by_partition = BTreeMap::<usize, Vec<(usize, DocId)>>::new();
-        for (rank, Reverse(candidate)) in ranked.iter().enumerate() {
+        for (rank, candidate) in ranked.iter().enumerate() {
             let partition_ordinal = candidate.document.partition_ordinal();
             let doc_id = candidate.document.doc_id;
             by_partition
@@ -1307,14 +1342,14 @@ impl InvertedIndex {
 
     async fn resolve_deferred_modern_candidates(
         &self,
-        ranked: Vec<Reverse<ScoredPartitionDoc>>,
+        ranked: &[ScoredPartitionDoc],
     ) -> Result<Vec<ScoredDoc>> {
         let mut resolved_documents = ranked
             .iter()
-            .map(|Reverse(candidate)| ScoredDoc::new(0, candidate.score.0))
+            .map(|candidate| ScoredDoc::new(0, candidate.score.0))
             .collect::<Vec<_>>();
         let mut by_partition = BTreeMap::<usize, Vec<(usize, DocId)>>::new();
-        for (rank, Reverse(candidate)) in ranked.iter().enumerate() {
+        for (rank, candidate) in ranked.iter().enumerate() {
             let partition_ordinal = candidate.document.partition_ordinal();
             let doc_id = candidate.document.doc_id;
             by_partition

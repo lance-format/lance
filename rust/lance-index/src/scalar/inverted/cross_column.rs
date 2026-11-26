@@ -232,6 +232,12 @@ impl WandDocuments for StagedWandDocuments<'_> {
             .map(|doc_id| self.scoring_length(doc_id))
             .unwrap_or_default()
     }
+
+    // Keys are DocIds. This adapter only feeds `WandCursor`, whose downstream
+    // collector settles ties on resolved addresses.
+    fn orders_ties_by_address(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Clone)]

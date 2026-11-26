@@ -8,7 +8,9 @@ use std::fmt::Debug;
 use lance_core::utils::address::RowAddress;
 use lance_select::RowAddrMask;
 
-use crate::scalar::inverted::documents::{DocId, DocLengths, DocVisibility};
+use crate::scalar::inverted::documents::{
+    DocId, DocLengths, DocVisibility, ResidentAddressProjection,
+};
 use crate::scalar::inverted::{DocInfo, DocSet};
 
 #[derive(Debug)]
@@ -51,6 +53,27 @@ pub(in crate::scalar::inverted) trait WandDocuments {
     fn candidate_from_key(&self, key: u64) -> Self::Candidate;
     fn flat_documents(&self) -> Option<FlatDocuments<'_>>;
     fn flat_doc_length(&self, doc_id: u64, document_key: u64, compressed: bool) -> u32;
+
+    /// Whether [`WandDocuments::tie_order_key`] returns real row addresses.
+    ///
+    /// FTS results are ordered `(score DESC, row_id ASC)`. When this is true the
+    /// walk can rank score ties between rows itself; when it is false the ordering
+    /// key carries no information and the collector retains the whole k-th-score
+    /// band so the caller can re-select once addresses are resolved.
+    fn orders_ties_by_address(&self) -> bool;
+
+    /// Key used to rank score ties inside one partition's top-k.
+    ///
+    /// Implementations that report [`WandDocuments::orders_ties_by_address`] return
+    /// the row address here. A deferred walk returns a constant instead, which makes
+    /// every score tie compare equal and be retained. This default returns the
+    /// document key, which is what the legacy adapter wants (its key is the row
+    /// address); the test-only [`DocSet`] adapter inherits it too, so a wand unit
+    /// test over a DocSet without row_ids ranks by a DocId that production would
+    /// have deferred, and does not exercise the retained band.
+    fn tie_order_key(&self, document_key: u64) -> u64 {
+        document_key
+    }
 }
 
 pub(in crate::scalar::inverted) trait ModernVisibility {
@@ -110,6 +133,9 @@ impl ModernVisibility for &DocVisibility {
 pub(in crate::scalar::inverted) struct ModernWandDocuments<'a, V> {
     lengths: &'a DocLengths,
     visibility: V,
+    /// Attached only when the partition's row addresses are already in memory.
+    /// The walk then orders k-th-score ties exactly instead of deferring them.
+    addresses: Option<&'a ResidentAddressProjection>,
 }
 
 impl<'a> ModernWandDocuments<'a, AllModernDocuments> {
@@ -117,6 +143,7 @@ impl<'a> ModernWandDocuments<'a, AllModernDocuments> {
         Self {
             lengths,
             visibility: AllModernDocuments,
+            addresses: None,
         }
     }
 }
@@ -126,7 +153,19 @@ impl<'a> ModernWandDocuments<'a, &'a DocVisibility> {
         Self {
             lengths,
             visibility,
+            addresses: None,
         }
+    }
+}
+
+impl<'a, V> ModernWandDocuments<'a, V> {
+    /// Order k-th-score ties by row address instead of deferring them.
+    pub(crate) fn with_addresses(
+        mut self,
+        addresses: Option<&'a ResidentAddressProjection>,
+    ) -> Self {
+        self.addresses = addresses;
+        self
     }
 }
 
@@ -193,6 +232,24 @@ impl<V: ModernVisibility> WandDocuments for ModernWandDocuments<'_, V> {
 
     fn flat_doc_length(&self, doc_id: u64, _document_key: u64, _compressed: bool) -> u32 {
         self.scoring_num_tokens(doc_id as u32)
+    }
+
+    fn orders_ties_by_address(&self) -> bool {
+        self.addresses.is_some()
+    }
+
+    fn tie_order_key(&self, document_key: u64) -> u64 {
+        // Element documents of one row share its address, so this key ranks rows
+        // but not the elements within a row. The collector keeps every candidate it
+        // cannot rank, and the final sort settles them on `doc_index`.
+        //
+        // A dead slot has no current address. It is not visible to the walk, so
+        // ranking it last only guards against it winning a tie. Without a
+        // projection the key is that same constant for every document, which makes
+        // the collector retain the whole k-th-score band.
+        self.addresses
+            .and_then(|addresses| addresses.address(DocId::new(document_key as u32)))
+            .unwrap_or(u64::MAX)
     }
 }
 
@@ -265,6 +322,11 @@ impl WandDocuments for LegacyWandDocuments<'_> {
             self.docs.num_tokens_by_row_id(document_key)
         }
     }
+
+    // Legacy document keys are row addresses, so the walk orders ties exactly.
+    fn orders_ties_by_address(&self) -> bool {
+        true
+    }
 }
 
 // Most unit tests exercise WAND in isolation with an in-memory complete
@@ -323,5 +385,10 @@ impl WandDocuments for DocSet {
         } else {
             self.num_tokens_by_row_id(document_key)
         }
+    }
+
+    // `document_key` is a row address whenever this in-memory DocSet carries one.
+    fn orders_ties_by_address(&self) -> bool {
+        self.has_row_ids()
     }
 }

@@ -53,6 +53,7 @@ pub use posting::PostingIterator;
 pub(super) use posting::{GroupedTermScorer, validate_modern_posting_doc_ids};
 
 use bounds::{ScoreContribution, score_contributions_in_query_order};
+pub(super) use collector::SCORE_FLOOR_BUFFER;
 use collector::TopKCollector;
 
 const TERMINATED_DOC_ID: u64 = u64::MAX;
@@ -349,6 +350,36 @@ pub struct Wand<'a, S: Scorer, D: WandDocuments> {
     // -- a lower bound on the global k-th, so it never drops a real top-k doc.
     shared_threshold: Option<Arc<AtomicU32>>,
     shared_norm_addends: Option<SharedNormAddends>,
+    // Set when the last search dropped part of its k-th-score tie band because
+    // the walk could not order ties by row address.
+    score_floor_overflow: bool,
+    // Set when an address-ordered search filled its band and fell back to the
+    // DocId proxy for the elements of one row.
+    band_truncated: bool,
+}
+
+/// Lower a competitive-score threshold by one ULP so the score-only WAND prune
+/// tests (`score <= threshold`) and their admit mirrors (`score > threshold`)
+/// keep, rather than drop, documents whose score equals the k-th best.
+///
+/// This is the admit-ties half of the deterministic `(score DESC, row_id ASC)`
+/// tiebreak: the pruning kernels stay score-only and fast, and the equal-score
+/// band survives to be ordered by row_id in the collector and in the
+/// cross-partition merge. Documents strictly below the k-th score are still
+/// pruned, so non-tied queries keep their pruning power: a block max rarely
+/// bit-equals the running k-th score. For a zero or negative input the result
+/// drops below zero, which the `threshold > 0.0` guards read as "no threshold
+/// yet". The smallest positive subnormal stays where it is instead of stepping
+/// down to zero, so a positive floor never disables pruning; no BM25 score ties
+/// there in practice.
+#[inline]
+fn admit_ties_floor(threshold: f32) -> f32 {
+    let lowered = threshold.next_down();
+    if threshold > 0.0 && lowered <= 0.0 {
+        threshold
+    } else {
+        lowered
+    }
 }
 
 /// Monotonically raise an f32 stored in an `AtomicU32` to `val`. CAS loop (not a
@@ -464,7 +495,37 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             scorer,
             shared_threshold: None,
             shared_norm_addends: None,
+            score_floor_overflow: false,
+            band_truncated: false,
         }
+    }
+
+    /// Build the top-k collector for one walk.
+    ///
+    /// The document adapter decides whether k-th-score ties can be settled during
+    /// the walk or must be deferred (see [`WandDocuments::orders_ties_by_address`]).
+    fn new_collector(&self, limit: usize, initial_capacity: usize) -> TopKCollector {
+        if self.documents.orders_ties_by_address() {
+            TopKCollector::by_row_address(limit, initial_capacity)
+        } else {
+            TopKCollector::deferring_addresses(limit, initial_capacity)
+        }
+    }
+
+    /// Whether the last search dropped part of its k-th-score tie band.
+    ///
+    /// The candidates it returned are then only the exact top-k up to that band,
+    /// so the caller must retry the partition with resolved row addresses.
+    pub(crate) fn score_floor_overflow(&self) -> bool {
+        self.score_floor_overflow
+    }
+
+    /// Whether the last search filled its band while already ordering by row
+    /// address. A retry cannot improve on it, so the caller only reports it:
+    /// elements of that one row past the cap may order by DocId instead of by
+    /// `doc_index`.
+    pub(crate) fn band_truncated(&self) -> bool {
+        self.band_truncated
     }
 
     /// Test hook: force one conjunction mode so parity tests can compare bulk
@@ -542,8 +603,28 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         Some((norms, addends))
     }
 
+    /// How a k-th score becomes the stored threshold.
+    ///
+    /// An exclusive floor (`score > threshold`) is lowered one ULP so it admits
+    /// ties ([`admit_ties_floor`]). An inclusive floor (`score >= threshold`)
+    /// already admits them, so it keeps the k-th score as is.
+    fn tie_admitting_floor(&self, kth: f32) -> f32 {
+        match self.floor_mode {
+            CompetitiveFloorMode::Exclusive => admit_ties_floor(kth),
+            CompetitiveFloorMode::Inclusive => kth,
+        }
+    }
+
     /// Set the pruning threshold from this partition's k-th best, raised to the
     /// shared cross-partition floor when one is attached.
+    ///
+    /// The stored value sits one ULP below the k-th score ([`admit_ties_floor`]) so
+    /// documents tied at the k-th score are admitted rather than pruned; the
+    /// collector and the cross-partition merge then order them by row_id. The raw
+    /// k-th score is what gets published to the shared floor, so every partition
+    /// lowers from the same basis. The tiebreak holds for `wand_factor <= 1.0` (the
+    /// default); a larger factor lifts the floor above the k-th score and may prune
+    /// ties.
     fn update_threshold(&mut self, local_kth: f32, wand_factor: f32) {
         let mut t = local_kth * wand_factor;
         if let Some(shared) = self.shared_threshold.as_ref() {
@@ -553,6 +634,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 t = g;
             }
         }
+        let t = self.tie_admitting_floor(t);
         if self.score_first_and_enabled && self.threshold <= 0.0 && t > 0.0 {
             // A zero-floor window did not prepare block bounds. Force the next
             // conjunction candidate to establish a score-first window.
@@ -562,11 +644,17 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         self.threshold = t;
     }
 
-    /// Raise the local threshold to the shared cross-partition floor, picking up
-    /// updates published by sibling partitions.
+    /// Raise the local threshold to the shared cross-partition floor published by
+    /// sibling partitions.
+    ///
+    /// Lowered one ULP like [`Wand::update_threshold`], so a tie at the shared k-th
+    /// score is not pruned by whichever partition published first. The merge
+    /// resolves it by row_id, which makes the result independent of partition
+    /// completion order.
     fn raise_to_shared_floor(&mut self, wand_factor: f32) {
         if let Some(shared) = self.shared_threshold.as_ref() {
-            let g = f32::from_bits(shared.load(Ordering::Relaxed)) * wand_factor;
+            let g = self
+                .tie_admitting_floor(f32::from_bits(shared.load(Ordering::Relaxed)) * wand_factor);
             if g > self.threshold {
                 if self.score_first_and_enabled && self.threshold <= 0.0 && g > 0.0 {
                     self.up_to = None;
@@ -647,7 +735,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             return self.and_bulk_search(params, metrics);
         }
 
-        let mut candidates = TopKCollector::new(limit, std::cmp::min(limit, BLOCK_SIZE * 10));
+        let mut candidates = self.new_collector(limit, std::cmp::min(limit, BLOCK_SIZE * 10));
         let mut num_comparisons = 0;
         loop {
             self.raise_to_shared_floor(params.wand_factor);
@@ -727,6 +815,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
 
             if candidates.insert(
                 ScoredDoc::new(document_key, score),
+                self.documents.tie_order_key(document_key),
                 doc_length,
                 posting_doc_id,
                 self.iter_term_freqs(),
@@ -739,6 +828,10 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             }
         }
         metrics.record_comparisons(num_comparisons);
+
+        self.score_floor_overflow = candidates.score_floor_overflow();
+
+        self.band_truncated = candidates.band_truncated();
 
         candidates.into_candidates(|key| self.documents.candidate_from_key(key))
     }
@@ -769,7 +862,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             .unwrap_or(false);
 
         let mut num_comparisons = 0;
-        let mut candidates = TopKCollector::new(limit, 0);
+        let mut candidates = self.new_collector(limit, 0);
         for (doc_id, document_key) in documents {
             num_comparisons += 1;
             self.move_head_before_target_to_tail(doc_id);
@@ -824,6 +917,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
 
             if candidates.insert(
                 ScoredDoc::new(document_key, score),
+                self.documents.tie_order_key(document_key),
                 doc_length,
                 doc_id,
                 self.iter_term_freqs(),
@@ -835,6 +929,10 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             self.advance_lead_to_head(doc_id + 1);
         }
         metrics.record_comparisons(num_comparisons);
+
+        self.score_floor_overflow = candidates.score_floor_overflow();
+
+        self.band_truncated = candidates.band_truncated();
 
         candidates.into_candidates(|key| self.documents.candidate_from_key(key))
     }
