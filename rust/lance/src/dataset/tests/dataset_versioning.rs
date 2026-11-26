@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::process::Command;
 use std::sync::{
     Arc, Mutex,
@@ -923,6 +923,64 @@ async fn test_tag(
         dataset = dataset.checkout_version("tag1").await.unwrap();
         assert_eq!(dataset.manifest.version, version);
     }
+}
+
+#[tokio::test]
+async fn test_create_ref_metadata_without_overwrite() {
+    let mut dataset = Dataset::write(id_rows(0, 2), "memory://", None)
+        .await
+        .unwrap();
+    let tag = tag_path(&dataset.table_state.base, "release");
+    let branch = branch_contents_path(&dataset.table_state.base, "experiment");
+    let written = Arc::new(Mutex::new(HashSet::new()));
+    let mut policy = ProxyObjectStorePolicy::new();
+    let ref_writes = written.clone();
+    policy.set_before_policy(
+        "create_only_refs",
+        Arc::new(move |method, path| {
+            if matches!(method, "put" | "put_multipart")
+                && (path == &tag || path == &branch)
+                && !ref_writes.lock().unwrap().insert(path.clone())
+            {
+                return Err(object_store::Error::PermissionDenied {
+                    path: path.to_string(),
+                    source: "ref overwrites are disabled".into(),
+                }
+                .into());
+            }
+            Ok(())
+        }),
+    );
+    let mut store = dataset.table_state.object_store.as_ref().clone();
+    store.inner = Arc::new(ProxyObjectStore::new(
+        store.inner.clone(),
+        Arc::new(Mutex::new(policy)),
+    ));
+    dataset.refs = Refs::new(
+        Arc::new(store),
+        dataset.commit_handler(),
+        dataset.branch_location(),
+    );
+
+    let metadata = HashMap::from([("owner".to_string(), "analytics".to_string())]);
+    dataset
+        .tags()
+        .create_with_metadata("release", 1, metadata.clone())
+        .await
+        .unwrap();
+    dataset
+        .create_branch_with_metadata("experiment", "release", None, metadata.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        dataset.tags().get("release").await.unwrap().metadata,
+        metadata
+    );
+    assert_eq!(
+        dataset.branches().get("experiment").await.unwrap().metadata,
+        metadata
+    );
+    assert_eq!(written.lock().unwrap().len(), 2);
 }
 
 #[tokio::test]
