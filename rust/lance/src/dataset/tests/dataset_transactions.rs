@@ -441,23 +441,29 @@ fn test_distinct_unknown_transactions_are_not_equal() {
     assert_ne!(decode("a"), decode("b"));
 }
 
+#[rstest::rstest]
+#[case::current_version(2, false)]
+#[case::older_version(1, false)]
+#[case::strict_overwrite(2, true)]
 #[tokio::test]
-async fn test_migrate_v2_manifest_paths() {
-    let test_uri = TempStrDir::default();
-
-    let data = lance_datagen::gen_batch()
-        .col("key", array::step::<Int32Type>())
-        .into_reader_rows(RowCount::from(10), BatchCount::from(1));
+async fn test_migrate_v2_manifest_paths(
+    #[case] stale_version: u64,
+    #[case] is_strict_overwrite: bool,
+) {
+    let session = Arc::new(Session::default());
     let mut dataset = Dataset::write(
-        data,
-        &test_uri,
+        gen_rows(),
+        "memory://",
         Some(WriteParams {
             enable_v2_manifest_paths: false,
+            session: Some(session.clone()),
             ..Default::default()
         }),
     )
     .await
     .unwrap();
+    dataset.append(gen_rows(), None).await.unwrap();
+    let mut stale_writer = dataset.checkout_version(stale_version).await.unwrap();
     assert_eq!(
         dataset.manifest_location().naming_scheme,
         ManifestNamingScheme::V1
@@ -468,6 +474,70 @@ async fn test_migrate_v2_manifest_paths() {
         dataset.manifest_location().naming_scheme,
         ManifestNamingScheme::V2
     );
+
+    // Migration does not advance the version or refresh other open handles.
+    assert_eq!(dataset.version().version, 2);
+    assert_eq!(
+        stale_writer.manifest_location().naming_scheme,
+        ManifestNamingScheme::V1
+    );
+    if is_strict_overwrite {
+        let transaction = Transaction::new(
+            stale_version,
+            Operation::Overwrite {
+                schema: stale_writer.schema().clone(),
+                fragments: stale_writer.manifest.fragments.as_ref().clone(),
+                config_upsert_values: Some(HashMap::from([(
+                    "feature".to_string(),
+                    "yes".to_string(),
+                )])),
+                initial_bases: None,
+            },
+            None,
+        );
+        stale_writer = CommitBuilder::new(Arc::new(stale_writer))
+            .with_max_retries(0)
+            .execute(transaction)
+            .await
+            .unwrap();
+    } else {
+        stale_writer
+            .update_config([("feature", "yes")])
+            .await
+            .unwrap();
+    }
+    assert_eq!(stale_writer.version().version, 3);
+    assert_eq!(
+        stale_writer.manifest_location().naming_scheme,
+        ManifestNamingScheme::V2
+    );
+
+    let reopened = DatasetBuilder::from_uri("memory://")
+        .with_session(session)
+        .load()
+        .await
+        .unwrap();
+    assert_eq!(reopened.version().version, 3);
+    assert_eq!(reopened.manifest.config["feature"], "yes");
+    assert_eq!(reopened.manifest.fragments.len(), 2);
+    assert_eq!(reopened.count_rows(None).await.unwrap(), 20);
+
+    let versions = reopened
+        .table_state
+        .commit_handler
+        .list_manifest_locations(
+            &reopened.table_state.base,
+            &reopened.table_state.object_store,
+            true,
+        )
+        .map_ok(|location| {
+            assert_eq!(location.naming_scheme, ManifestNamingScheme::V2);
+            location.version
+        })
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    assert_eq!(versions, vec![3, 2, 1]);
 }
 
 pub(super) async fn execute_sql(

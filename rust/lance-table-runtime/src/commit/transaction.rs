@@ -497,6 +497,18 @@ pub async fn commit_transaction(
         } else {
             ensure_can_write_manifest(&dataset.manifest)?;
         }
+
+        // Migration can rename manifests without advancing the version, leaving
+        // idle writers' cached V1 locations stale. Check through the handler so
+        // the next commit uses the table's current naming scheme.
+        let manifest_naming_scheme = if manifest_naming_scheme == ManifestNamingScheme::V1 {
+            commit_handler
+                .resolve_latest_location(&dataset.state.base, object_store)
+                .await?
+                .naming_scheme
+        } else {
+            manifest_naming_scheme
+        };
         let attempt_start = Instant::now();
         let retry_start = *retry_start.get_or_insert(attempt_start);
 
