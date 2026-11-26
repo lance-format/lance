@@ -237,7 +237,7 @@ impl PyShardSnapshot {
 pub struct PyShardWriter {
     inner: Arc<TokioMutex<Option<ShardWriter>>>,
     closed_state: Arc<TokioMutex<Option<ClosedShardWriterState>>>,
-    /// The error of a `close()` that failed after taking the writer.
+    /// The error of a `close()` that took the writer and did not finish cleanly.
     close_error: Arc<TokioMutex<Option<String>>>,
     shard_id: Uuid,
     dataset: Arc<LanceDataset>,
@@ -371,13 +371,18 @@ impl PyShardWriter {
         let close_error = self.close_error.clone();
         rt().block_on(Some(py), async move {
             let mut guard = inner.lock().await;
+            let mut close_error = close_error.lock().await;
             let Some(writer) = guard.take() else {
-                // A failed close() already gave the writer up, so report its error again.
-                return match close_error.lock().await.clone() {
-                    Some(message) => Err(message),
-                    None => Ok(()),
-                };
+                // The writer is gone: Ok after a clean close, the stored error otherwise.
+                return close_error.clone().map_or(Ok(()), Err);
             };
+            // Recorded before the drain, so a close() cancelled by an interrupt is not
+            // reported as clean by the next call.
+            *close_error = Some(
+                "ShardWriter.close() was interrupted before it finished; \
+                 unflushed rows may be lost"
+                    .to_string(),
+            );
             let result: lance::Result<()> = async {
                 let stats_handle = writer.stats_handle();
                 // Snapshot stats before close so the captured state reflects
@@ -394,12 +399,8 @@ impl PyShardWriter {
                 Ok(())
             }
             .await;
-            if let Err(err) = result {
-                let message = err.to_string();
-                *close_error.lock().await = Some(message.clone());
-                return Err(message);
-            }
-            Ok(())
+            *close_error = result.err().map(|err| err.to_string());
+            close_error.clone().map_or(Ok(()), Err)
         })?
         .map_err(PyIOError::new_err)
     }
