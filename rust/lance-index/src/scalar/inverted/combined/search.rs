@@ -26,8 +26,10 @@ use crate::vector::graph::OrderedFloat;
 /// ASC`, the same order the single-column path imposes in
 /// `classify_wand_exactness_certificate`.
 ///
-/// [`ScoredDoc`](super::super::builder::ScoredDoc) compares on score alone, which
-/// is not enough for the bounded heap [`combined_maxscore`] collects into: among
+/// [`ScoredDoc`](super::super::builder::ScoredDoc) orders `(score, row_id)` the
+/// same way, then falls back to `doc_index`. The combined path has no document
+/// index, and a `ScoredDoc` costs a `Vec<u32>` per candidate. A bounded heap
+/// that ranks on score alone is not enough for [`combined_maxscore`]: among
 /// equal scores it evicts whichever row the heap happens to hold at the bottom, so
 /// rows that belong in the top-k are dropped and no later sort can bring them
 /// back. A fully covered plan returns this search's output directly, with no

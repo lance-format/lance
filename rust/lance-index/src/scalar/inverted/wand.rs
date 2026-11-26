@@ -54,7 +54,7 @@ pub(super) use posting::{GroupedTermScorer, validate_modern_posting_doc_ids};
 
 use bounds::{ScoreContribution, score_contributions_in_query_order};
 pub(super) use collector::SCORE_FLOOR_BUFFER;
-use collector::{TieHandling, TopKCollector};
+use collector::{TieOrdering, TopKCollector};
 
 const TERMINATED_DOC_ID: u64 = u64::MAX;
 
@@ -345,10 +345,9 @@ pub struct Wand<'a, S: Scorer, D: WandDocuments> {
     phrase_position_checks: Cell<usize>,
     documents: &'a D,
     scorer: S,
-    // How far this walk can see into the `(score DESC, row_id ASC)` result order.
-    // Decided once from the document adapter so the collector and every score
-    // floor make the same choice about documents tied at the k-th score.
-    tie_handling: TieHandling,
+    // Which tiebreak the document adapter allows, fixed at construction so the
+    // collector and every score floor treat a k-th-score tie the same way.
+    tie_ordering: TieOrdering,
     // Shared cross-partition top-k floor. Each partition publishes its local
     // k-th score (`atomic_store_max_f32`) and prunes against the running value
     // -- a lower bound on the global k-th, so it never drops a real top-k doc.
@@ -358,27 +357,20 @@ pub struct Wand<'a, S: Scorer, D: WandDocuments> {
     // the walk could not order ties by row address.
     score_floor_overflow: bool,
     // Set when an address-ordered search filled its band and fell back to the
-    // DocId proxy for the elements of one row.
+    // DocId proxy for a single row's elements.
     band_truncated: bool,
 }
 
-/// Lower a competitive-score threshold by one ULP so the score-only WAND prune
-/// tests (`score <= threshold`) and their admit mirrors (`score > threshold`)
-/// keep, rather than drop, documents whose score equals the k-th best.
+/// Lowers a competitive-score threshold by one ULP so that the score-only WAND
+/// prune (`score <= threshold`) and the matching admit test (`score > threshold`)
+/// keep documents whose score equals the k-th best. The pruning kernels rank on
+/// score alone, and the collector and the cross-partition merge order the
+/// equal-score band by row_id. The lower floor keeps pruning power because a
+/// block max rarely bit-equals the running k-th score.
 ///
-/// This is the admit-ties half of the deterministic `(score DESC, row_id ASC)`
-/// tiebreak: the pruning kernels stay score-only and fast, and the equal-score
-/// band survives to be ordered by row_id in the collector and in the
-/// cross-partition merge. Documents strictly below the k-th score are still
-/// pruned, so non-tied queries keep their pruning power: a block max rarely
-/// bit-equals the running k-th score. For a zero or negative input the result
-/// drops below zero, which the `threshold > 0.0` guards read as "no threshold
-/// yet". The smallest positive subnormal stays where it is instead of stepping
-/// down to zero, so a positive floor never disables pruning; no BM25 score ties
-/// there in practice.
-///
-/// Only a walk that cannot rank a k-th-score tie needs this. See
-/// [`Wand::local_score_floor`] for the case that does not.
+/// The `threshold > 0.0` guards read a non-positive threshold as "no threshold
+/// yet", so a zero or negative input stays non-positive and the smallest
+/// positive subnormal is left alone. A `+inf` k-th score lowers to `f32::MAX`.
 #[inline]
 fn admit_ties_floor(threshold: f32) -> f32 {
     let lowered = threshold.next_down();
@@ -451,12 +443,12 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 .doc_norm(1)
                 .is_some_and(|norm| norm.is_finite() && norm >= 0.0);
 
-        let tie_handling = if !documents.orders_ties_by_address() {
-            TieHandling::DeferredAddresses
+        let tie_ordering = if !documents.orders_ties_by_address() {
+            TieOrdering::DeferredAddresses
         } else if documents.row_addresses_ascend_with_doc_id() {
-            TieHandling::AscendingRowAddresses
+            TieOrdering::AscendingRowAddresses
         } else {
-            TieHandling::ByRowAddress
+            TieOrdering::ByRowAddress
         };
 
         Self {
@@ -508,7 +500,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             phrase_position_checks: Cell::new(0),
             documents,
             scorer,
-            tie_handling,
+            tie_ordering,
             shared_threshold: None,
             shared_norm_addends: None,
             score_floor_overflow: false,
@@ -516,27 +508,23 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         }
     }
 
-    /// Build the top-k collector for one walk.
-    ///
-    /// The document adapter decides how far the walk can rank k-th-score ties (see
-    /// [`WandDocuments::orders_ties_by_address`] and
+    /// Build the walk's top-k collector with the tie ordering the document
+    /// adapter allows ([`WandDocuments::orders_ties_by_address`] and
     /// [`WandDocuments::row_addresses_ascend_with_doc_id`]).
     fn new_collector(&self, limit: usize, initial_capacity: usize) -> TopKCollector {
-        TopKCollector::new(limit, initial_capacity, self.tie_handling)
+        TopKCollector::new(limit, initial_capacity, self.tie_ordering)
     }
 
-    /// Whether the last search dropped part of its k-th-score tie band.
-    ///
-    /// The candidates it returned are then only the exact top-k up to that band,
-    /// so the caller must retry the partition with resolved row addresses.
+    /// True when the last search dropped part of its k-th-score tie band. The
+    /// candidates are then the exact top-k plus an incomplete band, so the
+    /// caller retries the partition with resolved row addresses.
     pub(crate) fn score_floor_overflow(&self) -> bool {
         self.score_floor_overflow
     }
 
-    /// Whether the last search filled its band while already ordering by row
-    /// address. A retry cannot improve on it, so the caller only reports it:
-    /// elements of that one row past the cap may order by DocId instead of by
-    /// `doc_index`.
+    /// True when the last search filled its band while already ordering ties by
+    /// row address. A retry cannot rank what the cap dropped, so it is only
+    /// reported: those elements may order by DocId instead of by `doc_index`.
     pub(crate) fn band_truncated(&self) -> bool {
         self.band_truncated
     }
@@ -616,11 +604,12 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         Some((norms, addends))
     }
 
-    /// How a k-th score becomes the stored threshold.
-    ///
-    /// An exclusive floor (`score > threshold`) is lowered one ULP so it admits
-    /// ties ([`admit_ties_floor`]). An inclusive floor (`score >= threshold`)
-    /// already admits them, so it keeps the k-th score as is.
+    /// How a k-th score becomes the stored threshold. An exclusive floor
+    /// (`score > threshold`) drops one ULP to admit ties
+    /// ([`admit_ties_floor`]); an inclusive floor (`score >= threshold`) already
+    /// admits them. A sibling partition's shared k-th score is always lowered: it
+    /// says nothing about this partition's address order, so those ties have to
+    /// reach the merge, which ranks them by row_id.
     fn tie_admitting_floor(&self, kth: f32) -> f32 {
         match self.floor_mode {
             CompetitiveFloorMode::Exclusive => admit_ties_floor(kth),
@@ -628,16 +617,14 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         }
     }
 
-    /// The floor this partition's own k-th score puts on its walk.
-    ///
-    /// When the walk reaches documents in ascending row-address order it cannot
-    /// rank a k-th-score tie either: the newcomer lost. The floor then stays at the
-    /// raw k-th score, which is what keeps block-max pruning working on a corpus
-    /// whose block maxes bit-equal the k-th score. Otherwise the tie has to reach
-    /// the collector, so the floor drops one ULP.
+    /// The floor this partition's own k-th score puts on its walk. An address
+    /// ascending walk ranks a k-th-score tie against the k-th entry: it reaches
+    /// the newcomer later, so the newcomer lost, and the floor stays at the raw
+    /// k-th score to keep pruning blocks whose max bit-equals it. Otherwise the
+    /// tie has to reach the collector, so the floor drops one ULP.
     fn local_score_floor(&self, kth: f32, wand_factor: f32) -> f32 {
         let scaled = kth * wand_factor;
-        if self.tie_handling == TieHandling::AscendingRowAddresses {
+        if self.tie_ordering == TieOrdering::AscendingRowAddresses {
             scaled
         } else {
             self.tie_admitting_floor(scaled)
@@ -645,16 +632,12 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
     }
 
     /// Set the pruning threshold from this partition's k-th best, raised to the
-    /// shared cross-partition floor when one is attached.
-    ///
-    /// The local half follows [`Wand::local_score_floor`]. The shared half always
-    /// sits one ULP below the published k-th score ([`admit_ties_floor`]): a
-    /// sibling partition's k-th score says nothing about this partition's row
-    /// address order, so its ties must reach this walk's collector. The raw k-th
-    /// score is what gets published to the shared floor, so every partition lowers
-    /// from the same basis, and the merge resolves the ties by row_id. That holds
-    /// for `wand_factor <= 1.0` (the default); a larger factor lifts the floor
-    /// above the k-th score and may prune ties.
+    /// shared cross-partition floor when one is attached. The local half follows
+    /// [`Wand::local_score_floor`] and the shared half
+    /// [`Wand::tie_admitting_floor`]. The raw k-th score is published to the
+    /// shared floor, so every partition lowers from the same basis. A
+    /// `wand_factor` above 1.0 puts the floor above the k-th score, pruning the
+    /// documents in between (`FtsSearchParams::with_wand_factor`).
     fn update_threshold(&mut self, local_kth: f32, wand_factor: f32) {
         let mut t = self.local_score_floor(local_kth, wand_factor);
         if let Some(shared) = self.shared_threshold.as_ref() {
@@ -675,13 +658,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
     }
 
     /// Raise the local threshold to the shared cross-partition floor published by
-    /// sibling partitions.
-    ///
-    /// Lowered one ULP in every tie-handling mode, unlike a partition's own k-th
-    /// score: a sibling's k-th score says nothing about this partition's row
-    /// address order, so a tie at the shared floor is not one this walk can rank.
-    /// The merge resolves it by row_id, which makes the result independent of
-    /// partition completion order.
+    /// sibling partitions, lowered as [`Wand::tie_admitting_floor`] describes.
     fn raise_to_shared_floor(&mut self, wand_factor: f32) {
         if let Some(shared) = self.shared_threshold.as_ref() {
             let g = self
@@ -855,9 +832,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 self.update_threshold(kth, params.wand_factor);
             }
             if candidates.aborted() {
-                // The collector stopped on a tie it cannot rank, and the rest of
-                // the walk cannot rank it either. Leave the remainder to the
-                // address-ordered retry instead of scoring it.
+                // The rest of the walk cannot rank the tie that stopped it.
                 break;
             }
             if self.operator == Operator::Or {
@@ -866,7 +841,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         }
         metrics.record_comparisons(num_comparisons);
 
-        self.score_floor_overflow = candidates.score_floor_overflow();
+        self.score_floor_overflow = candidates.aborted();
 
         self.band_truncated = candidates.band_truncated();
 
@@ -970,7 +945,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         }
         metrics.record_comparisons(num_comparisons);
 
-        self.score_floor_overflow = candidates.score_floor_overflow();
+        self.score_floor_overflow = candidates.aborted();
 
         self.band_truncated = candidates.band_truncated();
 

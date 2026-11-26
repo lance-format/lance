@@ -852,13 +852,7 @@ impl ExecutionPlan for HybridCompoundQueryExec {
                 .chain(residual_row_ids.into_iter().zip(residual_scores))
                 .map(|(row_id, score)| ScoredDoc::new(row_id, score))
                 .collect::<Vec<_>>();
-            documents.sort_unstable_by(|left, right| {
-                right
-                    .score
-                    .0
-                    .total_cmp(&left.score.0)
-                    .then_with(|| left.row_id.cmp(&right.row_id))
-            });
+            documents.sort_unstable_by(|left, right| right.cmp(left));
             documents.truncate(limit);
             metrics.baseline_metrics.record_output(documents.len());
             scored_documents_batch(schema, documents).map_err(DataFusionError::from)
@@ -942,13 +936,7 @@ fn classify_wand_exactness_certificate(
     {
         return WandExactnessCertificate::Ambiguous;
     }
-    documents.sort_unstable_by(|left, right| {
-        right
-            .score
-            .0
-            .total_cmp(&left.score.0)
-            .then_with(|| left.row_id.cmp(&right.row_id))
-    });
+    documents.sort_unstable_by(|left, right| right.cmp(left));
     if documents.len() < probe_limit {
         WandExactnessCertificate::Exhaustive
     } else if documents[limit - 1].score.0.total_cmp(

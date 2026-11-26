@@ -714,12 +714,10 @@ fn test_wand_batches_lagging_iterators(#[values(false, true)] is_compressed: boo
 
 #[test]
 fn test_or_tied_corpus_keeps_block_max_pruning() {
-    // Reviewer reproducer: every document scores the same, so every block max
-    // bit-equals the k-th score, and the winners sit at the very start of the
-    // walk. Row addresses ascend with DocId here, so a document reached after the
-    // heap filled has already lost the tie on row address and its whole block can
-    // be skipped. A walk that admits every k-th-score tie instead scores the
-    // entire corpus.
+    // Every document scores the same, so each block max bit-equals the k-th score
+    // and the winners sit at the start of the walk. Addresses ascend with DocId, so
+    // a document reached after the heap filled lost the tie and its whole block is
+    // skipped. A walk that admits every k-th-score tie scores the whole corpus.
     const NUM_BLOCKS: usize = 128;
     let total = (NUM_BLOCKS * BLOCK_SIZE) as u32;
 
@@ -767,10 +765,10 @@ fn test_or_tied_corpus_keeps_block_max_pruning() {
 
 #[test]
 fn test_or_ascending_addresses_only_reject_after_the_kth_score() {
-    // Guard for the address-ascending mode: refusing a k-th-score tie must not turn
-    // into refusing every later candidate. The best scores sit in the last block, so
-    // a collector that stopped admitting once its heap was full would return the
-    // first documents, and a floor that never rose would score the whole corpus.
+    // Refusing a k-th-score tie must not refuse every later candidate. The best
+    // scores sit in the last block, so a collector that stopped admitting once its
+    // heap was full would return the first documents, and a floor that did not
+    // rise would score the whole corpus.
     const NUM_BLOCKS: usize = 16;
     let total = (NUM_BLOCKS * BLOCK_SIZE) as u32;
     let last_block_start = total - BLOCK_SIZE as u32;

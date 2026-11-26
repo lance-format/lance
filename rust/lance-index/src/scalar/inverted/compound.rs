@@ -32,7 +32,7 @@ use super::{
     tokenizer::document_tokenizer::TextTokenizer,
     wand::{
         FLAT_SEARCH_PERCENT_THRESHOLD, LegacyWandDocuments, ModernWandDocuments, PostingIterator,
-        WandCursor, WandDocuments, score_sum_upper_bound_factor,
+        SCORE_FLOOR_BUFFER, WandCursor, WandDocuments, score_sum_upper_bound_factor,
     },
 };
 use crate::{metrics::MetricsCollector, prefilter::PreFilter};
@@ -40,7 +40,6 @@ use crate::{metrics::MetricsCollector, prefilter::PreFilter};
 use self::should_maxscore::ShouldMaxScoreScorer;
 
 const DEFAULT_BLOCK_SIZE: usize = 128;
-const SCORE_FLOOR_RESOLUTION_BATCH_SIZE: usize = DEFAULT_BLOCK_SIZE;
 
 /// One exact FTS result in a compound collector's candidate domain.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -4243,9 +4242,7 @@ fn collect_loaded_partitions(
                     )?;
                     debug_assert_eq!(status, CollectionStatus::Complete);
                 } else {
-                    let max_buffered = collector
-                        .limit
-                        .saturating_add(SCORE_FLOOR_RESOLUTION_BATCH_SIZE);
+                    let max_buffered = collector.limit.saturating_add(SCORE_FLOOR_BUFFER);
                     let mut local_collector = TopKCollector::retaining_score_floor(
                         collector.limit,
                         collector.competitive_score.clone(),
@@ -4301,7 +4298,7 @@ async fn merge_resolved_compound_rows(
     collector: &mut TopKCollector<u64>,
     deferred: DeferredCompoundRows,
 ) -> Result<()> {
-    for rows in deferred.rows.chunks(SCORE_FLOOR_RESOLUTION_BATCH_SIZE) {
+    for rows in deferred.rows.chunks(SCORE_FLOOR_BUFFER) {
         let doc_ids = rows.iter().map(|row| row.row_id).collect::<Vec<_>>();
         let addresses = deferred.documents.resolve_addresses(&doc_ids).await?;
         if addresses.len() != rows.len() {
@@ -4913,7 +4910,7 @@ mod tests {
             .map(|row_id| (row_id as u64, 1.0))
             .collect::<Vec<_>>();
         let mut scorer = MaterializedScorer::try_new(rows(&values)).unwrap();
-        let max_buffered = limit + SCORE_FLOOR_RESOLUTION_BATCH_SIZE;
+        let max_buffered = limit + SCORE_FLOOR_BUFFER;
         let mut collector = TopKCollector::retaining_score_floor(
             limit,
             Arc::new(CompetitiveScore::default()),

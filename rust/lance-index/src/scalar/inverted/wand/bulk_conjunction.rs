@@ -547,9 +547,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
 
         'window: loop {
             if candidates.aborted() {
-                // The collector stopped on a tie it cannot rank and the rest of
-                // the conjunction cannot rank it either, so leave what is left of
-                // the walk to the address-ordered retry.
+                // The rest of the conjunction cannot rank the tie that stopped it.
                 break;
             }
             #[cfg(test)]
@@ -957,7 +955,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
 
         metrics.record_comparisons(num_comparisons);
 
-        self.score_floor_overflow = candidates.score_floor_overflow();
+        self.score_floor_overflow = candidates.aborted();
 
         self.band_truncated = candidates.band_truncated();
 

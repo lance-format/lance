@@ -1574,9 +1574,8 @@ impl Scanner {
                     fts_node,
                     schema,
                 )?);
-                // The aggregate above groups on `_rowid` alone, collapsing a
-                // row's elements into one `max(_score)`, so its output carries no
-                // coordinate for the sort key to pick up.
+                // MultiMatch rejects `DocumentGranularity::ListElement`, so the
+                // plan has no `doc_index` column and the sort key ends at `row_id`.
                 let sort_exprs = Self::fts_score_sort_exprs(fts_node.schema().as_ref())?;
                 if params.limit == Some(0) {
                     return zero_candidate_plan(fts_node, sort_exprs);
@@ -2312,9 +2311,9 @@ impl Scanner {
             plan,
             Partitioning::RoundRobinBatch(1),
         )?);
-        // A `SortExec` top-k is not stable, so it sorts on the full FTS key rather
-        // than on score alone. Both inputs need that: the union interleaves two
-        // independent plans, and a flat-only scan interleaves its fragments.
+        // A `SortExec` with a fetch is not a stable top-k: among equal scores it
+        // keeps rows in arrival order. The union's two plans and the flat scan's
+        // fragments are read concurrently, so their rows interleave.
         Ok(Arc::new(
             SortExec::new(sort_exprs, plan).with_fetch(params.limit),
         ))
@@ -2400,16 +2399,15 @@ impl Scanner {
         Ok(flat_match_plan)
     }
 
-    /// Sort keys for an FTS plan whose scores come from more than one source, or
-    /// from a source that does not sort.
+    /// Sort keys for an FTS plan whose scores come from several sources, or from
+    /// a source that does not sort.
     ///
-    /// `row_id ASC` is a required second key, not a nicety: a score-only sort over
-    /// concurrently read sources breaks ties by arrival order, so equal-scoring
-    /// documents would come back in a different order run to run and
-    /// `limit`/`offset` pagination could skip and repeat rows.
+    /// A score-only sort breaks ties by arrival order, so equal-scoring rows
+    /// change order between runs, and `limit`/`offset` pagination skips and
+    /// repeats rows.
     ///
-    /// For list-element granularity one row address covers every element of that
-    /// row, so `doc_index ASC` is appended when the schema carries it.
+    /// At list-element granularity a row's elements share its address, so
+    /// `row_id` leaves them tied and `doc_index` orders them.
     fn fts_score_sort_exprs(schema: &ArrowSchema) -> Result<LexOrdering> {
         let ascending = SortOptions {
             descending: false,

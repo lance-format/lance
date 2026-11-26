@@ -1538,6 +1538,9 @@ impl InvertedPartition {
         }))
     }
 
+    /// Search a legacy partition. Its document keys are row addresses, so the
+    /// walk ranks every k-th-score tie and
+    /// [`Wand::score_floor_overflow`] cannot be set.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn bm25_search_legacy(
         &self,
@@ -1568,10 +1571,10 @@ impl InvertedPartition {
         Ok(candidates)
     }
 
-    /// Search one modern partition.
-    ///
-    /// Returns the candidates plus what the walk gave up on its tie band, which
-    /// tells the caller whether to retry the partition with `addresses` attached.
+    /// Search a modern partition. When
+    /// [`WandBandStatus::score_floor_overflow`] is set the candidates are missing
+    /// part of the partition's k-th-score tie band, so the caller searches again
+    /// with `addresses` attached.
     /// `shared_norm_addends` is used only with `impact_scorer`, and must be
     /// shared only by searches that pass the same impact scorer.
     #[allow(clippy::too_many_arguments)]

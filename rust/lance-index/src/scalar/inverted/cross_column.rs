@@ -233,8 +233,9 @@ impl WandDocuments for StagedWandDocuments<'_> {
             .unwrap_or_default()
     }
 
-    // Keys are DocIds. This adapter only feeds `WandCursor`, whose downstream
-    // collector settles ties on resolved addresses.
+    // A document key is a DocId, so a score tie has no row address to rank it.
+    // The collector retains the k-th-score band and the caller re-selects once row
+    // addresses are resolved.
     fn orders_ties_by_address(&self) -> bool {
         false
     }

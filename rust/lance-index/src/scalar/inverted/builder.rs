@@ -2302,14 +2302,10 @@ impl PartialOrd for ScoredDoc {
 }
 
 impl Ord for ScoredDoc {
-    /// The FTS result order (score DESC, row_id ASC, doc_index ASC) expressed
-    /// "best is greatest", so a lower row_id compares as greater here.
-    ///
-    /// A total tiebreak makes top-k a stable prefix across `k` (top-k1 is an
-    /// ordered prefix of top-k2), which tied-score pagination needs. This
-    /// orientation also makes a `Reverse`-wrapped min-heap peek at the worst
-    /// candidate to evict first, and `into_sorted_vec` over `Reverse<ScoredDoc>`
-    /// yield the results in final order.
+    /// The FTS result order: score descending, then `row_id` ascending, then
+    /// `doc_index` ascending, oriented so the best document compares greatest.
+    /// The order is total, so the top-k at limit k is an ordered prefix of the
+    /// top-k at any larger limit.
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.score
             .cmp(&other.score)

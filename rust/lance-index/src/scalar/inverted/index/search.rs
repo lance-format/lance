@@ -924,7 +924,7 @@ impl InvertedIndex {
             .try_flatten();
         while let Some(partition) = parts.try_next().await? {
             for (row_id, score) in rescore_partition_candidates(partition, scorer) {
-                push_scored_key(&mut ranked, limit, row_id, score);
+                push_top_k_document(&mut ranked, limit, ScoredDoc::new(row_id, score));
             }
         }
         Ok(ranked
@@ -987,12 +987,14 @@ impl InvertedIndex {
         let limit = request.limit;
         let ranked = self.bm25_search_modern_candidates(request).await?;
         if let Some(result) = self.resolve_resident_modern_candidates(&ranked)? {
-            return Ok(rank_resolved_documents(result, limit));
+            return Ok(rank_resolved_documents(result, limit, |document| document));
         }
         self.document_projections_resident
             .store(false, Ordering::Release);
         let resolved = self.resolve_deferred_modern_candidates(&ranked).await?;
-        Ok(rank_resolved_documents(resolved, limit))
+        Ok(rank_resolved_documents(resolved, limit, |document| {
+            document
+        }))
     }
 
     async fn bm25_search_modern_deferred(
@@ -1039,7 +1041,9 @@ impl InvertedIndex {
         let limit = request.limit;
         let ranked = self.bm25_search_modern_candidates(request).await?;
         let resolved = self.resolve_deferred_modern_candidates(&ranked).await?;
-        Ok(rank_resolved_documents(resolved, limit))
+        Ok(rank_resolved_documents(resolved, limit, |document| {
+            document
+        }))
     }
 
     async fn bm25_search_modern_candidates(
@@ -1127,11 +1131,8 @@ impl InvertedIndex {
                             load_modern_partition(
                                 partition_ordinal,
                                 part,
-                                context.tokens.as_ref(),
-                                context.params.as_ref(),
-                                context.operator,
+                                &context,
                                 &mask,
-                                context.metrics.as_ref(),
                                 partition_term_ids,
                                 false,
                             )
@@ -1166,9 +1167,8 @@ impl InvertedIndex {
             .collect::<Vec<_>>();
 
         let mut ranked = ModernCandidates::default();
-        // Partitions whose k-th-score tie band outgrew the collector's buffer.
-        // Their candidates are not the exact top-k, so they are searched again
-        // below with row addresses attached instead of being merged here.
+        // Partitions whose tie band overflowed the collector: their candidates
+        // are incomplete, so each partition is searched again with addresses.
         let mut retries = Vec::new();
         let mut parts = stream::iter(parts)
             .buffer_unordered(buffered_chunks)
@@ -1190,9 +1190,8 @@ impl InvertedIndex {
             }
         }
 
-        // Retries repeat a partition's posting load and WAND walk, so they run
-        // concurrently instead of serially behind the main pass. A broad tied
-        // query can overflow every partition at once.
+        // A retry repeats a partition's posting load and WAND walk. A broad tied
+        // query can overflow every partition, so retries run concurrently.
         let mut retried = stream::iter(retries.into_iter().map(|(partition_ordinal, part)| {
             let context = context.clone();
             let mask = mask.clone();
@@ -1201,11 +1200,8 @@ impl InvertedIndex {
                 let Some(loaded) = load_modern_partition(
                     partition_ordinal,
                     part,
-                    context.tokens.as_ref(),
-                    context.params.as_ref(),
-                    context.operator,
+                    &context,
                     &mask,
-                    context.metrics.as_ref(),
                     partition_term_ids,
                     true,
                 )
@@ -1238,8 +1234,8 @@ impl InvertedIndex {
         Ok(ranked.into_vec())
     }
 
-    /// Merge one partition's rescored candidates into the global top-k, then
-    /// keep the retained tie band bounded.
+    /// Merge a partition's rescored candidates into the global top-k and bound
+    /// the retained tie band.
     async fn merge_modern_partition(
         &self,
         ranked: &mut ModernCandidates,
@@ -1257,18 +1253,13 @@ impl InvertedIndex {
         self.compact_modern_candidates(ranked, limit).await
     }
 
-    /// Keep the cross-partition tie band bounded.
-    ///
-    /// The merge retains every candidate tied at the k-th score, and with enough
-    /// partitions contributing to one tie group that band is the only unbounded
-    /// buffer on this path. Once it passes `limit + SCORE_FLOOR_BUFFER` the merge
-    /// resolves what it holds, keeps the exact top-k by
-    /// `(score DESC, row_id ASC, doc_index ASC)` and starts a fresh band. That is
-    /// still exact: every later candidate is compared against a k-th entry that is
-    /// now the true k-th of everything seen so far.
-    ///
-    /// The resolution costs address reads for partitions that may not survive, so
-    /// it only runs past the bound. A no-tie query never reaches it.
+    /// Compact the cross-partition tie band past `limit + SCORE_FLOOR_BUFFER`.
+    /// The merge retains every candidate tied at the k-th score, so this band
+    /// grows with the number of partitions. Compaction resolves row addresses,
+    /// keeps the exact top-k by `(score DESC, row_id ASC, doc_index ASC)` and
+    /// starts a fresh band, so later candidates compare against the k-th score of
+    /// everything merged so far. It runs only past the bound, since resolving
+    /// reads addresses for candidates the compaction then drops.
     async fn compact_modern_candidates(
         &self,
         ranked: &mut ModernCandidates,
@@ -1279,15 +1270,15 @@ impl InvertedIndex {
         }
         let candidates = std::mem::take(ranked).into_vec();
         let resolved = self.resolve_deferred_modern_candidates(&candidates).await?;
-        let mut order = (0..candidates.len()).collect::<Vec<_>>();
-        order.sort_unstable_by(|&left, &right| resolved[right].cmp(&resolved[left]));
-        order.truncate(limit);
-        *ranked = ModernCandidates::from_ranked(
-            order
-                .into_iter()
-                .map(|rank| candidates[rank].clone())
-                .collect(),
-        );
+        let survivors = rank_resolved_documents(
+            candidates.into_iter().zip(resolved).collect::<Vec<_>>(),
+            limit,
+            |(_, resolved)| resolved,
+        )
+        .into_iter()
+        .map(|(candidate, _)| candidate)
+        .collect();
+        *ranked = ModernCandidates::from_ranked(survivors);
         Ok(())
     }
 

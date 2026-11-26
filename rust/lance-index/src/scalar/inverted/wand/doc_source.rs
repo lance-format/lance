@@ -54,35 +54,25 @@ pub(in crate::scalar::inverted) trait WandDocuments {
     fn flat_documents(&self) -> Option<FlatDocuments<'_>>;
     fn flat_doc_length(&self, doc_id: u64, document_key: u64, compressed: bool) -> u32;
 
-    /// Whether [`WandDocuments::tie_order_key`] returns real row addresses.
-    ///
-    /// FTS results are ordered `(score DESC, row_id ASC)`. When this is true the
-    /// walk can rank score ties between rows itself; when it is false the ordering
-    /// key carries no information and the collector retains the whole k-th-score
-    /// band so the caller can re-select once addresses are resolved.
+    /// True when [`WandDocuments::tie_order_key`] returns row addresses, so the
+    /// walk ranks score ties between rows itself. Otherwise the key is a constant
+    /// and the collector keeps the whole k-th-score band for the caller.
     fn orders_ties_by_address(&self) -> bool;
 
-    /// Key used to rank score ties inside one partition's top-k.
-    ///
-    /// Implementations that report [`WandDocuments::orders_ties_by_address`] return
-    /// the row address here. A deferred walk returns a constant instead, which makes
-    /// every score tie compare equal and be retained. This default returns the
-    /// document key, which is what the legacy adapter wants (its key is the row
-    /// address); the test-only [`DocSet`] adapter inherits it too, so a wand unit
-    /// test over a DocSet without row_ids ranks by a DocId that production would
-    /// have deferred, and does not exercise the retained band.
+    /// Key that ranks score ties inside a partition's top-k: the row address when
+    /// [`WandDocuments::orders_ties_by_address`] is true, otherwise a constant, so
+    /// every tie compares equal and is retained. The default returns
+    /// `document_key`, the row address for the legacy adapter. A [`DocSet`] with no
+    /// row ids inherits the default and ranks ties by DocId where production defers
+    /// them.
     fn tie_order_key(&self, document_key: u64) -> u64 {
         document_key
     }
 
-    /// Whether this partition's row addresses are unique and strictly ascend with
-    /// the local DocId order every WAND walk follows.
-    ///
-    /// Only meaningful once [`WandDocuments::orders_ties_by_address`] says the
-    /// ordering key really is a row address. Then a true answer means DocId order is
-    /// result order among equal scores, so any candidate still to come loses a tie
-    /// against the k-th entry and the walk may prune at the raw k-th score instead
-    /// of admitting the whole k-th-score band. Conservative default: false.
+    /// True when this partition's row addresses are unique and strictly ascend
+    /// with the local DocId order every WAND walk follows, which makes DocId order
+    /// result order among equal scores. Requires
+    /// [`WandDocuments::orders_ties_by_address`]. Default false.
     fn row_addresses_ascend_with_doc_id(&self) -> bool {
         false
     }
@@ -145,8 +135,7 @@ impl ModernVisibility for &DocVisibility {
 pub(in crate::scalar::inverted) struct ModernWandDocuments<'a, V> {
     lengths: &'a DocLengths,
     visibility: V,
-    /// Attached only when the partition's row addresses are already in memory.
-    /// The walk then orders k-th-score ties exactly instead of deferring them.
+    /// Row addresses resident in memory, which rank k-th-score ties between rows.
     addresses: Option<&'a ResidentAddressProjection>,
 }
 
@@ -251,22 +240,18 @@ impl<V: ModernVisibility> WandDocuments for ModernWandDocuments<'_, V> {
     }
 
     fn row_addresses_ascend_with_doc_id(&self) -> bool {
-        // `dense` matters as much as `ascending`: a slot the remapper dropped has
-        // no current address, so the walk would rank it last while later DocIds
-        // carry real ones, and the address order would no longer follow DocId.
+        // `dense` matters as much as `ascending`: a dead slot has no current
+        // address, so ranking it last breaks the DocId-to-address order.
         self.addresses
             .is_some_and(ResidentAddressProjection::dense_and_strictly_ascending)
     }
 
     fn tie_order_key(&self, document_key: u64) -> u64 {
-        // Element documents of one row share its address, so this key ranks rows
-        // but not the elements within a row. The collector keeps every candidate it
-        // cannot rank, and the final sort settles them on `doc_index`.
-        //
-        // A dead slot has no current address. It is not visible to the walk, so
-        // ranking it last only guards against it winning a tie. Without a
-        // projection the key is that same constant for every document, which makes
-        // the collector retain the whole k-th-score band.
+        // The elements of a row share its address, so the key ranks rows, not
+        // their elements: the collector retains what it cannot rank and the final
+        // sort orders them by `doc_index`. `u64::MAX` ranks a dead slot the walk
+        // skips, and every document when no projection is attached: then every
+        // tie compares equal and the whole k-th-score band is retained.
         self.addresses
             .and_then(|addresses| addresses.address(DocId::new(document_key as u32)))
             .unwrap_or(u64::MAX)
@@ -348,9 +333,8 @@ impl WandDocuments for LegacyWandDocuments<'_> {
         true
     }
 
-    // A loaded legacy `DocSet` keeps its row ids sorted, so the only thing that
-    // can break DocId-equals-address order is a row owning several documents.
-    // The answer is memoized per set, so no query rescans it.
+    // A loaded legacy `DocSet` keeps its row ids sorted, so only a row owning
+    // several documents breaks DocId-equals-address order. The verdict is memoized.
     fn row_addresses_ascend_with_doc_id(&self) -> bool {
         self.docs.row_ids_strictly_ascending()
     }
@@ -414,7 +398,7 @@ impl WandDocuments for DocSet {
         }
     }
 
-    // `document_key` is a row address whenever this in-memory DocSet carries one.
+    // `document_key` is a row address whenever the in-memory DocSet has row ids.
     fn orders_ties_by_address(&self) -> bool {
         self.has_row_ids()
     }

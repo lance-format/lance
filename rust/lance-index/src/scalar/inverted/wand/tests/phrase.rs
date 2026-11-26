@@ -644,10 +644,10 @@ fn phrase_skips_position_confirm_when_complete_score_cannot_beat_floor(
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].posting_doc_id, phrase_doc as u64);
     assert_eq!(wand.bulk_and_searches, usize::from(mode == BulkAndMode::On));
-    // Every document ties on its complete score. A document reached later can only
-    // win that tie with a lower row address, so when addresses ascend with DocId
-    // order the floor prunes it and its positions are never confirmed; a remapped
-    // partition still has every candidate confirmed.
+    // Every document ties on its complete score. A later document wins that tie
+    // only with a lower row address, so when addresses ascend with DocId the floor
+    // prunes it and its positions go unconfirmed; a remapped partition confirms
+    // every candidate.
     let later_ties_already_lost = ascending_addresses && limit == 1 && phrase_first;
     assert_eq!(
         wand.phrase_position_checks.get(),

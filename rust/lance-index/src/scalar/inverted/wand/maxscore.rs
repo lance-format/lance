@@ -226,9 +226,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
 
         while window_min < TERMINATED_DOC_ID {
             if candidates.aborted() {
-                // The collector stopped on a tie it cannot rank and the rest of
-                // the corpus cannot rank it either, so leave what is left of the
-                // walk to the address-ordered retry.
+                // The rest of the corpus cannot rank the tie that stopped it.
                 break;
             }
             clauses.retain(|clause| clause.posting.doc().is_some());
@@ -871,7 +869,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
 
         metrics.record_comparisons(num_comparisons);
 
-        self.score_floor_overflow = candidates.score_floor_overflow();
+        self.score_floor_overflow = candidates.aborted();
 
         self.band_truncated = candidates.band_truncated();
 

@@ -17,7 +17,9 @@ use lance_index::metrics::MetricsCollector;
 use lance_index::prefilter::PreFilter;
 use lance_index::scalar::inverted::builder::ScoredDoc;
 use lance_index::scalar::inverted::query::{FtsSearchParams, Operator, Tokens};
-use lance_index::scalar::inverted::{CombinedFieldColumn, InvertedIndex, MemBM25Scorer};
+use lance_index::scalar::inverted::{
+    CombinedFieldColumn, InvertedIndex, MemBM25Scorer, push_top_k_document,
+};
 use lance_table::format::IndexMetadata;
 
 use super::matches::PreparedMatch;
@@ -196,32 +198,6 @@ pub(super) async fn combined_columns_the_prefilter_may_match(
         retained.push(CombinedFieldColumn { indices, ..column });
     }
     retained
-}
-
-/// Merge one segment's document into the cross-segment top-k.
-///
-/// Segments complete in whatever order `buffer_unordered` yields, so the merge
-/// evicts on the full `(score DESC, row_id ASC, doc_index ASC)` key: a score tie
-/// with a lower row_id wins whichever segment produced it. A NaN score is
-/// rejected first, because the total order ranks NaN above every real score. A
-/// zero `limit` keeps nothing.
-fn push_top_k_document(
-    candidates: &mut std::collections::BinaryHeap<std::cmp::Reverse<ScoredDoc>>,
-    limit: usize,
-    document: ScoredDoc,
-) {
-    if document.score.0.is_nan() {
-        return;
-    }
-    if candidates.len() < limit {
-        candidates.push(std::cmp::Reverse(document));
-    } else if candidates
-        .peek()
-        .is_some_and(|std::cmp::Reverse(worst)| *worst < document)
-    {
-        candidates.pop();
-        candidates.push(std::cmp::Reverse(document));
-    }
 }
 
 pub(super) async fn search_prepared_segments(

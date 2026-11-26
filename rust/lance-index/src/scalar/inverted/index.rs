@@ -133,6 +133,7 @@ pub use posting_builder::*;
 pub use posting_list::*;
 pub use posting_reader::*;
 use prewarm::*;
+pub use search_candidates::push_top_k_document;
 pub(super) use search_candidates::*;
 pub use token_set::*;
 

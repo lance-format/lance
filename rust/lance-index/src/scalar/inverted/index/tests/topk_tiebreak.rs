@@ -1,54 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use super::query::MaskFilter;
 use super::*;
 
-// Deterministic top-k tiebreak (score DESC, row_id ASC).
-//
-// A BM25 top-k that breaks ties arbitrarily is not a stable prefix across `k`:
-// top-k1 is not a prefix of top-k2, so paginating a tied-score query (a broad
-// term where many documents share `(tf, doc_len)`) duplicates and skips rows.
-// Four coupled pieces fix that, all keyed on the row address:
-//   1. `ScoredDoc::cmp` is the total order used for the final sort.
-//   2. `wand::TopKCollector` evicts on the full key when the walk knows row
-//      addresses, and retains the whole k-th-score tie band when it does not.
-//   3. `wand::admit_ties_floor` lowers the WAND threshold one ULP so the
-//      score-only prune kernels keep, rather than drop, that band, including a
-//      slower partition's ties behind the shared cross-partition floor.
-//   4. `ModernCandidates::push` keeps the band across partitions and
-//      `rank_resolved_documents` re-selects once addresses are resolved.
-//
-// The tests below cover a single partition, a post-compaction address order that
-// diverges from DocId order, several partitions, and a tie band wide enough to
-// overflow the collector's buffer and force the address-ordered retry.
-
-struct MaskPreFilter {
-    mask: Arc<RowAddrMask>,
-}
-
-#[cfg_attr(coverage, coverage(off))]
-#[async_trait]
-impl PreFilter for MaskPreFilter {
-    async fn wait_for_ready(&self) -> Result<()> {
-        Ok(())
-    }
-
-    fn is_empty(&self) -> bool {
-        false
-    }
-
-    fn mask(&self) -> Arc<RowAddrMask> {
-        self.mask.clone()
-    }
-
-    fn filter_row_ids<'a>(&self, row_ids: Box<dyn Iterator<Item = &'a u64> + 'a>) -> Vec<u64> {
-        self.mask.selected_indices(row_ids)
-    }
-}
-
-/// Build one partition whose documents all score identically: term "alpha"
-/// once, doc length 1. `row_ids` is indexed by DocId, so passing an unsorted
-/// slice models a post-compaction remap.
+/// Build a partition whose documents all score the same: term "alpha" once, doc
+/// length 1. `row_ids` is indexed by DocId, so an unsorted slice models a
+/// post-compaction remap.
 async fn build_tied_partition(store: &Arc<LanceIndexStore>, partition_id: u64, row_ids: &[u64]) {
     let mut builder = InnerBuilder::new(partition_id, false, TokenSetFormat::default());
     builder.tokens.get_or_add("alpha");
@@ -60,13 +18,9 @@ async fn build_tied_partition(store: &Arc<LanceIndexStore>, partition_id: u64, r
     builder.write(store.as_ref()).await.unwrap();
 }
 
-async fn load_tied_index(partitions: &[(u64, Vec<u64>)]) -> (TempObjDir, Arc<InvertedIndex>) {
-    load_tied_index_with(partitions, &LanceCache::with_capacity(64 * 1024 * 1024)).await
-}
-
-/// Load a tied corpus against an explicit cache. An uncached index never keeps a
-/// partition's row addresses resident between queries, so its first walk starts
-/// without them.
+/// Load a tied corpus against an explicit cache. An uncached index keeps no
+/// partition's row addresses resident between queries, so its walks start without
+/// them.
 async fn load_tied_index_with(
     partitions: &[(u64, Vec<u64>)],
     cache: &LanceCache,
@@ -106,8 +60,6 @@ async fn search_alpha_with(
         )
         .await
         .unwrap();
-    // Every document ties, so the premise of these tests is that the returned
-    // scores are all identical; without that the row_id order proves nothing.
     for window in scores.windows(2) {
         assert!(
             (window[0] - window[1]).abs() < 1e-6,
@@ -117,12 +69,7 @@ async fn search_alpha_with(
     row_ids
 }
 
-async fn search_alpha(index: &InvertedIndex, limit: usize) -> Vec<u64> {
-    search_alpha_with(index, limit, Arc::new(NoFilter)).await
-}
-
-/// Search for "alpha" and return `(row_id, doc_index)` per hit, so an
-/// element-granularity result can be checked down to the element.
+/// Search for "alpha" and return `(row_id, doc_index)` per hit.
 async fn search_alpha_documents(index: &InvertedIndex, limit: usize) -> Vec<(u64, Vec<u32>)> {
     index
         .bm25_search_documents(
@@ -140,97 +87,213 @@ async fn search_alpha_documents(index: &InvertedIndex, limit: usize) -> Vec<(u64
         .collect()
 }
 
-#[tokio::test]
-async fn test_fts_topk_tied_scores_resolve_by_row_id_not_doc_id() {
-    // Row addresses no longer ascend with DocId, as after a compaction remap.
-    // Postings are still walked in DocId order, so a collector that kept the
-    // first documents it saw would return 105, 100, 107 instead of 100, 101, 102.
-    let (_tmpdir, index) =
-        load_tied_index(&[(0, vec![105, 100, 107, 102, 104, 101, 106, 103])]).await;
-
-    let top3 = search_alpha(&index, 3).await;
-    let top5 = search_alpha(&index, 5).await;
-    assert_eq!(
-        top3,
-        vec![100, 101, 102],
-        "the tie band must resolve by row_id, not by DocId or encounter order"
-    );
-    assert_eq!(top5, vec![100, 101, 102, 103, 104]);
-    assert_eq!(top3, top5[..3], "top-3 must be a prefix of top-5");
+/// Row addresses descending with DocId, from `base + num_docs - 1` down to
+/// `base`, so the lowest addresses are the last documents the walk reaches.
+fn descending_row_ids(base: u64, num_docs: u64) -> Vec<u64> {
+    (0..num_docs).rev().map(|doc_id| base + doc_id).collect()
 }
 
-#[tokio::test]
-async fn test_fts_topk_tied_scores_stable_prefix_across_partitions() {
-    // Tied documents split across partitions with interleaved row_ids, so the
-    // shared cross-partition WAND floor and the merge must resolve ties by
-    // row_id no matter which partition finishes first (`buffer_unordered`).
-    let (_tmpdir, index) =
-        load_tied_index(&[(0, vec![100, 102, 104, 106]), (1, vec![101, 103, 105, 107])]).await;
-
-    let top3 = search_alpha(&index, 3).await;
-    let top6 = search_alpha(&index, 6).await;
-    assert_eq!(
-        top3,
-        vec![100, 101, 102],
-        "cross-partition ties must resolve by row_id"
-    );
-    assert_eq!(top6, vec![100, 101, 102, 103, 104, 105]);
-    assert_eq!(top3, top6[..3], "top-3 must be a prefix of top-6");
+fn one_partition(row_ids: Vec<u64>) -> Vec<(u64, Vec<u64>)> {
+    vec![(0, row_ids)]
 }
 
-#[tokio::test]
-async fn test_fts_topk_tied_scores_are_stable_across_repeated_searches() {
-    // Twelve partitions all tied at one score, with row_ids striped across them
-    // so the correct top-6 draws one document from each of six partitions. The
-    // partitions complete in whatever order `buffer_unordered` yields, so
-    // repeating the query checks directly that the result does not depend on it.
+/// A single partition whose row addresses no longer ascend with DocId, as after
+/// a compaction remap. Postings are still walked in DocId order, so a collector
+/// that kept the first documents it saw would answer 105, 100, 107.
+fn remapped_row_ids() -> Vec<(u64, Vec<u64>)> {
+    one_partition(vec![105, 100, 107, 102, 104, 101, 106, 103])
+}
+
+/// Two partitions with interleaved row addresses, so a tie spans partitions and
+/// the shared WAND floor and the merge have to rank it.
+fn interleaved_row_ids() -> Vec<(u64, Vec<u64>)> {
+    vec![(0, vec![100, 102, 104, 106]), (1, vec![101, 103, 105, 107])]
+}
+
+/// Twelve partitions holding row addresses striped across them, so the six
+/// winners come from six different partitions and the answer turns on the order
+/// `buffer_unordered` completes them in.
+fn striped_row_ids() -> Vec<(u64, Vec<u64>)> {
     const PARTITIONS: u64 = 12;
-    let partitions = (0..PARTITIONS)
+    (0..PARTITIONS)
         .map(|partition_id| {
             let row_ids = (0..3)
                 .map(|offset| partition_id + offset * PARTITIONS)
                 .collect::<Vec<_>>();
             (partition_id, row_ids)
         })
-        .collect::<Vec<_>>();
-    let (_tmpdir, index) = load_tied_index(&partitions).await;
+        .collect()
+}
 
-    let expected_top6 = vec![0, 1, 2, 3, 4, 5];
-    for _ in 0..8 {
-        assert_eq!(search_alpha(&index, 3).await, expected_top6[..3]);
-        assert_eq!(search_alpha(&index, 6).await, expected_top6);
+/// `count` partitions of `per_partition` documents each, addresses descending
+/// inside each. Each band fits its own collector while the bands together pass
+/// the merge's bound, the only buffer on the merge path that grows with the
+/// partition count.
+///
+/// The walk defers ties because no address projection is resident: the index
+/// loads through a cache that has not read this partition's documents.
+fn descending_partitions(per_partition: u64, count: u64) -> Vec<(u64, Vec<u64>)> {
+    (0..count)
+        .map(|partition_id| {
+            (
+                partition_id,
+                descending_row_ids(partition_id * 1_000, per_partition),
+            )
+        })
+        .collect()
+}
+
+/// How a tied corpus compares to `limit + SCORE_FLOOR_BUFFER`, the bound that
+/// picks whether the merge or the address-ordered retry ranks the tie.
+#[derive(Debug, Clone, Copy)]
+enum Band {
+    /// Every partition holds its whole band, and the merge stays inside its own.
+    FitsCollector,
+    /// Every partition holds its band, but the bands together overrun the merge's
+    /// bound, so the merge compacts them.
+    MergeOverruns,
+    /// Every partition's band is wider than its collector, forcing the
+    /// address-ordered retry.
+    CollectorOverruns,
+}
+
+/// The filter a search runs with. An allow-all prefilter gives the walk the
+/// partition's addresses; an unfiltered walk has them only if a cache kept them.
+#[derive(Debug, Clone, Copy)]
+enum FilterPath {
+    Unfiltered,
+    AllowAll,
+}
+
+/// The cache an index loads with, and what a search leaves resident behind it.
+#[derive(Debug, Clone, Copy)]
+enum Residency {
+    /// The 64 MiB cache an index is loaded with by default.
+    Roomy,
+    /// Nothing stays resident, so every walk starts without addresses.
+    Nothing,
+}
+
+/// Search a corpus tied at a single score at each limit: every limit must return
+/// the lowest row addresses, so top-k at a small `k` is an ordered prefix of
+/// top-k at a larger `k`. `rounds` repeats the searches against one loaded index,
+/// so a later search starts from what an earlier one left in the cache.
+async fn assert_tied_top_k_is_an_ordered_prefix(
+    partitions: &[(u64, Vec<u64>)],
+    limits: &[usize],
+    band: Band,
+    filter_path: FilterPath,
+    residency: Residency,
+    rounds: usize,
+) {
+    let docs_per_partition = partitions
+        .iter()
+        .map(|(_, row_ids)| row_ids.len())
+        .collect::<Vec<_>>();
+    let max_limit = *limits.iter().max().unwrap();
+    let min_limit = *limits.iter().min().unwrap();
+    match band {
+        Band::FitsCollector | Band::MergeOverruns => assert!(
+            docs_per_partition
+                .iter()
+                .all(|docs| *docs <= max_limit + SCORE_FLOOR_BUFFER),
+            "premise: every partition must hold its whole tie band, got {docs_per_partition:?} documents for limit {max_limit}"
+        ),
+        Band::CollectorOverruns => assert!(
+            docs_per_partition
+                .iter()
+                .all(|docs| *docs > min_limit + SCORE_FLOOR_BUFFER),
+            "premise: every partition's tie band must overflow its collector, got {docs_per_partition:?} documents for limit {min_limit}"
+        ),
+    }
+    if matches!(band, Band::MergeOverruns) {
+        let total = docs_per_partition.iter().sum::<usize>();
+        assert!(
+            total > max_limit + SCORE_FLOOR_BUFFER,
+            "premise: the partitions together must overrun the merge's band bound, got {total} documents for limit {max_limit}"
+        );
+    }
+
+    let expected = ascending_row_ids(partitions);
+    assert!(
+        expected.len() >= max_limit,
+        "premise: the corpus must hold at least {max_limit} tied documents"
+    );
+
+    let cache = match residency {
+        Residency::Roomy => LanceCache::with_capacity(64 * 1024 * 1024),
+        Residency::Nothing => LanceCache::no_cache(),
+    };
+    let (_tmpdir, index) = load_tied_index_with(partitions, &cache).await;
+    if matches!(residency, Residency::Nothing) {
+        assert!(
+            !index.has_resident_document_projections(),
+            "premise: the first search must start without resident addresses"
+        );
+    }
+
+    let prefilter: Arc<dyn PreFilter> = match filter_path {
+        FilterPath::Unfiltered => Arc::new(NoFilter),
+        FilterPath::AllowAll => Arc::new(MaskFilter(RowAddrMask::from_allowed(
+            RowAddrTreeMap::from_iter(expected.iter().copied()),
+        ))),
+    };
+
+    for round in 0..rounds {
+        for &limit in limits {
+            let found = search_alpha_with(&index, limit, prefilter.clone()).await;
+            assert_eq!(
+                found,
+                expected[..limit],
+                "round {round}: top-{limit} must be the {limit} lowest row addresses"
+            );
+        }
     }
 }
 
-#[tokio::test]
-async fn test_fts_topk_tied_scores_survive_a_prefilter() {
-    // An explicit allow-list routes the search off the unfiltered fast path.
-    // The partition then loads its addresses to build visibility, so the walk
-    // settles the tie itself instead of deferring it to the merge.
-    let row_ids = [105u64, 100, 107, 102, 104, 101, 106, 103];
-    let (_tmpdir, index) = load_tied_index(&[(0, row_ids.to_vec())]).await;
-    let allow_all = || -> Arc<dyn PreFilter> {
-        Arc::new(MaskPreFilter {
-            mask: Arc::new(RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(
-                row_ids.iter().copied(),
-            ))),
-        })
-    };
-
-    let top3 = search_alpha_with(&index, 3, allow_all()).await;
-    let top5 = search_alpha_with(&index, 5, allow_all()).await;
-    assert_eq!(
-        top3,
-        vec![100, 101, 102],
-        "the filtered path must resolve ties by row_id too"
-    );
-    assert_eq!(top5, vec![100, 101, 102, 103, 104]);
-    assert_eq!(top3, top5[..3], "top-3 must be a prefix of top-5");
+/// The corpus's row addresses sorted ascending, the order a tie returns under
+/// the `row_id ASC` tiebreak.
+fn ascending_row_ids(partitions: &[(u64, Vec<u64>)]) -> Vec<u64> {
+    let mut row_ids = partitions
+        .iter()
+        .flat_map(|(_, ids)| ids.iter().copied())
+        .collect::<Vec<_>>();
+    row_ids.sort_unstable();
+    row_ids
 }
 
-/// Build one element-granularity partition. Each entry is `(row_id, doc_index)`
-/// and is appended in the given order, so `row_ids` indexed by DocId can
-/// disagree with the element coordinates the result must be ordered by.
+#[rstest::rstest]
+#[case::single_partition_row_id_remap(remapped_row_ids(), &[3, 5], Band::FitsCollector, FilterPath::Unfiltered, Residency::Roomy, 1)]
+#[case::two_partitions_interleaved_row_ids(interleaved_row_ids(), &[3, 6], Band::FitsCollector, FilterPath::Unfiltered, Residency::Roomy, 1)]
+#[case::twelve_partitions_striped_row_ids(striped_row_ids(), &[3, 6], Band::FitsCollector, FilterPath::Unfiltered, Residency::Roomy, 8)]
+#[case::allow_all_prefilter(remapped_row_ids(), &[3, 5], Band::FitsCollector, FilterPath::AllowAll, Residency::Roomy, 1)]
+#[case::six_partitions_overrun_the_merge_band(descending_partitions(100, 6), &[4], Band::MergeOverruns, FilterPath::Unfiltered, Residency::Roomy, 1)]
+#[case::ascending_row_ids_uncached(one_partition((0..1_024).collect()), &[10, 3], Band::CollectorOverruns, FilterPath::Unfiltered, Residency::Nothing, 1)]
+#[case::ascending_row_ids_uncached_allow_all(one_partition((0..1_024).collect()), &[10, 3], Band::CollectorOverruns, FilterPath::AllowAll, Residency::Nothing, 1)]
+#[case::descending_row_ids_overflow_one_partition(one_partition(descending_row_ids(10_001, 512)), &[3, 5], Band::CollectorOverruns, FilterPath::Unfiltered, Residency::Roomy, 1)]
+#[tokio::test]
+async fn test_fts_topk_tied_scores_are_an_ordered_prefix(
+    #[case] partitions: Vec<(u64, Vec<u64>)>,
+    #[case] limits: &[usize],
+    #[case] band: Band,
+    #[case] filter_path: FilterPath,
+    #[case] residency: Residency,
+    #[case] rounds: usize,
+) {
+    assert_tied_top_k_is_an_ordered_prefix(
+        &partitions,
+        limits,
+        band,
+        filter_path,
+        residency,
+        rounds,
+    )
+    .await;
+}
+
+/// Build an element-granularity partition. Each `(row_id, doc_index)` entry is
+/// appended in the given order, so DocId order can disagree with the element
+/// coordinates that decide the result order.
 async fn build_tied_element_partition(
     store: &Arc<LanceIndexStore>,
     partition_id: u64,
@@ -252,10 +315,9 @@ async fn build_tied_element_partition(
 
 #[tokio::test]
 async fn test_fts_topk_tied_elements_of_one_row_resolve_by_doc_index() {
-    // Element documents of one row share its address, so the WAND ordering key
-    // ranks the row but not its elements. The winning element is visited after
-    // the heap is full, which a collector that let the address key settle the
-    // tie would drop, and no later sort could bring it back.
+    // The elements of a row share its address, so the WAND ordering key ranks
+    // the row, not its elements. The winning element is visited after the heap
+    // fills: a collector that let the address key decide the tie would drop it.
     let tmpdir = TempObjDir::default();
     let store = Arc::new(LanceIndexStore::new(
         ObjectStore::local().into(),
@@ -268,11 +330,12 @@ async fn test_fts_topk_tied_elements_of_one_row_resolve_by_doc_index() {
     let index = InvertedIndex::load(store, None, &cache).await.unwrap();
 
     let expected = vec![(50, vec![0]), (100, vec![0])];
-    // Cold: the walk defers addresses, so the whole k-th-score band is retained.
+    // No addresses are resident yet, so the walk defers the tie and the whole
+    // k-th-score band survives.
     assert_eq!(search_alpha_documents(&index, 2).await, expected);
 
-    // Prewarmed: the address projection is resident, so the walk ranks by row
-    // address and only the elements of one row stay ambiguous.
+    // With the address projection resident, the walk ranks by row address and
+    // only the elements of a single row stay ambiguous.
     index.partitions[0]
         .docs
         .modern()
@@ -283,7 +346,6 @@ async fn test_fts_topk_tied_elements_of_one_row_resolve_by_doc_index() {
     assert!(index.has_resident_document_projections());
     assert_eq!(search_alpha_documents(&index, 2).await, expected);
 
-    // Stable prefix across k, down to the element.
     let top4 = search_alpha_documents(&index, 4).await;
     assert_eq!(
         top4,
@@ -297,14 +359,103 @@ async fn test_fts_topk_tied_elements_of_one_row_resolve_by_doc_index() {
     assert_eq!(top4[..2], expected);
 }
 
+#[tokio::test]
+async fn test_fts_topk_tied_elements_past_the_band_cap_keep_doc_index_order() {
+    // A single row holds more elements than `limit + SCORE_FLOOR_BUFFER`, so the
+    // band fills mid-walk and the walk ranks the rest of that row's elements by
+    // posting DocId. Documents are appended in coordinate order, so DocId order
+    // and `doc_index` order name the same elements. `band_truncated` only reaches
+    // a debug log in `score_modern_partition`, so no assertion covers it.
+    const TRUNCATED_ROW: u64 = 200;
+    const TRUNCATED_ROW_ELEMENTS: u32 = 135;
+    const OTHER_ROW: u64 = 100;
+    const OTHER_ROW_ELEMENTS: u32 = 3;
+    // The smaller limit runs second, so its answer can be compared against the
+    // larger one as a prefix.
+    const MAX_LIMIT: usize = 5;
+    const MIN_LIMIT: usize = 3;
+
+    assert!(
+        TRUNCATED_ROW_ELEMENTS as usize > MAX_LIMIT + SCORE_FLOOR_BUFFER,
+        "premise: row {TRUNCATED_ROW} must hold more elements than the band cap, got {TRUNCATED_ROW_ELEMENTS} for limit {MAX_LIMIT}"
+    );
+
+    // Elements of the wide row come first, so the heap fills from that row and the
+    // second row's addresses outrank them only once the walk reaches them.
+    let fixture = (0..TRUNCATED_ROW_ELEMENTS)
+        .map(|doc_index| (TRUNCATED_ROW, doc_index))
+        .chain((0..OTHER_ROW_ELEMENTS).map(|doc_index| (OTHER_ROW, doc_index)))
+        .collect::<Vec<_>>();
+    let element_counts = [
+        (TRUNCATED_ROW, TRUNCATED_ROW_ELEMENTS),
+        (OTHER_ROW, OTHER_ROW_ELEMENTS),
+    ];
+
+    let tmpdir = TempObjDir::default();
+    let store = Arc::new(LanceIndexStore::new(
+        ObjectStore::local().into(),
+        tmpdir.clone(),
+        Arc::new(LanceCache::no_cache()),
+    ));
+    build_tied_element_partition(&store, 0, &fixture).await;
+    write_test_metadata(&store, vec![0], InvertedIndexParams::default()).await;
+    let cache = LanceCache::with_capacity(64 * 1024 * 1024);
+    let index = InvertedIndex::load(store, None, &cache).await.unwrap();
+    index.partitions[0]
+        .docs
+        .modern()
+        .unwrap()
+        .prewarm()
+        .await
+        .unwrap();
+    assert!(
+        index.has_resident_document_projections(),
+        "premise: resident addresses make the walk rank ties by row address, the mode where the cap truncates"
+    );
+
+    let top5 = search_alpha_documents(&index, MAX_LIMIT).await;
+    assert_eq!(
+        top5,
+        vec![
+            (OTHER_ROW, vec![0]),
+            (OTHER_ROW, vec![1]),
+            (OTHER_ROW, vec![2]),
+            (TRUNCATED_ROW, vec![0]),
+            (TRUNCATED_ROW, vec![1]),
+        ],
+        "the DocId proxy must hand back the lowest `doc_index` elements of row {TRUNCATED_ROW}"
+    );
+    assert_eq!(
+        search_alpha_documents(&index, MIN_LIMIT).await,
+        top5[..MIN_LIMIT],
+        "top-{MIN_LIMIT} must be an ordered prefix of top-{MAX_LIMIT}"
+    );
+
+    // A coordinate only counts as correct together with the address it belongs to:
+    // an element past the row's element count came from another row.
+    for (row_id, coordinates) in &top5 {
+        let Some(&elements) = element_counts
+            .iter()
+            .find(|(id, _)| *id == *row_id)
+            .map(|(_, count)| count)
+        else {
+            panic!("row {row_id} is not part of the fixture");
+        };
+        assert_eq!(coordinates.len(), 1, "coordinate rank 1 gives one element");
+        assert!(
+            coordinates[0] < elements,
+            "element {coordinates:?} does not belong to row {row_id}, which holds {elements}"
+        );
+    }
+}
+
 #[test]
-fn test_push_scored_key_breaks_legacy_ties_by_row_id() {
-    // The legacy merge holds row addresses, so it settles a score tie on the
-    // spot: a lower row_id evicts the worst tied entry and a higher one loses,
-    // whatever order the candidates arrive in.
+fn test_push_top_k_document_breaks_legacy_ties_by_row_id() {
+    // The legacy merge compares row addresses, so a lower row_id evicts the
+    // worst tied entry and a higher one loses, in any arrival order.
     let mut candidates = BinaryHeap::new();
     for (row_id, score) in [(20u64, 1.0f32), (10, 1.0), (5, 1.0), (30, 1.0), (15, 0.5)] {
-        push_scored_key(&mut candidates, 2, row_id, score);
+        push_top_k_document(&mut candidates, 2, ScoredDoc::new(row_id, score));
     }
     let ranked = candidates
         .into_sorted_vec()
@@ -315,135 +466,21 @@ fn test_push_scored_key_breaks_legacy_ties_by_row_id() {
 }
 
 #[test]
-fn test_push_scored_key_rejects_nan_scores() {
-    // A NaN score is not a rank. `OrderedFloat` compares with `total_cmp`, which
-    // sorts NaN above every real score, so the legacy merge drops it instead of
-    // letting it take the top of the result. Before the tiebreak the same
-    // candidate slipped into an under-filled heap and came back first.
+fn test_push_top_k_document_rejects_nan_scores() {
+    // `OrderedFloat` compares with `total_cmp`, which sorts NaN above every real
+    // score. The legacy merge drops a NaN, in an under-filled heap too.
     let mut candidates = BinaryHeap::new();
-    push_scored_key(&mut candidates, 4, 7, f32::NAN);
-    assert!(candidates.is_empty(), "NaN must never become a candidate");
+    push_top_k_document(&mut candidates, 4, ScoredDoc::new(7, f32::NAN));
+    assert!(candidates.is_empty(), "NaN must not become a candidate");
 
-    push_scored_key(&mut candidates, 4, 1, 1.0);
-    push_scored_key(&mut candidates, 4, 2, f32::NAN);
+    push_top_k_document(&mut candidates, 4, ScoredDoc::new(1, 1.0));
+    push_top_k_document(&mut candidates, 4, ScoredDoc::new(2, f32::NAN));
     let ranked = candidates
         .into_sorted_vec()
         .into_iter()
         .map(|Reverse(doc)| doc.row_id)
         .collect::<Vec<_>>();
     assert_eq!(ranked, vec![1]);
-}
-
-#[tokio::test]
-async fn test_fts_topk_tied_scores_bound_the_cross_partition_band() {
-    // Every document ties, so each partition hands the merge its whole
-    // `limit + SCORE_FLOOR_BUFFER` band. Six of those overrun the merge's own
-    // bound several times over, which is the one buffer on this path that grows
-    // with the number of partitions rather than with `limit`.
-    const PARTITIONS: u64 = 6;
-    const PER_PARTITION: u64 = 100;
-    const LIMIT: usize = 4;
-    let partitions = (0..PARTITIONS)
-        .map(|partition_id| {
-            let base = partition_id * 1_000;
-            // Addresses descend with DocId, so the partitions keep handing over
-            // their tie band: an address-ascending partition ranks the ties during
-            // the walk and the merge never sees enough candidates to compact.
-            let row_ids = (0..PER_PARTITION)
-                .rev()
-                .map(|d| base + d)
-                .collect::<Vec<_>>();
-            (partition_id, row_ids)
-        })
-        .collect::<Vec<_>>();
-    let (_tmpdir, index) = load_tied_index(&partitions).await;
-
-    // Each partition's band fits its collector, so every document reaches the
-    // merge, and together they overrun the merge's own bound.
-    assert!(PER_PARTITION as usize <= LIMIT + SCORE_FLOOR_BUFFER);
-    assert!(
-        (PARTITIONS * PER_PARTITION) as usize > LIMIT + SCORE_FLOOR_BUFFER,
-        "premise: the partitions together must overrun the merge's band bound"
-    );
-    assert_eq!(
-        search_alpha(&index, LIMIT).await,
-        vec![0, 1, 2, 3],
-        "compacting the band must not change the exact top-k"
-    );
-}
-
-#[tokio::test]
-async fn test_fts_topk_tied_scores_cold_and_warm_searches_agree() {
-    // A cache that keeps nothing: the partition's row addresses are not resident
-    // when its walk starts, so the first pass cannot rank the corpus-wide tie and
-    // stops at the first boundary tie. The retry holds the addresses, ranks the
-    // ties by row address and prunes every tied document behind the k-th. A
-    // prefilter builds visibility from those addresses, so that walk has them from
-    // the start. Every variant must return the same exact top-k.
-    const NUM_DOCS: u64 = 1_024;
-    const LIMIT: usize = 10;
-    let row_ids = (0..NUM_DOCS).collect::<Vec<_>>();
-    let expected = (0..LIMIT as u64).collect::<Vec<_>>();
-
-    let (_tmpdir, index) =
-        load_tied_index_with(&[(0, row_ids.clone())], &LanceCache::no_cache()).await;
-    assert!(
-        !index.has_resident_document_projections(),
-        "premise: the first search must start without resident addresses"
-    );
-    assert_eq!(
-        search_alpha(&index, LIMIT).await,
-        expected,
-        "the address-ordered retry must return the exact top-k"
-    );
-    let top3 = search_alpha(&index, 3).await;
-    assert_eq!(top3, vec![0, 1, 2]);
-    assert_eq!(top3, expected[..3], "top-3 must be a prefix of top-10");
-
-    let (_prefiltered_tmpdir, prefiltered) = load_tied_index(&[(0, row_ids.clone())]).await;
-    let mask = Arc::new(MaskPreFilter {
-        mask: Arc::new(RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(
-            row_ids,
-        ))),
-    });
-    assert_eq!(
-        search_alpha_with(&prefiltered, LIMIT, mask).await,
-        expected,
-        "a walk that already holds the addresses must resolve the tie exactly"
-    );
-    assert_eq!(
-        search_alpha(&prefiltered, LIMIT).await,
-        expected,
-        "the same index searched unfiltered must agree"
-    );
-}
-
-#[tokio::test]
-async fn test_fts_topk_tied_scores_wider_than_the_collector_buffer() {
-    // The tie band is far wider than the collector's buffer, and row addresses
-    // descend with DocId, so the winners sit at the very end of the walk. A
-    // collector that truncated its band would answer with the highest row_ids;
-    // the overflow retry reloads the partition's addresses and orders exactly.
-    const NUM_DOCS: u64 = 512;
-    const BASE: u64 = 10_000;
-    let row_ids = (0..NUM_DOCS)
-        .map(|doc_id| BASE + NUM_DOCS - doc_id)
-        .collect::<Vec<_>>();
-    let (_tmpdir, index) = load_tied_index(&[(0, row_ids)]).await;
-
-    assert!(
-        NUM_DOCS as usize > 5 + SCORE_FLOOR_BUFFER,
-        "premise: the tie band must overflow the collector's buffer"
-    );
-    let top3 = search_alpha(&index, 3).await;
-    let top5 = search_alpha(&index, 5).await;
-    assert_eq!(
-        top3,
-        vec![BASE + 1, BASE + 2, BASE + 3],
-        "the exact lowest row_ids, which the walk only reaches at its last DocIds"
-    );
-    assert_eq!(top5, vec![BASE + 1, BASE + 2, BASE + 3, BASE + 4, BASE + 5]);
-    assert_eq!(top3, top5[..3], "top-3 must be a prefix of top-5");
 }
 
 /// Counts reads of the element coordinate columns across every partition.
@@ -489,96 +526,25 @@ impl IndexReader for CountingCoordinateReader {
 }
 
 #[derive(Debug)]
-struct CountingCoordinateStore {
-    inner: Arc<dyn IndexStore>,
+struct CoordinateReads {
     counter: Arc<CoordinateReadCounter>,
 }
 
-#[cfg_attr(coverage, coverage(off))]
-impl DeepSizeOf for CountingCoordinateStore {
-    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
-        self.inner.deep_size_of_children(context)
-    }
-}
-
-#[cfg_attr(coverage, coverage(off))]
-#[async_trait]
-impl IndexStore for CountingCoordinateStore {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-    fn clone_arc(&self) -> Arc<dyn IndexStore> {
-        Arc::new(Self {
-            inner: self.inner.clone(),
+impl ReaderWrapper for CoordinateReads {
+    fn wrap(&self, _name: &str, reader: Arc<dyn IndexReader>) -> Arc<dyn IndexReader> {
+        Arc::new(CountingCoordinateReader {
+            inner: reader,
             counter: self.counter.clone(),
         })
-    }
-    fn io_parallelism(&self) -> usize {
-        self.inner.io_parallelism()
-    }
-    fn with_io_priority(&self, io_priority: u64) -> Arc<dyn IndexStore> {
-        Arc::new(Self {
-            inner: self.inner.with_io_priority(io_priority),
-            counter: self.counter.clone(),
-        })
-    }
-    fn with_io_buffer_size(&self, bytes: u64) -> Arc<dyn IndexStore> {
-        Arc::new(Self {
-            inner: self.inner.with_io_buffer_size(bytes),
-            counter: self.counter.clone(),
-        })
-    }
-    async fn new_index_file(
-        &self,
-        name: &str,
-        schema: Arc<arrow_schema::Schema>,
-    ) -> Result<Box<dyn crate::scalar::IndexWriter>> {
-        self.inner.new_index_file(name, schema).await
-    }
-    async fn open_index_file(&self, name: &str) -> Result<Arc<dyn IndexReader>> {
-        Ok(Arc::new(CountingCoordinateReader {
-            inner: self.inner.open_index_file(name).await?,
-            counter: self.counter.clone(),
-        }))
-    }
-    async fn copy_index_file(
-        &self,
-        name: &str,
-        dest_store: &dyn IndexStore,
-    ) -> Result<crate::scalar::IndexFile> {
-        self.inner.copy_index_file(name, dest_store).await
-    }
-    async fn copy_index_file_to(
-        &self,
-        name: &str,
-        new_name: &str,
-        dest_store: &dyn IndexStore,
-    ) -> Result<crate::scalar::IndexFile> {
-        self.inner
-            .copy_index_file_to(name, new_name, dest_store)
-            .await
-    }
-    async fn rename_index_file(
-        &self,
-        name: &str,
-        new_name: &str,
-    ) -> Result<crate::scalar::IndexFile> {
-        self.inner.rename_index_file(name, new_name).await
-    }
-    async fn delete_index_file(&self, name: &str) -> Result<()> {
-        self.inner.delete_index_file(name).await
-    }
-    async fn list_files_with_sizes(&self) -> Result<Vec<crate::scalar::IndexFile>> {
-        self.inner.list_files_with_sizes().await
     }
 }
 
 #[tokio::test]
 async fn test_element_fts_resolves_coordinates_once_per_partition() {
-    // The merge compacts its tie band after every partition once past the bound,
-    // and each compaction re-resolves the candidates of every partition merged so
-    // far. Resolving coordinates straight from the docs file made that quadratic
-    // in the number of partitions, so the columns are read once and cached.
+    // Past the bound the merge compacts after every partition, and each
+    // compaction re-resolves every merged candidate. Reading the coordinate
+    // columns from the docs file each time is quadratic in the partition count,
+    // so they are cached.
     const PARTITIONS: u64 = 8;
     const PER_PARTITION: u64 = 100;
     let tmpdir = TempObjDir::default();
@@ -601,9 +567,11 @@ async fn test_element_fts_resolves_coordinates_once_per_partition() {
     .await;
 
     let counter = Arc::new(CoordinateReadCounter::default());
-    let store: Arc<dyn IndexStore> = Arc::new(CountingCoordinateStore {
+    let store: Arc<dyn IndexStore> = Arc::new(WrappingReaderStore {
         inner: inner.clone(),
-        counter: counter.clone(),
+        wrapper: Arc::new(CoordinateReads {
+            counter: counter.clone(),
+        }),
     });
     let cache = LanceCache::with_capacity(64 * 1024 * 1024);
     let index = InvertedIndex::load(store, None, &cache).await.unwrap();
@@ -623,10 +591,10 @@ async fn test_element_fts_resolves_coordinates_once_per_partition() {
 
 #[tokio::test]
 async fn test_fts_topk_tied_scores_retry_every_overflowed_partition() {
-    // Every partition overflows its tie band at once, which is what a broad
-    // single-term query over quantized doc lengths looks like. All of them are
-    // rescored against resolved addresses, concurrently, and the answer is still
-    // the exact lowest row_ids.
+    // Five partitions of 200 documents with addresses striped across them: each
+    // winner sits in a different partition, and every partition overflows its
+    // band at once. A broad single-term query over quantized doc lengths does
+    // that, and all five retries then run concurrently over resolved addresses.
     const PARTITIONS: u64 = 5;
     const PER_PARTITION: u64 = 200;
     const BASE: u64 = 10_000;
@@ -640,18 +608,23 @@ async fn test_fts_topk_tied_scores_retry_every_overflowed_partition() {
             (partition_id, row_ids)
         })
         .collect::<Vec<_>>();
-    let (_tmpdir, index) = load_tied_index(&partitions).await;
 
-    assert!(
-        PER_PARTITION as usize > 5 + SCORE_FLOOR_BUFFER,
-        "premise: every partition's tie band must overflow the collector's buffer"
-    );
-    let top5 = search_alpha(&index, 5).await;
-    // The lowest addresses are the last DocId of each partition, one per
-    // partition: BASE + partition_id + PARTITIONS.
+    // Each partition's lowest address belongs to its last DocId.
     let expected = (0..PARTITIONS)
         .map(|partition_id| BASE + partition_id + PARTITIONS)
         .collect::<Vec<_>>();
-    assert_eq!(top5, expected);
-    assert_eq!(search_alpha(&index, 3).await, expected[..3]);
+    assert_eq!(
+        expected,
+        ascending_row_ids(&partitions)[..PARTITIONS as usize]
+    );
+
+    assert_tied_top_k_is_an_ordered_prefix(
+        &partitions,
+        &[5, 3],
+        Band::CollectorOverruns,
+        FilterPath::Unfiltered,
+        Residency::Roomy,
+        1,
+    )
+    .await;
 }

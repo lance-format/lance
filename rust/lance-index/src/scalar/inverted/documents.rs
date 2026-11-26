@@ -101,11 +101,12 @@ impl CacheKey for DocRowIdsKey {
     }
 }
 
-/// One partition's element coordinate columns, one per coordinate rank.
+/// Holds the element coordinate columns of a partition: one column per
+/// coordinate rank.
 ///
-/// Cached like [`CachedDocRowIds`], because the final top-k resolves the same
-/// documents repeatedly: the cross-partition merge compacts its tie band against
-/// resolved keys and then resolves the survivors again at the end.
+/// The cross-partition merge resolves the same documents again on each tie-band
+/// compaction and for the final ranking, so they are cached under
+/// [`DocCoordinatesKey`].
 #[derive(Debug)]
 pub(super) struct CachedDocCoordinates {
     pub(crate) coordinates: Vec<Arc<UInt32Array>>,
@@ -1057,8 +1058,8 @@ impl ResidentAddressProjection {
     /// granularity relies on the second half: cross-field statistics count
     /// distinct rows, so an ascending partition can answer
     /// [`AddressKeyedDocuments::num_distinct_rows`] without walking it. The FTS
-    /// top-k walk uses the same property to prune documents tied at the k-th
-    /// score, since it reaches documents in DocId order.
+    /// top-k walk visits documents in DocId order, so it can prune a k-th-score
+    /// tie rather than retain it.
     ///
     /// The ordering half is [`OrderedRowAddressProjection`], whose verdict this
     /// projection already caches for the cross-column scorer. Density is the
@@ -2122,11 +2123,8 @@ impl PartitionDocuments {
             .collect())
     }
 
-    /// One partition's element coordinate columns, read once and cached.
-    ///
-    /// Reading whole columns rather than the candidate rows keeps repeated
-    /// resolutions of the same documents off the object store: the merge resolves
-    /// its tie band once per compaction and once more for the final ranking.
+    /// The partition's element coordinate columns, read whole and cached, so a
+    /// candidate costs no range read of its own.
     async fn coordinate_columns(&self) -> Result<Vec<Arc<UInt32Array>>> {
         let store = self.store.clone();
         let path = self.path.clone();

@@ -1570,11 +1570,14 @@ fn compound_match_query(term: &str, column: &str, boost: f32) -> FtsQuery {
         .into()
 }
 
-async fn compound_fts_results(
+/// `(row_id, coordinates, score)` per hit of an FTS scan, in result order.
+/// `coordinates` are the hit's `doc_index` values, empty when the plan has no
+/// `doc_index` column.
+async fn fts_hit_rows(
     dataset: &Dataset,
     query: FtsQuery,
     limit: Option<i64>,
-) -> Vec<(u64, f32)> {
+) -> Vec<(u64, Vec<u32>, f32)> {
     let mut scan = dataset.scan();
     scan.with_row_id()
         .full_text_search(FullTextSearchQuery::new_query(query))
@@ -1585,11 +1588,62 @@ async fn compound_fts_results(
     let batch = scan.try_into_batch().await.unwrap();
     let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().values();
     let scores = batch[SCORE_COL].as_primitive::<Float32Type>().values();
-    row_ids
-        .iter()
-        .copied()
-        .zip(scores.iter().copied())
+    let doc_indices = batch
+        .column_by_name(DOC_INDEX_COL)
+        .map(|column| column.as_list::<i32>());
+    (0..batch.num_rows())
+        .map(|row| {
+            let coordinates = doc_indices.map_or_else(Vec::new, |coordinates| {
+                coordinates
+                    .value(row)
+                    .as_primitive::<UInt32Type>()
+                    .values()
+                    .to_vec()
+            });
+            (row_ids[row], coordinates, scores[row])
+        })
         .collect()
+}
+
+async fn compound_fts_results(
+    dataset: &Dataset,
+    query: FtsQuery,
+    limit: Option<i64>,
+) -> Vec<(u64, f32)> {
+    fts_hit_rows(dataset, query, limit)
+        .await
+        .into_iter()
+        .map(|(row_id, _, score)| (row_id, score))
+        .collect()
+}
+
+/// `(row_id, doc_index, score)` per hit of a list-element FTS scan.
+async fn element_fts_results(
+    dataset: &Dataset,
+    query: FtsQuery,
+    limit: Option<i64>,
+) -> Vec<(u64, u32, f32)> {
+    fts_hit_rows(dataset, query, limit)
+        .await
+        .into_iter()
+        .map(|(row_id, coordinates, score)| {
+            assert_eq!(
+                coordinates.len(),
+                1,
+                "a list-element FTS hit carries one coordinate"
+            );
+            (row_id, coordinates[0], score)
+        })
+        .collect()
+}
+
+/// Panics unless every hit scores the same, so the tiebreak alone orders them.
+fn assert_tied_scores<T>(hits: &[T], score: impl Fn(&T) -> f32) {
+    let top_score = score(&hits[0]);
+    assert!(
+        hits.iter().all(|hit| (score(hit) - top_score).abs() < 1e-6),
+        "premise: every document must tie on score"
+    );
 }
 
 fn scored_row_bits(rows: &[(u64, f32)]) -> Vec<(u64, u32)> {
@@ -1608,14 +1662,55 @@ fn compound_fts_result_bits(batch: &RecordBatch) -> Vec<(u64, u32)> {
         .collect()
 }
 
-async fn assert_compound_fts_top_k(dataset: &Dataset, query: FtsQuery, limit: usize) {
-    let exhaustive = compound_fts_results(dataset, query.clone(), None).await;
+/// top-k for each limit must be an ordered prefix of the exhaustive result, so
+/// paginating a tied result skips no row and repeats none.
+async fn assert_compound_fts_top_k(dataset: &Dataset, query: FtsQuery, limits: &[usize]) {
+    let exhaustive = fts_hit_rows(dataset, query.clone(), None).await;
+    assert_fts_top_k_prefix(dataset, query, limits, &exhaustive).await;
+}
+
+/// Each limit's result must equal the first `limit` hits of `expected`. Use it
+/// when an unlimited scan leaves the order undefined, so the caller supplies
+/// `expected`.
+async fn assert_fts_top_k_prefix(
+    dataset: &Dataset,
+    query: FtsQuery,
+    limits: &[usize],
+    expected: &[(u64, Vec<u32>, f32)],
+) {
+    let max_limit = *limits.iter().max().unwrap();
     assert!(
-        exhaustive.len() > limit,
+        expected.len() > max_limit,
         "the exhaustive result must contain candidates beyond k"
     );
-    let limited = compound_fts_results(dataset, query, Some(limit as i64)).await;
-    assert_eq!(limited, exhaustive[..limit]);
+    for &limit in limits {
+        let limited = fts_hit_rows(dataset, query.clone(), Some(limit as i64)).await;
+        assert_eq!(
+            limited,
+            expected[..limit],
+            "top-{limit} must be an ordered prefix of the expected result"
+        );
+    }
+}
+
+/// A `text` column with the same term in every row, so every hit ties on BM25
+/// and result order comes from the tiebreak alone. Segments are committed in
+/// reverse fragment order, so segment order and row_id order disagree.
+async fn tied_single_term_dataset(num_rows: usize, rows_per_fragment: usize) -> Dataset {
+    let batch = arrow_array::record_batch!(("text", Utf8, vec!["common"; num_rows])).unwrap();
+    let schema = batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: rows_per_fragment,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    create_fragmented_fts_index_with_order(&mut dataset, "text", false, true).await;
+    dataset
 }
 
 fn expected_must_score_sum(left: Vec<(u64, f32)>, right: Vec<(u64, f32)>) -> Vec<(u64, f32)> {
@@ -3771,7 +3866,7 @@ async fn test_nested_combined_fields_limit_propagation() {
             .any(|rows| rows[0].1 == rows[1].1 && rows[0].0 < rows[1].0),
         "the exhaustive result should include a deterministic score tie"
     );
-    assert_compound_fts_top_k(&dataset, must_query, 2).await;
+    assert_compound_fts_top_k(&dataset, must_query, &[2]).await;
 
     let should_query: FtsQuery = BooleanQuery::new([
         (Occur::Should, compound_combined_fields_query()),
@@ -3781,7 +3876,7 @@ async fn test_nested_combined_fields_limit_propagation() {
         ),
     ])
     .into();
-    assert_compound_fts_top_k(&dataset, should_query, 2).await;
+    assert_compound_fts_top_k(&dataset, should_query, &[2]).await;
 
     let boost_query: FtsQuery = BoostQuery::new(
         compound_combined_fields_query(),
@@ -3789,9 +3884,9 @@ async fn test_nested_combined_fields_limit_propagation() {
         Some(1.0),
     )
     .into();
-    assert_compound_fts_top_k(&dataset, boost_query, 2).await;
+    assert_compound_fts_top_k(&dataset, boost_query, &[2]).await;
 
-    assert_compound_fts_top_k(&dataset, compound_combined_fields_query(), 1).await;
+    assert_compound_fts_top_k(&dataset, compound_combined_fields_query(), &[1]).await;
 }
 
 #[tokio::test]
@@ -3843,7 +3938,7 @@ async fn test_same_column_compound_scorer_is_exact_and_bounded() {
     ])
     .into();
 
-    assert_compound_fts_top_k(&dataset, query.clone(), 2).await;
+    assert_compound_fts_top_k(&dataset, query.clone(), &[2]).await;
 
     let mut scanner = dataset.scan();
     scanner
@@ -3869,7 +3964,7 @@ async fn test_same_column_compound_scorer_is_exact_and_bounded() {
     .try_with_boosts(vec![1.0, 0.5])
     .unwrap()
     .into();
-    assert_compound_fts_top_k(&dataset, same_column_multimatch.clone(), 2).await;
+    assert_compound_fts_top_k(&dataset, same_column_multimatch.clone(), &[2]).await;
     let mut scanner = dataset.scan();
     scanner
         .with_row_id()
@@ -4021,31 +4116,19 @@ async fn test_compound_phrase_confirmation_short_circuit_is_exact() {
         (Occur::Must, phrase_query("cheap reject")),
     ])
     .into();
-    assert_compound_fts_top_k(&dataset, query.clone(), 10).await;
+    assert_compound_fts_top_k(&dataset, query.clone(), &[10]).await;
 
     let nested: FtsQuery = BooleanQuery::new([
         (Occur::Must, query.clone()),
         (Occur::Should, compound_match_query("bonus", "text", 1.0)),
     ])
     .into();
-    assert_compound_fts_top_k(&dataset, nested, 10).await;
+    assert_compound_fts_top_k(&dataset, nested, &[10]).await;
 }
 
 #[tokio::test]
 async fn test_compound_tie_uses_resolved_row_id() {
-    let batch = arrow_array::record_batch!(("text", Utf8, vec!["common"; 384])).unwrap();
-    let schema = batch.schema();
-    let mut dataset = Dataset::write(
-        RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema),
-        "memory://",
-        Some(WriteParams {
-            max_rows_per_file: 256,
-            ..Default::default()
-        }),
-    )
-    .await
-    .unwrap();
-    create_fragmented_fts_index_with_order(&mut dataset, "text", false, true).await;
+    let dataset = tied_single_term_dataset(384, 256).await;
 
     let query: FtsQuery = MultiMatchQuery::try_new(
         "common".to_owned(),
@@ -4069,40 +4152,20 @@ async fn test_compound_tie_uses_resolved_row_id() {
 
 #[tokio::test]
 async fn test_match_query_tie_is_a_stable_prefix_across_limits() {
-    // Every row holds the same single term, so every hit ties on BM25 and the
-    // result order is decided entirely by the row_id tiebreak. A plain match query
-    // does not go through the compound scorer, so this covers the WAND collector,
-    // the cross-partition merge and the prepared segment merge in
-    // `search_prepared_segments`.
-    // The segments are committed in reverse order to keep segment ordinal order
-    // from accidentally agreeing with row_id order.
+    // A match query has no compound scorer, so the top-k comes from the WAND
+    // collector, the cross-partition merge, and `search_prepared_segments`.
+
+    // The tie band is capped at `limit + SCORE_FLOOR_BUFFER` candidates, so the
+    // 128 buffer sets it for limits 1 and 5 and the limit sets it for 129 and 200.
     const NUM_ROWS: usize = 384;
-    let batch = arrow_array::record_batch!(("text", Utf8, vec!["common"; NUM_ROWS])).unwrap();
-    let schema = batch.schema();
-    let mut dataset = Dataset::write(
-        RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema),
-        "memory://",
-        Some(WriteParams {
-            max_rows_per_file: 128,
-            ..Default::default()
-        }),
-    )
-    .await
-    .unwrap();
-    create_fragmented_fts_index_with_order(&mut dataset, "text", false, true).await;
+    let dataset = tied_single_term_dataset(NUM_ROWS, 128).await;
 
     let query: FtsQuery = MatchQuery::new("common".to_owned())
         .with_column(Some("text".to_owned()))
         .into();
     let exhaustive = compound_fts_results(&dataset, query.clone(), None).await;
     assert_eq!(exhaustive.len(), NUM_ROWS);
-    let top_score = exhaustive[0].1;
-    assert!(
-        exhaustive
-            .iter()
-            .all(|(_, score)| (score - top_score).abs() < 1e-6),
-        "premise: every document must tie on score"
-    );
+    assert_tied_scores(&exhaustive, |(_, score)| *score);
     let row_ids = exhaustive
         .iter()
         .map(|(row_id, _)| *row_id)
@@ -4111,26 +4174,8 @@ async fn test_match_query_tie_is_a_stable_prefix_across_limits() {
     ascending.sort_unstable();
     assert_eq!(row_ids, ascending, "tied hits must come back by row_id ASC");
 
-    for limit in [1, 5, 129, 200] {
-        let limited = compound_fts_results(&dataset, query.clone(), Some(limit as i64)).await;
-        assert_eq!(
-            limited,
-            exhaustive[..limit],
-            "top-{limit} must be an ordered prefix of the exhaustive result"
-        );
-    }
+    assert_compound_fts_top_k(&dataset, query.clone(), &[1, 5, 129, 200]).await;
 
-    // Segments and partitions complete in whatever order the search streams yield,
-    // so repeat the query to check the result does not depend on it.
-    for _ in 0..5 {
-        assert_eq!(
-            compound_fts_results(&dataset, query.clone(), Some(10)).await,
-            exhaustive[..10]
-        );
-    }
-
-    // Pages fetched with limit/offset concatenate to the larger query's prefix,
-    // with no row skipped or repeated across page and segment boundaries.
     const PAGE: usize = 50;
     let mut paged: Vec<u64> = Vec::new();
     for offset in (0..200).step_by(PAGE) {
@@ -4149,7 +4194,6 @@ async fn test_match_query_tie_is_a_stable_prefix_across_limits() {
         "pages must tile the result without gaps"
     );
 
-    // A zero limit is a valid, empty result rather than a panic in the merge.
     assert!(
         compound_fts_results(&dataset, query.clone(), Some(0))
             .await
@@ -4159,9 +4203,9 @@ async fn test_match_query_tie_is_a_stable_prefix_across_limits() {
 
 #[tokio::test]
 async fn test_match_query_tie_is_a_stable_prefix_with_unindexed_rows() {
-    // Rows appended after indexing are scored on the flat path, so the top-k runs
-    // over the union of indexed and flat hits. That union is the one place where a
-    // score-only sort could still scramble a tie.
+    // Rows appended after indexing are scored on the flat path, so top-k merges
+    // indexed and flat hits. Limit 4 cuts inside the 16 indexed rows; limits 17
+    // and 30 cut inside the appended rows.
     const INDEXED_ROWS: usize = 16;
     const APPENDED_ROWS: usize = 16;
     let batch = arrow_array::record_batch!(("text", Utf8, vec!["common"; INDEXED_ROWS])).unwrap();
@@ -4195,27 +4239,14 @@ async fn test_match_query_tie_is_a_stable_prefix_with_unindexed_rows() {
         .into();
     let exhaustive = compound_fts_results(&dataset, query.clone(), None).await;
     assert_eq!(exhaustive.len(), INDEXED_ROWS + APPENDED_ROWS);
-    for limit in [1, 4, 17, 30] {
-        let limited = compound_fts_results(&dataset, query.clone(), Some(limit as i64)).await;
-        assert_eq!(
-            limited,
-            exhaustive[..limit],
-            "top-{limit} must be an ordered prefix of the exhaustive result"
-        );
-    }
-    for _ in 0..5 {
-        assert_eq!(
-            compound_fts_results(&dataset, query.clone(), Some(9)).await,
-            exhaustive[..9]
-        );
-    }
+    assert_compound_fts_top_k(&dataset, query.clone(), &[1, 4, 17, 30]).await;
 }
 
 #[tokio::test]
 async fn test_match_query_tie_is_a_stable_prefix_without_an_index() {
-    // With no FTS index every hit is scored on the flat path, and the leaf top-k is
-    // a `SortExec` over a scan that carries no ranking of its own. Only the sort key
-    // decides which of the tied rows survive the fetch.
+    // With no FTS index every hit is scored on the flat path, and the leaf top-k
+    // is a `SortExec` over an unordered scan. Limits 9 and 33 span more than one
+    // of the eight fragments.
     const NUM_ROWS: usize = 64;
     let batch = arrow_array::record_batch!(("text", Utf8, vec!["common"; NUM_ROWS])).unwrap();
     let schema = batch.schema();
@@ -4234,67 +4265,13 @@ async fn test_match_query_tie_is_a_stable_prefix_without_an_index() {
     let query: FtsQuery = MatchQuery::new("common".to_owned())
         .with_column(Some("text".to_owned()))
         .into();
-    // An unlimited flat plan has no top-k above it, so this is a source of the tied
-    // hits, not of their order.
-    let mut expected = compound_fts_results(&dataset, query.clone(), None).await;
+    // An unlimited flat plan has no top-k, so it returns the tied hits unordered.
+    let mut expected = fts_hit_rows(&dataset, query.clone(), None).await;
     assert_eq!(expected.len(), NUM_ROWS);
-    let top_score = expected[0].1;
-    assert!(
-        expected
-            .iter()
-            .all(|(_, score)| (score - top_score).abs() < 1e-6),
-        "premise: every document must tie on score"
-    );
-    expected.sort_unstable_by_key(|(row_id, _)| *row_id);
+    assert_tied_scores(&expected, |(_, _, score)| *score);
+    expected.sort_unstable_by_key(|(row_id, _, _)| *row_id);
 
-    for limit in [1, 9, 33] {
-        let limited = compound_fts_results(&dataset, query.clone(), Some(limit as i64)).await;
-        assert_eq!(
-            limited,
-            expected[..limit],
-            "top-{limit} must be the lowest tied row_ids, in row_id order"
-        );
-    }
-    // The eight fragments feed the sort concurrently, so repeat the query to check
-    // the result does not depend on the order they arrive in.
-    for _ in 0..5 {
-        assert_eq!(
-            compound_fts_results(&dataset, query.clone(), Some(5)).await,
-            expected[..5]
-        );
-    }
-}
-
-/// One `(row_id, doc_index, score)` per hit of an element-granularity FTS scan,
-/// in result order.
-async fn element_fts_results(
-    dataset: &Dataset,
-    query: FtsQuery,
-    limit: Option<i64>,
-) -> Vec<(u64, u32, f32)> {
-    let mut scan = dataset.scan();
-    scan.with_row_id()
-        .full_text_search(FullTextSearchQuery::new_query(query))
-        .unwrap();
-    if let Some(limit) = limit {
-        scan.limit(Some(limit), None).unwrap();
-    }
-    let batch = scan.try_into_batch().await.unwrap();
-    let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>().values();
-    let scores = batch[SCORE_COL].as_primitive::<Float32Type>().values();
-    let doc_indices = batch[DOC_INDEX_COL].as_list::<i32>();
-    (0..batch.num_rows())
-        .map(|row| {
-            let coordinates = doc_indices.value(row);
-            let coordinates = coordinates.as_primitive::<UInt32Type>();
-            assert_eq!(
-                coordinates.len(),
-                1,
-                "a list-element FTS hit carries one coordinate"
-            );
-            (row_ids[row], coordinates.value(0), scores[row])
-        })
-        .collect()
+    assert_fts_top_k_prefix(&dataset, query.clone(), &[1, 9, 33], &expected).await;
 }
 
 fn tag_lists(rows: &[&[&str]]) -> ArrayRef {
@@ -4310,9 +4287,9 @@ fn tag_lists(rows: &[&[&str]]) -> ArrayRef {
 
 #[tokio::test]
 async fn test_element_fts_tie_is_a_stable_prefix_with_unindexed_rows() {
-    // Every element of every row holds the same term, so all hits tie on score and
-    // one row_id covers several results. Only `doc_index` separates them, and the
-    // top-k over the union of indexed and flat hits has to sort on it too.
+    // Every element repeats the query term, so hits tie on score. A row_id
+    // covers three results, so `doc_index` orders them, on the union of indexed
+    // and flat hits as well.
     let indexed = RecordBatch::try_from_iter(vec![(
         "tags",
         tag_lists(&[&["alpha", "alpha", "alpha"], &["alpha", "alpha", "alpha"]]),
@@ -4359,6 +4336,7 @@ async fn test_element_fts_tie_is_a_stable_prefix_with_unindexed_rows() {
         .into();
     let exhaustive = element_fts_results(&dataset, query.clone(), None).await;
     assert_eq!(exhaustive.len(), 9, "three elements in each of three rows");
+    assert_tied_scores(&exhaustive, |(_, _, score)| *score);
     let keys = exhaustive
         .iter()
         .map(|(row_id, doc_index, _)| (*row_id, *doc_index))
@@ -4370,20 +4348,7 @@ async fn test_element_fts_tie_is_a_stable_prefix_with_unindexed_rows() {
         "tied element hits must come back by (row_id, doc_index) ASC"
     );
 
-    for limit in [1, 2, 4, 7] {
-        let limited = element_fts_results(&dataset, query.clone(), Some(limit as i64)).await;
-        assert_eq!(
-            limited,
-            exhaustive[..limit],
-            "top-{limit} must be an ordered prefix of the exhaustive result"
-        );
-    }
-    for _ in 0..5 {
-        assert_eq!(
-            element_fts_results(&dataset, query.clone(), Some(3)).await,
-            exhaustive[..3]
-        );
-    }
+    assert_compound_fts_top_k(&dataset, query.clone(), &[1, 2, 4, 7]).await;
 }
 
 pub(super) fn nested_fts_batch(

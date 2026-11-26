@@ -3,39 +3,28 @@
 
 use super::*;
 
-// Deterministic top-k tiebreak (score DESC, row_id ASC).
-//
-// A BM25 top-k that breaks ties arbitrarily is not a stable prefix across `k`:
-// top-k1 is not a prefix of top-k2, so paginating a tied-score query (a broad
-// term where many documents share `(tf, doc_len)`) duplicates and skips rows.
-// What the collector does with a document tied at the k-th score follows from
-// how far the walk can see into the result order:
-//
-// * addresses resident and ascending with DocId: the tie has already been lost,
-//   so the candidate is rejected and nothing is retained;
-// * addresses resident, order unknown: the tie is between things the walk cannot
-//   rank (the elements of one row), so it is retained;
-// * no resident addresses: the tie is unrankable and this pass cannot rank it, so
-//   the walk stops and asks the caller to retry with addresses.
-//
-// `admit_ties_floor` keeps the WAND pruning kernels from dropping the band the
-// collector still needs in the two admit modes.
+// Top-k tiebreak: score descending, then row_id ascending. A broad term ties
+// many documents on `(tf, doc_len)`, and a tied query paginates only when the
+// top-k at one limit is an ordered prefix of the top-k at a larger limit, so the
+// tiebreak has to be total. `TieOrdering` names the three modes and the
+// condition that selects each. `admit_ties_floor` keeps the pruning kernels from
+// dropping the band that the two retaining modes need.
 
 /// Collector for a walk whose row addresses are resident and strictly ascend with
 /// the DocId order the walk visits.
 fn ascending_address_collector(limit: usize) -> TopKCollector {
-    TopKCollector::new(limit, limit, TieHandling::AscendingRowAddresses)
+    TopKCollector::new(limit, limit, TieOrdering::AscendingRowAddresses)
 }
 
 /// Collector for a walk whose row addresses are resident but whose DocId order
 /// does not follow them, or whose rows own several documents.
 fn row_address_collector(limit: usize) -> TopKCollector {
-    TopKCollector::new(limit, limit, TieHandling::ByRowAddress)
+    TopKCollector::new(limit, limit, TieOrdering::ByRowAddress)
 }
 
 /// Collector for a walk that has no resident row addresses.
 fn deferred_address_collector(limit: usize) -> TopKCollector {
-    TopKCollector::new(limit, limit, TieHandling::DeferredAddresses)
+    TopKCollector::new(limit, limit, TieOrdering::DeferredAddresses)
 }
 
 #[test]
@@ -72,8 +61,8 @@ fn test_top_k_collector_reuses_frequency_slots() -> Result<()> {
     Ok(())
 }
 
-/// The ordering key a walk that defers row addresses hands the collector: one
-/// constant for every document, so every score tie compares equal.
+/// The ordering key a walk that defers row addresses hands the collector: the
+/// same constant for every document, so every score tie compares equal.
 const DEFERRED_ORDER_KEY: u64 = u64::MAX;
 
 /// Insert a document the walk can rank by row address. `document_key` doubles
@@ -82,8 +71,8 @@ fn insert_addressed(collector: &mut TopKCollector, document_key: u64, score: f32
     insert_at_address(collector, document_key, document_key, score)
 }
 
-/// Insert a document at an explicit address, so several documents can share
-/// one address the way the elements of a list row do.
+/// Insert a document at an explicit address, so several documents can share a
+/// single address as the elements of a list row do.
 fn insert_at_address(
     collector: &mut TopKCollector,
     document_key: u64,
@@ -132,7 +121,7 @@ fn test_admit_ties_floor_zero_negative_and_nan() {
     // prune guards read as "no threshold yet" (pruning disabled).
     assert!(admit_ties_floor(0.0) < 0.0);
     assert!(admit_ties_floor(-1.0) < -1.0);
-    // NaN stays NaN; it is never a competitive score and is guarded at insert time.
+    // NaN stays NaN: a NaN score is rejected at insert.
     assert!(admit_ties_floor(f32::NAN).is_nan());
     // The smallest positive subnormal would step down to zero and disable
     // pruning, so it stays put.
@@ -143,17 +132,15 @@ fn test_admit_ties_floor_zero_negative_and_nan() {
 #[test]
 fn test_top_k_collector_ascending_addresses_reject_kth_ties() -> Result<()> {
     // The walk reaches documents in address order, so a candidate tied at the
-    // k-th score has the higher address and lost the tie before the collector saw
-    // it. Retaining it would only make the caller re-rank documents it already
-    // knows lose.
+    // k-th score has a higher address and lost the tie already.
     let mut collector = ascending_address_collector(2);
     assert!(insert_addressed(&mut collector, 10, 1.0)?);
     assert!(insert_addressed(&mut collector, 20, 1.0)?); // heap full, k-th is (1.0, 20)
     assert!(!insert_addressed(&mut collector, 30, 1.0)?); // later address, same score
     assert!(!insert_addressed(&mut collector, 40, 1.0)?);
     assert!(!insert_addressed(&mut collector, 15, 0.5)?); // below the k-th score
-    // Refusal covers rank ties only. A candidate that beats the k-th score still
-    // enters, and the k-th score it publishes is what keeps the walk pruning.
+    // Refusal covers rank ties only: a higher score still enters, and the k-th
+    // score it publishes is what keeps the walk pruning.
     assert!(
         insert_addressed(&mut collector, 30, 3.0)?,
         "a higher score must enter the heap even when addresses ascend"
@@ -167,7 +154,7 @@ fn test_top_k_collector_ascending_addresses_reject_kth_ties() -> Result<()> {
         collector.tie_band_len() == 0,
         "an address-ascending walk retains nothing"
     );
-    assert!(!collector.score_floor_overflow());
+    assert!(!collector.aborted());
     assert!(!collector.band_truncated());
     assert_eq!(
         collected_keys(collector)?,
@@ -179,9 +166,8 @@ fn test_top_k_collector_ascending_addresses_reject_kth_ties() -> Result<()> {
 
 #[test]
 fn test_top_k_collector_ascending_addresses_keep_the_band_empty_under_ties() -> Result<()> {
-    // A corpus where every document ties, in address order: the heap fills and
-    // every later candidate is rejected, so the working set never grows past
-    // `limit` and the caller never has to re-select.
+    // Every document ties, in address order: the heap fills and every later
+    // candidate is rejected, so the working set stays at `limit`.
     const LIMIT: usize = 10;
     let mut collector = ascending_address_collector(LIMIT);
     for document_key in 0..4_000u64 {
@@ -193,7 +179,7 @@ fn test_top_k_collector_ascending_addresses_keep_the_band_empty_under_ties() -> 
         "nothing may accumulate beyond the heap"
     );
     assert!(collector.tie_band_len() == 0);
-    assert!(!collector.score_floor_overflow());
+    assert!(!collector.aborted());
     assert!(!collector.band_truncated());
     assert_eq!(
         collected_keys(collector)?,
@@ -204,16 +190,15 @@ fn test_top_k_collector_ascending_addresses_keep_the_band_empty_under_ties() -> 
 
 #[test]
 fn test_top_k_collector_by_row_address_evicts_on_full_key() -> Result<()> {
-    // The ordering key is the row address but DocId order does not follow it, so
-    // a score tie is still decided here: a lower address evicts the worst tied
-    // entry, a higher one loses.
+    // The ordering key is the row address but DocId order does not follow it, so a
+    // score tie is still ranked by address: a lower one evicts, a higher one loses.
     let mut collector = row_address_collector(2);
     assert!(insert_addressed(&mut collector, 20, 1.0)?);
     assert!(insert_addressed(&mut collector, 10, 1.0)?); // heap full {10, 20}
     assert!(insert_addressed(&mut collector, 5, 1.0)?); // ties, lower address
     assert!(!insert_addressed(&mut collector, 30, 1.0)?); // ties, higher address
     assert!(!insert_addressed(&mut collector, 15, 0.5)?); // below the k-th score
-    assert!(!collector.score_floor_overflow());
+    assert!(!collector.aborted());
     // Distinct addresses leave nothing the walk cannot rank.
     assert!(collector.tie_band_len() == 0);
     assert_eq!(
@@ -226,10 +211,8 @@ fn test_top_k_collector_by_row_address_evicts_on_full_key() -> Result<()> {
 
 #[test]
 fn test_top_k_collector_retains_element_documents_of_one_row() -> Result<()> {
-    // Element documents of one row share its address, so the address key cannot
-    // rank them and only `doc_index` can, which the walk never sees. Evicting
-    // one of them here would pick an arbitrary element, so both are retained and
-    // the resolved re-selection settles it.
+    // The elements of a row share its address, so the address key cannot rank
+    // them: only `doc_index` can, and the walk does not read it. Both are retained.
     const ROW: u64 = 100;
     let mut collector = row_address_collector(2);
     assert!(insert_at_address(&mut collector, 11, ROW, 1.0)?);
@@ -237,7 +220,7 @@ fn test_top_k_collector_retains_element_documents_of_one_row() -> Result<()> {
     // A lower address outranks the row whatever its elements' coordinates are,
     // so it takes a heap slot and the element it displaced stays a candidate.
     assert!(insert_at_address(&mut collector, 10, 50, 1.0)?);
-    assert!(!collector.score_floor_overflow());
+    assert!(!collector.aborted());
     assert_eq!(
         collected_keys(collector)?,
         vec![10, 11, 12],
@@ -267,16 +250,15 @@ fn test_top_k_collector_ranks_rows_around_a_tied_element_row() -> Result<()> {
 
 #[test]
 fn test_top_k_collector_retains_kth_score_band_of_one_row() -> Result<()> {
-    // Documents the walk cannot rank against the k-th entry survive on both sides
-    // of the split, whether they land in the heap or beside it. The DocId proxy
-    // only decides which side that is.
+    // Candidates the walk cannot rank survive on both sides of the split: in the
+    // heap and in the band. The DocId proxy only picks which side.
     const ROW: u64 = 100;
     let mut collector = row_address_collector(2);
     assert!(insert_at_address(&mut collector, 10, ROW, 1.0)?);
     assert!(insert_at_address(&mut collector, 11, ROW, 1.0)?);
     assert!(insert_at_address(&mut collector, 5, ROW, 1.0)?); // wins the proxy, heap
     assert!(!insert_at_address(&mut collector, 20, ROW, 1.0)?); // loses it, band
-    assert!(!collector.score_floor_overflow());
+    assert!(!collector.aborted());
     assert_eq!(
         collected_keys(collector)?,
         vec![5, 10, 11, 20],
@@ -297,9 +279,8 @@ fn test_top_k_collector_retains_kth_score_band_of_one_row() -> Result<()> {
 #[test]
 fn test_top_k_collector_deferred_addresses_stop_when_the_band_fills() -> Result<()> {
     // A walk with no resident addresses cannot rank a k-th-score tie, but a single
-    // tie is common and cheap, so it is retained like any other. A band that fills
-    // means the corpus ties at the k-th score throughout: scoring the rest of it
-    // cannot rank the band either, so the pass stops there with the retry signal.
+    // tie is cheap, so it is retained. A full band means the corpus ties at the
+    // k-th score throughout: scoring the rest cannot rank the band either.
     const LIMIT: usize = 2;
     let mut collector = deferred_address_collector(LIMIT);
     assert!(insert_deferred(&mut collector, 10, 1.0)?);
@@ -327,19 +308,15 @@ fn test_top_k_collector_deferred_addresses_stop_when_the_band_fills() -> Result<
     insert_deferred(&mut collector, 9_000, 1.0)?;
     assert!(
         collector.aborted(),
-        "a full band means a corpus tied at the k-th score, so stop walking"
-    );
-    assert!(
-        collector.score_floor_overflow(),
-        "the caller must retry with addresses"
+        "a full band means a corpus tied at the k-th score: stop walking and retry with addresses"
     );
     Ok(())
 }
 
 #[test]
 fn test_top_k_collector_deferred_abort_survives_a_later_better_score() -> Result<()> {
-    // An abort is not a band that became obsolete: the pass ended early, so what
-    // it returned stays incomplete however the k-th score moves afterwards.
+    // The pass ended early, so its result stays incomplete no matter how the
+    // k-th score moves afterwards.
     const LIMIT: usize = 2;
     let mut collector = deferred_address_collector(LIMIT);
     for key in 0..(LIMIT + SCORE_FLOOR_BUFFER + 50) {
@@ -355,20 +332,16 @@ fn test_top_k_collector_deferred_abort_survives_a_later_better_score() -> Result
 
     assert!(insert_deferred(&mut collector, 1_000, 2.0)?);
     assert!(insert_deferred(&mut collector, 1_001, 2.0)?);
-    assert!(
-        collector.score_floor_overflow(),
-        "a deliberate abort is never obsolete"
-    );
+    assert!(collector.aborted(), "a deliberate abort is never obsolete");
     assert_eq!(collected_keys(collector)?, vec![1_000, 1_001]);
     Ok(())
 }
 
 #[test]
 fn test_top_k_collector_bounds_the_element_band() -> Result<()> {
-    // Nothing bounds how many elements a list row holds, so a walk that retains a
-    // band caps it too. Past the cap the heap keeps ranking on the DocId proxy,
-    // so the documents the result order wants survive even though the rest of the
-    // group is dropped.
+    // A list row can hold any number of elements, so a retaining walk caps its
+    // band. Past the cap the heap ranks on the DocId proxy: the result order's
+    // winners survive and the rest of the group is dropped.
     const ROW: u64 = 100;
     const LIMIT: usize = 2;
     let max_buffered = LIMIT + SCORE_FLOOR_BUFFER;
@@ -382,7 +355,7 @@ fn test_top_k_collector_bounds_the_element_band() -> Result<()> {
         let truncated = collector.band_truncated();
         let buffered = collector.buffered();
         assert!(
-            !collector.score_floor_overflow(),
+            !collector.aborted(),
             "a walk with resident addresses has nothing to retry"
         );
         Ok((collected_keys(collector)?, truncated, buffered))
@@ -410,9 +383,8 @@ fn test_top_k_collector_bounds_the_element_band() -> Result<()> {
 
 #[test]
 fn test_top_k_collector_clears_obsolete_band_truncation() -> Result<()> {
-    // A truncation describes the k-th-score band it happened in. Once the k-th
-    // score rises past that band, nothing it dropped can win, so the collector
-    // must stop reporting it.
+    // A truncation describes the band it happened in: once the k-th score rises
+    // past that band, nothing it dropped can win.
     const LIMIT: usize = 2;
     const ROW: u64 = 100;
     let mut collector = row_address_collector(LIMIT);
@@ -432,11 +404,9 @@ fn test_top_k_collector_clears_obsolete_band_truncation() -> Result<()> {
 
 #[test]
 fn test_top_k_collector_reuses_slots_when_no_tie_is_retained() -> Result<()> {
-    // A deferred walk over strictly improving scores retains nothing, so every
-    // replacement must reuse the displaced entry's slot in place. Allocating a
-    // slot for the newcomer and releasing the displaced one instead would add a
-    // slot and hand its buffer away, which is exactly what `FrequencySlots`
-    // exists to avoid.
+    // A deferred walk over strictly improving scores retains nothing, so each
+    // replacement reuses the displaced entry's slot in place: a fresh slot per
+    // insert would grow the slot count and release the old buffer.
     const LIMIT: usize = 4;
     const NUM_PAIRS: u32 = 4;
     let mut collector = deferred_address_collector(LIMIT);
@@ -506,9 +476,8 @@ fn test_top_k_collector_rejects_nan_while_filling() -> Result<()> {
 
 #[test]
 fn test_top_k_collector_rejects_score_admits_kth_ties() -> Result<()> {
-    // MaxScore skips candidates `rejects_score` refuses before they reach the
-    // collector, so a tie at the k-th score must not be refused wherever the
-    // collector still has to rank or retain it.
+    // MaxScore drops what `rejects_score` refuses, so a k-th-score tie has to
+    // survive there whenever the collector still has to rank or retain it.
     let mut collector = row_address_collector(1);
     assert!(
         !collector.rejects_score(1.0),
@@ -527,9 +496,9 @@ fn test_top_k_collector_rejects_score_admits_kth_ties() -> Result<()> {
 
 #[test]
 fn test_top_k_collector_rejects_score_refuses_kth_ties_when_addresses_ascend() -> Result<()> {
-    // The same heap in the address-ascending mode: the candidate reaches the walk
-    // after the k-th entry, so its address already lost the tie and refusing it
-    // here is what lets block-max pruning skip a whole block.
+    // The address-ascending walk reaches this candidate after the k-th entry, so
+    // its address lost the tie. Refusing it keeps the floor at the raw k-th score,
+    // which lets block-max pruning skip a whole block.
     let mut collector = ascending_address_collector(1);
     assert!(insert_addressed(&mut collector, 10, 1.0)?);
     assert!(

@@ -946,6 +946,49 @@ mod tests {
         assert_eq!(execute_results(widened.as_ref()).await.unwrap().len(), 6);
     }
 
+    /// Lowering the limit below a cross-segment score tie keeps the lowest row
+    /// addresses.
+    #[tokio::test]
+    async fn test_match_query_exec_with_limit_recut_breaks_cross_segment_tie() {
+        let (dataset, segments, _) = create_segment_selection_fixture().await;
+        // Every indexed row reads "quick brown fox", so the four hits tie on
+        // score: rows 0 and 1 in fragment 0, rows 2^32 and 2^32 + 1 in fragment 1.
+        let higher = segment_uuid_for_fragment(&segments, 1);
+        let lower = segment_uuid_for_fragment(&segments, 0);
+        let query = MatchQuery::new("quick".to_string())
+            .with_column(Some("text".to_string()))
+            .with_document_granularity(DocumentGranularity::Row);
+        let exec = MatchQueryExec::new_with_segment_uuids(
+            dataset,
+            query,
+            FtsSearchParams::default().with_limit(Some(4)),
+            PreFilterSource::None,
+            vec![higher, lower],
+        )
+        .unwrap();
+
+        let all = execute_results(&exec).await.unwrap();
+        let tied = expected_row_ids(&[0, 1]);
+        assert_eq!(
+            all.iter().map(|(row_id, _)| *row_id).collect::<Vec<_>>(),
+            tied
+        );
+        let score = all[0].1;
+        assert!(
+            all.iter().all(|(_, hit)| *hit == score),
+            "the cut is only ambiguous while every hit ties: {all:?}"
+        );
+
+        let expected = tied[..2]
+            .iter()
+            .map(|row_id| (*row_id, score))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            execute_results(&exec.with_limit(2)).await.unwrap(),
+            expected
+        );
+    }
+
     #[derive(Debug, Clone, Copy)]
     pub(super) enum ResidualFailure {
         Execute,
