@@ -96,11 +96,10 @@ public class Dataset implements Closeable {
 
   private long nativeDatasetHandle;
 
-  private BufferAllocator allocator;
+  private volatile BufferAllocator allocator;
   // Default opens give checkouts independent allocation budgets. Direct commits share the source's.
   private boolean separateDerivedAllocators;
-  // Non-null when the last Dataset sharing this root is responsible for closing it.
-  private AtomicInteger allocatorOwners;
+  private OwnedAllocator ownedAllocator;
   private Session session;
   private boolean ownsSession = false;
 
@@ -113,6 +112,15 @@ public class Dataset implements Closeable {
   private final LockManager lockManager = new LockManager(this);
 
   private Dataset() {}
+
+  private static final class OwnedAllocator {
+    final BufferAllocator root;
+    final AtomicInteger references = new AtomicInteger(1);
+
+    OwnedAllocator(BufferAllocator root) {
+      this.root = root;
+    }
+  }
 
   /**
    * Creates a builder for writing a dataset.
@@ -609,12 +617,8 @@ public class Dataset implements Closeable {
     Preconditions.checkNotNull(operation);
     Preconditions.checkNotNull(readVersion);
     Dataset dataset = operation.commit(allocator, path, readVersion, storageOptions);
-    if (dataset.allocator != allocator) {
-      // A custom FragmentOperation can return a dataset with its own allocator.
-      dataset.releaseOwnedAllocator();
-      dataset.allocator = allocator;
-      dataset.separateDerivedAllocators = false;
-    }
+    // Readers opened by a custom operation can still hold buffers from the original root.
+    dataset.allocator = allocator;
     return dataset;
   }
 
@@ -707,36 +711,27 @@ public class Dataset implements Closeable {
 
   private void ownAllocator(BufferAllocator allocator) {
     this.allocator = allocator;
-    allocatorOwners = new AtomicInteger(1);
-  }
-
-  private void releaseOwnedAllocator() {
-    if (allocatorOwners != null) {
-      AtomicInteger owners = allocatorOwners;
-      allocatorOwners = null;
-      if (owners.decrementAndGet() == 0) {
-        allocator.close();
-      }
-    }
+    ownedAllocator = new OwnedAllocator(allocator);
   }
 
   void shareAllocator(Dataset source) {
-    allocator = source.allocator;
-    allocatorOwners = source.allocatorOwners;
-    if (allocatorOwners != null) {
-      allocatorOwners.incrementAndGet();
-    }
+    initializeDerivedAllocator(source, false);
   }
 
   void initializeDerivedAllocator(Dataset source) {
     initializeDerivedAllocator(source, source.separateDerivedAllocators);
   }
 
-  private void initializeDerivedAllocator(Dataset source, boolean separateAllocator) {
-    if (separateAllocator) {
+  private void initializeDerivedAllocator(Dataset source, boolean separateIfOwned) {
+    allocator = source.allocator;
+    if (source.ownedAllocator == null || source.ownedAllocator.root != allocator) {
+      return;
+    }
+    if (separateIfOwned) {
       ownAllocator(new RootAllocator(Long.MAX_VALUE));
     } else {
-      shareAllocator(source);
+      ownedAllocator = source.ownedAllocator;
+      ownedAllocator.references.incrementAndGet();
     }
   }
 
@@ -2299,7 +2294,13 @@ public class Dataset implements Closeable {
         session = null;
         ownsSession = false;
       }
-      releaseOwnedAllocator();
+      if (ownedAllocator != null) {
+        OwnedAllocator owner = ownedAllocator;
+        ownedAllocator = null;
+        if (owner.references.decrementAndGet() == 0) {
+          owner.root.close();
+        }
+      }
     }
   }
 
@@ -2588,7 +2589,7 @@ public class Dataset implements Closeable {
     try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
       Dataset created = nativeCreateBranch(branch, ref, storageOptions);
-      created.initializeDerivedAllocator(this, allocatorOwners != null);
+      created.initializeDerivedAllocator(this, true);
       created.initializeSession();
       return created;
     }

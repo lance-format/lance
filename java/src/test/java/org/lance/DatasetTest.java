@@ -69,6 +69,7 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
+import java.io.UncheckedIOException;
 import java.net.URISyntaxException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
@@ -2369,7 +2370,7 @@ public class DatasetTest {
   }
 
   @Test
-  void testCustomFragmentCommitAllocator(@TempDir Path dir) {
+  void testCustomFragmentCommitAllocator(@TempDir Path dir) throws Exception {
     String path = dir.resolve("table").toString();
     try (BufferAllocator allocator = new RootAllocator()) {
       TestUtils.SimpleTestDataset suite = new TestUtils.SimpleTestDataset(allocator, path);
@@ -2377,6 +2378,8 @@ public class DatasetTest {
       List<FragmentMetadata> fragments = suite.createNewFragment(2, 1);
       class DirectAppend extends FragmentOperation {
         BufferAllocator commitAllocator;
+        LanceScanner scanner;
+        ArrowReader reader;
 
         @Override
         public Dataset commit(
@@ -2384,16 +2387,39 @@ public class DatasetTest {
             String uri,
             Optional<Long> version,
             Map<String, String> options) {
-          Dataset result = Dataset.commitAppend(uri, version, fragments, options);
+          Dataset.commitAppend(uri, version, fragments, options).close();
+          Dataset result = Dataset.open(uri);
           commitAllocator = result.allocator();
+          scanner = result.newScan();
+          reader = scanner.scanBatches();
+          try {
+            assertTrue(reader.loadNextBatch());
+          } catch (IOException e) {
+            throw new UncheckedIOException(e);
+          }
           return result;
         }
       }
       DirectAppend operation = new DirectAppend();
-      try (Dataset result = Dataset.commit(allocator, path, operation, Optional.of(1L))) {
-        assertThrows(IllegalStateException.class, operation.commitAllocator::assertOpen);
+      try (Dataset result = Dataset.commit(allocator, path, operation, Optional.of(1L));
+          Dataset branch = result.createBranch("dev", Ref.ofMain());
+          Dataset checkout = result.checkoutVersion(result.version())) {
+        assertEquals(2L, result.version());
         assertSame(allocator, result.allocator());
-        assertEquals(suite.getSchema(), result.getSchema());
+        assertSame(allocator, branch.allocator());
+        assertSame(allocator, checkout.allocator());
+        try (LanceScanner scanner = operation.scanner;
+            ArrowReader reader = operation.reader) {
+          assertEquals(0, reader.getVectorSchemaRoot().getVector("id").getObject(0));
+          assertTrue(reader.loadNextBatch());
+          assertEquals(1, reader.getVectorSchemaRoot().getVector("id").getObject(0));
+          assertFalse(reader.loadNextBatch());
+        }
+        result.close();
+        assertThrows(IllegalStateException.class, operation.commitAllocator::assertOpen);
+        try (LanceScanner scanner = branch.newScan()) {
+          suite.validateScanResults(branch, scanner, 2, 1, 0);
+        }
       }
       allocator.assertOpen();
     }
