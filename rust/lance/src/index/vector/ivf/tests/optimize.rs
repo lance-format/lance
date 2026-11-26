@@ -229,6 +229,7 @@ async fn test_optimize_ivf_hnsw_records_actual_file_sizes() {
     let indices_dir = dataset.indices_dir().join(index.uuid.to_string());
     for file in files {
         let actual = dataset
+            .table_state
             .object_store
             .size(&indices_dir.clone().join(file.path.as_str()))
             .await
@@ -262,6 +263,13 @@ async fn test_optimize_legacy_hnsw_sq_refuses_before_writing() {
         .open_vector_index("vector", &legacy_uuid, &NoOpMetricsCollector)
         .await
         .unwrap();
+    assert_eq!(
+        dataset.ivf_partition_shape(&legacy_uuid).await.unwrap(),
+        (
+            legacy.ivf_model().num_partitions(),
+            legacy.ivf_model().dimension()
+        ),
+    );
     assert!(
         legacy.as_any().is::<IVFIndex>(),
         "the fixture is a v1 IVFIndex"
@@ -877,7 +885,7 @@ async fn index_file_version(dataset: &Dataset, uuid: &Uuid) -> (u16, u16) {
         .indices_dir()
         .join(uuid.to_string())
         .join(INDEX_FILE_NAME);
-    let reader = dataset.object_store.open(&path).await.unwrap();
+    let reader = dataset.table_state.object_store.open(&path).await.unwrap();
     let footer = read_last_block(reader.as_ref()).await.unwrap();
     read_version(&footer).unwrap()
 }

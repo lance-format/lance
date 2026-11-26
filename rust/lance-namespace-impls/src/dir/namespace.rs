@@ -772,9 +772,17 @@ impl LanceNamespace for DirectoryNamespace {
             Some(b) => self.resolve_branch_location(&table_uri, b).await?,
             None => table_uri,
         };
-        let want_descending = request.descending == Some(true);
+        if request.descending != Some(true) {
+            return self
+                .list_ascending_version_page(
+                    &table_uri,
+                    request.limit,
+                    request.page_token.as_deref(),
+                )
+                .await;
+        }
         let table_versions = self
-            .list_table_versions_from_storage(&table_uri, want_descending, request.limit)
+            .list_table_versions_from_storage(&table_uri, true, request.limit)
             .await?;
 
         Ok(ListTableVersionsResponse {

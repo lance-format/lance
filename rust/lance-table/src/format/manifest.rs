@@ -196,6 +196,12 @@ impl Manifest {
         self.reader_feature_flags & crate::feature_flags::FLAG_MANAGED_BLOBS != 0
     }
 
+    /// Whether this table has activated version 1 zone write seeds.
+    pub fn has_zone_write_seeds(&self) -> bool {
+        self.reader_feature_flags & crate::feature_flags::FLAG_ZONE_WRITE_SEEDS != 0
+            && self.writer_feature_flags & crate::feature_flags::FLAG_ZONE_WRITE_SEEDS != 0
+    }
+
     pub fn new(
         schema: Schema,
         fragments: Arc<Vec<Fragment>>,

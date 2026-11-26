@@ -3230,7 +3230,7 @@ checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
 
 [[package]]
 name = "fsst"
-version = "15.0.0-beta.28"
+version = "15.1.0-beta.2"
 dependencies = [
  "arrow-array",
  "rand 0.9.5",
@@ -4544,7 +4544,7 @@ checksum = "e037a2e1d8d5fdbd49b16a4ea09d5d6401c1f29eca5ff29d03d3824dba16256a"
 
 [[package]]
 name = "lance"
-version = "15.0.0-beta.28"
+version = "15.1.0-beta.2"
 dependencies = [
  "all_asserts",
  "approx",
@@ -4593,8 +4593,6 @@ dependencies = [
  "humantime",
  "itertools 0.14.0",
  "lance-arrow",
- "lance-arrow-scalar",
- "lance-arrow-stats",
  "lance-bitpacking",
  "lance-core",
  "lance-datafusion",
@@ -4608,6 +4606,7 @@ dependencies = [
  "lance-namespace",
  "lance-select",
  "lance-table",
+ "lance-table-runtime",
  "lance-test-macros",
  "lance-testing",
  "lance-tokenizer",
@@ -4638,6 +4637,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serial_test",
+ "sha2 0.10.9",
  "snafu",
  "tempfile",
  "test-log",
@@ -4656,13 +4656,15 @@ dependencies = [
 
 [[package]]
 name = "lance-arrow"
-version = "15.0.0-beta.28"
+version = "15.1.0-beta.2"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
+ "arrow-cast",
  "arrow-data",
  "arrow-ipc",
  "arrow-ord",
+ "arrow-row",
  "arrow-schema",
  "arrow-select",
  "bytemuck",
@@ -4672,41 +4674,14 @@ dependencies = [
  "half",
  "lance-jsonb",
  "num-traits",
+ "proptest",
  "rand 0.9.5",
  "rstest",
 ]
 
 [[package]]
-name = "lance-arrow-scalar"
-version = "59.0.0"
-dependencies = [
- "arrow-array",
- "arrow-buffer",
- "arrow-cast",
- "arrow-data",
- "arrow-ord",
- "arrow-row",
- "arrow-schema",
- "half",
- "proptest",
- "rstest",
-]
-
-[[package]]
-name = "lance-arrow-stats"
-version = "59.0.0"
-dependencies = [
- "arrow-array",
- "arrow-schema",
- "arrow-select",
- "lance-arrow-scalar",
- "proptest",
- "rstest",
-]
-
-[[package]]
 name = "lance-bitpacking"
-version = "15.0.0-beta.28"
+version = "15.1.0-beta.2"
 dependencies = [
  "arrayref",
  "bitpacking",
@@ -4718,7 +4693,7 @@ dependencies = [
 
 [[package]]
 name = "lance-core"
-version = "15.0.0-beta.28"
+version = "15.1.0-beta.2"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4762,7 +4737,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datafusion"
-version = "15.0.0-beta.28"
+version = "15.1.0-beta.2"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4799,7 +4774,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datafusion-exec"
-version = "15.0.0-beta.28"
+version = "15.1.0-beta.2"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4817,6 +4792,7 @@ dependencies = [
  "lance-arrow",
  "lance-core",
  "lance-datagen",
+ "lance-io",
  "lance-jsonb",
  "log",
  "pin-project",
@@ -4827,7 +4803,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datagen"
-version = "15.0.0-beta.28"
+version = "15.1.0-beta.2"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4847,7 +4823,7 @@ dependencies = [
 
 [[package]]
 name = "lance-derive"
-version = "15.0.0-beta.28"
+version = "15.1.0-beta.2"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4856,7 +4832,7 @@ dependencies = [
 
 [[package]]
 name = "lance-encoding"
-version = "15.0.0-beta.28"
+version = "15.1.0-beta.2"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -4899,7 +4875,7 @@ dependencies = [
 
 [[package]]
 name = "lance-examples"
-version = "15.0.0-beta.28"
+version = "15.1.0-beta.2"
 dependencies = [
  "all_asserts",
  "arrow",
@@ -4925,7 +4901,7 @@ dependencies = [
 
 [[package]]
 name = "lance-file"
-version = "15.0.0-beta.28"
+version = "15.1.0-beta.2"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -4939,7 +4915,6 @@ dependencies = [
  "byteorder",
  "bytes",
  "criterion",
- "datafusion-common",
  "futures",
  "lance-arrow",
  "lance-core",
@@ -4965,7 +4940,7 @@ dependencies = [
 
 [[package]]
 name = "lance-geo"
-version = "15.0.0-beta.28"
+version = "15.1.0-beta.2"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -5006,7 +4981,7 @@ dependencies = [
 
 [[package]]
 name = "lance-index"
-version = "15.0.0-beta.28"
+version = "15.1.0-beta.2"
 dependencies = [
  "approx",
  "arc-swap",
@@ -5044,7 +5019,6 @@ dependencies = [
  "itertools 0.14.0",
  "jieba-rs",
  "lance-arrow",
- "lance-arrow-stats",
  "lance-bitpacking",
  "lance-core",
  "lance-datafusion",
@@ -5090,7 +5064,7 @@ dependencies = [
 
 [[package]]
 name = "lance-index-core"
-version = "15.0.0-beta.28"
+version = "15.1.0-beta.2"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -5113,7 +5087,7 @@ dependencies = [
 
 [[package]]
 name = "lance-io"
-version = "15.0.0-beta.28"
+version = "15.1.0-beta.2"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -5168,7 +5142,7 @@ dependencies = [
 
 [[package]]
 name = "lance-jsonb"
-version = "15.0.0-beta.28"
+version = "15.1.0-beta.2"
 dependencies = [
  "byteorder",
  "ethnum",
@@ -5189,7 +5163,7 @@ dependencies = [
 
 [[package]]
 name = "lance-linalg"
-version = "15.0.0-beta.28"
+version = "15.1.0-beta.2"
 dependencies = [
  "approx",
  "argminmax",
@@ -5211,7 +5185,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace"
-version = "15.0.0-beta.28"
+version = "15.1.0-beta.2"
 dependencies = [
  "arrow",
  "async-trait",
@@ -5225,7 +5199,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace-datafusion"
-version = "15.0.0-beta.28"
+version = "15.1.0-beta.2"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -5241,7 +5215,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace-impls"
-version = "15.0.0-beta.28"
+version = "15.1.0-beta.2"
 dependencies = [
  "arc-swap",
  "arrow",
@@ -5303,11 +5277,11 @@ dependencies = [
 
 [[package]]
 name = "lance-protos"
-version = "15.0.0-beta.28"
+version = "15.1.0-beta.2"
 
 [[package]]
 name = "lance-select"
-version = "15.0.0-beta.28"
+version = "15.1.0-beta.2"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -5324,7 +5298,7 @@ dependencies = [
 
 [[package]]
 name = "lance-table"
-version = "15.0.0-beta.28"
+version = "15.1.0-beta.2"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -5371,8 +5345,55 @@ dependencies = [
 ]
 
 [[package]]
+name = "lance-table-runtime"
+version = "15.1.0-beta.2"
+dependencies = [
+ "arrow-array",
+ "arrow-buffer",
+ "arrow-cast",
+ "arrow-data",
+ "arrow-ipc",
+ "arrow-row",
+ "arrow-schema",
+ "arrow-select",
+ "async-trait",
+ "blake3",
+ "byteorder",
+ "bytes",
+ "chrono",
+ "futures",
+ "humantime",
+ "itertools 0.14.0",
+ "lance-arrow",
+ "lance-core",
+ "lance-datagen",
+ "lance-encoding",
+ "lance-file",
+ "lance-io",
+ "lance-namespace",
+ "lance-select",
+ "lance-table",
+ "log",
+ "object_store 0.14.2",
+ "prost",
+ "prost-types",
+ "rand 0.9.5",
+ "roaring",
+ "rstest",
+ "semver",
+ "serde",
+ "serde_json",
+ "snafu",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "url",
+ "uuid",
+]
+
+[[package]]
 name = "lance-test-macros"
-version = "15.0.0-beta.28"
+version = "15.1.0-beta.2"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -5381,7 +5402,7 @@ dependencies = [
 
 [[package]]
 name = "lance-testing"
-version = "15.0.0-beta.28"
+version = "15.1.0-beta.2"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -5394,7 +5415,7 @@ dependencies = [
 
 [[package]]
 name = "lance-tokenizer"
-version = "15.0.0-beta.28"
+version = "15.1.0-beta.2"
 dependencies = [
  "frostem",
  "icu_segmenter",
@@ -5408,7 +5429,7 @@ dependencies = [
 
 [[package]]
 name = "lance-tools"
-version = "15.0.0-beta.28"
+version = "15.1.0-beta.2"
 dependencies = [
  "arrow-array",
  "chrono",

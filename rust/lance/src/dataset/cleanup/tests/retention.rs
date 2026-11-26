@@ -128,6 +128,7 @@ async fn cleanup_retention_policy_ladder(
     let expected_data = dataset.scan().try_into_batch().await.unwrap();
     let orphan = dataset.data_dir().join("uncommitted.lance");
     dataset
+        .table_state
         .object_store
         .put(&orphan, b"uncommitted")
         .await
@@ -201,7 +202,12 @@ async fn cleanup_retention_policy_ladder(
         stats.old_versions * 2 + u64::from(delete_unverified)
     );
     assert_eq!(
-        dataset.object_store.exists(&orphan).await.unwrap(),
+        dataset
+            .table_state
+            .object_store
+            .exists(&orphan)
+            .await
+            .unwrap(),
         !delete_unverified
     );
     assert_eq!(
@@ -372,7 +378,12 @@ async fn cleanup_separates_expiration_and_thinning(
     }
     let dataset = fixture.open().await.unwrap();
     if let Some(version) = hinted_version {
-        write_version_hint(&dataset.object_store, &dataset.base, version).await;
+        write_version_hint(
+            &dataset.table_state.object_store,
+            &dataset.table_state.base,
+            version,
+        )
+        .await;
     }
     let mut operation = if auto_config {
         let mut manifest = dataset.manifest.as_ref().clone();
@@ -587,8 +598,13 @@ async fn cleanup_thinning_anchors_to_hint(
         }
     }
     let dataset = fixture.open().await.unwrap();
-    assert!(!dataset.object_store.list_is_lexically_ordered);
-    write_version_hint(&dataset.object_store, &dataset.base, 7).await;
+    assert!(!dataset.table_state.object_store.list_is_lexically_ordered);
+    write_version_hint(
+        &dataset.table_state.object_store,
+        &dataset.table_state.base,
+        7,
+    )
+    .await;
     let dataset = if pinned_snapshot {
         Box::new(dataset.checkout_version(6).await.unwrap())
     } else {
@@ -718,9 +734,11 @@ async fn cleanup_thinning_fails_on_invalid_hint(
     let dataset = fixture.open().await.unwrap();
     if is_malformed {
         dataset
+            .table_state
             .object_store
             .put(
                 &dataset
+                    .table_state
                     .base
                     .clone()
                     .join("_versions")
@@ -730,17 +748,28 @@ async fn cleanup_thinning_fails_on_invalid_hint(
             .await
             .unwrap();
     } else {
-        write_version_hint(&dataset.object_store, &dataset.base, hinted_version).await;
+        write_version_hint(
+            &dataset.table_state.object_store,
+            &dataset.table_state.base,
+            hinted_version,
+        )
+        .await;
         let location = dataset
+            .table_state
             .commit_handler
             .resolve_version_location(
-                &dataset.base,
+                &dataset.table_state.base,
                 hinted_version,
-                dataset.object_store.inner.as_ref(),
+                dataset.table_state.object_store.inner.as_ref(),
             )
             .await
             .unwrap();
-        dataset.object_store.delete(&location.path).await.unwrap();
+        dataset
+            .table_state
+            .object_store
+            .delete(&location.path)
+            .await
+            .unwrap();
     }
     let before = fixture.count_files().await.unwrap();
     let operation = dataset
@@ -764,13 +793,28 @@ async fn cleanup_thinning_falls_back_when_historical_hint_target_was_expired() {
     fixture.create_some_data().await.unwrap();
     fixture.overwrite_some_data().await.unwrap();
     let dataset = fixture.open().await.unwrap();
-    write_version_hint(&dataset.object_store, &dataset.base, 1).await;
+    write_version_hint(
+        &dataset.table_state.object_store,
+        &dataset.table_state.base,
+        1,
+    )
+    .await;
     let location = dataset
+        .table_state
         .commit_handler
-        .resolve_version_location(&dataset.base, 1, dataset.object_store.inner.as_ref())
+        .resolve_version_location(
+            &dataset.table_state.base,
+            1,
+            dataset.table_state.object_store.inner.as_ref(),
+        )
         .await
         .unwrap();
-    dataset.object_store.delete(&location.path).await.unwrap();
+    dataset
+        .table_state
+        .object_store
+        .delete(&location.path)
+        .await
+        .unwrap();
     let before = fixture.count_files().await.unwrap();
     let operation = dataset
         .cleanup(CleanupPolicy::default())
@@ -792,9 +836,11 @@ async fn cleanup_thinning_without_hint_uses_snapshot() {
     fixture.overwrite_some_data().await.unwrap();
     let dataset = fixture.open().await.unwrap();
     dataset
+        .table_state
         .object_store
         .delete(
             &dataset
+                .table_state
                 .base
                 .clone()
                 .join("_versions")
@@ -803,7 +849,7 @@ async fn cleanup_thinning_without_hint_uses_snapshot() {
         .await
         .unwrap();
     assert_eq!(
-        read_version_hint(&dataset.object_store, &dataset.base)
+        read_version_hint(&dataset.table_state.object_store, &dataset.table_state.base)
             .await
             .unwrap(),
         None
@@ -837,7 +883,12 @@ async fn cleanup_expiration_uses_wall_clock(#[values(false, true)] thinning: boo
     MockClock::set_system_time(Duration::from_secs(3600));
     fixture.overwrite_some_data().await.unwrap();
     let dataset = fixture.open().await.unwrap();
-    write_version_hint(&dataset.object_store, &dataset.base, 1).await;
+    write_version_hint(
+        &dataset.table_state.object_store,
+        &dataset.table_state.base,
+        1,
+    )
+    .await;
     MockClock::set_system_time(Duration::from_secs(86_400));
     let mut manifest = dataset.manifest.as_ref().clone();
     manifest.config.extend([
@@ -907,11 +958,13 @@ async fn cleanup_thinning_honors_hints_with_updates_disabled() {
         }
     }
     let dataset = fixture.open().await.unwrap();
-    assert!(!uses_version_hint(&dataset.object_store));
+    assert!(!uses_version_hint(&dataset.table_state.object_store));
     dataset
+        .table_state
         .object_store
         .put(
             &dataset
+                .table_state
                 .base
                 .clone()
                 .join("_versions")
@@ -1044,15 +1097,16 @@ async fn cleanup_local_object_store_staging_files(
     }
     // object_store hides these files even when delete_unverified is requested.
     let listed = dataset
+        .table_state
         .object_store
-        .read_dir_all(&dataset.base, None)
+        .read_dir_all(&dataset.table_state.base, None)
         .try_collect::<Vec<_>>()
         .await
         .unwrap();
     assert!(temporary_paths.iter().all(|path| {
-        !listed
-            .iter()
-            .any(|meta| meta.location == Path::parse(format!("{}/{path}", dataset.base)).unwrap())
+        !listed.iter().any(|meta| {
+            meta.location == Path::parse(format!("{}/{path}", dataset.table_state.base)).unwrap()
+        })
     }));
 
     MockClock::set_system_time(TimeDelta::days(cleanup_day).to_std().unwrap());
@@ -1157,14 +1211,24 @@ async fn cleanup_temporary_data_files(
             .data_dir()
             .join(data_file_key)
             .join("10000000000000000000000000000000.blob"),
-        dataset.base.clone().join("database").join(".tmpAb3Xz9"),
+        dataset
+            .table_state
+            .base
+            .clone()
+            .join("database")
+            .join(".tmpAb3Xz9"),
     ];
 
     // The debris is newer than every retained manifest, as with an interrupted
     // append. Its eligibility must depend on its own age, not the manifest age.
     MockClock::set_system_time(TimeDelta::days(1).to_std().unwrap());
     for path in temporary_paths.iter().chain(&preserved_paths) {
-        dataset.object_store.put(path, b"debris").await.unwrap();
+        dataset
+            .table_state
+            .object_store
+            .put(path, b"debris")
+            .await
+            .unwrap();
     }
     MockClock::set_system_time(TimeDelta::days(cleanup_day).to_std().unwrap());
 
@@ -1199,13 +1263,16 @@ async fn cleanup_temporary_data_files(
     assert_eq!(removed.old_versions, 0);
     for path in &temporary_paths {
         assert_eq!(
-            dataset.object_store.exists(path).await.unwrap(),
+            dataset.table_state.object_store.exists(path).await.unwrap(),
             !should_remove,
             "{path}"
         );
     }
     for path in &preserved_paths {
-        assert!(dataset.object_store.exists(path).await.unwrap(), "{path}");
+        assert!(
+            dataset.table_state.object_store.exists(path).await.unwrap(),
+            "{path}"
+        );
     }
     assert_eq!(fixture.count_rows().await.unwrap(), expected_rows);
 }

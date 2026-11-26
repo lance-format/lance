@@ -423,7 +423,7 @@ pub(super) async fn open_combined_fields_scan(
         if !omitted_segments.is_empty() {
             let omitted_loaded: Vec<InvertedIndexParams> = stream::iter(omitted_segments)
                 .map(|segment| async move { load_segment_params(dataset, &segment).await })
-                .buffered(dataset.object_store.io_parallelism())
+                .buffered(dataset.table_state.object_store.io_parallelism())
                 .try_collect()
                 .await?;
             field_params.extend(omitted_loaded);

@@ -110,8 +110,8 @@ message List {
      * The reason we do this is so that reading a single list at index i only
      * requires us to load the indices at i and i-1.
      *
-     * If the offset at index i is greater than `null_offset_adjustment``
-     * then the list at index i is null.
+     * If the offset at index i is greater than or equal to
+     * `null_offset_adjustment`, then the list at index i is null.
      *
      * Otherwise the length of the list is `offsets[i] - base` where
      * base is defined the same as above.

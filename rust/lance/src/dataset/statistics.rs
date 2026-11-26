@@ -76,8 +76,8 @@ pub(super) async fn collect_current_data_stats(
     field_stats: &mut HashMap<u32, FieldStatistics>,
 ) -> Result<()> {
     let scan_scheduler = ScanScheduler::new(
-        dataset.object_store.clone(),
-        SchedulerConfig::max_bandwidth(dataset.object_store.as_ref()),
+        dataset.table_state.object_store.clone(),
+        SchedulerConfig::max_bandwidth(dataset.table_state.object_store.as_ref()),
     );
     let schema = dataset.schema().clone();
     let fragments = dataset.fragments().as_ref().clone();
@@ -88,7 +88,7 @@ pub(super) async fn collect_current_data_stats(
             let scan_scheduler = scan_scheduler.clone();
             async move { file_fragment.storage_stats(&schema, scan_scheduler).await }
         })
-        .buffer_unordered(dataset.object_store.io_parallelism())
+        .buffer_unordered(dataset.table_state.object_store.io_parallelism())
         .try_for_each(|fragment_stats| {
             for (field_id, bytes) in fragment_stats {
                 if let Some(stats) = field_stats.get_mut(&field_id) {
@@ -173,7 +173,12 @@ impl<'a> DatasetStatistics<'a> {
             };
             covered |= bitmap.clone();
         }
-        if !dataset.fragment_bitmap.as_ref().is_subset(&covered) {
+        if !dataset
+            .table_state
+            .fragment_bitmap
+            .as_ref()
+            .is_subset(&covered)
+        {
             return Ok(None);
         }
 
@@ -187,7 +192,7 @@ impl<'a> DatasetStatistics<'a> {
             for idx in &segments {
                 collect_overlay_stale_frags(idx, &overlaid, &mut stale, dataset.schema())?;
             }
-            if !stale.is_disjoint(dataset.fragment_bitmap.as_ref()) {
+            if !stale.is_disjoint(dataset.table_state.fragment_bitmap.as_ref()) {
                 return Ok(None);
             }
         }
