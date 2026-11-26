@@ -3023,6 +3023,15 @@ async fn test_append_legacy_blob_lists(
         original_fragments.as_slice()
     );
 
+    let native_file = &dataset.manifest.fragments.last().unwrap().files[0];
+    let file_schema = crate::utils::test::data_file_schema(&dataset, &native_file.path).await;
+    for target in &original_schema.fields {
+        let written = file_schema.field(&target.name).unwrap();
+        assert_eq!(written.logical_type, target.logical_type, "{}", target.name);
+        assert_eq!(written.id, target.id);
+        assert_eq!(written.children[0].id, target.children[0].id);
+    }
+
     let mut scanner = dataset.scan();
     scanner.blob_handling(BlobHandling::AllBinary);
     let result = scanner.try_into_batch().await.unwrap();
