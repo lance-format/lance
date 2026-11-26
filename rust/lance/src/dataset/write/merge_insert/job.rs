@@ -957,7 +957,11 @@ impl MergeInsertJob {
         provider: Arc<dyn TableProvider>,
         source_mode: SourceProviderMode,
     ) -> Result<(Arc<Dataset>, MergeStats)> {
-        let provider = source_in_table_representation(provider, self.dataset.schema())?;
+        let provider = source_in_table_representation(
+            provider,
+            self.dataset.schema(),
+            self.params.write_version(&self.dataset),
+        )?;
         let dataset = self.dataset.clone();
         let config = RetryConfig {
             max_retries: if source_mode.supports_retries() {
@@ -1502,7 +1506,11 @@ impl MergeInsertJob {
         provider: Arc<dyn TableProvider>,
         source_mode: SourceProviderMode,
     ) -> Result<UncommittedMergeInsert> {
-        let provider = source_in_table_representation(provider, self.dataset.schema())?;
+        let provider = source_in_table_representation(
+            provider,
+            self.dataset.schema(),
+            self.params.write_version(&self.dataset),
+        )?;
         // Validate list completeness before either plan can write fragment data.
         if self.params.insert_not_matched
             || matches!(
@@ -1943,9 +1951,16 @@ impl MergeInsertJob {
             Some(s) => s.clone(),
             None => arrow_schema::Schema::from(self.dataset.schema()),
         };
-        let schema = TableRepresentation::try_new(&schema, self.dataset.schema())
-            .map(|representation| representation.schema().as_ref().clone())
-            .unwrap_or(schema);
+        let schema = TableRepresentation::try_new(
+            &schema,
+            self.dataset.schema(),
+            self.dataset
+                .manifest
+                .data_storage_format
+                .lance_file_format(),
+        )
+        .map(|representation| representation.schema().as_ref().clone())
+        .unwrap_or(schema);
 
         // Check if we can use create_plan
         if !self.can_use_create_plan(&schema).await? {
@@ -2095,7 +2110,11 @@ impl MergeInsertJob {
         provider: Arc<dyn TableProvider>,
         source_mode: SourceProviderMode,
     ) -> Result<MergeInsertAnalysis> {
-        let provider = source_in_table_representation(provider, self.dataset.schema())?;
+        let provider = source_in_table_representation(
+            provider,
+            self.dataset.schema(),
+            self.params.write_version(&self.dataset),
+        )?;
         let operation_id = Uuid::new_v4();
         let scope = Arc::new(analysis::AnalysisScope::new(self.dataset.uri()));
         let mut job = self.clone();
@@ -2378,7 +2397,11 @@ impl MergeInsertJob {
     /// * Any error from building or executing the plan. This method runs the merge
     ///   to collect metrics, so I/O and source-deduplication failures surface here.
     pub async fn analyze_plan_provider(&self, provider: Arc<dyn TableProvider>) -> Result<String> {
-        let provider = source_in_table_representation(provider, self.dataset.schema())?;
+        let provider = source_in_table_representation(
+            provider,
+            self.dataset.schema(),
+            self.params.write_version(&self.dataset),
+        )?;
         // Check if we can use create_plan
         if !self.can_use_create_plan(provider.schema().as_ref()).await? {
             return Err(Error::not_supported_source("This merge insert configuration does not support plan reporting: either the source schema is not one the plan path accepts, or the join takes the scalar-index execution path.".into()));

@@ -326,7 +326,7 @@ impl<'a> FragmentCreateBuilder<'a> {
         };
         let (stream, schema) = match schema {
             Some(schema) => (
-                Self::convert_to_table_representation(source.into_stream(), &schema),
+                self.convert_to_table_representation(source.into_stream(), &schema),
                 schema,
             ),
             None => source.into_stream_and_schema().await?,
@@ -337,10 +337,15 @@ impl<'a> FragmentCreateBuilder<'a> {
     /// Convert string and binary columns to the representations of the
     /// table schema the fragment is written with, as dataset appends do.
     fn convert_to_table_representation(
+        &self,
         stream: SendableRecordBatchStream,
         schema: &Schema,
     ) -> SendableRecordBatchStream {
-        match TableRepresentation::try_new(stream.schema().as_ref(), schema) {
+        let version = self
+            .write_params
+            .map(|params| params.storage_version_or_default())
+            .unwrap_or_else(stable_file_version);
+        match TableRepresentation::try_new(stream.schema().as_ref(), schema, version) {
             Some(representation) => representation.convert_stream(stream),
             None => stream,
         }

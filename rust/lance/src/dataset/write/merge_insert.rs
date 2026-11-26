@@ -680,14 +680,17 @@ fn one_shot_provider(stream: SendableRecordBatchStream) -> Result<Arc<dyn TableP
 fn source_in_table_representation(
     provider: Arc<dyn TableProvider>,
     target: &lance_core::datatypes::Schema,
+    version: ConcreteFileVersion,
 ) -> Result<Arc<dyn TableProvider>> {
-    let Some(representation) = TableRepresentation::try_new(provider.schema().as_ref(), target)
+    let Some(representation) =
+        TableRepresentation::try_new(provider.schema().as_ref(), target, version)
     else {
         return Ok(provider);
     };
     Ok(Arc::new(TableRepresentationProvider {
         provider,
         target: Arc::new(target.clone()),
+        version,
         schema: representation.schema().clone(),
     }))
 }
@@ -699,6 +702,7 @@ fn source_in_table_representation(
 struct TableRepresentationProvider {
     provider: Arc<dyn TableProvider>,
     target: Arc<lance_core::datatypes::Schema>,
+    version: ConcreteFileVersion,
     schema: Arc<Schema>,
 }
 
@@ -722,7 +726,7 @@ impl TableProvider for TableRepresentationProvider {
         // Filters stay above this scan: they are written against the
         // converted types, which the source does not have.
         let input = self.provider.scan(state, projection, &[], limit).await?;
-        match TableRepresentation::try_new(input.schema().as_ref(), &self.target) {
+        match TableRepresentation::try_new(input.schema().as_ref(), &self.target, self.version) {
             Some(representation) => Ok(Arc::new(TableRepresentationExec::new(
                 input,
                 representation,

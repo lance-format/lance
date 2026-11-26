@@ -36,6 +36,7 @@ use arrow_schema::{DataType, Field as ArrowField, FieldRef, Schema as ArrowSchem
 use futures::StreamExt;
 use lance_arrow::schema::FieldExt;
 use lance_core::{Error, Result, datatypes::Schema};
+use lance_file::version::ConcreteFileVersion;
 use lance_io::stream::{RecordBatchStreamAdapter, SendableRecordBatchStream};
 
 /// Largest number of value bytes an array with 32-bit offsets can address.
@@ -78,7 +79,15 @@ fn same_extension(input: &ArrowField, table: &ArrowField) -> bool {
 
 /// The caller's field with the table's string or binary representation, or
 /// `None` when nothing in it needs converting.
-fn target_field(input: &ArrowField, table: &ArrowField) -> Option<ArrowField> {
+///
+/// Dictionary targets are skipped unless `convert_dictionaries`: a converted
+/// batch carries dictionary keys of its own, and Legacy V1 files store the
+/// table's dictionary instead, so its keys would decode to other values.
+fn target_field(
+    input: &ArrowField,
+    table: &ArrowField,
+    convert_dictionaries: bool,
+) -> Option<ArrowField> {
     if input.data_type() == table.data_type() || !same_extension(input, table) || table.is_blob() {
         return None;
     }
@@ -91,7 +100,9 @@ fn target_field(input: &ArrowField, table: &ArrowField) -> Option<ArrowField> {
                     let converted = table_children
                         .iter()
                         .find(|table_child| table_child.name() == input_child.name())
-                        .and_then(|table_child| target_field(input_child, table_child));
+                        .and_then(|table_child| {
+                            target_field(input_child, table_child, convert_dictionaries)
+                        });
                     changed |= converted.is_some();
                     converted
                         .map(Arc::new)
@@ -103,26 +114,32 @@ fn target_field(input: &ArrowField, table: &ArrowField) -> Option<ArrowField> {
             }
             DataType::Struct(children.into())
         }
-        (DataType::List(input_item), DataType::List(table_item)) => {
-            DataType::List(Arc::new(target_field(input_item, table_item)?))
-        }
-        (DataType::LargeList(input_item), DataType::LargeList(table_item)) => {
-            DataType::LargeList(Arc::new(target_field(input_item, table_item)?))
-        }
+        (DataType::List(input_item), DataType::List(table_item)) => DataType::List(Arc::new(
+            target_field(input_item, table_item, convert_dictionaries)?,
+        )),
+        (DataType::LargeList(input_item), DataType::LargeList(table_item)) => DataType::LargeList(
+            Arc::new(target_field(input_item, table_item, convert_dictionaries)?),
+        ),
         (
             DataType::FixedSizeList(input_item, input_size),
             DataType::FixedSizeList(table_item, table_size),
-        ) if input_size == table_size => {
-            DataType::FixedSizeList(Arc::new(target_field(input_item, table_item)?), *input_size)
-        }
+        ) if input_size == table_size => DataType::FixedSizeList(
+            Arc::new(target_field(input_item, table_item, convert_dictionaries)?),
+            *input_size,
+        ),
         (DataType::Map(input_entries, sorted), DataType::Map(table_entries, _)) => DataType::Map(
-            Arc::new(target_field(input_entries, table_entries)?),
+            Arc::new(target_field(
+                input_entries,
+                table_entries,
+                convert_dictionaries,
+            )?),
             *sorted,
         ),
         (input_type, table_type)
             if family(input_type).is_some()
                 && family(input_type) == family(table_type)
-                && !matches!(table_type, DataType::Utf8View | DataType::BinaryView) =>
+                && !matches!(table_type, DataType::Utf8View | DataType::BinaryView)
+                && (convert_dictionaries || !matches!(table_type, DataType::Dictionary(_, _))) =>
         {
             table_type.clone()
         }
@@ -144,18 +161,28 @@ impl TableRepresentation {
     ///
     /// Returns `None` when no column needs converting. Columns that the table
     /// does not have, or whose types differ in any other way, are left as they
-    /// are for the schema check to report.
-    pub fn try_new(input: &ArrowSchema, table: &Schema) -> Option<Self> {
+    /// are for the schema check to report. `version` is the file version the
+    /// write produces: Legacy V1 files keep the table's dictionaries, so no
+    /// column is converted into a dictionary for them.
+    pub fn try_new(
+        input: &ArrowSchema,
+        table: &Schema,
+        version: ConcreteFileVersion,
+    ) -> Option<Self> {
         let table = ArrowSchema::from(table);
+        let convert_dictionaries = version != ConcreteFileVersion::V1;
         let mut changed = false;
         let fields = input
             .fields()
             .iter()
             .map(|input_field| {
-                let converted = table
-                    .field_with_name(input_field.name())
-                    .ok()
-                    .and_then(|table_field| target_field(input_field, table_field));
+                let converted =
+                    table
+                        .field_with_name(input_field.name())
+                        .ok()
+                        .and_then(|table_field| {
+                            target_field(input_field, table_field, convert_dictionaries)
+                        });
                 changed |= converted.is_some();
                 converted
                     .map(Arc::new)
@@ -287,6 +314,17 @@ fn convert_values(array: &ArrayRef, target: &DataType, path: &str) -> Result<Arr
         // and narrow only the values.
         DataType::Dictionary(key_type, value_type) => {
             let wide_type = with_large_offsets(value_type);
+            // A dictionary's keys address its whole values array, referenced
+            // or not, so casting them to another key type can fail where the
+            // referenced values fit. Re-encode the referenced values instead.
+            let unpacked;
+            let array = match array.data_type() {
+                DataType::Dictionary(input_key_type, _) if input_key_type != key_type => {
+                    unpacked = cast(array.as_ref(), &wide_type)?;
+                    &unpacked
+                }
+                _ => array,
+            };
             let wide = cast(
                 array.as_ref(),
                 &DataType::Dictionary(key_type.clone(), Box::new(wide_type.clone())),

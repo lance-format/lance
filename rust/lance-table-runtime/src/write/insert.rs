@@ -395,9 +395,11 @@ impl<'a> InsertBuilder<'a> {
         else {
             return Ok((stream, schema));
         };
-        let Some(representation) =
-            TableRepresentation::try_new(stream.schema().as_ref(), table.schema())
-        else {
+        let Some(representation) = TableRepresentation::try_new(
+            stream.schema().as_ref(),
+            table.schema(),
+            context.storage_version,
+        ) else {
             return Ok((stream, schema));
         };
         let schema = Schema::try_from(representation.schema().as_ref())?;

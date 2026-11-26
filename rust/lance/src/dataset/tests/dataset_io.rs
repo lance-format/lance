@@ -6275,6 +6275,44 @@ async fn test_append_rejects_dictionary_key_overflow() {
     assert_eq!(dataset.latest_version_id().await.unwrap(), 1);
 }
 
+/// Narrowing dictionary keys re-encodes the values the rows reference, so a
+/// slice of a large dictionary fits a small key type when its values do.
+#[rstest::rstest]
+#[case::string(DataType::Utf8)]
+#[case::binary(DataType::Binary)]
+#[tokio::test]
+async fn test_append_reencodes_dictionary_for_narrower_keys(#[case] value_type: DataType) {
+    let table_type = dictionary_type(DataType::Int8, value_type.clone());
+    let dataset = table_with_representation(&table_type).await;
+    let strings: ArrayRef = Arc::new(StringArray::from_iter_values(
+        (0..256).map(|i| format!("value {i}")),
+    ));
+    let dictionary = arrow_array::DictionaryArray::<arrow_array::types::Int16Type>::try_new(
+        arrow_array::Int16Array::from(vec![Some(0), Some(200), None]),
+        arrow::compute::cast(&strings, &value_type).unwrap(),
+    )
+    .unwrap();
+    let values = Arc::new(dictionary.slice(1, 2)) as ArrayRef;
+    let dataset = append_representation(
+        dataset,
+        ArrowField::new("value", values.data_type().clone(), true),
+        values,
+    )
+    .await
+    .unwrap();
+
+    let result = dataset.scan().try_into_batch().await.unwrap();
+    assert_eq!(result["value"].data_type(), &table_type);
+    assert_eq!(
+        representation_values(result["value"].as_ref()).as_ref(),
+        representation_values(
+            representation_array(&table_type, &[Some("first"), None, Some("value 200"), None])
+                .as_ref()
+        )
+        .as_ref()
+    );
+}
+
 /// Values that need more bytes than 32-bit offsets address fail naming the
 /// field before anything is allocated for them.
 #[tokio::test]

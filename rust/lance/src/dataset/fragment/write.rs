@@ -94,7 +94,8 @@ mod tests {
 
     use arrow_array::cast::AsArray;
     use arrow_array::{
-        Int64Array, RecordBatch, RecordBatchIterator, RecordBatchReader, StringArray, record_batch,
+        ArrayRef, Int64Array, RecordBatch, RecordBatchIterator, RecordBatchReader, StringArray,
+        record_batch,
     };
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use lance_arrow::SchemaExt;
@@ -399,6 +400,109 @@ mod tests {
                 .collect::<Vec<_>>(),
             [Some("first"), Some("x"), None]
         );
+    }
+
+    /// Legacy V1 files keep the dictionary the table was created with, not the
+    /// one a batch carries, so plain or differently encoded strings for a
+    /// dictionary column stay rejected and the table keeps its rows.
+    #[rstest]
+    #[case::write_string(WritePath::Write, DataType::Utf8)]
+    #[case::write_fragments_string(WritePath::WriteFragments, DataType::Utf8)]
+    #[case::append_string(WritePath::Append, DataType::Utf8)]
+    #[case::write_dictionary(WritePath::Write, dictionary(DataType::Int16, DataType::LargeUtf8))]
+    #[case::write_fragments_dictionary(
+        WritePath::WriteFragments,
+        dictionary(DataType::Int16, DataType::LargeUtf8)
+    )]
+    #[case::append_dictionary(WritePath::Append, dictionary(DataType::Int16, DataType::LargeUtf8))]
+    #[tokio::test]
+    async fn test_v1_write_rejects_string_conversion_into_dictionary(
+        #[case] path: WritePath,
+        #[case] input_type: DataType,
+    ) {
+        let tmp_dir = TempStrDir::default();
+        let table_type = dictionary(DataType::Int32, DataType::Utf8);
+        let table_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int64, false),
+            ArrowField::new("value", table_type.clone(), true),
+        ]));
+        let strings: ArrayRef = Arc::new(StringArray::from(vec!["a", "b"]));
+        let table = RecordBatch::try_new(
+            table_schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![0, 1])),
+                arrow_cast::cast(&strings, &table_type).unwrap(),
+            ],
+        )
+        .unwrap();
+        let params = WriteParams {
+            data_storage_version: Some(LanceFileVersion::Legacy),
+            ..Default::default()
+        };
+        let dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(table.clone())], table_schema.clone()),
+            &tmp_dir,
+            Some(params),
+        )
+        .await
+        .unwrap();
+
+        // In a batch of its own, "b" is the first value: key 0 of the
+        // table's dictionary is "a".
+        let input_schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int64, false),
+            ArrowField::new("value", input_type.clone(), true),
+        ]));
+        let input_strings: ArrayRef = Arc::new(StringArray::from(vec!["b"]));
+        let input = RecordBatch::try_new(
+            input_schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![2])),
+                arrow_cast::cast(&input_strings, &input_type).unwrap(),
+            ],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new([Ok(input)], input_schema);
+        let append = WriteParams {
+            mode: WriteMode::Append,
+            data_storage_version: Some(LanceFileVersion::Legacy),
+            ..Default::default()
+        };
+        let error = match path {
+            WritePath::Write => FragmentCreateBuilder::new(&tmp_dir)
+                .write_params(&append)
+                .write(reader, None)
+                .await
+                .map(|_| ())
+                .unwrap_err(),
+            WritePath::WriteFragments => FragmentCreateBuilder::new(&tmp_dir)
+                .write_params(&append)
+                .write_fragments(reader)
+                .await
+                .map(|_| ())
+                .unwrap_err(),
+            WritePath::Append => Dataset::write(reader, &tmp_dir, Some(append))
+                .await
+                .map(|_| ())
+                .unwrap_err(),
+        };
+        assert!(matches!(error, Error::SchemaMismatch { .. }), "{error:?}");
+
+        let reopened = Dataset::open(&tmp_dir).await.unwrap();
+        assert_eq!(reopened.version().version, dataset.version().version);
+        let result = reopened.scan().try_into_batch().await.unwrap();
+        assert_eq!(result, table);
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum WritePath {
+        Write,
+        WriteFragments,
+        Append,
+    }
+
+    fn dictionary(key_type: DataType, value_type: DataType) -> DataType {
+        DataType::Dictionary(Box::new(key_type), Box::new(value_type))
     }
 
     #[tokio::test]
