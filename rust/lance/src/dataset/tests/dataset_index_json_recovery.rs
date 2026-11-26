@@ -3,14 +3,18 @@
 
 //! JSON target-type recovery, query-domain and scan-fallback tests.
 
+use super::super::dataset_overlay_index_masking::commit_overlay;
 use super::json_filter_ids;
 use super::*;
 use crate::dataset::optimize::{CompactionOptions, compact_files};
 use crate::index::frag_reuse_reader::tests::persist_fixture;
 use crate::index::{CreateIndexBuilder, IndexScanStatisticsOptions};
+use lance_arrow::json::JsonArray;
 use lance_index::pb::JsonIndexDetails;
 use lance_index::pb::JsonTargetDataType;
+use lance_index::scalar::json::JSON_ROW_ID_DOMAIN_VERSION;
 use lance_table::format::IndexMetadata;
+use lance_table::format::overlay::OverlayCoverage;
 use prost::Message;
 
 /// [`json_batch`] plus an `id` column that identifies a row across
@@ -386,6 +390,85 @@ async fn json_index_segment_per_fragment(
         });
     }
     segments
+}
+
+#[rstest]
+#[case::uncovered_overlay(false, 0)]
+#[case::covered_overlay(true, 1)]
+#[tokio::test]
+async fn test_index_scan_statistics_legacy_json_overlay_scope(
+    #[case] overlay_covered_fragment: bool,
+    #[case] stale_slots: u64,
+) {
+    let batch = json_id_batch(vec![r#"{"p":1}"#, r#"{"p":2}"#]);
+    let schema = batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch)], schema),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 1,
+            enable_stable_row_ids: true,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let name = "json_overlay";
+    let params = ScalarIndexParams::new("json".into()).with_params(&serde_json::json!({
+        "target_index_type": "zonemap",
+        "target_data_type": "Int64",
+        "path": "p",
+    }));
+    let mut segment = dataset
+        .create_index_builder(&["json"], IndexType::Scalar, &params)
+        .name(name.into())
+        .fragments(vec![0])
+        .execute_uncommitted()
+        .await
+        .unwrap();
+    assert_eq!(segment.fragment_bitmap, Some([0].into_iter().collect()));
+    let keyed_fields = segment.fields.clone();
+    let overlay_json = Arc::new(
+        JsonArray::try_from_iter([Some(r#"{"p":3}"#)])
+            .unwrap()
+            .into_inner(),
+    );
+    for fragment_id in if overlay_covered_fragment {
+        &[1, 0][..]
+    } else {
+        &[1][..]
+    } {
+        dataset = commit_overlay(
+            dataset,
+            &format!("json-{fragment_id}"),
+            *fragment_id,
+            &keyed_fields,
+            OverlayCoverage::Shared(Arc::new([0].into_iter().collect())),
+            vec![overlay_json.clone()],
+        )
+        .await;
+    }
+    segment.index_version = JSON_ROW_ID_DOMAIN_VERSION as i32;
+    segment.fragment_bitmap = Some([0, 1].into_iter().collect());
+    assert!(segment.legacy_json_coverage_requires_verification());
+    persist_fixture(&mut dataset, vec![segment]).await;
+
+    let stats = dataset
+        .index_scan_statistics(
+            name,
+            IndexScanStatisticsOptions::default().with_segment_stats(true),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        stats.segments[0].covered_fragment_ids,
+        Some([0].into_iter().collect())
+    );
+    let coverage = stats.coverage.unwrap();
+    assert_eq!(coverage.covered_fragment_live_rows, Some(1));
+    assert_eq!(coverage.uncovered_fragment_ids, [1].into_iter().collect());
+    assert_eq!(coverage.uncovered_fragment_live_rows, Some(1));
+    assert_eq!(coverage.overlay_stale_row_slots, stale_slots);
 }
 
 async fn assert_json_scan_coverage(

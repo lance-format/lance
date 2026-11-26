@@ -521,9 +521,12 @@ class LanceDataset(pa.dataset.Dataset):
 
         The default reads only the pinned manifest. Unknown measurements are
         returned as ``None``. Set ``include_segment_stats=True`` to resolve
-        fragment-reuse coverage, verify legacy JSON coverage when required,
-        and inspect IVF models. This may read index files and returns one entry
-        count per partition of each eligible vector segment.
+        fragment-reuse coverage, verify legacy JSON and overlapping legacy
+        vector coverage, and inspect IVF models. This may read index files,
+        including partitions when verifying legacy vector coverage. Detailed
+        statistics return one entry count per partition of each eligible
+        vector segment. Each data byte total counts a file once by storage
+        base and path.
         JSON details report ``target_index_type`` and include
         ``target_index_version`` when the wrapper recorded a version.
 

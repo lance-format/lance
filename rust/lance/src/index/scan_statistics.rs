@@ -17,7 +17,7 @@ use lance_index::scalar::{
     ngram::POSTINGS_FILENAME,
     zonemap::ZONEMAP_INDEX_FILENAME,
 };
-use lance_index::{INDEX_FILE_NAME, metrics::NoOpMetricsCollector};
+use lance_index::{INDEX_FILE_NAME, Index, IndexType, metrics::NoOpMetricsCollector};
 use lance_linalg::distance::DistanceType;
 use lance_table::format::overlay::staleness::{
     collect_overlay_stale_rows_for_segment, overlaid_fragments,
@@ -31,6 +31,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use super::append::is_definition_only_segment;
+use super::field_dependencies::described_field_ids;
 use super::loading::DatasetIndexInternalExt;
 use super::loading::recover_scalar_query_domain;
 use super::scalar::{IndexDetails, SCALAR_INDEX_PLUGIN_REGISTRY};
@@ -41,6 +42,7 @@ use super::statistics::empty_fragment_bitmap_has_unknown_coverage;
 use super::vector::details::{
     decode_vector_details, decoded_vector_index_type, recorded_vector_metric, vector_details_value,
 };
+use super::vector::ivf::IVFIndex;
 use super::vector::utils::infer_vector_element_type;
 use crate::{Dataset, Error, Result};
 
@@ -53,8 +55,8 @@ pub struct IndexScanStatisticsOptions {
 }
 
 impl IndexScanStatisticsOptions {
-    /// Allow fragment-reuse resolution, legacy JSON coverage verification,
-    /// and IVF model inspection.
+    /// Allow fragment-reuse resolution, legacy JSON and vector coverage
+    /// verification, and IVF model inspection.
     ///
     /// This may read index files and open a handle per eligible segment.
     /// The layout occupies space proportional to the sum of their partition counts.
@@ -78,7 +80,7 @@ pub struct IndexScanStatistics {
     pub live_rows: Option<u64>,
     /// Deleted slots in current fragments, if their counts are known.
     pub deleted_rows: Option<u64>,
-    /// Recorded whole-file bytes for current base and overlay data, if complete.
+    /// Recorded bytes for unique base and overlay data files in current fragments, if complete.
     pub total_data_bytes: Option<u64>,
     /// Logical index name.
     pub index_name: String,
@@ -116,7 +118,7 @@ pub struct IndexScanCoverage {
     pub covered_fragment_live_rows: Option<u64>,
     /// Live rows in uncovered fragments, if their counts are known.
     pub uncovered_fragment_live_rows: Option<u64>,
-    /// Recorded whole-file base and overlay data bytes in uncovered fragments, if complete.
+    /// Recorded bytes for unique base and overlay data files in uncovered fragments, if complete.
     pub uncovered_data_bytes: Option<u64>,
     /// Fraction of live rows in covered fragments, if known. Zero for a known empty dataset.
     pub covered_live_row_ratio: Option<f64>,
@@ -176,10 +178,13 @@ impl Dataset {
     /// Inspect all registered segments of a named data index at this snapshot.
     ///
     /// By default, only the pinned manifest may be read. Missing facts remain
-    /// absent. This includes current coverage on fragment-reuse snapshots
-    /// and legacy JSON coverage that requires verification against index files.
+    /// absent. This includes current coverage on fragment-reuse snapshots,
+    /// some legacy JSON indices, and legacy vector segments with overlapping
+    /// declared coverage.
     /// [IndexScanStatisticsOptions::with_segment_stats] permits additional
-    /// query-visible metadata and index reads. Both modes are read-only.
+    /// query-visible metadata and index reads, including partition reads to
+    /// verify legacy vector coverage. Both modes are read-only. Each data
+    /// byte total counts a file once by storage base and path.
     /// JSON details include `target_index_type` and, when recorded,
     /// `target_index_version` for each resolved wrapper.
     ///
@@ -278,17 +283,13 @@ impl Dataset {
                 &query_segments
             },
         );
-        let mut stats = collect_manifest_statistics(
-            self,
-            first,
-            &segments,
-            reuse_coverage,
-            options.include_segment_stats,
-            &context,
-        )
-        .await?;
-        if options.include_segment_stats {
-            let mut layouts = inspect_ivf(
+        let mut legacy_vector_coverage = if !has_reuse && !self.manifest().uses_stable_row_ids() {
+            overlapping_legacy_vector_segments(self, &segments)
+        } else {
+            HashMap::new()
+        };
+        let mut layouts = if options.include_segment_stats {
+            inspect_ivf(
                 self,
                 index_name,
                 segments.iter().filter_map(|stored| {
@@ -303,14 +304,73 @@ impl Dataset {
                         .get(&stored.uuid)
                         .map(|query| (*stored, *query))
                 }),
+                &mut legacy_vector_coverage,
             )
-            .await?;
-            for segment in &mut stats.segments {
-                segment.ivf = layouts.remove(&segment.uuid);
-            }
+            .await?
+        } else {
+            HashMap::new()
+        };
+        let mut stats = collect_manifest_statistics(
+            self,
+            first,
+            &segments,
+            reuse_coverage,
+            &legacy_vector_coverage,
+            options.include_segment_stats,
+            &context,
+        )
+        .await?;
+        for segment in &mut stats.segments {
+            segment.ivf = layouts.remove(&segment.uuid);
         }
         Ok(stats)
     }
+}
+
+fn overlapping_legacy_vector_segments(
+    dataset: &Dataset,
+    segments: &[&IndexMetadata],
+) -> HashMap<Uuid, Option<RoaringBitmap>> {
+    // Pre-details manifests can omit both the type marker and the file list.
+    // A vector-typed key is only a hint. Detailed inspection checks the files
+    // and verifies membership using the legacy IVF-PQ reader.
+    let may_be_vector = |segment: &IndexMetadata| {
+        segment_has_vector_details(segment)
+            || (segment.index_details.is_none()
+                && segment.files.is_none()
+                && indexes_vector_column(dataset, segment))
+    };
+    if segments.len() < 2
+        || !segments
+            .iter()
+            .any(|segment| segment.index_version == 0 && may_be_vector(segment))
+    {
+        return HashMap::new();
+    }
+    let declared = || {
+        segments
+            .iter()
+            .filter(|segment| may_be_vector(segment))
+            .filter_map(|segment| {
+                segment
+                    .fragment_bitmap
+                    .as_ref()
+                    .map(|bitmap| (segment, bitmap))
+            })
+    };
+    // Historical delta writers could copy the preceding segment's bitmap.
+    // Only overlaps that could still affect this snapshot need verification.
+    let mut seen = RoaringBitmap::new();
+    let mut overlapping = RoaringBitmap::new();
+    for (_, bitmap) in declared() {
+        overlapping |= &seen & bitmap;
+        seen |= bitmap;
+    }
+    overlapping &= dataset.fragment_bitmap().as_ref();
+    declared()
+        .filter(|(segment, bitmap)| segment.index_version == 0 && !bitmap.is_disjoint(&overlapping))
+        .map(|(segment, _)| (segment.uuid, None))
+        .collect()
 }
 
 async fn collect_manifest_statistics(
@@ -318,6 +378,7 @@ async fn collect_manifest_statistics(
     first: &IndexMetadata,
     segments: &[&IndexMetadata],
     reuse_coverage: Option<&HashMap<Uuid, &IndexMetadata>>,
+    legacy_vector_coverage: &HashMap<Uuid, Option<RoaringBitmap>>,
     include_segment_stats: bool,
     context: &str,
 ) -> Result<IndexScanStatistics> {
@@ -376,7 +437,14 @@ async fn collect_manifest_statistics(
                 }
             }
         }
-        let bitmap = if needs_type_recovery && json_domain.is_none() {
+        let bitmap = if let Some(verified) = legacy_vector_coverage.get(&stored.uuid) {
+            registered
+                .zip(verified.as_ref())
+                .map(|(mut bitmap, verified)| {
+                    bitmap &= verified;
+                    bitmap
+                })
+        } else if needs_type_recovery && json_domain.is_none() {
             None
         } else if dataset.manifest().uses_stable_row_ids()
             && stored.legacy_json_coverage_requires_verification()
@@ -394,6 +462,16 @@ async fn collect_manifest_statistics(
         let counts = if let (Some(metadata), Some(bitmap)) = (coverage_metadata, &bitmap) {
             covered |= bitmap;
             if !overlaid.is_empty() && !bitmap.is_empty() {
+                let scoped_metadata;
+                let metadata = if metadata.fragment_bitmap.as_ref() == Some(bitmap) {
+                    metadata
+                } else {
+                    scoped_metadata = IndexMetadata {
+                        fragment_bitmap: Some(bitmap.clone()),
+                        ..metadata.clone()
+                    };
+                    &scoped_metadata
+                };
                 collect_overlay_stale_rows_for_segment(
                     metadata,
                     &overlaid,
@@ -494,7 +572,7 @@ async fn collect_manifest_statistics(
         deleted_rows: totals.deleted,
         total_data_bytes: fragments.sum_bytes(current, context)?,
         index_name: index_name.to_string(),
-        keyed_field_ids: first.keyed_fields().to_vec(),
+        keyed_field_ids: described_field_ids(first).into_owned(),
         covering_field_ids: first.covering_fields.clone(),
         type_url,
         index_type: common_value(
@@ -718,6 +796,7 @@ async fn inspect_ivf<'a>(
     dataset: &Dataset,
     name: &str,
     metadata: impl Iterator<Item = (&'a IndexMetadata, &'a IndexMetadata)>,
+    legacy_vector_coverage: &mut HashMap<Uuid, Option<RoaringBitmap>>,
 ) -> Result<HashMap<Uuid, IndexScanIvfStatistics>> {
     let mut layouts = HashMap::with_capacity(metadata.size_hint().0);
     for (stored, query) in metadata {
@@ -747,6 +826,18 @@ async fn inspect_ivf<'a>(
             .open_vector_index_from_metadata(&column, query, &NoOpMetricsCollector)
             .await
             .map_err(open_error)?;
+        if let Some(coverage) = legacy_vector_coverage.get_mut(&stored.uuid)
+            && let Some(index) = handle.as_any().downcast_ref::<IVFIndex>()
+            && index.index_type() == IndexType::IvfPq
+        {
+            match index.calculate_included_frags().await {
+                Ok(included) => *coverage = Some(included),
+                Err(error) => log::warn!(
+                    "Could not verify coverage for index '{name}', segment {}: {error}",
+                    stored.uuid
+                ),
+            }
+        }
         let Some(partition_entry_counts) =
             handle.ivf_partition_entry_counts().map_err(open_error)?
         else {
@@ -782,11 +873,7 @@ async fn legacy_segment_is_vector(dataset: &Dataset, segment: &IndexMetadata) ->
     {
         return Ok(true);
     }
-    let is_vector_column = segment
-        .keyed_field()
-        .and_then(|field_id| dataset.schema().field_by_id(field_id))
-        .is_some_and(|field| infer_vector_element_type(&field.data_type()).is_ok());
-    if !is_vector_column {
+    if !indexes_vector_column(dataset, segment) {
         return Ok(false);
     }
     // An unavailable vector file is ambiguous. Only a positive scalar marker
@@ -807,23 +894,30 @@ async fn legacy_segment_is_vector(dataset: &Dataset, segment: &IndexMetadata) ->
         .await?)
 }
 
+fn indexes_vector_column(dataset: &Dataset, segment: &IndexMetadata) -> bool {
+    segment
+        .keyed_field()
+        .and_then(|field_id| dataset.schema().field_by_id(field_id))
+        .is_some_and(|field| infer_vector_element_type(&field.data_type()).is_ok())
+}
+
 #[derive(Clone, Copy)]
 struct Rows {
     live: Option<u64>,
     deleted: Option<u64>,
 }
 
-struct FragmentFact {
+struct FragmentFact<'a> {
     rows: Rows,
-    data_bytes: Option<u64>,
+    fragment: &'a Fragment,
 }
 
-struct FragmentFacts {
-    by_id: HashMap<u32, FragmentFact>,
+struct FragmentFacts<'a> {
+    by_id: HashMap<u32, FragmentFact<'a>>,
 }
 
-impl FragmentFacts {
-    fn new(dataset: &Dataset) -> Result<Self> {
+impl<'a> FragmentFacts<'a> {
+    fn new(dataset: &'a Dataset) -> Result<Self> {
         let manifest = dataset.manifest();
         let trust_rows = manifest.writer_version.is_some();
         let mut by_id = HashMap::with_capacity(manifest.fragments.len());
@@ -852,13 +946,11 @@ impl FragmentFacts {
                     })
                 })
                 .transpose()?;
-            let data_bytes =
-                fragment_bytes(fragment, format_args!("snapshot {version}, fragment {id}"))?;
             by_id.insert(
                 fragment_id,
                 FragmentFact {
                     rows: Rows { live, deleted },
-                    data_bytes,
+                    fragment,
                 },
             );
         }
@@ -885,37 +977,27 @@ impl FragmentFacts {
     }
 
     fn sum_bytes(&self, ids: &RoaringBitmap, context: &str) -> Result<Option<u64>> {
-        checked_sum(
-            ids.iter().map(|id| self.by_id[&id].data_bytes),
-            context,
-            "data bytes",
-        )
-    }
-}
-
-fn fragment_bytes(fragment: &Fragment, context: impl Display) -> Result<Option<u64>> {
-    if fragment.overlays.is_empty() && fragment.files.len() <= 1 {
-        return Ok(fragment
-            .files
-            .first()
-            .map_or(Some(0), |file| file.file_size_bytes.get().map(u64::from)));
-    }
-    let mut files = HashMap::new();
-    for file in fragment.referenced_lance_files() {
-        let size = file.file_size_bytes.get().map(u64::from);
-        let existing = files
-            .entry((file.base_id, file.path.as_str()))
-            .or_insert(size);
-        if existing.is_none() {
-            *existing = size;
-        } else if size.is_some() && *existing != size {
-            return Err(Error::index(format!(
-                "{context}: inconsistent recorded sizes for {}",
-                file.path
-            )));
+        let mut files = HashMap::new();
+        for file in ids
+            .iter()
+            .flat_map(|id| self.by_id[&id].fragment.referenced_lance_files())
+        {
+            let size = file.file_size_bytes.get().map(u64::from);
+            let existing = files
+                .entry((file.base_id, file.path.as_str()))
+                .or_insert(size);
+            if let (Some(previous), Some(size)) = (*existing, size)
+                && previous != size
+            {
+                return Err(Error::index(format!(
+                    "{context}: inconsistent recorded sizes ({previous} and {size}) for file '{}' at base {:?}",
+                    file.path, file.base_id
+                )));
+            }
+            *existing = existing.or(size);
         }
+        checked_sum(files.into_values(), context, "data bytes")
     }
-    checked_sum(files.into_values(), context, "data bytes")
 }
 
 fn checked_sum(

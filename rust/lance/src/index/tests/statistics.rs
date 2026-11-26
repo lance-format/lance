@@ -10,12 +10,12 @@ use crate::index::vector::details::vector_index_details;
 use lance_core::utils::testing::{ProxyObjectStore, ProxyObjectStorePolicy};
 use lance_index::pb::{JsonIndexDetails, JsonTargetDataType, VectorIndexDetails, VectorMetricType};
 use lance_index::scalar::minhash_lsh::MinHashQuery;
-use lance_table::format::IndexFile;
 use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
 use lance_table::format::pb::fragment_reuse_index_details::InlineContent;
+use lance_table::format::{Fragment, IndexFile};
 use prost::Message;
 use serde_json::json;
-use std::sync::Mutex;
+use std::{num::NonZeroU64, sync::Mutex};
 
 #[tokio::test]
 async fn test_bitmap_index_statistics_minimal_io_via_dataset() {
@@ -2063,6 +2063,94 @@ async fn test_index_scan_statistics_fragment_union_and_overlay_slots() {
     assert_eq!(coverage.covered_live_row_ratio, None);
 }
 
+#[rstest]
+#[case::all_sizes_recorded(Some(101), false)]
+#[case::duplicate_size_missing(None, false)]
+#[case::conflicting_sizes(Some(303), false)]
+#[case::covered_size_missing(Some(101), true)]
+#[tokio::test]
+async fn test_index_scan_statistics_counts_unique_data_files(
+    #[case] duplicate_size: Option<u64>,
+    #[case] covered_size_missing: bool,
+) {
+    let batch = arrow_array::record_batch!(("id", Int32, [0, 1, 2, 3, 4, 5])).unwrap();
+    let schema = batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch)], schema),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 2,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let params = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree);
+    let name = "unique_data_files";
+    let segment = dataset
+        .create_index_builder(&["id"], IndexType::Scalar, &params)
+        .name(name.into())
+        .fragments(vec![0])
+        .execute_uncommitted()
+        .await
+        .unwrap();
+    let manifest = Arc::make_mut(&mut dataset.manifest);
+    let fragments = Arc::make_mut(&mut manifest.fragments);
+    let base_bytes =
+        |fragment: &Fragment| u64::from(fragment.files[0].file_size_bytes.get().unwrap());
+    let covered_bytes = base_bytes(&fragments[0]);
+    let uncovered_bytes = base_bytes(&fragments[1]) + base_bytes(&fragments[2]);
+    let make_overlay = |fragment: &Fragment, base_id, size: Option<u64>| {
+        let mut file = fragment.files[0].clone();
+        file.path = "shared-overlay.lance".to_string();
+        file.base_id = base_id;
+        file.file_size_bytes = size.and_then(NonZeroU64::new).into();
+        DataOverlayFile {
+            data_file: file,
+            coverage: OverlayCoverage::Shared(Arc::new([0].into_iter().collect())),
+            committed_version: manifest.version,
+        }
+    };
+    for (fragment, size) in fragments
+        .iter_mut()
+        .zip([Some(101), duplicate_size, Some(101)])
+    {
+        let overlay = make_overlay(fragment, None, size);
+        fragment.overlays.push(overlay);
+    }
+    let other_base = make_overlay(&fragments[2], Some(42), Some(202));
+    fragments[2].overlays.push(other_base);
+    if covered_size_missing {
+        fragments[0].files[0].file_size_bytes = None.into();
+    }
+    persist_fixture(&mut dataset, vec![segment]).await;
+    let stats = dataset
+        .index_scan_statistics(name, IndexScanStatisticsOptions::default())
+        .await;
+    if duplicate_size == Some(303) {
+        let error = stats.unwrap_err();
+        assert!(matches!(error, Error::Index { .. }), "{error}");
+        let message = error.to_string();
+        assert!(message.contains("inconsistent recorded sizes"), "{message}");
+        assert!(message.contains("shared-overlay.lance"), "{message}");
+        return;
+    }
+    let stats = stats.unwrap();
+    assert_eq!(
+        stats.total_data_bytes,
+        (!covered_size_missing).then_some(covered_bytes + uncovered_bytes + 101 + 202)
+    );
+    let coverage = stats.coverage.unwrap();
+    assert_eq!(
+        coverage.uncovered_fragment_ids,
+        [1, 2].into_iter().collect()
+    );
+    assert_eq!(
+        coverage.uncovered_data_bytes,
+        Some(uncovered_bytes + 101 + 202)
+    );
+}
+
 #[derive(Debug)]
 struct ScanStatisticsStore(Arc<Mutex<ProxyObjectStorePolicy>>);
 
@@ -2115,38 +2203,96 @@ fn assert_only_manifest_requests(dataset: &Dataset, requests: &ScanRequests) {
     }
 }
 
+#[rstest]
+#[case::v0_21_0_vector_marker(false)]
+#[case::v0_18_2_pre_details_manifest(true)]
 #[tokio::test]
-async fn test_index_scan_statistics_reads_only_pinned_manifest() {
+async fn test_index_scan_statistics_reads_only_pinned_manifest(#[case] pre_details: bool) {
     let temp = copy_test_data_to_tmp("v0.21.0/bad_index_fragment_bitmap").unwrap();
-    let dataset = DatasetBuilder::from_uri(temp.path_str())
+    let mut dataset = DatasetBuilder::from_uri(temp.path_str())
         .with_session(Arc::new(Session::default()))
         .load()
         .await
         .unwrap();
-    let index = raw_manifest_indices(&dataset)
-        .await
-        .into_iter()
-        .find(|index| !lance_index::is_system_index(index))
-        .unwrap();
+    assert_eq!(dataset.manifest.version, 4);
+    if pre_details {
+        // Reproduce the 0.18.2 manifest with the fixture's unchanged IVF-PQ files.
+        let mut segments = raw_manifest_indices(&dataset).await;
+        for segment in &mut segments {
+            assert_eq!(segment.index_version, 0);
+            segment.index_details = None;
+            segment.files = None;
+        }
+        persist_fixture(&mut dataset, segments).await;
+    }
+    let original = raw_manifest_indices(&dataset).await;
+    if pre_details {
+        assert!(
+            original
+                .iter()
+                .all(|segment| { segment.index_details.is_none() && segment.files.is_none() })
+        );
+    }
+    let name = &original[0].name;
+    let full = uuid::uuid!("dc833a6e-a710-48aa-af24-9ab80f30700c");
+    let delta = uuid::uuid!("ca9b1111-abfc-4fde-b4cc-8e667b84e65d");
+    let declared = |indices: &[IndexMetadata], uuid| {
+        indices
+            .iter()
+            .find(|index| index.uuid == uuid)
+            .unwrap()
+            .fragment_bitmap
+            .clone()
+            .unwrap()
+    };
+    assert_eq!(declared(&original, full), [0].into_iter().collect());
+    assert_eq!(declared(&original, delta), [0, 1].into_iter().collect());
     let version = dataset.manifest.version;
     let (tracked, requests) = observe_scan_requests(&dataset);
     dataset.index_cache.clear().await;
-    for is_warm in [false, true] {
-        if is_warm {
-            dataset.load_indices().await.unwrap();
-        }
+    for detailed in [false, true, false] {
         requests.lock().unwrap().clear();
         let stats = tracked
-            .index_scan_statistics(&index.name, IndexScanStatisticsOptions::default())
+            .index_scan_statistics(
+                name,
+                IndexScanStatisticsOptions::default().with_segment_stats(detailed),
+            )
             .await
             .unwrap();
         assert_eq!(stats.dataset_version, version);
         assert_eq!(stats.metric_type, None);
-        assert_only_manifest_requests(&tracked, &requests);
+        assert_eq!(stats.live_rows, Some(288));
+        assert_eq!(stats.segments.len(), 2);
+        for (uuid, fragment, rows) in [(full, 0, 256), (delta, 1, 32)] {
+            let segment = stats.segments.iter().find(|s| s.uuid == uuid).unwrap();
+            if detailed {
+                assert_eq!(
+                    segment.covered_fragment_ids,
+                    Some([fragment].into_iter().collect())
+                );
+                assert_eq!(segment.covered_fragment_live_rows, Some(rows));
+                assert_eq!(segment.ivf.as_ref().unwrap().partition_entry_counts, [rows]);
+            } else {
+                assert_eq!(segment.covered_fragment_ids, None);
+                assert_eq!(segment.covered_fragment_live_rows, None);
+                assert_eq!(segment.covered_fragment_deleted_rows, None);
+                assert!(segment.ivf.is_none());
+            }
+        }
+        if detailed {
+            let coverage = stats.coverage.unwrap();
+            assert_eq!(coverage.covered_fragment_live_rows, Some(288));
+            assert_eq!(coverage.uncovered_fragment_live_rows, Some(0));
+            assert!(coverage.uncovered_fragment_ids.is_empty());
+        } else {
+            assert!(stats.coverage.is_none());
+            assert_only_manifest_requests(&tracked, &requests);
+        }
     }
 
     let latest = Dataset::open(&temp.path_str()).await.unwrap();
     assert_eq!(latest.manifest.version, version);
+    assert_eq!(raw_manifest_indices(&latest).await, original);
 }
 
 #[tokio::test]

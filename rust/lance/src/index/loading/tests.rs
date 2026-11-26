@@ -354,6 +354,17 @@ async fn test_list_element_dependency_fields_preserve_single_input() {
     assert_eq!(described.len(), 1);
     assert_eq!(described[0].field_ids(), [fields[0] as u32]);
     let metadata = dataset.load_indices_by_name("objects_idx").await.unwrap();
+    assert_eq!(metadata[0].fields, fields);
+    for detailed in [false, true] {
+        let stats = dataset
+            .index_scan_statistics(
+                "objects_idx",
+                IndexScanStatisticsOptions::default().with_segment_stats(detailed),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stats.keyed_field_ids, [fields[0]]);
+    }
     let recovered = crate::index::scalar::load_scalar_segment_params(&dataset, &metadata[0])
         .await
         .unwrap();
