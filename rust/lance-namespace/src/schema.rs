@@ -787,13 +787,14 @@ mod tests {
     #[test]
     fn test_time_unit_roundtrip() {
         // Time32 takes seconds or milliseconds, Time64 microseconds or nanoseconds.
-        for data_type in [
-            DataType::Time32(TimeUnit::Second),
-            DataType::Time32(TimeUnit::Millisecond),
-            DataType::Time64(TimeUnit::Microsecond),
-            DataType::Time64(TimeUnit::Nanosecond),
+        for (data_type, wire_name) in [
+            (DataType::Time32(TimeUnit::Second), "time32:s"),
+            (DataType::Time32(TimeUnit::Millisecond), "time32:ms"),
+            (DataType::Time64(TimeUnit::Microsecond), "time64:us"),
+            (DataType::Time64(TimeUnit::Nanosecond), "time64:ns"),
         ] {
             let json = arrow_type_to_json(&data_type).unwrap();
+            assert_eq!(json.r#type, wire_name);
             assert_eq!(convert_json_arrow_type(&json).unwrap(), data_type);
         }
     }
