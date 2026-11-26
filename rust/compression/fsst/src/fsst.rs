@@ -2392,6 +2392,24 @@ But exactly how the acquaintance and friendship came about, we cannot say.";
     }
 
     #[test]
+    fn test_training_slow_path_agrees_with_the_fast_path_on_trained_tables() {
+        // Wherever at least 8 bytes remain, both lookups see the same 8-byte load, so
+        // a table trained on real text must give the same code from either of them.
+        for paragraph in [TEST_PARAGRAPH, TEST_PARAGRAPH2, TEST_PARAGRAPH3] {
+            let offsets = [0i32, paragraph.len() as i32];
+            let st = build_symbol_table(paragraph.as_bytes(), &offsets).unwrap();
+            let text = paragraph.as_bytes();
+            for curr in 0..text.len() - 7 {
+                assert_eq!(
+                    st.find_longest_symbol_from_char_slice(&text[curr..]),
+                    match_next_symbol_in_sample(&st, text, curr).0,
+                    "position {curr}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn test_decompress_accepts_fast_path_escape_with_payload() {
         let (table, _, _) = compress_paragraph();
         let bytes = [0, 0, 0, FSST_ESC, b'Z'];
