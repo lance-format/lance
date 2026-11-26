@@ -26,13 +26,15 @@
 use std::sync::Arc;
 
 use arrow_array::cast::AsArray;
+use arrow_array::types::UInt64Type;
 use arrow_array::{
-    Array, ArrayRef, FixedSizeListArray, GenericListArray, MapArray, OffsetSizeTrait, RecordBatch,
-    RecordBatchOptions, StructArray,
+    AnyDictionaryArray, Array, ArrayRef, DictionaryArray, FixedSizeListArray, GenericListArray,
+    MapArray, OffsetSizeTrait, RecordBatch, RecordBatchOptions, StructArray, UInt64Array,
 };
 use arrow_buffer::NullBuffer;
 use arrow_cast::{CastOptions, cast_with_options};
 use arrow_schema::{DataType, Field as ArrowField, FieldRef, Schema as ArrowSchema, SchemaRef};
+use arrow_select::take::take;
 use futures::StreamExt;
 use lance_arrow::schema::FieldExt;
 use lance_core::{Error, Result, datatypes::Schema};
@@ -314,14 +316,16 @@ fn convert_values(array: &ArrayRef, target: &DataType, path: &str) -> Result<Arr
         // and narrow only the values.
         DataType::Dictionary(key_type, value_type) => {
             let wide_type = with_large_offsets(value_type);
-            // A dictionary's keys address its whole values array, referenced
-            // or not, so casting them to another key type can fail where the
-            // referenced values fit. Re-encode the referenced values instead.
-            let unpacked;
-            let array = match array.data_type() {
-                DataType::Dictionary(input_key_type, _) if input_key_type != key_type => {
-                    unpacked = cast(array.as_ref(), &wide_type)?;
-                    &unpacked
+            // Keys address the whole values array, referenced or not, so a
+            // key that does not fit the table's key type may only point at
+            // values the rows never use. Keep just the referenced entries
+            // then; otherwise the keys are cast as they are and each value is
+            // converted once.
+            let compacted;
+            let array = match array.as_any_dictionary_opt() {
+                Some(dictionary) if !keys_fit(dictionary, key_type) => {
+                    compacted = referenced_entries(dictionary)?;
+                    &compacted
                 }
                 _ => array,
             };
@@ -349,6 +353,64 @@ fn convert_values(array: &ArrayRef, target: &DataType, path: &str) -> Result<Arr
             cast(wide.as_ref(), target)
         }
     }
+}
+
+/// Whether every valid key of `dictionary` fits `key_type`.
+fn keys_fit(dictionary: &dyn AnyDictionaryArray, key_type: &DataType) -> bool {
+    let max_key = match key_type {
+        DataType::Int8 => i8::MAX as u64,
+        DataType::Int16 => i16::MAX as u64,
+        DataType::Int32 => i32::MAX as u64,
+        DataType::UInt8 => u8::MAX as u64,
+        DataType::UInt16 => u16::MAX as u64,
+        DataType::UInt32 => u32::MAX as u64,
+        _ => u64::MAX,
+    };
+    // Keys index the values, so a short enough values array fits whatever
+    // the keys are. This also skips `normalized_keys`, which rejects an empty
+    // values array.
+    if dictionary.values().len() as u64 <= max_key.saturating_add(1) {
+        return true;
+    }
+    let nulls = dictionary.keys().logical_nulls();
+    dictionary
+        .normalized_keys()
+        .iter()
+        .enumerate()
+        .all(|(row, &key)| {
+            nulls.as_ref().is_some_and(|nulls| nulls.is_null(row)) || key as u64 <= max_key
+        })
+}
+
+/// `dictionary` with only the entries its valid rows reference, renumbered in
+/// order of first reference. The referenced values are taken once each, so
+/// memory stays proportional to the keys and those values.
+fn referenced_entries(dictionary: &dyn AnyDictionaryArray) -> Result<ArrayRef> {
+    let nulls = dictionary.keys().logical_nulls();
+    let mut remapped = vec![None; dictionary.values().len()];
+    let mut referenced = Vec::new();
+    let keys = dictionary
+        .normalized_keys()
+        .iter()
+        .enumerate()
+        .map(|(row, &key)| {
+            if nulls.as_ref().is_some_and(|nulls| nulls.is_null(row)) {
+                return None;
+            }
+            Some(*remapped[key].get_or_insert_with(|| {
+                referenced.push(key as u64);
+                referenced.len() as u64 - 1
+            }))
+        })
+        .collect::<UInt64Array>();
+    let values = take(
+        dictionary.values().as_ref(),
+        &UInt64Array::from(referenced),
+        None,
+    )?;
+    Ok(Arc::new(DictionaryArray::<UInt64Type>::try_new(
+        keys, values,
+    )?))
 }
 
 fn check_small_offsets(array: &dyn Array, target: &DataType, path: &str) -> Result<()> {
