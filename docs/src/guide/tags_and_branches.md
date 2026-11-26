@@ -27,6 +27,12 @@ In reference contexts, `"main"` is an alias for the default branch and is equiva
     Creating or deleting tags does not generate new dataset versions.
     Tags exist as auxiliary metadata stored in a separate directory.
 
+A tag retarget or metadata replacement can report a conflict when another writer changes the same tag. Read the tag again before retrying.
+
+If an S3 update returns a storage error during publication, read the tag to determine whether the write took effect before retrying.
+
+Native GCS and in-memory stores check the version of the tag object. The native and OpenDAL S3 clients send `If-Match` by default, including when completing a multipart update. S3-compatible endpoints must enforce this condition. On native Unix files, cooperating Lance writers use advisory file locks and atomic replacement. Coordinate writers externally on Azure and other stores without conditional tag updates, on mounts without cross-writer locking, or when using a client that overwrites tags unconditionally.
+
 === "Python"
 
     ```python

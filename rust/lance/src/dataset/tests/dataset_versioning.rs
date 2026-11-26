@@ -925,6 +925,148 @@ async fn test_tag(
     }
 }
 
+#[cfg(unix)]
+#[derive(Debug)]
+struct PublishDuringTagResolution {
+    uri: String,
+    mutation: &'static str,
+    inner: Arc<dyn CommitHandler>,
+}
+
+#[cfg(unix)]
+#[async_trait::async_trait]
+impl CommitHandler for PublishDuringTagResolution {
+    async fn resolve_version_location(
+        &self,
+        base: &Path,
+        version: u64,
+        store: &dyn OSObjectStore,
+    ) -> lance_core::Result<ManifestLocation> {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "dataset::tests::dataset_versioning::test_tag_mutation_child",
+                "--nocapture",
+            ])
+            .env("LANCE_TEST_TAG_URI", &self.uri)
+            .env("LANCE_TEST_TAG_MUTATION", self.mutation)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        self.inner
+            .resolve_version_location(base, version, store)
+            .await
+    }
+
+    async fn commit(
+        &self,
+        manifest: &mut lance_table::format::Manifest,
+        indices: Option<Vec<lance_table::format::IndexMetadata>>,
+        base: &Path,
+        store: &ObjectStore,
+        writer: ManifestWriter,
+        scheme: ManifestNamingScheme,
+        transaction: Option<lance_table::format::Transaction>,
+    ) -> std::result::Result<ManifestLocation, CommitError> {
+        self.inner
+            .commit(manifest, indices, base, store, writer, scheme, transaction)
+            .await
+    }
+}
+
+#[cfg(unix)]
+#[rstest]
+#[case::metadata("metadata")]
+#[case::delete("delete")]
+#[case::recreate("recreate")]
+#[tokio::test]
+async fn test_tag_retarget_observes_concurrent_writer(#[case] mutation: &'static str) {
+    let temp = TempStdDir::default();
+    let table = temp.join("space %2F");
+    let path = table.to_str().unwrap();
+    let mut first = Dataset::write(id_rows(0, 2), path, None).await.unwrap();
+    first.delete("id = 0").await.unwrap();
+    first.tags().create("发布", 1).await.unwrap();
+    let original_creation = first.tags().get("发布").await.unwrap().created_at.unwrap();
+
+    let peer = PublishDuringTagResolution {
+        uri: format!(
+            "file-object-store://{}",
+            Url::from_directory_path(&table).unwrap().path()
+        ),
+        mutation,
+        inner: first.commit_handler(),
+    };
+    first.refs = Refs::new(
+        first.table_state.object_store.clone(),
+        Arc::new(peer),
+        first.branch_location(),
+    );
+    let result = first.tags().update("发布", 2).await;
+    let fresh = Dataset::open(path).await.unwrap();
+    let observed = fresh.tags().get("发布").await;
+    if mutation == "delete" {
+        assert!(
+            matches!(observed, Err(Error::RefNotFound { .. })),
+            "retarget={result:?}, fresh={observed:?}"
+        );
+    } else {
+        let tag = observed.unwrap();
+        assert_eq!(
+            tag.metadata.get("owner").map(String::as_str),
+            Some(mutation),
+            "retarget={result:?}, fresh={tag:?}"
+        );
+        assert!(
+            tag.updated_at >= tag.created_at,
+            "retarget={result:?}, fresh={tag:?}"
+        );
+        if mutation == "recreate" {
+            assert_ne!(tag.created_at, Some(original_creation));
+        } else {
+            assert_eq!(tag.created_at, Some(original_creation));
+        }
+        if mutation == "recreate" && result.is_ok() {
+            // A serialized retarget can precede deletion or follow recreation.
+            assert!(matches!(tag.version, 1 | 2), "fresh={tag:?}");
+        } else {
+            assert_eq!(tag.version, if result.is_ok() { 2 } else { 1 });
+        }
+    }
+    assert!(
+        matches!(
+            result,
+            Ok(()) | Err(Error::RefConflict { .. } | Error::RefNotFound { .. })
+        ),
+        "{result:?}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_tag_mutation_child() {
+    let Ok(uri) = std::env::var("LANCE_TEST_TAG_URI") else {
+        return;
+    };
+    let mutation = std::env::var("LANCE_TEST_TAG_MUTATION").unwrap();
+    let dataset = Dataset::open(&uri).await.unwrap();
+    let tags = dataset.tags();
+    if mutation != "metadata" {
+        tags.delete("发布").await.unwrap();
+        if mutation == "delete" {
+            return;
+        }
+        tags.create("发布", 1).await.unwrap();
+    }
+    tags.replace_metadata("发布", HashMap::from([("owner".to_owned(), mutation)]))
+        .await
+        .unwrap();
+}
+
 #[tokio::test]
 async fn test_concurrent_tag_creation_conflict() {
     let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(

@@ -22,8 +22,8 @@ use url::Url;
 
 use crate::object_store::opendal_store::OpendalStore;
 use crate::object_store::{
-    DEFAULT_CLOUD_BLOCK_SIZE, DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE, ObjectStore,
-    ObjectStoreParams, ObjectStoreProvider, StorageOptions, StorageOptionsAccessor,
+    DEFAULT_CLOUD_BLOCK_SIZE, DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE, MutationBackend,
+    ObjectStore, ObjectStoreParams, ObjectStoreProvider, StorageOptions, StorageOptionsAccessor,
     dynamic_credentials::build_dynamic_credential_provider,
     throttle::{
         AimdThrottleState, Transport, cloud_http_connector, reject_http_connector_for_opendal,
@@ -349,9 +349,10 @@ impl ObjectStoreProvider for GcsStoreProvider {
             with_throttling(throttle_state, !use_opendal, inner, paginated_lister);
 
         Ok(ObjectStore {
+            mutation_backend: (!use_opendal)
+                .then(|| (MutationBackend::Version, Arc::downgrade(&inner))),
             inner,
             external_blob_inner: None,
-            direct_local_io: false,
             _external_blob_origin: None,
             local_dir_operations: None,
             local_fsync: false,
@@ -415,6 +416,13 @@ impl StorageOptions {
     }
 }
 
+/// The SDK can replay a generation-conditioned PUT after an HTTP 5xx. The
+/// transport shares this marker between attempts so only one reaches storage.
+#[derive(Clone, Default)]
+pub(in crate::object_store) struct GenerationUpdate(
+    pub(in crate::object_store) Arc<std::sync::atomic::AtomicBool>,
+);
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -422,14 +430,92 @@ mod tests {
 
     use crate::object_store::test_utils::RecordingConnector;
     use crate::object_store::test_utils::StaticMockStorageOptionsProvider;
-    use crate::object_store::{ObjectStoreParams, StorageOptionsAccessor};
+    use crate::object_store::{ObjectStoreParams, ObjectStoreRegistry, StorageOptionsAccessor};
     use object_store::client::{HttpError, HttpErrorKind};
     use tempfile::TempDir;
     use tokio::io::{AsyncBufReadExt, BufReader};
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
-        matchers::{method, path},
+        matchers::{header, method, path},
     };
+
+    #[rstest::rstest]
+    #[case::applied(200)]
+    #[case::stale(412)]
+    #[case::lost_acknowledgement(504)]
+    #[tokio::test]
+    async fn test_read_for_update_on_gcs(#[case] put_status: u16) {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/bucket/tag"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", "\"v1\"")
+                    .insert_header("x-goog-generation", "271")
+                    .insert_header("last-modified", "Tue, 15 Nov 1994 12:45:26 GMT")
+                    .set_body_string("old"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let received = writes.clone();
+        Mock::given(method("PUT"))
+            .and(path("/bucket/tag"))
+            .and(header("x-goog-if-generation-match", "271"))
+            .respond_with(move |_: &wiremock::Request| {
+                // The first write advances the generation, even if the gateway
+                // returns 504. A second upload using generation 271 would fail.
+                let response = if received.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+                    put_status
+                } else {
+                    412
+                };
+                ResponseTemplate::new(response)
+                    .insert_header("etag", "\"v2\"")
+                    .insert_header("x-goog-generation", "272")
+            })
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let options = HashMap::from([
+            ("google_base_url".into(), server.uri()),
+            ("google_storage_token".into(), "test-token".into()),
+            ("allow_http".into(), "true".into()),
+        ]);
+        let params = ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                options,
+            ))),
+            ..Default::default()
+        };
+        let (store, tag) = ObjectStore::from_uri_and_params(
+            Arc::new(ObjectStoreRegistry::default()),
+            "gs://bucket/tag",
+            &params,
+        )
+        .await
+        .unwrap();
+        let (bytes, version) = store.read_for_update(&tag).await.unwrap().unwrap();
+        assert_eq!(bytes.as_ref(), b"old");
+        assert_eq!(version.version.as_deref(), Some("271"));
+        let result = store.replace_if_current(&tag, "new".into(), version).await;
+        assert_eq!(writes.load(std::sync::atomic::Ordering::Relaxed), 1);
+        if put_status == 504 {
+            assert!(
+                matches!(result, Err(object_store::Error::Generic { .. })),
+                "{result:?}"
+            );
+        } else if put_status == 412 {
+            assert!(
+                matches!(result, Err(object_store::Error::Precondition { .. })),
+                "{result:?}"
+            );
+        } else {
+            assert_eq!(result.unwrap().e_tag.as_deref(), Some("\"v2\""));
+        }
+    }
 
     #[rstest::rstest]
     #[case::canonical("google_service_account", "service_account")]

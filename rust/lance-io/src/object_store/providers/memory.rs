@@ -4,8 +4,8 @@
 use std::{collections::HashMap, sync::Arc};
 
 use crate::object_store::{
-    DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_LOCAL_BLOCK_SIZE, DEFAULT_MAX_IOP_SIZE, ObjectStore,
-    ObjectStoreParams, ObjectStoreProvider, StorageOptions,
+    DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_LOCAL_BLOCK_SIZE, DEFAULT_MAX_IOP_SIZE, MutationBackend,
+    ObjectStore, ObjectStoreParams, ObjectStoreProvider, StorageOptions,
 };
 use lance_core::error::Result;
 use object_store::{memory::InMemory, path::Path};
@@ -21,10 +21,11 @@ impl ObjectStoreProvider for MemoryStoreProvider {
         let block_size = params.block_size.unwrap_or(DEFAULT_LOCAL_BLOCK_SIZE);
         let storage_options = StorageOptions(params.storage_options().cloned().unwrap_or_default());
         let download_retry_count = storage_options.download_retry_count();
+        let inner: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
         Ok(ObjectStore {
-            inner: Arc::new(InMemory::new()),
+            mutation_backend: Some((MutationBackend::ETag, Arc::downgrade(&inner))),
+            inner,
             external_blob_inner: None,
-            direct_local_io: false,
             _external_blob_origin: None,
             local_dir_operations: None,
             local_fsync: false,

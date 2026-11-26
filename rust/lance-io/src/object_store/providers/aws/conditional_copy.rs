@@ -1,14 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Conditional S3 copies using only the published object_store API.
+//! Conditional S3 multipart completion using the published object_store API.
 
 use std::fmt;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use futures::stream::BoxStream;
-use http::{HeaderValue, header::IF_NONE_MATCH};
+use futures::{
+    StreamExt, TryStreamExt,
+    stream::{self, BoxStream},
+};
+use http::{
+    HeaderName, HeaderValue,
+    header::{IF_MATCH, IF_NONE_MATCH},
+};
 use object_store::ClientOptions;
 use object_store::aws::{AmazonS3, AmazonS3Builder};
 use object_store::multipart::MultipartStore;
@@ -24,12 +30,21 @@ const MAX_COPY_SIZE: u64 = 5 * 1024 * 1024 * 1024;
 /// Bound client memory while leaving room for S3's 10,000-part limit.
 const MIN_PART_SIZE: u64 = 8 * 1024 * 1024;
 
-#[derive(Debug)]
 pub(super) struct ConditionalS3Store {
     inner: Arc<AmazonS3>,
-    /// Used ONLY for completion: its default If-None-Match header makes the
-    /// published MultipartStore::complete_multipart operation conditional.
-    completion: AmazonS3,
+    builder: AmazonS3Builder,
+    client_options: ClientOptions,
+    copy_completion: Option<AmazonS3>,
+    single_update: tokio::sync::OnceCell<AmazonS3>,
+}
+
+impl fmt::Debug for ConditionalS3Store {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The builder can contain static credentials.
+        f.debug_struct("ConditionalS3Store")
+            .field("inner", &self.inner)
+            .finish_non_exhaustive()
+    }
 }
 
 impl fmt::Display for ConditionalS3Store {
@@ -43,21 +58,47 @@ impl ConditionalS3Store {
         inner: Arc<AmazonS3>,
         builder: AmazonS3Builder,
         client_options: ClientOptions,
+        multipart_copy: bool,
     ) -> Result<Self> {
-        // Only completion calls use this client. In particular, an ordinary
-        // overwrite must never inherit the conditional completion header.
-        let mut headers = client_options
+        let mut store = Self {
+            inner,
+            builder,
+            client_options,
+            copy_completion: None,
+            single_update: Default::default(),
+        };
+        if multipart_copy {
+            store.copy_completion = Some(
+                store
+                    .completion_builder(IF_NONE_MATCH, HeaderValue::from_static("*"))
+                    .build()?,
+            );
+        }
+        Ok(store)
+    }
+
+    // Only completion uses this client. Upload creation, individual parts and
+    // ordinary overwrites must never inherit the destination precondition.
+    fn completion_builder(&self, name: HeaderName, value: HeaderValue) -> AmazonS3Builder {
+        let mut headers = self
+            .client_options
             .get_default_headers()
             .cloned()
             .unwrap_or_default();
-        headers.insert(IF_NONE_MATCH, HeaderValue::from_static("*"));
-        let completion = builder
-            .with_client_options(client_options.with_default_headers(headers))
-            .build()?;
-        Ok(Self { inner, completion })
+        headers.insert(name, value);
+        self.builder
+            .clone()
+            .with_client_options(self.client_options.clone().with_default_headers(headers))
     }
 
-    async fn copy_large(&self, from: &Path, to: &Path, size: u64, part_size: u64) -> Result<()> {
+    async fn copy_large(
+        &self,
+        completion: &AmazonS3,
+        from: &Path,
+        to: &Path,
+        size: u64,
+        part_size: u64,
+    ) -> Result<()> {
         let upload_id = self.inner.create_multipart(to).await?;
         let result = async {
             let mut parts = Vec::with_capacity(size.div_ceil(part_size) as usize);
@@ -80,9 +121,7 @@ impl ConditionalS3Store {
                         .await?,
                 );
             }
-            self.completion
-                .complete_multipart(to, &upload_id, parts)
-                .await?;
+            completion.complete_multipart(to, &upload_id, parts).await?;
             Ok(())
         }
         .await;
@@ -92,6 +131,67 @@ impl ConditionalS3Store {
             log::warn!("Failed to abort conditional copy to {to}: {error}");
         }
         result
+    }
+
+    async fn update_large(
+        &self,
+        path: &Path,
+        payload: PutPayload,
+        options: &PutOptions,
+        update: &super::MultipartUpdate,
+    ) -> Result<PutResult> {
+        let header =
+            HeaderValue::from_str(&update.etag).map_err(|source| object_store::Error::Generic {
+                store: "S3 conditional update",
+                source: Box::new(source),
+            })?;
+        // A lost success response makes the outcome unknown. Replaying completion
+        // may return NoSuchUpload or a mismatch against our own published ETag.
+        // The SDK accepts the signed header on a separate client. Large tag
+        // updates pay for another pool and, on S3 Express, a session.
+        let completion = self
+            .completion_builder(IF_MATCH, header)
+            .with_retry(object_store::RetryConfig {
+                max_retries: 0,
+                ..Default::default()
+            })
+            .build()?;
+        let upload_id = self
+            .inner
+            .create_multipart_opts(
+                path,
+                PutMultipartOptions {
+                    tags: options.tags.clone(),
+                    attributes: options.attributes.clone(),
+                    extensions: options.extensions.clone(),
+                },
+            )
+            .await?;
+        let pending = super::multipart_update::PendingUpload::new(
+            (self.inner.clone(), path.clone(), upload_id.clone()),
+            |(store, path, id)| {
+                Box::pin(async move {
+                    if let Err(error) = store.abort_multipart(&path, &id).await {
+                        log::warn!("Failed to abort conditional update to {path}: {error}");
+                    }
+                })
+            },
+        );
+        let chunks =
+            opendal::Buffer::chunks(&opendal::Buffer::from_iter(payload), update.part_size);
+        let result = async {
+            let parts = stream::iter(chunks.enumerate())
+                .map(|(index, chunk)| {
+                    self.inner
+                        .put_part(path, &upload_id, index, PutPayload::from_iter(chunk))
+                })
+                .buffered(update.concurrency)
+                .try_collect()
+                .await?;
+            completion.complete_multipart(path, &upload_id, parts).await
+        }
+        .await;
+        pending.finish(result).await
     }
 }
 
@@ -103,6 +203,56 @@ impl ObjectStore for ConditionalS3Store {
         payload: PutPayload,
         options: PutOptions,
     ) -> Result<PutResult> {
+        use super::ConditionalUpdate;
+        if let Some(update) = options.extensions.get::<ConditionalUpdate>() {
+            let ConditionalUpdate::Multipart(update) = update else {
+                // Share one client across small conditional updates. Generic puts
+                // keep the ordinary client's configured retry and encryption policy.
+                let client = self
+                    .single_update
+                    .get_or_try_init(|| async {
+                        self.builder
+                            .clone()
+                            .with_retry(object_store::RetryConfig {
+                                max_retries: 0,
+                                ..Default::default()
+                            })
+                            .build()
+                    })
+                    .await?;
+                return client.put_opts(path, payload, options).await;
+            };
+            return self
+                .update_large(path, payload, &options, update)
+                .await
+                .map_err(|error| match error {
+                    // The missing resource could be an upload ID, not the tag.
+                    object_store::Error::NotFound { ref source, .. } => {
+                        // The SDK's typed service response error is private.
+                        let response = source.source().map(ToString::to_string);
+                        let code = response
+                            .as_deref()
+                            .and_then(|s| {
+                                s.strip_prefix(
+                                    "Server returned non-2xx status code: 404 Not Found: ",
+                                )
+                            })
+                            .and_then(crate::object_store::throttle::error_document_code);
+                        if code.as_deref() == Some("NoSuchKey") {
+                            object_store::Error::Precondition {
+                                path: path.to_string(),
+                                source: Box::new(error),
+                            }
+                        } else {
+                            object_store::Error::Generic {
+                                store: "S3 multipart update",
+                                source: Box::new(error),
+                            }
+                        }
+                    }
+                    error => error,
+                });
+        }
         self.inner.put_opts(path, payload, options).await
     }
 
@@ -142,7 +292,9 @@ impl ObjectStore for ConditionalS3Store {
     }
 
     async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> Result<()> {
-        if options.mode == CopyMode::Create {
+        if options.mode == CopyMode::Create
+            && let Some(completion) = &self.copy_completion
+        {
             let size = self.inner.head(from).await?.size;
             if size == 0 {
                 self.inner
@@ -159,7 +311,7 @@ impl ObjectStore for ConditionalS3Store {
             }
             if size > MAX_COPY_SIZE {
                 let part_size = MIN_PART_SIZE.max(size.div_ceil(10_000));
-                return self.copy_large(from, to, size, part_size).await;
+                return self.copy_large(completion, from, to, size, part_size).await;
             }
         }
         self.inner.copy_opts(from, to, options).await
@@ -186,15 +338,20 @@ mod tests {
         StorageOptionsAccessor,
     };
 
-    async fn provider_store(server: &MockServer, mode: Option<&str>) -> LanceObjectStore {
+    async fn provider_store(
+        server: &MockServer,
+        mode: Option<&str>,
+        opendal: bool,
+    ) -> LanceObjectStore {
         let mut options = HashMap::from([
-            ("aws_endpoint".into(), server.uri()),
-            ("aws_region".into(), "us-east-1".into()),
-            ("aws_access_key_id".into(), "test".into()),
-            ("aws_secret_access_key".into(), "test".into()),
-            ("aws_allow_http".into(), "true".into()),
-            ("client_max_retries".into(), "0".into()),
-            ("lance_aimd_max_retries".into(), "0".into()),
+            ("endpoint".into(), server.uri()),
+            ("region".into(), "us-east-1".into()),
+            ("access_key_id".into(), "test".into()),
+            ("secret_access_key".into(), "test".into()),
+            ("allow_http".into(), "true".into()),
+            ("use_opendal".into(), opendal.to_string()),
+            ("client_max_retries".into(), "2".into()),
+            ("lance_aimd_max_retries".into(), "2".into()),
         ]);
         if let Some(mode) = mode {
             options.insert("aws_copy_if_not_exists".into(), mode.into());
@@ -241,6 +398,283 @@ mod tests {
             "<CompleteMultipartUploadResult><ETag>\"destination\"</ETag></CompleteMultipartUploadResult>")
     }
 
+    fn multipart_fixture_options() -> PutOptions {
+        let etag = "\"original\"";
+        let mut options: PutOptions = PutMode::Update(object_store::UpdateVersion {
+            e_tag: Some(etag.into()),
+            version: None,
+        })
+        .into();
+        // Keep wire fixtures small regardless of the process upload threshold.
+        options
+            .extensions
+            .insert(super::super::ConditionalUpdate::Multipart(
+                super::super::MultipartUpdate {
+                    etag: etag.into(),
+                    part_size: 5 * 1024 * 1024,
+                    concurrency: 1,
+                },
+            ));
+        options
+    }
+
+    #[rstest]
+    #[case::applied(200, "", false)]
+    #[case::stale(412, "PreconditionFailed", true)]
+    #[case::concurrent(409, "ConditionalRequestConflict", true)]
+    #[case::locked(409, "BucketAlreadyOwnedByYou", false)]
+    #[case::denied(403, "AccessDenied", false)]
+    #[case::expired_upload(404, "NoSuchUpload", false)]
+    #[case::deleted_destination(404, "NoSuchKey", true)]
+    #[case::ambiguous_completion(503, "SlowDown", false)]
+    #[tokio::test]
+    async fn multipart_update_checks_etag_at_completion(
+        #[case] status: u16,
+        #[case] code: &str,
+        #[case] conflict: bool,
+        #[values(false, true)] opendal: bool,
+    ) {
+        let server = MockServer::start().await;
+        initiate(&server).await;
+        let retry_first_part = std::sync::atomic::AtomicBool::new(status == 200);
+        Mock::given(method("PUT"))
+            .and(query_param("uploadId", "upload-1"))
+            .respond_with(move |request: &wiremock::Request| {
+                if request
+                    .url
+                    .query_pairs()
+                    .any(|(k, v)| k == "partNumber" && v == "1")
+                    && retry_first_part.swap(false, std::sync::atomic::Ordering::Relaxed)
+                {
+                    ResponseTemplate::new(503)
+                        .set_body_string("<Error><Code>SlowDown</Code></Error>")
+                } else {
+                    ResponseTemplate::new(200).insert_header("etag", "\"part\"")
+                }
+            })
+            .expect(if status == 200 { 3 } else { 2 })
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(query_param("uploadId", "upload-1"))
+            .and(header("if-match", "\"original\""))
+            .respond_with(if status == 200 {
+                completed()
+            } else {
+                ResponseTemplate::new(status).set_body_string(format!(
+                    "<Error><Code>{code}</Code><Message>write rejected</Message></Error>"
+                ))
+            })
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(query_param("uploadId", "upload-1"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(u64::from(status != 200))
+            .mount(&server)
+            .await;
+        // A custom copy policy must not disable conditional update completion.
+        let store = provider_store(
+            &server,
+            Some("header:cf-copy-destination-if-none-match:*"),
+            opendal,
+        )
+        .await;
+        let first = bytes::Bytes::from(vec![b'a'; 5 * 1024 * 1024]);
+        let payload = PutPayload::from_iter([first.clone(), bytes::Bytes::from_static(b"b")]);
+        let result = store
+            .put_payload_opts(
+                &Path::from("destination"),
+                payload,
+                multipart_fixture_options(),
+            )
+            .await;
+        if status == 200 {
+            assert_eq!(result.unwrap().size, first.len() + 1);
+        } else {
+            let error = result.unwrap_err();
+            assert_eq!(
+                matches!(error, object_store::Error::Precondition { .. })
+                    || super::super::is_conditional_put_conflict(&error),
+                conflict,
+                "{error}"
+            );
+            assert!(
+                !matches!(error, object_store::Error::NotFound { .. }),
+                "{error}"
+            );
+        }
+        let requests = server.received_requests().await.unwrap();
+        for request in requests {
+            let part = request
+                .url
+                .query_pairs()
+                .find(|(name, _)| name == "partNumber");
+            if let Some((_, number)) = part {
+                assert_eq!(
+                    request.body.as_slice(),
+                    if number == "1" { first.as_ref() } else { b"b" }
+                );
+            }
+            let completion = request.method == http::Method::POST
+                && request.url.query_pairs().any(|(key, _)| key == "uploadId");
+            assert_eq!(request.headers.contains_key(IF_MATCH), completion);
+            if completion && !opendal {
+                let signature = request.headers[http::header::AUTHORIZATION]
+                    .to_str()
+                    .unwrap();
+                assert!(signature.contains("if-match"), "{signature}");
+            }
+        }
+    }
+
+    #[rstest]
+    #[case::timeout(400, "RequestTimeout", true)]
+    #[case::in_progress(409, "OperationAborted", true)]
+    #[case::invalid(400, "InvalidRequest", false)]
+    #[case::locked(409, "ObjectLockedByBucketPolicy", false)]
+    #[tokio::test]
+    async fn opendal_retries_only_temporary_multipart_update_parts(
+        #[case] status: u16,
+        #[case] code: &'static str,
+        #[case] retry: bool,
+    ) {
+        let server = MockServer::start().await;
+        initiate(&server).await;
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        Mock::given(method("PUT"))
+            .and(query_param("partNumber", "1"))
+            .respond_with(move |_: &wiremock::Request| {
+                if attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+                    ResponseTemplate::new(status)
+                        .set_body_string(format!("<Error><Code>{code}</Code></Error>"))
+                } else {
+                    ResponseTemplate::new(200).insert_header("etag", "\"part\"")
+                }
+            })
+            .expect(if retry { 2 } else { 1 })
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(query_param("partNumber", "2"))
+            .respond_with(ResponseTemplate::new(200).insert_header("etag", "\"tail\""))
+            .expect(u64::from(retry))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(query_param("uploadId", "upload-1"))
+            .and(header("if-match", "\"original\""))
+            .respond_with(completed())
+            .expect(u64::from(retry))
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(query_param("uploadId", "upload-1"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(u64::from(!retry))
+            .mount(&server)
+            .await;
+        let store = provider_store(&server, None, true).await;
+        let result = store
+            .put_payload_opts(
+                &Path::from("destination"),
+                vec![0; 5 * 1024 * 1024 + 1].into(),
+                multipart_fixture_options(),
+            )
+            .await;
+        if retry {
+            result.unwrap();
+        } else {
+            let error = result.unwrap_err();
+            assert!(error.to_string().contains(code), "{error}");
+            assert!(!matches!(error, object_store::Error::Precondition { .. }));
+        }
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn cancelled_multipart_update_aborts(#[values(false, true)] opendal: bool) {
+        use std::time::Duration;
+        // An already dispatched part may arrive after cancellation. Give it an
+        // exclusive server so it cannot reach another test's pooled endpoint.
+        let server = MockServer::builder().start().await;
+        initiate(&server).await;
+        let part = Mock::given(method("PUT"))
+            .and(query_param("uploadId", "upload-1"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_secs(30))
+                    .insert_header("etag", "\"part\""),
+            )
+            .expect(1..=2)
+            .mount_as_scoped(&server)
+            .await;
+        let abort = Mock::given(method("DELETE"))
+            .and(query_param("uploadId", "upload-1"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+        let store = provider_store(&server, None, opendal).await;
+        let write = tokio::spawn(async move {
+            store
+                .put_payload_opts(
+                    &Path::from("destination"),
+                    vec![0; 5 * 1024 * 1024 + 1].into(),
+                    multipart_fixture_options(),
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(4), part.wait_until_satisfied())
+            .await
+            .unwrap();
+        write.abort();
+        assert!(write.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(Duration::from_secs(4), abort.wait_until_satisfied())
+            .await
+            .unwrap();
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn ordinary_large_conditional_put_remains_single_request(
+        #[values(false, true)] opendal: bool,
+    ) {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/bucket/destination"))
+            .and(header("if-match", "\"original\""))
+            .respond_with(ResponseTemplate::new(200).insert_header("etag", "\"next\""))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let store = provider_store(&server, None, opendal).await;
+        let path = Path::from("destination");
+        let mode = PutMode::Update(object_store::UpdateVersion {
+            e_tag: Some("\"original\"".into()),
+            version: None,
+        });
+        let payload = PutPayload::from(vec![0; 5 * 1024 * 1024 + 1]);
+        store
+            .put_payload_opts(&path, payload.clone(), mode.clone().into())
+            .await
+            .unwrap();
+        store
+            .inner
+            .put_opts(&path, payload, mode.into())
+            .await
+            .unwrap();
+        assert!(
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .all(|r| r.url.query().is_none())
+        );
+    }
+
     #[rstest]
     #[case::default(None)]
     #[case::multipart(Some("multipart"))]
@@ -266,7 +700,7 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        let store = provider_store(&server, mode).await;
+        let store = provider_store(&server, mode, false).await;
         let result = store
             .copy_if_not_exists_or_same_size(&Path::from("source"), &Path::from("destination"))
             .await
@@ -287,11 +721,15 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        provider_store(&server, Some("header:cf-copy-destination-if-none-match:*"))
-            .await
-            .copy_if_not_exists_or_same_size(&Path::from("source"), &Path::from("destination"))
-            .await
-            .unwrap();
+        provider_store(
+            &server,
+            Some("header:cf-copy-destination-if-none-match:*"),
+            false,
+        )
+        .await
+        .copy_if_not_exists_or_same_size(&Path::from("source"), &Path::from("destination"))
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -305,7 +743,7 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        let result = provider_store(&server, None)
+        let result = provider_store(&server, None, false)
             .await
             .copy_if_not_exists_or_same_size(&Path::from("source"), &Path::from("destination"))
             .await
@@ -336,7 +774,7 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        let error = provider_store(&server, mode)
+        let error = provider_store(&server, mode, false)
             .await
             .copy_if_not_exists_or_same_size(&Path::from("source"), &Path::from("destination"))
             .await
@@ -362,7 +800,7 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        provider_store(&server, None)
+        provider_store(&server, None, false)
             .await
             .put(&Path::from("destination"), b"overwrite")
             .await
@@ -449,11 +887,21 @@ mod tests {
                 max_retries: 0,
                 ..Default::default()
             });
-        let store =
-            ConditionalS3Store::new(Arc::new(builder.clone().build().unwrap()), builder, options)
-                .unwrap();
+        let store = ConditionalS3Store::new(
+            Arc::new(builder.clone().build().unwrap()),
+            builder,
+            options,
+            true,
+        )
+        .unwrap();
         let result = store
-            .copy_large(&Path::from("source"), &Path::from("destination"), 8, 5)
+            .copy_large(
+                store.copy_completion.as_ref().unwrap(),
+                &Path::from("source"),
+                &Path::from("destination"),
+                8,
+                5,
+            )
             .await;
         if outcome == 200 && !is_embedded_error {
             result.unwrap();

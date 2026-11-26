@@ -777,7 +777,7 @@ pub struct LocalWriter {
 static INJECTED_CLOSE_FAILURE: std::sync::Mutex<Option<std::path::PathBuf>> =
     std::sync::Mutex::new(None);
 
-fn close_file(file: std::fs::File, path: &std::path::Path) -> io::Result<()> {
+pub(crate) fn close_file(file: std::fs::File, path: &std::path::Path) -> io::Result<()> {
     #[cfg(not(test))]
     let _ = path;
 

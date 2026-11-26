@@ -29,6 +29,8 @@ use crate::object_store::hf_throttle::mark_huggingface_rate_limited;
 #[derive(Debug, Clone)]
 pub(super) struct OpendalStore {
     inner: InnerOpendalStore,
+    #[cfg(feature = "aws")]
+    s3: Option<Operator>,
     /// Mark rate-limit errors so Hugging Face's outer retry loops stop repeating
     /// requests that OpenDAL has already retried.
     marks_huggingface_rate_limit: bool,
@@ -39,14 +41,24 @@ impl OpendalStore {
         Self {
             inner: InnerOpendalStore::new(operator),
             marks_huggingface_rate_limit: false,
+            #[cfg(feature = "aws")]
+            s3: None,
+        }
+    }
+
+    #[cfg(feature = "aws")]
+    pub(super) fn new_s3(operator: Operator, conditional: Operator) -> Self {
+        Self {
+            s3: Some(conditional),
+            ..Self::new(operator)
         }
     }
 
     #[cfg(feature = "huggingface")]
     pub(super) fn new_huggingface(operator: Operator) -> Self {
         Self {
-            inner: InnerOpendalStore::new(operator),
             marks_huggingface_rate_limit: true,
+            ..Self::new(operator)
         }
     }
 }
@@ -104,6 +116,24 @@ impl OSObjectStore for OpendalStore {
         payload: PutPayload,
         options: PutOptions,
     ) -> object_store::Result<PutResult> {
+        #[cfg(feature = "aws")]
+        if let Some(operator) = &self.s3
+            && let Some(update) = options
+                .extensions
+                .get::<super::providers::aws::ConditionalUpdate>()
+        {
+            use super::providers::aws::ConditionalUpdate;
+            return match update {
+                ConditionalUpdate::Single => {
+                    InnerOpendalStore::new(operator.clone())
+                        .put_opts(location, payload, options)
+                        .await
+                }
+                ConditionalUpdate::Multipart(update) => {
+                    update.write_opendal(operator, location, payload).await
+                }
+            };
+        }
         self.inner.put_opts(location, payload, options).await
     }
 

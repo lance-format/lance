@@ -6,8 +6,8 @@ use std::{collections::HashMap, sync::Arc};
 #[cfg(any(windows, test))]
 use crate::object_store::LocalDirOperations;
 use crate::object_store::{
-    DEFAULT_LOCAL_BLOCK_SIZE, DEFAULT_LOCAL_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE, ObjectStore,
-    ObjectStoreParams, ObjectStoreProvider, StorageOptions,
+    DEFAULT_LOCAL_BLOCK_SIZE, DEFAULT_LOCAL_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE, MutationBackend,
+    ObjectStore, ObjectStoreParams, ObjectStoreProvider, StorageOptions,
 };
 use lance_core::Error;
 use lance_core::error::Result;
@@ -145,10 +145,11 @@ impl ObjectStoreProvider for FileStoreProvider {
         #[cfg(not(windows))]
         let local_dir_operations = None;
 
+        let inner: Arc<dyn object_store::ObjectStore> = Arc::new(inner);
         Ok(ObjectStore {
-            inner: Arc::new(inner),
+            mutation_backend: Some((MutationBackend::Local, Arc::downgrade(&inner))),
+            inner,
             external_blob_inner: None,
-            direct_local_io: true,
             _external_blob_origin: None,
             local_dir_operations,
             local_fsync,
@@ -263,10 +264,11 @@ mod tests {
         let local_dir_operations = Arc::new(FileSystemDirOperations {
             local_file_system: inner.clone(),
         });
+        let inner: Arc<dyn object_store::ObjectStore> = Arc::new(inner);
         ObjectStore {
-            inner: Arc::new(inner),
+            mutation_backend: Some((MutationBackend::Local, Arc::downgrade(&inner))),
+            inner,
             external_blob_inner: None,
-            direct_local_io: true,
             _external_blob_origin: None,
             local_dir_operations: Some(local_dir_operations),
             local_fsync: false,

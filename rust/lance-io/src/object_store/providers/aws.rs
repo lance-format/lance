@@ -36,8 +36,8 @@ use url::Url;
 
 use crate::object_store::opendal_store::OpendalStore;
 use crate::object_store::{
-    DEFAULT_CLOUD_BLOCK_SIZE, DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE, ObjectStore,
-    ObjectStoreParams, ObjectStoreProvider, StorageOptions, StorageOptionsAccessor,
+    DEFAULT_CLOUD_BLOCK_SIZE, DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE, MutationBackend,
+    ObjectStore, ObjectStoreParams, ObjectStoreProvider, StorageOptions, StorageOptionsAccessor,
     dynamic_credentials::{NamespaceCredentialsProvider, build_dynamic_credential_provider},
     throttle::{
         AimdThrottleConfig, AimdThrottleState, Transport, cloud_http_connector,
@@ -48,13 +48,45 @@ use lance_core::error::{Error, Result};
 use lance_core::utils::{aimd::AimdConfig, parse::str_is_truthy};
 
 mod conditional_copy;
+mod multipart_update;
 
 use conditional_copy::ConditionalS3Store;
+pub(in crate::object_store) use multipart_update::{
+    ConditionalUpdate, MultipartUpdate, conditional_operator,
+};
 
 use super::opendal::finish_opendal_operator;
 
 #[derive(Default, Debug)]
 pub struct AwsStoreProvider;
+
+/// object_store converts every HTTP 409 into AlreadyExists, including S3
+/// bucket-lock policy errors. Only a conditional-write conflict is retryable
+/// by a tag writer which rereads the current tag.
+pub(in crate::object_store) fn is_conditional_put_conflict(error: &object_store::Error) -> bool {
+    match error {
+        object_store::Error::AlreadyExists { source, .. } => {
+            // The native client's typed HTTP response error is private.
+            let Some(response) = source.source() else {
+                return false;
+            };
+            let message = response.to_string();
+            let Some(body) =
+                message.strip_prefix("Server returned non-2xx status code: 409 Conflict: ")
+            else {
+                return false;
+            };
+            matches!(
+                crate::object_store::throttle::error_document_code(body).as_deref(),
+                Some("ConditionalRequestConflict" | "OperationAborted")
+            )
+        }
+        object_store::Error::Generic { source, .. } => source
+            .downcast_ref::<opendal::Error>()
+            .is_some_and(|e| e.kind() == opendal::ErrorKind::Conflict),
+        _ => false,
+    }
+}
 
 struct ResolvedS3StorageOptions {
     options: HashMap<AmazonS3ConfigKey, String>,
@@ -85,6 +117,13 @@ impl ResolvedS3StorageOptions {
 
     fn effective_endpoint(&self) -> Option<&str> {
         effective_s3_endpoint(&self.options)
+    }
+
+    fn supports_conditional_update(&self) -> bool {
+        // Match the native S3 client's default for both S3 implementations.
+        self.options
+            .get(&AmazonS3ConfigKey::ConditionalPut)
+            .is_none_or(|mode| mode.trim() == "etag")
     }
 
     fn throttle_defaults(&self, is_s3_express: bool, use_opendal: bool) -> AimdThrottleConfig {
@@ -167,6 +206,7 @@ impl AwsStoreProvider {
                 client_options = client_options.with_config(*key, value);
             }
         }
+        let conditional_updates = resolved_s3_options.supports_conditional_update();
         let mut builder = AmazonS3Builder::new()
             .with_client_options(client_options.clone())
             .with_copy_if_not_exists(S3CopyIfNotExists::Multipart);
@@ -189,11 +229,12 @@ impl AwsStoreProvider {
             .get_config_value(&AmazonS3ConfigKey::CopyIfNotExists)
             .is_some_and(|mode| mode.trim() == "multipart");
         let store = Arc::new(builder.clone().build()?);
-        let inner: Arc<dyn OSObjectStore> = if use_multipart_copy {
+        let inner: Arc<dyn OSObjectStore> = if use_multipart_copy || conditional_updates {
             Arc::new(ConditionalS3Store::new(
                 store.clone(),
                 builder,
                 client_options,
+                use_multipart_copy,
             )?)
         } else {
             store.clone()
@@ -244,9 +285,14 @@ impl AwsStoreProvider {
 
         let operator = Operator::from_iter::<S3>(config_map)
             .map_err(|e| Error::invalid_input(format!("Failed to create S3 operator: {:?}", e)))?;
-        let operator = finish_opendal_operator(operator, storage_options.client_max_retries());
-
-        Ok(Arc::new(OpendalStore::new(operator)) as Arc<dyn OSObjectStore>)
+        let retries = storage_options.client_max_retries();
+        // OpenDAL's RetryLayer takes ownership of the writer during write/close.
+        // Cancellation would leave no writer to abort. Both handles share the
+        // same service and HTTP client; staged parts retry at the transport.
+        let conditional =
+            conditional_operator(&finish_opendal_operator(operator.clone(), 0), retries);
+        let operator = finish_opendal_operator(operator, retries);
+        Ok(Arc::new(OpendalStore::new_s3(operator, conditional)) as Arc<dyn OSObjectStore>)
     }
 }
 
@@ -292,6 +338,7 @@ impl ObjectStoreProvider for AwsStoreProvider {
         let throttle_defaults = resolved_s3_options.throttle_defaults(is_s3_express, use_opendal);
         let throttle_state = shared_throttle_state(&store_prefix, params, throttle_defaults)?;
 
+        let update_conditions = resolved_s3_options.supports_conditional_update();
         let (inner, paginated_lister) = if use_opendal {
             reject_http_connector_for_opendal(params)?;
             // Use OpenDAL implementation
@@ -323,9 +370,16 @@ impl ObjectStoreProvider for AwsStoreProvider {
             with_throttling(throttle_state, !use_opendal, inner, paginated_lister);
 
         Ok(ObjectStore {
+            mutation_backend: update_conditions.then(|| {
+                let kind = if use_opendal {
+                    MutationBackend::OpenDalS3
+                } else {
+                    MutationBackend::ETag
+                };
+                (kind, Arc::downgrade(&inner))
+            }),
             inner,
             external_blob_inner: None,
-            direct_local_io: false,
             _external_blob_origin: None,
             local_dir_operations: None,
             local_fsync: false,
@@ -911,11 +965,104 @@ mod tests {
     use mock_instant::thread_local::MockClock;
     use object_store::path::Path;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use wiremock::matchers::any;
+    use wiremock::matchers::{any, header, method};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
     use crate::object_store::test_utils::RecordingConnector;
+
+    #[rstest::rstest]
+    #[case::stale(412, "PreconditionFailed", true)]
+    #[case::concurrent(409, "ConditionalRequestConflict", true)]
+    #[case::locked(409, "ObjectLockedByBucketPolicy", false)]
+    #[case::denied(403, "AccessDenied", false)]
+    #[case::uncertain_publication(503, "SlowDown", false)]
+    #[tokio::test]
+    async fn test_read_for_update_on_s3(
+        #[values(false, true)] use_opendal: bool,
+        #[case] status: u16,
+        #[case] code: &str,
+        #[case] conflict: bool,
+    ) {
+        let server = MockServer::start().await;
+        let old_etag = "\"old\"";
+        let object = ResponseTemplate::new(200)
+            .insert_header("etag", old_etag)
+            .insert_header("last-modified", "Tue, 15 Nov 1994 12:45:26 GMT")
+            .set_body_string("old");
+        let mut get = Mock::given(method("GET"));
+        if use_opendal {
+            Mock::given(method("HEAD"))
+                .respond_with(object.clone())
+                .expect(1)
+                .mount(&server)
+                .await;
+            get = get.and(header("if-match", old_etag));
+        }
+        get.respond_with(object).expect(1).mount(&server).await;
+        Mock::given(method("PUT"))
+            .and(header("if-match", old_etag))
+            .respond_with(ResponseTemplate::new(status).set_body_string(format!(
+                "<Error><Code>{code}</Code><Message>Write rejected</Message></Error>",
+            )))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let options = HashMap::from([
+            ("endpoint".into(), server.uri()),
+            ("region".into(), "us-east-1".into()),
+            ("access_key_id".into(), "key".into()),
+            ("secret_access_key".into(), "secret".into()),
+            ("allow_http".into(), "true".into()),
+            ("use_opendal".into(), use_opendal.to_string()),
+            ("client_max_retries".into(), "2".into()),
+            ("lance_aimd_max_retries".into(), "2".into()),
+        ]);
+        let params = ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                options,
+            ))),
+            ..Default::default()
+        };
+        let (store, path) = ObjectStore::from_uri_and_params(
+            Arc::new(ObjectStoreRegistry::default()),
+            "s3://bucket/tag",
+            &params,
+        )
+        .await
+        .unwrap();
+
+        let (bytes, version) = store.read_for_update(&path).await.unwrap().unwrap();
+        assert_eq!(bytes.as_ref(), b"old");
+        assert_eq!(version.e_tag.as_deref(), Some(old_etag));
+        let error = store
+            .replace_if_current(&path, "new".into(), version)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            matches!(error, object_store::Error::Precondition { .. }),
+            conflict,
+            "{error}"
+        );
+        assert!(error.to_string().contains(code), "{error}");
+    }
+
+    #[rstest::rstest]
+    #[case::default(None, true)]
+    #[case::enabled(Some("etag"), true)]
+    #[case::disabled(Some("disabled"), false)]
+    #[case::unknown(Some("unknown"), false)]
+    fn test_conditional_update_configuration(#[case] mode: Option<&str>, #[case] expected: bool) {
+        let mut options = HashMap::new();
+        if let Some(mode) = mode {
+            options.insert(AmazonS3ConfigKey::ConditionalPut, mode.into());
+        }
+        assert_eq!(
+            ResolvedS3StorageOptions::new(options, None, None).supports_conditional_update(),
+            expected
+        );
+    }
 
     #[rstest::rstest]
     #[case::canonical("aws_region", "region")]

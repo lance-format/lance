@@ -52,6 +52,10 @@ pub(crate) mod dynamic_opendal;
 use copy_diagnostics::{CopyDiagnostics, CopyOperation, CopyOperationObserver};
 pub(crate) mod hf_throttle;
 mod list_retry;
+#[cfg(unix)]
+mod local_mutation;
+#[cfg(unix)]
+pub use local_mutation::LocalFileMutation;
 mod local_staging;
 #[cfg(feature = "metrics")]
 pub mod metrics;
@@ -292,6 +296,16 @@ impl Clone for ExternalBlobStore {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MutationBackend {
+    Local,
+    ETag,
+    #[cfg(feature = "gcp")]
+    Version,
+    #[cfg(feature = "aws")]
+    OpenDalS3,
+}
+
 /// Wraps [ObjectStore](object_store::ObjectStore)
 #[derive(Clone)]
 pub struct ObjectStore {
@@ -301,7 +315,9 @@ pub struct ObjectStore {
     external_blob_inner: Option<ExternalBlobStore>,
     // Keep the registry's weak binding alive while only an external view is held.
     _external_blob_origin: Option<Arc<Self>>,
-    direct_local_io: bool,
+    // A capability belongs to the selected physical backend. Public callers
+    // can replace `inner` on a clone, in which case the capability no longer applies.
+    mutation_backend: Option<(MutationBackend, std::sync::Weak<dyn OSObjectStore>)>,
     // Provider-owned native directory operations for rooted local stores.
     local_dir_operations: Option<Arc<dyn LocalDirOperations>>,
     // Whether local writes sync file data and directory entries before returning.
@@ -1063,7 +1079,7 @@ impl ObjectStore {
                 inner: tracked_store,
                 external_blob_inner,
                 _external_blob_origin: None,
-                direct_local_io: false,
+                mutation_backend: None,
                 local_dir_operations: None,
                 local_fsync: false,
                 scheme: path.scheme().to_string(),
@@ -1162,7 +1178,146 @@ impl ObjectStore {
     }
 
     fn has_absolute_local_mapping(&self) -> bool {
-        self.direct_local_io && self.store_prefix == self.scheme
+        matches!(self.mutation_backend, Some((MutationBackend::Local, _)))
+            && self.store_prefix == self.scheme
+    }
+
+    fn selected_mutation_backend(&self) -> Option<MutationBackend> {
+        if self.has_wrapper() {
+            return None;
+        }
+        self.mutation_backend.as_ref().and_then(|(kind, original)| {
+            original
+                .ptr_eq(&Arc::downgrade(&self.inner))
+                .then_some(*kind)
+        })
+    }
+
+    /// Read a small object together with the version to use for a conditional
+    /// replacement. Returns `None` when the configured backend cannot supply
+    /// both a coherent read and an atomic conditional put.
+    ///
+    /// ```
+    /// # use lance_io::object_store::ObjectStore;
+    /// # use object_store::path::Path;
+    /// # async fn update(store: &ObjectStore, path: &Path) -> object_store::Result<()> {
+    /// if let Some((current, version)) = store.read_for_update(path).await? {
+    ///     let value = [current.as_ref(), b"\n"].concat();
+    ///     store.replace_if_current(path, value.into(), version).await?;
+    /// }
+    /// # Ok(()) }
+    /// ```
+    pub async fn read_for_update(
+        &self,
+        path: &Path,
+    ) -> object_store::Result<Option<(Bytes, object_store::UpdateVersion)>> {
+        let (if_match, requires_version): (Option<String>, bool) =
+            match self.selected_mutation_backend() {
+                Some(MutationBackend::ETag) => (None, false),
+                #[cfg(feature = "gcp")]
+                Some(MutationBackend::Version) => (None, true),
+                #[cfg(feature = "aws")]
+                Some(MutationBackend::OpenDalS3) => {
+                    // The OpenDAL bridge can obtain metadata and bytes in separate
+                    // requests. Bind both to the ETag used to replace the object.
+                    let etag = self
+                        .stat(path)
+                        .await?
+                        .e_tag
+                        .filter(|s| !s.is_empty())
+                        .ok_or_else(|| object_store::Error::Generic {
+                            store: "S3",
+                            source: format!("missing ETag for conditional update of {path}").into(),
+                        })?;
+                    (Some(etag), false)
+                }
+                _ => return Ok(None),
+            };
+        let options = object_store::GetOptions {
+            if_match: if_match.clone(),
+            ..Default::default()
+        };
+        let (bytes, meta) = crate::object_reader::read_with_meta(
+            self.inner.clone(),
+            path,
+            options,
+            self.download_retry_count,
+        )
+        .await
+        .map_err(|error| match error {
+            object_store::Error::NotFound { path, source } if if_match.is_some() => {
+                object_store::Error::Precondition { path, source }
+            }
+            error => error,
+        })?;
+        if if_match.is_some() && if_match != meta.e_tag {
+            return Err(object_store::Error::Precondition {
+                path: path.to_string(),
+                source: format!("ETag changed during conditional read of {path}").into(),
+            });
+        }
+        let (name, validator) = if requires_version {
+            ("generation", meta.version.as_deref())
+        } else {
+            ("ETag", meta.e_tag.as_deref())
+        };
+        if validator.is_none_or(str::is_empty) {
+            return Err(object_store::Error::Generic {
+                store: "ObjectStore",
+                source: format!("missing {name} for conditional update of {path}").into(),
+            });
+        }
+        Ok(Some((
+            bytes,
+            object_store::UpdateVersion {
+                e_tag: meta.e_tag,
+                version: meta.version,
+            },
+        )))
+    }
+
+    /// Replace a document using the validator from [Self::read_for_update].
+    /// Large S3 documents use the same write condition at multipart completion.
+    /// See [Self::read_for_update] for a complete example.
+    pub async fn replace_if_current(
+        &self,
+        path: &Path,
+        payload: PutPayload,
+        version: object_store::UpdateVersion,
+    ) -> object_store::Result<WriteResult> {
+        let options = object_store::PutOptions::from(PutMode::Update(version));
+        #[cfg(feature = "gcp")]
+        if self.selected_mutation_backend() == Some(MutationBackend::Version) {
+            let mut options = options;
+            options
+                .extensions
+                .insert(providers::gcp::GenerationUpdate::default());
+            return self.put_payload_opts(path, payload, options).await;
+        }
+        #[cfg(feature = "aws")]
+        if matches!(self.scheme(), "s3" | "s3+ddb") && self.selected_mutation_backend().is_some() {
+            let mut options = options;
+            use providers::aws::{ConditionalUpdate, MultipartUpdate};
+            let update = match MultipartUpdate::for_payload(&options, payload.content_length())? {
+                Some(update) => ConditionalUpdate::Multipart(update),
+                None => ConditionalUpdate::Single,
+            };
+            options.extensions.insert(update);
+            return self
+                .put_payload_opts(path, payload, options)
+                .await
+                .map_err(|error| {
+                    if providers::aws::is_conditional_put_conflict(&error) {
+                        object_store::Error::Precondition {
+                            path: path.to_string(),
+                            source: Box::new(error),
+                        }
+                    } else {
+                        error
+                    }
+                });
+        }
+        self.put_payload_opts(path, payload, options).await
     }
 
     fn has_wrapper(&self) -> bool {
@@ -3028,7 +3183,7 @@ impl ObjectStore {
             inner: tracked_store,
             external_blob_inner,
             _external_blob_origin: None,
-            direct_local_io: false,
+            mutation_backend: None,
             local_dir_operations: None,
             local_fsync: false,
             scheme: scheme.into(),
@@ -3959,6 +4114,8 @@ mod tests {
         };
         assert!(!store.has_direct_local_paths());
         let source = base.clone().join("source");
+        #[cfg(unix)]
+        assert!(store.open_local_mutation(&source).await.unwrap().is_none());
         replacement
             .put(&source, Bytes::from_static(b"wrapped").into())
             .await

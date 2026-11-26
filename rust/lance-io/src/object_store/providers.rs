@@ -343,6 +343,7 @@ impl ObjectStoreRegistry {
         scheduler_error_mode: SchedulerErrorMode,
     ) -> Result<Arc<ObjectStore>> {
         let mut store = provider.new_store(base_path, params).await?;
+        let mutation_backend = store.selected_mutation_backend();
         // Providers only know the explicit parameter; the storage option is
         // applied here so every store honours it the same way.
         if let Some(block_size) = params.resolved_block_size()? {
@@ -369,6 +370,11 @@ impl ObjectStoreRegistry {
             external.inner = store.io_tracker.wrap("", external.inner.clone());
         }
         store.inner = store.io_tracker.wrap("", store.inner);
+        if let Some(kind) = mutation_backend
+            && !store.has_wrapper()
+        {
+            store.mutation_backend = Some((kind, Arc::downgrade(&store.inner)));
+        }
 
         Ok(Arc::new(store))
     }

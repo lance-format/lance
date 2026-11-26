@@ -311,9 +311,9 @@ impl ObjectStoreProvider for AzureBlobStoreProvider {
             with_throttling(throttle_state, !use_opendal, inner, paginated_lister);
 
         Ok(ObjectStore {
+            mutation_backend: None,
             inner,
             external_blob_inner: None,
-            direct_local_io: false,
             _external_blob_origin: None,
             local_dir_operations: None,
             local_fsync: false,

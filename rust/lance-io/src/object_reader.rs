@@ -34,6 +34,7 @@ use crate::{
 };
 
 mod streaming;
+pub(crate) use streaming::read_with_meta;
 
 /// GetResult extension for adapters whose conditional options differ from the
 /// object_store API. Returning an identifier does not imply support for using it.
@@ -1067,6 +1068,51 @@ mod tests {
         object_store::Error::Generic {
             store: "PartialBodyStore",
             source: "connection reset".into(),
+        }
+    }
+
+    #[rstest]
+    #[case::resume(1, false)]
+    #[case::replaced(1, true)]
+    #[case::disabled(0, false)]
+    #[tokio::test]
+    async fn test_read_with_meta_truncated(#[case] retries: usize, #[case] replaced: bool) {
+        let mut tail =
+            stream_response(4..16, vec![Ok(Bytes::from_static(b"efghijklmnop"))]).unwrap();
+        if replaced {
+            tail.meta.version = Some("replacement".into());
+        }
+        let store = streaming_store(vec![
+            stream_response(0..16, vec![Ok(Bytes::from_static(b"abcd"))]),
+            Ok(tail),
+        ]);
+        let result = read_with_meta(
+            store.clone(),
+            &Path::from("test/data.lance"),
+            GetOptions::default(),
+            retries,
+        )
+        .await;
+        if retries == 0 {
+            let error = result.unwrap_err();
+            assert!(error.to_string().contains("ended before"), "{error}");
+        } else if replaced {
+            let error = result.unwrap_err();
+            assert!(
+                matches!(error, object_store::Error::Precondition { .. }),
+                "{error}"
+            );
+            assert!(error.to_string().contains("replacement"), "{error}");
+        } else {
+            let (bytes, meta) = result.unwrap();
+            assert_eq!(bytes.as_ref(), b"abcdefghijklmnop");
+            assert_eq!(meta.version.as_deref(), Some("original-version"));
+        }
+        let requests = store.request_options.lock().unwrap();
+        assert_eq!(requests.len(), 1 + retries);
+        if retries > 0 {
+            assert_eq!(requests[1].if_match.as_deref(), Some("original-etag"));
+            assert_eq!(requests[1].range, Some((4..16).into()));
         }
     }
 

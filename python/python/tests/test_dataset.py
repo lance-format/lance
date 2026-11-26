@@ -1002,6 +1002,22 @@ def test_v2_manifest_paths_migration(tmp_path: Path):
     assert re.match(r"\d{20}\.manifest", manifest_path[0])
 
 
+@pytest.mark.parametrize(
+    ("method", "args"),
+    [("update", (1,)), ("replace_metadata", ({"owner": "review"},)), ("delete", ())],
+)
+def test_contended_tag_mutation(tmp_path: Path, method: str, args: tuple):
+    fcntl = pytest.importorskip("fcntl")
+    ds = lance.write_dataset(pa.table({"id": [1]}), tmp_path)
+    ds.tags.create("release", 1)
+    original = ds.tags.get("release")
+    with (tmp_path / "_refs" / "tags" / "release.json").open("rb") as tag:
+        fcntl.flock(tag, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with pytest.raises(ValueError, match="Ref conflict error"):
+            getattr(ds.tags, method)("release", *args)
+    assert lance.dataset(tmp_path).tags.get("release") == original
+
+
 def test_tag(tmp_path: Path):
     table = pa.Table.from_pydict({"colA": [1, 2, 3], "colB": [4, 5, 6]})
     base_dir = tmp_path / "test"

@@ -2116,10 +2116,47 @@ async fn test_create_existing_tag_conflict() {
     let mut req = CreateTableTagRequest::new("v1".to_string(), 2);
     req.id = Some(table_id);
     let err = namespace.create_table_tag(req).await.unwrap_err();
+    assert_eq!(namespace_code(&err), Some(ErrorCode::TableTagAlreadyExists));
     assert!(
         err.to_string().to_lowercase().contains("already exists"),
         "expected already-exists error, got: {}",
         err
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_tag_mutation_conflict() {
+    let (namespace, _temp_dir, table_id) = create_tagged_test_table(2).await;
+    let id = Some(table_id);
+    let mut create = CreateTableTagRequest::new("rolling".into(), 1);
+    create.id = id.clone();
+    namespace.create_table_tag(create).await.unwrap();
+
+    let location = namespace.resolve_table_location(&id).await.unwrap();
+    let table = uri_to_url(&location).unwrap().to_file_path().unwrap();
+    let tag = std::fs::File::open(table.join("_refs/tags/rolling.json")).unwrap();
+    tag.try_lock().unwrap();
+
+    let mut update = UpdateTableTagRequest::new("rolling".into(), 2);
+    update.id = id.clone();
+    let mut delete = DeleteTableTagRequest::new("rolling".into());
+    delete.id = id.clone();
+    for error in [
+        namespace.update_table_tag(update).await.unwrap_err(),
+        namespace.delete_table_tag(delete).await.unwrap_err(),
+    ] {
+        assert_eq!(
+            namespace_code(&error),
+            Some(ErrorCode::ConcurrentModification)
+        );
+        assert!(error.to_string().contains("rolling"), "{error}");
+    }
+    let mut get = GetTableTagVersionRequest::new("rolling".into());
+    get.id = id;
+    assert_eq!(
+        namespace.get_table_tag_version(get).await.unwrap().version,
+        1
     );
 }
 

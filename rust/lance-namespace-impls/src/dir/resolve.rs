@@ -317,8 +317,8 @@ impl DirectoryNamespace {
                 message: format!("tag '{}' for table at '{}'", tag, table_uri),
             }
             .into(),
-            lance_core::Error::RefConflict { .. } => NamespaceError::TableTagAlreadyExists {
-                message: format!("tag '{}' for table at '{}'", tag, table_uri),
+            lance_core::Error::RefConflict { message } => NamespaceError::ConcurrentModification {
+                message: format!("{message} for table at '{table_uri}'"),
             }
             .into(),
             lance_core::Error::InvalidRef { message } => NamespaceError::InvalidInput {

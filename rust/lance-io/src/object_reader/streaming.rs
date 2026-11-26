@@ -2,11 +2,12 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::ops::Range;
+use std::sync::Arc;
 
 use bytes::Bytes;
 use futures::{StreamExt, stream};
 use lance_core::Error;
-use object_store::{GetResult, ObjectMeta, Result};
+use object_store::{GetOptions, GetResult, ObjectMeta, ObjectStore, Result, path::Path};
 
 use super::{ConditionalGetSupport, GetRequest};
 use crate::object_store::hf_throttle::is_huggingface_rate_limited;
@@ -35,7 +36,35 @@ async fn request_with_retry(request: &GetRequest, retries: &mut usize) -> Result
     }
 }
 
-pub(super) async fn get_stream(request: GetRequest, mut retries: usize) -> Result<ByteStream> {
+pub(super) async fn get_stream(request: GetRequest, retries: usize) -> Result<ByteStream> {
+    Ok(open_download(request, retries).await?.into_stream())
+}
+
+pub async fn read_with_meta(
+    object_store: Arc<dyn ObjectStore>,
+    path: &Path,
+    options: GetOptions,
+    retries: usize,
+) -> Result<(Bytes, ObjectMeta)> {
+    let request = GetRequest {
+        object_store,
+        path: path.clone(),
+        options,
+    };
+    let download = open_download(request, retries).await?;
+    let meta = download.meta.clone();
+    let bytes = object_store::collect_bytes(download.into_stream(), Some(meta.size))
+        .await
+        .map_err(|error| match error {
+            object_store::Error::NotFound { path, source } => {
+                object_store::Error::Precondition { path, source }
+            }
+            error => error,
+        })?;
+    Ok((bytes, meta))
+}
+
+async fn open_download(request: GetRequest, mut retries: usize) -> Result<StreamingDownload> {
     let result = request_with_retry(&request, &mut retries).await?;
     let expected_range = match &request.options.range {
         Some(range) => range.as_range(result.meta.size).map_err(|error| {
@@ -53,15 +82,14 @@ pub(super) async fn get_stream(request: GetRequest, mut retries: usize) -> Resul
         ))
         .into());
     }
-    let download = StreamingDownload {
+    Ok(StreamingDownload {
         request,
         remaining: expected_range,
         meta: result.meta.clone(),
         conditions: result.extensions.get::<ConditionalGetSupport>().copied(),
         body: result.into_stream(),
         retries,
-    };
-    Ok(stream::try_unfold(download, |download| download.next()).boxed())
+    })
 }
 
 struct StreamingDownload {
@@ -74,6 +102,10 @@ struct StreamingDownload {
 }
 
 impl StreamingDownload {
+    fn into_stream(self) -> ByteStream {
+        stream::try_unfold(self, |download| download.next()).boxed()
+    }
+
     async fn next(mut self) -> Result<Option<(Bytes, Self)>> {
         loop {
             let error = match self.body.next().await {
