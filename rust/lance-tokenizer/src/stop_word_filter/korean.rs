@@ -399,6 +399,7 @@ pub(super) const KOREAN: &[&str] = &[
     "우리들",
     "우선",
     "우에 종합한것과같이",
+    "운운",
     "위에서 서술한바와같이",
     "위하여",
     "위해서",
@@ -449,6 +450,7 @@ pub(super) const KOREAN: &[&str] = &[
     "이와 반대로",
     "이와같다면",
     "이외에도",
+    "이용하여",
     "이유만으로",
     "이젠",
     "이지만",
@@ -650,7 +652,8 @@ mod tests {
 
     #[test]
     fn preserves_korean_search_terms() {
-        let text = "0 1 2 3 4 5 6 7 8 9 ０ １ ２ ３ ４ ５ ６ ７ ８ ９ 시간 시각 구토하다 도착하다 아니 아이 전자";
+        let text = "0 1 2 3 4 5 6 7 8 9 ０ １ ２ ３ ４ ５ ６ ７ ８ ９ 시간 시각 구토하다 도착하다 아니 아이 전자 \
+            자기집 옆사람 한항목 좋아 메쓰겁다 비걱거리다";
         for split in [false, true] {
             for stem in [false, true] {
                 let base = if split {

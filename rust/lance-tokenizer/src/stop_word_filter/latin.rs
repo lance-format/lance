@@ -542,7 +542,7 @@ mod tests {
     #[test]
     fn preserves_latin_search_terms() {
         let text = "war son sin van want cat dog hay soy sea bin hat nun mint ill don haven won not no \
-            pot pic ale era mine mining dig ad ads com ci os io vitamin c vitamin e";
+            pot pic ale era mine mining dig ad ads com ci os io vitamin c vitamin e j l";
         for split in [false, true] {
             for stem in [false, true] {
                 let base = if split {
