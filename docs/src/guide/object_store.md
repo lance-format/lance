@@ -507,6 +507,58 @@ The following keys can be used as both environment variables or keys in the
 
 ## Azure Blob Storage Configuration
 
+### Dataset URIs
+
+Lance uses the same Azure URI resolver in Rust, Python, and Java builds with Azure
+support. The built-in Azure provider handles `az://` and `abfss://` dataset URIs.
+
+| Service | Dataset URI | Account configuration |
+|---------|-------------|-----------------------|
+| Azure Blob Storage | `az://<container>/<path>` | Set `account_name` in storage options or `AZURE_STORAGE_ACCOUNT_NAME` in the environment. |
+| Azure Blob Storage, native backend | `az://<container>@<account>.blob.core.windows.net/<path>` | The URI supplies the account. The native backend also accepts the `dfs.core.windows.net` suffix in this form. |
+| Azure Data Lake Storage Gen2 | `abfss://<filesystem>@<account>.dfs.core.windows.net/<path>` | The URI supplies the account. |
+| Azure Data Lake Storage Gen2, native backend | `abfss://<filesystem>/<path>` | Set `account_name` in storage options or `AZURE_STORAGE_ACCOUNT_NAME` in the environment. |
+| Microsoft Fabric OneLake, native backend | `abfss://<workspace>@onelake.dfs.fabric.microsoft.com/<item>.lakehouse/Files/<path>` | The URI supplies the account and selects the Fabric endpoint. |
+
+When using `use_opendal=true`, use `az://<container>/<path>` with the account and
+`azure_endpoint` in storage options for Blob Storage. For ADLS Gen2, use the
+qualified `abfss://<filesystem>@<account>.dfs.core.windows.net/<path>` form.
+
+The qualified `az://` form requires a full account hostname. A bare authority
+such as `az://container@account/path` fails Azure URL validation. The default
+registry returns an unsupported-scheme error for `abfs://`, `adl://`, and direct
+`https://` URLs for Azure Blob Storage, ADLS Gen2, and OneLake.
+
+For example, with Azure credentials configured, open an ADLS Gen2 dataset using
+its filesystem name and account hostname.
+
+```python
+import lance
+
+ds = lance.dataset(
+    "abfss://myfilesystem@storageaccount.dfs.core.windows.net/example.lance"
+)
+```
+
+For OneLake, provide a Microsoft Entra token for the Storage audience. If the
+workspace name contains spaces, use
+`abfss://<workspace-guid>@onelake.dfs.fabric.microsoft.com/<item-guid>/Files/<path>`.
+See
+[Connecting to Microsoft OneLake](https://learn.microsoft.com/en-us/fabric/onelake/onelake-access-api).
+
+```python
+import os
+
+import lance
+
+ds = lance.dataset(
+    "abfss://analytics@onelake.dfs.fabric.microsoft.com/events.lakehouse/Files/example.lance",
+    storage_options={"azure_storage_token": os.environ["AZURE_STORAGE_TOKEN"]},
+)
+```
+
+### Credentials and storage options
+
 Azure Blob Storage credentials can be configured by setting the `AZURE_STORAGE_ACCOUNT_NAME`
 and `AZURE_STORAGE_ACCOUNT_KEY` environment variables. Alternatively, you can pass
 the account name and key in the `storage_options` parameter:
@@ -535,7 +587,7 @@ These keys can be used as both environment variables or keys in the `storage_opt
 | `azure_storage_token` / `bearer_token` / `token` | Bearer token. |
 | `azure_storage_use_emulator` / `object_store_use_emulator` / `use_emulator` | Use object store with azurite storage emulator. |
 | `azure_endpoint` / `endpoint` | Override the endpoint used to communicate with blob storage. |
-| `azure_use_fabric_endpoint` / `use_fabric_endpoint` | Use object store with url scheme account.dfs.fabric.microsoft.com. |
+| `azure_use_fabric_endpoint` / `use_fabric_endpoint` | Use the Microsoft Fabric endpoint for native Azure requests. A qualified Fabric URI selects this endpoint automatically. |
 | `azure_msi_endpoint` / `azure_identity_endpoint` / `identity_endpoint` / `msi_endpoint` | Endpoint to request a imds managed identity token. |
 | `azure_object_id` / `object_id` | Object id for use with managed identity authentication. |
 | `azure_msi_resource_id` / `msi_resource_id` | Msi resource id for use with managed identity authentication. |
