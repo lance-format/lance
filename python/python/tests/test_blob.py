@@ -12,8 +12,10 @@ import sys
 import tarfile
 import textwrap
 import threading
+import time
 import uuid
 import zipfile
+from datetime import timedelta
 from pathlib import Path
 
 import lance
@@ -21,7 +23,13 @@ import pandas as pd
 import pyarrow as pa
 import pytest
 from lance import Blob, BlobColumn, BlobFile, DatasetBasePath
-from lance.blob import BlobType
+from lance.blob import (
+    BlobRefBatch,
+    BlobRefCapture,
+    BlobRefReader,
+    BlobSourceContext,
+    BlobType,
+)
 from lance.file import LanceFileSession
 from lance.fragment import write_fragments
 
@@ -3642,3 +3650,320 @@ def _read_in_8k_chunks(blob: BlobFile) -> bytes:
             break
         chunks.append(chunk)
     return b"".join(chunks)
+
+
+def _wait_for_blob_ref_budget_release(reader):
+    # Submitted backend I/O may finish after stream completion or cancellation.
+    deadline = time.monotonic() + 1
+    while reader.reserved_bytes != 0 or reader.io_reserved_bytes != 0:
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(0.001)
+    assert reader.reserved_bytes == 0
+    assert reader.io_reserved_bytes == 0
+
+
+@pytest.mark.parametrize("first_factory", ["capture", "reader"])
+def test_portable_factories_bind_partially_read_worker_without_rehashing(
+    tmp_path, first_factory
+):
+    dataset = lance.write_dataset(
+        pa.table({"id": [1, 2], "blob": lance.blob_array([b"first", b"second"])}),
+        tmp_path / "worker.lance",
+        data_storage_version="2.2",
+        max_rows_per_file=1,
+    )
+    dataset.create_scalar_index("id", "BTREE", name="x" * (128 << 10))
+    source = BlobSourceContext.decode(
+        BlobSourceContext.from_dataset(dataset, "catalog/table", "workers").encode()
+    )
+    scanned = (
+        dataset.to_table(
+            columns=["blob"], with_row_address=True, blob_handling="all_descriptions"
+        )
+        .combine_chunks()
+        .to_batches()[0]
+    )
+    field_id = dataset.lance_schema.field("blob").id()
+    worker = lance.dataset(dataset.uri, block_size=4096)
+    before = worker.io_stats_snapshot()
+    assert before.read_bytes == 4096
+    capture_dataset = worker if first_factory == "capture" else dataset
+    with BlobRefCapture(capture_dataset, source, field_id) as capture:
+        if first_factory == "capture":
+            assert worker.io_stats_snapshot().read_iops == before.read_iops
+            assert worker.io_stats_snapshot().read_bytes == before.read_bytes
+        refs = capture.capture(
+            source, scanned.schema.field("blob"), scanned["_rowaddr"], scanned["blob"]
+        )
+    with BlobRefReader(
+        [(source, worker)],
+        io_buffer_size_bytes=1 << 20,
+        materialization_readahead_bytes=1 << 20,
+    ) as reader:
+        # Identity verification uses the token observed when the handle was opened.
+        assert worker.io_stats_snapshot().read_iops == before.read_iops
+        assert worker.io_stats_snapshot().read_bytes == before.read_bytes
+        with reader.read(refs, [0, 1], [0, 1]) as stream:
+            values = {}
+            for result in stream:
+                values[result["request_index"][0].as_py()] = result["data"][0].as_py()
+                del result
+    assert values == {0: b"first", 1: b"second"}
+
+
+@pytest.fixture
+def portable_blob_references(tmp_path):
+    values = [b"abc", b"abcde", b"abcdefghij", None, b"", b"uv"]
+    table = pa.Table.from_arrays(
+        [lance.blob_array(values)],
+        schema=pa.schema(
+            [
+                lance.blob_field(
+                    "blob", inline_size_threshold=4, dedicated_size_threshold=8
+                )
+            ]
+        ),
+    )
+    dataset = lance.write_dataset(
+        table,
+        tmp_path / "portable.lance",
+        max_rows_per_file=3,
+        enable_stable_row_ids=True,
+        data_storage_version="2.2",
+    )
+    source = BlobSourceContext.from_dataset(dataset, "catalog/portable", "workers")
+    batch = (
+        dataset.to_table(
+            columns=["blob"],
+            with_row_address=True,
+            blob_handling="all_descriptions",
+        )
+        .combine_chunks()
+        .to_batches()[0]
+    )
+    with BlobRefCapture(
+        dataset, source, field_id=dataset.lance_schema.field("blob").id()
+    ) as capture:
+        references = capture.capture(
+            source,
+            batch.schema.field("blob"),
+            batch["_rowaddr"],
+            batch["blob"],
+        )
+    capture.close()
+    assert not (Path(dataset.uri) / "_refs" / "retention").exists()
+    return dataset, source, references
+
+
+@pytest.mark.parametrize("replace_manifest", [False, True])
+def test_portable_worker_checks_v1_manifest_generation(tmp_path, replace_manifest):
+    uri = tmp_path / "source.lance"
+    table = pa.table({"blob": lance.blob_array([b"first", b"second"])})
+    lance.write_dataset(
+        table,
+        uri,
+        data_storage_version="2.2",
+        max_rows_per_file=1,
+        enable_v2_manifest_paths=False,
+    )
+    producer = lance.dataset(uri)
+    source = BlobSourceContext.decode(
+        BlobSourceContext.from_dataset(producer, "catalog/table", "workers").encode()
+    )
+    scanned = (
+        producer.to_table(
+            columns=["blob"], with_row_address=True, blob_handling="all_descriptions"
+        )
+        .combine_chunks()
+        .to_batches()[0]
+    )
+    with BlobRefCapture(
+        producer, source, producer.lance_schema.field("blob").id()
+    ) as capture:
+        references = capture.capture(
+            source, scanned.schema.field("blob"), scanned["_rowaddr"], scanned["blob"]
+        )
+    lance.write_dataset(
+        table,
+        uri,
+        mode="append",
+        data_storage_version="2.2",
+        enable_v2_manifest_paths=False,
+    )
+    worker_root = lance.dataset(uri)
+    assert worker_root.version == source.version + 1
+    if replace_manifest:
+        other_uri = tmp_path / "other.lance"
+        lance.write_dataset(
+            pa.table({"blob": lance.blob_array([b"other", b"values"])}),
+            other_uri,
+            data_storage_version="2.2",
+            enable_v2_manifest_paths=False,
+        )
+        (uri / "_versions" / "1.manifest").write_bytes(
+            (other_uri / "_versions" / "1.manifest").read_bytes()
+        )
+    worker = worker_root.checkout_version((source.branch, source.version))
+    if replace_manifest:
+        with pytest.raises(ValueError, match="does not match dataset snapshot"):
+            BlobRefReader(
+                [(source, worker)],
+                io_buffer_size_bytes=1024,
+                materialization_readahead_bytes=1024,
+            )
+    else:
+        with BlobRefReader(
+            [(source, worker)],
+            io_buffer_size_bytes=1024,
+            materialization_readahead_bytes=1024,
+        ) as reader:
+            values = {}
+            with reader.read(references, [0, 1], [0, 1]) as stream:
+                for result in stream:
+                    request_index = result["request_index"][0].as_py()
+                    values[request_index] = result["data"][0].as_py()
+                    del result
+        assert values == {0: b"first", 1: b"second"}
+
+
+def test_portable_blob_reference_requests(portable_blob_references):
+    dataset, source, references = portable_blob_references
+    assert BlobSourceContext.protocol_version() == 1
+    assert BlobSourceContext.supported_capabilities() == [1, 2]
+    assert BlobSourceContext.supported_operations() == [
+        "capture_top_level",
+        "read_whole",
+        "read_range",
+        "streaming",
+        "cancellation",
+    ]
+    assert source.table_identity == "catalog/portable"
+    assert source.access_context_key == "workers"
+    assert source.branch is None
+    assert BlobSourceContext.decode(source.encode()).encode() == source.encode()
+    references = BlobRefBatch.decode(references.encode())
+    selected = references.array.take(pa.array([2, 0, 1, 3, 4, 2]))
+    selected = BlobRefBatch.from_arrow(references.contexts, references.field, selected)
+    selected = selected.remap_contexts([BlobSourceContext.decode(source.encode())])
+    assert len(selected) == 6
+    worker = lance.dataset(dataset.uri, version=source.version)
+    with BlobRefReader(
+        [(source, worker)],
+        io_buffer_size_bytes=1024,
+        materialization_readahead_bytes=1024,
+    ) as reader:
+        with reader.read(
+            selected,
+            list(range(6)),
+            [(1 << 64) - 1, 0, 1, 2, 3, 4],
+            [None, None, (1, 3), None, None, (2, 4)],
+        ) as stream:
+            results = {}
+            for batch in stream:
+                results[batch["request_index"][0].as_py()] = batch["data"][0].as_py()
+                del batch
+        assert results == {
+            (1 << 64) - 1: b"abcdefghij",
+            0: b"abc",
+            1: b"bcd",
+            2: None,
+            3: b"",
+            4: b"cdef",
+        }
+        _wait_for_blob_ref_budget_release(reader)
+
+
+@pytest.mark.parametrize(
+    "indices, request_indices, ranges, message",
+    [
+        ([0], [], None, "counts differ"),
+        ([99], [0], None, "index"),
+        ([0, 0], [1, 1], None, "Duplicate"),
+        ([0], [0], [(2, 2)], "range"),
+        ([0], [0], [((1 << 64) - 1, 1)], "overflow"),
+    ],
+)
+def test_portable_blob_reference_validation(
+    portable_blob_references, indices, request_indices, ranges, message
+):
+    dataset, source, references = portable_blob_references
+    with BlobRefReader(
+        [(source, dataset)],
+        io_buffer_size_bytes=1024,
+        materialization_readahead_bytes=1024,
+    ) as reader:
+        with pytest.raises(ValueError, match=message):
+            reader.read(references, indices, request_indices, ranges)
+        assert reader.reserved_bytes == 0
+    wire = bytearray(source.encode())
+    wire[1] = 99
+    with pytest.raises(ValueError, match="protocol version"):
+        BlobSourceContext.decode(bytes(wire))
+
+
+def test_portable_blob_reference_cancel_and_buffer_ownership(portable_blob_references):
+    dataset, source, references = portable_blob_references
+    with BlobRefReader(
+        [(source, dataset)],
+        io_buffer_size_bytes=1,
+        materialization_readahead_bytes=1,
+    ) as reader:
+        stream = reader.read(references, [0, 1], [0, 1])
+        first = next(stream)
+        array = first["data"]
+        del first
+        assert array[0].as_py() == b"abc"
+        assert reader.reserved_bytes >= 3
+        stream.cancel()
+        with pytest.raises(OSError, match="cancel"):
+            next(stream)
+        stream.close()
+        stream.close()
+        assert array[0].as_py() == b"abc"
+        assert reader.reserved_bytes >= 3
+        del array
+        _wait_for_blob_ref_budget_release(reader)
+        assert next(stream, None) is None
+
+
+def test_portable_blob_references_in_separate_process(
+    portable_blob_references, tmp_path
+):
+    dataset, source, references = portable_blob_references
+    reference_path = tmp_path / "refs.bin"
+    reference_path.write_bytes(references.encode())
+    # The application coordinates this existing tag with cleanup and readers.
+    dataset.tags.create("source", source.version)
+    dataset.delete("true")
+    dataset.cleanup_old_versions(
+        older_than=timedelta(0), error_if_tagged_old_versions=False
+    )
+    script = textwrap.dedent("""
+        import sys
+        from pathlib import Path
+        import lance
+        refs = lance.BlobRefBatch.decode(Path(sys.argv[1]).read_bytes())
+        source = refs.contexts[0]
+        worker = lance.dataset(source.table_uri, version=source.version)
+        with lance.BlobRefReader([(source, worker)], io_buffer_size_bytes=1024,
+                                 materialization_readahead_bytes=1024) as reader:
+            with reader.read(refs, [2, 0, 3, 4], [(1 << 64) - 1, 1, 2, 3],
+                             [(2, 4), None, None, None]) as stream:
+                values = {}
+                for batch in stream:
+                    values[batch['request_index'][0].as_py()] = batch['data'][0].as_py()
+                    del batch
+            assert values == {(1 << 64) - 1: b'cdef', 1: b'abc', 2: None, 3: b''}
+            assert reader.reserved_bytes == 0
+    """)
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(reference_path)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert completed.returncode == 0, completed.stderr
+    dataset.tags.delete("source")
+    stats = dataset.cleanup_old_versions(older_than=timedelta(0))
+    assert stats.data_files_removed >= 2

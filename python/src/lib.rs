@@ -70,6 +70,7 @@ use std::ptr::NonNull;
 pub(crate) mod arrow;
 pub(crate) mod bitmap;
 pub(crate) mod blob;
+mod blob_reference;
 #[cfg(feature = "datagen")]
 pub(crate) mod datagen;
 pub(crate) mod dataset;
@@ -290,6 +291,11 @@ fn lance(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyPackedBlobWriter>()?;
     m.add_class::<PyManagedBlobWriter>()?;
     m.add_class::<PyDedicatedBlobWriter>()?;
+    m.add_class::<blob_reference::PyBlobSourceContext>()?;
+    m.add_class::<blob_reference::PyBlobRefBatch>()?;
+    m.add_class::<blob_reference::PyBlobRefCapture>()?;
+    m.add_class::<blob_reference::PyBlobRefReader>()?;
+    m.add_class::<blob_reference::PyBlobRefReadStream>()?;
     m.add_class::<LanceFileReader>()?;
     m.add_class::<LanceFileWriter>()?;
     m.add_class::<LanceFileWriteSummary>()?;

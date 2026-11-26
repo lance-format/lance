@@ -40,6 +40,7 @@ macro_rules! ok_or_throw_with_return {
 }
 
 mod async_scanner;
+mod blob_reference;
 mod blocking_blob;
 mod blocking_dataset;
 mod blocking_scanner;
