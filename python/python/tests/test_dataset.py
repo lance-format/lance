@@ -11135,3 +11135,39 @@ class TestLanceScannerTake:
         ds = self._make_dataset(tmp_path)
         scanner = ds.scanner(filter="id >= 4")
         assert scanner.take(pa.array([0, 2]))["id"].to_pylist() == [4, 6]
+
+
+def test_merge_insert_with_concurrent_reader(tmp_path: Path):
+    # A merge committed while another thread was reading through the same handle used
+    # to raise PanicException ("Already borrowed") after the commit had landed. It now
+    # returns its stats; the handle may stay at the previous version.
+    uri = tmp_path / "data"
+    ds = lance.write_dataset(pa.table({"id": range(256)}), uri)
+    stop = threading.Event()
+    reader_errors = []
+
+    def read_concurrently():
+        try:
+            while not stop.is_set():
+                ds.count_rows()
+        except BaseException as err:
+            reader_errors.append(err)
+
+    reader = threading.Thread(target=read_concurrently)
+    reader.start()
+    new_table = pa.table({"id": range(256)})
+    try:
+        for _ in range(3):
+            version_before = lance.dataset(uri).version
+            stats = ds.merge_insert("id").when_matched_update_all().execute(new_table)
+            assert stats["num_updated_rows"] == len(new_table)
+            assert lance.dataset(uri).version == version_before + 1
+            assert ds.version <= version_before + 1
+    finally:
+        stop.set()
+        reader.join()
+    assert reader_errors == []
+
+    # With the reader gone, the handle moves to each new commit again.
+    ds.merge_insert("id").when_matched_update_all().execute(new_table)
+    assert ds.version == lance.dataset(uri).version

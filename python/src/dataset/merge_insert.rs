@@ -24,7 +24,7 @@ use crate::rt;
 use crate::utils::PyLance;
 
 use super::replayable::replayable_provider;
-use super::{Dataset, convert_reader};
+use super::{Dataset, convert_reader, set_committed_dataset};
 
 #[pyclass(name = "_MergeInsertBuilder", module = "_lib", subclass)]
 pub struct MergeInsertBuilder {
@@ -202,9 +202,7 @@ impl MergeInsertBuilder {
             .spawn(Some(py), job.execute_reader(new_data))?
             .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
 
-        let dataset = self.dataset.bind(py);
-
-        dataset.borrow_mut().ds = new_dataset;
+        set_committed_dataset(self.dataset.bind(py), new_dataset);
 
         Ok(Self::build_stats(&stats, py)?.into())
     }
@@ -247,7 +245,7 @@ impl MergeInsertBuilder {
         let (new_dataset, stats) = rt()
             .spawn(Some(py), job.execute_provider(provider))?
             .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
-        self.dataset.bind(py).borrow_mut().ds = new_dataset;
+        set_committed_dataset(self.dataset.bind(py), new_dataset);
         Ok(Self::build_stats(&stats, py)?.into())
     }
 
@@ -261,7 +259,7 @@ impl MergeInsertBuilder {
         let (dataset, stats) = rt()
             .spawn(Some(py), job.execute_dataset(source))?
             .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
-        self.dataset.bind(py).borrow_mut().ds = dataset;
+        set_committed_dataset(self.dataset.bind(py), dataset);
         Ok(Self::build_stats(&stats, py)?.into())
     }
 
@@ -286,8 +284,7 @@ impl MergeInsertBuilder {
             .spawn(Some(py), job.execute_batches(batches))?
             .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
 
-        let dataset = self.dataset.bind(py);
-        dataset.borrow_mut().ds = new_dataset;
+        set_committed_dataset(self.dataset.bind(py), new_dataset);
 
         Ok(Self::build_stats(&stats, py)?.into())
     }

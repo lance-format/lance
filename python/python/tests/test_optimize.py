@@ -1724,3 +1724,36 @@ def test_read_transaction_of_a_compaction_that_rewrites_an_index(tmp_path: Path)
     assert rewritten.new_details_type_url == index.type_url
     assert isinstance(rewritten.new_details_value, bytes)
     assert rewritten.new_index_version == index.segments[0].index_version
+
+
+def test_compaction_with_concurrent_reader(tmp_path: Path):
+    # Compaction that commits while another thread reads through the same handle must
+    # not raise after the commit has landed.
+    uri = tmp_path / "data"
+    for i in range(8):
+        lance.write_dataset(
+            pa.table({"a": range(i * 10, i * 10 + 10)}),
+            uri,
+            mode="append" if i else "create",
+        )
+    ds = lance.dataset(uri)
+    stop = threading.Event()
+    reader_errors = []
+
+    def read_concurrently():
+        try:
+            while not stop.is_set():
+                ds.count_rows()
+        except BaseException as err:
+            reader_errors.append(err)
+
+    reader = threading.Thread(target=read_concurrently)
+    reader.start()
+    try:
+        metrics = ds.optimize.compact_files()
+    finally:
+        stop.set()
+        reader.join()
+    assert reader_errors == []
+    assert metrics.fragments_removed == 8
+    assert len(lance.dataset(uri).get_fragments()) == 1

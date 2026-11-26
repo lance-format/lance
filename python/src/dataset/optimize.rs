@@ -578,7 +578,7 @@ impl PyCompaction {
         // repack commit fails or is interrupted, `new_ds` is at the rewrite's
         // version, which has landed.
         if new_ds.manifest.version != dataset.ds.manifest.version {
-            dataset_ref.borrow_mut().ds = Arc::new(new_ds);
+            set_committed_dataset(&dataset_ref, Arc::new(new_ds));
         }
         let metrics = result?.map_err(|err| PyIOError::new_err(err.to_string()))?;
         Ok(metrics.into())
@@ -665,7 +665,7 @@ impl PyCompaction {
         let result = rt().block_on(None, fut);
         // See `execute`: the rewrites may have landed even on an error.
         if new_ds.manifest.version != dataset.ds.manifest.version {
-            dataset_ref.borrow_mut().ds = Arc::new(new_ds);
+            set_committed_dataset(&dataset_ref, Arc::new(new_ds));
         }
         let metrics = result?.map_err(|err| PyIOError::new_err(err.to_string()))?;
         Ok(metrics.into())
