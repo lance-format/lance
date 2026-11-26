@@ -251,6 +251,11 @@ pub fn get_write_params(
         {
             p.enable_v2_manifest_paths = enable_v2_manifest_paths;
         }
+        if let Some(disable_transaction_file) =
+            get_dict_opt::<bool>(options, "disable_transaction_file")?
+        {
+            p.disable_transaction_file = disable_transaction_file;
+        }
 
         if let Some(auto_cleanup) = get_dict_opt::<Bound<PyAny>>(options, "auto_cleanup_options")? {
             let mut auto_cleanup_params = AutoCleanupParams::default();

@@ -536,6 +536,57 @@ mod tests {
         assert!(!params.skip_auto_cleanup);
     }
 
+    #[tokio::test]
+    async fn test_disable_transaction_file_applies_to_its_commit_only() {
+        use crate::dataset::transaction::Operation;
+        use lance_table::feature_flags::FLAG_DISABLE_TRANSACTION_FILE;
+
+        let tmp = TempStrDir::default();
+        let uri = tmp.as_str();
+        let transaction_file_count = || {
+            std::fs::read_dir(std::path::Path::new(uri).join("_transactions"))
+                .map(|entries| entries.count())
+                .unwrap_or(0)
+        };
+        let data = || {
+            gen_batch()
+                .col("id", array::step::<arrow_array::types::Int32Type>())
+                .into_reader_rows(RowCount::from(3), BatchCount::from(1))
+        };
+
+        let params = WriteParams {
+            disable_transaction_file: true,
+            ..Default::default()
+        };
+        let dataset = Dataset::write(data(), uri, Some(params)).await.unwrap();
+        assert!(dataset.manifest.transaction_file.is_none());
+        assert!(dataset.manifest.transaction_section.is_some());
+        assert_ne!(
+            dataset.manifest.writer_feature_flags & FLAG_DISABLE_TRANSACTION_FILE,
+            0
+        );
+        assert_eq!(transaction_file_count(), 0);
+
+        // A fresh handle has no cached transaction, so this reads the inline section.
+        let reopened = Dataset::open(uri).await.unwrap();
+        assert_eq!(reopened.count_rows(None).await.unwrap(), 3);
+        let transaction = reopened.read_transaction().await.unwrap().unwrap();
+        assert!(matches!(transaction.operation, Operation::Overwrite { .. }));
+
+        let params = WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        };
+        let dataset = Dataset::write(data(), uri, Some(params)).await.unwrap();
+        assert!(dataset.manifest.transaction_file.is_some());
+        assert_eq!(
+            dataset.manifest.writer_feature_flags & FLAG_DISABLE_TRANSACTION_FILE,
+            0
+        );
+        assert_eq!(transaction_file_count(), 1);
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 6);
+    }
+
     #[cfg(windows)]
     #[tokio::test]
     async fn test_create_and_reopen_from_unc_uri() {

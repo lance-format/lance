@@ -72,7 +72,7 @@ impl Scanner {
             minhash_query: None,
             batch_size: None,
             batch_size_bytes: None,
-            batch_readahead: get_num_compute_intensive_cpus(),
+            batch_readahead: Self::default_batch_readahead(),
             fragment_readahead: None,
             io_buffer_size: None,
             materialization_readahead_bytes: None,
@@ -662,10 +662,15 @@ impl Scanner {
         self
     }
 
+    /// The number of batches decoded concurrently when no override is supplied.
+    pub fn default_batch_readahead() -> usize {
+        get_num_compute_intensive_cpus()
+    }
+
     /// Set the number of batches to decode concurrently.
     ///
     /// This bounds the decode fan-out of the scan: at most this many batch-decode
-    /// tasks run in flight at once. Defaults to `get_num_compute_intensive_cpus()`.
+    /// tasks run in flight at once. Defaults to [`Self::default_batch_readahead`].
     ///
     /// `nbatches` must be greater than zero.
     pub fn batch_readahead(&mut self, nbatches: usize) -> &mut Self {

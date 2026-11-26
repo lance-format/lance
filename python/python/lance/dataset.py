@@ -526,9 +526,20 @@ class LanceDataset(pa.dataset.Dataset):
     def has_index(self):
         return len(self.describe_indices()) > 0
 
-    def _apply_default_scan_options(self, builder: ScannerBuilder):
-        if self._default_scan_options:
-            builder.apply_defaults(self._default_scan_options)
+    def _apply_default_scan_options(
+        self, builder: ScannerBuilder, *, override_nearest: bool = False
+    ):
+        default_options = self._default_scan_options
+        if default_options:
+            # Vector and MinHash queries use separate builder fields, so an
+            # explicit nearest drops every default key that sets either one.
+            if override_nearest:
+                default_options = {
+                    key: value
+                    for key, value in default_options.items()
+                    if key not in ("nearest", "minhash_search")
+                }
+            builder.apply_defaults(default_options)
         return builder
 
     def scanner(
@@ -875,7 +886,9 @@ class LanceDataset(pa.dataset.Dataset):
 
         """
         builder = ScannerBuilder(self)
-        builder = self._apply_default_scan_options(builder)
+        builder = self._apply_default_scan_options(
+            builder, override_nearest=nearest is not None
+        )
 
         # Calls the setter if the user provided a non-None value
         # We need to avoid calling the setter with a None value so
@@ -5855,6 +5868,7 @@ def write_dataset(
     enable_v2_manifest_paths: bool = True,
     enable_stable_row_ids: bool = False,
     auto_cleanup_options: Optional[AutoCleanupConfig] = None,
+    disable_transaction_file: bool = False,
     commit_message: Optional[str] = None,
     transaction_properties: Optional[Dict[str, str]] = None,
     initial_bases: Optional[List[DatasetBasePath]] = None,
@@ -5958,6 +5972,17 @@ def write_dataset(
         then no autocleaning will be performed.
         Note: this option only takes effect when creating a new dataset,
         it has no effect on existing datasets.
+    disable_transaction_file: bool, default False
+        If True, this write's commit stores its transaction only inline in the
+        manifest and skips the separate file under ``_transactions/``, saving one
+        object write. The transaction is inlined regardless of its size (up to
+        4 GiB), so very large transactions grow the manifest. The new version
+        gets a writer feature flag, so Lance releases older than 1.0.0 refuse to
+        write to it. Later commits that leave this unset write the transaction
+        file again and drop the flag. Readers older than Lance 14.0 return no
+        transaction for such a version and cannot rebase a concurrent commit
+        across it, so keep the transaction file when clients older than 14.0
+        read transaction history or commit concurrently.
     commit_message: str, optional
         A message to associate with this commit. This message will be stored in the
         dataset's metadata and can be retrieved using read_transaction().
@@ -6134,6 +6159,7 @@ def write_dataset(
         "enable_v2_manifest_paths": enable_v2_manifest_paths,
         "enable_stable_row_ids": enable_stable_row_ids,
         "auto_cleanup_options": auto_cleanup_options,
+        "disable_transaction_file": disable_transaction_file,
         "transaction_properties": merged_properties,
         "initial_bases": initial_bases,
         "target_bases": target_bases,

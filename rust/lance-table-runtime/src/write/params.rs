@@ -193,6 +193,25 @@ pub struct WriteParams<S> {
     /// just try and log a failure anyway. Default is false.
     pub skip_auto_cleanup: bool,
 
+    /// If true, this write's commit stores its transaction only inline in the
+    /// manifest and skips the separate file under `_transactions/`, saving one
+    /// object write per commit. The transaction is inlined regardless of its
+    /// size (up to `u32::MAX` bytes), so very large transactions grow the
+    /// manifest instead of spilling to a separate file.
+    ///
+    /// The new manifest gets a writer feature flag, so Lance releases older than
+    /// v1.0.0 refuse to write to that version. The setting applies only to this
+    /// commit: later commits that leave it unset write the transaction file again
+    /// and drop the flag.
+    ///
+    /// Readers older than Lance 14.0 return no transaction for such a version
+    /// and cannot rebase a concurrent commit across it. Keep the transaction
+    /// file when clients older than 14.0 read transaction history or commit
+    /// concurrently.
+    ///
+    /// Default is false.
+    pub disable_transaction_file: bool,
+
     /// Configuration key-value pairs for this write operation.
     /// This can include commit messages, engine information, etc.
     /// this properties map will be persisted as part of Transaction object.
@@ -267,6 +286,7 @@ impl<S> Default for WriteParams<S> {
             session: None,
             auto_cleanup: None,
             skip_auto_cleanup: false,
+            disable_transaction_file: false,
             transaction_properties: None,
             initial_bases: None,
             target_bases: None,
@@ -300,6 +320,7 @@ impl<S> WriteParams<S> {
             session,
             auto_cleanup: self.auto_cleanup,
             skip_auto_cleanup: self.skip_auto_cleanup,
+            disable_transaction_file: self.disable_transaction_file,
             transaction_properties: self.transaction_properties,
             initial_bases: self.initial_bases,
             target_bases: self.target_bases,
