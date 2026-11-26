@@ -1494,16 +1494,15 @@ impl BlobPreprocessor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::blob::test_util::reject_empty_range_store;
+    use crate::blob::test_util::{RecordingRangeObjectStore, reject_empty_range_store};
     use crate::blob::{BlobArrayBuilder, blob_field};
     use arrow_schema::{Field, Schema};
     use lance_arrow::{
         BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY, BLOB_INLINE_SIZE_THRESHOLD_META_KEY,
         BLOB_PACK_FILE_SIZE_THRESHOLD_META_KEY,
     };
-    use lance_io::testing::MockObjectStore;
-    use object_store::{ObjectStore as _, ObjectStoreExt, memory::InMemory};
     use rstest::rstest;
+    use std::sync::atomic::Ordering;
 
     #[rstest]
     #[case::exact(4096)]
@@ -1515,23 +1514,9 @@ mod tests {
         let body = Bytes::from(vec![7; actual_size]);
         let root = Path::from("table");
         let relative_path = Path::from("_blobs/ingest/attempt/value.payload");
-        let path = root.parts().chain(relative_path.parts()).collect::<Path>();
-        let backend = Arc::new(InMemory::new());
-        backend.put(&path, body.clone().into()).await.unwrap();
-        let mut cloud = MockObjectStore::new();
-        cloud
-            .expect_get_opts()
-            .once()
-            .withf(move |location, options| {
-                location == &path && !options.head && options.range.is_none()
-            })
-            .returning(move |location, options| {
-                let backend = backend.clone();
-                let location = location.clone();
-                Box::pin(async move { backend.get_opts(&location, options).await })
-            });
+        let cloud = Arc::new(RecordingRangeObjectStore::new(body.clone()));
         let store = ObjectStore::new(
-            Arc::new(cloud),
+            cloud.clone(),
             url::Url::parse(concat!("s3", "://", "fixture")).unwrap(),
             Some(1024),
             None,
@@ -1546,7 +1531,7 @@ mod tests {
                 .unwrap();
         let mut writer = BlobPreprocessor::new(
             store,
-            root.child("data"),
+            Path::from("table/data"),
             "output".into(),
             &schema,
             None,
@@ -1564,6 +1549,8 @@ mod tests {
         let result = writer
             .write_registered_blob(&source, &root, expected_size, usize::MAX, usize::MAX)
             .await;
+        assert_eq!(cloud.head_requests.load(Ordering::Relaxed), 0);
+        assert_eq!(cloud.requested_ranges(), vec![0..actual_size as u64]);
         if actual_size == expected_size {
             let BlobDescriptor::Inline { data } = result.unwrap() else {
                 panic!("the fixture should be inlined");
