@@ -2404,7 +2404,13 @@ But exactly how the acquaintance and friendship came about, we cannot say.";
         // a table trained on real text must give the same code from either of them.
         for paragraph in [TEST_PARAGRAPH, TEST_PARAGRAPH2, TEST_PARAGRAPH3] {
             let offsets = [0i32, paragraph.len() as i32];
-            let st = build_symbol_table(paragraph.as_bytes(), &offsets).unwrap();
+            let trained = build_symbol_table(paragraph.as_bytes(), &offsets).unwrap();
+            // Training looks symbols up before `finalize()`. Finalizing moves every code
+            // below FSST_CODE_BASE, so neither lookup would take its two-byte fallback.
+            let mut st = SymbolTable::new();
+            for symbol in &trained.symbols[..trained.n_symbols as usize] {
+                assert!(st.add(*symbol));
+            }
             let text = paragraph.as_bytes();
             for curr in 0..text.len() - 7 {
                 assert_eq!(
