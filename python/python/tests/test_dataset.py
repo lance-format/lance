@@ -11172,4 +11172,4 @@ def test_commit_lock_conflict_error_keeps_type(tmp_path: Path):
             max_retries=0,
         )
     assert exc_info.value.retryable is True
-    assert dataset.version == 1
+    assert lance.dataset(tmp_path / "data").version == 1
