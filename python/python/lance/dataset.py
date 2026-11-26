@@ -526,9 +526,20 @@ class LanceDataset(pa.dataset.Dataset):
     def has_index(self):
         return len(self.describe_indices()) > 0
 
-    def _apply_default_scan_options(self, builder: ScannerBuilder):
-        if self._default_scan_options:
-            builder.apply_defaults(self._default_scan_options)
+    def _apply_default_scan_options(
+        self, builder: ScannerBuilder, *, override_nearest: bool = False
+    ):
+        default_options = self._default_scan_options
+        if default_options:
+            # Vector and MinHash queries use separate builder fields, so an
+            # explicit nearest drops every default key that sets either one.
+            if override_nearest:
+                default_options = {
+                    key: value
+                    for key, value in default_options.items()
+                    if key not in ("nearest", "minhash_search")
+                }
+            builder.apply_defaults(default_options)
         return builder
 
     def scanner(
@@ -875,7 +886,9 @@ class LanceDataset(pa.dataset.Dataset):
 
         """
         builder = ScannerBuilder(self)
-        builder = self._apply_default_scan_options(builder)
+        builder = self._apply_default_scan_options(
+            builder, override_nearest=nearest is not None
+        )
 
         # Calls the setter if the user provided a non-None value
         # We need to avoid calling the setter with a None value so
