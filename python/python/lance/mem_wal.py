@@ -300,6 +300,12 @@ class ShardWriter:
 
         After ``close()``, calling :meth:`put` raises an error.
         Automatically called when used as a context manager.
+
+        Raises
+        ------
+        IOError
+            If the flush fails. A ``close()`` that failed or was interrupted is
+            reported again by every later ``close()``.
         """
         self._raw.close()
 
@@ -353,8 +359,7 @@ class ShardWriter:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> bool:
-        self.close()
-        return False
+        return self._raw.__exit__(exc_type, exc_val, exc_tb)
 
 
 class LsmScanner:

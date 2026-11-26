@@ -33,7 +33,7 @@ use lance_arrow::deepcopy::deep_copy_batch;
 use lance_index::mem_wal::{
     CompactedSsTable as LanceCompactedSsTable, ShardingField, ShardingSpec,
 };
-use pyo3::exceptions::{PyIOError, PyRuntimeError, PyValueError};
+use pyo3::exceptions::{PyException, PyIOError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use tokio::sync::Mutex as TokioMutex;
@@ -249,6 +249,21 @@ struct ClosedShardWriterState {
     memtable_stats: MemTableStats,
 }
 
+/// Why a `close()` call did not return cleanly.
+enum CloseFailure {
+    /// This call's flush failed.
+    Flush(String),
+    /// An earlier call gave the writer up; this is the error it recorded.
+    Recorded(String),
+}
+
+impl CloseFailure {
+    fn into_py_err(self) -> PyErr {
+        let (Self::Flush(message) | Self::Recorded(message)) = self;
+        PyIOError::new_err(message)
+    }
+}
+
 const DEFAULT_MAX_WRITE_BYTES: usize = 256 * 1024 * 1024;
 
 impl PyShardWriter {
@@ -300,6 +315,49 @@ impl PyShardWriter {
         }
         py.check_signals()?;
         Ok(buffer.into_batches())
+    }
+
+    fn close_writer(&self, py: Python<'_>) -> PyResult<Result<(), CloseFailure>> {
+        let inner = self.inner.clone();
+        let closed_state = self.closed_state.clone();
+        let close_error = self.close_error.clone();
+        rt().block_on(Some(py), async move {
+            let mut guard = inner.lock().await;
+            let mut close_error = close_error.lock().await;
+            let Some(writer) = guard.take() else {
+                // The writer is gone: Ok after a clean close, the stored error otherwise.
+                return close_error
+                    .clone()
+                    .map_or(Ok(()), |message| Err(CloseFailure::Recorded(message)));
+            };
+            // Recorded before the drain, so a close() cancelled by an interrupt is not
+            // reported as clean by the next call.
+            *close_error = Some(
+                "ShardWriter.close() was interrupted before it finished; \
+                 unflushed rows may be lost"
+                    .to_string(),
+            );
+            let result: lance::Result<()> = async {
+                let stats_handle = writer.stats_handle();
+                // Snapshot stats before close so the captured state reflects
+                // what was written, not any internal bookkeeping done by close().
+                let stats_snapshot = stats_handle.snapshot();
+                let memtable_stats_before_close = writer.memtable_stats().await?;
+                writer.close().await?;
+                let closed_memtable_stats = closed_memtable_stats(memtable_stats_before_close);
+                let mut closed_guard = closed_state.lock().await;
+                *closed_guard = Some(ClosedShardWriterState {
+                    stats: stats_snapshot,
+                    memtable_stats: closed_memtable_stats,
+                });
+                Ok(())
+            }
+            .await;
+            *close_error = result.err().map(|err| err.to_string());
+            close_error
+                .clone()
+                .map_or(Ok(()), |message| Err(CloseFailure::Flush(message)))
+        })
     }
 }
 
@@ -366,43 +424,7 @@ impl PyShardWriter {
     /// After close(), calling put() will raise an error.
     /// This is called automatically when using the context manager.
     pub fn close(&self, py: Python<'_>) -> PyResult<()> {
-        let inner = self.inner.clone();
-        let closed_state = self.closed_state.clone();
-        let close_error = self.close_error.clone();
-        rt().block_on(Some(py), async move {
-            let mut guard = inner.lock().await;
-            let mut close_error = close_error.lock().await;
-            let Some(writer) = guard.take() else {
-                // The writer is gone: Ok after a clean close, the stored error otherwise.
-                return close_error.clone().map_or(Ok(()), Err);
-            };
-            // Recorded before the drain, so a close() cancelled by an interrupt is not
-            // reported as clean by the next call.
-            *close_error = Some(
-                "ShardWriter.close() was interrupted before it finished; \
-                 unflushed rows may be lost"
-                    .to_string(),
-            );
-            let result: lance::Result<()> = async {
-                let stats_handle = writer.stats_handle();
-                // Snapshot stats before close so the captured state reflects
-                // what was written, not any internal bookkeeping done by close().
-                let stats_snapshot = stats_handle.snapshot();
-                let memtable_stats_before_close = writer.memtable_stats().await?;
-                writer.close().await?;
-                let closed_memtable_stats = closed_memtable_stats(memtable_stats_before_close);
-                let mut closed_guard = closed_state.lock().await;
-                *closed_guard = Some(ClosedShardWriterState {
-                    stats: stats_snapshot,
-                    memtable_stats: closed_memtable_stats,
-                });
-                Ok(())
-            }
-            .await;
-            *close_error = result.err().map(|err| err.to_string());
-            close_error.clone().map_or(Ok(()), Err)
-        })?
-        .map_err(PyIOError::new_err)
+        self.close_writer(py)?.map_err(CloseFailure::into_py_err)
     }
 
     /// Return a snapshot of current write statistics.
@@ -541,11 +563,26 @@ impl PyShardWriter {
         &self,
         py: Python<'_>,
         _exc_type: &Bound<'_, PyAny>,
-        _exc_val: &Bound<'_, PyAny>,
+        exc_val: &Bound<'_, PyAny>,
         _exc_tb: &Bound<'_, PyAny>,
     ) -> PyResult<bool> {
-        self.close(py)?;
-        Ok(false)
+        let Err(failure) = self.close_writer(py)? else {
+            return Ok(false);
+        };
+        // With an exception propagating, raise only this call's own flush failure, and only
+        // over an `Exception`: an OSError raised over KeyboardInterrupt would let
+        // `except Exception` swallow the interrupt. An error not raised here stays recorded
+        // for the next close().
+        let propagating = !exc_val.is_none();
+        let raise = match failure {
+            CloseFailure::Flush(_) => !propagating || exc_val.is_instance_of::<PyException>(),
+            CloseFailure::Recorded(_) => !propagating,
+        };
+        if raise {
+            Err(failure.into_py_err())
+        } else {
+            Ok(false)
+        }
     }
 }
 
