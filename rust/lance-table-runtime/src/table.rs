@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use chrono::{DateTime, Utc};
 use futures::stream::{self, StreamExt, TryStreamExt};
@@ -74,6 +74,7 @@ pub struct TableState {
     pub manifest_location: ManifestLocation,
     // Serialized manifests and arbitrary views have not established this pairing.
     pub(crate) is_manifest_generation_verified: bool,
+    manifest_provenance: Option<Arc<ManifestProvenance>>,
     pub(crate) session: Arc<TableSession>,
     pub(crate) index_cache: LanceCache,
     // Keep the incarnation opened by this handle; the name may later be reused.
@@ -88,6 +89,17 @@ pub struct TableState {
 
 /// The cell coalesces concurrent first resolutions into one build.
 type BaseObjectStores = Arc<Mutex<HashMap<u32, Arc<OnceCell<Arc<ObjectStore>>>>>>;
+
+struct ManifestProvenance {
+    // A weak owner also detects Arc::make_mut, which detaches weak references.
+    manifest: Weak<Manifest>,
+    store: Weak<dyn object_store::ObjectStore>,
+    store_prefix: String,
+    version: u64,
+    path: Path,
+    identity: Option<String>,
+    e_tag: Option<String>,
+}
 
 impl TableState {
     /// Initialize runtime bindings and derived metadata for a loaded snapshot.
@@ -112,7 +124,8 @@ impl TableState {
             base,
             uri,
             manifest_location,
-            is_manifest_generation_verified: true,
+            is_manifest_generation_verified: false,
+            manifest_provenance: None,
             session,
             index_cache,
             commit_handler,
@@ -143,6 +156,33 @@ impl TableState {
         *current = manifest;
         self.manifest_location = manifest_location;
         self.is_manifest_generation_verified = true;
+        self.record_manifest_provenance(current);
+    }
+
+    pub(crate) fn record_manifest_provenance(&mut self, manifest: &Arc<Manifest>) {
+        self.manifest_provenance = Some(Arc::new(ManifestProvenance {
+            manifest: Arc::downgrade(manifest),
+            store: Arc::downgrade(&self.object_store.inner),
+            store_prefix: self.object_store.store_prefix.clone(),
+            version: self.manifest_location.version,
+            path: self.manifest_location.path.clone(),
+            identity: self.manifest_location.identity.clone(),
+            e_tag: self.manifest_location.e_tag.clone(),
+        }));
+    }
+
+    pub(crate) fn owns_manifest_provenance(&self, manifest: &Arc<Manifest>) -> bool {
+        self.manifest_provenance.as_ref().is_some_and(|proof| {
+            proof.manifest.ptr_eq(&Arc::downgrade(manifest))
+                && proof
+                    .store
+                    .ptr_eq(&Arc::downgrade(&self.object_store.inner))
+                && proof.store_prefix == self.object_store.store_prefix
+                && proof.version == self.manifest_location.version
+                && proof.path == self.manifest_location.path
+                && proof.identity == self.manifest_location.identity
+                && proof.e_tag == self.manifest_location.e_tag
+        })
     }
 
     fn update_fragment_and_base_state(&mut self, current: &Manifest, new: &Manifest) {
@@ -189,7 +229,9 @@ impl<'a> TableView<'a> {
         // Comparing the token still prevents reusing this Dataset's manifest
         // after the physical object was replaced, for example by a recent
         // drop/recreate at the same URI and version.
-        self.manifest.branch.as_deref() == branch_name
+        self.state.is_manifest_generation_verified
+            && self.state.owns_manifest_provenance(self.manifest)
+            && self.manifest.branch.as_deref() == branch_name
             && self.manifest.version == location.version
             && self.state.manifest_location.naming_scheme == location.naming_scheme
             && location.e_tag.as_ref().is_some_and(|e_tag| {
@@ -805,11 +847,14 @@ impl Table {
     /// ```
     #[doc(hidden)]
     pub fn from_parts_with_snapshot_digest(
-        state: TableState,
+        mut state: TableState,
         manifest: Arc<Manifest>,
         refs: Refs,
         snapshot_digest: Arc<tokio::sync::OnceCell<[u8; 32]>>,
     ) -> Self {
+        if state.manifest_provenance.is_none() {
+            state.record_manifest_provenance(&manifest);
+        }
         Self {
             state,
             snapshot_digest,
@@ -905,7 +950,7 @@ impl Table {
             log::Level::Debug,
         );
         let metadata_cache = Arc::new(session.metadata_cache().for_dataset(&uri));
-        let state = TableState::new(
+        let mut state = TableState::new(
             object_store,
             base_path,
             uri,
@@ -919,6 +964,7 @@ impl Table {
             store_params,
             base_store_params,
         );
+        state.is_manifest_generation_verified = true;
         Ok(Self::from_parts(state, manifest, refs))
     }
 

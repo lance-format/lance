@@ -72,6 +72,7 @@ impl Table {
                 "Snapshot table_identity cannot be empty",
             ));
         }
+        self.validate_manifest_provenance()?;
         if self.manifest.version != self.state.manifest_location.version {
             return Err(Error::invalid_input(format!(
                 "Loaded manifest version {} does not match resolved version {}",
@@ -124,6 +125,7 @@ impl Table {
     /// # }
     /// ```
     pub fn validate_snapshot(&self, snapshot: &SnapshotRef) -> Result<()> {
+        self.validate_manifest_provenance()?;
         let mismatch = || {
             Error::invalid_input(format!(
                 "Snapshot {:?}/{} at {} does not match dataset snapshot {:?}/{} at {} (manifest {}, expected {})",
@@ -160,6 +162,11 @@ impl Table {
             return Err(mismatch());
         }
         if snapshot.manifest_digest().is_empty() {
+            if !self.state.is_manifest_generation_verified {
+                return Err(Error::invalid_input(
+                    "Loaded manifest generation has not been verified; reopen the committed snapshot before validating a lightweight reference",
+                ));
+            }
             return Ok(());
         }
         let digest = self.snapshot_digest.get().ok_or_else(|| {
@@ -186,6 +193,7 @@ impl Table {
     /// ```
     #[doc(hidden)]
     pub async fn ensure_snapshot_digest(&self) -> Result<[u8; 32]> {
+        self.validate_manifest_provenance()?;
         self.snapshot_digest
             .get_or_try_init(|| async {
                 let key = ManifestDigestKey {
@@ -230,6 +238,16 @@ impl Table {
             .await
             .copied()
     }
+
+    fn validate_manifest_provenance(&self) -> Result<()> {
+        if !self.state.owns_manifest_provenance(&self.manifest) {
+            return Err(Error::invalid_input(format!(
+                "Snapshot verification evidence does not belong to the loaded manifest at {} version {}; reopen the committed snapshot",
+                self.state.manifest_location.path, self.manifest.version,
+            )));
+        }
+        Ok(())
+    }
 }
 
 fn matches_loaded_manifest(mut observed: Manifest, loaded: &Manifest) -> bool {
@@ -255,7 +273,23 @@ mod tests {
     use arrow_array::record_batch;
     use lance_table::transaction::{Operation, Transaction};
     use object_store::ObjectStoreExt;
+    use prost::Message;
     use rstest::rstest;
+
+    async fn local_multi_fragment_table() -> (tempfile::TempDir, Table) {
+        let directory = tempfile::tempdir().unwrap();
+        let uri = directory.path().join("table");
+        let batch = record_batch!(("id", Int32, [1, 2, 3, 4, 5, 6])).unwrap();
+        let table = InsertBuilder::new(uri.to_str().unwrap())
+            .with_params(&WriteParams {
+                max_rows_per_file: 2,
+                ..Default::default()
+            })
+            .execute(vec![batch])
+            .await
+            .unwrap();
+        (directory, table)
+    }
 
     #[rstest]
     #[case::commit_identity(true, true)]
@@ -271,6 +305,7 @@ mod tests {
         if !has_etag {
             table.state.manifest_location.e_tag = None;
         }
+        table.state.record_manifest_provenance(&table.manifest);
         let snapshot = table.snapshot_ref("catalog/table").await.unwrap();
         assert_eq!(snapshot.manifest_identity().is_some(), has_commit_identity);
         assert_eq!(
@@ -352,6 +387,151 @@ mod tests {
             .await
             .unwrap(),
             before
+        );
+    }
+
+    #[rstest]
+    #[case::serialized_manifest(true)]
+    #[case::manifest_view(false)]
+    #[tokio::test]
+    async fn refresh_reloads_unverified_manifest(#[case] is_serialized: bool) {
+        let (_directory, source) = local_multi_fragment_table().await;
+        let mut replacement = source.manifest.as_ref().clone();
+        Arc::make_mut(&mut replacement.fragments).truncate(1);
+        let mut producer = if is_serialized {
+            let serialized =
+                lance_table::format::pb::Manifest::from(source.manifest.as_ref()).encode_to_vec();
+            lance_table::io::commit::write_manifest_file_to_path(
+                &source.state.object_store,
+                &mut replacement,
+                None,
+                &source.state.manifest_location.path,
+                None,
+            )
+            .await
+            .unwrap();
+            crate::TableBuilder::from_uri(source.uri())
+                .with_session(source.session())
+                .with_serialized_manifest(&serialized)
+                .unwrap()
+                .load_with_session(source.session())
+                .await
+                .unwrap()
+        } else {
+            source.view().with_manifest_view(Arc::new(replacement))
+        };
+        let error = producer.snapshot_ref("catalog/table").await.unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(error.to_string().contains("loaded"), "{error}");
+        producer.checkout_latest().await.unwrap();
+        let snapshot = producer.snapshot_ref("catalog/table").await.unwrap();
+        let worker = crate::TableBuilder::from_uri(source.uri())
+            .with_session(source.session())
+            .load_snapshot_with_session(&snapshot, source.session())
+            .await
+            .unwrap();
+        assert_eq!(
+            producer.count_rows().await.unwrap(),
+            if is_serialized { 2 } else { 6 }
+        );
+        assert_eq!(
+            producer.count_rows().await.unwrap(),
+            worker.count_rows().await.unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn lightweight_validation_rejects_unverified_serialized_manifest() {
+        let (_directory, source) = local_multi_fragment_table().await;
+        let serialized =
+            lance_table::format::pb::Manifest::from(source.manifest.as_ref()).encode_to_vec();
+        let mut replacement = source.manifest.as_ref().clone();
+        Arc::make_mut(&mut replacement.fragments).truncate(1);
+        lance_table::io::commit::write_manifest_file_to_path(
+            &source.state.object_store,
+            &mut replacement,
+            None,
+            &source.state.manifest_location.path,
+            None,
+        )
+        .await
+        .unwrap();
+        let producer = crate::TableBuilder::from_uri(source.uri())
+            .with_session(source.session())
+            .with_serialized_manifest(&serialized)
+            .unwrap()
+            .load_with_session(source.session())
+            .await
+            .unwrap();
+        let current = crate::TableBuilder::from_uri(source.uri())
+            .with_session(source.session())
+            .load_with_session(source.session())
+            .await
+            .unwrap();
+        let snapshot = current.snapshot_ref("catalog/table").await.unwrap();
+        assert!(snapshot.manifest_digest().is_empty());
+        assert_eq!(producer.count_rows().await.unwrap(), 6);
+        assert_eq!(current.count_rows().await.unwrap(), 2);
+        let error = producer.validate_snapshot(&snapshot).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("generation has not been verified"),
+            "{error}"
+        );
+    }
+
+    #[rstest]
+    #[case::identity(SnapshotVerification::Identity, false)]
+    #[case::cold_digest(SnapshotVerification::FullManifestDigest, false)]
+    #[case::warm_digest(SnapshotVerification::FullManifestDigest, true)]
+    #[tokio::test]
+    async fn mutated_manifest_cannot_reuse_verification(
+        #[case] verification: SnapshotVerification,
+        #[case] has_digest: bool,
+    ) {
+        let mut producer = crate::test_util::test_commit_table(6, 3).await;
+        let snapshot = producer
+            .snapshot_ref_with_verification(
+                "catalog/table",
+                if has_digest {
+                    SnapshotVerification::FullManifestDigest
+                } else {
+                    SnapshotVerification::Identity
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(producer.snapshot_digest.get().is_some(), has_digest);
+        Arc::make_mut(&mut Arc::make_mut(&mut producer.manifest).fragments).truncate(1);
+        assert_eq!(producer.count_rows().await.unwrap(), 2);
+        let error = producer
+            .snapshot_ref_with_verification("catalog/table", verification)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("does not belong to the loaded manifest"),
+            "{error}"
+        );
+        let error = producer.ensure_snapshot_digest().await.unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("does not belong to the loaded manifest"),
+            "{error}"
+        );
+        let error = producer.validate_snapshot(&snapshot).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("does not belong to the loaded manifest"),
+            "{error}"
         );
     }
 }

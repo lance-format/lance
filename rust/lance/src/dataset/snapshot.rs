@@ -807,8 +807,11 @@ mod tests {
             location.size.unwrap() as usize - index_offset
                 > dataset.table_state.object_store.block_size()
         );
-        dataset.manifest = old_manifest.clone();
-        dataset.table_state.manifest_location = location.clone();
+        dataset.table_state.set_manifest(
+            &mut dataset.manifest,
+            old_manifest.clone(),
+            location.clone(),
+        );
         dataset.snapshot_digest = old_digest.clone();
         let old_snapshot = dataset
             .snapshot_ref_with_verification(
@@ -839,8 +842,9 @@ mod tests {
         assert!(!Arc::ptr_eq(&old_manifest, &new_manifest));
         assert!(new_digest.get().is_none());
         assert_eq!(new_manifest.fragments.len(), 2);
-        dataset.manifest = new_manifest;
-        dataset.table_state.manifest_location = location;
+        dataset
+            .table_state
+            .set_manifest(&mut dataset.manifest, new_manifest, location);
         dataset.snapshot_digest = new_digest;
         assert_ne!(
             dataset

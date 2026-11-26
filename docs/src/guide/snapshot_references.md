@@ -66,9 +66,14 @@ retry; checking with `HEAD` followed by unconditional reads is insufficient.
 An ETag is an opaque object-generation condition, not a content checksum.
 
 Identity capture from a normally opened handle does not fetch the manifest again.
-A separately serialized manifest or arbitrary manifest view must first be checked
-against the original file; a token resolved later is not proof of its generation.
-Such handles use complete-file verification before issuing a reference.
+A separately serialized manifest must first be checked against the original file;
+a token resolved later is not proof of its generation. Such handles use
+complete-file verification before issuing a reference. Verification evidence is
+bound to the exact loaded manifest and storage location. Replacing or mutating
+that manifest invalidates the evidence, including an initialized digest.
+Arbitrary manifest views must reopen a committed snapshot before capture.
+Refreshing an unverified handle reloads the committed manifest before certifying
+its generation. Synchronous validation rejects unverified generation pairings.
 A cold worker can read the
 manifest protobuf and necessary metadata sections without fetching otherwise
 unused leading sections solely for a digest. If neither a commit identity nor
