@@ -152,7 +152,7 @@ fn bench_distance(c: &mut Criterion) {
     // these keep ~256 KiB of targets in cache so they measure the kernel.
     // Both inputs are 64-byte-aligned views, as for u8 above, so that results
     // do not depend on heap placement.
-    for dim in [8, 16, 32, 64, 128, 768, 1024, 1536] {
+    for dim in [8, 16, 24, 32, 64, 128, 768, 1024, 1536] {
         let num_vectors = 64 * 1024 / dim;
         let aligned = |len: usize, seed: [u8; 32]| {
             let values = generate_random_array_with_seed::<Float32Type>(len + 15, seed);

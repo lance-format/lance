@@ -654,10 +654,9 @@ mod x86 {
         #[target_features("avx", "fma")]
         #[candidate(pub(super) DOT_F32_BATCH_AVX_FMA: BatchKernel)]
         /// The dimension-8 and dimension-16 fast paths cover the common PQ
-        /// sub-vector widths. With a runtime length, the pair kernel's
-        /// auto-vectorized loop only reaches its 8-wide main loop from 32
-        /// dimensions, so at 16 it runs four dependent 4-wide FMAs; the
-        /// dimension-16 path runs one 8-wide multiply and one 8-wide FMA.
+        /// sub-vector widths. They load the key once for the whole batch and
+        /// start each row with a multiply, where the pair kernel reloads the
+        /// key per row and starts from a zero accumulator.
         pub(super) fn dot_batch_f32_avx_fma(
             x: &[f32],
             batch: &[f32],
@@ -912,7 +911,28 @@ mod x86 {
         #[candidate(pub(super) DOT_F32_AVX_FMA: PairKernel)]
         #[inline]
         pub(super) fn dot_f32_avx_fma(x: &[f32], y: &[f32]) -> f32 {
-            super::dot_f32_impl(x, y)
+            // LLVM's loop for `dot_f32_impl` runs 4 ymm accumulators, so it
+            // needs 32 floats for one pass of its main loop and handles
+            // shorter vectors with a 4-wide xmm epilogue. Below 32 floats, one
+            // 8-wide FMA chain is faster on AVX2 hosts: 35% at dimension 16
+            // and 29% at 24. Single-pair calls use this kernel on AVX2 hosts;
+            // the batch kernel uses it for the other widths on every x86 host.
+            //
+            // A single length test on purpose: also checking `len >= 8` added
+            // a cycle to every call and cost 10% at dimensions 32-64.
+            if x.len() >= 32 {
+                return super::dot_f32_impl(x, y);
+            }
+            let (x_chunks, x_tail) = x.as_chunks::<8>();
+            let (y_chunks, y_tail) = y.as_chunks::<8>();
+            let mut acc = _mm256_setzero_ps();
+            for (x, y) in x_chunks.iter().zip(y_chunks) {
+                let x = unsafe { _mm256_loadu_ps(x.as_ptr()) };
+                let y = unsafe { _mm256_loadu_ps(y.as_ptr()) };
+                acc = _mm256_fmadd_ps(x, y, acc);
+            }
+            let head = unsafe { hsum256_ps(acc) };
+            head + super::dot_f32_impl(x_tail, y_tail)
         }
     }
 
