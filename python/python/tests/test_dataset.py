@@ -10933,6 +10933,49 @@ def test_branches(tmp_path: Path):
     assert branch1.to_table().combine_chunks() == expected_branch1.combine_chunks()
 
 
+@pytest.mark.parametrize(
+    "source_branch,target_branch,selection",
+    [
+        pytest.param("main", "dev", "version", id="checkout-main-to-dev"),
+        pytest.param("dev", "main", "version", id="checkout-dev-to-main"),
+        pytest.param("main", "dev", "tag", id="checkout-tag"),
+        pytest.param("main", "dev", "open_tag", id="open-tag"),
+        pytest.param("main", "main", "version", id="same-main"),
+        pytest.param("dev", "dev", "version", id="same-dev"),
+    ],
+)
+def test_branch_snapshot_uri(tmp_path: Path, source_branch, target_branch, selection):
+    main = lance.write_dataset(pa.table({"id": [0]}), tmp_path / "data.lance")
+    dev = main.create_branch("dev")
+    dev = lance.write_dataset(pa.table({"id": [1]}), dev, mode="append")
+    main = lance.write_dataset(pa.table({"id": [2]}), main, mode="append")
+    assert main.version == dev.version
+
+    branches = {"main": main, "dev": dev}
+    source = branches[source_branch]
+    target = branches[target_branch]
+    source_uri = source.uri
+    if selection == "version":
+        snapshot = source.checkout_version((target_branch, target.version))
+    else:
+        target.tags.create("snapshot", (target_branch, target.version))
+        if selection == "tag":
+            snapshot = source.checkout_version("snapshot")
+        else:
+            snapshot = lance.dataset(source.uri, version="snapshot")
+
+    expected = target.to_table()
+    assert snapshot.to_table() == expected
+    assert snapshot.version == target.version
+    assert snapshot._ds.uri == target.uri
+    assert snapshot.uri == target.uri
+    assert lance.dataset(snapshot.uri, version=snapshot.version).to_table() == expected
+    restored = pickle.loads(pickle.dumps(snapshot))
+    assert restored.uri == target.uri
+    assert restored.to_table() == expected
+    assert source.uri == source_uri
+
+
 def test_default_scan_options_nearest(tmp_path: Path) -> None:
     dim = 4
     num_rows = 10
