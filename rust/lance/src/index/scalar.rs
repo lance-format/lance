@@ -1226,6 +1226,20 @@ pub fn index_matches_criteria(
             ).into()));
         }
 
+        // An index on a list column written before index details were stored
+        // can be a LABEL_LIST index, which answers list membership and not
+        // equality on the whole list, so it cannot serve an exact equality join.
+        if criteria.must_support_exact_equality
+            && fields.iter().any(|field| {
+                matches!(
+                    field.data_type(),
+                    DataType::List(_) | DataType::LargeList(_)
+                )
+            })
+        {
+            return Ok(false);
+        }
+
         // If we don't have details then allow it for backwards compatibility
         return Ok(true);
     };
