@@ -11172,3 +11172,24 @@ def test_auto_cleanup_options_partial_and_mapping(tmp_path):
         auto_cleanup_options=MappingProxyType({"interval": 5}),
     )
     assert lance.dataset(tmp_path / "b").config()["lance.auto_cleanup.interval"] == "5"
+
+
+def test_auto_cleanup_options_keep_errors_from_index(tmp_path):
+    # Only pyo3's own conversion errors get the option name. An error raised by a
+    # user's __index__ reaches the caller as it was raised.
+    class CustomTypeError(TypeError):
+        pass
+
+    for raised in [ValueError("bad interval"), CustomTypeError("bad interval")]:
+
+        class Interval:
+            def __index__(self):
+                raise raised
+
+        with pytest.raises(type(raised)) as exc_info:
+            lance.write_dataset(
+                pa.table({"a": [1]}),
+                tmp_path / type(raised).__name__,
+                auto_cleanup_options={"interval": Interval()},
+            )
+        assert exc_info.value is raised

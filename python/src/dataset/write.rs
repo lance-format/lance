@@ -179,14 +179,17 @@ fn auto_cleanup_value<'py>(
     Ok((!value.is_none()).then_some(value))
 }
 
-/// Names the option in pyo3's conversion errors, keeping their type. Any other error,
-/// for example one raised by a user's `__index__`, is returned unchanged.
+/// Prefixes pyo3's TypeError or OverflowError with the option name. Any other error,
+/// including a subclass raised by a user's `__index__`, is returned unchanged.
 fn auto_cleanup_error(py: Python<'_>, key: &str, err: PyErr) -> PyErr {
-    if !err.is_instance_of::<PyTypeError>(py) && !err.is_instance_of::<PyOverflowError>(py) {
+    let error_type = err.get_type(py);
+    if !error_type.is(py.get_type::<PyTypeError>())
+        && !error_type.is(py.get_type::<PyOverflowError>())
+    {
         return err;
     }
     let renamed = PyErr::from_type(
-        err.get_type(py),
+        error_type,
         format!("auto_cleanup_options['{key}']: {}", err.value(py)),
     );
     renamed.set_cause(py, Some(err));
