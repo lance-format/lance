@@ -5386,13 +5386,15 @@ class LanceDataset(pa.dataset.Dataset):
             The end version (inclusive) for the comparison range.
             Must be used together with ``begin_version``.
         begin_date : datetime, optional
-            Exclusive start of a time window. Naive datetimes are treated as UTC.
-            Must not be combined with a version range.
+            Exclusive start of a time window. A naive datetime, or one whose
+            ``utcoffset()`` is ``None``, is a local wall time, matching
+            :meth:`versions` and ``asof``. An aware datetime converts as an
+            instant. Must not be combined with a version range.
         end_date : datetime, optional
-            Inclusive end of a time window. Naive datetimes are treated as UTC.
-            Requires ``begin_date``. When omitted, the latest committed version
-            is the end, including commits from another writer, and row reads use
-            that same snapshot.
+            Inclusive end of a time window, interpreted the same way as
+            ``begin_date``. Requires ``begin_date``. When omitted, the latest
+            committed version is the end, including commits from another writer,
+            and row reads use that same snapshot.
 
         Returns
         -------

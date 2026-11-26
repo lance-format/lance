@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
-from datetime import datetime, timedelta, timezone
+import os
+import time
+from datetime import datetime, timedelta, timezone, tzinfo
 
 import lance
 import pyarrow as pa
@@ -259,9 +261,22 @@ def test_delta_with_dates():
     inserted = ds.delta(begin_date=begin, end_date=end).get_inserted_rows().read_all()
     assert inserted.column("id").to_pylist() == [3]
 
-    # Naive datetimes are treated as UTC, so drop the zone from a UTC value.
-    naive_begin = begin.replace(tzinfo=None)
-    naive_end = end.replace(tzinfo=None)
+    # Aware values name instants. The same window in another zone still
+    # selects the write that happened inside it.
+    shifted_begin = begin.astimezone(timezone(timedelta(hours=8)))
+    shifted_end = end.astimezone(timezone(timedelta(hours=-5)))
+    inserted = (
+        ds.delta(begin_date=shifted_begin, end_date=shifted_end)
+        .get_inserted_rows()
+        .read_all()
+    )
+    assert inserted.column("id").to_pylist() == [3]
+
+    # Naive datetimes are local wall times, matching versions() and asof.
+    # Dropping the zone from a UTC value would name a different instant
+    # wherever the machine is not on UTC.
+    naive_begin = begin.astimezone().replace(tzinfo=None)
+    naive_end = end.astimezone().replace(tzinfo=None)
     inserted = (
         ds.delta(begin_date=naive_begin, end_date=naive_end)
         .get_inserted_rows()
@@ -283,3 +298,82 @@ def test_date_delta_after_external_append(tmp_path):
     assert len(delta.list_transactions()) == 1
     observed = delta.get_upserted_rows().read_all()["id"].to_pylist()
     assert observed == [2]
+
+
+class _NoOffsetTzInfo(tzinfo):
+    """A tzinfo without a UTC offset; Python treats such datetimes as naive."""
+
+    def utcoffset(self, dt):
+        return None
+
+    def dst(self, dt):
+        return None
+
+    def tzname(self, dt):
+        return None
+
+
+@pytest.fixture
+def asia_shanghai_tz():
+    previous = os.environ.get("TZ")
+    os.environ["TZ"] = "Asia/Shanghai"
+    time.tzset()
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = previous
+        time.tzset()
+
+
+@pytest.mark.usefixtures("asia_shanghai_tz")
+def test_delta_naive_version_timestamp_is_local_wall_time(tmp_path):
+    """A naive version timestamp passed back as begin_date stays local.
+
+    versions() and get_version() return naive local wall times. In
+    Asia/Shanghai, 12:00 is 04:00Z. Labeling that naive value as UTC would
+    move an exclusive begin to 12:00Z and skip commits over the next eight
+    hours.
+    """
+    noon = datetime(2026, 6, 1, 12, 0)
+    assert noon.utcoffset() is None
+    assert noon.astimezone(timezone.utc) == datetime(
+        2026, 6, 1, 4, 0, tzinfo=timezone.utc
+    )
+
+    ds = write_dataset(
+        pa.table({"id": pa.array([1], type=pa.int32())}),
+        tmp_path / "delta.lance",
+        enable_stable_row_ids=True,
+    )
+    created = ds.get_version()["timestamp"]
+    assert created.tzinfo is None
+    assert created == ds.versions()[0]["timestamp"]
+    # The same eight-hour shift as 12:00 local versus 12:00Z.
+    assert created.astimezone(timezone.utc) == created.replace(
+        tzinfo=timezone.utc
+    ) - timedelta(hours=8)
+
+    ds.insert(pa.table({"id": pa.array([2], type=pa.int32())}))
+
+    # The commit timestamp, unchanged, is an exclusive begin. The following
+    # write stays inside the window.
+    inserted = ds.delta(begin_date=created).get_inserted_rows().read_all()
+    assert 2 in inserted.column("id").to_pylist()
+
+    # Aware UTC names the same instant.
+    inserted = (
+        ds.delta(begin_date=created.astimezone(timezone.utc))
+        .get_inserted_rows()
+        .read_all()
+    )
+    assert 2 in inserted.column("id").to_pylist()
+
+    # A tzinfo with no offset is naive too, matching asof.
+    unmarked = created.replace(tzinfo=_NoOffsetTzInfo())
+    assert unmarked.tzinfo is not None
+    assert unmarked.utcoffset() is None
+    inserted = ds.delta(begin_date=unmarked).get_inserted_rows().read_all()
+    assert 2 in inserted.column("id").to_pylist()

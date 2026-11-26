@@ -99,8 +99,9 @@ class _DatasetDeltaBuilder:
 
 
 def _as_utc(timestamp: datetime) -> datetime:
-    # versions() reports a naive local wall time. Callers who pass that value
-    # unchanged would shift the window, so naive inputs are UTC by contract.
-    if timestamp.tzinfo is None:
-        return timestamp.replace(tzinfo=timezone.utc)
+    # versions() reports a naive local wall time. A tzinfo whose utcoffset()
+    # is None is still naive, matching asof: interpret it as local wall time.
+    # Aware values convert as instants. Rust still receives DateTime<Utc>.
+    if timestamp.utcoffset() is None:
+        timestamp = timestamp.replace(tzinfo=None)
     return timestamp.astimezone(timezone.utc)
