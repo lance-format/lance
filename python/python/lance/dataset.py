@@ -5390,11 +5390,20 @@ class LanceDataset(pa.dataset.Dataset):
             ``utcoffset()`` is ``None``, is a local wall time, matching
             :meth:`versions` and ``asof``. An aware datetime converts as an
             instant. Must not be combined with a version range.
+
+            Bounds use the microsecond precision :meth:`versions` and
+            :meth:`get_version` expose. Those methods floor manifest
+            nanoseconds; passing a reported timestamp back selects that same
+            commit. The latest commit at or before this microsecond is
+            excluded. Commits that share a microsecond are one boundary, the
+            later commit, so this start skips every commit in that microsecond.
         end_date : datetime, optional
             Inclusive end of a time window, interpreted the same way as
-            ``begin_date``. Requires ``begin_date``. When omitted, the latest
-            committed version is the end, including commits from another writer,
-            and row reads use that same snapshot.
+            ``begin_date``. The latest commit at or before this microsecond is
+            included, which keeps every commit that shares it. Requires
+            ``begin_date``. When omitted, the latest committed version is the
+            end, including commits from another writer, and row reads use that
+            same snapshot.
 
         Returns
         -------

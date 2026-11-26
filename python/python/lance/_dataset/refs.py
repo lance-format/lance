@@ -44,7 +44,8 @@ class Version(TypedDict):
 def _convert_version_timestamp(version: Version) -> Version:
     # TODO: python datetime supports only microsecond precision. When a
     # separate Version object is implemented, expose the precise timestamp
-    # (ns) to python.
+    # (ns) to python. delta() compares this floored value, so passing it
+    # back still names this version.
     ts_nanos = version["timestamp"]
     # replace() keeps the fold that marks the second pass through a repeated
     # local hour, which adding a timedelta would reset.

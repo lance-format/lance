@@ -12,7 +12,7 @@ use crate::dataset::scanner::{
 use arrow_array::{ArrayRef, RecordBatch, UInt64Array};
 use arrow_schema::Schema as ArrowSchema;
 use arrow_schema::SortOptions;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use datafusion::common::NullEquality;
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::JoinType;
@@ -141,6 +141,13 @@ impl DatasetDeltaBuilder {
 
     /// Set the beginning timestamp for the delta (exclusive).
     ///
+    /// The boundary is the latest version whose commit time, truncated to
+    /// microseconds, is at or before `timestamp`; that version is excluded.
+    /// A timestamp floored to microseconds — the precision Python
+    /// `versions()` exposes — therefore names that commit rather than the
+    /// one before it. Commits that share a microsecond are one boundary, the
+    /// later version, so this start skips all of them.
+    ///
     /// Must be used together with `with_end_date`.
     /// Cannot be used together with `compared_against_version` or explicit version range.
     pub fn with_begin_date(mut self, timestamp: DateTime<Utc>) -> Self {
@@ -149,6 +156,12 @@ impl DatasetDeltaBuilder {
     }
 
     /// Set the ending timestamp for the delta (inclusive).
+    ///
+    /// The boundary is the latest version whose commit time, truncated to
+    /// microseconds, is at or before `timestamp`; that version is included.
+    /// Flooring a commit's nanoseconds to microseconds still includes that
+    /// commit. Commits that share a microsecond are one boundary, the later
+    /// version, so this end keeps all of them.
     ///
     /// Must be used together with `with_begin_date`.
     /// Cannot be used together with `compared_against_version` or explicit version range.
@@ -231,6 +244,34 @@ impl DatasetDeltaBuilder {
     }
 }
 
+/// Floor a commit timestamp to microseconds.
+///
+/// Python `datetime` cannot represent the nanoseconds a manifest stores.
+/// `versions()` / `get_version()` floor those nanoseconds, and passing the
+/// result back into a date window must name the same commit.
+fn truncate_to_micros(ts: DateTime<Utc>) -> DateTime<Utc> {
+    let remainder_ns = i64::from(ts.timestamp_subsec_nanos() % 1_000);
+    ts - TimeDelta::nanoseconds(remainder_ns)
+}
+
+/// Latest version whose commit time, truncated to microseconds, is at or
+/// before `bound`.
+///
+/// Returns 0 when every commit is later. That is the empty snapshot, not a
+/// real version. Several commits in one microsecond collapse to the later
+/// version: an exclusive begin then skips all of them, and an inclusive end
+/// keeps all of them.
+fn latest_version_at_or_before_micros(versions: &[super::Version], bound: DateTime<Utc>) -> u64 {
+    let bound_us = truncate_to_micros(bound);
+    let mut version = 0;
+    for candidate in versions {
+        if truncate_to_micros(candidate.timestamp) <= bound_us && candidate.version > version {
+            version = candidate.version;
+        }
+    }
+    version
+}
+
 /// APIs for exploring changes between two versions of a dataset.
 pub struct DatasetDelta {
     /// The base version number for comparison.
@@ -253,39 +294,32 @@ enum RowChange {
 impl DatasetDelta {
     /// Resolve the effective version range for this delta.
     ///
-    /// If a date window is set (`begin_timestamp` and `end_timestamp` provided), this lazily
-    /// maps timestamps to version ids by scanning dataset versions:
-    /// - Begin is exclusive: pick the greatest version with `timestamp < begin_timestamp`.
-    /// - End is inclusive:  pick the greatest version with `timestamp <= end_timestamp`.
+    /// Date windows are resolved at microsecond precision. Manifest timestamps
+    /// keep nanoseconds, and a caller that floors them (Python `datetime`)
+    /// must still select the same version. Comparing the raw nanoseconds
+    /// treats that floored value as strictly earlier, so the exclusive begin
+    /// lands on the previous version — version 0 when the commit is the first,
+    /// whose deletion stream is empty — and the inclusive end drops the commit.
     ///
-    /// If no date window is set, returns the explicit `begin_version`/`end_version` stored on
-    /// the struct.
+    /// Both bounds are the latest version whose truncated timestamp is at or
+    /// before the given microsecond. The begin version is excluded and the end
+    /// version is included. Commits that share a microsecond cannot be split:
+    /// the later version is the boundary, so an exclusive begin skips every
+    /// commit in that microsecond and an inclusive end keeps every commit in it.
+    ///
+    /// If no date window is set, returns the explicit `begin_version`/`end_version`
+    /// stored on the struct.
     async fn resolve_range(&self) -> Result<(u64, u64)> {
         if let (Some(begin_ts), Some(end_ts)) = (self.begin_timestamp, self.end_timestamp) {
-            // Load all dataset versions and fold them to a version interval matching the date window
             let versions = self.base_dataset.versions().await?;
-            let mut begin_version: u64 = 0;
-            let mut end_version: u64 = 0;
-            for v in &versions {
-                // Exclusive begin: track the largest version strictly before begin_ts
-                if v.timestamp < begin_ts && v.version > begin_version {
-                    begin_version = v.version;
-                }
-                // Inclusive end: track the largest version at or before end_ts
-                if v.timestamp <= end_ts && v.version > end_version {
-                    end_version = v.version;
-                }
-            }
-            Ok((begin_version, end_version))
+            Ok((
+                latest_version_at_or_before_micros(&versions, begin_ts),
+                latest_version_at_or_before_micros(&versions, end_ts),
+            ))
         } else if let (Some(begin_ts), None) = (self.begin_timestamp, self.end_timestamp) {
             // Open-ended range: use latest version as end
             let versions = self.base_dataset.versions().await?;
-            let mut begin_version: u64 = 0;
-            for v in &versions {
-                if v.timestamp < begin_ts && v.version > begin_version {
-                    begin_version = v.version;
-                }
-            }
+            let begin_version = latest_version_at_or_before_micros(&versions, begin_ts);
             let end_version = self.base_dataset.latest_version_id().await?;
             Ok((begin_version, end_version))
         } else {
@@ -2852,6 +2886,130 @@ mod tests {
             deleted.is_empty(),
             "nothing is deleted relative to the empty snapshot: {deleted:?}"
         );
+    }
+
+    /// Python floors manifest nanoseconds to microseconds. Passing those
+    /// floored values back must select the same versions: exclusive begin
+    /// excludes the start commit, inclusive end includes the end commit.
+    /// 187ns and 297ns are remainders that used to select the previous
+    /// version, including version 0, whose deletion stream is empty.
+    #[tokio::test]
+    async fn test_floored_microsecond_timestamp_round_trips_to_the_same_version() {
+        let dir = lance_core::utils::tempfile::TempStrDir::default();
+        MockClock::set_system_time(std::time::Duration::new(1_700_000_000, 187));
+        let data = lance_datagen::gen_batch()
+            .col("key", array::cycle::<Int32Type>(vec![1, 9]))
+            .col("value", array::fill_utf8("v1".to_string()))
+            .into_reader_rows(RowCount::from(2), BatchCount::from(1));
+        let ds = Dataset::write(
+            data,
+            &dir,
+            Some(WriteParams {
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(ds.version().version, 1);
+
+        MockClock::set_system_time(std::time::Duration::new(1_700_000_001, 297));
+        let mut ds = write_dataset_temp(&dir, 2, 1, 1, "v2", true, true).await;
+        assert_eq!(ds.version().version, 2);
+        let live = ds.scan().with_row_id().try_into_batch().await.unwrap();
+        let keys = live["key"].as_primitive::<Int32Type>().values();
+        let row_ids = live[ROW_ID].as_primitive::<UInt64Type>().values();
+        let row_of_9 = keys
+            .iter()
+            .zip(row_ids)
+            .find(|(key, _)| **key == 9)
+            .map(|(_, row_id)| *row_id);
+        // Rows are written as key 1 then key 9, so the deleted key is row id 1.
+        assert_eq!(row_of_9, Some(1));
+
+        MockClock::set_system_time(std::time::Duration::new(1_700_000_002, 50));
+        ds.delete("key = 9").await.unwrap();
+        assert_eq!(ds.version().version, 3);
+
+        // A commit after the inclusive end. Its key must not leak through.
+        MockClock::set_system_time(std::time::Duration::new(1_700_000_003, 10));
+        let ds = write_dataset_temp(&dir, 3, 1, 1, "v4", true, true).await;
+        assert_eq!(ds.version().version, 4);
+
+        let versions = ds.versions().await.unwrap();
+        assert_eq!(versions[0].timestamp.timestamp_subsec_nanos(), 187);
+        assert_eq!(versions[1].timestamp.timestamp_subsec_nanos(), 297);
+        let begin = super::truncate_to_micros(versions[0].timestamp);
+        let end = super::truncate_to_micros(versions[2].timestamp);
+        assert_ne!(begin, versions[0].timestamp);
+        assert_ne!(end, versions[2].timestamp);
+
+        let delta = ds
+            .delta()
+            .with_begin_date(begin)
+            .with_end_date(end)
+            .build()
+            .unwrap();
+        assert_eq!(delta.list_transactions().await.unwrap().len(), 2);
+        let inserted = collect_stream(delta.get_inserted_rows().await.unwrap()).await;
+        assert_eq!(
+            inserted["key"].as_primitive::<Int32Type>().values(),
+            &[2],
+            "version 1 must not leak, and version 4 must stay past the end"
+        );
+        assert_eq!(
+            collect_deleted(&delta).await,
+            vec![1],
+            "a floored begin must not resolve to version 0, which reports no deletions"
+        );
+    }
+
+    /// Two commits in one microsecond are indistinguishable once the timestamp
+    /// is floored. The later version is the boundary for both ends.
+    #[tokio::test]
+    async fn test_commits_sharing_a_microsecond_share_one_date_boundary() {
+        let dir = lance_core::utils::tempfile::TempStrDir::default();
+        MockClock::set_system_time(std::time::Duration::new(10, 100));
+        let _v1 = write_dataset_temp(&dir, 1, 1, 1, "v1", true, false).await;
+        MockClock::set_system_time(std::time::Duration::new(10, 900));
+        let _v2 = write_dataset_temp(&dir, 2, 1, 1, "v2", true, true).await;
+        MockClock::set_system_time(std::time::Duration::new(11, 0));
+        let ds = write_dataset_temp(&dir, 3, 1, 1, "v3", true, true).await;
+        assert_eq!(ds.version().version, 3);
+
+        let versions = ds.versions().await.unwrap();
+        assert_eq!(
+            super::truncate_to_micros(versions[0].timestamp),
+            super::truncate_to_micros(versions[1].timestamp)
+        );
+        let shared = chrono::DateTime::<chrono::Utc>::from_timestamp(10, 0).unwrap();
+        let before = chrono::DateTime::<chrono::Utc>::from_timestamp(9, 0).unwrap();
+        let after = chrono::DateTime::<chrono::Utc>::from_timestamp(11, 0).unwrap();
+
+        let keys_of = |delta: super::DatasetDelta| async move {
+            let batch = collect_stream(delta.get_inserted_rows().await.unwrap()).await;
+            let mut keys = batch["key"].as_primitive::<Int32Type>().values().to_vec();
+            keys.sort_unstable();
+            keys
+        };
+
+        // Exclusive begin at the shared microsecond skips both commits.
+        let skipped = ds
+            .delta()
+            .with_begin_date(shared)
+            .with_end_date(after)
+            .build()
+            .unwrap();
+        assert_eq!(keys_of(skipped).await, vec![3]);
+
+        // Inclusive end at the shared microsecond keeps both commits.
+        let kept = ds
+            .delta()
+            .with_begin_date(before)
+            .with_end_date(shared)
+            .build()
+            .unwrap();
+        assert_eq!(keys_of(kept).await, vec![1, 2]);
     }
 
     /// Unchanged shared fragments appear nowhere; changed ones on both

@@ -315,6 +315,9 @@ class _NoOffsetTzInfo(tzinfo):
 
 @pytest.fixture
 def asia_shanghai_tz():
+    # time.tzset is Unix-only, matching the guard in test_dataset.py.
+    if not hasattr(time, "tzset"):
+        pytest.skip("time.tzset is Unix-only")
     previous = os.environ.get("TZ")
     os.environ["TZ"] = "Asia/Shanghai"
     time.tzset()
@@ -328,6 +331,7 @@ def asia_shanghai_tz():
         time.tzset()
 
 
+@pytest.mark.skipif(not hasattr(time, "tzset"), reason="time.tzset is Unix-only")
 @pytest.mark.usefixtures("asia_shanghai_tz")
 def test_delta_naive_version_timestamp_is_local_wall_time(tmp_path):
     """A naive version timestamp passed back as begin_date stays local.
@@ -361,7 +365,7 @@ def test_delta_naive_version_timestamp_is_local_wall_time(tmp_path):
     # The commit timestamp, unchanged, is an exclusive begin. The following
     # write stays inside the window.
     inserted = ds.delta(begin_date=created).get_inserted_rows().read_all()
-    assert 2 in inserted.column("id").to_pylist()
+    assert inserted.column("id").to_pylist() == [2]
 
     # Aware UTC names the same instant.
     inserted = (
@@ -369,11 +373,64 @@ def test_delta_naive_version_timestamp_is_local_wall_time(tmp_path):
         .get_inserted_rows()
         .read_all()
     )
-    assert 2 in inserted.column("id").to_pylist()
+    assert inserted.column("id").to_pylist() == [2]
 
     # A tzinfo with no offset is naive too, matching asof.
     unmarked = created.replace(tzinfo=_NoOffsetTzInfo())
     assert unmarked.tzinfo is not None
     assert unmarked.utcoffset() is None
     inserted = ds.delta(begin_date=unmarked).get_inserted_rows().read_all()
-    assert 2 in inserted.column("id").to_pylist()
+    assert inserted.column("id").to_pylist() == [2]
+
+
+def _wait_until_after(stamp: datetime) -> None:
+    """Block until the local clock moves past ``stamp``.
+
+    An inclusive end keeps every commit in that microsecond. The commit that
+    exercises the upper bound has to land in a later one.
+    """
+    deadline = time.monotonic() + 2.0
+    while datetime.now() <= stamp:
+        if time.monotonic() > deadline:
+            break
+        time.sleep(0.0002)
+
+
+def test_delta_exposed_version_timestamps_round_trip(tmp_path):
+    """get_version() timestamps are the exclusive begin and inclusive end.
+
+    Create ids 1 and 9, append 2, delete 9, then a later append. (1, 3] is
+    inserted id 2 and deleted row id 1. A membership check on 2 would still
+    pass if version 1 leaked, and a begin that resolved to version 0 would
+    report no deletions.
+    """
+    uri = tmp_path / "delta.lance"
+    ds = write_dataset(pa.table({"id": [1, 9]}), uri, enable_stable_row_ids=True)
+    ds.insert(pa.table({"id": [2]}))
+    live = ds.to_table(columns=["id"], with_row_id=True)
+    row_id_of_9 = dict(zip(live["id"].to_pylist(), live["_rowid"].to_pylist()))[9]
+    assert row_id_of_9 == 1
+    ds.delete("id = 9")
+    end_commit = ds.get_version()["timestamp"]
+    _wait_until_after(end_commit)
+    ds.insert(pa.table({"id": [3]}))
+    assert ds.version == 4
+
+    begin = lance.dataset(uri, version=1).get_version()["timestamp"]
+    end = lance.dataset(uri, version=3).get_version()["timestamp"]
+    reported = {v["version"]: v["timestamp"] for v in ds.versions()}
+    assert begin == reported[1]
+    assert end == reported[3]
+    assert begin.tzinfo is None
+    assert end.tzinfo is None
+
+    delta = ds.delta(begin_date=begin, end_date=end)
+    assert len(delta.list_transactions()) == 2
+    inserted = delta.get_inserted_rows().read_all()["id"].to_pylist()
+    deleted = delta.get_deleted_row_ids().read_all()["_rowid"].to_pylist()
+    assert inserted == [2]
+    assert deleted == [1]
+
+    by_version = ds.delta(begin_version=1, end_version=3)
+    assert by_version.get_inserted_rows().read_all()["id"].to_pylist() == inserted
+    assert by_version.get_deleted_row_ids().read_all()["_rowid"].to_pylist() == deleted
