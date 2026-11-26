@@ -3,12 +3,16 @@
 
 //! Extends logical expression.
 
+use std::sync::Arc;
+
 use arrow_schema::DataType;
 
 use crate::expr::safe_coerce_scalar;
 use crate::numeric_coercion::rewrite as rewrite_numeric;
+use datafusion::common::DFSchema;
 use datafusion::logical_expr::{Between, ScalarUDFImpl};
 use datafusion::logical_expr::{BinaryExpr, Operator};
+use datafusion::optimizer::simplify_expressions::{ExprSimplifier, SimplifyContext};
 use datafusion::prelude::*;
 use datafusion::scalar::ScalarValue;
 use datafusion_functions::core::expr_ext::FieldAccessor;
@@ -90,6 +94,101 @@ fn is_literal_only_same_type_expr(expr: &Expr) -> bool {
     }
 }
 
+/// Whether `expr` is arithmetic on literals only, such as `100 + 100`.
+fn is_constant_expr(expr: &Expr) -> bool {
+    matches!(expr, Expr::BinaryExpr(_)) && is_literal_only_same_type_expr(expr)
+}
+
+/// Folds a constant expression to a literal, or returns `None` when it does not fold.
+fn simplify_constant(expr: Expr) -> Option<ScalarValue> {
+    let schema = Arc::new(DFSchema::empty());
+    let context = SimplifyContext::builder().with_schema(schema.clone());
+    let simplifier = ExprSimplifier::new(context.build());
+    let folded = simplifier
+        .coerce(expr, &schema)
+        .and_then(|expr| simplifier.simplify(expr))
+        .ok()?;
+    match folded {
+        Expr::Literal(value, _) => Some(value),
+        _ => None,
+    }
+}
+
+/// Evaluates a constant expression with each of its literals converted to
+/// `data_type`, so `u = 1 << 63` shifts as `UInt64` for a `UInt64` column.
+/// Returns `None` when a literal does not convert or the sum, difference or
+/// product overflows `data_type`.
+fn fold_as(expr: &Expr, data_type: &DataType) -> Option<ScalarValue> {
+    match expr {
+        Expr::Literal(value, _) => safe_coerce_scalar(value, data_type),
+        Expr::BinaryExpr(BinaryExpr { left, op, right }) => {
+            let left = fold_as(left, data_type)?;
+            let right = fold_as(right, data_type)?;
+            match op {
+                Operator::Plus => left.add_checked(&right).ok(),
+                Operator::Minus => left.sub_checked(&right).ok(),
+                Operator::Multiply => left.mul_checked(&right).ok(),
+                _ => simplify_constant(binary_expr(lit(left), *op, lit(right))),
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Folds a constant expression compared with a column of type `data_type`:
+/// in that type when it holds the result, otherwise with the literals' own
+/// types, so `i8_col < 100 + 100` compares with 200 rather than a wrapped `-56`.
+fn fold_constant(expr: &Expr, data_type: Option<&DataType>) -> Option<Expr> {
+    if !is_constant_expr(expr) {
+        return None;
+    }
+    let value = data_type
+        .and_then(|data_type| fold_as(expr, data_type))
+        .or_else(|| simplify_constant(expr.clone()))?;
+    Some(lit(value))
+}
+
+/// Folds the constant operands of a comparison, `BETWEEN` or `IN` list, which
+/// are then resolved like any other literal. Returns `None` when no operand folds.
+fn fold_constant_operands(expr: &Expr, schema: &Schema) -> Option<Expr> {
+    let fold = |operand: &Expr, column: &Expr| {
+        fold_constant(operand, resolve_column_type(column, schema).as_ref())
+            .unwrap_or_else(|| operand.clone())
+    };
+    let folded = match expr {
+        Expr::BinaryExpr(BinaryExpr { left, op, right })
+            if !matches!(op, Operator::And | Operator::Or)
+                && (is_constant_expr(left) || is_constant_expr(right)) =>
+        {
+            Expr::BinaryExpr(BinaryExpr::new(
+                Box::new(fold(left, right)),
+                *op,
+                Box::new(fold(right, left)),
+            ))
+        }
+        Expr::Between(between)
+            if is_constant_expr(&between.low) || is_constant_expr(&between.high) =>
+        {
+            Expr::Between(Between {
+                low: Box::new(fold(&between.low, &between.expr)),
+                high: Box::new(fold(&between.high, &between.expr)),
+                ..between.clone()
+            })
+        }
+        Expr::InList(in_list) if in_list.list.iter().any(is_constant_expr) => Expr::in_list(
+            in_list.expr.as_ref().clone(),
+            in_list
+                .list
+                .iter()
+                .map(|item| fold(item, &in_list.expr))
+                .collect(),
+            in_list.negated,
+        ),
+        _ => return None,
+    };
+    (folded != *expr).then_some(folded)
+}
+
 /// Resolve logical expression `expr`.
 ///
 /// Parameters
@@ -97,6 +196,9 @@ fn is_literal_only_same_type_expr(expr: &Expr) -> bool {
 /// - *expr*: a datafusion logical expression
 /// - *schema*: lance schema.
 pub fn resolve_expr(expr: &Expr, schema: &Schema) -> Result<Expr> {
+    if let Some(folded) = fold_constant_operands(expr, schema) {
+        return resolve_expr(&folded, schema);
+    }
     if let Some(rewritten) = rewrite_numeric(expr, schema) {
         return Ok(rewritten);
     }
@@ -139,14 +241,6 @@ pub fn resolve_expr(expr: &Expr, schema: &Schema) -> Result<Expr> {
                         op: *op,
                         right: Box::new(coerce_expr(right.as_ref(), &left_type)?),
                     })),
-                    // Constant expressions need the column type applied to all of their literals.
-                    Expr::BinaryExpr(_) if is_literal_only_same_type_expr(right) => {
-                        Ok(Expr::BinaryExpr(BinaryExpr {
-                            left: left.clone(),
-                            op: *op,
-                            right: Box::new(coerce_expr(right, &left_type)?),
-                        }))
-                    }
                     // Let DataFusion coerce other expressions. Recursively resolving them
                     // can narrow literals to an inner column's type before arithmetic promotes
                     // its operands, for example the 0.5 in `float_col = int_col + 0.5`.
@@ -399,22 +493,8 @@ mod tests {
         });
         let resolved = resolve_expr(&expr, &Schema::try_from(&arrow_schema).unwrap()).unwrap();
 
-        match resolved {
-            Expr::BinaryExpr(be) => match be.right.as_ref() {
-                Expr::BinaryExpr(r_be) => {
-                    assert_eq!(
-                        r_be.left.as_ref(),
-                        &Expr::Literal(ScalarValue::Float64(Some(2.0)), None)
-                    );
-                    assert_eq!(
-                        r_be.right.as_ref(),
-                        &Expr::Literal(ScalarValue::Float64(Some(-1.0)), None)
-                    );
-                }
-                _ => panic!("Expected BinaryExpr"),
-            },
-            _ => panic!("Expected BinaryExpr"),
-        }
+        // The constant is folded first, then the result is coerced to the column type.
+        assert_eq!(resolved, col("a").eq(lit(3.0_f64)));
     }
 
     #[test]
