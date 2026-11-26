@@ -40,6 +40,7 @@ use crate::{FileFragment, TableBuilder, TableSession};
 #[derive(Clone)]
 pub struct Table {
     pub(crate) state: TableState,
+    pub(crate) snapshot_digest: Arc<tokio::sync::OnceCell<[u8; 32]>>,
     /// The checked-out manifest.
     pub manifest: Arc<Manifest>,
     /// Branch and tag operations bound to this table.
@@ -71,6 +72,8 @@ pub struct TableState {
     pub uri: String,
     pub base: Path,
     pub manifest_location: ManifestLocation,
+    // Serialized manifests and arbitrary views have not established this pairing.
+    pub(crate) is_manifest_generation_verified: bool,
     pub(crate) session: Arc<TableSession>,
     pub(crate) index_cache: LanceCache,
     // Keep the incarnation opened by this handle; the name may later be reused.
@@ -109,6 +112,7 @@ impl TableState {
             base,
             uri,
             manifest_location,
+            is_manifest_generation_verified: true,
             session,
             index_cache,
             commit_handler,
@@ -138,6 +142,7 @@ impl TableState {
         self.update_fragment_and_base_state(current, &manifest);
         *current = manifest;
         self.manifest_location = manifest_location;
+        self.is_manifest_generation_verified = true;
     }
 
     fn update_fragment_and_base_state(&mut self, current: &Manifest, new: &Manifest) {
@@ -175,6 +180,7 @@ impl<'a> TableView<'a> {
     pub fn with_manifest_view(&self, manifest: Arc<Manifest>) -> Table {
         let mut state = self.state.clone();
         state.update_fragment_and_base_state(self.manifest, &manifest);
+        state.is_manifest_generation_verified = false;
         Table::from_parts(state, manifest, self.refs.clone())
     }
 
@@ -228,7 +234,7 @@ impl<'a> TableView<'a> {
             .branch_location()
             .find_branch(standardized_branch.as_deref())?;
 
-        let manifest_location = if let Some(version_number) = version_number {
+        let mut manifest_location = if let Some(version_number) = version_number {
             self.state
                 .commit_handler
                 .resolve_version_location(
@@ -244,12 +250,18 @@ impl<'a> TableView<'a> {
                 .await?
         };
 
+        crate::manifest::resolve_manifest_generation(
+            &self.state.object_store,
+            &mut manifest_location,
+        )
+        .await?;
+
         if self.already_checked_out(&manifest_location, standardized_branch.as_deref()) {
             self.ensure_branch_exists().await?;
             return Ok(None);
         }
 
-        let manifest = Table::get_manifest(
+        let (manifest, digest) = Table::get_manifest_with_digest(
             self.state.object_store.as_ref(),
             &manifest_location,
             &new_location.uri,
@@ -270,7 +282,7 @@ impl<'a> TableView<'a> {
             )));
         }
 
-        let table = Table::checkout_manifest(
+        let mut table = Table::checkout_manifest(
             self.state.object_store.clone(),
             new_location.path,
             new_location.uri,
@@ -291,6 +303,7 @@ impl<'a> TableView<'a> {
                 ),
             });
         }
+        table.snapshot_digest = digest;
         Ok(Some(table))
     }
 
@@ -315,6 +328,20 @@ impl<'a> TableView<'a> {
     }
 
     pub async fn latest_manifest(&self) -> Result<(Arc<Manifest>, ManifestLocation)> {
+        let (manifest, location, _) = self.latest_manifest_with_digest(Default::default()).await?;
+        Ok((manifest, location))
+    }
+
+    /// Load the latest manifest while carrying the digest from the same observation.
+    #[doc(hidden)]
+    pub async fn latest_manifest_with_digest(
+        &self,
+        current_digest: Arc<tokio::sync::OnceCell<[u8; 32]>>,
+    ) -> Result<(
+        Arc<Manifest>,
+        ManifestLocation,
+        Arc<tokio::sync::OnceCell<[u8; 32]>>,
+    )> {
         self.ensure_branch_exists().await?;
         let location = self
             .state
@@ -325,9 +352,13 @@ impl<'a> TableView<'a> {
         if self.already_checked_out(&location, self.manifest.branch.as_deref()) {
             ensure_can_read_manifest(self.manifest)?;
             self.ensure_branch_exists().await?;
-            return Ok((self.manifest.clone(), self.state.manifest_location.clone()));
+            return Ok((
+                self.manifest.clone(),
+                self.state.manifest_location.clone(),
+                current_digest,
+            ));
         }
-        let manifest = Table::get_manifest(
+        let (manifest, digest) = Table::get_manifest_with_digest(
             &self.state.object_store,
             &location,
             &self.state.uri,
@@ -335,7 +366,7 @@ impl<'a> TableView<'a> {
         )
         .await?;
         self.ensure_branch_exists().await?;
-        Ok((manifest, location))
+        Ok((manifest, location, digest))
     }
 
     pub fn branch_location(&self) -> BranchLocation {
@@ -758,11 +789,40 @@ impl Table {
     /// Assemble a snapshot using the matching parts returned by into_parts.
     #[doc(hidden)]
     pub fn from_parts(state: TableState, manifest: Arc<Manifest>, refs: Refs) -> Self {
+        Self::from_parts_with_snapshot_digest(state, manifest, refs, Default::default())
+    }
+
+    /// Restore matching runtime parts and the digest shared by that snapshot's handles.
+    /// Embedders must pass the digest obtained from the same checked-out snapshot.
+    ///
+    /// ```
+    /// # use lance_table_runtime::Table;
+    /// # fn example(table: Table) -> Table {
+    /// let digest = table.snapshot_digest();
+    /// let (state, manifest, refs) = table.into_parts();
+    /// Table::from_parts_with_snapshot_digest(state, manifest, refs, digest)
+    /// # }
+    /// ```
+    #[doc(hidden)]
+    pub fn from_parts_with_snapshot_digest(
+        state: TableState,
+        manifest: Arc<Manifest>,
+        refs: Refs,
+        snapshot_digest: Arc<tokio::sync::OnceCell<[u8; 32]>>,
+    ) -> Self {
         Self {
             state,
+            snapshot_digest,
             manifest,
             refs,
         }
+    }
+
+    /// Share the original-byte digest without depending on metadata-cache retention.
+    /// An uninitialized cell means the complete original file has not been read.
+    #[doc(hidden)]
+    pub fn snapshot_digest(&self) -> Arc<tokio::sync::OnceCell<[u8; 32]>> {
+        self.snapshot_digest.clone()
     }
 
     /// Transfer the runtime state, manifest and refs without copying their contents.
@@ -773,6 +833,7 @@ impl Table {
 
     /// Update this handle to the newly published snapshot.
     pub(crate) fn set_manifest(&mut self, manifest: Arc<Manifest>, location: ManifestLocation) {
+        self.snapshot_digest = Default::default();
         self.state
             .set_manifest(&mut self.manifest, manifest, location);
     }
@@ -863,9 +924,13 @@ impl Table {
 
     /// Check out the latest version of the dataset
     pub async fn checkout_latest(&mut self) -> Result<()> {
-        let (manifest, manifest_location) = self.latest_manifest().await?;
+        let (manifest, location, digest) = self
+            .view()
+            .latest_manifest_with_digest(self.snapshot_digest.clone())
+            .await?;
         self.state
-            .set_manifest(&mut self.manifest, manifest, manifest_location);
+            .set_manifest(&mut self.manifest, manifest, location);
+        self.snapshot_digest = digest;
         Ok(())
     }
 

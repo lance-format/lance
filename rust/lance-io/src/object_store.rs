@@ -1393,6 +1393,50 @@ impl ObjectStore {
         }
     }
 
+    /// Open a conditional reader bound to an observed object ETag.
+    ///
+    /// Every range and complete-object read applies `If-Match`, including retries.
+    /// Local stores also use their object-store implementation to enforce the
+    /// condition instead of bypassing it through direct filesystem reads.
+    ///
+    /// ```
+    /// # use lance_io::object_store::ObjectStore;
+    /// # use object_store::path::Path;
+    /// # fn example(store: &ObjectStore, path: &Path, etag: String) -> lance_core::Result<()> {
+    /// let reader = store.open_with_if_match(path, None, etag)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn open_with_if_match(
+        &self,
+        path: &Path,
+        known_size: Option<usize>,
+        e_tag: String,
+    ) -> Result<Box<dyn Reader>> {
+        if e_tag.is_empty() {
+            return Err(Error::invalid_input(
+                "Conditional reader ETag cannot be empty",
+            ));
+        }
+        let e_tag = if self.has_direct_local_paths() && !e_tag.starts_with('"') {
+            format!("\"{e_tag}\"")
+        } else {
+            e_tag
+        };
+        Ok(Box::new(
+            CloudObjectReader::new(
+                self.inner.clone(),
+                path.clone(),
+                self.block_size,
+                known_size,
+                self.download_retry_count,
+            )?
+            .with_if_match(e_tag)
+            .with_transport_stats(self.is_cloud())
+            .with_io_parallelism(self.io_parallelism()),
+        ))
+    }
+
     /// Open a reader for a file with known size.
     ///
     /// This size may either have been retrieved from a list operation or

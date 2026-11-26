@@ -1,12 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::sync::Arc;
+use std::{borrow::Cow, sync::Arc};
+
+use futures::TryStreamExt;
+use prost::bytes::Buf;
 
 use byteorder::{ByteOrder, LittleEndian};
 use lance_core::{Error, Result, box_error};
+use lance_io::object_reader::SmallReader;
 use lance_io::object_store::ObjectStore;
-use lance_io::utils::{read_last_block, read_message, read_metadata_offset, read_struct};
+use lance_io::traits::Reader;
+use lance_io::utils::{
+    ChunkedBuf, METADATA_READ_CHUNK_SIZE, read_last_block, read_message, read_metadata_offset,
+    read_range_in_chunks,
+};
 use lance_table::feature_flags::{CoveringContract, ensure_can_read_manifest};
 use lance_table::format::{
     IndexMetadata, MAGIC, Manifest, pb, populate_manifest_schema_dictionaries,
@@ -14,10 +22,50 @@ use lance_table::format::{
 };
 use lance_table::io::{commit::ManifestLocation, manifest::read_manifest};
 use lance_table::transaction::Transaction;
+use object_store::ObjectStoreExt;
 use prost::Message;
 
-use crate::caches::{IndexMetadataKey, ManifestKey, TransactionKey};
+use crate::caches::{
+    IndexMetadataKey, ManifestDigestKey, ManifestKey, ManifestTransactionKey, cache_manifest,
+};
 use crate::{Table, TableSession, TableState, TableView, VersionTransaction, refs};
+
+#[derive(Clone, Copy)]
+pub enum ManifestRead {
+    Metadata,
+    Snapshot,
+}
+
+pub fn conditional_etag<'a>(store: &ObjectStore, token: &'a str) -> Cow<'a, str> {
+    if store.has_direct_local_paths() && !token.starts_with('"') {
+        Cow::Owned(format!("\"{token}\""))
+    } else {
+        Cow::Borrowed(token)
+    }
+}
+
+pub async fn resolve_manifest_generation(
+    store: &ObjectStore,
+    location: &mut ManifestLocation,
+) -> Result<()> {
+    if location.size.is_none() && location.e_tag.is_none() && location.identity.is_none() {
+        // V1 and detached path resolution can omit metadata. Observe the token
+        // before reading so later verification uses the generation actually read.
+        let metadata = store
+            .inner
+            .head(&location.path)
+            .await
+            .map_err(|error| match error {
+                object_store::Error::NotFound { path, source } => {
+                    Error::dataset_not_found(path, source)
+                }
+                error => Error::from(error),
+            })?;
+        location.size = Some(metadata.size);
+        location.e_tag = metadata.e_tag;
+    }
+    Ok(())
+}
 
 impl Table {
     /// Read and validate a manifest, prefetching sections available in its tail block.
@@ -28,13 +76,94 @@ impl Table {
         uri: &str,
         session: &TableSession,
     ) -> Result<Manifest> {
-        let object_reader = if let Some(size) = manifest_location.size {
-            object_store
-                .open_with_size(&manifest_location.path, size as usize)
-                .await
-        } else {
-            object_store.open(&manifest_location.path).await
-        };
+        Ok(Self::load_manifest_impl(
+            object_store,
+            manifest_location,
+            uri,
+            session,
+            ManifestRead::Metadata,
+        )
+        .await?
+        .0)
+    }
+
+    /// Read unhydrated metadata and hash its complete original file for snapshot verification.
+    #[doc(hidden)]
+    pub async fn load_manifest_with_digest(
+        object_store: &ObjectStore,
+        manifest_location: &ManifestLocation,
+        uri: &str,
+        session: &TableSession,
+    ) -> Result<(Manifest, [u8; 32])> {
+        let (manifest, digest) = Self::load_manifest_impl(
+            object_store,
+            manifest_location,
+            uri,
+            session,
+            ManifestRead::Snapshot,
+        )
+        .await?;
+        let digest =
+            digest.ok_or_else(|| Error::internal("Snapshot manifest digest is missing"))?;
+        Ok((manifest, digest))
+    }
+
+    pub(crate) async fn load_manifest_impl(
+        object_store: &ObjectStore,
+        manifest_location: &ManifestLocation,
+        uri: &str,
+        session: &TableSession,
+        mode: ManifestRead,
+    ) -> Result<(Manifest, Option<[u8; 32]>)> {
+        let object_reader: Result<Box<dyn Reader>> =
+            match mode {
+                ManifestRead::Metadata if manifest_location.e_tag.is_some() => {
+                    let token = manifest_location.e_tag.clone().ok_or_else(|| {
+                        Error::internal("Conditional manifest reader is missing its ETag")
+                    })?;
+                    let token = conditional_etag(object_store, &token).into_owned();
+                    object_store.open_with_if_match(
+                        &manifest_location.path,
+                        manifest_location.size.map(|size| size as usize),
+                        token,
+                    )
+                }
+                ManifestRead::Metadata => {
+                    if let Some(size) = manifest_location.size {
+                        object_store
+                            .open_with_size(&manifest_location.path, size as usize)
+                            .await
+                    } else {
+                        object_store.open(&manifest_location.path).await
+                    }
+                }
+                ManifestRead::Snapshot => {
+                    let if_match = manifest_location
+                        .e_tag
+                        .as_ref()
+                        .map(|token| conditional_etag(object_store, token).into_owned());
+                    let result = object_store.inner.get_opts(
+                    &manifest_location.path,
+                    object_store::GetOptions { if_match, ..Default::default() },
+                ).await.map_err(|error| match error {
+                    object_store::Error::NotFound { path, source } => {
+                        Error::dataset_not_found(path, source)
+                    }
+                    object_store::Error::Precondition { .. } => Error::invalid_input(format!(
+                        "Manifest {} no longer matches the loaded snapshot at version {}",
+                        manifest_location.path, manifest_location.version,
+                    )),
+                    error => Error::from(error),
+                });
+                    match result {
+                        Ok(result) => Ok(Box::new(SmallReader::from_bytes(
+                            manifest_location.path.clone(),
+                            result.bytes().await?,
+                        )) as Box<dyn Reader>),
+                        Err(error) => Err(error),
+                    }
+                }
+            };
         let object_reader = object_reader.map_err(|e| match &e {
             Error::NotFound { uri, .. } => Error::dataset_not_found(uri.clone(), box_error(e)),
             _ => e,
@@ -55,11 +184,12 @@ impl Table {
                     size: None,
                     ..manifest_location.clone()
                 };
-                return Box::pin(Self::load_manifest(
+                return Box::pin(Self::load_manifest_impl(
                     object_store,
                     &manifest_location,
                     uri,
                     session,
+                    mode,
                 ))
                 .await;
             }
@@ -69,36 +199,42 @@ impl Table {
             ));
         }
 
-        let last_block =
-            read_last_block(object_reader.as_ref())
-                .await
-                .map_err(|err| match err {
-                    object_store::Error::NotFound { path, source } => {
-                        Error::dataset_not_found(path, source)
-                    }
-                    _ => Error::io(format!(
-                        "failed to read manifest {}: {}",
-                        manifest_location.path, err
-                    )),
-                })?;
-
-        // A stale cached size yields a bogus footer offset. Detect it (the block
-        // lacks the trailing magic) and retry with the true size, like
-        // read_manifest. At the true size, the file itself is damaged.
-        if !last_block.ends_with(MAGIC) {
-            if manifest_location.size.is_some() {
-                let manifest_location = ManifestLocation {
-                    size: None,
-                    ..manifest_location.clone()
-                };
-                return Box::pin(Self::load_manifest(
-                    object_store,
-                    &manifest_location,
-                    uri,
-                    session,
-                ))
-                .await;
+        let last_block = read_last_block(object_reader.as_ref()).await;
+        // A stale cached size can truncate the footer, produce a short tail, or
+        // make a backend reject the range. Retry once using the actual size.
+        let should_retry_size = manifest_location.size.is_some()
+            && match &last_block {
+                Ok(block) => {
+                    !block.ends_with(MAGIC)
+                        || block.len() != manifest_size.min(object_reader.block_size())
+                }
+                Err(object_store::Error::NotFound { .. }) => false,
+                Err(_) => true,
+            };
+        if should_retry_size {
+            let manifest_location = ManifestLocation {
+                size: None,
+                ..manifest_location.clone()
+            };
+            return Box::pin(Self::load_manifest_impl(
+                object_store,
+                &manifest_location,
+                uri,
+                session,
+                mode,
+            ))
+            .await;
+        }
+        let last_block = last_block.map_err(|err| match err {
+            object_store::Error::NotFound { path, source } => {
+                Error::dataset_not_found(path, source)
             }
+            _ => Error::io(format!(
+                "failed to read manifest {}: {}",
+                manifest_location.path, err
+            )),
+        })?;
+        if !last_block.ends_with(MAGIC) {
             return Err(Error::corrupt_file(
                 manifest_location.path.clone(),
                 format!(
@@ -109,20 +245,59 @@ impl Table {
 
         let offset = read_metadata_offset(&last_block)?;
 
-        // If manifest is in the last block, we can decode directly from memory.
-        let manifest_size = object_reader.size().await?;
-        let mut manifest = if manifest_size - offset <= last_block.len() {
-            let manifest_len = manifest_size - offset;
-            let offset_in_block = last_block.len() - manifest_len;
-            let message_len =
-                LittleEndian::read_u32(&last_block[offset_in_block..offset_in_block + 4]) as usize;
-            let message_data = &last_block[offset_in_block + 4..offset_in_block + 4 + message_len];
-            Manifest::try_from(lance_table::format::pb::Manifest::decode(message_data)?)
-        } else {
-            let mut manifest: Manifest = read_struct(object_reader.as_ref(), offset).await?;
-            manifest.detach_sparse_inline_row_ids(manifest_size - offset);
-            Ok(manifest)
-        }?;
+        if offset
+            .checked_add(4)
+            .is_none_or(|end| end > manifest_size - 16)
+        {
+            return Err(Error::corrupt_file(
+                manifest_location.path.clone(),
+                format!("Invalid manifest offset {offset} for file size {manifest_size}"),
+            ));
+        }
+
+        // Ordinary opens need only the protobuf and the prefetched tail. Snapshot
+        // capture additionally hashes leading sections, without joining chunks.
+        let tail_offset = manifest_size - last_block.len();
+        let read_offset = match mode {
+            ManifestRead::Metadata => offset.min(tail_offset),
+            ManifestRead::Snapshot => 0,
+        };
+        let mut bytes = ChunkedBuf::default();
+        {
+            let mut chunks = read_range_in_chunks(
+                object_reader.as_ref(),
+                read_offset..tail_offset,
+                METADATA_READ_CHUNK_SIZE,
+            );
+            while let Some(chunk) = chunks.try_next().await? {
+                bytes.push(chunk);
+            }
+        }
+        bytes.push(last_block.clone());
+        let digest =
+            (read_offset == 0).then(|| lance_table::snapshot::digest_manifest(bytes.clone()));
+        bytes.advance(offset - read_offset);
+        let message_len = bytes.get_u32_le() as usize;
+        bytes.truncate(bytes.remaining() - 16);
+        if message_len == 0 {
+            return Err(Error::corrupt_file(
+                manifest_location.path.clone(),
+                format!(
+                    "Invalid format: manifest at offset {offset} of {manifest_size} bytes has version 0"
+                ),
+            ));
+        }
+        if bytes.remaining() != message_len {
+            return Err(Error::corrupt_file(
+                manifest_location.path.clone(),
+                format!(
+                    "Invalid format: manifest length does not match. Expected {message_len}, got {}",
+                    bytes.remaining(),
+                ),
+            ));
+        }
+        let mut manifest = Manifest::try_from(lance_table::format::pb::Manifest::decode(bytes)?)?;
+        manifest.detach_sparse_inline_row_ids(manifest_size - offset);
 
         // A zeroed length prefix decodes to an empty message without an error, which would
         // open as an empty dataset. Versions start at 1.
@@ -141,7 +316,9 @@ impl Table {
 
         // If indices were also in the last block, we can take the opportunity to
         // decode them now and cache them.
-        if let Some(index_offset) = manifest.index_section
+        if !matches!(mode, ManifestRead::Snapshot)
+            && let Some(index_offset) = manifest.index_section
+            && manifest_location.e_tag.is_some()
             && manifest_size - index_offset <= last_block.len()
         {
             let offset_in_block = last_block.len() - (manifest_size - index_offset);
@@ -152,7 +329,7 @@ impl Table {
             // Cached unfiltered: this is the same cache the commit path reads
             // from, and an index this build cannot decode still has to survive
             // into the next manifest. Version filtering happens on the way out,
-            // when a consumer chooses indices for a query.
+            // in `DatasetIndexExt::load_indices`.
             let contract = CoveringContract::of(&manifest);
             let indices: Vec<IndexMetadata> = section
                 .indices
@@ -171,7 +348,9 @@ impl Table {
 
         // If transaction is also in the last block, we can take the opportunity to
         // decode them now and cache them.
-        if let Some(transaction_offset) = manifest.transaction_section
+        if !matches!(mode, ManifestRead::Snapshot)
+            && let Some(transaction_offset) = manifest.transaction_section
+            && let Some(metadata_key) = ManifestTransactionKey::new(object_store, manifest_location)
             && manifest_size - transaction_offset <= last_block.len()
         {
             let offset_in_block = last_block.len() - (manifest_size - transaction_offset);
@@ -182,22 +361,22 @@ impl Table {
                 decode_inline_transaction(message_data, manifest_location.version)
             {
                 let metadata_cache = session.metadata_cache().for_dataset(uri);
-                let metadata_key = TransactionKey {
-                    version: manifest_location.version,
-                };
                 metadata_cache
                     .insert_with_key(&metadata_key, Arc::new(transaction))
                     .await;
             }
         }
 
-        populate_manifest_schema_dictionaries(&mut manifest, object_reader.as_ref()).await?;
+        if !matches!(mode, ManifestRead::Snapshot) {
+            // Snapshot verification compares persisted metadata; the ordinary
+            // read owns hydrated dictionaries without retaining this full buffer.
+            populate_manifest_schema_dictionaries(&mut manifest, object_reader.as_ref()).await?;
+        }
 
-        Ok(manifest)
+        Ok((manifest, digest))
     }
 
-    /// Fetch the manifest for `manifest_location` from the session metadata
-    /// cache, loading and caching it on a miss.
+    /// Fetch validated metadata through the session's manifest cache.
     #[doc(hidden)]
     pub async fn get_manifest(
         object_store: &ObjectStore,
@@ -205,26 +384,64 @@ impl Table {
         uri: &str,
         session: &TableSession,
     ) -> Result<Arc<Manifest>> {
-        if manifest_location.size.is_none() {
-            return Ok(Arc::new(
-                Self::load_manifest(object_store, manifest_location, uri, session).await?,
-            ));
-        }
+        Ok(
+            Self::get_manifest_with_digest(object_store, manifest_location, uri, session)
+                .await?
+                .0,
+        )
+    }
+
+    /// Fetch a manifest with a shared digest cell, initialized when all bytes were read.
+    #[doc(hidden)]
+    pub async fn get_manifest_with_digest(
+        object_store: &ObjectStore,
+        manifest_location: &ManifestLocation,
+        uri: &str,
+        session: &TableSession,
+    ) -> Result<(Arc<Manifest>, Arc<tokio::sync::OnceCell<[u8; 32]>>)> {
         let metadata_cache = session.metadata_cache().for_dataset(uri);
         let manifest_key = ManifestKey {
             version: manifest_location.version,
             e_tag: manifest_location.e_tag.as_deref(),
         };
-        if let Some(cached) = metadata_cache.get_with_key(&manifest_key).await {
+        let digest_key = ManifestDigestKey {
+            version: manifest_location.version,
+            store_identity: &object_store.store_prefix,
+            manifest_path: &manifest_location.path,
+            manifest_identity: manifest_location.identity.as_deref(),
+            e_tag: manifest_location.e_tag.as_deref(),
+        };
+        if manifest_location.size.is_some()
+            && manifest_location.e_tag.is_some()
+            && let Some(cached) = metadata_cache.get_with_key(&manifest_key).await
+            && let Some(digest) = metadata_cache.get_with_key(&digest_key).await
+            && digest.manifest.ptr_eq(&Arc::downgrade(&cached))
+            && digest.store.ptr_eq(&Arc::downgrade(&object_store.inner))
+        {
             ensure_can_read_manifest(&cached)?;
-            return Ok(cached);
+            return Ok((cached, digest.digest.clone()));
         }
-        let loaded =
-            Arc::new(Self::load_manifest(object_store, manifest_location, uri, session).await?);
-        metadata_cache
-            .insert_with_key(&manifest_key, loaded.clone())
+        let (loaded, digest) = Self::load_manifest_impl(
+            object_store,
+            manifest_location,
+            uri,
+            session,
+            ManifestRead::Metadata,
+        )
+        .await?;
+        let loaded = Arc::new(loaded);
+        let digest = Arc::new(tokio::sync::OnceCell::new_with(digest));
+        if manifest_location.size.is_some() {
+            cache_manifest(
+                &metadata_cache,
+                object_store,
+                manifest_location,
+                loaded.clone(),
+                digest.clone(),
+            )
             .await;
-        Ok(loaded)
+        }
+        Ok((loaded, digest))
     }
 }
 
@@ -234,14 +451,10 @@ impl TableView<'_> {
     /// If there was no transaction file written for this version of the dataset
     /// then this will return None.
     pub async fn read_transaction(&self) -> Result<Option<Transaction>> {
-        let transaction_key = TransactionKey {
-            version: self.manifest.version,
-        };
-        if let Some(transaction) = self
-            .state
-            .metadata_cache
-            .get_with_key(&transaction_key)
-            .await
+        let transaction_key =
+            ManifestTransactionKey::new(&self.state.object_store, &self.state.manifest_location);
+        if let Some(key) = &transaction_key
+            && let Some(transaction) = self.state.metadata_cache.get_with_key(key).await
         {
             return Ok(Some((*transaction).clone()));
         }
@@ -251,10 +464,12 @@ impl TableView<'_> {
             .read_transaction_from_storage(self.manifest, &self.state.manifest_location)
             .await?;
 
-        if let Some(tx) = transaction.as_ref() {
+        if let Some(tx) = transaction.as_ref()
+            && let Some(key) = &transaction_key
+        {
             self.state
                 .metadata_cache
-                .insert_with_key(&transaction_key, Arc::new(tx.clone()))
+                .insert_with_key(key, Arc::new(tx.clone()))
                 .await;
         }
         Ok(transaction)
@@ -273,9 +488,8 @@ impl TableView<'_> {
     /// `checkout_version`) is reused instead of being downloaded again.
     ///
     /// Neither path consults or populates the session's transaction cache
-    /// (unlike [`Self::read_transaction`]): that cache is keyed only by
-    /// version number, which is not safe to reuse across a dataset dropped
-    /// and recreated at the same URI within the same session (see #8916).
+    /// (unlike [`Self::read_transaction`]). Reads use the resolved generation
+    /// directly and do not retain transaction entries while walking history.
     ///
     /// Returns an error if the version does not exist (for example, if it has
     /// been cleaned up).
@@ -409,13 +623,18 @@ impl TableState {
     ) -> Result<Option<Transaction>> {
         // Prefer inline transaction from manifest when available
         if let Some(pos) = manifest.transaction_section {
-            let reader = match manifest_location.size {
-                Some(size) => {
+            let reader = match (&manifest_location.e_tag, manifest_location.size) {
+                (Some(e_tag), size) => self.object_store.open_with_if_match(
+                    &manifest_location.path,
+                    size.map(|size| size as usize),
+                    e_tag.clone(),
+                )?,
+                (None, Some(size)) => {
                     self.object_store
                         .open_with_size(&manifest_location.path, size as usize)
                         .await?
                 }
-                None => self.object_store.open(&manifest_location.path).await?,
+                (None, None) => self.object_store.open(&manifest_location.path).await?,
             };
 
             // A concurrent overwrite can leave the listed size too small; retry
@@ -425,7 +644,15 @@ impl TableState {
                     if manifest_location.size.is_some()
                         && e.to_string().contains("file size is too small") =>
                 {
-                    let reader = self.object_store.open(&manifest_location.path).await?;
+                    let reader = if let Some(e_tag) = &manifest_location.e_tag {
+                        self.object_store.open_with_if_match(
+                            &manifest_location.path,
+                            None,
+                            e_tag.clone(),
+                        )?
+                    } else {
+                        self.object_store.open(&manifest_location.path).await?
+                    };
                     read_message(reader.as_ref(), pos).await?
                 }
                 other => other?,

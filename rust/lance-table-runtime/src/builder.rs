@@ -165,6 +165,105 @@ impl TableBuilder {
         self
     }
 
+    /// Validate that a transported snapshot does not conflict with configured selectors.
+    #[doc(hidden)]
+    fn validate_snapshot_selector(
+        &self,
+        snapshot: &lance_table::snapshot::SnapshotRef,
+    ) -> Result<()> {
+        if self.version.is_some() || self.manifest.is_some() {
+            return Err(Error::invalid_input(
+                "snapshot_ref cannot be combined with version, branch, tag, or serialized_manifest",
+            ));
+        }
+        snapshot.validate_table_uri(&self.table_uri)
+    }
+
+    /// Resolve the exact snapshot and validate its commit identity, conditional
+    /// ETag, or full-file digest. The caller resolves table incarnation and storage
+    /// authority independently; a reference carries no credentials or retention.
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use lance_core::Result;
+    /// # use lance_table::snapshot::SnapshotRef;
+    /// # use lance_table_runtime::{TableBuilder, TableSession};
+    /// # async fn example(reference: &SnapshotRef) -> Result<()> {
+    /// let table = TableBuilder::from_uri(reference.table_uri())
+    ///     .load_snapshot_with_session(reference, Arc::new(TableSession::default())).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn load_snapshot_with_session(
+        mut self,
+        snapshot: &lance_table::snapshot::SnapshotRef,
+        session: Arc<TableSession>,
+    ) -> Result<Table> {
+        self.validate_snapshot_selector(snapshot)?;
+        self.apply_storage_options_override();
+        let table_uri = self.table_uri.clone();
+        let file_reader_options = self.file_reader_options.clone();
+        let store_params = self.options.clone();
+        let base_store_params = (!self.base_store_params.is_empty())
+            .then(|| Arc::new(std::mem::take(&mut self.base_store_params)));
+        let (object_store, base_path, commit_handler) = self.build_object_store().await?;
+        let location = BranchLocation {
+            path: base_path,
+            uri: table_uri,
+            branch: None,
+        }
+        .find_branch(snapshot.branch())?;
+        let mut manifest_location = commit_handler
+            .resolve_version_location(&location.path, snapshot.version(), &object_store.inner)
+            .await?;
+        let (manifest, digest) = if snapshot.manifest_digest().is_empty() {
+            if let Some(expected) = snapshot.manifest_etag() {
+                // Enforce the reference on the actual reads. A local listing may
+                // omit HTTP quotes, so comparing it to a HEAD token is insufficient.
+                manifest_location.e_tag = Some(expected.to_owned());
+            }
+            let (manifest, digest) = Table::load_manifest_impl(
+                &object_store,
+                &manifest_location,
+                &location.uri,
+                &session,
+                crate::manifest::ManifestRead::Metadata,
+            )
+            .await?;
+            (
+                Arc::new(manifest),
+                Arc::new(tokio::sync::OnceCell::new_with(digest)),
+            )
+        } else {
+            Table::get_manifest_with_digest(
+                &object_store,
+                &manifest_location,
+                &location.uri,
+                &session,
+            )
+            .await?
+        };
+        let mut table = Table::checkout_manifest(
+            object_store,
+            location.path,
+            location.uri,
+            manifest,
+            manifest_location,
+            session,
+            commit_handler,
+            file_reader_options,
+            Some(store_params),
+            base_store_params,
+        )
+        .await?;
+        table.snapshot_digest = digest;
+        if !snapshot.manifest_digest().is_empty() {
+            table.ensure_snapshot_digest().await?;
+        }
+        table.validate_snapshot(snapshot)?;
+        Ok(table)
+    }
+
     /// Sets `version` for the builder using a version number
     pub fn with_version(mut self, version: u64) -> Self {
         self.version = Some(Ref::from(version));
@@ -729,7 +828,8 @@ impl TableBuilder {
         store_params: Option<ObjectStoreParams>,
         base_store_params: Option<Arc<HashMap<String, ObjectStoreParams>>>,
     ) -> Result<Table> {
-        let (manifest, location) = if let Some(mut manifest) = manifest {
+        let has_serialized_manifest = manifest.is_some();
+        let (manifest, location, digest) = if let Some(mut manifest) = manifest {
             ensure_can_read_manifest(&manifest)?;
             check_manifest_storage_version(&mut manifest)?;
             let location = commit_handler
@@ -739,9 +839,13 @@ impl TableBuilder {
                 let reader = object_store.open(&location.path).await?;
                 populate_manifest_schema_dictionaries(&mut manifest, reader.as_ref()).await?;
             }
-            (Arc::new(manifest), location)
+            (
+                Arc::new(manifest),
+                location,
+                Arc::new(tokio::sync::OnceCell::new()),
+            )
         } else {
-            let manifest_location = match version_number {
+            let mut manifest_location = match version_number {
                 Some(version) => {
                     let target_manifest_result = commit_handler
                         .resolve_version_location(&base_path, version, &object_store.inner)
@@ -773,17 +877,19 @@ impl TableBuilder {
                     })?,
             };
 
-            let manifest = Table::get_manifest(
+            crate::manifest::resolve_manifest_generation(&object_store, &mut manifest_location)
+                .await?;
+            let (manifest, digest) = Table::get_manifest_with_digest(
                 &object_store,
                 &manifest_location,
                 &table_uri,
                 session.as_ref(),
             )
             .await?;
-            (manifest, manifest_location)
+            (manifest, manifest_location, digest)
         };
 
-        Table::checkout_manifest(
+        let mut table = Table::checkout_manifest(
             object_store,
             base_path,
             table_uri,
@@ -795,7 +901,10 @@ impl TableBuilder {
             store_params,
             base_store_params,
         )
-        .await
+        .await?;
+        table.snapshot_digest = digest;
+        table.state.is_manifest_generation_verified = !has_serialized_manifest;
+        Ok(table)
     }
 }
 
