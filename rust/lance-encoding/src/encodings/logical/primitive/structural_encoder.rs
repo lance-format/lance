@@ -1605,6 +1605,18 @@ impl PrimitiveStructuralEncoder {
                 DataBlock::FixedWidth(Self::expand_boolean_to_bytes(fixed))
             }
             DataBlock::FixedSizeList(fsl) if Self::fsl_booleans_need_bytes(&fsl) => {
+                if !compression_strategy.allows_byte_wide_fsl_booleans() {
+                    return Err(Error::not_supported_source(
+                        format!(
+                            "field '{}': this FixedSizeList<Boolean> column needs one byte per \
+                             item in the full-zip layout because its rows do not fill whole \
+                             bytes or its items can be null. Released 2.1 and 2.2 readers \
+                             cannot read that layout, so write it with file version 2.3",
+                            field.name
+                        )
+                        .into(),
+                    ));
+                }
                 Self::expand_fsl_booleans_to_bytes(DataBlock::FixedSizeList(fsl))
             }
             other => other,
