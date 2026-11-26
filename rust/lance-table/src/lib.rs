@@ -5,6 +5,7 @@ pub mod feature_flags;
 pub mod format;
 pub mod io;
 pub mod rowids;
+pub mod snapshot;
 pub mod system_index;
 pub mod transaction;
 pub mod utils;
