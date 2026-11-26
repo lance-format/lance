@@ -7548,6 +7548,50 @@ def test_default_scan_options_unknown(tmp_path: Path):
         dataset.scanner()
 
 
+@pytest.mark.parametrize("alias", ["doubled", "cols"])
+def test_default_scan_options_transformed_columns(tmp_path: Path, alias: str):
+    table = pa.table({"id": [0, 1, 2, 3]})
+    dataset = lance.write_dataset(table, tmp_path, max_rows_per_file=2)
+    columns = {alias: "id * 2"}
+    expected = pa.table({alias: [0, 2, 4, 6]})
+    assert dataset.scanner(columns=columns).to_table().equals(expected)
+
+    projected = lance.dataset(tmp_path, default_scan_options={"columns": columns})
+    assert projected.schema == expected.schema
+    assert projected.to_table().equals(expected)
+    assert projected.to_table(columns=["id"]).equals(table)
+
+    selected = lance.dataset(tmp_path, default_scan_options={"columns": ["id"]})
+    assert selected.to_table(columns=columns).equals(expected)
+
+
+@pytest.mark.parametrize(
+    ("expression", "override"),
+    [
+        pytest.param("id >= 2", pc.field("id") < 2, id="sql-default"),
+        pytest.param(pc.field("id") >= 2, "id < 2", id="arrow-default"),
+    ],
+)
+def test_default_scan_options_filter_dict(tmp_path: Path, expression, override):
+    table = pa.table({"id": [0, 1, 2, 3]})
+    dataset = lance.write_dataset(table, tmp_path, max_rows_per_file=2)
+    predicate = {"expr_filter": expression}
+    assert dataset.scanner(filter=predicate).to_table().equals(table.slice(2))
+
+    filtered = lance.dataset(tmp_path, default_scan_options={"filter": predicate})
+    assert filtered.to_table().equals(table.slice(2))
+    assert filtered.to_table(filter=override).equals(table.slice(0, 2))
+
+
+def test_default_scan_options_filter_keyword_dict(tmp_path: Path):
+    table = pa.table({"id": [0, 1, 2, 3]})
+    lance.write_dataset(table, tmp_path, max_rows_per_file=2)
+    dataset = lance.dataset(
+        tmp_path, default_scan_options={"filter": {"filter": "id >= 2"}}
+    )
+    assert dataset.to_table().equals(table.slice(2))
+
+
 def test_inline_deletions(tmp_path: Path):
     import json
 
