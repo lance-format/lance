@@ -501,7 +501,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                                             self.documents.scoring_num_tokens(doc as u32);
                                         if candidates.insert(
                                             ScoredDoc::new(document_key, canonical_score),
-                                            self.documents.tie_order_key(document_key),
+                                            self.documents.tie_order(document_key),
                                             doc_length,
                                             doc,
                                             std::iter::once((essential_term, freq)).chain(
@@ -832,7 +832,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                             }
                             if candidates.insert(
                                 ScoredDoc::new(document_key, score),
-                                self.documents.tie_order_key(document_key),
+                                self.documents.tie_order(document_key),
                                 doc_length,
                                 doc,
                                 clauses.iter().enumerate().filter_map(|(i, clause)| {
@@ -1537,7 +1537,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 }
                 if candidates.insert(
                     ScoredDoc::new(document_key, canonical),
-                    self.documents.tie_order_key(document_key),
+                    self.documents.tie_order(document_key),
                     doc_length,
                     scratch.docs[i],
                     freqs.into_iter(),
@@ -1584,7 +1584,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             }
             if candidates.insert(
                 ScoredDoc::new(document_key, canonical),
-                self.documents.tie_order_key(document_key),
+                self.documents.tie_order(document_key),
                 doc_length,
                 scratch.docs[i],
                 freqs.into_iter(),

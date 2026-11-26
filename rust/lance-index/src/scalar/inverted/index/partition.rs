@@ -1574,7 +1574,8 @@ impl InvertedPartition {
     /// Search a modern partition. When
     /// [`WandBandStatus::score_floor_overflow`] is set the candidates are missing
     /// part of the partition's k-th-score tie band, so the caller searches again
-    /// with `addresses` attached.
+    /// with resident `addresses`, plus `coordinates` for a partition whose element
+    /// ranks fit one key.
     /// `shared_norm_addends` is used only with `impact_scorer`, and must be
     /// shared only by searches that pass the same impact scorer.
     #[allow(clippy::too_many_arguments)]
@@ -1583,6 +1584,7 @@ impl InvertedPartition {
         lengths: &DocLengths,
         visibility: &DocVisibility,
         addresses: Option<&ResidentAddressProjection>,
+        coordinates: Option<ResidentDocCoordinates>,
         params: &FtsSearchParams,
         operator: Operator,
         postings: Vec<PostingIterator>,
@@ -1592,7 +1594,9 @@ impl InvertedPartition {
         shared_threshold: Arc<AtomicU32>,
     ) -> Result<(Vec<DocCandidate<DocId>>, WandBandStatus)> {
         if visibility.is_all() {
-            let documents = ModernWandDocuments::all(lengths).with_addresses(addresses);
+            let documents = ModernWandDocuments::all(lengths)
+                .with_addresses(addresses)
+                .with_coordinates(coordinates);
             self.bm25_search_with_documents(
                 &documents,
                 params,
@@ -1604,8 +1608,9 @@ impl InvertedPartition {
                 shared_threshold,
             )
         } else {
-            let documents =
-                ModernWandDocuments::filtered(lengths, visibility).with_addresses(addresses);
+            let documents = ModernWandDocuments::filtered(lengths, visibility)
+                .with_addresses(addresses)
+                .with_coordinates(coordinates);
             self.bm25_search_with_documents(
                 &documents,
                 params,

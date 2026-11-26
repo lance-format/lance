@@ -348,6 +348,9 @@ pub struct Wand<'a, S: Scorer, D: WandDocuments> {
     // Which tiebreak the document adapter allows, fixed at construction so the
     // collector and every score floor treat a k-th-score tie the same way.
     tie_ordering: TieOrdering,
+    // True when the walk's element coordinate keys cover every `doc_index` rank of
+    // its partition, so the collector may read an equal key as a duplicate element.
+    coordinate_key_is_total: bool,
     // Shared cross-partition top-k floor. Each partition publishes its local
     // k-th score (`atomic_store_max_f32`) and prunes against the running value
     // -- a lower bound on the global k-th, so it never drops a real top-k doc.
@@ -450,6 +453,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         } else {
             TieOrdering::ByRowAddress
         };
+        let coordinate_key_is_total = documents.ranks_element_coordinates();
 
         Self {
             // Standalone leaf top-k keeps its established exclusive floor.
@@ -501,6 +505,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             documents,
             scorer,
             tie_ordering,
+            coordinate_key_is_total,
             shared_threshold: None,
             shared_norm_addends: None,
             score_floor_overflow: false,
@@ -510,9 +515,15 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
 
     /// Build the walk's top-k collector with the tie ordering the document
     /// adapter allows ([`WandDocuments::orders_ties_by_address`] and
-    /// [`WandDocuments::row_addresses_ascend_with_doc_id`]).
+    /// [`WandDocuments::row_addresses_ascend_with_doc_id`]) and the reach of its
+    /// element coordinate keys ([`WandDocuments::ranks_element_coordinates`]).
     fn new_collector(&self, limit: usize, initial_capacity: usize) -> TopKCollector {
-        TopKCollector::new(limit, initial_capacity, self.tie_ordering)
+        TopKCollector::new(
+            limit,
+            initial_capacity,
+            self.tie_ordering,
+            self.coordinate_key_is_total,
+        )
     }
 
     /// True when the last search dropped part of its k-th-score tie band. The
@@ -823,7 +834,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
 
             if candidates.insert(
                 ScoredDoc::new(document_key, score),
-                self.documents.tie_order_key(document_key),
+                self.documents.tie_order(document_key),
                 doc_length,
                 posting_doc_id,
                 self.iter_term_freqs(),
@@ -929,7 +940,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
 
             if candidates.insert(
                 ScoredDoc::new(document_key, score),
-                self.documents.tie_order_key(document_key),
+                self.documents.tie_order(document_key),
                 doc_length,
                 doc_id,
                 self.iter_term_freqs(),

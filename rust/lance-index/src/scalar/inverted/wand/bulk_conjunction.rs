@@ -930,7 +930,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
 
                     if candidates.insert(
                         ScoredDoc::new(document_key, score),
-                        self.documents.tie_order_key(document_key),
+                        self.documents.tie_order(document_key),
                         doc_length,
                         u64::from(doc),
                         wins.iter().zip(self.lead.iter()).zip(offs.iter()).map(

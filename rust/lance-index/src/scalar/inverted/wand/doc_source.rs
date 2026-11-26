@@ -9,9 +9,11 @@ use lance_core::utils::address::RowAddress;
 use lance_select::RowAddrMask;
 
 use crate::scalar::inverted::documents::{
-    DocId, DocLengths, DocVisibility, ResidentAddressProjection,
+    DocId, DocLengths, DocVisibility, ResidentAddressProjection, ResidentDocCoordinates,
 };
 use crate::scalar::inverted::{DocInfo, DocSet};
+
+use super::collector::TieOrder;
 
 #[derive(Debug)]
 pub struct DocCandidate<C> {
@@ -54,19 +56,28 @@ pub(in crate::scalar::inverted) trait WandDocuments {
     fn flat_documents(&self) -> Option<FlatDocuments<'_>>;
     fn flat_doc_length(&self, doc_id: u64, document_key: u64, compressed: bool) -> u32;
 
-    /// True when [`WandDocuments::tie_order_key`] returns row addresses, so the
-    /// walk ranks score ties between rows itself. Otherwise the key is a constant
-    /// and the collector keeps the whole k-th-score band for the caller.
+    /// True when [`WandDocuments::tie_order`] returns row addresses, so the
+    /// walk ranks score ties between rows itself. Otherwise the address is a
+    /// constant and the collector keeps the whole k-th-score band for the caller.
     fn orders_ties_by_address(&self) -> bool;
 
-    /// Key that ranks score ties inside a partition's top-k: the row address when
-    /// [`WandDocuments::orders_ties_by_address`] is true, otherwise a constant, so
-    /// every tie compares equal and is retained. The default returns
-    /// `document_key`, the row address for the legacy adapter. A [`DocSet`] with no
-    /// row ids inherits the default and ranks ties by DocId where production defers
-    /// them.
-    fn tie_order_key(&self, document_key: u64) -> u64 {
-        document_key
+    /// True when [`WandDocuments::tie_order`] returns a coordinate key covering
+    /// every `doc_index` rank of the partition.
+    fn ranks_element_coordinates(&self) -> bool {
+        false
+    }
+
+    /// Rank below the score inside a partition's top-k. `address` is the row
+    /// address when [`WandDocuments::orders_ties_by_address`] is true, otherwise a
+    /// constant, so every tie compares equal and is retained. `coordinate` ranks
+    /// the documents sharing an address. The default returns `document_key` as the
+    /// address with no coordinate, which is what the legacy adapter and a
+    /// [`DocSet`] without row ids use.
+    fn tie_order(&self, document_key: u64) -> TieOrder {
+        TieOrder {
+            address: document_key,
+            coordinate: None,
+        }
     }
 
     /// True when this partition's row addresses are unique and strictly ascend
@@ -137,6 +148,9 @@ pub(in crate::scalar::inverted) struct ModernWandDocuments<'a, V> {
     visibility: V,
     /// Row addresses resident in memory, which rank k-th-score ties between rows.
     addresses: Option<&'a ResidentAddressProjection>,
+    /// Element coordinates resident in memory, which rank the ties between one
+    /// row's elements. Only useful together with `addresses`.
+    coordinates: Option<ResidentDocCoordinates>,
 }
 
 impl<'a> ModernWandDocuments<'a, AllModernDocuments> {
@@ -145,6 +159,7 @@ impl<'a> ModernWandDocuments<'a, AllModernDocuments> {
             lengths,
             visibility: AllModernDocuments,
             addresses: None,
+            coordinates: None,
         }
     }
 }
@@ -155,6 +170,7 @@ impl<'a> ModernWandDocuments<'a, &'a DocVisibility> {
             lengths,
             visibility,
             addresses: None,
+            coordinates: None,
         }
     }
 }
@@ -166,6 +182,13 @@ impl<'a, V> ModernWandDocuments<'a, V> {
         addresses: Option<&'a ResidentAddressProjection>,
     ) -> Self {
         self.addresses = addresses;
+        self
+    }
+
+    /// Rank one row's element ties by `doc_index`. Attach coordinates only with
+    /// the addresses: a coordinate orders documents inside one address.
+    pub(crate) fn with_coordinates(mut self, coordinates: Option<ResidentDocCoordinates>) -> Self {
+        self.coordinates = coordinates;
         self
     }
 }
@@ -239,6 +262,12 @@ impl<V: ModernVisibility> WandDocuments for ModernWandDocuments<'_, V> {
         self.addresses.is_some()
     }
 
+    fn ranks_element_coordinates(&self) -> bool {
+        self.coordinates
+            .as_ref()
+            .is_some_and(|coordinates| coordinates.covers_every_coordinate_rank())
+    }
+
     fn row_addresses_ascend_with_doc_id(&self) -> bool {
         // `dense` matters as much as `ascending`: a dead slot has no current
         // address, so ranking it last breaks the DocId-to-address order.
@@ -246,15 +275,24 @@ impl<V: ModernVisibility> WandDocuments for ModernWandDocuments<'_, V> {
             .is_some_and(ResidentAddressProjection::dense_and_strictly_ascending)
     }
 
-    fn tie_order_key(&self, document_key: u64) -> u64 {
-        // The elements of a row share its address, so the key ranks rows, not
-        // their elements: the collector retains what it cannot rank and the final
-        // sort orders them by `doc_index`. `u64::MAX` ranks a dead slot the walk
-        // skips, and every document when no projection is attached: then every
-        // tie compares equal and the whole k-th-score band is retained.
-        self.addresses
-            .and_then(|addresses| addresses.address(DocId::new(document_key as u32)))
-            .unwrap_or(u64::MAX)
+    fn tie_order(&self, document_key: u64) -> TieOrder {
+        let doc_id = DocId::new(document_key as u32);
+        // The elements of a row share its address, so the coordinate ranks what
+        // the address cannot. `u64::MAX` ranks a dead slot the walk skips, and
+        // every document when no projection is attached: then every tie compares
+        // equal and the whole k-th-score band is retained. `load_modern_partition`
+        // attaches coordinates only together with an address projection, so
+        // a deferred walk defers the element ties as well.
+        TieOrder {
+            address: self
+                .addresses
+                .and_then(|addresses| addresses.address(doc_id))
+                .unwrap_or(u64::MAX),
+            coordinate: self
+                .coordinates
+                .as_ref()
+                .map(|coordinates| coordinates.coordinate_key(doc_id)),
+        }
     }
 }
 

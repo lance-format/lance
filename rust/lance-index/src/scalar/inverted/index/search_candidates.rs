@@ -370,6 +370,10 @@ pub(super) struct LoadedModernPartition {
     /// those read for the retry after a tie overflow. Without them the walk
     /// defers ties to the global merge.
     pub(super) addresses: Option<ResidentAddressProjection>,
+    /// Element coordinates the walk orders one row's ties by: read when the
+    /// partition holds list elements and the addresses are resident. Without them
+    /// the walk cannot rank those.
+    pub(super) coordinates: Option<ResidentDocCoordinates>,
 }
 
 /// Load everything the CPU scoring phase needs for one modern partition.
@@ -430,6 +434,18 @@ pub(super) async fn load_modern_partition(
     } else {
         documents.resident_address_projection()
     };
+    // An element's `doc_index` ranks the ties an address cannot, and the walk
+    // reads it per candidate, so an element partition supplies the whole column.
+    // The final ranking reads the same cached columns.
+    let coordinate_rank = documents.coordinate_rank();
+    let coordinates = if addresses.is_some()
+        && coordinate_rank > 0
+        && coordinate_rank <= MAX_RANKED_COORDINATE_RANK
+    {
+        Some(documents.resident_coordinates().await?)
+    } else {
+        None
+    };
     Ok(Some(LoadedModernPartition {
         partition_ordinal,
         part,
@@ -437,6 +453,7 @@ pub(super) async fn load_modern_partition(
         visibility,
         postings,
         addresses,
+        coordinates,
     }))
 }
 
@@ -481,6 +498,7 @@ pub(super) fn score_modern_partition(
         visibility,
         postings,
         addresses,
+        coordinates,
     } = loaded;
     let LoadedPostings {
         postings,
@@ -504,6 +522,7 @@ pub(super) fn score_modern_partition(
         lengths.as_ref(),
         &visibility,
         addresses.as_ref(),
+        coordinates,
         context.params.as_ref(),
         context.operator,
         postings,

@@ -13,6 +13,7 @@ use std::collections::BinaryHeap;
 use lance_core::{Error, Result};
 
 use crate::scalar::inverted::builder::ScoredDoc;
+use crate::scalar::inverted::documents::ElementCoordinateKey;
 use crate::vector::graph::OrderedFloat;
 
 use super::doc_source::DocCandidate;
@@ -22,20 +23,29 @@ use super::doc_source::DocCandidate;
 /// the caller re-walks the partition with row addresses attached.
 pub(in crate::scalar::inverted) const SCORE_FLOOR_BUFFER: usize = 128;
 
-/// The part of the FTS result order the walk can rank, greatest first.
-/// `order_key` is the row address, or a constant when the walk defers ties
-/// (see [`WandDocuments::tie_order_key`]): equal keys mark an unrankable tie.
+/// The part of the result order below the score that a walk can rank: the row
+/// address, then the element coordinate that separates one row's elements.
+/// `coordinate` is `None` where the walk has no element coordinates; a
+/// row-granularity partition needs none, its documents own distinct addresses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(in crate::scalar::inverted) struct TieOrder {
+    pub(in crate::scalar::inverted) address: u64,
+    pub(in crate::scalar::inverted) coordinate: Option<ElementCoordinateKey>,
+}
+
+/// The result order below the score, greatest first, from
+/// [`WandDocuments::tie_order`](super::doc_source::WandDocuments::tie_order).
+/// Equal keys mark a tie the walk cannot rank.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct TopKRankKey {
     score: OrderedFloat,
     order_key: Reverse<u64>,
+    coordinate: Option<Reverse<ElementCoordinateKey>>,
 }
 
 /// The rank key plus the posting DocId, making the heap order total. DocId is
-/// not in the result order: past the band cap it picks which candidate of an
-/// unrankable group survives. Documents are appended in coordinate order and a
-/// merge copies that order, so DocId follows `doc_index` inside a row. The
-/// collector does not check the order, so it uses DocId only past the cap.
+/// not part of the result order; it decides which candidate of an unrankable
+/// group keeps its heap slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct TopKKey {
     rank: TopKRankKey,
@@ -47,7 +57,7 @@ struct TopKKey {
 #[derive(Debug, Clone)]
 struct TopKEntry {
     doc: ScoredDoc,
-    order_key: u64,
+    order: TieOrder,
     doc_length: u32,
     posting_doc_id: u64,
     frequency_slot: u32,
@@ -57,7 +67,8 @@ impl TopKEntry {
     fn rank_key(&self) -> TopKRankKey {
         TopKRankKey {
             score: self.doc.score,
-            order_key: Reverse(self.order_key),
+            order_key: Reverse(self.order.address),
+            coordinate: self.order.coordinate.map(Reverse),
         }
     }
 
@@ -174,8 +185,12 @@ pub(in crate::scalar::inverted) enum TieOrdering {
     /// the score floor sits at the raw k-th score.
     AscendingRowAddresses,
     /// Row addresses are resident but DocId order does not follow them (a remapped
-    /// partition), or a row's elements share an address. Those ties are retained;
-    /// a full band cannot be reread, so the walk ranks on the DocId proxy and
+    /// partition), or one row owns several documents. The rank key is total for a
+    /// rank-0 partition, and for an element partition of `coordinate_rank` at most
+    /// [`MAX_RANKED_COORDINATE_RANK`](crate::scalar::inverted::documents::MAX_RANKED_COORDINATE_RANK)
+    /// with resident coordinates. A band fills where no key separates the
+    /// documents: deeper partitions, a walk without coordinates, or two documents
+    /// with the same element path. The walk then ranks on the DocId proxy and
     /// reports [`TopKCollector::band_truncated`].
     ByRowAddress,
     /// No resident addresses, so `order_key` is a constant and every k-th-score
@@ -199,13 +214,21 @@ pub(super) struct TopKCollector {
     /// without ties leaves the band empty.
     tie_band: Vec<TieCandidate>,
     band_truncated: bool,
+    /// True when the walk's element coordinate keys cover every `doc_index` rank of
+    /// its partition, so an equal key names one element twice.
+    coordinate_key_is_total: bool,
     /// Set when the collector gave up on the pass rather than merely dropping
     /// candidates, so a later improvement cannot make the flag obsolete.
     aborted: bool,
 }
 
 impl TopKCollector {
-    pub(super) fn new(limit: usize, initial_capacity: usize, tie_ordering: TieOrdering) -> Self {
+    pub(super) fn new(
+        limit: usize,
+        initial_capacity: usize,
+        tie_ordering: TieOrdering,
+        coordinate_key_is_total: bool,
+    ) -> Self {
         let initial_capacity = initial_capacity.min(limit);
         Self {
             limit,
@@ -215,6 +238,7 @@ impl TopKCollector {
             max_buffered: limit.saturating_add(SCORE_FLOOR_BUFFER),
             tie_band: Vec::new(),
             band_truncated: false,
+            coordinate_key_is_total,
             aborted: false,
         }
     }
@@ -226,7 +250,8 @@ impl TopKCollector {
     }
 
     /// True when an address-ordered walk filled its band and ranked on the DocId
-    /// proxy. A retry cannot recover what the cap dropped.
+    /// proxy. A retry cannot recover what the cap dropped. [`TieOrdering`] lists
+    /// which partitions reach the cap.
     pub(super) fn band_truncated(&self) -> bool {
         self.band_truncated
     }
@@ -237,7 +262,7 @@ impl TopKCollector {
     pub(super) fn insert(
         &mut self,
         doc: ScoredDoc,
-        order_key: u64,
+        order: TieOrder,
         doc_length: u32,
         posting_doc_id: u64,
         pairs: impl Iterator<Item = (u32, u32)>,
@@ -264,7 +289,7 @@ impl TopKCollector {
             let frequency_slot = self.frequency_slots.push(pairs)?;
             self.heap.push(Reverse(TopKEntry {
                 doc,
-                order_key,
+                order,
                 doc_length,
                 posting_doc_id,
                 frequency_slot,
@@ -274,7 +299,8 @@ impl TopKCollector {
         let candidate = TopKKey {
             rank: TopKRankKey {
                 score: doc.score,
-                order_key: Reverse(order_key),
+                order_key: Reverse(order.address),
+                coordinate: order.coordinate.map(Reverse),
             },
             posting_doc_id: Reverse(posting_doc_id),
         };
@@ -292,6 +318,13 @@ impl TopKCollector {
             if self.tie_ordering == TieOrdering::AscendingRowAddresses {
                 return Ok(false);
             }
+            // With every rank covered, an equal key needs two documents with the
+            // same element path. `InnerBuilder::merge_from` concatenates partitions
+            // without dedup, so it can happen.
+            debug_assert!(
+                candidate.rank.coordinate.is_none() || self.coordinate_key_is_total,
+                "an element coordinate key ranked a tie outside the ranks it covers"
+            );
             if self.band_is_full() {
                 self.record_band_full();
             } else if candidate > worst_key {
@@ -305,7 +338,7 @@ impl TopKCollector {
                 let displaced = self.retain_displaced(
                     displaced,
                     doc,
-                    order_key,
+                    order,
                     doc_length,
                     posting_doc_id,
                     pairs,
@@ -359,7 +392,7 @@ impl TopKCollector {
                     let displaced = self.retain_displaced(
                         displaced,
                         doc,
-                        order_key,
+                        order,
                         doc_length,
                         posting_doc_id,
                         pairs,
@@ -373,7 +406,7 @@ impl TopKCollector {
                     self.frequency_slots.replace(frequency_slot, pairs)?;
                     self.heap.push(Reverse(TopKEntry {
                         doc,
-                        order_key,
+                        order,
                         doc_length,
                         posting_doc_id,
                         frequency_slot,
@@ -390,7 +423,7 @@ impl TopKCollector {
         &mut self,
         displaced: TopKEntry,
         doc: ScoredDoc,
-        order_key: u64,
+        order: TieOrder,
         doc_length: u32,
         posting_doc_id: u64,
         pairs: impl Iterator<Item = (u32, u32)>,
@@ -398,7 +431,7 @@ impl TopKCollector {
         let frequency_slot = self.frequency_slots.push(pairs)?;
         self.heap.push(Reverse(TopKEntry {
             doc,
-            order_key,
+            order,
             doc_length,
             posting_doc_id,
             frequency_slot,

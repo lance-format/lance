@@ -291,33 +291,56 @@ async fn test_fts_topk_tied_scores_are_an_ordered_prefix(
     .await;
 }
 
-/// Build an element-granularity partition. Each `(row_id, doc_index)` entry is
+/// Build an element-granularity partition of coordinate rank `RANK`. Entries are
 /// appended in the given order, so DocId order can disagree with the element
-/// coordinates that decide the result order.
-async fn build_tied_element_partition(
+/// coordinates.
+async fn build_tied_element_partition_of_rank<const RANK: usize>(
     store: &Arc<LanceIndexStore>,
     partition_id: u64,
-    elements: &[(u64, u32)],
+    elements: &[(u64, [u32; RANK])],
 ) {
     let mut builder = InnerBuilder::new(partition_id, false, TokenSetFormat::default());
-    builder.docs = DocSet::with_coordinate_rank(1);
+    builder.docs = DocSet::with_coordinate_rank(RANK);
     builder.tokens.get_or_add("alpha");
     builder.posting_lists.push(PostingListBuilder::new(false));
-    for (doc_id, &(row_id, doc_index)) in elements.iter().enumerate() {
+    for (doc_id, (row_id, coordinates)) in elements.iter().enumerate() {
         builder.posting_lists[0].add(doc_id as u32, PositionRecorder::Count(1));
         builder
             .docs
-            .append_with_doc_index(row_id, 1, &[doc_index])
+            .append_with_doc_index(*row_id, 1, coordinates)
             .unwrap();
     }
     builder.write(store.as_ref()).await.unwrap();
 }
 
+/// `build_tied_element_partition_of_rank` at coordinate rank 1.
+async fn build_tied_element_partition(
+    store: &Arc<LanceIndexStore>,
+    partition_id: u64,
+    elements: &[(u64, u32)],
+) {
+    let elements = elements
+        .iter()
+        .map(|(row_id, doc_index)| (*row_id, [*doc_index]))
+        .collect::<Vec<_>>();
+    build_tied_element_partition_of_rank(store, partition_id, &elements).await;
+}
+
+/// Build an element-granularity partition of coordinate rank 2, as a
+/// `List<List<String>>` column stores its elements. Each `(row_id, [doc_index_0,
+/// doc_index_1])` entry is appended in the given order.
+async fn build_tied_nested_element_partition(
+    store: &Arc<LanceIndexStore>,
+    partition_id: u64,
+    elements: &[(u64, [u32; 2])],
+) {
+    build_tied_element_partition_of_rank(store, partition_id, elements).await;
+}
+
 #[tokio::test]
 async fn test_fts_topk_tied_elements_of_one_row_resolve_by_doc_index() {
-    // The elements of a row share its address, so the WAND ordering key ranks
-    // the row, not its elements. The winning element is visited after the heap
-    // fills: a collector that let the address key decide the tie would drop it.
+    // The winning element of a row is visited after the heap fills: a collector
+    // that ranked the row address alone, or the posting DocId, would drop it.
     let tmpdir = TempObjDir::default();
     let store = Arc::new(LanceIndexStore::new(
         ObjectStore::local().into(),
@@ -335,7 +358,7 @@ async fn test_fts_topk_tied_elements_of_one_row_resolve_by_doc_index() {
     assert_eq!(search_alpha_documents(&index, 2).await, expected);
 
     // With the address projection resident, the walk ranks by row address and
-    // only the elements of a single row stay ambiguous.
+    // element coordinate.
     index.partitions[0]
         .docs
         .modern()
@@ -361,11 +384,10 @@ async fn test_fts_topk_tied_elements_of_one_row_resolve_by_doc_index() {
 
 #[tokio::test]
 async fn test_fts_topk_tied_elements_past_the_band_cap_keep_doc_index_order() {
-    // A single row holds more elements than `limit + SCORE_FLOOR_BUFFER`, so the
-    // band fills mid-walk and the walk ranks the rest of that row's elements by
-    // posting DocId. Documents are appended in coordinate order, so DocId order
-    // and `doc_index` order name the same elements. `band_truncated` only reaches
-    // a debug log in `score_modern_partition`, so no assertion covers it.
+    // More elements than `limit + SCORE_FLOOR_BUFFER`, appended in coordinate
+    // order, so DocId order and `doc_index` order name the same elements. The
+    // descending direction lives in
+    // `test_fts_topk_tied_elements_with_descending_doc_index_beat_the_band_cap`.
     const TRUNCATED_ROW: u64 = 200;
     const TRUNCATED_ROW_ELEMENTS: u32 = 135;
     const OTHER_ROW: u64 = 100;
@@ -410,7 +432,7 @@ async fn test_fts_topk_tied_elements_past_the_band_cap_keep_doc_index_order() {
         .unwrap();
     assert!(
         index.has_resident_document_projections(),
-        "premise: resident addresses make the walk rank ties by row address, the mode where the cap truncates"
+        "premise: resident addresses let the walk rank element ties by coordinate"
     );
 
     let top5 = search_alpha_documents(&index, MAX_LIMIT).await;
@@ -445,6 +467,351 @@ async fn test_fts_topk_tied_elements_past_the_band_cap_keep_doc_index_order() {
         assert!(
             coordinates[0] < elements,
             "element {coordinates:?} does not belong to row {row_id}, which holds {elements}"
+        );
+    }
+}
+
+/// One row holds more elements than the band cap, with element coordinates
+/// opposite to DocId order.
+#[tokio::test]
+async fn test_fts_topk_tied_elements_with_descending_doc_index_beat_the_band_cap() {
+    const ROW: u64 = 100;
+    const ELEMENTS: u32 = 135;
+    const LIMITS: &[usize] = &[5, 2, 1];
+
+    assert!(
+        ELEMENTS as usize > LIMITS[0] + SCORE_FLOOR_BUFFER,
+        "premise: row {ROW} must hold more elements than the band cap at limit {}, got {ELEMENTS}",
+        LIMITS[0]
+    );
+
+    let fixture = (0..ELEMENTS)
+        .rev()
+        .map(|doc_index| (ROW, doc_index))
+        .collect::<Vec<_>>();
+    let expected = (0..ELEMENTS)
+        .map(|doc_index| (ROW, vec![doc_index]))
+        .collect::<Vec<_>>();
+
+    for residency in [Residency::Nothing, Residency::Roomy] {
+        let cache = match residency {
+            Residency::Roomy => LanceCache::with_capacity(64 * 1024 * 1024),
+            Residency::Nothing => LanceCache::no_cache(),
+        };
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        build_tied_element_partition(&store, 0, &fixture).await;
+        write_test_metadata(&store, vec![0], InvertedIndexParams::default()).await;
+        let index = InvertedIndex::load(store, None, &cache).await.unwrap();
+        if matches!(residency, Residency::Roomy) {
+            index.partitions[0]
+                .docs
+                .modern()
+                .unwrap()
+                .prewarm()
+                .await
+                .unwrap();
+            assert!(
+                index.has_resident_document_projections(),
+                "premise: resident addresses let the walk rank element ties by coordinate"
+            );
+        } else {
+            assert!(
+                !index.has_resident_document_projections(),
+                "premise: the walk starts without resident addresses, so it defers the tie and retries"
+            );
+        }
+
+        let widest = search_alpha_documents(&index, LIMITS[0]).await;
+        assert_eq!(
+            widest,
+            expected[..LIMITS[0]],
+            "{residency:?}: top-{} must be the {} lowest `doc_index` elements of row {ROW}",
+            LIMITS[0],
+            LIMITS[0]
+        );
+        for &limit in &LIMITS[1..] {
+            let found = search_alpha_documents(&index, limit).await;
+            assert_eq!(
+                found,
+                expected[..limit],
+                "{residency:?}: top-{limit} must be the {limit} lowest `doc_index` elements of row {ROW}"
+            );
+            assert_eq!(
+                found,
+                widest[..limit],
+                "{residency:?}: top-{limit} must be an ordered prefix of top-{}",
+                LIMITS[0]
+            );
+        }
+    }
+}
+
+/// A `List<List<String>>` row: its elements share rank 0, so rank 1 decides, and
+/// the key packs both ranks into one value.
+#[tokio::test]
+async fn test_fts_topk_tied_nested_list_elements_resolve_by_the_second_doc_index() {
+    const ROW: u64 = 100;
+    const ELEMENTS: u32 = 135;
+    const LIMITS: &[usize] = &[5, 2, 1];
+
+    assert!(
+        ELEMENTS as usize > LIMITS[0] + SCORE_FLOOR_BUFFER,
+        "premise: row {ROW} must hold more elements than the band cap at limit {}, got {ELEMENTS}",
+        LIMITS[0]
+    );
+
+    // A key holding rank 0 alone ranks all 135 elements equal.
+    let fixture = (0..ELEMENTS)
+        .rev()
+        .map(|doc_index| (ROW, [0, doc_index]))
+        .collect::<Vec<_>>();
+    let expected = (0..ELEMENTS)
+        .map(|doc_index| (ROW, vec![0, doc_index]))
+        .collect::<Vec<_>>();
+
+    let tmpdir = TempObjDir::default();
+    let store = Arc::new(LanceIndexStore::new(
+        ObjectStore::local().into(),
+        tmpdir.clone(),
+        Arc::new(LanceCache::no_cache()),
+    ));
+    build_tied_nested_element_partition(&store, 0, &fixture).await;
+    write_test_metadata(&store, vec![0], InvertedIndexParams::default()).await;
+    let cache = LanceCache::with_capacity(64 * 1024 * 1024);
+    let index = InvertedIndex::load(store, None, &cache).await.unwrap();
+    index.partitions[0]
+        .docs
+        .modern()
+        .unwrap()
+        .prewarm()
+        .await
+        .unwrap();
+    assert!(
+        index.has_resident_document_projections(),
+        "premise: resident addresses let the walk rank element ties by coordinate"
+    );
+
+    let widest = search_alpha_documents(&index, LIMITS[0]).await;
+    assert_eq!(
+        widest,
+        expected[..LIMITS[0]],
+        "top-{} must be the {} lowest (`doc_index_0`, `doc_index_1`) elements of row {ROW}",
+        LIMITS[0],
+        LIMITS[0]
+    );
+    for &limit in &LIMITS[1..] {
+        let found = search_alpha_documents(&index, limit).await;
+        assert_eq!(
+            found,
+            expected[..limit],
+            "top-{limit} must be the {limit} lowest (`doc_index_0`, `doc_index_1`) elements of row {ROW}"
+        );
+        assert_eq!(
+            found,
+            widest[..limit],
+            "top-{limit} must be an ordered prefix of top-{}",
+            LIMITS[0]
+        );
+    }
+}
+
+/// One row of a rank-`RANK` partition holds more elements than the band cap, and
+/// its last coordinate runs opposite to DocId order. The earlier ranks are
+/// constant, so one packed coordinate key ranks every element equal.
+async fn assert_tied_deep_element_top_k_is_an_ordered_prefix<const RANK: usize>(limits: &[usize]) {
+    const ROW: u64 = 100;
+    const ELEMENTS: u32 = 135;
+
+    assert!(
+        ELEMENTS as usize > limits[0] + SCORE_FLOOR_BUFFER,
+        "premise: row {ROW} must hold more elements than the band cap at limit {}, got {ELEMENTS}",
+        limits[0]
+    );
+
+    let coordinates = |doc_index: u32| {
+        let mut path = [0; RANK];
+        path[RANK - 1] = doc_index;
+        path
+    };
+    let fixture = (0..ELEMENTS)
+        .rev()
+        .map(|doc_index| (ROW, coordinates(doc_index)))
+        .collect::<Vec<_>>();
+    let expected = (0..ELEMENTS)
+        .map(|doc_index| (ROW, coordinates(doc_index).to_vec()))
+        .collect::<Vec<_>>();
+
+    let tmpdir = TempObjDir::default();
+    let store = Arc::new(LanceIndexStore::new(
+        ObjectStore::local().into(),
+        tmpdir.clone(),
+        Arc::new(LanceCache::no_cache()),
+    ));
+    build_tied_element_partition_of_rank(&store, 0, &fixture).await;
+    write_test_metadata(&store, vec![0], InvertedIndexParams::default()).await;
+    let cache = LanceCache::with_capacity(64 * 1024 * 1024);
+    let index = InvertedIndex::load(store, None, &cache).await.unwrap();
+    index.partitions[0]
+        .docs
+        .modern()
+        .unwrap()
+        .prewarm()
+        .await
+        .unwrap();
+    assert!(
+        index.has_resident_document_projections(),
+        "premise: resident addresses let the walk rank element ties by coordinate"
+    );
+
+    let widest = search_alpha_documents(&index, limits[0]).await;
+    assert_eq!(
+        widest,
+        expected[..limits[0]],
+        "top-{} must be the {} lowest element coordinates of row {ROW}",
+        limits[0],
+        limits[0]
+    );
+    for &limit in &limits[1..] {
+        let found = search_alpha_documents(&index, limit).await;
+        assert_eq!(
+            found,
+            expected[..limit],
+            "top-{limit} must be the {limit} lowest element coordinates of row {ROW}"
+        );
+        assert_eq!(
+            found,
+            widest[..limit],
+            "top-{limit} must be an ordered prefix of top-{}",
+            limits[0]
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_fts_topk_tied_rank_three_list_elements_resolve_by_the_third_doc_index() {
+    // A `List<List<List<String>>>` row: its elements share ranks 0-1, so the first
+    // packed key ranks all 135 equal and ranking needs rank 2.
+    assert_tied_deep_element_top_k_is_an_ordered_prefix::<3>(&[5, 2, 1]).await;
+}
+
+#[tokio::test]
+async fn test_fts_topk_tied_rank_four_list_elements_resolve_by_the_fourth_doc_index() {
+    // A `List<List<List<List<String>>>>` row: its elements share ranks 0-2, so only
+    // rank 3, the second rank of the second packed key, separates them.
+    assert_tied_deep_element_top_k_is_an_ordered_prefix::<4>(&[5, 2, 1]).await;
+}
+
+/// Coordinate rank 5 is deeper than the two packed keys cover, so the walk gets
+/// no key and retains the row's k-th-score band.
+#[tokio::test]
+async fn test_fts_topk_tied_rank_five_list_elements_stay_exact_inside_the_band_cap() {
+    const ROW: u64 = 100;
+    const ELEMENTS: u32 = 20;
+    const LIMITS: &[usize] = &[5, 2, 1];
+
+    // Past `limit + SCORE_FLOOR_BUFFER` the DocId proxy decides which elements
+    // survive, so this fixture has to fit every limit.
+    let min_limit = *LIMITS.iter().min().unwrap();
+    assert!(
+        ELEMENTS as usize <= min_limit + SCORE_FLOOR_BUFFER,
+        "premise: every limit must hold the row's whole tie band, got {ELEMENTS} elements for limit {min_limit}"
+    );
+
+    // Ranks 0-3 are constant and rank 4 runs opposite to DocId order.
+    let coordinates = |doc_index: u32| {
+        let mut path = [0; 5];
+        path[4] = doc_index;
+        path
+    };
+    let fixture = (0..ELEMENTS)
+        .rev()
+        .map(|doc_index| (ROW, coordinates(doc_index)))
+        .collect::<Vec<_>>();
+    let expected = (0..ELEMENTS)
+        .map(|doc_index| (ROW, coordinates(doc_index).to_vec()))
+        .collect::<Vec<_>>();
+
+    let tmpdir = TempObjDir::default();
+    let store = Arc::new(LanceIndexStore::new(
+        ObjectStore::local().into(),
+        tmpdir.clone(),
+        Arc::new(LanceCache::no_cache()),
+    ));
+    build_tied_element_partition_of_rank(&store, 0, &fixture).await;
+    write_test_metadata(&store, vec![0], InvertedIndexParams::default()).await;
+    let cache = LanceCache::with_capacity(64 * 1024 * 1024);
+    let index = InvertedIndex::load(store, None, &cache).await.unwrap();
+    index.partitions[0]
+        .docs
+        .modern()
+        .unwrap()
+        .prewarm()
+        .await
+        .unwrap();
+    assert!(
+        index.has_resident_document_projections(),
+        "premise: resident addresses make the walk retain element ties"
+    );
+
+    let widest = search_alpha_documents(&index, LIMITS[0]).await;
+    assert_eq!(
+        widest,
+        expected[..LIMITS[0]],
+        "top-{} must be the {} lowest element coordinates of row {ROW}",
+        LIMITS[0],
+        LIMITS[0]
+    );
+    for &limit in &LIMITS[1..] {
+        let found = search_alpha_documents(&index, limit).await;
+        assert_eq!(
+            found,
+            expected[..limit],
+            "top-{limit} must be the {limit} lowest element coordinates of row {ROW}"
+        );
+        assert_eq!(
+            found,
+            widest[..limit],
+            "top-{limit} must be an ordered prefix of top-{}",
+            LIMITS[0]
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_fts_topk_element_ties_are_not_ranked_by_doc_index_without_row_addresses() {
+    // A walk with no resident addresses cannot rank a tie between two rows, so it
+    // retains the band and the merge ranks it by row address. An element coordinate
+    // on its own would rank that tie by element position across rows, and drop the
+    // winner of the result order from the band.
+    let fixture = [(200, 0), (100, 5), (300, 1)];
+    let expected = [(100, vec![5]), (200, vec![0]), (300, vec![1])];
+
+    let tmpdir = TempObjDir::default();
+    let store = Arc::new(LanceIndexStore::new(
+        ObjectStore::local().into(),
+        tmpdir.clone(),
+        Arc::new(LanceCache::no_cache()),
+    ));
+    build_tied_element_partition(&store, 0, &fixture).await;
+    write_test_metadata(&store, vec![0], InvertedIndexParams::default()).await;
+    let cache = LanceCache::no_cache();
+    let index = InvertedIndex::load(store, None, &cache).await.unwrap();
+    assert!(
+        !index.has_resident_document_projections(),
+        "premise: the walk starts without resident addresses, so it defers every tie"
+    );
+
+    for limit in (1..=fixture.len()).rev() {
+        let found = search_alpha_documents(&index, limit).await;
+        assert_eq!(
+            found,
+            expected[..limit],
+            "top-{limit} must be the {limit} lowest row addresses of the fixture"
         );
     }
 }

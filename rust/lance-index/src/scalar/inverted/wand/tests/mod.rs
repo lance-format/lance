@@ -29,13 +29,13 @@ use crate::scalar::inverted::{
     PostingList, PostingListBuilder, SharedPositionStream,
 };
 
-use super::super::documents::resident_row_address_projection_for_test;
+use super::super::documents::{pack_coordinate_ranks, resident_row_address_projection_for_test};
 use super::super::impact::build_impact_skip_data;
 use super::bounds::{
     ScoreContribution, conservative_score_sum, exclusive_partial_score_limit, next_down_f32,
     next_up_f32, score_contributions_in_query_order,
 };
-use super::collector::TopKCollector;
+use super::collector::{TieOrder, TopKCollector};
 use super::maxscore::{MAXSCORE_INNER_WINDOW, MaxScoreClause, MaxScoreSoaScratch};
 use super::phrase::counted_anchor_steps;
 use super::posting::{FIND_NEXT_GEQ, FIND_NEXT_GEQ_IN_BLOCK, take_position_cursor_calls};

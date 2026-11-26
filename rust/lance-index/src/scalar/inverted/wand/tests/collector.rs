@@ -3,6 +3,8 @@
 
 use super::*;
 
+use crate::scalar::inverted::documents::ElementCoordinateKey;
+
 // Top-k tiebreak: score descending, then row_id ascending. A broad term ties
 // many documents on `(tf, doc_len)`, and a tied query paginates only when the
 // top-k at one limit is an ordered prefix of the top-k at a larger limit, so the
@@ -13,18 +15,26 @@ use super::*;
 /// Collector for a walk whose row addresses are resident and strictly ascend with
 /// the DocId order the walk visits.
 fn ascending_address_collector(limit: usize) -> TopKCollector {
-    TopKCollector::new(limit, limit, TieOrdering::AscendingRowAddresses)
+    TopKCollector::new(limit, limit, TieOrdering::AscendingRowAddresses, false)
 }
 
 /// Collector for a walk whose row addresses are resident but whose DocId order
-/// does not follow them, or whose rows own several documents.
+/// does not follow them, or whose rows own several documents. No element
+/// coordinates are attached: the partition is row granularity or deeper than the
+/// packed coordinate keys.
 fn row_address_collector(limit: usize) -> TopKCollector {
-    TopKCollector::new(limit, limit, TieOrdering::ByRowAddress)
+    TopKCollector::new(limit, limit, TieOrdering::ByRowAddress, false)
+}
+
+/// Collector for an address-ordered walk over a partition whose `coordinate_rank`
+/// fits the two packed keys, so every document carries element coordinates.
+fn ranked_element_collector(limit: usize) -> TopKCollector {
+    TopKCollector::new(limit, limit, TieOrdering::ByRowAddress, true)
 }
 
 /// Collector for a walk that has no resident row addresses.
 fn deferred_address_collector(limit: usize) -> TopKCollector {
-    TopKCollector::new(limit, limit, TieOrdering::DeferredAddresses)
+    TopKCollector::new(limit, limit, TieOrdering::DeferredAddresses, false)
 }
 
 #[test]
@@ -37,7 +47,10 @@ fn test_top_k_collector_reuses_frequency_slots() -> Result<()> {
         let num_terms = doc % 4 + 1;
         let inserted = collector.insert(
             ScoredDoc::new(doc as u64, doc as f32),
-            doc as u64,
+            TieOrder {
+                address: doc as u64,
+                coordinate: None,
+            },
             num_terms as u32,
             doc as u64,
             (0..num_terms).map(|term| (term as u32, doc as u32)),
@@ -81,7 +94,35 @@ fn insert_at_address(
 ) -> Result<bool> {
     collector.insert(
         ScoredDoc::new(document_key, score),
-        address,
+        TieOrder {
+            address,
+            coordinate: None,
+        },
+        1,
+        document_key,
+        std::iter::once((0u32, 1u32)),
+    )
+}
+
+/// Insert an element of `address` whose packed element coordinate the walk can
+/// rank: one coordinate key holding ranks 0-1, as a partition of coordinate rank
+/// 1 or 2 supplies.
+fn insert_element_at_address(
+    collector: &mut TopKCollector,
+    document_key: u64,
+    address: u64,
+    coordinate: u64,
+    score: f32,
+) -> Result<bool> {
+    collector.insert(
+        ScoredDoc::new(document_key, score),
+        TieOrder {
+            address,
+            coordinate: Some(ElementCoordinateKey {
+                ranks_0_1: coordinate,
+                ranks_2_3: None,
+            }),
+        },
         1,
         document_key,
         std::iter::once((0u32, 1u32)),
@@ -338,10 +379,102 @@ fn test_top_k_collector_deferred_abort_survives_a_later_better_score() -> Result
 }
 
 #[test]
-fn test_top_k_collector_bounds_the_element_band() -> Result<()> {
-    // A list row can hold any number of elements, so a retaining walk caps its
-    // band. Past the cap the heap ranks on the DocId proxy: the result order's
-    // winners survive and the rest of the group is dropped.
+fn test_top_k_collector_ranks_the_elements_of_one_row_by_coordinate() -> Result<()> {
+    // The element coordinate is part of the rank key, so the elements of a row
+    // are totally ranked as the walk reaches them: nothing is retained and the
+    // band cap cannot fill.
+    const ROW: u64 = 100;
+    const LIMIT: usize = 2;
+    const ELEMENTS: u64 = (LIMIT + SCORE_FLOOR_BUFFER) as u64 + 50;
+
+    let mut collector = ranked_element_collector(LIMIT);
+    // The walk visits DocIds ascending while the coordinates descend, so the
+    // elements the result order picks arrive last.
+    for doc_id in 0..ELEMENTS {
+        insert_element_at_address(&mut collector, doc_id, ROW, ELEMENTS - 1 - doc_id, 1.0)?;
+    }
+
+    assert_eq!(
+        collector.tie_band_len(),
+        0,
+        "a total rank key has no unrankable tie to retain"
+    );
+    assert!(
+        !collector.band_truncated(),
+        "an empty band cannot reach its cap"
+    );
+    assert!(
+        !collector.aborted(),
+        "an address-ordered walk has nothing to retry"
+    );
+    assert_eq!(collector.buffered(), LIMIT);
+    // The winners carry coordinates 0 and 1, the last DocIds the walk reached.
+    assert_eq!(
+        collected_keys(collector)?,
+        vec![ELEMENTS - 2, ELEMENTS - 1],
+        "the exact top-{LIMIT} by `doc_index` must be returned"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_top_k_collector_ranks_elements_by_the_second_coordinate_rank() -> Result<()> {
+    // A nested list's elements share their first coordinate, so only the second
+    // rank separates them. A packed key holds both ranks, so the band stays empty.
+    // A key that ordered rank 1 first would take its winner from the group with the
+    // worse rank 0.
+    const ROW: u64 = 100;
+    const LIMIT: usize = 2;
+    const GROUP: u64 = 90;
+    const ELEMENTS: u64 = GROUP * 2;
+    assert!(
+        ELEMENTS as usize > LIMIT + SCORE_FLOOR_BUFFER,
+        "premise: the elements must exceed the band cap, got {ELEMENTS} for limit {LIMIT}"
+    );
+
+    let mut collector = ranked_element_collector(LIMIT);
+    // The walk visits DocIds ascending. Inside each rank-0 group the rank-1
+    // coordinate descends, so a group's wanted elements arrive last.
+    for rank_0 in 0..2u32 {
+        for element in 0..GROUP {
+            let document_key = rank_0 as u64 * GROUP + element;
+            insert_element_at_address(
+                &mut collector,
+                document_key,
+                ROW,
+                pack_coordinate_ranks(rank_0, (GROUP - 1 - element) as u32),
+                1.0,
+            )?;
+        }
+    }
+
+    assert_eq!(
+        collector.tie_band_len(),
+        0,
+        "a total rank key has no unrankable tie to retain"
+    );
+    assert!(
+        !collector.band_truncated(),
+        "an empty band cannot reach its cap"
+    );
+    assert_eq!(collector.buffered(), LIMIT);
+    // The winners are (rank 0, rank 1) = (0, 1) and (0, 0): the last two DocIds of
+    // the first group.
+    assert_eq!(
+        collected_keys(collector)?,
+        vec![GROUP - 2, GROUP - 1],
+        "the exact top-{LIMIT} by rank 0 then rank 1 must be returned"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_top_k_collector_bounds_the_band_without_a_resident_coordinate() -> Result<()> {
+    // A partition whose coordinate rank exceeds the two ranks one key packs gets no
+    // resident coordinate, so a row's elements stay unrankable and a retaining walk
+    // caps its band; an adapter that loaded no coordinates reaches the same shape.
+    // Past the cap the heap ranks on the DocId proxy: the result order's winners
+    // survive and the rest of the group is dropped.
     const ROW: u64 = 100;
     const LIMIT: usize = 2;
     let max_buffered = LIMIT + SCORE_FLOOR_BUFFER;
@@ -364,7 +497,7 @@ fn test_top_k_collector_bounds_the_element_band() -> Result<()> {
     let (kept, truncated, buffered) = collect()?;
     assert!(
         truncated,
-        "an element band wider than the buffer must report a truncation"
+        "an unranked band wider than the buffer must report a truncation"
     );
     assert!(
         buffered <= max_buffered,
@@ -382,16 +515,20 @@ fn test_top_k_collector_bounds_the_element_band() -> Result<()> {
 }
 
 #[test]
-fn test_top_k_collector_clears_obsolete_band_truncation() -> Result<()> {
+fn test_top_k_collector_clears_obsolete_truncation_without_a_resident_coordinate() -> Result<()> {
     // A truncation describes the band it happened in: once the k-th score rises
-    // past that band, nothing it dropped can win.
+    // past that band, nothing it dropped can win. The band belongs to a partition
+    // the walk cannot rank by coordinate.
     const LIMIT: usize = 2;
     const ROW: u64 = 100;
     let mut collector = row_address_collector(LIMIT);
     for key in 0..(LIMIT + SCORE_FLOOR_BUFFER + 1) {
         insert_at_address(&mut collector, key as u64, ROW, 1.0)?;
     }
-    assert!(collector.band_truncated());
+    assert!(
+        collector.band_truncated(),
+        "a band the walk cannot rank must reach its cap"
+    );
 
     assert!(insert_at_address(&mut collector, 1_000, ROW, 2.0)?);
     assert!(insert_at_address(&mut collector, 1_001, ROW, 2.0)?);
@@ -413,7 +550,10 @@ fn test_top_k_collector_reuses_slots_when_no_tie_is_retained() -> Result<()> {
     for doc in 0..1_000u64 {
         collector.insert(
             ScoredDoc::new(doc, doc as f32),
-            DEFERRED_ORDER_KEY,
+            TieOrder {
+                address: DEFERRED_ORDER_KEY,
+                coordinate: None,
+            },
             1,
             doc,
             (0..NUM_PAIRS).map(|term| (term, doc as u32)),
