@@ -11105,13 +11105,15 @@ class TestLanceScannerTake:
     ],
 )
 def test_cleanup_rejects_negative_age(tmp_path: Path, method, keyword, error_type):
-    # A negative age puts the cutoff in the future, which would delete all history
-    # without any error. It must be rejected like every other negative duration.
-    ds = lance.write_dataset(pa.table({"a": [1]}), tmp_path)
+    # A negative age puts the cutoff in the future, which would remove every old
+    # version without any error.
+    data = pa.table({"a": [1]})
+    lance.write_dataset(data, tmp_path)
+    ds = lance.write_dataset(data, tmp_path, mode="append")
 
     with pytest.raises(error_type, match=f"{keyword} must be non-negative"):
         getattr(ds, method)(**{keyword: timedelta(days=-1)})
-    assert len(ds.versions()) == 1
+    assert len(lance.dataset(tmp_path).versions()) == 2
 
 
 def test_auto_cleanup_options_reject_invalid_values(tmp_path):
