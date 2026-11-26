@@ -9,7 +9,7 @@ Lance is an open table format. You can work with Lance tables from many engines,
 
 - **LanceDB** (this page) is a retrieval database built on Lance. It runs embedded in your application or as a distributed service.
 - **[Apache Spark](spark.md)** runs SQL and distributed data processing on Lance tables.
-- **Format SDKs ([PyLance](pylance.md), [Rust](rust.md), [Java](java.md))** provide low-level control over Lance datasets when building custom engines or pipelines.
+- **Format SDKs ([PyLance](pylance.md), [Rust](rust.md), [Java](java.md), [C/C++](https://github.com/lance-format/lance-c#quickstart), [Go](https://github.com/lance-format/lance-go#quickstart))** provide low-level control over Lance datasets when building custom engines or pipelines.
 
 All of these tools read and write the same format, so a table you create with one of them can be opened with the others.
 
