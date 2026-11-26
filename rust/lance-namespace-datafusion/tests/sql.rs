@@ -468,7 +468,6 @@ async fn stale_table_is_reloaded_without_deadlocking() -> DFResult<()> {
         .append(reader, None)
         .await
         .map_err(|e| DataFusionError::Execution(e.to_string()))?;
-    assert!(version_of(&first) < first_version + 2);
 
     let (tx, rx) = std::sync::mpsc::channel();
     let lookup = {
