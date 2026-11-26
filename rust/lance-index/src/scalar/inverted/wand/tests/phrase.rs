@@ -574,12 +574,21 @@ fn phrase_skips_position_confirm_when_complete_score_cannot_beat_floor(
     #[values(0_u32, 3)] phrase_slop: u32,
     #[values(true, false)] phrase_first: bool,
     #[values(1_usize, 32)] limit: usize,
+    #[values(true, false)] ascending_addresses: bool,
 ) {
     let num_docs = 32_usize;
     let phrase_doc = if phrase_first { 0 } else { num_docs - 1 };
+    let row_id = |doc: usize| -> u64 {
+        if ascending_addresses {
+            doc as u64
+        } else {
+            // A remapped partition: DocId order no longer follows row address.
+            (num_docs - doc) as u64
+        }
+    };
     let mut docs = DocSet::default();
     for doc in 0..num_docs {
-        docs.append(doc as u64, 1);
+        docs.append(row_id(doc), 1);
     }
     let postings = (0..2_u32)
         .map(|term| {
@@ -635,8 +644,14 @@ fn phrase_skips_position_confirm_when_complete_score_cannot_beat_floor(
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].posting_doc_id, phrase_doc as u64);
     assert_eq!(wand.bulk_and_searches, usize::from(mode == BulkAndMode::On));
-    // Every document ties on its complete score. A tie at the k-th score can
-    // still win on row address, so the floor admits it and its positions are
-    // confirmed even after the phrase document filled a `limit == 1` heap.
-    assert_eq!(wand.phrase_position_checks.get(), num_docs);
+    // Every document ties on its complete score. A document reached later can only
+    // win that tie with a lower row address, so when addresses ascend with DocId
+    // order the floor prunes it and its positions are never confirmed; a remapped
+    // partition still has every candidate confirmed.
+    let later_ties_already_lost = ascending_addresses && limit == 1 && phrase_first;
+    assert_eq!(
+        wand.phrase_position_checks.get(),
+        if later_ties_already_lost { 1 } else { num_docs },
+        "positions must only go unconfirmed for ties that had already lost"
+    );
 }

@@ -201,20 +201,31 @@ struct TieCandidate {
     freqs: Vec<(u32, u32)>,
 }
 
-/// What the WAND walk knows about the final result order, which decides whether a
-/// full retained band can be recovered from.
+/// What the WAND walk knows about the final result order, which decides how it
+/// treats a document tied at the k-th score.
+///
+/// Every walk visits candidates in ascending partition-local DocId order, so the
+/// relation between DocId order and row-address order is what separates modes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TieHandling {
-    /// `order_key` is the row address. Candidates the walk cannot rank are then
-    /// documents of one row that also tie on score, differing only in the element
-    /// coordinate the walk cannot see. It stays empty for a row-granularity index,
-    /// where one row address maps to one document. A full band cannot be recovered
-    /// by rereading anything, so it degrades to the DocId proxy and reports
+pub(in crate::scalar::inverted) enum TieHandling {
+    /// Row addresses are resident, unique, and strictly ascend with DocId. DocId
+    /// order is then result order among equal scores, so every candidate still to
+    /// come loses a tie against the k-th entry: a k-th-score tie is rejected
+    /// outright, the retained band stays empty, and the score floor can sit at the
+    /// raw k-th score instead of one ULP below it.
+    AscendingRowAddresses,
+    /// Row addresses are resident but DocId order does not track them (a remapped
+    /// partition), or several documents share one address (the elements of a list
+    /// row). `order_key` ranks rows but not what the walk cannot see, so those
+    /// candidates are retained. A full band cannot be recovered by rereading
+    /// anything, so it degrades to the DocId proxy and reports
     /// [`TopKCollector::band_truncated`].
     ByRowAddress,
-    /// `order_key` is a constant, so the band is the whole k-th-score group. A full
-    /// band reports [`TopKCollector::score_floor_overflow`] and the caller retries
-    /// the partition with addresses attached.
+    /// No resident addresses, so `order_key` is one constant and every k-th-score
+    /// tie is unrankable. This walk cannot rank it and neither can the rest of the
+    /// corpus, so the first such tie ends the pass and reports
+    /// [`TopKCollector::score_floor_overflow`]; the caller retries the partition
+    /// with addresses, where one of the modes above applies.
     DeferredAddresses,
 }
 
@@ -234,20 +245,13 @@ pub(super) struct TopKCollector {
     tie_band: Vec<TieCandidate>,
     score_floor_overflow: bool,
     band_truncated: bool,
+    /// Set when the collector gave up on the pass rather than merely dropping
+    /// candidates, so a later improvement cannot make the flag obsolete.
+    aborted: bool,
 }
 
 impl TopKCollector {
-    /// Collector for a walk whose document keys are row addresses.
-    pub(super) fn by_row_address(limit: usize, initial_capacity: usize) -> Self {
-        Self::new(limit, initial_capacity, TieHandling::ByRowAddress)
-    }
-
-    /// Collector for a walk that resolves row addresses only afterwards.
-    pub(super) fn deferring_addresses(limit: usize, initial_capacity: usize) -> Self {
-        Self::new(limit, initial_capacity, TieHandling::DeferredAddresses)
-    }
-
-    fn new(limit: usize, initial_capacity: usize, tie_handling: TieHandling) -> Self {
+    pub(super) fn new(limit: usize, initial_capacity: usize, tie_handling: TieHandling) -> Self {
         let initial_capacity = initial_capacity.min(limit);
         Self {
             limit,
@@ -258,14 +262,23 @@ impl TopKCollector {
             tie_band: Vec::new(),
             score_floor_overflow: false,
             band_truncated: false,
+            aborted: false,
         }
     }
 
-    /// True when the walk dropped part of its k-th-score tie band. The caller must
-    /// discard these candidates and retry the partition with resolved row
-    /// addresses, otherwise the final order is not the exact top-k.
+    /// True when the walk gave up on part of its k-th-score tie band, either by
+    /// stopping at an unrankable tie or by dropping one it could not buffer. The
+    /// candidates it returned are then only the exact top-k up to that band, so
+    /// the caller must retry the partition with resolved row addresses.
     pub(super) fn score_floor_overflow(&self) -> bool {
         self.score_floor_overflow
+    }
+
+    /// True once the walk must stop: [`Self::score_floor_overflow`] is set and
+    /// nothing later in this pass can make the result exact. A walk that ignores
+    /// this keeps scoring documents whose ties it cannot resolve.
+    pub(super) fn aborted(&self) -> bool {
+        self.aborted
     }
 
     /// True when an address-ordered walk filled its band and fell back to the DocId
@@ -336,6 +349,21 @@ impl TopKCollector {
         // order still separates them through the DocId proxy, but that is not the
         // result order, so the loser is retained instead of dropped.
         if candidate.rank == worst_key.rank {
+            match self.tie_handling {
+                // Unique ascending addresses make rank keys unique, so a walk that
+                // visits documents in address order never gets here. Rejecting
+                // anyway keeps the retained band empty if a caller feeds the
+                // collector candidates out of order.
+                TieHandling::AscendingRowAddresses => return Ok(false),
+                // Neither this walk nor anything it could still do ranks the two,
+                // so end the pass and let the caller retry with addresses instead
+                // of admitting ties forever.
+                TieHandling::DeferredAddresses => {
+                    self.abort_pass();
+                    return Ok(false);
+                }
+                TieHandling::ByRowAddress => {}
+            }
             if self.band_is_full() {
                 self.record_band_full();
             } else if candidate > worst_key {
@@ -384,10 +412,14 @@ impl TopKCollector {
                     // The k-th rank rose past the band: none of its members can win,
                     // and neither can anything a full band dropped earlier, since it
                     // ranked no higher than the band. Clearing the flags keeps a stale
-                    // overflow from forcing a needless address-ordered retry.
+                    // overflow from forcing a needless address-ordered retry. A
+                    // deliberate abort is not stale: the pass stopped early, so its
+                    // candidates stay incomplete whatever arrived afterwards.
                     self.tie_band.clear();
-                    self.score_floor_overflow = false;
-                    self.band_truncated = false;
+                    if !self.aborted {
+                        self.score_floor_overflow = false;
+                        self.band_truncated = false;
+                    }
                     false
                 } else if band_full {
                     self.record_band_full();
@@ -468,15 +500,26 @@ impl TopKCollector {
 
     /// Record that the band could not take another candidate.
     ///
-    /// A deferred walk can be retried with addresses. An address-ordered one has
-    /// nothing to reread, so it keeps ranking the heap on the DocId proxy: the
-    /// documents the result order would pick still reach the final selection, but
-    /// the rest of the unrankable group past the cap is dropped.
+    /// A walk whose addresses are resident but unordered has nothing to reread, so
+    /// it keeps ranking the heap on the DocId proxy: the documents the result order
+    /// would pick still reach the final selection, but the rest of the unrankable
+    /// group past the cap is dropped.
     fn record_band_full(&mut self) {
         match self.tie_handling {
+            // Unreachable: an address-ascending walk keeps an empty band.
+            TieHandling::AscendingRowAddresses => {}
             TieHandling::ByRowAddress => self.band_truncated = true,
-            TieHandling::DeferredAddresses => self.score_floor_overflow = true,
+            // Unreachable too: a deferred walk aborts at its first boundary tie, so
+            // its band never grows to the cap.
+            TieHandling::DeferredAddresses => self.abort_pass(),
         }
+    }
+
+    /// Give up on this pass: the candidate just seen ties the k-th score and cannot
+    /// be ranked, and the rest of the corpus will not rank it either.
+    fn abort_pass(&mut self) {
+        self.aborted = true;
+        self.score_floor_overflow = true;
     }
 
     /// Documents held for the final selection: the heap plus the retained band.
@@ -492,14 +535,19 @@ impl TopKCollector {
     /// Whether a document with `score` cannot enter the top-k, whatever its
     /// position in the result order.
     ///
-    /// Only a score strictly below the k-th is rejected. A tie at the k-th score
-    /// may still win on row address, or has to be retained until addresses are
-    /// resolved, so [`Self::insert`] decides it.
+    /// When the walk reaches documents in ascending row-address order a tie at the
+    /// k-th score has already lost, so only a score strictly above the k-th
+    /// competes. Otherwise a tie may still win on address, or has to be retained
+    /// until addresses are resolved, and [`Self::insert`] decides it.
     pub(super) fn rejects_score(&self, score: f32) -> bool {
         if score.is_nan() {
             return true;
         }
-        self.kth_score_if_full().is_some_and(|kth| score < kth)
+        self.kth_score_if_full()
+            .is_some_and(|kth| match self.tie_handling {
+                TieHandling::AscendingRowAddresses => score <= kth,
+                TieHandling::ByRowAddress | TieHandling::DeferredAddresses => score < kth,
+            })
     }
 
     pub(super) fn kth_score_if_full(&self) -> Option<f32> {

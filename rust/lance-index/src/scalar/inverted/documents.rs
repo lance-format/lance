@@ -1056,7 +1056,9 @@ impl ResidentAddressProjection {
     /// so a contiguous DocId range spans a contiguous address interval. Row
     /// granularity relies on the second half: cross-field statistics count
     /// distinct rows, so an ascending partition can answer
-    /// [`AddressKeyedDocuments::num_distinct_rows`] without walking it.
+    /// [`AddressKeyedDocuments::num_distinct_rows`] without walking it. The FTS
+    /// top-k walk uses the same property to prune documents tied at the k-th
+    /// score, since it reaches documents in DocId order.
     ///
     /// The ordering half is [`OrderedRowAddressProjection`], whose verdict this
     /// projection already caches for the cross-column scorer. Density is the
@@ -1065,7 +1067,7 @@ impl ResidentAddressProjection {
     /// cannot tell from an exhausted cursor. A remapper is attached whenever the
     /// dataset carries a fragment reuse index, even when it retains every
     /// document, so liveness has to be decided on cardinality.
-    fn dense_and_strictly_ascending(&self) -> bool {
+    pub(super) fn dense_and_strictly_ascending(&self) -> bool {
         // A cached invalid verdict already decides the answer. Asking for the
         // ordered view would rebuild its diagnostics by rescanning the documents
         // up to the first violation, only to discard them.

@@ -711,3 +711,56 @@ fn test_wand_batches_lagging_iterators(#[values(false, true)] is_compressed: boo
     assert_eq!(candidate.0.doc_id(), 10);
     assert_eq!(wand.lead.len(), 3);
 }
+
+#[test]
+fn test_or_tied_corpus_keeps_block_max_pruning() {
+    // Reviewer reproducer: every document scores the same, so every block max
+    // bit-equals the k-th score, and the winners sit at the very start of the
+    // walk. Row addresses ascend with DocId here, so a document reached after the
+    // heap filled has already lost the tie on row address and its whole block can
+    // be skipped. A walk that admits every k-th-score tie instead scores the
+    // entire corpus.
+    const NUM_BLOCKS: usize = 128;
+    let total = (NUM_BLOCKS * BLOCK_SIZE) as u32;
+
+    let mut docs = DocSet::default();
+    for row_id in 0..total {
+        docs.append(row_id as u64, 1);
+    }
+
+    let posting = PostingIterator::with_query_weight(
+        String::from("term"),
+        0,
+        0,
+        1.0,
+        generate_posting_list((0..total).collect(), 1.0, Some(vec![1.0; NUM_BLOCKS]), true),
+        docs.len(),
+    );
+
+    let scored = Arc::new(AtomicUsize::new(0));
+    let params = FtsSearchParams::new().with_limit(Some(10));
+    let mut wand = Wand::new(
+        Operator::Or,
+        std::iter::once(posting),
+        &docs,
+        CountingScorer {
+            scored: scored.clone(),
+        },
+    );
+    let hits = wand.search(&params, &NoOpMetricsCollector).unwrap();
+    let scored = scored.load(Ordering::Relaxed);
+
+    assert_eq!(
+        sorted_candidate_row_ids(hits),
+        (0..10u64).collect::<Vec<_>>(),
+        "the lowest row addresses win a corpus-wide tie"
+    );
+    assert!(
+        !wand.score_floor_overflow() && !wand.band_truncated(),
+        "the walk ranked the tie itself, so nothing may be left unresolved"
+    );
+    assert!(
+        scored <= 2 * BLOCK_SIZE,
+        "a tied corpus must still be pruned by its block maxes, but scored {scored} of {total}"
+    );
+}

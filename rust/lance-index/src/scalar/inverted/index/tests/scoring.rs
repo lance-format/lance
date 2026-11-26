@@ -908,6 +908,7 @@ async fn assert_no_impact_bulk_conjunction_preserves_winner(with_phrase: bool) {
     let shared_threshold = Arc::new(AtomicU32::new(f32::NEG_INFINITY.to_bits()));
     let shared_norm_addends = SharedNormAddends::default();
     let mut results = Vec::new();
+    let mut bands = Vec::new();
     let mut published_floors = Vec::new();
     for partition_id in [0, 1] {
         let partition = index
@@ -939,39 +940,92 @@ async fn assert_no_impact_bulk_conjunction_preserves_winner(with_phrase: bool) {
         let documents = partition.docs.modern().unwrap();
         let lengths = documents.lengths().await.unwrap();
         let visibility = documents.visibility(NoFilter.mask(), false).await.unwrap();
-        results.push(
-            partition
-                .bm25_search_modern(
-                    lengths.as_ref(),
-                    &visibility,
-                    None,
-                    params.as_ref(),
-                    Operator::And,
-                    postings,
-                    Some(scorer.clone()),
-                    shared_norm_addends.clone(),
-                    &NoOpMetricsCollector,
-                    shared_threshold.clone(),
-                )
-                .unwrap()
-                .0,
-        );
+        let (candidates, band) = partition
+            .bm25_search_modern(
+                lengths.as_ref(),
+                &visibility,
+                None,
+                params.as_ref(),
+                Operator::And,
+                postings,
+                Some(scorer.clone()),
+                shared_norm_addends.clone(),
+                &NoOpMetricsCollector,
+                shared_threshold.clone(),
+            )
+            .unwrap();
+        results.push(candidates);
+        bands.push(band);
         published_floors.push(f32::from_bits(shared_threshold.load(Ordering::Relaxed)));
     }
 
     assert_eq!(results[0].len(), 1);
+    assert!(!bands[0].score_floor_overflow);
     assert!(published_floors[0] > 0.0);
     let winner_score = 2.0 * scorer.query_weight("lead") * scorer.doc_weight(63, 126);
     assert!(winner_score > published_floors[0]);
-    // All 100 winner-partition documents tie. Without resident addresses the
-    // walk cannot rank them, so it retains the whole k-th-score band and the
-    // merge settles it once addresses are resolved.
-    assert_eq!(results[1].len(), 100);
+    // All 100 winner-partition documents tie. Without resident addresses the walk
+    // cannot rank any of them, so it stops at the first boundary tie and reports
+    // the retry signal instead of scoring the rest of the partition.
+    assert!(
+        bands[1].score_floor_overflow,
+        "a cold walk over a tied partition must ask for the address-ordered retry"
+    );
+    assert_eq!(results[1].len(), 1);
     assert!(
         results[1]
             .iter()
-            .any(|candidate| candidate.document == DocId::new(0))
+            .any(|candidate| candidate.document == DocId::new(0)),
+        "the winner must be collected before the walk stops"
     );
+
+    // The retry holds the partition's row addresses, which ascend with DocId, so
+    // the walk ranks the ties itself: the lowest address keeps the slot and the 99
+    // tied followers are pruned rather than retained. The floor starts empty so the
+    // only thing that can prune them is this partition's own k-th score.
+    let winner_partition = index
+        .partitions
+        .iter()
+        .find(|partition| partition.id() == 1)
+        .unwrap();
+    let documents = winner_partition.docs.modern().unwrap();
+    let lengths = documents.lengths().await.unwrap();
+    let addresses = documents.address_projection().await.unwrap();
+    let visibility = documents.visibility(NoFilter.mask(), false).await.unwrap();
+    let LoadedPostings { postings, .. } = winner_partition
+        .load_posting_lists(
+            tokens.as_ref(),
+            params.as_ref(),
+            Operator::And,
+            scorer.as_ref(),
+            &NoOpMetricsCollector,
+        )
+        .await
+        .unwrap();
+    let (resolved, retry_band) = winner_partition
+        .bm25_search_modern(
+            lengths.as_ref(),
+            &visibility,
+            Some(&addresses),
+            params.as_ref(),
+            Operator::And,
+            postings,
+            Some(scorer.clone()),
+            shared_norm_addends.clone(),
+            &NoOpMetricsCollector,
+            Arc::new(AtomicU32::new(f32::NEG_INFINITY.to_bits())),
+        )
+        .unwrap();
+    assert!(
+        !retry_band.score_floor_overflow && !retry_band.band_truncated,
+        "an address-ordered pass leaves nothing unresolved"
+    );
+    assert_eq!(
+        resolved.len(),
+        1,
+        "the tied followers lose on row address and get pruned"
+    );
+    assert_eq!(resolved[0].document, DocId::new(0));
 }
 
 #[tokio::test]

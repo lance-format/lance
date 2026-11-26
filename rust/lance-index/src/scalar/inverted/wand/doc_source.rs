@@ -74,6 +74,18 @@ pub(in crate::scalar::inverted) trait WandDocuments {
     fn tie_order_key(&self, document_key: u64) -> u64 {
         document_key
     }
+
+    /// Whether this partition's row addresses are unique and strictly ascend with
+    /// the local DocId order every WAND walk follows.
+    ///
+    /// Only meaningful once [`WandDocuments::orders_ties_by_address`] says the
+    /// ordering key really is a row address. Then a true answer means DocId order is
+    /// result order among equal scores, so any candidate still to come loses a tie
+    /// against the k-th entry and the walk may prune at the raw k-th score instead
+    /// of admitting the whole k-th-score band. Conservative default: false.
+    fn row_addresses_ascend_with_doc_id(&self) -> bool {
+        false
+    }
 }
 
 pub(in crate::scalar::inverted) trait ModernVisibility {
@@ -238,6 +250,14 @@ impl<V: ModernVisibility> WandDocuments for ModernWandDocuments<'_, V> {
         self.addresses.is_some()
     }
 
+    fn row_addresses_ascend_with_doc_id(&self) -> bool {
+        // `dense` matters as much as `ascending`: a slot the remapper dropped has
+        // no current address, so the walk would rank it last while later DocIds
+        // carry real ones, and the address order would no longer follow DocId.
+        self.addresses
+            .is_some_and(ResidentAddressProjection::dense_and_strictly_ascending)
+    }
+
     fn tie_order_key(&self, document_key: u64) -> u64 {
         // Element documents of one row share its address, so this key ranks rows
         // but not the elements within a row. The collector keeps every candidate it
@@ -327,6 +347,13 @@ impl WandDocuments for LegacyWandDocuments<'_> {
     fn orders_ties_by_address(&self) -> bool {
         true
     }
+
+    // A loaded legacy `DocSet` keeps its row ids sorted, so the only thing that
+    // can break DocId-equals-address order is a row owning several documents.
+    // The answer is memoized per set, so no query rescans it.
+    fn row_addresses_ascend_with_doc_id(&self) -> bool {
+        self.docs.row_ids_strictly_ascending()
+    }
 }
 
 // Most unit tests exercise WAND in isolation with an in-memory complete
@@ -390,5 +417,11 @@ impl WandDocuments for DocSet {
     // `document_key` is a row address whenever this in-memory DocSet carries one.
     fn orders_ties_by_address(&self) -> bool {
         self.has_row_ids()
+    }
+
+    // Unit tests build DocSets in DocId order, so this is the mode a partition
+    // written by the current writer reports and the pruned-walk path gets covered.
+    fn row_addresses_ascend_with_doc_id(&self) -> bool {
+        self.has_row_ids() && self.row_ids_strictly_ascending()
     }
 }

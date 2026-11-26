@@ -546,6 +546,12 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         }
 
         'window: loop {
+            if candidates.aborted() {
+                // The collector stopped on a tie it cannot rank and the rest of
+                // the conjunction cannot rank it either, so leave what is left of
+                // the walk to the address-ordered retry.
+                break;
+            }
             #[cfg(test)]
             {
                 self.and_window_stats.windows_sliced += 1;

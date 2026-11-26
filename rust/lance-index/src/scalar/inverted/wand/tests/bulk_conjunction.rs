@@ -842,9 +842,10 @@ fn bulk_and_builds_frequency_prune_table_after_mid_window_floor() {
     assert_eq!(bulk, classic);
     assert_eq!(bulk.len(), 1);
     assert_eq!(bulk[0].0, 0);
-    // The stored floor sits one ULP below the k-th score so k-th-score ties
-    // still reach the collector, which orders them by row address.
-    assert_eq!(bulk_floor, 20.0_f32.next_down());
+    // Row addresses ascend with DocId here, so a document tied at the k-th score
+    // already lost the tie on row address: the floor stays at the raw k-th score
+    // instead of dropping one ULP to let the tie reach the collector.
+    assert_eq!(bulk_floor, 20.0);
     assert_eq!(bulk_floor, classic_floor);
     assert_eq!(
         windows_sliced, 2,

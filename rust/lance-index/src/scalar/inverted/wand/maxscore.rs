@@ -225,6 +225,12 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             .unwrap_or(TERMINATED_DOC_ID);
 
         while window_min < TERMINATED_DOC_ID {
+            if candidates.aborted() {
+                // The collector stopped on a tie it cannot rank and the rest of
+                // the corpus cannot rank it either, so leave what is left of the
+                // walk to the address-ordered retry.
+                break;
+            }
             clauses.retain(|clause| clause.posting.doc().is_some());
             if clauses.is_empty() {
                 break;
