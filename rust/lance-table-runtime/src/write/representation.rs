@@ -23,6 +23,7 @@
 //! (and the same for Binary, LargeBinary and BinaryView)
 //! ```
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::cast::AsArray;
@@ -382,12 +383,13 @@ fn keys_fit(dictionary: &dyn AnyDictionaryArray, key_type: &DataType) -> bool {
         })
 }
 
-/// `dictionary` with only the entries its valid rows reference, renumbered in
-/// order of first reference. The referenced values are taken once each, so
-/// memory stays proportional to the keys and those values.
+/// `dictionary` rebuilt from the values its valid rows reference: equal values
+/// share one entry, and an entry holding null becomes a null key. Only the
+/// referenced entries are taken, each once, so memory stays proportional to
+/// the keys and those values.
 fn referenced_entries(dictionary: &dyn AnyDictionaryArray) -> Result<ArrayRef> {
     let nulls = dictionary.keys().logical_nulls();
-    let mut remapped = vec![None; dictionary.values().len()];
+    let mut slots = HashMap::new();
     let mut referenced = Vec::new();
     let keys = dictionary
         .normalized_keys()
@@ -397,7 +399,7 @@ fn referenced_entries(dictionary: &dyn AnyDictionaryArray) -> Result<ArrayRef> {
             if nulls.as_ref().is_some_and(|nulls| nulls.is_null(row)) {
                 return None;
             }
-            Some(*remapped[key].get_or_insert_with(|| {
+            Some(*slots.entry(key).or_insert_with(|| {
                 referenced.push(key as u64);
                 referenced.len() as u64 - 1
             }))
@@ -408,8 +410,20 @@ fn referenced_entries(dictionary: &dyn AnyDictionaryArray) -> Result<ArrayRef> {
         &UInt64Array::from(referenced),
         None,
     )?;
+    // Casting the referenced entries to a dictionary interns them: each
+    // distinct value is kept once, and a null entry gets a null key.
+    let interned = arrow_cast::cast(
+        &values,
+        &DataType::Dictionary(
+            Box::new(DataType::UInt64),
+            Box::new(values.data_type().clone()),
+        ),
+    )?;
+    let interned = interned.as_dictionary::<UInt64Type>();
+    let keys = take(interned.keys(), &keys, None)?;
     Ok(Arc::new(DictionaryArray::<UInt64Type>::try_new(
-        keys, values,
+        keys.as_primitive::<UInt64Type>().clone(),
+        interned.values().clone(),
     )?))
 }
 

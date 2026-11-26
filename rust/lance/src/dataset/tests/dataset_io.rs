@@ -6313,6 +6313,63 @@ async fn test_append_reencodes_dictionary_for_narrower_keys(#[case] value_type: 
     );
 }
 
+/// Narrowing dictionary keys counts distinct values, not referenced entries:
+/// entries holding equal values share one key, and an entry holding null
+/// becomes a null key.
+#[rstest::rstest]
+#[case::string(DataType::Utf8, DataType::Utf8)]
+#[case::string_view(DataType::Utf8View, DataType::Utf8)]
+#[case::binary(DataType::Binary, DataType::Binary)]
+#[case::large_binary(DataType::LargeBinary, DataType::Binary)]
+#[tokio::test]
+async fn test_append_reencodes_dictionary_by_value_for_narrower_keys(
+    #[case] input_type: DataType,
+    #[case] value_type: DataType,
+) {
+    let table_type = dictionary_type(DataType::Int8, value_type);
+    // 129 entries holding the same value, all referenced; then 128 distinct
+    // values and an entry holding null, all referenced. Each ends with a null
+    // key.
+    let same = vec![Some("same".to_string()); 129];
+    let distinct = (0..128)
+        .map(|i| Some(format!("value {i}")))
+        .chain([None])
+        .collect::<Vec<_>>();
+    for entries in [same, distinct] {
+        let dataset = table_with_representation(&table_type).await;
+        let strings: ArrayRef = Arc::new(StringArray::from(entries.clone()));
+        let dictionary = arrow_array::DictionaryArray::<arrow_array::types::Int16Type>::try_new(
+            arrow_array::Int16Array::from_iter((0..entries.len() as i16).map(Some).chain([None])),
+            arrow::compute::cast(&strings, &input_type).unwrap(),
+        )
+        .unwrap();
+        let values = Arc::new(dictionary) as ArrayRef;
+        let dataset = append_representation(
+            dataset,
+            ArrowField::new("value", values.data_type().clone(), true),
+            values,
+        )
+        .await
+        .unwrap();
+
+        // Read the appended fragment alone: a scan of the whole table merges
+        // both fragments' dictionaries into one, which 128 entries plus the
+        // first fragment's would overflow on their own.
+        let fragment = dataset.get_fragment(1).unwrap();
+        let result = fragment.scan().try_into_batch().await.unwrap();
+        assert_eq!(result["value"].data_type(), &table_type);
+        let expected = entries
+            .iter()
+            .map(|entry| entry.as_deref())
+            .chain([None])
+            .collect::<Vec<_>>();
+        assert_eq!(
+            representation_values(result["value"].as_ref()).as_ref(),
+            representation_values(representation_array(&table_type, &expected).as_ref()).as_ref()
+        );
+    }
+}
+
 /// Values that need more bytes than 32-bit offsets address fail naming the
 /// field before anything is allocated for them.
 #[tokio::test]
