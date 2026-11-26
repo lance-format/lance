@@ -504,7 +504,7 @@ impl Dataset {
     /// [`Self::derived_index_listing`] for a raw listing the caller already
     /// loaded, so a caller that must inspect the raw listing first does not
     /// load it twice.
-    async fn derive_index_listing(
+    pub(super) async fn derive_index_listing(
         &self,
         indices: Arc<Vec<IndexMetadata>>,
     ) -> Result<DerivedIndexListing> {

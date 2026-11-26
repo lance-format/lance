@@ -5,9 +5,9 @@
 //! A hit takes a shard read lock, clones the cached value, and marks it as
 //! accessed. There is no read-operation channel or inline eviction work.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 
 use async_trait::async_trait;
 
@@ -15,9 +15,9 @@ use super::backend::{CacheBackend, CacheEntry, CacheLoader, ImmediateCacheRead};
 use super::backend_metrics::BackendCounters;
 use super::moka::key_footprint;
 use super::{
-    CacheBackendDiagnostics, CacheBackendKind, CacheCodec, CacheLoadOutcome, CacheOccupancyByType,
-    CacheOperationContext, CacheSnapshotMode, CacheTypeOccupancy, InternalCacheKey,
-    PriorityEntries,
+    CacheBackendDiagnostics, CacheBackendKind, CacheCodec, CacheEntryOwner, CacheLoadOutcome,
+    CacheOccupancyByType, CacheOperationContext, CachePrewarmPolicy, CacheSnapshotMode,
+    CacheTypeOccupancy, IndexFileRegistration, InternalCacheKey, PriorityEntries,
 };
 use crate::Result;
 use crate::deepsize::Context;
@@ -28,6 +28,8 @@ struct QuickEntry {
     size_bytes: usize,
     submission_id: u64,
     type_name: Option<&'static str>,
+    owner: Option<CacheEntryOwner>,
+    index_file: Option<Arc<IndexFileRegistration>>,
 }
 
 #[derive(Clone)]
@@ -112,6 +114,15 @@ pub struct QuickCacheBackend {
     generation: AtomicU64,
     priority_active: AtomicBool,
     priority: Mutex<PriorityEntries<QuickEntry>>,
+    // Scoped admission must reserve and insert without ordinary writes intervening.
+    admission: RwLock<()>,
+    index_files: Mutex<IndexFileRegistrations>,
+}
+
+#[derive(Default)]
+struct IndexFileRegistrations {
+    entries: HashMap<InternalCacheKey, Weak<IndexFileRegistration>>,
+    sweep_at: usize,
 }
 
 /// Controls how a [`QuickCacheBackend`] divides its weight budget.
@@ -243,6 +254,8 @@ impl QuickCacheBackend {
             generation: AtomicU64::new(0),
             priority_active: AtomicBool::new(false),
             priority: Mutex::new(PriorityEntries::default()),
+            admission: RwLock::new(()),
+            index_files: Mutex::default(),
         }
     }
 
@@ -254,6 +267,7 @@ impl QuickCacheBackend {
     /// cache. Growing only changes the budget; evicted entries are reloaded on
     /// demand.
     pub fn set_capacity(&self, capacity: usize) {
+        let _admission = self.admission.write().unwrap_or_else(|e| e.into_inner());
         let dropped = {
             let mut entries = self.priority.lock().unwrap_or_else(|e| e.into_inner());
             self.capacity.store(capacity, Ordering::Release);
@@ -263,16 +277,12 @@ impl QuickCacheBackend {
             }
             dropped
         };
-        self.record_priority_removals(&dropped);
+        self.record_explicit_removals(&dropped);
         drop(dropped);
     }
 
-    /// Record evictions from the priority tier.
-    ///
-    /// Priority entries live outside quick_cache, so its lifecycle hooks never
-    /// observe them. Charge them with the same per-entry weight used on
-    /// admission: fixed key footprint plus declared payload.
-    fn record_priority_removals(&self, dropped: &[QuickEntry]) {
+    /// Record explicit capacity evictions, which bypass quick_cache lifecycle hooks.
+    fn record_explicit_removals(&self, dropped: &[QuickEntry]) {
         if dropped.is_empty() {
             return;
         }
@@ -338,7 +348,7 @@ impl QuickCacheBackend {
             (dropped, replaced)
         };
         if !dropped.is_empty() {
-            self.record_priority_removals(&dropped);
+            self.record_explicit_removals(&dropped);
         }
         drop((dropped, replaced));
     }
@@ -381,13 +391,26 @@ impl QuickCacheBackend {
         self.cache.shard_index(key)
     }
 
+    fn registered_index_file(
+        &self,
+        context: CacheOperationContext,
+    ) -> Option<Arc<IndexFileRegistration>> {
+        let key = context.index_file?;
+        self.index_files
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entries
+            .get(&key)
+            .and_then(Weak::upgrade)
+    }
+
     async fn insert_tagged(
         &self,
         key: &InternalCacheKey,
         entry: CacheEntry,
         size_bytes: usize,
         codec: Option<CacheCodec>,
-        type_name: Option<&'static str>,
+        context: CacheOperationContext,
     ) {
         let submission_id = self.record_write(key, size_bytes);
         if !self.admits_measured_size(size_bytes) {
@@ -399,9 +422,12 @@ impl QuickCacheBackend {
             entry,
             size_bytes,
             submission_id,
-            type_name,
+            type_name: context.type_name(),
+            owner: context.owner,
+            index_file: self.registered_index_file(context),
         };
         let priority = codec.map(|c| c.memory_priority()).unwrap_or(0);
+        let _admission = self.admission.read().unwrap_or_else(|e| e.into_inner());
         if priority > 0 || self.priority_active.load(Ordering::Acquire) {
             self.admit_priority(
                 *key,
@@ -420,7 +446,7 @@ impl QuickCacheBackend {
         key: &InternalCacheKey,
         loader: CacheLoader<'a>,
         codec: Option<CacheCodec>,
-        type_name: Option<&'static str>,
+        context: CacheOperationContext,
     ) -> Result<(CacheEntry, bool)> {
         let priority = codec.map(|c| c.memory_priority()).unwrap_or(0);
         if (priority > 0 || self.priority_active.load(Ordering::Acquire))
@@ -447,8 +473,11 @@ impl QuickCacheBackend {
                     entry: entry.clone(),
                     size_bytes,
                     submission_id,
-                    type_name,
+                    type_name: context.type_name(),
+                    owner: context.owner,
+                    index_file: self.registered_index_file(context),
                 };
+                let _admission = self.admission.read().unwrap_or_else(|e| e.into_inner());
                 match guard.insert_with_lifecycle(item.clone()) {
                     Ok(removals) => {
                         if priority > 0 || self.priority_active.load(Ordering::Acquire) {
@@ -560,8 +589,14 @@ impl CacheBackend for QuickCacheBackend {
         size_bytes: usize,
         codec: Option<CacheCodec>,
     ) {
-        self.insert_tagged(key, entry, size_bytes, codec, None)
-            .await;
+        self.insert_tagged(
+            key,
+            entry,
+            size_bytes,
+            codec,
+            CacheOperationContext::default(),
+        )
+        .await;
     }
 
     async fn insert_with_context(
@@ -572,7 +607,7 @@ impl CacheBackend for QuickCacheBackend {
         codec: Option<CacheCodec>,
         context: CacheOperationContext,
     ) {
-        self.insert_tagged(key, entry, size_bytes, codec, context.type_name())
+        self.insert_tagged(key, entry, size_bytes, codec, context)
             .await;
     }
 
@@ -582,7 +617,8 @@ impl CacheBackend for QuickCacheBackend {
         loader: CacheLoader<'a>,
         codec: Option<CacheCodec>,
     ) -> Result<(CacheEntry, bool)> {
-        self.get_or_insert_tagged(key, loader, codec, None).await
+        self.get_or_insert_tagged(key, loader, codec, CacheOperationContext::default())
+            .await
     }
 
     async fn get_or_insert_with_context<'a>(
@@ -598,8 +634,7 @@ impl CacheBackend for QuickCacheBackend {
         if let Some(entry) = self.get_entry(key, codec) {
             return Ok((entry, true));
         }
-        self.get_or_insert_tagged(key, loader, codec, context.type_name())
-            .await
+        self.get_or_insert_tagged(key, loader, codec, context).await
     }
 
     async fn get_or_insert_with_context_outcome<'a>(
@@ -613,7 +648,7 @@ impl CacheBackend for QuickCacheBackend {
         if let Some(entry) = self.get_entry(key, codec) {
             return Ok((entry, CacheLoadOutcome::ResidentHit));
         }
-        self.get_or_insert_tagged(key, loader, codec, context.type_name())
+        self.get_or_insert_tagged(key, loader, codec, context)
             .await
             .map(|(entry, was_cached)| {
                 let outcome = if was_cached {
@@ -627,7 +662,198 @@ impl CacheBackend for QuickCacheBackend {
             })
     }
 
+    fn register_index_file(
+        &self,
+        key: InternalCacheKey,
+        collection: Option<InternalCacheKey>,
+    ) -> Option<Arc<IndexFileRegistration>> {
+        // Marking a file shared and selecting prewarm victims must be ordered.
+        let _admission = self.admission.read().unwrap_or_else(|e| e.into_inner());
+        let mut files = self.index_files.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(file) = files.entries.get(&key).and_then(Weak::upgrade) {
+            file.observe(collection);
+            return Some(file);
+        }
+        // Sweep in batches so opening each new file does not scan every live file.
+        if files.entries.len() >= files.sweep_at {
+            files.entries.retain(|_, file| file.strong_count() != 0);
+            files.sweep_at = files.entries.len().saturating_mul(2).max(64);
+        }
+        let file = Arc::new(IndexFileRegistration::new(key, collection));
+        files.entries.insert(key, Arc::downgrade(&file));
+        Some(file)
+    }
+
+    fn supports_scoped_prewarm(&self) -> bool {
+        true
+    }
+
+    async fn admit_prewarm(
+        &self,
+        key: &InternalCacheKey,
+        entry: CacheEntry,
+        size_bytes: usize,
+        codec: Option<CacheCodec>,
+        context: CacheOperationContext,
+        policy: &CachePrewarmPolicy,
+    ) -> Result<CacheEntry> {
+        let _admission = self.admission.write().unwrap_or_else(|e| e.into_inner());
+        let mut priority_entries = self.priority.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(resident) = priority_entries
+            .peek(key)
+            .cloned()
+            .or_else(|| self.cache.peek(key))
+        {
+            return Ok(resident.entry);
+        }
+
+        let memory_priority = codec.map(|codec| codec.memory_priority()).unwrap_or(0);
+        let priority_active = self.priority_active.load(Ordering::Acquire);
+        let use_priority = priority_active || memory_priority > 0;
+        let capacity = self.capacity.load(Ordering::Acquire) as u64;
+        let needed = key_footprint(key).saturating_add(size_bytes) as u64;
+        let mut global_used = if priority_active {
+            priority_entries.bytes() as u64
+        } else {
+            self.cache.weight()
+        };
+        let mut global_free = capacity.saturating_sub(global_used);
+        let shard =
+            (!use_priority && self.cache.num_shards() > 1).then(|| self.cache.shard_index(key));
+        let shard_capacity = if shard.is_some() {
+            self.cache.shard_capacity()
+        } else {
+            capacity
+        };
+        let mut shard_free = match shard {
+            Some(_) if global_used.saturating_add(needed) <= shard_capacity => {
+                shard_capacity - global_used
+            }
+            Some(shard) => shard_capacity.saturating_sub(
+                self.cache
+                    .iter()
+                    .filter(|(key, _)| self.cache.shard_index(key) == shard)
+                    .map(|(key, item)| quick_cache::Weighter::weight(&EntryWeighter, &key, &item))
+                    .sum(),
+            ),
+            None => capacity,
+        };
+        let mut victims = Vec::new();
+        if size_bytes > 0
+            && needed <= capacity
+            && needed <= shard_capacity
+            && global_free.min(shard_free) < needed
+            && policy.reclaim_before.is_some()
+        {
+            let mut eligible = BTreeMap::<_, Vec<_>>::new();
+            let mut collect = |key: InternalCacheKey, weight: u64, item: &QuickEntry| {
+                if item
+                    .index_file
+                    .as_ref()
+                    .is_some_and(|file| file.is_shared())
+                {
+                    return;
+                }
+                if let Some(owner) = item.owner.filter(|owner| policy.can_reclaim(*owner)) {
+                    eligible
+                        .entry((owner.version, owner.segment))
+                        .or_default()
+                        .push((key, weight));
+                }
+            };
+            if priority_active {
+                for (key, weight, item) in priority_entries.snapshot() {
+                    collect(key, weight as u64, &item);
+                }
+            } else {
+                for (key, item) in self.cache.iter() {
+                    collect(
+                        key,
+                        quick_cache::Weighter::weight(&EntryWeighter, &key, &item),
+                        &item,
+                    );
+                }
+            }
+            for segment in eligible.into_values() {
+                let local_weight: u64 = shard.map_or(0, |shard| {
+                    segment
+                        .iter()
+                        .filter(|(key, _)| self.cache.shard_index(key) == shard)
+                        .map(|(_, weight)| *weight)
+                        .sum()
+                });
+                if shard_free < needed && local_weight == 0 {
+                    continue;
+                }
+                shard_free = shard_free.saturating_add(local_weight);
+                global_used =
+                    global_used.saturating_sub(segment.iter().map(|(_, weight)| *weight).sum());
+                global_free = capacity.saturating_sub(global_used);
+                victims.extend(segment.into_iter().map(|(key, _)| key));
+                if global_free.min(shard_free) >= needed {
+                    break;
+                }
+            }
+        }
+        if size_bytes == 0 || global_free.min(shard_free) < needed {
+            let available = global_free.min(shard_free);
+            return Err(crate::Error::invalid_input(format!(
+                "index cache prewarm needs {needed} bytes for the next entry but only {available} bytes are available after eligible reclamation (cache capacity {capacity} bytes)"
+            )));
+        }
+
+        let dropped: Vec<_> = victims
+            .into_iter()
+            .filter_map(|victim| {
+                if priority_active {
+                    priority_entries.remove(&victim)
+                } else {
+                    self.cache.remove(&victim).map(|(_, item)| item)
+                }
+            })
+            .collect();
+        drop(priority_entries);
+        self.record_explicit_removals(&dropped);
+
+        let submission_id = self.record_write(key, size_bytes);
+        let item = QuickEntry {
+            entry: entry.clone(),
+            size_bytes,
+            submission_id,
+            type_name: context.type_name(),
+            owner: context.owner,
+            index_file: self.registered_index_file(context),
+        };
+        if use_priority {
+            self.admit_priority(
+                *key,
+                item,
+                memory_priority,
+                self.generation.load(Ordering::Acquire),
+            );
+        } else {
+            self.cache
+                .insert_with_lifecycle(*key, item)
+                .finish(&self.metrics, Some((*key, submission_id)));
+        }
+        let resident = self
+            .priority
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(key)
+            || self.cache.contains_key(key);
+        drop(_admission);
+        drop(dropped);
+        if !resident {
+            return Err(crate::Error::invalid_input(format!(
+                "index cache declined a {needed}-byte prewarm entry (cache capacity {capacity} bytes)"
+            )));
+        }
+        Ok(entry)
+    }
+
     async fn clear(&self) {
+        let _admission = self.admission.write().unwrap_or_else(|e| e.into_inner());
         self.generation.fetch_add(1, Ordering::AcqRel);
         let dropped = {
             let mut entries = self.priority.lock().unwrap_or_else(|e| e.into_inner());
@@ -769,6 +995,164 @@ mod tests {
         fn type_name() -> &'static str {
             std::any::type_name::<T>()
         }
+    }
+
+    #[rstest::rstest]
+    #[case::clock(false)]
+    #[case::priority(true)]
+    #[tokio::test]
+    async fn scoped_prewarm_reclaims_only_older_unprotected_segments(#[case] priority: bool) {
+        let key = |id| InternalCacheKey::from_bytes([id; 16]);
+        let codec = priority.then(|| {
+            CacheCodec::new("test.priority", 1, |_, _| Ok(()), |_| Ok(Arc::new(())))
+                .with_memory_priority(3)
+        });
+        let context = |collection, segment, version| {
+            let mut context = CacheOperationContext::default();
+            context.owner = Some(CacheEntryOwner {
+                collection: key(collection),
+                segment: key(segment),
+                version,
+            });
+            context
+        };
+        let weight = key_footprint(&key(0)) + 32;
+        let backend = QuickCacheBackend::with_capacity(5 * weight);
+        let index = 20;
+        // Two partitions of the same old segment, a retained old segment,
+        // and an entry from another table, branch, or index collection.
+        for (id, owner) in [
+            (1, context(index, 10, 1)),
+            (2, context(index, 10, 1)),
+            (3, context(index, 11, 1)),
+            (4, context(21, 12, 1)),
+        ] {
+            backend
+                .insert_with_context(&key(id), Arc::new(id), 32, codec, owner)
+                .await;
+        }
+        let mut policy = CachePrewarmPolicy {
+            collection: key(index),
+            reclaim_before: None,
+            protected_segments: [key(11), key(13)].into_iter().collect(),
+        };
+        backend
+            .admit_prewarm(
+                &key(5),
+                Arc::new(5u64),
+                32,
+                codec,
+                context(index, 13, 2),
+                &policy,
+            )
+            .await
+            .unwrap();
+        assert!(
+            backend.peek_resident(&key(1)).await,
+            "free space should be used first"
+        );
+
+        let error = backend
+            .admit_prewarm(
+                &key(6),
+                Arc::new(6u64),
+                32,
+                codec,
+                context(index, 13, 2),
+                &policy,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("only 0 bytes are available"));
+        assert!(
+            backend.peek_resident(&key(2)).await,
+            "historical prewarm cannot reclaim"
+        );
+
+        policy.reclaim_before = Some(2);
+        backend
+            .admit_prewarm(
+                &key(6),
+                Arc::new(6u64),
+                32,
+                codec,
+                context(index, 13, 2),
+                &policy,
+            )
+            .await
+            .unwrap();
+        for id in [1, 2] {
+            assert!(
+                !backend.peek_resident(&key(id)).await,
+                "old segment partition {id}"
+            );
+        }
+        for id in [3, 4, 5, 6] {
+            assert!(
+                backend.peek_resident(&key(id)).await,
+                "protected entry {id}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn scoped_prewarm_uses_the_destination_shard_budget() {
+        let entry_bytes = 32;
+        let weight = key_footprint(&InternalCacheKey::from_bytes([0; 16])) + entry_bytes;
+        let backend = QuickCacheBackend::with_shards(4 * weight, 2);
+        let keys = keys_in_shard(&backend, 0, 3);
+        let collection = InternalCacheKey::from_bytes([42; 16]);
+        let mut context = CacheOperationContext::default();
+        context.owner = Some(CacheEntryOwner {
+            collection,
+            segment: keys[0],
+            version: 1,
+        });
+        backend
+            .insert_with_context(&keys[0], Arc::new(0u64), entry_bytes, None, context)
+            .await;
+        backend
+            .insert(&keys[1], Arc::new(1u64), entry_bytes, None)
+            .await;
+        let mut policy = CachePrewarmPolicy {
+            collection,
+            reclaim_before: None,
+            protected_segments: [keys[2]].into_iter().collect(),
+        };
+        let error = backend
+            .admit_prewarm(
+                &keys[2],
+                Arc::new(2u64),
+                entry_bytes,
+                None,
+                context,
+                &policy,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("only 0 bytes are available"));
+        assert_eq!(backend.size_bytes().await, 2 * weight);
+
+        policy.reclaim_before = Some(2);
+        context.owner = Some(CacheEntryOwner {
+            collection,
+            segment: keys[2],
+            version: 2,
+        });
+        backend
+            .admit_prewarm(
+                &keys[2],
+                Arc::new(2u64),
+                entry_bytes,
+                None,
+                context,
+                &policy,
+            )
+            .await
+            .unwrap();
+        assert!(!backend.peek_resident(&keys[0]).await);
+        assert!(backend.peek_resident(&keys[1]).await);
+        assert!(backend.peek_resident(&keys[2]).await);
     }
 
     #[tokio::test]
@@ -985,6 +1369,8 @@ mod tests {
             size_bytes: 7,
             submission_id: 0,
             type_name: None,
+            owner: None,
+            index_file: None,
         };
         assert_eq!(
             quick_cache::Weighter::weight(&EntryWeighter, &key, &entry),
@@ -1411,6 +1797,8 @@ mod tests {
                 size_bytes: 8,
                 submission_id: id as u64,
                 type_name: None,
+                owner: None,
+                index_file: None,
             };
             quick_cache::Lifecycle::on_evict(&lifecycle, &mut summary, key, value);
         }
@@ -1437,6 +1825,8 @@ mod tests {
             size_bytes: 8,
             submission_id,
             type_name: None,
+            owner: None,
+            index_file: None,
         };
         backend.cache.insert(key, entry(1));
 
@@ -1619,13 +2009,13 @@ mod tests {
             let key = InternalCacheKey::from_bytes(11_u128.to_le_bytes());
             let payload = || Arc::new(vec![0_u8; 8192]) as CacheEntry;
 
-            cache.insert_tagged(&key, payload(), 0, None, None).await;
+            cache.insert(&key, payload(), 0, None).await;
             assert!(
                 cache.get_resident(&key).await.is_none(),
                 "capacity={capacity}: an unmeasured insertion was retained"
             );
             let (entry, inserted) = cache
-                .get_or_insert_tagged(&key, Box::pin(async { Ok((payload(), 0)) }), None, None)
+                .get_or_insert(&key, Box::pin(async { Ok((payload(), 0)) }), None)
                 .await
                 .unwrap();
             assert_eq!(*entry.downcast_ref::<Vec<u8>>().unwrap(), vec![0_u8; 8192]);
@@ -1636,7 +2026,7 @@ mod tests {
             assert!(cache.get_resident(&key).await.is_none());
 
             // A measured insertion still lands as soon as the budget holds it.
-            cache.insert_tagged(&key, payload(), 8192, None, None).await;
+            cache.insert(&key, payload(), 8192, None).await;
             assert_eq!(
                 cache.get_resident(&key).await.is_some(),
                 capacity > 0,

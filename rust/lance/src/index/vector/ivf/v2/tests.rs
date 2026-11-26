@@ -8956,8 +8956,17 @@ async fn test_optimize_split_after_delete_with_stable_row_ids() {
     IvfBuildParams::new(4),
     RQBuildParams::with_rotation_type(5, RQRotationType::Fast),
 ))]
+#[case::ivf_hnsw_rq(VectorIndexParams::with_ivf_hnsw_rq_params(
+    DistanceType::L2,
+    IvfBuildParams::new(4),
+    HnswBuildParams::default(),
+    RQBuildParams::with_rotation_type(5, RQRotationType::Fast),
+))]
 #[tokio::test]
-async fn test_prewarm_vector_index(#[case] params: VectorIndexParams) {
+async fn test_prewarm_vector_index(
+    #[case] params: VectorIndexParams,
+    #[values(false, true)] scoped: bool,
+) {
     use lance_io::assert_io_eq;
 
     const INDEX_NAME: &str = "my_idx";
@@ -8983,7 +8992,20 @@ async fn test_prewarm_vector_index(#[case] params: VectorIndexParams) {
         .unwrap();
 
     // Reopen to avoid carrying index state in memory from index creation.
-    let dataset = Dataset::open(test_uri).await.unwrap();
+    let dataset = crate::DatasetBuilder::from_uri(test_uri)
+        .with_index_cache_backend(Arc::new(
+            lance_core::cache::QuickCacheBackend::with_capacity(64 * 1024 * 1024),
+        ))
+        .load()
+        .await
+        .unwrap();
+    let warm = || async {
+        if scoped {
+            dataset.prewarm_index_with_cache_budget(INDEX_NAME).await
+        } else {
+            dataset.prewarm_index(INDEX_NAME).await
+        }
+    };
     let indices = dataset.load_indices_by_name(INDEX_NAME).await.unwrap();
     assert_eq!(indices.len(), 2, "expected two index deltas");
     let unique_uuids: HashSet<_> = indices.iter().map(|meta| meta.uuid).collect();
@@ -9004,14 +9026,11 @@ async fn test_prewarm_vector_index(#[case] params: VectorIndexParams) {
         .as_ref()
         .io_stats_incremental();
 
-    // Concurrent prewarms should single-flight each partition through the
-    // cache loader and leave a complete warm cache for both callers.
-    let (first, second) = tokio::time::timeout(std::time::Duration::from_secs(30), async {
-        tokio::join!(
-            dataset.prewarm_index(INDEX_NAME),
-            dataset.prewarm_index(INDEX_NAME)
-        )
-    })
+    // Concurrent requests must leave a complete warm cache for both callers.
+    let (first, second) = Box::pin(tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        async { tokio::join!(warm(), warm()) },
+    ))
     .await
     .expect("concurrent prewarms deadlocked");
     first.unwrap();
@@ -9071,14 +9090,21 @@ async fn test_prewarm_vector_index(#[case] params: VectorIndexParams) {
         after_prewarm.index.activity.warm.loads_succeeded
     );
 
-    // Second prewarm should not need IO (already cached).
-    dataset.prewarm_index(INDEX_NAME).await.unwrap();
-    let stats = dataset
-        .table_state
-        .object_store
-        .as_ref()
-        .io_stats_incremental();
-    assert_io_eq!(stats, read_iops, 0, "second prewarm should not perform IO");
+    warm().await.unwrap();
+    let after_second_warm = dataset.session().cache_diagnostics();
+    assert_eq!(
+        after_query.index.activity.warm.loads_succeeded,
+        after_second_warm.index.activity.warm.loads_succeeded,
+        "prewarm need not reload resident partitions"
+    );
+    if !scoped {
+        let stats = dataset
+            .table_state
+            .object_store
+            .as_ref()
+            .io_stats_incremental();
+        assert_io_eq!(stats, read_iops, 0, "second prewarm should not perform IO");
+    }
 }
 
 /// Index-cache backend that can drop partition entries on demand.

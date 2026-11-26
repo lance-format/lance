@@ -32,6 +32,18 @@ pub trait Index: Send + Sync + DeepSizeOf {
     /// This will load the index into memory and cache it.
     async fn prewarm(&self) -> Result<()>;
 
+    /// Whether this index exposes residency checks for capacity-aware prewarm.
+    fn supports_scoped_prewarm(&self) -> bool {
+        false
+    }
+
+    /// Confirm that all entries required for a warmed index are still resident.
+    async fn verify_prewarm_residency(&self) -> Result<()> {
+        Err(lance_core::Error::not_supported(
+            "index does not expose prewarm residency",
+        ))
+    }
+
     /// Get the type of the index
     fn index_type(&self) -> IndexType;
 

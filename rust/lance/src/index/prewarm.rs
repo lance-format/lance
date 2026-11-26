@@ -7,6 +7,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
 
+use lance_core::cache::{CachePrewarmPolicy, InternalCacheKey};
 use lance_index::{
     FtsPrewarmDiagnostics, FtsPrewarmOptions, FtsPrewarmResult, FtsPrewarmSegmentStatus, Index,
     PrewarmOptions, metrics::NoOpMetricsCollector, scalar::inverted::InvertedIndex,
@@ -15,9 +16,132 @@ use lance_table::format::IndexMetadata;
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use crate::index::loading::DatasetIndexInternalExt;
+use crate::index::DatasetIndexExt;
+use crate::index::frag_reuse::OpenPurpose;
+use crate::index::loading::{DatasetIndexInternalExt, load_all_indices};
 use crate::index::scalar;
+use crate::index::segment::segment_has_vector_details;
 use crate::{Dataset, Error, Result};
+
+impl Dataset {
+    /// Prewarm a current-format IVF index within the session index-cache budget.
+    ///
+    /// The branch head can reclaim older segments of the same logical index.
+    /// A historical view uses free space. Success requires all partitions to
+    /// be resident at the end of this call. The ordinary prewarm path remains
+    /// available for other index types and cache backends.
+    ///
+    /// ```no_run
+    /// # async fn warm(dataset: &lance::Dataset) -> lance::Result<()> {
+    /// dataset.prewarm_index_with_cache_budget("embedding_idx").await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn prewarm_index_with_cache_budget(&self, name: &str) -> Result<()> {
+        if !self.index_cache.supports_scoped_prewarm() {
+            return self.prewarm_index(name).await;
+        }
+        // Discovery uses the same cache as the indices. A cold listing must
+        // not evict anything before we know which segments to protect.
+        let (indices, protected_segments) = self
+            .index_cache
+            .without_admission(async {
+                let manifest_indices = load_all_indices(self).await?;
+                let listing = self.derive_index_listing(manifest_indices.clone()).await?;
+                if listing.unverifiable.contains(name) {
+                    return Err(Error::io(format!(
+                        "cannot prewarm index {name:?}: a segment format could not be verified; retry prewarm"
+                    )));
+                }
+                let visible = listing.indices.iter()
+                    .filter(|segment| segment.name == name)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                // Coverage can hide a segment even after successful derivation.
+                // The manifest still references it, so it must stay protected.
+                let protected = manifest_indices.iter()
+                    .filter(|segment| segment.name == name)
+                    .map(|segment| InternalCacheKey::from_bytes(*segment.uuid.as_bytes()))
+                    .collect();
+                Ok((visible, protected))
+            })
+            .await?;
+        if indices.is_empty() {
+            return Err(Error::index_not_found(format!("name={name}")));
+        }
+        if !indices.iter().all(segment_has_vector_details) {
+            return self.prewarm_index(name).await;
+        }
+        let version = self.version_id();
+        let policy = CachePrewarmPolicy {
+            collection: self.index_cache.index_collection(name),
+            reclaim_before: self.prewarm_at_verified_head().await?.then_some(version),
+            protected_segments,
+        };
+        let needs_legacy_fallback = Box::pin(self.index_cache.with_scoped_prewarm(policy, async {
+            let mut opened = Vec::with_capacity(indices.len());
+            for segment in &indices {
+                opened.push(
+                    self.open_vector_index_from_metadata_with_purpose(
+                        name,
+                        segment,
+                        &NoOpMetricsCollector,
+                        OpenPurpose::Query,
+                    )
+                    .await?,
+                );
+            }
+            if opened.iter().all(|index| !index.supports_scoped_prewarm()) {
+                return Ok(true);
+            }
+            if opened.iter().any(|index| !index.supports_scoped_prewarm()) {
+                return Err(Error::not_supported(format!(
+                    "index {name:?} at version {version} mixes scoped prewarm and legacy segments"
+                )));
+            }
+            for index in &opened {
+                index.prewarm().await?;
+            }
+            for index in &opened {
+                index.verify_prewarm_residency().await?;
+            }
+            Ok(false)
+        }))
+        .await?;
+        if needs_legacy_fallback {
+            self.prewarm_index(name).await?;
+        }
+        Ok(())
+    }
+
+    async fn prewarm_at_verified_head(&self) -> Result<bool> {
+        match self.table_view().ensure_branch_exists().await {
+            Ok(()) => {}
+            Err(Error::RefNotFound { .. } | Error::NotFound { .. }) => return Ok(false),
+            Err(error) => return Err(error),
+        }
+        let state = &self.table_state;
+        let latest = match state
+            .commit_handler
+            .resolve_latest_location(&state.base, &state.object_store)
+            .await
+        {
+            Ok(latest) => latest,
+            Err(Error::DatasetNotFound { .. } | Error::NotFound { .. }) => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        let pinned = self.manifest_location();
+        // A version number can be reused when the table is recreated at this URI.
+        let same_generation = match (&pinned.identity, &latest.identity) {
+            (Some(pinned), Some(latest)) => pinned == latest,
+            _ => pinned
+                .e_tag
+                .as_ref()
+                .is_some_and(|tag| latest.e_tag.as_ref() == Some(tag)),
+        };
+        Ok(latest.version == self.version_id() && latest.path == pinned.path && same_generation)
+    }
+}
 
 async fn prewarm_opened_index(
     index: Arc<dyn Index>,

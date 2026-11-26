@@ -42,7 +42,8 @@ use crate::deepsize::Context;
 
 use super::{
     CacheBackendDiagnostics, CacheCodec, CacheLoadOutcome, CacheOccupancyByType,
-    CacheOperationContext, CacheSnapshotMode, InternalCacheKey,
+    CacheOperationContext, CachePrewarmPolicy, CacheSnapshotMode, IndexFileRegistration,
+    InternalCacheKey,
 };
 
 /// A type-erased cache entry.
@@ -288,6 +289,37 @@ pub trait CacheBackend: Send + Sync + std::fmt::Debug {
                 };
                 (entry, outcome)
             })
+    }
+
+    /// Register an open of a physical index file for cache ownership tracking.
+    #[doc(hidden)]
+    fn register_index_file(
+        &self,
+        _key: InternalCacheKey,
+        _collection: Option<InternalCacheKey>,
+    ) -> Option<Arc<IndexFileRegistration>> {
+        None
+    }
+
+    /// Whether this backend supports scoped, memory-only prewarm admission.
+    fn supports_scoped_prewarm(&self) -> bool {
+        false
+    }
+
+    /// Admit a prewarm entry using free space and eligible old index entries.
+    /// An existing resident value for this key is reused and returned.
+    async fn admit_prewarm(
+        &self,
+        _key: &InternalCacheKey,
+        _entry: CacheEntry,
+        _size_bytes: usize,
+        _codec: Option<CacheCodec>,
+        _context: CacheOperationContext,
+        _policy: &CachePrewarmPolicy,
+    ) -> Result<CacheEntry> {
+        Err(crate::Error::not_supported(
+            "cache backend does not support scoped prewarm",
+        ))
     }
 
     /// Resize the backend's weighted capacity, evicting entries as needed so
