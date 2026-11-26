@@ -27,6 +27,9 @@ file version. New semantics require a negotiated capability or a new version.
 | `required_capabilities` | Sorted, unique capability IDs: 1 is raw object-range transport; 2 is immutable external-object support. |
 
 The context contains no manifest, base registry, worker handle, or credentials.
+The capability list must be exactly `[1]` or `[1, 2]`. Missing capability 1,
+duplicates, other ordering, and unsupported IDs are errors. Locator origin must
+be `LANCE` or `EXTERNAL_IMMUTABLE`; `UNSPECIFIED` is invalid.
 Its source binding fingerprint is BLAKE3 of the validated encoded context.
 Encoding uses ascending protobuf field numbers, minimal varints, omitted implicit
 defaults, a sorted packed capability list, and optional-field presence. Neither
