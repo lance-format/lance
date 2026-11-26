@@ -152,6 +152,17 @@ fn test_top_k_collector_ascending_addresses_reject_kth_ties() -> Result<()> {
     assert!(!insert_addressed(&mut collector, 30, 1.0)?); // later address, same score
     assert!(!insert_addressed(&mut collector, 40, 1.0)?);
     assert!(!insert_addressed(&mut collector, 15, 0.5)?); // below the k-th score
+    // Refusal covers rank ties only. A candidate that beats the k-th score still
+    // enters, and the k-th score it publishes is what keeps the walk pruning.
+    assert!(
+        insert_addressed(&mut collector, 30, 3.0)?,
+        "a higher score must enter the heap even when addresses ascend"
+    );
+    assert_eq!(
+        collector.kth_score_if_full(),
+        Some(1.0),
+        "the k-th score is the weakest live candidate"
+    );
     assert!(
         collector.tie_band_len() == 0,
         "an address-ascending walk retains nothing"
@@ -160,8 +171,8 @@ fn test_top_k_collector_ascending_addresses_reject_kth_ties() -> Result<()> {
     assert!(!collector.band_truncated());
     assert_eq!(
         collected_keys(collector)?,
-        vec![10, 20],
-        "the two lowest addresses among the tie"
+        vec![10, 30],
+        "the tie stays resolved on the lowest address, and a higher score replaces one"
     );
     Ok(())
 }
@@ -284,25 +295,43 @@ fn test_top_k_collector_retains_kth_score_band_of_one_row() -> Result<()> {
 }
 
 #[test]
-fn test_top_k_collector_deferred_addresses_abort_at_the_first_boundary_tie() -> Result<()> {
-    // A walk with no resident addresses cannot rank any k-th-score tie, and
-    // scoring the rest of the corpus will not rank it either. It stops at the
-    // first one and reports the retry signal instead of buffering the band.
-    let mut collector = deferred_address_collector(2);
+fn test_top_k_collector_deferred_addresses_stop_when_the_band_fills() -> Result<()> {
+    // A walk with no resident addresses cannot rank a k-th-score tie, but a single
+    // tie is common and cheap, so it is retained like any other. A band that fills
+    // means the corpus ties at the k-th score throughout: scoring the rest of it
+    // cannot rank the band either, so the pass stops there with the retry signal.
+    const LIMIT: usize = 2;
+    let mut collector = deferred_address_collector(LIMIT);
     assert!(insert_deferred(&mut collector, 10, 1.0)?);
     assert!(insert_deferred(&mut collector, 11, 1.0)?); // heap full
-    assert!(!insert_deferred(&mut collector, 12, 1.0)?); // first unrankable tie
+    assert!(
+        !insert_deferred(&mut collector, 12, 1.0)?,
+        "a tie the walk cannot rank is retained rather than ranked"
+    );
+    assert_eq!(collector.tie_band_len(), 1);
+    assert!(
+        !collector.aborted(),
+        "one boundary tie is not a reason to abandon the pass"
+    );
+
+    for key in 13..(12 + SCORE_FLOOR_BUFFER) {
+        insert_deferred(&mut collector, key as u64, 1.0)?;
+    }
+    assert_eq!(
+        collector.buffered(),
+        LIMIT + SCORE_FLOOR_BUFFER,
+        "the retained band is bounded by the same cap as the other modes"
+    );
+    assert!(!collector.aborted(), "a band that just filled is not over");
+
+    insert_deferred(&mut collector, 9_000, 1.0)?;
     assert!(
         collector.aborted(),
-        "the walk must not keep scoring an unresolvable tie"
+        "a full band means a corpus tied at the k-th score, so stop walking"
     );
     assert!(
         collector.score_floor_overflow(),
         "the caller must retry with addresses"
-    );
-    assert!(
-        collector.tie_band_len() == 0,
-        "an aborted pass buffers nothing beyond the heap it filled"
     );
     Ok(())
 }
@@ -319,8 +348,8 @@ fn test_top_k_collector_deferred_abort_survives_a_later_better_score() -> Result
     assert!(collector.aborted());
     assert_eq!(
         collector.buffered(),
-        LIMIT,
-        "the tie band never grew, so nothing beyond the heap is buffered"
+        LIMIT + SCORE_FLOOR_BUFFER,
+        "the band stopped growing at its cap once the pass aborted"
     );
     assert!(collector.num_frequency_slots() <= LIMIT);
 

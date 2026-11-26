@@ -222,10 +222,11 @@ pub(in crate::scalar::inverted) enum TieHandling {
     /// [`TopKCollector::band_truncated`].
     ByRowAddress,
     /// No resident addresses, so `order_key` is one constant and every k-th-score
-    /// tie is unrankable. This walk cannot rank it and neither can the rest of the
-    /// corpus, so the first such tie ends the pass and reports
-    /// [`TopKCollector::score_floor_overflow`]; the caller retries the partition
-    /// with addresses, where one of the modes above applies.
+    /// tie is unrankable. Occasional ties are cheap, so they are retained like any
+    /// other; once the band fills the corpus is tied at the k-th score rather than
+    /// the top-k boundary, and the pass stops there and reports
+    /// [`TopKCollector::score_floor_overflow`]. The caller then retries the
+    /// partition with addresses, where one of the modes above applies.
     DeferredAddresses,
 }
 
@@ -349,20 +350,12 @@ impl TopKCollector {
         // order still separates them through the DocId proxy, but that is not the
         // result order, so the loser is retained instead of dropped.
         if candidate.rank == worst_key.rank {
-            match self.tie_handling {
-                // Unique ascending addresses make rank keys unique, so a walk that
-                // visits documents in address order never gets here. Rejecting
-                // anyway keeps the retained band empty if a caller feeds the
-                // collector candidates out of order.
-                TieHandling::AscendingRowAddresses => return Ok(false),
-                // Neither this walk nor anything it could still do ranks the two,
-                // so end the pass and let the caller retry with addresses instead
-                // of admitting ties forever.
-                TieHandling::DeferredAddresses => {
-                    self.abort_pass();
-                    return Ok(false);
-                }
-                TieHandling::ByRowAddress => {}
+            // Unique ascending addresses make rank keys unique, so a walk that
+            // visits documents in address order never gets here. Rejecting one
+            // anyway keeps the retained band empty if a caller feeds the collector
+            // candidates out of order.
+            if self.tie_handling == TieHandling::AscendingRowAddresses {
+                return Ok(false);
             }
             if self.band_is_full() {
                 self.record_band_full();
@@ -509,14 +502,15 @@ impl TopKCollector {
             // Unreachable: an address-ascending walk keeps an empty band.
             TieHandling::AscendingRowAddresses => {}
             TieHandling::ByRowAddress => self.band_truncated = true,
-            // Unreachable too: a deferred walk aborts at its first boundary tie, so
-            // its band never grows to the cap.
+            // A deferred walk can be retried with addresses, so stop walking rather
+            // than keep scoring a corpus that ties at the k-th score throughout.
             TieHandling::DeferredAddresses => self.abort_pass(),
         }
     }
 
-    /// Give up on this pass: the candidate just seen ties the k-th score and cannot
-    /// be ranked, and the rest of the corpus will not rank it either.
+    /// Give up on this pass: the k-th-score tie band is full and this walk cannot
+    /// rank its members, so the corpus ties at the k-th score throughout and the
+    /// rest of the walk would only score documents it has to throw away.
     fn abort_pass(&mut self) {
         self.aborted = true;
         self.score_floor_overflow = true;

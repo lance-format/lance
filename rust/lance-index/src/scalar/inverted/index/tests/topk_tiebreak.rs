@@ -61,6 +61,16 @@ async fn build_tied_partition(store: &Arc<LanceIndexStore>, partition_id: u64, r
 }
 
 async fn load_tied_index(partitions: &[(u64, Vec<u64>)]) -> (TempObjDir, Arc<InvertedIndex>) {
+    load_tied_index_with(partitions, &LanceCache::with_capacity(64 * 1024 * 1024)).await
+}
+
+/// Load a tied corpus against an explicit cache. An uncached index never keeps a
+/// partition's row addresses resident between queries, so its first walk starts
+/// without them.
+async fn load_tied_index_with(
+    partitions: &[(u64, Vec<u64>)],
+    cache: &LanceCache,
+) -> (TempObjDir, Arc<InvertedIndex>) {
     let tmpdir = TempObjDir::default();
     let store = Arc::new(LanceIndexStore::new(
         ObjectStore::local().into(),
@@ -76,8 +86,7 @@ async fn load_tied_index(partitions: &[(u64, Vec<u64>)]) -> (TempObjDir, Arc<Inv
         InvertedIndexParams::default(),
     )
     .await;
-    let cache = LanceCache::with_capacity(64 * 1024 * 1024);
-    let index = InvertedIndex::load(store, None, &cache).await.unwrap();
+    let index = InvertedIndex::load(store, None, cache).await.unwrap();
     (tmpdir, index)
 }
 
@@ -337,7 +346,14 @@ async fn test_fts_topk_tied_scores_bound_the_cross_partition_band() {
     let partitions = (0..PARTITIONS)
         .map(|partition_id| {
             let base = partition_id * 1_000;
-            (partition_id, (0..PER_PARTITION).map(|d| base + d).collect())
+            // Addresses descend with DocId, so the partitions keep handing over
+            // their tie band: an address-ascending partition ranks the ties during
+            // the walk and the merge never sees enough candidates to compact.
+            let row_ids = (0..PER_PARTITION)
+                .rev()
+                .map(|d| base + d)
+                .collect::<Vec<_>>();
+            (partition_id, row_ids)
         })
         .collect::<Vec<_>>();
     let (_tmpdir, index) = load_tied_index(&partitions).await;
@@ -353,6 +369,52 @@ async fn test_fts_topk_tied_scores_bound_the_cross_partition_band() {
         search_alpha(&index, LIMIT).await,
         vec![0, 1, 2, 3],
         "compacting the band must not change the exact top-k"
+    );
+}
+
+#[tokio::test]
+async fn test_fts_topk_tied_scores_cold_and_warm_searches_agree() {
+    // A cache that keeps nothing: the partition's row addresses are not resident
+    // when its walk starts, so the first pass cannot rank the corpus-wide tie and
+    // stops at the first boundary tie. The retry holds the addresses, ranks the
+    // ties by row address and prunes every tied document behind the k-th. A
+    // prefilter builds visibility from those addresses, so that walk has them from
+    // the start. Every variant must return the same exact top-k.
+    const NUM_DOCS: u64 = 1_024;
+    const LIMIT: usize = 10;
+    let row_ids = (0..NUM_DOCS).collect::<Vec<_>>();
+    let expected = (0..LIMIT as u64).collect::<Vec<_>>();
+
+    let (_tmpdir, index) =
+        load_tied_index_with(&[(0, row_ids.clone())], &LanceCache::no_cache()).await;
+    assert!(
+        !index.has_resident_document_projections(),
+        "premise: the first search must start without resident addresses"
+    );
+    assert_eq!(
+        search_alpha(&index, LIMIT).await,
+        expected,
+        "the address-ordered retry must return the exact top-k"
+    );
+    let top3 = search_alpha(&index, 3).await;
+    assert_eq!(top3, vec![0, 1, 2]);
+    assert_eq!(top3, expected[..3], "top-3 must be a prefix of top-10");
+
+    let (_prefiltered_tmpdir, prefiltered) = load_tied_index(&[(0, row_ids.clone())]).await;
+    let mask = Arc::new(MaskPreFilter {
+        mask: Arc::new(RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(
+            row_ids,
+        ))),
+    });
+    assert_eq!(
+        search_alpha_with(&prefiltered, LIMIT, mask).await,
+        expected,
+        "a walk that already holds the addresses must resolve the tie exactly"
+    );
+    assert_eq!(
+        search_alpha(&prefiltered, LIMIT).await,
+        expected,
+        "the same index searched unfiltered must agree"
     );
 }
 

@@ -764,3 +764,63 @@ fn test_or_tied_corpus_keeps_block_max_pruning() {
         "a tied corpus must still be pruned by its block maxes, but scored {scored} of {total}"
     );
 }
+
+#[test]
+fn test_or_ascending_addresses_only_reject_after_the_kth_score() {
+    // Guard for the address-ascending mode: refusing a k-th-score tie must not turn
+    // into refusing every later candidate. The best scores sit in the last block, so
+    // a collector that stopped admitting once its heap was full would return the
+    // first documents, and a floor that never rose would score the whole corpus.
+    const NUM_BLOCKS: usize = 16;
+    let total = (NUM_BLOCKS * BLOCK_SIZE) as u32;
+    let last_block_start = total - BLOCK_SIZE as u32;
+
+    let mut docs = DocSet::default();
+    for row_id in 0..total {
+        docs.append(row_id as u64, 1);
+    }
+    let freqs = (0..total)
+        .map(|doc_id| if doc_id >= last_block_start { 2 } else { 1 })
+        .collect::<Vec<_>>();
+    let block_max_scores = (0..NUM_BLOCKS)
+        .map(|block| if block + 1 == NUM_BLOCKS { 2.0 } else { 1.0 })
+        .collect::<Vec<_>>();
+    let posting = PostingIterator::with_query_weight(
+        String::from("term"),
+        0,
+        0,
+        1.0,
+        generate_posting_list_with_freqs(
+            (0..total).collect(),
+            freqs,
+            2.0,
+            Some(block_max_scores),
+            true,
+        ),
+        docs.len(),
+    );
+
+    let scored = Arc::new(AtomicUsize::new(0));
+    let params = FtsSearchParams::new().with_limit(Some(10));
+    let mut wand = Wand::new(
+        Operator::Or,
+        std::iter::once(posting),
+        &docs,
+        CountingScorer {
+            scored: scored.clone(),
+        },
+    );
+    let hits = wand.search(&params, &NoOpMetricsCollector).unwrap();
+    let scored = scored.load(Ordering::Relaxed);
+
+    assert_eq!(
+        sorted_candidate_row_ids(hits),
+        ((last_block_start as u64)..(last_block_start as u64 + 10)).collect::<Vec<_>>(),
+        "the last block wins, so the k-th score has to rise as the walk advances"
+    );
+    assert!(
+        scored <= 3 * BLOCK_SIZE,
+        "a rising floor must keep pruning, but scored {scored} of {total}"
+    );
+    assert!(!wand.score_floor_overflow() && !wand.band_truncated());
+}

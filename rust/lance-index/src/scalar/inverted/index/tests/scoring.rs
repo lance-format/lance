@@ -965,18 +965,16 @@ async fn assert_no_impact_bulk_conjunction_preserves_winner(with_phrase: bool) {
     let winner_score = 2.0 * scorer.query_weight("lead") * scorer.doc_weight(63, 126);
     assert!(winner_score > published_floors[0]);
     // All 100 winner-partition documents tie. Without resident addresses the walk
-    // cannot rank any of them, so it stops at the first boundary tie and reports
-    // the retry signal instead of scoring the rest of the partition.
-    assert!(
-        bands[1].score_floor_overflow,
-        "a cold walk over a tied partition must ask for the address-ordered retry"
-    );
-    assert_eq!(results[1].len(), 1);
+    // cannot rank them, so it retains the k-th-score band (under its cap here) and
+    // the merge settles it once addresses are resolved. A tie group beyond the cap
+    // makes the pass stop and retry; see `topk_tiebreak.rs` for that.
+    assert!(!bands[1].score_floor_overflow);
+    assert_eq!(results[1].len(), 100);
     assert!(
         results[1]
             .iter()
             .any(|candidate| candidate.document == DocId::new(0)),
-        "the winner must be collected before the walk stops"
+        "the winner must be among the retained candidates"
     );
 
     // The retry holds the partition's row addresses, which ascend with DocId, so
