@@ -259,9 +259,9 @@ def test_take(tmp_path):
     with pytest.raises(ValueError):
         reader.take_rows([0, 100]).to_table()
     # Indices beyond u32 must be rejected, not wrapped around to another row.
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="Row index 4294967299 is out of range"):
         reader.take_rows([0, 2**32 + 3]).to_table()
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="Row index 4294967373 is out of range"):
         reader.take_rows([2**32 + 77]).to_table()
 
     table = reader.take_rows([0, 77, 83]).to_table()
