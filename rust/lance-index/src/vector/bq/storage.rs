@@ -38,6 +38,7 @@ use lance_linalg::simd::{
     target_arch = "loongarch64"
 ))]
 use lance_linalg::simd::{SIMD, f32::f32x16};
+use lance_select::RowAddrMask;
 use lance_table::utils::LanceIteratorExtension;
 use num_traits::AsPrimitive;
 use prost::Message;
@@ -1611,7 +1612,7 @@ impl<'a> RabitDistCalculator<'a> {
         &self,
         ctx: &RawQueryTopkContext<'_>,
         id: usize,
-        row_id: u64,
+        row_id: impl FnOnce() -> Option<u64>,
         binary_ip: f32,
         raw_lower_bound: f32,
         res: &mut BinaryHeap<OrderedNode<u64>>,
@@ -1627,6 +1628,9 @@ impl<'a> RabitDistCalculator<'a> {
             return;
         }
 
+        let Some(row_id) = row_id() else {
+            return;
+        };
         counters.exact += 1;
         let dist = self.raw_query_multi_bit_exact_distance(
             id,
@@ -1694,7 +1698,7 @@ impl<'a> RabitDistCalculator<'a> {
             self.accumulate_raw_query_multi_bit_row(
                 &ctx,
                 id,
-                row_id,
+                || Some(row_id),
                 binary_ip,
                 raw_lower_bound,
                 res,
@@ -1714,7 +1718,7 @@ impl<'a> RabitDistCalculator<'a> {
         k: usize,
         lower_bound: Option<f32>,
         upper_bound: Option<f32>,
-        row_id: impl Fn(u32) -> u64,
+        row_id: impl Fn(u32) -> Option<u64>,
         res: &mut BinaryHeap<OrderedNode<u64>>,
         dists: &mut Vec<f32>,
         quantized_dists: &mut Vec<u16>,
@@ -1790,7 +1794,7 @@ impl<'a> RabitDistCalculator<'a> {
                 self.accumulate_raw_query_multi_bit_row(
                     &ctx,
                     id,
-                    row_id(id as u32),
+                    || row_id(id as u32),
                     binary_ip,
                     lower_bound_of(id, binary_ip),
                     res,
@@ -1807,7 +1811,7 @@ impl<'a> RabitDistCalculator<'a> {
             self.accumulate_raw_query_multi_bit_row(
                 &ctx,
                 id,
-                row_id(id as u32),
+                || row_id(id as u32),
                 binary_ip,
                 lower_bound_of(id, binary_ip),
                 res,
@@ -2253,12 +2257,13 @@ impl DistCalculator for RabitDistCalculator<'_> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn accumulate_topk_with_scratch(
+    fn accumulate_topk_with_mask(
         &self,
         k: usize,
         lower_bound: Option<f32>,
         upper_bound: Option<f32>,
         row_id: impl Fn(u32) -> u64,
+        mask: Option<&RowAddrMask>,
         res: &mut BinaryHeap<OrderedNode<u64>>,
         dists: &mut Vec<f32>,
         quantized_dists: &mut Vec<u16>,
@@ -2268,6 +2273,11 @@ impl DistCalculator for RabitDistCalculator<'_> {
         if k == 0 {
             return;
         }
+        let eligible_row = |id| {
+            let address = row_id(id);
+            mask.is_none_or(|mask| mask.selected(address))
+                .then_some(address)
+        };
         if let Some(reason) = self.raw_query_lower_bound_gating_disabled_reason() {
             record_rabit_prune_bypass(reason);
             self.distance_all_with_scratch(
@@ -2277,7 +2287,7 @@ impl DistCalculator for RabitDistCalculator<'_> {
                 quantized_dists_table,
                 hacc_quantized_dists,
             );
-            accumulate_distances_into_heap(k, lower_bound, upper_bound, row_id, res, dists);
+            accumulate_distances_into_heap(k, lower_bound, upper_bound, eligible_row, res, dists);
             return;
         }
 
@@ -2285,7 +2295,7 @@ impl DistCalculator for RabitDistCalculator<'_> {
             k,
             lower_bound,
             upper_bound,
-            row_id,
+            eligible_row,
             res,
             dists,
             quantized_dists,
@@ -2352,7 +2362,7 @@ fn accumulate_distances_into_heap(
     k: usize,
     lower_bound: Option<f32>,
     upper_bound: Option<f32>,
-    row_id: impl Fn(u32) -> u64,
+    row_id: impl Fn(u32) -> Option<u64>,
     res: &mut BinaryHeap<OrderedNode<u64>>,
     dists: &[f32],
 ) {
@@ -2365,14 +2375,20 @@ fn accumulate_distances_into_heap(
             continue;
         }
         if res.len() < k {
-            res.push(OrderedNode::new(row_id(id as u32), dist));
+            let Some(row_id) = row_id(id as u32) else {
+                continue;
+            };
+            res.push(OrderedNode::new(row_id, dist));
             if res.len() == k {
                 max_dist = res.peek().map(|node| node.dist);
             }
         } else if max_dist.is_some_and(|max_dist| max_dist > dist) {
+            let Some(row_id) = row_id(id as u32) else {
+                continue;
+            };
             {
                 let mut top = res.peek_mut().unwrap();
-                top.id = row_id(id as u32);
+                top.id = row_id;
                 top.dist = dist;
             }
             max_dist = res.peek().map(|node| node.dist);

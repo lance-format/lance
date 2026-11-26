@@ -17,16 +17,20 @@ use datafusion_physical_plan::{
     },
     stream::RecordBatchStreamAdapter,
 };
-use futures::{StreamExt, TryStreamExt, stream};
+use futures::{StreamExt, TryStreamExt};
 use lance_core::Result;
 use lance_core::datatypes::Schema;
+use lance_io::stream::{
+    RecordBatchStreamAdapter as LanceStreamAdapter, SendableRecordBatchStream as LanceBatchStream,
+    infer_write_schema,
+};
 
-pub mod background_iterator;
+pub use lance_io::stream::background_iterator;
 
 /// A trait for [`RecordBatch`] iterators, readers and streams
 /// that can be converted to a concrete stream type [`SendableRecordBatchStream`].
 ///
-/// This also cam read the schema from the first batch
+/// This also can read the schema from the first batch
 /// and then update the schema to reflect the dictionary columns.
 #[async_trait]
 pub trait StreamingWriteSource: Send {
@@ -41,20 +45,8 @@ pub trait StreamingWriteSource: Send {
     where
         Self: Sized,
     {
-        let mut stream = self.into_stream();
-        let (stream, arrow_schema, schema) = lance_core::utils::tokio::spawn(async move {
-            let arrow_schema = stream.schema();
-            let mut schema: Schema = Schema::try_from(arrow_schema.as_ref())?;
-            let first_batch = stream.try_next().await?;
-            if let Some(batch) = &first_batch {
-                schema.set_dictionary(batch)?;
-            }
-            let stream = stream::iter(first_batch.map(Ok)).chain(stream);
-            Result::Ok((stream, arrow_schema, schema))
-        })
-        .await
-        .unwrap()?;
-        schema.validate()?;
+        let (stream, arrow_schema, schema) =
+            infer_write_schema(self.into_stream(), |stream| stream.schema()).await?;
         let adapter = RecordBatchStreamAdapter::new(arrow_schema, stream);
         Ok((Box::pin(adapter), schema))
     }
@@ -140,6 +132,7 @@ impl StreamingWriteSource for SendableRecordBatchStream {
 /// The reader will be called in a background thread.
 pub fn reader_to_stream(batches: Box<dyn RecordBatchReader + Send>) -> SendableRecordBatchStream {
     let arrow_schema = batches.arrow_schema();
+    // Keep readers' Arrow errors available through DataFusion's ArrowError variant.
     let stream = RecordBatchStreamAdapter::new(
         arrow_schema,
         BackgroundIterator::new(batches)
@@ -147,6 +140,22 @@ pub fn reader_to_stream(batches: Box<dyn RecordBatchReader + Send>) -> SendableR
             .map_err(DataFusionError::from),
     );
     Box::pin(stream)
+}
+
+/// Convert a DataFusion stream to a Lance stream, preserving its schema and
+/// converting errors as batches are read.
+///
+/// ```
+/// # use datafusion_execution::SendableRecordBatchStream;
+/// # use lance_datafusion_exec::utils::from_datafusion_stream;
+/// # fn example(input: SendableRecordBatchStream) {
+/// let stream = from_datafusion_stream(input);
+/// # drop(stream);
+/// # }
+/// ```
+pub fn from_datafusion_stream(stream: SendableRecordBatchStream) -> LanceBatchStream {
+    let schema = stream.schema();
+    Box::pin(LanceStreamAdapter::new(schema, stream.map_err(Into::into)))
 }
 
 pub trait MetricsExt {
@@ -267,3 +276,28 @@ pub const SCALAR_INDEX_MIN_ALLOWED_METRIC: &str = "min_allowed";
 pub const SCALAR_INDEX_MIN_BLOCKED_METRIC: &str = "min_blocked";
 pub const SCALAR_INDEX_MAX_ALLOWED_METRIC: &str = "max_allowed";
 pub const SCALAR_INDEX_MAX_BLOCKED_METRIC: &str = "max_blocked";
+
+#[cfg(test)]
+mod tests {
+    use arrow_array::record_batch;
+    use futures::stream;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn write_source_preserves_datafusion_error_after_first_batch() {
+        let batch = record_batch!(("id", Int32, [1])).unwrap();
+        let input: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            batch.schema(),
+            stream::iter([
+                Ok(batch.clone()),
+                Err(DataFusionError::Plan("bad plan".into())),
+            ]),
+        ));
+
+        let (mut stream, _) = input.into_stream_and_schema().await.unwrap();
+        assert_eq!(stream.try_next().await.unwrap(), Some(batch));
+        let error = stream.try_next().await.unwrap_err();
+        assert!(matches!(error, DataFusionError::Plan(message) if message == "bad plan"));
+    }
+}

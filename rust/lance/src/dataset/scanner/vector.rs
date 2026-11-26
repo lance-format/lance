@@ -996,8 +996,9 @@ impl Scanner {
                 let filter_columns = Planner::column_names_in_expr(expr);
                 take_proj = take_proj.union_columns(filter_columns, OnMissing::Error)?;
             }
-            let mut stale_node =
-                self.row_ids_take(stale_rows.result_rows().await?.clone(), take_proj)?;
+            let mut stale_node = self
+                .row_addrs_take(stale_rows.physical_selection(), take_proj)
+                .await?;
             if let Some(expr) = filter_plan.full_expr.as_ref() {
                 stale_node = Arc::new(LanceFilterExec::try_new(expr.clone(), stale_node)?);
             }
@@ -1296,7 +1297,7 @@ impl Scanner {
         if let Some(fragments) = &self.fragments {
             RoaringBitmap::from_iter(fragments.iter().map(|f| f.id as u32))
         } else {
-            self.dataset.fragment_bitmap.as_ref().clone()
+            self.dataset.table_state.fragment_bitmap.as_ref().clone()
         }
     }
 
@@ -1366,7 +1367,7 @@ impl Scanner {
     ) -> Result<PreFilterSource> {
         if filter_plan.is_empty() && !indices.is_empty() {
             let excluded_fragments =
-                self.dataset.fragment_bitmap.as_ref() - &self.get_fragments_as_bitmap();
+                self.dataset.table_state.fragment_bitmap.as_ref() - &self.get_fragments_as_bitmap();
             let has_full_index_coverage = indices.iter().all(|index| {
                 index
                     .fragment_bitmap
@@ -1407,7 +1408,8 @@ impl Scanner {
                         && self.fragments.is_none()
                         && self.index_segments.is_none()
                         && self.physical_row_addr_prefilter.is_none()
-                        && self.get_indexed_frags(index) == *self.dataset.fragment_bitmap
+                        && self.get_indexed_frags(index)
+                            == *self.dataset.table_state.fragment_bitmap
                 })
                 .map(|query| QuantizedRefinementOptions {
                     result_count: query.k,

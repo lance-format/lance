@@ -146,6 +146,7 @@ mod compatibility;
 mod coreset_algo;
 pub mod io;
 mod partition_serde;
+mod shape;
 mod streaming_hamming;
 pub mod v2;
 
@@ -740,8 +741,8 @@ fn existing_index_sources(
         .segments()
         .map(|(metadata, index)| {
             let (Some(effective), Some(deleted)) = (
-                metadata.effective_fragment_bitmap(&dataset.fragment_bitmap),
-                metadata.deleted_fragment_bitmap(&dataset.fragment_bitmap),
+                metadata.effective_fragment_bitmap(&dataset.table_state.fragment_bitmap),
+                metadata.deleted_fragment_bitmap(&dataset.table_state.fragment_bitmap),
             ) else {
                 return ExistingIndex::unfiltered(index.clone());
             };
@@ -831,7 +832,7 @@ pub(crate) async fn optimize_vector_indices(
     }
 
     let new_uuid = Uuid::new_v4();
-    let object_store = dataset.object_store.as_ref();
+    let object_store = dataset.table_state.object_store.as_ref();
     let index_file = dataset
         .indices_dir()
         .join(new_uuid.to_string())
@@ -1703,7 +1704,6 @@ fn sanity_check_params(ivf: &IvfBuildParams, pq: &PQBuildParams) -> Result<()> {
 /// - IVF model.
 ///
 /// Visibility: pub(super) for testing
-#[instrument(level = "debug", skip_all, name = "build_ivf_model")]
 pub async fn build_ivf_model(
     dataset: &Dataset,
     column: &str,
@@ -1712,6 +1712,44 @@ pub async fn build_ivf_model(
     params: &IvfBuildParams,
     fragment_ids: Option<&[u32]>,
     progress: std::sync::Arc<dyn lance_index::progress::IndexBuildProgress>,
+) -> Result<IvfModel> {
+    build_ivf_model_with_sample_loss(
+        dataset,
+        column,
+        dim,
+        metric_type,
+        params,
+        fragment_ids,
+        progress,
+        SampleLoss::Measure,
+    )
+    .await
+}
+
+/// Whether IVF training from a sample measures the k-means loss over that
+/// sample, which takes one more assignment of every sampled vector to every
+/// centroid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SampleLoss {
+    Measure,
+    /// For an index build, whose merge replaces the model's loss with the one
+    /// its shuffle measured over every row.
+    Skip,
+}
+
+/// [`build_ivf_model`] that measures the training loss only when
+/// `sample_loss` asks for it. Streaming training always reports its loss.
+#[allow(clippy::too_many_arguments)]
+#[instrument(level = "debug", skip_all, name = "build_ivf_model")]
+pub(crate) async fn build_ivf_model_with_sample_loss(
+    dataset: &Dataset,
+    column: &str,
+    dim: usize,
+    metric_type: MetricType,
+    params: &IvfBuildParams,
+    fragment_ids: Option<&[u32]>,
+    progress: std::sync::Arc<dyn lance_index::progress::IndexBuildProgress>,
+    sample_loss: SampleLoss,
 ) -> Result<IvfModel> {
     let num_partitions = params.num_partitions.unwrap();
     let centroids = params.centroids.clone();
@@ -1783,7 +1821,8 @@ pub async fn build_ivf_model(
         "Finished loading training data in {:02} seconds",
         start.elapsed().as_secs_f32()
     );
-    train_ivf_model_from_sample(training_data, metric_type, params, progress).await
+    train_ivf_model_from_sample_with_loss(training_data, metric_type, params, progress, sample_loss)
+        .await
 }
 
 /// Train an in-memory IVF model from caller-supplied vector samples.
@@ -1826,6 +1865,23 @@ pub async fn train_ivf_model_from_sample(
     metric_type: MetricType,
     params: &IvfBuildParams,
     progress: std::sync::Arc<dyn lance_index::progress::IndexBuildProgress>,
+) -> Result<IvfModel> {
+    train_ivf_model_from_sample_with_loss(
+        training_data,
+        metric_type,
+        params,
+        progress,
+        SampleLoss::Measure,
+    )
+    .await
+}
+
+async fn train_ivf_model_from_sample_with_loss(
+    training_data: FixedSizeListArray,
+    metric_type: MetricType,
+    params: &IvfBuildParams,
+    progress: std::sync::Arc<dyn lance_index::progress::IndexBuildProgress>,
+    sample_loss: SampleLoss,
 ) -> Result<IvfModel> {
     let num_partitions = params.num_partitions.filter(|&k| k > 0).ok_or_else(|| {
         Error::invalid_input(format!(
@@ -1931,6 +1987,7 @@ pub async fn train_ivf_model_from_sample(
         mt,
         params,
         progress,
+        sample_loss,
     )
     .await?;
     info!(
@@ -2039,7 +2096,7 @@ pub async fn build_ivf_pq_index(
     let precomputed_partitions = load_precomputed_partitions_if_available(ivf_params).await?;
 
     let file = write_ivf_pq_file(
-        dataset.object_store.as_ref(),
+        dataset.table_state.object_store.as_ref(),
         dataset.indices_dir(),
         column,
         index_name,
@@ -2332,7 +2389,7 @@ pub(crate) async fn remap_index_file(
     column: String,
     transforms: Vec<pb::Transform>,
 ) -> Result<IndexFile> {
-    let object_store = dataset.object_store.as_ref();
+    let object_store = dataset.table_state.object_store.as_ref();
     let old_path = dataset
         .indices_dir()
         .join(old_uuid.to_string())
@@ -2480,7 +2537,7 @@ pub async fn write_ivf_pq_file_from_existing_index(
     pq: ProductQuantizer,
     streams: Vec<impl Stream<Item = Result<RecordBatch>>>,
 ) -> Result<()> {
-    let obj_store = dataset.object_store.as_ref();
+    let obj_store = dataset.table_state.object_store.as_ref();
     let path = dataset
         .indices_dir()
         .join(index_id.to_string())
@@ -2522,7 +2579,7 @@ async fn write_ivf_hnsw_file(
     shuffle_partition_concurrency: usize,
     precomputed_shuffle_buffers: Option<(Path, Vec<String>)>,
 ) -> Result<()> {
-    let object_store = dataset.object_store.as_ref();
+    let object_store = dataset.table_state.object_store.as_ref();
     let path = dataset
         .indices_dir()
         .join(uuid.to_string())
@@ -2660,7 +2717,7 @@ pub(crate) async fn merge_segments(
         );
     }
     merge_segments_inner(
-        dataset.object_store.as_ref(),
+        dataset.table_state.object_store.as_ref(),
         &dataset.indices_dir(),
         segments,
         Some(row_filters),
@@ -2676,7 +2733,7 @@ pub(crate) async fn merge_remapped_segments(
     segments: Vec<TableIndexMetadata>,
 ) -> Result<TableIndexMetadata> {
     merge_segments_inner(
-        dataset.object_store.as_ref(),
+        dataset.table_state.object_store.as_ref(),
         &dataset.indices_dir(),
         segments,
         None,
@@ -3401,6 +3458,7 @@ async fn do_train_ivf_model<T: ArrowPrimitiveType>(
     metric_type: MetricType,
     params: &IvfBuildParams,
     progress: std::sync::Arc<dyn lance_index::progress::IndexBuildProgress>,
+    sample_loss: SampleLoss,
 ) -> Result<IvfModel>
 where
     <T as ArrowPrimitiveType>::Native: Dot + L2 + Normalize,
@@ -3442,14 +3500,19 @@ where
     drop(progress_tx);
     progress_worker.await??;
     let kmeans = kmeans?;
-    let training_data = FixedSizeListArray::try_new_from_values(
-        Arc::new(data.clone()) as ArrayRef,
-        dimension as i32,
-    )?;
-    let loss = kmeans.compute_loss(&training_data)?;
+    let loss = match sample_loss {
+        SampleLoss::Measure => {
+            let training_data = FixedSizeListArray::try_new_from_values(
+                Arc::new(data.clone()) as ArrayRef,
+                dimension as i32,
+            )?;
+            Some(kmeans.compute_loss(&training_data)?)
+        }
+        SampleLoss::Skip => None,
+    };
     Ok(IvfModel::new(
         FixedSizeListArray::try_new_from_values(kmeans.centroids, dimension as i32)?,
-        Some(loss),
+        loss,
     ))
 }
 
@@ -5471,7 +5534,7 @@ async fn train_streaming_coreset_ivf_model_with_algorithm<A: StreamingCoresetAlg
         generate_fixed_training_ranges(
             selection_rows,
             selection_rows.min(requested_rows),
-            dataset.object_store.as_ref().block_size(),
+            dataset.table_state.object_store.as_ref().block_size(),
             sampler.byte_width,
         )
     });
@@ -5821,6 +5884,7 @@ async fn train_ivf_model(
     distance_type: DistanceType,
     params: &IvfBuildParams,
     progress: std::sync::Arc<dyn lance_index::progress::IndexBuildProgress>,
+    sample_loss: SampleLoss,
 ) -> Result<IvfModel> {
     assert!(
         distance_type != DistanceType::Cosine,
@@ -5837,6 +5901,7 @@ async fn train_ivf_model(
                 distance_type,
                 params,
                 progress.clone(),
+                sample_loss,
             )
             .await
         }
@@ -5848,6 +5913,7 @@ async fn train_ivf_model(
                 distance_type,
                 params,
                 progress.clone(),
+                sample_loss,
             )
             .await
         }
@@ -5859,6 +5925,7 @@ async fn train_ivf_model(
                 distance_type,
                 params,
                 progress.clone(),
+                sample_loss,
             )
             .await
         }
@@ -5874,6 +5941,7 @@ async fn train_ivf_model(
                 distance_type,
                 params,
                 progress.clone(),
+                sample_loss,
             )
             .await
         }
@@ -5885,6 +5953,7 @@ async fn train_ivf_model(
                 distance_type,
                 params,
                 progress.clone(),
+                sample_loss,
             )
             .await
         }
@@ -6634,7 +6703,7 @@ mod tests {
             fields: vec![field.id],
             covering_fields: vec![],
             name: INDEX_NAME.to_string(),
-            fragment_bitmap: Some(dataset.fragment_bitmap.as_ref().clone()),
+            fragment_bitmap: Some(dataset.table_state.fragment_bitmap.as_ref().clone()),
             index_details: Some(Arc::new(vector_index_details_default())),
             index_version: VECTOR_INDEX_VERSION as i32,
             created_at: Some(chrono::Utc::now()),
@@ -6738,7 +6807,7 @@ mod tests {
             fields: vec![field.id],
             covering_fields: vec![],
             name: format!("{}_remapped", INDEX_NAME),
-            fragment_bitmap: Some(dataset_mut.fragment_bitmap.as_ref().clone()),
+            fragment_bitmap: Some(dataset_mut.table_state.fragment_bitmap.as_ref().clone()),
             index_details: Some(Arc::new(vector_index_details_default())),
             index_version: VECTOR_INDEX_VERSION as i32,
             created_at: Some(chrono::Utc::now()),
@@ -7331,6 +7400,7 @@ mod tests {
         assert_eq!(2, ivf_model.centroids.as_ref().unwrap().len());
         assert_eq!(32, ivf_model.centroids.as_ref().unwrap().value_length());
         assert_eq!(2, ivf_model.num_partitions());
+        assert!(ivf_model.loss().is_some_and(|loss| loss > 0.0));
 
         // All centroids values should be in the range [1000, 1100]
         ivf_model
@@ -7343,6 +7413,22 @@ mod tests {
             .for_each(|v| {
                 assert!((1000.0..1100.0).contains(v));
             });
+
+        // An index build skips the sample loss its shuffle replaces.
+        let without_loss = build_ivf_model_with_sample_loss(
+            &dataset,
+            "vector",
+            DIM,
+            MetricType::L2,
+            &ivf_params,
+            None,
+            lance_index::progress::noop_progress(),
+            SampleLoss::Skip,
+        )
+        .await
+        .unwrap();
+        assert_eq!(2, without_loss.num_partitions());
+        assert!(without_loss.loss().is_none());
     }
 
     #[tokio::test]
@@ -10251,11 +10337,19 @@ mod tests {
             .unwrap();
 
         // Reset IO stats after index creation
-        dataset.object_store.as_ref().io_stats_incremental();
+        dataset
+            .table_state
+            .object_store
+            .as_ref()
+            .io_stats_incremental();
 
         // Prewarm should perform IO to load all partitions into cache
         dataset.prewarm_index("my_idx").await.unwrap();
-        let stats = dataset.object_store.as_ref().io_stats_incremental();
+        let stats = dataset
+            .table_state
+            .object_store
+            .as_ref()
+            .io_stats_incremental();
         assert!(
             stats.read_iops > 0,
             "prewarm should have read from disk, but read_iops was 0"
@@ -10272,7 +10366,11 @@ mod tests {
             .try_into_batch()
             .await
             .unwrap();
-        let stats = dataset.object_store.as_ref().io_stats_incremental();
+        let stats = dataset
+            .table_state
+            .object_store
+            .as_ref()
+            .io_stats_incremental();
         assert_io_eq!(
             stats,
             read_iops,
@@ -10282,7 +10380,11 @@ mod tests {
 
         // Second prewarm should not need IO (already cached)
         dataset.prewarm_index("my_idx").await.unwrap();
-        let stats = dataset.object_store.as_ref().io_stats_incremental();
+        let stats = dataset
+            .table_state
+            .object_store
+            .as_ref()
+            .io_stats_incremental();
         assert_io_eq!(stats, read_iops, 0, "second prewarm should not perform IO");
     }
 
@@ -10404,11 +10506,19 @@ mod tests {
             .clone();
 
         // Reset IO stats after migration and sampling.
-        dataset.object_store.as_ref().io_stats_incremental();
+        dataset
+            .table_state
+            .object_store
+            .as_ref()
+            .io_stats_incremental();
 
         // Prewarm should perform IO to load all index deltas into cache.
         dataset.prewarm_index("vector_idx").await.unwrap();
-        let stats = dataset.object_store.as_ref().io_stats_incremental();
+        let stats = dataset
+            .table_state
+            .object_store
+            .as_ref()
+            .io_stats_incremental();
         assert!(
             stats.read_iops > 0,
             "prewarm should have read from disk, but read_iops was 0"
@@ -10424,7 +10534,11 @@ mod tests {
             .try_into_batch()
             .await
             .unwrap();
-        let stats = dataset.object_store.as_ref().io_stats_incremental();
+        let stats = dataset
+            .table_state
+            .object_store
+            .as_ref()
+            .io_stats_incremental();
         assert_io_eq!(
             stats,
             read_iops,
@@ -10434,7 +10548,11 @@ mod tests {
 
         // Second prewarm should not need IO (already cached).
         dataset.prewarm_index("vector_idx").await.unwrap();
-        let stats = dataset.object_store.as_ref().io_stats_incremental();
+        let stats = dataset
+            .table_state
+            .object_store
+            .as_ref()
+            .io_stats_incremental();
         assert_io_eq!(stats, read_iops, 0, "second prewarm should not perform IO");
     }
 }

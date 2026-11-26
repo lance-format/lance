@@ -7,11 +7,9 @@ use std::sync::Arc;
 use crate::Dataset;
 use crate::dataset::transaction::{Operation, Transaction, TransactionBuilder};
 use crate::index::frag_reuse::{
-    build_frag_reuse_index_metadata, build_tagged_frag_reuse_entry,
-    decode_frag_reuse_ledger_from_content, load_frag_reuse_index_details,
-    load_raw_frag_reuse_content,
+    build_frag_reuse_index_metadata, decode_frag_reuse_ledger_from_content,
+    load_frag_reuse_index_details, load_raw_frag_reuse_content,
 };
-use crate::index::frag_reuse_with_stable_row_ids::history::trimmable_versions;
 use crate::index::loading::DatasetIndexInternalExt;
 use lance_core::{Error, Result};
 use lance_index::frag_reuse::{
@@ -22,8 +20,12 @@ use lance_index::metrics::NoOpMetricsCollector;
 use lance_table::format::IndexMetadata;
 use lance_table::io::manifest::read_manifest_indexes;
 use lance_table::system_index::frag_reuse::retention::{
-    TrimRecord, compute_tagged_retention, is_index_remap_caught_up, reuse_chain_frag_bitmap,
-    split_trim_elements,
+    is_index_remap_caught_up, reuse_chain_frag_bitmap,
+};
+use lance_table_runtime::frag_reuse::history::trimmable_versions;
+use lance_table_runtime::frag_reuse::{
+    SUPERSEDED_PRUNE_PROPERTY, SUPERSEDED_PRUNE_REBASED_TO_NOOP, TAGGED_TRIM_REBASED_TO_NOOP,
+    TaggedTrimOutcome,
 };
 use roaring::RoaringBitmap;
 
@@ -133,8 +135,8 @@ impl Dataset {
 pub async fn cleanup_frag_reuse_index(dataset: &mut Dataset) -> lance_core::Result<()> {
     // check against index metadata before auto-remap
     let indices = read_manifest_indexes(
-        &dataset.object_store,
-        &dataset.manifest_location,
+        &dataset.table_state.object_store,
+        &dataset.table_state.manifest_location,
         &dataset.manifest,
     )
     .await?;
@@ -250,70 +252,6 @@ async fn cleanup_stable_row_id_history(
     Ok(())
 }
 
-/// Conflict-source marker for a trim whose rebase derived nothing left to
-/// trim: a concurrent commit already satisfied it, so instead of writing an
-/// empty no-op manifest version the commit attempt aborts with a retryable
-/// conflict carrying this message, and [`cleanup_frag_reuse_index`] treats
-/// exactly that conflict as success.
-pub(crate) const TAGGED_TRIM_REBASED_TO_NOOP: &str =
-    "the tagged trim rebased to nothing to trim; a concurrent commit already satisfied it";
-
-/// Conflict-source marker for a superseded-segment prune whose rebase derived
-/// nothing left to remove: a concurrent commit changed the coverage the
-/// original removal set relied on (or already removed the segments), so
-/// instead of writing an empty no-op manifest version the commit attempt
-/// aborts with a retryable conflict carrying this message, and
-/// [`prune_superseded_segments`] treats exactly that conflict as success.
-pub(crate) const SUPERSEDED_PRUNE_REBASED_TO_NOOP: &str = "the superseded-segment prune rebased to nothing to remove; \
-     a concurrent commit changed the coverage it relied on";
-
-/// Transaction property marking a removal-only `CreateIndex` as a
-/// superseded-segment prune.
-///
-/// The shape alone (removals, no creations) is ambiguous: `drop_index`
-/// commits exactly the same operation, and re-deriving a user's drop as a
-/// prune would resurrect indexes they asked to remove. The explicit property
-/// travels with the transaction through the commit loop, so the conflict
-/// resolver's `finish_create_index` can recognize the prune and re-derive its
-/// removal set against the current manifest whenever the attempt builds on a
-/// version newer than the one it read. Without that, a rebase over a
-/// non-conflicting concurrent commit (e.g. a remap swap narrowing a sibling's
-/// coverage) would re-commit the stale removal set and silently drop index
-/// coverage.
-pub(crate) const SUPERSEDED_PRUNE_PROPERTY: &str = "__lance.frag_reuse.superseded_prune";
-
-/// Whether a transaction is a superseded-segment prune: marked with
-/// [`SUPERSEDED_PRUNE_PROPERTY`] and shaped as a pure removal.
-pub(crate) fn is_superseded_prune_transaction(transaction: &Transaction) -> bool {
-    let has_marker = transaction
-        .transaction_properties
-        .as_ref()
-        .is_some_and(|props| props.contains_key(SUPERSEDED_PRUNE_PROPERTY));
-    has_marker
-        && matches!(
-            &transaction.operation,
-            Operation::CreateIndex {
-                new_indices,
-                removed_indices,
-            } if new_indices.is_empty() && !removed_indices.is_empty()
-        )
-}
-
-/// The outcome of deriving a tagged trim against the current manifest.
-#[derive(Debug)]
-pub(crate) enum TaggedTrimOutcome {
-    /// Every record is still needed, or there is no tagged entry to trim.
-    NothingToTrim,
-    /// Replace the current entry with the filtered history.
-    Replace {
-        new_entry: Box<IndexMetadata>,
-        current_entry: Box<IndexMetadata>,
-    },
-    /// Everything trimmed away: delete the entry outright. The manifest
-    /// feature flags stay set (they are sticky).
-    Delete { current_entry: Box<IndexMetadata> },
-}
-
 /// Segments of a logical index whose whole contribution is already served
 /// directly by other retained segments of the same index.
 ///
@@ -344,8 +282,8 @@ pub(crate) async fn derive_superseded_segments(
     dataset: &Dataset,
 ) -> lance_core::Result<Vec<IndexMetadata>> {
     let stored = read_manifest_indexes(
-        &dataset.object_store,
-        &dataset.manifest_location,
+        &dataset.table_state.object_store,
+        &dataset.table_state.manifest_location,
         &dataset.manifest,
     )
     .await?;
@@ -394,7 +332,7 @@ pub(crate) async fn derive_superseded_segments(
                 .map(|bitmap| (idx.uuid, bitmap))
         })
         .collect();
-    let live = dataset.fragment_bitmap.as_ref();
+    let live = dataset.table_state.fragment_bitmap.as_ref();
 
     let mut groups: HashMap<&str, Vec<&IndexMetadata>> = HashMap::new();
     for index in stored.iter() {
@@ -538,113 +476,13 @@ async fn cleanup_tagged_frag_reuse_index(dataset: &mut Dataset) -> lance_core::R
     }
 }
 
-/// Whether a `CreateIndex` payload has the tagged-trim shape: exactly the
-/// tagged FRI entry replaced, or removed outright. A v0 trim (v0 entry
-/// replacing a v0 entry) deliberately does not match.
-pub(crate) fn is_tagged_trim_operation(
-    new_indices: &[IndexMetadata],
-    removed_indices: &[IndexMetadata],
-) -> bool {
-    use lance_table::system_index::frag_reuse::metadata::is_tagged;
-    let [removed] = removed_indices else {
-        return false;
-    };
-    if removed.name != FRAG_REUSE_INDEX_NAME {
-        return false;
-    }
-    match new_indices {
-        [] => is_tagged(removed),
-        [entry] => is_tagged(entry),
-        _ => false,
-    }
-}
-
-/// Derive the trimmed tagged entry from the CURRENT manifest state.
-///
-/// Zero payload IO: retention is computed from the entry's digests, the
-/// stored index metadata and the manifest's live fragments alone. Row-map
-/// files released by trimming a stable-partition transition are collected
-/// separately by dataset cleanup.
-pub(crate) async fn derive_tagged_trim(dataset: &Dataset) -> lance_core::Result<TaggedTrimOutcome> {
-    let indices = read_manifest_indexes(
-        &dataset.object_store,
-        &dataset.manifest_location,
-        &dataset.manifest,
+pub(crate) async fn derive_tagged_trim(dataset: &Dataset) -> Result<TaggedTrimOutcome> {
+    let hook = crate::io::commit::LanceCommitHook::new(dataset.session.clone());
+    lance_table_runtime::frag_reuse::derive_tagged_trim(
+        &dataset.table_view().to_table(),
+        Some(&hook),
     )
-    .await?;
-    let Some(entry) = indices
-        .iter()
-        .find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
-        .cloned()
-    else {
-        return Ok(TaggedTrimOutcome::NothingToTrim);
-    };
-    if entry.index_version == 0 {
-        // Reachable only through a rebase whose entry was concurrently
-        // replaced by a v0 one; nothing tagged remains to trim.
-        return Ok(TaggedTrimOutcome::NothingToTrim);
-    }
-
-    let content = load_raw_frag_reuse_content(dataset, &entry).await?;
-    // Full ledger validation (lineage order, digest conservation, mapping
-    // presence) plus unsupported-transition detection before interpreting
-    // anything.
-    let ledger = decode_frag_reuse_ledger_from_content(entry.index_version, &content).await?;
-    if ledger.has_unsupported_transitions() {
-        return Err(Error::not_supported(
-            "the tagged FRI history carries transitions this client cannot interpret; \
-             upgrade to a newer version of Lance before trimming",
-        ));
-    }
-    let elements = split_trim_elements(&content)?;
-    // The live fragments of the same snapshot `indices` was read from; the
-    // commit-time rebase calls this again with the rebased dataset.
-    let retained = compute_tagged_retention(
-        &elements,
-        &indices,
-        dataset.fragment_bitmap.as_ref(),
-        crate::index::segment::index_is_usable,
-    );
-
-    if retained.iter().all(|kept| *kept) {
-        return Ok(TaggedTrimOutcome::NothingToTrim);
-    }
-    if retained.iter().all(|kept| !*kept) {
-        return Ok(TaggedTrimOutcome::Delete {
-            current_entry: Box::new(entry),
-        });
-    }
-
-    let mut new_content = Vec::new();
-    let mut fragment_bitmap = RoaringBitmap::new();
-    for (element, kept) in elements.iter().zip(retained.iter()) {
-        if !kept {
-            continue;
-        }
-        new_content.extend_from_slice(&element.raw);
-        match &element.record {
-            TrimRecord::LegacyVersion(version) => {
-                fragment_bitmap.extend(version.old_frag_ids().iter().map(|&id| id as u32));
-                fragment_bitmap.extend(version.new_frag_ids().iter().map(|&id| id as u32));
-            }
-            TrimRecord::Transition(transition) => {
-                for digest in transition
-                    .sources
-                    .iter()
-                    .chain(transition.destinations.iter())
-                {
-                    fragment_bitmap.insert(digest.id as u32);
-                }
-            }
-        }
-    }
-    // The filtered history must itself decode as a well-formed ledger.
-    decode_frag_reuse_ledger_from_content(entry.index_version, &new_content).await?;
-    let new_entry = build_tagged_frag_reuse_entry(dataset, new_content, fragment_bitmap).await?;
-    Ok(TaggedTrimOutcome::Replace {
-        new_entry: Box::new(new_entry),
-        current_entry: Box::new(entry),
-    })
+    .await
 }
 
 #[cfg(test)]
@@ -655,7 +493,9 @@ pub(crate) mod tests {
     use crate::index::DatasetIndexExt;
     use crate::index::vector::details::vector_index_details_default;
     use crate::session::Session;
-    use crate::session::index_caches::{DerivedIndexListingKey, IndexMetadataKey};
+    use crate::session::index_caches::{
+        DerivedIndexListingKey, IndexMetadataKey, QueryIndexListingKey,
+    };
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
     use all_asserts::{assert_false, assert_true};
     use arrow_array::cast::AsArray;
@@ -927,8 +767,8 @@ pub(crate) mod tests {
         assert_eq!(fri.index_version, 0);
         let raw_key = IndexMetadataKey {
             version: dataset.manifest.version,
-            store_identity: &dataset.object_store.store_prefix,
-            e_tag: dataset.manifest_location.e_tag.as_deref(),
+            store_identity: &dataset.table_state.object_store.store_prefix,
+            e_tag: dataset.table_state.manifest_location.e_tag.as_deref(),
         };
         let remapped_key = DerivedIndexListingKey {
             version: raw_key.version,
@@ -953,8 +793,8 @@ pub(crate) mod tests {
         let uncached = open(uncached_session).await.unwrap();
         assert_eq!(*first, *uncached.load_indices().await.unwrap());
 
-        // An entry still awaiting vector-details inference keeps the listing
-        // out of the cache, so a later successful inference is not hidden.
+        // The runtime can cache the bitmap translation while the query
+        // listing still needs to retry vector-details inference.
         let dataset = open(Arc::new(Session::default())).await.unwrap();
         let mut legacy = scalar(&raw);
         legacy.uuid = uuid::Uuid::new_v4();
@@ -971,13 +811,21 @@ pub(crate) mod tests {
             scalar(&listing).fragment_bitmap,
             scalar(&first).fragment_bitmap
         );
-        assert!(
-            dataset
-                .index_cache
-                .get_with_key(&remapped_key)
-                .await
-                .is_none()
+        let remapped = dataset
+            .index_cache
+            .get_with_key(&remapped_key)
+            .await
+            .unwrap();
+        assert_eq!(
+            scalar(&remapped).fragment_bitmap,
+            scalar(&first).fragment_bitmap
         );
+        let query = dataset
+            .index_cache
+            .get_with_key(&QueryIndexListingKey(remapped_key))
+            .await
+            .unwrap();
+        assert!(query.retry_derivation);
     }
 
     /// With more than one index on the table, remapping every index must catch
@@ -1197,7 +1045,9 @@ pub(crate) mod tests {
         use lance_table::format::Fragment;
         use lance_table::format::pb::fragment_reuse_index_details as pb_fri;
         use lance_table::system_index::frag_reuse::ledger::Mapping;
-        use lance_table::system_index::frag_reuse::retention::TrimElement;
+        use lance_table::system_index::frag_reuse::retention::{
+            TrimElement, TrimRecord, compute_tagged_retention, split_trim_elements,
+        };
         use lance_table::transaction::RewriteGroup;
         use uuid::Uuid;
 
@@ -2686,8 +2536,8 @@ pub(crate) mod tests {
 
         async fn stored_segments(dataset: &Dataset, name: &str) -> Vec<IndexMetadata> {
             read_manifest_indexes(
-                &dataset.object_store,
-                &dataset.manifest_location,
+                &dataset.table_state.object_store,
+                &dataset.table_state.manifest_location,
                 &dataset.manifest,
             )
             .await
@@ -2740,7 +2590,7 @@ pub(crate) mod tests {
         /// Union of the coverage the reader attributes to the usable
         /// segments of `name`, restricted to live fragments.
         async fn covered_fragments(dataset: &Dataset, name: &str) -> roaring::RoaringBitmap {
-            let live = dataset.fragment_bitmap.as_ref();
+            let live = dataset.table_state.fragment_bitmap.as_ref();
             let mut covered = roaring::RoaringBitmap::new();
             for index in dataset.load_indices().await.unwrap().iter() {
                 if index.name == name
@@ -2995,8 +2845,8 @@ pub(crate) mod tests {
                 ..entry.clone()
             };
             let indices = read_manifest_indexes(
-                &dataset.object_store,
-                &dataset.manifest_location,
+                &dataset.table_state.object_store,
+                &dataset.table_state.manifest_location,
                 &dataset.manifest,
             )
             .await
