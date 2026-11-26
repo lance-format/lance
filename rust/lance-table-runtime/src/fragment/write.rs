@@ -16,6 +16,7 @@ use std::borrow::Cow;
 use uuid::Uuid;
 
 use crate::paths::DATA_DIR;
+use crate::write::representation::TableRepresentation;
 use crate::write::schema::promote_legacy_blob_schema;
 use crate::write::{
     SeedCollector, WriteMode, WriteParams, WriterOptions, blob_v2_external_base_resolver,
@@ -324,10 +325,25 @@ impl<'a> FragmentCreateBuilder<'a> {
             None
         };
         let (stream, schema) = match schema {
-            Some(schema) => (source.into_stream(), schema),
+            Some(schema) => (
+                Self::convert_to_table_representation(source.into_stream(), &schema),
+                schema,
+            ),
             None => source.into_stream_and_schema().await?,
         };
         Ok((stream, schema))
+    }
+
+    /// Convert string and binary columns to the representations of the
+    /// table schema the fragment is written with, as dataset appends do.
+    fn convert_to_table_representation(
+        stream: SendableRecordBatchStream,
+        schema: &Schema,
+    ) -> SendableRecordBatchStream {
+        match TableRepresentation::try_new(stream.schema().as_ref(), schema) {
+            Some(representation) => representation.convert_stream(stream),
+            None => stream,
+        }
     }
 
     async fn existing_dataset_schema(&self) -> Result<Option<Schema>> {

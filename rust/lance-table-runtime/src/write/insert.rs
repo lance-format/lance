@@ -25,6 +25,7 @@ use crate::commit::{
 };
 use crate::{CommitBuilder, Table, TableBuilder, TableSession};
 
+use super::representation::TableRepresentation;
 use super::schema::{promote_legacy_blob_schema, schema_compare_options};
 use super::{
     FragmentWriteOptions, WriteMode, WriteParams, WriteProgressFn, WriteSeedHook, WriteStats,
@@ -280,6 +281,7 @@ impl<'a> InsertBuilder<'a> {
             mode=?context.params.mode
         );
 
+        let (stream, schema) = Self::convert_to_table_representation(&context, stream, schema)?;
         self.validate_write(&mut context, &schema)?;
 
         let existing_base_paths = context.dest.table().map(|ds| &ds.manifest.base_paths);
@@ -378,6 +380,28 @@ impl<'a> InsertBuilder<'a> {
         .build();
 
         Ok(transaction)
+    }
+
+    /// Convert string and binary columns appended to an existing table to the
+    /// representations the table stores, so the rest of the write sees the
+    /// table's types.
+    fn convert_to_table_representation(
+        context: &WriteContext,
+        stream: SendableRecordBatchStream,
+        schema: Schema,
+    ) -> Result<(SendableRecordBatchStream, Schema)> {
+        let (WriteMode::Append, CommitDestination::Table(table)) =
+            (&context.params.mode, &context.dest)
+        else {
+            return Ok((stream, schema));
+        };
+        let Some(representation) =
+            TableRepresentation::try_new(stream.schema().as_ref(), table.schema())
+        else {
+            return Ok((stream, schema));
+        };
+        let schema = Schema::try_from(representation.schema().as_ref())?;
+        Ok((representation.convert_stream(stream), schema))
     }
 
     fn validate_write(&self, context: &mut WriteContext, data_schema: &Schema) -> Result<()> {

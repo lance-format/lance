@@ -12,6 +12,7 @@ mod insert;
 mod params;
 mod parts;
 pub mod progress;
+pub mod representation;
 pub(crate) mod schema;
 mod schema_adapter;
 mod seeds;

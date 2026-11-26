@@ -92,6 +92,7 @@ impl<'a> FragmentCreateBuilder<'a> {
 mod tests {
     use std::sync::Arc;
 
+    use arrow_array::cast::AsArray;
     use arrow_array::{
         Int64Array, RecordBatch, RecordBatchIterator, RecordBatchReader, StringArray, record_batch,
     };
@@ -339,6 +340,65 @@ mod tests {
         assert_eq!(fragment.files.len(), 1);
         assert_eq!(fragment.files[0].fields.as_ref(), &[3, 1]);
         assert_eq!(fragment.files[0].column_indices.as_ref(), &[0, 1]);
+    }
+
+    /// Fragments written against a table's schema convert string columns to
+    /// the table's representation, as dataset appends do.
+    #[rstest]
+    #[case::explicit_schema_single(true, false)]
+    #[case::explicit_schema_multiple(true, true)]
+    #[case::append_schema_single(false, false)]
+    #[case::append_schema_multiple(false, true)]
+    #[tokio::test]
+    async fn test_fragment_write_converts_string_representation(
+        #[case] explicit_schema: bool,
+        #[case] multi: bool,
+    ) {
+        let tmp_dir = TempStrDir::default();
+        let table = record_batch!(("id", Int64, [0]), ("value", Utf8, ["first"])).unwrap();
+        let table_schema = table.schema();
+        let dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(table)], table_schema.clone()),
+            &tmp_dir,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let input = record_batch!(
+            ("id", Int64, [1, 2]),
+            ("value", LargeUtf8, [Some("x"), None])
+        )
+        .unwrap();
+        let input_schema = input.schema();
+        let params = WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        };
+        let mut builder = FragmentCreateBuilder::new(&tmp_dir).write_params(&params);
+        if explicit_schema {
+            builder = builder.schema(dataset.schema());
+        }
+        let reader = RecordBatchIterator::new([Ok(input)], input_schema);
+        let fragments = if multi {
+            builder.write_fragments(reader).await.unwrap()
+        } else {
+            vec![builder.write(reader, None).await.unwrap()]
+        };
+
+        let dataset = CommitBuilder::new(Arc::new(dataset))
+            .execute(Transaction::new(1, Operation::Append { fragments }, None))
+            .await
+            .unwrap();
+        let result = dataset.scan().try_into_batch().await.unwrap();
+        assert_eq!(result.schema().as_ref(), table_schema.as_ref());
+        assert_eq!(
+            result["value"]
+                .as_string::<i32>()
+                .iter()
+                .collect::<Vec<_>>(),
+            [Some("first"), Some("x"), None]
+        );
     }
 
     #[tokio::test]
