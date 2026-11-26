@@ -27,7 +27,6 @@ use bytes::Bytes;
 use lance_arrow::{ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY};
 use lance_core::datatypes::BlobKind;
 use lance_core::{Error, Result};
-use lance_io::object_store::uri_to_url;
 use lance_table::snapshot::SnapshotRef;
 use prost::Message;
 
@@ -36,6 +35,11 @@ pub(crate) use crate::blob_reference_pb as pb;
 
 mod bindings;
 pub use bindings::BlobRefReadSession;
+mod metrics;
+pub use metrics::BlobRefMetrics;
+pub(crate) use metrics::ReaderMetrics;
+mod nested;
+pub use nested::NestedBlobRefBatch;
 
 pub use crate::dataset::blob::capture::BlobRefCapture;
 pub use crate::dataset::blob::{
@@ -44,6 +48,36 @@ pub use crate::dataset::blob::{
     ReadBlobRef,
 };
 
+/// Bounds memoization on object-per-row inputs; eviction changes cost, never validation.
+pub(crate) const URI_CACHE_CAPACITY: usize = 256;
+
+pub(crate) use lance_table_runtime::blob::locate::{CanonicalBlobUri, canonical_uri};
+
+#[derive(Default)]
+struct ValidatedUris(HashSet<String>);
+
+impl ValidatedUris {
+    fn validate(&mut self, uri: &str) -> Result<()> {
+        if !self.0.contains(uri) {
+            validate_canonical_uri(uri)?;
+            if self.0.len() == URI_CACHE_CAPACITY {
+                self.0.clear();
+            }
+            self.0.insert(uri.to_owned());
+        }
+        Ok(())
+    }
+}
+
+fn validate_canonical_uri(uri: &str) -> Result<()> {
+    if canonical_uri(uri)? != uri {
+        return Err(Error::invalid_input(format!(
+            "Noncanonical blob object URI {uri}"
+        )));
+    }
+    Ok(())
+}
+
 /// Supported execution-wire version. Query it before scheduling remote workers.
 pub const BLOB_REFERENCE_PROTOCOL_VERSION: u32 = 1;
 /// Supported source capabilities: object ranges and immutable external objects.
@@ -51,6 +85,8 @@ pub const BLOB_REFERENCE_CAPABILITIES: &[u32] = &[1, 2];
 /// SDK operations available independently of the source transport capabilities.
 pub const BLOB_REFERENCE_OPERATIONS: &[&str] = &[
     "capture_top_level",
+    "capture_nested",
+    "reader_metrics_v1",
     "read_whole",
     "read_range",
     "streaming",
@@ -233,9 +269,27 @@ impl BlobSourceContext {
         dataset.validate_snapshot(&self.snapshot)
     }
 
+    #[cfg(test)]
     pub(crate) fn reference(
         &self,
         object_uri: String,
+        offset: u64,
+        length: Option<u64>,
+        kind: BlobKind,
+        base_id: Option<u32>,
+    ) -> Result<BlobRef> {
+        self.reference_canonical(
+            &CanonicalBlobUri::try_new(&object_uri)?,
+            offset,
+            length,
+            kind,
+            base_id,
+        )
+    }
+
+    pub(crate) fn reference_canonical(
+        &self,
+        object_uri: &CanonicalBlobUri,
         offset: u64,
         length: Option<u64>,
         kind: BlobKind,
@@ -260,20 +314,32 @@ impl BlobSourceContext {
             | BlobKind::Managed
             | BlobKind::ManagedWithBase => pb::object_locator::Origin::Lance,
         };
-        BlobRef::try_new(
-            0,
-            pb::ObjectLocator {
+        let reference = BlobRef {
+            source_context: 0,
+            locator: pb::ObjectLocator {
                 protocol_version: VERSION,
                 source_id: Bytes::copy_from_slice(&self.source_id),
-                object_uri: canonical_uri(&object_uri)?,
+                object_uri: object_uri.as_str().to_owned(),
                 offset,
                 length,
                 origin: origin as i32,
                 base_id,
             }
-            .encode_to_vec(),
+            .encode_to_vec()
+            .into(),
             length,
-        )
+        };
+        // The private proof avoids parsing an unchanged URI again. Every other locator
+        // check still runs, including lengths, origins, source IDs, and overflow.
+        reference.object_locator_with_uri_validation(|uri| {
+            if uri != object_uri.as_str() {
+                return Err(Error::internal(
+                    "Canonical blob URI changed during construction",
+                ));
+            }
+            Ok(())
+        })?;
+        Ok(reference)
     }
 
     fn from_proto(proto: pb::SourceContext) -> Result<Self> {
@@ -397,7 +463,15 @@ impl BlobRef {
         &self,
         context: &BlobSourceContext,
     ) -> Result<pb::ObjectLocator> {
-        let object = self.object_locator()?;
+        self.object_locator_in_context_with_uri_validation(context, validate_canonical_uri)
+    }
+
+    fn object_locator_in_context_with_uri_validation(
+        &self,
+        context: &BlobSourceContext,
+        validate_uri: impl FnOnce(&str) -> Result<()>,
+    ) -> Result<pb::ObjectLocator> {
+        let object = self.object_locator_with_uri_validation(validate_uri)?;
         if object.source_id.as_ref() != context.source_id {
             return Err(Error::invalid_input(format!(
                 "Blob reference does not match source_context slot {}",
@@ -418,6 +492,13 @@ impl BlobRef {
     }
 
     fn object_locator(&self) -> Result<pb::ObjectLocator> {
+        self.object_locator_with_uri_validation(validate_canonical_uri)
+    }
+
+    fn object_locator_with_uri_validation(
+        &self,
+        validate_uri: impl FnOnce(&str) -> Result<()>,
+    ) -> Result<pb::ObjectLocator> {
         let object = pb::ObjectLocator::decode(self.locator.clone()).map_err(|error| {
             Error::invalid_input(format!("Invalid blob object locator protobuf: {error}",))
         })?;
@@ -428,12 +509,7 @@ impl BlobRef {
                 object.source_id.len(),
             )));
         }
-        if canonical_uri(&object.object_uri)? != object.object_uri {
-            return Err(Error::invalid_input(format!(
-                "Noncanonical blob object URI {}",
-                object.object_uri
-            )));
-        }
+        validate_uri(&object.object_uri)?;
         if object.length != self.length {
             return Err(Error::invalid_input(format!(
                 "Blob reference length {:?} disagrees with locator length {:?}",
@@ -577,6 +653,7 @@ impl BlobRefBatch {
             }
         }
         let batch = Self { contexts, array };
+        let mut validated_uris = ValidatedUris::default();
         for index in 0..batch.array.len() {
             if let Some(reference) = batch.reference(index)? {
                 let context = batch.contexts.get(reference.source_context as usize).ok_or_else(|| Error::invalid_input(format!(
@@ -584,7 +661,9 @@ impl BlobRefBatch {
                     reference.source_context, batch.contexts.len(),
                 )))?;
                 reference
-                    .object_locator_in_context(context)
+                    .object_locator_in_context_with_uri_validation(context, |uri| {
+                        validated_uris.validate(uri)
+                    })
                     .map_err(|error| {
                         Error::invalid_input(format!("Blob reference row {index}: {error}"))
                     })?;
@@ -758,22 +837,6 @@ fn check_version(version: u32, component: &str) -> Result<()> {
     Ok(())
 }
 
-fn canonical_uri(uri: &str) -> Result<String> {
-    if url::Url::parse(uri).is_err() && !std::path::Path::new(uri).is_absolute() {
-        return Err(Error::invalid_input(format!(
-            "Blob reference URI must be absolute: {uri}"
-        )));
-    }
-    let url = uri_to_url(uri)?;
-    let has_username = !url.username().is_empty() && !matches!(url.scheme(), "az" | "abfss");
-    if url.fragment().is_some() || has_username || url.password().is_some() {
-        return Err(Error::invalid_input(
-            "Blob reference URI must not contain credentials or a fragment",
-        ));
-    }
-    Ok(url.to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -869,6 +932,72 @@ mod tests {
             ],
         )
         .unwrap()
+    }
+
+    #[rstest]
+    #[case::source("source", "does not match source_context")]
+    #[case::length("length", "disagrees with locator length")]
+    #[case::overflow("overflow", "overflows u64")]
+    #[case::origin("origin", "Unsupported blob locator origin")]
+    #[case::uri("uri", "must not contain credentials or a fragment")]
+    fn cached_uri_still_checks_every_locator(#[case] invalid: &str, #[case] message: &str) {
+        let context = context(1, None);
+        let first = reference(&context, 0, Some(3));
+        let mut second = first.clone();
+        let mut object = first.object_locator().unwrap();
+        match invalid {
+            "source" => object.source_id = Bytes::from(vec![0; 32]),
+            "length" => object.length = Some(4),
+            "overflow" => object.offset = u64::MAX,
+            "origin" => object.origin = 999,
+            "uri" => object.object_uri.push_str("#fragment"),
+            _ => unreachable!(),
+        }
+        second.locator = object.encode_to_vec().into();
+        let error = BlobRefBatch::try_new(vec![context], [Some(first), Some(second)]).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("row 1"), "{error}");
+        assert!(error.to_string().contains(message), "{error}");
+    }
+
+    #[test]
+    fn canonical_uri_memoization_is_bounded_and_keeps_validation() {
+        let mut cache = ValidatedUris::default();
+        for index in 0..=URI_CACHE_CAPACITY {
+            cache
+                .validate(&format!("file:///tmp/blob-{index}"))
+                .unwrap();
+            assert!(cache.0.len() <= URI_CACHE_CAPACITY);
+        }
+        cache.validate("file:///tmp/blob-0").unwrap();
+        let error = cache.validate("file:///tmp/blob-0#fragment").unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("must not contain credentials or a fragment")
+        );
+    }
+
+    #[test]
+    fn canonical_uri_proof_does_not_reuse_source_identity() {
+        let uri = CanonicalBlobUri::try_new("s3://source/table.lance/_blobs/shared.blob").unwrap();
+        let first = context(1, None);
+        let later = context(2, None);
+        let reference = first
+            .reference_canonical(&uri, 0, Some(3), BlobKind::Packed, None)
+            .unwrap();
+        let same = first
+            .reference(uri.as_str().to_owned(), 0, Some(3), BlobKind::Packed, None)
+            .unwrap();
+        assert_eq!(reference, same);
+        let different = later
+            .reference_canonical(&uri, 0, Some(3), BlobKind::Packed, None)
+            .unwrap();
+        assert_ne!(reference.locator(), different.locator());
+        let error = different.object_locator_in_context(&first).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("does not match source_context"));
     }
 
     #[test]
@@ -1241,15 +1370,14 @@ mod tests {
 
     #[cfg_attr(coverage, coverage(off))]
     async fn capture_dataset(uri: &str) -> Arc<Dataset> {
-        let mut blobs = BlobArrayBuilder::new(6);
-        for bytes in [
-            Some(b"abc".as_slice()),
-            Some(b"abcde"),
-            Some(b"abcdefghij"),
-            None,
-            Some(b""),
-            Some(b"uv"),
-        ] {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../test_data/blob_reference_v1/conformance.json"
+        ))
+        .unwrap();
+        let payloads = fixture["payloads"].as_array().unwrap();
+        let mut blobs = BlobArrayBuilder::new(payloads.len());
+        for value in payloads {
+            let bytes = value.as_str().map(str::as_bytes);
             if let Some(bytes) = bytes {
                 blobs.push_bytes(bytes).unwrap();
             } else {
@@ -1676,8 +1804,28 @@ mod tests {
             .capture(&source, &field, &addresses, selected.as_struct())
             .await
             .unwrap();
+        let mut invalid_addresses = addresses.clone();
+        let fragment_id = addresses[1].fragment_id();
+        let physical_rows = dataset
+            .find_fragment(u64::from(fragment_id))
+            .unwrap()
+            .physical_rows
+            .unwrap();
+        invalid_addresses[1] =
+            RowAddress::new_from_parts(fragment_id, u32::try_from(physical_rows).unwrap());
+        let error = capture
+            .capture(&source, &field, &invalid_addresses, selected.as_struct())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("row 1 has invalid address"));
+        let after_error = capture
+            .capture(&source, &field, &addresses, selected.as_struct())
+            .await
+            .unwrap();
         let restored = BlobRefBatch::decode(&batch.encode().unwrap()).unwrap();
         assert_eq!(batch.array(), repeated.array());
+        assert_eq!(batch.array(), after_error.array());
         assert_eq!(batch.array(), restored.array());
         assert_eq!(
             dataset
@@ -1707,6 +1855,114 @@ mod tests {
                 }
                 (None, None) => {}
                 other => panic!("Unexpected captured value {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn shared_reference_conformance_fixture() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../test_data/blob_reference_v1/conformance.json"
+        ))
+        .unwrap();
+        assert_eq!(
+            fixture["protocol_version"].as_u64().unwrap(),
+            u64::from(BLOB_REFERENCE_PROTOCOL_VERSION)
+        );
+        let dataset = capture_dataset("memory://").await;
+        let source = BlobSourceContext::from_dataset(&dataset, "catalog/conformance", "workers")
+            .await
+            .unwrap();
+        let references = capture_ref_batch(&dataset, &source).await;
+        let references = BlobRefBatch::decode(&references.encode().unwrap()).unwrap();
+        let reader = BlobRefReader::try_new(
+            vec![BlobRefBinding::try_new(source, dataset).unwrap()],
+            BlobMaterializationContext::try_new(1024, 1024).unwrap(),
+        )
+        .unwrap();
+        let requests = fixture["requests"].as_array().unwrap();
+        let indices = requests
+            .iter()
+            .map(|request| request["reference_index"].as_u64().unwrap())
+            .collect::<Vec<_>>();
+        let request_indices = requests
+            .iter()
+            .map(|request| {
+                request["request_index"]
+                    .as_str()
+                    .unwrap()
+                    .parse::<u64>()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let ranges = requests
+            .iter()
+            .map(|request| {
+                request["range"].as_array().map(|range| {
+                    BlobReadRange::new(range[0].as_u64().unwrap(), range[1].as_u64().unwrap())
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut stream = reader
+            .read(
+                references
+                    .read_requests(&indices, &request_indices, &ranges)
+                    .unwrap(),
+            )
+            .unwrap();
+        let mut results = HashMap::new();
+        while let Some(result) = stream.try_next().await.unwrap() {
+            results.insert(result.request_index, result.data.map(|data| data.to_vec()));
+        }
+        for (request, index) in requests.iter().zip(request_indices) {
+            assert_eq!(
+                results[&index].as_deref(),
+                request["expected"].as_str().map(str::as_bytes)
+            );
+        }
+        for range in fixture["invalid_ranges"].as_array().unwrap() {
+            let offset = range["offset"].as_str().unwrap().parse().unwrap();
+            let length = range["length"].as_str().unwrap().parse().unwrap();
+            let error = reader
+                .read(
+                    references
+                        .read_requests(&[2], &[0], &[Some(BlobReadRange::new(offset, length))])
+                        .unwrap(),
+                )
+                .err()
+                .unwrap();
+            assert!(matches!(error, Error::InvalidInput { .. }));
+            assert!(error.to_string().contains("range"));
+        }
+        assert_eq!(reader.metrics().unwrap().duplicate_demands, 1);
+    }
+
+    #[tokio::test]
+    async fn portable_capture_reads_released_blob_descriptors() {
+        let directory = crate::utils::test::copy_test_data_to_tmp("v11.0.0/blob_sidecars").unwrap();
+        let dataset = Arc::new(Dataset::open(&directory.path_str()).await.unwrap());
+        let source = BlobSourceContext::from_dataset(&dataset, "catalog/released", "workers")
+            .await
+            .unwrap();
+        let references = capture_ref_batch(&dataset, &source).await;
+        for (index, expected) in [
+            Some(vec![b'p'; 16]),
+            Some(b"inline".to_vec()),
+            None,
+            Some(Vec::new()),
+            Some(vec![b'd'; 32]),
+            Some(b"inline".to_vec()),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            match (references.reference(index).unwrap(), expected) {
+                (Some(reference), Some(expected)) => assert_eq!(
+                    read_one_ref(&dataset, &source, reference).await.as_ref(),
+                    expected
+                ),
+                (None, None) => (),
+                other => panic!("Unexpected released-fixture value {other:?}"),
             }
         }
     }
@@ -2209,6 +2465,17 @@ mod tests {
         assert_eq!(recorded.head_requests.load(Ordering::Acquire), 0);
         // Eight physical bytes plus fourteen logical bytes, including duplicates.
         assert_eq!(budget.reserved_bytes().unwrap(), 22);
+        let metrics = reader.metrics().unwrap();
+        assert_eq!(metrics.descriptor_requests, 0);
+        assert_eq!(metrics.metadata_requests, 0);
+        assert_eq!(metrics.payload_requests, 1);
+        assert_eq!(metrics.payload_bytes, 8);
+        assert_eq!(metrics.coalesced_bytes, 8);
+        assert_eq!(metrics.requested_logical_bytes, 14);
+        assert_eq!(metrics.returned_logical_bytes, 14);
+        assert_eq!(metrics.duplicate_demands, 1);
+        assert_eq!(metrics.peak_reserved_bytes, 22);
+        assert_eq!(metrics.peak_io_reserved_bytes, 8);
         let clone = results
             .iter()
             .find(|result| result.request_index == 90)
@@ -2293,6 +2560,104 @@ mod tests {
         assert_eq!(result.data.as_deref(), Some(b"ijkl".as_slice()));
         drop(result);
         drop(next);
+        wait_for_ref_budget_release(&budget).await;
+    }
+
+    #[rstest]
+    #[case::middle(false)]
+    #[case::last(true)]
+    #[tokio::test]
+    async fn read_refs_cancel_queued_stream_preserves_survivor(#[case] cancel_last: bool) {
+        let (reader, source, budget, recorded) = recorded_ref_reader(4, 8).await;
+        let mut streams = (0..3)
+            .map(|index| {
+                reader
+                    .read([ref_read_request(
+                        &source,
+                        index,
+                        index * 4,
+                        4,
+                        BlobRefDemand::Whole,
+                    )])
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let first = streams[0].try_next().await.unwrap().unwrap();
+        assert!(streams[1].try_next().now_or_never().is_none());
+        assert!(streams[2].try_next().now_or_never().is_none());
+        let cancelled = if cancel_last { 2 } else { 1 };
+        let survivor = if cancel_last { 1 } else { 2 };
+        streams[cancelled].cancel();
+        let error = streams[cancelled].try_next().await.unwrap_err();
+        assert!(matches!(error, Error::IO { .. }));
+        assert!(error.to_string().contains("cancelled"));
+        drop(first);
+        let result = tokio::time::timeout(Duration::from_secs(1), streams[survivor].try_next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.request_index, survivor as u64);
+        assert_eq!(
+            result.data.as_deref(),
+            Some(if cancel_last {
+                b"efgh".as_slice()
+            } else {
+                b"ijkl".as_slice()
+            })
+        );
+        assert_eq!(recorded.requested_blob_ranges().len(), 2);
+        drop(result);
+        drop(streams);
+        wait_for_ref_budget_release(&budget).await;
+    }
+
+    #[tokio::test]
+    async fn read_refs_cancel_metadata_initializer_with_waiting_stream() {
+        let (reader, source, budget, recorded, gate) = external_metadata_ref_reader(2).await;
+        let reference = source
+            .reference(
+                "mock://objects/shared".into(),
+                0,
+                None,
+                BlobKind::External,
+                None,
+            )
+            .unwrap();
+        let request = BlobRefRequest::new(
+            0,
+            Some(reference),
+            BlobRefDemand::Range(BlobReadRange::new(2, 3)),
+        );
+        let mut first = reader.read([request.clone()]).unwrap();
+        let mut second = reader.read([request.clone()]).unwrap();
+        assert!(first.try_next().now_or_never().is_none());
+        assert!(second.try_next().now_or_never().is_none());
+        assert_eq!(recorded.head_requests.load(Ordering::Acquire), 1);
+        first.cancel();
+        let error = first.try_next().await.unwrap_err();
+        assert!(matches!(error, Error::IO { .. }));
+        assert!(error.to_string().contains("cancelled"));
+        gate.add_permits(1);
+        let result = tokio::time::timeout(Duration::from_secs(1), second.try_next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.data.as_deref(), Some(b"cde".as_slice()));
+        assert_eq!(recorded.head_requests.load(Ordering::Acquire), 2);
+        drop(result);
+        drop(second);
+        let repeated = reader
+            .read([request])
+            .unwrap()
+            .try_next()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(repeated.data.as_deref(), Some(b"cde".as_slice()));
+        assert_eq!(recorded.head_requests.load(Ordering::Acquire), 2);
+        drop(repeated);
         wait_for_ref_budget_release(&budget).await;
     }
 
@@ -2473,8 +2838,11 @@ mod tests {
         assert_eq!(second_recorded.requested_blob_ranges(), vec![0..3]);
     }
 
+    #[rstest]
+    #[case::arrow(false)]
+    #[case::bytes(true)]
     #[tokio::test]
-    async fn binding_arrow_results_preserve_demands_and_nulls() {
+    async fn binding_results_preserve_demands_and_nulls(#[case] byte_results: bool) {
         let directory = tempfile::tempdir().unwrap();
         let dataset = capture_dataset(directory.path().to_str().unwrap()).await;
         let source = BlobSourceContext::from_dataset(&dataset, "catalog/bindings", "workers")
@@ -2520,16 +2888,26 @@ mod tests {
             )
             .unwrap();
         let session = BlobRefReadSession::try_new(&reader, remaining).unwrap();
-        while let Some(batch) = session.next_batch().await {
-            let batch = batch.unwrap();
-            values.insert(
-                batch["request_index"].as_primitive::<UInt64Type>().value(0),
-                if batch["data"].is_null(0) {
-                    None
-                } else {
-                    Some(batch["data"].as_binary::<i64>().value(0).to_vec())
-                },
-            );
+        if byte_results {
+            while let Some(result) = session.next_result().await {
+                let result = result.unwrap();
+                values.insert(
+                    result.request_index,
+                    result.data.map(|bytes| bytes.to_vec()),
+                );
+            }
+        } else {
+            while let Some(batch) = session.next_batch().await {
+                let batch = batch.unwrap();
+                values.insert(
+                    batch["request_index"].as_primitive::<UInt64Type>().value(0),
+                    if batch["data"].is_null(0) {
+                        None
+                    } else {
+                        Some(batch["data"].as_binary::<i64>().value(0).to_vec())
+                    },
+                );
+            }
         }
         assert_eq!(
             values,
@@ -2760,6 +3138,11 @@ mod tests {
             "{error}"
         );
         assert!(error.to_string().contains("exceeds length 8"), "{error}");
+        let metrics = reader.metrics().unwrap();
+        assert_eq!(metrics.metadata_requests, 1);
+        assert_eq!(metrics.payload_bytes, 3);
+        assert_eq!(metrics.requested_logical_bytes, 3);
+        assert_eq!(metrics.returned_logical_bytes, 3);
     }
 
     #[rstest]

@@ -20,7 +20,7 @@ static RESULT_SCHEMA: LazyLock<Arc<Schema>> = LazyLock::new(|| {
     ]))
 });
 
-/// A binding-friendly cancellable stream of Arrow result batches.
+/// A binding-friendly cancellable stream of indexed results.
 ///
 /// Each batch contains one completed request with `request_index: uint64` and
 /// nullable `data: large_binary`. Completion order is unspecified. Payload buffers
@@ -58,12 +58,34 @@ impl BlobRefReadSession {
     /// Await one completed demand. EOF and errors release pending native resources.
     /// Calls are serialized; cancellation can be requested concurrently.
     pub async fn next_batch(&self) -> Option<Result<RecordBatch>> {
+        let result = self.next_result().await?.and_then(result_batch);
+        if result.is_err() {
+            self.close().await;
+        }
+        Some(result)
+    }
+
+    /// Await one indexed result without constructing an Arrow batch.
+    ///
+    /// The returned bytes keep their materialization reservation until dropped,
+    /// including after this session is closed. Bindings that copy into managed
+    /// memory can release that owner after the copy; those copies require their
+    /// own memory limits. Calls are serialized with [`Self::next_batch`].
+    ///
+    /// ```
+    /// # use lance::blob::reference::BlobRefReadSession;
+    /// # async fn example(session: &BlobRefReadSession) -> lance::Result<()> {
+    /// while let Some(result) = session.next_result().await.transpose()? {
+    ///     let request_index = result.request_index;
+    ///     let nullable_bytes = result.data;
+    ///     // Consume and release the bytes before requesting more results.
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn next_result(&self) -> Option<Result<ReadBlobRef>> {
         let mut stream = self.stream.lock().await;
-        let result = stream
-            .as_mut()?
-            .next()
-            .await
-            .map(|result| result.and_then(result_batch));
+        let result = stream.as_mut()?.next().await;
         if !matches!(result, Some(Ok(_))) {
             stream.take();
         }

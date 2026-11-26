@@ -15,6 +15,8 @@ package org.lance;
 
 import org.lance.BlobReferences.Batch;
 import org.lance.BlobReferences.Capture;
+import org.lance.BlobReferences.NestedBatch;
+import org.lance.BlobReferences.ReadResult;
 import org.lance.BlobReferences.ReadStream;
 import org.lance.BlobReferences.Reader;
 import org.lance.BlobReferences.Request;
@@ -45,6 +47,8 @@ import org.lance.schema.ColumnAlteration;
 import org.lance.schema.LanceField;
 import org.lance.schema.SqlExpressions;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.arrow.c.ArrowArrayStream;
 import org.apache.arrow.c.Data;
 import org.apache.arrow.memory.BufferAllocator;
@@ -52,8 +56,10 @@ import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.vector.IntVector;
 import org.apache.arrow.vector.LargeVarBinaryVector;
+import org.apache.arrow.vector.UInt4Vector;
 import org.apache.arrow.vector.UInt8Vector;
 import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.complex.ListVector;
 import org.apache.arrow.vector.complex.StructVector;
 import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.arrow.vector.types.pojo.ArrowType;
@@ -66,6 +72,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
@@ -81,6 +88,7 @@ import java.net.URISyntaxException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.channels.ClosedChannelException;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Clock;
@@ -2686,7 +2694,13 @@ public class DatasetTest {
       assertArrayEquals(new int[] {1, 2}, BlobReferences.getSupportedCapabilities());
       assertArrayEquals(
           new String[] {
-            "capture_top_level", "read_whole", "read_range", "streaming", "cancellation"
+            "capture_top_level",
+            "capture_nested",
+            "reader_metrics_v1",
+            "read_whole",
+            "read_range",
+            "streaming",
+            "cancellation"
           },
           BlobReferences.getSupportedOperations());
       SourceContext source = SourceContext.fromDataset(original, "catalog/portable", "workers");
@@ -2791,10 +2805,388 @@ public class DatasetTest {
           assertTrue(reader.getReservedBytes() >= 2);
         }
         assertEquals(0, reader.getReservedBytes());
+        ReadResult copied;
+        try (ReadStream stream =
+            reader.read(batch, List.of(Request.whole(0, 0), Request.whole(0, 1)))) {
+          copied = stream.nextBytes();
+          assertNotNull(copied);
+          assertTrue(copied.getRequestIndex() == 0 || copied.getRequestIndex() == 1);
+          stream.cancel();
+          IOException cancelled = assertThrows(IOException.class, stream::nextBytes);
+          assertTrue(cancelled.getMessage().contains("cancel"));
+          stream.close();
+          assertNull(stream.nextBytes());
+        }
+        assertArrayEquals(new byte[] {0, 10}, copied.getData());
       }
       byte[] unsupported = source.encode();
       unsupported[1] = 99;
       assertThrows(IllegalArgumentException.class, () -> SourceContext.decode(unsupported));
+    }
+  }
+
+  @Test
+  void testPortableNestedBlobReferences(@TempDir Path tempDir) throws Exception {
+    try (RootAllocator allocator = new RootAllocator();
+        Dataset dataset =
+            createNestedBlobDataset(allocator, tempDir.resolve("nested").toString())) {
+      SourceContext source = SourceContext.fromDataset(dataset, "catalog/nested", "workers");
+      int fieldId =
+          dataset
+              .getLanceSchema()
+              .fields()
+              .get(0)
+              .getChildren()
+              .get(0)
+              .getChildren()
+              .get(0)
+              .getId();
+      try (Capture capture = Capture.create(dataset, source, fieldId);
+          LanceScanner scanner =
+              dataset.newScan(new ScanOptions.Builder().withRowAddress(true).build());
+          ArrowReader scanned = scanner.scanBatches();
+          Reader reader = Reader.create(List.of(source), List.of(dataset), 1024, 1024)) {
+        int batchIndex = 0;
+        while (scanned.loadNextBatch()) {
+          NestedBatch nested =
+              capture.captureNested(source, scanned.getVectorSchemaRoot(), "media", allocator);
+          nested = NestedBatch.decode(nested.encode());
+          try (VectorSchemaRoot indices = nested.getIndices(allocator)) {
+            NestedBatch rebuilt =
+                NestedBatch.fromArrow(
+                    nested.getReferences().remapContexts(List.of(source)), indices, allocator);
+            assertArrayEquals(nested.getReferences().encode(), rebuilt.getReferences().encode());
+            StructVector media = (StructVector) indices.getVector("media");
+            ListVector clips = (ListVector) media.getChild("clips");
+            if (batchIndex == 0) {
+              assertEquals(0, clips.getElementStartIndex(0));
+              assertEquals(3, clips.getElementEndIndex(0));
+              assertEquals(3, clips.getElementStartIndex(1));
+              assertEquals(3, clips.getElementEndIndex(1));
+              Map<Long, byte[]> values = new HashMap<>();
+              try (ReadStream stream =
+                  reader.read(
+                      nested.getReferences(),
+                      List.of(
+                          Request.whole(0, 0),
+                          Request.whole(0, 1),
+                          Request.whole(1, 2),
+                          Request.whole(2, 3)))) {
+                VectorSchemaRoot next;
+                while ((next = stream.next(allocator)) != null) {
+                  try (VectorSchemaRoot result = next) {
+                    values.put(
+                        ((UInt8Vector) result.getVector("request_index")).get(0),
+                        ((LargeVarBinaryVector) result.getVector("data")).get(0));
+                  }
+                }
+              }
+              assertArrayEquals("first".getBytes(StandardCharsets.UTF_8), values.get(0L));
+              assertArrayEquals(values.get(0L), values.get(1L));
+              assertNull(values.get(2L));
+              assertArrayEquals(new byte[0], values.get(3L));
+            } else {
+              assertTrue(media.isNull(0));
+            }
+          }
+          batchIndex++;
+        }
+        assertEquals(2, batchIndex);
+        assertEquals(1L, reader.getMetrics().get("payload_requests"));
+        assertEquals(5L, reader.getMetrics().get("payload_bytes"));
+        assertEquals(10L, reader.getMetrics().get("returned_logical_bytes"));
+        assertEquals(1L, reader.getMetrics().get("duplicate_demands"));
+        assertEquals(0L, reader.getMetrics().get("reserved_bytes"));
+      }
+    }
+  }
+
+  private static Dataset createNestedBlobDataset(BufferAllocator allocator, String path) {
+    Field blob =
+        new Field(
+            "item",
+            new FieldType(
+                true,
+                ArrowType.Struct.INSTANCE,
+                null,
+                Map.of(
+                    "ARROW:extension:name",
+                    "lance.blob.v2",
+                    "lance-encoding:blob-inline-size-threshold",
+                    "0",
+                    "lance-encoding:blob-dedicated-size-threshold",
+                    "1")),
+            List.of(
+                Field.nullable("data", ArrowType.LargeBinary.INSTANCE),
+                Field.nullable("uri", ArrowType.Utf8.INSTANCE)));
+    Schema schema =
+        new Schema(
+            List.of(
+                new Field(
+                    "media",
+                    FieldType.nullable(ArrowType.Struct.INSTANCE),
+                    List.of(
+                        new Field(
+                            "clips",
+                            FieldType.nullable(ArrowType.List.INSTANCE),
+                            List.of(blob))))));
+    try (Dataset empty =
+            Dataset.write()
+                .allocator(allocator)
+                .uri(path)
+                .schema(schema)
+                .dataStorageVersion(LanceConstants.FILE_FORMAT_VERSION_2_2)
+                .execute();
+        VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+      root.allocateNew();
+      StructVector media = (StructVector) root.getVector("media");
+      ListVector clips = (ListVector) media.getChild("clips");
+      StructVector blobs = (StructVector) clips.getDataVector();
+      LargeVarBinaryVector data = (LargeVarBinaryVector) blobs.getChild("data");
+      for (int row = 0; row < 4; row++) media.setIndexDefined(row);
+      clips.startNewValue(0);
+      clips.endValue(0, 3);
+      clips.startNewValue(1);
+      clips.endValue(1, 0);
+      clips.startNewValue(2);
+      clips.endValue(2, 0);
+      clips.setNull(2);
+      media.setNull(2);
+      clips.startNewValue(3);
+      clips.endValue(3, 1);
+      blobs.setIndexDefined(0);
+      data.setSafe(0, "first".getBytes(StandardCharsets.UTF_8));
+      blobs.setNull(1);
+      blobs.setIndexDefined(2);
+      data.setSafe(2, new byte[0]);
+      blobs.setIndexDefined(3);
+      data.setSafe(3, "second".getBytes(StandardCharsets.UTF_8));
+      root.setRowCount(4);
+      List<FragmentMetadata> fragments =
+          Fragment.create(
+              path,
+              allocator,
+              root,
+              new WriteParams.Builder()
+                  .withMode(WriteParams.WriteMode.APPEND)
+                  .withDataStorageVersion(LanceConstants.FILE_FORMAT_VERSION_2_2)
+                  .withMaxRowsPerFile(2)
+                  .build());
+      try (Transaction transaction =
+          new Transaction.Builder()
+              .readVersion(empty.version())
+              .operation(Append.builder().fragments(fragments).build())
+              .build()) {
+        return new CommitBuilder(empty).execute(transaction);
+      }
+    }
+  }
+
+  @ParameterizedTest
+  @CsvSource({"false, false", "false, true", "true, false", "true, true"})
+  void testSharedBlobReferenceConformance(
+      boolean directArrow, boolean byteResults, @TempDir Path tempDir) throws Exception {
+    JsonNode fixture =
+        new ObjectMapper()
+            .readTree(Files.readString(Path.of("../test_data/blob_reference_v1/conformance.json")));
+    assertEquals(fixture.get("protocol_version").asInt(), BlobReferences.getProtocolVersion());
+    try (RootAllocator allocator = new RootAllocator();
+        Dataset dataset =
+            createConformanceBlobDataset(
+                allocator, tempDir.resolve("conformance").toString(), fixture)) {
+      SourceContext source = SourceContext.fromDataset(dataset, "catalog/conformance", "workers");
+      int fieldId = dataset.getLanceSchema().fields().get(0).getId();
+      try (Capture capture = Capture.create(dataset, source, fieldId);
+          LanceScanner scanner =
+              dataset.newScan(new ScanOptions.Builder().withRowAddress(true).build());
+          ArrowReader scanned = scanner.scanBatches();
+          Reader reader = Reader.create(List.of(source), List.of(dataset), 1024, 1024)) {
+        assertTrue(scanned.loadNextBatch());
+        Batch refs;
+        if (directArrow) {
+          try (VectorSchemaRoot captured =
+              capture.captureToArrow(source, scanned.getVectorSchemaRoot(), "blob", allocator)) {
+            refs = Batch.fromArrow(List.of(source), captured, allocator);
+            try (VectorSchemaRoot wire =
+                capture
+                    .capture(source, scanned.getVectorSchemaRoot(), "blob", allocator)
+                    .toArrow(allocator)) {
+              assertEquals(wire.getSchema(), captured.getSchema());
+              StructVector expectedRefs = (StructVector) wire.getVector(0);
+              StructVector actualRefs = (StructVector) captured.getVector(0);
+              assertEquals(wire.getRowCount(), captured.getRowCount());
+              for (int index = 0; index < wire.getRowCount(); index++) {
+                assertEquals(expectedRefs.isNull(index), actualRefs.isNull(index));
+                if (!expectedRefs.isNull(index)) {
+                  assertEquals(
+                      ((UInt4Vector) expectedRefs.getChild("source_context")).get(index),
+                      ((UInt4Vector) actualRefs.getChild("source_context")).get(index));
+                  assertArrayEquals(
+                      ((LargeVarBinaryVector) expectedRefs.getChild("locator")).get(index),
+                      ((LargeVarBinaryVector) actualRefs.getChild("locator")).get(index));
+                  assertEquals(
+                      ((UInt8Vector) expectedRefs.getChild("length")).getObject(index),
+                      ((UInt8Vector) actualRefs.getChild("length")).getObject(index));
+                }
+              }
+            }
+          }
+          assertEquals(fixture.get("payloads").size(), scanned.getVectorSchemaRoot().getRowCount());
+          SourceContext unrelated = SourceContext.fromDataset(dataset, "other/table", "workers");
+          IllegalArgumentException mismatch =
+              assertThrows(
+                  IllegalArgumentException.class,
+                  () ->
+                      capture.captureToArrow(
+                          unrelated, scanned.getVectorSchemaRoot(), "blob", allocator));
+          assertTrue(mismatch.getMessage().contains("scan source"));
+          RuntimeException wireMissing =
+              assertThrows(
+                  RuntimeException.class,
+                  () ->
+                      capture.capture(source, scanned.getVectorSchemaRoot(), "missing", allocator));
+          RuntimeException directMissing =
+              assertThrows(
+                  wireMissing.getClass(),
+                  () ->
+                      capture.captureToArrow(
+                          source, scanned.getVectorSchemaRoot(), "missing", allocator));
+          assertEquals(wireMissing.getMessage(), directMissing.getMessage());
+        } else {
+          refs = capture.capture(source, scanned.getVectorSchemaRoot(), "blob", allocator);
+        }
+        refs = Batch.decode(refs.encode());
+        List<Request> requests = new ArrayList<>();
+        for (JsonNode request : fixture.get("requests")) {
+          long index = Long.parseUnsignedLong(request.get("request_index").asText());
+          JsonNode range = request.get("range");
+          requests.add(
+              range.isNull()
+                  ? Request.whole(request.get("reference_index").asLong(), index)
+                  : Request.range(
+                      request.get("reference_index").asLong(),
+                      index,
+                      range.get(0).asLong(),
+                      range.get(1).asLong()));
+        }
+        Map<Long, byte[]> results = new HashMap<>();
+        try (ReadStream stream = reader.read(refs, requests)) {
+          if (byteResults) {
+            ReadResult result;
+            while ((result = stream.nextBytes()) != null) {
+              assertFalse(results.containsKey(result.getRequestIndex()));
+              results.put(result.getRequestIndex(), result.getData());
+            }
+            assertNull(stream.nextBytes());
+          } else {
+            VectorSchemaRoot next;
+            while ((next = stream.next(allocator)) != null) {
+              try (VectorSchemaRoot result = next) {
+                results.put(
+                    ((UInt8Vector) result.getVector("request_index")).get(0),
+                    ((LargeVarBinaryVector) result.getVector("data")).get(0));
+              }
+            }
+          }
+          stream.close();
+          assertNull(stream.next(allocator));
+          assertNull(stream.nextBytes());
+        }
+        assertEquals(requests.size(), results.size());
+        for (JsonNode request : fixture.get("requests")) {
+          long index = Long.parseUnsignedLong(request.get("request_index").asText());
+          JsonNode expected = request.get("expected");
+          assertTrue(results.containsKey(index));
+          if (expected.isNull()) assertNull(results.get(index));
+          else
+            assertArrayEquals(
+                expected.asText().getBytes(StandardCharsets.UTF_8), results.get(index));
+        }
+        if (byteResults) {
+          byte[] duplicate = results.get(5L).clone();
+          results.get(4L)[0] ^= 1;
+          assertArrayEquals(duplicate, results.get(5L));
+        }
+        Batch validated = refs;
+        for (JsonNode range : fixture.get("invalid_ranges")) {
+          long offset = Long.parseUnsignedLong(range.get("offset").asText());
+          long length = Long.parseUnsignedLong(range.get("length").asText());
+          IllegalArgumentException error =
+              assertThrows(
+                  IllegalArgumentException.class,
+                  () -> reader.read(validated, List.of(Request.range(2, 0, offset, length))));
+          assertTrue(error.getMessage().contains("range"));
+        }
+        assertEquals(1L, reader.getMetrics().get("duplicate_demands"));
+        // A scheduler task can retain the read reservation briefly after delivering its response.
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(1);
+        while ((reader.getReservedBytes() != 0 || reader.getIoReservedBytes() != 0)
+            && System.nanoTime() < deadline) {
+          Thread.sleep(1);
+        }
+        assertEquals(0L, reader.getMetrics().get("reserved_bytes"));
+        assertEquals(0, reader.getIoReservedBytes());
+        assertFalse(scanned.loadNextBatch());
+      }
+    }
+  }
+
+  private static Dataset createConformanceBlobDataset(
+      BufferAllocator allocator, String path, JsonNode fixture) {
+    Field blob =
+        new Field(
+            "blob",
+            new FieldType(
+                true,
+                ArrowType.Struct.INSTANCE,
+                null,
+                Map.of(
+                    "ARROW:extension:name",
+                    "lance.blob.v2",
+                    "lance-encoding:blob-inline-size-threshold",
+                    "4",
+                    "lance-encoding:blob-dedicated-size-threshold",
+                    "8")),
+            List.of(
+                Field.nullable("data", ArrowType.LargeBinary.INSTANCE),
+                Field.nullable("uri", ArrowType.Utf8.INSTANCE)));
+    Schema schema = new Schema(List.of(blob));
+    try (Dataset empty =
+            Dataset.write()
+                .allocator(allocator)
+                .uri(path)
+                .schema(schema)
+                .dataStorageVersion(LanceConstants.FILE_FORMAT_VERSION_2_2)
+                .execute();
+        VectorSchemaRoot root = VectorSchemaRoot.create(schema, allocator)) {
+      root.allocateNew();
+      StructVector blobs = (StructVector) root.getVector("blob");
+      LargeVarBinaryVector data = (LargeVarBinaryVector) blobs.getChild("data");
+      JsonNode payloads = fixture.get("payloads");
+      for (int index = 0; index < payloads.size(); index++) {
+        if (payloads.get(index).isNull()) blobs.setNull(index);
+        else {
+          blobs.setIndexDefined(index);
+          data.setSafe(index, payloads.get(index).asText().getBytes(StandardCharsets.UTF_8));
+        }
+      }
+      root.setRowCount(payloads.size());
+      List<FragmentMetadata> fragments =
+          Fragment.create(
+              path,
+              allocator,
+              root,
+              new WriteParams.Builder()
+                  .withMode(WriteParams.WriteMode.APPEND)
+                  .withDataStorageVersion(LanceConstants.FILE_FORMAT_VERSION_2_2)
+                  .build());
+      try (Transaction transaction =
+          new Transaction.Builder()
+              .readVersion(empty.version())
+              .operation(Append.builder().fragments(fragments).build())
+              .build()) {
+        return new CommitBuilder(empty).execute(transaction);
+      }
     }
   }
 

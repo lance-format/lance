@@ -522,11 +522,15 @@ impl Scanner {
             let mut vector_scan_projection = self
                 .dataset
                 .empty_projection()
+                .with_blob_handling(self.blob_handling.clone())
                 .with_row_id()
                 .union_columns(&columns, OnMissing::Error)?;
 
             vector_scan_projection.with_row_addr =
                 self.projection_plan.physical_projection.with_row_addr;
+            vector_scan_projection = self
+                .calc_eager_projection(filter_plan, &vector_scan_projection)?
+                .union_columns(&columns, OnMissing::Error)?;
 
             let PlannedFilteredScan { mut plan, .. } = self
                 .filtered_read(

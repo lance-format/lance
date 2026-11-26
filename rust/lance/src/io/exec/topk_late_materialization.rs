@@ -48,7 +48,7 @@ use std::collections::HashSet;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
-use arrow_schema::{Fields, Schema as ArrowSchema};
+use arrow_schema::{DataType, FieldRef, Fields, Schema as ArrowSchema};
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::config::ConfigOptions;
 use datafusion::error::Result as DFResult;
@@ -65,8 +65,8 @@ use datafusion::physical_plan::{ExecutionPlan, Partitioning};
 use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_expr::utils::{collect_columns, reassign_expr_columns};
 use datafusion_physical_expr::{LexOrdering, PhysicalExpr, PhysicalSortExpr};
-use lance_core::ROW_ID;
-use lance_core::datatypes::OnMissing;
+use lance_arrow::DataTypeExt;
+use lance_core::datatypes::{BlobHandling, Field, OnMissing};
 use lance_select::RowSetOps;
 
 use super::TakeExec;
@@ -224,11 +224,16 @@ impl TopKLateMaterialization {
 
         let original = node.schema();
         let full = &read.options().projection;
+        // A filter may read descriptors even when the result requests payloads.
+        // Recover the final take's handling from the output types, independently
+        // of the filter's cheaper representation.
+        let mut binary_ids = HashSet::new();
+        collect_binary_field_ids(&dataset.schema().fields, original.fields(), &mut binary_ids);
         let wanted = dataset
             .empty_projection()
             .union_arrow_schema(&original, OnMissing::Ignore)
             .map_err(|e| e.to_string())?
-            .with_blob_handling(full.blob_handling.clone());
+            .with_blob_handling(BlobHandling::SomeBinary(binary_ids));
         let mut narrow = dataset
             .empty_projection()
             .union_columns(sort_column_names(sort.expr()), OnMissing::Ignore)
@@ -336,6 +341,37 @@ impl TopKLateMaterialization {
     }
 }
 
+/// Match by name since provider schemas can omit storage field IDs and metadata.
+fn collect_binary_field_ids(stored: &[Field], output: &[FieldRef], binary_ids: &mut HashSet<u32>) {
+    for output_field in output {
+        let Some(stored_field) = stored
+            .iter()
+            .find(|field| &field.name == output_field.name())
+        else {
+            continue;
+        };
+        match output_field.data_type() {
+            data_type if data_type.is_binary_like() => {
+                binary_ids.insert(stored_field.id as u32);
+            }
+            DataType::Struct(children) if !stored_field.is_blob() => {
+                collect_binary_field_ids(&stored_field.children, children, binary_ids);
+            }
+            DataType::List(child)
+            | DataType::LargeList(child)
+            | DataType::FixedSizeList(child, _)
+            | DataType::Map(child, _) => {
+                collect_binary_field_ids(
+                    &stored_field.children,
+                    std::slice::from_ref(child),
+                    binary_ids,
+                );
+            }
+            _ => {}
+        }
+    }
+}
+
 impl PhysicalOptimizerRule for TopKLateMaterialization {
     fn optimize(
         &self,
@@ -382,15 +418,21 @@ fn rebuild(
     input: Arc<dyn ExecutionPlan>,
 ) -> Result<Arc<dyn ExecutionPlan>, String> {
     if let Some(projection) = node.downcast_ref::<ProjectionExec>() {
-        // Keep the selected columns the narrowed read still has, plus the row id.
+        // Keep the selected columns first, then every other narrowed column.
+        // A scanner projection may remove sort keys before a take restores them;
+        // dropping that take requires carrying the keys through the projection.
         let schema = input.schema();
-        let kept = projection
+        let mut kept = projection
             .expr()
             .iter()
             .map(|projected| projected.alias.as_str())
-            .filter(|name| *name != ROW_ID && schema.index_of(name).is_ok())
-            .chain([ROW_ID])
+            .filter(|name| schema.index_of(name).is_ok())
             .collect::<Vec<_>>();
+        for field in schema.fields() {
+            if !kept.contains(&field.name().as_str()) {
+                kept.push(field.name());
+            }
+        }
         return project(input, kept);
     }
     replace_children_if_necessary(node.clone(), vec![input]).map_err(|e| e.to_string())
@@ -523,6 +565,7 @@ mod tests {
     use datafusion::prelude::{SessionContext, col as logical_col, lit};
     use datafusion_functions::core::expr_fn::arrow_metadata;
     use datafusion_physical_expr::expressions::{col, is_null};
+    use lance_core::ROW_ID;
     use rstest::rstest;
 
     use super::*;

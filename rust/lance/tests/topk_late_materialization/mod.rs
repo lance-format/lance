@@ -10,7 +10,8 @@ use std::sync::Arc;
 use arrow::datatypes::{Int32Type, UInt64Type};
 use arrow_array::cast::AsArray;
 use arrow_array::{
-    Int32Array, RecordBatch, RecordBatchIterator, RecordBatchOptions, StringArray, UInt32Array,
+    Int32Array, RecordBatch, RecordBatchIterator, RecordBatchOptions, StringArray, StructArray,
+    UInt32Array,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef, SortOptions};
 use arrow_select::take::take_record_batch;
@@ -39,11 +40,12 @@ use datafusion::prelude::SessionContext;
 use futures::StreamExt;
 use lance::datafusion::LanceTableProvider;
 use lance::dataset::WriteParams;
+use lance::dataset::scanner::ColumnOrdering;
 use lance::io::exec::TakeExec;
 use lance::io::exec::filtered_read::{FilteredReadExec, FilteredReadOptions, FilteredReadPlan};
 use lance::io::exec::topk_late_materialization::TopKLateMaterialization;
 use lance::{BlobArrayBuilder, Dataset, blob_field};
-use lance_core::datatypes::BlobHandling;
+use lance_core::{Error, datatypes::BlobHandling};
 use lance_datafusion::utils::{BYTES_READ_METRIC, MetricsExt};
 use lance_datagen::{BatchCount, ByteCount, RowCount, array, gen_batch};
 use lance_select::RowAddrTreeMap;
@@ -226,11 +228,20 @@ async fn sql_topk_keeps_its_ordering_for_the_parent() {
 
 /// 3 fragments of 4 rows: `id` is the row number, `text` is derived from it,
 /// and `blob` is a blob v2 column holding `id` bytes, null every third row.
-async fn make_blob_dataset() -> Arc<Dataset> {
+async fn make_blob_dataset(is_nested: bool) -> Arc<Dataset> {
+    let blob = if is_nested {
+        Field::new(
+            "blob",
+            DataType::Struct(vec![blob_field("value", true)].into()),
+            true,
+        )
+    } else {
+        blob_field("blob", true)
+    };
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int32, false),
         Field::new("text", DataType::Utf8, false),
-        blob_field("blob", true),
+        blob,
     ]));
     let ids = (0..12).collect::<Vec<i32>>();
     let texts = StringArray::from_iter_values(ids.iter().map(|id| format!("text {id}")));
@@ -244,13 +255,23 @@ async fn make_blob_dataset() -> Arc<Dataset> {
             blobs.push_bytes(vec![*id as u8; *id as usize]).unwrap();
         }
     }
+    let blobs = blobs.finish().unwrap();
+    let blobs = if is_nested {
+        let fields = match schema.field(2).data_type() {
+            DataType::Struct(fields) => fields.clone(),
+            _ => unreachable!(),
+        };
+        Arc::new(StructArray::new(
+            fields,
+            vec![blobs.clone()],
+            blobs.nulls().cloned(),
+        )) as arrow_array::ArrayRef
+    } else {
+        blobs
+    };
     let batch = RecordBatch::try_new(
         schema.clone(),
-        vec![
-            Arc::new(Int32Array::from(ids)),
-            Arc::new(texts),
-            blobs.finish().unwrap(),
-        ],
+        vec![Arc::new(Int32Array::from(ids)), Arc::new(texts), blobs],
     )
     .unwrap();
     let mut dataset = Dataset::write(
@@ -283,14 +304,19 @@ async fn make_blob_dataset() -> Arc<Dataset> {
      SELECT id, blob FROM s ORDER BY id",
     0
 )]
+#[case::filtered_nulls(
+    "SELECT id, blob FROM t WHERE blob IS NULL ORDER BY md5(text), id LIMIT 2",
+    2
+)]
 #[tokio::test]
 async fn sql_topk_takes_a_blob_column(
     #[case] sql: &str,
     #[case] expected_nulls: usize,
     #[values(None, Some(BlobHandling::AllBinary))] blob_handling: Option<BlobHandling>,
     #[values(false, true)] is_wrapped: bool,
+    #[values(false, true)] is_nested: bool,
 ) {
-    let mut provider = LanceTableProvider::new(make_blob_dataset().await, false, false);
+    let mut provider = LanceTableProvider::new(make_blob_dataset(is_nested).await, false, false);
     if let Some(blob_handling) = blob_handling {
         provider = provider.with_blob_handling(blob_handling);
     }
@@ -318,7 +344,7 @@ async fn sql_topk_takes_a_blob_column(
 #[tokio::test]
 async fn sql_topk_sorting_on_field_metadata_keeps_its_order() {
     let provider = Arc::new(LanceTableProvider::new(
-        make_blob_dataset().await,
+        make_blob_dataset(false).await,
         false,
         false,
     ));
@@ -336,6 +362,37 @@ async fn sql_topk_sorting_on_field_metadata_keeps_its_order() {
     );
     assert_eq!(take_output_rows(&rewritten), [2], "{shown}");
     assert_eq!(actual, expected, "{shown}");
+}
+
+#[rstest]
+#[case::payload_exact("blob", false)]
+#[case::payload_uppercase("BLOB", false)]
+#[case::metadata_exact("blob.size", true)]
+#[case::metadata_uppercase("BLOB.SIZE", true)]
+#[tokio::test]
+async fn scanner_blob_ordering_resolves_case_consistently(
+    #[case] column: &str,
+    #[case] is_metadata: bool,
+) {
+    let dataset = make_blob_dataset(false).await;
+    let mut scan = dataset.scan();
+    scan.blob_handling(BlobHandling::AllDescriptions);
+    scan.project(&["id"]).unwrap();
+    scan.order_by(Some(vec![ColumnOrdering::asc_nulls_last(column.into())]))
+        .unwrap();
+    let result = scan.try_into_batch().await;
+    if is_metadata {
+        let result = result.unwrap();
+        assert_eq!(result.num_rows(), 12);
+        assert_eq!(
+            &result["id"].as_primitive::<Int32Type>().values()[..8],
+            &[1, 2, 4, 5, 7, 8, 10, 11]
+        );
+    } else {
+        let error = result.unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(error.to_string().contains("requires binary blob handling"));
+    }
 }
 
 #[tokio::test]

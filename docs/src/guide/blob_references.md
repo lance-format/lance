@@ -335,6 +335,9 @@ compact context does not carry a base registry.
 
 ## Combining batches
 
+For nested capture, worker reconstruction, conformance inputs, and measured I/O
+qualification, see [Engine blob integration](blob_reference_integration.md).
+
 Two independently produced batches can both use slot zero for unrelated sources.
 Intern contexts by their full source fingerprint, then call
 `BlobRefBatch::remap_contexts` with the shared context table. The method updates
@@ -502,13 +505,31 @@ that needs the same budget. A retained slice or array keeps its reservation even
 after the stream is cancelled or closed. Additional copies made by an engine are
 outside this native budget and need separate accounting.
 
+Java consumers that need byte arrays can call `ReadStream.nextBytes()`. It returns
+a `ReadResult` with `getRequestIndex()` and nullable `getData()`, or null at EOF.
+It copies each result into JVM memory without creating an Arrow result batch.
+The copied arrays remain valid after stream close and do not retain native
+reservations. Bound their retained JVM memory separately. Each value must fit a
+Java byte array; use Arrow results or chunked range requests for larger values.
+For a consumer accepting a request index and a nullable byte array:
+
+```java
+try (BlobReferences.ReadStream stream = reader.read(refs, requests)) {
+    BlobReferences.ReadResult result;
+    while ((result = stream.nextBytes()) != null) {
+        consume.accept(result.getRequestIndex(), result.getData());
+    }
+}
+```
+
 Both factories require finite, nonzero `io_buffer_size_bytes` and
 `materialization_readahead_bytes` limits (camel case in Java). One oversized demand
 may run alone when idle; use chunked ranges if an engine requires a per-value cap.
 Streams from one reader share these limits. Closing the reader factory prevents
-new submissions; existing streams and returned arrays keep their owners and must
-be closed/released separately. Cancellation can interrupt a blocked `next` or a
-budget wait. Pending requests terminate with an error instead of becoming nulls.
+new submissions; existing streams and returned Arrow arrays keep their owners and
+must be closed/released separately. Cancellation can interrupt a blocked `next`,
+`nextBytes`, or a budget wait. Pending requests terminate with an error instead of
+becoming nulls.
 
 Java represents unsigned indices, versions, offsets, lengths, and limits as `long`
 bit patterns; use `Long.parseUnsignedLong`/`Long.toUnsignedString` as needed.
@@ -523,4 +544,6 @@ Python accepts integers in `0..=2**64-1`. Neither binding truncates high bits.
 | Source snapshot lifetime | Application-managed | Application-managed | Application-managed |
 | Automatic expiration/renewal | No | No | No |
 | Foreign dataset owner retention | Separate agreement | Separate agreement | Separate agreement |
-| Nested reference capture | No | No | No |
+| Struct/List/LargeList reference capture | Yes | Yes | Yes |
+| FixedSizeList/Map/union reference capture | No | No | No |
+| Reader I/O, demand, and reservation metrics | Yes | Yes | Yes |

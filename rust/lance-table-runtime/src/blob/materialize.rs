@@ -40,7 +40,6 @@ pub(super) struct BlobMaterializationBudgetState {
     next_ticket: u64,
     serving_ticket: u64,
     cancelled_tickets: HashSet<u64>,
-    #[cfg(any(test, feature = "test-util"))]
     peak_reserved: u64,
 }
 
@@ -98,10 +97,7 @@ impl BlobMaterializationAdmission {
                 let oversized_and_idle = state.reserved == 0 && bytes > budget.limit;
                 if self.ticket == state.serving_ticket && (fits || oversized_and_idle) {
                     state.reserved = state.reserved.saturating_add(bytes);
-                    #[cfg(any(test, feature = "test-util"))]
-                    {
-                        state.peak_reserved = state.peak_reserved.max(state.reserved);
-                    }
+                    state.peak_reserved = state.peak_reserved.max(state.reserved);
                     state.serving_ticket = state.serving_ticket.wrapping_add(1);
                     state.skip_cancelled();
                     self.acquired = true;
@@ -275,6 +271,25 @@ impl BlobMaterializationContext {
             })
             .transpose()
             .map(|bytes| bytes.unwrap_or(0))
+    }
+
+    /// Peak materialization and I/O reservations across readers sharing this context.
+    #[doc(hidden)]
+    pub fn reservation_peaks(&self) -> Result<(u64, u64)> {
+        let peak = |budget: &Option<Arc<BlobMaterializationBudget>>| -> Result<u64> {
+            budget
+                .as_ref()
+                .map(|budget| {
+                    budget
+                        .state
+                        .lock()
+                        .map(|state| state.peak_reserved)
+                        .map_err(|_| Error::internal("Blob reservation budget lock was poisoned"))
+                })
+                .transpose()
+                .map(|value| value.unwrap_or(0))
+        };
+        Ok((peak(&self.budget)?, peak(&self.io_budget)?))
     }
 
     #[cfg(any(test, feature = "test-util"))]

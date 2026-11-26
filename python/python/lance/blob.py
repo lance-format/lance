@@ -41,6 +41,9 @@ from .lance import (
     ManagedBlobWriter as ManagedBlobWriter,
 )
 from .lance import (
+    NestedBlobRefBatch as NestedBlobRefBatch,
+)
+from .lance import (
     PackedBlobWriter as PackedBlobWriter,
 )
 from .lance import read_blob_file_ranges as _read_blob_file_ranges

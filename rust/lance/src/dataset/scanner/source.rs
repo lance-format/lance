@@ -27,6 +27,7 @@ use datafusion::physical_plan::union::UnionExec;
 use datafusion::scalar::ScalarValue;
 use futures::FutureExt;
 use futures::future::BoxFuture;
+use lance_arrow::FieldExt;
 use lance_core::datatypes::{OnMissing, Projection};
 use lance_core::error::LanceOptionExt;
 use lance_core::utils::address::RowAddress;
@@ -60,6 +61,32 @@ use super::{
     DEFAULT_IO_BUFFER_SIZE, LEGACY_DEFAULT_FRAGMENT_READAHEAD, PlannedFilteredScan, Scanner,
     validate_batch_size,
 };
+
+// Carried descriptors and payloads share field identities but cannot satisfy each other's layout.
+fn blob_layout_differs(expected: &arrow_schema::Field, current: &arrow_schema::Field) -> bool {
+    if expected.is_blob_v2() || current.is_blob_v2() {
+        return matches!(expected.data_type(), DataType::LargeBinary)
+            != matches!(current.data_type(), DataType::LargeBinary);
+    }
+    match (expected.data_type(), current.data_type()) {
+        (DataType::Struct(expected), DataType::Struct(current)) => expected.iter().any(|field| {
+            current
+                .find(field.name())
+                .is_some_and(|(_, current)| blob_layout_differs(field, current))
+        }),
+        (
+            DataType::List(expected)
+            | DataType::LargeList(expected)
+            | DataType::FixedSizeList(expected, _)
+            | DataType::Map(expected, _),
+            DataType::List(current)
+            | DataType::LargeList(current)
+            | DataType::FixedSizeList(current, _)
+            | DataType::Map(current, _),
+        ) => blob_layout_differs(expected, current),
+        _ => false,
+    }
+}
 
 /// Represents a user-requested take operation
 #[derive(Debug, Clone)]
@@ -316,7 +343,8 @@ impl Scanner {
             let scan = self.scan_fragments(
                 ScanOptions {
                     with_row_id: projection.with_row_id,
-                    with_row_address: self.projection_plan.physical_projection.with_row_addr,
+                    with_row_address: projection.with_row_addr
+                        || self.projection_plan.physical_projection.with_row_addr,
                     with_row_last_updated_at_version: self
                         .projection_plan
                         .physical_projection
@@ -720,7 +748,23 @@ impl Scanner {
     // columns referenced by the aggregate, not all the columns from the projection plan.
     fn source_projection(&self) -> Result<Projection> {
         let Some(agg) = &self.aggregate else {
-            return Ok(self.projection_plan.physical_projection.clone());
+            let mut projection = self.projection_plan.physical_projection.clone();
+            if let Some(ordering) = &self.ordering {
+                let sorting = self.ordering_projection(ordering)?;
+                let content = self.ordering_content_projection(ordering)?;
+                // Keep row identity until descriptors have been replaced by bytes,
+                // including hidden content sort keys on an unfiltered scan.
+                let requires_payload_take = self.dataset.schema().fields_pre_order().any(|field| {
+                    field.is_blob_v2()
+                        && (projection.field_ids.contains(&field.id)
+                            || content.field_ids.contains(&field.id))
+                        && !projection.blob_handling.returns_description(field)
+                        && sorting.blob_handling.returns_description(field)
+                });
+                projection.with_row_addr |= requires_payload_take;
+                projection.blob_handling = sorting.blob_handling;
+            }
+            return Ok(projection);
         };
         let required_columns = agg.required_columns();
         if required_columns.is_empty() {
@@ -814,6 +858,17 @@ impl Scanner {
             // If the user is not requesting any columns then we will scan the row address which
             // is cheap
             projection.with_row_addr = true;
+        }
+
+        if let Some(ordering) = &self.ordering {
+            let projected = projection.to_schema();
+            let sort_column_missing = ordering
+                .iter()
+                .any(|column| projected.field(&column.column_name).is_none());
+            if sort_column_missing && !projection.with_row_id && !projection.with_row_addr {
+                // Fetching an unselected sort column later needs a physical row identity.
+                projection.with_row_addr = true;
+            }
         }
 
         // An external mask is applied as the row source inside new_filtered_read, so
@@ -1228,6 +1283,28 @@ impl Scanner {
         input: Arc<dyn ExecutionPlan>,
         output_projection: Projection,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        let output_schema = output_projection.to_arrow_schema();
+        let input_schema = input.schema();
+        let carried_fields = input_schema
+            .fields()
+            .iter()
+            .filter(|field| {
+                !output_schema
+                    .field_with_name(field.name())
+                    .is_ok_and(|expected| blob_layout_differs(expected, field))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let input = if carried_fields.len() != input_schema.fields().len() {
+            // Remove the old representation so the row-stream read fetches the requested one.
+            let carried_schema = arrow_schema::Schema::new_with_metadata(
+                carried_fields,
+                input_schema.metadata().clone(),
+            );
+            Arc::new(project(input, &carried_schema)?) as Arc<dyn ExecutionPlan>
+        } else {
+            input
+        };
         let fields_to_take = output_projection
             .clone()
             .subtract_arrow_schema(input.schema().as_ref(), OnMissing::Ignore)?;

@@ -270,7 +270,7 @@ struct BlobReadLocation {
 #[derive(Debug)]
 pub struct BlobReferenceLocation {
     /// Absolute backing-object URI, preserving provider-specific authority.
-    pub object_uri: String,
+    pub object_uri: CanonicalBlobUri,
     /// Start of the logical blob within the backing object.
     pub offset: u64,
     /// Logical length; absent for unresolved whole external objects.
@@ -279,6 +279,45 @@ pub struct BlobReferenceLocation {
     pub kind: BlobKind,
     /// Registered storage base, when present.
     pub base_id: Option<u32>,
+}
+
+/// A URI canonicalized by the same validator used for untrusted locators.
+#[derive(Clone, Debug)]
+pub struct CanonicalBlobUri(Arc<str>);
+
+impl CanonicalBlobUri {
+    /// Validate an absolute URI and normalize its representation.
+    pub fn try_new(uri: &str) -> Result<Self> {
+        canonical_uri(uri).map(|value| Self(value.into()))
+    }
+    /// Canonical URI bytes used in transported locators.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Validate and normalize the backing-object URI used by a portable locator.
+pub fn canonical_uri(uri: &str) -> Result<String> {
+    if url::Url::parse(uri).is_err() && !std::path::Path::new(uri).is_absolute() {
+        return Err(Error::invalid_input(format!(
+            "Blob reference URI must be absolute: {uri}"
+        )));
+    }
+    let url = uri_to_url(uri)?;
+    let has_username = !url.username().is_empty() && !matches!(url.scheme(), "az" | "abfss");
+    if url.fragment().is_some() || has_username || url.password().is_some() {
+        return Err(Error::invalid_input(
+            "Blob reference URI must not contain credentials or a fragment",
+        ));
+    }
+    Ok(url.to_string())
+}
+
+struct CaptureBase {
+    root: String,
+    path: Path,
+    url: url::Url,
+    objects: HashMap<Path, CanonicalBlobUri>,
 }
 
 /// Resolves [`StoredBlob`]s of one blob field to physical locations.
@@ -299,6 +338,7 @@ pub struct BlobLocator<'a> {
     /// Object lengths of External blobs, keyed by `(base_id, uri)`, for
     /// descriptors that were written without a size.
     external_sizes: HashMap<(u32, String), u64>,
+    capture_bases: HashMap<Option<u32>, CaptureBase>,
 }
 
 impl<'a> BlobLocator<'a> {
@@ -312,6 +352,7 @@ impl<'a> BlobLocator<'a> {
             external_stores: HashMap::new(),
             sources: HashMap::new(),
             external_sizes: HashMap::new(),
+            capture_bases: HashMap::new(),
         }
     }
 
@@ -325,6 +366,7 @@ impl<'a> BlobLocator<'a> {
             stores: self.stores,
             external_stores: self.external_stores,
             sources: self.sources,
+            capture_bases: self.capture_bases,
             external_sizes: self.external_sizes,
         }
     }
@@ -507,7 +549,7 @@ impl<'a> BlobLocator<'a> {
                     ));
                 }
                 return Ok(BlobReferenceLocation {
-                    object_uri: uri.to_string(),
+                    object_uri: CanonicalBlobUri::try_new(uri)?,
                     offset: position,
                     length: (size > 0).then_some(size),
                     kind: BlobKind::External,
@@ -542,36 +584,69 @@ impl<'a> BlobLocator<'a> {
                 (base_id, path, position, Some(size), BlobKind::Managed)
             }
         };
-        let root = match base_id {
-            Some(id) => self
-                .table
-                .manifest()
-                .base_paths
-                .get(&id)
-                .ok_or_else(|| {
-                    Error::invalid_input(format!("Blob references unknown base_id {id}"))
+        if !self.capture_bases.contains_key(&base_id) {
+            let root = match base_id {
+                Some(id) => self
+                    .table
+                    .manifest()
+                    .base_paths
+                    .get(&id)
+                    .ok_or_else(|| {
+                        Error::invalid_input(format!("Blob references unknown base_id {id}"))
+                    })?
+                    .path
+                    .clone(),
+                None => self.table.refs.root()?.uri,
+            };
+            let root_path = ObjectStore::extract_path_from_uri(
+                self.table.state.session.store_registry(),
+                &root,
+            )?;
+            let url = uri_to_url(&root)?;
+            self.capture_bases.insert(
+                base_id,
+                CaptureBase {
+                    root,
+                    path: root_path,
+                    url,
+                    objects: HashMap::new(),
+                },
+            );
+        }
+        let base = self
+            .capture_bases
+            .get_mut(&base_id)
+            .ok_or_else(|| Error::internal("Blob capture base disappeared after insertion"))?;
+        if !base.objects.contains_key(&path) {
+            let relative = path.prefix_match(&base.path).ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "Resolved blob path {path} is outside source root {}",
+                    base.root
+                ))
+            })?;
+            let mut url = base.url.clone();
+            // Keep provider-specific authorities while extending the physical path.
+            url.path_segments_mut()
+                .map_err(|_| {
+                    Error::invalid_input(format!(
+                        "Blob source URI cannot contain paths: {}",
+                        base.root
+                    ))
                 })?
-                .path
-                .clone(),
-            None => self.table.refs.root()?.uri,
-        };
-        let root_path =
-            ObjectStore::extract_path_from_uri(self.table.state.session.store_registry(), &root)?;
-        let relative = path.prefix_match(&root_path).ok_or_else(|| {
-            Error::invalid_input(format!(
-                "Resolved blob path {path} is outside source root {root}"
-            ))
-        })?;
-        let mut url = uri_to_url(&root)?;
-        // Keep provider-specific authorities while extending the physical path.
-        url.path_segments_mut()
-            .map_err(|_| {
-                Error::invalid_input(format!("Blob source URI cannot contain paths: {root}"))
-            })?
-            .pop_if_empty()
-            .extend(relative.map(|part| part.as_ref().to_string()));
+                .pop_if_empty()
+                .extend(relative.map(|part| part.as_ref().to_string()));
+            let canonical = CanonicalBlobUri::try_new(url.as_str())?;
+            if base.objects.len() == 256 {
+                base.objects.clear();
+            }
+            base.objects.insert(path.clone(), canonical);
+        }
+        let uri = base
+            .objects
+            .get(&path)
+            .ok_or_else(|| Error::internal("Blob capture object disappeared after insertion"))?;
         Ok(BlobReferenceLocation {
-            object_uri: url.into(),
+            object_uri: uri.clone(),
             offset: position,
             length: size,
             kind,

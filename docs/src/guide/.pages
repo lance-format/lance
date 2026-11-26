@@ -8,6 +8,7 @@ nav:
     - Snapshot Reference Protocol: snapshot_reference_protocol.md
     - Blob Reference Protocol: blob_reference_protocol.md
     - Portable Blob References: blob_references.md
+    - Engine Blob Integration: blob_reference_integration.md
     - JSON Support: json.md
     - Data Evolution: data_evolution.md
     - Tags and Branches: tags_and_branches.md

@@ -4,6 +4,7 @@
 import gc
 import importlib
 import io
+import json
 import queue
 import random
 import shutil
@@ -29,6 +30,7 @@ from lance.blob import (
     BlobRefReader,
     BlobSourceContext,
     BlobType,
+    NestedBlobRefBatch,
 )
 from lance.file import LanceFileSession
 from lance.fragment import write_fragments
@@ -39,7 +41,11 @@ LEGACY_BLOB_STORAGE_VERSION = "2.1"
 
 
 @pytest.mark.parametrize("complete", [False, True], ids=["minimal", "complete"])
-@pytest.mark.parametrize("nested", [False, True], ids=["top-level", "nested"])
+@pytest.mark.parametrize(
+    "parent",
+    ["video", "meta.video", "meta.`video.dot`"],
+    ids=["top-level", "nested", "quoted"],
+)
 @pytest.mark.parametrize(
     "child, value",
     [
@@ -50,7 +56,7 @@ LEGACY_BLOB_STORAGE_VERSION = "2.1"
         ("blob_uri", "external.bin"),
     ],
 )
-def test_blob_v2_descriptor_subfield_queries(tmp_path, complete, nested, child, value):
+def test_blob_v2_descriptor_subfield_queries(tmp_path, complete, parent, child, value):
     external = tmp_path / "external.bin"
     external.write_bytes(b"world!")
     blobs = lance.blob_array([b"hello", None, external.as_uri(), b"again"])
@@ -63,17 +69,16 @@ def test_blob_v2_descriptor_subfield_queries(tmp_path, complete, nested, child, 
             mask=blobs.is_null(),
         )
         blobs = pa.ExtensionArray.from_storage(blob_type, storage)
-    if nested:
+    if parent != "video":
+        leaf_name = "video.dot" if "`" in parent else "video"
         data = pa.table(
             {
                 "id": [0, 1, 2, 3],
-                "meta": pa.StructArray.from_arrays([blobs], names=["video"]),
+                "meta": pa.StructArray.from_arrays([blobs], names=[leaf_name]),
             }
         )
-        parent = "meta.video"
     else:
         data = pa.table({"id": [0, 1, 2, 3], "video": blobs})
-        parent = "video"
     ds = lance.write_dataset(
         data,
         tmp_path / "dataset",
@@ -3714,7 +3719,14 @@ def test_portable_factories_bind_partially_read_worker_without_rehashing(
 
 @pytest.fixture
 def portable_blob_references(tmp_path):
-    values = [b"abc", b"abcde", b"abcdefghij", None, b"", b"uv"]
+    fixture = json.loads(
+        (
+            Path(__file__).parents[3] / "test_data/blob_reference_v1/conformance.json"
+        ).read_text()
+    )
+    values = [
+        value.encode() if value is not None else None for value in fixture["payloads"]
+    ]
     table = pa.Table.from_arrays(
         [lance.blob_array(values)],
         schema=pa.schema(
@@ -3827,12 +3839,61 @@ def test_portable_worker_checks_v1_manifest_generation(tmp_path, replace_manifes
         assert values == {0: b"first", 1: b"second"}
 
 
+def test_portable_nested_capture_null_kind(tmp_path):
+    dataset = lance.write_dataset(
+        pa.table({"blob": lance.blob_array([b"a", None])}),
+        tmp_path / "null-kind.lance",
+        data_storage_version="2.2",
+    )
+    scanned = dataset.to_table(with_row_address=True).combine_chunks().to_batches()[0]
+    descriptors = scanned["blob"]
+    # Arrow operators may retain valid structs while making their children nullable.
+    descriptors = pa.StructArray.from_arrays(
+        [pa.array([None, None], type=pa.uint8())]
+        + [descriptors.field(i) for i in range(1, len(descriptors.type))],
+        fields=[field.with_nullable(True) for field in descriptors.type],
+    )
+    field = scanned.schema.field("blob").with_type(descriptors.type)
+    source = BlobSourceContext.from_dataset(dataset, "catalog/null-kind", "workers")
+    with BlobRefCapture(
+        dataset, source, dataset.lance_schema.field("blob").id()
+    ) as capture:
+        before = dataset.io_stats_snapshot()
+        nested = capture.capture_nested(source, field, scanned["_rowaddr"], descriptors)
+        assert dataset.io_stats_snapshot().read_iops == before.read_iops
+    assert nested.references.array.to_pylist() == [None, None]
+    assert nested.indices.column(0).to_pylist() == [None, None]
+
+
+@pytest.mark.parametrize("offset", [None, 0, 1])
+@pytest.mark.parametrize("sort_column", ["id", "blob"])
+def test_blob_zero_limit_sort(tmp_path, offset, sort_column):
+    dataset = lance.write_dataset(
+        pa.table({"id": [1, 0], "blob": lance.blob_array([b"a", b"b"])}),
+        tmp_path / "zero-limit.lance",
+        data_storage_version="2.2",
+    )
+    before = dataset.io_stats_snapshot()
+    result = dataset.to_table(
+        columns=["id"],
+        order_by=[sort_column],
+        blob_handling="all_binary",
+        limit=0,
+        offset=offset,
+    )
+    assert result.schema == pa.schema([pa.field("id", pa.int64())])
+    assert result.num_rows == 0
+    assert dataset.io_stats_snapshot().read_iops == before.read_iops
+
+
 def test_portable_blob_reference_requests(portable_blob_references):
     dataset, source, references = portable_blob_references
     assert BlobSourceContext.protocol_version() == 1
     assert BlobSourceContext.supported_capabilities() == [1, 2]
     assert BlobSourceContext.supported_operations() == [
         "capture_top_level",
+        "capture_nested",
+        "reader_metrics_v1",
         "read_whole",
         "read_range",
         "streaming",
@@ -3872,6 +3933,701 @@ def test_portable_blob_reference_requests(portable_blob_references):
             4: b"cdef",
         }
         _wait_for_blob_ref_budget_release(reader)
+        metrics = reader.metrics
+        assert metrics["descriptor_requests"] == 0
+        assert metrics["metadata_requests"] == 0
+        assert metrics["requested_logical_bytes"] == 20
+        assert metrics["returned_logical_bytes"] == 20
+        assert metrics["payload_bytes"] > 0
+        assert metrics["peak_reserved_bytes"] > 0
+
+
+def _nested_reference_scan(tmp_path, large_list):
+    fields = [
+        lance.blob_field(
+            "blob.dot", inline_size_threshold=0, dedicated_size_threshold=1
+        ),
+        lance.blob_field(
+            "sibling", inline_size_threshold=0, dedicated_size_threshold=1
+        ),
+    ]
+    items = pa.StructArray.from_arrays(
+        [
+            lance.blob_array(
+                [
+                    b"first",
+                    None,
+                    b"",
+                    b"hidden-child",
+                    b"hidden-parent",
+                    b"second",
+                    None,
+                ]
+            ),
+            lance.blob_array([b"unrelated"] * 7),
+        ],
+        fields=fields,
+        mask=pa.array([False, False, False, True, False, False, False]),
+    )
+    list_type = pa.LargeListArray if large_list else pa.ListArray
+    lists = list_type.from_arrays(
+        pa.array(
+            [0, 3, 3, 3, 4, 5, 6, 7], type=pa.int64() if large_list else pa.int32()
+        ),
+        items,
+        mask=pa.array([False, False, True, False, False, False, False]),
+    )
+    root = pa.StructArray.from_arrays(
+        [lists],
+        names=["clips.dot"],
+        mask=pa.array([False, False, False, False, True, False, False]),
+    )
+    dataset = lance.write_dataset(
+        pa.table({"media": root}),
+        tmp_path / "nested.lance",
+        max_rows_per_file=3,
+        data_storage_version="2.2",
+    )
+    source = BlobSourceContext.from_dataset(dataset, "catalog/nested", "workers")
+    scanned = dataset.to_table(with_row_address=True).combine_chunks().to_batches()[0]
+    scanned = scanned.take(pa.array([5, 0, 4, 3, 1, 2, 6, 0]))
+    leaf = dataset.lance_schema.fields()[0].children()[0].children()[0].children()[0]
+    return dataset, source, leaf.id(), scanned
+
+
+@pytest.mark.parametrize("large_list", [False, True], ids=["list", "large-list"])
+def test_portable_nested_capture(tmp_path, large_list):
+    dataset, source, field_id, scanned = _nested_reference_scan(tmp_path, large_list)
+    with BlobRefCapture(dataset, source, field_id) as capture:
+        before = dataset.io_stats_snapshot()
+        nested = capture.capture_nested(
+            source, scanned.schema.field("media"), scanned["_rowaddr"], scanned["media"]
+        )
+        assert dataset.io_stats_snapshot().read_iops == before.read_iops
+        with pytest.raises(ValueError, match="capture_nested"):
+            capture.capture(
+                source,
+                scanned.schema.field("media"),
+                scanned["_rowaddr"],
+                scanned["media"],
+            )
+    nested = NestedBlobRefBatch.decode(nested.encode())
+    nested = NestedBlobRefBatch.from_arrow(
+        nested.references.remap_contexts([source]), nested.indices
+    )
+    with pytest.raises(ValueError, match="exceeds reference count"):
+        NestedBlobRefBatch.from_arrow(
+            nested.references,
+            pa.record_batch(
+                [pa.array([(1 << 64) - 1], type=pa.uint64())], names=["invalid"]
+            ),
+        )
+    indices = nested.indices.column(0).to_pylist()
+    assert indices[2] is None
+    assert indices[4] == {"clips.dot": []}
+    assert indices[5] == {"clips.dot": None}
+    assert indices[3] == {"clips.dot": [None]}
+    assert indices[6] == {"clips.dot": [{"blob.dot": None}]}
+    refs = nested.references
+    selected = [
+        indices[0]["clips.dot"][0]["blob.dot"],
+        indices[1]["clips.dot"][0]["blob.dot"],
+        indices[1]["clips.dot"][2]["blob.dot"],
+        indices[7]["clips.dot"][0]["blob.dot"],
+    ]
+    with BlobRefReader(
+        [(source, dataset)],
+        io_buffer_size_bytes=1024,
+        materialization_readahead_bytes=1024,
+    ) as reader:
+        with reader.read(refs, selected, list(range(4))) as stream:
+            results = {}
+            for batch in stream:
+                results[batch["request_index"][0].as_py()] = batch["data"][0].as_py()
+                del batch
+        assert results == {0: b"second", 1: b"first", 2: b"", 3: b"first"}
+        assert reader.metrics["payload_requests"] == 2
+        assert reader.metrics["payload_bytes"] == 11
+        assert reader.metrics["duplicate_demands"] == 1
+
+
+def test_portable_shared_conformance_fixture(portable_blob_references):
+    dataset, source, refs = portable_blob_references
+    fixture = json.loads(
+        (
+            Path(__file__).parents[3] / "test_data/blob_reference_v1/conformance.json"
+        ).read_text()
+    )
+    requests = fixture["requests"]
+    assert fixture["protocol_version"] == BlobSourceContext.protocol_version()
+    with BlobRefReader(
+        [(source, dataset)],
+        io_buffer_size_bytes=1024,
+        materialization_readahead_bytes=1024,
+    ) as reader:
+        with reader.read(
+            refs,
+            [request["reference_index"] for request in requests],
+            [int(request["request_index"]) for request in requests],
+            [
+                tuple(request["range"]) if request["range"] is not None else None
+                for request in requests
+            ],
+        ) as stream:
+            results = {}
+            for batch in stream:
+                results[batch["request_index"][0].as_py()] = batch["data"][0].as_py()
+                del batch
+        assert results == {
+            int(request["request_index"]): request["expected"].encode()
+            if request["expected"] is not None
+            else None
+            for request in requests
+        }
+        for bounds in fixture["invalid_ranges"]:
+            with pytest.raises(ValueError, match="range"):
+                reader.read(
+                    refs, [2], [0], [(int(bounds["offset"]), int(bounds["length"]))]
+                )
+        assert reader.metrics["duplicate_demands"] == 1
+
+
+@pytest.mark.parametrize("large_list", [False, True], ids=["list", "large-list"])
+@pytest.mark.parametrize("start,length", [(0, 0), (1, 2), (4, 0), (7, 1), (8, 0)])
+def test_portable_nested_capture_slices(tmp_path, large_list, start, length):
+    dataset, source, field_id, scanned = _nested_reference_scan(tmp_path, large_list)
+    expected = [
+        {"clips.dot": [{"blob.dot": b"second"}]},
+        {"clips.dot": [{"blob.dot": b"first"}, {"blob.dot": None}, {"blob.dot": b""}]},
+        None,
+        {"clips.dot": [None]},
+        {"clips.dot": []},
+        {"clips.dot": None},
+        {"clips.dot": [{"blob.dot": None}]},
+        {"clips.dot": [{"blob.dot": b"first"}, {"blob.dot": None}, {"blob.dot": b""}]},
+    ][start : start + length]
+    scanned = scanned.slice(start, length)
+    with BlobRefCapture(dataset, source, field_id) as capture:
+        before = dataset.io_stats_snapshot()
+        nested = capture.capture_nested(
+            source, scanned.schema.field("media"), scanned["_rowaddr"], scanned["media"]
+        )
+        assert dataset.io_stats_snapshot().read_iops == before.read_iops
+    nested = NestedBlobRefBatch.decode(nested.encode())
+    refs = nested.references
+    with BlobRefReader(
+        [(source, dataset)],
+        io_buffer_size_bytes=1024,
+        materialization_readahead_bytes=1024,
+    ) as reader:
+        values = {}
+        with reader.read(
+            refs, list(range(len(refs))), list(range(len(refs)))
+        ) as stream:
+            for batch in stream:
+                values[batch["request_index"][0].as_py()] = batch["data"][0].as_py()
+                del batch
+    actual = nested.indices.column(0).to_pylist()
+    for root in actual:
+        if root is not None and root["clips.dot"] is not None:
+            for item in root["clips.dot"]:
+                if item is not None:
+                    index = item["blob.dot"]
+                    item["blob.dot"] = None if index is None else values[index]
+    assert actual == expected
+    lists = nested.indices.column(0).field("clips.dot")
+    assert lists.offsets[0].as_py() == 0
+
+
+@pytest.mark.parametrize("large_list", [False, True], ids=["list", "large-list"])
+@pytest.mark.parametrize("length", [0, 1])
+def test_portable_nested_mapping_post_capture_slice(tmp_path, large_list, length):
+    dataset, source, field_id, scanned = _nested_reference_scan(tmp_path, large_list)
+    with BlobRefCapture(dataset, source, field_id) as capture:
+        captured = capture.capture_nested(
+            source, scanned.schema.field("media"), scanned["_rowaddr"], scanned["media"]
+        )
+    refs = captured.references
+    refs = BlobRefBatch.from_arrow(refs.contexts, refs.field, refs.array.slice(0, 1))
+    visible = captured.indices.slice(0, length)
+    restored = NestedBlobRefBatch.from_arrow(refs, visible)
+    assert restored.indices.equals(visible)
+    assert NestedBlobRefBatch.decode(restored.encode()).indices.equals(visible)
+    with pytest.raises(ValueError, match="exceeds reference count 1"):
+        NestedBlobRefBatch.from_arrow(refs, captured.indices)
+
+
+@pytest.mark.parametrize(
+    "array,message",
+    [
+        (pa.array([0], type=pa.int32()), "Unsupported nested blob index layout"),
+        (pa.array([6], type=pa.uint64()), "exceeds reference count"),
+        (pa.array([[6]], type=pa.list_(pa.uint64())), "exceeds reference count"),
+        (
+            pa.array(
+                [{"a": 0, "b": 0}],
+                type=pa.struct([("a", pa.uint64()), ("b", pa.uint64())]),
+            ),
+            "Unsupported nested blob index layout",
+        ),
+        (
+            pa.array([[0]], type=pa.list_(pa.uint64(), 1)),
+            "Unsupported nested blob index layout",
+        ),
+    ],
+)
+def test_portable_nested_mapping_validation(portable_blob_references, array, message):
+    _, _, refs = portable_blob_references
+    with pytest.raises(ValueError, match=message):
+        NestedBlobRefBatch.from_arrow(refs, pa.record_batch([array], names=["indices"]))
+
+
+def test_portable_nested_null_mapping_without_references(portable_blob_references):
+    _, _, refs = portable_blob_references
+    refs = BlobRefBatch.from_arrow(refs.contexts, refs.field, refs.array.slice(0, 0))
+    indices = pa.record_batch(
+        [pa.array([None, None], type=pa.uint64())], names=["indices"]
+    )
+    nested = NestedBlobRefBatch.decode(
+        NestedBlobRefBatch.from_arrow(refs, indices).encode()
+    )
+    assert len(nested.references) == 0
+    assert nested.indices == indices
+
+
+@pytest.mark.parametrize(
+    "offset,length,expected",
+    [(0, 0, b""), (0, 10, b"abcdefghij"), (9, 1, b"j"), (10, 0, b"")],
+)
+def test_portable_range_boundaries(portable_blob_references, offset, length, expected):
+    dataset, source, refs = portable_blob_references
+    with BlobRefReader(
+        [(source, dataset)],
+        io_buffer_size_bytes=32,
+        materialization_readahead_bytes=64,
+    ) as reader:
+        with reader.read(refs, [2], [0], [(offset, length)]) as stream:
+            batch = next(stream)
+            assert batch["data"].to_pylist() == [expected]
+            del batch
+            assert next(stream, None) is None
+        assert reader.metrics["payload_bytes"] == length
+        assert reader.metrics["metadata_requests"] == 0
+        _wait_for_blob_ref_budget_release(reader)
+
+
+@pytest.mark.parametrize("offset,length", [(10, 1), (11, 0), ((1 << 64) - 1, 1)])
+def test_portable_invalid_last_demand_is_atomic(
+    portable_blob_references, offset, length
+):
+    dataset, source, refs = portable_blob_references
+    with BlobRefReader(
+        [(source, dataset)],
+        io_buffer_size_bytes=32,
+        materialization_readahead_bytes=64,
+    ) as reader:
+        with pytest.raises(ValueError, match="range"):
+            reader.read(refs, [0, 2], [0, 1], [None, (offset, length)])
+        assert reader.metrics["payload_requests"] == 0
+        assert reader.metrics["metadata_requests"] == 0
+        assert reader.reserved_bytes == 0
+
+
+@pytest.mark.parametrize("cancel", [False, True], ids=["close", "cancel"])
+def test_portable_unpolled_stream_termination(portable_blob_references, cancel):
+    dataset, source, refs = portable_blob_references
+    with BlobRefReader(
+        [(source, dataset)],
+        io_buffer_size_bytes=1,
+        materialization_readahead_bytes=1,
+    ) as reader:
+        stream = reader.read(refs, [0], [0])
+        if cancel:
+            stream.cancel()
+            with pytest.raises(OSError, match="cancel"):
+                next(stream)
+        else:
+            stream.close()
+        assert next(stream, None) is None
+        stream.close()
+        assert reader.metrics["payload_requests"] == 0
+        assert reader.metrics["metadata_requests"] == 0
+        assert reader.reserved_bytes == 0
+
+
+def test_portable_factory_close_preserves_stream_and_slice(portable_blob_references):
+    dataset, source, refs = portable_blob_references
+    reader = BlobRefReader(
+        [(source, dataset)],
+        io_buffer_size_bytes=4,
+        materialization_readahead_bytes=8,
+    )
+    stream = reader.read(refs, [0, 1], [0, 1])
+    reader.close()
+    with pytest.raises(ValueError, match="closed"):
+        reader.read(refs, [0], [0])
+    first = next(stream)
+    retained = first["data"].slice(0, 1)
+    del first
+    assert retained.to_pylist() == [b"abc"]
+    assert reader.reserved_bytes > 0
+    del retained
+    second = next(stream)
+    retained = second["data"].slice(0, 1)
+    del second
+    stream.close()
+    assert retained.to_pylist() == [b"abcde"]
+    assert reader.reserved_bytes > 0
+    del retained
+    _wait_for_blob_ref_budget_release(reader)
+    assert next(stream, None) is None
+
+
+def test_portable_error_after_yield_preserves_output(tmp_path):
+    healthy = tmp_path / "healthy.bin"
+    missing = tmp_path / "missing.bin"
+    healthy.write_bytes(b"good")
+    missing.write_bytes(b"gone")
+    dataset = lance.write_dataset(
+        pa.table(
+            {
+                "blob": lance.blob_array(
+                    [
+                        Blob.from_uri(path.as_uri(), position=0, size=4)
+                        for path in [healthy, missing]
+                    ]
+                )
+            }
+        ),
+        tmp_path / "partial-error.lance",
+        data_storage_version="2.2",
+        allow_external_blob_outside_bases=True,
+    )
+    source = BlobSourceContext.from_dataset(
+        dataset,
+        "catalog/partial-error",
+        "workers",
+        assume_immutable_external=True,
+    )
+    scanned = dataset.to_table(with_row_address=True).combine_chunks().to_batches()[0]
+    with BlobRefCapture(
+        dataset, source, dataset.lance_schema.field("blob").id()
+    ) as capture:
+        refs = capture.capture(
+            source, scanned.schema.field("blob"), scanned["_rowaddr"], scanned["blob"]
+        )
+    # Deliberately violate the external lifetime promise to exercise the error path.
+    missing.unlink()
+    with BlobRefReader(
+        [(source, dataset)], io_buffer_size_bytes=4, materialization_readahead_bytes=16
+    ) as reader:
+        with reader.read(refs, [0, 1], [70, 71]) as stream:
+            first = next(stream)
+            with pytest.raises(OSError, match="request 71.*payload read failed"):
+                next(stream)
+            assert next(stream, None) is None
+        assert first["data"].to_pylist() == [b"good"]
+        assert reader.reserved_bytes > 0
+        del first
+        with reader.read(refs, [0], [72]) as stream:
+            result = next(stream)
+            assert result["data"].to_pylist() == [b"good"]
+            del result
+        _wait_for_blob_ref_budget_release(reader)
+
+
+@pytest.mark.parametrize("large_list", [False, True])
+def test_portable_nested_combine_sources(tmp_path, large_list):
+    captures = []
+    bindings = []
+    for name in ["first", "second"]:
+        dataset, source, field_id, scanned = _nested_reference_scan(
+            tmp_path / name, large_list
+        )
+        bindings.append((source, dataset))
+        scanned = scanned.slice(0 if name == "first" else 1, 1)
+        with BlobRefCapture(dataset, source, field_id) as capture:
+            captures.append(
+                capture.capture_nested(
+                    source,
+                    scanned.schema.field("media"),
+                    scanned["_rowaddr"],
+                    scanned["media"],
+                )
+            )
+    contexts = [source for source, _ in bindings]
+    arrays = [nested.references.remap_contexts(contexts).array for nested in captures]
+    refs = BlobRefBatch.from_arrow(
+        contexts, captures[0].references.field, pa.concat_arrays(arrays)
+    )
+    mappings = []
+    offset = 0
+    for nested in captures:
+        rows = nested.indices.column(0).to_pylist()
+        for row in rows:
+            for item in row["clips.dot"]:
+                if item is not None and item["blob.dot"] is not None:
+                    item["blob.dot"] += offset
+        mappings.extend(rows)
+        offset += len(nested.references)
+    indices = pa.record_batch(
+        [pa.array(mappings, type=captures[0].indices.column(0).type)],
+        schema=captures[0].indices.schema,
+    ).take(pa.array([1, 0, 1]))
+    nested = NestedBlobRefBatch.decode(
+        NestedBlobRefBatch.from_arrow(refs, indices).encode()
+    )
+    selected = [
+        row["clips.dot"][0]["blob.dot"] for row in nested.indices.column(0).to_pylist()
+    ]
+    assert selected == [1, 0, 1]
+    assert [
+        row["source_context"] for row in refs.array.to_pylist() if row is not None
+    ] == [0, 1, 1]
+    with BlobRefReader(
+        bindings, io_buffer_size_bytes=1024, materialization_readahead_bytes=1024
+    ) as reader:
+        with reader.read(nested.references, selected, [0, 1, 2]) as stream:
+            values = {}
+            for batch in stream:
+                values[batch["request_index"][0].as_py()] = batch["data"][0].as_py()
+                del batch
+        assert values == {0: b"first", 1: b"second", 2: b"first"}
+        assert reader.metrics["payload_requests"] == 2
+    # Independent slot zero must not silently select the first source.
+    with pytest.raises(ValueError, match="does not match source_context"):
+        BlobRefBatch.from_arrow(
+            contexts,
+            refs.field,
+            pa.concat_arrays([item.references.array for item in captures]),
+        )
+
+
+@pytest.mark.parametrize("indexed", [False, True])
+def test_blob_scalar_refinement_with_unindexed_tail(tmp_path, indexed):
+    schema = pa.schema([pa.field("id", pa.int64()), lance.blob_field("blob")])
+    dataset = lance.write_dataset(
+        pa.Table.from_arrays(
+            [pa.array([0, 1, 2, 3]), lance.blob_array([b"c", None, b"b", b"a"])],
+            schema=schema,
+        ),
+        tmp_path / "refine.lance",
+        data_storage_version="2.2",
+        max_rows_per_file=2,
+        enable_stable_row_ids=True,
+    )
+    if indexed:
+        dataset.create_scalar_index("id", "BTREE")
+    dataset = lance.write_dataset(
+        pa.Table.from_arrays(
+            [pa.array([4, 5]), lance.blob_array([b"", b"aa"])], schema=schema
+        ),
+        dataset.uri,
+        mode="append",
+        max_rows_per_file=2,
+    )
+    dataset.delete("id = 2")
+    result = dataset.to_table(
+        columns=["id"],
+        filter="id >= 1 AND blob IS NOT NULL",
+        order_by=["blob", "id"],
+        blob_handling="all_binary",
+        limit=2,
+        offset=1,
+    )
+    assert result.to_pydict() == {"id": [3, 5]}
+
+
+def test_portable_metadata_filter_top_k_capture(portable_blob_references):
+    dataset, source, _ = portable_blob_references
+    scanned = (
+        dataset.to_table(
+            columns=["blob"],
+            filter="blob.size > 4",
+            order_by=["blob.size"],
+            limit=1,
+            with_row_address=True,
+            blob_handling="all_descriptions",
+        )
+        .combine_chunks()
+        .to_batches()[0]
+    )
+    with BlobRefCapture(
+        dataset, source, dataset.lance_schema.field("blob").id()
+    ) as capture:
+        before = dataset.io_stats_snapshot()
+        refs = capture.capture(
+            source, scanned.schema.field("blob"), scanned["_rowaddr"], scanned["blob"]
+        )
+        assert dataset.io_stats_snapshot().read_iops == before.read_iops
+    with BlobRefReader(
+        [(source, dataset)],
+        io_buffer_size_bytes=1024,
+        materialization_readahead_bytes=1024,
+    ) as reader:
+        with reader.read(refs, [0], [42]) as stream:
+            result = next(stream)
+            assert result["request_index"][0].as_py() == 42
+            assert result["data"][0].as_py() == b"abcde"
+            del result
+            assert next(stream, None) is None
+        assert reader.metrics["requested_logical_bytes"] == 5
+        assert reader.metrics["payload_requests"] == 1
+
+
+@pytest.mark.parametrize("with_row_address", [False, True])
+def test_blob_scan_orders_payload_bytes(tmp_path, with_row_address):
+    dataset = lance.write_dataset(
+        pa.table(
+            {"id": [0, 1, 2, 3], "blob": lance.blob_array([b"c", b"a", None, b"b"])}
+        ),
+        tmp_path / "sort.lance",
+        data_storage_version="2.2",
+        max_rows_per_file=2,
+    )
+    result = dataset.to_table(
+        columns=["id"],
+        order_by=["blob"],
+        blob_handling="all_binary",
+        with_row_address=with_row_address,
+    )
+    assert result["id"].to_pylist() == [1, 3, 0, 2]
+    assert result.column_names == (["id", "_rowaddr"] if with_row_address else ["id"])
+    with pytest.raises(ValueError, match="requires binary blob handling"):
+        dataset.to_table(
+            columns=["id"], order_by=["blob"], blob_handling="all_descriptions"
+        )
+    assert dataset.to_table(columns=["id"], order_by=["blob.size", "id"])[
+        "id"
+    ].to_pylist() == [0, 1, 3, 2]
+
+
+@pytest.mark.parametrize("metadata_first", [False, True])
+@pytest.mark.parametrize("filter_expr", [None, "id >= 0"])
+@pytest.mark.parametrize("limit,offset", [(None, 0), (2, 0), (2, 1)])
+@pytest.mark.parametrize("project_payload", [False, True])
+@pytest.mark.parametrize("nested", [False, True])
+def test_blob_mixed_metadata_and_content_order(
+    tmp_path, metadata_first, filter_expr, limit, offset, project_payload, nested
+):
+    payloads = [b"c" * 32, b"a" * 32, b"b" * 32, b"z" * 16, b"", None]
+    blobs = lance.blob_array(payloads)
+    data = {"id": range(len(payloads)), "payload": blobs}
+    payload_column = "payload"
+    if nested:
+        data = {
+            "id": range(len(payloads)),
+            "meta": pa.StructArray.from_arrays([blobs], names=["payload"]),
+        }
+        payload_column = "meta.payload"
+    dataset = lance.write_dataset(
+        pa.table(data),
+        tmp_path / "mixed_sort.lance",
+        data_storage_version="2.2",
+        max_rows_per_file=2,
+    )
+    ordering = [f"{payload_column}.size", payload_column]
+    expected_ids = [4, 3, 1, 2, 0, 5]
+    if not metadata_first:
+        ordering.reverse()
+        expected_ids = [4, 1, 2, 0, 3, 5]
+    expected_ids = expected_ids[offset:][:limit]
+    result = dataset.to_table(
+        columns=["id", payload_column] if project_payload else ["id"],
+        order_by=ordering,
+        filter=filter_expr,
+        blob_handling="all_binary",
+        limit=limit,
+        offset=offset,
+    )
+    expected = {"id": expected_ids}
+    if project_payload:
+        expected[payload_column] = [payloads[index] for index in expected_ids]
+    assert result.to_pydict() == expected
+
+
+@pytest.mark.parametrize("filter_expr", [None, "id >= 0"])
+@pytest.mark.parametrize("same_column", [False, True])
+@pytest.mark.parametrize("limit,offset", [(None, 0), (3, 1)])
+def test_blob_descriptor_order_preserves_binary_output(
+    tmp_path, filter_expr, same_column, limit, offset
+):
+    dataset = lance.write_dataset(
+        pa.table(
+            {
+                "id": [0, 1, 2, 3, 4],
+                "payload": lance.blob_array([b"four", b"z", b"qq", b"bbb", None]),
+                "sort_blob": lance.blob_array([b"ccc", b"", None, b"x", b"yy"]),
+            }
+        ),
+        tmp_path / "descriptor_sort.lance",
+        data_storage_version="2.2",
+        max_rows_per_file=2,
+    )
+    sort_column = "payload" if same_column else "sort_blob"
+    result = dataset.to_table(
+        columns=["payload"],
+        filter=filter_expr,
+        order_by=[f"{sort_column}.size", "id"],
+        blob_handling="all_binary",
+        limit=limit,
+        offset=offset,
+    )
+    assert result.schema.field("payload").type == pa.large_binary()
+    expected = (
+        [b"z", b"qq", b"bbb", b"four", None]
+        if same_column
+        else [b"z", b"bbb", None, b"four", b"qq"]
+    )
+    assert result.to_pydict() == {"payload": expected[offset:][:limit]}
+
+
+@pytest.mark.parametrize(
+    "prefilter, indexed",
+    [(None, False), (False, False), (True, False), (False, True), (True, True)],
+    ids=[
+        "scan",
+        "flat-postfilter",
+        "flat-prefilter",
+        "indexed-postfilter",
+        "indexed-prefilter",
+    ],
+)
+@pytest.mark.parametrize("filter_expr", ["blob IS NOT NULL", "blob.size > 0"])
+def test_blob_filter_preserves_binary_output(tmp_path, prefilter, indexed, filter_expr):
+    vectors = pa.FixedSizeListArray.from_arrays(
+        pa.array(
+            [float(row) for row in range(32) for _ in range(2)], type=pa.float32()
+        ),
+        2,
+    )
+    payloads = [None if row % 3 == 1 else bytes([row]) for row in range(32)]
+    dataset = lance.write_dataset(
+        pa.table({"vector": vectors, "blob": lance.blob_array(payloads)}),
+        tmp_path / "vectors.lance",
+        data_storage_version="2.2",
+        max_rows_per_file=16,
+    )
+    if indexed:
+        dataset.create_index("vector", "IVF_FLAT", num_partitions=2)
+    scanner = dataset.scanner(
+        columns=["blob"],
+        filter=filter_expr,
+        prefilter=bool(prefilter),
+        nearest=(
+            {"column": "vector", "q": [0.0, 0.0], "k": 32, "nprobes": 2}
+            if prefilter is not None
+            else None
+        ),
+        blob_handling="all_binary",
+    )
+    if indexed:
+        assert "ANNSubIndex" in scanner.explain_plan()
+    result = scanner.to_table()
+    assert result["blob"].type == pa.large_binary()
+    assert sorted(result["blob"].to_pylist()) == sorted(
+        value for value in payloads if value is not None
+    )
 
 
 @pytest.mark.parametrize(
@@ -3941,6 +4697,7 @@ def test_portable_blob_references_in_separate_process(
     )
     script = textwrap.dedent("""
         import sys
+        import time
         from pathlib import Path
         import lance
         refs = lance.BlobRefBatch.decode(Path(sys.argv[1]).read_bytes())
@@ -3955,7 +4712,14 @@ def test_portable_blob_references_in_separate_process(
                     values[batch['request_index'][0].as_py()] = batch['data'][0].as_py()
                     del batch
             assert values == {(1 << 64) - 1: b'cdef', 1: b'abc', 2: None, 3: b''}
+            deadline = time.monotonic() + 1
+            while (
+                (reader.reserved_bytes != 0 or reader.io_reserved_bytes != 0)
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.001)
             assert reader.reserved_bytes == 0
+            assert reader.io_reserved_bytes == 0
     """)
     completed = subprocess.run(
         [sys.executable, "-c", script, str(reference_path)],

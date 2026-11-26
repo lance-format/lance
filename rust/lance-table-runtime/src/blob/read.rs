@@ -16,7 +16,7 @@ use bytes::Bytes;
 use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt, stream};
 use lance_io::object_store::ObjectStore;
-use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
+use lance_io::scheduler::{IoStats, ScanScheduler, SchedulerConfig};
 
 pub use self::plan::BlobEntry;
 use self::plan::{
@@ -716,6 +716,7 @@ pub struct ReadBlobsExecution {
     pub io_buffer_size_bytes: Option<u64>,
     pub schedulers: Arc<std::sync::Mutex<HashMap<usize, Arc<ScanScheduler>>>>,
     pub reservation: Option<Arc<reservation::ReadReservation>>,
+    pub io_stats: Option<IoStats>,
 }
 
 impl ReadBlobsExecution {
@@ -724,6 +725,7 @@ impl ReadBlobsExecution {
             io_buffer_size_bytes,
             schedulers: Arc::new(std::sync::Mutex::new(HashMap::new())),
             reservation: None,
+            io_stats: None,
         }
     }
 
@@ -1019,7 +1021,10 @@ pub async fn execute_blob_read_plan(
             }) as Arc<dyn lance_io::traits::Reader>,
             None => reader.into(),
         };
-        let file_scheduler = scheduler.open_reader(reader);
+        let mut file_scheduler = scheduler.open_reader(reader);
+        if let Some(stats) = &execution.io_stats {
+            file_scheduler = file_scheduler.with_io_stats(stats.recorder());
+        }
         let priority = first_range.start;
         let physical_range_count = physical_ranges.len();
         let returned = file_scheduler

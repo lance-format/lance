@@ -26,6 +26,7 @@ import javax.annotation.Nullable;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 
 /**
@@ -215,7 +216,56 @@ public final class BlobReferences {
     private DatasetBinding() {}
   }
 
-  /** Capture session for one exact snapshot and original top-level Lance field ID. */
+  /**
+   * Flat references plus the selected nested container path. Uint64 leaves in the index Arrow batch
+   * address {@link #getReferences()}; null leaves represent SQL nulls. Struct parent nulls,
+   * List/LargeList offsets, empty lists, and element order are preserved.
+   */
+  public static final class NestedBatch {
+    private final byte[] encoded;
+
+    private NestedBatch(byte[] encoded) {
+      this.encoded = encoded;
+    }
+
+    /** Decode both the reference table and shape mapping from another process. */
+    public static NestedBatch decode(byte[] encoded) {
+      return new NestedBatch(validateNestedBatchNative(encoded));
+    }
+
+    /** Rebuild after Arrow shape operations or remapping the flat reference contexts. */
+    public static NestedBatch fromArrow(
+        Batch references, VectorSchemaRoot indices, BufferAllocator allocator) {
+      try (ArrowArray array = ArrowArray.allocateNew(allocator);
+          ArrowSchema schema = ArrowSchema.allocateNew(allocator)) {
+        Data.exportVectorSchemaRoot(allocator, indices, null, array, schema);
+        return new NestedBatch(
+            importNestedBatchNative(
+                references.encoded, array.memoryAddress(), schema.memoryAddress()));
+      }
+    }
+
+    /** Encode for exchange/spill. This does not acquire snapshot retention. */
+    public byte[] encode() {
+      return encoded.clone();
+    }
+
+    /** Flat nullable references accepted by the whole/range reader. */
+    public Batch getReferences() {
+      return new Batch(nestedReferencesNative(encoded));
+    }
+
+    /** Export the one-column shape mapping. The caller must close the returned root. */
+    public VectorSchemaRoot getIndices(BufferAllocator allocator) {
+      try (ArrowArray array = ArrowArray.allocateNew(allocator);
+          ArrowSchema schema = ArrowSchema.allocateNew(allocator)) {
+        exportNestedIndicesNative(encoded, array.memoryAddress(), schema.memoryAddress());
+        return Data.importVectorSchemaRoot(allocator, array, schema, null);
+      }
+    }
+  }
+
+  /** Capture session for one exact snapshot and original Blob V2 leaf field ID. */
   public static final class Capture extends NativeResource {
     private Capture() {}
 
@@ -229,7 +279,8 @@ public final class BlobReferences {
     /**
      * Consume the original descriptor field and physical uint64 _rowaddr from a scan batch. No
      * payloads, HEAD requests, or descriptor re-takes are performed. Preserve scanSource through
-     * operators; column aliases cannot establish provenance. Nested fields are unsupported.
+     * operators; column aliases cannot establish provenance. Use {@link #captureNested} for nested
+     * leaves.
      */
     public Batch capture(
         SourceContext scanSource,
@@ -242,6 +293,73 @@ public final class BlobReferences {
         Data.exportVectorSchemaRoot(allocator, scanBatch, null, array, schema);
         return new Batch(
             captureNative(
+                this, scanSource.encoded, column, array.memoryAddress(), schema.memoryAddress()));
+      }
+    }
+
+    /**
+     * Capture directly into a nullable {@code lance.blob.ref} Arrow column in this process.
+     *
+     * <p>Uses the same source, field, and physical-address validation as {@link #capture}, without
+     * serializing an execution message and decoding it again. The result uses source-context slot
+     * zero; retain {@code scanSource} alongside it. For exchange, reconstruct a {@link Batch} with
+     * {@link Batch#fromArrow}. The input remains caller-owned. Close the returned root after use.
+     *
+     * <pre>{@code
+     * try (VectorSchemaRoot refs = capture.captureToArrow(source, scanned, "blob", allocator)) {
+     *   Batch portable = Batch.fromArrow(List.of(source), refs, allocator);
+     * }
+     * }</pre>
+     */
+    public VectorSchemaRoot captureToArrow(
+        SourceContext scanSource,
+        VectorSchemaRoot scanBatch,
+        String column,
+        BufferAllocator allocator)
+        throws IOException {
+      try (ArrowArray inputArray = ArrowArray.allocateNew(allocator);
+          ArrowSchema inputSchema = ArrowSchema.allocateNew(allocator);
+          ArrowArray outputArray = ArrowArray.allocateNew(allocator);
+          ArrowSchema outputSchema = ArrowSchema.allocateNew(allocator)) {
+        Data.exportVectorSchemaRoot(allocator, scanBatch, null, inputArray, inputSchema);
+        captureToArrowNative(
+            this,
+            scanSource.encoded,
+            column,
+            inputArray.memoryAddress(),
+            inputSchema.memoryAddress(),
+            outputArray.memoryAddress(),
+            outputSchema.memoryAddress());
+        return Data.importVectorSchemaRoot(allocator, outputArray, outputSchema, null);
+      }
+    }
+
+    /**
+     * Capture the selected leaf below Struct, List, and LargeList containers. column identifies the
+     * original root scan column; the session's field ID identifies the leaf. No sibling payloads
+     * are read. Map, union, and fixed-size list containers are unsupported.
+     *
+     * <pre>{@code
+     * try (Capture capture = Capture.create(dataset, source, leafFieldId)) {
+     *   NestedBatch nested = capture.captureNested(source, scanBatch, "media", allocator);
+     *   Batch references = nested.getReferences();
+     *   try (VectorSchemaRoot indices = nested.getIndices(allocator)) {
+     *     // Preserve these offsets and indices through UNNEST/reconstruction.
+     *   }
+     * }
+     * }</pre>
+     */
+    public NestedBatch captureNested(
+        SourceContext scanSource,
+        VectorSchemaRoot scanBatch,
+        String column,
+        BufferAllocator allocator)
+        throws IOException {
+      try (ArrowArray array = ArrowArray.allocateNew(allocator);
+          ArrowSchema schema = ArrowSchema.allocateNew(allocator)) {
+        Data.exportVectorSchemaRoot(allocator, scanBatch, null, array, schema);
+        return new NestedBatch(
+            captureNestedNative(
                 this, scanSource.encoded, column, array.memoryAddress(), schema.memoryAddress()));
       }
     }
@@ -351,11 +469,52 @@ public final class BlobReferences {
     public long getIoReservedBytes() {
       return reservedBytesNative(this, true);
     }
+
+    /**
+     * Cumulative counters with the same snake_case names as Rust/Python. Payload counters measure
+     * scheduler submissions after coalescing/splitting, excluding backend retries. Logical bytes
+     * count duplicates. Reservation peaks cover the shared native context and retained outputs.
+     * Descriptor scans before capture are excluded; descriptor_requests is always zero.
+     *
+     * <pre>{@code
+     * long physicalBytes = reader.getMetrics().get("payload_bytes");
+     * long logicalBytes = reader.getMetrics().get("returned_logical_bytes");
+     * }</pre>
+     */
+    public Map<String, Long> getMetrics() {
+      return metricsNative(this);
+    }
+  }
+
+  /** One indexed result copied into JVM memory, with SQL null distinct from an empty array. */
+  public static final class ReadResult {
+    private final long requestIndex;
+    @Nullable private final byte[] data;
+
+    private ReadResult(long requestIndex, @Nullable byte[] data) {
+      this.requestIndex = requestIndex;
+      this.data = data;
+    }
+
+    /** Engine correlation index supplied in the corresponding {@link Request}. */
+    public long getRequestIndex() {
+      return requestIndex;
+    }
+
+    /**
+     * Caller-owned bytes, or null for SQL null. The array remains valid after stream close and does
+     * not retain a native memory reservation.
+     */
+    @Nullable
+    public byte[] getData() {
+      return data;
+    }
   }
 
   /**
    * Cancellable native result stream. Close it on success, failure, and cancellation. Closing the
    * reader factory does not close its streams. Errors terminate the stream and never become nulls.
+   * Only one thread may call {@link #next(BufferAllocator)} or {@link #nextBytes} at a time.
    */
   public static final class ReadStream extends NativeResource {
     private ReadStream() {}
@@ -374,6 +533,30 @@ public final class BlobReferences {
         if (!nextNative(this, array.memoryAddress(), schema.memoryAddress())) return null;
         return Data.importVectorSchemaRoot(allocator, array, schema, null);
       }
+    }
+
+    /**
+     * Await one completed request copied into JVM memory, or return null at EOF. Completion order
+     * is unspecified. A result with null data represents SQL null; a null result represents EOF.
+     * This avoids Arrow result conversion when the consumer needs Java byte arrays. The copies are
+     * outside the reader's native materialization budget, so consumers must bound their own
+     * retained JVM memory. Each value must fit a Java byte array; use {@link
+     * #next(BufferAllocator)} or range requests for larger values.
+     *
+     * <pre>{@code
+     * try (ReadStream stream = reader.read(references, requests)) {
+     *   ReadResult result;
+     *   while ((result = stream.nextBytes()) != null) {
+     *     long requestIndex = result.getRequestIndex();
+     *     byte[] data = result.getData();
+     *   }
+     * }
+     * }</pre>
+     */
+    @Nullable
+    public ReadResult nextBytes() throws IOException {
+      if (isClosed()) return null;
+      return nextBytesNative(this);
     }
 
     /** Cancel concurrently with a blocked next call or budget admission. */
@@ -413,6 +596,30 @@ public final class BlobReferences {
       Capture capture, byte[] scanSource, String column, long array, long schema)
       throws IOException;
 
+  private static native void captureToArrowNative(
+      Capture capture,
+      byte[] scanSource,
+      String column,
+      long array,
+      long schema,
+      long outputArray,
+      long outputSchema)
+      throws IOException;
+
+  private static native byte[] captureNestedNative(
+      Capture capture, byte[] scanSource, String column, long array, long schema)
+      throws IOException;
+
+  private static native byte[] validateNestedBatchNative(byte[] encoded);
+
+  private static native byte[] importNestedBatchNative(byte[] references, long array, long schema);
+
+  private static native byte[] nestedReferencesNative(byte[] encoded);
+
+  private static native void exportNestedIndicesNative(byte[] encoded, long array, long schema);
+
+  private static native Map<String, Long> metricsNative(Reader reader);
+
   private static native DatasetBinding bindDatasetNative(Dataset dataset);
 
   private static native Reader createReaderNative(
@@ -432,6 +639,9 @@ public final class BlobReferences {
 
   private static native boolean nextNative(ReadStream stream, long array, long schema)
       throws IOException;
+
+  @Nullable
+  private static native ReadResult nextBytesNative(ReadStream stream) throws IOException;
 
   private static native void cancelNative(ReadStream stream);
 

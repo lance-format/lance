@@ -26,7 +26,9 @@ use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_expr::{PhysicalExpr, create_physical_expr};
 use datafusion_physical_plan::projection::ProjectionExec;
 use lance_arrow::floats::{FloatType, coerce_float_vector};
-use lance_core::datatypes::{BlobHandling, escape_field_path_for_project};
+use lance_core::datatypes::{
+    BlobHandling, Schema as LanceSchema, escape_field_path_for_project, format_field_path_minimal,
+};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_datafusion::exec::ExecutionStatsCallback;
 use lance_datafusion::projection::ProjectionPlan;
@@ -1350,21 +1352,27 @@ impl Scanner {
     /// If Some, then the resulting stream will be sorted according to the given ordering.
     /// This may increase the latency of the first result since all data must be read before
     /// the first batch can be returned.
-    pub fn order_by(&mut self, ordering: Option<Vec<ColumnOrdering>>) -> Result<&mut Self> {
-        if let Some(ordering) = &ordering {
+    pub fn order_by(&mut self, mut ordering: Option<Vec<ColumnOrdering>>) -> Result<&mut Self> {
+        if let Some(ordering) = &mut ordering {
             if ordering.is_empty() {
                 self.ordering = None;
                 return Ok(self);
             }
-            // Verify early that the fields exist
+            let schema = self
+                .dataset
+                .full_projection()
+                .with_blob_handling(BlobHandling::AllDescriptions)
+                .into_schema();
             for column in ordering {
-                self.dataset
-                    .schema()
-                    .field(&column.column_name)
-                    .ok_or(Error::invalid_input(format!(
-                        "Column {} not found",
-                        column.column_name
-                    )))?;
+                let fields = schema.resolve_case_insensitive(&column.column_name).ok_or(
+                    Error::invalid_input(format!("Column {} not found", column.column_name)),
+                )?;
+                column.column_name = format_field_path_minimal(
+                    &fields
+                        .iter()
+                        .map(|field| field.name.as_str())
+                        .collect::<Vec<_>>(),
+                );
             }
         }
         self.ordering = ordering;
@@ -1513,10 +1521,9 @@ impl Scanner {
     /// Create a physical expression for a column that may be nested
     pub(super) fn create_column_expr(
         column_name: &str,
-        dataset: &Dataset,
         arrow_schema: &ArrowSchema,
     ) -> Result<Arc<dyn PhysicalExpr>> {
-        let lance_schema = dataset.schema();
+        let lance_schema = LanceSchema::try_from(arrow_schema)?;
         let field_path = lance_schema
             .resolve_case_insensitive(column_name)
             .ok_or_else(|| {
@@ -1587,7 +1594,7 @@ impl Scanner {
             ));
         }
         projection_exprs.push((
-            Self::create_column_expr(column_name, self.dataset.as_ref(), input_schema.as_ref())?,
+            Self::create_column_expr(column_name, input_schema.as_ref())?,
             column_name.to_string(),
         ));
 
