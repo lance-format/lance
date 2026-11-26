@@ -11175,8 +11175,8 @@ def test_auto_cleanup_options_partial_and_mapping(tmp_path):
 
 
 def test_auto_cleanup_options_keep_errors_from_index(tmp_path):
-    # Only pyo3's own conversion errors get the option name. An error raised by a
-    # user's __index__ reaches the caller as it was raised.
+    # Only pyo3's own conversion errors get the option name. A ValueError or a
+    # TypeError subclass raised by a user's __index__ reaches the caller unchanged.
     class CustomTypeError(TypeError):
         pass
 
