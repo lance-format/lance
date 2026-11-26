@@ -10,7 +10,7 @@ use crate::traits::{FromJObjectWithEnv, import_vec_from_method, import_vec_to_ru
 use arrow::array::{ArrayRef, FixedSizeListArray, Float32Array};
 use arrow::{ffi::FFI_ArrowSchema, ffi_stream::FFI_ArrowArrayStream};
 use arrow_schema::{DataType, Field, SchemaRef};
-use jni::objects::{JObject, JString, JValueGen};
+use jni::objects::{JClass, JObject, JString, JValueGen};
 use jni::sys::{JNI_TRUE, jboolean, jint};
 use jni::{JNIEnv, sys::jlong};
 use lance::dataset::scanner::{
@@ -36,6 +36,23 @@ use crate::{
     traits::IntoJava,
     utils::parse_approx_mode,
 };
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_ipc_ScanOptions_nativeDefaultBatchReadahead(
+    mut env: JNIEnv,
+    _class: JClass,
+) -> jint {
+    let count = std::panic::catch_unwind(Scanner::default_batch_readahead)
+        .map_err(|_| Error::runtime_error("Failed to resolve the default batch readahead".into()))
+        .and_then(|n| {
+            jint::try_from(n).map_err(|_| {
+                Error::input_error(format!(
+                    "Default batch readahead {n} exceeds Java's int range"
+                ))
+            })
+        });
+    ok_or_throw_with_return!(env, count, 0)
+}
 
 pub const NATIVE_SCANNER: &str = "nativeScannerHandle";
 
@@ -300,7 +317,7 @@ pub(crate) struct ScannerOptions<'a> {
     pub prefilter: jboolean,
     pub with_row_id: jboolean,
     pub with_row_address: jboolean,
-    pub batch_readahead: jint,
+    pub batch_readahead_obj: JObject<'a>,
     pub fragment_readahead_obj: JObject<'a>,
     pub scan_in_order: jboolean,
     pub late_materialization_obj: JObject<'a>,
@@ -568,7 +585,9 @@ pub(crate) fn build_scanner_with_options<'a>(
         scanner.fast_search();
     }
 
-    scanner.batch_readahead(options.batch_readahead as usize);
+    if let Some(batch_readahead) = env.get_int_opt(&options.batch_readahead_obj)? {
+        scanner.batch_readahead(batch_readahead as usize);
+    }
 
     let fragment_readahead_opt = env.get_int_opt(&options.fragment_readahead_obj)?;
     if let Some(fragment_readahead) = fragment_readahead_opt {
@@ -672,7 +691,7 @@ pub extern "system" fn Java_org_lance_ipc_LanceScanner_createScanner<'local>(
     prefilter: jboolean,                  // boolean
     with_row_id: jboolean,                // boolean
     with_row_address: jboolean,           // boolean
-    batch_readahead: jint,                // int
+    batch_readahead_obj: JObject<'local>, // Optional<Integer>
     fragment_readahead_obj: JObject<'local>, // Optional<Integer>
     scan_in_order: jboolean,              // boolean
     late_materialization_obj: JObject<'local>, // Optional<MaterializationStyle>
@@ -707,7 +726,7 @@ pub extern "system" fn Java_org_lance_ipc_LanceScanner_createScanner<'local>(
             prefilter,
             with_row_id,
             with_row_address,
-            batch_readahead,
+            batch_readahead_obj,
             fragment_readahead_obj,
             scan_in_order,
             late_materialization_obj,
@@ -744,7 +763,7 @@ fn inner_create_scanner<'local>(
     prefilter: jboolean,
     with_row_id: jboolean,
     with_row_address: jboolean,
-    batch_readahead: jint,
+    batch_readahead_obj: JObject<'local>,
     fragment_readahead_obj: JObject<'local>,
     scan_in_order: jboolean,
     late_materialization_obj: JObject<'local>,
@@ -780,7 +799,7 @@ fn inner_create_scanner<'local>(
         prefilter,
         with_row_id,
         with_row_address,
-        batch_readahead,
+        batch_readahead_obj,
         fragment_readahead_obj,
         scan_in_order,
         late_materialization_obj,

@@ -332,7 +332,7 @@ async fn test_merge_insert_updates_indices() {
             let id_frags_bitmap = RoaringBitmap::from_iter(id_frags.iter().copied());
             // Check the effective bitmap (raw bitmap intersected with existing fragments)
             let effective_bitmap = id_index
-                .effective_fragment_bitmap(&dataset.fragment_bitmap)
+                .effective_fragment_bitmap(&dataset.table_state.fragment_bitmap)
                 .unwrap();
             assert_eq!(effective_bitmap, id_frags_bitmap);
         }
@@ -349,7 +349,7 @@ async fn test_merge_insert_updates_indices() {
             let value_frags_bitmap = RoaringBitmap::from_iter(value_frags.iter().copied());
             // Check the effective bitmap (raw bitmap intersected with existing fragments)
             let effective_bitmap = value_index
-                .effective_fragment_bitmap(&dataset.fragment_bitmap)
+                .effective_fragment_bitmap(&dataset.table_state.fragment_bitmap)
                 .unwrap();
             assert_eq!(effective_bitmap, value_frags_bitmap);
         }
@@ -363,7 +363,7 @@ async fn test_merge_insert_updates_indices() {
         // The other_value index retains its original bitmap [0,1,2,3] since
         // partial merges that don't modify other_value won't prune it.
         let effective_bitmap = other_value_index
-            .effective_fragment_bitmap(&dataset.fragment_bitmap)
+            .effective_fragment_bitmap(&dataset.table_state.fragment_bitmap)
             .unwrap();
 
         // The effective bitmap is the intersection of the index's original bitmap
@@ -371,11 +371,11 @@ async fn test_merge_insert_updates_indices() {
         // partial merges, it retains its validity for fragments it was originally trained on
         // that still exist in the dataset.
         let index_bitmap = other_value_index.fragment_bitmap.as_ref().unwrap();
-        let expected_bitmap = index_bitmap & dataset.fragment_bitmap.as_ref();
+        let expected_bitmap = index_bitmap & dataset.table_state.fragment_bitmap.as_ref();
         assert_eq!(
             effective_bitmap, expected_bitmap,
             "other_value index effective bitmap should be intersection. index_bitmap: {:?}, dataset_fragments: {:?}, effective_bitmap: {:?}",
-            index_bitmap, dataset.fragment_bitmap, effective_bitmap
+            index_bitmap, dataset.table_state.fragment_bitmap, effective_bitmap
         );
     };
 
@@ -780,9 +780,13 @@ async fn test_transaction_inserted_rows_filter_roundtrip(
         .await
         .unwrap();
     let tx_path = committed.manifest().transaction_file.clone().unwrap();
-    let tx_read = read_transaction_file(dataset.object_store.as_ref(), &dataset.base, &tx_path)
-        .await
-        .unwrap();
+    let tx_read = read_transaction_file(
+        dataset.table_state.object_store.as_ref(),
+        &dataset.table_state.base,
+        &tx_path,
+    )
+    .await
+    .unwrap();
     let Operation::Update {
         inserted_rows_filter,
         ..

@@ -390,7 +390,7 @@ only conflicts with operations that modify the max fragment id. Here are the ope
 
 Creates a shallow or deep copy of the table.
 Shallow clones are metadata-only copies that reference original data files through `base_paths`.
-Deep clones are full copies using object storage native copy operations (e.g., S3 CopyObject).
+Deep clones copy the source files to the destination before committing the clone.
 
 <details>
 <summary>Clone protobuf message</summary>
@@ -408,7 +408,7 @@ As a result, there is no such thing as a conflict with Clone.
 
 ### Update
 
-Modifies row values without adding or removing rows.
+Updates rows or applies merge-insert changes, including inserts and deletes.
 Supports two execution modes: REWRITE_ROWS deletes rows in current fragments and rewrites them in new fragments, which is optimal when the majority of columns are modified or only a small number of rows are affected; REWRITE_COLUMNS fully rewrites affected columns within fragments by tombstoning old column versions, which is optimal when most rows are affected but only a subset of columns are modified.
 
 <details>

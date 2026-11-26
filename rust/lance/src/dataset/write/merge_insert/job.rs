@@ -77,7 +77,7 @@ use lance_datafusion::{
         new_session_context_with_memory_tracking, provider_to_stream,
     },
     spill::{materialize_stream, spilling_table_provider_with_job_disk_manager},
-    utils::StreamingWriteSource,
+    utils::{StreamingWriteSource, from_datafusion_stream},
 };
 use lance_file::version::ConcreteFileVersion;
 use lance_index::IndexCriteria;
@@ -103,6 +103,37 @@ use uuid::Uuid;
 /// covers a blob reached through any nesting — not just a direct struct member.
 fn subtree_has_blob(field: &lance_core::datatypes::Field) -> bool {
     field.is_blob() || field.children.iter().any(subtree_has_blob)
+}
+
+/// List children share offsets and validity, so they must be replaced together.
+fn check_complete_list_fields(
+    source: &lance_core::datatypes::Field,
+    target: &lance_core::datatypes::Field,
+    path: &str,
+    options: &SchemaCompareOptions,
+) -> Result<()> {
+    if (source.logical_type.is_list()
+        || source.logical_type.is_large_list()
+        || source.logical_type.is_fixed_size_list_struct())
+        && !source.compare_with_options(target, options)
+    {
+        return Err(Error::invalid_input(format!(
+            "merge_insert source partially supplies list field '{path}'. \
+             Supply all item fields to replace the list; partial list updates \
+             can produce inconsistent offsets or validity."
+        )));
+    }
+    for source_child in &source.children {
+        if let Some(target_child) = target.child(&source_child.name) {
+            check_complete_list_fields(
+                source_child,
+                target_child,
+                &format!("{path}.{}", source_child.name),
+                options,
+            )?;
+        }
+    }
+    Ok(())
 }
 
 impl MergeInsertJob {
@@ -145,8 +176,21 @@ impl MergeInsertJob {
         // If full match fails, try subschema match.
         options.allow_subschema = true;
 
-        check_source_schema(&lance_schema, target_schema, &options)
-            .map(|_| SchemaComparison::Subschema)
+        check_source_schema(&lance_schema, target_schema, &options)?;
+        options.allow_subschema = false;
+        let lance_schema = super::super::promote_legacy_blob_schema(&lance_schema)?;
+        let target_schema = super::super::promote_legacy_blob_schema(target_schema)?;
+        for source_field in &lance_schema.fields {
+            if let Some(target_field) = target_schema.field(&source_field.name) {
+                check_complete_list_fields(
+                    source_field,
+                    target_field,
+                    &source_field.name,
+                    &options,
+                )?;
+            }
+        }
+        Ok(SchemaComparison::Subschema)
     }
 
     /// Collect every join column that has a scalar index supporting exact
@@ -364,7 +408,7 @@ impl MergeInsertJob {
                 .lance_file_format(),
             self.dataset.clone(),
             index_mapper,
-            projection,
+            projection.clone(),
             add_row_addr,
         )?;
 
@@ -383,12 +427,6 @@ impl MergeInsertJob {
             columns.push(Arc::new(ROW_ADDR_FIELD.clone()));
         }
         target = Arc::new(project(target, &Schema::new(columns))?);
-
-        let column_names = schema
-            .field_names()
-            .into_iter()
-            .filter(|name| name.as_str() != ROW_ID && name.as_str() != ROW_ADDR)
-            .collect::<Vec<_>>();
 
         // 5a - Scan unindexed fragments and overlay-stale rows using current values.
         //      A row can be reached by the composite index probe only if it
@@ -410,9 +448,10 @@ impl MergeInsertJob {
                 }
                 builder.with_physical_row_addr_prefilter(fallback_rows);
             }
+            // Must match the take's nested projection: `UnionExec` requires identical types.
             let fallback_data = builder
                 .with_row_id()
-                .project(&column_names)?
+                .project_with_schema(&projection.to_schema())?
                 .create_plan()
                 .await?;
             let unioned = UnionExec::try_new(vec![target, fallback_data])?;
@@ -1460,6 +1499,15 @@ impl MergeInsertJob {
         provider: Arc<dyn TableProvider>,
         source_mode: SourceProviderMode,
     ) -> Result<UncommittedMergeInsert> {
+        // Validate list completeness before either plan can write fragment data.
+        if self.params.insert_not_matched
+            || matches!(
+                self.params.when_matched,
+                WhenMatched::UpdateAll | WhenMatched::UpdateIf(_) | WhenMatched::UpdateIfExpr(_)
+            )
+        {
+            self.check_compatible_schema(provider.schema().as_ref())?;
+        }
         // Resolve the write mode before the path fork. The v2 plan resolves it
         // again in `create_plan`, but the legacy path below does not go through
         // that, and its partial-schema branch patches columns whatever the mode
@@ -1665,10 +1713,10 @@ impl MergeInsertJob {
                     write_fragments_internal_impl(
                         self.params.write_version(&self.dataset),
                         Some(&self.dataset),
-                        self.dataset.object_store.clone(),
-                        &self.dataset.base,
+                        self.dataset.table_state.object_store.clone(),
+                        &self.dataset.table_state.base,
                         self.dataset.schema().clone(),
-                        stream,
+                        from_datafusion_stream(stream),
                         self.write_params.as_ref().clone(),
                         target_bases_info,
                         None,
@@ -1683,8 +1731,8 @@ impl MergeInsertJob {
                     write_fragments_internal(
                         self.params.write_version(&self.dataset),
                         Some(&self.dataset),
-                        self.dataset.object_store.clone(),
-                        &self.dataset.base,
+                        self.dataset.table_state.object_store.clone(),
+                        &self.dataset.table_state.base,
                         self.dataset.schema().clone(),
                         stream,
                         self.write_params.as_ref().clone(),
@@ -1748,8 +1796,8 @@ impl MergeInsertJob {
                 Ok(removed_row_addrs) => removed_row_addrs,
                 Err(e) => {
                     cleanup_data_fragments(
-                        &self.dataset.object_store,
-                        &self.dataset.base,
+                        &self.dataset.table_state.object_store,
+                        &self.dataset.table_state.base,
                         cleanup_bases.as_deref(),
                         &new_fragments,
                     )
@@ -1763,8 +1811,8 @@ impl MergeInsertJob {
                 Ok(v) => v,
                 Err(e) => {
                     cleanup_data_fragments(
-                        &self.dataset.object_store,
-                        &self.dataset.base,
+                        &self.dataset.table_state.object_store,
+                        &self.dataset.table_state.base,
                         cleanup_bases.as_deref(),
                         &new_fragments,
                     )
@@ -1840,7 +1888,7 @@ impl MergeInsertJob {
                     if let Some(bitmap) = bitmaps_ref.get(&(fragment_id as u32)) {
                         match fragment.extend_deletions(*bitmap).await {
                             Ok(Some(new_fragment)) => {
-                                Ok(FragmentChange::Modified(Box::new(new_fragment.metadata)))
+                                Ok(FragmentChange::Modified(Box::new(new_fragment.into())))
                             }
                             Ok(None) => Ok(FragmentChange::Removed(fragment_id as u64)),
                             Err(e) => Err(e),
@@ -1850,7 +1898,7 @@ impl MergeInsertJob {
                     }
                 }
             })
-            .buffer_unordered(dataset.object_store.io_parallelism());
+            .buffer_unordered(dataset.table_state.object_store.io_parallelism());
 
         while let Some(res) = stream.next().await.transpose()? {
             match res {
@@ -2427,7 +2475,7 @@ impl MergeInsertJob {
                     .is_none_or(|original| original.deletion_file.as_ref() != Some(deletion_file))
             {
                 written_deletion_files.push(deletion_file_path(
-                    &self.dataset.base,
+                    &self.dataset.table_state.base,
                     updated.id,
                     deletion_file,
                 ));
@@ -2440,8 +2488,8 @@ impl MergeInsertJob {
                 .ok()
                 .flatten();
             cleanup_data_fragments(
-                &self.dataset.object_store,
-                &self.dataset.base,
+                &self.dataset.table_state.object_store,
+                &self.dataset.table_state.base,
                 target_bases_info.as_deref(),
                 &written_fragments,
             )
@@ -2450,7 +2498,7 @@ impl MergeInsertJob {
         // Merge insert writes deletion files with `write_deletion_file`, which
         // always places them under the dataset root.
         for path in written_deletion_files {
-            if let Err(e) = self.dataset.object_store.delete(&path).await {
+            if let Err(e) = self.dataset.table_state.object_store.delete(&path).await {
                 log::warn!(
                     "Failed to clean up orphaned deletion file '{}': {}",
                     path,
@@ -2469,7 +2517,7 @@ struct MergeInsertJobWithProvider {
     attempt_count: Arc<AtomicU32>,
 }
 
-impl RetryExecutor for MergeInsertJobWithProvider {
+impl RetryExecutor<Dataset> for MergeInsertJobWithProvider {
     type Data = UncommittedMergeInsert;
     type Result = (Arc<Dataset>, MergeStats);
 
@@ -2520,8 +2568,8 @@ impl RetryExecutor for MergeInsertJobWithProvider {
                             .ok()
                             .flatten();
                     cleanup_data_fragments(
-                        &cleanup_dataset.object_store,
-                        &cleanup_dataset.base,
+                        &cleanup_dataset.table_state.object_store,
+                        &cleanup_dataset.table_state.base,
                         target_bases_info.as_deref(),
                         &new_fragments,
                     )

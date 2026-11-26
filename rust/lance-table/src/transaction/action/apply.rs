@@ -25,8 +25,8 @@
 
 use super::{CompositeOperation, FieldId, FieldRef, Ref};
 use crate::feature_flags::{
-    FLAG_MANAGED_BLOBS, apply_index_object_metadata_flag, inherit_sticky_feature_flags,
-    managed_blobs_enabled, validate_auto_cleanup_config,
+    FLAG_MANAGED_BLOBS, apply_index_object_metadata_flag, apply_zone_write_seeds_version_config,
+    inherit_sticky_feature_flags, managed_blobs_enabled, validate_auto_cleanup_config,
 };
 use crate::format::overlay::staleness::field_affects_index;
 use crate::format::{
@@ -194,6 +194,10 @@ pub(super) struct ApplyState<'a> {
     /// to be written back over the assembled manifest.
     config: HashMap<String, String>,
     table_metadata: HashMap<String, String>,
+    /// Whether an action in this operation wrote or deleted
+    /// [`ZONE_WRITE_SEEDS_VERSION_KEY`](crate::feature_flags::ZONE_WRITE_SEEDS_VERSION_KEY).
+    /// An inherited value, even `"1"`, is not an opt-in.
+    zone_write_seeds_version_written: bool,
 
     /// The highest id handed out so far in each space, by the version being
     /// committed on top of or by this operation. Kept as marks rather than
@@ -302,6 +306,7 @@ impl<'a> ApplyState<'a> {
             existing_base_paths: manifest.base_paths.clone(),
             config: manifest.config.clone(),
             table_metadata: manifest.table_metadata.clone(),
+            zone_write_seeds_version_written: false,
             fragment_high_water: manifest.max_fragment_id(),
             field_high_water: manifest.max_field_id(),
             base_high_water: max_base_id(manifest),
@@ -357,6 +362,7 @@ impl<'a> ApplyState<'a> {
             field_high_water,
             config: dataset_config,
             table_metadata,
+            zone_write_seeds_version_written,
             ..
         } = self;
 
@@ -432,6 +438,7 @@ impl<'a> ApplyState<'a> {
             manifest.reader_feature_flags |= FLAG_MANAGED_BLOBS;
             manifest.writer_feature_flags |= FLAG_MANAGED_BLOBS;
         }
+        apply_zone_write_seeds_version_config(&mut manifest, zone_write_seeds_version_written)?;
 
         // The assembly derives the marks from what the manifest still holds,
         // which misses ids this operation reserved or minted and then
@@ -454,7 +461,8 @@ impl<'a> ApplyState<'a> {
             *current = (*current).max(field_high_water);
         }
 
-        manifest.transaction_file = Some(transaction_file_path.to_string());
+        manifest.transaction_file =
+            (!transaction_file_path.is_empty()).then(|| transaction_file_path.to_string());
         if let Some(next_row_id) = next_row_id {
             manifest.next_row_id = next_row_id;
         }
@@ -628,6 +636,12 @@ impl<'a> ApplyState<'a> {
 
     pub(super) fn config_mut(&mut self) -> &mut HashMap<String, String> {
         &mut self.config
+    }
+
+    /// Record that this operation itself writes or deletes the zone write seed
+    /// version key, as opposed to inheriting it from the current manifest.
+    pub(super) fn mark_zone_write_seeds_version_written(&mut self) {
+        self.zone_write_seeds_version_written = true;
     }
 
     pub(super) fn table_metadata_mut(&mut self) -> &mut HashMap<String, String> {
