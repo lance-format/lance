@@ -1089,6 +1089,25 @@ async fn test_read_version_transaction_v1_manifest_naming() {
 }
 
 #[tokio::test]
+async fn test_historical_inline_transaction_reuses_manifest_size() {
+    let ds = write_versions("memory://", 3, false).await;
+    let store = &ds.table_state.object_store;
+    store.io_stats_incremental();
+    let record = ds.read_version_transaction(2).await.unwrap();
+    let stats = store.io_stats_incremental();
+
+    assert_eq!(record.version, 2);
+    assert!(record.transaction.is_some());
+    let path = ManifestNamingScheme::V1.manifest_path(&ds.table_state.base, 2);
+    let heads = stats
+        .requests
+        .iter()
+        .filter(|r| r.method == "head" && r.path == path)
+        .count();
+    assert_eq!(heads, 1, "{:?}", stats.requests);
+}
+
+#[tokio::test]
 async fn test_read_version_transaction_on_branch() {
     let test_uri = TempStrDir::default();
     let mut main_ds = write_versions(&test_uri, 1, true).await;

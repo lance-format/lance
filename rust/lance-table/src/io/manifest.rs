@@ -61,7 +61,7 @@ pub async fn read_manifest_proto(
     path: &Path,
     known_size: Option<u64>,
 ) -> Result<pb::Manifest> {
-    let (proto, _) = read_manifest_proto_with_length(object_store, path, known_size).await?;
+    let (proto, _, _) = read_manifest_proto_with_length(object_store, path, known_size).await?;
     Ok(proto)
 }
 
@@ -69,7 +69,7 @@ async fn read_manifest_proto_with_length(
     object_store: &ObjectStore,
     path: &Path,
     known_size: Option<u64>,
-) -> Result<(pb::Manifest, usize)> {
+) -> Result<(pb::Manifest, usize, u64)> {
     let file_size = if let Some(known_size) = known_size {
         known_size
     } else {
@@ -145,16 +145,24 @@ async fn read_manifest_proto_with_length(
         }
         let recorded_length = chunked.get_u32_le() as usize;
         chunked.truncate(chunked.remaining() - 16);
-        return decode_manifest(chunked, recorded_length);
+        return Ok((
+            decode_manifest(chunked, recorded_length)?,
+            recorded_length,
+            file_size,
+        ));
     };
 
     let recorded_length = LittleEndian::read_u32(&buf[0..4]) as usize;
     // Need to trim the magic number at end and message length at beginning
     let buf = buf.slice(4..buf.len() - 16);
-    decode_manifest(buf, recorded_length)
+    Ok((
+        decode_manifest(buf, recorded_length)?,
+        recorded_length,
+        file_size,
+    ))
 }
 
-fn decode_manifest(buf: impl Buf, recorded_length: usize) -> Result<(pb::Manifest, usize)> {
+fn decode_manifest(buf: impl Buf, recorded_length: usize) -> Result<pb::Manifest> {
     if buf.remaining() != recorded_length {
         return Err(Error::invalid_input(format!(
             "Invalid format: manifest length does not match. Expected {}, got {}",
@@ -162,8 +170,7 @@ fn decode_manifest(buf: impl Buf, recorded_length: usize) -> Result<(pb::Manifes
             buf.remaining()
         )));
     }
-    let proto = pb::Manifest::decode(buf)?;
-    Ok((proto, recorded_length))
+    Ok(pb::Manifest::decode(buf)?)
 }
 
 /// Read the semantic [`Manifest`] from a URI.
@@ -194,11 +201,22 @@ pub async fn read_manifest(
     path: &Path,
     known_size: Option<u64>,
 ) -> Result<Manifest> {
-    let (proto, recorded_length) =
+    Ok(read_manifest_with_size(object_store, path, known_size)
+        .await?
+        .0)
+}
+
+/// Read a manifest and return the object size used to decode its footer.
+pub async fn read_manifest_with_size(
+    object_store: &ObjectStore,
+    path: &Path,
+    known_size: Option<u64>,
+) -> Result<(Manifest, u64)> {
+    let (proto, recorded_length, file_size) =
         read_manifest_proto_with_length(object_store, path, known_size).await?;
     let mut manifest = Manifest::try_from(proto)?;
     manifest.detach_sparse_inline_row_ids(recorded_length);
-    Ok(manifest)
+    Ok((manifest, file_size))
 }
 
 #[instrument(level = "debug", skip(object_store, manifest))]
@@ -660,6 +678,10 @@ mod test {
             .unwrap();
 
         assert_eq!(expected, roundtripped_manifest);
+        let (_, observed_size) = read_manifest_with_size(&store, &path, Some(stale_known_size))
+            .await
+            .unwrap();
+        assert_eq!(observed_size, actual_size);
         store.delete(&path).await.unwrap();
     }
 

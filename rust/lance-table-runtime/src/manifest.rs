@@ -12,7 +12,7 @@ use lance_table::format::{
     IndexMetadata, MAGIC, Manifest, pb, populate_manifest_schema_dictionaries,
     storage_contract::check_manifest_storage_version,
 };
-use lance_table::io::{commit::ManifestLocation, manifest::read_manifest};
+use lance_table::io::{commit::ManifestLocation, manifest::read_manifest_with_size};
 use lance_table::transaction::Transaction;
 use prost::Message;
 
@@ -294,7 +294,7 @@ impl TableView<'_> {
         }
 
         // Resolve against this dataset's current branch.
-        let manifest_location = self
+        let mut manifest_location = self
             .state
             .commit_handler
             .resolve_version_location(&self.state.base, version, &self.state.object_store.inner)
@@ -318,7 +318,7 @@ impl TableView<'_> {
             None => {
                 // Keep the DatasetNotFound variant callers expect for a missing
                 // version.
-                let manifest = read_manifest(
+                let (manifest, file_size) = read_manifest_with_size(
                     &self.state.object_store,
                     &manifest_location.path,
                     manifest_location.size,
@@ -330,6 +330,8 @@ impl TableView<'_> {
                     }
                     _ => e,
                 })?;
+                // Reuse the size from the footer read when opening the inline transaction.
+                manifest_location.size = Some(file_size);
                 Arc::new(manifest)
             }
         };
