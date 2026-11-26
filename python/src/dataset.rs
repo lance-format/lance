@@ -672,7 +672,7 @@ impl Dataset {
 
         match dataset {
             Ok(ds) => Ok(Self {
-                uri,
+                uri: ds.uri().to_string(),
                 ds: Arc::new(ds),
             }),
             Err(err) => Err(PyValueError::new_err(err.to_string())),
@@ -4407,8 +4407,8 @@ impl Dataset {
             })?;
 
         Ok(Self {
+            uri: ds.uri().to_string(),
             ds: Arc::new(ds),
-            uri: self.uri.clone(),
         })
     }
 
