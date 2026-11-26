@@ -28,13 +28,13 @@ use crate::Dataset;
 use crate::dataset::builder::DatasetBuilder;
 use crate::dataset::index::frag_reuse::cleanup_frag_reuse_index;
 use crate::dataset::optimize::remapping::remap_column_index;
-use crate::dataset::optimize::{CompactionOptions, compact_files};
+use crate::dataset::optimize::{CompactionMetrics, CompactionOptions, compact_files};
 use crate::dataset::transaction::{Operation, RewriteGroup, Transaction};
 use crate::dataset::write::CommitBuilder;
 use crate::dataset::{
     MergeInsertBuilder, MergeInsertWriteMode, WhenMatched, WhenNotMatched, WriteParams,
 };
-use crate::index::frag_reuse::frag_reuse_entry_appending;
+use crate::index::frag_reuse::{frag_reuse_entry_appending, load_frag_reuse_index_details};
 use crate::index::frag_reuse_reader::tests::prepare_partition;
 use crate::index::{DatasetIndexExt, DatasetIndexInternalExt};
 use crate::session::Session;
@@ -47,6 +47,11 @@ const INDEX_NAME: &str = "idx";
 pub(super) enum HistoryForm {
     /// A deferred compaction on an untagged table records a v0 reuse version.
     V0,
+    /// The same untagged v0 history on a table with stable row IDs, where
+    /// row IDs and row addresses diverge once a compaction moves rows. Only
+    /// the dedicated stable-row-ID test uses it: the staged merge race and
+    /// the in-place update are out of scope for this test.
+    V0WithStableRowIds,
     /// Deferred compaction on a tagged table records ordered-compaction
     /// transitions. A stable partition committed before the index exists
     /// makes the table tagged.
@@ -88,7 +93,7 @@ impl TestDataset {
         let dataset = Dataset::write(
             RecordBatchIterator::new([Ok(batch)], schema),
             dir.as_str(),
-            Some(write_params()),
+            Some(write_params(form)),
         )
         .await
         .unwrap();
@@ -171,7 +176,7 @@ impl TestDataset {
         self.dataset
             .append(
                 RecordBatchIterator::new([Ok(batch)], schema),
-                Some(write_params()),
+                Some(write_params(self.form)),
             )
             .await
             .unwrap();
@@ -192,7 +197,16 @@ impl TestDataset {
             .write_mode(MergeInsertWriteMode::RewriteColumns);
         // Leaving `pad` out of the patch is what makes the update a column
         // rewrite that keeps row addresses.
-        let patch = Row::to_batch(&updated).project(&[0, 2, 3, 4, 5]).unwrap();
+        let batch = Row::to_batch(&updated);
+        let schema = batch.schema();
+        let keep: Vec<usize> = schema
+            .fields()
+            .iter()
+            .enumerate()
+            .filter(|(_, field)| field.name() != "pad")
+            .map(|(index, _)| index)
+            .collect();
+        let patch = batch.project(&keep).unwrap();
         let schema = patch.schema();
         let (dataset, _) = merge
             .try_build()
@@ -222,7 +236,7 @@ impl TestDataset {
     /// Rewrites every live fragment in the record form of `self.form`.
     pub(super) async fn rewrite(&mut self) {
         match self.form {
-            HistoryForm::V0 | HistoryForm::TaggedOrdered => {
+            HistoryForm::V0 | HistoryForm::V0WithStableRowIds | HistoryForm::TaggedOrdered => {
                 self.deferred_compaction(CompactionOptions::default().target_rows_per_fragment)
                     .await;
             }
@@ -237,7 +251,7 @@ impl TestDataset {
         let is_tagged = entry.index_version >= 1;
         assert_eq!(
             is_tagged,
-            !matches!(self.form, HistoryForm::V0),
+            !matches!(self.form, HistoryForm::V0 | HistoryForm::V0WithStableRowIds),
             "{:?} recorded index_version {}",
             self.form,
             entry.index_version
@@ -354,18 +368,44 @@ impl TestDataset {
     /// the compaction's own moves; refusing the compaction is also correct.
     pub(super) async fn eager_compaction_over_pending_history(&mut self) {
         self.append(ROWS_PER_FRAGMENT).await;
-        let options = CompactionOptions {
-            target_rows_per_fragment: 1000,
-            defer_index_remap: false,
-            ..Default::default()
-        };
-        match compact_files(&mut self.dataset, options, None).await {
-            Ok(_) => self.widen_uncovered_to_fragments().await,
+        match self.try_eager_compaction().await {
+            Ok(_) => {}
             // A refused compaction leaves the table, and the appended rows
             // unindexed, as they were.
             Err(Error::InvalidInput { .. } | Error::NotSupported { .. }) => {}
             Err(error) => panic!("{:?}: eager compaction failed: {error}", self.kind),
         }
+    }
+
+    /// Compacts everything eagerly and returns its metrics, or the compaction's error.
+    /// A refusal leaves the table as it was.
+    pub(super) async fn try_eager_compaction(&mut self) -> Result<CompactionMetrics, Error> {
+        let options = CompactionOptions {
+            target_rows_per_fragment: 1000,
+            defer_index_remap: false,
+            ..Default::default()
+        };
+        let metrics = compact_files(&mut self.dataset, options, None).await?;
+        self.widen_uncovered_to_fragments().await;
+        Ok(metrics)
+    }
+
+    /// The number of versions the fragment reuse index's history holds. It
+    /// asserts the history is the untagged v0 form, which `deferred_compaction`
+    /// alone does not check.
+    pub(super) async fn history_len(&self) -> usize {
+        let entry = self
+            .dataset
+            .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+            .await
+            .unwrap()
+            .expect("the table has a fragment reuse index");
+        assert_eq!(entry.index_version, 0, "the history is not the v0 form");
+        load_frag_reuse_index_details(&self.dataset, &entry)
+            .await
+            .unwrap()
+            .versions
+            .len()
     }
 
     pub(super) async fn optimize(&mut self) {
@@ -392,7 +432,7 @@ impl TestDataset {
     }
 
     /// The fragment holding each live row, by `i`.
-    async fn fragment_ids(dataset: &Dataset) -> BTreeMap<i32, u64> {
+    pub(super) async fn fragment_ids(dataset: &Dataset) -> BTreeMap<i32, u64> {
         let mut scan = dataset.scan();
         scan.project(&["i", ROW_ADDR]).unwrap();
         let batch = scan.try_into_batch().await.unwrap();
@@ -477,8 +517,9 @@ impl TestDataset {
     }
 }
 
-fn write_params() -> WriteParams {
+fn write_params(form: HistoryForm) -> WriteParams {
     WriteParams {
+        enable_stable_row_ids: matches!(form, HistoryForm::V0WithStableRowIds),
         max_rows_per_file: ROWS_PER_FRAGMENT as usize,
         ..Default::default()
     }

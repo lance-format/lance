@@ -87,10 +87,13 @@ impl RowAddrMask {
     }
 
     /// Returns whether this mask selects every row in `rows`.
+    ///
+    /// Vector search asks this for every probed partition, so it compares the
+    /// maps in place instead of building their difference or intersection.
     pub fn selects_all(&self, rows: &RowAddrTreeMap) -> bool {
         match self {
-            Self::AllowList(allow_list) => (rows.clone() - allow_list).is_empty(),
-            Self::BlockList(block_list) => (rows.clone() & block_list).is_empty(),
+            Self::AllowList(allow_list) => rows.is_subset(allow_list),
+            Self::BlockList(block_list) => rows.is_disjoint(block_list),
         }
     }
 
@@ -619,6 +622,39 @@ impl RowAddrSelection {
 }
 
 impl RowAddrTreeMap {
+    /// Whether every row of `self` is also in `other`, without allocating.
+    ///
+    /// A full fragment in `self` is only covered by a full fragment (or a
+    /// full bitmap) in `other`.
+    pub fn is_subset(&self, other: &Self) -> bool {
+        self.inner
+            .iter()
+            .all(|(fragment, lhs)| match (lhs, other.inner.get(fragment)) {
+                (_, Some(RowAddrSelection::Full)) => true,
+                (RowAddrSelection::Partial(lhs), Some(RowAddrSelection::Partial(rhs))) => {
+                    lhs.is_subset(rhs)
+                }
+                (RowAddrSelection::Partial(lhs), None) => lhs.is_empty(),
+                (RowAddrSelection::Full, Some(RowAddrSelection::Partial(rhs))) => rhs.is_full(),
+                (RowAddrSelection::Full, None) => false,
+            })
+    }
+
+    /// Whether `self` and `other` hold no row in common, without allocating.
+    pub fn is_disjoint(&self, other: &Self) -> bool {
+        self.inner
+            .iter()
+            .all(|(fragment, lhs)| match (lhs, other.inner.get(fragment)) {
+                (_, None) => true,
+                (RowAddrSelection::Partial(lhs), Some(RowAddrSelection::Partial(rhs))) => {
+                    lhs.is_disjoint(rhs)
+                }
+                (RowAddrSelection::Partial(lhs), Some(RowAddrSelection::Full)) => lhs.is_empty(),
+                (RowAddrSelection::Full, Some(RowAddrSelection::Partial(rhs))) => rhs.is_empty(),
+                (RowAddrSelection::Full, Some(RowAddrSelection::Full)) => false,
+            })
+    }
+
     /// Rows held by both maps, allocating only the result.
     pub fn intersection(&self, other: &Self) -> Self {
         let inner = self
@@ -1851,6 +1887,51 @@ mod tests {
         assert!(RowAddrMask::from_block(rows(&[30])).selects_all(&partition_rows));
         assert!(!RowAddrMask::from_block(rows(&[20, 30])).selects_all(&partition_rows));
         assert!(RowAddrMask::allow_nothing().selects_all(&RowAddrTreeMap::new()));
+
+        // Whole fragments: a full fragment is only covered by a full fragment.
+        let mut full_fragment = RowAddrTreeMap::new();
+        full_fragment.insert_fragment(2);
+        assert!(!RowAddrMask::from_allowed(full_fragment.clone()).selects_all(&partition_rows));
+        let mut allow_full = rows(&[10, 20]);
+        allow_full.insert_fragment(2);
+        assert!(RowAddrMask::from_allowed(allow_full.clone()).selects_all(&partition_rows));
+        assert!(!RowAddrMask::from_allowed(partition_rows.clone()).selects_all(&full_fragment));
+        assert!(RowAddrMask::from_allowed(allow_full).selects_all(&full_fragment));
+        assert!(!RowAddrMask::from_block(full_fragment.clone()).selects_all(&partition_rows));
+        assert!(RowAddrMask::from_block(rows(&[10])).selects_all(&full_fragment));
+        assert!(!RowAddrMask::from_block(rows(&[2_u64 << 32 | 9])).selects_all(&full_fragment));
+    }
+
+    /// The in-place predicates agree with the allocating set operations.
+    #[test]
+    fn test_is_subset_and_is_disjoint_match_set_operations() {
+        let mut full_two = RowAddrTreeMap::new();
+        full_two.insert_fragment(2);
+        let mut mixed = rows(&[1, 5, 1_u64 << 32 | 7]);
+        mixed.insert_fragment(2);
+        let maps = [
+            RowAddrTreeMap::new(),
+            rows(&[1, 5]),
+            rows(&[5, 9]),
+            rows(&[1, 5, 9, 1_u64 << 32 | 7]),
+            rows(&[2_u64 << 32 | 3]),
+            full_two,
+            mixed,
+        ];
+        for lhs in &maps {
+            for rhs in &maps {
+                assert_eq!(
+                    lhs.is_subset(rhs),
+                    lhs.difference(rhs).is_empty(),
+                    "is_subset({lhs:?}, {rhs:?})"
+                );
+                assert_eq!(
+                    lhs.is_disjoint(rhs),
+                    lhs.intersection(rhs).is_empty(),
+                    "is_disjoint({lhs:?}, {rhs:?})"
+                );
+            }
+        }
     }
 
     #[test]

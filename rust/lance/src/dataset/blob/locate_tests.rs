@@ -219,6 +219,7 @@ async fn test_take_blob_v2_from_non_default_base_packed() {
     assert_eq!(blobs.len(), 1);
     let blob = blobs[0].as_ref().unwrap();
     assert_eq!(blob.kind(), BlobKind::Packed);
+    assert_eq!(blob.base_id(), Some(1));
     assert_eq!(
         blob.read().await.unwrap().as_ref(),
         fixture.expected.as_slice()
