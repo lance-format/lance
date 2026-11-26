@@ -417,11 +417,13 @@ impl SymbolTable {
         let input_in_u64 = fsst_unaligned_load_unchecked(input_in_1_word.as_ptr());
         // Symbols are inserted under the hash of their first three bytes; hashing
         // the whole padded word probes a different bucket whenever the fourth byte
-        // is odd, and the symbol is missed. When no longer symbol starts here, a
-        // declared two-byte symbol is the match, as in `match_next_symbol_in_sample`.
+        // is odd, and the symbol is missed. A symbol longer than the input must not
+        // match the zero padding. When no longer symbol starts here, a declared
+        // two-byte symbol is the match, as in `match_next_symbol_in_sample`.
         let hash_idx = fsst_hash(input_in_u64 & 0xFFFFFF) as usize & (FSST_HASH_TAB_SIZE - 1);
         let s_in_hash_tab = self.hash_tab[hash_idx];
         if s_in_hash_tab.icl < FSST_ICL_FREE
+            && s_in_hash_tab.symbol_len() as usize <= len
             && s_in_hash_tab.val == (input_in_u64 & (u64::MAX >> s_in_hash_tab.ignored_bits()))
         {
             return s_in_hash_tab.code();
@@ -2389,6 +2391,11 @@ But exactly how the acquaintance and friendship came about, we cannot say.";
             st.find_longest_symbol_from_char_slice(b"cox"),
             first_code(&st)
         );
+
+        // A symbol longer than the input does not match its zero padding.
+        let mut st = SymbolTable::new();
+        assert!(st.add(Symbol::concat(pair(b'a', b'b'), pair(b'c', 0))));
+        assert_eq!(st.find_longest_symbol_from_char_slice(b"abc"), b'a' as u16);
     }
 
     #[test]
