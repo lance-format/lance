@@ -298,10 +298,10 @@ impl Clone for ExternalBlobStore {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MutationBackend {
-    Local,
+    Local {
+        external_tag_coordination: bool,
+    },
     ETag,
-    #[cfg(feature = "gcp")]
-    Version,
     #[cfg(feature = "aws")]
     OpenDalS3,
 }
@@ -1178,8 +1178,10 @@ impl ObjectStore {
     }
 
     fn has_absolute_local_mapping(&self) -> bool {
-        matches!(self.mutation_backend, Some((MutationBackend::Local, _)))
-            && self.store_prefix == self.scheme
+        matches!(
+            self.mutation_backend,
+            Some((MutationBackend::Local { .. }, _))
+        ) && self.store_prefix == self.scheme
     }
 
     fn selected_mutation_backend(&self) -> Option<MutationBackend> {
@@ -1211,28 +1213,25 @@ impl ObjectStore {
         &self,
         path: &Path,
     ) -> object_store::Result<Option<(Bytes, object_store::UpdateVersion)>> {
-        let (if_match, requires_version): (Option<String>, bool) =
-            match self.selected_mutation_backend() {
-                Some(MutationBackend::ETag) => (None, false),
-                #[cfg(feature = "gcp")]
-                Some(MutationBackend::Version) => (None, true),
-                #[cfg(feature = "aws")]
-                Some(MutationBackend::OpenDalS3) => {
-                    // The OpenDAL bridge can obtain metadata and bytes in separate
-                    // requests. Bind both to the ETag used to replace the object.
-                    let etag = self
-                        .stat(path)
-                        .await?
-                        .e_tag
-                        .filter(|s| !s.is_empty())
-                        .ok_or_else(|| object_store::Error::Generic {
-                            store: "S3",
-                            source: format!("missing ETag for conditional update of {path}").into(),
-                        })?;
-                    (Some(etag), false)
-                }
-                _ => return Ok(None),
-            };
+        let if_match: Option<String> = match self.selected_mutation_backend() {
+            Some(MutationBackend::ETag) => None,
+            #[cfg(feature = "aws")]
+            Some(MutationBackend::OpenDalS3) => {
+                // The OpenDAL bridge can obtain metadata and bytes in separate
+                // requests. Bind both to the ETag used to replace the object.
+                let etag = self
+                    .stat(path)
+                    .await?
+                    .e_tag
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| object_store::Error::Generic {
+                        store: "S3",
+                        source: format!("missing ETag for conditional update of {path}").into(),
+                    })?;
+                Some(etag)
+            }
+            _ => return Ok(None),
+        };
         let options = object_store::GetOptions {
             if_match: if_match.clone(),
             ..Default::default()
@@ -1256,15 +1255,10 @@ impl ObjectStore {
                 source: format!("ETag changed during conditional read of {path}").into(),
             });
         }
-        let (name, validator) = if requires_version {
-            ("generation", meta.version.as_deref())
-        } else {
-            ("ETag", meta.e_tag.as_deref())
-        };
-        if validator.is_none_or(str::is_empty) {
+        if meta.e_tag.as_deref().is_none_or(str::is_empty) {
             return Err(object_store::Error::Generic {
                 store: "ObjectStore",
-                source: format!("missing {name} for conditional update of {path}").into(),
+                source: format!("missing ETag for conditional update of {path}").into(),
             });
         }
         Ok(Some((
@@ -1286,14 +1280,6 @@ impl ObjectStore {
         version: object_store::UpdateVersion,
     ) -> object_store::Result<WriteResult> {
         let options = object_store::PutOptions::from(PutMode::Update(version));
-        #[cfg(feature = "gcp")]
-        if self.selected_mutation_backend() == Some(MutationBackend::Version) {
-            let mut options = options;
-            options
-                .extensions
-                .insert(providers::gcp::GenerationUpdate::default());
-            return self.put_payload_opts(path, payload, options).await;
-        }
         #[cfg(feature = "aws")]
         if matches!(self.scheme(), "s3" | "s3+ddb") && self.selected_mutation_backend().is_some() {
             let mut options = options;
@@ -2922,12 +2908,12 @@ impl StorageOptions {
         Ok(Some(threshold))
     }
 
-    /// Whether local writes must sync files and directory entries before returning.
-    pub(crate) fn local_fsync(&self) -> Result<bool> {
+    fn local_bool(&self, option: &str) -> Result<bool> {
         let Some((_, value)) = self
             .0
             .iter()
-            .find(|(key, _)| key.eq_ignore_ascii_case("local_fsync"))
+            .filter(|(key, _)| key.eq_ignore_ascii_case(option))
+            .min_by_key(|(key, _)| (key.as_str() != option, key.as_str()))
         else {
             return Ok(false);
         };
@@ -2935,7 +2921,7 @@ impl StorageOptions {
             "true" => Ok(true),
             "false" => Ok(false),
             _ => Err(Error::invalid_input(format!(
-                "storage option local_fsync must be `true` or `false`, got `{value}`"
+                "storage option {option} must be `true` or `false`, got `{value}`"
             ))),
         }
     }

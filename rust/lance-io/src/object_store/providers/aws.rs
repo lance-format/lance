@@ -90,6 +90,7 @@ pub(in crate::object_store) fn is_conditional_put_conflict(error: &object_store:
 
 struct ResolvedS3StorageOptions {
     options: HashMap<AmazonS3ConfigKey, String>,
+    conditional_updates: bool,
     profile_region: Option<String>,
     profile_credentials: Option<SharedCredentialsProvider>,
 }
@@ -99,7 +100,19 @@ impl ResolvedS3StorageOptions {
         mut options: HashMap<AmazonS3ConfigKey, String>,
         profile_config: Option<&SdkConfig>,
         profile_credentials: Option<SharedCredentialsProvider>,
-    ) -> Self {
+    ) -> Result<Self> {
+        let mode = options
+            .get(&AmazonS3ConfigKey::ConditionalPut)
+            .map_or("etag", String::as_str);
+        let conditional_updates = match mode.trim() {
+            "etag" => true,
+            "disabled" => false,
+            _ => {
+                return Err(Error::invalid_input(format!(
+                    "Invalid aws_conditional_put value {mode:?}, expected 'etag' or 'disabled'"
+                )));
+            }
+        };
         if effective_s3_endpoint(&options).is_none()
             && let Some(endpoint) = profile_config.and_then(SdkConfig::endpoint_url)
         {
@@ -108,22 +121,16 @@ impl ResolvedS3StorageOptions {
         let profile_region = profile_config
             .and_then(SdkConfig::region)
             .map(|region| region.as_ref().to_string());
-        Self {
+        Ok(Self {
             options,
+            conditional_updates,
             profile_region,
             profile_credentials,
-        }
+        })
     }
 
     fn effective_endpoint(&self) -> Option<&str> {
         effective_s3_endpoint(&self.options)
-    }
-
-    fn supports_conditional_update(&self) -> bool {
-        // Match the native S3 client's default for both S3 implementations.
-        self.options
-            .get(&AmazonS3ConfigKey::ConditionalPut)
-            .is_none_or(|mode| mode.trim() == "etag")
     }
 
     fn throttle_defaults(&self, is_s3_express: bool, use_opendal: bool) -> AimdThrottleConfig {
@@ -206,7 +213,7 @@ impl AwsStoreProvider {
                 client_options = client_options.with_config(*key, value);
             }
         }
-        let conditional_updates = resolved_s3_options.supports_conditional_update();
+        let conditional_updates = resolved_s3_options.conditional_updates;
         let mut builder = AmazonS3Builder::new()
             .with_client_options(client_options.clone())
             .with_copy_if_not_exists(S3CopyIfNotExists::Multipart);
@@ -324,7 +331,7 @@ impl ObjectStoreProvider for AwsStoreProvider {
             storage_options.as_s3_options(),
             config.as_ref(),
             credentials,
-        );
+        )?;
 
         // Determine S3 Express and constant size upload parts before building the store
         let is_s3_express = check_s3_express(&base_path, &storage_options);
@@ -338,7 +345,7 @@ impl ObjectStoreProvider for AwsStoreProvider {
         let throttle_defaults = resolved_s3_options.throttle_defaults(is_s3_express, use_opendal);
         let throttle_state = shared_throttle_state(&store_prefix, params, throttle_defaults)?;
 
-        let update_conditions = resolved_s3_options.supports_conditional_update();
+        let update_conditions = resolved_s3_options.conditional_updates;
         let (inner, paginated_lister) = if use_opendal {
             reject_http_connector_for_opendal(params)?;
             // Use OpenDAL implementation
@@ -1052,16 +1059,39 @@ mod tests {
     #[case::default(None, true)]
     #[case::enabled(Some("etag"), true)]
     #[case::disabled(Some("disabled"), false)]
-    #[case::unknown(Some("unknown"), false)]
+    #[case::padded(Some(" etag "), true)]
     fn test_conditional_update_configuration(#[case] mode: Option<&str>, #[case] expected: bool) {
         let mut options = HashMap::new();
         if let Some(mode) = mode {
             options.insert(AmazonS3ConfigKey::ConditionalPut, mode.into());
         }
         assert_eq!(
-            ResolvedS3StorageOptions::new(options, None, None).supports_conditional_update(),
+            ResolvedS3StorageOptions::new(options, None, None)
+                .unwrap()
+                .conditional_updates,
             expected
         );
+    }
+
+    #[rstest::rstest]
+    #[tokio::test]
+    async fn test_invalid_conditional_put_rejected(#[values(false, true)] use_opendal: bool) {
+        let options = HashMap::from([
+            ("aws_conditional_put".into(), "etga".into()),
+            ("use_opendal".into(), use_opendal.to_string()),
+        ]);
+        let params = ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                options,
+            ))),
+            ..Default::default()
+        };
+        let error = AwsStoreProvider
+            .new_store(Url::parse("s3://bucket/tag").unwrap(), &params)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("etga"));
     }
 
     #[rstest::rstest]
@@ -1357,7 +1387,7 @@ mod tests {
         let url = Url::parse("s3://test-bucket/path").unwrap();
 
         let resolved_s3_options =
-            ResolvedS3StorageOptions::new(HashMap::new(), Some(&profile_config), None);
+            ResolvedS3StorageOptions::new(HashMap::new(), Some(&profile_config), None).unwrap();
         let region = resolve_s3_region(&url, &resolved_s3_options).await.unwrap();
 
         assert_eq!(region.as_deref(), Some("us-west-004"));
@@ -1376,7 +1406,7 @@ mod tests {
             ),
         ]);
         let resolved_s3_options =
-            ResolvedS3StorageOptions::new(explicit_options, Some(&profile_config), None);
+            ResolvedS3StorageOptions::new(explicit_options, Some(&profile_config), None).unwrap();
         let region = resolve_s3_region(&url, &resolved_s3_options).await.unwrap();
 
         assert_eq!(region.as_deref(), Some("explicit-region"));
@@ -1392,7 +1422,7 @@ mod tests {
     async fn test_region_only_aws_profile_preserves_bucket_discovery() {
         let profile_config = load_test_profile("[profile selected]\nregion = us-east-1").await;
         let resolved_s3_options =
-            ResolvedS3StorageOptions::new(HashMap::new(), Some(&profile_config), None);
+            ResolvedS3StorageOptions::new(HashMap::new(), Some(&profile_config), None).unwrap();
 
         let url = Url::parse("s3:///path").unwrap();
         let error = resolve_s3_region(&url, &resolved_s3_options)
@@ -1412,7 +1442,7 @@ mod tests {
         )
         .await;
         let resolved_s3_options =
-            ResolvedS3StorageOptions::new(HashMap::new(), Some(&profile_config), None);
+            ResolvedS3StorageOptions::new(HashMap::new(), Some(&profile_config), None).unwrap();
 
         assert!(resolved_s3_options.requires_constant_size_upload_parts());
     }
@@ -1630,7 +1660,7 @@ mod tests {
 
     #[test]
     fn test_s3_read_rate_defaults() {
-        let native = ResolvedS3StorageOptions::new(HashMap::new(), None, None);
+        let native = ResolvedS3StorageOptions::new(HashMap::new(), None, None).unwrap();
         let defaults = native.throttle_defaults(false, false);
         assert_eq!(defaults.read.max_rate, 11_000.0);
         for category in [defaults.write, defaults.delete, defaults.list] {
@@ -1643,7 +1673,8 @@ mod tests {
             )]),
             None,
             None,
-        );
+        )
+        .unwrap();
         for config in [
             native.throttle_defaults(true, false),
             native.throttle_defaults(false, true),

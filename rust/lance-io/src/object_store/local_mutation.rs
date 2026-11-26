@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::fs::{File, Metadata, Permissions, TryLockError};
+use std::fs::{File, Metadata, Permissions};
 use std::io::{self, ErrorKind, Write};
 use std::os::unix::fs::{FileExt, MetadataExt, PermissionsExt};
 use std::path::PathBuf;
@@ -10,6 +10,8 @@ use std::sync::Arc;
 use object_store::path::Path as ObjectPath;
 use object_store::{GetOptions, GetResultPayload};
 use tempfile::TempPath;
+
+mod mount;
 
 use super::{MutationBackend, ObjectStore};
 use crate::object_writer::close_file;
@@ -27,8 +29,10 @@ pub struct LocalFileMutation {
 }
 
 impl ObjectStore {
-    /// Capture an existing tag in an unwrapped native filesystem. Other stores
-    /// return `None` and continue through their selected object-store backend.
+    /// Capture an existing tag on a native filesystem with local inode locks.
+    /// Other mounts and stores return `None` to use their object-store backend.
+    /// An unidentifiable Linux mount can return [`ErrorKind::Unsupported`].
+    /// Explicit external tag coordination skips the mount lookup.
     ///
     /// ```
     /// # use lance_io::object_store::ObjectStore;
@@ -46,7 +50,12 @@ impl ObjectStore {
         location: &ObjectPath,
     ) -> io::Result<Option<LocalFileMutation>> {
         if !self.has_absolute_local_mapping()
-            || self.selected_mutation_backend() != Some(MutationBackend::Local)
+            || !matches!(
+                self.selected_mutation_backend(),
+                Some(MutationBackend::Local {
+                    external_tag_coordination: false
+                })
+            )
         {
             return Ok(None);
         }
@@ -57,14 +66,19 @@ impl ObjectStore {
         let GetResultPayload::File(file, path) = response.payload else {
             return Err(io::Error::other("native filesystem HEAD returned no file"));
         };
-        Ok(Some(LocalFileMutation {
+        let mutation = LocalFileMutation {
             original: Arc::new(file),
             path,
             location: location.clone(),
             size: response.meta.size,
             tracker: self.io_tracker.clone(),
             fsync: self.local_fsync,
-        }))
+        };
+        // NFS exclusive locks require a writable file, while renaming and
+        // unlinking only require write access to its directory. All writers
+        // on a mount must choose the same protocol before attempting a lock.
+        blocking(move || Ok(mount::supports_inode_lock(&mutation.original)?.then_some(mutation)))
+            .await
     }
 }
 
@@ -142,24 +156,7 @@ impl LocalFileMutation {
         // Writers that observed the same generation share this inode. A writer
         // that opens the replacement already observes the preceding publication.
         let held = self.original.metadata()?;
-        let lock = match self.original.try_lock() {
-            Ok(()) => self.original,
-            // Some filesystems (notably NFS) require write access for an
-            // exclusive lock. Confirm a writable reopen refers to the same generation.
-            Err(TryLockError::Error(error))
-                if error.raw_os_error() == Some(nix::libc::EBADF)
-                    || error.kind() == ErrorKind::PermissionDenied =>
-            {
-                let writable = File::options()
-                    .write(true)
-                    .open(&self.path)
-                    .map_err(missing_generation)?;
-                check_generation(&held, &writable.metadata()?)?;
-                writable.try_lock()?;
-                Arc::new(writable)
-            }
-            Err(error) => return Err(error.into()),
-        };
+        self.original.try_lock()?;
         check_generation(
             &held,
             &std::fs::metadata(&self.path).map_err(missing_generation)?,
@@ -169,7 +166,7 @@ impl LocalFileMutation {
             Some(staged) => staged.persist(&self.path).map_err(|e| e.error)?,
             None => std::fs::remove_file(&self.path)?,
         }
-        drop(lock);
+        drop(self.original);
         if sync_parent {
             let parent = self
                 .path
@@ -223,7 +220,9 @@ mod tests {
             .unwrap();
         let path = base.join("release.json");
         store.put(&path, b"original").await.unwrap();
-        let old = store.open_local_mutation(&path).await.unwrap().unwrap();
+        let Some(old) = store.open_local_mutation(&path).await.unwrap() else {
+            return;
+        };
         let competing = store.open_local_mutation(&path).await.unwrap().unwrap();
         competing.publish(Some(b"new".to_vec())).await.unwrap();
         assert_eq!(old.read_all().await.unwrap().as_slice(), b"original");
@@ -248,7 +247,9 @@ mod tests {
             .unwrap();
         let path = base.join("release.json");
         store.put(&path, b"original").await.unwrap();
-        let old = store.open_local_mutation(&path).await.unwrap().unwrap();
+        let Some(old) = store.open_local_mutation(&path).await.unwrap() else {
+            return;
+        };
         let remover = store.open_local_mutation(&path).await.unwrap().unwrap();
         remover.publish(None).await.unwrap();
         assert_eq!(
@@ -283,7 +284,9 @@ mod tests {
         let second = base.join("second.json");
         store.put(&first, b"first").await.unwrap();
         store.put(&second, b"second").await.unwrap();
-        let blocked = store.open_local_mutation(&first).await.unwrap().unwrap();
+        let Some(blocked) = store.open_local_mutation(&first).await.unwrap() else {
+            return;
+        };
         let independent = store.open_local_mutation(&second).await.unwrap().unwrap();
         let held = std::fs::File::options()
             .read(true)
@@ -325,7 +328,9 @@ mod tests {
         let native_path = directory.join("release.json");
         store.put(&path, b"original").await.unwrap();
         std::fs::set_permissions(&native_path, std::fs::Permissions::from_mode(0o444)).unwrap();
-        let mutation = store.open_local_mutation(&path).await.unwrap().unwrap();
+        let Some(mutation) = store.open_local_mutation(&path).await.unwrap() else {
+            return;
+        };
         mutation.publish(replacement.clone()).await.unwrap();
         if let Some(expected) = replacement {
             assert_eq!(std::fs::read(native_path).unwrap(), expected);
@@ -348,7 +353,9 @@ mod tests {
                 .unwrap();
             let path = base.join("release.json");
             store.put(&path, b"original").await.unwrap();
-            let mutation = store.open_local_mutation(&path).await.unwrap().unwrap();
+            let Some(mutation) = store.open_local_mutation(&path).await.unwrap() else {
+                return;
+            };
 
             let (entered, ready) = tokio::sync::oneshot::channel();
             let (release, wait) = std::sync::mpsc::channel();

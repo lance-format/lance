@@ -2,6 +2,8 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::collections::HashMap;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::os::fd::AsRawFd;
 use std::process::Command;
 use std::sync::{
     Arc, Mutex,
@@ -925,7 +927,7 @@ async fn test_tag(
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[derive(Debug)]
 struct PublishDuringTagResolution {
     uri: String,
@@ -933,7 +935,7 @@ struct PublishDuringTagResolution {
     inner: Arc<dyn CommitHandler>,
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[async_trait::async_trait]
 impl CommitHandler for PublishDuringTagResolution {
     async fn resolve_version_location(
@@ -978,7 +980,62 @@ impl CommitHandler for PublishDuringTagResolution {
     }
 }
 
-#[cfg(unix)]
+// Keep the fixture independent of the tag implementation so the same race
+// runs when replaying this test on older versions.
+#[cfg(target_os = "linux")]
+fn supports_tag_race_fixture(dir: &std::fs::File) -> bool {
+    let Ok(fdinfo) =
+        std::fs::read_to_string(format!("/proc/thread-self/fdinfo/{}", dir.as_raw_fd()))
+    else {
+        return false;
+    };
+    let Some(id) = fdinfo.lines().find_map(|line| line.strip_prefix("mnt_id:")) else {
+        return false;
+    };
+    let Ok(mounts) = std::fs::read("/proc/thread-self/mountinfo") else {
+        return false;
+    };
+    String::from_utf8_lossy(&mounts).lines().any(|line| {
+        let Some((mount_id, rest)) = line.split_once(' ') else {
+            return false;
+        };
+        mount_id == id.trim_ascii()
+            && rest.split_once(" - ").is_some_and(|(_, fs)| {
+                matches!(
+                    fs.split_ascii_whitespace().next(),
+                    Some("ext4" | "overlay" | "tmpfs")
+                )
+            })
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn supports_tag_race_fixture(dir: &std::fs::File) -> bool {
+    let mut attrs = libc::attrlist {
+        bitmapcount: libc::ATTR_BIT_MAP_COUNT,
+        reserved: 0,
+        commonattr: libc::ATTR_CMN_OBJTAG,
+        volattr: libc::ATTR_VOL_INFO,
+        dirattr: 0,
+        fileattr: 0,
+        forkattr: 0,
+    };
+    let mut reply = [0_u32; 2]; // byte length, then volume root vnode tag
+    // SAFETY: attrs and reply are live, aligned buffers of the declared sizes.
+    let status = unsafe {
+        libc::fgetattrlist(
+            dir.as_raw_fd(),
+            (&raw mut attrs).cast(),
+            reply.as_mut_ptr().cast(),
+            size_of_val(&reply),
+            0,
+        )
+    };
+    assert_eq!(status, 0, "{}", std::io::Error::last_os_error());
+    reply == [size_of_val(&reply) as u32, 25] // VT_APFS in <sys/vnode.h>
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[rstest]
 #[case::metadata("metadata")]
 #[case::delete("delete")]
@@ -986,6 +1043,9 @@ impl CommitHandler for PublishDuringTagResolution {
 #[tokio::test]
 async fn test_tag_retarget_observes_concurrent_writer(#[case] mutation: &'static str) {
     let temp = TempStdDir::default();
+    if !supports_tag_race_fixture(&std::fs::File::open(&*temp).unwrap()) {
+        return;
+    }
     let table = temp.join("space %2F");
     let path = table.to_str().unwrap();
     let mut first = Dataset::write(id_rows(0, 2), path, None).await.unwrap();
@@ -1046,7 +1106,7 @@ async fn test_tag_retarget_observes_concurrent_writer(#[case] mutation: &'static
     );
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[tokio::test]
 async fn test_tag_mutation_child() {
     let Ok(uri) = std::env::var("LANCE_TEST_TAG_URI") else {

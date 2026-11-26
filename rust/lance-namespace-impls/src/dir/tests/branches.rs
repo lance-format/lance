@@ -2134,6 +2134,18 @@ async fn test_tag_mutation_conflict() {
     namespace.create_table_tag(create).await.unwrap();
 
     let location = namespace.resolve_table_location(&id).await.unwrap();
+    let (store, base) = lance_io::object_store::ObjectStore::from_uri(&location)
+        .await
+        .unwrap();
+    let tag_path = base.join("_refs").join("tags").join("rolling.json");
+    if store
+        .open_local_mutation(&tag_path)
+        .await
+        .unwrap()
+        .is_none()
+    {
+        return;
+    }
     let table = uri_to_url(&location).unwrap().to_file_path().unwrap();
     let tag = std::fs::File::open(table.join("_refs/tags/rolling.json")).unwrap();
     tag.try_lock().unwrap();

@@ -123,7 +123,9 @@ impl ObjectStoreProvider for FileStoreProvider {
         let block_size = params.block_size.unwrap_or(DEFAULT_LOCAL_BLOCK_SIZE);
         let storage_options = StorageOptions(params.storage_options().cloned().unwrap_or_default());
         let download_retry_count = storage_options.download_retry_count();
-        let local_fsync = storage_options.local_fsync()?;
+        let local_fsync = storage_options.local_bool("local_fsync")?;
+        let external_tag_coordination =
+            storage_options.local_bool("local_tag_external_coordination")?;
 
         #[cfg(windows)]
         let (inner, local_dir_operations) = match windows::extract_unc_path(&base_path)? {
@@ -147,7 +149,12 @@ impl ObjectStoreProvider for FileStoreProvider {
 
         let inner: Arc<dyn object_store::ObjectStore> = Arc::new(inner);
         Ok(ObjectStore {
-            mutation_backend: Some((MutationBackend::Local, Arc::downgrade(&inner))),
+            mutation_backend: Some((
+                MutationBackend::Local {
+                    external_tag_coordination,
+                },
+                Arc::downgrade(&inner),
+            )),
             inner,
             external_blob_inner: None,
             _external_blob_origin: None,
@@ -242,11 +249,14 @@ mod tests {
         assert_eq!(std::fs::read(file_path).unwrap(), b"data");
     }
 
+    #[rstest]
+    #[case::durability("local_fsync")]
+    #[case::tag_coordination("local_tag_external_coordination")]
     #[tokio::test]
-    async fn test_invalid_local_fsync_storage_option() {
+    async fn test_invalid_local_boolean_storage_option(#[case] option: &str) {
         let params = ObjectStoreParams {
             storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
-                HashMap::from([("local_fsync".to_owned(), "sometimes".to_owned())]),
+                HashMap::from([(option.to_owned(), "sometimes".to_owned())]),
             ))),
             ..Default::default()
         };
@@ -255,8 +265,31 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
-        assert!(error.to_string().contains("local_fsync"), "{error}");
+        assert!(error.to_string().contains(option), "{error}");
         assert!(error.to_string().contains("sometimes"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[rstest]
+    #[case::direct("file")]
+    #[case::object_store("file-object-store")]
+    #[tokio::test]
+    async fn test_external_tag_coordination_preserves_local_paths(#[case] scheme: &str) {
+        let params = ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                HashMap::from([("local_tag_external_coordination".into(), "true".into())]),
+            ))),
+            ..Default::default()
+        };
+        let store = FileStoreProvider
+            .new_store(Url::parse(&format!("{scheme}:///")).unwrap(), &params)
+            .await
+            .unwrap();
+        assert!(store.has_absolute_local_mapping());
+        assert_eq!(store.has_direct_local_paths(), scheme == "file");
+        let dir = tempdir().unwrap();
+        let missing = Path::from_absolute_path(dir.path().join("absent")).unwrap();
+        assert!(store.open_local_mutation(&missing).await.unwrap().is_none());
     }
 
     fn rooted_local_store(root: &StdPath) -> ObjectStore {
@@ -266,7 +299,12 @@ mod tests {
         });
         let inner: Arc<dyn object_store::ObjectStore> = Arc::new(inner);
         ObjectStore {
-            mutation_backend: Some((MutationBackend::Local, Arc::downgrade(&inner))),
+            mutation_backend: Some((
+                MutationBackend::Local {
+                    external_tag_coordination: false,
+                },
+                Arc::downgrade(&inner),
+            )),
             inner,
             external_blob_inner: None,
             _external_blob_origin: None,

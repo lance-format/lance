@@ -950,19 +950,6 @@ impl AimdHttpService {
 #[async_trait]
 impl HttpService for AimdHttpService {
     async fn call(&self, request: HttpRequest) -> Result<HttpResponse, HttpError> {
-        #[cfg(feature = "gcp")]
-        if let Some(update) = request
-            .extensions()
-            .get::<super::providers::gcp::GenerationUpdate>()
-            && update.0.swap(true, std::sync::atomic::Ordering::Relaxed)
-        {
-            return Err(HttpError::new(
-                HttpErrorKind::Unknown,
-                std::io::Error::other(
-                    "generation-conditioned write outcome is unknown after a failed response",
-                ),
-            ));
-        }
         if let Some(delete) = self.delete.as_ref().filter(|_| is_delete_request(&request)) {
             // The cloud client owns retry and bulk response handling. Each HTTP
             // attempt draws one token, including retries of a bulk request.
@@ -1309,16 +1296,6 @@ impl ObjectStore for AimdThrottledStore {
         opts: PutOptions,
     ) -> OSResult<PutResult> {
         let max_retries = self.write.max_retries;
-        #[cfg(feature = "gcp")]
-        let max_retries = if opts
-            .extensions
-            .get::<super::providers::gcp::GenerationUpdate>()
-            .is_some()
-        {
-            0
-        } else {
-            max_retries
-        };
         #[cfg(feature = "aws")]
         let max_retries = if opts
             .extensions
