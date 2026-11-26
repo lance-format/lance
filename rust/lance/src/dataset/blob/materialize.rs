@@ -11,9 +11,9 @@ use lance_table_runtime::blob as runtime;
 use crate::Dataset;
 
 pub use runtime::{
-    BlobMaterializationAdmission, BlobMaterializationContext, MaterializedBlobBatch,
-    blob_v2_descriptor_schema, public_blob_v2_binary_output_schema, schema_has_blob_v2_binary_view,
-    split_batch_by_bytes,
+    BlobMaterializationAdmission, BlobMaterializationContext, BlobMaterializationReservation,
+    MaterializedBlobBatch, blob_v2_descriptor_schema, public_blob_v2_binary_output_schema,
+    schema_has_blob_v2_binary_view, split_batch_by_bytes,
 };
 
 /// Materialize blob v2 descriptor arrays in a decoded batch into binary arrays.

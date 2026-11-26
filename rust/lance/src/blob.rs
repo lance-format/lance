@@ -15,6 +15,8 @@
 //! this metadata, logical writes use Inline, Packed, and Dedicated descriptors;
 //! prepared Managed descriptors are rejected.
 
+pub mod reference;
+
 pub use lance_table_runtime::blob::{
     BlobArrayBuilder, BlobDescriptor, BlobDescriptorArrayBuilder, BlobDescriptorColumn,
     BlobFieldOptions, BlobFile, BlobRange, BlobReadRange, BlobWriteSources, DedicatedBlobWriter,
