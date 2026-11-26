@@ -1105,14 +1105,15 @@ impl LanceFileReader {
         batch_size: u32,
         batch_readahead: u32,
     ) -> PyResult<PyArrowType<Box<dyn RecordBatchReader + Send>>> {
-        // Row indices are u32; reject larger values instead of letting them
-        // wrap around to a different, valid row.
+        // The reader takes u32 indices; reject larger values instead of letting
+        // them wrap around to a different, valid row.
         let indices = row_indices
             .into_iter()
             .map(|idx| {
                 u32::try_from(idx).map_err(|_| {
                     PyValueError::new_err(format!(
-                        "Row index {idx} is out of range (maximum is {})",
+                        "take_rows supports row indices up to {}, got {idx}; use read_range \
+                         for rows beyond that",
                         u32::MAX
                     ))
                 })
