@@ -7,13 +7,14 @@ use futures::future::BoxFuture;
 use futures::stream::BoxStream;
 use futures::{FutureExt, StreamExt, TryStreamExt};
 use lance_core::{Error, Result};
+use lance_table::io::commit::{ManifestLocation, ManifestNamingScheme};
 use lance_table::transaction::Transaction;
 
 use crate::Table;
 use crate::caches::TransactionKey;
 
 struct NewTransactionResult<'a> {
-    dataset: BoxFuture<'a, Result<Table>>,
+    dataset: BoxFuture<'a, Result<(Table, Option<ManifestLocation>)>>,
     new_transactions: BoxStream<'a, Result<(u64, Arc<Transaction>)>>,
 }
 
@@ -29,17 +30,34 @@ fn load_new_transactions(
     dataset: &Table,
     source: TransactionReadSource,
 ) -> NewTransactionResult<'_> {
-    // Resolve every manifest with version > our current version (the latest plus
-    // the ones in between). On non-lexically-ordered stores this uses the version
-    // hint to avoid an O(n) listing.
+    // Include the current V1 version so even an up-to-date writer can observe
+    // migration without a second listing. Only newer transactions are loaded.
+    // On non-lexically-ordered stores the hint still avoids an O(n) listing.
     let io_parallelism = dataset.state.object_store.as_ref().io_parallelism();
     // Both stages must poll their input even when the store permits only one I/O.
     let stage_parallelism = (io_parallelism / 2).max(1);
-    let locations = dataset.state.commit_handler.list_manifest_locations_since(
-        &dataset.state.base,
-        dataset.state.object_store.as_ref(),
-        dataset.manifest.version,
-    );
+    let since_version = if dataset.state.manifest_location.naming_scheme == ManifestNamingScheme::V1
+    {
+        dataset.manifest.version.saturating_sub(1)
+    } else {
+        dataset.manifest.version
+    };
+    let (location_tx, location_rx) = tokio::sync::oneshot::channel();
+    let mut location_tx = Some(location_tx);
+    let locations = dataset
+        .state
+        .commit_handler
+        .list_manifest_locations_since(
+            &dataset.state.base,
+            dataset.state.object_store.as_ref(),
+            since_version,
+        )
+        .inspect_ok(move |location| {
+            if let Some(tx) = location_tx.take() {
+                let _ = tx.send(location.clone());
+            }
+        })
+        .try_filter(|location| futures::future::ready(location.version > dataset.manifest.version));
 
     // Will send the latest manifest via a channel.
     let (latest_tx, latest_rx) = tokio::sync::oneshot::channel();
@@ -121,16 +139,18 @@ fn load_new_transactions(
         .try_buffer_unordered(stage_parallelism);
 
     let dataset = async move {
-        if let Ok((latest_manifest, location)) = latest_rx.await {
+        let latest_location = location_rx.await.ok();
+        let latest = if let Ok((latest_manifest, location)) = latest_rx.await {
             // Advancing a retry must preserve the handle's branch incarnation.
             let mut latest = dataset.clone();
             latest.set_manifest(latest_manifest, location);
-            Ok(latest)
+            latest
         } else {
             // If we didn't get the latest manifest, we can still return the dataset
             // with the current manifest.
-            Ok(dataset.clone())
-        }
+            dataset.clone()
+        };
+        Ok((latest, latest_location))
     }
     .boxed();
 
@@ -146,12 +166,29 @@ pub async fn load_and_sort_new_transactions(
     dataset: &Table,
     source: TransactionReadSource,
 ) -> Result<(Table, Vec<(u64, Arc<Transaction>)>)> {
+    let (dataset, transactions, _) =
+        load_and_sort_new_transactions_with_location(dataset, source).await?;
+    Ok((dataset, transactions))
+}
+
+/// Also return the first authoritative location observed by the listing.
+/// It can be the current version after migration; it is absent if no retained
+/// manifest satisfies the listing bound, so a commit must use its resolver.
+pub(super) async fn load_and_sort_new_transactions_with_location(
+    dataset: &Table,
+    source: TransactionReadSource,
+) -> Result<(
+    Table,
+    Vec<(u64, Arc<Transaction>)>,
+    Option<ManifestLocation>,
+)> {
     let NewTransactionResult {
         dataset: new_ds,
         new_transactions,
     } = load_new_transactions(dataset, source);
     let new_transactions = new_transactions.try_collect::<Vec<_>>();
-    let (new_ds, mut txns) = futures::future::try_join(new_ds, new_transactions).await?;
+    let ((new_ds, location), mut txns) =
+        futures::future::try_join(new_ds, new_transactions).await?;
     txns.sort_by_key(|(version, _)| *version);
-    Ok((new_ds, txns))
+    Ok((new_ds, txns, location))
 }
