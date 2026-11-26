@@ -43,7 +43,19 @@ fn handle_error(py_err: PyErr, py: Python) -> CommitError {
     };
 
     if py_err.is_instance(py, &conflict_err_type) {
-        CommitError::CommitConflict
+        // `retryable=False` means retrying cannot help, so it must not be retried.
+        let retryable = py_err
+            .value(py)
+            .getattr("retryable")
+            .and_then(|flag| flag.is_truthy())
+            .unwrap_or(true);
+        if retryable {
+            CommitError::CommitConflict
+        } else {
+            CommitError::OtherError(Error::incompatible_transaction_source(
+                py_err.to_string().into(),
+            ))
+        }
     } else {
         CommitError::OtherError(Error::internal(format!(
             "Error from commit handler: {}",

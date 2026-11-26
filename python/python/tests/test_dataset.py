@@ -11151,14 +11151,17 @@ class TestLanceScannerTake:
         assert scanner.take(pa.array([0, 2]))["id"].to_pylist() == [4, 6]
 
 
-def test_commit_lock_conflict_error_keeps_type(tmp_path: Path):
-    # A CommitConflictError raised by a custom lock must surface as that type, with its
-    # retryable flag, instead of being flattened into a generic internal OSError.
+@pytest.mark.parametrize("retryable", [True, False])
+def test_commit_lock_conflict_error_keeps_type(tmp_path: Path, retryable):
+    # A CommitConflictError raised by a custom lock is a commit conflict, not a generic
+    # internal OSError. A retryable one is retried; one that is not fails at once.
     commit_module = importlib.import_module("lance.commit")
+    lock_calls = []
 
     @contextlib.contextmanager
-    def conflicting_lock(_version: int):
-        raise commit_module.CommitConflictError("taken by another writer")
+    def conflicting_lock(version: int):
+        lock_calls.append(version)
+        raise commit_module.CommitConflictError("taken", retryable=retryable)
 
     dataset = lance.write_dataset(pa.table({"a": range(10)}), tmp_path / "data")
     fragment = dataset.get_fragments()[0]
@@ -11169,7 +11172,8 @@ def test_commit_lock_conflict_error_keeps_type(tmp_path: Path):
             lance.LanceOperation.Append([fragment.metadata]),
             read_version=dataset.version,
             commit_lock=conflicting_lock,
-            max_retries=0,
+            max_retries=3,
         )
-    assert exc_info.value.retryable is True
+    assert exc_info.value.retryable is retryable
+    assert len(lock_calls) == (3 if retryable else 1)
     assert lance.dataset(tmp_path / "data").version == 1
