@@ -1321,11 +1321,14 @@ mod tests {
         let dataset = capture_dataset("memory://").await;
         let source = BlobSourceContext::from_dataset(&dataset, identity, "workers")
             .await
-            .unwrap();
-        let mut dataset = dataset.as_ref().clone();
-        dataset.table_state.object_store = store;
+            .unwrap()
+            .with_external_immutability_assumption();
+        dataset
+            .session
+            .store_registry()
+            .insert("mock", Arc::new(FixedStoreProvider(store.as_ref().clone())));
         (
-            BlobRefBinding::try_new(source.clone(), Arc::new(dataset)).unwrap(),
+            BlobRefBinding::try_new(source.clone(), dataset).unwrap(),
             source,
         )
     }
@@ -1388,6 +1391,29 @@ mod tests {
             None,
         );
         let dataset = capture_dataset("memory://").await;
+        // Configure the scheduling limit before reopening the real manifest.
+        let manifest_store = ObjectStore::new(
+            dataset.table_state.object_store.inner.clone(),
+            url::Url::parse(dataset.uri()).unwrap(),
+            None,
+            None,
+            false,
+            true,
+            parallelism,
+            lance_io::object_store::DEFAULT_DOWNLOAD_RETRY_COUNT,
+            None,
+        );
+        dataset
+            .session
+            .store_registry()
+            .insert("memory", Arc::new(FixedStoreProvider(manifest_store)));
+        let dataset = Arc::new(
+            DatasetBuilder::from_uri(dataset.uri())
+                .with_session(dataset.session.clone())
+                .load()
+                .await
+                .unwrap(),
+        );
         let source = BlobSourceContext::from_dataset(&dataset, "catalog/table", "workers")
             .await
             .unwrap()
@@ -1396,11 +1422,9 @@ mod tests {
             .session
             .store_registry()
             .insert("mock", Arc::new(FixedStoreProvider(store.clone())));
-        let mut dataset = dataset.as_ref().clone();
-        dataset.table_state.object_store = Arc::new(store);
         let budget = BlobMaterializationContext::try_new(1024, 1024).unwrap();
         let reader = BlobRefReader::try_new(
-            vec![BlobRefBinding::try_new(source.clone(), Arc::new(dataset)).unwrap()],
+            vec![BlobRefBinding::try_new(source.clone(), dataset).unwrap()],
             budget.clone(),
         )
         .unwrap();
@@ -1417,10 +1441,10 @@ mod tests {
     ) -> BlobRefRequest {
         let reference = source
             .reference(
-                "memory:///_blobs/payload.blob".to_string(),
+                "mock://objects/_blobs/payload.blob".to_string(),
                 offset,
                 Some(length),
-                BlobKind::Packed,
+                BlobKind::External,
                 None,
             )
             .unwrap();
