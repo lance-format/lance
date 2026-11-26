@@ -239,13 +239,24 @@ impl Tags<'_> {
     }
 
     pub async fn create(&self, tag: &str, reference: impl Into<Ref>) -> Result<()> {
+        self.create_with_metadata(tag, reference, HashMap::new())
+            .await
+    }
+
+    /// Create a tag with user metadata in the initial conditional write.
+    pub async fn create_with_metadata(
+        &self,
+        tag: &str,
+        reference: impl Into<Ref>,
+        metadata: HashMap<String, String>,
+    ) -> Result<()> {
         check_valid_tag(tag)?;
         let root_location = self.refs.root()?;
         let tag_file = tag_path(&root_location.path, tag);
 
         let now = Utc::now();
         let tag_contents = self
-            .build_tag_content_by_ref(reference, Some(now), Some(now))
+            .build_tag_content_by_ref(reference, Some(now), Some(now), metadata)
             .await?;
 
         put_ref_if_absent(
@@ -282,15 +293,15 @@ impl Tags<'_> {
                 message: format!("tag {} does not exist", tag),
             });
         }
-        let mut tag_contents = TagContents::from_path(&tag_file, self.object_store()).await?;
-        let updated_reference = self
-            .build_tag_content_by_ref(reference, tag_contents.created_at, Some(Utc::now()))
+        let previous = TagContents::from_path(&tag_file, self.object_store()).await?;
+        let tag_contents = self
+            .build_tag_content_by_ref(
+                reference,
+                previous.created_at,
+                Some(Utc::now()),
+                previous.metadata,
+            )
             .await?;
-        tag_contents.branch = updated_reference.branch;
-        tag_contents.version = updated_reference.version;
-        tag_contents.created_at = updated_reference.created_at;
-        tag_contents.updated_at = updated_reference.updated_at;
-        tag_contents.manifest_size = updated_reference.manifest_size;
 
         self.object_store()
             .put(
@@ -333,6 +344,7 @@ impl Tags<'_> {
         reference: impl Into<Ref>,
         created_at: Option<DateTime<Utc>>,
         updated_at: Option<DateTime<Utc>>,
+        metadata: HashMap<String, String>,
     ) -> Result<TagContents> {
         let reference = reference.into();
         let (branch, version_number) = match reference {
@@ -384,7 +396,7 @@ impl Tags<'_> {
             created_at,
             updated_at,
             manifest_size,
-            metadata: HashMap::new(),
+            metadata,
         };
         Ok(tag_contents)
     }
@@ -479,6 +491,17 @@ impl Branches<'_> {
         version_number: u64,
         source_branch: Option<&str>,
     ) -> Result<BranchContents> {
+        self.create_with_metadata(branch_name, version_number, source_branch, HashMap::new())
+            .await
+    }
+
+    pub(crate) async fn create_with_metadata(
+        &self,
+        branch_name: &str,
+        version_number: u64,
+        source_branch: Option<&str>,
+        metadata: HashMap<String, String>,
+    ) -> Result<BranchContents> {
         check_valid_branch(branch_name)?;
 
         let source_branch = source_branch.and_then(standardize_branch);
@@ -531,7 +554,7 @@ impl Branches<'_> {
             } else {
                 self.object_store().size(&manifest_file.path).await? as usize
             },
-            metadata: HashMap::new(),
+            metadata,
         };
 
         put_ref_if_absent(

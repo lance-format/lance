@@ -2314,11 +2314,21 @@ impl Dataset {
         })
     }
 
-    fn create_tag(&mut self, tag: String, reference: Option<Bound<PyAny>>) -> PyResult<()> {
+    #[pyo3(signature = (tag, reference=None, *, metadata=None))]
+    fn create_tag(
+        &mut self,
+        tag: String,
+        reference: Option<Bound<PyAny>>,
+        metadata: Option<HashMap<String, String>>,
+    ) -> PyResult<()> {
         let reference = self.transform_ref(reference)?;
         rt().block_on(
             None,
-            self.ds.as_ref().tags().create(tag.as_str(), reference),
+            self.ds.as_ref().tags().create_with_metadata(
+                tag.as_str(),
+                reference,
+                metadata.unwrap_or_default(),
+            ),
         )?
         .map_err(|err| match err {
             Error::NotFound { .. } => PyValueError::new_err(err.to_string()),
@@ -2372,12 +2382,13 @@ impl Dataset {
     }
 
     /// Create a branch from a specific version reference (version number or tag)
-    #[pyo3(signature = (branch, reference=None, storage_options=None))]
+    #[pyo3(signature = (branch, reference=None, storage_options=None, *, metadata=None))]
     fn create_branch(
         &mut self,
         branch: String,
         reference: Option<Bound<PyAny>>,
         storage_options: Option<HashMap<String, String>>,
+        metadata: Option<HashMap<String, String>>,
     ) -> PyResult<Self> {
         let mut new_self = self.ds.as_ref().clone();
         let reference = self.transform_ref(reference)?;
@@ -2390,7 +2401,12 @@ impl Dataset {
         let created = rt()
             .block_on(
                 None,
-                new_self.create_branch(branch.as_str(), reference, store_params),
+                new_self.create_branch_with_metadata(
+                    branch.as_str(),
+                    reference,
+                    store_params,
+                    metadata.unwrap_or_default(),
+                ),
             )?
             .map_err(|err| PyIOError::new_err(err.to_string()))?;
         // Update self to reflect any metadata changes; return the new branch dataset
