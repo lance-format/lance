@@ -126,7 +126,7 @@ impl LoggingPassthroughState {
             // Panicking here would poison SUBSCRIBER and every later span would panic too.
             return Err(PyRuntimeError::new_err(
                 "A trace event callback is already registered; call \
-                 lance.lance.shutdown_tracing() before registering another one",
+                 lance.tracing.shutdown_tracing() before registering another one",
             ));
         }
         let (sender, receiver) = mpsc::sync_channel(1000);

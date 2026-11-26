@@ -50,6 +50,12 @@ def capture_trace_events(callback: Callable[[TraceEvent], None]):
     ----------
     callback: Callable[[TraceEvent], None]
         The callback to call with each trace event.
+
+    Raises
+    ------
+    RuntimeError
+        If a callback is already registered. Call ``shutdown_tracing()`` before
+        registering another one.
     """
     lance_capture_trace_events(callback)
     atexit.register(lambda: shutdown_tracing())

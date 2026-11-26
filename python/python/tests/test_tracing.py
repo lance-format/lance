@@ -138,7 +138,7 @@ def test_tracing_callback_twice(tmp_path):
 import lance
 import pyarrow as pa
 
-from lance.tracing import capture_trace_events
+from lance.tracing import capture_trace_events, shutdown_tracing
 
 capture_trace_events(lambda evt: None)
 try:
@@ -150,6 +150,11 @@ else:
 
 path = sys.argv[1]
 lance.write_dataset(pa.table({"x": range(10)}), path)
+assert lance.dataset(path).count_rows() == 10
+
+# Once the first callback is shut down, another one can be registered.
+shutdown_tracing()
+capture_trace_events(lambda evt: None)
 assert lance.dataset(path).count_rows() == 10
 """
     )
