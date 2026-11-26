@@ -1174,15 +1174,25 @@ mod tests {
     use num_traits::AsPrimitive;
     use proptest::prelude::*;
 
-    fn cosine_dist_brute_force(x: &[f32], y: &[f32]) -> f32 {
+    /// Cosine distance accumulated in f64, as a reference independent of the
+    /// f32 summation order.
+    fn cosine_dist_f64(x: &[f32], y: &[f32]) -> f32 {
         let xy = x
             .iter()
             .zip(y.iter())
-            .map(|(&xi, &yi)| xi * yi)
-            .sum::<f32>();
-        let x_sq = x.iter().map(|&xi| xi * xi).sum::<f32>().sqrt();
-        let y_sq = y.iter().map(|&yi| yi * yi).sum::<f32>().sqrt();
-        1.0 - xy / x_sq / y_sq
+            .map(|(&xi, &yi)| xi as f64 * yi as f64)
+            .sum::<f64>();
+        let x_sq = x
+            .iter()
+            .map(|&xi| xi as f64 * xi as f64)
+            .sum::<f64>()
+            .sqrt();
+        let y_sq = y
+            .iter()
+            .map(|&yi| yi as f64 * yi as f64)
+            .sum::<f64>()
+            .sqrt();
+        (1.0 - xy / x_sq / y_sq) as f32
     }
 
     #[test]
@@ -1243,7 +1253,10 @@ mod tests {
         let x = (0..total).map(|v| v as f32).collect::<Vec<_>>();
         let y = (1024..1024 + total).map(|v| v as f32).collect::<Vec<_>>();
         let d = cosine_distance_batch_vec(&x, &y, total);
-        assert_relative_eq!(d[0], cosine_dist_brute_force(&x, &y));
+        // The similarity is ~0.945, so `1 - similarity` magnifies its rounding
+        // about 18x: a few ulps in the f32 dot product move the distance by
+        // several 1e-6. The SSE fallback lands 7e-6 from the f64 value.
+        assert_relative_eq!(d[0], cosine_dist_f64(&x, &y), max_relative = 2e-5);
     }
 
     #[test]
