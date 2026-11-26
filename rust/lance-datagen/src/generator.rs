@@ -4,7 +4,7 @@
 use std::{collections::HashMap, iter, marker::PhantomData, sync::Arc, sync::LazyLock};
 
 use arrow::{
-    array::{AsArray, Float32Builder, GenericBinaryBuilder, GenericStringBuilder},
+    array::{ArrayData, AsArray, Float32Builder, GenericBinaryBuilder, GenericStringBuilder},
     buffer::{BooleanBuffer, Buffer, MutableBuffer, NullBuffer, OffsetBuffer, ScalarBuffer},
     datatypes::{
         ArrowPrimitiveType, Float32Type, Int32Type, Int64Type, IntervalDayTime,
@@ -135,6 +135,31 @@ fn null_buffer_for_array(
             unsafe { NullBuffer::new_unchecked(validity, null_count) }
         }
         None => NullBuffer::new(validity),
+    }
+}
+
+fn replace_validity(
+    data: ArrayData,
+    nulls: Option<NullBuffer>,
+) -> Result<Arc<dyn Array>, ArrowError> {
+    let len = data.len();
+    let nulls = nulls.filter(|mask| mask.null_count() > 0);
+    // A parent mask can hide logical nulls in non-nullable children even when the
+    // child has no physical bitmap. The typed constructors check those nulls.
+    match data.data_type() {
+        DataType::Struct(_) => {
+            let (fields, children, _) = StructArray::from(data).into_parts();
+            Ok(Arc::new(StructArray::try_new_with_length(
+                fields, children, nulls, len,
+            )?))
+        }
+        DataType::FixedSizeList(_, _) => {
+            let (field, size, values, _) = FixedSizeListArray::from(data).into_parts();
+            Ok(Arc::new(FixedSizeListArray::try_new_with_length(
+                field, size, values, nulls, len,
+            )?))
+        }
+        _ => Ok(make_array(data.into_builder().nulls(nulls).build()?)),
     }
 }
 
@@ -270,11 +295,7 @@ impl ArrayGenerator for CycleNullGenerator {
             data.offset(),
             None,
         );
-        // SAFETY: the source data is valid, `nulls` has exactly `data.len()`
-        // visible entries and enough backing bits for the source offset, and the
-        // builder preserves every other field.
-        let new_data = unsafe { data.into_builder().nulls(Some(nulls)).build_unchecked() };
-        Ok(make_array(new_data))
+        replace_validity(data, Some(nulls))
     }
 
     fn data_type(&self) -> &DataType {
@@ -383,11 +404,7 @@ impl ArrayGenerator for NullGenerator {
         let nulls = new_validity.map(|validity| {
             null_buffer_for_array(validity, data.len(), data.offset(), Some(null_count))
         });
-        // SAFETY: the source data is valid, any `nulls` value has exactly
-        // `data.len()` visible entries and enough backing bits for the source
-        // offset, and the builder preserves every other field.
-        let new_data = unsafe { data.into_builder().nulls(nulls).build_unchecked() };
-        Ok(make_array(new_data))
+        replace_validity(data, nulls)
     }
 
     fn metadata(&self) -> Option<HashMap<String, String>> {
@@ -2292,7 +2309,6 @@ impl FixedSizeBatchGenerator {
             let arr = genn.generate(self.batch_size, &mut self.rng)?;
             arrays.push(arr);
         }
-        self.num_batches.0 -= 1;
         Ok(RecordBatch::try_new_with_options(
             self.schema.clone(),
             arrays,
@@ -2309,7 +2325,14 @@ impl Iterator for FixedSizeBatchGenerator {
         if self.num_batches.0 == 0 {
             return None;
         }
-        Some(self.gen_next())
+        let batch = self.gen_next();
+        // Earlier columns may already have advanced when a later generator fails.
+        self.num_batches.0 = if batch.is_ok() {
+            self.num_batches.0 - 1
+        } else {
+            0
+        };
+        Some(batch)
     }
 }
 
@@ -3638,107 +3661,92 @@ mod tests {
         assert!((3..5).all(|idx| arr.is_valid(idx)));
         assert!(arr.is_null(5));
         assert!(arr.is_valid(6));
+    }
 
-        #[derive(Debug)]
-        struct OffsetArray(arrow::array::ArrayData);
+    #[derive(Debug)]
+    struct TestArrayGenerator(Arc<dyn Array>);
 
-        // SAFETY: `OffsetArray` preserves the invariants of its valid `ArrayData`.
-        unsafe impl Array for OffsetArray {
-            fn as_any(&self) -> &dyn std::any::Any {
-                self
-            }
-
-            fn to_data(&self) -> arrow::array::ArrayData {
-                self.0.clone()
-            }
-
-            fn into_data(self) -> arrow::array::ArrayData {
-                self.0
-            }
-
-            fn data_type(&self) -> &DataType {
-                self.0.data_type()
-            }
-
-            fn slice(&self, offset: usize, length: usize) -> Arc<dyn Array> {
-                Arc::new(Self(self.0.slice(offset, length)))
-            }
-
-            fn len(&self) -> usize {
-                self.0.len()
-            }
-
-            fn is_empty(&self) -> bool {
-                self.0.is_empty()
-            }
-
-            fn offset(&self) -> usize {
-                self.0.offset()
-            }
-
-            fn nulls(&self) -> Option<&arrow::buffer::NullBuffer> {
-                self.0.nulls()
-            }
-
-            fn get_buffer_memory_size(&self) -> usize {
-                self.0.get_buffer_memory_size()
-            }
-
-            fn get_array_memory_size(&self) -> usize {
-                self.0.get_array_memory_size()
-            }
+    impl ArrayGenerator for TestArrayGenerator {
+        fn generate(
+            &mut self,
+            length: RowCount,
+            _rng: &mut rand_xoshiro::Xoshiro256PlusPlus,
+        ) -> Result<Arc<dyn Array>, ArrowError> {
+            Ok(self.0.slice(0, length.0 as usize))
         }
 
-        #[derive(Debug)]
-        struct SlicedGenerator {
-            generator: Box<dyn ArrayGenerator>,
-            offset: usize,
+        fn data_type(&self) -> &DataType {
+            self.0.data_type()
         }
 
-        impl ArrayGenerator for SlicedGenerator {
-            fn generate(
-                &mut self,
-                length: RowCount,
-                rng: &mut rand_xoshiro::Xoshiro256PlusPlus,
-            ) -> Result<Arc<dyn arrow_array::Array>, ArrowError> {
-                let source_length = RowCount::from(length.0 + self.offset as u64);
-                let data = self.generator.generate(source_length, rng)?.to_data();
-                let data = data.slice(self.offset, length.0 as usize);
-                assert_eq!(data.offset(), self.offset);
-                Ok(Arc::new(OffsetArray(data)))
-            }
-
-            fn data_type(&self) -> &DataType {
-                self.generator.data_type()
-            }
-
-            fn element_size_bytes(&self) -> Option<ByteCount> {
-                self.generator.element_size_bytes()
-            }
+        fn element_size_bytes(&self) -> Option<ByteCount> {
+            None
         }
+    }
 
-        let sliced = |offset| -> Box<dyn ArrayGenerator> {
-            Box::new(SlicedGenerator {
-                generator: array::rand::<Int32Type>(),
-                offset,
-            })
-        };
-        let mut genn = sliced(2).with_validity(&[true, false, true]);
-        let arr = genn.generate(RowCount::from(5), &mut rng).unwrap();
-        assert_eq!(
-            arr.nulls().unwrap().iter().collect::<Vec<_>>(),
-            [true, false, true, true, false]
+    fn sliced_booleans() -> Box<dyn ArrayGenerator> {
+        let source = BooleanArray::from(vec![
+            false, false, false, false, false, false, true, false, false, true, false,
+        ]);
+        Box::new(TestArrayGenerator(Arc::new(source.slice(6, 5))))
+    }
+
+    #[rstest]
+    #[case::cyclic(
+        sliced_booleans().with_validity(&[true, false, true]),
+        [Some(true), None, Some(false), Some(true), None]
+    )]
+    #[case::seeded_random(
+        sliced_booleans().with_random_nulls(0.45),
+        [Some(true), Some(false), None, None, None]
+    )]
+    fn test_nulls_on_sliced_boolean_array(
+        #[case] mut generator: Box<dyn ArrayGenerator>,
+        #[case] expected: [Option<bool>; 5],
+    ) {
+        let array = generator.generate_default(RowCount::from(5)).unwrap();
+        let data = array.to_data();
+        assert_eq!(data.offset(), 6);
+        assert_eq!(array.as_boolean().iter().collect::<Vec<_>>(), expected);
+        data.validate_full().unwrap();
+    }
+
+    #[test]
+    fn test_nulls_reject_bitmap_on_null_type() {
+        let mut reader = gen_batch()
+            .col("value", array::null_type().with_nulls(&[true]))
+            .into_reader_rows(RowCount::from(1), BatchCount::from(2));
+        let err = reader.next().unwrap().unwrap_err();
+        assert!(
+            matches!(err, ArrowError::InvalidArgumentError(msg) if msg.contains("cannot contain a null bitmask"))
         );
-        assert!(arr.is_valid(0));
-        assert!(arr.is_null(1));
-        assert!(arr.is_valid(2));
-        assert!(arr.is_valid(3));
-        assert!(arr.is_null(4));
-        arr.to_data().validate_full().unwrap();
+        assert!(reader.next().is_none());
+    }
 
-        let mut genn = sliced(8).with_random_nulls(0.5);
-        let arr = genn.generate(RowCount::from(5), &mut rng).unwrap();
-        arr.to_data().validate_full().unwrap();
+    #[rstest]
+    #[case::struct_child(Arc::new(StructArray::new_null(
+        vec![Field::new("value", DataType::Null, false)].into(), 2,
+    )))]
+    #[case::list_child(Arc::new(FixedSizeListArray::new_null(
+        Arc::new(Field::new("item", DataType::Null, false)),
+        2,
+        2,
+    )))]
+    fn test_nulls_must_mask_non_nullable_child(#[case] parent: Arc<dyn Array>) {
+        let source = || -> Box<dyn ArrayGenerator> { Box::new(TestArrayGenerator(parent.clone())) };
+        let masked = source()
+            .with_nulls(&[true])
+            .generate_default(RowCount::from(2))
+            .unwrap();
+        assert_eq!(masked.to_data(), parent.to_data());
+
+        let err = source()
+            .with_random_nulls(0.0)
+            .generate_default(RowCount::from(2))
+            .unwrap_err();
+        assert!(
+            matches!(err, ArrowError::InvalidArgumentError(msg) if msg.contains("unmasked nulls for non-nullable"))
+        );
     }
 
     #[test]
