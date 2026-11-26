@@ -11204,3 +11204,5 @@ def test_commit_lock_release_conflict_is_not_a_commit_conflict(tmp_path: Path):
         )
     assert not isinstance(exc_info.value, commit_module.CommitConflictError)
     assert len(lock_calls) == 1
+    # The manifest was written before the release failed.
+    assert lance.dataset(tmp_path / "data").version == 2

@@ -61,8 +61,9 @@ fn handle_error(py_err: PyErr, py: Python) -> CommitError {
     }
 }
 
-/// Errors from releasing a lock are not conflicts: the commit may already have
-/// landed, so they must not trigger a retry or report the commit as rejected.
+/// Maps a lock error to an internal error. Release maps every error this way:
+/// `release(true)` runs after the manifest is written, so treating a conflict there
+/// as one would retry or reject a commit that landed.
 fn handler_error(py_err: PyErr) -> CommitError {
     CommitError::OtherError(Error::internal(format!(
         "Error from commit handler: {}",
