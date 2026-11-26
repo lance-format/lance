@@ -492,30 +492,35 @@ mod tests {
         .unwrap();
         build_segments(&mut dataset, "s", BuiltinIndexType::ZoneMap, &[&[0, 1]]).await;
 
-        let predicate = "s.x IS NULL";
-        assert_candidates(&dataset, predicate, &[0, 1]).await;
+        assert_candidates(&dataset, "s.x IS NULL", &[0, 1]).await;
         assert_candidates(&dataset, "s IS NULL", &[]).await;
 
-        let indexed = dataset
-            .scan()
-            .filter(predicate)
-            .unwrap()
-            .try_into_batch()
-            .await
-            .unwrap();
-        let full = dataset
-            .scan()
-            .use_scalar_index(false)
-            .filter(predicate)
-            .unwrap()
-            .try_into_batch()
-            .await
-            .unwrap();
-        assert_eq!(indexed, full);
-        assert_eq!(full.num_rows(), 1);
+        for (predicate, expected_row) in [("s.x IS NULL", 0), ("s.x IS NOT NULL", 1)] {
+            let indexed = dataset
+                .scan()
+                .filter(predicate)
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap();
+            let full = dataset
+                .scan()
+                .use_scalar_index(false)
+                .filter(predicate)
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap();
+            assert_eq!(indexed, full, "{predicate}");
+            assert_eq!(
+                full["s"].as_ref(),
+                batch["s"].slice(expected_row, 1).as_ref(),
+                "{predicate}"
+            );
+        }
 
         build_segments(&mut dataset, "s.x", BuiltinIndexType::ZoneMap, &[&[0, 1]]).await;
-        assert_candidates(&dataset, predicate, &[0]).await;
+        assert_candidates(&dataset, "s.x IS NULL", &[0]).await;
     }
 
     #[tokio::test]
