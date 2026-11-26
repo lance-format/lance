@@ -5,11 +5,13 @@ import atexit
 from typing import Callable, Optional
 
 from .lance import (
-    TraceEvent,
-    shutdown_tracing,
+    TraceEvent as TraceEvent,
 )
 from .lance import (
     capture_trace_events as lance_capture_trace_events,
+)
+from .lance import (
+    shutdown_tracing as shutdown_tracing,
 )
 from .lance import (
     trace_to_chrome as lance_trace_to_chrome,

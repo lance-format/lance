@@ -173,8 +173,11 @@ impl LoggingPassthroughState {
         if let Some(handle) = self.callback_handle.take() {
             // This will signal the callback handler to exit
             self.callback_sender.take();
-            // Wait for remaining trace events to be processed
-            handle.join().unwrap();
+            // Wait for remaining trace events to be processed. A callback thread that
+            // panicked must not panic here too: that would poison SUBSCRIBER.
+            if handle.join().is_err() {
+                log::warn!("The trace event callback thread panicked");
+            }
         }
     }
 }
