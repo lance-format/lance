@@ -1512,6 +1512,18 @@ impl PrimitiveStructuralEncoder {
         }
     }
 
+    /// Why a fixed-size list of booleans that needs byte-wide items cannot be
+    /// written with a strategy that does not allow them.
+    fn byte_wide_fsl_booleans_error(field: &Field) -> String {
+        format!(
+            "field '{}': this FixedSizeList<Boolean> column needs one byte per item in the \
+             full-zip layout because its rows do not fill whole bytes or its items can be null. \
+             Released 2.1 and 2.2 readers cannot read that layout, so write it with file \
+             version 2.3",
+            field.name
+        )
+    }
+
     /// Expands the bit-packed boolean items of a fixed-size list to one byte each,
     /// keeping every layer's validity.
     fn expand_fsl_booleans_to_bytes(data: DataBlock) -> DataBlock {
@@ -1607,14 +1619,7 @@ impl PrimitiveStructuralEncoder {
             DataBlock::FixedSizeList(fsl) if Self::fsl_booleans_need_bytes(&fsl) => {
                 if !compression_strategy.allows_byte_wide_fsl_booleans() {
                     return Err(Error::not_supported_source(
-                        format!(
-                            "field '{}': this FixedSizeList<Boolean> column needs one byte per \
-                             item in the full-zip layout because its rows do not fill whole \
-                             bytes or its items can be null. Released 2.1 and 2.2 readers \
-                             cannot read that layout, so write it with file version 2.3",
-                            field.name
-                        )
-                        .into(),
+                        Self::byte_wide_fsl_booleans_error(field).into(),
                     ));
                 }
                 Self::expand_fsl_booleans_to_bytes(DataBlock::FixedSizeList(fsl))
@@ -2407,6 +2412,11 @@ impl PrimitiveStructuralEncoder {
             let requested_encoding = encoding_metadata
                 .get(STRUCTURAL_ENCODING_META_KEY)
                 .map(|requested| requested.to_lowercase());
+            let needs_byte_wide_booleans = matches!(
+                &data_block,
+                DataBlock::FixedSizeList(fsl) if Self::fsl_booleans_need_bytes(fsl)
+            ) && !compression_strategy
+                .allows_byte_wide_fsl_booleans();
             let fullzip_error = match &data_block {
                 // 1-bit booleans are widened to bytes inside `encode_full_zip`.
                 DataBlock::FixedWidth(fixed)
@@ -2435,6 +2445,11 @@ impl PrimitiveStructuralEncoder {
                 }
                 DataBlock::Dictionary(_) => {
                     Some("Full-zip does not encode dictionary data blocks directly".to_string())
+                }
+                // Full-zip widens these booleans to a byte each when the strategy
+                // allows it, so the same check decides here.
+                DataBlock::FixedSizeList(fsl) if Self::fsl_booleans_need_bytes(fsl) => {
+                    needs_byte_wide_booleans.then(|| Self::byte_wide_fsl_booleans_error(&field))
                 }
                 DataBlock::FixedSizeList(fsl) => match fsl.clone().try_into_flat() {
                     Some(flat) if flat.bits_per_value.is_multiple_of(8) => None,
@@ -2474,6 +2489,11 @@ impl PrimitiveStructuralEncoder {
                         return Ok(DensePageEncoding::FullZip(full_zip_request(
                             data_block, repdef,
                         )?));
+                    }
+                    if requested_encoding.is_none() && needs_byte_wide_booleans {
+                        return Err(Error::not_supported_source(
+                            Self::byte_wide_fsl_booleans_error(&field).into(),
+                        ));
                     }
                     return Err(Error::invalid_input_source(
                         format!(
