@@ -2481,6 +2481,8 @@ pub async fn write_ivf_pq_file_from_existing_index(
     pq: ProductQuantizer,
     streams: Vec<impl Stream<Item = Result<RecordBatch>>>,
 ) -> Result<()> {
+    super::reject_hamming_metric(IndexType::IvfPq, pq.distance_type)?;
+
     let obj_store = dataset.table_state.object_store.as_ref();
     let path = dataset
         .indices_dir()
