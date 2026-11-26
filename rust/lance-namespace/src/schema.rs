@@ -866,6 +866,11 @@ mod tests {
             "duration:decade",
             "timestamp:us",
             "duration:us:extra",
+            // Time32 only takes s/ms and Time64 only us/ns. The bare names carry no unit.
+            "time32:us",
+            "time64:ms",
+            "time32",
+            "time64",
         ] {
             let data_type: JsonArrowDataType =
                 serde_json::from_str(&format!(r#"{{"type":"{encoded}"}}"#)).unwrap();
