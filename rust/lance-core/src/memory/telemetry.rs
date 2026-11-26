@@ -22,6 +22,8 @@ pub const METRIC_STAGE_PEAK: &str = "lance_memory_stage_peak_bytes";
 /// when the operation commits the index, in bytes, labelled by `operation` and
 /// `index_type`.
 pub const METRIC_OPERATION_PEAK: &str = "lance_memory_operation_peak_bytes";
+/// Live backing bytes of newly copied fixed-width IVF partition buffers.
+pub const METRIC_IVF_PARTITION_BACKING: &str = "lance_ivf_partition_backing_bytes";
 /// Bytes that Lance components hold right now, labelled by `component`.
 pub const METRIC_COMPONENT: &str = "lance_memory_component_bytes";
 
@@ -90,6 +92,11 @@ pub fn describe_metrics() {
             METRIC_OPERATION_PEAK,
             Bytes,
             "Peak resident set size during each index build operation, by operation and index type."
+        );
+        metrics::describe_gauge!(
+            METRIC_IVF_PARTITION_BACKING,
+            Bytes,
+            "Live bytes in observed fixed-width copies materialized by IVF partition reads."
         );
         metrics::describe_gauge!(
             METRIC_COMPONENT,
