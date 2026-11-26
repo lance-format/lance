@@ -26,10 +26,10 @@ use lance_table::format::{BasePath, Fragment};
 use lance_table::io::commit::CommitHandler;
 use lance_table::io::commit::external_manifest::ExternalManifestCommitHandler;
 use pyo3::IntoPyObjectExt;
-use pyo3::exceptions::{PyIOError, PyValueError};
+use pyo3::exceptions::{PyIOError, PyOverflowError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::pybacked::PyBackedStr;
-use pyo3::types::PyDict;
+use pyo3::types::{PyDict, PyMapping};
 
 use crate::Scanner;
 use crate::dataset::commit::PyCommitLock;
@@ -167,6 +167,32 @@ pub fn get_commit_handler(options: &Bound<'_, PyDict>) -> PyResult<Option<Arc<dy
     })
 }
 
+/// The value of `key` in `auto_cleanup_options`, or `None` when it is absent or None.
+fn auto_cleanup_value<'py>(
+    options: &Bound<'py, PyMapping>,
+    key: &str,
+) -> PyResult<Option<Bound<'py, PyAny>>> {
+    if !options.contains(key)? {
+        return Ok(None);
+    }
+    let value = options.get_item(key)?;
+    Ok((!value.is_none()).then_some(value))
+}
+
+/// Names the option in pyo3's conversion errors, keeping their type. Any other error,
+/// for example one raised by a user's `__index__`, is returned unchanged.
+fn auto_cleanup_error(py: Python<'_>, key: &str, err: PyErr) -> PyErr {
+    if !err.is_instance_of::<PyTypeError>(py) && !err.is_instance_of::<PyOverflowError>(py) {
+        return err;
+    }
+    let renamed = PyErr::from_type(
+        err.get_type(py),
+        format!("auto_cleanup_options['{key}']: {}", err.value(py)),
+    );
+    renamed.set_cause(py, Some(err));
+    renamed
+}
+
 /// `table_uri` is the destination table's root uri; it roots the namespace
 /// manifest store when `namespace_client_managed_versioning` is requested.
 #[allow(deprecated)]
@@ -252,19 +278,32 @@ pub fn get_write_params(
             p.enable_v2_manifest_paths = enable_v2_manifest_paths;
         }
 
-        if let Some(auto_cleanup) = get_dict_opt::<Bound<PyDict>>(options, "auto_cleanup_options")?
+        if let Some(auto_cleanup) =
+            get_dict_opt::<Bound<PyMapping>>(options, "auto_cleanup_options")?
         {
+            let py = auto_cleanup.py();
             let mut auto_cleanup_params = AutoCleanupParams::default();
 
-            // A key that is absent keeps its default. A key that is present must be
-            // valid: falling back to the default would install a retention policy the
+            // A key that is absent or None keeps its default. A key that is present must
+            // be valid: falling back to the default would install a retention policy the
             // caller never asked for.
-            if let Some(interval) = auto_cleanup.get_item("interval")? {
-                auto_cleanup_params.interval = interval.extract::<usize>()?;
+            if let Some(interval) = auto_cleanup_value(&auto_cleanup, "interval")? {
+                auto_cleanup_params.interval = interval
+                    .extract::<usize>()
+                    .map_err(|e| auto_cleanup_error(py, "interval", PyErr::from(e)))?;
             }
-            if let Some(older_than_seconds) = auto_cleanup.get_item("older_than_seconds")? {
+            if let Some(older_than_seconds) =
+                auto_cleanup_value(&auto_cleanup, "older_than_seconds")?
+            {
+                let seconds = older_than_seconds
+                    .extract::<i64>()
+                    .map_err(|e| auto_cleanup_error(py, "older_than_seconds", PyErr::from(e)))?;
                 auto_cleanup_params.older_than =
-                    TimeDelta::seconds(older_than_seconds.extract::<i64>()?);
+                    TimeDelta::try_seconds(seconds).ok_or_else(|| {
+                        PyValueError::new_err(format!(
+                            "auto_cleanup_options['older_than_seconds'] is out of range: {seconds}"
+                        ))
+                    })?;
             }
 
             p.auto_cleanup = Some(auto_cleanup_params);
