@@ -553,8 +553,10 @@ impl PyCompaction {
     /// ----------
     /// dataset : lance.Dataset
     ///    The dataset to compact. The dataset instance will be updated to the
-    ///    new version once complete. Rewrites and repacks commit separately,
-    ///    so after an error it may be at a version the rewrites made.
+    ///    new version once complete, unless another thread is using it at that
+    ///    moment; then it stays at its previous version and a warning is logged.
+    ///    Rewrites and repacks commit separately, so after an error it may be at
+    ///    a version the rewrites made.
     /// options : CompactionOptions
     ///    The compaction options.
     ///
@@ -628,7 +630,9 @@ impl PyCompaction {
     /// ----------
     /// dataset : lance.Dataset
     ///     The dataset to compact. The dataset instance will be updated to the
-    ///     new version once committed. Rewrites and repacks commit separately,
+    ///     new version once committed, unless another thread is using it at that
+    ///     moment; then it stays at its previous version and a warning is logged.
+    ///     Rewrites and repacks commit separately,
     ///     so after an error it may be at a version the rewrites made; plan
     ///     again rather than passing the same results back.
     /// rewrites : List[RewriteResult]
