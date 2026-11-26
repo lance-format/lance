@@ -86,7 +86,7 @@ def test_executor_creation_can_be_retried_after_failure():
         import pyarrow as pa
 
         resource.setrlimit(resource.RLIMIT_NOFILE, (96, 96))
-        # Leave no room for the threads the executor needs.
+        # Use up the file descriptors, so the executor's I/O driver cannot be created.
         held = []
         try:
             while True:
@@ -96,8 +96,8 @@ def test_executor_creation_can_be_retried_after_failure():
         table = pa.table({"id": [1]})
         try:
             lance.write_dataset(table, "memory://retry")
-        except BaseException:
-            pass
+        except BaseException as err:
+            assert "Creating Tokio runtime" in str(err), err
         else:
             raise AssertionError("write_dataset succeeded without file descriptors")
         for fd in held:
