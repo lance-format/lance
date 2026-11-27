@@ -39,6 +39,7 @@ on:
       - .github/release.yml
       - .github/labeler-area.yml
       - .github/workflows/format-vote-gate.yml
+      - .github/workflows/java.yml
       - .github/workflows/java-publish.yml
       - .github/workflows/recover-beta-win-arm64-wheel.yml
       - .github/workflows/ci-scripts.yml
