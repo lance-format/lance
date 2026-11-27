@@ -551,6 +551,14 @@ impl InlineBitpacking {
             ));
         }
 
+        if range.is_empty() {
+            return Ok(DataBlock::FixedWidth(FixedWidthDataBlock {
+                data: LanceBuffer::reinterpret_vec(Vec::<u128>::new()),
+                bits_per_value: 128,
+                num_values: 0,
+                block_info: BlockInfo::new(),
+            }));
+        }
         let mut decompressed = vec![0u128; ELEMS_PER_CHUNK as usize];
         // SAFETY: the header is at most 128, `body` has exactly `bit_width * 128` bytes (both
         // checked above), and `decompressed` is one block.
@@ -981,6 +989,11 @@ fn append_u128_chunk(
 /// sufficient for `bytemuck::cast_slice_mut::<u128, u32>` / `<u64>` because u128 is
 /// 16-byte aligned.
 ///
+/// Every value must be below `2^bit_width`. Lance writers take the width from the bitwise OR
+/// of the same values, so a negative i128 always gets `bit_width = 128`. In every branch, a
+/// value that does not fit keeps only its low `bit_width` bits, as in the 8 to 64-bit
+/// kernels, and is never read or written out of bounds. Debug builds assert each value.
+///
 /// # Safety
 /// Caller guarantees:
 /// - `src.len() == ELEMS_PER_CHUNK` (1024).
@@ -990,18 +1003,6 @@ fn append_u128_chunk(
 ///   satisfy their alignment requirements unconditionally — there is no
 ///   alignment-failure path for the narrow branches.
 /// - `bit_width <= 128`.
-/// - For `bit_width <= 127`, every value in `src` satisfies `v >> bit_width == 0`
-///   (no bit set above position `bit_width - 1`). This is enforced upstream by
-///   `Stat::BitWidth`, which OR-folds the chunk's u128-reinterpreted bytes and
-///   reports `128 - leading_zeros(or_fold)` — a negative i128 (sign bit set) or
-///   any value exceeding `2^bit_width - 1` therefore drives the chunk's reported
-///   bit_width to at least the position of its highest set bit, so a chunk
-///   reaching the narrow or split branches is provably bounded by
-///   `2^bit_width`. `debug_assertions` builds re-check each value to catch any
-///   future drift in the statistics computation.
-/// - The `bit_width == 128` branch holds raw, full-range values that are written
-///   verbatim via `copy_nonoverlapping` and is the only branch that can carry
-///   negative i128 values.
 /// - `BitPacking::unchecked_pack`'s contract requires `bit_width <= size_of::<T>() * 8`,
 ///   which is satisfied by construction: `T = u32` for 1..=32, `u64` for 33..=64, and
 ///   `u64` at `bit_width - 64` for the high bits of 65..=127. The 0 and 128 arms
@@ -1033,30 +1034,13 @@ unsafe fn pack_u128_chunk(bit_width: usize, src: &[u128], dest_u128: &mut [u128]
             }
         }
         U128Kernel::NarrowU32 => {
-            // bit_width 1..=32: every src value is bounded by `2^bit_width` (sign-safety
-            // invariant from `Stat::BitWidth`), so the high 96 bits are zero and casting
-            // to `u32` is lossless.
-            //
-            // Release-build sentinel on the first value: corruption modes that drive a
-            // value's high bits set while keeping `bit_width <= 32` (e.g. a stale
-            // `Stat::BitWidth` reused across calls, or a malformed encoder feeding a
-            // negative i128 down this path) would silently truncate to u32 in
-            // production. We pay a single check on `src[0]` to turn that into a
-            // defined panic; the remaining 1023 values are still covered by the
-            // per-value `debug_assert!` in dev/test builds.
-            assert!(
-                src[0] >> bit_width == 0,
-                "pack_u128_chunk narrow-u32: src[0]={:#x} exceeds bit_width={bit_width} \
-                 (Stat::BitWidth invariant violated)",
-                src[0]
-            );
+            // bit_width 1..=32: values below `2^bit_width` have their high 96 bits clear, so
+            // casting to `u32` is lossless.
             let mut narrow = [0u32; ELEMS_PER_CHUNK as usize];
             for (n, &v) in narrow.iter_mut().zip(src.iter()) {
                 debug_assert!(
                     v >> bit_width == 0,
-                    "pack_u128_chunk narrow-u32: value {v:#x} exceeds bit_width={bit_width} \
-                     — Stat::BitWidth invariant violated (any high bit, including i128 sign, \
-                     must drive bit_width to 128 and route to the memcpy path)"
+                    "pack_u128_chunk narrow-u32: value {v:#x} exceeds bit_width={bit_width}"
                 );
                 *n = v as u32;
             }
@@ -1066,25 +1050,12 @@ unsafe fn pack_u128_chunk(bit_width: usize, src: &[u128], dest_u128: &mut [u128]
             unsafe { BitPacking::unchecked_pack(bit_width, &narrow, dest_u32) };
         }
         U128Kernel::NarrowU64 => {
-            // bit_width 33..=64: every src value fits in 64 bits (same invariant).
-            //
-            // Release-build sentinel on the first value: mirrors the NarrowU32 branch.
-            // A miscomputed `Stat::BitWidth` could otherwise let a high-bit value
-            // silently truncate to u64. One assert turns the silent corruption into a
-            // defined panic; per-value `debug_assert!` covers dev/test builds.
-            assert!(
-                src[0] >> bit_width == 0,
-                "pack_u128_chunk narrow-u64: src[0]={:#x} exceeds bit_width={bit_width} \
-                 (Stat::BitWidth invariant violated)",
-                src[0]
-            );
+            // bit_width 33..=64: values below `2^bit_width` fit in a `u64`.
             let mut narrow = [0u64; ELEMS_PER_CHUNK as usize];
             for (n, &v) in narrow.iter_mut().zip(src.iter()) {
                 debug_assert!(
                     v >> bit_width == 0,
-                    "pack_u128_chunk narrow-u64: value {v:#x} exceeds bit_width={bit_width} \
-                     — Stat::BitWidth invariant violated (any high bit, including i128 sign, \
-                     must drive bit_width to 128 and route to the memcpy path)"
+                    "pack_u128_chunk narrow-u64: value {v:#x} exceeds bit_width={bit_width}"
                 );
                 *n = v as u64;
             }
@@ -1102,8 +1073,7 @@ unsafe fn pack_u128_chunk(bit_width: usize, src: &[u128], dest_u128: &mut [u128]
             for ((l, h), &v) in low.iter_mut().zip(high_halves.iter_mut()).zip(src.iter()) {
                 debug_assert!(
                     v >> bit_width == 0,
-                    "pack_u128_chunk split-u64: value {v:#x} exceeds bit_width={bit_width} \
-                     — Stat::BitWidth invariant violated"
+                    "pack_u128_chunk split-u64: value {v:#x} exceeds bit_width={bit_width}"
                 );
                 *l = v as u64;
                 *h = (v >> 64) as u64;
@@ -1295,9 +1265,8 @@ fn bitpack_out_of_line_u128(data: FixedWidthDataBlock, compressed_bit_width: usi
         let src = &values[chunk_idx * chunk_len..][..chunk_len];
         let dest = &mut output[chunk_idx * words_per_chunk..][..words_per_chunk];
         // SAFETY: `src` is one block, `dest` holds `compressed_bit_width * 8` words, and
-        // `compress` rejects widths above 128. The selector passes the block's maximum
-        // `Stat::BitWidth`, so every value fits; a value that does not fit loses bits but is
-        // never read or written out of bounds.
+        // `compress` rejects widths above 128. The selector passes the largest per-block
+        // `Stat::BitWidth`, so every value fits; see `pack_u128_chunk` for one that does not.
         unsafe { pack_u128_chunk(compressed_bit_width, src, dest) };
     }
     if pad_tail {

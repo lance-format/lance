@@ -1516,6 +1516,25 @@ pub(crate) fn require_no_block_payload(data: Option<LanceBuffer>, codec: &str) -
     Ok(())
 }
 
+/// Checks an `InlineBitpacking` description before any payload is read, so an empty block,
+/// which the decoder returns without reading its buffer, cannot carry an invalid width.
+pub fn validate_inline_bitpacking(
+    description: &crate::format::metadata::InlineBitpacking,
+) -> Result<()> {
+    let width = description.uncompressed_bits_per_value;
+    if !matches!(width, 8 | 16 | 32 | 64 | 128) {
+        return Err(Error::invalid_input(format!(
+            "Inline bitpacking requires an 8, 16, 32, 64, or 128-bit width, got {width}"
+        )));
+    }
+    if description.values.is_some() {
+        return Err(Error::invalid_input(
+            "Inline bitpacking cannot contain leaf compression",
+        ));
+    }
+    Ok(())
+}
+
 pub trait DecompressionStrategy: std::fmt::Debug + Send + Sync {
     fn create_miniblock_decompressor(
         &self,
@@ -1562,15 +1581,7 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
             }
             #[cfg(feature = "bitpacking")]
             Compression::InlineBitpacking(description) => {
-                if !matches!(
-                    description.uncompressed_bits_per_value,
-                    8 | 16 | 32 | 64 | 128
-                ) || description.values.is_some()
-                {
-                    return Err(Error::invalid_input(
-                        "Inline bitpacking requires an 8, 16, 32, 64, or 128-bit width and no leaf compression",
-                    ));
-                }
+                validate_inline_bitpacking(description)?;
                 Ok(Box::new(InlineBitpacking::from_description(description)))
             }
             #[cfg(not(feature = "bitpacking"))]
@@ -1835,9 +1846,12 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
             Error::invalid_input("Block encoding is missing its compression variant")
         })?;
         match compression {
-            Compression::InlineBitpacking(inline_bitpacking) => Ok(Box::new(
-                InlineBitpacking::from_description(inline_bitpacking),
-            )),
+            Compression::InlineBitpacking(inline_bitpacking) => {
+                validate_inline_bitpacking(inline_bitpacking)?;
+                Ok(Box::new(InlineBitpacking::from_description(
+                    inline_bitpacking,
+                )))
+            }
             Compression::Flat(flat) => Ok(Box::new(ValueDecompressor::from_flat(flat))),
             Compression::Constant(constant) => {
                 let scalar = constant
@@ -1859,10 +1873,10 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
                         "OutOfLineBitpacking values are missing a compression variant",
                     )
                 })? {
-                    Compression::Flat(flat) => flat.bits_per_value,
+                    Compression::Flat(flat) if flat.data.is_none() => flat.bits_per_value,
                     _ => {
                         return Err(Error::invalid_input_source(
-                            "OutOfLineBitpacking values must use Flat encoding".into(),
+                            "OutOfLineBitpacking values must use Flat encoding with no buffer compression".into(),
                         ));
                     }
                 };
@@ -4110,6 +4124,41 @@ mod tests {
                 .is_err()
         );
         assert!(strategy.create_block_decompressor(&missing).is_err());
+    }
+
+    /// An empty block decodes without reading its payload, so a bad descriptor has to fail
+    /// when the decompressor is created.
+    #[cfg(feature = "bitpacking")]
+    #[rstest::rstest]
+    #[case::inline_width(EncodingUtils::inline_bitpacking(7, None), "got 7")]
+    #[case::inline_values(
+        EncodingUtils::inline_bitpacking(128, Some(Default::default())),
+        "leaf compression"
+    )]
+    #[case::out_of_line_values(
+        EncodingUtils::out_of_line_bitpacking(
+            128,
+            EncodingUtils::flat(24, Some(Default::default()))
+        ),
+        "no buffer compression"
+    )]
+    fn decompressors_reject_invalid_bitpacking_descriptors(
+        #[case] encoding: CompressiveEncoding,
+        #[case] message: &str,
+    ) {
+        let strategy = DefaultDecompressionStrategy::default();
+        let mut errors = vec![strategy.create_block_decompressor(&encoding).unwrap_err()];
+        if matches!(encoding.compression, Some(Compression::InlineBitpacking(_))) {
+            errors.push(
+                strategy
+                    .create_miniblock_decompressor(&encoding, &strategy)
+                    .unwrap_err(),
+            );
+        }
+        for error in errors {
+            assert!(matches!(error, Error::InvalidInput { .. }));
+            assert!(error.to_string().contains(message), "{error}");
+        }
     }
 
     /// A 128-bit block of low-magnitude values, the shape a `Decimal128` column produces.

@@ -5,7 +5,7 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use lance_core::{Error, Result, datatypes::Schema};
 use lance_encoding::{
-    compression::{DecompressionStrategy, DefaultDecompressionStrategy},
+    compression::{self, DecompressionStrategy, DefaultDecompressionStrategy},
     decoder::ColumnInfo,
     encodings::physical::binary::BinaryMiniBlockDecompressor,
     format::{metadata, pb23},
@@ -63,9 +63,10 @@ fn validate_compressive_encoding(
     use metadata::compressive_encoding::Compression;
 
     match encoding.compression.as_ref() {
-        Some(Compression::Flat(_))
-        | Some(Compression::InlineBitpacking(_))
-        | Some(Compression::Constant(_)) => Ok(()),
+        Some(Compression::Flat(_)) | Some(Compression::Constant(_)) => Ok(()),
+        Some(Compression::InlineBitpacking(bitpacking)) => {
+            compression::validate_inline_bitpacking(bitpacking)
+        }
         Some(Compression::Variable(variable)) if position == EncodingPosition::MiniBlock => {
             // Variable mini-blocks own the optional offset payload and typed codec grammar.
             BinaryMiniBlockDecompressor::from_variable(variable).map(|_| ())
@@ -479,6 +480,21 @@ mod grammar_tests {
                     .contains("Tensor transform is not supported")
             );
         }
+    }
+
+    #[test]
+    fn rejects_inline_bitpacking_with_invalid_width() {
+        let encoding = lance_encoding::format::EncodingUtils::inline_bitpacking(7, None);
+        for position in [
+            EncodingPosition::BufferBackedBlock,
+            EncodingPosition::MiniBlock,
+        ] {
+            let error = validate_compressive_encoding(&encoding, position).unwrap_err();
+            assert!(matches!(error, Error::InvalidInput { .. }));
+            assert!(error.to_string().contains("got 7"), "{error}");
+        }
+        let encoding = lance_encoding::format::EncodingUtils::inline_bitpacking(128, None);
+        validate_compressive_encoding(&encoding, EncodingPosition::MiniBlock).unwrap();
     }
 
     #[test]
