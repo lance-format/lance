@@ -191,6 +191,10 @@ enum CompressionScheme {
  * zstd, lz4, etc.  The entire buffer is compressed as a single unit.  If this happens
  * then any parent encoding becomes opaque, even if it would normally be transparent.
  *
+ * BufferCompression is valid only where the enclosing codec permits it. In
+ * mini-block positions, Flat.data, InlineBitpacking.values, and Variable.values
+ * must be absent. General provides wrapper compression as described below.
+ *
  * This is a leaf, no further compression is applied to the data.
  */
 message BufferCompression {
@@ -208,9 +212,9 @@ message BufferCompression {
 
 /* Fixed width items placed contiguously in a single buffer
  *
- * This is a leaf encoding, there is no compression applied to the data.
+ * This is a leaf encoding, transparent when data is absent.
  *
- * This is a transparent encoding by definition.
+ * In mini-block and generic unsigned block positions, data must be absent.
  *
  * The input is a fixed-width data block.
  * The output is a single buffer.
@@ -220,7 +224,7 @@ message Flat {
    * not need to be a multiple of 8
    */
   uint64 bits_per_value = 1;
-  // The compression applied to the data
+  // Buffer compression; must be absent in mini-block and generic unsigned block positions.
   optional BufferCompression data = 2;
 }
 
@@ -232,6 +236,10 @@ message Flat {
  *
  * This is a transparent encoding by definition.
  *
+ * In mini-block positions, values must be absent. Offsets use plain 32/64-bit
+ * Flat for the interleaved layout, or a non-Flat generic unsigned block codec
+ * for separate chunk-relative offsets and value buffers.
+ *
  * The input is a variable-width data block.
  * The output is a single fixed-width data block (the offsets) and
  * a single buffer (the values)
@@ -239,7 +247,7 @@ message Flat {
 message Variable {
   // Describes how the offsets data block is compressed
   CompressiveEncoding offsets = 1;
-  // The compression applied to the values
+  // Buffer compression; must be absent in mini-block positions.
   optional BufferCompression values = 2;
 }
 
@@ -259,7 +267,8 @@ message Constant {
  *
  * The value at index i is `start + step * i`. The container supplies the
  * number of values. Writers use this encoding only when step is positive and
- * the final value fits in the declared bit width.
+ * the final value fits in the declared bit width. The sequence must contain
+ * at least two values; empty and singleton sequences use Constant.
  *
  * The input is a u32 or u64 fixed-width data block.
  * There is no output buffer.
@@ -276,8 +285,9 @@ message Range {
 /* An unstable Lance 2.3 non-decreasing unsigned fixed-width sequence
  * represented by its first value and the differences between adjacent values.
  *
- * The child contains one fewer value than the input. The container supplies
- * the input cardinality. Delta has a payload exactly when its child has one.
+ * The input must contain at least two values. The child contains one fewer
+ * value than the input. The container supplies the input cardinality.
+ * Delta has a payload exactly when its child has one.
  *
  * The input is a u32 or u64 fixed-width data block.
  */
@@ -318,13 +328,16 @@ message OutOfLineBitpacking {
  *
  * This is an opaque encoding.
  *
+ * In mini-block positions, uncompressed_bits_per_value must be 8, 16, 32, or
+ * 64. In mini-block and generic unsigned block positions, values must be absent.
+ *
  * The input is a fixed-width data block.
  * The output is a single buffer.
  */
 message InlineBitpacking {
   // the number of bits of the uncompressed value. e.g. for a u32, this will be 32
   uint64 uncompressed_bits_per_value = 1;
-  // The compression applied to the values
+  // Buffer compression; must be absent in mini-block and generic unsigned block positions.
   optional BufferCompression values = 2;
 }
 
@@ -437,27 +450,19 @@ message VariablePackedStruct {
 
 /* A compression scheme that wraps the underlying data with general compression
  *
- * Note: The application of wrapped compression will depend on the layout of the data.
- * If we apply it to mini-block data then we compress entire mini-blocks.  If we apply
- * it to full-zip data then we compress each value individually.
+ * Compression is applied to the output of the inner encoding. Its scope depends
+ * on the layout:
+ * - Mini-block: values must be a valid mini-block codec. Compress only the first
+ *   buffer of each chunk, independently. Preserve buffer count and order, leaving
+ *   remaining buffers unchanged. Decompress the first buffer before invoking the
+ *   inner codec. This covers the entire chunk only for single-buffer codecs.
+ * - Full-zip: compress each value individually.
+ * - Generic unsigned block: allowed only at the root, wrapping plain Flat of the
+ *   sequence width, without Flat.data compression.
  *
- * Note: Wrapped compression is somewhat unique at the moment as it is applied to the
- * output of the inner encoding and not the input like all other compressive encodings.
- *
- * Note: General compression can usually be applied in two spots.  We can apply
- * it to individual buffers or we can apply it here, to the entire array.
- *
- * For example, let's say we are storing mini-blocks of strings and we are using
- * FSST and bitpacking the offsets.  We have something like this...
- *
- * WRAPPED(†3) -> FSST -> VARIABLE -(offsets)-> INLINE_BITPACKING -(data)-> FLAT -> BUFFER (†1)
- *                                 -(data)-> BUFFER (†2)
- *
- * General compression can be applied at †1, †2, or †3 (or any combination of these).
- *
- * If we apply it at †1 then we apply it just to the bitpacked offsets
- * If we apply it at †2 then we apply it just to the FSST compressed data
- * If we apply it at †3 then we apply it to the entire mini-block (both offsets and data)
+ * A General wrapper does not permit leaf BufferCompression in mini-block
+ * Flat.data, InlineBitpacking.values, or Variable.values. Variable offsets must
+ * still follow their interleaved or generic unsigned block contract.
  *
  * The input is a single data block of any kind.
  * The output is a single data block of the same kind as the input.

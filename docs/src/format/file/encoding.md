@@ -651,6 +651,9 @@ with a fixed number of bits per value.
 When applied in a mini-block context we find the largest power of 2 number of values that will be less than
 8,186 bytes and use that as the block size.
 
+In Lance 2.3 mini-block and generic unsigned block positions, `Flat.data` must be absent: leaf
+`BufferCompression` is not supported. General compression uses a `General` wrapper at a permitted position.
+
 ### Variable
 
 Variable compression is the uncompressed representation of variable-width data. There is a buffer of values and
@@ -695,6 +698,9 @@ do not emit a separate generic `Flat` container.
 Readers fetch and decode only the selected mini-block, so the additional logical buffer does not change random-read
 granularity.
 
+In Lance 2.3 mini-block positions, `Variable.values` must be absent in both the interleaved and generic forms.
+Value bytes are stored without leaf `BufferCompression`; the offsets must follow the layout-specific contract above.
+
 ### Generic Unsigned Blocks
 
 A generic unsigned block has a `CompressiveEncoding` descriptor and zero or one payload buffer. Its container supplies
@@ -717,11 +723,20 @@ generic unsigned block root
 └── Dictionary(indices=u32 leaf, items=sequence-width leaf)
 ```
 
-`Delta` decodes `num_values - 1` child values. RLE children have the same run cardinality, all run lengths are
-positive, and their checked sum equals `num_values`. Dictionary indices have `num_values` entries and every index
-is less than the declared dictionary item count. General compression must decode exactly the byte length implied by
-the containing cardinality and sequence width. Readers reject missing children, incompatible widths, unsupported
-nesting, wrong payload arity, malformed framing and arithmetic overflow.
+`Range` and `Delta` require `num_values >= 2`; `Delta` decodes `num_values - 1` child values.
+
+RLE children have the same run cardinality, all run lengths are positive, and their checked sum equals `num_values`.
+To recover that run cardinality, block RLE
+requires either `run_lengths` encoded as `Constant` or `Range`, or at least one plain `Flat` child (`values` or
+`run_lengths`, with no `BufferCompression`). Constant run lengths must divide `num_values` exactly; Range run lengths
+must have a positive start and step and an integer run count whose arithmetic-series sum is `num_values`.
+Otherwise, the run count is the plain child's payload byte length divided by its declared byte width. Two bitpacked
+children are invalid because neither supplies the run count.
+
+Dictionary indices have `num_values` entries and every index is less than the declared dictionary item count.
+General compression must decode exactly the byte length implied by the containing cardinality and sequence width.
+Readers reject missing children, incompatible widths, unsupported nesting, wrong payload arity, malformed framing
+and arithmetic overflow.
 
 ### Constant
 
@@ -731,9 +746,9 @@ Other containers, such as all-null encodings, define their own Constant semantic
 
 ### Range
 
-Range is a metadata-only block encoding for unsigned `u32` and `u64` arithmetic sequences. It stores the first
-value and a positive step; the containing block supplies the number of values. Readers compute value `i` as
-`start + step * i` and reject invalid widths or arithmetic overflow.
+Range is a metadata-only block encoding for unsigned `u32` and `u64` arithmetic sequences of at least two values.
+It stores the first value and a positive step; the containing block supplies the number of values. Readers compute
+value `i` as `start + step * i` and reject invalid widths or arithmetic overflow.
 
 ```protobuf
 %%% proto.message.Range %%%
@@ -742,8 +757,8 @@ value and a positive step; the containing block supplies the number of values. R
 ### Delta
 
 Delta encodes a non-decreasing unsigned `u32` or `u64` sequence as its first value and the `n - 1` adjacent
-differences. The differences are represented by a child block codec. Delta has a payload exactly when its child
-has one, and readers reconstruct values with checked prefix sums.
+differences, requiring at least two input values. The differences are represented by a child block codec.
+Delta has a payload exactly when its child has one, and readers reconstruct values with checked prefix sums.
 
 ```protobuf
 %%% proto.message.Delta %%%
@@ -771,6 +786,10 @@ a u32 array and the maximum value is 5000 then we only need 13 bits to store eac
 
 When used in a mini-block context we always use 1024 values per block. In addition, we store the compressed bit
 width inline in the block itself.
+
+In Lance 2.3 mini-block positions, `InlineBitpacking.uncompressed_bits_per_value` must be 8, 16, 32, or 64,
+and `InlineBitpacking.values` must be absent. Leaf `BufferCompression` is also forbidden for generic unsigned
+block bitpacking; `OutOfLineBitpacking.values` must be plain `Flat`.
 
 Bitpacking is, in theory, usable in a full zip context. However, values in this context are so large that shaving
 off a few bits is unlikely to have any meaningful impact. Also, the full-zip context keeps things byte-aligned and
@@ -909,8 +928,14 @@ General compression is a catch-all term for classical opaque compression techniq
 etc. These techniques are typically back-referencing compressors which replace values with a "back reference" to
 a spot where we already saw the value.
 
-When applied in a mini-block context we run general compression after all other compression and compress the entire
-mini-block.
+In Lance 2.3 mini-block positions, `General.values` must describe a valid mini-block codec. After that inner codec
+encodes a chunk, `General` compresses only its first buffer, independently for each chunk. The buffer count and order
+are preserved; remaining buffers are unchanged. Decoding decompresses the first buffer before passing all buffers to
+the inner codec. For a single-buffer codec this compresses the entire chunk; for a multi-buffer codec it does not.
+The wrapper does not permit leaf `BufferCompression` on `Flat.data`, `InlineBitpacking.values`, or `Variable.values`.
+
+In generic unsigned block positions, `General` is permitted only as the root wrapping plain `Flat` of the sequence
+width, as specified in the [generic unsigned block contract](#generic-unsigned-blocks).
 
 When applied in a full zip context we run general compression on each value.
 
@@ -953,8 +978,8 @@ The `lance-encoding:compression` setting enables general-purpose compression alg
   the Pcodec section above. It accepts `lance-encoding:compression-level` from 0 to 12 (default 8).
 
 General compression is applied on top of other encoding techniques (RLE, BSS, bitpacking, etc.) to further reduce
-data size. For mini-block layouts, compression is applied to entire mini-blocks. For full-zip layouts with large values
-(≥32KiB), compression is automatically applied per-value.
+data size. For Lance 2.3 mini-block layouts, `General` compresses each chunk's first buffer as described above.
+For full-zip layouts with large values (≥32KiB), compression is automatically applied per-value.
 
 #### Compression Level
 
