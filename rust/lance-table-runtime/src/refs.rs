@@ -1736,11 +1736,22 @@ mod tests {
     #[case::replace_metadata(false)]
     #[case::delete(true)]
     #[tokio::test]
-    async fn test_stale_tag_update_on_conditional_store(#[case] delete: bool) {
-        let store = Arc::new(ObjectStore::memory());
+    async fn test_stale_tag_update_on_conditional_store(
+        #[case] delete: bool,
+        #[values("memory", "shared-memory")] scheme: &str,
+    ) {
+        let uri = format!("{scheme}://stale-tag-{delete}/table");
+        let (store, base) = ObjectStore::from_uri(&uri).await.unwrap();
+        // Each from_uri call creates an independent registry. Only shared-memory
+        // resolves the same authority to the same backend across registries.
+        let peer = if scheme == "shared-memory" {
+            ObjectStore::from_uri(&uri).await.unwrap().0
+        } else {
+            store.clone()
+        };
         let root = BranchLocation {
-            path: Path::from("table"),
-            uri: "memory://table".into(),
+            path: base,
+            uri,
             branch: None,
         };
         let path = tag_path(&root.path, "release");
@@ -1748,15 +1759,18 @@ mod tests {
             .put(&path, br#"{"version":1,"manifestSize":12}"#)
             .await
             .unwrap();
+        let peer_refs = Refs::new(peer, Arc::new(ConditionalPutCommitHandler), root.clone());
         let refs = Refs::new(store.clone(), Arc::new(ConditionalPutCommitHandler), root);
         let tags = refs.tags();
         let (mut stale, update) = tags.read_for_update("release").await.unwrap();
         stale.version = 2;
         let metadata = HashMap::from([("owner".into(), "review".into())]);
         if delete {
-            tags.delete("release").await.unwrap();
+            peer_refs.tags().delete("release").await.unwrap();
         } else {
-            tags.replace_metadata("release", metadata.clone())
+            peer_refs
+                .tags()
+                .replace_metadata("release", metadata.clone())
                 .await
                 .unwrap();
         }

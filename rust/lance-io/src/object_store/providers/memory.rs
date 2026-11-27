@@ -15,13 +15,17 @@ use url::Url;
 #[derive(Default, Debug)]
 pub struct MemoryStoreProvider;
 
-#[async_trait::async_trait]
-impl ObjectStoreProvider for MemoryStoreProvider {
-    async fn new_store(&self, base_path: Url, params: &ObjectStoreParams) -> Result<ObjectStore> {
+impl MemoryStoreProvider {
+    pub(super) fn new_store_with_backend(
+        &self,
+        base_path: &Url,
+        params: &ObjectStoreParams,
+        backend: Arc<InMemory>,
+    ) -> Result<ObjectStore> {
         let block_size = params.block_size.unwrap_or(DEFAULT_LOCAL_BLOCK_SIZE);
         let storage_options = StorageOptions(params.storage_options().cloned().unwrap_or_default());
         let download_retry_count = storage_options.download_retry_count();
-        let inner: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+        let inner: Arc<dyn object_store::ObjectStore> = backend;
         Ok(ObjectStore {
             mutation_backend: Some((MutationBackend::ETag, Arc::downgrade(&inner))),
             inner,
@@ -39,11 +43,18 @@ impl ObjectStoreProvider for MemoryStoreProvider {
             scheduler_error_mode: Default::default(),
             io_tracker: Default::default(),
             store_prefix: self
-                .calculate_object_store_prefix(&base_path, params.storage_options())?,
+                .calculate_object_store_prefix(base_path, params.storage_options())?,
             // Listed in full: the store is already in memory, so a page costs no less than
             // the directory does.
             paginated_lister: None,
         })
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStoreProvider for MemoryStoreProvider {
+    async fn new_store(&self, base_path: Url, params: &ObjectStoreParams) -> Result<ObjectStore> {
+        self.new_store_with_backend(&base_path, params, Arc::new(InMemory::new()))
     }
 
     fn extract_path(&self, url: &Url) -> Result<Path> {

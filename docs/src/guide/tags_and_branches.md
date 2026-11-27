@@ -29,7 +29,7 @@ In reference contexts, `"main"` is an alias for the default branch and is equiva
 
 A tag retarget or metadata replacement can report a conflict when another writer changes the same tag. Read the tag again before retrying.
 
-If an S3 update returns a storage error during publication, read the tag to determine whether the write took effect before retrying.
+If an S3 update returns a storage error during publication, the outcome may be unknown. Another writer may already have changed the tag. Read the current tag and retry only if the intended change still makes sense for that state.
 
 The native and OpenDAL S3 clients send `If-Match` by default, including on multipart completion. S3-compatible endpoints must enforce this condition. The in-memory store also checks the tag's ETag.
 
