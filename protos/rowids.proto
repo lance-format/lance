@@ -19,6 +19,9 @@ message RowIdSequence {
 
 /// Different ways to encode a sequence of u64 values.
 message U64Segment {
+
+    // --8<-- [start:range]
+
     /// A range of u64 values.
     message Range {
         /// The start of the range, inclusive.
@@ -26,6 +29,8 @@ message U64Segment {
         /// The end of the range, exclusive.
         uint64 end = 2;
     }
+
+    // --8<-- [end:range]
 
     /// A range of u64 values with holes.
     message RangeWithHoles {

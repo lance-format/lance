@@ -725,13 +725,19 @@ generic unsigned block root
 
 `Range` and `Delta` require `num_values >= 2`; `Delta` decodes `num_values - 1` child values.
 
+When either RLE child has a payload, the frame starts with the `values` payload length as an 8-byte
+little-endian integer, followed by that many `values` payload bytes, then the `run_lengths` payload through
+the end of the frame. A metadata-only child contributes zero payload bytes. If both children are metadata-only,
+the entire frame, including its length prefix, is omitted.
+
 RLE children have the same run cardinality, all run lengths are positive, and their checked sum equals `num_values`.
 To recover that run cardinality, block RLE
 requires either `run_lengths` encoded as `Constant` or `Range`, or at least one plain `Flat` child (`values` or
 `run_lengths`, with no `BufferCompression`). Constant run lengths must divide `num_values` exactly; Range run lengths
 must have a positive start and step and an integer run count whose arithmetic-series sum is `num_values`.
 Otherwise, the run count is the plain child's payload byte length divided by its declared byte width. Two bitpacked
-children are invalid because neither supplies the run count.
+children are invalid because neither supplies the run count. A `Range` child in either position requires at least
+two recovered runs.
 
 Dictionary indices have `num_values` entries and every index is less than the declared dictionary item count.
 General compression must decode exactly the byte length implied by the containing cardinality and sequence width.
@@ -751,7 +757,7 @@ It stores the first value and a positive step; the containing block supplies the
 value `i` as `start + step * i` and reject invalid widths or arithmetic overflow.
 
 ```protobuf
-%%% proto.message.Range %%%
+--8<-- "protos/encodings_v2_3.proto:range"
 ```
 
 ### Delta
@@ -928,10 +934,12 @@ General compression is a catch-all term for classical opaque compression techniq
 etc. These techniques are typically back-referencing compressors which replace values with a "back reference" to
 a spot where we already saw the value.
 
-In Lance 2.3 mini-block positions, `General.values` must describe a valid mini-block codec. After that inner codec
-encodes a chunk, `General` compresses only its first buffer, independently for each chunk. The buffer count and order
-are preserved; remaining buffers are unchanged. Decoding decompresses the first buffer before passing all buffers to
-the inner codec. For a single-buffer codec this compresses the entire chunk; for a multi-buffer codec it does not.
+In Lance 2.3, when `General` wraps the whole mini-block codec, `General.values` must describe a valid mini-block
+codec. After that inner codec encodes a chunk, `General` compresses only its first buffer, independently for each
+chunk. The buffer count and order are preserved; remaining buffers are unchanged. Decoding decompresses the first
+buffer before passing all buffers to the inner codec. For a single-buffer codec this compresses the entire chunk;
+for a multi-buffer codec it does not. Within mini-block `Rle`, `values` and `run_lengths` can each independently
+use `General(Flat)` to compress their respective child buffers.
 The wrapper does not permit leaf `BufferCompression` on `Flat.data`, `InlineBitpacking.values`, or `Variable.values`.
 
 In generic unsigned block positions, `General` is permitted only as the root wrapping plain `Flat` of the sequence

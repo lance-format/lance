@@ -721,6 +721,16 @@ impl ::prost::Name for Dictionary {
 /// There are two outputs:
 /// - A data block of the same kind as the input (the run values)
 /// - A fixed-width data block containing the lengths of the runs
+///
+/// In generic unsigned blocks, a payload starts with the values payload length
+/// as an 8-byte little-endian integer, followed by values, then run_lengths
+/// through the end. A metadata-only child contributes zero payload bytes. If
+/// both children are metadata-only, the entire frame is omitted.
+///
+/// Both children have the same run cardinality. Recover it from Constant/Range
+/// run_lengths or a plain Flat child's payload length and width. Run lengths
+/// must be positive and sum to the input cardinality. A Range child requires
+/// at least two recovered runs.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Rle {
     /// The compression used to store the run values data block
@@ -853,13 +863,17 @@ impl ::prost::Name for VariablePackedStruct {
 ///
 /// Compression is applied to the output of the inner encoding. Its scope depends
 /// on the layout:
-/// - Mini-block: values must be a valid mini-block codec. Compress only the first
-///    buffer of each chunk, independently. Preserve buffer count and order, leaving
-///    remaining buffers unchanged. Decompress the first buffer before invoking the
-///    inner codec. This covers the entire chunk only for single-buffer codecs.
+/// - Mini-block: when wrapping the whole mini-block codec, values must be a valid
+///    mini-block codec. Compress only the first buffer of each chunk, independently.
+///    Preserve buffer count and order, leaving remaining buffers unchanged.
+///    Decompress the first buffer before invoking the inner codec. This covers
+///    the entire chunk only for single-buffer codecs.
 /// - Full-zip: compress each value individually.
 /// - Generic unsigned block: allowed only at the root, wrapping plain Flat of the
 ///    sequence width, without Flat.data compression.
+///
+/// Within mini-block Rle, values and run_lengths may each independently use
+/// General(Flat), compressing their respective child buffers.
 ///
 /// A General wrapper does not permit leaf BufferCompression in mini-block
 /// Flat.data, InlineBitpacking.values, or Variable.values. Variable offsets must
