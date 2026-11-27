@@ -27,7 +27,7 @@ use datafusion_physical_expr::{PhysicalExpr, create_physical_expr};
 use datafusion_physical_plan::projection::ProjectionExec;
 use lance_arrow::floats::{FloatType, coerce_float_vector};
 use lance_core::datatypes::{
-    BlobHandling, Schema as LanceSchema, escape_field_path_for_project, format_field_path_minimal,
+    BlobHandling, escape_field_path_for_project, format_field_path_minimal, parse_field_path,
 };
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_datafusion::exec::ExecutionStatsCallback;
@@ -1523,16 +1523,44 @@ impl Scanner {
         column_name: &str,
         arrow_schema: &ArrowSchema,
     ) -> Result<Arc<dyn PhysicalExpr>> {
-        let lance_schema = LanceSchema::try_from(arrow_schema)?;
-        let field_path = lance_schema
-            .resolve_case_insensitive(column_name)
-            .ok_or_else(|| {
-                Error::invalid_input(format!("Field '{}' not found in schema", column_name))
-            })?;
+        // Physical plans may contain generated aliases such as "s.a". These
+        // are valid Arrow columns, even though persisted Lance fields forbid dots.
+        let names = if arrow_schema
+            .fields()
+            .iter()
+            .any(|field| field.name().eq_ignore_ascii_case(column_name))
+        {
+            vec![column_name.to_owned()]
+        } else {
+            parse_field_path(column_name)?
+        };
+        let mut fields = arrow_schema.fields().as_ref();
+        let mut field_path = Vec::with_capacity(names.len());
+        for name in &names {
+            let field = fields
+                .iter()
+                .find(|field| field.name() == name)
+                .or_else(|| {
+                    fields
+                        .iter()
+                        .find(|field| field.name().eq_ignore_ascii_case(name))
+                })
+                .ok_or_else(|| {
+                    Error::invalid_input(format!("Field '{column_name}' not found in schema"))
+                })?;
+            field_path.push(field);
+            fields = match field.data_type() {
+                DataType::Struct(children) => children.as_ref(),
+                DataType::List(child)
+                | DataType::LargeList(child)
+                | DataType::FixedSizeList(child, _) => std::slice::from_ref(child),
+                _ => &[],
+            };
+        }
 
         if field_path.len() == 1 {
             // Simple top-level column
-            expressions::col(&field_path[0].name, arrow_schema).map_err(|e| {
+            expressions::col(field_path[0].name(), arrow_schema).map_err(|e| {
                 Error::internal(format!(
                     "Failed to create column expression for '{}': {}",
                     column_name, e
@@ -1545,10 +1573,10 @@ impl Scanner {
             // Use Expr::Column with Column::new_unqualified to preserve exact case
             // (col() normalizes identifiers to lowercase)
             let mut expr = Expr::Column(datafusion::common::Column::new_unqualified(
-                &field_path[0].name,
+                field_path[0].name(),
             ));
             for nested_field in &field_path[1..] {
-                expr = get_field_func.call(vec![expr, lit(&nested_field.name)]);
+                expr = get_field_func.call(vec![expr, lit(nested_field.name())]);
             }
 
             // Convert logical to physical expression
