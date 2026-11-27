@@ -41,7 +41,7 @@ use crate::encoder::{
 };
 use crate::encodings::logical::primitive::fullzip::{PerValueCompressor, PerValueDataBlock};
 use crate::encodings::logical::primitive::miniblock::{
-    MiniBlockChunk, MiniBlockCompressed, MiniBlockCompressionContext,
+    MAX_LARGE_MINIBLOCK_BYTES, MiniBlockChunk, MiniBlockCompressed, MiniBlockCompressionContext,
 };
 use crate::encodings::physical::value::{ValueDecompressor, ValueEncoder};
 use crate::format::metadata::CompressiveEncoding;
@@ -222,13 +222,34 @@ pub struct PrimitiveStructuralEncoder {
 
 struct CompressedLevelsChunk {
     data: LanceBuffer,
-    num_levels: u16,
+    num_levels: u64,
+}
+
+impl CompressedLevelsChunk {
+    fn fits_chunk_header(&self) -> bool {
+        self.num_levels <= u16::MAX as u64 && self.data.len() <= u16::MAX as usize
+    }
 }
 
 struct CompressedLevels {
     data: Vec<CompressedLevelsChunk>,
     compression: CompressiveEncoding,
     rep_index: Option<LanceBuffer>,
+}
+
+// General compression wraps the selected value chunks without changing their boundaries.
+fn fixed_width_chunk_size_is_configurable(encoding: &metadata::CompressiveEncoding) -> bool {
+    use metadata::compressive_encoding::Compression;
+    match encoding.compression.as_ref() {
+        Some(
+            Compression::Flat(_) | Compression::FixedSizeList(_) | Compression::ByteStreamSplit(_),
+        ) => true,
+        Some(Compression::General(general)) => general
+            .values
+            .as_deref()
+            .is_some_and(fixed_width_chunk_size_is_configurable),
+        _ => false,
+    }
 }
 
 struct SerializedMiniBlockPage {
@@ -532,8 +553,15 @@ impl PrimitiveStructuralEncoder {
             // Write the number of levels, or 0 if there is no rep/def
             let num_levels = rep
                 .as_ref()
-                .map(|r| r.num_levels)
-                .unwrap_or(def.as_ref().map(|d| d.num_levels).unwrap_or(0));
+                .or(def.as_ref())
+                .map_or(0, |chunk| chunk.num_levels);
+            let num_levels = u16::try_from(num_levels).map_err(|_| {
+                Error::invalid_input(format!(
+                    "Mini-block cannot encode {num_levels} rep/def levels in one chunk. \
+                     This usually means a top-level row contains too much nested structure \
+                     for the current layout."
+                ))
+            })?;
             data_buffer.extend_from_slice(&num_levels.to_le_bytes());
 
             // Write the buffer lengths
@@ -603,7 +631,7 @@ impl PrimitiveStructuralEncoder {
             let chunk_bytes = data_buffer.len() - start_pos;
             let max_chunk_size = match miniblock_chunk_size {
                 MiniblockChunkSize::U16 => 32 * 1024,
-                MiniblockChunkSize::U32 => 1_u64 << 31,
+                MiniblockChunkSize::U32 => MAX_LARGE_MINIBLOCK_BYTES,
             };
             if chunk_bytes == 0 || chunk_bytes as u64 > max_chunk_size {
                 return Err(Error::internal(format!(
@@ -768,20 +796,9 @@ impl PrimitiveStructuralEncoder {
                     "Rep/def block compressor selected a metadata-only codec".to_string(),
                 )
             })?;
-            let num_levels = u16::try_from(num_chunk_levels).map_err(|_| {
-                Error::invalid_input_source(
-                    format!(
-                        "Mini-block cannot encode {} rep/def levels in one chunk. \
-                         This usually means a top-level row contains too much nested structure \
-                         for the current layout.",
-                        num_chunk_levels
-                    )
-                    .into(),
-                )
-            })?;
             level_chunks.push(CompressedLevelsChunk {
                 data: compressed_levels,
-                num_levels,
+                num_levels: num_chunk_levels,
             });
         }
         debug_assert_eq!(levels.num_levels_remaining(), 0);
@@ -1155,46 +1172,79 @@ impl PrimitiveStructuralEncoder {
         } else {
             compression_strategy.create_miniblock_compressor(field, &data)?
         };
-        let common_chunk_buffers =
-            u64::from(repdef.rep_slicer().is_some()) + u64::from(repdef.def_slicer().is_some());
+        let common_chunk_buffers = u64::from(repdef.repetition_levels.is_some())
+            + u64::from(repdef.definition_levels.is_some());
         let support_large_chunk = miniblock_chunk_size == MiniblockChunkSize::U32;
-        let compression_context =
+        let mut compression_context =
             MiniBlockCompressionContext::new(common_chunk_buffers, support_large_chunk, true);
-        let (compressed_data, value_encoding) = compressor.compress(compression_context, data)?;
-
+        let minichunk_size = if support_large_chunk
+            && dictionary_data.is_none()
+            && matches!(
+                &data,
+                DataBlock::FixedWidth(_) | DataBlock::FixedSizeList(_)
+            ) {
+            compression_strategy.minichunk_size(field)?
+        } else {
+            None
+        };
+        if let Some(target) = minichunk_size {
+            compression_context = compression_context.with_fixed_width_chunk_target(target);
+        }
+        // Keep a reference to the raw values only for this opt-in path. Dense
+        // level counts can exceed the number of visible values, and each
+        // compressed level buffer has its own u16 length in the chunk header.
+        let retry_data =
+            (minichunk_size.is_some() && common_chunk_buffers > 0).then(|| data.clone());
         let max_rep = repdef.def_meaning.iter().filter(|l| l.is_list()).count() as u16;
-
-        let mut compressed_rep = repdef
-            .rep_slicer()
-            .map(|rep_slicer| {
+        let mut data = data;
+        let (compressed_data, value_encoding, mut compressed_rep, mut compressed_def) = loop {
+            let (compressed_data, value_encoding) =
+                compressor.compress(compression_context, data)?;
+            let compress = |slicer, max_rep| {
                 Self::compress_levels(
-                    rep_slicer,
+                    slicer,
                     num_items,
                     compression_strategy,
                     &compressed_data.chunks,
                     max_rep,
                 )
-            })
-            .transpose()?;
-
-        let (rep_index, rep_index_depth) =
-            match compressed_rep.as_mut().and_then(|cr| cr.rep_index.as_mut()) {
-                Some(rep_index) => (Some(rep_index.clone()), 1),
-                None => (None, 0),
             };
+            let compressed_rep = repdef
+                .rep_slicer()
+                .map(|slicer| compress(slicer, max_rep))
+                .transpose()?;
+            let compressed_def = repdef
+                .def_slicer()
+                .map(|slicer| compress(slicer, 0))
+                .transpose()?;
+            // Only codecs using the variable fixed-width target can retry
+            // with smaller chunks. The selection is encoded in the page.
+            if let Some(raw) = &retry_data
+                && fixed_width_chunk_size_is_configurable(&value_encoding)
+                && [&compressed_rep, &compressed_def]
+                    .into_iter()
+                    .flatten()
+                    .flat_map(|levels| &levels.data)
+                    .any(|chunk| !chunk.fits_chunk_header())
+                && let Some(first_chunk) = compressed_data.chunks.first()
+                && compression_context
+                    .reduce_fixed_width_chunk_limit(first_chunk.num_values(0, num_items))
+            {
+                data = raw.clone();
+                continue;
+            }
+            break (
+                compressed_data,
+                value_encoding,
+                compressed_rep,
+                compressed_def,
+            );
+        };
 
-        let mut compressed_def = repdef
-            .def_slicer()
-            .map(|def_slicer| {
-                Self::compress_levels(
-                    def_slicer,
-                    num_items,
-                    compression_strategy,
-                    &compressed_data.chunks,
-                    /*max_rep=*/ 0,
-                )
-            })
-            .transpose()?;
+        let rep_index = compressed_rep
+            .as_mut()
+            .and_then(|levels| levels.rep_index.take());
+        let rep_index_depth = u32::from(rep_index.is_some());
 
         // TODO: Parquet sparsely encodes values here.  We could do the same but
         // then we won't have log2 values per chunk.  This means more metadata
@@ -2863,6 +2913,10 @@ fn plan_dense_primitive_pages(
 }
 
 impl PrimitivePageEncodingBehavior for DenseU16PrimitiveEncoding {
+    fn validate_field(&self, field: &Field, _metadata: &HashMap<String, String>) -> Result<()> {
+        self.compression.minichunk_size(field).map(|_| ())
+    }
+
     fn try_plan_pages(
         &self,
         _ctx: &PrimitivePlanContext<'_>,
@@ -2898,6 +2952,10 @@ impl PrimitivePageEncodingBehavior for DenseU16PrimitiveEncoding {
 }
 
 impl PrimitivePageEncodingBehavior for DenseU32PrimitiveEncoding {
+    fn validate_field(&self, field: &Field, _metadata: &HashMap<String, String>) -> Result<()> {
+        self.compression.minichunk_size(field).map(|_| ())
+    }
+
     fn try_plan_pages(
         &self,
         _ctx: &PrimitivePlanContext<'_>,
