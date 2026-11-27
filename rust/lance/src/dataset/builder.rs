@@ -3,6 +3,7 @@
 
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
+use futures::FutureExt;
 use lance_core::cache::CacheBackend;
 use lance_file::reader::FileReaderOptions;
 use lance_io::object_store::{
@@ -26,6 +27,7 @@ use crate::{Dataset, Result, session::Session};
 #[derive(Clone)]
 pub struct DatasetBuilder {
     table: TableBuilder,
+    snapshot: Option<super::snapshot::SnapshotRef>,
     index_cache_size_bytes: usize,
     metadata_cache_size_bytes: usize,
     index_cache_backend: Option<Arc<dyn CacheBackend>>,
@@ -36,6 +38,7 @@ impl std::fmt::Debug for DatasetBuilder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DatasetBuilder")
             .field("table", &self.table)
+            .field("snapshot", &self.snapshot)
             .field("index_cache_size_bytes", &self.index_cache_size_bytes)
             .field("metadata_cache_size_bytes", &self.metadata_cache_size_bytes)
             .field("session", &self.session.is_some())
@@ -49,9 +52,29 @@ impl DatasetBuilder {
         Self::from_table_builder(TableBuilder::from_uri(table_uri))
     }
 
+    /// Reopen an exact snapshot using independently supplied storage settings.
+    ///
+    /// Resolution validates the requested commit identity, ETag, or full-file digest. It never
+    /// falls back to the latest version. The reference does not supply credentials
+    /// or acquire retention.
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result};
+    /// # use lance::dataset::builder::DatasetBuilder;
+    /// # async fn example(dataset: &Dataset) -> Result<()> {
+    /// let snapshot = dataset.snapshot_ref("catalog/table-incarnation").await?;
+    /// let worker = DatasetBuilder::from_snapshot(snapshot).load().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn from_snapshot(snapshot: super::snapshot::SnapshotRef) -> Self {
+        Self::from_uri(snapshot.table_uri()).with_snapshot_ref(snapshot)
+    }
+
     fn from_table_builder(table: TableBuilder) -> Self {
         Self {
             table,
+            snapshot: None,
             index_cache_size_bytes: DEFAULT_INDEX_CACHE_SIZE,
             metadata_cache_size_bytes: DEFAULT_METADATA_CACHE_SIZE,
             index_cache_backend: None,
@@ -147,6 +170,27 @@ impl DatasetBuilder {
     /// Defaults to 4KB for local files and 64KB for others
     pub fn with_block_size(mut self, block_size: usize) -> Self {
         self.table = self.table.with_block_size(block_size);
+        self
+    }
+
+    /// Require this exact snapshot and its encoded verification requirements.
+    ///
+    /// The builder URI must be the reference's table root. Combining a snapshot
+    /// reference with a version, branch, tag, or serialized manifest is an error.
+    /// Storage and per-base settings are resolved independently on the worker.
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result};
+    /// # use lance::dataset::builder::DatasetBuilder;
+    /// # async fn example(dataset: &Dataset) -> Result<()> {
+    /// let snapshot = dataset.snapshot_ref("catalog/table-incarnation").await?;
+    /// let worker = DatasetBuilder::from_uri(snapshot.table_uri())
+    ///     .with_snapshot_ref(snapshot.clone()).load().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn with_snapshot_ref(mut self, snapshot: super::snapshot::SnapshotRef) -> Self {
+        self.snapshot = Some(snapshot);
         self
     }
 
@@ -410,11 +454,17 @@ impl DatasetBuilder {
     /// supported because listing physical manifest objects may omit committed versions whose
     /// authoritative locations are held outside the object store.
     pub async fn list_manifest_locations(self) -> Result<Vec<ManifestLocation>> {
+        if self.snapshot.is_some() {
+            return Err(lance_core::Error::invalid_input(
+                "list_manifest_locations does not support an explicit version, branch, tag, or snapshot_ref",
+            ));
+        }
         Box::pin(self.table.list_manifest_locations()).await
     }
 
     /// Open the configured snapshot, resolving the latest version by default.
-    pub async fn load(self) -> Result<Dataset> {
+    pub async fn load(mut self) -> Result<Dataset> {
+        let snapshot = self.snapshot.take();
         let session = self
             .session
             .unwrap_or_else(|| match self.index_cache_backend {
@@ -429,11 +479,22 @@ impl DatasetBuilder {
                     Default::default(),
                 )),
             });
-        let table = self
-            .table
-            .load_with_session(session.table_session.clone())
-            .await?;
-        Ok(Dataset::from_table(table, session))
+        let table = if let Some(snapshot) = &snapshot {
+            // Erase backend future types so downstream Send proofs stay shallow.
+            self.table
+                .load_snapshot_with_session(snapshot, session.table_session.clone())
+                .boxed()
+                .await?
+        } else {
+            self.table
+                .load_with_session(session.table_session.clone())
+                .await?
+        };
+        let dataset = Dataset::from_table(table, session);
+        if let Some(snapshot) = snapshot {
+            dataset.validate_snapshot(&snapshot)?;
+        }
+        Ok(dataset)
     }
 
     /// Open a snapshot using an already resolved store and commit handler.

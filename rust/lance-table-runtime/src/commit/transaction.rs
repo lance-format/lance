@@ -185,25 +185,25 @@ async fn record_successful_commit(
     lifecycle_hook: Option<&dyn CommitLifecycleHook>,
 ) -> Result<()> {
     dataset.view().ensure_branch_exists().await?;
-    let tx_key = crate::caches::TransactionKey {
-        version: manifest.version,
-    };
-    dataset
-        .state
-        .metadata_cache
-        .insert_with_key(&tx_key, Arc::new(transaction.clone()))
-        .await;
+    if let Some(tx_key) =
+        crate::caches::ManifestTransactionKey::new(&dataset.state.object_store, location)
+    {
+        dataset
+            .state
+            .metadata_cache
+            .insert_with_key(&tx_key, Arc::new(transaction.clone()))
+            .await;
+    }
 
-    let manifest_key = crate::caches::ManifestKey {
-        version: location.version,
-        e_tag: location.e_tag.as_deref(),
-    };
-    dataset
-        .state
-        .metadata_cache
-        .insert_with_key(&manifest_key, Arc::new(manifest.clone()))
-        .await;
-    if !indices.is_empty() {
+    crate::caches::cache_manifest(
+        &dataset.state.metadata_cache,
+        &dataset.state.object_store,
+        location,
+        Arc::new(manifest.clone()),
+        Arc::new(tokio::sync::OnceCell::new()),
+    )
+    .await;
+    if !indices.is_empty() && location.e_tag.is_some() {
         let key = IndexMetadataKey {
             version: manifest.version,
             store_identity: &dataset.state.object_store.store_prefix,

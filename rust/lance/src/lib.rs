@@ -112,6 +112,14 @@ pub mod cache_diagnostics_pb {
     include!("pb/lance.cache.rs");
 }
 
+/// Generated messages for the portable blob-reference execution protocol.
+///
+/// These types define transport only. Capture, payload reading, worker bindings,
+/// and snapshot retention are separate runtime responsibilities.
+pub mod blob_reference_pb {
+    include!("pb/lance.blob.reference.rs");
+}
+
 pub use blob::{
     BlobArrayBuilder, BlobDescriptor, BlobDescriptorArrayBuilder, BlobDescriptorColumn,
     BlobFieldOptions, BlobRange, DedicatedBlobWriter, ManagedBlobWriter, PackedBlobWriter,

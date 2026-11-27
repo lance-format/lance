@@ -274,8 +274,14 @@ pub async fn commit_new_dataset(
     // if there is a conflict.
     match result {
         Ok(manifest_location) => {
-            record_new_dataset_commit(metadata_cache, transaction, &manifest, &manifest_location)
-                .await;
+            record_new_dataset_commit(
+                metadata_cache,
+                object_store,
+                transaction,
+                &manifest,
+                &manifest_location,
+            )
+            .await;
             Ok((manifest, manifest_location))
         }
         Err(CommitError::CommitConflict) => {
@@ -300,6 +306,7 @@ pub async fn commit_new_dataset(
                     let committed_manifest = *committed_manifest;
                     record_new_dataset_commit(
                         metadata_cache,
+                        object_store,
                         transaction,
                         &committed_manifest,
                         &location,
@@ -340,6 +347,7 @@ pub async fn commit_new_dataset(
                     let committed_manifest = *committed_manifest;
                     record_new_dataset_commit(
                         metadata_cache,
+                        object_store,
                         transaction,
                         &committed_manifest,
                         &location,
@@ -369,22 +377,23 @@ pub async fn commit_new_dataset(
 /// direct-success and verified-own-commit paths of [`commit_new_dataset`].
 async fn record_new_dataset_commit(
     metadata_cache: &DSMetadataCache,
+    object_store: &ObjectStore,
     transaction: &Transaction,
     manifest: &Manifest,
     location: &ManifestLocation,
 ) {
-    let tx_key = crate::caches::TransactionKey {
-        version: manifest.version,
-    };
-    metadata_cache
-        .insert_with_key(&tx_key, Arc::new(transaction.clone()))
-        .await;
+    if let Some(tx_key) = crate::caches::ManifestTransactionKey::new(object_store, location) {
+        metadata_cache
+            .insert_with_key(&tx_key, Arc::new(transaction.clone()))
+            .await;
+    }
 
-    let manifest_key = crate::caches::ManifestKey {
-        version: location.version,
-        e_tag: location.e_tag.as_deref(),
-    };
-    metadata_cache
-        .insert_with_key(&manifest_key, Arc::new(manifest.clone()))
-        .await;
+    crate::caches::cache_manifest(
+        metadata_cache,
+        object_store,
+        location,
+        Arc::new(manifest.clone()),
+        Arc::new(tokio::sync::OnceCell::new()),
+    )
+    .await;
 }

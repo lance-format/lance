@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::{
+    borrow::Cow,
     collections::{HashMap, HashSet},
     sync::Arc,
 };
@@ -10,7 +11,7 @@ use arrow_array::cast::AsArray;
 use arrow_array::types::{UInt8Type, UInt32Type, UInt64Type};
 use arrow_array::{Array, StructArray, UInt64Array};
 use futures::{StreamExt, TryStreamExt, stream};
-use lance_io::object_store::ObjectStore;
+use lance_io::object_store::{ObjectStore, uri_to_url};
 use object_store::path::Path;
 
 use super::file::{BlobFile, BlobSource, BlobSourceKey, shared_blob_source};
@@ -268,6 +269,21 @@ struct BlobReadLocation {
     data_file_path: Path,
 }
 
+/// A physical location captured without opening payload storage or reading bytes.
+#[derive(Debug)]
+pub struct BlobReferenceLocation {
+    /// Absolute backing-object URI, preserving provider-specific authority.
+    pub object_uri: String,
+    /// Start of the logical blob within the backing object.
+    pub offset: u64,
+    /// Logical length; absent for unresolved whole external objects.
+    pub length: Option<u64>,
+    /// Descriptor storage kind.
+    pub kind: BlobKind,
+    /// Registered storage base, when present.
+    pub base_id: Option<u32>,
+}
+
 /// Resolves [`StoredBlob`]s of one blob field to physical locations.
 ///
 /// Rows are identified by row address, which selects the fragment data file
@@ -276,7 +292,7 @@ struct BlobReadLocation {
 /// sources are cached, so a locator should be reused across the rows of a
 /// batch.
 pub struct BlobLocator<'a> {
-    table: &'a Table,
+    table: Cow<'a, Table>,
     field_id: u32,
     fragments: HashMap<u32, BlobReadLocation>,
     base_roots: HashMap<u32, Path>,
@@ -291,7 +307,7 @@ pub struct BlobLocator<'a> {
 impl<'a> BlobLocator<'a> {
     pub fn new(table: &'a Table, field_id: u32) -> Self {
         Self {
-            table,
+            table: Cow::Borrowed(table),
             field_id,
             fragments: HashMap::new(),
             base_roots: HashMap::new(),
@@ -299,6 +315,20 @@ impl<'a> BlobLocator<'a> {
             external_stores: HashMap::new(),
             sources: HashMap::new(),
             external_sizes: HashMap::new(),
+        }
+    }
+
+    /// Own the table handle while preserving all cached physical locations.
+    pub fn into_owned(self) -> BlobLocator<'static> {
+        BlobLocator {
+            table: Cow::Owned(self.table.into_owned()),
+            field_id: self.field_id,
+            fragments: self.fragments,
+            base_roots: self.base_roots,
+            stores: self.stores,
+            external_stores: self.external_stores,
+            sources: self.sources,
+            external_sizes: self.external_sizes,
         }
     }
 
@@ -427,6 +457,133 @@ impl<'a> BlobLocator<'a> {
                     .with_base_id(base_id))
             }
         }
+    }
+
+    /// Capture a locator without opening storage clients or reading payloads.
+    pub fn capture_location(
+        &mut self,
+        blob: &StoredBlob<'_>,
+        row_addr: u64,
+    ) -> Result<BlobReferenceLocation> {
+        let (base_id, path, position, size, kind) = match *blob {
+            StoredBlob::Empty | StoredBlob::Inline { .. } => {
+                let location = self.data_file(row_addr)?.clone();
+                let (position, size) = match *blob {
+                    StoredBlob::Inline { position, size } => (position, size),
+                    _ => (0, 0),
+                };
+                (
+                    location.base_id,
+                    location.data_file_path,
+                    position,
+                    Some(size),
+                    BlobKind::Inline,
+                )
+            }
+            StoredBlob::Packed {
+                blob_id,
+                position,
+                size,
+            } => {
+                let location = self.data_file(row_addr)?.clone();
+                let path = blob_path(&location.data_file_dir, &location.data_file_key, blob_id);
+                (
+                    location.base_id,
+                    path,
+                    position,
+                    Some(size),
+                    BlobKind::Packed,
+                )
+            }
+            StoredBlob::Dedicated { blob_id, size } => {
+                let location = self.data_file(row_addr)?.clone();
+                let path = blob_path(&location.data_file_dir, &location.data_file_key, blob_id);
+                (location.base_id, path, 0, Some(size), BlobKind::Dedicated)
+            }
+            StoredBlob::External {
+                base_id: 0,
+                uri,
+                position,
+                size,
+            } => {
+                if self.table.state.session.unregistered_external_blob_policy()
+                    == UnregisteredExternalBlobPolicy::Deny
+                {
+                    return Err(Error::invalid_input(
+                        "External blob with base_id=0 is not allowed by this session; external blobs must reference a registered storage base",
+                    ));
+                }
+                return Ok(BlobReferenceLocation {
+                    object_uri: uri.to_string(),
+                    offset: position,
+                    length: (size > 0).then_some(size),
+                    kind: BlobKind::External,
+                    base_id: None,
+                });
+            }
+            StoredBlob::External {
+                base_id,
+                uri,
+                position,
+                size,
+            } => {
+                let root = self.base_root(Some(base_id))?;
+                let path = join_base_and_relative_path(&root, uri)?;
+                (
+                    Some(base_id),
+                    path,
+                    position,
+                    (size > 0).then_some(size),
+                    BlobKind::External,
+                )
+            }
+            StoredBlob::Managed {
+                base_id,
+                uri,
+                position,
+                size,
+            } => {
+                let base_id = self.managed_base(base_id, row_addr)?;
+                let root = self.base_root(base_id)?;
+                let path = join_base_and_relative_path(&root, uri)?;
+                (base_id, path, position, Some(size), BlobKind::Managed)
+            }
+        };
+        let root = match base_id {
+            Some(id) => self
+                .table
+                .manifest()
+                .base_paths
+                .get(&id)
+                .ok_or_else(|| {
+                    Error::invalid_input(format!("Blob references unknown base_id {id}"))
+                })?
+                .path
+                .clone(),
+            None => self.table.refs.root()?.uri,
+        };
+        let root_path =
+            ObjectStore::extract_path_from_uri(self.table.state.session.store_registry(), &root)?;
+        let relative = path.prefix_match(&root_path).ok_or_else(|| {
+            Error::invalid_input(format!(
+                "Resolved blob path {path} is outside source root {root}"
+            ))
+        })?;
+        let mut url = uri_to_url(&root)?;
+        // Keep provider-specific authorities while extending the physical path.
+        url.path_segments_mut()
+            .map_err(|_| {
+                Error::invalid_input(format!("Blob source URI cannot contain paths: {root}"))
+            })?
+            .pop_if_empty()
+            .extend(relative.map(|part| part.as_ref().to_string()));
+        Ok(BlobReferenceLocation {
+            object_uri: url.into(),
+            offset: position,
+            length: size,
+            kind,
+            base_id,
+        })
     }
 
     /// The base that a Managed blob's `uri` is relative to: the descriptor's

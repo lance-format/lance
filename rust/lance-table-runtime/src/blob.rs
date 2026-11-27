@@ -27,8 +27,8 @@ pub use managed::preserve_managed_descriptors;
 #[doc(hidden)]
 pub use managed::{field_contains_blob, managed_references};
 pub use materialize::{
-    BlobMaterializationAdmission, BlobMaterializationContext, MaterializedBlobBatch,
-    blob_v2_descriptor_schema, materialize_blob_v2_binary_batch,
+    BlobMaterializationAdmission, BlobMaterializationContext, BlobMaterializationReservation,
+    MaterializedBlobBatch, blob_v2_descriptor_schema, materialize_blob_v2_binary_batch,
     materialize_blob_v2_binary_batch_with_admission, materialize_blob_v2_binary_batch_with_context,
     public_blob_v2_binary_output_schema, schema_has_blob_v2_binary_view, split_batch_by_bytes,
 };
@@ -66,8 +66,15 @@ pub use read::{
 /// Payload execution shared with callers that already hold descriptors.
 #[doc(hidden)]
 pub mod execution {
+    pub use super::file::BlobSource;
+    pub use super::materialize::BlobMaterializationBudget;
+    pub use super::read::plan::{
+        BlobReadBatch, BlobReadPlan, PlannedBlobRead, plan_blob_read_batches_with_limits,
+    };
+    pub use super::read::reservation::ReadReservation;
     pub use super::read::{
         BlobEntry, IndexedReadBlob, ReadBlobsExecution, execute_blob_entries_with_execution,
+        execute_blob_read_plan,
     };
 }
 
