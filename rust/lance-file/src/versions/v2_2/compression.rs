@@ -8,12 +8,12 @@ use lance_encoding::compression::PerValueGeneralCompression;
 use lance_encoding::{
     compression::{
         BlockCompressor, CompressionStrategy, field_metadata_params, finalize_miniblock_compressor,
-        try_bitpacking_block, try_bitpacking_miniblock, try_byte_stream_split_miniblock,
-        try_fixed_packed_struct_miniblock, try_fixed_u8_rle_block, try_fixed_u8_rle_miniblock,
-        try_general_block, try_raw_block, try_raw_fixed_size_list_miniblock,
-        try_raw_fixed_width_miniblock, try_raw_per_value, try_uncompressed_fixed_width_miniblock,
-        try_variable_packed_struct_per_value, try_variable_width_miniblock,
-        try_variable_width_per_value,
+        try_bitpacking_block, try_bitpacking_miniblock_with_target,
+        try_byte_stream_split_miniblock, try_fixed_packed_struct_miniblock, try_fixed_u8_rle_block,
+        try_fixed_u8_rle_miniblock, try_general_block, try_raw_block,
+        try_raw_fixed_size_list_miniblock, try_raw_fixed_width_miniblock, try_raw_per_value,
+        try_uncompressed_fixed_width_miniblock, try_variable_packed_struct_per_value,
+        try_variable_width_miniblock, try_variable_width_per_value,
     },
     compression_config::{CompressionFieldParams, CompressionParams},
     data::DataBlock,
@@ -40,6 +40,10 @@ impl Strategy {
 }
 
 impl CompressionStrategy for Strategy {
+    fn minichunk_size(&self, field: &Field) -> Result<Option<u64>> {
+        self.params.minichunk_size(field)
+    }
+
     fn create_miniblock_compressor(
         &self,
         field: &Field,
@@ -53,7 +57,7 @@ impl CompressionStrategy for Strategy {
                 compressor
             } else if let Some(compressor) = try_fixed_u8_rle_miniblock(data, &params) {
                 compressor
-            } else if let Some(compressor) = try_bitpacking_miniblock(data) {
+            } else if let Some(compressor) = try_bitpacking_miniblock_with_target(data, &params) {
                 compressor
             } else if let Some(compressor) = try_raw_fixed_width_miniblock(data) {
                 compressor

@@ -19,7 +19,9 @@
 use crate::encodings::physical::axis_delta::AxisDeltaDecompressor;
 pub use crate::encodings::physical::axis_delta::try_tensor_per_value;
 #[cfg(feature = "bitpacking")]
-use crate::encodings::physical::bitpacking::{InlineBitpacking, OutOfLineBitpacking};
+use crate::encodings::physical::bitpacking::{
+    ELEMS_PER_CHUNK, InlineBitpacking, OutOfLineBitpacking,
+};
 #[cfg(feature = "pcodec")]
 use crate::encodings::physical::pcodec::{PcodecMiniBlockDecompressor, PcodecMiniBlockEncoder};
 use crate::{
@@ -35,7 +37,10 @@ use crate::{
     encodings::{
         logical::primitive::{
             fullzip::PerValueCompressor,
-            miniblock::{MAX_MINIBLOCK_VALUES, MiniBlockCompressor},
+            miniblock::{
+                MAX_MINIBLOCK_BYTES, MAX_MINIBLOCK_VALUES, MiniBlockCompressionContext,
+                MiniBlockCompressor,
+            },
         },
         physical::{
             alp::{AlpMiniBlockDecompressor, AlpMiniBlockEncoder, should_use_alp},
@@ -145,6 +150,12 @@ pub trait CompressionStrategy: Send + Sync + std::fmt::Debug {
         data: &DataBlock,
     ) -> Result<Box<dyn PerValueCompressor>>;
 
+    /// Resolve and validate the byte target for mini-block chunks of this field.
+    /// `None` leaves the chunk size to the selected codec.
+    fn minichunk_size(&self, _field: &Field) -> Result<Option<u64>> {
+        Ok(None)
+    }
+
     /// Create a mini-block compressor for the given data
     fn create_miniblock_compressor(
         &self,
@@ -216,6 +227,17 @@ fn try_alp_for_mini_block(
     // before the candidate scan, and the page-level fallback already guarantees
     // ALP never enlarges data. Only v2.3 writers call this path.
     let mode = params.alp.unwrap_or(AlpMode::Auto);
+    // ALP packets and inline bitpacking both use 1024-value groups. An
+    // explicitly selected ALP codec keeps that framing. Automatic ALP
+    // yields to a different requested General compression unit, or to
+    // an explicit BSS request paired with that byte target.
+    if mode == AlpMode::Auto
+        && let Some(target) = explicit_general_chunk_target(params)
+        && (params.bss == Some(BssMode::On)
+            || general_chunk_target_conflicts(data, target, AlpMiniBlockEncoder::VALUES_PER_CHUNK))
+    {
+        return None;
+    }
     if !should_use_alp(data, mode) {
         return None;
     }
@@ -343,6 +365,20 @@ fn try_child_rle_for_mini_block(
     params: &CompressionFieldParams,
 ) -> Option<Box<dyn MiniBlockCompressor>> {
     let raw_bytes = rle_is_applicable(data, params)?;
+    if params.rle_threshold.is_none()
+        && let Some(target) = explicit_general_chunk_target(params)
+        && data.expect_single_stat::<UInt64Type>(Stat::RunCount) == data.num_values
+    {
+        // With only singleton runs, RLE adds a length byte to each value
+        // before applying the child codecs. Use General directly when that
+        // extra byte and the legacy RLE budget would change the chunk count.
+        let run_bytes = data.bits_per_value / 8 + 1;
+        let max_values = (*MAX_MINIBLOCK_VALUES).min(MAX_MINIBLOCK_BYTES / run_bytes);
+        let chunk_values = 1 << max_values.ilog2();
+        if general_chunk_target_conflicts(data, target, chunk_values) {
+            return None;
+        }
+    }
     // Plain u8 runs retain full blocks. Composite RLE uses smaller blocks to
     // bound child materialization during random reads; estimate both in one pass.
     let (run_length_width, estimated_bytes, max_values) = select_miniblock_run_length_width(
@@ -695,15 +731,9 @@ pub fn field_metadata_params(field: &Field) -> CompressionFieldParams {
             None => log::warn!("Invalid ALP mode '{}', using default", alp_str),
         }
     }
-    if let Some(minichunk_size_str) = field
-        .metadata
-        .get(super::constants::MINICHUNK_SIZE_META_KEY)
-    {
-        if let Ok(minichunk_size) = minichunk_size_str.parse::<i64>() {
-            params.minichunk_size = Some(minichunk_size);
-        } else {
-            log::warn!("Invalid minichunk_size '{}', skipping", minichunk_size_str);
-        }
+    match crate::compression_config::minichunk_size_from_metadata(field) {
+        Ok(size) => params.minichunk_size = size,
+        Err(error) => log::warn!("{error}"),
     }
 
     params
@@ -740,6 +770,38 @@ pub fn try_byte_stream_split_miniblock(
         return None;
     };
     try_bss_for_mini_block(data, params)
+}
+
+fn explicit_general_chunk_target(params: &CompressionFieldParams) -> Option<u64> {
+    if matches!(params.compression.as_deref(), Some("lz4" | "zstd")) {
+        params
+            .minichunk_size
+            .and_then(|size| u64::try_from(size).ok())
+    } else {
+        None
+    }
+}
+
+fn general_chunk_target_conflicts(
+    data: &FixedWidthDataBlock,
+    target: u64,
+    codec_chunk_values: u64,
+) -> bool {
+    if !matches!(data.bits_per_value, 8 | 16 | 32 | 64) {
+        return false;
+    }
+    let context =
+        MiniBlockCompressionContext::new(0, true, true).with_fixed_width_chunk_target(target);
+    match context.fixed_width_values_per_chunk(data.num_values, 1, 1, |values| {
+        values * (data.bits_per_value / 8)
+    }) {
+        Ok(Some(values)) => {
+            values != codec_chunk_values && data.num_values > values.min(codec_chunk_values)
+        }
+        Ok(None) => false,
+        // Let the encoder that handles explicit targets report an unusable budget.
+        Err(_) => true,
+    }
 }
 
 /// Select modern ALP compression for an applicable floating-point miniblock.
@@ -832,6 +894,22 @@ pub fn try_bitpacking_miniblock(data: &DataBlock) -> Option<Box<dyn MiniBlockCom
         return None;
     };
     try_bitpack_for_mini_block(data)
+}
+
+/// Select inline bitpacking unless its fixed group size conflicts with an
+/// explicit General compression byte target.
+pub fn try_bitpacking_miniblock_with_target(
+    data: &DataBlock,
+    _params: &CompressionFieldParams,
+) -> Option<Box<dyn MiniBlockCompressor>> {
+    #[cfg(feature = "bitpacking")]
+    if let DataBlock::FixedWidth(data) = data
+        && let Some(target) = explicit_general_chunk_target(_params)
+        && general_chunk_target_conflicts(data, target, ELEMS_PER_CHUNK)
+    {
+        return None;
+    }
+    try_bitpacking_miniblock(data)
 }
 
 /// Store fixed-width miniblock values without a value codec.

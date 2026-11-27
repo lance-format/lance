@@ -9,6 +9,9 @@
 use std::collections::HashMap;
 
 use arrow_schema::DataType;
+use lance_core::{Error, Result, datatypes::Field};
+
+use crate::constants::MINICHUNK_SIZE_META_KEY;
 
 /// Byte stream split encoding mode
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -125,7 +128,8 @@ pub struct CompressionFieldParams {
     /// General compression and its level are configured independently.
     pub axis_delta: Option<AxisDeltaMode>,
 
-    /// Minichunk size threshold for encoding
+    /// Target uncompressed bytes per mini-block chunk. Unset uses the codec default.
+    /// Fixed-width mini-blocks support this target in Lance 2.2 and later.
     pub minichunk_size: Option<i64>,
 }
 
@@ -168,6 +172,38 @@ impl CompressionParams {
 
         params
     }
+
+    /// Resolve the positive mini-block byte target, with field metadata taking precedence
+    /// over programmatic column and type settings. `None` uses the codec default.
+    pub fn minichunk_size(&self, field: &Field) -> Result<Option<u64>> {
+        let size = match minichunk_size_from_metadata(field)? {
+            Some(size) => Some(size),
+            None if self.columns.is_empty() && self.types.is_empty() => None,
+            None => {
+                self.get_field_params(&field.name, &field.data_type())
+                    .minichunk_size
+            }
+        };
+        size.map(|size| {
+            if size <= 0 {
+                return Err(Error::invalid_input(format!(
+                    "Field '{}' has {MINICHUNK_SIZE_META_KEY}={size}; expected a positive byte count",
+                    field.name
+                )));
+            }
+            Ok(size as u64)
+        })
+        .transpose()
+    }
+}
+
+pub(crate) fn minichunk_size_from_metadata(field: &Field) -> Result<Option<i64>> {
+    field.metadata.get(MINICHUNK_SIZE_META_KEY).map(|size| {
+        size.parse().map_err(|_| Error::invalid_input(format!(
+            "Field '{}' has {MINICHUNK_SIZE_META_KEY}='{size}'; expected a positive integer byte count",
+            field.name
+        )))
+    }).transpose()
 }
 
 impl Default for CompressionParams {
