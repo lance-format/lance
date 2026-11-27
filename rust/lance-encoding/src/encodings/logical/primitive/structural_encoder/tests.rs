@@ -24,7 +24,7 @@ use crate::compression::DefaultDecompressionStrategy;
 #[cfg(feature = "bitpacking")]
 use crate::compression::{BlockCompressor, CompressionStrategy, try_bitpacking_block};
 use crate::constants::{
-    COMPRESSION_LEVEL_META_KEY, COMPRESSION_META_KEY, DICT_DIVISOR_META_KEY,
+    AXIS_DELTA_META_KEY, COMPRESSION_LEVEL_META_KEY, COMPRESSION_META_KEY, DICT_DIVISOR_META_KEY,
     DICT_SIZE_RATIO_META_KEY, DICT_VALUES_COMPRESSION_LEVEL_META_KEY,
     DICT_VALUES_COMPRESSION_META_KEY, STRUCTURAL_ENCODING_META_KEY, STRUCTURAL_ENCODING_MINIBLOCK,
 };
@@ -882,7 +882,7 @@ async fn test_tensor_per_value_compression(
         (COMPRESSION_META_KEY.to_string(), compression.to_string()),
         (COMPRESSION_LEVEL_META_KEY.to_string(), "3".to_string()),
         // Exercise the configured codec independently of automatic selection.
-        ("lance-encoding:axis-delta".to_string(), "off".to_string()),
+        (AXIS_DELTA_META_KEY.to_string(), "off".to_string()),
     ]);
     let field = arrow_schema::Field::new("tensor", array.data_type().clone(), true)
         .with_metadata(metadata.clone());
@@ -2276,11 +2276,11 @@ async fn test_axis_delta_per_value_compression(
             "lance-encoding:structural-encoding".to_string(),
             structure.to_string(),
         ),
-        ("lance-encoding:axis-delta".to_string(), mode.to_string()),
+        (AXIS_DELTA_META_KEY.to_string(), mode.to_string()),
         (COMPRESSION_META_KEY.to_string(), compression.to_string()),
     ]);
     if mode == "default" {
-        metadata.remove("lance-encoding:axis-delta");
+        metadata.remove(AXIS_DELTA_META_KEY);
     }
     metadata.insert(
         "ARROW:extension:name".into(),
@@ -2412,7 +2412,7 @@ async fn test_default_axis_delta_preserves_other_encodings(
         // or the tensor is unsupported. Stable writers already use raw storage.
         metadata.remove(COMPRESSION_META_KEY);
     }
-    metadata.insert("lance-encoding:axis-delta".into(), "off".into());
+    metadata.insert(AXIS_DELTA_META_KEY.into(), "off".into());
     let field =
         arrow_schema::Field::new("value", array.data_type().clone(), false).with_metadata(metadata);
     let disabled = encode_first_page(field, array, version).await;

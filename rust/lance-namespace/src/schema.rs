@@ -86,8 +86,6 @@ fn arrow_type_to_json(data_type: &DataType) -> Result<JsonArrowDataType> {
         }
         DataType::Date32 => Ok(JsonArrowDataType::new("date32".to_string())),
         DataType::Date64 => Ok(JsonArrowDataType::new("date64".to_string())),
-        DataType::Time32(_) => Ok(JsonArrowDataType::new("time32".to_string())),
-        DataType::Time64(_) => Ok(JsonArrowDataType::new("time64".to_string())),
         // Preserve the legacy encoding where it already represents the exact type.
         DataType::Timestamp(TimeUnit::Microsecond, None) => {
             Ok(JsonArrowDataType::new("timestamp".to_string()))
@@ -97,7 +95,10 @@ fn arrow_type_to_json(data_type: &DataType) -> Result<JsonArrowDataType> {
         }
         // Other temporal types use Lance's existing logical-type spelling so their
         // unit and timezone survive the namespace JSON round trip.
-        DataType::Timestamp(_, _) | DataType::Duration(_) => {
+        DataType::Timestamp(_, _)
+        | DataType::Duration(_)
+        | DataType::Time32(_)
+        | DataType::Time64(_) => {
             let logical_type = LogicalType::try_from(data_type)?;
             Ok(JsonArrowDataType::new(logical_type.to_string()))
         }
@@ -262,7 +263,11 @@ pub fn convert_json_arrow_type(json_type: &JsonArrowDataType) -> Result<DataType
     let raw_type_name = json_type.r#type.as_str();
     let type_name = raw_type_name.to_ascii_lowercase();
 
-    if type_name.starts_with("timestamp:") || type_name.starts_with("duration:") {
+    if type_name.starts_with("timestamp:")
+        || type_name.starts_with("duration:")
+        || type_name.starts_with("time32:")
+        || type_name.starts_with("time64:")
+    {
         let logical_type = LogicalType::from(raw_type_name);
         return DataType::try_from(&logical_type).map_err(|error| {
             Error::namespace(format!(
@@ -780,6 +785,21 @@ mod tests {
     }
 
     #[test]
+    fn test_time_unit_roundtrip() {
+        // Time32 takes seconds or milliseconds, Time64 microseconds or nanoseconds.
+        for (data_type, wire_name) in [
+            (DataType::Time32(TimeUnit::Second), "time32:s"),
+            (DataType::Time32(TimeUnit::Millisecond), "time32:ms"),
+            (DataType::Time64(TimeUnit::Microsecond), "time64:us"),
+            (DataType::Time64(TimeUnit::Nanosecond), "time64:ns"),
+        ] {
+            let json = arrow_type_to_json(&data_type).unwrap();
+            assert_eq!(json.r#type, wire_name);
+            assert_eq!(convert_json_arrow_type(&json).unwrap(), data_type);
+        }
+    }
+
+    #[test]
     fn test_legacy_timestamp_and_duration_payloads_still_decode() {
         let legacy_timestamp: JsonArrowDataType =
             serde_json::from_str(r#"{"type":"timestamp"}"#).unwrap();
@@ -846,6 +866,11 @@ mod tests {
             "duration:decade",
             "timestamp:us",
             "duration:us:extra",
+            // Time32 only takes s/ms and Time64 only us/ns. The bare names carry no unit.
+            "time32:us",
+            "time64:ms",
+            "time32",
+            "time64",
         ] {
             let data_type: JsonArrowDataType =
                 serde_json::from_str(&format!(r#"{{"type":"{encoded}"}}"#)).unwrap();

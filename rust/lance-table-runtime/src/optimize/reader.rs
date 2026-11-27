@@ -9,6 +9,7 @@ use lance_core::datatypes::BlobHandling;
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn};
 use lance_core::{ROW_ADDR_FIELD, ROW_ID_FIELD, Result};
 use lance_file::version::ConcreteFileVersion;
+use lance_io::object_store::ObjectStore;
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::stream::{RecordBatchStreamAdapter, SendableRecordBatchStream};
 use lance_table::format::Fragment;
@@ -20,6 +21,26 @@ use crate::fragment::read_defaults::{
 };
 use crate::rowids::{CapturedRowIds, make_rowid_capture_stream};
 use crate::{BaseSchedulers, FileFragment, FragReadConfig, Table};
+
+/// Give `config` one scheduler for the table's own files and one per base for
+/// files in other bases, sized by `io_buffer_size`, then
+/// `LANCE_DEFAULT_IO_BUFFER_SIZE`, then the store's max bandwidth.
+pub(super) fn with_read_budget(
+    config: FragReadConfig,
+    store: &Arc<ObjectStore>,
+    io_buffer_size: Option<u64>,
+) -> FragReadConfig {
+    let io_buffer_size = io_buffer_size.or_else(get_default_io_buffer_size_override);
+    let scheduler_config = io_buffer_size.map_or_else(
+        || SchedulerConfig::max_bandwidth(store),
+        SchedulerConfig::new,
+    );
+    let base_schedulers =
+        io_buffer_size.map_or_else(BaseSchedulers::max_bandwidth, BaseSchedulers::new);
+    config
+        .with_scan_scheduler(ScanScheduler::new(store.clone(), scheduler_config))
+        .with_base_schedulers(base_schedulers)
+}
 
 pub(super) struct RewriteReader {
     pub batches: SendableRecordBatchStream,
@@ -92,16 +113,7 @@ pub(super) fn prepare_reader(
         .with_row_address(has_blob_v2);
     let mut batch_size_bytes = None;
     if !is_legacy {
-        let io_buffer_size = io_buffer_size.or_else(get_default_io_buffer_size_override);
-        let scheduler_config = io_buffer_size.map_or_else(
-            || SchedulerConfig::max_bandwidth(store),
-            SchedulerConfig::new,
-        );
-        let base_schedulers =
-            io_buffer_size.map_or_else(BaseSchedulers::max_bandwidth, BaseSchedulers::new);
-        config = config
-            .with_scan_scheduler(ScanScheduler::new(store.clone(), scheduler_config))
-            .with_base_schedulers(base_schedulers);
+        config = with_read_budget(config, store, io_buffer_size);
         if let Some(file_options) = table.file_reader_options() {
             batch_size_bytes = file_options.batch_size_bytes;
             config = config.with_file_reader_options(file_options.clone());
