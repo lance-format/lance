@@ -1605,30 +1605,20 @@ class LanceScanner(pa.dataset.Scanner):
         # Collect the rows at the requested filtered-relative positions. Rows
         # are gathered in scan order first and re-ordered to the caller's
         # index order at the end, so repeated and unsorted indices work.
-        max_index = max(indices)
-        sorted_unique = sorted(set(indices))
-        batches = []
-        matched = 0  # number of matching rows consumed so far
-        exhausted = False
-        for batch in self.to_batches():
-            batch_end = matched + batch.num_rows
-            positions = [i - matched for i in sorted_unique if matched <= i < batch_end]
-            if positions:
-                batches.append(batch.take(positions))
-            matched = batch_end
-            if matched > max_index:
-                exhausted = True
-                break
-        if not exhausted:
-            # The stream ended before covering max_index, so matched is the
+        sorted_unique = sorted({operator.index(i) for i in indices})
+        max_index = sorted_unique[-1]
+        # An index beyond the native integer range still needs the scan's row
+        # count for the bounds error. An empty native selection only counts rows.
+        positions = sorted_unique if max_index < 2**64 else []
+        batches, matched = self._scanner.take_sorted_positions(positions)
+        if max_index >= matched:
+            # The stream ended before covering the largest index, so matched is the
             # full row count of the scan output. (count_rows is unavailable
             # here anyway when the scanner has a limit/offset.)
             raise IndexError(
                 f"index {max_index} is out of bounds for a scan with {matched} rows"
             )
 
-        # Reaching here means max_index was covered by the scan, so at least
-        # one row was collected.
         table = pa.Table.from_batches(batches)
         # rows are in sorted-unique index order; map back to the caller's order.
         row_lookup = {idx: i for i, idx in enumerate(sorted_unique)}

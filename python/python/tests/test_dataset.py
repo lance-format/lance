@@ -11067,15 +11067,18 @@ class TestLanceScannerTake:
         result = scanner.take([0, 19]).to_pylist()
         assert result == expected
 
-    def test_take_out_of_bounds_raises(self, tmp_path):
+    @pytest.mark.parametrize("position", [20, 2**64])
+    def test_take_out_of_bounds_raises(self, tmp_path, position):
         ds = self._make_dataset(tmp_path)
         scanner = ds.scanner()  # 20 rows
 
         with pytest.raises(IndexError):
-            scanner.take(20)
+            scanner.take(position)
 
-        with pytest.raises(IndexError):
-            scanner.take([0, 20])
+        with pytest.raises(
+            IndexError, match=rf"index {position} is out of bounds.*20 rows"
+        ):
+            scanner.take([0, position])
 
     def test_take_empty_indices_raises(self, tmp_path):
         ds = self._make_dataset(tmp_path)
@@ -11102,25 +11105,36 @@ class TestLanceScannerTake:
         assert "id" not in result[0]
 
     def test_take_spans_multiple_batches(self, tmp_path):
-        table = pa.table({"id": pa.array(range(20))})
-        ds = lance.write_dataset(table, tmp_path / "ds", max_rows_per_file=4)
-        # 5 fragments of 4 rows each.
-        scanner = ds.scanner()
-        # Take across fragment boundaries.
-        result = scanner.take([2, 6, 10, 18]).to_pylist()
-        assert [r["id"] for r in result] == [2, 6, 10, 18]
+        ds = self._make_dataset(tmp_path, max_rows_per_file=4)
+        scanner = ds.scanner(batch_size=4, strict_batch_size=True)
+        positions = [2, 3, 4, 5, 7, 8, 19]
+        assert scanner.take(positions)["id"].to_pylist() == positions
 
     def test_take_duplicates_and_unsorted(self, tmp_path):
-        ds = self._make_dataset(tmp_path)
-        scanner = ds.scanner()
-        result = scanner.take([7, 1, 7, 1]).to_pylist()
-        assert [r["id"] for r in result] == [7, 1, 7, 1]
+        ds = self._make_dataset(tmp_path, max_rows_per_file=4)
+        scanner = ds.scanner(filter="id % 2 = 0", batch_size=1, strict_batch_size=True)
+        positions = [8, 0, 5, 2, 8, 1, 0, 7]
+        actual = scanner.take(positions)
+        assert actual.equals(scanner.to_table().take(positions))
+        assert actual["id"].to_pylist() == [16, 0, 10, 4, 16, 2, 0, 14]
+
+    def test_take_does_not_read_each_batch_in_python(self, tmp_path, monkeypatch):
+        ds = self._make_dataset(tmp_path, max_rows_per_file=4)
+        scanner = ds.scanner(filter="id BETWEEN 4 AND 5 OR id >= 12", batch_size=2)
+
+        def to_reader(_):
+            pytest.fail("take opened a Python batch reader")
+
+        monkeypatch.setattr(type(scanner), "to_reader", to_reader)
+        assert scanner.take([2, 0, 2])["id"].to_pylist() == [12, 4, 12]
 
     def test_take_positions_are_within_limited_output(self, tmp_path):
-        ds = self._make_dataset(tmp_path)
-        scanner = ds.scanner(limit=5)
-        result = scanner.take(4).to_pylist()
-        assert result == [{"id": 4}]
+        ds = self._make_dataset(tmp_path, max_rows_per_file=4)
+        scanner = ds.scanner(filter="id % 2 = 0", limit=5, offset=3, batch_size=2)
+        positions = [4, 0, 2, 4]
+        actual = scanner.take(positions)
+        assert actual.equals(scanner.to_table().take(positions))
+        assert actual["id"].to_pylist() == [14, 6, 10, 14]
 
     def test_take_out_of_bounds_with_scanner_limit(self, tmp_path):
         # The out-of-bounds path must not call count_rows, which rejects
@@ -11130,8 +11144,16 @@ class TestLanceScannerTake:
         with pytest.raises(IndexError):
             scanner.take(5)
 
-    def test_take_accepts_pyarrow_array(self, tmp_path):
-        # pyarrow Scanner.take() documents pa.Array as an accepted form.
+    def test_take_propagates_scan_read_errors(self, tmp_path):
+        ds = self._make_dataset(tmp_path)
+        next((tmp_path / "ds" / "data").glob("*.lance")).unlink()
+        with pytest.raises(pa.ArrowInvalid, match="External error"):
+            ds.scanner().take(0)
+
+    @pytest.mark.parametrize(
+        "positions", [pa.array([0, 2]), np.array([0, 2], dtype=np.uint64)]
+    )
+    def test_take_accepts_integer_arrays(self, tmp_path, positions):
         ds = self._make_dataset(tmp_path)
         scanner = ds.scanner(filter="id >= 4")
-        assert scanner.take(pa.array([0, 2]))["id"].to_pylist() == [4, 6]
+        assert scanner.take(positions)["id"].to_pylist() == [4, 6]
