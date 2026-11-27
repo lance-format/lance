@@ -62,9 +62,9 @@ fn validate_compressive_encoding(
             }
             EncodingPosition::BufferBackedBlock => {
                 match encoding.compression.as_ref() {
-                    Some(Compression::Range(_) | Compression::Delta(_)) => {
+                    Some(Compression::Range(_) | Compression::MonotonicDelta(_)) => {
                         return Err(Error::invalid_input(
-                            "Range and delta compression require an optional-payload block",
+                            "Range and MonotonicDelta compression require an optional-payload block",
                         ));
                     }
                     Some(Compression::General(general)) => validate_compressive_encoding(
@@ -491,7 +491,7 @@ mod grammar_tests {
         EncodingUtils::packed_struct_field_variable(EncodingUtils::variable(flat(32), None), 32),
     ]), [false, false, false, false, true])]
     #[case::range(EncodingUtils::range(32, 0, 1), [true, false, false, false, false])]
-    #[case::delta(EncodingUtils::delta(32, 0, flat(32)), [true, false, false, false, false])]
+    #[case::monotonic_delta(EncodingUtils::delta(32, 0, flat(32)), [true, false, false, false, false])]
     #[case::axis_delta(axis_delta(), [false, false, false, true, false])]
     #[case::missing(CompressiveEncoding::default(), [false; 5])]
     fn codec_roots_match_decoder_contracts(
@@ -532,7 +532,7 @@ mod grammar_tests {
         EncodingUtils::variable(EncodingUtils::rle(flat(32), flat(32)), None),
         true
     )]
-    #[case::delta_offsets(
+    #[case::monotonic_delta_offsets(
         EncodingUtils::variable(EncodingUtils::delta(32, 0, flat(32)), None),
         true
     )]
@@ -586,7 +586,7 @@ mod grammar_tests {
     }
 
     #[rstest::rstest]
-    #[case::delta_of_delta(
+    #[case::monotonic_delta_of_monotonic_delta(
         EncodingPosition::OptionalPayloadBlock,
         EncodingUtils::delta(32, 0, EncodingUtils::delta(32, 0, flat(32)))
     )]
@@ -602,7 +602,7 @@ mod grammar_tests {
         EncodingPosition::BufferBackedBlock,
         general(EncodingUtils::range(32, 0, 1))
     )]
-    #[case::buffer_delta(
+    #[case::buffer_monotonic_delta(
         EncodingPosition::BufferBackedBlock,
         general(EncodingUtils::delta(32, 0, flat(32)))
     )]
