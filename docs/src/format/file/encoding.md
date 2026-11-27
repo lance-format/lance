@@ -415,25 +415,38 @@ packed structs can compose with sparse structure. Codec selection is a writer po
 
 #### Fixed-Size List Values
 
-A `FixedSizeList` compression descriptor preserves one fixed-size list layer in the value plane. Let
-`c_i` be the product of the dimensions from the outermost layer through layer `i`, and let `D` be the
-product through the innermost layer. Dimensions are positive. `has_validity` at layer `i` describes
-that layer's *children*, with `c_i` validity bits per value-plane row. The structure plane records
-whether the row itself is valid. Counts and byte sizes derived from dimensions must fit without overflow.
+A `FixedSizeList` compression descriptor preserves one layer of a fixed-size list of fixed-width items
+in the value plane. Its nested dimensions must match the fixed-size list layers of the leaf column, which
+may be enclosed by structs or variable-size lists. Let `c_i` be the product of the dimensions from the outermost layer
+through layer `i`, and let `D` be the product through the innermost layer. Dimensions are positive. A
+value-plane row is one complete fixed-size list value, with `D` leaf items. Counts and byte sizes derived
+from dimensions must fit without overflow.
 
-In `ChunkedValues`, each mini-block contains whole fixed-size list rows. The chunk count in Buffer 0
-counts rows, so a chunk with `N` rows decodes `N * D` leaf items. Each chunk stores the validity buffers
-in outermost-to-innermost order, followed by the leaf codec's buffers. Each validity buffer occupies
+The structure plane represents enclosing lists and structs and the validity of the fixed-size list value
+itself. Each `has_validity` flag describes that layer's *children*, with `c_i` validity bits per value-plane
+row. Child validity beneath this boundary is stored in the value-plane bitmaps. In sparse structure the
+terminal domain contains complete fixed-size list values in leaf-column order. These value dimensions
+are absent from the sparse layers. `SparseFixedSizeListLayer` represents a structural fixed-size list
+ancestor of a separate leaf column, such as a fixed-size list of structs.
+
+In `ChunkedValues`, each mini-block contains whole value-plane rows. The chunk count in Buffer 0
+counts those rows, so a chunk with `N` rows decodes `N * D` leaf items. With dense structure,
+`num_items` counts the value-plane rows across the page, excluding structural events with no value.
+With sparse structure, chunks cover all terminal slots including null placeholders. The terminal domain
+determines the count and `num_items` is zero. Each chunk stores the validity buffers in
+outermost-to-innermost order, followed by the leaf codec's buffers. Each validity buffer occupies
 `ceil(N * c_i / 8)` bytes, with the least significant bit of the first byte describing the first child.
 `ChunkedValues.num_buffers` is the number of present validity buffers plus the number of leaf buffers.
 
 The innermost descriptor uses one of these leaf codecs:
 
 - `Flat` with a positive bit width and absent `data` uses one buffer.
-- `Constant` with absent `value` represents all-null children and uses zero leaf buffers.
-- `OutOfLineBitpacking` uses one buffer of 1024-item FastLanes blocks. Its `values` is a `Flat` width
-  descriptor with absent `data` and a width no greater than the original 8-, 16-, 32-, or 64-bit width.
-  The final partial block can be raw or padded to 1024 items and packed. Its byte length selects the
+- `Constant` with absent `value` represents all-null children of the last described layer and uses
+  zero leaf buffers. An all-null child can itself be a fixed-size list.
+- `OutOfLineBitpacking` uses one buffer of 1024-item FastLanes blocks over the flattened chunk.
+  Blocks run across fixed-size list rows within the chunk. Its `values` is a `Flat` width descriptor
+  with absent `data` and a width no greater than the original 8-, 16-, 32-, or 64-bit width. The final
+  partial block can be raw or padded to 1024 items and packed. Its byte length selects the
   representation, with equal lengths interpreted as raw.
 - `InlineBitpacking` with absent `values` uses one buffer. It consists of `ceil(N * D / 1024)`
   consecutive segments. Each segment starts with its packed bit width as an unsigned little-endian
@@ -446,7 +459,8 @@ The innermost descriptor uses one of these leaf codecs:
   fixed-width child grammar.
 - `ByteStreamSplit` uses one buffer and wraps plain `Flat` of 32 or 64 bits.
 - `Alp` uses four buffers for 32- or 64-bit floating-point items. All chunks share the page's ALP
-  descriptor and buffer count.
+  descriptor and buffer count. The codec decodes the flattened chunk count, and exception positions
+  are 16-bit indices into that flattened chunk.
 - `General` wraps one of the payload-bearing leaf codecs above and compresses its first buffer.
   It appears inside the fixed-size list layers, after all validity buffers. The other leaf buffers
   retain the inner codec's framing.
@@ -454,12 +468,29 @@ The innermost descriptor uses one of these leaf codecs:
 In fixed-width `ZippedValues`, a fixed-size list can also use `OutOfLineBitpacking` with the same
 width descriptor. Each row starts a fresh sequence of 1024-item blocks. With original width `w` and
 packed width `b`, each complete block uses `128 * b` bytes. A tail of `r = D % 1024` items uses
-`min(r * w / 8, 128 * b)` bytes, and uses raw items when those sizes are equal. A row starts with
-one `ceil(c_i / 8)`-byte validity bitmap for each layer with `has_validity`, in outermost-to-innermost
-order, followed by the packed leaf frame. `bits_per_value` is the exact width of this physical row
-in bits and must be positive and divisible by eight. In variable-width `ZippedValues`, outer
-`General` can compress each of these complete rows independently, using `bits_per_offset` to address
-its compressed frames.
+`min(r * w / 8, 128 * b)` bytes. Writers store it raw when `r * w / 8` is at most `128 * b`, and readers
+interpret equal lengths as raw. A row starts with one `ceil(c_i / 8)`-byte child validity bitmap for each
+layer with `has_validity`, in outermost-to-innermost order, followed by the packed leaf frame. Bits in
+each bitmap are stored least-significant bit first. `bits_per_value` must equal the width in bits derived
+from those bitmaps and the leaf frame, be positive, and be divisible by eight. Readers reject a mismatch.
+
+With dense structure, `num_items` counts control events, including events without a visible value (such
+as an empty enclosing list). `num_visible_items` counts the visible fixed-size list slots, including
+visible null slots. Each visible event in a fixed-width stream carries a row frame, including when the
+list itself is null. A control word precedes each event when repetition or definition levels are present.
+Its bytes are outside `bits_per_value`. The repetition index locates top-level rows when repetition
+levels are present. For an unindexed stream with zero repetition and definition bits, the shared dense
+full-zip reader also accepts one zero padding byte before each fixed-width frame when the total buffer
+length matches that stride.
+
+With sparse structure, `num_items` and `num_visible_items` both count materialized fixed-size list slots.
+Frames follow the materialized positions in order, without control words or frames for null slots.
+
+Outer `General` wraps each complete fixed-width row independently in variable-width `ZippedValues`.
+It requires `bits_per_offset` addressing, with the usual variable-width length prefixes and byte index.
+The child describes the uncompressed row width, including child validity and the leaf frame. In dense
+streams the control word remains outside the compressed frame. Only valid visible events carry a
+length and a frame.
 
 `Pcodec` and `AxisDelta` retain their own plain `Flat` leaf grammar when wrapping fixed-size list
 layers. The new leaf codecs and compositions apply only to unstable Lance 2.3 planar values. Stable

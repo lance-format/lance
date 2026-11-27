@@ -148,7 +148,9 @@ pub struct ChunkedValues {
     /// Number of value buffers per chunk, excluding repetition and definition.
     #[prost(uint64, tag = "5")]
     pub num_buffers: u64,
-    /// Dense structural event count. Sparse counts are derived from its domains.
+    /// Number of dense value-plane slots, including visible nulls. A fixed-size
+    /// list in the value plane occupies one slot. Must be zero for sparse
+    /// structure, which supplies the terminal slot count including nulls.
     #[prost(uint64, tag = "6")]
     pub num_items: u64,
 }
@@ -190,10 +192,12 @@ pub struct ZippedValues {
     /// Present only with dense structure; sparse values contain no control words.
     #[prost(message, optional, tag = "2")]
     pub levels: ::core::option::Option<DenseZipLevels>,
-    /// Dense event count or sparse materialized value count.
+    /// Dense control event count, or sparse materialized value count.
     #[prost(uint64, tag = "5")]
     pub num_items: u64,
-    /// Leaf slots for dense pages; equal to num_items for sparse pages.
+    /// Visible value-plane slots (including visible nulls) for dense structure.
+    /// For sparse structure, both counts are the number of materialized slots.
+    /// A value-plane fixed-size list occupies one slot regardless of its shape.
     #[prost(uint64, tag = "6")]
     pub num_visible_items: u64,
     #[prost(oneof = "zipped_values::Addressing", tags = "3, 4")]
@@ -203,8 +207,12 @@ pub struct ZippedValues {
 pub mod zipped_values {
     #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Oneof)]
     pub enum Addressing {
+        /// Width in bits of one fixed-width value frame, excluding dense control
+        /// words. Must be positive, byte-aligned, and match the compression
+        /// descriptor, including any fixed-size list child validity bytes.
         #[prost(uint32, tag = "3")]
         BitsPerValue(u32),
+        /// Width in bits of the variable-width length prefixes.
         #[prost(uint32, tag = "4")]
         BitsPerOffset(u32),
     }
@@ -728,6 +736,9 @@ impl ::prost::Name for Rle {
     }
 }
 /// Preserves one fixed-size list layer in the unstable 2.3 value plane.
+/// These dimensions match the fixed-size list shape of the leaf column. A
+/// sparse terminal slot is a complete list value. The structure plane holds
+/// validity of that slot, and the descriptors below hold child validity.
 /// In ChunkedValues, chunks contain whole rows. Child validity buffers appear
 /// outermost first, followed by the leaf codec's buffers. The leaf is plain
 /// Flat, null Constant, OutOfLineBitpacking, InlineBitpacking, Rle,
@@ -735,8 +746,8 @@ impl ::prost::Name for Rle {
 /// InlineBitpacking holds consecutive 1024-item segments within each chunk.
 /// In fixed ZippedValues, OutOfLineBitpacking restarts at each row, with a
 /// raw tail when raw and padded sizes are equal. Child validity bytes precede
-/// the leaf frame in each row. General can wrap those rows in ZippedValues
-/// addressed by byte offsets.
+/// the leaf frame in each row. Bitmaps are least-significant-bit first.
+/// Outer General compression of these rows requires bits_per_offset.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct FixedSizeList {
     /// The positive number of children per value at this layer.
