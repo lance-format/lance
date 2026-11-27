@@ -560,11 +560,12 @@ impl ::prost::Name for Range {
 /// represented by its first value and the differences between adjacent values.
 ///
 /// The child contains one fewer value than the input. The container supplies
-/// the input cardinality. Delta has a payload exactly when its child has one.
+/// the input cardinality. MonotonicDelta has a payload exactly when its child
+/// has one.
 ///
 /// The input is a u32 or u64 fixed-width data block.
 #[derive(Clone, PartialEq, ::prost::Message)]
-pub struct Delta {
+pub struct MonotonicDelta {
     /// The width of each decompressed value. Must be 32 or 64.
     #[prost(uint64, tag = "1")]
     pub uncompressed_bits_per_value: u64,
@@ -575,14 +576,14 @@ pub struct Delta {
     #[prost(message, optional, boxed, tag = "3")]
     pub deltas: ::core::option::Option<::prost::alloc::boxed::Box<CompressiveEncoding>>,
 }
-impl ::prost::Name for Delta {
-    const NAME: &'static str = "Delta";
+impl ::prost::Name for MonotonicDelta {
+    const NAME: &'static str = "MonotonicDelta";
     const PACKAGE: &'static str = "lance.encodings23";
     fn full_name() -> ::prost::alloc::string::String {
-        "lance.encodings23.Delta".into()
+        "lance.encodings23.MonotonicDelta".into()
     }
     fn type_url() -> ::prost::alloc::string::String {
-        "/lance.encodings23.Delta".into()
+        "/lance.encodings23.MonotonicDelta".into()
     }
 }
 /// A compression scheme in which a single fixed-width block is "packed" into
@@ -1038,7 +1039,7 @@ pub mod compressive_encoding {
         #[prost(message, tag = "14")]
         Range(super::Range),
         #[prost(message, tag = "15")]
-        Delta(::prost::alloc::boxed::Box<super::Delta>),
+        MonotonicDelta(::prost::alloc::boxed::Box<super::MonotonicDelta>),
         #[prost(message, tag = "16")]
         AxisDelta(::prost::alloc::boxed::Box<super::AxisDelta>),
         #[prost(message, tag = "17")]
