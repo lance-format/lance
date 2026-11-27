@@ -1860,10 +1860,11 @@ pub(crate) struct OldSegment<'a> {
 /// `index_map` order can be trusted for old and new files alike, which is what
 /// makes this work without an index version bump.
 ///
-/// Sources whose file rows follow key order are read in one pass through
-/// [`SequentialBitmapReader`] for small merges and bounded range reads for wide
-/// merges. Unsorted files read individual rows. All paths apply fragment-reuse
-/// remapping and skip the index cache: every source entry is read exactly once
+/// Sources whose file rows follow key order are streamed in one pass through
+/// [`SequentialBitmapReader`]. When too many sources can pin local file
+/// descriptors, those sources use bounded range reads. Unsorted files read
+/// individual rows. All paths apply fragment-reuse remapping and skip the
+/// index cache: every source entry is read exactly once
 /// and the sources are retired right after, so caching would only evict live
 /// entries. Reading raw bytes without remapping would emit addresses pointing
 /// at fragments compaction has already retired.
@@ -1896,12 +1897,19 @@ impl<'a> OldSegments<'a> {
             .collect();
         let mut heap = BinaryHeap::with_capacity(segments.len());
         let mut readers = Vec::with_capacity(segments.len());
+        let bound_local_readers = segments
+            .iter()
+            .filter(|s| {
+                !s.index.index_map.is_empty() && s.index.store.readers_may_pin_local_files()
+            })
+            .count()
+            > MAX_OPEN_LOCAL_MERGE_SOURCES;
         for (source_idx, keys) in key_iters.iter_mut().enumerate() {
             if let Some((key, row_offset)) = keys.next() {
                 heap.push(Reverse((key, source_idx, *row_offset)));
             }
             let index = segments[source_idx].index;
-            readers.push(if segments.len() > MAX_STREAMING_MERGE_SOURCES {
+            let reader = if bound_local_readers && index.store.readers_may_pin_local_files() {
                 MergeBitmapReader::Window {
                     start: 0,
                     bitmaps: BinaryArray::new_null(0),
@@ -1915,7 +1923,8 @@ impl<'a> OldSegments<'a> {
                 MergeBitmapReader::Stream(SequentialBitmapReader::open(index).await?)
             } else {
                 MergeBitmapReader::Random
-            });
+            };
+            readers.push(reader);
         }
         Ok(Self {
             segments,
@@ -2443,9 +2452,9 @@ const MERGE_BITMAP_BATCH_ROWS: u64 = 1024;
 /// Batches of a source's bitmaps a merge may decode ahead of the merge itself.
 const MERGE_BITMAP_READAHEAD: u32 = 2;
 
-// A streaming cursor pins its source file. Wide merges keep decoded windows
-// between reads so the number of open files does not grow with the fan-in.
-const MAX_STREAMING_MERGE_SOURCES: usize = 32;
+// Above this many local sources, buffer decoded windows so open files do not
+// grow with fan-in. Remote readers can coalesce reads across the whole file.
+const MAX_OPEN_LOCAL_MERGE_SOURCES: usize = 32;
 
 enum MergeBitmapReader<'a> {
     Stream(SequentialBitmapReader<'a>),
@@ -5491,7 +5500,7 @@ mod tests {
         let keys = MERGE_BITMAP_BATCH_ROWS + 1;
         let mut dirs = Vec::new();
         let mut sources = Vec::new();
-        for source in 0..=MAX_STREAMING_MERGE_SOURCES as u64 {
+        for source in 0..256 {
             let (dir, store) = test_util::index_store();
             let values = (0..keys).map(|i| Some(format!("k-{i:05}")));
             let stream = utf8_value_stream(values, (0..keys).map(|i| source * keys + i));
@@ -5528,6 +5537,93 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(read_bitmap_contents(dest.as_ref()).await, expected);
+    }
+
+    #[tokio::test]
+    async fn test_wide_bitmap_merge_streams_remote_source() {
+        const KEYS: u64 = 65_537;
+        let throttle = Arc::new(object_store::throttle::ThrottledStore::new(
+            object_store::memory::InMemory::new(),
+            Default::default(),
+        ));
+        let remote = Arc::new(ObjectStore::new(
+            throttle.clone(),
+            "s3://bitmap-test/".parse().unwrap(),
+            Some(64 * 1024),
+            None,
+            false,
+            true,
+            64,
+            3,
+            None,
+        ));
+        let cache = Arc::new(LanceCache::with_capacity(64 * 1024 * 1024));
+        let store = LanceIndexStore::new(remote.clone(), Path::from("remote"), cache.clone());
+        let stream = utf8_value_stream((0..KEYS).map(|i| Some(format!("k-{i:06}"))), 0..KEYS);
+        let file = BitmapIndexPlugin::train_bitmap_index(stream, &store)
+            .await
+            .unwrap();
+        let store = store.with_file_sizes(HashMap::from([(
+            BITMAP_LOOKUP_NAME.to_owned(),
+            file.size_bytes,
+        )]));
+        let cloud_source = BitmapIndex::load(Arc::new(store), None, &cache, true)
+            .await
+            .unwrap();
+
+        // Enough local segments to require bounded readers even in a mixed merge.
+        let mut dirs = Vec::new();
+        let mut sources = vec![cloud_source];
+        for n in 0..=MAX_OPEN_LOCAL_MERGE_SOURCES as u64 {
+            let (dir, store) = test_util::index_store();
+            let stream = utf8_value_stream([Some("local")], [KEYS + n]);
+            BitmapIndexPlugin::train_bitmap_index(stream, store.as_ref())
+                .await
+                .unwrap();
+            sources.push(
+                BitmapIndex::load(store, None, &LanceCache::no_cache(), true)
+                    .await
+                    .unwrap(),
+            );
+            dirs.push(dir);
+        }
+
+        let (_dir, dest) = test_util::index_store();
+        throttle
+            .config_mut(|config| config.wait_get_per_call = std::time::Duration::from_millis(25));
+        remote.io_stats_incremental();
+        let start = std::time::Instant::now();
+        BitmapIndex::merge_segments(
+            &sources,
+            utf8_value_stream(std::iter::empty::<Option<&str>>(), std::iter::empty()),
+            dest.as_ref(),
+            &vec![None; sources.len()],
+        )
+        .await
+        .unwrap();
+        let remote_reads = remote.io_stats_incremental().read_iops;
+        eprintln!("remote reads: {remote_reads}, merge: {:?}", start.elapsed());
+
+        let output = read_bitmap_contents(dest.as_ref()).await;
+        assert_eq!(output.len(), KEYS as usize + 1);
+        for (i, (key, rows)) in output.iter().take(KEYS as usize).enumerate() {
+            assert_eq!(key.as_ref().unwrap(), &format!("k-{i:06}"));
+            assert_eq!(rows, &[i as u64]);
+        }
+        assert_eq!(
+            output.last().unwrap(),
+            &(
+                Some("local".to_owned()),
+                (KEYS..KEYS + sources.len() as u64 - 1).collect()
+            )
+        );
+        for source in &sources[1..] {
+            assert!(source.lazy_reader.index_reader.lock().await.is_none());
+        }
+        assert!(
+            remote_reads < 20,
+            "remote source required {remote_reads} reads"
+        );
     }
 
     /// A lookup file whose rows are not in key order -- how LabelList wrote them

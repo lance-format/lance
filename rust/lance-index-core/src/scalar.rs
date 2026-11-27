@@ -413,6 +413,13 @@ pub trait IndexStore: std::fmt::Debug + Send + Sync + DeepSizeOf {
         false
     }
 
+    /// Whether keeping an index reader alive can pin a local file descriptor.
+    /// Stores that open persistent local file handles should opt in so wide
+    /// merges can release their readers between reads.
+    fn readers_may_pin_local_files(&self) -> bool {
+        false
+    }
+
     /// Suggested I/O parallelism for the store
     fn io_parallelism(&self) -> usize;
 

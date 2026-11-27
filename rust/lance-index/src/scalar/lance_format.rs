@@ -601,6 +601,10 @@ impl IndexStore for LanceIndexStore {
         })
     }
 
+    fn readers_may_pin_local_files(&self) -> bool {
+        self.object_store.has_direct_local_paths()
+    }
+
     fn io_parallelism(&self) -> usize {
         self.object_store.io_parallelism()
     }
