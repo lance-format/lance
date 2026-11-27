@@ -28,12 +28,12 @@ use lance_core::{Error, Result};
 pub struct ValueEncoder {}
 
 impl ValueEncoder {
-    /// Use the largest chunk we can smaller than 4KiB
-    fn find_log_vals_per_chunk(bytes_per_word: u64, values_per_word: u64) -> Result<(u64, u64)> {
+    /// Preserve the default byte and value budgets when no target is set.
+    fn default_values_per_chunk(bytes_per_word: u64, values_per_word: u64) -> Result<u64> {
         let mut size_bytes = 2 * bytes_per_word;
-        let (mut log_num_vals, mut num_vals) = match values_per_word {
-            1 => (1, 2),
-            8 => (3, 8),
+        let mut num_vals = match values_per_word {
+            1 => 2,
+            8 => 8,
             _ => unreachable!(),
         };
 
@@ -47,32 +47,46 @@ impl ValueEncoder {
         }
 
         while 2 * size_bytes < MAX_MINIBLOCK_BYTES && 2 * num_vals <= *MAX_MINIBLOCK_VALUES {
-            log_num_vals += 1;
             size_bytes *= 2;
             num_vals *= 2;
         }
 
-        Ok((log_num_vals, num_vals))
+        Ok(num_vals)
     }
 
-    fn chunk_data(data: FixedWidthDataBlock) -> Result<MiniBlockCompressed> {
+    fn chunk_data(
+        data: FixedWidthDataBlock,
+        context: MiniBlockCompressionContext,
+    ) -> Result<MiniBlockCompressed> {
         // Usually there are X bytes per value.  However, when working with boolean
         // or FSL<boolean> we might have some number of bits per value that isn't
         // divisible by 8.  In this case, to avoid chunking in the middle of a byte
         // we calculate how many 8-value words we can fit in a chunk.
+        if data.bits_per_value == 0 {
+            return Err(Error::invalid_input(
+                "Fixed-width mini-block values must have positive bit width",
+            ));
+        }
         let (bytes_per_word, values_per_word) = if data.bits_per_value.is_multiple_of(8) {
             (data.bits_per_value / 8, 1)
         } else {
             (data.bits_per_value, 8)
         };
 
-        // Aim for 4KiB chunks
-        let (log_vals_per_chunk, vals_per_chunk) =
-            Self::find_log_vals_per_chunk(bytes_per_word, values_per_word)?;
+        let chunk_bytes = |values: u64| values.saturating_mul(data.bits_per_value).div_ceil(8);
+        let vals_per_chunk = match context.fixed_width_values_per_chunk(
+            data.num_values,
+            values_per_word,
+            1,
+            chunk_bytes,
+        )? {
+            Some(values) => values,
+            None => Self::default_values_per_chunk(bytes_per_word, values_per_word)?,
+        };
+        let log_vals_per_chunk = MiniBlockChunk::log_for_fixed_width_chunk(vals_per_chunk);
         let num_chunks = bit_util::ceil(data.num_values as usize, vals_per_chunk as usize);
-        debug_assert_eq!(vals_per_chunk % values_per_word, 0);
-        let bytes_per_chunk = bytes_per_word * (vals_per_chunk / values_per_word);
-        let bytes_per_chunk = u32::try_from(bytes_per_chunk).unwrap();
+        debug_assert!(num_chunks <= 1 || vals_per_chunk.is_multiple_of(values_per_word));
+        let bytes_per_chunk = chunk_bytes(vals_per_chunk) as u32;
         debug_assert!(bytes_per_chunk > 0);
 
         let data_buffer = data.data;
@@ -85,7 +99,7 @@ impl ValueEncoder {
             if row_offset + vals_per_chunk <= data.num_values {
                 // We can make a full chunk
                 chunks.push(MiniBlockChunk {
-                    log_num_values: log_vals_per_chunk as u8,
+                    log_num_values: log_vals_per_chunk,
                     buffer_sizes: vec![bytes_per_chunk],
                 });
                 row_offset += vals_per_chunk;
@@ -245,6 +259,7 @@ impl ValueEncoder {
         data: FixedWidthDataBlock,
         layers: Vec<MiniblockFslLayer>,
         num_rows: u64,
+        context: MiniBlockCompressionContext,
     ) -> Result<(MiniBlockCompressed, CompressiveEncoding)> {
         let num_validity_buffers = layers
             .iter()
@@ -256,8 +271,26 @@ impl ValueEncoder {
                 .iter()
                 .map(|layer| (layer.dimension, layer.validity.is_some())),
         );
-        let (log_rows_per_chunk, rows_per_chunk) =
-            Self::find_log_vals_per_chunk(est_bytes_per_word, vals_per_word)?;
+        let chunk_bytes = |mut rows: u64| {
+            let mut validity_bytes = 0_u64;
+            for layer in &layers {
+                rows = rows.saturating_mul(layer.dimension);
+                if layer.validity.is_some() {
+                    validity_bytes = validity_bytes.saturating_add(rows.div_ceil(8));
+                }
+            }
+            validity_bytes.saturating_add(rows.saturating_mul(data.bits_per_value).div_ceil(8))
+        };
+        let rows_per_chunk = match context.fixed_width_values_per_chunk(
+            num_rows,
+            vals_per_word,
+            num_validity_buffers as u64 + 1,
+            chunk_bytes,
+        )? {
+            Some(rows) => rows,
+            None => Self::default_values_per_chunk(est_bytes_per_word, vals_per_word)?,
+        };
+        let log_rows_per_chunk = MiniBlockChunk::log_for_fixed_width_chunk(rows_per_chunk);
 
         let num_chunks = num_rows.div_ceil(rows_per_chunk) as usize;
 
@@ -290,7 +323,7 @@ impl ValueEncoder {
             );
             row_offset += rows_per_chunk;
             chunks.push(MiniBlockChunk {
-                log_num_values: log_rows_per_chunk as u8,
+                log_num_values: log_rows_per_chunk,
                 buffer_sizes,
             })
         }
@@ -327,7 +360,10 @@ impl ValueEncoder {
         ))
     }
 
-    fn miniblock_fsl(data: DataBlock) -> Result<(MiniBlockCompressed, CompressiveEncoding)> {
+    fn miniblock_fsl(
+        data: DataBlock,
+        context: MiniBlockCompressionContext,
+    ) -> Result<(MiniBlockCompressed, CompressiveEncoding)> {
         let num_rows = data.num_values();
         let fsl = data.as_fixed_size_list().unwrap();
         let mut layers = Vec::new();
@@ -352,7 +388,7 @@ impl ValueEncoder {
                 }
                 DataBlock::FixedWidth(inner) => {
                     layers.push(cur_layer);
-                    return Self::chunk_fsl(inner, layers, num_rows);
+                    return Self::chunk_fsl(inner, layers, num_rows, context);
                 }
                 _ => unreachable!("Unexpected data block type in value encoder's miniblock_fsl"),
             }
@@ -534,15 +570,15 @@ impl BlockCompressor for ValueEncoder {
 impl MiniBlockCompressor for ValueEncoder {
     fn compress(
         &self,
-        _context: MiniBlockCompressionContext,
+        context: MiniBlockCompressionContext,
         chunk: DataBlock,
     ) -> Result<(MiniBlockCompressed, CompressiveEncoding)> {
         match chunk {
             DataBlock::FixedWidth(fixed_width) => {
                 let encoding = EncodingUtils::flat(fixed_width.bits_per_value, None);
-                Ok((Self::chunk_data(fixed_width)?, encoding))
+                Ok((Self::chunk_data(fixed_width, context)?, encoding))
             }
-            DataBlock::FixedSizeList(_) => Self::miniblock_fsl(chunk),
+            DataBlock::FixedSizeList(_) => Self::miniblock_fsl(chunk, context),
             _ => Err(Error::invalid_input_source(
                 format!(
                     "Cannot compress a data block of type {} with ValueEncoder",

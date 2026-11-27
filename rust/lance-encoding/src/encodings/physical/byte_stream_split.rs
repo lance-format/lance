@@ -49,9 +49,10 @@
 //!
 //! ## Chunk Handling
 //!
-//! - Maximum chunk size depends on data type:
+//! - The default maximum chunk size depends on data type:
 //!   - f32: 1024 values (4KB per chunk)
 //!   - f64: 512 values (4KB per chunk)
+//! - Lance 2.2 and later support an explicit byte target for chunks
 //! - All chunks share a single global buffer
 //! - Non-last chunks always contain power-of-2 values
 
@@ -112,7 +113,7 @@ impl ByteStreamSplitEncoder {
 impl MiniBlockCompressor for ByteStreamSplitEncoder {
     fn compress(
         &self,
-        _context: MiniBlockCompressionContext,
+        context: MiniBlockCompressionContext,
         page: DataBlock,
     ) -> Result<(MiniBlockCompressed, CompressiveEncoding)> {
         match page {
@@ -162,7 +163,11 @@ impl MiniBlockCompressor for ByteStreamSplitEncoder {
                     ));
                 }
 
-                let max_chunk_size = self.max_chunk_size();
+                let max_chunk_size = context
+                    .fixed_width_values_per_chunk(num_values, 1, 1, |values| {
+                        values * bytes_per_value as u64
+                    })?
+                    .map_or_else(|| self.max_chunk_size(), |values| values as usize);
                 let mut global_buffer: Vec<u8> = Vec::with_capacity(total_size);
                 let dst_base = global_buffer.as_mut_ptr();
                 let mut chunks = Vec::with_capacity(num_values_usize.div_ceil(max_chunk_size));

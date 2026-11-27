@@ -34,6 +34,7 @@ from ..sampler import (
     Sampler,
     ShardedBatchSampler,
     ShardedFragmentSampler,
+    _SharedEpoch,
     maybe_sample,
 )
 from .dist import get_global_rank, get_global_world_size
@@ -324,7 +325,11 @@ class LanceDataset(torch.utils.data.IterableDataset):
             The number of batches to read ahead in different (Rust) threads for each
             fragment.
         sampler: callable, optional
-            A function that samples the dataset.
+            A function that samples the dataset. The epoch of a
+            :class:`lance.sampler.ShardedFragmentSampler` or
+            :class:`lance.sampler.ShardedBatchSampler` is moved into shared memory
+            so that ``sampler.set_epoch()`` reaches DataLoader workers, including
+            persistent ones.
         to_tensor_fn : callable, optional
             A function that converts a pyarrow RecordBatch to torch.Tensor.
             Should accept a batch (RecordBatch or Dict[str, pa.Array]) as the first
@@ -357,7 +362,7 @@ class LanceDataset(torch.utils.data.IterableDataset):
         self.world_size = world_size
         if rank is not None and world_size is not None:
             warnings.warn("rank and world_size are deprecated", DeprecationWarning)
-        self.sampler: Optional[Sampler] = sampler
+        self.sampler = sampler
 
         # Dataset with huggingface metadata
         if (
@@ -375,6 +380,40 @@ class LanceDataset(torch.utils.data.IterableDataset):
 
     def __repr__(self) -> str:
         return f"LanceTorchDataset({self.dataset.uri}, size={self.samples})"
+
+    @property
+    def sampler(self) -> Optional[Sampler]:
+        """The sampler, or None to let iteration choose one.
+
+        Assigning a sharded sampler moves its epoch into shared memory, as
+        passing it to the constructor does.
+        """
+        return self._sampler
+
+    @sampler.setter
+    def sampler(self, sampler: Optional[Sampler]) -> None:
+        if isinstance(sampler, _SharedEpoch):
+            # Let set_epoch in the main process reach persistent DataLoader workers.
+            sampler._share_epoch_with_workers()
+        self._sampler = sampler
+
+    def __setstate__(self, state: Any) -> None:
+        # A subclass with __slots__ pickles as (__dict__, slots).
+        state, slots = state if isinstance(state, tuple) else (state, None)
+        state = dict(state or {})
+        # Datasets pickled by earlier releases stored the sampler as ``sampler``,
+        # which the property now shadows.
+        if "sampler" in state:
+            state.setdefault("_sampler", state.pop("sampler"))
+        self.__dict__.update(state)
+        for name, value in (slots or {}).items():
+            setattr(self, name, value)
+        # Deep copies and plain pickles carry an unshared epoch tensor; fork
+        # workers only see set_epoch through shared storage, so share it again.
+        # A subclass that skips LanceDataset.__init__ may have no sampler at all.
+        sampler = getattr(self, "_sampler", None)
+        if sampler is not None:
+            self.sampler = sampler
 
     @property
     def schema(self) -> pa.Schema:
