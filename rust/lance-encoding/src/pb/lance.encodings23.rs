@@ -481,9 +481,14 @@ impl ::prost::Name for Flat {
 ///
 /// This is a transparent encoding by definition.
 ///
+/// In buffer-backed block and variable-width Zipped value positions, offsets
+/// must be Flat with bits_per_value equal to 32 or 64 and Flat.data absent.
+/// In both positions, values must be absent.
+///
 /// In mini-block positions, values must be absent. Offsets use plain 32/64-bit
 /// Flat for the interleaved layout, or a non-Flat generic unsigned block codec
-/// for separate chunk-relative offsets and value buffers.
+/// for separate chunk-relative offsets and value buffers. Generic offsets are
+/// supported only in mini-block positions.
 ///
 /// The input is a variable-width data block.
 /// The output is a single fixed-width data block (the offsets) and
@@ -493,7 +498,8 @@ pub struct Variable {
     /// Describes how the offsets data block is compressed
     #[prost(message, optional, boxed, tag = "1")]
     pub offsets: ::core::option::Option<::prost::alloc::boxed::Box<CompressiveEncoding>>,
-    /// Buffer compression; must be absent in mini-block positions.
+    /// Buffer compression; must be absent in mini-block, buffer-backed block,
+    /// and variable-width Zipped value positions.
     #[prost(message, optional, tag = "2")]
     pub values: ::core::option::Option<BufferCompression>,
 }

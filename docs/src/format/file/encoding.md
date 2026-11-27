@@ -660,6 +660,10 @@ In Lance 2.3 mini-block and generic unsigned block positions, `Flat.data` must b
 Variable compression is the uncompressed representation of variable-width data. There is a buffer of values and
 a buffer of offsets.
 
+In Lance 2.3 buffer-backed block positions and variable-width `Zipped` value positions, `Variable.offsets` must
+be `Flat` with `bits_per_value` equal to 32 or 64 and `Flat.data` absent. `Variable.values` must also be absent.
+The generic offset encodings described below are supported only in mini-block positions.
+
 When applied in a mini-block context each block may have a different number of values. We walk through the values
 until we find the point that would exceed 4,096 bytes and then use the most recent power of 2 number of values that
 we have passed.
@@ -676,8 +680,9 @@ chunk buffer
 The first legacy offset points past the offset table to the first value byte. The chunk is padded to an 8-byte
 boundary.
 
-Starting with Lance 2.3, a writer may instead encode the offsets as an independently decodable generic block when
-that produces fewer complete serialized bytes, including the descriptor, chunk header, buffer entries and padding.
+Starting with Lance 2.3, a mini-block writer may instead encode the offsets as an independently decodable generic
+block when that produces fewer complete serialized bytes, including the descriptor, chunk header, buffer entries
+and padding.
 Every chunk in the page uses the same offset codec. Its offset sequence contains `num_values + 1` unsigned values,
 starts at zero, is non-decreasing, and ends at the length of that chunk's value buffer.
 
