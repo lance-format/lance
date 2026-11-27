@@ -13,7 +13,7 @@ use std::collections::BinaryHeap;
 use lance_core::{Error, Result};
 
 use crate::scalar::inverted::builder::ScoredDoc;
-use crate::scalar::inverted::documents::ElementCoordinateKey;
+use crate::scalar::inverted::documents::{DocId, ElementCoordinateKey, ResidentDocCoordinates};
 use crate::vector::graph::OrderedFloat;
 
 use super::doc_source::DocCandidate;
@@ -27,15 +27,16 @@ pub(in crate::scalar::inverted) const SCORE_FLOOR_BUFFER: usize = 128;
 /// address, then the element coordinate that separates one row's elements.
 /// `coordinate` is `None` where the walk has no element coordinates; a
 /// row-granularity partition needs none, its documents own distinct addresses.
+/// Ranks deeper than the packed key are compared against the partition's
+/// resident columns, see `TopKEntry::cmp_deeper_ranks`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(in crate::scalar::inverted) struct TieOrder {
     pub(in crate::scalar::inverted) address: u64,
     pub(in crate::scalar::inverted) coordinate: Option<ElementCoordinateKey>,
 }
 
-/// The result order below the score, greatest first, from
-/// [`WandDocuments::tie_order`](super::doc_source::WandDocuments::tie_order).
-/// Equal keys mark a tie the walk cannot rank.
+/// The fixed-size part of the order below the score, greatest first: score, row
+/// address, and the element ranks a packed key covers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct TopKRankKey {
     score: OrderedFloat,
@@ -43,14 +44,8 @@ struct TopKRankKey {
     coordinate: Option<Reverse<ElementCoordinateKey>>,
 }
 
-/// The rank key plus the posting DocId, making the heap order total. DocId is
-/// not part of the result order; it decides which candidate of an unrankable
-/// group keeps its heap slot.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-struct TopKKey {
-    rank: TopKRankKey,
-    posting_doc_id: Reverse<u64>,
-}
+/// Frequency slot of a candidate that has not been admitted to the heap.
+const UNALLOCATED_SLOT: u32 = u32::MAX;
 
 /// A live top-k candidate. Its (term, freq) pairs live in a [`FrequencySlots`]
 /// slot, so heap churn moves a compact record instead of a `Vec`.
@@ -61,6 +56,8 @@ struct TopKEntry {
     doc_length: u32,
     posting_doc_id: u64,
     frequency_slot: u32,
+    /// Element ranks past the packed key, shared by every entry of the partition.
+    deeper_coordinates: Option<ResidentDocCoordinates>,
 }
 
 impl TopKEntry {
@@ -72,17 +69,43 @@ impl TopKEntry {
         }
     }
 
-    fn key(&self) -> TopKKey {
-        TopKKey {
-            rank: self.rank_key(),
-            posting_doc_id: Reverse(self.posting_doc_id),
+    /// Compare the ranks deeper than the packed key. DocIds are posting-local and
+    /// entries of one partition share one handle. Reversed: the result order takes
+    /// the lower `doc_index` first, the heap ranks the winner greatest.
+    fn cmp_deeper_ranks(&self, other: &Self) -> std::cmp::Ordering {
+        match self
+            .deeper_coordinates
+            .as_ref()
+            .or(other.deeper_coordinates.as_ref())
+        {
+            Some(columns) => columns
+                .compare_deeper_ranks(
+                    DocId::new(self.posting_doc_id as u32),
+                    DocId::new(other.posting_doc_id as u32),
+                )
+                .reverse(),
+            None => std::cmp::Ordering::Equal,
         }
+    }
+
+    /// Compare on the result order below the score: row address, then element path.
+    fn cmp_result_order(&self, other: &Self) -> std::cmp::Ordering {
+        self.rank_key()
+            .cmp(&other.rank_key())
+            .then_with(|| self.cmp_deeper_ranks(other))
+    }
+
+    /// The result order plus the posting DocId, which makes it total. DocId only
+    /// splits candidates the result order leaves tied.
+    fn cmp_total(&self, other: &Self) -> std::cmp::Ordering {
+        self.cmp_result_order(other)
+            .then_with(|| other.posting_doc_id.cmp(&self.posting_doc_id))
     }
 }
 
 impl PartialEq for TopKEntry {
     fn eq(&self, other: &Self) -> bool {
-        self.key() == other.key()
+        self.cmp_total(other) == std::cmp::Ordering::Equal
     }
 }
 
@@ -96,7 +119,7 @@ impl PartialOrd for TopKEntry {
 
 impl Ord for TopKEntry {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.key().cmp(&other.key())
+        self.cmp_total(other)
     }
 }
 
@@ -185,13 +208,10 @@ pub(in crate::scalar::inverted) enum TieOrdering {
     /// the score floor sits at the raw k-th score.
     AscendingRowAddresses,
     /// Row addresses are resident but DocId order does not follow them (a remapped
-    /// partition), or one row owns several documents. The rank key is total for a
-    /// rank-0 partition, and for an element partition of `coordinate_rank` at most
-    /// [`MAX_RANKED_COORDINATE_RANK`](crate::scalar::inverted::documents::MAX_RANKED_COORDINATE_RANK)
-    /// with resident coordinates. A band fills where no key separates the
-    /// documents: deeper partitions, a walk without coordinates, or two documents
-    /// with the same element path. The walk then ranks on the DocId proxy and
-    /// reports [`TopKCollector::band_truncated`].
+    /// partition), or one row owns several documents. The order key is total for a
+    /// rank-0 partition and for an element partition whose coordinates the walk
+    /// reads. A band fills where nothing separates the documents, and the walk then
+    /// ranks on the DocId proxy and reports [`TopKCollector::band_truncated`].
     ByRowAddress,
     /// No resident addresses, so `order_key` is a constant and every k-th-score
     /// tie is unrankable. Ties are retained until the band fills, the pass stops
@@ -214,9 +234,9 @@ pub(super) struct TopKCollector {
     /// without ties leaves the band empty.
     tie_band: Vec<TieCandidate>,
     band_truncated: bool,
-    /// True when the walk's element coordinate keys cover every `doc_index` rank of
-    /// its partition, so an equal key names one element twice.
-    coordinate_key_is_total: bool,
+    /// Element ranks past the packed key. Heap records hold a cloned handle: the
+    /// compare path allocates nothing.
+    deeper_coordinates: Option<ResidentDocCoordinates>,
     /// Set when the collector gave up on the pass rather than merely dropping
     /// candidates, so a later improvement cannot make the flag obsolete.
     aborted: bool,
@@ -227,7 +247,7 @@ impl TopKCollector {
         limit: usize,
         initial_capacity: usize,
         tie_ordering: TieOrdering,
-        coordinate_key_is_total: bool,
+        deeper_coordinates: Option<ResidentDocCoordinates>,
     ) -> Self {
         let initial_capacity = initial_capacity.min(limit);
         Self {
@@ -238,7 +258,7 @@ impl TopKCollector {
             max_buffered: limit.saturating_add(SCORE_FLOOR_BUFFER),
             tie_band: Vec::new(),
             band_truncated: false,
-            coordinate_key_is_total,
+            deeper_coordinates,
             aborted: false,
         }
     }
@@ -286,48 +306,33 @@ impl TopKCollector {
         }
 
         if self.heap.len() < self.limit {
-            let frequency_slot = self.frequency_slots.push(pairs)?;
-            self.heap.push(Reverse(TopKEntry {
-                doc,
-                order,
-                doc_length,
-                posting_doc_id,
-                frequency_slot,
-            }));
+            let mut candidate = self.new_candidate(doc, order, doc_length, posting_doc_id);
+            candidate.frequency_slot = self.frequency_slots.push(pairs)?;
+            self.heap.push(Reverse(candidate));
             return Ok(true);
         }
-        let candidate = TopKKey {
-            rank: TopKRankKey {
-                score: doc.score,
-                order_key: Reverse(order.address),
-                coordinate: order.coordinate.map(Reverse),
-            },
-            posting_doc_id: Reverse(posting_doc_id),
-        };
+        let mut candidate = self.new_candidate(doc, order, doc_length, posting_doc_id);
         let Some(Reverse(worst)) = self.heap.peek() else {
             return Err(Error::internal(
                 "FTS top-k heap is empty while its nonzero limit is reached",
             ));
         };
-        let worst_key = worst.key();
+        // Both comparisons borrow `worst`; the heap order is the same one.
+        let order_cmp = candidate.cmp_result_order(worst);
+        let total_cmp = order_cmp.then_with(|| worst.posting_doc_id.cmp(&candidate.posting_doc_id));
 
-        // An equal rank key is a tie the walk cannot rank. The DocId proxy picks
-        // the heap slot and the loser goes to the band.
-        if candidate.rank == worst_key.rank {
-            // Resident ascending addresses make rank keys unique.
+        // An equal order key is a tie the result order cannot rank. The DocId proxy
+        // picks the heap slot and the loser goes to the band.
+        if order_cmp == std::cmp::Ordering::Equal {
+            // Resident ascending addresses make the order key unique.
             if self.tie_ordering == TieOrdering::AscendingRowAddresses {
                 return Ok(false);
             }
-            // With every rank covered, an equal key needs two documents with the
-            // same element path. `InnerBuilder::merge_from` concatenates partitions
-            // without dedup, so it can happen.
-            debug_assert!(
-                candidate.rank.coordinate.is_none() || self.coordinate_key_is_total,
-                "an element coordinate key ranked a tie outside the ranks it covers"
-            );
+            // An equal order key means two documents with the same element path:
+            // `InnerBuilder::merge_from` concatenates partitions without dedup.
             if self.band_is_full() {
                 self.record_band_full();
-            } else if candidate > worst_key {
+            } else if total_cmp == std::cmp::Ordering::Greater {
                 // The proxy decides: this candidate takes the heap slot and the
                 // displaced entry joins the band.
                 let Some(Reverse(displaced)) = self.heap.pop() else {
@@ -335,28 +340,21 @@ impl TopKCollector {
                         "FTS top-k heap entry disappeared during replacement",
                     ));
                 };
-                let displaced = self.retain_displaced(
-                    displaced,
-                    doc,
-                    order,
-                    doc_length,
-                    posting_doc_id,
-                    pairs,
-                )?;
+                let displaced = self.retain_displaced(displaced, candidate, pairs)?;
                 self.tie_band.push(displaced);
                 return Ok(true);
             } else {
                 self.tie_band.push(TieCandidate {
-                    doc,
-                    doc_length,
-                    posting_doc_id,
+                    doc: candidate.doc,
+                    doc_length: candidate.doc_length,
+                    posting_doc_id: candidate.posting_doc_id,
                     freqs: pairs.collect(),
                 });
                 return Ok(false);
             }
         }
 
-        match candidate.cmp(&worst_key) {
+        match total_cmp {
             std::cmp::Ordering::Less | std::cmp::Ordering::Equal => Ok(false),
             std::cmp::Ordering::Greater => {
                 // Checked before the pop, which would otherwise make the buffer look
@@ -367,13 +365,20 @@ impl TopKCollector {
                         "FTS top-k heap entry disappeared during replacement",
                     ));
                 };
-                // The k-th key after the replacement is the smaller of what the pop
-                // exposed and the newcomer, both known without pushing first.
-                let kth = self
-                    .heap
-                    .peek()
-                    .map_or(candidate, |Reverse(entry)| entry.key().min(candidate));
-                let retain_displaced = if kth.rank > worst_key.rank {
+                // The k-th order key after the replacement is the worse of what the
+                // pop exposed and the newcomer, both known without pushing first.
+                let kth_order_rises = match self.heap.peek() {
+                    None => candidate.cmp_result_order(&displaced),
+                    Some(Reverse(exposed)) => {
+                        let kth = if exposed.cmp_total(&candidate) == std::cmp::Ordering::Greater {
+                            &candidate
+                        } else {
+                            exposed
+                        };
+                        kth.cmp_result_order(&displaced)
+                    }
+                } == std::cmp::Ordering::Greater;
+                let retain_displaced = if kth_order_rises {
                     // The k-th rank rose past the band, so no member of the band
                     // can win, and nothing a full band dropped earlier can win
                     // either: it ranked no higher than the band. The flag
@@ -389,14 +394,7 @@ impl TopKCollector {
                 };
 
                 if retain_displaced {
-                    let displaced = self.retain_displaced(
-                        displaced,
-                        doc,
-                        order,
-                        doc_length,
-                        posting_doc_id,
-                        pairs,
-                    )?;
+                    let displaced = self.retain_displaced(displaced, candidate, pairs)?;
                     self.tie_band.push(displaced);
                 } else {
                     // The displaced frequencies have no owner, so the slot and its
@@ -404,38 +402,43 @@ impl TopKCollector {
                     // of a query without ties does.
                     let frequency_slot = displaced.frequency_slot;
                     self.frequency_slots.replace(frequency_slot, pairs)?;
-                    self.heap.push(Reverse(TopKEntry {
-                        doc,
-                        order,
-                        doc_length,
-                        posting_doc_id,
-                        frequency_slot,
-                    }));
+                    candidate.frequency_slot = frequency_slot;
+                    self.heap.push(Reverse(candidate));
                 }
                 Ok(true)
             }
         }
     }
 
-    /// Push `doc` with a fresh frequency slot and return the displaced entry as a
-    /// retained tie, owning the frequencies its slot released.
-    fn retain_displaced(
-        &mut self,
-        displaced: TopKEntry,
+    /// A heap record for a candidate, sharing the partition's deeper coordinate
+    /// columns and holding no frequency slot until it is admitted.
+    fn new_candidate(
+        &self,
         doc: ScoredDoc,
         order: TieOrder,
         doc_length: u32,
         posting_doc_id: u64,
-        pairs: impl Iterator<Item = (u32, u32)>,
-    ) -> Result<TieCandidate> {
-        let frequency_slot = self.frequency_slots.push(pairs)?;
-        self.heap.push(Reverse(TopKEntry {
+    ) -> TopKEntry {
+        TopKEntry {
             doc,
             order,
             doc_length,
             posting_doc_id,
-            frequency_slot,
-        }));
+            frequency_slot: UNALLOCATED_SLOT,
+            deeper_coordinates: self.deeper_coordinates.clone(),
+        }
+    }
+
+    /// Push `candidate` with a fresh frequency slot and return the displaced entry
+    /// as a retained tie, owning the frequencies its slot released.
+    fn retain_displaced(
+        &mut self,
+        displaced: TopKEntry,
+        mut candidate: TopKEntry,
+        pairs: impl Iterator<Item = (u32, u32)>,
+    ) -> Result<TieCandidate> {
+        candidate.frequency_slot = self.frequency_slots.push(pairs)?;
+        self.heap.push(Reverse(candidate));
         let freqs = self.frequency_slots.release(displaced.frequency_slot)?;
         Ok(TieCandidate {
             doc: displaced.doc,

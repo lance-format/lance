@@ -434,14 +434,10 @@ pub(super) async fn load_modern_partition(
     } else {
         documents.resident_address_projection()
     };
-    // An element's `doc_index` ranks the ties an address cannot, and the walk
-    // reads it per candidate, so an element partition supplies the whole column.
-    // The final ranking reads the same cached columns.
-    let coordinate_rank = documents.coordinate_rank();
-    let coordinates = if addresses.is_some()
-        && coordinate_rank > 0
-        && coordinate_rank <= MAX_RANKED_COORDINATE_RANK
-    {
+    // Element partitions supply coordinate columns at any depth: an element's
+    // `doc_index` ranks the ties an address cannot. The final ranking reads the
+    // same cached columns.
+    let coordinates = if addresses.is_some() && documents.coordinate_rank() > 0 {
         Some(documents.resident_coordinates().await?)
     } else {
         None
@@ -540,7 +536,7 @@ pub(super) fn score_modern_partition(
     if band.band_truncated {
         debug!(
             partition_ordinal,
-            "FTS element tie band truncated; elements of one row past the cap order by DocId"
+            "FTS element tie band truncated; elements tied on the whole `doc_index` path past the cap order by DocId"
         );
     }
     let scored = rescore_partition_candidates(

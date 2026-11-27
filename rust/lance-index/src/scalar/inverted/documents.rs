@@ -9,6 +9,7 @@
 
 use lance_index_core::remapping::{BatchRowIdRemapper, remap_row_ids_async};
 use std::borrow::Cow;
+use std::cmp::Ordering;
 use std::ops::Range;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, OnceLock, Weak};
@@ -139,10 +140,11 @@ impl CacheKey for DocCoordinatesKey {
     }
 }
 
-/// The highest coordinate rank an element coordinate key covers: two packed
-/// values hold ranks 0-1 and ranks 2-3. A deeper partition gets no key, and its
-/// ties past the collector's band cap order by posting DocId.
-pub(in crate::scalar::inverted) const MAX_RANKED_COORDINATE_RANK: usize = 4;
+/// The coordinate ranks one [`ElementCoordinateKey`] holds: ranks 0-1 in
+/// `ranks_0_1`, ranks 2-3 in `ranks_2_3`. Deeper ranks are compared against
+/// the resident columns, see
+/// [`ResidentDocCoordinates::compare_deeper_ranks`].
+pub(in crate::scalar::inverted) const PACKED_COORDINATE_RANKS: usize = 4;
 
 /// Two coordinate ranks in one u64: rank 0 in the high 32 bits, rank 1 in the
 /// low 32. Numeric order matches comparing the ranks in order.
@@ -150,8 +152,9 @@ pub(super) fn pack_coordinate_ranks(rank_0: u32, rank_1: u32) -> u64 {
     (u64::from(rank_0) << 32) | u64::from(rank_1)
 }
 
-/// Element coordinates of one document as an ordering key. Field order is rank
-/// order. `ranks_2_3` is `None` for a partition with two rank columns or fewer.
+/// The ranks of one document's element path that fit a packed key, in rank
+/// order. `ranks_2_3` is `None` at two rank columns or fewer. A prefix of the
+/// partition's full element path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(in crate::scalar::inverted) struct ElementCoordinateKey {
     pub(in crate::scalar::inverted) ranks_0_1: u64,
@@ -169,10 +172,27 @@ pub(super) struct ResidentDocCoordinates {
 }
 
 impl ResidentDocCoordinates {
-    /// True when the packed keys cover every rank column of the partition.
+    /// True when the partition has rank columns past the packed key.
     #[inline]
-    pub(super) fn covers_every_coordinate_rank(&self) -> bool {
-        self.coordinate_rank <= MAX_RANKED_COORDINATE_RANK
+    pub(super) fn has_deeper_ranks(&self) -> bool {
+        self.coordinate_rank > PACKED_COORDINATE_RANKS
+    }
+
+    /// Continue a tie that [`Self::coordinate_key`] left equal, over the ranks past
+    /// the packed key. A rank the partition lacks and an out-of-range DocId rank
+    /// last, as in the key. `Ordering::Equal` means both documents hold the same
+    /// element path.
+    #[inline]
+    pub(super) fn compare_deeper_ranks(&self, lhs: DocId, rhs: DocId) -> Ordering {
+        for rank in PACKED_COORDINATE_RANKS..self.coordinate_rank {
+            let ordering = self
+                .rank_value(rank, lhs.as_usize())
+                .cmp(&self.rank_value(rank, rhs.as_usize()));
+            if ordering != Ordering::Equal {
+                return ordering;
+            }
+        }
+        Ordering::Equal
     }
 
     /// The coordinate key of `doc_id`. A rank column the partition lacks, and an
@@ -202,6 +222,18 @@ impl ResidentDocCoordinates {
             .get(rank)
             .filter(|column| position < column.len())
             .map_or(u32::MAX, |column| column.value(position))
+    }
+}
+
+/// Resident element coordinates built from one column per rank, without a store,
+/// for the collector tests that rank a partition's element ties.
+#[cfg(test)]
+pub(super) fn resident_coordinates_for_test(columns: Vec<UInt32Array>) -> ResidentDocCoordinates {
+    let coordinates = columns.into_iter().map(Arc::new).collect::<Vec<_>>();
+    let coordinate_rank = coordinates.len();
+    ResidentDocCoordinates {
+        columns: Arc::new(CachedDocCoordinates { coordinates }),
+        coordinate_rank,
     }
 }
 

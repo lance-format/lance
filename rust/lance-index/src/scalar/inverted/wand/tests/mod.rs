@@ -29,7 +29,9 @@ use crate::scalar::inverted::{
     PostingList, PostingListBuilder, SharedPositionStream,
 };
 
-use super::super::documents::{pack_coordinate_ranks, resident_row_address_projection_for_test};
+use super::super::documents::{
+    pack_coordinate_ranks, resident_coordinates_for_test, resident_row_address_projection_for_test,
+};
 use super::super::impact::build_impact_skip_data;
 use super::bounds::{
     ScoreContribution, conservative_score_sum, exclusive_partial_score_limit, next_down_f32,

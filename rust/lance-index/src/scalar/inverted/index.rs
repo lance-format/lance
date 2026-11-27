@@ -61,8 +61,8 @@ use tokio::{
 use tracing::{debug, info, instrument, warn};
 
 use super::documents::{
-    AddressKeyedDocuments, DocId, DocLengths, DocVisibility, MAX_RANKED_COORDINATE_RANK,
-    PartitionDocumentStore, PartitionDocuments, ResidentAddressProjection, ResidentDocCoordinates,
+    AddressKeyedDocuments, DocId, DocLengths, DocVisibility, PartitionDocumentStore,
+    PartitionDocuments, ResidentAddressProjection, ResidentDocCoordinates,
 };
 use super::encoding::{MAX_POSTING_BLOCK_SIZE, PositionBlockBuilder};
 use super::impact::{IMPACT_LEVEL1_BLOCKS, ImpactSkipData, ImpactSkipDataBuilder};

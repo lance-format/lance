@@ -18,6 +18,7 @@ use crate::metrics::MetricsCollector;
 
 use super::PostingList;
 use super::builder::{BLOCK_SIZE, ScoredDoc};
+use super::documents::ResidentDocCoordinates;
 use super::encoding::MAX_POSTING_BLOCK_SIZE;
 use super::index::dequantize_doc_length;
 use super::query::{FtsSearchParams, Operator};
@@ -348,9 +349,9 @@ pub struct Wand<'a, S: Scorer, D: WandDocuments> {
     // Which tiebreak the document adapter allows, fixed at construction so the
     // collector and every score floor treat a k-th-score tie the same way.
     tie_ordering: TieOrdering,
-    // True when the walk's element coordinate keys cover every `doc_index` rank of
-    // its partition, so the collector may read an equal key as a duplicate element.
-    coordinate_key_is_total: bool,
+    // Coordinate columns for the ranks past one packed key; `None` when the key
+    // covers every rank or the walk ranks no coordinates.
+    deeper_coordinates: Option<ResidentDocCoordinates>,
     // Shared cross-partition top-k floor. Each partition publishes its local
     // k-th score (`atomic_store_max_f32`) and prunes against the running value
     // -- a lower bound on the global k-th, so it never drops a real top-k doc.
@@ -453,7 +454,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         } else {
             TieOrdering::ByRowAddress
         };
-        let coordinate_key_is_total = documents.ranks_element_coordinates();
+        let deeper_coordinates = documents.deeper_element_coordinates();
 
         Self {
             // Standalone leaf top-k keeps its established exclusive floor.
@@ -505,7 +506,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             documents,
             scorer,
             tie_ordering,
-            coordinate_key_is_total,
+            deeper_coordinates,
             shared_threshold: None,
             shared_norm_addends: None,
             score_floor_overflow: false,
@@ -513,16 +514,14 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         }
     }
 
-    /// Build the walk's top-k collector with the tie ordering the document
-    /// adapter allows ([`WandDocuments::orders_ties_by_address`] and
-    /// [`WandDocuments::row_addresses_ascend_with_doc_id`]) and the reach of its
-    /// element coordinate keys ([`WandDocuments::ranks_element_coordinates`]).
+    /// Build the walk's top-k collector with the tie ordering the document adapter
+    /// allows and the element coordinate columns for ranks past one packed key.
     fn new_collector(&self, limit: usize, initial_capacity: usize) -> TopKCollector {
         TopKCollector::new(
             limit,
             initial_capacity,
             self.tie_ordering,
-            self.coordinate_key_is_total,
+            self.deeper_coordinates.clone(),
         )
     }
 
@@ -533,9 +532,8 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         self.score_floor_overflow
     }
 
-    /// True when the last search filled its band while already ordering ties by
-    /// row address. A retry cannot rank what the cap dropped, so it is only
-    /// reported: those elements may order by DocId instead of by `doc_index`.
+    /// True when the last search filled its band while already ordering ties by row
+    /// address. A retry cannot recover what the cap dropped: the flag is reported.
     pub(crate) fn band_truncated(&self) -> bool {
         self.band_truncated
     }

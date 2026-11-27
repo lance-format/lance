@@ -622,7 +622,7 @@ async fn test_fts_topk_tied_nested_list_elements_resolve_by_the_second_doc_index
 
 /// One row of a rank-`RANK` partition holds more elements than the band cap, and
 /// its last coordinate runs opposite to DocId order. The earlier ranks are
-/// constant, so one packed coordinate key ranks every element equal.
+/// constant.
 async fn assert_tied_deep_element_top_k_is_an_ordered_prefix<const RANK: usize>(limits: &[usize]) {
     const ROW: u64 = 100;
     const ELEMENTS: u32 = 135;
@@ -706,80 +706,23 @@ async fn test_fts_topk_tied_rank_four_list_elements_resolve_by_the_fourth_doc_in
     assert_tied_deep_element_top_k_is_an_ordered_prefix::<4>(&[5, 2, 1]).await;
 }
 
-/// Coordinate rank 5 is deeper than the two packed keys cover, so the walk gets
-/// no key and retains the row's k-th-score band.
 #[tokio::test]
-async fn test_fts_topk_tied_rank_five_list_elements_stay_exact_inside_the_band_cap() {
-    const ROW: u64 = 100;
-    const ELEMENTS: u32 = 20;
-    const LIMITS: &[usize] = &[5, 2, 1];
+async fn test_fts_topk_tied_rank_five_list_elements_resolve_by_the_fifth_doc_index() {
+    // Five-deep `List`: ranks 0-3 are constant, rank 4 separates the elements.
+    assert_tied_deep_element_top_k_is_an_ordered_prefix::<5>(&[5, 2, 1]).await;
+}
 
-    // Past `limit + SCORE_FLOOR_BUFFER` the DocId proxy decides which elements
-    // survive, so this fixture has to fit every limit.
-    let min_limit = *LIMITS.iter().min().unwrap();
-    assert!(
-        ELEMENTS as usize <= min_limit + SCORE_FLOOR_BUFFER,
-        "premise: every limit must hold the row's whole tie band, got {ELEMENTS} elements for limit {min_limit}"
-    );
+#[tokio::test]
+async fn test_fts_topk_tied_rank_six_list_elements_resolve_by_the_sixth_doc_index() {
+    // Two ranks past the packed key: the exact comparison must carry past the first
+    // rank it does not cover.
+    assert_tied_deep_element_top_k_is_an_ordered_prefix::<6>(&[5, 2, 1]).await;
+}
 
-    // Ranks 0-3 are constant and rank 4 runs opposite to DocId order.
-    let coordinates = |doc_index: u32| {
-        let mut path = [0; 5];
-        path[4] = doc_index;
-        path
-    };
-    let fixture = (0..ELEMENTS)
-        .rev()
-        .map(|doc_index| (ROW, coordinates(doc_index)))
-        .collect::<Vec<_>>();
-    let expected = (0..ELEMENTS)
-        .map(|doc_index| (ROW, coordinates(doc_index).to_vec()))
-        .collect::<Vec<_>>();
-
-    let tmpdir = TempObjDir::default();
-    let store = Arc::new(LanceIndexStore::new(
-        ObjectStore::local().into(),
-        tmpdir.clone(),
-        Arc::new(LanceCache::no_cache()),
-    ));
-    build_tied_element_partition_of_rank(&store, 0, &fixture).await;
-    write_test_metadata(&store, vec![0], InvertedIndexParams::default()).await;
-    let cache = LanceCache::with_capacity(64 * 1024 * 1024);
-    let index = InvertedIndex::load(store, None, &cache).await.unwrap();
-    index.partitions[0]
-        .docs
-        .modern()
-        .unwrap()
-        .prewarm()
-        .await
-        .unwrap();
-    assert!(
-        index.has_resident_document_projections(),
-        "premise: resident addresses make the walk retain element ties"
-    );
-
-    let widest = search_alpha_documents(&index, LIMITS[0]).await;
-    assert_eq!(
-        widest,
-        expected[..LIMITS[0]],
-        "top-{} must be the {} lowest element coordinates of row {ROW}",
-        LIMITS[0],
-        LIMITS[0]
-    );
-    for &limit in &LIMITS[1..] {
-        let found = search_alpha_documents(&index, limit).await;
-        assert_eq!(
-            found,
-            expected[..limit],
-            "top-{limit} must be the {limit} lowest element coordinates of row {ROW}"
-        );
-        assert_eq!(
-            found,
-            widest[..limit],
-            "top-{limit} must be an ordered prefix of top-{}",
-            LIMITS[0]
-        );
-    }
+#[tokio::test]
+async fn test_fts_topk_tied_rank_nine_list_elements_resolve_by_the_ninth_doc_index() {
+    // Pins exactness past the packed key's depth.
+    assert_tied_deep_element_top_k_is_an_ordered_prefix::<9>(&[5, 2, 1]).await;
 }
 
 #[tokio::test]

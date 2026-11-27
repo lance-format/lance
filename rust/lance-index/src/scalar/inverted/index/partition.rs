@@ -1574,8 +1574,8 @@ impl InvertedPartition {
     /// Search a modern partition. When
     /// [`WandBandStatus::score_floor_overflow`] is set the candidates are missing
     /// part of the partition's k-th-score tie band, so the caller searches again
-    /// with resident `addresses`, plus `coordinates` for a partition whose element
-    /// ranks fit one key.
+    /// with resident `addresses`, plus the `coordinates` of an element partition at
+    /// any rank.
     /// `shared_norm_addends` is used only with `impact_scorer`, and must be
     /// shared only by searches that pass the same impact scorer.
     #[allow(clippy::too_many_arguments)]

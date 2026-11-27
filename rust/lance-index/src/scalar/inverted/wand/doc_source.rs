@@ -61,10 +61,12 @@ pub(in crate::scalar::inverted) trait WandDocuments {
     /// constant and the collector keeps the whole k-th-score band for the caller.
     fn orders_ties_by_address(&self) -> bool;
 
-    /// True when [`WandDocuments::tie_order`] returns a coordinate key covering
-    /// every `doc_index` rank of the partition.
-    fn ranks_element_coordinates(&self) -> bool {
-        false
+    /// The partition's element coordinate columns for the ranks past the packed key
+    /// [`tie_order`](Self::tie_order) returns, which continue a tie that key leaves
+    /// equal. `None` when the walk ranks no element coordinates, or its key already
+    /// covers every rank of the partition.
+    fn deeper_element_coordinates(&self) -> Option<ResidentDocCoordinates> {
+        None
     }
 
     /// Rank below the score inside a partition's top-k. `address` is the row
@@ -262,10 +264,11 @@ impl<V: ModernVisibility> WandDocuments for ModernWandDocuments<'_, V> {
         self.addresses.is_some()
     }
 
-    fn ranks_element_coordinates(&self) -> bool {
+    fn deeper_element_coordinates(&self) -> Option<ResidentDocCoordinates> {
         self.coordinates
             .as_ref()
-            .is_some_and(|coordinates| coordinates.covers_every_coordinate_rank())
+            .filter(|coordinates| coordinates.has_deeper_ranks())
+            .cloned()
     }
 
     fn row_addresses_ascend_with_doc_id(&self) -> bool {
@@ -280,9 +283,10 @@ impl<V: ModernVisibility> WandDocuments for ModernWandDocuments<'_, V> {
         // The elements of a row share its address, so the coordinate ranks what
         // the address cannot. `u64::MAX` ranks a dead slot the walk skips, and
         // every document when no projection is attached: then every tie compares
-        // equal and the whole k-th-score band is retained. `load_modern_partition`
-        // attaches coordinates only together with an address projection, so
-        // a deferred walk defers the element ties as well.
+        // equal and the whole k-th-score band is retained.
+        // `load_modern_partition` attaches coordinates only with an address projection,
+        // and the collector finishes ranks past the packed key using
+        // [`Self::deeper_element_coordinates`].
         TieOrder {
             address: self
                 .addresses
