@@ -754,10 +754,12 @@ pub fn try_alp_miniblock(
     try_alp_for_mini_block(field, data, params)
 }
 
-/// Select pcodec compression when the field requests `compression=pcodec`.
+/// Select Pcodec compression when the field requests `compression=pcodec`.
 ///
-/// pcodec applies to float16/float32/float64 values and fixed-size lists of them. A
-/// request for any other type is rejected instead of silently ignored.
+/// Pcodec applies to float16/float32/float64 values and fixed-size lists of them.
+/// Requests for other types return an error. Lists with null items fall back to
+/// another encoding. For an eligible page, a build that omits the `pcodec` Cargo
+/// feature returns [`Error::NotSupported`].
 pub fn try_pcodec_miniblock(
     field: &Field,
     data: &DataBlock,
@@ -799,7 +801,13 @@ pub fn try_pcodec_miniblock(
     #[cfg(not(feature = "pcodec"))]
     {
         Err(Error::not_supported_source(
-            "package was not built with pcodec support".into(),
+            format!(
+                "Cannot write Pcodec-compressed values for field '{}' because this Lance binary was \
+                 built without the `pcodec` Cargo feature. Enable `lance-encoding/pcodec` and rebuild \
+                 or choose another compression scheme.",
+                field.name
+            )
+            .into(),
         ))
     }
 }
@@ -1591,7 +1599,9 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
             )),
             #[cfg(not(feature = "pcodec"))]
             Compression::Pcodec(_) => Err(Error::not_supported_source(
-                "package was not built with pcodec support".into(),
+                "Cannot read Pcodec-compressed values because this Lance binary was built without \
+                 the `pcodec` Cargo feature. Use a build with `lance-encoding/pcodec` enabled."
+                    .into(),
             )),
             Compression::General(general) => {
                 // Create inner decompressor
@@ -2437,8 +2447,71 @@ mod tests {
     use crate::format::EncodingUtils;
     use crate::statistics::ComputeStat;
     use crate::testing::{TestEncoding, extract_array_encoding_chain, test_compression_strategy};
+    #[cfg(not(feature = "pcodec"))]
+    use arrow_array::{ArrayRef, FixedSizeListArray, Float32Array};
     use arrow_schema::{DataType, Field as ArrowField};
     use std::collections::HashMap;
+
+    #[cfg(not(feature = "pcodec"))]
+    #[rstest::rstest]
+    #[case::direct(None)]
+    #[case::wrapped(Some(CompressionScheme::Zstd))]
+    fn pcodec_miniblock_read_without_feature(#[case] wrapper: Option<CompressionScheme>) {
+        let values = EncodingUtils::pcodec(EncodingUtils::flat(32, None));
+        let encoding = if let Some(scheme) = wrapper {
+            EncodingUtils::wrapped(CompressionConfig::new(scheme, None), values).unwrap()
+        } else {
+            values
+        };
+
+        let strategy = DefaultDecompressionStrategy::default();
+        let error = strategy
+            .create_miniblock_decompressor(&encoding, &strategy)
+            .unwrap_err();
+        assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+        let message = error.to_string();
+        assert!(
+            message.contains("this Lance binary was built without the `pcodec` Cargo feature"),
+            "{message}"
+        );
+        assert!(message.contains("`lance-encoding/pcodec`"), "{message}");
+    }
+
+    #[cfg(not(feature = "pcodec"))]
+    #[rstest::rstest]
+    #[case::eligible(Some(2.0))]
+    #[case::null_item(None)]
+    fn pcodec_miniblock_write_without_feature(#[case] second_item: Option<f32>) {
+        let item_field = Arc::new(ArrowField::new("item", DataType::Float32, true));
+        let items = Arc::new(Float32Array::from(vec![
+            Some(1.0),
+            second_item,
+            Some(3.0),
+            Some(4.0),
+        ]));
+        let array: ArrayRef = Arc::new(FixedSizeListArray::new(item_field, 2, items, None));
+        let field = create_test_field("signal", array.data_type().clone());
+        let data = DataBlock::from_arrays(&[array], 2);
+        let params = CompressionFieldParams {
+            compression: Some(PCODEC_COMPRESSION.to_string()),
+            ..Default::default()
+        };
+
+        let result = try_pcodec_miniblock(&field, &data, &params);
+        if second_item.is_none() {
+            assert!(result.unwrap().is_none());
+            return;
+        }
+        let error = result.unwrap_err();
+        assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+        let message = error.to_string();
+        assert!(message.contains("field 'signal'"), "{message}");
+        assert!(
+            message.contains("this Lance binary was built without the `pcodec` Cargo feature"),
+            "{message}"
+        );
+        assert!(message.contains("`lance-encoding/pcodec`"), "{message}");
+    }
 
     #[rstest::rstest]
     #[case(EncodingUtils::flat(0, None), "positive bit width")]
