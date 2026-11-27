@@ -1095,9 +1095,8 @@ unsafe fn pack_u128_chunk(bit_width: usize, src: &[u128], dest_u128: &mut [u128]
 /// (no heap allocation) via byte-level `copy_nonoverlapping`, which has no
 /// alignment requirement on the on-disk u8 source — `BitPacking::unchecked_unpack`
 /// is then called on the (now correctly aligned) stack buffer. The narrow
-/// branches widen each lane back to `u128` lossless-zero-extend; the
-/// encoder's sign-safety invariant guarantees those values are in
-/// `0..=2^bit_width`. The `bit_width == 128` arm short-circuits to a single
+/// branches zero-extend each lane back to `u128`; unpacked values are below
+/// `2^bit_width` by construction. The `bit_width == 128` arm short-circuits to a single
 /// byte-level memcpy that mirrors the encoder's `copy_nonoverlapping`
 /// fast-path — no intermediate `Vec`, no second `copy_from_slice`.
 ///
@@ -1162,8 +1161,8 @@ unsafe fn unpack_u128_chunk(bit_width: usize, body_bytes: &[u8], dest: &mut [u12
         U128Kernel::NarrowU32 => {
             // bit_width 1..=32: stage the on-disk packed body into an aligned
             // stack u32 buffer (no heap alloc), unpack into a second stack
-            // buffer, then widen each lane to u128 (lossless zero-extend by the
-            // sign-safety invariant). `words <= ELEMS_PER_CHUNK` for `bit_width <= 32`.
+            // buffer, then zero-extend each lane to u128. `words <= ELEMS_PER_CHUNK`
+            // for `bit_width <= 32`.
             let words = bit_width * (ELEMS_PER_CHUNK as usize / 32);
             debug_assert!(words <= ELEMS_PER_CHUNK as usize);
             let mut packed = [0u32; ELEMS_PER_CHUNK as usize];
