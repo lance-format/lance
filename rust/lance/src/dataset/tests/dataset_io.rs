@@ -6370,6 +6370,85 @@ async fn test_append_reencodes_dictionary_by_value_for_narrower_keys(
     }
 }
 
+/// A dictionary with more entries than the target key type addresses keeps
+/// only the entries its rows reference, even when those keys fit: the writer
+/// numbers every non-null entry, and unused ones would be stored as well.
+#[rstest::rstest]
+#[case::int8_v2_0(DataType::Int8, 128, LanceFileVersion::V2_0)]
+#[case::int8_v2_2(DataType::Int8, 128, LanceFileVersion::V2_2)]
+#[case::uint8_v2_0(DataType::UInt8, 256, LanceFileVersion::V2_0)]
+#[case::uint8_v2_2(DataType::UInt8, 256, LanceFileVersion::V2_2)]
+#[tokio::test]
+async fn test_append_compacts_oversized_dictionary_with_fitting_keys(
+    #[case] key_type: DataType,
+    #[case] key_space: usize,
+    #[case] version: LanceFileVersion,
+) {
+    let table_type = dictionary_type(key_type, DataType::Utf8);
+    let others = |count: usize| (1..=count).map(|i| Some(format!("value {i}")));
+    // One entry more than the key space either way: an unused null last, or
+    // all non-null.
+    let with_null = std::iter::once(Some("keep".to_string()))
+        .chain(others(key_space - 1))
+        .chain([None])
+        .collect::<Vec<_>>();
+    let non_null = std::iter::once(Some("keep".to_string()))
+        .chain(others(key_space))
+        .collect::<Vec<_>>();
+    for entries in [with_null, non_null] {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("value", table_type.clone(), true),
+        ]));
+        let seed = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![0, 1])),
+                representation_array(&table_type, &[Some("first"), None]),
+            ],
+        )
+        .unwrap();
+        let dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(seed)], schema),
+            "memory://",
+            Some(WriteParams {
+                data_storage_version: Some(version),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let dictionary = arrow_array::DictionaryArray::<arrow_array::types::Int16Type>::try_new(
+            arrow_array::Int16Array::from(vec![Some(0), None]),
+            Arc::new(StringArray::from(entries)),
+        )
+        .unwrap();
+        let values = Arc::new(dictionary) as ArrayRef;
+        let dataset = append_representation(
+            dataset,
+            ArrowField::new("value", values.data_type().clone(), true),
+            values,
+        )
+        .await
+        .unwrap();
+
+        let fragment = dataset.get_fragments().pop().unwrap();
+        let result = fragment.scan().try_into_batch().await.unwrap();
+        assert_eq!(result["value"].data_type(), &table_type);
+        // V2.0 reads null rows back through a null dictionary entry, so count
+        // the non-null entries.
+        let stored = result["value"].as_any_dictionary().values();
+        assert_eq!(stored.len() - stored.null_count(), 1);
+        assert_eq!(
+            representation_values(result["value"].as_ref()).as_ref(),
+            representation_values(
+                representation_array(&table_type, &[Some("keep"), None]).as_ref()
+            )
+            .as_ref()
+        );
+    }
+}
+
 /// Values that need more bytes than 32-bit offsets address fail naming the
 /// field before anything is allocated for them.
 #[tokio::test]

@@ -317,14 +317,13 @@ fn convert_values(array: &ArrayRef, target: &DataType, path: &str) -> Result<Arr
         // and narrow only the values.
         DataType::Dictionary(key_type, value_type) => {
             let wide_type = with_large_offsets(value_type);
-            // Keys address the whole values array, referenced or not, so a
-            // key that does not fit the table's key type may only point at
-            // values the rows never use. Keep just the referenced entries
-            // then; otherwise the keys are cast as they are and each value is
-            // converted once.
+            // A values array the table's key type addresses is kept as it is:
+            // the keys are cast and each value is converted once. A larger one
+            // may hold entries the rows never use, so keep just the referenced
+            // ones then.
             let compacted;
             let array = match array.as_any_dictionary_opt() {
-                Some(dictionary) if !keys_fit(dictionary, key_type) => {
+                Some(dictionary) if !values_fit(dictionary, key_type) => {
                     compacted = referenced_entries(dictionary)?;
                     &compacted
                 }
@@ -356,8 +355,11 @@ fn convert_values(array: &ArrayRef, target: &DataType, path: &str) -> Result<Arr
     }
 }
 
-/// Whether every valid key of `dictionary` fits `key_type`.
-fn keys_fit(dictionary: &dyn AnyDictionaryArray, key_type: &DataType) -> bool {
+/// Whether `dictionary`'s values array fits the keys of `key_type`. Keys
+/// index the values, and the writer numbers every non-null entry whether rows
+/// reference it or not, so a values array the key type cannot address has to
+/// be compacted even when the row keys themselves fit.
+fn values_fit(dictionary: &dyn AnyDictionaryArray, key_type: &DataType) -> bool {
     let max_key = match key_type {
         DataType::Int8 => i8::MAX as u64,
         DataType::Int16 => i16::MAX as u64,
@@ -367,20 +369,7 @@ fn keys_fit(dictionary: &dyn AnyDictionaryArray, key_type: &DataType) -> bool {
         DataType::UInt32 => u32::MAX as u64,
         _ => u64::MAX,
     };
-    // Keys index the values, so a short enough values array fits whatever
-    // the keys are. This also skips `normalized_keys`, which rejects an empty
-    // values array.
-    if dictionary.values().len() as u64 <= max_key.saturating_add(1) {
-        return true;
-    }
-    let nulls = dictionary.keys().logical_nulls();
-    dictionary
-        .normalized_keys()
-        .iter()
-        .enumerate()
-        .all(|(row, &key)| {
-            nulls.as_ref().is_some_and(|nulls| nulls.is_null(row)) || key as u64 <= max_key
-        })
+    dictionary.values().len() as u64 <= max_key.saturating_add(1)
 }
 
 /// `dictionary` rebuilt from the values its valid rows reference: equal values
