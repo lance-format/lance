@@ -455,13 +455,16 @@ impl Scanner {
     }
 
     pub(super) fn ordering_projection(&self, ordering: &[ColumnOrdering]) -> Result<Projection> {
+        // Descriptor fields such as `size` are synthesized and may be absent
+        // from the stored schema. Resolve sort keys against their read schema.
+        let descriptor_schema = self
+            .dataset
+            .full_projection()
+            .with_blob_handling(BlobHandling::AllDescriptions)
+            .into_schema();
         let descriptor_ids = ordering
             .iter()
-            .filter_map(|column| {
-                self.dataset
-                    .schema()
-                    .resolve_case_insensitive(&column.column_name)
-            })
+            .filter_map(|column| descriptor_schema.resolve_case_insensitive(&column.column_name))
             .flat_map(|fields| fields.into_iter().rev().skip(1))
             .filter(|field| field.is_blob_v2())
             .map(|field| field.id)
@@ -489,15 +492,17 @@ impl Scanner {
         &self,
         ordering: &[ColumnOrdering],
     ) -> Result<Projection> {
+        let descriptor_schema = self
+            .dataset
+            .full_projection()
+            .with_blob_handling(BlobHandling::AllDescriptions)
+            .into_schema();
         self.dataset
             .empty_projection()
             .with_blob_handling(self.blob_handling.clone())
             .union_columns(
                 ordering.iter().filter_map(|column| {
-                    let fields = self
-                        .dataset
-                        .schema()
-                        .resolve_case_insensitive(&column.column_name)?;
+                    let fields = descriptor_schema.resolve_case_insensitive(&column.column_name)?;
                     (!fields.iter().rev().skip(1).any(|field| field.is_blob_v2()))
                         .then_some(&column.column_name)
                 }),

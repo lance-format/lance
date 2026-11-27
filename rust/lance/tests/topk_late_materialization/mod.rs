@@ -41,6 +41,7 @@ use futures::StreamExt;
 use lance::datafusion::LanceTableProvider;
 use lance::dataset::WriteParams;
 use lance::dataset::scanner::ColumnOrdering;
+use lance::index::DatasetIndexExt;
 use lance::io::exec::TakeExec;
 use lance::io::exec::filtered_read::{FilteredReadExec, FilteredReadOptions, FilteredReadPlan};
 use lance::io::exec::topk_late_materialization::TopKLateMaterialization;
@@ -48,6 +49,9 @@ use lance::{BlobArrayBuilder, Dataset, blob_field};
 use lance_core::{Error, datatypes::BlobHandling};
 use lance_datafusion::utils::{BYTES_READ_METRIC, MetricsExt};
 use lance_datagen::{BatchCount, ByteCount, RowCount, array, gen_batch};
+use lance_index::IndexType;
+use lance_index::scalar::FullTextSearchQuery;
+use lance_index::scalar::inverted::tokenizer::InvertedIndexParams;
 use lance_select::RowAddrTreeMap;
 use rstest::rstest;
 
@@ -226,9 +230,8 @@ async fn sql_topk_keeps_its_ordering_for_the_parent() {
     assert_eq!(actual, expected, "{shown}");
 }
 
-/// 3 fragments of 4 rows: `id` is the row number, `text` is derived from it,
-/// and `blob` is a blob v2 column holding `id` bytes, null every third row.
-async fn make_blob_dataset(is_nested: bool) -> Arc<Dataset> {
+/// Twelve rows with `id` bytes per blob, null every third row.
+fn blob_test_batch(is_nested: bool) -> RecordBatch {
     let blob = if is_nested {
         Field::new(
             "blob",
@@ -269,11 +272,17 @@ async fn make_blob_dataset(is_nested: bool) -> Arc<Dataset> {
     } else {
         blobs
     };
-    let batch = RecordBatch::try_new(
-        schema.clone(),
+    RecordBatch::try_new(
+        schema,
         vec![Arc::new(Int32Array::from(ids)), Arc::new(texts), blobs],
     )
-    .unwrap();
+    .unwrap()
+}
+
+/// Three fragments of four rows, with schema metadata for the wrapping-provider tests.
+async fn make_blob_dataset(is_nested: bool) -> Arc<Dataset> {
+    let batch = blob_test_batch(is_nested);
+    let schema = batch.schema();
     let mut dataset = Dataset::write(
         RecordBatchIterator::new([Ok(batch)], schema),
         "memory://",
@@ -392,6 +401,101 @@ async fn scanner_blob_ordering_resolves_case_consistently(
         let error = result.unwrap_err();
         assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
         assert!(error.to_string().contains("requires binary blob handling"));
+    }
+}
+
+#[rstest]
+#[case::descriptors(BlobHandling::AllDescriptions)]
+#[case::payloads(BlobHandling::AllBinary)]
+#[tokio::test]
+async fn scanner_fts_blob_metadata_ordering(
+    #[case] blob_handling: BlobHandling,
+    #[values(false, true)] is_nested: bool,
+    #[values(false, true)] is_fts: bool,
+) {
+    let batch = blob_test_batch(is_nested);
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch.slice(0, 4))], batch.schema()),
+        "memory://",
+        None,
+    )
+    .await
+    .unwrap();
+    // Keep two of the three fragments unindexed, so filtering, sorting and the
+    // final blob fetch must work over the union of indexed and flat FTS results.
+    dataset
+        .create_index(
+            &["text"],
+            IndexType::Inverted,
+            None,
+            &InvertedIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+    dataset
+        .append(
+            RecordBatchIterator::new([Ok(batch.slice(4, 8))], batch.schema()),
+            Some(WriteParams {
+                max_rows_per_file: 4,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+    let path = if is_nested { "blob.value" } else { "blob" };
+    let mut scan = dataset.scan();
+    scan.blob_handling(blob_handling.clone());
+    scan.project(&["id", "blob"]).unwrap();
+    scan.filter(&format!("{path}.size >= 2 OR {path} IS NULL"))
+        .unwrap();
+    if is_fts {
+        scan.full_text_search(
+            FullTextSearchQuery::new("text".into())
+                .with_column("text".into())
+                .unwrap(),
+        )
+        .unwrap();
+    }
+    scan.order_by(Some(vec![
+        ColumnOrdering::asc_nulls_first(format!("{path}.size").to_ascii_uppercase()),
+        ColumnOrdering::asc_nulls_first("id".into()),
+    ]))
+    .unwrap();
+    scan.limit(Some(6), None).unwrap();
+    let plan = scan.explain_plan(true).await.unwrap();
+    assert_eq!(plan.contains("FlatMatchQuery"), is_fts, "{plan}");
+    let batch = scan.try_into_batch().await.unwrap();
+    let expected_ids = [0, 3, 6, 9, 2, 4];
+    assert_eq!(
+        batch["id"].as_primitive::<Int32Type>().values(),
+        &expected_ids
+    );
+    let blobs = if is_nested {
+        batch["blob"].as_struct().column_by_name("value").unwrap()
+    } else {
+        &batch["blob"]
+    };
+    for (row, id) in expected_ids.into_iter().enumerate() {
+        assert_eq!(blobs.is_null(row), id % 3 == 0);
+        if id % 3 != 0 {
+            if blob_handling == BlobHandling::AllBinary {
+                assert_eq!(
+                    blobs.as_binary::<i64>().value(row),
+                    vec![id as u8; id as usize]
+                );
+            } else {
+                assert_eq!(
+                    blobs
+                        .as_struct()
+                        .column_by_name("size")
+                        .unwrap()
+                        .as_primitive::<UInt64Type>()
+                        .value(row),
+                    id as u64
+                );
+            }
+        }
     }
 }
 

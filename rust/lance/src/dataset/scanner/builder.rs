@@ -1525,38 +1525,48 @@ impl Scanner {
     ) -> Result<Arc<dyn PhysicalExpr>> {
         // Physical plans may contain generated aliases such as "s.a". These
         // are valid Arrow columns, even though persisted Lance fields forbid dots.
-        let names = if arrow_schema
-            .fields()
-            .iter()
-            .any(|field| field.name().eq_ignore_ascii_case(column_name))
-        {
-            vec![column_name.to_owned()]
+        let field_path = if let Some((_, field)) = arrow_schema.column_with_name(column_name) {
+            vec![field]
         } else {
-            parse_field_path(column_name)?
-        };
-        let mut fields = arrow_schema.fields().as_ref();
-        let mut field_path = Vec::with_capacity(names.len());
-        for name in &names {
-            let field = fields
-                .iter()
-                .find(|field| field.name() == name)
-                .or_else(|| {
-                    fields
+            let names = parse_field_path(column_name)?;
+            let resolve_path = |is_case_insensitive| {
+                let mut fields = arrow_schema.fields().as_ref();
+                let mut path = Vec::with_capacity(names.len());
+                for name in &names {
+                    let field = fields
                         .iter()
-                        .find(|field| field.name().eq_ignore_ascii_case(name))
+                        .find(|field| field.name() == name)
+                        .or_else(|| {
+                            fields.iter().find(|field| {
+                                is_case_insensitive && field.name().eq_ignore_ascii_case(name)
+                            })
+                        })?;
+                    path.push(field.as_ref());
+                    fields = match field.data_type() {
+                        DataType::Struct(children) => children.as_ref(),
+                        DataType::List(child)
+                        | DataType::LargeList(child)
+                        | DataType::FixedSizeList(child, _) => std::slice::from_ref(child),
+                        _ => &[],
+                    };
+                }
+                Some(path)
+            };
+            // Successive FTS projections can contain both an alias "s.A" and
+            // the original struct. The alias must not shadow the exact path "s.a".
+            resolve_path(false)
+                .or_else(|| {
+                    arrow_schema
+                        .fields()
+                        .iter()
+                        .find(|field| field.name().eq_ignore_ascii_case(column_name))
+                        .map(|field| vec![field.as_ref()])
                 })
+                .or_else(|| resolve_path(true))
                 .ok_or_else(|| {
                     Error::invalid_input(format!("Field '{column_name}' not found in schema"))
-                })?;
-            field_path.push(field);
-            fields = match field.data_type() {
-                DataType::Struct(children) => children.as_ref(),
-                DataType::List(child)
-                | DataType::LargeList(child)
-                | DataType::FixedSizeList(child, _) => std::slice::from_ref(child),
-                _ => &[],
-            };
-        }
+                })?
+        };
 
         if field_path.len() == 1 {
             // Simple top-level column
@@ -1648,7 +1658,7 @@ mod tests {
     use arrow_array::types::{Float32Type, UInt64Type};
     use arrow_array::{
         ArrayRef, FixedSizeListArray, Float16Array, Float32Array, Float64Array, Int32Array,
-        ListArray, RecordBatch, RecordBatchIterator, StringArray, UInt8Array,
+        ListArray, RecordBatch, RecordBatchIterator, StringArray, StructArray, UInt8Array,
     };
     use arrow_schema::{Field as ArrowField, Fields};
     use arrow_select::concat::concat_batches;
@@ -1670,6 +1680,68 @@ mod tests {
     use crate::index::DatasetIndexExt;
     use crate::index::vector::VectorIndexParams;
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+
+    #[rstest]
+    #[case::exact_alias("s.A", Some(100))]
+    #[case::exact_nested_path("s.a", Some(2))]
+    #[case::exact_parent_path("S.A", Some(5))]
+    #[case::exact_parent_and_child_path("S.a", Some(6))]
+    #[case::quoted_nested_path("s.`a`", Some(2))]
+    #[case::quoted_alias("`s.A`", Some(100))]
+    #[case::case_insensitive_alias("s.c", Some(500))]
+    #[case::case_insensitive_nested_path("s.INNER.`x`", Some(4))]
+    #[case::exact_deep_alias("s.Inner.X", Some(300))]
+    #[case::exact_deep_path("s.Inner.x", Some(4))]
+    #[case::missing_leaf("s.missing", None)]
+    #[case::missing_root("missing.a", None)]
+    #[case::scalar_child("s.a.child", None)]
+    fn test_create_column_expr_alias_precedence(
+        #[case] column: &str,
+        #[case] expected: Option<i32>,
+    ) {
+        let int_array = |value| Arc::new(Int32Array::from(vec![value])) as ArrayRef;
+        let int_field = |name| Arc::new(ArrowField::new(name, DataType::Int32, false));
+        let inner = StructArray::from(vec![
+            (int_field("X"), int_array(3)),
+            (int_field("x"), int_array(4)),
+        ]);
+        let nested = StructArray::from(vec![
+            (int_field("A"), int_array(1)),
+            (int_field("a"), int_array(2)),
+            (
+                Arc::new(ArrowField::new("Inner", inner.data_type().clone(), false)),
+                Arc::new(inner) as ArrayRef,
+            ),
+        ]);
+        let batch = RecordBatch::try_from_iter([
+            ("s", Arc::new(nested) as ArrayRef),
+            (
+                "S",
+                Arc::new(StructArray::from(vec![
+                    (int_field("A"), int_array(5)),
+                    (int_field("a"), int_array(6)),
+                ])) as ArrayRef,
+            ),
+            ("s.A", int_array(100)),
+            ("s.Inner.X", int_array(300)),
+            ("s.C", int_array(500)),
+        ])
+        .unwrap();
+        let result = Scanner::create_column_expr(column, batch.schema().as_ref());
+        if let Some(expected) = expected {
+            let actual = result
+                .unwrap()
+                .evaluate(&batch)
+                .unwrap()
+                .into_array(batch.num_rows())
+                .unwrap();
+            assert_eq!(actual.as_primitive::<Int32Type>().value(0), expected);
+        } else {
+            let error = result.unwrap_err();
+            assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+            assert!(error.to_string().contains(column), "{error}");
+        }
+    }
 
     #[rstest]
     #[case::missing_fragment(42, 0, 1, "not present")]
