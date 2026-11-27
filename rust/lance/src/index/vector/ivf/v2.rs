@@ -1501,6 +1501,29 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> CacheKey for IVFPartit
     }
 }
 
+#[derive(Debug)]
+struct IVFPartitionRowsKey(usize);
+
+impl CacheKey for IVFPartitionRowsKey {
+    type ValueType = RowAddrTreeMap;
+
+    fn key(&self) -> Cow<'_, str> {
+        format!("ivf-rows-{}", self.0).into()
+    }
+
+    fn type_name() -> &'static str {
+        "IVFPartitionRows"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.index.ivf-partition-rows", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_u64(self.0 as u64);
+    }
+}
+
 /// What the session opening an IVF index declares about it, passed to
 /// [`IVFIndex::try_new`] and to the reconstruction from a cached
 /// [`IvfIndexState`]. The default declares nothing and charges no cache.
@@ -1647,6 +1670,14 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         partition_id: usize,
         partition: &Arc<PartitionEntry<S, Q>>,
     ) -> Result<Arc<RowAddrTreeMap>> {
+        if !partition.cache_whole_partition {
+            let partition = partition.clone();
+            return index_cache
+                .get_or_insert_with_key(IVFPartitionRowsKey(partition_id), || async move {
+                    spawn_cpu(move || Ok(partition.storage.row_ids().collect())).await
+                })
+                .await;
+        }
         let rows = partition.partition_rows();
         if partition.cache_whole_partition
             && !partition.partition_rows_accounted.load(Ordering::Acquire)

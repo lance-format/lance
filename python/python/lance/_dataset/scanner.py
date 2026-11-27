@@ -763,6 +763,9 @@ class ScannerBuilder:
                 if value is None:
                     continue
                 key = "full_text_search"
+            if key == "nearest" and isinstance(value, MinHashQuery):
+                self.minhash_search(value)
+                continue
             setter = getattr(self, key, None)
             if setter is None:
                 raise ValueError(f"Unknown option {key}")
