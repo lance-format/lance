@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
+import asyncio
 import math
 import os
 import time
@@ -1043,19 +1044,30 @@ def _fenced_writer(tmp_path):
     return fenced, ds.mem_wal_writer(shard_id)
 
 
-@pytest.mark.parametrize("in_flight", [KeyboardInterrupt, ValueError])
-def test_shard_writer_close_failure_is_reported_again(tmp_path, in_flight):
+@pytest.mark.parametrize(
+    ("in_flight", "raised", "match"),
+    [
+        (None, OSError, "Writer fenced"),
+        (KeyboardInterrupt, KeyboardInterrupt, "in flight"),
+        (ValueError, ValueError, "in flight"),
+    ],
+)
+def test_shard_writer_close_failure_is_reported_again(
+    tmp_path, in_flight, raised, match
+):
     # A close() that fails gives the writer up. A later close() must report the same
     # failure instead of returning as if the rows had been flushed.
     fenced, successor = _fenced_writer(tmp_path)
 
-    # Leaving the block does not replace the exception that is propagating.
-    with pytest.raises(in_flight, match="in flight"):
+    # Leaving the block reports the failure again when the body caught it and exits
+    # normally, and does not replace an exception that is propagating.
+    with pytest.raises(raised, match=match):
         with fenced:
             with pytest.raises(OSError, match="Writer fenced"):
                 fenced.close()
-            raise in_flight("in flight")
-    # With nothing propagating, leaving the block and close() both report it again.
+            if in_flight is not None:
+                raise in_flight("in flight")
+    # Later, an empty `with` block and close() both report it again.
     with pytest.raises(OSError, match="Writer fenced"):
         with fenced:
             pass
@@ -1067,19 +1079,23 @@ def test_shard_writer_close_failure_is_reported_again(tmp_path, in_flight):
 @pytest.mark.parametrize(
     ("in_flight", "raised", "match"),
     [
-        (KeyboardInterrupt, KeyboardInterrupt, "in flight"),
+        (None, OSError, "Writer fenced"),
         (ValueError, OSError, "Writer fenced"),
+        (SystemExit, OSError, "Writer fenced"),
+        (GeneratorExit, OSError, "Writer fenced"),
+        (KeyboardInterrupt, KeyboardInterrupt, "in flight"),
+        (asyncio.CancelledError, asyncio.CancelledError, "in flight"),
     ],
 )
-def test_shard_writer_exit_flush_failure_while_raising(
-    tmp_path, in_flight, raised, match
-):
-    # A flush that fails on exit replaces an Exception, but must not turn
-    # KeyboardInterrupt into an OSError that `except Exception` would swallow.
+def test_shard_writer_exit_flush_failure(tmp_path, in_flight, raised, match):
+    # A flush that fails on exit is raised when the block exits normally and replaces
+    # an Exception, SystemExit or GeneratorExit, but must not turn KeyboardInterrupt or
+    # a cancellation into an OSError that `except Exception` would swallow.
     fenced, successor = _fenced_writer(tmp_path)
     with pytest.raises(raised, match=match):
         with fenced:
-            raise in_flight("in flight")
+            if in_flight is not None:
+                raise in_flight("in flight")
     with pytest.raises(OSError, match="Writer fenced"):
         fenced.close()
     successor.close()

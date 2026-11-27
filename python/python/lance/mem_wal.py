@@ -299,7 +299,14 @@ class ShardWriter:
         """Flush and close the writer.
 
         After ``close()``, calling :meth:`put` raises an error.
-        Automatically called when used as a context manager.
+
+        Leaving a ``with`` block closes the writer the same way. If the block is
+        exiting on an exception, an error recorded by an earlier ``close()`` is not
+        raised, and a failed flush replaces the propagating exception only if that
+        exception is an ``Exception``, ``SystemExit`` or ``GeneratorExit``, so
+        ``KeyboardInterrupt``, ``asyncio.CancelledError`` and other ``BaseException``
+        keep propagating. Call ``close()`` afterwards to see an error that was not
+        raised.
 
         Raises
         ------
