@@ -2339,9 +2339,9 @@ impl FtsMemIndex {
 
     /// BM25 OR-search over the query tokens, scored with one corpus-wide
     /// [`MemBM25Scorer`]. With a result limit, all partitions and the tail
-    /// feed a single shared top-k heap: the tail is scanned first to warm the
-    /// pruning threshold, then each partition's WAND prunes against the
-    /// shared rising threshold (instead of every partition cold-starting).
+    /// feed a single shared top-k heap: the block-max partitions are scanned
+    /// first to warm the pruning threshold, then the tail, which can be skipped
+    /// wholesale once its score bound falls short of that threshold.
     /// Without a limit, an exact O(matches) scan across partitions + tail.
     fn search_match(
         &self,
@@ -3463,6 +3463,8 @@ fn score_terms(
         }
         tail_terms.push((qw, slice));
     }
+    // `<=` suffices: the tail is scored after every frozen partition and holds
+    // only newer row positions, so a tail tie loses on row position.
     if tail_ub <= theta {
         return Vec::new();
     }
@@ -4795,7 +4797,7 @@ impl Partition {
     /// Single-term top-k with block-max skipping. For each 128-doc block, the
     /// per-block upper bound `qw * doc_weight(block.max_freq, block.min_dl)`
     /// bounds every doc's score in the block; when the top-k heap is full and
-    /// that bound cannot beat the current k-th score, the block is skipped
+    /// that bound falls short of the current k-th score, the block is skipped
     /// without decoding. This keeps cost ~O(competitive blocks) instead of
     /// O(df), the gap behind term-query latency scaling with corpus size.
     /// Exactness is preserved: the bound is sound, so no top-k doc is dropped.
@@ -4807,8 +4809,12 @@ impl Partition {
         let mut reader = BlockReader::new(self, &pref);
         while let Some(bm) = reader.next_meta() {
             let block_ub = bm.block_ub(scorer, qw);
-            if block_ub <= topk.threshold() {
-                continue; // no doc in this block can enter the top-k
+            // Strict: a block bound equal to the k-th score can hold a doc that ties
+            // on score and wins on key. Partitions are not walked in key order
+            // (`install_pending_merge` appends the older merged partition), so the
+            // threshold may sit on a worse key.
+            if block_ub < topk.threshold() {
+                continue;
             }
             let n = bm.n;
             let df_start = bm.df_offset as usize;
@@ -4884,17 +4890,18 @@ impl Partition {
     /// those can't enter the top-k, so candidates are generated from the
     /// "essential" suffix alone (iterating fewer lists than WAND) and the
     /// non-essential lists are only probed per candidate, highest-`ub` first,
-    /// with an early exit once the remaining bound can't beat the threshold.
+    /// with an early exit once the remaining bound can't reach the threshold.
     /// Exact: same bounds as WAND, just a different traversal.
     fn maxscore_loop(&self, mut lanes: Vec<WandLane>, scorer: &MemBM25Scorer, topk: &mut TopK) {
         // Fixed ascending-`ub` order so the non-essential prefix is well-defined.
         lanes.sort_by(|a, b| a.ub.partial_cmp(&b.ub).unwrap_or(std::cmp::Ordering::Equal));
         loop {
             let theta = topk.threshold();
-            // Non-essential prefix [0..ne): cumulative `ub` sum <= theta.
+            // Non-essential prefix [0..ne): `cum + ub` stays below theta. Strict, since
+            // a doc that only reaches theta may tie the k-th score and win on key.
             let mut ne = 0;
             let mut cum = 0.0f32;
-            while ne < lanes.len() && cum + lanes[ne].ub <= theta {
+            while ne < lanes.len() && cum + lanes[ne].ub < theta {
                 cum += lanes[ne].ub;
                 ne += 1;
             }
@@ -4923,7 +4930,8 @@ impl Partition {
             let mut rem = cum;
             let mut alive = true;
             for i in (0..ne).rev() {
-                if score + rem <= theta {
+                // Strict for the same reason as the prefix bound.
+                if score + rem < theta {
                     alive = false;
                     break;
                 }
@@ -5078,8 +5086,10 @@ impl Partition {
     }
 }
 
-/// A scored MemTable row, ordered by score then row position (`total_cmp`,
-/// so a stray non-finite score cannot panic the heap).
+/// A scored MemTable row in top-k eviction order: worst score first, and
+/// within a tied score band the largest key first, since the result order is
+/// `(score DESC, row_position ASC, doc_index ASC)`. `total_cmp` keeps a
+/// non-finite score from panicking the heap.
 struct ScoredEntry {
     score: f32,
     key: DocumentKey,
@@ -5100,7 +5110,7 @@ impl Ord for ScoredEntry {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.score
             .total_cmp(&other.score)
-            .then(self.key.cmp(&other.key))
+            .then_with(|| other.key.cmp(&self.key))
     }
 }
 
@@ -5120,7 +5130,8 @@ impl TopK {
         }
     }
 
-    /// Score a doc must beat to enter the top-k (`-inf` until the heap fills).
+    /// The k-th score (`-inf` until the heap fills). The WAND and MaxScore
+    /// bounds compare this, so it stays score-only.
     fn threshold(&self) -> f32 {
         if self.heap.len() >= self.k {
             self.heap.peek().unwrap().0.score
@@ -5129,12 +5140,18 @@ impl TopK {
         }
     }
 
+    /// Admit the candidate if it beats the eviction victim on the result order.
     fn offer(&mut self, score: f32, key: DocumentKey) {
+        let entry = ScoredEntry { score, key };
         if self.heap.len() < self.k {
-            self.heap.push(Reverse(ScoredEntry { score, key }));
-        } else if score > self.heap.peek().unwrap().0.score {
+            self.heap.push(Reverse(entry));
+        } else if self
+            .heap
+            .peek()
+            .is_some_and(|victim| entry.cmp(&victim.0) == std::cmp::Ordering::Greater)
+        {
             self.heap.pop();
-            self.heap.push(Reverse(ScoredEntry { score, key }));
+            self.heap.push(Reverse(entry));
         }
     }
 
@@ -7569,6 +7586,174 @@ mod tests {
         full.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
         assert_eq!(results[0].row_position, full[0].row_position);
         assert_eq!(results[1].row_position, full[1].row_position);
+    }
+
+    /// Rows 0 and 1 hold identical text and tie on score; row 2 is shorter and
+    /// outscores both. A tied band the top-k heap has to resolve by row position.
+    fn tied_band_index() -> FtsMemIndex {
+        let index = FtsMemIndex::new(1, "description".to_string()).with_freeze_threshold_rows(3);
+        let batch = RecordBatch::try_new(
+            create_test_schema(),
+            vec![
+                Arc::new(Int32Array::from(vec![0, 1, 2])),
+                Arc::new(StringArray::from(vec![
+                    "alpha filler filler",
+                    "alpha filler filler",
+                    "alpha",
+                ])),
+            ],
+        )
+        .unwrap();
+        index.insert(&batch, 0).unwrap();
+        let st = index.state.load_full();
+        assert_eq!(st.partitions.len(), 1, "the batch should have frozen");
+        assert_eq!(st.tail.visible_count(), 0);
+        index
+    }
+
+    /// Row positions of a boosted `alpha` match, tail excluded.
+    fn tied_band_rows(index: &FtsMemIndex, limit: Option<usize>) -> Vec<u64> {
+        let query = FtsQueryExpr::Match {
+            column: None,
+            query: "alpha".to_string(),
+            operator: Operator::Or,
+            boost: 2.0,
+        };
+        let mut options = SearchOptions::new().with_include_tail(false);
+        if let Some(limit) = limit {
+            options = options.with_limit(limit);
+        }
+        index
+            .search_with_options(&query, options)
+            .into_iter()
+            .map(|entry| entry.row_position)
+            .collect()
+    }
+
+    #[rstest]
+    #[case::limit_1(1, &[2u64])]
+    #[case::limit_2(2, &[2, 0])]
+    #[case::limit_3(3, &[2, 0, 1])]
+    fn test_top_k_of_a_tied_band_keeps_the_best_key(
+        #[case] limit: usize,
+        #[case] expected: &[u64],
+    ) {
+        let index = tied_band_index();
+        let rows = tied_band_rows(&index, Some(limit));
+        assert_eq!(rows, expected, "limit={limit}");
+    }
+
+    /// The unbounded result is the reference order, and every bounded result
+    /// must be an ordered prefix of it.
+    #[test]
+    fn test_top_k_of_a_tied_band_is_an_ordered_prefix() {
+        let index = tied_band_index();
+        let unlimited = tied_band_rows(&index, None);
+        assert_eq!(unlimited, vec![2u64, 0, 1]);
+
+        let mut prefix: Vec<u64> = Vec::new();
+        for limit in 1..=4 {
+            let rows = tied_band_rows(&index, Some(limit));
+            assert_eq!(rows.len(), limit.min(unlimited.len()), "limit={limit}");
+            assert_eq!(rows, unlimited[..rows.len()], "limit={limit}");
+            assert!(rows.starts_with(&prefix), "limit={limit} is not a prefix");
+            prefix = rows;
+        }
+    }
+
+    /// An index whose partitions are walked oldest-last, the shape
+    /// `install_pending_merge` produces: it appends the merged partition, and
+    /// that partition holds the rows frozen before the ones still live at the
+    /// front of the list. Every document carries the same text, so all matches
+    /// tie on score and a block-max bound equals the k-th score exactly.
+    fn merged_partition_walked_last_index() -> FtsMemIndex {
+        let mut index =
+            FtsMemIndex::new(1, "description".to_string()).with_freeze_threshold_rows(3);
+        let batch = RecordBatch::try_new(
+            create_test_schema(),
+            vec![
+                Arc::new(Int32Array::from(vec![0, 1, 2])),
+                Arc::new(StringArray::from(vec!["alpha beta"; 3])),
+            ],
+        )
+        .unwrap();
+        for batch_index in 0..8 {
+            index.insert(&batch, batch_index * 100).unwrap();
+        }
+        // Hold the ninth batch in the tail: a freeze is what installs a pending
+        // merge, and a freeze needs a non-empty tail.
+        index.freeze_threshold_rows = usize::MAX;
+        index.insert(&batch, 800).unwrap();
+
+        let st = index.state.load_full();
+        assert_eq!(st.partitions.len(), 8, "eight batches should have frozen");
+        let sources: Vec<usize> = st
+            .partitions
+            .iter()
+            .map(|p| Arc::as_ptr(p) as usize)
+            .collect();
+        let merged = Arc::new(Partition::merge(&st.partitions).unwrap());
+        drop(st);
+        *index.merge.lock().unwrap() = Some(PendingMerge {
+            sources,
+            result: Some(merged),
+        });
+        index.flush();
+
+        let st = index.state.load_full();
+        assert_eq!(
+            st.partitions.len(),
+            2,
+            "the merged partition installs alongside the newest one"
+        );
+        assert!(
+            st.partitions[1].docs.row_id(0) < st.partitions[0].docs.row_id(0),
+            "the merged (older) partition must be the one walked last"
+        );
+        index
+    }
+
+    /// The shared top-k heap prunes a block whose bound equals the current k-th
+    /// score, and MaxScore prunes a candidate whose partial score plus the
+    /// remaining bound equals it. Such a block or candidate can still hold a
+    /// document that ties on score and wins on `row_position`, which the
+    /// merged-partition walk order makes reachable: the oldest rows are scored
+    /// last, against a threshold warmed by newer rows.
+    #[rstest]
+    #[case::single_term_block_max_prune("alpha")]
+    #[case::multi_term_maxscore_prune("alpha beta")]
+    fn test_top_k_prefix_when_an_older_partition_is_walked_last(#[case] query_text: &str) {
+        let index = merged_partition_walked_last_index();
+        let query = FtsQueryExpr::match_query(query_text);
+        let rows = |limit: Option<usize>| -> Vec<u64> {
+            let mut options = SearchOptions::new().with_include_tail(false);
+            if let Some(limit) = limit {
+                options = options.with_limit(limit);
+            }
+            index
+                .search_with_options(&query, options)
+                .into_iter()
+                .map(|entry| entry.row_position)
+                .collect()
+        };
+
+        let expected: Vec<u64> = (0..9u64)
+            .flat_map(|batch| [batch * 100, batch * 100 + 1, batch * 100 + 2])
+            .collect();
+        assert_eq!(rows(None), expected, "unbounded search");
+
+        let mut prefix: Vec<u64> = Vec::new();
+        // Limits at and below the newest partition's document count are the
+        // ones that reach the k-th-score band before the older rows are walked.
+        for limit in [1usize, 2, 3, 5, 8, 27] {
+            let limited = rows(Some(limit));
+            assert_eq!(limited, expected[..limit], "limit={limit}");
+            assert!(
+                limited.starts_with(&prefix),
+                "limit={limit} is not an ordered prefix of the larger top-k"
+            );
+            prefix = limited;
+        }
     }
 
     /// Boost makes negative scores reachable, and the factor threshold has to
