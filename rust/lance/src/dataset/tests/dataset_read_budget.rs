@@ -11,8 +11,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arrow::compute::{concat_batches, sort_to_indices, take_record_batch};
+use arrow_array::RecordBatch;
 use arrow_array::types::{Float32Type, Int32Type};
-use arrow_array::{RecordBatch, cast::AsArray};
 use arrow_schema::{DataType, Field, Fields};
 use datafusion::execution::TaskContext;
 use datafusion::physical_plan::ExecutionPlan;

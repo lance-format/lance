@@ -551,6 +551,7 @@ pub struct Scanner {
     /// Mainly, if the result is returned strictly according to the batch_size,
     /// batching and waiting are required, and the performance will decrease.
     strict_batch_size: bool,
+    strict_batch_memory_accounting: bool,
 
     /// Whether a read memory limit may shrink the scan's batches; see
     /// [`Scanner::keep_batch_size`].

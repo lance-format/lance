@@ -235,11 +235,14 @@ pub(crate) async fn join_local_io<T>(
     }
 }
 
+pub(crate) mod resources;
+
 /// Object reader for local file system.
 #[derive(Debug)]
 pub struct LocalObjectReader {
+    memory_pool: Option<Arc<dyn lance_core::utils::memory::MemoryReserver>>,
     /// File handler.
-    file: Arc<File>,
+    file: Arc<resources::LocalFile>,
 
     /// Fie path.
     path: Path,
@@ -302,7 +305,11 @@ impl LocalObjectReader {
             })?;
             let size = OnceCell::new_with(known_size);
             Ok(Box::new(Self {
-                file: Arc::new(file),
+                memory_pool: None,
+                file: Arc::new(resources::LocalFile {
+                    file: Arc::new(file),
+                    _control: None,
+                }),
                 block_size,
                 size,
                 path,
@@ -314,6 +321,23 @@ impl LocalObjectReader {
 }
 
 impl Reader for LocalObjectReader {
+    fn memory_reserver(&self) -> Option<Arc<dyn lance_core::utils::memory::MemoryReserver>> {
+        self.memory_pool.clone()
+    }
+
+    fn configure_memory_reserver(
+        &mut self,
+        pool: Arc<dyn lance_core::utils::memory::MemoryReserver>,
+    ) -> Result<()> {
+        if self.memory_pool.is_some() {
+            return Err(Error::invalid_input(
+                "local reader memory reserver is already configured",
+            ));
+        }
+        self.memory_pool = Some(pool);
+        Ok(())
+    }
+
     fn path(&self) -> &Path {
         &self.path
     }
@@ -335,8 +359,21 @@ impl Reader for LocalObjectReader {
                     // The metadata lookup is this reader's equivalent of the HEAD
                     // request a cloud reader makes to learn the object size.
                     let metrics = self.io_tracker.begin_io("head");
-                    let result =
-                        join_local_io(tokio::task::spawn_blocking(move || file.metadata())).await;
+                    let result = if let Some(pool) = &self.memory_pool {
+                        lance_core::utils::tokio::io_task_with_resources(
+                            pool.clone(),
+                            "local file metadata",
+                            move || file.file.metadata(),
+                        )?
+                        .await?
+                        .map_err(|source| object_store::Error::Generic {
+                            store: "LocalFileSystem",
+                            source: Box::new(source),
+                        })
+                    } else {
+                        join_local_io(tokio::task::spawn_blocking(move || file.file.metadata()))
+                            .await
+                    };
                     metrics.record(&result, 0);
                     Ok(result?.len() as usize)
                 })
@@ -348,6 +385,15 @@ impl Reader for LocalObjectReader {
     /// Reads a range of data.
     #[instrument(level = "debug", skip(self))]
     fn get_range(&self, range: Range<usize>) -> BoxFuture<'static, object_store::Result<Bytes>> {
+        if let Some(pool) = &self.memory_pool {
+            return Self::read_with_resources(
+                self.file.clone(),
+                self.path.clone(),
+                self.io_tracker.clone(),
+                pool.clone(),
+                range,
+            );
+        }
         let file = self.file.clone();
         let io_tracker = self.io_tracker.clone();
         let path = self.path.clone();
@@ -362,9 +408,9 @@ impl Reader for LocalObjectReader {
                 // written to below and we check all data is initialized at that point.
                 unsafe { buf.set_len(range.len()) };
                 #[cfg(unix)]
-                file.read_exact_at(buf.as_mut(), range.start as u64)?;
+                file.file.read_exact_at(buf.as_mut(), range.start as u64)?;
                 #[cfg(windows)]
-                read_exact_at(file, buf.as_mut(), range.start as u64)?;
+                read_exact_at(file.file.clone(), buf.as_mut(), range.start as u64)?;
 
                 Ok(buf.freeze())
             }))
@@ -382,15 +428,22 @@ impl Reader for LocalObjectReader {
     /// Reads the entire file.
     #[instrument(level = "debug", skip(self))]
     fn get_all(&self) -> BoxFuture<'_, object_store::Result<Bytes>> {
+        if self.memory_pool.is_some() {
+            return Box::pin(async move {
+                let size = self.size().await?;
+                self.get_range(0..size).await
+            });
+        }
         Box::pin(async move {
-            let mut file = self.file.clone();
+            let file = self.file.clone();
             let io_tracker = self.io_tracker.clone();
             let path = self.path.clone();
 
             let metrics = io_tracker.begin_io("get");
             let result = join_local_io(tokio::task::spawn_blocking(move || {
                 let mut buf = Vec::new();
-                file.read_to_end(buf.as_mut())?;
+                let mut handle = file.file.as_ref();
+                handle.read_to_end(buf.as_mut())?;
                 Ok(Bytes::from(buf))
             }))
             .await;
@@ -408,8 +461,11 @@ impl Reader for LocalObjectReader {
     fn get_stream(&self) -> BoxFuture<'_, object_store::Result<ByteStream>> {
         Box::pin(async move {
             let size = self.size().await?;
+            if self.memory_pool.is_some() {
+                return Ok(self.stream_with_resources(0..size));
+            }
             Ok(stream_local_range(
-                self.file.clone(),
+                self.file.file.clone(),
                 self.path.clone(),
                 self.io_tracker.clone(),
                 0..size,
@@ -422,13 +478,21 @@ impl Reader for LocalObjectReader {
         &self,
         range: Range<usize>,
     ) -> BoxFuture<'_, object_store::Result<ByteStream>> {
+        if self.memory_pool.is_some() {
+            let stream = self.stream_with_resources(range);
+            return Box::pin(async move { Ok(stream) });
+        }
         let file = self.file.clone();
         let path = self.path.clone();
         let io_tracker = self.io_tracker.clone();
         let chunk_size = self.block_size.max(8 * 1024);
         Box::pin(async move {
             Ok(stream_local_range(
-                file, path, io_tracker, range, chunk_size,
+                file.file.clone(),
+                path,
+                io_tracker,
+                range,
+                chunk_size,
             ))
         })
     }
@@ -476,5 +540,315 @@ impl Writer for tokio::fs::File {
         let size = self.seek(SeekFrom::Current(0)).await? as usize;
         tokio::io::AsyncWriteExt::shutdown(self).await?;
         Ok(WriteResult { size, e_tag: None })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        object_store::ObjectStore,
+        scheduler::{ScanScheduler, SchedulerConfig},
+        utils::CachedFileSize,
+    };
+    use futures::TryStreamExt;
+    use lance_core::utils::memory::MemoryReserver;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Debug, Default)]
+    struct ReadPool {
+        used: Arc<AtomicUsize>,
+        limit: usize,
+        tasks: Arc<lance_core::utils::tasks::ResourceTaskGroup>,
+    }
+
+    struct ReadCharge {
+        used: Arc<AtomicUsize>,
+        bytes: usize,
+    }
+
+    impl Drop for ReadCharge {
+        fn drop(&mut self) {
+            self.used.fetch_sub(self.bytes, Ordering::Release);
+        }
+    }
+
+    impl MemoryReserver for ReadPool {
+        fn task_group(&self) -> Option<Arc<lance_core::utils::tasks::ResourceTaskGroup>> {
+            Some(self.tasks.clone())
+        }
+        fn reserve(&self, stage: &str, bytes: usize) -> Result<Box<dyn Send + Sync>> {
+            self.used
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+                    used.checked_add(bytes).filter(|next| *next <= self.limit)
+                })
+                .map_err(|used| {
+                    Error::execution(format!(
+                        "{stage}: requested_bytes={bytes}, used_bytes={used}, budget_bytes={}",
+                        self.limit
+                    ))
+                })?;
+            Ok(Box::new(ReadCharge {
+                used: self.used.clone(),
+                bytes,
+            }))
+        }
+    }
+
+    #[rstest::rstest]
+    #[tokio::test]
+    async fn resource_read_scheduler_retains_slices(#[values(false, true)] lite: bool) {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), [7_u8; 64]).unwrap();
+        let used = Arc::new(AtomicUsize::new(0));
+        let pool = Arc::new(ReadPool {
+            used: used.clone(),
+            limit: 16 * 1024,
+            ..Default::default()
+        });
+        let mut config = SchedulerConfig::new(4096);
+        config.use_lite_scheduler = Some(lite);
+        let scheduler = ScanScheduler::new(Arc::new(ObjectStore::local()), config);
+        // Memory observation retains a weak reference before admission is configured.
+        let observed = Arc::downgrade(&scheduler);
+        let scheduler = scheduler.with_memory_reserver(pool).unwrap();
+        assert!(Arc::ptr_eq(&scheduler, &observed.upgrade().unwrap()));
+        let reader = scheduler
+            .open_file(
+                &Path::from_filesystem_path(file.path()).unwrap(),
+                &CachedFileSize::unknown(),
+            )
+            .await
+            .unwrap();
+        let mut bytes = reader.submit_request(vec![0..4, 8..12], 0).await.unwrap();
+        assert_eq!(bytes.len(), 2);
+        assert!(used.load(Ordering::Acquire) >= 12 + 1024);
+        drop(bytes.remove(0));
+        let remaining = bytes.pop().unwrap();
+        assert_eq!(remaining.as_ref(), &[7_u8; 4]);
+        drop(reader);
+        drop(scheduler);
+        assert!(used.load(Ordering::Acquire) >= 12 + 1024);
+        drop(remaining);
+        assert_eq!(used.load(Ordering::Acquire), 0);
+    }
+
+    #[rstest::rstest]
+    #[tokio::test]
+    async fn resource_read_scheduler_rejects_reconfiguration(
+        #[values(false, true)] lite: bool,
+        #[values(false, true)] configured: bool,
+    ) {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let pool = Arc::new(ReadPool {
+            limit: 16 * 1024,
+            ..Default::default()
+        });
+        let mut config = SchedulerConfig::new(4096);
+        config.use_lite_scheduler = Some(lite);
+        let scheduler = ScanScheduler::new(Arc::new(ObjectStore::local()), config);
+        let scheduler = if configured {
+            scheduler.with_memory_reserver(pool.clone()).unwrap()
+        } else {
+            let _reader = scheduler
+                .open_file(
+                    &Path::from_filesystem_path(file.path()).unwrap(),
+                    &CachedFileSize::unknown(),
+                )
+                .await
+                .unwrap();
+            scheduler
+        };
+        let error = scheduler.with_memory_reserver(pool).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(
+            error.to_string().contains(
+                "must be configured before opening files and can only be configured once"
+            )
+        );
+    }
+
+    #[rstest::rstest]
+    #[tokio::test]
+    async fn resource_detached_stream_retains_file_state(#[values(false, true)] whole: bool) {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), [7_u8; 64]).unwrap();
+        let pool = Arc::new(ReadPool {
+            limit: 64 * 1024,
+            ..Default::default()
+        });
+        let reader = ObjectStore::local()
+            .open_with_memory_reserver(
+                &Path::from_filesystem_path(file.path()).unwrap(),
+                Some(64),
+                pool.clone(),
+            )
+            .await
+            .unwrap();
+        let baseline = pool.used.load(Ordering::Acquire);
+        assert!(baseline > 0);
+        let mut first = if whole {
+            reader.get_stream().await.unwrap()
+        } else {
+            reader.get_range_stream(0..64).await.unwrap()
+        };
+        let second = reader.get_range_stream(0..64).await.unwrap();
+        drop(reader);
+        assert_eq!(pool.used.load(Ordering::Acquire), baseline);
+        drop(second);
+        assert_eq!(pool.used.load(Ordering::Acquire), baseline);
+        let bytes = first.try_next().await.unwrap().unwrap();
+        assert_eq!(bytes.as_ref(), &[7_u8; 64]);
+        drop(first);
+        assert_eq!(pool.used.load(Ordering::Acquire), 64 + 1024);
+        let slice = bytes.slice(1..2);
+        drop(bytes);
+        assert_eq!(pool.used.load(Ordering::Acquire), 64 + 1024);
+        drop(slice);
+        assert_eq!(pool.used.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn resource_detached_stream_queued_read_retains_file_state() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let file = tempfile::NamedTempFile::new().unwrap();
+            std::fs::write(file.path(), [7_u8; 64]).unwrap();
+            let pool = Arc::new(ReadPool {
+                limit: 64 * 1024,
+                ..Default::default()
+            });
+            let reader = ObjectStore::local()
+                .open_with_memory_reserver(
+                    &Path::from_filesystem_path(file.path()).unwrap(),
+                    Some(64),
+                    pool.clone(),
+                )
+                .await
+                .unwrap();
+            let baseline = pool.used.load(Ordering::Acquire);
+            let mut stream = reader.get_range_stream(0..64).await.unwrap();
+            let (release, blocked) = std::sync::mpsc::channel::<()>();
+            // Disconnecting the sender also releases the gate on assertion failure.
+            let (started, ready) = tokio::sync::oneshot::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                let _ = started.send(());
+                let _ = blocked.recv();
+            });
+            ready.await.unwrap();
+            assert!(futures::poll!(stream.try_next()).is_pending());
+            drop(stream);
+            drop(reader);
+            assert!(pool.used.load(Ordering::Acquire) >= baseline);
+            assert!(pool.tasks.active() > 0);
+            assert!(futures::FutureExt::now_or_never(pool.tasks.wait()).is_none());
+            release.send(()).unwrap();
+            blocker.await.unwrap();
+            pool.tasks.wait().await;
+            assert_eq!(pool.used.load(Ordering::Acquire), 0);
+        });
+    }
+
+    #[rstest::rstest]
+    #[case::range(0)]
+    #[case::whole_file(1)]
+    #[case::range_stream(2)]
+    #[case::whole_stream(3)]
+    #[tokio::test]
+    async fn resource_read_retains_full_parent_charge(#[case] mode: usize) {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), [7_u8; 64]).unwrap();
+        let used = Arc::new(AtomicUsize::new(0));
+        let pool = Arc::new(ReadPool {
+            used: used.clone(),
+            limit: 8192,
+            ..Default::default()
+        });
+        let mut reader = LocalObjectReader::open_local_path(file.path(), 64, None)
+            .await
+            .unwrap();
+        reader.configure_memory_reserver(pool).unwrap();
+        let bytes = match mode {
+            0 => reader.get_range(0..64).await.unwrap(),
+            1 => reader.get_all().await.unwrap(),
+            2 => reader
+                .get_range_stream(0..64)
+                .await
+                .unwrap()
+                .try_next()
+                .await
+                .unwrap()
+                .unwrap(),
+            _ => reader
+                .get_stream()
+                .await
+                .unwrap()
+                .try_next()
+                .await
+                .unwrap()
+                .unwrap(),
+        };
+        assert_eq!(bytes.as_ref(), &[7_u8; 64]);
+        assert_eq!(used.load(Ordering::Acquire), 64 + 1024);
+        let slice = bytes.slice(1..2);
+        drop(bytes);
+        drop(reader);
+        assert_eq!(used.load(Ordering::Acquire), 64 + 1024);
+        assert_eq!(slice.as_ref(), &[7]);
+        drop(slice);
+        assert_eq!(used.load(Ordering::Acquire), 0);
+    }
+
+    #[rstest::rstest]
+    #[case::cancel_before_poll(0)]
+    #[case::unexpected_eof(1)]
+    #[case::denied_before_io(2)]
+    #[case::overflow(3)]
+    #[case::reversed(4)]
+    #[tokio::test]
+    async fn resource_read_errors_and_cancellation_release_charge(#[case] mode: usize) {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), [7_u8; 64]).unwrap();
+        let used = Arc::new(AtomicUsize::new(0));
+        let pool = Arc::new(ReadPool {
+            used: used.clone(),
+            limit: if mode == 2 { 1 } else { 8192 },
+            ..Default::default()
+        });
+        let mut reader = LocalObjectReader::open_local_path(file.path(), 64, None)
+            .await
+            .unwrap();
+        reader.configure_memory_reserver(pool).unwrap();
+        let range = match mode {
+            3 => 0..usize::MAX,
+            4 => Range { start: 2, end: 1 },
+            _ => 0..128,
+        };
+        let read = reader.get_range(range);
+        if mode == 0 {
+            assert_eq!(used.load(Ordering::Acquire), 128 + 1024);
+            drop(read);
+        } else {
+            let error = read.await.unwrap_err();
+            if mode == 1 {
+                assert!(error.to_string().contains("fill whole buffer"));
+            } else {
+                let object_store::Error::Generic { source, .. } = error else {
+                    panic!("expected Lance resource error")
+                };
+                let error = source.downcast_ref::<Error>().unwrap();
+                if mode == 2 {
+                    assert!(matches!(error, Error::Execution { .. }));
+                    assert!(error.to_string().contains("local read buffer"));
+                } else {
+                    assert!(matches!(error, Error::InvalidInput { .. }));
+                }
+            }
+        }
+        assert_eq!(used.load(Ordering::Acquire), 0);
     }
 }

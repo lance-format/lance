@@ -14,7 +14,7 @@ use std::num::{NonZero, NonZeroU32};
 use std::ops::Range;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Instant;
 use tokio::sync::Notify;
 
@@ -33,6 +33,9 @@ mod lite;
 const BACKPRESSURE_MIN: u64 = 5;
 // Don't log backpressure warnings more than once / minute
 const BACKPRESSURE_DEBOUNCE: u64 = 60;
+// Covers Bytes::from_owner reference-count storage and allocation control,
+// without depending on bytes' private owner-wrapper layout.
+const REASSEMBLY_CONTROL_BYTES: usize = 1024;
 const SCHEDULER_STATE_EVENT_TARGET: &str = "lance_io::scheduler::state";
 
 /// Storage option used to configure scheduler error handling.
@@ -1004,6 +1007,8 @@ impl FromStr for SchedulerErrorMode {
 /// Note: The 2.X file readers already do this so this is only a concern if you are
 /// using the ScanScheduler directly.
 pub struct ScanScheduler {
+    // Freeze admission on first open, including an explicitly unaccounted reader.
+    memory_pool: OnceLock<Option<Arc<dyn lance_core::utils::memory::MemoryReserver>>>,
     object_store: Arc<ObjectStore>,
     io_queue: IoQueueType,
     stats: IoStats,
@@ -1162,6 +1167,7 @@ impl ScanScheduler {
             IoQueueType::Standard(io_queue)
         };
         let scheduler = Arc::new(Self {
+            memory_pool: OnceLock::new(),
             object_store,
             io_queue,
             stats,
@@ -1190,6 +1196,36 @@ impl ScanScheduler {
         }
     }
 
+    /// Configure admission for raw read buffers before opening any files.
+    /// Returned buffers retain their charges through cloning and slicing. The
+    /// reader must implement [`Reader::configure_memory_reserver`]; unsupported
+    /// backends return an error on open rather than issuing unaccounted reads.
+    /// Configuration is allowed once, including when shared with memory observers,
+    /// and must precede the first file open. This does not account for decoded
+    /// arrays or scheduler request metadata.
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use lance_core::{Result, utils::memory::MemoryReserver};
+    /// # use lance_io::{scheduler::{ScanScheduler, SchedulerConfig}, object_store::ObjectStore};
+    /// fn scheduler(store: Arc<ObjectStore>, pool: Arc<dyn MemoryReserver>) -> Result<Arc<ScanScheduler>> {
+    ///     ScanScheduler::new(store, SchedulerConfig::new(1024 * 1024))
+    ///         .with_memory_reserver(pool)
+    /// }
+    /// ```
+    #[doc(hidden)]
+    pub fn with_memory_reserver(
+        self: Arc<Self>,
+        pool: Arc<dyn lance_core::utils::memory::MemoryReserver>,
+    ) -> Result<Arc<Self>> {
+        self.memory_pool.set(Some(pool)).map_err(|_| {
+            Error::invalid_input(
+                "scheduler memory reserver must be configured before opening files and can only be configured once",
+            )
+        })?;
+        Ok(self)
+    }
+
     /// Open a file for reading
     ///
     /// # Arguments
@@ -1204,19 +1240,41 @@ impl ScanScheduler {
         base_priority: u64,
         file_size_bytes: &CachedFileSize,
     ) -> Result<FileScheduler> {
-        let file_size_bytes = if let Some(size) = file_size_bytes.get() {
-            u64::from(size)
-        } else {
-            let size = self.object_store.size(path).await?;
+        let reader = if let Some(pool) = self.memory_pool.get_or_init(|| None) {
+            // SmallReader caches the entire object. Open the actual backend in
+            // this mode, including admission and ownership for open/HEAD tasks.
+            let known_size = file_size_bytes
+                .get()
+                .map(|size| {
+                    usize::try_from(u64::from(size)).map_err(|_| {
+                        Error::invalid_input(format!("cached local file size={size} exceeds usize"))
+                    })
+                })
+                .transpose()?;
+            let reader = self
+                .object_store
+                .open_with_memory_reserver(path, known_size, pool.clone())
+                .await?;
+            let size = u64::try_from(reader.size().await?)
+                .map_err(|_| Error::invalid_input("local file size exceeds u64"))?;
             if let Some(size) = NonZero::new(size) {
                 file_size_bytes.set(size);
             }
-            size
+            reader
+        } else {
+            let size = if let Some(size) = file_size_bytes.get() {
+                u64::from(size)
+            } else {
+                let size = self.object_store.size(path).await?;
+                if let Some(size) = NonZero::new(size) {
+                    file_size_bytes.set(size);
+                }
+                size
+            };
+            self.object_store
+                .open_with_size(path, size as usize)
+                .await?
         };
-        let reader = self
-            .object_store
-            .open_with_size(path, file_size_bytes as usize)
-            .await?;
         let block_size = self.object_store.block_size() as u64;
         let max_iop_size = self.object_store.max_iop_size();
         Ok(FileScheduler {
@@ -1545,6 +1603,26 @@ fn is_overlapping(range1: &Range<u64>, range2: &Range<u64>) -> bool {
 }
 
 impl FileScheduler {
+    /// Return the actual reader's raw-buffer pool. Reassembly and decoding can
+    /// share it even when this scheduler was opened over a charged spill reader.
+    /// This getter does not configure decoder accounting.
+    ///
+    /// ```
+    /// # use lance_core::Result;
+    /// # use lance_io::scheduler::FileScheduler;
+    /// fn reserve(reader: &FileScheduler) -> Result<()> {
+    ///     if let Some(pool) = reader.memory_reserver() {
+    ///         let owner = pool.reserve("read transformation", 1024)?;
+    ///         drop(owner);
+    ///     }
+    ///     Ok(())
+    /// }
+    /// ```
+    #[doc(hidden)]
+    pub fn memory_reserver(&self) -> Option<Arc<dyn lance_core::utils::memory::MemoryReserver>> {
+        self.reader.memory_reserver()
+    }
+
     /// Submit a batch of I/O requests to the reader
     ///
     /// The requests will be queued in a FIFO manner and, when all requests
@@ -1630,6 +1708,7 @@ impl FileScheduler {
             self.extra_stats.clone(),
         );
 
+        let memory_reserver = self.reader.memory_reserver();
         let mut updated_index = 0;
         let mut final_bytes = Vec::with_capacity(request.len());
 
@@ -1654,7 +1733,21 @@ impl FileScheduler {
                         // The original read was split into multiple requests, need to copy
                         // back into a single buffer
                         let orig_size = orig_range.end - orig_range.start;
-                        let mut merged_bytes = Vec::with_capacity(orig_size as usize);
+                        let length = usize::try_from(orig_size).map_err(|_| {
+                            Error::invalid_input(format!(
+                                "read reassembly length exceeds usize: requested_bytes={orig_size}"
+                            ))
+                        })?;
+                        let reservation_bytes = length.checked_add(size_of::<crate::local::resources::OwnedIoBuffer>())
+                            .and_then(|bytes| bytes.checked_add(REASSEMBLY_CONTROL_BYTES))
+                            .ok_or_else(|| Error::invalid_input(format!("read reassembly reservation overflow: requested_bytes={orig_size}")))?;
+                        let reservation = memory_reserver
+                            .as_ref()
+                            .map(|pool| {
+                                pool.reserve("scheduler read reassembly", reservation_bytes)
+                            })
+                            .transpose()?;
+                        let mut merged_bytes = Vec::with_capacity(length);
                         merged_bytes.extend_from_slice(&bytes_vec[updated_index].slice(start..));
                         let mut copy_offset = merged_bytes.len() as u64;
                         // Later ranges may overlap this one, so keep their search
@@ -1670,7 +1763,14 @@ impl FileScheduler {
                             );
                             copy_offset += bytes_to_take;
                         }
-                        final_bytes.push(Bytes::from(merged_bytes));
+                        final_bytes.push(if reservation.is_some() {
+                            Bytes::from_owner(crate::local::resources::OwnedIoBuffer {
+                                bytes: merged_bytes,
+                                _reservation: reservation,
+                            })
+                        } else {
+                            Bytes::from(merged_bytes)
+                        });
                     }
                     orig_index += 1;
                 } else {
@@ -1744,6 +1844,12 @@ impl FileScheduler {
             extra_stats: Some(stats),
             ..self.clone()
         }
+    }
+
+    /// The ranges of a request at most this many bytes apart are read as one
+    /// I/O, including the bytes between them.
+    pub fn block_size(&self) -> u64 {
+        self.block_size
     }
 
     /// Returns a copy of this scheduler that merges the ranges of a request
@@ -1823,6 +1929,114 @@ mod tests {
     };
 
     use super::*;
+
+    #[derive(Debug, Default)]
+    struct ReassemblyPool {
+        used: Arc<AtomicU64>,
+        sources_at_copy: AtomicU64,
+        deny_copy: bool,
+    }
+    struct ReassemblyCharge {
+        used: Arc<AtomicU64>,
+        bytes: u64,
+    }
+    impl Drop for ReassemblyCharge {
+        fn drop(&mut self) {
+            self.used.fetch_sub(self.bytes, Ordering::AcqRel);
+        }
+    }
+    impl lance_core::utils::memory::MemoryReserver for ReassemblyPool {
+        fn reserve(&self, stage: &str, bytes: usize) -> Result<Box<dyn Send + Sync>> {
+            if stage == "scheduler read reassembly" {
+                self.sources_at_copy
+                    .store(self.used.load(Ordering::Acquire), Ordering::Release);
+                if self.deny_copy {
+                    return Err(Error::execution(format!(
+                        "{stage}: requested_bytes={bytes} denied"
+                    )));
+                }
+            }
+            self.used.fetch_add(bytes as u64, Ordering::AcqRel);
+            Ok(Box::new(ReassemblyCharge {
+                used: self.used.clone(),
+                bytes: bytes as u64,
+            }))
+        }
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn resource_read_reassembly_retains_backing(
+        #[values(false, true)] lite: bool,
+        #[values(false, true)] deny_copy: bool,
+        #[values(false, true)] overlap: bool,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let local = directory.path().join("input");
+        let data: Vec<u8> = (0..64).collect();
+        std::fs::write(&local, &data).unwrap();
+        let pool = Arc::new(ReassemblyPool {
+            deny_copy,
+            ..Default::default()
+        });
+        let config = SchedulerConfig {
+            use_lite_scheduler: Some(lite),
+            ..SchedulerConfig::new(4096)
+        };
+        let scheduler = ScanScheduler::new(Arc::new(ObjectStore::local()), config)
+            .with_memory_reserver(pool.clone())
+            .unwrap();
+        let mut reader = scheduler
+            .open_file(
+                &Path::from_filesystem_path(&local).unwrap(),
+                &CachedFileSize::unknown(),
+            )
+            .await
+            .unwrap();
+        reader.max_iop_size = 8;
+        let baseline = pool.used.load(Ordering::Acquire);
+        let ranges = if overlap {
+            vec![0..15, 5..20, 24..25]
+        } else {
+            vec![0..20]
+        };
+        let result = reader.submit_request(ranges.clone(), 0).await;
+        // Source chunks and their charges must coexist with each admitted copy.
+        assert!(pool.sources_at_copy.load(Ordering::Acquire) >= baseline + 20 + 3 * 1024);
+        if deny_copy {
+            let error = result.unwrap_err();
+            assert!(matches!(error, Error::Execution { .. }));
+            assert!(error.to_string().contains("scheduler read reassembly"));
+            drop(reader);
+            drop(scheduler);
+            assert_eq!(pool.used.load(Ordering::Acquire), 0);
+            return;
+        }
+        let mut outputs = result.unwrap();
+        for (bytes, range) in outputs.iter().zip(&ranges) {
+            assert_eq!(
+                bytes.as_ref(),
+                &data[range.start as usize..range.end as usize]
+            );
+        }
+        let first = outputs.remove(0);
+        drop(outputs);
+        drop(reader);
+        drop(scheduler);
+        let retained = first.len()
+            + size_of::<crate::local::resources::OwnedIoBuffer>()
+            + REASSEMBLY_CONTROL_BYTES;
+        assert_eq!(pool.used.load(Ordering::Acquire), retained as u64);
+        let clone = first.clone();
+        drop(first);
+        assert_eq!(pool.used.load(Ordering::Acquire), retained as u64);
+        let slice = clone.slice(1..3);
+        drop(clone);
+        assert_eq!(slice.as_ref(), &data[1..3]);
+        assert_eq!(pool.used.load(Ordering::Acquire), retained as u64);
+        drop(slice);
+        assert_eq!(pool.used.load(Ordering::Acquire), 0);
+    }
 
     fn make_task(priority: u128, bypass_backpressure: bool) -> IoTask {
         IoTask {

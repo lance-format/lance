@@ -20,7 +20,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use arrow_array::RecordBatch;
 use datafusion::physical_plan::metrics::Time;
-use lance_core::{Error, Result};
+use lance_core::{
+    Error, Result,
+    utils::memory::{MemoryLease, MemoryReserver},
+};
+use lance_datafusion::resources::{
+    DataFusionMemoryReserver, flat_batch_allowance, flat_batch_retained_bytes, retain_batch_owner,
+};
 use lance_file::reader::ReadEstimate;
 use lance_io::read_budget::{Admission, BudgetReader, Reservation};
 
@@ -92,6 +98,13 @@ pub(super) async fn plan_chunks(
     // the target.
     let rows_per_chunk = if rows_per_chunk >= batch_size || keep_batch_size {
         rows_per_chunk.next_multiple_of(batch_size)
+    } else {
+        rows_per_chunk
+    };
+    // One output per accounted chunk gives the decoded backing one owner
+    // whose allowance can shrink as soon as the batch is ready.
+    let rows_per_chunk = if chunk_size.account_backing {
+        rows_per_chunk.min(batch_size)
     } else {
         rows_per_chunk
     };
@@ -179,7 +192,15 @@ fn known_decoded(estimate: ReadEstimate) -> f64 {
 }
 
 /// One scan's use of the read memory budget.
+#[derive(Clone)]
+struct AccountedScan {
+    pool: Arc<DataFusionMemoryReserver>,
+    schema: arrow_schema::SchemaRef,
+    batch_size: usize,
+}
+
 pub struct ScanBudget {
+    resources: Option<AccountedScan>,
     reader: BudgetReader,
     whole_read: bool,
     decoded: Arc<DecodedSize>,
@@ -190,11 +211,38 @@ pub struct ScanBudget {
 impl ScanBudget {
     pub fn new(reader: BudgetReader, wait_time: Time) -> Self {
         Self {
+            resources: None,
             reader,
             whole_read: false,
             decoded: Arc::new(DecodedSize::new()),
             wait_time,
         }
+    }
+
+    pub(super) fn with_resources(
+        mut self,
+        pool: Arc<DataFusionMemoryReserver>,
+        schema: arrow_schema::SchemaRef,
+        batch_size: usize,
+    ) -> Result<Self> {
+        flat_batch_allowance(&schema, 0)?;
+        if batch_size == 0 {
+            return Err(Error::invalid_input(
+                "accounted scan batch_size must be greater than zero",
+            ));
+        }
+        self.resources = Some(AccountedScan {
+            pool,
+            schema,
+            batch_size,
+        });
+        Ok(self)
+    }
+
+    pub(super) fn memory_reserver(&self) -> Option<Arc<dyn MemoryReserver>> {
+        self.resources
+            .as_ref()
+            .map(|resources| resources.pool.clone() as _)
     }
 
     /// A budget that reserves a whole read at once: its consumer collects all
@@ -211,6 +259,7 @@ impl ScanBudget {
     /// partition. It shares what the scan learns about decoded sizes.
     pub fn sibling(&self) -> Self {
         Self {
+            resources: self.resources.clone(),
             reader: self.reader.sibling(),
             whole_read: self.whole_read,
             decoded: self.decoded.clone(),
@@ -226,6 +275,7 @@ impl ScanBudget {
     pub fn chunk_size(&self) -> ChunkSize {
         ChunkSize {
             chunk_bytes: self.reader.chunk_bytes(),
+            account_backing: self.resources.is_some(),
             decoded: self.decoded.clone(),
         }
     }
@@ -234,6 +284,7 @@ impl ScanBudget {
     /// its chunks.
     pub fn admission(&self) -> ChunkAdmission {
         ChunkAdmission {
+            resources: self.resources.clone(),
             admission: self.reader.admission(),
             decoded: self.decoded.clone(),
             chunk_bytes: self.reader.chunk_bytes(),
@@ -246,6 +297,7 @@ impl ScanBudget {
 #[derive(Clone)]
 pub struct ChunkSize {
     pub chunk_bytes: u64,
+    account_backing: bool,
     decoded: Arc<DecodedSize>,
 }
 
@@ -258,6 +310,7 @@ impl ChunkSize {
 }
 
 pub struct ChunkAdmission {
+    resources: Option<AccountedScan>,
     admission: Admission,
     decoded: Arc<DecodedSize>,
     chunk_bytes: u64,
@@ -271,9 +324,38 @@ impl ChunkAdmission {
         let decoded = self.decoded.decoded(estimate, self.chunk_bytes);
         let reservation = {
             let _waiting = self.wait_time.timer();
-            self.admission.reserve(estimate.bytes + decoded).await
+            let allowance = estimate
+                .bytes
+                .checked_add(decoded)
+                .ok_or_else(|| Error::invalid_input("read policy allowance overflow"))?;
+            self.admission.reserve(allowance).await
         };
+        // The soft policy can overdraw. Its reservation is released here if
+        // the same operation's hard pool refuses the decoded backing.
+        let hard_backing = self
+            .resources
+            .map(|resources| {
+                let rows = usize::try_from(rows)
+                    .map_err(|_| Error::invalid_input("scan row count exceeds usize"))?;
+                if rows > resources.batch_size {
+                    return Err(Error::internal(format!(
+                        "accounted chunk rows {rows} exceed batch_size {}",
+                        resources.batch_size
+                    )));
+                }
+                let allowance = flat_batch_allowance(&resources.schema, rows)?
+                    .checked_add(512)
+                    .ok_or_else(|| {
+                        Error::invalid_input("scan decoded backing allowance overflow")
+                    })?;
+                resources
+                    .pool
+                    .reserve_lease("strict scan decoded backing", allowance)
+                    .map(|lease| Arc::new(Mutex::new(lease)))
+            })
+            .transpose()?;
         Ok(Arc::new(ChunkBudget {
+            hard_backing,
             reservation,
             estimate,
             rows,
@@ -287,6 +369,7 @@ impl ChunkAdmission {
 /// released once the chunk is decoded. Its output batches move their share
 /// out with [`ChunkBudget::charge_output`] and keep it until emitted.
 pub struct ChunkBudget {
+    hard_backing: Option<Arc<Mutex<Box<dyn MemoryLease>>>>,
     reservation: Reservation,
     estimate: ReadEstimate,
     rows: u64,
@@ -297,6 +380,24 @@ pub struct ChunkBudget {
 }
 
 impl ChunkBudget {
+    pub(super) fn retain_output(&self, batch: RecordBatch) -> Result<RecordBatch> {
+        let Some(owner) = &self.hard_backing else {
+            return Ok(batch);
+        };
+        if u64::try_from(batch.num_rows()).ok() != Some(self.rows) {
+            return Err(Error::internal(format!(
+                "accounted scan chunk of {} rows decoded a batch of {} rows",
+                self.rows,
+                batch.num_rows()
+            )));
+        }
+        owner
+            .lock()
+            .map_err(|_| Error::internal("scan backing lease poisoned"))?
+            .try_shrink(flat_batch_retained_bytes(&batch)?)?;
+        retain_batch_owner(batch, owner.clone())
+    }
+
     /// Charges an output batch of the chunk until the batch is dropped, taken
     /// from the chunk's decoded share so it is not counted twice. Never waits.
     pub fn charge_output(&self, bytes: u64) -> Reservation {

@@ -97,6 +97,7 @@ impl Scanner {
             include_deleted_rows: false,
             scan_stats_callback: None,
             strict_batch_size: false,
+            strict_batch_memory_accounting: false,
             keep_batch_size: false,
             file_reader_options,
             aggregate: None,
@@ -782,6 +783,22 @@ impl Scanner {
     /// [`ReadParams::file_reader_options`](crate::dataset::ReadParams::file_reader_options).
     pub fn strict_batch_size(&mut self, strict_batch_size: bool) -> &mut Self {
         self.strict_batch_size = strict_batch_size;
+        self
+    }
+
+    /// Share the execution pool between direct local scan reads and strict
+    /// batch formation. Requires strict batching and a session read policy.
+    /// This experimental mode supports plain Lance 2.2 scans of Int32 and Int64
+    /// columns (including nulls).
+    ///
+    /// ```
+    /// # fn configure(scanner: &mut lance::dataset::scanner::Scanner) {
+    /// scanner.strict_batch_size(true).with_strict_batch_memory_accounting(true);
+    /// # }
+    /// ```
+    #[doc(hidden)]
+    pub fn with_strict_batch_memory_accounting(&mut self, enabled: bool) -> &mut Self {
+        self.strict_batch_memory_accounting = enabled;
         self
     }
 

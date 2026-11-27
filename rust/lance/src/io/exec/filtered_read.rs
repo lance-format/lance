@@ -55,7 +55,7 @@ use lance_datafusion::utils::{
     RANGES_SCANNED_METRIC, READ_BUDGET_WAIT_TIME_METRIC, ROWS_SCANNED_METRIC,
     TASK_WAIT_TIME_METRIC,
 };
-use lance_file::reader::{FileReaderOptions, ReadEstimate};
+use lance_file::reader::FileReaderOptions;
 use lance_index::scalar::expression::FilterPlan;
 use lance_io::object_store::{
     METRIC_SCAN_DECODE_TIME, METRIC_SCAN_TASK_WAIT_TIME, ObjectStore, StoreCounter,
@@ -85,67 +85,16 @@ use crate::dataset::scanner::{
 use crate::dataset::versions;
 
 use super::column_width::{self, MeasuredWidths};
-use super::read_budget::{self, ChunkAdmission, ChunkBudget, ChunkSize, ReadChunk, ScanBudget};
+use super::read_budget::{self, ChunkBudget, ChunkSize, ReadChunk, ScanBudget};
 use super::utils::{IoMetrics, estimated_bytes_per_row, estimated_total_byte_size};
+
+mod budgeted;
+
+use budgeted::{ChunkQueue, SharedChunks};
 
 type MaterializedReadBatchFut = futures::future::BoxFuture<'static, Result<MaterializedBlobBatch>>;
 type MaterializedReadBatchesFut =
     futures::future::BoxFuture<'static, Result<Vec<MaterializedBlobBatch>>>;
-type FragmentChunk = (Arc<OpenedFragmentRead>, ReadChunk);
-type FragmentChunkStream = BoxStream<'static, Result<FragmentChunk>>;
-
-/// The chunks of a budgeted read that its partitions take from.
-struct SharedChunks {
-    chunks: Arc<ChunkQueue>,
-    scan_budget: ScanBudget,
-    /// Chunks each partition reads ahead: the scan's read-ahead split among
-    /// its partitions.
-    readahead: usize,
-}
-
-/// The chunks of a budgeted read, shared by its partitions through a bounded
-/// channel, so a partition whose consumer stops polling holds no lock the
-/// others need.
-struct ChunkQueue {
-    receiver: async_channel::Receiver<Result<FragmentChunk>>,
-    /// The chunks and their sender, until the first partition starts the
-    /// producer task; the read is planned outside a runtime.
-    unstarted: std::sync::Mutex<
-        Option<(
-            FragmentChunkStream,
-            async_channel::Sender<Result<FragmentChunk>>,
-        )>,
-    >,
-    producer: std::sync::OnceLock<SpawnedTask<()>>,
-}
-
-impl ChunkQueue {
-    fn new(chunks: FragmentChunkStream, capacity: usize) -> Arc<Self> {
-        let (sender, receiver) = async_channel::bounded(capacity.max(1));
-        Arc::new(Self {
-            receiver,
-            unstarted: std::sync::Mutex::new(Some((chunks, sender))),
-            producer: Default::default(),
-        })
-    }
-
-    /// The next chunk, or `None` once the read has none left. Shaped for
-    /// [`futures::stream::unfold`].
-    async fn pop(self: Arc<Self>) -> Option<(Result<FragmentChunk>, Arc<Self>)> {
-        if let Some((mut chunks, sender)) = self.unstarted.lock().unwrap().take() {
-            let _ = self.producer.set(SpawnedTask::spawn(async move {
-                while let Some(chunk) = chunks.next().await {
-                    if sender.send(chunk).await.is_err() {
-                        return;
-                    }
-                }
-            }));
-        }
-        let chunk = self.receiver.recv().await.ok()?;
-        Some((chunk, self))
-    }
-}
-
 fn public_blob_v2_binary_projection_schema(projection: &Projection) -> SchemaRef {
     let schema = projection.to_schema();
     let schema = crate::dataset::blob::public_blob_v2_binary_output_schema(&schema);
@@ -558,6 +507,7 @@ impl OpenedFragmentRead {
                 let fragment_counted = fragment_counted.clone();
                 let range_tracker = range_tracker.clone();
                 let decoded_budget = chunk_budget.clone();
+                let output_budget = chunk_budget.clone();
                 let batch_fut = batch_fut
                     .inspect_ok(move |batch| {
                         if let Some(chunk_budget) = &decoded_budget {
@@ -575,6 +525,12 @@ impl OpenedFragmentRead {
                                 range_tracker.incremental_ranges_scanned(num_rows);
                             global_metrics.ranges_scanned.add(additional_ranges);
                         }
+                    })
+                    .and_then(move |batch| {
+                        future::ready(match output_budget {
+                            Some(budget) => budget.retain_output(batch),
+                            None => Ok(batch),
+                        })
                     })
                     .boxed();
                 if materialize_blob_v2_binary {
@@ -833,6 +789,12 @@ impl FilteredReadStream {
     ) -> Result<Self> {
         let scan_scheduler =
             scan_scheduler.unwrap_or_else(|| Self::make_scan_scheduler(&dataset, &options));
+        let scan_scheduler =
+            if let Some(pool) = scan_budget.as_ref().and_then(ScanBudget::memory_reserver) {
+                scan_scheduler.with_memory_reserver(pool)?
+            } else {
+                scan_scheduler
+            };
         let base_schedulers =
             base_schedulers.unwrap_or_else(|| Self::make_base_schedulers(&options));
         let threading_mode = options.threading_mode;
@@ -1880,142 +1842,6 @@ impl FilteredReadStream {
                 Box::pin(RecordBatchStreamAdapter::new(output_schema, batch_stream))
             }
         }
-    }
-
-    /// Opens the fragments and splits each one's ranges into chunks of about
-    /// `chunk_size` of memory.
-    #[allow(clippy::too_many_arguments)]
-    fn budgeted_chunk_stream(
-        dataset: Arc<Dataset>,
-        scoped_fragments: Vec<ScopedFragmentRead>,
-        global_metrics: Arc<FilteredReadGlobalMetrics>,
-        fragment_soft_limit: Option<u64>,
-        materialization_context: Arc<BlobMaterializationContext>,
-        materialize_blob_v2_binary: bool,
-        readahead: usize,
-        chunk_size: ChunkSize,
-    ) -> FragmentChunkStream {
-        futures::stream::iter(scoped_fragments)
-            .map(move |scoped_fragment| {
-                let chunk_size = chunk_size.clone();
-                let open = Self::open_fragment(
-                    dataset.clone(),
-                    scoped_fragment,
-                    global_metrics.clone(),
-                    fragment_soft_limit,
-                    materialization_context.clone(),
-                    materialize_blob_v2_binary,
-                );
-                SpawnedTask::spawn(
-                    async move {
-                        let fragment = open.await?;
-                        let chunks = fragment.plan_chunks(&chunk_size).await?;
-                        Ok::<_, Error>(futures::stream::iter(
-                            chunks
-                                .into_iter()
-                                .map(move |chunk| Ok((fragment.clone(), chunk))),
-                        ))
-                    }
-                    .in_current_span(),
-                )
-                .map(|thread_result| thread_result.unwrap())
-            })
-            .buffered(readahead)
-            .try_flatten()
-            .boxed()
-    }
-
-    /// Reads a chunk once the budget admits it, in its own task so chunks are
-    /// set up in parallel.
-    fn read_budgeted_chunk(
-        admission: ChunkAdmission,
-        chunk: Result<FragmentChunk>,
-    ) -> impl Future<Output = Result<BoxStream<'static, Result<MaterializedReadBatchesFut>>>> {
-        let read = async move {
-            let (fragment, chunk) = chunk?;
-            if fragment.reached_soft_limit() {
-                return Ok::<_, Error>(futures::stream::empty().boxed());
-            }
-            let chunk_budget = admission.reserve(chunk.rows(), chunk.estimate).await?;
-            fragment.read_ranges(chunk.ranges, Some(chunk_budget)).await
-        };
-        SpawnedTask::spawn(read.in_current_span()).map(|thread_result| thread_result.unwrap())
-    }
-
-    /// Reads the chunks with up to `readahead` of them admitted ahead, taking
-    /// admissions in the order the scan consumes the chunks.
-    fn budgeted_task_stream(
-        chunks: FragmentChunkStream,
-        readahead: usize,
-        scan_budget: ScanBudget,
-    ) -> BoxStream<'static, Result<MaterializedReadBatchesFut>> {
-        chunks
-            .map(move |chunk| Self::read_budgeted_chunk(scan_budget.admission(), chunk))
-            .buffered(readahead)
-            .try_flatten()
-            .boxed()
-    }
-
-    /// One partition's tasks from the shared chunks, admitted with its own
-    /// reader since partitions are consumed independently.
-    fn partition_task_stream(
-        shared: &SharedChunks,
-    ) -> BoxStream<'static, Result<MaterializedReadBatchesFut>> {
-        let scan_budget = shared.scan_budget.sibling();
-        futures::stream::unfold(shared.chunks.clone(), ChunkQueue::pop)
-            .map(move |chunk| Self::read_budgeted_chunk(scan_budget.admission(), chunk))
-            .buffered(shared.readahead.max(1))
-            .try_flatten()
-            .boxed()
-    }
-
-    /// Reads the fragments under one reservation for the whole read, taken
-    /// before any of their pages are requested.
-    #[allow(clippy::too_many_arguments)]
-    fn budgeted_whole_read_stream(
-        dataset: Arc<Dataset>,
-        scoped_fragments: Vec<ScopedFragmentRead>,
-        global_metrics: Arc<FilteredReadGlobalMetrics>,
-        fragment_soft_limit: Option<u64>,
-        materialization_context: Arc<BlobMaterializationContext>,
-        materialize_blob_v2_binary: bool,
-        readahead: usize,
-        scan_budget: ScanBudget,
-    ) -> BoxStream<'static, Result<MaterializedReadBatchesFut>> {
-        let admission = scan_budget.admission();
-        futures::stream::once(async move {
-            let fragments: Vec<Arc<OpenedFragmentRead>> = futures::stream::iter(scoped_fragments)
-                .map(|scoped_fragment| {
-                    Self::open_fragment(
-                        dataset.clone(),
-                        scoped_fragment,
-                        global_metrics.clone(),
-                        fragment_soft_limit,
-                        materialization_context.clone(),
-                        materialize_blob_v2_binary,
-                    )
-                })
-                .buffered(readahead)
-                .try_collect()
-                .await?;
-            let (mut rows, mut estimate) = (0, ReadEstimate::default());
-            for fragment in &fragments {
-                rows += fragment.ranges.iter().map(|r| r.end - r.start).sum::<u64>();
-                estimate = estimate
-                    + fragment
-                        .reader
-                        .estimate_read(fragment.ranges.clone().into())
-                        .await?;
-            }
-            let chunk_budget = admission.reserve(rows, estimate).await?;
-            let reads = futures::future::try_join_all(fragments.iter().map(|fragment| {
-                fragment.read_ranges(fragment.ranges.clone(), Some(chunk_budget.clone()))
-            }))
-            .await?;
-            Ok::<_, Error>(futures::stream::iter(reads).flatten())
-        })
-        .try_flatten()
-        .boxed()
     }
 
     // Reads a single fragment into a stream of batch tasks
@@ -3396,6 +3222,18 @@ impl FilteredReadExec {
         );
 
         let stream = futures::stream::once(async move {
+            let resources =
+                lance_datafusion::resources::DataFusionMemoryReserver::from_context(&context)?;
+            if resources.is_some()
+                && (!single_partition
+                    || index_input.is_some()
+                    || options.full_filter.is_some()
+                    || options.refine_filter.is_some())
+            {
+                return Err(Error::not_supported(
+                    "accounted scans require a single-partition read without filters or index input",
+                ).into());
+            }
             let mut running_stream = running_stream_lock.lock().await;
             let inner = if let Some(running_stream) = &*running_stream {
                 running_stream.get_stream(&metrics, partition)
@@ -3416,6 +3254,23 @@ impl FilteredReadExec {
                         metrics.new_time(READ_BUDGET_WAIT_TIME_METRIC, partition),
                     )
                 });
+                let scan_budget = match (scan_budget, resources) {
+                    (Some(budget), Some(resources)) => {
+                        let schema = Arc::new(options.projection.to_arrow_schema());
+                        let batch_size = options.batch_size.map_or_else(
+                            || context.session_config().batch_size(),
+                            |rows| rows as usize,
+                        );
+                        Some(budget.with_resources(resources, schema, batch_size)?)
+                    }
+                    (budget, None) => budget,
+                    (None, Some(_)) => {
+                        return Err(Error::invalid_input(
+                            "accounted scan context requires a session read memory budget",
+                        )
+                        .into());
+                    }
+                };
                 let new_running_stream = FilteredReadStream::try_new(
                     dataset,
                     options,
