@@ -56,11 +56,17 @@ Decimal types support arbitrary-precision numeric values. The format is: `decima
 
 | Logical Type | Arrow Type | Precision | Example |
 |---|---|---|---|
+| `decimal:32:P:S` | `Decimal32` | Up to 9 digits | `decimal:32:9:2` |
+| `decimal:64:P:S` | `Decimal64` | Up to 18 digits | `decimal:64:18:4` |
 | `decimal:128:P:S` | `Decimal128` | Up to 38 digits | `decimal:128:10:2` (10 total digits, 2 after decimal) |
 | `decimal:256:P:S` | `Decimal256` | Up to 76 digits | `decimal:256:20:5` |
 
-- **Precision (P)**: Total number of digits (1-38 for Decimal128, up to 76 for Decimal256)
+- **Precision (P)**: Total number of digits (1-9 for Decimal32, 1-18 for Decimal64, 1-38 for Decimal128, up to 76 for Decimal256)
 - **Scale (S)**: Number of digits after the decimal point (0 ≤ S ≤ P)
+
+`decimal:32` and `decimal:64` require data storage version 2.3 or later. Lance releases that predate
+them cannot parse these logical types, so a dataset with an earlier data storage version must not
+contain a field of either type, at any nesting depth.
 
 ### Date and Time Types
 
@@ -550,6 +556,8 @@ When converting between logical types and Arrow types, Lance uses the following 
 | `Arrow::LargeUtf8` | `large_string` |
 | `Arrow::Binary`, `Arrow::BinaryView` | `binary` |
 | `Arrow::LargeBinary` | `large_binary` |
+| `Arrow::Decimal32(p, s)` | `decimal:32:p:s` |
+| `Arrow::Decimal64(p, s)` | `decimal:64:p:s` |
 | `Arrow::Decimal128(p, s)` | `decimal:128:p:s` |
 | `Arrow::Decimal256(p, s)` | `decimal:256:p:s` |
 | `Arrow::Date32` | `date32:day` |
