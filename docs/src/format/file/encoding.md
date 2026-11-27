@@ -56,7 +56,8 @@ scheduling so that compression libraries can focus on compression. This keeps ou
 without sacrificing our ability to perform random access.
 
 Lance 2.1 and 2.2 describe structural encodings with `lance.encodings21.PageLayout`.
-Their protobuf schema contains only stable layouts and codecs; sparse planes, Range, and Delta belong to 2.3.
+Their protobuf schema contains only stable layouts and codecs.
+Sparse planes, Range, and MonotonicDelta belong to 2.3.
 Lance 2.3 uses the independent planes described in [Planar Page Layout](#planar-page-layout).
 
 ```protobuf
@@ -336,8 +337,8 @@ is not supported. Lance 2.0, 2.1, and 2.2 retain their original metadata and phy
 
 `encodings_v2_3.proto` defines the complete 2.3 metadata grammar, including the recursive
 `lance.encodings23.CompressiveEncoding` tree and repetition/definition layer interpretations.
-It does not import the stable `encodings_v2_1.proto`. Range, Delta, generic variable-width offsets,
-and generic unsigned sequence compositions belong to 2.3. The stable `lance.encodings21` package
+It does not import the stable `encodings_v2_1.proto`. Range, MonotonicDelta, generic variable-width
+offsets, and generic unsigned sequence compositions belong to 2.3. The stable `lance.encodings21` package
 contains only the 2.1/2.2 grammar; matching codec names across packages do not imply that their
 allowed compositions are interchangeable.
 
@@ -606,8 +607,8 @@ free to pretend that the fixed-size list data type does not exist.
 
 ## Compression
 
-Generic block compression (including Range, Delta, block dictionary compositions and generic mini-block
-offsets) belongs to the **unstable Lance 2.3** file format. It is not part of the stable 2.0, 2.1 or 2.2
+Generic block compression (including Range, MonotonicDelta, block dictionary compositions and generic
+mini-block offsets) belongs to the **unstable Lance 2.3** file format. It is not part of the stable 2.0, 2.1 or 2.2
 contracts. The complete 2.3 format will undergo a consolidated format vote when it is proposed for stable
 status; intermediate unstable revisions do not establish compatibility requirements.
 
@@ -630,7 +631,7 @@ on a per-value basis. We use ☑️ to mark a technique that is applied on a per
 | Variable        | ✅ (2.1)              | ✅ (2.1)                 | ✅ (2.1)                   |
 | Constant        | ✅ (2.1)              | ❓                       | ❓                         |
 | Range           | ✅ (2.3)              | ❌                       | ❌                         |
-| Delta           | ✅ (2.3)              | ❌                       | ❌                         |
+| MonotonicDelta  | ✅ (2.3)              | ❌                       | ❌                         |
 | Dictionary      | ✅ (2.3)              | ❌                       | ❌                         |
 | Bitpacking      | ✅ (2.1)              | ❓                       | ✅ (2.1)                   |
 | Fsst            | ❓                    | ✅ (2.1)                 | ✅ (2.1)                   |
@@ -703,21 +704,21 @@ child grammar and payload framing; the container defines the meaning and constra
 
 An empty sequence uses `Constant` with an absent scalar and no payload. Non-empty `Constant` stores one little-endian
 scalar of the declared width. `Range` and other metadata-only expressions consume no payload, including
-`Delta(Constant)`. Each payload-bearing root consumes exactly one buffer; RLE and dictionary roots frame their
-children inside that buffer. These rules apply to both variable-width offsets and sparse structural sequences.
+`MonotonicDelta(Constant)`. Each payload-bearing root consumes exactly one buffer. RLE and dictionary roots frame
+their children inside that buffer. These rules apply to both variable-width offsets and sparse structural sequences.
 
 The generic fixed-width decoder accepts one composite root at most:
 
 ```text
 generic unsigned block root
 ├── leaf: Flat, Constant, Range, InlineBitpacking, OutOfLineBitpacking
-├── Delta(leaf)
+├── MonotonicDelta(leaf)
 ├── General(Flat)
 ├── Rle(values=leaf, run_lengths=u32 leaf)
 └── Dictionary(indices=u32 leaf, items=sequence-width leaf)
 ```
 
-`Delta` decodes `num_values - 1` child values. RLE children have the same run cardinality, all run lengths are
+`MonotonicDelta` decodes `num_values - 1` child values. RLE children have the same run cardinality, all run lengths are
 positive, and their checked sum equals `num_values`. Dictionary indices have `num_values` entries and every index
 is less than the declared dictionary item count. General compression must decode exactly the byte length implied by
 the containing cardinality and sequence width. Readers reject missing children, incompatible widths, unsupported
@@ -736,17 +737,17 @@ value and a positive step; the containing block supplies the number of values. R
 `start + step * i` and reject invalid widths or arithmetic overflow.
 
 ```protobuf
-%%% proto.message.Range %%%
+--8<-- "protos/encodings_v2_3.proto:encoding-range"
 ```
 
-### Delta
+### MonotonicDelta
 
-Delta encodes a non-decreasing unsigned `u32` or `u64` sequence as its first value and the `n - 1` adjacent
-differences. The differences are represented by a child block codec. Delta has a payload exactly when its child
-has one, and readers reconstruct values with checked prefix sums.
+MonotonicDelta encodes a non-decreasing unsigned `u32` or `u64` sequence as its first value and the `n - 1`
+adjacent differences. A child block codec represents those differences. MonotonicDelta has a payload exactly
+when its child has one. Readers reconstruct values with checked prefix sums.
 
 ```protobuf
-%%% proto.message.Delta %%%
+%%% proto.message.MonotonicDelta %%%
 ```
 
 ### Block Dictionary
