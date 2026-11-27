@@ -936,8 +936,8 @@ to `k - 1`) occupies bits `r * w` to `(r + 1) * w - 1`. Row `r` of lane `l` hold
 `O[r / 8] * 16 + (r % 8) * 128 + l`, where `O = [0, 4, 2, 6, 1, 5, 3, 7]`. When `w = k` the block is still this
 permutation of the values, not a plain copy. A block with `w = 0` is empty.
 
-A standalone `InlineBitpacking` buffer holds at most 1024 values. It is one word of the
-uncompressed width holding `w`, little-endian, followed by one packed block; for 128-bit values the header is 16 bytes
+A standalone `InlineBitpacking` buffer holds at most 1024 values. It starts with one little-endian word of the
+uncompressed width holding `w`, followed by one packed block. For 128-bit values the header is 16 bytes
 and `w` is from 0 to 128. Each chunk has its own `w`. A buffer of fewer than 1024 values is zero-padded to 1024 before
 packing, and readers keep the leading values. A buffer that holds no values (`num_values = 0`) is 0 bytes, with no
 header, and readers return no values without reading it. `InlineBitpacking.values` must be absent. Readers reject a
@@ -997,12 +997,12 @@ own reconstruction parameters.
 
 #### ALP Chunk Framing
 
-A standalone ALP chunk has four value buffers, so `ChunkedValues.num_buffers` is `4`. Their lengths use the `u32` mini-block
-framing of the [planar page layout](#planar-page-layout). The outer chunk header starts with a little-endian `u16`
-level count, followed by a little-endian `u16` byte length for each present repetition and definition stream in
-that order, then four little-endian `u32` value buffer lengths. The buffers follow in the same order. Sparse
-chunks write zero for the level count, then the four value lengths. The writer aligns the end of the outer
-header and of each buffer to 8 bytes using `0xFE`. The declared lengths exclude that alignment padding. Empty
+A standalone ALP chunk has four value buffers, so `ChunkedValues.num_buffers` is `4`. Their lengths use the
+`u32` mini-block framing of the [planar page layout](#planar-page-layout). The outer chunk header starts with a
+little-endian `u16` level count, followed by a little-endian `u16` byte length for each present repetition and
+definition stream in that order, then four little-endian `u32` value buffer lengths. The buffers follow in the
+same order. Sparse chunks write zero for the level count, then the four value lengths. The writer aligns the
+end of the outer header and of each buffer to 8 bytes using `0xFE`. The declared lengths exclude that alignment padding. Empty
 value buffers still have a length entry. When `General` wraps `Alp`, decompress value buffer 0 with the declared
 general codec before interpreting its ALP contents.
 
@@ -1013,8 +1013,9 @@ they must agree with that count. The page total comes from `ChunkedValues.num_it
 terminal slot domain for sparse pages. The standalone ALP writer emits 1024 values per chunk, with a shorter final
 chunk if needed. It writes `10` for a full chunk and `0` for the shorter final chunk.
 
-For a fixed-size list leaf, the four ALP buffers follow the child validity buffers, and `n` is the flattened
-item count for the chunk. See [Fixed-Size List Values](#fixed-size-list-values).
+For a [fixed-size list leaf](#fixed-size-list-values), the chunk metadata counts whole list values, and the four
+ALP buffers follow any child validity buffers. In the ALP reconstruction below, `n` counts the flattened leaf
+items in the chunk.
 
 The reader rejects a mismatched declared buffer count, truncated outer chunk headers, and buffers that extend
 past the chunk boundary. The chunk lengths must sum to the size of the page's chunk data buffer. A zero-value
