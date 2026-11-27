@@ -579,10 +579,9 @@ mod float_miniblocks {
 
     fn float_array(
         data_type: &DataType,
-        num_rows: usize,
         dimension: usize,
         first_edge_row: usize,
-        offset: usize,
+        ordinary_values: impl Iterator<Item = f32>,
         [nan_payload, subnormal]: [u64; 2],
         validity: Option<NullBuffer>,
     ) -> ArrayRef {
@@ -606,11 +605,7 @@ mod float_miniblocks {
             sign_bit | subnormal,
         ];
 
-        // The ordinary values have low byte-position entropy and are exactly
-        // representable as decimals, so ALP can retain the page with exceptions.
-        let mut bits: Vec<_> = (0..num_rows * dimension)
-            .map(|i| to_bits((offset + i % 2048) as f32 / 4.0))
-            .collect();
+        let mut bits: Vec<_> = ordinary_values.map(to_bits).collect();
         for (i, value) in edge_values.into_iter().enumerate() {
             bits[(first_edge_row + i) * dimension + i % dimension] = value;
         }
@@ -645,6 +640,7 @@ mod float_miniblocks {
         dimension: usize,
         has_null_items: bool,
         is_sparse: bool,
+        value_step: f32,
         mut metadata: HashMap<String, String>,
         verify_compression: impl Fn(&Compression) -> bool + 'static,
     ) {
@@ -705,9 +701,8 @@ mod float_miniblocks {
                 &strategy,
                 |(num_rows, first_edge_row, nulls_per_eight, offset, seeds)| {
                     let edge_rows = first_edge_row..first_edge_row + NUM_EDGE_VALUES;
-                    // Keep the next row null so planar validity is nontrivial
-                    // even if the generated null pattern contributes no nulls.
-                    // The range and take below both include this row.
+                    // Place a null right after the edge values so the range
+                    // and take both read it at every generated null density.
                     let row_validity = NullBuffer::from_iter((0..num_rows).map(|row| {
                         edge_rows.contains(&row)
                             || (row != edge_rows.end && row % 8 >= nulls_per_eight)
@@ -722,12 +717,13 @@ mod float_miniblocks {
                         });
                         (item_validity, Some(row_validity))
                     };
+                    let ordinary_values =
+                        (0..num_rows * dimension).map(|i| (offset + i % 2048) as f32 * value_step);
                     let values = float_array(
                         &data_type,
-                        num_rows,
                         dimension,
                         first_edge_row,
-                        offset,
+                        ordinary_values,
                         seeds,
                         item_validity,
                     );
@@ -767,9 +763,17 @@ mod float_miniblocks {
     #[case::dense_f64(DataType::Float64, false)]
     #[case::sparse_f64(DataType::Float64, true)]
     fn alp(#[case] data_type: DataType, #[case] is_sparse: bool) {
-        check_float_miniblocks(data_type, 1, false, is_sparse, HashMap::new(), |codec| {
-            matches!(codec, Compression::Alp(_))
-        });
+        // Half steps fit the smallest decimal scale ALP tries, even when the
+        // strided sample contains only integers.
+        check_float_miniblocks(
+            data_type,
+            1,
+            false,
+            is_sparse,
+            0.5,
+            HashMap::new(),
+            |codec| matches!(codec, Compression::Alp(_)),
+        );
     }
 
     #[cfg(feature = "pcodec")]
@@ -789,6 +793,7 @@ mod float_miniblocks {
             dimension,
             has_null_items,
             true,
+            0.25,
             metadata,
             move |codec| {
                 if has_null_items {
