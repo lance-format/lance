@@ -141,12 +141,9 @@ impl DatasetDeltaBuilder {
 
     /// Set the beginning timestamp for the delta (exclusive).
     ///
-    /// The boundary is the latest version whose commit time, truncated to
-    /// microseconds, is at or before `timestamp`; that version is excluded.
-    /// A timestamp floored to microseconds — the precision Python
-    /// `versions()` exposes — therefore names that commit rather than the
-    /// one before it. Commits that share a microsecond are one boundary, the
-    /// later version, so this start skips all of them.
+    /// The boundary is the latest version whose commit time is strictly before
+    /// `timestamp`. Comparison uses the full [`DateTime<Utc>`], including
+    /// sub-microsecond digits stored on the manifest.
     ///
     /// Must be used together with `with_end_date`.
     /// Cannot be used together with `compared_against_version` or explicit version range.
@@ -157,11 +154,8 @@ impl DatasetDeltaBuilder {
 
     /// Set the ending timestamp for the delta (inclusive).
     ///
-    /// The boundary is the latest version whose commit time, truncated to
-    /// microseconds, is at or before `timestamp`; that version is included.
-    /// Flooring a commit's nanoseconds to microseconds still includes that
-    /// commit. Commits that share a microsecond are one boundary, the later
-    /// version, so this end keeps all of them.
+    /// The boundary is the latest version whose commit time is at or before
+    /// `timestamp`, compared at full [`DateTime<Utc>`] precision.
     ///
     /// Must be used together with `with_begin_date`.
     /// Cannot be used together with `compared_against_version` or explicit version range.
@@ -244,32 +238,37 @@ impl DatasetDeltaBuilder {
     }
 }
 
-/// Floor a commit timestamp to microseconds.
-///
-/// Python `datetime` cannot represent the nanoseconds a manifest stores.
-/// `versions()` / `get_version()` floor those nanoseconds, and passing the
-/// result back into a date window must name the same commit.
-fn truncate_to_micros(ts: DateTime<Utc>) -> DateTime<Utc> {
+/// Floor to the microsecond a Python `datetime` can store.
+fn floor_to_microsecond(ts: DateTime<Utc>) -> DateTime<Utc> {
     let remainder_ns = i64::from(ts.timestamp_subsec_nanos() % 1_000);
     ts - TimeDelta::nanoseconds(remainder_ns)
 }
 
-/// Latest version whose commit time, truncated to microseconds, is at or
-/// before `bound`.
+/// Exclusive-begin bound for a microsecond-precision caller.
 ///
-/// Returns 0 when every commit is later. That is the empty snapshot, not a
-/// real version. Several commits in one microsecond collapse to the later
-/// version: an exclusive begin then skips all of them, and an inclusive end
-/// keeps all of them.
-fn latest_version_at_or_before_micros(versions: &[super::Version], bound: DateTime<Utc>) -> u64 {
-    let bound_us = truncate_to_micros(bound);
-    let mut version = 0;
-    for candidate in versions {
-        if truncate_to_micros(candidate.timestamp) <= bound_us && candidate.version > version {
-            version = candidate.version;
-        }
-    }
-    version
+/// [`DatasetDelta`] compares full nanosecond timestamps and does not call this.
+/// Python `datetime` only has microseconds, and `versions()` / `get_version()`
+/// floor the manifest time to that. One microsecond past the floored value is
+/// strictly after every commit in the bucket, so the resolver's strictly-before
+/// comparison selects the later of those commits and the exclusive start drops
+/// the whole bucket.
+#[doc(hidden)]
+pub fn exclusive_begin_for_microsecond(timestamp: DateTime<Utc>) -> DateTime<Utc> {
+    floor_to_microsecond(timestamp)
+        .checked_add_signed(TimeDelta::microseconds(1))
+        .expect("microsecond bucket stays inside DateTime<Utc>")
+}
+
+/// Inclusive-end bound for a microsecond-precision caller.
+///
+/// [`DatasetDelta`] compares full nanosecond timestamps and does not call this.
+/// One nanosecond before the next microsecond includes every commit in this
+/// one and excludes a commit that lands on the following microsecond.
+#[doc(hidden)]
+pub fn inclusive_end_for_microsecond(timestamp: DateTime<Utc>) -> DateTime<Utc> {
+    exclusive_begin_for_microsecond(timestamp)
+        .checked_sub_signed(TimeDelta::nanoseconds(1))
+        .expect("one nanosecond before the next microsecond stays in range")
 }
 
 /// APIs for exploring changes between two versions of a dataset.
@@ -294,32 +293,41 @@ enum RowChange {
 impl DatasetDelta {
     /// Resolve the effective version range for this delta.
     ///
-    /// Date windows are resolved at microsecond precision. Manifest timestamps
-    /// keep nanoseconds, and a caller that floors them (Python `datetime`)
-    /// must still select the same version. Comparing the raw nanoseconds
-    /// treats that floored value as strictly earlier, so the exclusive begin
-    /// lands on the previous version — version 0 when the commit is the first,
-    /// whose deletion stream is empty — and the inclusive end drops the commit.
+    /// If a date window is set (`begin_timestamp` and `end_timestamp` provided), this lazily
+    /// maps timestamps to version ids by scanning dataset versions. Both comparisons use the
+    /// full timestamp, including sub-microsecond digits. Commit times and the caller's bound
+    /// are not floored here:
+    /// - Begin is exclusive: pick the greatest version with `timestamp < begin_timestamp`.
+    /// - End is inclusive:  pick the greatest version with `timestamp <= end_timestamp`.
     ///
-    /// Both bounds are the latest version whose truncated timestamp is at or
-    /// before the given microsecond. The begin version is excluded and the end
-    /// version is included. Commits that share a microsecond cannot be split:
-    /// the later version is the boundary, so an exclusive begin skips every
-    /// commit in that microsecond and an inclusive end keeps every commit in it.
-    ///
-    /// If no date window is set, returns the explicit `begin_version`/`end_version`
-    /// stored on the struct.
+    /// If no date window is set, returns the explicit `begin_version`/`end_version` stored on
+    /// the struct.
     async fn resolve_range(&self) -> Result<(u64, u64)> {
         if let (Some(begin_ts), Some(end_ts)) = (self.begin_timestamp, self.end_timestamp) {
+            // Load all dataset versions and fold them to a version interval matching the date window
             let versions = self.base_dataset.versions().await?;
-            Ok((
-                latest_version_at_or_before_micros(&versions, begin_ts),
-                latest_version_at_or_before_micros(&versions, end_ts),
-            ))
+            let mut begin_version: u64 = 0;
+            let mut end_version: u64 = 0;
+            for v in &versions {
+                // Exclusive begin: track the largest version strictly before begin_ts
+                if v.timestamp < begin_ts && v.version > begin_version {
+                    begin_version = v.version;
+                }
+                // Inclusive end: track the largest version at or before end_ts
+                if v.timestamp <= end_ts && v.version > end_version {
+                    end_version = v.version;
+                }
+            }
+            Ok((begin_version, end_version))
         } else if let (Some(begin_ts), None) = (self.begin_timestamp, self.end_timestamp) {
             // Open-ended range: use latest version as end
             let versions = self.base_dataset.versions().await?;
-            let begin_version = latest_version_at_or_before_micros(&versions, begin_ts);
+            let mut begin_version: u64 = 0;
+            for v in &versions {
+                if v.timestamp < begin_ts && v.version > begin_version {
+                    begin_version = v.version;
+                }
+            }
             let end_version = self.base_dataset.latest_version_id().await?;
             Ok((begin_version, end_version))
         } else {
@@ -2888,13 +2896,13 @@ mod tests {
         );
     }
 
-    /// Python floors manifest nanoseconds to microseconds. Passing those
-    /// floored values back must select the same versions: exclusive begin
-    /// excludes the start commit, inclusive end includes the end commit.
-    /// 187ns and 297ns are remainders that used to select the previous
-    /// version, including version 0, whose deletion stream is empty.
+    /// Full-precision bounds follow the manifest timestamp, nanoseconds
+    /// included. An exclusive begin at v2's own timestamp selects v1, and an
+    /// inclusive end at v3's own timestamp keeps the delete. Version 4 stays
+    /// past that end. 187ns and 297ns are remainders a floored comparison
+    /// would have discarded.
     #[tokio::test]
-    async fn test_floored_microsecond_timestamp_round_trips_to_the_same_version() {
+    async fn test_full_precision_timestamp_bounds_select_the_version_range() {
         let dir = lance_core::utils::tempfile::TempStrDir::default();
         MockClock::set_system_time(std::time::Duration::new(1_700_000_000, 187));
         let data = lance_datagen::gen_batch()
@@ -2939,10 +2947,10 @@ mod tests {
         let versions = ds.versions().await.unwrap();
         assert_eq!(versions[0].timestamp.timestamp_subsec_nanos(), 187);
         assert_eq!(versions[1].timestamp.timestamp_subsec_nanos(), 297);
-        let begin = super::truncate_to_micros(versions[0].timestamp);
-        let end = super::truncate_to_micros(versions[2].timestamp);
-        assert_ne!(begin, versions[0].timestamp);
-        assert_ne!(end, versions[2].timestamp);
+        assert_eq!(versions[2].timestamp.timestamp_subsec_nanos(), 50);
+        // v2's own timestamp is strictly after v1, so the exclusive start is v1.
+        let begin = versions[1].timestamp;
+        let end = versions[2].timestamp;
 
         let delta = ds
             .delta()
@@ -2960,14 +2968,15 @@ mod tests {
         assert_eq!(
             collect_deleted(&delta).await,
             vec![1],
-            "a floored begin must not resolve to version 0, which reports no deletions"
+            "version 1 is the exclusive start, so its deleted row is reported"
         );
     }
 
-    /// Two commits in one microsecond are indistinguishable once the timestamp
-    /// is floored. The later version is the boundary for both ends.
+    /// v1 at 10s+100ns and v2 at 10s+900ns share a microsecond. A full
+    /// `DateTime<Utc>` bound between them splits the commits. The microsecond
+    /// bucket Python passes still groups them.
     #[tokio::test]
-    async fn test_commits_sharing_a_microsecond_share_one_date_boundary() {
+    async fn test_submicrosecond_midpoint_splits_commits_python_groups() {
         let dir = lance_core::utils::tempfile::TempStrDir::default();
         MockClock::set_system_time(std::time::Duration::new(10, 100));
         let _v1 = write_dataset_temp(&dir, 1, 1, 1, "v1", true, false).await;
@@ -2978,13 +2987,9 @@ mod tests {
         assert_eq!(ds.version().version, 3);
 
         let versions = ds.versions().await.unwrap();
-        assert_eq!(
-            super::truncate_to_micros(versions[0].timestamp),
-            super::truncate_to_micros(versions[1].timestamp)
-        );
-        let shared = chrono::DateTime::<chrono::Utc>::from_timestamp(10, 0).unwrap();
-        let before = chrono::DateTime::<chrono::Utc>::from_timestamp(9, 0).unwrap();
-        let after = chrono::DateTime::<chrono::Utc>::from_timestamp(11, 0).unwrap();
+        assert_eq!(versions[0].timestamp.timestamp_subsec_nanos(), 100);
+        assert_eq!(versions[1].timestamp.timestamp_subsec_nanos(), 900);
+        assert_eq!(versions[2].timestamp.timestamp_subsec_nanos(), 0);
 
         let keys_of = |delta: super::DatasetDelta| async move {
             let batch = collect_stream(delta.get_inserted_rows().await.unwrap()).await;
@@ -2993,23 +2998,61 @@ mod tests {
             keys
         };
 
-        // Exclusive begin at the shared microsecond skips both commits.
-        let skipped = ds
-            .delta()
-            .with_begin_date(shared)
-            .with_end_date(after)
-            .build()
-            .unwrap();
-        assert_eq!(keys_of(skipped).await, vec![3]);
+        let before = chrono::DateTime::<chrono::Utc>::from_timestamp(9, 0).unwrap();
+        let midpoint = chrono::DateTime::<chrono::Utc>::from_timestamp(10, 500).unwrap();
+        let v2_at = versions[1].timestamp;
 
-        // Inclusive end at the shared microsecond keeps both commits.
-        let kept = ds
+        // Inclusive end at 10s+500ns is after v1 and before v2.
+        let ended = ds
             .delta()
             .with_begin_date(before)
-            .with_end_date(shared)
+            .with_end_date(midpoint)
             .build()
             .unwrap();
-        assert_eq!(keys_of(kept).await, vec![1, 2]);
+        assert_eq!(
+            keys_of(ended).await,
+            vec![1],
+            "inclusive end at 10s+500ns returns only v1"
+        );
+
+        // Exclusive start at 10s+500ns is after v1, so v2 stays in the window.
+        let started = ds
+            .delta()
+            .with_begin_date(midpoint)
+            .with_end_date(v2_at)
+            .build()
+            .unwrap();
+        assert_eq!(
+            keys_of(started).await,
+            vec![2],
+            "exclusive start at 10s+500ns includes v2"
+        );
+
+        // The datetime Python would pass for this shared microsecond.
+        let shared = chrono::DateTime::<chrono::Utc>::from_timestamp(10, 0).unwrap();
+        let after = chrono::DateTime::<chrono::Utc>::from_timestamp(11, 0).unwrap();
+        let skipped = ds
+            .delta()
+            .with_begin_date(super::exclusive_begin_for_microsecond(shared))
+            .with_end_date(super::inclusive_end_for_microsecond(after))
+            .build()
+            .unwrap();
+        assert_eq!(
+            keys_of(skipped).await,
+            vec![3],
+            "a microsecond begin skips both commits in that microsecond"
+        );
+        let kept = ds
+            .delta()
+            .with_begin_date(super::exclusive_begin_for_microsecond(before))
+            .with_end_date(super::inclusive_end_for_microsecond(shared))
+            .build()
+            .unwrap();
+        assert_eq!(
+            keys_of(kept).await,
+            vec![1, 2],
+            "a microsecond end keeps both commits in that microsecond"
+        );
     }
 
     /// Unchanged shared fragments appear nowhere; changed ones on both

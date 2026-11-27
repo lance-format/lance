@@ -87,6 +87,8 @@ class _DatasetDeltaBuilder:
         return self
 
     def with_begin_date(self, timestamp: datetime) -> "_DatasetDeltaBuilder":
+        # `_as_utc` yields a microsecond datetime. The extension then covers
+        # that whole microsecond before the full-precision Rust comparison.
         self._builder = self._builder.with_begin_date(_as_utc(timestamp))
         return self
 

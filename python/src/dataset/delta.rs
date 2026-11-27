@@ -122,6 +122,10 @@ impl DatasetDeltaBuilder {
 
     #[pyo3(signature = (timestamp))]
     fn with_begin_date(&self, timestamp: DateTime<Utc>) -> Self {
+        // Python datetime is microseconds. Map that bucket onto the
+        // full-precision resolver before calling it: the next microsecond is
+        // the exclusive start, so every commit in this one is dropped.
+        let timestamp = lance::dataset::delta::exclusive_begin_for_microsecond(timestamp);
         Self {
             builder: self.builder.clone().with_begin_date(timestamp),
         }
@@ -129,6 +133,9 @@ impl DatasetDeltaBuilder {
 
     #[pyo3(signature = (timestamp))]
     fn with_end_date(&self, timestamp: DateTime<Utc>) -> Self {
+        // One nanosecond before the next microsecond keeps every commit in
+        // this one. Python datetime cannot represent that nanosecond.
+        let timestamp = lance::dataset::delta::inclusive_end_for_microsecond(timestamp);
         Self {
             builder: self.builder.clone().with_end_date(timestamp),
         }

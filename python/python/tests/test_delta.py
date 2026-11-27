@@ -434,3 +434,56 @@ def test_delta_exposed_version_timestamps_round_trip(tmp_path):
     by_version = ds.delta(begin_version=1, end_version=3)
     assert by_version.get_inserted_rows().read_all()["id"].to_pylist() == inserted
     assert by_version.get_deleted_row_ids().read_all()["_rowid"].to_pylist() == deleted
+
+
+def test_delta_groups_commits_that_share_a_microsecond(tmp_path):
+    """Commits versions() reports at one timestamp are a single boundary.
+
+    An exclusive begin skips every commit in that microsecond. An inclusive
+    end keeps every one of them. Expected ids are that group, so a second
+    commit sharing the microsecond cannot leak past the end or survive the
+    begin.
+    """
+    uri = tmp_path / "delta.lance"
+    ds = write_dataset(pa.table({"id": [1]}), uri, enable_stable_row_ids=True)
+    ds.insert(pa.table({"id": [2]}))
+    _wait_until_after(ds.get_version()["timestamp"])
+    ds.insert(pa.table({"id": [3]}))
+    assert ds.version == 3
+
+    written = {1: 1, 2: 2, 3: 3}
+    order = []
+    groups = {}
+    for entry in ds.versions():
+        stamp = entry["timestamp"]
+        assert stamp.tzinfo is None
+        if stamp not in groups:
+            order.append(stamp)
+            groups[stamp] = []
+        groups[stamp].append(entry["version"])
+    assert order[-1] > order[0]
+
+    def ids_of(versions):
+        return [written[version] for version in versions]
+
+    shared = order[0]
+    after = order[-1]
+    before = shared - timedelta(seconds=1)
+    first = groups[shared]
+    later = [version for stamp in order[1:] for version in groups[stamp]]
+
+    skipped = (
+        ds.delta(begin_date=shared, end_date=after)
+        .get_inserted_rows()
+        .read_all()["id"]
+        .to_pylist()
+    )
+    assert skipped == ids_of(later)
+
+    kept = (
+        ds.delta(begin_date=before, end_date=shared)
+        .get_inserted_rows()
+        .read_all()["id"]
+        .to_pylist()
+    )
+    assert kept == ids_of(first)
