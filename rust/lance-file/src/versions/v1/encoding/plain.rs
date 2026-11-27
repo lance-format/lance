@@ -7,7 +7,6 @@
 //! it stores the array directly in the file. It offers O(1) read access.
 
 use std::ops::Range;
-use std::slice::from_raw_parts;
 use std::sync::Arc;
 
 use arrow_arith::numeric::sub;
@@ -101,15 +100,18 @@ impl<'a> PlainEncoder<'a> {
             self.encode_boolean(boolean_arr.as_slice()).await?;
         } else {
             let byte_width = data_type.byte_width();
-            for a in arrays.iter() {
+            for (i, a) in arrays.iter().enumerate() {
+                if a.data_type().byte_width_opt() != Some(byte_width) {
+                    return Err(Error::invalid_input(format!(
+                        "cannot plain-encode arrays of different widths: array {i} has data type {}, \
+                         but array 0 has {data_type} ({byte_width} bytes per value)",
+                        a.data_type()
+                    )));
+                }
                 let data = a.to_data();
-                let slice = unsafe {
-                    from_raw_parts(
-                        data.buffers()[0].as_ptr().add(a.offset() * byte_width),
-                        a.len() * byte_width,
-                    )
-                };
-                self.writer.write_all(slice).await?;
+                let start = a.offset() * byte_width;
+                let values = &data.buffers()[0].as_slice()[start..start + a.len() * byte_width];
+                self.writer.write_all(values).await?;
             }
         }
         Ok(offset)
@@ -450,6 +452,7 @@ mod tests {
     use lance_core::utils::tempfile::TempStdFile;
     use lance_io::local::LocalObjectReader;
     use rand::prelude::*;
+    use rstest::rstest;
 
     use super::*;
 
@@ -634,6 +637,34 @@ mod tests {
                 .build()
                 .unwrap(),
         )
+    }
+
+    #[rstest]
+    #[case::narrower_after_wider(
+        Arc::new(Int64Array::from(vec![1, 2, 3, 4])) as ArrayRef,
+        Arc::new(Int8Array::from(vec![1, 2, 3, 4])) as ArrayRef
+    )]
+    #[case::wider_after_narrower(
+        Arc::new(Int8Array::from(vec![1, 2, 3, 4])) as ArrayRef,
+        Arc::new(Int64Array::from(vec![1, 2, 3, 4])) as ArrayRef
+    )]
+    #[tokio::test]
+    async fn test_encode_rejects_mixed_widths(#[case] first: ArrayRef, #[case] second: ArrayRef) {
+        let path = TempStdFile::default();
+        let mut writer = tokio::fs::File::create(&path).await.unwrap();
+        let error = PlainEncoder::write(&mut writer, &[first.as_ref(), second.as_ref()])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, Error::InvalidInput { .. }),
+            "unexpected error: {error:?}"
+        );
+        let expected = format!(
+            "array 1 has data type {}, but array 0 has {}",
+            second.data_type(),
+            first.data_type()
+        );
+        assert!(error.to_string().contains(&expected), "{error}");
     }
 
     #[tokio::test]

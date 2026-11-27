@@ -6,7 +6,7 @@ use std::future::Future;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use arc_swap::ArcSwap;
-use arrow_schema::{DataType, Field};
+use arrow_schema::{DataType, Field, Fields};
 use async_trait::async_trait;
 use datafusion_execution::SendableRecordBatchStream;
 use futures::future::BoxFuture;
@@ -19,7 +19,10 @@ use lance_core::{
 use crate::progress::IndexBuildProgress;
 use crate::registry::IndexPluginRegistry;
 use crate::scalar::RowIdRemapper;
-use crate::scalar::{CreatedIndex, IndexStore, ScalarIndex, expression::ScalarQueryParser};
+use crate::scalar::{
+    CreatedIndex, IndexStore, ScalarIndex,
+    expression::{ScalarIndexPlanner, ScalarQueryParser},
+};
 use lance_index_core::remapping::BatchRowIdRemapper;
 // Re-export training types that were previously defined here
 pub use crate::scalar::{TrainingCriteria, TrainingOrdering};
@@ -106,6 +109,28 @@ pub enum IndexOrderingCapability {
     Unordered,
     /// The index streams keys in either direction, with nulls first or last.
     Bidirectional,
+}
+
+/// What one persisted index segment declares it can answer.
+///
+/// A planned search records only an index name, and execution opens every
+/// segment registered under that name -- across columns -- and asks each one.
+/// The planner therefore compares this declaration across all of a name's
+/// segments before it routes a predicate to any of them: a query planned from
+/// one segment's declaration is handed to every segment the search opens.
+#[derive(Debug, Clone, PartialEq)]
+pub struct QueryDomain {
+    /// The Arrow type of the values the segment's keys were built from.
+    pub data_type: DataType,
+    /// Everything besides [`Self::data_type`] that makes one predicate mean the
+    /// same thing on another segment: the expression the values were extracted
+    /// from, the index kind and configuration that keys them, and the versions
+    /// that decide how those keys are read.
+    ///
+    /// Opaque to the planner, which compares it byte for byte. `None` compares
+    /// segments on `data_type` alone, preserving the behavior of indices whose
+    /// segments are not wrappers that can hold one type for different queries.
+    pub identity: Option<Vec<u8>>,
 }
 
 /// A trait for scalar index plugins
@@ -209,6 +234,31 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
     /// newer version than this, it cannot be read
     fn version(&self) -> u32;
 
+    /// Field IDs this index depends on in addition to its query input columns.
+    ///
+    /// Lance persists these IDs alongside the input columns in the index's
+    /// metadata so ordinary schema changes can invalidate the index without
+    /// loading its plugin. They are dependencies, not additional query inputs:
+    /// for example, an index queried on a list column can depend on selected
+    /// fields inside its element struct.
+    ///
+    /// IDs must be recorded in `index_details` before this method is called.
+    /// Return them in a deterministic order, without duplicates or input-column
+    /// IDs. This method must not access index files. The default declares no
+    /// additional dependencies and preserves existing plugins' input fields.
+    ///
+    /// ```
+    /// # use lance_index::{pbold, scalar::{btree::BTreeIndexPlugin, registry::ScalarIndexPlugin}};
+    /// # fn main() -> lance_core::Result<()> {
+    /// let details = prost_types::Any::from_msg(&pbold::BTreeIndexDetails::default())?;
+    /// assert!(BTreeIndexPlugin.additional_field_ids(&details)?.is_empty());
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn additional_field_ids(&self, _index_details: &prost_types::Any) -> Result<Vec<i32>> {
+        Ok(Vec::new())
+    }
+
     /// Whether Lance may maintain this index through `optimize_indices`.
     ///
     /// Return `false` when an external service owns refreshing and merging the
@@ -230,6 +280,68 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
         index_name: String,
         index_details: &prost_types::Any,
     ) -> Option<Box<dyn ScalarQueryParser>>;
+
+    /// The [`QueryDomain`] this index's persisted details declare, if any.
+    ///
+    /// `index_version` is the segment's own [`IndexMetadata::index_version`],
+    /// which a plugin whose versions change query semantics must fold into
+    /// [`QueryDomain::identity`].
+    ///
+    /// This must not read index files: planning calls it for every segment on
+    /// every query, including indices whose details never declare a domain.
+    ///
+    /// [`IndexMetadata::index_version`]: lance_table::format::IndexMetadata::index_version
+    fn recorded_query_domain(
+        &self,
+        _index_details: &prost_types::Any,
+        _index_version: u32,
+    ) -> Option<QueryDomain> {
+        None
+    }
+
+    /// [`Self::new_query_parser`] for a segment whose persisted details do not
+    /// declare the [`QueryDomain`] its keys were built for.
+    ///
+    /// A wrapper index that omits the type its target was trained on needs
+    /// this. The type is still in the target's own files or follows from the
+    /// target's training contract, so the answer is a persisted fact rather
+    /// than an inference from the query's values. The returned parser must
+    /// accept exactly the returned domain, and the planner compares the whole
+    /// answer across a name's segments the same way it compares
+    /// [`Self::recorded_query_domain`] answers.
+    ///
+    /// Implementations may read index file metadata but must not read index
+    /// data rows: planning calls this for every affected segment on every
+    /// query, and a caller that only wants a plan pays for it too.
+    ///
+    /// `Ok(None)` means this build cannot establish the domain from what is
+    /// persisted, which leaves the predicate to the scan. An error is reported
+    /// by the planner and also leaves the predicate to the scan: an index that
+    /// cannot be planned for is never a reason to fail the query.
+    async fn recover_query_domain(
+        &self,
+        _index_name: String,
+        _index_details: &prost_types::Any,
+        _index_version: u32,
+        _index_store: Arc<dyn IndexStore>,
+    ) -> Result<Option<(Box<dyn ScalarQueryParser>, QueryDomain)>> {
+        Ok(None)
+    }
+
+    /// Returns a planner for an index keyed on more than one column
+    ///
+    /// `keys` holds the key columns in key order, each named by its field path. The
+    /// default returns None, so the index takes no part in query optimization. The
+    /// [`ScalarIndexPlanner`] docs have an example planner. Lance never calls this
+    /// method for a dataset on legacy V1 storage.
+    fn new_planner(
+        &self,
+        _index_name: String,
+        _index_details: &prost_types::Any,
+        _keys: &Fields,
+    ) -> Option<Box<dyn ScalarIndexPlanner>> {
+        None
+    }
 
     /// Load an index from storage
     ///
@@ -801,6 +913,21 @@ mod tests {
         InvertedIndex, InvertedIndexParams, METADATA_FILE, TOKEN_SET_FORMAT_KEY, TokenSetFormat,
     };
     use crate::scalar::lance_format::LanceIndexStore;
+
+    #[test]
+    fn test_plugin_defaults_to_no_additional_field_ids() {
+        let registry = IndexPluginRegistry::with_default_plugins();
+        let details =
+            prost_types::Any::from_msg(&crate::pbold::BTreeIndexDetails::default()).unwrap();
+        assert!(
+            registry
+                .get_plugin_by_details(&details)
+                .unwrap()
+                .additional_field_ids(&details)
+                .unwrap()
+                .is_empty()
+        );
+    }
 
     /// Pause the cold caller after publication, allowing a warm caller to rotate
     /// the same entry before the cold caller receives its result.

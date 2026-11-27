@@ -18,6 +18,7 @@
 //! reads then.
 
 use crate::format::IndexMetadata;
+use crate::system_index::frag_reuse::FragReuseActionInputs;
 use crate::transaction::TaggedRewriteAssembly;
 use std::sync::Arc;
 
@@ -39,6 +40,9 @@ pub enum FragReuseUpdate {
     /// A trim of the tagged entry derived by the reuse index cleanup against
     /// the current entry at commit time.
     Trim,
+    /// An action-based transaction: what its fragment reuse actions need
+    /// that applying cannot read itself.
+    Actions(Arc<FragReuseActionInputs>),
 }
 
 /// The index lists of one commit attempt: the list as read from the

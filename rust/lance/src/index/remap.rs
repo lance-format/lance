@@ -6,6 +6,8 @@
 // These helpers stay crate-visible so callers do not depend on private parameter types.
 #![allow(clippy::redundant_pub_crate)]
 
+use super::field_dependencies::input_field_ids;
+
 use std::sync::Arc;
 
 use lance_core::utils::address::RowAddress;
@@ -88,8 +90,8 @@ pub(crate) async fn remap_index(
         .ok_or_else(|| Error::index(format!("Index with id {} does not exist", index_id)))?;
     let matched = &matched;
 
-    // Corrupt metadata fails closed before anything else: a declaration that is
-    // not a valid suffix of `fields` cannot be reasoned about at all, and the
+    // Corrupt metadata fails closed before anything else: a declaration that
+    // breaks the covering rules cannot be reasoned about at all, and the
     // withdrawal below would otherwise swallow it as an ordinary covered index.
     matched.validate_covering_fields()?;
 
@@ -104,23 +106,35 @@ pub(crate) async fn remap_index(
     if !matched.covering_fields.is_empty() {
         log::warn!(
             "Index '{}' declares covering fields {:?}, which no index builder \
-             writes or preserves yet. Index will be dropped during compaction \
-             and must be rebuilt.",
+             writes or preserves yet, so it is not remapped. Rebuild it to \
+             cover the rewritten fragments.",
             matched.name,
             matched.covering_fields,
         );
         return Ok(RemapResult::Drop);
     }
 
-    // With covering withdrawn above, `fields` is entirely keyed, so more than one
-    // entry means a genuinely composite index.
-    if matched.fields.len() > 1 {
+    // Additional dependency fields do not make an index composite. Remapping
+    // still requires one operational input after resolving the plugin declaration.
+    // A declaration that does not resolve is withdrawn like an index that cannot
+    // be opened below, rather than blocking compaction of the whole table.
+    let input_fields = match input_field_ids(matched) {
+        Ok(fields) => fields,
+        Err(error) => {
+            log::warn!(
+                "Index '{}' cannot be used: {error}, so it is not remapped. Rebuild the index.",
+                matched.name,
+            );
+            return Ok(RemapResult::Drop);
+        }
+    };
+    if input_fields.len() > 1 {
         return Err(Error::index(format!(
             "Remapping index '{}' is not supported: it has {} keyed fields {:?}; \
              only one keyed field is supported",
             matched.name,
-            matched.fields.len(),
-            matched.fields,
+            input_fields.len(),
+            input_fields,
         )));
     }
 
@@ -149,8 +163,7 @@ pub(crate) async fn remap_index(
         Ok(g) => g,
         Err(e) => {
             log::warn!(
-                "Cannot open index '{}' on '{}': {}. \
-                 Index will be dropped during compaction.",
+                "Cannot open index '{}' on '{}': {}, so it is not remapped. Rebuild the index.",
                 index_id,
                 field_path,
                 e

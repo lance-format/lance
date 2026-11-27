@@ -33,6 +33,7 @@ use lance_linalg::distance::{Cosine, DistanceType, Dot, L2, dot::DotPrepared, l2
 use lance_linalg::simd::dist_table::{
     filter_4bit_dist_table_transposed, sum_4bit_dist_table_transposed,
 };
+use lance_select::RowAddrMask;
 use lance_table::utils::LanceIteratorExtension;
 use lance_table::{format::SelfDescribingFileReader, io::manifest::ManifestDescribing};
 use object_store::path::Path;
@@ -43,7 +44,8 @@ use super::ProductQuantizer;
 use super::distance::{
     bounded_4bit_scores, build_distance_table_dot, build_distance_table_dot_prepared,
     build_distance_table_l2, build_distance_table_l2_prepared, compute_pq_distance,
-    compute_pq_distance_4bit_row, compute_pq_distance_4bit_rows, quantize_4bit_distance_table,
+    compute_pq_distance_4bit_row, compute_pq_distance_4bit_rows, compute_pq_distance_8bit_rows,
+    compute_pq_distance_into, quantize_4bit_distance_table,
 };
 use crate::frag_reuse::{FragReuseIndex, FragReuseIndexHandle};
 use crate::scalar::RowIdRemapper;
@@ -64,6 +66,8 @@ pub const PQ_METADATA_KEY: &str = "lance:pq";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProductQuantizationMetadata {
     pub codebook_position: usize,
+    /// Releases before 0.25 wrote this key as `num_bits`.
+    #[serde(alias = "num_bits")]
     pub nbits: u32,
     pub num_sub_vectors: usize,
     pub dimension: usize,
@@ -71,10 +75,12 @@ pub struct ProductQuantizationMetadata {
     #[serde(skip)]
     pub codebook: Option<FixedSizeListArray>,
 
-    // empty for v1 format
-    // used for v3 format
-    // deprecated in later version
+    /// The codebook as an encoded `pb::Tensor`. v3 writers from 0.12 and v1
+    /// writers from 0.14 filled it until 0.30; later ones leave it empty.
     pub codebook_tensor: Vec<u8>,
+    /// Releases before 0.19.2 did not write this key; their codes are not
+    /// transposed.
+    #[serde(default)]
     pub transposed: bool,
 }
 
@@ -148,10 +154,27 @@ impl QuantizerMetadata for ProductQuantizationMetadata {
                 "Reading PQ storage: metadata key {} not found",
                 PQ_METADATA_KEY
             )))?;
-        let mut metadata: Self = serde_json::from_str(metadata)
+        let value: serde_json::Value = serde_json::from_str(metadata)
+            .map_err(|_| Error::index(format!("Failed to parse PQ metadata: {}", metadata)))?;
+        // Legacy IVF_HNSW_PQ files written before 0.25 name the bit width
+        // `num_bits`. This reader does not support them: it subtracts the
+        // partition centroid from Dot queries, which those writers did not,
+        // and compaction cannot remap them.
+        if value.get("nbits").is_none() && value.get("num_bits").is_some() {
+            return Err(Error::not_supported(format!(
+                "IVF_HNSW_PQ index file {} was written before Lance 0.25 (its {} metadata \
+                 has `num_bits`, not `nbits`) and is no longer supported; rebuild the index",
+                reader.object_reader.path(),
+                PQ_METADATA_KEY
+            )));
+        }
+        let mut metadata: Self = serde_json::from_value(value)
             .map_err(|_| Error::index(format!("Failed to parse PQ metadata: {}", metadata)))?;
 
         debug_assert!(metadata.codebook.is_none());
+        // Holds for the (0,2) files that 0.17 and later releases write: their
+        // `create_index` no longer writes this layout, and the current legacy
+        // writer leaves `codebook_tensor` empty.
         debug_assert!(metadata.codebook_tensor.is_empty());
 
         let codebook_tensor: pb::Tensor =
@@ -370,9 +393,13 @@ impl ProductQuantizationStorage {
     }
 
     fn with_prepared_targets(mut self, quantizer: &ProductQuantizer) -> Self {
-        // The quantizer's L2 transform targets cover f16 and PQ4 as well.
-        // Partition-search sharing stays limited to the current f32/PQ8 path.
-        if quantizer.codebook.value_type() == DataType::Float32 && quantizer.num_bits == 8 {
+        // The quantizer's L2 transform targets cover PQ4 as well; partition-search
+        // sharing stays limited to PQ8, whose table build is the measurable cost.
+        if matches!(
+            quantizer.codebook.value_type(),
+            DataType::Float32 | DataType::Float16
+        ) && quantizer.num_bits == 8
+        {
             self.l2_targets = quantizer.l2_targets.clone();
             self.dot_targets = quantizer.dot_targets.clone();
         }
@@ -792,20 +819,41 @@ impl VectorStore for ProductQuantizationStorage {
         self.row_ids.values().iter()
     }
 
+    fn row_ids_slice(&self) -> Option<&[u64]> {
+        Some(self.row_ids.values().as_ref())
+    }
+
     fn dist_calculator(&self, query: ArrayRef, _dist_q_c: f32) -> Self::DistanceCalculator<'_> {
         let codebook = self.metadata.codebook.as_ref().unwrap();
         match codebook.value_type() {
-            DataType::Float16 => PQDistCalculator::new(
-                codebook
-                    .values()
-                    .as_primitive::<datatypes::Float16Type>()
-                    .values(),
-                self.metadata.nbits,
-                self.metadata.num_sub_vectors,
-                self.pq_code.clone(),
-                query.as_primitive::<datatypes::Float16Type>().values(),
-                self.distance_type,
-            ),
+            DataType::Float16 => {
+                let query = query.as_primitive::<datatypes::Float16Type>().values();
+                match (self.distance_type, &self.l2_targets) {
+                    // The targets were widened from this codebook once; widening the
+                    // query the same way skips the generic f16 table kernel.
+                    (DistanceType::L2, Some(targets)) => {
+                        let query: Vec<f32> = query.iter().map(|v| v.to_f32()).collect();
+                        PQDistCalculator::new_l2_prepared(
+                            targets,
+                            self.metadata.nbits,
+                            self.metadata.num_sub_vectors,
+                            self.pq_code.clone(),
+                            &query,
+                        )
+                    }
+                    _ => PQDistCalculator::new(
+                        codebook
+                            .values()
+                            .as_primitive::<datatypes::Float16Type>()
+                            .values(),
+                        self.metadata.nbits,
+                        self.metadata.num_sub_vectors,
+                        self.pq_code.clone(),
+                        query,
+                        self.distance_type,
+                    ),
+                }
+            }
             DataType::Float32 => {
                 let codebook = codebook
                     .values()
@@ -1049,6 +1097,27 @@ impl DistCalculator for PQDistCalculator {
             && bounded_4bit_scores(&self.distance_table)
     }
 
+    fn distance_all_with_scratch(
+        &self,
+        k_hint: usize,
+        dists: &mut Vec<f32>,
+        _u16_scratch: &mut Vec<u16>,
+        _u8_scratch: &mut Vec<u8>,
+        _u32_scratch: &mut Vec<u32>,
+    ) {
+        if self.distance_type != DistanceType::L2 {
+            *dists = self.distance_all(k_hint);
+            return;
+        }
+        compute_pq_distance_into(
+            &self.distance_table,
+            self.num_bits,
+            self.num_sub_vectors,
+            self.pq_code.values(),
+            dists,
+        );
+    }
+
     fn distance_all(&self, _k_hint: usize) -> Vec<f32> {
         match self.distance_type {
             DistanceType::L2 => compute_pq_distance(
@@ -1089,13 +1158,79 @@ impl DistCalculator for PQDistCalculator {
         }
     }
 
+    /// Scores the accepted rows with the selected-rows kernels instead of a
+    /// `distance` call per row, which a prefiltered partition scan otherwise
+    /// spends most of its time in.
     #[allow(clippy::too_many_arguments)]
-    fn accumulate_topk_with_scratch(
+    fn accumulate_filtered_topk_with_scratch(
+        &self,
+        k: usize,
+        lower_bound: Option<f32>,
+        upper_bound: Option<f32>,
+        row_ids: impl Iterator<Item = (u32, u64)>,
+        accept_row: impl Fn(u64) -> bool,
+        res: &mut BinaryHeap<OrderedNode<u64>>,
+        dists: &mut Vec<f32>,
+        _quantized_dists: &mut Vec<u16>,
+        _quantized_table: &mut Vec<u8>,
+        candidates: &mut Vec<u32>,
+    ) {
+        if k == 0 {
+            return;
+        }
+        // Rows go through in fixed chunks: the kernels stay batched while the
+        // ids and row ids of a chunk fit the scratch and the stack, so a scan
+        // allocates nothing per partition.
+        const CHUNK: usize = 256;
+        let mut chunk_row_ids = [0u64; CHUNK];
+        let mut rows = row_ids.filter(|(_, row_id)| accept_row(*row_id)).peekable();
+        while rows.peek().is_some() {
+            candidates.clear();
+            for (id, row_id) in rows.by_ref().take(CHUNK) {
+                chunk_row_ids[candidates.len()] = row_id;
+                candidates.push(id);
+            }
+            dists.resize(candidates.len(), 0.0);
+            if self.num_bits == 4 {
+                compute_pq_distance_4bit_rows(
+                    &self.distance_table,
+                    self.pq_code.values(),
+                    candidates,
+                    dists,
+                );
+            } else {
+                compute_pq_distance_8bit_rows(
+                    &self.distance_table,
+                    self.num_sub_vectors,
+                    self.pq_code.values(),
+                    candidates,
+                    dists,
+                );
+            }
+            if self.distance_type == DistanceType::Dot {
+                let diff = self.num_sub_vectors as f32 - 1.0;
+                dists.iter_mut().for_each(|dist| *dist -= diff);
+            }
+            accumulate_distances_into_heap(
+                k,
+                lower_bound,
+                upper_bound,
+                |i| chunk_row_ids[i as usize],
+                None,
+                res,
+                dists,
+            );
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn accumulate_topk_with_mask(
         &self,
         k: usize,
         lower_bound: Option<f32>,
         upper_bound: Option<f32>,
         row_id: impl Fn(u32) -> u64,
+        mask: Option<&RowAddrMask>,
         res: &mut BinaryHeap<OrderedNode<u64>>,
         dists: &mut Vec<f32>,
         quantized_dists: &mut Vec<u16>,
@@ -1115,8 +1250,8 @@ impl DistCalculator for PQDistCalculator {
         .then(|| quantize_4bit_distance_table(&self.distance_table, quantized_table))
         .flatten();
         let Some(table) = table else {
-            *dists = self.distance_all(k);
-            accumulate_distances_into_heap(k, lower_bound, upper_bound, row_id, res, dists);
+            self.distance_all_with_scratch(k, dists, quantized_dists, quantized_table, candidates);
+            accumulate_distances_into_heap(k, lower_bound, upper_bound, row_id, mask, res, dists);
             return;
         };
 
@@ -1223,8 +1358,13 @@ impl DistCalculator for PQDistCalculator {
             // distance of this partition before any row is scored. A row marked
             // `u16::MAX` only raises its block's minimum, so the bound holds.
             if lower_bound <= OrderedFloat(f32::MIN)
-                && let Some(sum) =
-                    kth_smallest_sum_bound(&quantized_dists[..num_rows], k, candidates)
+                && let Some(sum) = kth_smallest_sum_bound(
+                    &quantized_dists[..num_rows],
+                    k,
+                    candidates,
+                    mask,
+                    &row_id,
+                )
             {
                 threshold = threshold.min(OrderedFloat(table.kth_bound_distance(sum, score_diff)));
                 let Some(sum) = table.sum_cutoff(threshold.0, score_diff) else {
@@ -1269,14 +1409,17 @@ impl DistCalculator for PQDistCalculator {
                 if dist < lower_bound || dist >= upper_bound {
                     continue;
                 }
-                if res.len() < k {
-                    res.push(OrderedNode::new(row_id(id), dist));
-                } else if let Some(mut top) = res.peek_mut()
-                    && top.dist > dist
-                {
-                    *top = OrderedNode::new(row_id(id), dist);
-                } else {
+                if res.len() >= k && res.peek().is_some_and(|top| top.dist <= dist) {
                     continue;
+                }
+                let row_id = row_id(id);
+                if mask.is_some_and(|mask| !mask.selected(row_id)) {
+                    continue;
+                }
+                if res.len() < k {
+                    res.push(OrderedNode::new(row_id, dist));
+                } else if let Some(mut top) = res.peek_mut() {
+                    *top = OrderedNode::new(row_id, dist);
                 }
                 if res.len() >= k
                     && let Some(node) = res.peek()
@@ -1395,21 +1538,33 @@ fn fused_candidate_budget(num_rows: usize, k: usize) -> usize {
 /// fewer than `k` sums. Each of about `4 * k` contiguous blocks contributes its
 /// minimum, a distinct row, so the k-th smallest block minimum is reached by at
 /// least `k` rows while costing only a vectorizable pass and a small selection.
-fn kth_smallest_sum_bound(sums: &[u16], k: usize, block_mins: &mut Vec<u32>) -> Option<u16> {
+fn kth_smallest_sum_bound(
+    sums: &[u16],
+    k: usize,
+    block_mins: &mut Vec<u32>,
+    mask: Option<&RowAddrMask>,
+    row_id: &impl Fn(u32) -> u64,
+) -> Option<u16> {
     if k == 0 || sums.len() < k {
         return None;
     }
     let block_len = (sums.len() / (4 * k)).max(1);
     block_mins.clear();
-    block_mins.extend(
-        sums.chunks(block_len)
-            .map(|block| block.iter().copied().min().unwrap_or(u16::MAX) as u32),
-    );
-    debug_assert!(
-        block_mins.len() >= k,
-        "{} blocks for k={k}",
-        block_mins.len()
-    );
+    for (i, block) in sums.chunks(block_len).enumerate() {
+        let min = block.iter().copied().min()?;
+        // Each minimum needs a live witness. Skipping a block with a
+        // deleted minimum only loosens this optional initial bound.
+        if let Some(mask) = mask {
+            let first = block.iter().position(|&sum| sum == min)?;
+            if !mask.selected(row_id((i * block_len + first) as u32)) {
+                continue;
+            }
+        }
+        block_mins.push(u32::from(min));
+    }
+    if block_mins.len() < k {
+        return None;
+    }
     let (_, kth, _) = block_mins.select_nth_unstable(k - 1);
     Some(*kth as u16)
 }
@@ -1644,13 +1799,13 @@ mod tests {
         DISTANCE_TYPE_KEY,
         ivf::storage::IVF_METADATA_KEY,
         quantizer::{Quantization, Quantizer},
-        storage::{IvfQuantizationStorage, STORAGE_METADATA_KEY, StorageBuilder},
+        storage::{IvfQuantizationStorage, QueryScratch, STORAGE_METADATA_KEY, StorageBuilder},
     };
 
     use super::*;
 
     use approx::assert_relative_eq;
-    use arrow_array::{Float32Array, UInt32Array};
+    use arrow_array::{Float16Array, Float32Array, UInt32Array};
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use lance_arrow::FixedSizeListArrayExt;
     use lance_core::ROW_ID_FIELD;
@@ -1667,6 +1822,42 @@ mod tests {
     const DIM: usize = 32;
     const TOTAL: usize = 512;
     const NUM_SUB_VECTORS: usize = 16;
+
+    /// The JSON shapes v3 writers produced before 0.25 parse, and the current
+    /// shape still serializes as `nbits`, which every release since 0.25 requires.
+    #[rstest]
+    #[case::before_0_19_2("num_bits", vec![1, 2, 3], None)]
+    #[case::before_0_25("num_bits", vec![1, 2, 3], Some(true))]
+    #[case::current("nbits", vec![], Some(true))]
+    fn test_pq_metadata_compatibility(
+        #[case] bits_key: &str,
+        #[case] codebook_tensor: Vec<u8>,
+        #[case] transposed: Option<bool>,
+    ) {
+        let mut json = serde_json::json!({
+            "codebook_position": 123,
+            bits_key: 8,
+            "num_sub_vectors": 2,
+            "dimension": 8,
+            "codebook_tensor": codebook_tensor,
+        });
+        if let Some(transposed) = transposed {
+            json["transposed"] = serde_json::json!(transposed);
+        }
+
+        let metadata: ProductQuantizationMetadata = serde_json::from_value(json).unwrap();
+        assert_eq!(metadata.codebook_position, 123);
+        assert_eq!(metadata.nbits, 8);
+        assert_eq!(metadata.num_sub_vectors, 2);
+        assert_eq!(metadata.dimension, 8);
+        assert!(metadata.codebook.is_none());
+        assert_eq!(metadata.codebook_tensor, codebook_tensor);
+        assert_eq!(metadata.transposed, transposed.unwrap_or_default());
+
+        let serialized = serde_json::to_value(&metadata).unwrap();
+        assert_eq!(serialized["nbits"], 8);
+        assert!(serialized.get("num_bits").is_none());
+    }
 
     async fn create_pq_storage() -> ProductQuantizationStorage {
         create_pq_storage_with_distance(DistanceType::Dot).await
@@ -1836,6 +2027,116 @@ mod tests {
             .unwrap()
     }
 
+    /// The filtered scan must rank exactly the accepted rows, with the same
+    /// distances as `distance()`, for both code widths and distance types,
+    /// from an empty heap or one holding another partition's rows.
+    #[rstest]
+    #[tokio::test]
+    async fn test_filtered_accumulate_topk_matches_per_row(
+        #[values(4, 8)] num_bits: usize,
+        #[values(DistanceType::L2, DistanceType::Dot)] distance_type: DistanceType,
+        #[values(false, true)] prefilled: bool,
+    ) {
+        let rows = TOTAL;
+        let k = 10;
+        let storage = if num_bits == 4 {
+            create_4bit_pq_storage(rows, distance_type)
+        } else {
+            create_pq_storage_with_distance(distance_type).await
+        };
+        let query: ArrayRef = Arc::new(Float32Array::from_iter_values(
+            (0..DIM).map(|v| v as f32 / DIM as f32),
+        ));
+        let calc = storage.dist_calculator(query, 0.0);
+        // Two rows in three: more than one 256-row chunk out of TOTAL rows.
+        let accept = |row_id: u64| !row_id.is_multiple_of(3);
+        let mut expected = BinaryHeap::with_capacity(k);
+        let mut actual = BinaryHeap::with_capacity(k);
+        if prefilled {
+            for row in 0..5u64 {
+                let node = OrderedNode::new(1 << 40 | row, OrderedFloat(2.0 + row as f32));
+                expected.push(node.clone());
+                actual.push(node);
+            }
+        }
+        for id in 0..rows as u32 {
+            let row_id = storage.row_id(id);
+            if !accept(row_id) {
+                continue;
+            }
+            let dist = OrderedFloat(calc.distance(id));
+            if expected.len() < k {
+                expected.push(OrderedNode::new(row_id, dist));
+            } else if expected.peek().is_some_and(|worst| worst.dist > dist) {
+                expected.pop();
+                expected.push(OrderedNode::new(row_id, dist));
+            }
+        }
+        let mut scratch = QueryScratch::new();
+        calc.accumulate_filtered_topk_with_scratch(
+            k,
+            None,
+            None,
+            (0..rows as u32).map(|id| (id, storage.row_id(id))),
+            accept,
+            &mut actual,
+            &mut scratch.distances,
+            &mut scratch.u16,
+            &mut scratch.u8,
+            &mut scratch.u32,
+        );
+        let key = |heap: BinaryHeap<OrderedNode<u64>>| {
+            let mut nodes = heap.into_sorted_vec();
+            nodes.sort_by_key(|node| (node.dist.0.to_bits(), node.id));
+            nodes
+                .into_iter()
+                .map(|node| (node.id, node.dist.0.to_bits()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(key(actual), key(expected));
+    }
+
+    #[test]
+    fn test_pq4_deleted_rows_cannot_set_initial_cutoff() {
+        let storage = create_4bit_pq_storage(1024, DistanceType::L2);
+        let query: ArrayRef = Arc::new(Float32Array::from_iter_values(
+            (0..DIM).map(|i| i as f32 / DIM as f32),
+        ));
+        let calc = storage.dist_calculator(query, 0.0);
+        let mut by_distance: Vec<_> = (0..storage.len() as u32)
+            .map(|id| (OrderedFloat(calc.distance(id)), storage.row_id(id)))
+            .collect();
+        by_distance.sort_by_key(|&(distance, _)| distance);
+        let k = 10;
+        let (blocked, live) = by_distance.split_at(by_distance.len() - k);
+        let mask = RowAddrMask::from_block(blocked.iter().map(|&(_, row_id)| row_id).collect());
+        let mut actual = BinaryHeap::new();
+        calc.accumulate_topk_with_mask(
+            k,
+            None,
+            None,
+            |id| storage.row_id(id),
+            Some(&mask),
+            &mut actual,
+            &mut Vec::new(),
+            &mut Vec::new(),
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
+        // Even the farthest k must be returned if every closer row was deleted.
+        let mut actual: Vec<_> = actual
+            .into_iter()
+            .map(|node| (node.id, node.dist.0.to_bits()))
+            .collect();
+        let mut expected: Vec<_> = live
+            .iter()
+            .map(|&(dist, id)| (id, dist.0.to_bits()))
+            .collect();
+        actual.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(actual, expected);
+    }
+
     /// The 4-bit bulk scan must select the same top-k, with the same
     /// distances, as scoring every row with `distance()`, from an empty heap or
     /// one already holding another partition's rows, with or without bounds.
@@ -1871,7 +2172,15 @@ mod tests {
         }
         let row_id = |id: u32| id as u64 + 1_000_000;
         let mut expected = heap.clone();
-        accumulate_distances_into_heap(k, lower_bound, upper_bound, row_id, &mut expected, &exact);
+        accumulate_distances_into_heap(
+            k,
+            lower_bound,
+            upper_bound,
+            row_id,
+            None,
+            &mut expected,
+            &exact,
+        );
 
         let mut actual = heap;
         calc.accumulate_topk_with_scratch(
@@ -1923,6 +2232,65 @@ mod tests {
             .collect::<Vec<_>>();
         let distances = dist_calc.distance_all(100);
         assert_eq!(distances, expected);
+    }
+
+    /// An f16 PQ8 codebook shares the quantizer's prepared L2 targets and
+    /// scores through them within rounding of the generic f16 kernel.
+    #[test]
+    fn test_f16_pq8_uses_prepared_l2_targets() {
+        let mut rng = StdRng::seed_from_u64(16);
+        let codebook = Float16Array::from_iter_values(
+            (0..256 * DIM).map(|_| half::f16::from_f32(rng.random())),
+        );
+        let codebook = FixedSizeListArray::try_new_from_values(codebook, DIM as i32).unwrap();
+        let pq = ProductQuantizer::new(NUM_SUB_VECTORS, 8, DIM, codebook, DistanceType::L2);
+        assert!(pq.l2_targets.is_some());
+        let schema = ArrowSchema::new(vec![
+            Field::new(
+                "vec",
+                DataType::FixedSizeList(
+                    Field::new_list_field(DataType::Float16, true).into(),
+                    DIM as i32,
+                ),
+                true,
+            ),
+            ROW_ID_FIELD.clone(),
+        ]);
+        let vectors = Float16Array::from_iter_values(
+            (0..TOTAL * DIM).map(|_| half::f16::from_f32(rng.random())),
+        );
+        let fsl = FixedSizeListArray::try_new_from_values(vectors, DIM as i32).unwrap();
+        let row_ids = UInt64Array::from_iter_values(0..TOTAL as u64);
+        let batch =
+            RecordBatch::try_new(schema.into(), vec![Arc::new(fsl), Arc::new(row_ids)]).unwrap();
+        // The builder never attaches targets; partition loads do.
+        let generic = StorageBuilder::new("vec".to_owned(), DistanceType::L2, pq, None)
+            .unwrap()
+            .build(vec![batch])
+            .unwrap();
+        assert!(generic.l2_targets.is_none());
+        let quantizer =
+            ProductQuantizer::from_metadata(generic.metadata(), DistanceType::L2).unwrap();
+        let prepared = ProductQuantizationStorage::try_from_batch_with_quantizer(
+            generic.batch.clone(),
+            &quantizer,
+            generic.metadata(),
+            DistanceType::L2,
+            None,
+        )
+        .unwrap();
+        assert!(prepared.l2_targets.is_some());
+        let query: ArrayRef = Arc::new(Float16Array::from_iter_values(
+            (0..DIM).map(|_| half::f16::from_f32(rng.random())),
+        ));
+        let prepared = prepared
+            .dist_calculator(query.clone(), 0.0)
+            .distance_all(TOTAL);
+        let generic = generic.dist_calculator(query, 0.0).distance_all(TOTAL);
+        assert_eq!(prepared.len(), TOTAL);
+        for (prepared, generic) in prepared.iter().zip(&generic) {
+            assert_relative_eq!(prepared, generic, max_relative = 1e-3);
+        }
     }
 
     #[test]

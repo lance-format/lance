@@ -24,6 +24,7 @@ roaring = { workspace = true }
 [dev-dependencies]
 criterion = { workspace = true }
 proptest = { workspace = true }
+rstest = { workspace = true }
 
 [[bench]]
 name = "index_expr_result"
@@ -35,6 +36,10 @@ harness = false
 
 [[bench]]
 name = "nullable_equality"
+harness = false
+
+[[bench]]
+name = "combined_filter"
 harness = false
 
 [lints]

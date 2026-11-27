@@ -23,6 +23,9 @@ impl ObjectStoreProvider for MemoryStoreProvider {
         let download_retry_count = storage_options.download_retry_count();
         Ok(ObjectStore {
             inner: Arc::new(InMemory::new()),
+            external_blob_inner: None,
+            direct_local_io: false,
+            _external_blob_origin: None,
             local_dir_operations: None,
             local_fsync: false,
             scheme: String::from("memory"),

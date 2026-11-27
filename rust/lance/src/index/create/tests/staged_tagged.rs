@@ -227,6 +227,43 @@ async fn staged_segments_merge_after_stable_partition(#[case] index_type: IndexT
     assert_queries_match_scans(&dataset, true).await;
 }
 
+/// Bloom filter segments on a tagged history are not merged by their zones,
+/// which that merge cannot translate: a bounded plan keeps the index in one
+/// task, and optimize rebuilds it over the destinations.
+#[tokio::test]
+#[serial_test::serial(frag_reuse_maintenance)]
+async fn bloom_filter_segments_rebuild_on_a_tagged_table() {
+    let dir = TempStrDir::default();
+    let mut dataset = disk_fixture(dir.as_str()).await;
+    let s1 = staged_segment(&mut dataset, "i", IndexType::BloomFilter, vec![0]).await;
+    let s2 = staged_segment(&mut dataset, "i", IndexType::BloomFilter, vec![1]).await;
+    dataset
+        .commit_existing_index_segments("staged", "i", vec![s1, s2])
+        .await
+        .unwrap();
+    reserve_fragments(&mut dataset, 20).await;
+    let mut dataset = commit_stable_partition(dataset, &[0, 1], 10).await;
+    assert_eq!(fri_entry(&dataset).await.unwrap().index_version, 1);
+
+    let bounded = OptimizeOptions::merge(2).max_rows_per_task(Some(4));
+    let plan = crate::index::optimize::plan_optimize_indices(&dataset, &bounded)
+        .await
+        .unwrap();
+    assert_eq!(plan.tasks.len(), 1);
+    assert_eq!(plan.tasks[0].old_segments.len(), 2);
+
+    dataset
+        .optimize_indices(&OptimizeOptions::merge(2))
+        .await
+        .unwrap();
+    let dataset = Dataset::open(dir.as_str()).await.unwrap();
+    assert_eq!(
+        dataset.load_indices_by_name("staged").await.unwrap().len(),
+        1
+    );
+    assert_queries_match_scans(&dataset, true).await;
+}
+
 /// One staged contributor covers only part of the partition: the merge
 /// succeeds, the merged segment claims nothing the group cannot serve (its
 /// derived coverage is empty), and the queries scan.
@@ -651,7 +688,12 @@ async fn root_metadata_exists(dataset: &Dataset, segment: &IndexMetadata) -> boo
         .indices_dir()
         .join(segment.uuid.to_string())
         .join(lance_index::scalar::inverted::METADATA_FILE);
-    dataset.object_store.exists(&path).await.unwrap()
+    dataset
+        .table_state
+        .object_store
+        .exists(&path)
+        .await
+        .unwrap()
 }
 
 /// The NGram merge reads spill files and translates only through the v0
@@ -935,6 +977,104 @@ async fn staged_segments_rewritten_before_the_partition_are_validated_before_the
         values(&dataset, None, true).await,
         values(&dataset, None, false).await
     );
+}
+
+/// An in-place rewrite of `w = 9` (F2) narrows its segment to F1 while the
+/// segment's file keeps the old entry, and an append optimize indexes F2
+/// again, so the query must restrict each segment to its own coverage. A
+/// stable partition of F0 then leaves the other segment's stored bitmap on
+/// its retired source: that segment answers for the destinations the reader
+/// derives, and the restriction must keep those hits.
+#[rstest::rstest]
+#[case::btree(IndexType::BTree)]
+#[case::bitmap(IndexType::Bitmap)]
+#[tokio::test]
+#[serial_test::serial(frag_reuse_maintenance)]
+async fn narrowed_segment_beside_a_translated_segment(#[case] index_type: IndexType) {
+    let dir = TempStrDir::default();
+    let dataset = disk_fixture(dir.as_str()).await;
+    let mut dataset = append_scalar_rows(dataset, 8, 4).await;
+    assert_eq!(fragment_ids(&dataset), vec![0, 1, 2]);
+    let translated = staged_segment(&mut dataset, "i", index_type, vec![0]).await;
+    let narrowed = staged_segment(&mut dataset, "i", index_type, vec![1, 2]).await;
+    dataset
+        .commit_existing_index_segments("staged", "i", vec![translated.clone(), narrowed.clone()])
+        .await
+        .unwrap();
+    rewrite_in_place(
+        dir.as_str(),
+        "i",
+        9,
+        Arc::new(arrow_array::Int32Array::from(vec![999])),
+    )
+    .await;
+    let mut dataset = Dataset::open(dir.as_str()).await.unwrap();
+    dataset
+        .optimize_indices(&OptimizeOptions::append())
+        .await
+        .unwrap();
+    reserve_fragments(&mut dataset, 20).await;
+    let dataset = commit_stable_partition(dataset, &[0], 10).await;
+    assert_eq!(
+        dataset.table_state.fragment_bitmap.as_ref(),
+        &RoaringBitmap::from_iter([1u32, 2, 10, 11])
+    );
+    assert_eq!(fri_entry(&dataset).await.unwrap().index_version, 1);
+
+    let stored = stored_segments(&dataset, "staged").await;
+    assert!(!dataset.manifest.uses_stable_row_ids());
+    assert!(
+        stored
+            .iter()
+            .all(|segment| !segment.results_are_row_addrs()),
+        "without stable row ids the segments are labeled row-id domain"
+    );
+    let stored_bitmap = |uuid: Uuid| {
+        stored
+            .iter()
+            .find(|segment| segment.uuid == uuid)
+            .and_then(|segment| segment.fragment_bitmap.clone())
+            .unwrap()
+    };
+    assert_eq!(
+        stored_bitmap(translated.uuid),
+        RoaringBitmap::from_iter([0u32]),
+        "the stored bitmap keeps the retired source"
+    );
+    assert_eq!(
+        stored_bitmap(narrowed.uuid),
+        RoaringBitmap::from_iter([1u32]),
+        "the rewrite withdrew F2"
+    );
+    assert!(
+        stored.iter().any(|segment| segment.uuid != narrowed.uuid
+            && segment.fragment_bitmap.as_ref().unwrap().contains(2)),
+        "the append optimize indexes F2 again"
+    );
+    let listed = dataset.load_indices_by_name("staged").await.unwrap();
+    assert_eq!(
+        listed
+            .iter()
+            .find(|segment| segment.uuid == translated.uuid)
+            .and_then(|segment| segment.fragment_bitmap.clone()),
+        Some(RoaringBitmap::from_iter([10u32, 11])),
+        "the reader derives the destinations"
+    );
+
+    let plan = dataset
+        .scan()
+        .filter("i = 9")
+        .unwrap()
+        .explain_plan(false)
+        .await
+        .unwrap();
+    assert!(plan.contains("ScalarIndexQuery"), "{plan}");
+    assert_eq!(
+        values(&dataset, Some("i = 9"), true).await,
+        Vec::<i32>::new()
+    );
+    assert_eq!(values(&dataset, Some("i = 999"), true).await, vec![999]);
+    assert_scalar_queries_match(&dataset).await;
 }
 
 /// A committed vector index whose coverage an in-place rewrite of the
@@ -2126,6 +2266,120 @@ async fn v0_deferred_vector_segment_merge_keeps_the_legacy_version_pinned() {
     let (_, indexed) = nearest(&dataset, &query, total, true).await;
     assert_eq!(flat.len(), total);
     assert_eq!(indexed, flat, "every row is reachable through the index");
+}
+
+/// A committed bloom filter segment over a source a stable partition retired,
+/// which the reader translates, and over a live fragment rewritten in place:
+/// the default optimize indexes that fragment into the segment again. The
+/// rewritten fragment's old null rows go, and the retired source's zones and
+/// null rows are translated rather than dropped.
+#[tokio::test]
+#[serial_test::serial(frag_reuse_maintenance)]
+async fn bloom_filter_optimize_drops_rewritten_null_rows_on_a_tagged_history() {
+    let dir = TempStrDir::default();
+    // Three fragments of four rows; `value` is null where `i % 4 == 1`.
+    let schema = Arc::new(arrow_schema::Schema::new(vec![
+        arrow_schema::Field::new("i", arrow_schema::DataType::Int32, false),
+        arrow_schema::Field::new("value", arrow_schema::DataType::Int32, true),
+        arrow_schema::Field::new("w", arrow_schema::DataType::Int32, false),
+    ]));
+    let batch = arrow_array::RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(arrow_array::Int32Array::from_iter_values(0..12)),
+            Arc::new(arrow_array::Int32Array::from_iter(
+                (0..12).map(|i| (i % 4 != 1).then_some(i)),
+            )),
+            Arc::new(arrow_array::Int32Array::from_iter_values(0..12)),
+        ],
+    )
+    .unwrap();
+    let mut dataset = Dataset::write(
+        arrow_array::RecordBatchIterator::new(vec![Ok(batch)], schema),
+        dir.as_str(),
+        Some(WriteParams {
+            max_rows_per_file: 4,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    dataset
+        .create_index(
+            &["value"],
+            IndexType::BloomFilter,
+            Some("value_idx".into()),
+            &ScalarIndexParams::for_builtin(IndexType::BloomFilter.try_into().unwrap()),
+            false,
+        )
+        .await
+        .unwrap();
+
+    reserve_fragments(&mut dataset, 20).await;
+    let dataset = commit_stable_partition(dataset, &[0], 10).await;
+    assert_eq!(fri_entry(&dataset).await.unwrap().index_version, 1);
+    let mut fragments = fragment_ids(&dataset);
+    fragments.sort_unstable();
+    assert_eq!(fragments, vec![1, 2, 10, 11]);
+    let stored = stored_segment(&dataset, "value_idx").await;
+    assert_eq!(
+        stored.fragment_bitmap.unwrap(),
+        RoaringBitmap::from_iter([0u32, 1, 2])
+    );
+
+    // `w = 5` is the null of fragment 1.
+    rewrite_in_place(
+        dir.as_str(),
+        "value",
+        5,
+        Arc::new(arrow_array::Int32Array::from(vec![500])),
+    )
+    .await;
+    let mut dataset = Dataset::open(dir.as_str()).await.unwrap();
+    assert_eq!(
+        derived_coverage(&dataset, "value_idx").await,
+        Some(RoaringBitmap::from_iter([2u32, 10, 11]))
+    );
+
+    dataset
+        .optimize_indices(&OptimizeOptions::default())
+        .await
+        .unwrap();
+    let dataset = fresh_session(dir.as_str()).await;
+    assert_eq!(stored_segments(&dataset, "value_idx").await.len(), 1);
+    // Merged rather than rebuilt: the segment keeps the provenance it was
+    // stored with, where a rebuild would claim the live fragments.
+    assert_eq!(
+        stored_segment(&dataset, "value_idx")
+            .await
+            .fragment_bitmap
+            .unwrap(),
+        RoaringBitmap::from_iter([0u32, 1, 2])
+    );
+    let plan = dataset
+        .scan()
+        .filter("value IS NULL")
+        .unwrap()
+        .explain_plan(false)
+        .await
+        .unwrap();
+    assert!(plan.contains("@value_idx(BloomFilter)"), "{plan}");
+    assert_eq!(
+        values(&dataset, Some("value IS NULL"), false).await,
+        vec![1, 9]
+    );
+    assert_eq!(
+        values(&dataset, Some("value IS NULL"), true).await,
+        vec![1, 9]
+    );
+    for value in [0, 2, 3, 4, 6, 7, 8, 10, 11, 500] {
+        let predicate = format!("value = {value}");
+        assert_eq!(
+            values(&dataset, Some(&predicate), true).await,
+            values(&dataset, Some(&predicate), false).await,
+            "{predicate}"
+        );
+    }
 }
 
 /// RTree on a tagged history: segments covering a stable partition's sources

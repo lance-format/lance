@@ -6,7 +6,7 @@ use std::num::NonZeroUsize;
 use std::ops::Range;
 use std::sync::{
     Arc,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::time::Duration;
 use std::vec;
@@ -20,7 +20,7 @@ use crate::dataset::mem_wal::DatasetMemWalExt;
 use crate::dataset::schema_evolution::ColumnAlteration;
 use crate::dataset::transaction::Operation;
 use crate::dataset::{
-    ManifestWriteConfig, ReadParams, deep_clone_copy_parallelism,
+    DatasetRuntimeConfig, ReadParams, deep_clone_copy_parallelism,
     parse_deep_clone_stream_concurrency, sample_row_offsets, validate_dataset_root_for_drop,
     write_manifest_file,
 };
@@ -28,7 +28,7 @@ use crate::session::Session;
 use crate::session::caches::ManifestKey;
 use crate::utils::test::copy_test_data_to_tmp;
 use crate::{BlobArrayBuilder, BlobFieldOptions, Dataset, Error, Result, blob_field_with_options};
-use lance_table::format::DataStorageFormat;
+use lance_table::format::{DataStorageFormat, ManifestBuildConfig};
 
 use crate::dataset::optimize::{CompactionOptions, compact_files};
 use crate::dataset::write::{CommitBuilder, InsertBuilder, WriteMode, WriteParams};
@@ -44,7 +44,7 @@ use arrow_array::{
     types::{Float32Type, Int32Type},
 };
 use arrow_ord::sort::sort_to_indices;
-use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, TimeUnit};
 use bytes::Bytes;
 use futures::stream::BoxStream;
 use lance_arrow::bfloat16::{self, BFLOAT16_EXT_NAME};
@@ -60,7 +60,6 @@ use lance_io::assert_io_eq;
 use lance_table::feature_flags;
 use lance_table::format::{BasePath, Fragment, pb};
 use lance_table::io::deletion::DELETIONS_DIR;
-use object_store::ObjectStoreExt;
 use prost::Message;
 
 use crate::index::DatasetIndexExt;
@@ -69,15 +68,16 @@ use futures::TryStreamExt;
 use lance_index::IndexType;
 use lance_index::scalar::ScalarIndexParams;
 use lance_io::object_store::{
-    ObjectStore, ObjectStoreParams, StorageOptionsAccessor, WrappingObjectStore,
+    ObjectStore, ObjectStoreParams, ObjectStoreProvider, StorageOptionsAccessor,
+    StorageOptionsProvider, WrappingObjectStore,
 };
 use lance_io::utils::tracking_store::IOTracker;
 use lance_linalg::distance::MetricType;
-use lance_table::io::commit::write_manifest_file_to_path;
+use lance_table::io::commit::{ConditionalPutCommitHandler, write_manifest_file_to_path};
 use lance_table::io::manifest::read_manifest;
 use object_store::path::Path;
 use object_store::{
-    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
+    CopyOptions, Error as OSError, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
     PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions, Result as OSResult,
 };
 use rand::{SeedableRng, rngs::StdRng};
@@ -250,8 +250,8 @@ async fn test_with_object_store_clone_preserves_shared_state_and_overrides_store
     let wrapped_dataset = dataset.with_object_store(wrapped_store, Some(store_params));
     assert!(Arc::ptr_eq(&dataset.session(), &wrapped_dataset.session()));
     assert!(!Arc::ptr_eq(
-        &dataset.object_store.as_ref().inner,
-        &wrapped_dataset.object_store.as_ref().inner
+        &dataset.table_state.object_store.as_ref().inner,
+        &wrapped_dataset.table_state.object_store.as_ref().inner
     ));
 }
 
@@ -362,11 +362,7 @@ async fn test_with_object_store_wrappers_wraps_base_store_params() {
     let _ = existing_tracker.incremental_stats();
     let _ = request_tracker.incremental_stats();
 
-    base_store
-        .inner
-        .get_range(&base_location, 0..1)
-        .await
-        .unwrap();
+    base_store.read_range(&base_location, 0..1).await.unwrap();
 
     assert!(existing_tracker.incremental_stats().read_iops > 0);
     assert!(request_tracker.incremental_stats().read_iops > 0);
@@ -424,7 +420,7 @@ async fn test_store_params_for_base_resolves_base_scoped_options() {
         .join("data")
         .join("probe.lance");
     base_store.put(&probe, b"hello").await.unwrap();
-    let read = base_store.inner.get_range(&probe, 0..5).await.unwrap();
+    let read = base_store.read_range(&probe, 0..5).await.unwrap();
     assert_eq!(read.as_ref(), b"hello");
 }
 
@@ -572,6 +568,7 @@ async fn test_create_data_file_rejects_nested_schema_mismatch() {
             RecordBatch::try_new(schema.clone(), vec![Arc::new(struct_array) as ArrayRef]).unwrap();
 
         let object_writer = dataset
+            .table_state
             .object_store
             .create(&dataset.data_dir().join(file_name))
             .await
@@ -621,6 +618,154 @@ async fn test_create_data_file_rejects_nested_schema_mismatch() {
         err.to_string().contains("Schema mismatch"),
         "unexpected error: {err}"
     );
+}
+
+/// A replacement file must store each column's values as the dataset field's
+/// type: reads decode it as the dataset type, so `x: double` under `x: int64`
+/// returns the doubles' bit patterns. Nullability, list offset width and the
+/// name of a timestamp's time zone may differ.
+#[rstest::rstest]
+#[case::same_width(DataType::Int64, DataType::Float64, false)]
+#[case::narrower(DataType::Int64, DataType::Int32, false)]
+#[case::wider_string(DataType::Utf8, DataType::LargeUtf8, false)]
+#[case::other_timestamp_unit(
+    DataType::Timestamp(TimeUnit::Microsecond, None),
+    DataType::Timestamp(TimeUnit::Millisecond, None),
+    false
+)]
+#[case::list_item(
+    DataType::LargeList(Arc::new(ArrowField::new("item", DataType::Float32, true))),
+    DataType::List(Arc::new(ArrowField::new("item", DataType::Float64, true))),
+    false
+)]
+#[case::timestamp_gains_time_zone(
+    DataType::Timestamp(TimeUnit::Microsecond, Some("Asia/Shanghai".into())),
+    DataType::Timestamp(TimeUnit::Microsecond, None),
+    false
+)]
+#[case::same_type(DataType::Int64, DataType::Int64, true)]
+#[case::list_offset_width(
+    DataType::LargeList(Arc::new(ArrowField::new("item", DataType::Float32, true))),
+    DataType::List(Arc::new(ArrowField::new("item", DataType::Float32, true))),
+    true
+)]
+#[case::timestamp_time_zone(
+    DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+    DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into())),
+    true
+)]
+#[tokio::test]
+async fn test_create_data_file_checks_column_types(
+    #[case] dataset_type: DataType,
+    #[case] file_type: DataType,
+    #[case] accepted: bool,
+) {
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int64, false),
+        ArrowField::new("x", dataset_type.clone(), true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(vec![0, 1, 2])) as ArrayRef,
+            column_of(&dataset_type, &[10, 11, 12]),
+        ],
+    )
+    .unwrap();
+    let dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        "memory://",
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    // A non-nullable column under the dataset's nullable `x` is still allowed.
+    let file_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "x", file_type, false,
+    )]));
+    let values = column_of(file_schema.field(0).data_type(), &[20, 21, 22]);
+    let file_batch = RecordBatch::try_new(file_schema.clone(), vec![values]).unwrap();
+    let object_writer = dataset
+        .table_state
+        .object_store
+        .create(&dataset.data_dir().join("x.lance"))
+        .await
+        .unwrap();
+    let mut writer = lance_file::versions::v2_2::create_writer(
+        object_writer,
+        crate::datatypes::Schema::try_from(file_schema.as_ref()).unwrap(),
+        FileWriterOptions::default(),
+    )
+    .unwrap();
+    writer.write_batch(&file_batch).await.unwrap();
+    writer.finish().await.unwrap();
+
+    let result = dataset.create_data_file("x.lance", None).await;
+    if accepted {
+        // The accepted file reads back as its own values, in the dataset type.
+        let data_file = result.unwrap();
+        let read_version = dataset.version().version;
+        let dataset = Dataset::commit(
+            WriteDestination::Dataset(Arc::new(dataset)),
+            Operation::DataReplacement {
+                replacements: vec![crate::dataset::transaction::DataReplacementGroup(
+                    0, data_file,
+                )],
+                data_change: true,
+            },
+            Some(read_version),
+            None,
+            None,
+            Arc::new(Default::default()),
+            false,
+        )
+        .await
+        .unwrap();
+        let batch = dataset.scan().try_into_batch().await.unwrap();
+        assert_eq!(
+            batch["x"].as_ref(),
+            column_of(&dataset_type, &[20, 21, 22]).as_ref()
+        );
+    } else {
+        let err = result.unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "{err:?}");
+        assert!(
+            err.to_string().contains("Schema mismatch: field 'x"),
+            "{err}"
+        );
+    }
+
+    fn column_of(data_type: &DataType, values: &[i64]) -> ArrayRef {
+        let values: ArrayRef = Arc::new(Int64Array::from(values.to_vec()));
+        match data_type {
+            DataType::List(item) | DataType::LargeList(item) => {
+                let items = arrow::compute::cast(&values, item.data_type()).unwrap();
+                let offsets = arrow_buffer::OffsetBuffer::from_lengths(vec![1; values.len()]);
+                if matches!(data_type, DataType::List(_)) {
+                    Arc::new(arrow_array::ListArray::new(
+                        item.clone(),
+                        offsets,
+                        items,
+                        None,
+                    ))
+                } else {
+                    let offsets =
+                        arrow_buffer::OffsetBuffer::<i64>::from_lengths(vec![1; values.len()]);
+                    Arc::new(arrow_array::LargeListArray::new(
+                        item.clone(),
+                        offsets,
+                        items,
+                        None,
+                    ))
+                }
+            }
+            _ => arrow::compute::cast(&values, data_type).unwrap(),
+        }
+    }
 }
 
 async fn write_multi_fragment_source(uri: &str) -> Dataset {
@@ -739,10 +884,10 @@ async fn test_shallow_clone_base_artifacts_use_base_object_store() {
     let fragment = cloned
         .get_fragments()
         .into_iter()
-        .find(|fragment| fragment.metadata.deletion_file.is_some())
+        .find(|fragment| fragment.metadata().deletion_file.is_some())
         .unwrap();
     assert_eq!(
-        fragment.metadata.deletion_file.as_ref().unwrap().base_id,
+        fragment.metadata().deletion_file.as_ref().unwrap().base_id,
         Some(base.id)
     );
 
@@ -912,7 +1057,7 @@ async fn test_cold_prefiltered_vector_search_reads_each_deletion_file_once() {
     let deletion_files = dataset
         .get_fragments()
         .iter()
-        .filter(|fragment| fragment.metadata.deletion_file.is_some())
+        .filter(|fragment| fragment.metadata().deletion_file.is_some())
         .count();
     assert_eq!(deletion_files, 8);
 
@@ -1097,14 +1242,17 @@ async fn test_base_files_share_one_scheduler_per_scan() {
     // exactly one scheduler. Reverting the open_current_file_reader change
     // (a fresh scheduler per file) leaves the cache empty and fails this.
     assert_eq!(
-        cache.len(),
+        cache.num_cached_bases(),
         1,
         "all files of one base must share a single scheduler"
     );
 }
 
+#[rstest]
+#[case::dataset_defaults(false)]
+#[case::source_bindings(true)]
 #[tokio::test]
-async fn test_base_object_store_cache_invalidation() {
+async fn test_base_object_store_cache_invalidation(#[case] has_source_bindings: bool) {
     let source_dir = tempfile::tempdir().unwrap();
     let clone_dir = tempfile::tempdir().unwrap();
     let extra_dir = tempfile::tempdir().unwrap();
@@ -1112,21 +1260,46 @@ async fn test_base_object_store_cache_invalidation() {
     let clone_uri = file_object_store_uri(clone_dir.path());
 
     let mut source = write_multi_fragment_source(&source_uri).await;
-    let mut cloned = tag_and_shallow_clone(&mut source, &clone_uri).await;
+    let cloned = tag_and_shallow_clone(&mut source, &clone_uri).await;
+    // Reopening without runtime source bindings exercises dataset-level fallback params.
+    let mut cloned = if has_source_bindings {
+        cloned
+    } else {
+        DatasetBuilder::from_uri(&clone_uri)
+            .with_session(cloned.session.clone())
+            .load()
+            .await
+            .unwrap()
+    };
     let base_id = first_base_id(&cloned);
     let store = cloned.object_store(Some(base_id)).await.unwrap();
 
     let rebound = cloned.with_object_store(
-        cloned.object_store.clone(),
+        cloned.table_state.object_store.clone(),
         Some(ObjectStoreParams {
             block_size: Some(32 * 1024),
             ..Default::default()
         }),
     );
+    let attempts_before = registry_attempts(&rebound);
     let rebound_store = rebound.object_store(Some(base_id)).await.unwrap();
-    assert!(
-        !Arc::ptr_eq(&store, &rebound_store),
-        "changed store params must not serve the previously cached base store"
+    assert_eq!(
+        registry_attempts(&rebound) - attempts_before,
+        1,
+        "changed store params must invalidate the dataset's base store cache"
+    );
+    assert_eq!(
+        Arc::ptr_eq(&store, &rebound_store),
+        has_source_bindings,
+        "explicit source bindings must take precedence over changed dataset defaults"
+    );
+    assert_eq!(
+        rebound_store.block_size(),
+        if has_source_bindings {
+            store.block_size()
+        } else {
+            32 * 1024
+        }
     );
 
     cloned.delete("id = 0").await.unwrap();
@@ -1438,7 +1611,11 @@ async fn test_load_manifest_iops() {
     .await
     .unwrap();
 
-    let _ = _original_ds.object_store.as_ref().io_stats_incremental(); //reset
+    let _ = _original_ds
+        .table_state
+        .object_store
+        .as_ref()
+        .io_stats_incremental(); //reset
 
     let _dataset = DatasetBuilder::from_uri("memory://test")
         .with_session(session)
@@ -1450,7 +1627,11 @@ async fn test_load_manifest_iops() {
     // in the metadata cache. Opening therefore issues a single IOP:
     // 1. List _versions directory to resolve the latest manifest location.
     // The manifest body is served from the cache instead of being read from storage.
-    let io_stats = _dataset.object_store.as_ref().io_stats_incremental();
+    let io_stats = _dataset
+        .table_state
+        .object_store
+        .as_ref()
+        .io_stats_incremental();
     assert_io_eq!(io_stats, read_iops, 1);
 }
 
@@ -1481,7 +1662,9 @@ async fn test_checkout_removed_version_not_served_from_cache() {
 
     let version = dataset.manifest().version;
     let location = dataset.manifest_location().clone();
-    let cache = session.metadata_cache.for_dataset(&dataset.uri);
+    let cache = session
+        .metadata_cache()
+        .for_dataset(&dataset.table_state.uri);
 
     assert!(
         cache
@@ -1496,11 +1679,21 @@ async fn test_checkout_removed_version_not_served_from_cache() {
     dataset.checkout_version(version).await.unwrap();
 
     // Remove the version from storage, as cleanup (or a manual delete) would.
-    dataset.object_store.delete(&location.path).await.unwrap();
+    dataset
+        .table_state
+        .object_store
+        .delete(&location.path)
+        .await
+        .unwrap();
 
     let resolved = dataset
+        .table_state
         .commit_handler
-        .resolve_version_location(&dataset.base, version, &dataset.object_store.inner)
+        .resolve_version_location(
+            &dataset.table_state.base,
+            version,
+            &dataset.table_state.object_store.inner,
+        )
         .await
         .unwrap();
     assert!(
@@ -1569,13 +1762,10 @@ async fn test_write_params(
         assert_eq!(fragment.count_rows(None).await.unwrap(), 100);
         // No group / batch concept in v2
         if data_storage_version == LanceFileVersion::Legacy {
-            let reader = crate::dataset::versions::open_v1_fragment_reader(
-                fragment,
-                dataset.schema(),
-                &FragReadConfig::default(),
-            )
-            .await
-            .unwrap();
+            let reader = fragment
+                .open_v1_fragment_reader(dataset.schema(), &FragReadConfig::default())
+                .await
+                .unwrap();
             assert_eq!(reader.num_batches(), 10);
             for i in 0..reader.num_batches() as u32 {
                 assert_eq!(reader.num_rows_in_batch(i).unwrap(), 10);
@@ -1626,10 +1816,14 @@ async fn test_write_manifest(
 
     // New datasets retain legacy field-ID allocation until explicitly migrated.
     let manifest = read_manifest(
-        dataset.object_store.as_ref(),
+        dataset.table_state.object_store.as_ref(),
         &dataset
+            .table_state
             .commit_handler
-            .resolve_latest_location(&dataset.base, dataset.object_store.as_ref())
+            .resolve_latest_location(
+                &dataset.table_state.base,
+                dataset.table_state.object_store.as_ref(),
+            )
             .await
             .unwrap()
             .path,
@@ -1655,10 +1849,14 @@ async fn test_write_manifest(
 
     // Check it set the flag
     let mut manifest = read_manifest(
-        dataset.object_store.as_ref(),
+        dataset.table_state.object_store.as_ref(),
         &dataset
+            .table_state
             .commit_handler
-            .resolve_latest_location(&dataset.base, dataset.object_store.as_ref())
+            .resolve_latest_location(
+                &dataset.table_state.base,
+                dataset.table_state.object_store.as_ref(),
+            )
             .await
             .unwrap()
             .path,
@@ -1680,24 +1878,13 @@ async fn test_write_manifest(
     manifest.reader_feature_flags |= FLAG_UNKNOWN;
     manifest.version += 1;
     write_manifest_file(
-        dataset.object_store.as_ref(),
-        dataset.commit_handler.as_ref(),
-        &dataset.base,
+        dataset.table_state.object_store.as_ref(),
+        dataset.table_state.commit_handler.as_ref(),
+        &dataset.table_state.base,
         &mut manifest,
         None,
-        &ManifestWriteConfig {
-            auto_set_feature_flags: false,
-            timestamp: None,
-            use_stable_row_ids: false,
-            use_legacy_format: None,
-            storage_format: None,
-            disable_transaction_file: false,
-            migration_next_row_id: None,
-            activate_non_reusable_field_ids: false,
-            tagged_frag_reuse_trim: false,
-            clustering_definitions: None,
-        },
-        dataset.manifest_location.naming_scheme,
+        &ManifestBuildConfig::default().with_auto_set_feature_flags(false),
+        dataset.table_state.manifest_location.naming_scheme,
         None,
         // Previously classified from a None inline copy, which validated.
         true,
@@ -1756,16 +1943,13 @@ async fn test_clone_rejects_unknown_writer_requirements() {
     unknown_writer.version += 1;
     unknown_writer.writer_feature_flags |= feature_flags::FLAG_UNKNOWN;
     write_manifest_file(
-        dataset.object_store.as_ref(),
-        dataset.commit_handler.as_ref(),
-        &dataset.base,
+        dataset.table_state.object_store.as_ref(),
+        dataset.table_state.commit_handler.as_ref(),
+        &dataset.table_state.base,
         &mut unknown_writer,
         None,
-        &ManifestWriteConfig {
-            auto_set_feature_flags: false,
-            ..Default::default()
-        },
-        dataset.manifest_location.naming_scheme,
+        &ManifestBuildConfig::default().with_auto_set_feature_flags(false),
+        dataset.table_state.manifest_location.naming_scheme,
         None,
         true,
     )
@@ -1791,9 +1975,9 @@ async fn open_rejects_mixed_file_versions_without_capability() {
     create_file(&uri, WriteMode::Create, LanceFileVersion::V2_0).await;
     let dataset = Dataset::open(uri.to_str().unwrap()).await.unwrap();
     let mut manifest = read_manifest(
-        dataset.object_store.as_ref(),
-        &dataset.manifest_location.path,
-        dataset.manifest_location.size,
+        dataset.table_state.object_store.as_ref(),
+        &dataset.table_state.manifest_location.path,
+        dataset.table_state.manifest_location.size,
     )
     .await
     .unwrap();
@@ -1803,14 +1987,15 @@ async fn open_rejects_mixed_file_versions_without_capability() {
     manifest.version += 1;
 
     dataset
+        .table_state
         .commit_handler
         .commit(
             &mut manifest,
             None,
-            &dataset.base,
-            dataset.object_store.as_ref(),
+            &dataset.table_state.base,
+            dataset.table_state.object_store.as_ref(),
             write_manifest_file_to_path,
-            dataset.manifest_location.naming_scheme,
+            dataset.table_state.manifest_location.naming_scheme,
             None,
         )
         .await
@@ -1845,6 +2030,7 @@ async fn mixed_v2_snapshot_supports_scan_filter_and_take() {
 
     let file_name = "mixed-v2_1.lance";
     let object_writer = dataset
+        .table_state
         .object_store
         .create(&dataset.data_dir().join(file_name))
         .await
@@ -1876,16 +2062,13 @@ async fn mixed_v2_snapshot_supports_scan_filter_and_take() {
     manifest.writer_feature_flags |= feature_flags::FLAG_MIXED_DATA_FILE_VERSIONS;
     manifest.version += 1;
     write_manifest_file(
-        dataset.object_store.as_ref(),
-        dataset.commit_handler.as_ref(),
-        &dataset.base,
+        dataset.table_state.object_store.as_ref(),
+        dataset.table_state.commit_handler.as_ref(),
+        &dataset.table_state.base,
         &mut manifest,
         None,
-        &ManifestWriteConfig {
-            auto_set_feature_flags: false,
-            ..Default::default()
-        },
-        dataset.manifest_location.naming_scheme,
+        &ManifestBuildConfig::default().with_auto_set_feature_flags(false),
+        dataset.table_state.manifest_location.naming_scheme,
         None,
         false,
     )
@@ -1965,6 +2148,7 @@ async fn same_fragment_mixed_v2_files_validate_and_scan() {
     let mut data_files = Vec::with_capacity(columns.len());
     for (file_name, version, batch) in columns {
         let object_writer = dataset
+            .table_state
             .object_store
             .create(&dataset.data_dir().join(file_name))
             .await
@@ -1986,16 +2170,13 @@ async fn same_fragment_mixed_v2_files_validate_and_scan() {
     manifest.writer_feature_flags |= feature_flags::FLAG_MIXED_DATA_FILE_VERSIONS;
     manifest.version += 1;
     write_manifest_file(
-        dataset.object_store.as_ref(),
-        dataset.commit_handler.as_ref(),
-        &dataset.base,
+        dataset.table_state.object_store.as_ref(),
+        dataset.table_state.commit_handler.as_ref(),
+        &dataset.table_state.base,
         &mut manifest,
         None,
-        &ManifestWriteConfig {
-            auto_set_feature_flags: false,
-            ..Default::default()
-        },
-        dataset.manifest_location.naming_scheme,
+        &ManifestBuildConfig::default().with_auto_set_feature_flags(false),
+        dataset.table_state.manifest_location.naming_scheme,
         None,
         false,
     )
@@ -2024,22 +2205,19 @@ async fn test_restore_rejects_unknown_target_flags() {
         .into_reader_rows(RowCount::from(1), BatchCount::from(1));
     let dataset = Dataset::write(data, &test_uri, None).await.unwrap();
 
-    let write_config = ManifestWriteConfig {
-        auto_set_feature_flags: false,
-        ..Default::default()
-    };
+    let write_config = ManifestBuildConfig::default().with_auto_set_feature_flags(false);
     let mut unknown_manifest = dataset.manifest.as_ref().clone();
     unknown_manifest.version = 2;
     unknown_manifest.reader_feature_flags |= feature_flags::FLAG_UNKNOWN;
     unknown_manifest.writer_feature_flags |= feature_flags::FLAG_UNKNOWN;
     write_manifest_file(
-        dataset.object_store.as_ref(),
-        dataset.commit_handler.as_ref(),
-        &dataset.base,
+        dataset.table_state.object_store.as_ref(),
+        dataset.table_state.commit_handler.as_ref(),
+        &dataset.table_state.base,
         &mut unknown_manifest,
         None,
         &write_config,
-        dataset.manifest_location.naming_scheme,
+        dataset.table_state.manifest_location.naming_scheme,
         None,
         // No inline transaction to classify from, so validate.
         true,
@@ -2050,13 +2228,13 @@ async fn test_restore_rejects_unknown_target_flags() {
     let mut supported_manifest = dataset.manifest.as_ref().clone();
     supported_manifest.version = 3;
     write_manifest_file(
-        dataset.object_store.as_ref(),
-        dataset.commit_handler.as_ref(),
-        &dataset.base,
+        dataset.table_state.object_store.as_ref(),
+        dataset.table_state.commit_handler.as_ref(),
+        &dataset.table_state.base,
         &mut supported_manifest,
         None,
         &write_config,
-        dataset.manifest_location.naming_scheme,
+        dataset.table_state.manifest_location.naming_scheme,
         None,
         // No inline transaction to classify from, so validate.
         true,
@@ -2093,16 +2271,13 @@ async fn test_checkout_latest_rejects_unsupported_reader_before_caching() {
     unsupported_manifest.reader_feature_flags |= feature_flags::FLAG_UNKNOWN;
     unsupported_manifest.writer_feature_flags |= feature_flags::FLAG_UNKNOWN;
     let location = write_manifest_file(
-        dataset.object_store.as_ref(),
-        dataset.commit_handler.as_ref(),
-        &dataset.base,
+        dataset.table_state.object_store.as_ref(),
+        dataset.table_state.commit_handler.as_ref(),
+        &dataset.table_state.base,
         &mut unsupported_manifest,
         None,
-        &ManifestWriteConfig {
-            auto_set_feature_flags: false,
-            ..Default::default()
-        },
-        dataset.manifest_location.naming_scheme,
+        &ManifestBuildConfig::default().with_auto_set_feature_flags(false),
+        dataset.table_state.manifest_location.naming_scheme,
         None,
         // No inline transaction to classify from, so validate.
         true,
@@ -2115,6 +2290,7 @@ async fn test_checkout_latest_rejects_unsupported_reader_before_caching() {
     assert_eq!(dataset.version().version, original_version);
     assert!(
         dataset
+            .table_state
             .metadata_cache
             .get_with_key(&ManifestKey {
                 version: location.version,
@@ -2200,10 +2376,14 @@ async fn test_rle_v2_v23_write_and_append() {
     .unwrap();
 
     let manifest = read_manifest(
-        dataset.object_store.as_ref(),
+        dataset.table_state.object_store.as_ref(),
         &dataset
+            .table_state
             .commit_handler
-            .resolve_latest_location(&dataset.base, dataset.object_store.as_ref())
+            .resolve_latest_location(
+                &dataset.table_state.base,
+                dataset.table_state.object_store.as_ref(),
+            )
             .await
             .unwrap()
             .path,
@@ -2495,10 +2675,10 @@ async fn test_deep_clone(
     assert!(cloned_dataset.manifest().base_paths.is_empty());
 
     // Validate internal file counts are equal between source and cloned datasets
-    let store = branch.object_store.as_ref();
-    let src_root = dataset.base.clone();
-    let branch_root = branch.base.clone();
-    let dst_root = cloned_dataset.base.clone();
+    let store = branch.table_state.object_store.as_ref();
+    let src_root = dataset.table_state.base.clone();
+    let branch_root = branch.table_state.base.clone();
+    let dst_root = cloned_dataset.table_state.base.clone();
 
     let src_data = count_files(store, &src_root, "data").await;
     let dst_data = count_files(store, &dst_root, "data").await;
@@ -2551,8 +2731,8 @@ async fn test_deep_clone(
         )
         .await
         .unwrap();
-    let store = branch.object_store.as_ref();
-    let dst_root = cloned_dataset.base.clone();
+    let store = branch.table_state.object_store.as_ref();
+    let dst_root = cloned_dataset.table_state.base.clone();
 
     // Validate target dataset rows
     let batches = cloned_dataset
@@ -2630,8 +2810,12 @@ async fn test_deep_clone_copies_blob_v2_sidecars() {
         )
         .await
         .unwrap();
-    let source_index_file_count =
-        count_files(source.object_store.as_ref(), &source.base, "_indices").await;
+    let source_index_file_count = count_files(
+        source.table_state.object_store.as_ref(),
+        &source.table_state.base,
+        "_indices",
+    )
+    .await;
 
     let cloned = Arc::new(
         source
@@ -2643,7 +2827,12 @@ async fn test_deep_clone_copies_blob_v2_sidecars() {
     assert_eq!(cloned_indices.len(), 1);
     assert_eq!(cloned_indices[0].name, "id_idx");
     assert_eq!(
-        count_files(cloned.object_store.as_ref(), &cloned.base, "_indices").await,
+        count_files(
+            cloned.table_state.object_store.as_ref(),
+            &cloned.table_state.base,
+            "_indices"
+        )
+        .await,
         source_index_file_count
     );
 
@@ -2673,16 +2862,13 @@ async fn test_deep_clone_rejects_unsupported_writer_before_copying() {
     unsupported_manifest.version += 1;
     unsupported_manifest.writer_feature_flags |= feature_flags::FLAG_UNKNOWN << 1;
     write_manifest_file(
-        source.object_store.as_ref(),
-        source.commit_handler.as_ref(),
-        &source.base,
+        source.table_state.object_store.as_ref(),
+        source.table_state.commit_handler.as_ref(),
+        &source.table_state.base,
         &mut unsupported_manifest,
         None,
-        &ManifestWriteConfig {
-            auto_set_feature_flags: false,
-            ..Default::default()
-        },
-        source.manifest_location.naming_scheme,
+        &ManifestBuildConfig::default().with_auto_set_feature_flags(false),
+        source.table_state.manifest_location.naming_scheme,
         None,
         // No inline transaction to classify from, so validate.
         true,
@@ -2721,16 +2907,13 @@ async fn test_shallow_clone_rejects_unsupported_writer_before_writing_target() {
     unsupported_manifest.version += 1;
     unsupported_manifest.writer_feature_flags |= feature_flags::FLAG_UNKNOWN << 1;
     write_manifest_file(
-        source.object_store.as_ref(),
-        source.commit_handler.as_ref(),
-        &source.base,
+        source.table_state.object_store.as_ref(),
+        source.table_state.commit_handler.as_ref(),
+        &source.table_state.base,
         &mut unsupported_manifest,
         None,
-        &ManifestWriteConfig {
-            auto_set_feature_flags: false,
-            ..Default::default()
-        },
-        source.manifest_location.naming_scheme,
+        &ManifestBuildConfig::default().with_auto_set_feature_flags(false),
+        source.table_state.manifest_location.naming_scheme,
         None,
         // No inline transaction to classify from, so validate.
         true,
@@ -2824,7 +3007,7 @@ async fn test_deep_clone_cross_store(
     )
     .await
     .unwrap();
-    assert_ne!(dataset.object_store.store_prefix, "");
+    assert_ne!(dataset.table_state.object_store.store_prefix, "");
 
     // Create a scalar index so the index files and the manifest index section are also
     // copied across stores (the index section is read through the source store at commit).
@@ -2848,8 +3031,8 @@ async fn test_deep_clone_cross_store(
 
     // The clone targets a local store, distinct from the in-memory source.
     assert_ne!(
-        cloned_dataset.object_store.store_prefix,
-        dataset.object_store.store_prefix
+        cloned_dataset.table_state.object_store.store_prefix,
+        dataset.table_state.object_store.store_prefix
     );
     assert!(cloned_dataset.manifest().base_paths.is_empty());
 
@@ -2873,6 +3056,536 @@ async fn test_deep_clone_cross_store(
     assert_eq!(cloned_indices.len(), 1);
     assert_eq!(cloned_indices.first().unwrap().name, "id_idx");
     assert!(cloned_indices.iter().all(|idx| idx.base_id.is_none()));
+}
+
+#[rstest]
+#[case::empty_target(false, false)]
+#[case::target_path_exists_only_in_source(true, false)]
+#[case::target_path_exists_only_in_target(false, true)]
+#[tokio::test]
+async fn test_shallow_clone_cross_store(
+    #[case] source_has_target: bool,
+    #[case] target_has_target: bool,
+) {
+    use object_store::ObjectStoreExt;
+
+    let source_store: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::memory::InMemory::new());
+    let target_store: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::memory::InMemory::new());
+    let source_uri = "memory:///source";
+    let target_uri = "memory:///target";
+    #[allow(deprecated)] // Exercise caller-supplied, independent object stores.
+    let store_params = |store: Arc<dyn object_store::ObjectStore>, uri: &str| ObjectStoreParams {
+        object_store: Some((store, url::Url::parse(uri).unwrap())),
+        ..Default::default()
+    };
+    let data = || {
+        gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(8), BatchCount::from(1))
+    };
+    let mut source = Dataset::write(
+        data(),
+        source_uri,
+        Some(WriteParams {
+            max_rows_per_file: 4,
+            store_params: Some(store_params(source_store.clone(), source_uri)),
+            commit_handler: Some(Arc::new(ConditionalPutCommitHandler)),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(source.fragments().len(), 2);
+    let expected = source.scan().try_into_batch().await.unwrap();
+
+    for (store, has_target) in [
+        (&source_store, source_has_target),
+        (&target_store, target_has_target),
+    ] {
+        if has_target {
+            Dataset::write(
+                data(),
+                target_uri,
+                Some(WriteParams {
+                    store_params: Some(store_params(store.clone(), target_uri)),
+                    commit_handler: Some(Arc::new(ConditionalPutCommitHandler)),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        }
+    }
+    let source_before = source_store
+        .list(None)
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    let target_before = target_store
+        .list(None)
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    let result = source
+        .shallow_clone(
+            target_uri,
+            source.version().version,
+            Some(store_params(target_store.clone(), target_uri)),
+        )
+        .await;
+
+    assert_eq!(
+        source_store
+            .list(None)
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap(),
+        source_before,
+        "cloning must not write anything to the source store"
+    );
+    if target_has_target {
+        let error = result.unwrap_err();
+        assert!(matches!(error, Error::DatasetAlreadyExists { .. }));
+        assert!(error.to_string().contains(target_uri));
+        assert_eq!(
+            target_store
+                .list(None)
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap(),
+            target_before,
+            "rejecting an existing target must leave it unchanged"
+        );
+        return;
+    }
+
+    let cloned = result.unwrap();
+    assert_eq!(cloned.uri(), target_uri);
+    assert_eq!(cloned.version().version, 1);
+    target_store
+        .head(&cloned.table_state.manifest_location.path)
+        .await
+        .unwrap();
+    assert!(cloned.read_transaction().await.unwrap().is_some());
+    assert_eq!(
+        count_files(
+            &cloned.table_state.object_store,
+            &cloned.table_state.base,
+            "data"
+        )
+        .await,
+        0
+    );
+    let base_id = first_base_id(&cloned);
+    assert_eq!(cloned.manifest().base_paths[&base_id].path, source_uri);
+    assert_eq!(cloned.scan().try_into_batch().await.unwrap(), expected);
+
+    // Omitting target params must keep supporting the source's custom store.
+    let inherited = source
+        .shallow_clone("memory:///same-store", source.version().version, None)
+        .await
+        .unwrap();
+    assert!(
+        inherited
+            .table_state
+            .manifest_location
+            .path
+            .as_ref()
+            .starts_with("same-store/_versions/")
+    );
+    assert_eq!(inherited.scan().try_into_batch().await.unwrap(), expected);
+
+    let mut reopened = DatasetBuilder::from_uri(target_uri)
+        .with_read_params(ReadParams {
+            store_options: Some(store_params(target_store, target_uri)),
+            commit_handler: Some(Arc::new(ConditionalPutCommitHandler)),
+            ..Default::default()
+        })
+        .with_base_store_params(source_uri, store_params(source_store, source_uri))
+        .load()
+        .await
+        .unwrap();
+    assert_eq!(reopened.scan().try_into_batch().await.unwrap(), expected);
+
+    let chained_uri = "memory:///chained";
+    let chained = reopened
+        .shallow_clone(
+            chained_uri,
+            reopened.version().version,
+            Some(store_params(
+                Arc::new(object_store::memory::InMemory::new()),
+                chained_uri,
+            )),
+        )
+        .await
+        .unwrap();
+    assert_eq!(chained.scan().try_into_batch().await.unwrap(), expected);
+}
+
+#[tokio::test]
+async fn test_reconfigure_preserves_clone_bindings_and_read_options() {
+    let source_store: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::memory::InMemory::new());
+    let target_store: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::memory::InMemory::new());
+    let source_uri = "memory:///reconfigure-source";
+    let target_uri = "memory:///reconfigure-target";
+    #[allow(deprecated)] // Exercise caller-supplied, independent object stores.
+    let store_params = |store: Arc<dyn object_store::ObjectStore>, uri: &str| ObjectStoreParams {
+        object_store: Some((store, url::Url::parse(uri).unwrap())),
+        ..Default::default()
+    };
+    let data = || {
+        gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(8), BatchCount::from(1))
+    };
+    let mut source = Dataset::write(
+        data(),
+        source_uri,
+        Some(WriteParams {
+            max_rows_per_file: 4,
+            store_params: Some(store_params(source_store.clone(), source_uri)),
+            commit_handler: Some(Arc::new(ConditionalPutCommitHandler)),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let expected = source.scan().try_into_batch().await.unwrap();
+    let cloned = source
+        .shallow_clone(
+            target_uri,
+            source.version().version,
+            Some(store_params(target_store, target_uri)),
+        )
+        .await
+        .unwrap();
+    let session = cloned.session();
+
+    let mut configured = cloned
+        .reconfigure(DatasetRuntimeConfig {
+            block_size: Some(1024),
+            base_store_params: HashMap::from([(
+                source_uri.to_string(),
+                store_params(source_store, source_uri),
+            )]),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(Arc::ptr_eq(&session, &configured.session()));
+    assert_eq!(configured.scan().try_into_batch().await.unwrap(), expected);
+
+    configured = configured.with_file_reader_options(Some(FileReaderOptions {
+        decoder_config: lance_encoding::decoder::DecoderConfig {
+            cache_repetition_index: false,
+            validate_on_decode: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    }));
+    let options = configured.file_reader_options().unwrap();
+    assert!(!options.decoder_config.cache_repetition_index);
+    assert!(options.decoder_config.validate_on_decode);
+    assert_eq!(configured.scan().try_into_batch().await.unwrap(), expected);
+}
+
+/// Storage option carrying the credential the fixture backend authenticates with.
+const TEST_CREDENTIAL_KEY: &str = "test_credential";
+const EXPIRED_CREDENTIAL: &str = "expired-temporary";
+const REFRESHED_CREDENTIAL: &str = "refreshed-temporary";
+
+#[derive(Debug)]
+struct RotatingStorageOptionsProvider {
+    fetches: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl StorageOptionsProvider for RotatingStorageOptionsProvider {
+    async fn fetch_storage_options(&self) -> Result<Option<HashMap<String, String>>> {
+        self.fetches.fetch_add(1, Ordering::SeqCst);
+        Ok(Some(HashMap::from([(
+            TEST_CREDENTIAL_KEY.to_string(),
+            REFRESHED_CREDENTIAL.to_string(),
+        )])))
+    }
+
+    fn provider_id(&self) -> String {
+        "shallow-clone-rotating-credentials".to_string()
+    }
+}
+
+/// Serves a shared in-memory backend through stores that reject I/O once the
+/// test marks credentials expired, unless the accessor captured when the store
+/// was built vends the refreshed credential.
+#[derive(Debug)]
+struct CredentialCheckingProvider {
+    backend: Arc<dyn object_store::ObjectStore>,
+    expired: Arc<AtomicBool>,
+}
+
+#[async_trait::async_trait]
+impl ObjectStoreProvider for CredentialCheckingProvider {
+    async fn new_store(
+        &self,
+        base_path: url::Url,
+        params: &ObjectStoreParams,
+    ) -> Result<ObjectStore> {
+        ObjectStore::try_new(
+            Arc::new(CredentialCheckingStore {
+                backend: self.backend.clone(),
+                accessor: params.get_accessor(),
+                expired: self.expired.clone(),
+            }),
+            base_path,
+            params.block_size,
+            None,
+            false,
+            true,
+            64,
+            3,
+            params.storage_options(),
+        )
+    }
+}
+
+#[derive(Debug)]
+struct CredentialCheckingStore {
+    backend: Arc<dyn object_store::ObjectStore>,
+    accessor: Option<Arc<StorageOptionsAccessor>>,
+    expired: Arc<AtomicBool>,
+}
+
+impl CredentialCheckingStore {
+    async fn require_fresh_credentials(&self) -> OSResult<()> {
+        if !self.expired.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        let failure = |message: String| OSError::Generic {
+            store: "credential-test",
+            source: Box::new(std::io::Error::other(message)),
+        };
+        let Some(accessor) = self.accessor.as_ref() else {
+            return Err(failure("primary backend has no accessor".to_string()));
+        };
+        let options = accessor
+            .get_storage_options()
+            .await
+            .map_err(|source| OSError::Generic {
+                store: "credential-test",
+                source: Box::new(source),
+            })?;
+        match options.get(TEST_CREDENTIAL_KEY).map(String::as_str) {
+            Some(REFRESHED_CREDENTIAL) => Ok(()),
+            stale => Err(failure(format!(
+                "primary backend still authenticates with {stale:?}"
+            ))),
+        }
+    }
+}
+
+impl std::fmt::Display for CredentialCheckingStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "CredentialCheckingStore({})", self.backend)
+    }
+}
+
+#[async_trait::async_trait]
+impl object_store::ObjectStore for CredentialCheckingStore {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> OSResult<PutResult> {
+        self.require_fresh_credentials().await?;
+        self.backend.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOptions,
+    ) -> OSResult<Box<dyn MultipartUpload>> {
+        self.require_fresh_credentials().await?;
+        self.backend.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
+        self.require_fresh_credentials().await?;
+        self.backend.get_opts(location, options).await
+    }
+
+    async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> OSResult<Vec<Bytes>> {
+        self.require_fresh_credentials().await?;
+        self.backend.get_ranges(location, ranges).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, OSResult<Path>>,
+    ) -> BoxStream<'static, OSResult<Path>> {
+        self.backend.delete_stream(locations)
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, OSResult<ObjectMeta>> {
+        self.backend.list(prefix)
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OSResult<ListResult> {
+        self.backend.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(&self, from: &Path, to: &Path, opts: CopyOptions) -> OSResult<()> {
+        self.require_fresh_credentials().await?;
+        self.backend.copy_opts(from, to, opts).await
+    }
+}
+
+/// The accessor installed by `reconfigure` must reach the primary backend that
+/// was already built, not only the handle's params. The Python `shallow_clone`
+/// path builds the target store from static namespace credentials and only then
+/// installs the refreshable namespace accessor; updating params alone leaves the
+/// opened backend authenticating with the expired credentials.
+#[tokio::test]
+async fn test_reconfigure_installs_accessor_in_opened_primary_store() {
+    let source_backend: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::memory::InMemory::new());
+    let target_backend: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::memory::InMemory::new());
+    let expired = Arc::new(AtomicBool::new(false));
+    let fetches = Arc::new(AtomicUsize::new(0));
+
+    let source_uri = "memory:///accessor-refresh-source";
+    let target_uri = "credential-test:///accessor-refresh-target";
+    #[allow(deprecated)]
+    let source_params = ObjectStoreParams {
+        object_store: Some((source_backend, url::Url::parse(source_uri).unwrap())),
+        ..Default::default()
+    };
+    let data = || {
+        gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(8), BatchCount::from(1))
+    };
+    let mut source = Dataset::write(
+        data(),
+        source_uri,
+        Some(WriteParams {
+            max_rows_per_file: 4,
+            store_params: Some(source_params),
+            commit_handler: Some(Arc::new(ConditionalPutCommitHandler)),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let expected = source.scan().try_into_batch().await.unwrap();
+
+    source.session.store_registry().insert(
+        "credential-test",
+        Arc::new(CredentialCheckingProvider {
+            backend: target_backend,
+            expired: expired.clone(),
+        }),
+    );
+
+    // The public binding forwards the namespace's initial temporary credentials
+    // as a static accessor, so the clone's store is built from them.
+    let initial_options = HashMap::from([
+        (
+            TEST_CREDENTIAL_KEY.to_string(),
+            EXPIRED_CREDENTIAL.to_string(),
+        ),
+        ("expires_at_millis".to_string(), "0".to_string()),
+    ]);
+    let cloned = source
+        .shallow_clone(
+            target_uri,
+            source.version().version,
+            Some(ObjectStoreParams {
+                storage_options_accessor: Some(Arc::new(
+                    StorageOptionsAccessor::with_static_options(initial_options.clone()),
+                )),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+    // Credentials expire while the handle still holds the backend built above.
+    expired.store(true, Ordering::SeqCst);
+
+    let mut configured = cloned
+        .reconfigure(DatasetRuntimeConfig {
+            storage_options_accessor: Some(Arc::new(
+                StorageOptionsAccessor::with_initial_and_provider(
+                    initial_options,
+                    Arc::new(RotatingStorageOptionsProvider {
+                        fetches: fetches.clone(),
+                    }),
+                ),
+            )),
+            // The rebuild must keep the explicit block-size precedence too.
+            block_size: Some(1024),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        configured.storage_options_accessor().unwrap().accessor_id(),
+        "shallow-clone-rotating-credentials"
+    );
+    assert_eq!(configured.table_state.object_store.block_size(), 1024);
+
+    // A real metadata read through the primary backend must refresh credentials.
+    let versions = configured.versions().await.unwrap();
+    assert_eq!(
+        versions
+            .iter()
+            .map(|version| version.version)
+            .collect::<Vec<_>>(),
+        vec![1]
+    );
+    assert_eq!(
+        fetches.load(Ordering::SeqCst),
+        1,
+        "primary metadata reads must consult the refreshed accessor exactly once"
+    );
+
+    // The primary backend itself was replaced, not only the handle's params.
+    assert!(
+        !Arc::ptr_eq(
+            &cloned.table_state.object_store,
+            &configured.table_state.object_store
+        ),
+        "reconfigure must replace the primary backend when the accessor changes"
+    );
+
+    // Shared source files keep their own bindings after the primary rebuild.
+    assert_eq!(configured.scan().try_into_batch().await.unwrap(), expected);
+
+    // Commits and refs use the rebuilt backend too.
+    configured.delete("id < 2").await.unwrap();
+    configured
+        .tags()
+        .create("after-reconfigure", configured.version().version)
+        .await
+        .unwrap();
+    assert_eq!(
+        configured
+            .tags()
+            .get("after-reconfigure")
+            .await
+            .unwrap()
+            .version,
+        configured.version().version
+    );
+    assert_eq!(configured.count_rows(None).await.unwrap(), 6);
 }
 
 // Helper: count files under a dataset directory (data/_indices/_deletions)
@@ -3691,6 +4404,216 @@ async fn write_splits_files_before_dictionary_outgrows_key_type(
     dataset.validate().await.unwrap();
 }
 
+/// Int8 dictionary fragments of 100 values each with no values in common: no two fit
+/// one file, so compaction rewrites them into as many fragments as it read. Later runs
+/// must not rewrite them again until a commit changes the dataset.
+#[rstest]
+#[tokio::test]
+async fn compaction_skips_fragments_dictionary_keeps_apart(
+    #[values(LanceFileVersion::V2_1, LanceFileVersion::V2_2)] version: LanceFileVersion,
+) {
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "d",
+        DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+        true,
+    )]));
+    let batch = |start: usize| {
+        let values = StringArray::from_iter_values((start..start + 100).map(|i| format!("v{i}")));
+        let keys = Int8Array::from_iter_values((0..100).cycle().take(1000));
+        let dictionary = Int8DictionaryArray::try_new(keys, Arc::new(values)).unwrap();
+        RecordBatch::try_new(schema.clone(), vec![Arc::new(dictionary)]).unwrap()
+    };
+    let reader = |batch: RecordBatch| RecordBatchIterator::new([Ok(batch)], schema.clone());
+    let params = WriteParams {
+        data_storage_version: Some(version),
+        ..Default::default()
+    };
+    let mut dataset = Dataset::write(reader(batch(0)), "memory://", Some(params))
+        .await
+        .unwrap();
+    for start in [100, 200] {
+        dataset.append(reader(batch(start)), None).await.unwrap();
+    }
+    let compact = async |dataset: &mut Dataset| {
+        let metrics = compact_files(dataset, CompactionOptions::default(), None)
+            .await
+            .unwrap();
+        (metrics.fragments_removed, metrics.fragments_added)
+    };
+    let data_files = |dataset: &Dataset| {
+        dataset
+            .get_fragments()
+            .iter()
+            .flat_map(|fragment| {
+                fragment
+                    .metadata()
+                    .files
+                    .iter()
+                    .map(|file| file.path.clone())
+            })
+            .collect::<Vec<_>>()
+    };
+
+    assert_eq!(compact(&mut dataset).await, (3, 3));
+    let rewritten = data_files(&dataset);
+    let version_after_rewrite = dataset.version().version;
+    assert_eq!(compact(&mut dataset).await, (0, 0));
+    assert_eq!(compact(&mut dataset).await, (0, 0));
+    assert_eq!(data_files(&dataset), rewritten);
+    assert_eq!(dataset.version().version, version_after_rewrite);
+
+    // A delete is a newer commit: the fragments are planned again, and the rewrite
+    // drops the deleted rows from their files.
+    dataset.delete("d = 'v0'").await.unwrap();
+    assert_eq!(compact(&mut dataset).await, (3, 3));
+    assert!(
+        dataset
+            .get_fragments()
+            .iter()
+            .all(|fragment| fragment.metadata().deletion_file.is_none())
+    );
+    assert_eq!(compact(&mut dataset).await, (0, 0));
+
+    // New rows that share the last fragment's values can join it.
+    dataset.append(reader(batch(200)), None).await.unwrap();
+    assert_eq!(compact(&mut dataset).await, (4, 3));
+    let rows_per_fragment = dataset
+        .get_fragments()
+        .iter()
+        .map(|fragment| fragment.metadata().physical_rows)
+        .collect::<Vec<_>>();
+    assert_eq!(rows_per_fragment, [Some(990), Some(1000), Some(2000)]);
+
+    // The files' dictionaries cannot share one Int8 array, so compare the values as strings.
+    let actual = dataset
+        .scan()
+        .try_into_stream()
+        .await
+        .unwrap()
+        .map_ok(|batch| arrow_cast::cast(&batch["d"], &DataType::Utf8).unwrap())
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    let actual = arrow_select::concat::concat(
+        &actual
+            .iter()
+            .map(|array| array.as_ref())
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    let expected = StringArray::from_iter_values(
+        [0, 100, 200, 200]
+            .into_iter()
+            .flat_map(|start| (0..1000).map(move |i| format!("v{}", start + i % 100)))
+            .filter(|value| value != "v0")
+            .collect::<Vec<_>>(),
+    );
+    assert_eq!(as_string_array(&actual), &expected);
+    dataset.validate().await.unwrap();
+}
+
+/// Two fragments over the same 100 Int8 dictionary values, with 20 of them deleted,
+/// rewritten into two fragments only because of a small row target. A later run with a
+/// larger target must still merge them: their dictionaries fit one file.
+#[rstest]
+#[tokio::test]
+async fn compaction_merges_rewritten_fragments_whose_dictionaries_fit(
+    #[values(LanceFileVersion::V2_1, LanceFileVersion::V2_2)] version: LanceFileVersion,
+) {
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "d",
+        DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+        true,
+    )]));
+    let reader = |rows: usize| {
+        let values = StringArray::from_iter_values((0..100).map(|i| format!("v{i}")));
+        let keys = Int8Array::from_iter_values((0..100).cycle().take(rows));
+        let dictionary = Int8DictionaryArray::try_new(keys, Arc::new(values)).unwrap();
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(dictionary)]).unwrap();
+        RecordBatchIterator::new([Ok(batch)], schema.clone())
+    };
+    let params = WriteParams {
+        data_storage_version: Some(version),
+        ..Default::default()
+    };
+    let mut dataset = Dataset::write(reader(3000), "memory://", Some(params))
+        .await
+        .unwrap();
+    dataset.append(reader(500), None).await.unwrap();
+    let deleted = (0..20).map(|i| format!("'v{i}'")).collect::<Vec<_>>();
+    dataset
+        .delete(&format!("d IN ({})", deleted.join(", ")))
+        .await
+        .unwrap();
+    let mut compact = async |options: CompactionOptions| {
+        let metrics = compact_files(&mut dataset, options, None).await.unwrap();
+        (metrics.fragments_removed, metrics.fragments_added)
+    };
+
+    let small_target = CompactionOptions {
+        target_rows_per_fragment: 1000,
+        ..Default::default()
+    };
+    assert_eq!(compact(small_target).await, (2, 2));
+    assert_eq!(compact(CompactionOptions::default()).await, (2, 1));
+    assert_eq!(compact(CompactionOptions::default()).await, (0, 0));
+    assert_eq!(dataset.count_rows(None).await.unwrap(), 2800);
+    dataset.validate().await.unwrap();
+}
+
+/// Only the boundary between two rewritten fragments whose dictionaries cannot share a
+/// file is held back: each of them can still merge with its other neighbor.
+#[rstest]
+#[tokio::test]
+async fn compaction_merges_across_boundaries_dictionary_does_not_split(
+    #[values(LanceFileVersion::V2_1, LanceFileVersion::V2_2)] version: LanceFileVersion,
+) {
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "d",
+        DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+        true,
+    )]));
+    let reader = |start: usize, rows: usize| {
+        let values = StringArray::from_iter_values((start..start + 100).map(|i| format!("v{i}")));
+        let keys = Int8Array::from_iter_values((0..100).cycle().take(rows));
+        let dictionary = Int8DictionaryArray::try_new(keys, Arc::new(values)).unwrap();
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(dictionary)]).unwrap();
+        RecordBatchIterator::new([Ok(batch)], schema.clone())
+    };
+    let params = WriteParams {
+        data_storage_version: Some(version),
+        ..Default::default()
+    };
+    // Fragments A, B, C, A over three disjoint sets of 100 values; C is already full.
+    let mut dataset = Dataset::write(reader(0, 1000), "memory://", Some(params))
+        .await
+        .unwrap();
+    for (start, rows) in [(100, 1000), (200, 2000), (0, 1000)] {
+        dataset.append(reader(start, rows), None).await.unwrap();
+    }
+    let mut compact = async || {
+        let options = CompactionOptions {
+            target_rows_per_fragment: 2000,
+            ..Default::default()
+        };
+        let metrics = compact_files(&mut dataset, options, None).await.unwrap();
+        (metrics.fragments_removed, metrics.fragments_added)
+    };
+
+    // The rewrite leaves the fragments in the order C, A, A, B.
+    assert_eq!(compact().await, (2, 2));
+    // The two A fragments merge; only the boundary between A and B is held back.
+    assert_eq!(compact().await, (2, 1));
+    assert_eq!(compact().await, (0, 0));
+    let mut fragment_rows = Vec::new();
+    for fragment in dataset.get_fragments() {
+        fragment_rows.push(fragment.count_rows(None).await.unwrap());
+    }
+    assert_eq!(fragment_rows, [2000, 1000, 2000]);
+    assert_eq!(dataset.count_rows(None).await.unwrap(), 5000);
+    dataset.validate().await.unwrap();
+}
+
 /// A file finished early for its dictionary leaves the input's row-limit cuts out of line
 /// with the files. The next file must still stop at `max_rows_per_file` rows.
 #[rstest]
@@ -4435,7 +5358,7 @@ fn install_fragments(dataset: &mut Dataset, fragments: Vec<Fragment>) {
     let mut manifest = dataset.manifest.as_ref().clone();
     manifest.fragments = Arc::new(fragments);
     dataset.manifest = Arc::new(manifest);
-    dataset.fragment_bitmap = Arc::new(
+    dataset.table_state.fragment_bitmap = Arc::new(
         dataset
             .manifest
             .fragments
@@ -4541,11 +5464,11 @@ async fn test_open_damaged_latest_manifest_reports_path(
     assert_eq!(dataset.version().version, 2);
     assert_eq!(dataset.get_fragments().len(), 3);
 
-    let manifest_path = dataset.manifest_location.path.clone();
+    let manifest_path = dataset.table_state.manifest_location.path.clone();
     let local_path = lance_io::local::to_local_path(&manifest_path);
     let manifest = std::fs::read(&local_path).unwrap();
     // Past one block the manifest takes another request than the block with the footer.
-    let block_size = dataset.object_store.block_size();
+    let block_size = dataset.table_state.object_store.block_size();
     assert_eq!(manifest.len() > block_size, column_name_len > block_size);
     std::fs::write(&local_path, damage(&manifest)).unwrap();
 
@@ -4793,24 +5716,13 @@ async fn write_manifest_file_rejects_a_nullable_primary_key() {
     manifest.version += 1;
 
     let err = write_manifest_file(
-        dataset.object_store.as_ref(),
-        dataset.commit_handler.as_ref(),
-        &dataset.base,
+        dataset.table_state.object_store.as_ref(),
+        dataset.table_state.commit_handler.as_ref(),
+        &dataset.table_state.base,
         &mut manifest,
         None,
-        &ManifestWriteConfig {
-            auto_set_feature_flags: false,
-            timestamp: None,
-            use_stable_row_ids: false,
-            use_legacy_format: None,
-            storage_format: None,
-            disable_transaction_file: false,
-            migration_next_row_id: None,
-            activate_non_reusable_field_ids: false,
-            tagged_frag_reuse_trim: false,
-            clustering_definitions: None,
-        },
-        dataset.manifest_location.naming_scheme,
+        &ManifestBuildConfig::default().with_auto_set_feature_flags(false),
+        dataset.table_state.manifest_location.naming_scheme,
         None,
         // Previously classified from a None inline copy, which validated.
         true,
@@ -4881,17 +5793,18 @@ async fn forge_legacy_nullable_primary_key(uri: &str, with_mem_wal: bool) -> Dat
     // make building the fixture depend on the very validation these tests
     // exercise, so a regression would show up as a fixture that cannot be
     // built rather than as the behaviour under test changing.
-    manifest.set_timestamp(crate::dataset::timestamp_to_nanos(None));
+    manifest.set_timestamp(crate::utils::temporal::timestamp_to_nanos(None));
     manifest.update_max_fragment_id();
     dataset
+        .table_state
         .commit_handler
         .commit(
             &mut manifest,
             (!indices.is_empty()).then_some(indices),
-            &dataset.base,
-            dataset.object_store.as_ref(),
+            &dataset.table_state.base,
+            dataset.table_state.object_store.as_ref(),
             lance_table::io::commit::write_manifest_file_to_path,
-            dataset.manifest_location.naming_scheme,
+            dataset.table_state.manifest_location.naming_scheme,
             None,
         )
         .await

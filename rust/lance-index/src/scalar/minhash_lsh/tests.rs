@@ -15,6 +15,7 @@ use rstest::rstest;
 
 use super::*;
 use crate::metrics::{LocalMetricsCollector, NoOpMetricsCollector};
+use crate::progress::noop_progress;
 use crate::scalar::lance_format::LanceIndexStore;
 
 fn test_store() -> (TempObjDir, Arc<LanceIndexStore>) {
@@ -31,7 +32,7 @@ fn test_store() -> (TempObjDir, Arc<LanceIndexStore>) {
 fn text_stream(rows: &[(Option<&str>, u64)], batch_rows: usize) -> SendableRecordBatchStream {
     let schema = Arc::new(Schema::new(vec![
         Field::new(VALUE_COLUMN_NAME, DataType::Utf8, true),
-        Field::new(ROW_ID, DataType::UInt64, false),
+        Field::new(ROW_ADDR, DataType::UInt64, false),
     ]));
     let batches: Vec<datafusion_common::Result<RecordBatch>> = rows
         .chunks(batch_rows.max(1))
@@ -415,7 +416,7 @@ async fn test_rows_without_tokens_are_not_indexed() {
     let mut signatures = index.scan_signatures(Arc::new(RowAddrMask::all_rows()));
     let batch = signatures.try_next().await.unwrap().unwrap();
     assert_eq!(
-        batch[ROW_ID].as_primitive::<UInt64Type>().values(),
+        batch[ROW_ADDR].as_primitive::<UInt64Type>().values(),
         &[10, 14]
     );
     let values = batch[SIGNATURE_COL].as_fixed_size_list();
@@ -630,7 +631,7 @@ async fn test_load_rejects_mismatched_details_or_schema() {
     );
 
     // Replace the signature file with one whose signature is wider.
-    let other_schema = signatures_schema(params.num_hashes as i32 + 1);
+    let other_schema = signatures_schema(params.num_hashes as i32 + 1, true);
     let mut writer = store
         .new_index_file(SIGNATURES_FILENAME, other_schema.clone())
         .await
@@ -772,7 +773,7 @@ async fn test_rebuilds_remap_rows_of_a_deferred_compaction() {
     let mut signatures = index.scan_signatures(Arc::new(live));
     let batch = signatures.try_next().await.unwrap().unwrap();
     assert_eq!(
-        batch[ROW_ID].as_primitive::<UInt64Type>().values(),
+        batch[ROW_ADDR].as_primitive::<UInt64Type>().values(),
         &[compacted(0), compacted(3)]
     );
     assert!(signatures.try_next().await.unwrap().is_none());
@@ -831,9 +832,11 @@ async fn test_merge_segments() {
         (0..4u64).map(|i| (1u64 << 32) | i),
     ));
     let (_dir_merged, merged_store) = test_store();
-    let created = merge_minhash_indices(
+    let created = MinHashLshIndex::merge_segments(
         &[(&segment_a, None), (&segment_b, Some(&filter_b))],
+        None,
         merged_store.as_ref(),
+        noop_progress(),
     )
     .await
     .unwrap();
@@ -861,9 +864,11 @@ async fn test_merge_segments() {
     )
     .unwrap();
     let segment_c = build_and_load(&store_c, other, &rows_a, 3, &LanceCache::no_cache()).await;
-    let Err(err) = merge_minhash_indices(
+    let Err(err) = MinHashLshIndex::merge_segments(
         &[(&segment_a, None), (&segment_c, None)],
+        None,
         merged_store.as_ref(),
+        noop_progress(),
     )
     .await
     else {

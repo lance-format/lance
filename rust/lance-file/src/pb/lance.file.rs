@@ -106,7 +106,7 @@ pub struct Dictionary {
 pub struct Field {
     #[prost(enumeration = "field::Type", tag = "1")]
     pub r#type: i32,
-    /// Fully qualified name.
+    /// Unqualified field name.
     #[prost(string, tag = "2")]
     pub name: ::prost::alloc::string::String,
     /// Field Id.
@@ -114,7 +114,7 @@ pub struct Field {
     /// See the comment in `DataFile.fields` for how field ids are assigned.
     #[prost(int32, tag = "3")]
     pub id: i32,
-    /// / Parent Field ID. If not set, this is a top-level column.
+    /// ID of the parent field, or -1 for a top-level field.
     #[prost(int32, tag = "4")]
     pub parent_id: i32,
     /// Logical types, support parameterized Arrow Type.

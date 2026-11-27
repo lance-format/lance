@@ -90,6 +90,23 @@ pub trait ObjectStoreProvider: std::fmt::Debug + Sync + Send {
     ) -> Result<String> {
         Ok(format!("{}${}", url.scheme(), url.authority()))
     }
+
+    /// Calculate the prefix used to decide whether an absolute URI belongs to a
+    /// store configured with the given storage options.
+    ///
+    /// Unlike [`Self::calculate_object_store_prefix`], options that describe a
+    /// different scope of the same store return `Ok(None)` instead of an error.
+    /// This lets a base search skip unrelated bases, such as a different pinned
+    /// revision, while keeping malformed URIs and genuinely invalid
+    /// configurations as errors.
+    fn calculate_object_store_prefix_for_match(
+        &self,
+        url: &Url,
+        storage_options: Option<&HashMap<String, String>>,
+    ) -> Result<Option<String>> {
+        self.calculate_object_store_prefix(url, storage_options)
+            .map(Some)
+    }
 }
 
 /// Default smallest cache size at which [`ObjectStoreRegistry::get_store()`]
@@ -109,6 +126,41 @@ pub struct ObjectStoreRegistryStats {
 
 /// Serializes the builds of one cached store key.
 type BuildLock = Arc<tokio::sync::Mutex<()>>;
+
+/// Identity of one cached object store.
+///
+/// The storage options accessor is represented by its scoped `accessor_id()`
+/// rather than by the `Arc` itself. Keeping the `Arc` here would let the maps
+/// retain everything the accessor owns, including a namespace client and its
+/// session, which in turn owns this registry. The full params still drive the
+/// actual build; only the cache key strips the accessor.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ObjectStoreCacheKey {
+    cache_path: String,
+    params: ObjectStoreParams,
+    accessor_id: Option<String>,
+    scheduler_error_mode: SchedulerErrorMode,
+}
+
+impl ObjectStoreCacheKey {
+    fn new(
+        cache_path: String,
+        params: &ObjectStoreParams,
+        scheduler_error_mode: SchedulerErrorMode,
+    ) -> Self {
+        let mut params = params.clone();
+        let accessor_id = params
+            .storage_options_accessor
+            .take()
+            .map(|accessor| accessor.accessor_id());
+        Self {
+            cache_path,
+            params,
+            accessor_id,
+            scheduler_error_mode,
+        }
+    }
+}
 
 /// A registry of object store providers.
 ///
@@ -140,11 +192,10 @@ pub struct ObjectStoreRegistry {
     // Cache of object stores currently in use. We use a weak reference so the
     // cache itself doesn't keep them alive if no object store is actually using
     // it.
-    active_stores:
-        RwLock<HashMap<(String, ObjectStoreParams, SchedulerErrorMode), Weak<ObjectStore>>>,
+    active_stores: RwLock<HashMap<ObjectStoreCacheKey, Weak<ObjectStore>>>,
     // Held by `get_store` while it builds the store for a key, so concurrent
     // cold calls for that key wait for one build instead of each making one.
-    building: Mutex<HashMap<(String, ObjectStoreParams, SchedulerErrorMode), BuildLock>>,
+    building: Mutex<HashMap<ObjectStoreCacheKey, BuildLock>>,
     // Floor for `prune_threshold`; 0 disables the sweep.
     min_prune_threshold: AtomicUsize,
     // Cache size at which `get_store` sweeps out dead entries before inserting.
@@ -169,6 +220,38 @@ impl ObjectStoreRegistry {
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
         }
+    }
+
+    /// Remove providers before sharing this registry with a session.
+    ///
+    /// Consuming `self` prevents races with in-flight store creation. All cached
+    /// store bindings are discarded so re-registering a scheme cannot resurrect
+    /// an earlier provider's store, even when schemes share a cache prefix.
+    /// Existing store handles held by callers remain usable; this is a
+    /// construction-time restriction, not revocation of issued handles.
+    /// Unknown schemes are ignored. Returns an error if a registry lock is poisoned.
+    ///
+    /// ```
+    /// use lance_io::object_store::ObjectStoreRegistry;
+    /// # fn configured() -> lance_core::Result<()> {
+    /// let registry = ObjectStoreRegistry::default()
+    ///     .without_providers(["file", "file-object-store", "file+uring"])?;
+    /// assert!(registry.get_provider("file").is_none());
+    /// assert!(registry.get_provider("memory").is_some());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn without_providers(
+        mut self,
+        schemes: impl IntoIterator<Item = impl AsRef<str>>,
+    ) -> Result<Self> {
+        let providers = self.providers.get_mut().ok().expect_ok()?;
+        for scheme in schemes {
+            providers.remove(scheme.as_ref());
+        }
+        self.active_stores.get_mut().ok().expect_ok()?.clear();
+        self.building.get_mut().ok().expect_ok()?.clear();
+        Ok(self)
     }
 
     /// Set the smallest cache size at which [`Self::get_store()`] sweeps out
@@ -282,6 +365,9 @@ impl ObjectStoreRegistry {
         }
 
         // Always wrap with IO tracking
+        if let Some(external) = &mut store.external_blob_inner {
+            external.inner = store.io_tracker.wrap("", external.inner.clone());
+        }
         store.inner = store.io_tracker.wrap("", store.inner);
 
         Ok(Arc::new(store))
@@ -369,7 +455,7 @@ impl ObjectStoreRegistry {
         let store_prefix =
             provider.calculate_object_store_prefix(&base_path, params.storage_options())?;
         let cache_path = crate::object_store::metrics_base(&store_prefix, &base_path);
-        let cache_key = (cache_path.clone(), params.clone(), scheduler_error_mode);
+        let cache_key = ObjectStoreCacheKey::new(cache_path.clone(), params, scheduler_error_mode);
 
         // Check if we have a cached store for this base path and params
         {
@@ -563,6 +649,43 @@ mod tests {
     use crate::scheduler::SCHEDULER_ERROR_MODE_STORAGE_OPTION;
     use object_store::list::{PaginatedListOptions, PaginatedListResult, PaginatedListStore};
     use rstest::rstest;
+
+    #[tokio::test]
+    async fn test_without_providers_discards_cached_bindings() {
+        let registry = ObjectStoreRegistry::default();
+        let params = ObjectStoreParams::default();
+        let memory_uri = Url::parse("memory://").unwrap();
+        let memory = registry
+            .get_store(memory_uri.clone(), &params)
+            .await
+            .unwrap();
+        let file_uri = Url::parse("file-object-store:///tmp").unwrap();
+        let file = registry.get_store(file_uri.clone(), &params).await.unwrap();
+        let registry = registry
+            .without_providers(["file", "file-object-store", "file+uring", "absent"])
+            .unwrap();
+        assert!(registry.active_stores().is_empty());
+        for scheme in ["file", "file-object-store", "file+uring"] {
+            assert!(registry.get_provider(scheme).is_none());
+            let uri = Url::parse(&format!("{scheme}:///tmp")).unwrap();
+            let error = registry.get_store(uri.clone(), &params).await.unwrap_err();
+            assert!(matches!(error, Error::InvalidInput { .. }));
+            assert!(error.to_string().contains("No object store provider found"));
+            let error = registry.new_store(uri, &params).await.unwrap_err();
+            assert!(matches!(error, Error::InvalidInput { .. }));
+            assert!(error.to_string().contains("No object store provider found"));
+        }
+        // Re-registering cannot revive a binding created by the old provider.
+        registry.insert(
+            "file-object-store",
+            Arc::new(SchedulerModeIgnoringStoreProvider),
+        );
+        let replacement = registry.get_store(file_uri, &params).await.unwrap();
+        assert!(!Arc::ptr_eq(&file, &replacement));
+        let reopened = registry.get_store(memory_uri, &params).await.unwrap();
+        assert!(!Arc::ptr_eq(&memory, &reopened));
+        assert_eq!(reopened.scheme(), "memory");
+    }
 
     #[derive(Debug)]
     struct DummyProvider;
@@ -1113,6 +1236,55 @@ mod tests {
             err.to_string()
                 .contains(OBJECT_STORE_CACHE_PRUNE_THRESHOLD_OPTION),
             "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cache_does_not_retain_storage_options_provider() {
+        /// Holds the registry like a namespace client held by a real provider.
+        #[derive(Debug)]
+        struct RegistryHoldingStorageOptionsProvider {
+            // The accessor owns this provider, and this provider owns the
+            // registry. A cache key that retained the accessor closes the cycle.
+            _registry: Arc<ObjectStoreRegistry>,
+        }
+
+        #[async_trait::async_trait]
+        impl StorageOptionsProvider for RegistryHoldingStorageOptionsProvider {
+            async fn fetch_storage_options(&self) -> Result<Option<HashMap<String, String>>> {
+                Ok(None)
+            }
+
+            fn provider_id(&self) -> String {
+                "registry-holding-provider".to_string()
+            }
+        }
+
+        let registry = Arc::new(ObjectStoreRegistry::default());
+        let provider = Arc::new(RegistryHoldingStorageOptionsProvider {
+            _registry: registry.clone(),
+        });
+        let accessor = Arc::new(StorageOptionsAccessor::with_provider(provider.clone()));
+        let params = ObjectStoreParams {
+            storage_options_accessor: Some(accessor.clone()),
+            ..Default::default()
+        };
+        let store = registry
+            .get_store(Url::parse("file:///tmp").unwrap(), &params)
+            .await
+            .unwrap();
+        assert_eq!(store.scheme(), "file");
+        let provider_weak = Arc::downgrade(&provider);
+
+        drop(store);
+        drop(params);
+        drop(accessor);
+        drop(provider);
+        drop(registry);
+
+        assert!(
+            provider_weak.upgrade().is_none(),
+            "the object store cache retained the storage options provider"
         );
     }
 

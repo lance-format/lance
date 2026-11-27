@@ -31,13 +31,13 @@ use crate::Dataset;
 use crate::dataset::index::frag_reuse::cleanup_frag_reuse_index;
 use crate::dataset::optimize::remapping::remap_column_index;
 use crate::dataset::optimize::{CompactionOptions, compact_files};
-use crate::dataset::transaction::Operation;
+use crate::dataset::transaction::{Operation, Transaction};
 use crate::dataset::{
     MergeInsertBuilder, MergeInsertWriteMode, NewColumnTransform, WhenMatched, WhenNotMatched,
     WriteDestination, WriteParams,
 };
 use crate::index::{
-    DatasetIndexExt, IntoIndexSegment, provenance::fresh_fragments,
+    CreateIndexBuilder, DatasetIndexExt, IntoIndexSegment, provenance::fresh_fragments,
     provenance::prune_stale_segment_coverage, vector::details::vector_index_details_default,
 };
 use crate::utils::test::compact_into_two;
@@ -209,6 +209,127 @@ async fn test_btree_merge_drops_coverage_a_restore_revived_a_row_in() {
     );
 }
 
+#[rstest]
+#[case::cleanup_revives_all(true, false, true, false)]
+#[case::cleanup_revives_some(true, true, true, false)]
+#[case::cleanup_more_deletions(true, true, false, false)]
+#[case::cleanup_from_updated_handle(true, false, true, true)]
+#[case::distributed_revives_all(false, false, true, false)]
+#[case::distributed_revives_some(false, true, true, false)]
+#[case::distributed_more_deletions(false, true, false, false)]
+#[tokio::test]
+async fn test_create_index_revived_rows(
+    #[case] is_after_cleanup: bool,
+    #[case] has_prior_deletion: bool,
+    #[case] has_revived_rows: bool,
+    #[case] submit_from_updated_handle: bool,
+) {
+    let mut build = create_base_dataset_with(false).await;
+    if has_prior_deletion {
+        build.delete("id = 1").await.unwrap();
+    }
+    let restore_version = build.manifest.version;
+    build.delete("id = 3").await.unwrap();
+    let params = ScalarIndexParams::default();
+    let staged = CreateIndexBuilder::new(&mut build, &["id"], IndexType::BTree, &params)
+        .name("staged".to_string())
+        .execute_uncommitted()
+        .await
+        .unwrap();
+    assert_eq!(
+        staged.fragment_bitmap,
+        Some(RoaringBitmap::from_iter([0, 1]))
+    );
+
+    let mut current = if has_revived_rows {
+        let mut restored = build.checkout_version(restore_version).await.unwrap();
+        restored.restore().await.unwrap();
+        restored
+    } else {
+        let mut deleted = build.clone();
+        deleted.delete("id = 4").await.unwrap();
+        deleted
+    };
+    let intervening_version = current.manifest.version;
+    current
+        .append(
+            gen_batch()
+                .col("id", array::fill::<Int32Type>(12))
+                .col("age", array::fill::<Int32Type>(120))
+                .into_reader_rows(RowCount::from(1), BatchCount::from(1)),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let committed = if is_after_cleanup {
+        // Remove precisely the restore/delete commit: the build snapshot and
+        // its deletion file survive, but transaction replay cannot see it.
+        let path = current
+            .manifest_location()
+            .naming_scheme
+            .manifest_path(&current.table_state.base, intervening_version);
+        current
+            .table_state
+            .object_store
+            .delete(&path)
+            .await
+            .unwrap();
+        let mut submission = if submit_from_updated_handle {
+            current.clone()
+        } else {
+            build.clone()
+        };
+        submission
+            .apply_commit(
+                Transaction::new(
+                    build.manifest.version,
+                    Operation::CreateIndex {
+                        new_indices: vec![staged],
+                        removed_indices: vec![],
+                    },
+                    None,
+                ),
+                &Default::default(),
+                &Default::default(),
+            )
+            .await
+            .unwrap();
+        submission
+    } else {
+        // Untagged tables do not replay the staged segment's transactions.
+        current
+            .commit_existing_index_segments("staged", "id", vec![staged])
+            .await
+            .unwrap();
+        current
+    };
+
+    assert_eq!(
+        ids_matching(&committed, "id = 3").await,
+        if has_revived_rows { vec![3] } else { vec![] }
+    );
+    let mut scan = committed.scan();
+    scan.use_scalar_index(false);
+    scan.filter("id = 3").unwrap();
+    assert_eq!(
+        scan.try_into_batch().await.unwrap().num_rows(),
+        usize::from(has_revived_rows)
+    );
+    assert_eq!(ids_matching(&committed, "id = 7").await, vec![7]);
+    assert_eq!(ids_matching(&committed, "id = 12").await, vec![12]);
+    let indices = committed.load_indices().await.unwrap();
+    let index = indices.iter().find(|index| index.name == "staged").unwrap();
+    assert_eq!(
+        index.fragment_bitmap,
+        Some(if has_revived_rows {
+            RoaringBitmap::from_iter([1])
+        } else {
+            RoaringBitmap::from_iter([0, 1])
+        })
+    );
+}
+
 /// Rewrites `column` of `fragment` into a new file.
 async fn replace_column(
     dataset: Dataset,
@@ -229,6 +350,7 @@ async fn replace_column(
         WriteDestination::Dataset(Arc::new(dataset)),
         Operation::DataReplacement {
             replacements: vec![replacement],
+            data_change: true,
         },
         Some(read_version),
         None,
@@ -667,10 +789,12 @@ async fn test_btree_merge_drops_a_fragment_whose_creation_manifest_was_cleaned_u
         .checkout_version(compaction)
         .await
         .unwrap()
+        .table_state
         .manifest_location
         .path
         .clone();
     dataset
+        .table_state
         .object_store
         .delete(&compaction_manifest)
         .await
@@ -759,7 +883,11 @@ async fn rtree_merge_history_reads(dir: &TempStrDir, fragments: i32) -> usize {
     let groups = fragments / 2;
     assert_eq!(dataset.get_fragments().len(), groups as usize);
 
-    let _ = dataset.object_store.as_ref().io_stats_incremental();
+    let _ = dataset
+        .table_state
+        .object_store
+        .as_ref()
+        .io_stats_incremental();
     let merged = dataset.merge_existing_index_segments(staged).await.unwrap();
     assert_eq!(
         merged.fragment_bitmap.as_ref().unwrap().len() as i32,
@@ -767,6 +895,7 @@ async fn rtree_merge_history_reads(dir: &TempStrDir, fragments: i32) -> usize {
         "every group is covered whole, so coverage follows the rows"
     );
     dataset
+        .table_state
         .object_store
         .as_ref()
         .io_stats_incremental()

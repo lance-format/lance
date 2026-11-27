@@ -30,10 +30,10 @@ pub use lance_index_core::remapping::{
     materialize_remap,
 };
 pub use lance_index_core::scalar::{
-    AnyQuery, BuiltinIndexType, CreatedIndex, IndexFile, IndexReader, IndexStore, IndexWriter,
-    LANCE_SCALAR_INDEX, LOOKUP_KEY_INDEX, OldIndexDataFilter, OrderedScalarIndex, RowIdRemapper,
-    ScalarIndex, ScalarIndexParams, SearchOptions, SearchResult, TrainingCriteria,
-    TrainingOrdering, UpdateCriteria, lookup_batch, lookup_schema,
+    AnyQuery, BuiltinIndexType, CreatedIndex, IndexBinaryReader, IndexFile, IndexReader,
+    IndexStore, IndexWriter, LANCE_SCALAR_INDEX, LOOKUP_KEY_INDEX, OldIndexDataFilter,
+    OrderedScalarIndex, RowIdRemapper, ScalarIndex, ScalarIndexParams, SearchOptions, SearchResult,
+    TrainingCriteria, TrainingOrdering, UpdateCriteria, lookup_batch, lookup_schema,
 };
 
 /// The most matches one built-in index's [`ScalarIndex::lookup`] batch holds.
@@ -48,6 +48,7 @@ pub mod inverted;
 pub mod json;
 pub mod label_list;
 pub mod lance_format;
+pub mod list_element;
 #[cfg(test)]
 pub(crate) mod lookup_test_util;
 pub mod minhash_lsh;
@@ -470,7 +471,13 @@ impl AnyQuery for TextQuery {
     }
 
     fn format(&self, col: &str) -> String {
-        format!("{}", self.to_expr(col.to_string()))
+        let expr = self.to_expr(col.to_string());
+        match self {
+            Self::StringContains(_) => expr.to_string(),
+            Self::Regex(pattern) => {
+                format!("{expr} trigrams={}", ngram::regex_trigrams(pattern))
+            }
+        }
     }
 
     fn to_expr(&self, col: String) -> Expr {

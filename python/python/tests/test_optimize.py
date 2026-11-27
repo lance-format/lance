@@ -13,9 +13,11 @@ import lance
 import numpy as np
 import pyarrow as pa
 import pytest
+from lance.file import LanceFileReader
 from lance.lance import Compaction
 from lance.optimize import (
     CompactionOptions,
+    CompactionTask,
     OptimizeIndexMerge,
     OptimizeIndexTask,
     OptimizeIndices,
@@ -52,6 +54,71 @@ def test_dataset_optimize(tmp_path: Path):
 def test_compaction_options_keys_are_optional():
     assert CompactionOptions.__required_keys__ == frozenset()
     assert "source_budget_mode" in CompactionOptions.__optional_keys__
+    assert "data_cache_bytes" in CompactionOptions.__optional_keys__
+
+
+@pytest.mark.parametrize("api", ["optimizer", "execute", "plan"])
+@pytest.mark.parametrize(
+    "data_cache_bytes,expected_pages", [(None, 1), (0, 8), (1024, 8)]
+)
+def test_compaction_data_cache_bytes(
+    tmp_path: Path, api, data_cache_bytes, expected_pages
+):
+    data = pa.table({"a": pa.array(range(2048), type=pa.int64())})
+    base_dir = tmp_path / "dataset"
+    dataset = lance.write_dataset(
+        data, base_dir, max_rows_per_file=1024, data_storage_version="2.2"
+    )
+    assert len(dataset.get_fragments()) == 2
+    options = dict(
+        target_rows_per_fragment=2048,
+        batch_size=256,
+        compaction_mode="reencode",
+    )
+    if data_cache_bytes is not None:
+        options["data_cache_bytes"] = data_cache_bytes
+
+    if api == "optimizer":
+        dataset.optimize.compact_files(**options)
+    elif api == "execute":
+        Compaction.execute(dataset, options)
+    else:
+        plan = Compaction.plan(dataset, options)
+        assert plan.num_tasks() == 1
+        task = pickle.loads(pickle.dumps(plan.tasks[0]))
+        task_json = json.loads(task.json())
+        assert task_json["options"]["data_cache_bytes"] == data_cache_bytes
+        if data_cache_bytes is None:
+            # Tasks created before this option was added use the Rust default.
+            del task_json["options"]["data_cache_bytes"]
+            task = CompactionTask.from_json(json.dumps(task_json))
+        result = task.execute(dataset)
+        Compaction.commit(dataset, [result], options)
+
+    dataset = lance.dataset(base_dir)
+    fragments = dataset.get_fragments()
+    assert len(fragments) == 1
+    file = fragments[0].metadata.files[0]
+    reader = LanceFileReader(str(base_dir / "data" / file.path))
+    # A 256-row Int64 batch (2 KiB) overflows a 1 KiB cache.
+    assert len(reader.metadata().columns[0].pages) == expected_pages
+    assert reader.read_all().to_table() == data
+    assert dataset.to_table() == data
+
+
+@pytest.mark.parametrize("api", ["optimizer", "execute", "plan"])
+def test_compaction_data_cache_bytes_validation(tmp_path: Path, api):
+    dataset = lance.write_dataset(
+        pa.table({"a": range(4)}), tmp_path / "dataset", max_rows_per_file=2
+    )
+    options = dict(target_rows_per_fragment=4, data_cache_bytes=-1)
+    with pytest.raises(OverflowError):
+        if api == "optimizer":
+            dataset.optimize.compact_files(**options)
+        elif api == "execute":
+            Compaction.execute(dataset, options)
+        else:
+            Compaction.plan(dataset, options)
 
 
 @pytest.mark.parametrize("mode", ["reencode", "try_binary_copy", "force_binary_copy"])
@@ -181,6 +248,183 @@ def test_compact_files_max_source_fragments(tmp_path: Path):
     assert metrics.fragments_removed == 4
     assert metrics.fragments_added == 1
     assert len(dataset.get_fragments()) == 7
+
+
+def _backfilled(tmp_path: Path):
+    dataset = lance.write_dataset(
+        pa.table({"a": range(8), "b": range(8)}),
+        tmp_path / "dataset",
+        max_rows_per_file=4,
+    )
+    dataset.add_columns({"c": "a + 1"})
+    dataset.add_columns({"d": "a + 2"})
+    return dataset
+
+
+def _files_per_fragment(dataset):
+    return [len(fragment.metadata.files) for fragment in dataset.get_fragments()]
+
+
+def test_compact_files_repacks_columns(tmp_path: Path):
+    dataset = _backfilled(tmp_path)
+    expected = dataset.to_table()
+    assert _files_per_fragment(dataset) == [3, 3]
+    stats = dataset.stats.column_layout_stats()
+    assert [s["fragment_id"] for s in stats] == [0, 1]
+    for s in stats:
+        assert s["live_file_count"] == 3
+        assert s["fields_per_file"] == [2, 1, 1]
+        assert all(size is not None for size in s["file_sizes"])
+        assert s["dead_slot_ratio"] == 0.0
+        assert s["overlay_count"] == 0
+
+    metrics = dataset.optimize.compact_files(
+        max_data_files_per_fragment=1, scope="repack_columns"
+    )
+
+    assert metrics.files_added == 2
+    assert metrics.fragments_added == 0
+    assert _files_per_fragment(dataset) == [1, 1]
+    stats = dataset.stats.column_layout_stats()
+    assert [s["live_file_count"] for s in stats] == [1, 1]
+    assert [s["fields_per_file"] for s in stats] == [[4], [4]]
+    assert dataset.to_table() == expected
+    assert [f.fragment_id for f in dataset.get_fragments()] == [0, 1]
+
+
+def test_distributed_repack(tmp_path: Path):
+    dataset = _backfilled(tmp_path)
+    expected = dataset.to_table()
+
+    # c and d sit in separate files, so a limit of 2 merges them.
+    plan = Compaction.plan(
+        dataset, options=dict(max_data_files_per_fragment=2, scope="repack_columns")
+    )
+    assert [task.kind for task in plan.tasks] == ["repack_columns"] * 2
+    # Field ids 2 and 3 are c and d, merged into one file.
+    assert [task.repack_files for task in plan.tasks] == [[[2, 3]]] * 2
+    results = [
+        pickle.loads(pickle.dumps(pickle.loads(pickle.dumps(task)).execute(dataset)))
+        for task in plan.tasks
+    ]
+    Compaction.commit(dataset, results)
+
+    dataset = lance.dataset(dataset.uri)
+    assert _files_per_fragment(dataset) == [2, 2]
+    assert dataset.to_table() == expected
+
+
+def test_commit_leaves_dataset_at_the_rewrite_when_the_repack_fails(tmp_path: Path):
+    # Fragment 0 is full and spread over three files, so it is repacked;
+    # fragments 1 and 2 are small, so they are rewritten into one.
+    uri = tmp_path / "dataset"
+    dataset = lance.write_dataset(pa.table({"a": range(8), "b": range(8)}), uri)
+    dataset.insert(
+        pa.table({"a": range(8, 16), "b": range(8, 16)}), max_rows_per_file=4
+    )
+    dataset.add_columns({"c": "a * 2"})
+    dataset.add_columns({"d": "a * 3"})
+    plan = Compaction.plan(
+        dataset, options=dict(target_rows_per_fragment=8, max_data_files_per_fragment=1)
+    )
+    assert sorted(task.kind for task in plan.tasks) == [
+        "repack_columns",
+        "rewrite_fragments",
+    ]
+    results = [task.execute(dataset) for task in plan.tasks]
+    # Dropping c, which the repack of fragment 0 moves, makes the repack
+    # commit fail with a retryable conflict; the rewrite of fragments 1 and 2
+    # does not conflict with the drop.
+    lance.dataset(uri).drop_columns(["c"])
+    planned_version = dataset.version
+
+    with pytest.raises(OSError, match="Retryable commit conflict"):
+        Compaction.commit(dataset, results)
+
+    latest = lance.dataset(uri)
+    assert dataset.version == latest.version > planned_version + 1
+    # The rewrite landed and the repack did not.
+    fragments = dataset.get_fragments()
+    assert len(fragments) == 2
+    assert [len(f.metadata.files) for f in fragments if f.fragment_id == 0] == [2]
+    assert dataset.to_table() == latest.to_table()
+
+
+@pytest.mark.parametrize(
+    "config, files",
+    [
+        ({"lance.compaction.max_data_files_per_fragment": "1"}, [1, 1]),
+        ({"lance.compaction.max_data_files_per_fragment": "2"}, [2, 2]),
+    ],
+)
+def test_repack_options_come_from_dataset_config(tmp_path: Path, config, files):
+    dataset = _backfilled(tmp_path)
+    expected = dataset.to_table()
+    dataset.update_config(config)
+
+    dataset.optimize.compact_files(scope="repack_columns")
+
+    assert _files_per_fragment(dataset) == files
+    assert dataset.to_table() == expected
+
+
+def test_repack_options_override_dataset_config(tmp_path: Path):
+    dataset = _backfilled(tmp_path)
+    dataset.update_config({"lance.compaction.max_data_files_per_fragment": "2"})
+
+    dataset.optimize.compact_files(
+        max_data_files_per_fragment=1, scope="repack_columns"
+    )
+
+    assert _files_per_fragment(dataset) == [1, 1]
+
+
+def test_repack_rejects_bad_options(tmp_path: Path):
+    dataset = _backfilled(tmp_path)
+    with pytest.raises(ValueError, match="Invalid compaction scope"):
+        dataset.optimize.compact_files(scope="nonsense")
+
+    # A repack-only run with nothing to trigger a repack.
+    with pytest.raises(OSError, match="max_data_files_per_fragment is not set"):
+        dataset.optimize.compact_files(scope="repack_columns")
+
+    dataset.update_config({"lance.compaction.max_data_files_per_fragment": "lots"})
+    with pytest.raises(ValueError, match="expected a positive integer"):
+        dataset.optimize.compact_files(scope="repack_columns")
+
+
+def test_repack_keeps_vector_index(tmp_path: Path):
+    rows, dim = 512, 16
+    vectors = np.random.default_rng(0).standard_normal((rows, dim)).astype(np.float32)
+    table = vec_to_table(vectors).append_column("id", pa.array(range(rows)))
+    dataset = lance.write_dataset(table, tmp_path / "dataset")
+    dataset.add_columns({"tag": "id * 2"})
+    dataset.create_index("vector", "IVF_PQ", num_partitions=4, num_sub_vectors=4)
+    assert _files_per_fragment(dataset) == [2]
+    nearest = {"column": "vector", "q": vectors[123], "k": 10}
+
+    def segments(dataset):
+        return [
+            (segment.uuid, sorted(segment.fragment_ids))
+            for index in dataset.describe_indices()
+            for segment in index.segments
+        ]
+
+    before = segments(dataset)
+    assert len(before) == 1 and before[0][1] == [0]
+    ids = dataset.to_table(nearest=nearest)["id"].to_pylist()
+    addrs = dataset.to_table(columns=["id"], with_row_address=True)
+
+    # Merges the vector column's file with the backfilled one.
+    dataset.optimize.compact_files(
+        max_data_files_per_fragment=1, scope="repack_columns"
+    )
+
+    assert _files_per_fragment(dataset) == [1]
+    assert segments(dataset) == before
+    assert dataset.to_table(nearest=nearest)["id"].to_pylist() == ids
+    assert dataset.to_table(columns=["id"], with_row_address=True) == addrs
+    assert "ANNIvfPartition" in dataset.scanner(nearest=nearest).explain_plan(True)
 
 
 def test_blob_compaction(tmp_path: Path):
@@ -1243,8 +1487,6 @@ def test_remap_row_addrs(tmp_path: Path):
     before = ds.scanner(columns=["id"], with_row_address=True).to_table()
     old = dict(zip(before["id"].to_pylist(), before["_rowaddr"].to_pylist()))
 
-    # A deferred-remap compaction records a fragment-reuse index only when it
-    # rewrites data an index covers, so index a column first.
     ds.create_scalar_index("id", "BTREE")
 
     ds.optimize.compact_files(
@@ -1291,6 +1533,33 @@ def test_min_bytes_per_file(tmp_path: Path, min_bytes):
     else:
         assert plan.tasks
         assert metrics.fragments_removed == 2
+
+
+def test_optimize_indices_rejects_unknown_options(tmp_path: Path):
+    """An option name optimize_indices does not know must raise. Ignored, a
+    misspelled ``index_names`` runs the default optimize over every index."""
+    uri = str(tmp_path / "dataset")
+    dataset = lance.write_dataset(pa.table({"id": range(64)}), uri)
+    dataset.create_scalar_index("id", "BTREE", name="id_idx")
+    dataset = lance.write_dataset(pa.table({"id": range(64, 128)}), uri, mode="append")
+    version = dataset.version
+
+    with pytest.raises(TypeError, match="index_name"):
+        dataset.optimize.optimize_indices(index_name=["id_idx"])
+    with pytest.raises(ValueError, match="Invalid optimize_indices option: index_name"):
+        dataset._ds.optimize_indices(index_name=["id_idx"])
+    with pytest.raises(ValueError, match="Invalid optimize_indices option: index_name"):
+        OptimizeIndices.plan(dataset, {"index_name": ["id_idx"]})
+    with pytest.raises(ValueError, match="Invalid optimize_indices option: index_name"):
+        OptimizeIndices.commit(dataset, [], {"index_name": ["id_idx"]})
+    assert dataset.version == version
+    assert lance.dataset(uri).version == version
+
+    # A known option set to None is unset, in every entry point alike.
+    plan = OptimizeIndices.plan(dataset, {"index_names": None, "retrain": None})
+    assert [task.index_name for task in plan.tasks] == ["id_idx"]
+    dataset.optimize.optimize_indices(index_names=["id_idx"], retrain=None)
+    assert dataset.version == version + 1
 
 
 def test_optimize_indices_distributed(tmp_path: Path):
@@ -1353,6 +1622,8 @@ def test_optimize_indices_distributed(tmp_path: Path):
         ).get(timeout=300)
     assert {result.group for result in merged} == {merge.group for merge in plan.merges}
 
+    # The two-argument form is the original one: the commit takes the
+    # defaults, which is all a non-consolidating merge needs.
     OptimizeIndices.commit(dataset, merged)
     assert dataset.version == version + 2
     # The vector tasks appended a segment; the BTree merge absorbed the old one.
@@ -1381,3 +1652,75 @@ def test_optimize_indices_distributed(tmp_path: Path):
     # Only the fragment appended meanwhile is left to plan.
     plan = OptimizeIndices.plan(dataset, {"max_rows_per_task": 128})
     assert {tuple(task.fragments) for task in plan.tasks} == {(5,)}
+
+
+@pytest.mark.parametrize("distributed", [False, True])
+def test_optimize_indices_consolidate(tmp_path: Path, distributed: bool):
+    """A consolidation budget merges the newest vector segments that fit it,
+    in one process or as a plan committed with the same options."""
+
+    def table(start: int, rows: int) -> pa.Table:
+        vectors = np.random.default_rng(start).random((rows, 8), dtype=np.float32)
+        return vec_to_table(vectors).append_column(
+            "id", pa.array(range(start, start + rows))
+        )
+
+    # One segment per fragment: 100 rows over fragment 0, then 50 rows over
+    # each of fragments 1 and 2; fragment 3 (50 rows) stays unindexed.
+    uri = str(tmp_path / "dataset")
+    dataset = lance.write_dataset(table(0, 100), uri)
+    dataset.create_index(
+        "vector", index_type="IVF_FLAT", num_partitions=2, name="vector_idx"
+    )
+    for start in (100, 150):
+        dataset = lance.write_dataset(table(start, 50), uri, mode="append")
+        dataset.optimize.optimize_indices(num_indices_to_merge=0)
+    dataset = lance.write_dataset(table(200, 50), uri, mode="append")
+    assert dataset.stats.index_stats("vector_idx")["num_indices"] == 3
+
+    options = {"max_rows_to_consolidate": 100}
+    if distributed:
+        plan = OptimizeIndices.plan(dataset, options)
+        assert plan.tasks == [] and len(plan.merges) == 1
+        merged = plan.merges[0].execute(dataset, [])
+        with pytest.raises(ValueError, match="replace a source twice"):
+            OptimizeIndices.commit(dataset, [merged, merged], options)
+        OptimizeIndices.commit(dataset, [merged], options)
+    else:
+        dataset.optimize.optimize_indices(**options)
+
+    # The two 50-row segments fit the budget and merge; the 100-row segment
+    # and the unindexed fragment are left alone.
+    (index,) = dataset.describe_indices()
+    assert {tuple(segment.fragment_ids) for segment in index.segments} == {
+        (0,),
+        (1, 2),
+    }
+    assert dataset.stats.index_stats("vector_idx")["num_unindexed_rows"] == 50
+    vector = dataset.to_table(columns=["vector"], filter="id = 175")["vector"][0]
+    nearest = dataset.to_table(
+        columns=["id"], nearest={"column": "vector", "q": vector.as_py(), "k": 1}
+    )
+    assert nearest["id"].to_pylist() == [175]
+
+
+def test_read_transaction_of_a_compaction_that_rewrites_an_index(tmp_path: Path):
+    # Compacting a stable-row-id table rewrites its BTREE index; the commit's
+    # transaction must read back with every RewrittenIndex field.
+    data = pa.table({"id": pa.array(range(64), pa.int64())})
+    ds = lance.write_dataset(
+        data, tmp_path, enable_stable_row_ids=True, max_rows_per_file=16
+    )
+    ds.create_scalar_index("id", "BTREE")
+    ds.optimize.compact_files(target_rows_per_fragment=64)
+
+    ds = lance.dataset(tmp_path)
+    transaction = ds.read_transaction(ds.version)
+
+    assert isinstance(transaction.operation, lance.LanceOperation.Rewrite)
+    (rewritten,) = transaction.operation.rewritten_indices
+    (index,) = ds.describe_indices()
+    assert rewritten.new_id == index.segments[0].uuid
+    assert rewritten.new_details_type_url == index.type_url
+    assert isinstance(rewritten.new_details_value, bytes)
+    assert rewritten.new_index_version == index.segments[0].index_version

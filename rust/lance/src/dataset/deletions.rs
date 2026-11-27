@@ -15,30 +15,12 @@ use super::write::CommitBuilder;
 use crate::Dataset;
 use crate::io::deletion::read_dataset_deletion_file;
 
-/// Table config key: the largest bitmap encoding, in bytes, of a deletion
-/// vector that writers keep in the manifest rather than in a file under
-/// `_deletions/`. Unset or `0` always writes a file.
-///
-/// A reader pays one request per deletion file it needs, so a table whose
-/// fragments each lost a few rows pays one request per fragment on its first
-/// take; inline vectors come with the manifest instead.
-pub const INLINE_DELETIONS_MAX_BYTES_CONFIG_KEY: &str = "lance.deletions.inline_max_bytes";
+pub use lance_table_runtime::io::deletion::INLINE_DELETIONS_MAX_BYTES_CONFIG_KEY;
 
 impl Dataset {
     /// The inline budget from [`INLINE_DELETIONS_MAX_BYTES_CONFIG_KEY`], `0` when unset.
     pub fn inline_deletions_max_bytes(&self) -> Result<usize> {
-        let Some(value) = self
-            .manifest
-            .config
-            .get(INLINE_DELETIONS_MAX_BYTES_CONFIG_KEY)
-        else {
-            return Ok(0);
-        };
-        value.trim().parse().map_err(|err| {
-            Error::invalid_input(format!(
-                "table config {INLINE_DELETIONS_MAX_BYTES_CONFIG_KEY} must be a number of bytes, got `{value}`: {err}"
-            ))
-        })
+        lance_table_runtime::io::deletion::inline_deletions_max_bytes(&self.manifest)
     }
 
     /// Moves every deletion vector that fits the inline budget from its file
@@ -79,7 +61,7 @@ impl Dataset {
                 .map(|fragment| async move {
                     dataset.inline_fragment_deletions(fragment, max_bytes).await
                 })
-                .buffer_unordered(self.object_store.io_parallelism())
+                .buffer_unordered(self.table_state.object_store.io_parallelism())
                 .try_filter_map(|fragment| async move { Ok(fragment) })
                 .try_collect::<Vec<_>>()
                 .await?;
@@ -175,6 +157,7 @@ mod tests {
 
     fn deletion_file_requests(dataset: &Dataset) -> usize {
         dataset
+            .table_state
             .object_store
             .io_stats_incremental()
             .requests
@@ -219,15 +202,16 @@ mod tests {
         );
         assert!(
             dataset
+                .table_state
                 .object_store
-                .read_dir(dataset.base.clone().join("_deletions"))
+                .read_dir(dataset.table_state.base.clone().join("_deletions"))
                 .await
                 .unwrap_or_default()
                 .is_empty()
         );
 
-        let reopened = Dataset::open(&dataset.uri).await.unwrap();
-        reopened.object_store.io_stats_incremental();
+        let reopened = Dataset::open(&dataset.table_state.uri).await.unwrap();
+        reopened.table_state.object_store.io_stats_incremental();
         let values = live_values(&reopened).await;
         assert_eq!(values.len(), 36);
         assert!(!values.iter().any(|v| [3, 17, 18, 39].contains(v)));
@@ -331,8 +315,8 @@ mod tests {
             "only deletion files change, so the index stays"
         );
 
-        let reopened = Dataset::open(&dataset.uri).await.unwrap();
-        reopened.object_store.io_stats_incremental();
+        let reopened = Dataset::open(&dataset.table_state.uri).await.unwrap();
+        reopened.table_state.object_store.io_stats_incremental();
         let values = live_values(&reopened).await;
         assert_eq!(values.len(), 36);
         assert!(!values.iter().any(|v| [3, 17, 18, 39].contains(v)));

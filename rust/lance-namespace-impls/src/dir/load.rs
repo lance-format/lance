@@ -21,20 +21,18 @@ impl DirectoryNamespace {
     ) -> Result<DescribeTableResponse> {
         let is_root_level = request.id.as_ref().is_some_and(|id| id.len() == 1);
         let is_child_table = request.id.as_ref().is_some_and(|id| id.len() > 1);
-        let skip_manifest_for_root = self.dir_listing_enabled
-            && is_root_level
-            && !self.dir_listing_to_manifest_migration_enabled;
+        let probe_manifest_for_root = self.table_discovery_mode.uses_manifest_for_root();
+        let skip_manifest_for_root = is_root_level
+            && self.table_discovery_mode.has_directory_listing()
+            && !probe_manifest_for_root;
         // Self-heal the manifest wherever it can be authoritative: a child table
         // (no dir-listing fallback), a manifest-only namespace, or migration mode
         // (manifest-first -- it can hold registered_table -> external .lance
         // aliases that dir-listing cannot resolve, so a reader built before
         // __manifest must re-probe to see them). The bypass -- skipping the probe
-        // -- applies ONLY to migration-disabled directory-backed root reads,
+        // -- applies ONLY to directory-backed root reads without migration,
         // which are served entirely from the directory listing.
-        if is_child_table
-            || !self.dir_listing_enabled
-            || self.dir_listing_to_manifest_migration_enabled
-        {
+        if is_child_table || probe_manifest_for_root {
             self.ensure_read_manifest().await?;
         }
         if let Some(manifest_ns) = self.manifest_ns_for_read()
@@ -61,7 +59,7 @@ impl DirectoryNamespace {
                     // rather than degrading to a directory-listing view.
                     return Err(e);
                 }
-                Err(e) if self.dir_listing_enabled && is_root_level => {
+                Err(e) if self.table_discovery_mode.has_directory_listing() && is_root_level => {
                     // Only a genuinely-absent table (e.g. an unmigrated on-disk
                     // table) may fall through to the directory check; any other
                     // manifest error must propagate rather than be read as missing.
@@ -78,7 +76,7 @@ impl DirectoryNamespace {
 
         let table_name = Self::table_name_from_id(&request.id)?;
         let table_id = Self::format_table_id_from_request(&request.id);
-        if !self.dir_listing_enabled {
+        if !self.table_discovery_mode.has_directory_listing() {
             return Err(NamespaceError::TableNotFound { message: table_id }.into());
         }
 

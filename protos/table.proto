@@ -363,13 +363,17 @@ message IndexMetadata {
    */
   repeated int32 fields = 2;
 
-  // Index name. Must be unique within one dataset version.
+  // Logical index name shared by all segments of the index.
   string name = 3;
 
   // The version of the dataset this index was built from.
   uint64 dataset_version = 4;
 
   /* A bitmap of the included fragment ids.
+   *
+   * Stores committed dataset fragment IDs, not local IDs stored inside index
+   * files. When `local_fragment_aliases` is used, a commit or rebase updates
+   * this bitmap and the aliases together without rewriting the index files.
    *
    * This may by used to determine how much of the dataset is covered by the
    * index. This information can be retrieved from the dataset by looking at
@@ -397,7 +401,7 @@ message IndexMetadata {
    */
   google.protobuf.Any index_details = 6;
 
-  // The minimum lance version that this index is compatible with.
+  // Index format version for this segment. If unset, use version 0.
   optional int32 index_version = 7;
 
   /* Timestamp when the index was created (UTC timestamp in milliseconds since epoch)
@@ -407,9 +411,7 @@ message IndexMetadata {
    */
   optional uint64 created_at = 8;
 
-  /* The base path index of the data file. Used when the file is imported or referred from another dataset.
-   * Lance use it as key of the base_paths field in Manifest to determine the actual base path of the data file.
-   */
+  // Base path ID for the index files. If unset, use the dataset base path.
   optional uint32 base_id = 9;
 
   /* List of files and their sizes for this index segment.
@@ -459,6 +461,26 @@ message IndexMetadata {
    * inherit entries automatically. Requires writer flag 1 << 17 while nonempty.
    */
   map<string, string> metadata = 13;
+
+  /* Sparse map from fragment IDs stored in this segment's files to committed
+   * fragment IDs. An empty map means no mapping. Unmapped IDs keep their
+   * value. Each stored ID is translated once.
+   *
+   * Applies to every fragment ID referenced by the segment's files, such as the
+   * fragment half of a physical row address or a zone's fragment ID. A row
+   * address keeps its row offset. Stable logical row IDs and user column values
+   * are not translated.
+   *
+   * Keys and values must be less than 2^32 - 1. u32::MAX (2^32 - 1) is
+   * reserved for RowAddress::TOMBSTONE_FRAG. Two referenced fragment IDs must
+   * not resolve to the same final fragment ID.
+   *
+   * Requires flag 1 << 20 (FLAG_LOCAL_FRAGMENT_ALIASES) in both reader and
+   * writer feature flags while nonempty. Both bits are cleared when no
+   * retained segment has a nonempty map. Reserved until readers and index
+   * maintenance support aliases.
+   */
+  map<uint32, uint32> local_fragment_aliases = 14;
 }
 
 // Metadata about a single file within an index segment.

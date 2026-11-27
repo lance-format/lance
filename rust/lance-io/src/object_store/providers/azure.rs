@@ -280,7 +280,7 @@ impl ObjectStoreProvider for AzureBlobStoreProvider {
         // Keyed like the registry cache so per-dataset stores share the bucket's budget.
         let store_prefix =
             self.calculate_object_store_prefix(&base_path, params.storage_options())?;
-        let throttle_state = shared_throttle_state(&store_prefix, params)?;
+        let throttle_state = shared_throttle_state(&store_prefix, params, Default::default())?;
 
         let (inner, paginated_lister) = if use_opendal {
             reject_http_connector_for_opendal(params)?;
@@ -312,6 +312,9 @@ impl ObjectStoreProvider for AzureBlobStoreProvider {
 
         Ok(ObjectStore {
             inner,
+            external_blob_inner: None,
+            direct_local_io: false,
+            _external_blob_origin: None,
             local_dir_operations: None,
             local_fsync: false,
             scheme,

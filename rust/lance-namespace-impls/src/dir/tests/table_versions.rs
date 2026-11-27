@@ -78,7 +78,7 @@ async fn test_table_version_tracking_disabled_no_managed_versioning() {
 }
 
 #[tokio::test]
-async fn test_list_table_versions() {
+async fn test_list_table_versions_pagination() {
     use arrow::array::{Int32Array, RecordBatchIterator};
     use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
     use arrow::record_batch::RecordBatch;
@@ -148,7 +148,11 @@ async fn test_list_table_versions() {
     // List versions - should have versions 1, 2, and 3
     let mut list_req = ListTableVersionsRequest::new();
     list_req.id = Some(table_id.clone());
-    let list_resp = namespace.list_table_versions(list_req).await.unwrap();
+    let list_resp = namespace
+        .list_table_versions(list_req.clone())
+        .await
+        .unwrap();
+    assert!(list_resp.page_token.is_none());
 
     assert_eq!(
         list_resp.versions.len(),
@@ -190,6 +194,35 @@ async fn test_list_table_versions() {
             "timestamp_millis should be set for version {}",
             expected_version
         );
+    }
+    list_req.limit = Some(1);
+    let first = namespace
+        .list_table_versions(list_req.clone())
+        .await
+        .unwrap();
+    assert_eq!(first.versions, list_resp.versions[..1]);
+    assert_eq!(first.versions[0].version, 1);
+    list_req.page_token = Some(
+        first
+            .page_token
+            .expect("non-final page needs a continuation"),
+    );
+    list_req.limit = Some(2);
+    list_req.descending = Some(false);
+    let last = namespace
+        .list_table_versions(list_req.clone())
+        .await
+        .unwrap();
+    assert_eq!(last.versions, list_resp.versions[1..]);
+    assert!(last.page_token.is_none());
+
+    for token in ["not-a-version", "-1", "01"] {
+        list_req.page_token = Some(token.into());
+        let err = namespace
+            .list_table_versions(list_req.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(mutation_error_code(err), ErrorCode::InvalidInput);
     }
 }
 
@@ -897,8 +930,7 @@ async fn test_create_table_version_branch_cas_requires_parent_version() {
     let versions_dir = branch_ds.versions_dir();
     let store = branch_ds.object_store(None).await.unwrap();
     let manifests: Vec<_> = store
-        .inner
-        .list(Some(&versions_dir))
+        .list_objects(Some(&versions_dir))
         .try_collect()
         .await
         .unwrap();
@@ -914,8 +946,7 @@ async fn test_create_table_version_branch_cas_requires_parent_version() {
     // Confirm the branch object-store chain is empty (do not open the dataset:
     // with no manifests, Dataset::open would fail).
     let remaining_manifests = store
-        .inner
-        .list(Some(&versions_dir))
+        .list_objects(Some(&versions_dir))
         .try_collect::<Vec<_>>()
         .await
         .unwrap()
@@ -959,8 +990,7 @@ async fn test_create_table_version_branch_cas_requires_parent_version() {
 
     let staging_wrong = versions_dir.clone().join("staging_wrong");
     store
-        .inner
-        .put(&staging_wrong, source_bytes.clone().into())
+        .put_payload(&staging_wrong, source_bytes.clone().into())
         .await
         .unwrap();
     let err = namespace
@@ -982,8 +1012,7 @@ async fn test_create_table_version_branch_cas_requires_parent_version() {
 
     let staging_ok = versions_dir.join("staging_ok");
     store
-        .inner
-        .put(&staging_ok, source_bytes.into())
+        .put_payload(&staging_ok, source_bytes.into())
         .await
         .unwrap();
     let resp = namespace

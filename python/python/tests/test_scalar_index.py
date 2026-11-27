@@ -3643,6 +3643,69 @@ def test_minhash_lsh_index():
         ScannerBuilder(ds).minhash_search("not a query")  # type: ignore[arg-type]
 
 
+@pytest.mark.parametrize(
+    ("default_key", "default_kind", "explicit_kind"),
+    [
+        pytest.param("nearest", "vector", None, id="vector-default"),
+        pytest.param("nearest", "minhash", None, id="minhash-default"),
+        pytest.param("nearest", "vector", "minhash", id="minhash-overrides-vector"),
+        pytest.param("nearest", "minhash", "vector", id="vector-overrides-minhash"),
+        pytest.param(
+            "minhash_search", "minhash", "vector", id="vector-overrides-minhash-search"
+        ),
+    ],
+)
+def test_default_scan_options_nearest_modes(
+    tmp_path, default_key, default_kind, explicit_kind
+):
+    text = "the quick brown fox jumps over the lazy dog and runs away very fast"
+    table = pa.table(
+        {
+            "id": [0, 1, 2, 3],
+            "text": [text, "unrelated terms about ledger storage", None, text],
+            "vector": pa.array(
+                [[float(i), 0.0] for i in range(4)], type=pa.list_(pa.float32(), 2)
+            ),
+        }
+    )
+    dataset = lance.write_dataset(table, tmp_path, max_rows_per_file=2)
+    dataset.create_scalar_index(
+        "text",
+        IndexConfig(
+            index_type="minhashlsh",
+            parameters={"num_hashes": 64, "num_bands": 16, "shingle_size": 2},
+        ),
+    )
+    queries = {
+        "vector": {"column": "vector", "q": [1.2, 0.0], "k": 2, "use_index": False},
+        "minhash": MinHashQuery(text, "text"),
+    }
+    columns = ["id", "_distance"]
+
+    def control(kind):
+        table = (
+            dataset.scanner(nearest=queries[kind], limit=2, columns=columns)
+            .to_table()
+            .sort_by("id")
+        )
+        assert table["id"].to_pylist() == ([0, 3] if kind == "minhash" else [1, 2])
+        return table
+
+    reopened = lance.dataset(
+        tmp_path,
+        default_scan_options={
+            default_key: queries[default_kind],
+            "limit": 2,
+            "columns": columns,
+        },
+    )
+    if explicit_kind is not None:
+        actual = reopened.scanner(nearest=queries[explicit_kind]).to_table()
+        assert actual.sort_by("id") == control(explicit_kind)
+    # The saved default still applies once nearest is omitted again.
+    assert reopened.scanner().to_table().sort_by("id") == control(default_kind)
+
+
 def test_json_index():
     vals = ['{"x": 7, "y": 10}', '{"x": 11, "y": 22}', '{"y": 0}', '{"x": 10}']
     tbl = pa.table({"jsons": pa.array(vals, pa.json_())})
@@ -6018,7 +6081,7 @@ def test_minhashlsh_segment_merge_and_commit_from_python():
     assert ds.to_table(nearest=query, limit=3, columns=["id"])["id"].to_pylist()[2] == 2
 
 
-def test_fm_index():
+def test_fm_index(tmp_path):
     texts = ["hello world", "say hello", None, "goodbye", "hello again", "nothing"]
     tbl = pa.table({"id": list(range(len(texts))), "text": texts})
     ds = lance.write_dataset(tbl, "memory://fm_index", max_rows_per_file=2)
@@ -6055,6 +6118,49 @@ def test_fm_index():
     assert contains(ds, "hello") == [0, 1, 4]
     # Unlike NGRAM, a single-character pattern is still answered by the index.
     assert contains(ds, "y") == [1, 3]
+
+    texts = ["left\x00right", "left right", "left_right", None, ""]
+    ds = lance.write_dataset(
+        pa.table({"id": list(range(len(texts))), "text": texts}),
+        tmp_path / "fm_nul",
+        max_rows_per_file=2,
+    )
+    assert len(ds.get_fragments()) == 3
+    fragment_ids = [fragment.fragment_id for fragment in ds.get_fragments()]
+    segment = ds.create_index_uncommitted(
+        "text", "FM", name=index_name, fragment_ids=fragment_ids[:1]
+    )
+    ds = ds.commit_existing_index_segments(index_name, "text", [segment])
+
+    def check_patterns(ds):
+        safe_predicate = "contains(text, 'left')"
+        assert f"@{index_name}" in ds.scanner(filter=safe_predicate).explain_plan()
+        assert sorted(
+            ds.to_table(filter=safe_predicate, columns=["id"])["id"].to_pylist()
+        ) == [0, 1, 2]
+
+        for pattern in [" ", "left\x00right", "left right", "left\x00 right"]:
+            predicate = f"contains(text, '{pattern}')"
+            plan = ds.scanner(filter=predicate).explain_plan()
+            assert (f"@{index_name}" in plan) == ("\x00" not in pattern)
+            for expression in [
+                predicate,
+                f"NOT ({predicate})",
+                f"({predicate}) AND contains(text, 'right')",
+                f"({predicate}) OR contains(text, 'left_')",
+            ]:
+                expected = ds.to_table(
+                    filter=expression, columns=["id"], use_scalar_index=False
+                )["id"].to_pylist()
+                actual = ds.to_table(filter=expression, columns=["id"])[
+                    "id"
+                ].to_pylist()
+                assert sorted(actual) == sorted(expected), expression
+                assert ds.count_rows(expression) == len(expected), expression
+
+    check_patterns(ds)
+    ds.create_scalar_index("text", "FM", name=index_name)
+    check_patterns(lance.dataset(ds.uri))
 
 
 def test_merge_index_metadata_btree_soft_break(tmp_path):

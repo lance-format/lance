@@ -54,19 +54,24 @@ use crate::cache_pb::BitmapIndexHeader;
 use crate::pbold;
 use crate::{Index, IndexType, metrics::MetricsCollector};
 use crate::{
-    progress::IndexBuildProgress,
+    progress::{IndexBuildProgress, stage_until_first_batch},
     scalar::{
         CreatedIndex, RowIdRemapper, UpdateCriteria,
         expression::SargableQueryParser,
         registry::{
-            BasicTrainer, ScalarIndexLoad, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering,
-            TrainingRequest, VALUE_COLUMN_NAME, single_flight_open,
+            BasicTrainer, QueryDomain, ScalarIndexLoad, ScalarIndexPlugin, TrainingCriteria,
+            TrainingOrdering, TrainingRequest, VALUE_COLUMN_NAME, single_flight_open,
         },
     },
 };
 use crate::{scalar::IndexReader, scalar::expression::ScalarQueryParser};
 
 pub const BITMAP_LOOKUP_NAME: &str = "bitmap_page_lookup.lance";
+/// The first column of [`BITMAP_LOOKUP_NAME`]: the key each bitmap is
+/// stored under. Its type is the type every key in the index is stored as,
+/// which is what [`BitmapIndex::load`] and
+/// [`BitmapIndexPlugin::recover_query_domain`] both read the value type from.
+const BITMAP_LOOKUP_KEYS_COLUMN: &str = "keys";
 pub const INDEX_STATS_METADATA_KEY: &str = "lance:index_stats";
 const BITMAP_PART_LOOKUP_PREFIX: &str = "part_";
 const BITMAP_PART_LOOKUP_SUFFIX: &str = "_bitmap_page_lookup.lance";
@@ -241,6 +246,36 @@ impl CacheKey for BitmapKey {
     }
 }
 
+struct BitmapRangeKey {
+    first: BitmapKey,
+    last: BitmapKey,
+}
+
+impl CacheKey for BitmapRangeKey {
+    type ValueType = RowAddrTreeMap;
+
+    fn key(&self) -> Cow<'_, str> {
+        format!("{}:{}", self.first.row_offset, self.last.row_offset).into()
+    }
+
+    fn type_name() -> &'static str {
+        "BitmapRange"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.scalar.bitmap-range-key", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        self.first.write_key(builder);
+        self.last.write_key(builder);
+    }
+
+    fn codec() -> Option<CacheCodec> {
+        Some(CacheCodec::from_impl::<RowAddrTreeMap>())
+    }
+}
+
 /// The serializable state of a [`BitmapIndex`].
 ///
 /// `BitmapIndex` holds non-serializable infrastructure (an `IndexStore`, a
@@ -345,7 +380,7 @@ impl BitmapIndexState {
     /// at least one batch so an empty index still records its value type.
     fn lookup_batches(&self, max_batch_bytes: usize) -> Result<Vec<RecordBatch>> {
         let schema = Arc::new(Schema::new(vec![
-            Field::new("keys", self.value_type.clone(), true),
+            Field::new(BITMAP_LOOKUP_KEYS_COLUMN, self.value_type.clone(), true),
             Field::new("offsets", DataType::UInt64, false),
         ]));
         let mut batches = Vec::new();
@@ -716,26 +751,65 @@ impl BitmapIndex {
         };
         let cache_key = BitmapKey::try_new(row_offset)?;
 
-        if let Some(cached) = self.index_cache.get_with_key(&cache_key).await {
-            if let Some(metrics) = metrics {
-                metrics.record_index_cache_hit();
-            }
-            return Ok(cached);
-        }
-
-        // Record that we're loading a partition from disk
+        // Concurrent misses on one value share a single load, and the caller
+        // gets the cached bitmap rather than a second copy of it.
+        let (bitmap, hit) = self
+            .index_cache
+            .get_or_insert_with_key_hit(cache_key, || async move {
+                if let Some(metrics) = metrics {
+                    metrics.record_part_load();
+                }
+                self.read_bitmap_at(row_offset).await
+            })
+            .await?;
         if let Some(metrics) = metrics {
-            metrics.record_index_cache_miss();
-            metrics.record_part_load();
+            if hit {
+                metrics.record_index_cache_hit();
+            } else {
+                metrics.record_index_cache_miss();
+            }
         }
+        Ok(bitmap)
+    }
 
-        let bitmap = self.read_bitmap_at(row_offset).await?;
-
-        self.index_cache
-            .insert_with_key(&cache_key, Arc::new(bitmap.clone()))
-            .await;
-
-        Ok(Arc::new(bitmap))
+    async fn load_contiguous_range(
+        &self,
+        keys: Vec<OrderableScalarValue>,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<RowAddrTreeMap> {
+        let Some(first) = keys.first() else {
+            return Ok(RowAddrTreeMap::default());
+        };
+        if keys.len() == 1 {
+            return self
+                .load_bitmap(first, Some(metrics))
+                .await
+                .map(Arc::unwrap_or_clone);
+        }
+        let cache_key = BitmapRangeKey {
+            first: BitmapKey::try_new(self.index_map[first])?,
+            last: BitmapKey::try_new(self.index_map[keys.last().unwrap()])?,
+        };
+        let (bitmap, hit) = self
+            .index_cache
+            .get_or_insert_with_key_hit(cache_key, || async move {
+                let bitmaps: Vec<_> = stream::iter(
+                    keys.into_iter()
+                        .map(|key| async move { self.load_bitmap(&key, Some(metrics)).await }),
+                )
+                .buffer_unordered(get_num_compute_intensive_cpus())
+                .try_collect()
+                .await?;
+                let bitmap_refs: Vec<_> = bitmaps.iter().map(AsRef::as_ref).collect();
+                Ok(RowAddrTreeMap::union_all(&bitmap_refs))
+            })
+            .await?;
+        if hit {
+            metrics.record_index_cache_hit();
+        } else {
+            metrics.record_index_cache_miss();
+        }
+        Ok(Arc::unwrap_or_clone(bitmap))
     }
 
     /// Read one row set straight from the lookup file, remapped through the
@@ -1136,20 +1210,7 @@ impl ScalarIndex for BitmapIndex {
 
                 metrics.record_comparisons(keys.len());
 
-                let result = if keys.is_empty() {
-                    RowAddrTreeMap::default()
-                } else {
-                    let bitmaps: Vec<_> = stream::iter(
-                        keys.into_iter()
-                            .map(|key| async move { self.load_bitmap(&key, Some(metrics)).await }),
-                    )
-                    .buffer_unordered(get_num_compute_intensive_cpus())
-                    .try_collect()
-                    .await?;
-
-                    let bitmap_refs: Vec<_> = bitmaps.iter().map(|b| b.as_ref()).collect();
-                    RowAddrTreeMap::union_all(&bitmap_refs)
-                };
+                let result = self.load_contiguous_range(keys, metrics).await?;
 
                 (result, tracked_null_rows())
             }
@@ -1560,7 +1621,7 @@ pub(crate) async fn new_bitmap_batch_writer(
     value_type: &DataType,
 ) -> Result<BitmapBatchWriter> {
     let schema = Arc::new(Schema::new(vec![
-        Field::new("keys", value_type.clone(), true),
+        Field::new(BITMAP_LOOKUP_KEYS_COLUMN, value_type.clone(), true),
         Field::new("bitmaps", DataType::Binary, true),
     ]));
     let index_file = index_store.new_index_file(file_name, schema).await?;
@@ -1980,6 +2041,7 @@ impl BitmapIndexPlugin {
     ) -> Result<IndexFile> {
         let partition_id = bitmap_shard_partition_id(fragment_ids, shard_id)?;
         let file_name = bitmap_shard_file_name(partition_id);
+        let data = stage_until_first_batch(progress.as_ref(), "sort_values", data).await?;
         progress
             .stage_start("build_bitmap_shard", None, "rows")
             .await?;
@@ -2654,7 +2716,13 @@ impl BasicTrainer for BitmapIndexPlugin {
                     .to_string(),
             ));
         } else {
-            Self::train_bitmap_index(data, index_store).await?
+            let data = stage_until_first_batch(progress.as_ref(), "sort_values", data).await?;
+            progress
+                .stage_start("write_bitmap_index", None, "files")
+                .await?;
+            let file = Self::train_bitmap_index(data, index_store).await?;
+            progress.stage_complete("write_bitmap_index").await?;
+            file
         };
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pbold::BitmapIndexDetails::default())
@@ -2698,6 +2766,35 @@ impl ScalarIndexPlugin for BitmapIndexPlugin {
             SargableQueryParser::new(index_name, self.name().to_string(), false)
                 .without_like_prefix(),
         ))
+    }
+
+    async fn recover_query_domain(
+        &self,
+        index_name: String,
+        index_details: &prost_types::Any,
+        _index_version: u32,
+        index_store: Arc<dyn IndexStore>,
+    ) -> Result<Option<(Box<dyn ScalarQueryParser>, QueryDomain)>> {
+        // The value type is in the lookup file's schema, so answering costs one
+        // file open and no row reads.
+        let lookup = index_store.open_index_file(BITMAP_LOOKUP_NAME).await?;
+        let schema = lookup.schema();
+        let Some(field) = schema.fields.first() else {
+            return Ok(None);
+        };
+        if field.name != BITMAP_LOOKUP_KEYS_COLUMN {
+            return Ok(None);
+        }
+        let Some(parser) = self.new_query_parser(index_name, index_details) else {
+            return Ok(None);
+        };
+        Ok(Some((
+            parser,
+            QueryDomain {
+                data_type: field.data_type(),
+                identity: None,
+            },
+        )))
     }
 
     /// Load an index from storage
@@ -3239,6 +3336,195 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn test_bitmap_range_cache_bounds_nulls_and_eviction() {
+        let (_dir, store) = test_util::index_store();
+        let values = vec![None, Some(1), Some(10), Some(20), Some(30), Some(40)];
+        let addresses = vec![0, 1, 1 << 32, (1 << 32) + 1, 2 << 32, (2 << 32) + 1];
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("value", DataType::Int32, true),
+            Field::new(ROW_ADDR, DataType::UInt64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(values)),
+                Arc::new(UInt64Array::from(addresses)),
+            ],
+        )
+        .unwrap();
+        BitmapIndexPlugin::train_bitmap_index(
+            Box::pin(RecordBatchStreamAdapter::new(
+                schema,
+                stream::once(async move { Ok(batch) }),
+            )),
+            store.as_ref(),
+        )
+        .await
+        .unwrap();
+        let cache = LanceCache::with_capacity(1024 * 1024);
+        let index = BitmapIndex::load(store, None, &cache, true).await.unwrap();
+        let value = |v| ScalarValue::Int32(Some(v));
+        let query = SargableQuery::Range(Bound::Included(value(2)), Bound::Included(value(30)));
+        let metrics = LocalMetricsCollector::default();
+        let SearchResult::Exact(tracked) = index.search(&query, &metrics).await.unwrap() else {
+            panic!("expected exact range result");
+        };
+        assert_eq!(
+            test_util::row_addrs(&tracked.true_rows()),
+            vec![1 << 32, (1 << 32) + 1, 2 << 32]
+        );
+        assert_eq!(test_util::row_addrs(tracked.null_rows()), vec![0]);
+        assert_eq!(metrics.index_cache_misses(), 4);
+        assert_eq!(
+            metrics
+                .parts_loaded
+                .load(std::sync::atomic::Ordering::Relaxed),
+            3
+        );
+
+        let equivalent =
+            SargableQuery::Range(Bound::Excluded(value(1)), Bound::Excluded(value(40)));
+        let metrics = LocalMetricsCollector::default();
+        let SearchResult::Exact(untracked) = index
+            .search_with_options(
+                &equivalent,
+                SearchOptions::default().with_track_nulls(false),
+                &metrics,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected exact range result");
+        };
+        assert_eq!(untracked.true_rows(), tracked.true_rows());
+        assert!(untracked.null_rows().is_empty());
+        assert_eq!(metrics.index_cache_hits(), 1);
+        assert_eq!(metrics.index_cache_misses(), 0);
+        assert_eq!(
+            metrics
+                .parts_loaded
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+
+        for (query, expected) in [
+            (
+                SargableQuery::Range(Bound::Included(value(10)), Bound::Included(value(20))),
+                vec![1 << 32, (1 << 32) + 1],
+            ),
+            (
+                SargableQuery::Range(Bound::Included(value(20)), Bound::Included(value(20))),
+                vec![(1 << 32) + 1],
+            ),
+            (
+                SargableQuery::Range(Bound::Excluded(value(20)), Bound::Included(value(20))),
+                vec![],
+            ),
+            (
+                SargableQuery::Range(Bound::Included(value(30)), Bound::Included(value(10))),
+                vec![],
+            ),
+            (
+                SargableQuery::Range(Bound::Included(value(50)), Bound::Unbounded),
+                vec![],
+            ),
+            (
+                SargableQuery::Range(Bound::Unbounded, Bound::Excluded(value(10))),
+                vec![1],
+            ),
+        ] {
+            assert_eq!(search_addrs_for(&index, query).await, expected);
+        }
+        cache.clear().await;
+        let metrics = LocalMetricsCollector::default();
+        let SearchResult::Exact(reloaded) = index.search(&query, &metrics).await.unwrap() else {
+            panic!("expected exact range result");
+        };
+        assert_eq!(reloaded, tracked);
+        assert_eq!(metrics.index_cache_misses(), 4);
+    }
+
+    #[tokio::test]
+    async fn test_bitmap_range_cache_coalesces_loads_and_respects_namespace() {
+        let (_dir, store) = test_util::index_store();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("value", DataType::Int32, false),
+            Field::new(ROW_ADDR, DataType::UInt64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(UInt64Array::from(vec![0, 1 << 32, 2 << 32])),
+            ],
+        )
+        .unwrap();
+        BitmapIndexPlugin::train_bitmap_index(
+            Box::pin(RecordBatchStreamAdapter::new(
+                schema,
+                stream::once(async move { Ok(batch) }),
+            )),
+            store.as_ref(),
+        )
+        .await
+        .unwrap();
+        let cache = LanceCache::with_capacity(1024 * 1024);
+        let first_cache = cache.with_key_prefix("first");
+        let index = BitmapIndex::load(store.clone(), None, &first_cache, true)
+            .await
+            .unwrap();
+        let query = SargableQuery::Range(Bound::Unbounded, Bound::Unbounded);
+        let metrics = LocalMetricsCollector::default();
+        let results = futures::future::try_join_all((0..8).map(|_| index.search(&query, &metrics)))
+            .await
+            .unwrap();
+        for result in results {
+            let SearchResult::Exact(rows) = result else {
+                panic!("expected exact range result");
+            };
+            assert_eq!(
+                test_util::row_addrs(&rows.true_rows()),
+                vec![0, 1 << 32, 2 << 32]
+            );
+        }
+        assert_eq!(metrics.index_cache_misses(), 4);
+        assert_eq!(metrics.index_cache_hits(), 7);
+        assert_eq!(
+            metrics
+                .parts_loaded
+                .load(std::sync::atomic::Ordering::Relaxed),
+            3
+        );
+
+        let second_cache = cache.with_key_prefix("second");
+        let other = BitmapIndex::load(store.clone(), None, &second_cache, true)
+            .await
+            .unwrap();
+        let range_key = BitmapRangeKey {
+            first: BitmapKey::try_new(*other.index_map.values().next().unwrap()).unwrap(),
+            last: BitmapKey::try_new(*other.index_map.values().last().unwrap()).unwrap(),
+        };
+        first_cache
+            .insert_with_key(&range_key, Arc::new(RowAddrTreeMap::default()))
+            .await;
+        assert!(second_cache.get_with_key(&range_key).await.is_none());
+        assert_eq!(
+            search_addrs_for(&other, query.clone()).await,
+            vec![0, 1 << 32, 2 << 32]
+        );
+
+        let no_cache = LanceCache::no_cache();
+        let uncached = BitmapIndex::load(store, None, &no_cache, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            search_addrs_for(&uncached, query).await,
+            vec![0, 1 << 32, 2 << 32]
+        );
+        assert_eq!(no_cache.size().await, 0);
+    }
+
     /// Regression test for the review fix that gates `load_bitmap` on
     /// `index_map.contains_key` before recording a miss: a value that is
     /// not present in the index must short-circuit before touching the
@@ -3326,6 +3612,53 @@ mod tests {
         index.search(&query, &metrics).await.unwrap();
         assert_eq!(metrics.index_cache_hits(), 0);
         assert_eq!(metrics.index_cache_misses(), 1);
+    }
+
+    /// Concurrent searches for one uncached value share a single load.
+    #[tokio::test]
+    async fn test_bitmap_concurrent_misses_load_once() {
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("value", DataType::Utf8, false),
+            Field::new("_rowaddr", DataType::UInt64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["red", "blue", "red"])),
+                Arc::new(UInt64Array::from(vec![0u64, 1, 2])),
+            ],
+        )
+        .unwrap();
+        let batch = sort_batch_by_value(&batch);
+        let stream = stream::once(async move { Ok(batch) });
+        let stream = Box::pin(RecordBatchStreamAdapter::new(schema, stream));
+        BitmapIndexPlugin::train_bitmap_index(stream, store.as_ref())
+            .await
+            .unwrap();
+        let cache = LanceCache::with_capacity(1024 * 1024);
+        let index = BitmapIndex::load(store.clone(), None, &cache, true)
+            .await
+            .unwrap();
+
+        let metrics = LocalMetricsCollector::default();
+        let query = SargableQuery::Equals(ScalarValue::Utf8(Some("red".to_string())));
+        futures::future::try_join_all((0..8).map(|_| index.search(&query, &metrics)))
+            .await
+            .unwrap();
+        assert_eq!(
+            metrics
+                .parts_loaded
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert_eq!(metrics.index_cache_misses(), 1);
+        assert_eq!(metrics.index_cache_hits(), 7);
     }
 
     // Regression test for the O(N log N) warm-cache rebuild introduced in

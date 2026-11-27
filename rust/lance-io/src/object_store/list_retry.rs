@@ -9,6 +9,8 @@ use object_store::{ObjectMeta, ObjectStore, path::Path};
 use rand::Rng;
 use tokio::time::Sleep;
 
+use crate::object_store::hf_throttle::is_huggingface_rate_limited;
+
 const DEFAULT_BASE_RETRY_DELAY: Duration = Duration::from_millis(100);
 const DEFAULT_MAX_RETRY_DELAY: Duration = Duration::from_secs(5);
 
@@ -77,13 +79,14 @@ impl ListRetryStream {
     }
 
     fn is_retryable(error: &object_store::Error) -> bool {
-        !matches!(
-            error,
-            object_store::Error::NotFound { .. }
-                | object_store::Error::InvalidPath { .. }
-                | object_store::Error::NotSupported { .. }
-                | object_store::Error::NotImplemented { .. }
-        )
+        !is_huggingface_rate_limited(error)
+            && !matches!(
+                error,
+                object_store::Error::NotFound { .. }
+                    | object_store::Error::InvalidPath { .. }
+                    | object_store::Error::NotSupported { .. }
+                    | object_store::Error::NotImplemented { .. }
+            )
     }
 
     fn retry_delay(&self) -> Duration {

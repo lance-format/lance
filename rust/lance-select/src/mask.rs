@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::ops::{Range, RangeBounds, RangeInclusive};
@@ -86,25 +87,125 @@ impl RowAddrMask {
     }
 
     /// Returns whether this mask selects every row in `rows`.
+    ///
+    /// Vector search asks this for every probed partition, so it compares the
+    /// maps in place instead of building their difference or intersection.
     pub fn selects_all(&self, rows: &RowAddrTreeMap) -> bool {
         match self {
-            Self::AllowList(allow_list) => (rows.clone() - allow_list).is_empty(),
-            Self::BlockList(block_list) => (rows.clone() & block_list).is_empty(),
+            Self::AllowList(allow_list) => rows.is_subset(allow_list),
+            Self::BlockList(block_list) => rows.is_disjoint(block_list),
         }
     }
 
     /// Return the indices of the input row ids that were valid
+    ///
+    /// Rows are grouped into runs that share a fragment, so the fragment's
+    /// selection is looked up once per run instead of once per row, and an
+    /// ascending run of 64 or more rows is intersected with the fragment bitmap
+    /// in bulk instead of probed row by row. Vector search filters whole index
+    /// partitions through this, where per-row [`Self::selected`] dominated the
+    /// query.
     pub fn selected_indices<'a>(&self, row_ids: impl Iterator<Item = &'a u64> + 'a) -> Vec<u64> {
-        row_ids
-            .enumerate()
-            .filter_map(|(idx, row_id)| {
-                if self.selected(*row_id) {
-                    Some(idx as u64)
-                } else {
-                    None
+        let mut out = Vec::new();
+        self.for_each_selected(row_ids, |offset| out.push(offset as u64));
+        out
+    }
+
+    /// [`Self::selected_indices`] as `u32` offsets into `out`, cleared first,
+    /// so a scan over many partitions reuses one buffer.
+    ///
+    /// Callers must pass fewer than `u32::MAX` rows; an index partition always
+    /// does. Use [`Self::selected_indices`] when the row count is unbounded.
+    pub fn selected_offsets_into<'a>(
+        &self,
+        row_ids: impl Iterator<Item = &'a u64> + 'a,
+        out: &mut Vec<u32>,
+    ) {
+        out.clear();
+        self.for_each_selected(row_ids, |offset| out.push(offset as u32));
+    }
+
+    /// Calls `emit` with the position of every selected row id. Positions stay
+    /// `usize` here, so no caller's offset goes through `u32` and then back out.
+    fn for_each_selected<'a>(
+        &self,
+        row_ids: impl Iterator<Item = &'a u64> + 'a,
+        mut emit: impl FnMut(usize),
+    ) {
+        // Bulk intersection beats per-row probes only once a run amortizes
+        // building its own bitmap.
+        const BULK_RUN_MIN: usize = 64;
+        let (tree, allow) = match self {
+            Self::AllowList(tree) => (tree, true),
+            Self::BlockList(tree) => (tree, false),
+        };
+        let mut run: Vec<u32> = Vec::new();
+        let mut run_fragment = None;
+        let mut run_start = 0;
+        let mut ascending = true;
+        let mut flush = |fragment: Option<u32>, start: usize, run: &[u32], ascending: bool| {
+            let Some(fragment) = fragment else {
+                return;
+            };
+            let all = start..start + run.len();
+            match tree.inner.get(&fragment) {
+                None => {
+                    if !allow {
+                        for offset in all {
+                            emit(offset);
+                        }
+                    }
                 }
-            })
-            .collect()
+                Some(RowAddrSelection::Full) => {
+                    if allow {
+                        for offset in all {
+                            emit(offset);
+                        }
+                    }
+                }
+                Some(RowAddrSelection::Partial(bitmap)) => {
+                    if ascending && run.len() >= BULK_RUN_MIN {
+                        let run_set = RoaringBitmap::from_sorted_iter(run.iter().copied())
+                            .expect("run checked ascending");
+                        let hits = if allow {
+                            run_set & bitmap
+                        } else {
+                            run_set - bitmap
+                        };
+                        let mut hits = hits.iter();
+                        let mut next = hits.next();
+                        for (offset, &row) in run.iter().enumerate() {
+                            if next == Some(row) {
+                                emit(start + offset);
+                                next = hits.next();
+                            }
+                        }
+                    } else {
+                        for (offset, &row) in run.iter().enumerate() {
+                            if bitmap.contains(row) == allow {
+                                emit(start + offset);
+                            }
+                        }
+                    }
+                }
+            }
+        };
+        for (idx, &row_id) in row_ids.enumerate() {
+            let fragment = (row_id >> 32) as u32;
+            if run_fragment != Some(fragment) {
+                flush(run_fragment, run_start, &run, ascending);
+                run.clear();
+                run_fragment = Some(fragment);
+                run_start = idx;
+                ascending = true;
+            }
+            let row = row_id as u32;
+            if ascending && run.last().is_some_and(|&last| last >= row) {
+                ascending = false;
+            }
+            run.push(row);
+        }
+        flush(run_fragment, run_start, &run, ascending);
     }
 
     /// Also block the given addrs
@@ -147,15 +248,43 @@ impl RowAddrMask {
         })
     }
 
+    /// [`Self::intersect`] without consuming either side: only the result is
+    /// allocated, so masks shared from caches are combined without a copy.
+    pub fn intersect_ref(&self, other: &Self) -> Self {
+        match (self, other) {
+            (Self::AllowList(a), Self::AllowList(b)) => Self::AllowList(a.intersection(b)),
+            (Self::AllowList(allow), Self::BlockList(block))
+            | (Self::BlockList(block), Self::AllowList(allow)) => {
+                Self::AllowList(allow.difference(block))
+            }
+            (Self::BlockList(a), Self::BlockList(b)) => {
+                Self::BlockList(RowAddrTreeMap::union_all(&[a, b]))
+            }
+        }
+    }
+
     /// Intersect two masks: a row survives only if both select it.
     ///
     /// Lets a planner apply a caller-supplied mask at one boundary rather than
     /// at every branch that produces rows, which is how branches get missed.
     pub fn intersect(self, other: Self) -> Self {
         match (self, other) {
+            // Owning both block lists lets the union move fragments over.
+            (Self::BlockList(a), Self::BlockList(b)) => Self::BlockList(a | b),
+            // Narrow the allow list, whichever side it is on.
+            (block @ Self::BlockList(_), allow) => allow.intersect_with(&block),
+            (lhs, rhs) => lhs.intersect_with(&rhs),
+        }
+    }
+
+    /// [`Self::intersect`] with `other` borrowed: `self` is narrowed in place
+    /// where it can be, so folding shared masks into an owned one allocates
+    /// nothing per step.
+    pub fn intersect_with(self, other: &Self) -> Self {
+        match (self, other) {
             (Self::AllowList(a), Self::AllowList(b)) => Self::AllowList(a & b),
-            (Self::AllowList(a), Self::BlockList(b)) => Self::AllowList(a).also_block(b),
-            (Self::BlockList(a), Self::AllowList(b)) => Self::AllowList(b).also_block(a),
+            (Self::AllowList(a), Self::BlockList(b)) => Self::AllowList(a - b),
+            (Self::BlockList(a), Self::AllowList(b)) => Self::AllowList(b.difference(&a)),
             (Self::BlockList(a), Self::BlockList(b)) => Self::BlockList(a | b),
         }
     }
@@ -337,12 +466,7 @@ impl std::ops::BitAnd for RowAddrMask {
     type Output = Self;
 
     fn bitand(self, rhs: Self) -> Self::Output {
-        match (self, rhs) {
-            (Self::AllowList(a), Self::AllowList(b)) => Self::AllowList(a & b),
-            (Self::AllowList(allow), Self::BlockList(block))
-            | (Self::BlockList(block), Self::AllowList(allow)) => Self::AllowList(allow - block),
-            (Self::BlockList(a), Self::BlockList(b)) => Self::BlockList(a | b),
-        }
+        self.intersect(rhs)
     }
 }
 
@@ -444,6 +568,123 @@ impl RowAddrSelection {
         );
 
         if is_full { Self::Full } else { res }
+    }
+}
+
+impl RowAddrSelection {
+    /// Stands in for a selection taken out of a map by value; allocates nothing.
+    fn take(&mut self) -> Self {
+        std::mem::replace(self, Self::Partial(RoaringBitmap::new()))
+    }
+
+    /// The rows of one fragment held by both sides, or `None` if there are
+    /// none. An owned `lhs` is narrowed in place, a borrowed one is not copied
+    /// first. The one definition behind `&=` and
+    /// [`RowAddrTreeMap::intersection`].
+    fn intersection(lhs: Cow<'_, Self>, rhs: &Self) -> Option<Self> {
+        let selection = match (lhs, rhs) {
+            (lhs, Self::Full) => lhs.into_owned(),
+            (Cow::Borrowed(Self::Full) | Cow::Owned(Self::Full), rhs) => rhs.clone(),
+            (Cow::Borrowed(Self::Partial(lhs)), Self::Partial(rhs)) => Self::Partial(lhs & rhs),
+            (Cow::Owned(Self::Partial(mut lhs)), Self::Partial(rhs)) => {
+                lhs &= rhs;
+                Self::Partial(lhs)
+            }
+        };
+        let is_empty = matches!(&selection, Self::Partial(set) if set.is_empty());
+        (!is_empty).then_some(selection)
+    }
+
+    /// The rows of one fragment that `lhs` holds and `rhs` does not, or `None`
+    /// if there are none. An owned `lhs` is narrowed in place, a borrowed one
+    /// is not copied first. The one definition behind `-=` and
+    /// [`RowAddrTreeMap::difference`].
+    fn difference(lhs: Cow<'_, Self>, rhs: &Self) -> Option<Self> {
+        let set = match (lhs, rhs) {
+            (_, Self::Full) => return None,
+            (Cow::Borrowed(Self::Full) | Cow::Owned(Self::Full), Self::Partial(rhs)) => {
+                // This generally won't be hit.
+                if rhs.is_empty() {
+                    return Some(Self::Full);
+                }
+                let mut set = RoaringBitmap::full();
+                set -= rhs;
+                return Some(Self::Partial(set));
+            }
+            (Cow::Borrowed(Self::Partial(lhs)), Self::Partial(rhs)) => lhs - rhs,
+            (Cow::Owned(Self::Partial(mut lhs)), Self::Partial(rhs)) => {
+                lhs -= rhs;
+                lhs
+            }
+        };
+        (!set.is_empty()).then_some(Self::Partial(set))
+    }
+}
+
+impl RowAddrTreeMap {
+    /// Whether every row of `self` is also in `other`, without allocating.
+    ///
+    /// A full fragment in `self` is only covered by a full fragment (or a
+    /// full bitmap) in `other`.
+    pub fn is_subset(&self, other: &Self) -> bool {
+        self.inner
+            .iter()
+            .all(|(fragment, lhs)| match (lhs, other.inner.get(fragment)) {
+                (_, Some(RowAddrSelection::Full)) => true,
+                (RowAddrSelection::Partial(lhs), Some(RowAddrSelection::Partial(rhs))) => {
+                    lhs.is_subset(rhs)
+                }
+                (RowAddrSelection::Partial(lhs), None) => lhs.is_empty(),
+                (RowAddrSelection::Full, Some(RowAddrSelection::Partial(rhs))) => rhs.is_full(),
+                (RowAddrSelection::Full, None) => false,
+            })
+    }
+
+    /// Whether `self` and `other` hold no row in common, without allocating.
+    pub fn is_disjoint(&self, other: &Self) -> bool {
+        self.inner
+            .iter()
+            .all(|(fragment, lhs)| match (lhs, other.inner.get(fragment)) {
+                (_, None) => true,
+                (RowAddrSelection::Partial(lhs), Some(RowAddrSelection::Partial(rhs))) => {
+                    lhs.is_disjoint(rhs)
+                }
+                (RowAddrSelection::Partial(lhs), Some(RowAddrSelection::Full)) => lhs.is_empty(),
+                (RowAddrSelection::Full, Some(RowAddrSelection::Partial(rhs))) => rhs.is_empty(),
+                (RowAddrSelection::Full, Some(RowAddrSelection::Full)) => false,
+            })
+    }
+
+    /// Rows held by both maps, allocating only the result.
+    pub fn intersection(&self, other: &Self) -> Self {
+        let inner = self
+            .inner
+            .iter()
+            .filter_map(|(fragment, lhs)| {
+                let rhs = other.inner.get(fragment)?;
+                Some((
+                    *fragment,
+                    RowAddrSelection::intersection(Cow::Borrowed(lhs), rhs)?,
+                ))
+            })
+            .collect();
+        Self { inner }
+    }
+
+    /// Rows of `self` that `other` does not hold, allocating only the result.
+    pub fn difference(&self, other: &Self) -> Self {
+        let inner = self
+            .inner
+            .iter()
+            .filter_map(|(fragment, lhs)| {
+                let selection = match other.inner.get(fragment) {
+                    Some(rhs) => RowAddrSelection::difference(Cow::Borrowed(lhs), rhs)?,
+                    None => lhs.clone(),
+                };
+                Some((*fragment, selection))
+            })
+            .collect();
+        Self { inner }
     }
 }
 
@@ -598,37 +839,41 @@ impl RowAddrTreeMap {
         }
     }
 
-    /// Insert a range of values into the set
+    /// Insert a range of values into the set, returning the number of new values.
+    /// Empty ranges leave the set unchanged.
     pub fn insert_range<R: RangeBounds<u64>>(&mut self, range: R) -> u64 {
-        // Separate the start and end into high and low bits.
-        let (mut start_high, mut start_low) = match range.start_bound() {
-            std::ops::Bound::Included(&start) => ((start >> 32) as u32, start as u32),
-            std::ops::Bound::Excluded(&start) => {
-                let start = start.saturating_add(1);
-                ((start >> 32) as u32, start as u32)
-            }
-            std::ops::Bound::Unbounded => (0, 0),
+        let start = match range.start_bound() {
+            std::ops::Bound::Included(&start) => start,
+            std::ops::Bound::Excluded(&start) => match start.checked_add(1) {
+                Some(start) => start,
+                None => return 0,
+            },
+            std::ops::Bound::Unbounded => 0,
         };
 
-        let (end_high, end_low) = match range.end_bound() {
-            std::ops::Bound::Included(&end) => ((end >> 32) as u32, end as u32),
-            std::ops::Bound::Excluded(&end) => {
-                let end = end.saturating_sub(1);
-                ((end >> 32) as u32, end as u32)
-            }
-            std::ops::Bound::Unbounded => (u32::MAX, u32::MAX),
+        let end = match range.end_bound() {
+            std::ops::Bound::Included(&end) => end,
+            std::ops::Bound::Excluded(&end) => match end.checked_sub(1) {
+                Some(end) => end,
+                None => return 0,
+            },
+            std::ops::Bound::Unbounded => u64::MAX,
         };
+        if start > end {
+            return 0;
+        }
 
+        let (start_high, start_low) = ((start >> 32) as u32, start as u32);
+        let (end_high, end_low) = ((end >> 32) as u32, end as u32);
         let mut count = 0;
 
-        while start_high <= end_high {
-            let start = start_low;
-            let end = if start_high == end_high {
+        for fragment in start_high..=end_high {
+            let start = if fragment == start_high { start_low } else { 0 };
+            let end = if fragment == end_high {
                 end_low
             } else {
                 u32::MAX
             };
-            let fragment = start_high;
             match self.inner.get_mut(&fragment) {
                 None => {
                     let mut set = RoaringBitmap::new();
@@ -640,8 +885,6 @@ impl RowAddrTreeMap {
                     count += set.insert_range(start..=end);
                 }
             }
-            start_high += 1;
-            start_low = 0;
         }
 
         count
@@ -752,6 +995,34 @@ impl RowAddrTreeMap {
         for selection in self.inner.values_mut() {
             if let RowAddrSelection::Partial(bitmap) = selection {
                 bitmap.optimize();
+            }
+        }
+    }
+
+    /// Prefer array or bitmap containers for repeated point lookups, limiting
+    /// the run-container expansion to four times their current allocation.
+    ///
+    /// ```
+    /// use lance_select::RowAddrTreeMap;
+    ///
+    /// let mut rows = RowAddrTreeMap::from_iter((0..32768).filter(|row| row % 64 < 32));
+    /// rows.optimize();
+    /// let expected = rows.clone();
+    /// rows.optimize_for_lookup();
+    /// assert_eq!(rows, expected);
+    /// ```
+    pub fn optimize_for_lookup(&mut self) {
+        for selection in self.inner.values_mut() {
+            if let RowAddrSelection::Partial(bitmap) = selection {
+                if bitmap.is_full() {
+                    continue;
+                }
+                let stats = bitmap.statistics();
+                let expanded_bytes = (u64::from(stats.n_run_containers) * 8192)
+                    .min(u64::from(stats.n_values_run_containers) * 2);
+                if expanded_bytes <= stats.n_bytes_run_containers * 4 {
+                    bitmap.remove_run_compression();
+                }
             }
         }
     }
@@ -991,29 +1262,15 @@ impl std::ops::BitAndAssign<Self> for RowAddrTreeMap {
 
 impl std::ops::BitAndAssign<&Self> for RowAddrTreeMap {
     fn bitand_assign(&mut self, rhs: &Self) {
-        // Remove fragment that aren't on the RHS
-        self.inner
-            .retain(|fragment, _| rhs.inner.contains_key(fragment));
-
-        // For fragments that are on the RHS, intersect the bitmaps
-        for (fragment, mut lhs_set) in &mut self.inner {
-            match (&mut lhs_set, rhs.inner.get(fragment)) {
-                (_, None) => {} // Already handled by retain
-                (_, Some(RowAddrSelection::Full)) => {
-                    // Everything selected on RHS, so can leave LHS untouched.
-                }
-                (RowAddrSelection::Partial(lhs_set), Some(RowAddrSelection::Partial(rhs_set))) => {
-                    *lhs_set &= rhs_set;
-                }
-                (RowAddrSelection::Full, Some(RowAddrSelection::Partial(rhs_set))) => {
-                    *lhs_set = RowAddrSelection::Partial(rhs_set.clone());
-                }
-            }
-        }
-        // Some bitmaps might now be empty. If they are, we should remove them.
-        self.inner.retain(|_, set| match set {
-            RowAddrSelection::Partial(set) => !set.is_empty(),
-            RowAddrSelection::Full => true,
+        self.inner.retain(|fragment, lhs| {
+            let kept = rhs
+                .inner
+                .get(fragment)
+                .and_then(|rhs| RowAddrSelection::intersection(Cow::Owned(lhs.take()), rhs));
+            kept.is_some_and(|kept| {
+                *lhs = kept;
+                true
+            })
         });
     }
 }
@@ -1038,34 +1295,15 @@ impl std::ops::Sub<&Self> for RowAddrTreeMap {
 
 impl std::ops::SubAssign<&Self> for RowAddrTreeMap {
     fn sub_assign(&mut self, rhs: &Self) {
-        for (fragment, rhs_set) in &rhs.inner {
-            match self.inner.get_mut(fragment) {
-                None => {}
-                Some(RowAddrSelection::Full) => {
-                    // If the fragment is already selected then there is nothing to do
-                    match rhs_set {
-                        RowAddrSelection::Full => {
-                            self.inner.remove(fragment);
-                        }
-                        RowAddrSelection::Partial(rhs_set) => {
-                            // This generally won't be hit.
-                            let mut set = RoaringBitmap::full();
-                            set -= rhs_set;
-                            self.inner.insert(*fragment, RowAddrSelection::Partial(set));
-                        }
-                    }
+        for (fragment, rhs) in &rhs.inner {
+            let Some(lhs) = self.inner.get_mut(fragment) else {
+                continue;
+            };
+            match RowAddrSelection::difference(Cow::Owned(lhs.take()), rhs) {
+                Some(kept) => *lhs = kept,
+                None => {
+                    self.inner.remove(fragment);
                 }
-                Some(RowAddrSelection::Partial(lhs_set)) => match rhs_set {
-                    RowAddrSelection::Full => {
-                        self.inner.remove(fragment);
-                    }
-                    RowAddrSelection::Partial(rhs_set) => {
-                        *lhs_set -= rhs_set;
-                        if lhs_set.is_empty() {
-                            self.inner.remove(fragment);
-                        }
-                    }
-                },
             }
         }
     }
@@ -1393,8 +1631,11 @@ impl RowIdMask {
 
 #[cfg(test)]
 mod tests {
+    use std::ops::Bound::{self, Excluded, Included, Unbounded};
+
     use super::*;
     use proptest::{prop_assert, prop_assert_eq};
+    use rstest::rstest;
 
     fn rows(ids: &[u64]) -> RowAddrTreeMap {
         RowAddrTreeMap::from_iter(ids)
@@ -1411,6 +1652,123 @@ mod tests {
 
     fn selected_in_range(mask: &RowAddrMask, range: std::ops::Range<u64>) -> Vec<u64> {
         range.filter(|val| mask.selected(*val)).collect()
+    }
+
+    /// `intersect_ref` builds the same mask as the consuming `intersect`, for
+    /// every pairing of whole, partial, empty and absent fragments.
+    #[test]
+    fn test_intersect_ref_matches_intersect() {
+        let whole = || RowAddrSelection::Full;
+        let partial =
+            |offsets: &[u32]| RowAddrSelection::Partial(offsets.iter().copied().collect());
+        let tree = |fragments: Vec<(u32, RowAddrSelection)>| RowAddrTreeMap {
+            inner: fragments.into_iter().collect(),
+        };
+        // What the comment after each fragment names is its pairing with the
+        // same fragment of `lhs`, as `intersection` and then `difference` see it.
+        let lhs = tree(vec![
+            (0, whole()),
+            (1, partial(&[5, 6])),
+            (2, partial(&[0])),
+            (3, whole()),
+            (4, whole()),
+            (5, partial(&[1])),
+            (7, whole()),
+            (9, partial(&[3])),
+        ]);
+        let rhs = tree(vec![
+            (0, whole()),          // whole and whole; whole minus whole
+            (1, whole()),          // partial and whole; partial minus whole
+            (2, partial(&[1])),    // partial and partial, no rows left; rows left
+            (3, partial(&[7])),    // whole and partial; whole minus partial
+            (5, partial(&[1, 2])), // partial and partial, rows left; no rows left
+            (7, partial(&[])),     // whole and an empty partial
+            (8, whole()),          // absent from `lhs`
+                                   // 4 and 9: whole and partial absent from `rhs`
+        ]);
+        let block_rows = tree(vec![(1, partial(&[6])), (6, whole())]);
+
+        let allow = RowAddrMask::from_allowed(lhs);
+        let other_allow = RowAddrMask::from_allowed(rhs.clone());
+        let block = RowAddrMask::from_block(rhs);
+        let other_block = RowAddrMask::from_block(block_rows);
+        for (a, b) in [
+            (&allow, &other_allow),
+            (&other_allow, &allow),
+            (&allow, &block),
+            (&block, &allow),
+            (&block, &other_block),
+        ] {
+            assert_eq!(a.intersect_ref(b), a.clone().intersect(b.clone()));
+            assert_eq!(a.intersect_ref(b), a.clone().intersect_with(b));
+        }
+
+        // The expected masks spelled out, so that the two implementations
+        // cannot agree on a wrong answer.
+        assert_eq!(
+            allow.intersect_ref(&other_allow),
+            RowAddrMask::from_allowed(tree(vec![
+                (0, whole()),
+                (1, partial(&[5, 6])),
+                (3, partial(&[7])),
+                (5, partial(&[1])),
+            ]))
+        );
+        let mut all_but_seven = RoaringBitmap::full();
+        all_but_seven.remove(7);
+        assert_eq!(
+            allow.intersect_ref(&block),
+            RowAddrMask::from_allowed(tree(vec![
+                (2, partial(&[0])),
+                (3, RowAddrSelection::Partial(all_but_seven)),
+                (4, whole()),
+                (7, whole()),
+                (9, partial(&[3])),
+            ]))
+        );
+    }
+
+    /// `selected_indices` intersects ascending runs of at least 64 rows in
+    /// bulk and probes shorter, unsorted or duplicated runs row by row; every
+    /// path must agree with `selected`, for allow and block lists alike.
+    #[test]
+    fn test_selected_indices_bulk_matches_per_row() {
+        let mut tree = RowAddrTreeMap::new();
+        tree.insert_fragment(2);
+        for row in (0..20_000u64).step_by(2) {
+            tree.insert(1 << 32 | row);
+        }
+        let frag1 = |row: u64| 1_u64 << 32 | row;
+        let mut ids: Vec<u64> = (0..5_000).map(|r| frag1(r * 3)).collect();
+        ids.extend((0..5).map(|r| 2_u64 << 32 | r));
+        ids.extend((0..10).map(|r| frag1(100 + r)));
+        ids.extend((0..5).map(|r| 3_u64 << 32 | r));
+        ids.extend((0..200).rev().map(frag1));
+        ids.extend((0..100).map(|r| frag1(r / 2)));
+        for mask in [
+            RowAddrMask::from_allowed(tree.clone()),
+            RowAddrMask::from_block(tree.clone()),
+        ] {
+            let expected: Vec<u64> = ids
+                .iter()
+                .enumerate()
+                .filter(|(_, id)| mask.selected(**id))
+                .map(|(idx, _)| idx as u64)
+                .collect();
+            assert!(expected.len() > 1_000 && expected.len() < ids.len());
+            assert_eq!(mask.selected_indices(ids.iter()), expected);
+            let mut reused = vec![u32::MAX; 3];
+            mask.selected_offsets_into(ids.iter(), &mut reused);
+            assert_eq!(
+                reused.iter().map(|&i| u64::from(i)).collect::<Vec<_>>(),
+                expected
+            );
+        }
+        assert!(
+            RowAddrMask::from_allowed(tree)
+                .selected_indices([].iter())
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1557,6 +1915,51 @@ mod tests {
         assert!(RowAddrMask::from_block(rows(&[30])).selects_all(&partition_rows));
         assert!(!RowAddrMask::from_block(rows(&[20, 30])).selects_all(&partition_rows));
         assert!(RowAddrMask::allow_nothing().selects_all(&RowAddrTreeMap::new()));
+
+        // Whole fragments: a full fragment is only covered by a full fragment.
+        let mut full_fragment = RowAddrTreeMap::new();
+        full_fragment.insert_fragment(2);
+        assert!(!RowAddrMask::from_allowed(full_fragment.clone()).selects_all(&partition_rows));
+        let mut allow_full = rows(&[10, 20]);
+        allow_full.insert_fragment(2);
+        assert!(RowAddrMask::from_allowed(allow_full.clone()).selects_all(&partition_rows));
+        assert!(!RowAddrMask::from_allowed(partition_rows.clone()).selects_all(&full_fragment));
+        assert!(RowAddrMask::from_allowed(allow_full).selects_all(&full_fragment));
+        assert!(!RowAddrMask::from_block(full_fragment.clone()).selects_all(&partition_rows));
+        assert!(RowAddrMask::from_block(rows(&[10])).selects_all(&full_fragment));
+        assert!(!RowAddrMask::from_block(rows(&[2_u64 << 32 | 9])).selects_all(&full_fragment));
+    }
+
+    /// The in-place predicates agree with the allocating set operations.
+    #[test]
+    fn test_is_subset_and_is_disjoint_match_set_operations() {
+        let mut full_two = RowAddrTreeMap::new();
+        full_two.insert_fragment(2);
+        let mut mixed = rows(&[1, 5, 1_u64 << 32 | 7]);
+        mixed.insert_fragment(2);
+        let maps = [
+            RowAddrTreeMap::new(),
+            rows(&[1, 5]),
+            rows(&[5, 9]),
+            rows(&[1, 5, 9, 1_u64 << 32 | 7]),
+            rows(&[2_u64 << 32 | 3]),
+            full_two,
+            mixed,
+        ];
+        for lhs in &maps {
+            for rhs in &maps {
+                assert_eq!(
+                    lhs.is_subset(rhs),
+                    lhs.difference(rhs).is_empty(),
+                    "is_subset({lhs:?}, {rhs:?})"
+                );
+                assert_eq!(
+                    lhs.is_disjoint(rhs),
+                    lhs.intersection(rhs).is_empty(),
+                    "is_disjoint({lhs:?}, {rhs:?})"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1709,6 +2112,39 @@ mod tests {
         assert!(
             err.to_string().contains("only 0 bytes remain"),
             "expected a length complaint, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_row_addr_tree_map_optimize_for_lookup() {
+        let mut bitmap = RoaringBitmap::from_iter((0..32768).filter(|row| row % 64 < 32));
+        bitmap.optimize();
+        assert!(bitmap.statistics().n_run_containers > 0);
+        let mut rows = RowAddrTreeMap::new();
+        rows.insert_bitmap(7, bitmap);
+        rows.insert_fragment(8);
+        rows.insert_bitmap(11, RoaringBitmap::full());
+        rows.insert_bitmap(9, RoaringBitmap::from_iter([1, 3, 5]));
+        let expected = rows.clone();
+        rows.optimize_for_lookup();
+        assert_eq!(rows, expected);
+        assert_eq!(
+            rows.get_fragment_bitmap(7)
+                .unwrap()
+                .statistics()
+                .n_run_containers,
+            0
+        );
+
+        let mut long_range = RoaringBitmap::new();
+        long_range.insert_range(0..10_000_000);
+        long_range.optimize();
+        let size = long_range.serialized_size();
+        rows.insert_bitmap(10, long_range);
+        rows.optimize_for_lookup();
+        assert_eq!(
+            rows.get_fragment_bitmap(10).unwrap().serialized_size(),
+            size
         );
     }
 
@@ -1970,6 +2406,37 @@ mod tests {
         mask.insert_fragment(0);
         let count = mask.insert_range(100..200);
         assert_eq!(count, 0);
+    }
+
+    #[rstest]
+    #[case::zero(Included(0), Excluded(0))]
+    #[case::before_zero(Unbounded, Excluded(0))]
+    #[case::equal(Included(5), Excluded(5))]
+    #[case::reversed(Included(7), Included(3))]
+    #[case::fragment_boundary(Included(1 << 32), Excluded(1 << 32))]
+    #[case::after_max(Excluded(u64::MAX), Unbounded)]
+    #[case::excluded_max(Excluded(u64::MAX), Included(u64::MAX))]
+    fn test_map_insert_range_empty(#[case] start: Bound<u64>, #[case] end: Bound<u64>) {
+        let mut map = RowAddrTreeMap::new();
+        assert_eq!(map.insert_range((start, end)), 0);
+        assert!(map.is_empty());
+        assert_eq!(map.len(), Some(0));
+
+        map.insert(1);
+        map.insert(1 << 32);
+        let original = map.clone();
+        assert_eq!(map.insert_range((start, end)), 0);
+        assert_eq!(map, original);
+    }
+
+    #[rstest]
+    #[case::inclusive(Included(u64::MAX))]
+    #[case::unbounded(Unbounded)]
+    fn test_map_insert_range_terminal(#[case] end: Bound<u64>) {
+        let mut map = RowAddrTreeMap::new();
+        assert_eq!(map.insert_range((Included(u64::MAX - 2), end)), 3);
+        assert_eq!(map, RowAddrTreeMap::from_iter(u64::MAX - 2..=u64::MAX));
+        assert_eq!(map.insert_range((Included(u64::MAX - 2), end)), 0);
     }
 
     #[test]

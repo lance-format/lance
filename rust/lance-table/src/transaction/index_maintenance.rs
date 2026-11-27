@@ -70,19 +70,14 @@ impl Transaction {
             return Ok(());
         }
 
-        let value_updated_field_set = fields_for_preserving_frag_bitmap
-            .iter()
-            .collect::<HashSet<_>>();
-
         for index in indices.iter_mut() {
             // Only known stable row IDs can follow moved rows into a new
             // fragment. Unknown plugin domains must leave it for the scanner.
             if !index.can_follow_stable_row_ids() {
                 continue;
             }
-            let index_covers_modified_field = index.dependency_fields().iter().any(|field_id| {
-                value_updated_field_set.contains(&u32::try_from(*field_id).unwrap())
-            });
+            let index_covers_modified_field =
+                Self::index_depends_on_any(index, fields_for_preserving_frag_bitmap, schema);
             if index_covers_modified_field {
                 continue;
             }
@@ -131,9 +126,9 @@ impl Transaction {
     /// id, unexpanded: an update with `fields_modified` rewrites those
     /// fields in every updated fragment; a merge rewrites, in each fragment
     /// present in `previous_fragments`, the fields whose backing data file
-    /// changed (`merge_rewritten_fields`); a data replacement rewrites the
-    /// fields its new files carry, read through `schema`. Any other
-    /// operation rewrites nothing. `previous_fragments` is the caller's
+    /// changed (`merge_rewritten_fields`); a data replacement that changes
+    /// data rewrites the fields its new files carry, read through `schema`.
+    /// Any other operation rewrites nothing. `previous_fragments` is the caller's
     /// "before" list: the current manifest's for a commit, the read
     /// version's for a rebase.
     pub fn rewritten_physical_columns(
@@ -153,7 +148,11 @@ impl Transaction {
             Operation::Merge { fragments, .. } => {
                 Self::merge_rewritten_fields(previous_fragments, fragments)
             }
-            Operation::DataReplacement { replacements } => replacements
+            // Values that only moved to new files invalidate no index.
+            Operation::DataReplacement {
+                replacements,
+                data_change: true,
+            } => replacements
                 .iter()
                 .map(|DataReplacementGroup(fragment_id, new_file)| {
                     let mut fields: Vec<u32> = new_file
@@ -722,12 +721,13 @@ impl Transaction {
             .map(|f| f.id)
             .collect::<HashSet<_>>();
 
-        // Remove indices for fields no longer in schema
+        // Reserved fields never belong to the user schema, so their absence
+        // does not mean a column was dropped.
         indices.retain(|existing_index| {
             existing_index
                 .dependency_fields()
                 .iter()
-                .all(|field_id| field_ids.contains(field_id))
+                .all(|field_id| *field_id < 0 || field_ids.contains(field_id))
                 || is_system_index(existing_index)
         });
 
@@ -1344,8 +1344,16 @@ mod tests {
         assert!(error.to_string().contains("id=2"));
     }
 
-    #[test]
-    fn test_retain_indices_removes_missing_fields() {
+    #[rstest]
+    #[case::missing_user_field(vec![99], false)]
+    #[case::row_id(vec![crate::format::ROW_ID_FIELD_ID], true)]
+    #[case::unknown_reserved_field(vec![-100], true)]
+    #[case::reserved_and_present_user_field(vec![-3, 1], true)]
+    #[case::reserved_and_missing_user_field(vec![-3, 99], false)]
+    fn test_retain_indices_removes_missing_fields(
+        #[case] fields: Vec<i32>,
+        #[case] is_retained: bool,
+    ) {
         let schema = create_test_schema(&[1, 2]);
         let fragments = vec![Fragment::new(1), Fragment::new(2)];
 
@@ -1354,11 +1362,34 @@ mod tests {
             create_test_index("idx2", 2, 1, Some(RoaringBitmap::from_iter([1])), false),
             create_test_index("idx3", 99, 1, Some(RoaringBitmap::from_iter([1])), false), // Field doesn't exist
         ];
+        indices[2].fields = fields;
 
         Transaction::retain_relevant_indices(&mut indices, &schema, &fragments);
 
-        assert_eq!(indices.len(), 2);
-        assert!(indices.iter().all(|idx| idx.fields[0] != 99));
+        assert_eq!(indices.len(), 2 + usize::from(is_retained));
+        assert_eq!(indices.iter().any(|idx| idx.name == "idx3"), is_retained);
+    }
+
+    #[rstest]
+    #[case::all_fields(&["s.x", "s.y", "b"], true)]
+    #[case::indexed_child_dropped(&["s.y", "b"], false)]
+    #[case::unindexed_sibling_dropped(&["s.x", "b"], true)]
+    fn test_retain_unknown_plugin_nested_dependencies(
+        #[case] retained_paths: &[&str],
+        #[case] is_retained: bool,
+    ) {
+        let schema = create_nested_test_schema().project(retained_paths).unwrap();
+        let mut index =
+            create_test_index("external", 0, 1, Some(RoaringBitmap::from_iter([1])), false);
+        index.fields = vec![0, 1];
+        index.index_details = Some(Arc::new(prost_types::Any {
+            type_url: "type.googleapis.com/example.ExternalIndexDetails".to_string(),
+            // Generic schema maintenance must not decode plugin-specific bytes.
+            value: vec![0xff],
+        }));
+        let mut indices = vec![index];
+        Transaction::retain_relevant_indices(&mut indices, &schema, &[Fragment::new(1)]);
+        assert_eq!(indices.len(), usize::from(is_retained));
     }
 
     #[test]
@@ -2142,6 +2173,40 @@ mod tests {
             indices[2].fragment_bitmap.as_ref().unwrap(),
             &RoaringBitmap::from_iter([7u32, 8]),
             "an index on an unrelated field is unaffected"
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::parent(0, vec![1], false)]
+    #[case::child(1, vec![0], false)]
+    #[case::sibling(1, vec![2], true)]
+    #[case::unrelated(3, vec![1], true)]
+    #[case::carried(0, vec![3, 1], false)]
+    fn test_pure_row_rewrite_reuses_only_unchanged_dependencies(
+        #[case] changed: u32,
+        #[case] fields: Vec<i32>,
+        #[case] can_reuse: bool,
+    ) {
+        let schema = create_nested_test_schema();
+        let mut index =
+            create_test_index("idx", fields[0], 2, Some([0].into_iter().collect()), true);
+        if fields.len() > 1 {
+            index.covering_fields = fields[1..].to_vec();
+        }
+        index.fields = fields;
+        let mut indices = vec![index];
+        Transaction::register_pure_rewrite_rows_update_frags_in_indices(
+            &mut indices,
+            &[1],
+            &[0],
+            &[changed],
+            &HashMap::new(),
+            &schema,
+        )
+        .unwrap();
+        assert_eq!(
+            indices[0].fragment_bitmap.as_ref().unwrap().contains(1),
+            can_reuse
         );
     }
 

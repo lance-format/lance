@@ -17,21 +17,21 @@ fn main() -> Result<(), String> {
 
     // Let clippy know about our custom cfg attribute
     println!(
-        "cargo::rustc-check-cfg=cfg(kernel_support, values(\"avx512_f16\", \"avx512_bf16\", \"avx512_dist_table\", \"amx_fp16\"))"
+        "cargo::rustc-check-cfg=cfg(kernel_support, values(\"half\", \"avx512_f16\", \"avx512_bf16\", \"amx_fp16\"))"
     );
     println!("cargo::rustc-check-cfg=cfg(simd_fallback)");
 
     println!("cargo:rerun-if-changed=src/simd/f16.c");
     println!("cargo:rerun-if-changed=src/simd/bf16.c");
-    println!("cargo:rerun-if-changed=src/simd/dist_table.c");
     println!("cargo:rerun-if-changed=src/simd/amx_fp16.c");
     println!("cargo:rerun-if-env-changed=LANCE_AMX_FP16_CC");
 
     // Important: we don't use `cfg!(target_arch)` here because that is the target_arch
     // for the build script, not the target_arch for the library. Similar story for
-    // target_os.
+    // target_os and the library's features.
     let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap();
+    let fp16kernels = env::var_os("CARGO_FEATURE_FP16KERNELS").is_some();
 
     // Architectures without SIMD kernels back the vector types with plain arrays.
     if !matches!(target_arch.as_str(), "x86_64" | "aarch64" | "loongarch64") {
@@ -68,7 +68,7 @@ fn main() -> Result<(), String> {
                 "cargo:warning=Skipping build of AVX-512 fp16 kernels. Error: {}",
                 err
             );
-        } else if cfg!(feature = "fp16kernels") {
+        } else if fp16kernels {
             // We create a special cfg so that we can detect we have in fact
             // generated the AVX512 version of the f16 kernels.
             println!("cargo:rustc-cfg=kernel_support=\"avx512_f16\"");
@@ -81,18 +81,8 @@ fn main() -> Result<(), String> {
                 "cargo:warning=Skipping build of AVX-512 bf16 kernels. Error: {}",
                 err
             );
-        } else if cfg!(feature = "fp16kernels") {
+        } else if fp16kernels {
             println!("cargo:rustc-cfg=kernel_support=\"avx512_bf16\"");
-        };
-        // Only the ISA the intrinsics need, so the Rust candidate can require
-        // exactly these features and also run on AVX-512 CPUs without FP16.
-        if let Err(err) = build_dist_table_with_flags("avx512", &["-mavx512f", "-mavx512bw"]) {
-            println!(
-                "cargo:warning=Skipping build of AVX-512 dist_table. Error: {}",
-                err
-            );
-        } else {
-            println!("cargo:rustc-cfg=kernel_support=\"avx512_dist_table\"");
         };
         // Build the AMX-FP16 batched f16 dot-product kernel (Granite Rapids+).
         //
@@ -148,12 +138,15 @@ fn main() -> Result<(), String> {
     } else {
         // Only error if fp16kernels was explicitly requested on unsupported platform.
         // This allows builds on iOS, Android, etc. when the feature is disabled.
-        //
-        // Note: We use CARGO_FEATURE_* env var instead of cfg!() because cfg!()
-        // checks the build script's features, not the library's features.
-        if env::var("CARGO_FEATURE_FP16KERNELS").is_ok() {
+        if fp16kernels {
             return Err("Unable to build f16 kernels on given target_arch.  Please use x86_64 or aarch64 or remove the fp16kernels feature".to_string());
         }
+        return Ok(());
+    }
+    if fp16kernels {
+        // Every branch above that reaches here built the f16 and bf16 objects
+        // for this target.
+        println!("cargo:rustc-cfg=kernel_support=\"half\"");
     }
     Ok(())
 }
@@ -215,22 +208,6 @@ fn build_bf16_with_flags(suffix: &str, flags: &[&str]) -> Result<(), cc::Error> 
     }
 
     builder.try_compile(&format!("bf16_{}", suffix))
-}
-
-fn build_dist_table_with_flags(suffix: &str, flags: &[&str]) -> Result<(), cc::Error> {
-    let mut builder = cc::Build::new();
-    builder
-        .std("c17")
-        .file("src/simd/dist_table.c")
-        .flag("-funroll-loops")
-        .flag("-O3")
-        .flag("-Wall")
-        .flag("-Wextra")
-        .flag(format!("-DSUFFIX=_{}", suffix).as_str());
-    for flag in flags {
-        builder.flag(flag);
-    }
-    builder.try_compile(&format!("dist_table_{}", suffix))
 }
 
 /// Compile the AMX-FP16 kernel. Unlike the other kernels this may need a

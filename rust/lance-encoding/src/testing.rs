@@ -11,8 +11,7 @@ use crate::{
     },
 };
 
-use arrow_array::{Array, StructArray, UInt64Array, make_array};
-use arrow_data::transform::{Capacities, MutableArrayData};
+use arrow_array::{Array, StructArray, UInt64Array};
 use arrow_ord::ord::make_comparator;
 use arrow_schema::{DataType, Field, Field as ArrowField, FieldRef, Schema, SortOptions};
 use arrow_select::concat::concat;
@@ -121,6 +120,10 @@ impl TestCompressionStrategy {
 }
 
 impl CompressionStrategy for TestCompressionStrategy {
+    fn allows_byte_wide_fsl_booleans(&self) -> bool {
+        self.encoding == TestEncoding::StructuralSparse
+    }
+
     fn create_miniblock_compressor(
         &self,
         field: &LanceField,
@@ -939,7 +942,7 @@ fn tag(e: &Compression) -> &'static str {
         PackedStruct(_) => "packed_struct",
         VariablePackedStruct(_) => "variable_packed_struct",
         Range(_) => "range",
-        Delta(_) => "delta",
+        MonotonicDelta(_) => "monotonic_delta",
         AxisDelta(_) => "axis_delta",
         Alp(_) => "alp",
         Pcodec(_) => "pcodec",
@@ -1381,19 +1384,6 @@ async fn check_round_trip_encoding_inner(
     // that Arrow's lossy merge cannot combine).
     let concat_data = if test_cases.skip_validation || expected_override.is_some() {
         None
-    } else if let Some(DataType::Struct(_)) = data.first().map(|datum| datum.data_type()) {
-        // TODO(tsaucer) When arrow upgrades to 56, remove this if statement
-        // This is due to a check for concat_struct in arrow-rs. See https://github.com/lance-format/lance/pull/4598
-        let capacities = Capacities::Array(num_rows as usize);
-        let array_data: Vec<_> = data.iter().map(|a| a.to_data()).collect::<Vec<_>>();
-        let array_data = array_data.iter().collect();
-        let mut mutable = MutableArrayData::with_capacities(array_data, false, capacities);
-
-        for (i, a) in data.iter().enumerate() {
-            mutable.try_extend(i, 0, a.len()).unwrap();
-        }
-
-        Some(make_array(mutable.freeze()))
     } else {
         Some(concat(&data.iter().map(|arr| arr.as_ref()).collect::<Vec<_>>()).unwrap())
     };

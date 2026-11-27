@@ -12,7 +12,7 @@ use std::{
 };
 
 use all_asserts::{assert_ge, assert_lt};
-use arrow::datatypes::{Float64Type, UInt8Type, UInt32Type, UInt64Type};
+use arrow::datatypes::{Float64Type, Int32Type, UInt8Type, UInt32Type, UInt64Type};
 use arrow::{array::AsArray, datatypes::Float32Type};
 use arrow_array::{
     Array, ArrayRef, ArrowPrimitiveType, FixedSizeListArray, Float32Array, Int64Array, ListArray,
@@ -40,9 +40,11 @@ use crate::index::prefilter::DatasetPreFilter;
 use crate::index::vector::details::{
     target_partition_size_from_details, vector_index_details_default,
 };
+use crate::index::vector::ivf::compatibility::{VectorQueryContract, vector_segment_contract};
 use crate::index::vector::ivf::v2::{
     IVFPartitionKey, IvfFlatIndex, IvfHnswSqIndex, IvfPq, IvfStateEntryBox, PartitionEntry,
 };
+use crate::session::index_caches::{DerivedIndexListingKey, QueryIndexListingKey};
 use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount, copy_test_data_to_tmp};
 use crate::{
     Dataset,
@@ -77,7 +79,7 @@ use lance_index::vector::quantizer::{Quantization, QuantizerMetadata};
 use lance_index::vector::sq::ScalarQuantizer;
 use lance_index::vector::sq::builder::SQBuildParams;
 use lance_index::vector::{
-    ApproxMode, DEFAULT_QUERY_PARALLELISM, Query,
+    ApproxMode, DEFAULT_QUERY_PARALLELISM, Query, RqGraphScoring,
     pq::storage::ProductQuantizationMetadata,
     sq::storage::{SQ_METADATA_KEY, ScalarQuantizationMetadata},
     storage::STORAGE_METADATA_KEY,
@@ -381,6 +383,99 @@ async fn test_partition_coverage_is_only_built_for_capable_filters() {
     assert!(entry.partition_rows_accounted.load(Ordering::Acquire));
 }
 
+#[tokio::test]
+async fn test_partition_coverage_cache_does_not_retain_transient_storage() {
+    let entry = |num_rows: usize| {
+        let vectors = FixedSizeListArray::try_new_from_values(
+            Float32Array::from(vec![0.0_f32; num_rows * 4]),
+            4,
+        )
+        .unwrap();
+        let mut entry = PartitionEntry::<FlatIndex, FlatQuantizer>::new(
+            FlatIndex::default(),
+            FlatFloatStorage::new(vectors, DistanceType::L2),
+        );
+        entry.cache_whole_partition = false;
+        Arc::new(entry)
+    };
+    let cache = LanceCache::with_capacity(1 << 20);
+    let weak_cache = WeakLanceCache::from(&cache.with_key_prefix("translation-a"));
+    let first = entry(4);
+    let weak_entry = Arc::downgrade(&first);
+    let rows =
+        super::IVFIndex::<FlatIndex, FlatQuantizer>::cache_partition_rows(&weak_cache, 0, &first)
+            .await
+            .unwrap();
+    assert_eq!(rows.as_ref(), &(0..4_u64).collect::<RowAddrTreeMap>());
+    drop(first);
+    assert!(weak_entry.upgrade().is_none());
+    let second = entry(4);
+    let cached_rows =
+        super::IVFIndex::<FlatIndex, FlatQuantizer>::cache_partition_rows(&weak_cache, 0, &second)
+            .await
+            .unwrap();
+    assert!(Arc::ptr_eq(&rows, &cached_rows));
+    assert!(second.partition_rows.get().is_none());
+    let changed_cache = WeakLanceCache::from(&cache.with_key_prefix("translation-b"));
+    let changed_rows = super::IVFIndex::<FlatIndex, FlatQuantizer>::cache_partition_rows(
+        &changed_cache,
+        0,
+        &entry(2),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        changed_rows.as_ref(),
+        &(0..2_u64).collect::<RowAddrTreeMap>()
+    );
+    assert!(!Arc::ptr_eq(&rows, &changed_rows));
+}
+
+#[rstest]
+#[case::below_two_tasks(vec![600, 600], 1024, 8, vec![0..2])]
+#[case::one_partition(vec![5000], 1024, 8, vec![0..1])]
+#[case::even(vec![1024; 4], 1024, 8, vec![0..1, 1..2, 2..3, 3..4])]
+#[case::capped_by_tasks(vec![1024; 4], 1024, 2, vec![0..2, 2..4])]
+#[case::skewed(vec![3000, 1000, 1000, 1000], 1000, 4, vec![0..1, 1..2, 2..3, 3..4])]
+#[case::first_below_target(vec![1_400_000, 1_750_000], 1 << 20, 8, vec![0..1, 1..2])]
+#[case::concentrated(vec![3000, 1, 1, 1], 1, 4, vec![0..1, 1..4])]
+fn test_balanced_byte_ranges(
+    #[case] bytes: Vec<usize>,
+    #[case] min_task_bytes: usize,
+    #[case] max_tasks: usize,
+    #[case] expected: Vec<std::ops::Range<usize>>,
+) {
+    let ranges = super::balanced_byte_ranges(&bytes, min_task_bytes, max_tasks);
+    assert_eq!(ranges, expected);
+    assert!(ranges.len() <= max_tasks);
+    // Ranges are ordered, disjoint, and cover every partition exactly once.
+    assert!(ranges.windows(2).all(|pair| pair[0].end == pair[1].start));
+    assert_eq!(ranges.first().map(|range| range.start), Some(0));
+    assert_eq!(ranges.last().map(|range| range.end), Some(bytes.len()));
+}
+
+#[test]
+fn test_merge_topk_heaps_keeps_the_best() {
+    use crate::index::vector::ivf::v2::merge_topk_heaps;
+    use lance_index::vector::graph::{OrderedFloat, OrderedNode};
+    use std::collections::BinaryHeap;
+    let heap = |dists: &[f32]| {
+        dists
+            .iter()
+            .enumerate()
+            .map(|(id, &dist)| OrderedNode::new(id as u64 * 10 + dist as u64, OrderedFloat(dist)))
+            .collect::<BinaryHeap<_>>()
+    };
+    let merged = merge_topk_heaps(
+        vec![heap(&[5.0, 1.0, 9.0]), heap(&[2.0, 8.0]), heap(&[0.5])],
+        3,
+    );
+    let mut dists: Vec<f32> = merged.into_iter().map(|node| node.dist.0).collect();
+    dists.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    assert_eq!(dists, vec![0.5, 1.0, 2.0]);
+    assert!(merge_topk_heaps(vec![], 3).is_empty());
+}
+
 #[rstest]
 #[case::no_probes(vec![0, 0, 0], 4, vec![])]
 #[case::too_few_to_split(vec![1, 2, 3], 4, vec![0..3])]
@@ -410,6 +505,78 @@ fn test_balanced_query_ranges(
     }
 }
 
+/// A cached state carries its quantizer from the moment it is exported or
+/// decoded, so the cache charges for it on admission and a later
+/// reconstruction neither rebuilds it nor grows the entry.
+#[tokio::test]
+async fn test_state_entry_carries_quantizer_before_admission() {
+    let (batch, schema) = make_seeded_vector_batch(PQ_MATRIX_NUM_ROWS);
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        "memory://",
+        None,
+    )
+    .await
+    .unwrap();
+    let mut ivf = IvfBuildParams::new(LIGHTWEIGHT_PQ_PARTITIONS);
+    ivf.max_iters = 2;
+    ivf.sample_rate = LIGHTWEIGHT_IVF_SAMPLE_RATE;
+    let params = VectorIndexParams::with_ivf_pq_params(
+        DistanceType::L2,
+        ivf,
+        lightweight_pq_params_with_bits(8),
+    );
+    dataset
+        .create_index(
+            &["vector"],
+            IndexType::Vector,
+            Some("vector_idx".to_owned()),
+            &params,
+            true,
+        )
+        .await
+        .unwrap();
+    let uuid = dataset.load_indices_by_name("vector_idx").await.unwrap()[0].uuid;
+    let index = dataset
+        .open_vector_index("vector", &uuid, &NoOpMetricsCollector)
+        .await
+        .unwrap();
+    let index = index.as_any().downcast_ref::<IvfPq>().unwrap();
+    let exported = index.to_state_entry();
+    let codec = lance_core::cache::CacheCodec::from_impl::<IvfStateEntryBox>();
+    let mut encoded = Vec::new();
+    codec
+        .serialize(
+            &(Arc::new(IvfStateEntryBox(exported.0.clone())) as lance_core::cache::CacheEntry),
+            &mut encoded,
+        )
+        .unwrap();
+    let decoded = codec
+        .deserialize(&bytes::Bytes::from(encoded))
+        .hit()
+        .unwrap()
+        .downcast::<IvfStateEntryBox>()
+        .unwrap();
+    for entry in [Arc::new(exported), decoded] {
+        // Without this the size check below would also hold for an entry that
+        // never got a quantizer.
+        assert!(entry.0.has_quantizer());
+        let charged = entry.deep_size_of();
+        entry
+            .0
+            .reconstruct(
+                dataset.table_state.object_store.clone(),
+                dataset.table_state.metadata_cache.as_ref(),
+                LanceCache::no_cache(),
+                None,
+                super::IvfOpenContext::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(entry.deep_size_of(), charged);
+    }
+}
+
 #[rstest]
 #[case::flat(None)]
 #[case::pq4(Some(4))]
@@ -436,14 +603,25 @@ async fn test_batch_partition_prefilter_preserves_bulk_scoring(#[case] bits: Opt
         query_parallelism: DEFAULT_QUERY_PARALLELISM,
         dist_q_c: 0.0,
         approx_mode: Default::default(),
+        rq_graph_scoring: Default::default(),
     };
     let mut dataset = Dataset::write(
         RecordBatchIterator::new(vec![Ok(batch)], schema),
         "memory://",
-        None,
+        // Two fragments, so a partition offset is not a row address: the masked
+        // scorers must map the selected offset through `storage.row_id`.
+        Some(WriteParams {
+            max_rows_per_file: PQ_MATRIX_NUM_ROWS / 2,
+            ..Default::default()
+        }),
     )
     .await
     .unwrap();
+    assert_eq!(
+        dataset.fragments().len(),
+        2,
+        "the fixture must span two fragments"
+    );
     let mut ivf = IvfBuildParams::new(LIGHTWEIGHT_PQ_PARTITIONS);
     ivf.max_iters = 2;
     ivf.sample_rate = LIGHTWEIGHT_IVF_SAMPLE_RATE;
@@ -532,6 +710,11 @@ async fn test_batch_partition_prefilter_preserves_bulk_scoring(#[case] bits: Opt
         assert_ge!(recall, 0.5);
     }
     let row_ids = all_results[0][ROW_ID].as_primitive::<UInt64Type>();
+    assert!(
+        row_ids.values().iter().any(|row_id| row_id >> 32 != 0),
+        "the indexed results must include a row from the second fragment, \
+         whose address differs from its partition offset"
+    );
     let stale_row = row_ids.value(0);
     let owned_rows = row_ids.values().iter().copied().collect::<RowAddrTreeMap>();
     let mixed_rows = row_ids
@@ -1150,6 +1333,63 @@ fn make_seeded_vector_batch(num_rows: usize) -> (RecordBatch, SchemaRef) {
 }
 
 #[rstest]
+#[tokio::test]
+async fn refined_ivf_flat_keeps_nearest_live_rows(#[values(false, true)] stable_row_ids: bool) {
+    const K: usize = 5;
+    let (batch, schema) = make_seeded_vector_batch(240);
+    let query = batch["vector"].as_fixed_size_list().value(0);
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        "memory://",
+        Some(WriteParams {
+            enable_stable_row_ids: stable_row_ids,
+            max_rows_per_file: 40,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    dataset
+        .create_index(
+            &["vector"],
+            IndexType::Vector,
+            None,
+            &VectorIndexParams::ivf_flat(4, DistanceType::L2),
+            true,
+        )
+        .await
+        .unwrap();
+
+    // The same physical index outlives both partial and whole-fragment deletes.
+    for deleted_prefix in [1, 12, 72, 204] {
+        dataset
+            .delete(&format!("id < {deleted_prefix}"))
+            .await
+            .unwrap();
+        let expected = ground_truth(&dataset, "vector", query.as_ref(), K, DistanceType::L2).await;
+        let indexed = dataset
+            .scan()
+            .nearest("vector", query.as_ref(), K)
+            .unwrap()
+            .nprobes(4)
+            .refine(3)
+            .fast_search()
+            .with_row_id()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let actual: HashSet<u64> = indexed[ROW_ID]
+            .as_primitive::<UInt64Type>()
+            .values()
+            .iter()
+            .copied()
+            .collect();
+        assert_eq!(indexed.num_rows(), K);
+        assert_eq!(actual, expected, "deleted prefix {deleted_prefix}");
+    }
+}
+
+#[rstest]
 #[case::flat(None)]
 #[case::pq4(Some(4))]
 #[case::pq8(Some(8))]
@@ -1215,12 +1455,17 @@ async fn test_pairwise_partition_replay_has_no_source_io(#[case] bits: Option<us
         .unwrap();
     let session = dataset.session();
     let store = session.spill_store();
-    dataset.object_store.as_ref().io_stats_incremental();
+    dataset
+        .table_state
+        .object_store
+        .as_ref()
+        .io_stats_incremental();
     let memory = index
         .prepare_pairwise_partition(0, BATCH_SIZE, 16 * 1024 * 1024, store)
         .await
         .unwrap();
     let memory_bytes = dataset
+        .table_state
         .object_store
         .as_ref()
         .io_stats_incremental()
@@ -1230,6 +1475,7 @@ async fn test_pairwise_partition_replay_has_no_source_io(#[case] bits: Option<us
         .await
         .unwrap();
     let spilled_bytes = dataset
+        .table_state
         .object_store
         .as_ref()
         .io_stats_incremental()
@@ -1242,7 +1488,11 @@ async fn test_pairwise_partition_replay_has_no_source_io(#[case] bits: Option<us
         spilled_bytes < 2 * memory_bytes,
         "spilled preparation read {spilled_bytes} bytes, in-memory {memory_bytes}"
     );
-    dataset.object_store.as_ref().io_stats_incremental();
+    dataset
+        .table_state
+        .object_store
+        .as_ref()
+        .io_stats_incremental();
     let mut seen = HashSet::new();
     for _ in 0..3 {
         for batch_id in 0..NUM_ROWS.div_ceil(BATCH_SIZE) {
@@ -1258,7 +1508,11 @@ async fn test_pairwise_partition_replay_has_no_source_io(#[case] bits: Option<us
         }
     }
     assert_eq!(seen, (0..NUM_ROWS as u64).collect::<HashSet<u64>>());
-    let stats = dataset.object_store.as_ref().io_stats_incremental();
+    let stats = dataset
+        .table_state
+        .object_store
+        .as_ref()
+        .io_stats_incremental();
     assert_eq!(
         stats.read_iops, 0,
         "replay must not reread the source index"
@@ -1951,6 +2205,35 @@ fn make_two_fragment_batches() -> (Arc<Schema>, Vec<RecordBatch>) {
     (schema, vec![batch])
 }
 
+fn make_sq_merge_batches() -> (Arc<Schema>, Vec<RecordBatch>) {
+    let (schema, batches) = make_two_fragment_batches();
+    let batches = batches
+        .into_iter()
+        .map(|batch| {
+            let vectors = batch["vector"].as_fixed_size_list();
+            let mut values = vectors
+                .values()
+                .as_primitive::<Float32Type>()
+                .values()
+                .to_vec();
+            // Every training sample contains both bounds, so independently trained
+            // shards use the same SQ model without requiring a model injection API.
+            for vector in values.as_chunks_mut::<TWO_FRAG_DIM>().0 {
+                vector[0] = 0.0;
+                vector[1] = 1.0;
+            }
+            let vectors = FixedSizeListArray::try_new_from_values(
+                Float32Array::from(values),
+                TWO_FRAG_DIM as i32,
+            )
+            .unwrap();
+            RecordBatch::try_new(schema.clone(), vec![batch["id"].clone(), Arc::new(vectors)])
+                .unwrap()
+        })
+        .collect();
+    (schema, batches)
+}
+
 async fn write_dataset_from_batches(
     test_uri: &str,
     schema: Arc<Schema>,
@@ -2430,6 +2713,7 @@ async fn test_distributed_vector_build_commits_multiple_segments_and_preserves_q
             .join(lance_index::INDEX_FILE_NAME);
         assert!(
             ds_split
+                .table_state
                 .object_store
                 .as_ref()
                 .exists(&segment_index)
@@ -2525,7 +2809,11 @@ async fn test_distributed_vector_grouped_build_allows_concurrent_group_execution
     let test_dir = TempStrDir::default();
     let base_uri = test_dir.as_str();
 
-    let (schema, batches) = make_two_fragment_batches();
+    let (schema, batches) = if matches!(index_type, IndexType::IvfSq) {
+        make_sq_merge_batches()
+    } else {
+        make_two_fragment_batches()
+    };
     let ds_single_uri = format!("{}/grouped_single", base_uri);
     let ds_split_uri = format!("{}/grouped_split", base_uri);
 
@@ -3663,8 +3951,8 @@ async fn test_raw_index_commit_reads_each_segment_of_a_mixed_index(
     if matches!(commit, MixedIndexCommit::AddAfterACommit) {
         dataset.delete("false").await.unwrap();
         let saved = lance_table::io::manifest::read_manifest_indexes(
-            &dataset.object_store,
-            &dataset.manifest_location,
+            &dataset.table_state.object_store,
+            &dataset.table_state.manifest_location,
             &dataset.manifest,
         )
         .await
@@ -4032,8 +4320,6 @@ async fn test_vector_segment_contract_read_from_file_metadata(
     #[case] params: VectorIndexParams,
     #[case] index_type: IndexType,
 ) {
-    use crate::index::vector::ivf::{VectorQueryContract, vector_segment_contract};
-
     let mut dataset = write_small_vector_dataset("memory://").await;
     let segment = dataset
         .create_index_builder(&["vector"], IndexType::Vector, &params)
@@ -4065,6 +4351,134 @@ async fn test_vector_segment_contract_read_from_file_metadata(
     assert_eq!(opened.metric_type(), params.metric_type);
 }
 
+#[tokio::test]
+async fn test_vector_index_types_use_physical_files_and_cache_only_types() {
+    use crate::index::vector::details::vector_index_details;
+
+    let mut dataset = write_small_vector_dataset("memory://").await;
+    let flat = VectorIndexParams::ivf_flat(2, DistanceType::Cosine);
+    let rq = VectorIndexParams::ivf_rq(2, 1, DistanceType::Cosine);
+    let mut rq_segment = build_vector_segment(&mut dataset, &rq, vec![0, 1]).await;
+    let flat_segment = build_vector_segment(&mut dataset, &flat, vec![2, 3]).await;
+    // A single-segment raw commit may supply syntactically valid details
+    // copied from another index. A query still searches the actual RQ file.
+    rq_segment.index_details = Some(Arc::new(vector_index_details(&flat, Some(64))));
+    let (rq_uuid, flat_uuid) = (rq_segment.uuid, flat_segment.uuid);
+    let mut dataset = commit_raw_index_segments(
+        &dataset,
+        vec![("rq", rq_segment), ("flat", flat_segment)],
+        vec![],
+        false,
+    )
+    .await
+    .unwrap();
+    dataset.load_indices().await.unwrap();
+    let _ = dataset.table_state.object_store.io_stats_incremental();
+    let uuids = [flat_uuid, rq_uuid, flat_uuid];
+    let expected = vec![IndexType::IvfFlat, IndexType::IvfRq, IndexType::IvfFlat];
+    assert_eq!(
+        dataset.vector_index_types("vector", &uuids).await.unwrap(),
+        expected
+    );
+    let cold = dataset.table_state.object_store.io_stats_incremental();
+    assert!(!cold.requests.is_empty());
+    for uuid in [flat_uuid, rq_uuid] {
+        let path = format!("/{uuid}/{}", lance_index::INDEX_FILE_NAME);
+        assert!(
+            cold.requests
+                .iter()
+                .any(|r| r.path.as_ref().ends_with(&path))
+        );
+    }
+    assert!(
+        cold.requests
+            .iter()
+            .all(|r| !r.path.as_ref().ends_with(INDEX_AUXILIARY_FILE_NAME))
+    );
+    assert_eq!(
+        dataset.vector_index_types("vector", &uuids).await.unwrap(),
+        expected
+    );
+    assert_eq!(
+        dataset
+            .table_state
+            .object_store
+            .io_stats_incremental()
+            .read_iops,
+        0
+    );
+    assert!(dataset.vector_index_types("vector2", &uuids).await.is_err());
+
+    dataset.drop_index("rq").await.unwrap();
+    assert!(matches!(
+        dataset.vector_index_types("vector", &[rq_uuid]).await,
+        Err(lance_core::Error::IndexNotFound { .. })
+    ));
+}
+
+#[tokio::test]
+async fn test_ivf_partition_shape_per_segment_only_reads_index_file() {
+    let mut dataset = write_small_vector_dataset("memory://").await;
+    let mut entries = Vec::new();
+    let mut expected = Vec::new();
+    for (count, ids) in [(2, vec![0, 1]), (4, vec![2, 3])] {
+        let params = VectorIndexParams::ivf_flat(count, DistanceType::L2);
+        let segment = build_vector_segment(&mut dataset, &params, ids).await;
+        expected.push((segment.uuid, (count, 16)));
+        entries.push(("vector_idx", segment));
+    }
+    let mut dataset = commit_raw_index_segments(&dataset, entries, vec![], false)
+        .await
+        .unwrap();
+    dataset.load_indices().await.unwrap();
+    let _ = dataset.table_state.object_store.io_stats_incremental();
+    for (uuid, shape) in &expected {
+        assert_eq!(dataset.ivf_partition_shape(uuid).await.unwrap(), *shape);
+        let cold = dataset.table_state.object_store.io_stats_incremental();
+        let filename = format!("/{uuid}/{}", lance_index::INDEX_FILE_NAME);
+        assert!(!cold.requests.is_empty());
+        assert!(
+            cold.requests
+                .iter()
+                .all(|request| request.path.as_ref().ends_with(&filename))
+        );
+        assert_eq!(dataset.ivf_partition_shape(uuid).await.unwrap(), *shape);
+        assert_eq!(
+            dataset
+                .table_state
+                .object_store
+                .io_stats_incremental()
+                .read_iops,
+            0
+        );
+    }
+    dataset.drop_index("vector_idx").await.unwrap();
+    assert!(matches!(
+        dataset.ivf_partition_shape(&expected[0].0).await,
+        Err(lance_core::Error::IndexNotFound { .. })
+    ));
+}
+
+#[tokio::test]
+async fn test_vector_index_types_use_legacy_query_opener() {
+    let dataset = write_legacy_v1_dataset("memory://").await;
+    let segment = build_legacy_v1_segment(&dataset, DistanceType::L2, vec![0, 1]).await;
+    let uuid = segment.uuid;
+    let dataset = commit_raw_index_segments(&dataset, vec![("legacy", segment)], vec![], false)
+        .await
+        .unwrap();
+    // The (0, 2) index-file format supports several index types and extensions.
+    let opened = dataset
+        .open_vector_index("vector", &uuid, &NoOpMetricsCollector)
+        .await
+        .unwrap();
+    assert_eq!(opened.index_type(), IndexType::IvfHnswPq);
+    assert_eq!(
+        dataset.vector_index_types("vector", &[uuid]).await.unwrap(),
+        [opened.index_type()]
+    );
+}
+
 /// The format version in the footer of a segment's index file, which decides
 /// the reader that opens the segment.
 async fn index_file_version(dataset: &Dataset, segment: &IndexMetadata) -> (u16, u16) {
@@ -4073,7 +4487,7 @@ async fn index_file_version(dataset: &Dataset, segment: &IndexMetadata) -> (u16,
         .unwrap()
         .join(segment.uuid.to_string())
         .join(lance_index::INDEX_FILE_NAME);
-    let reader = dataset.object_store.open(&path).await.unwrap();
+    let reader = dataset.table_state.object_store.open(&path).await.unwrap();
     let footer = lance_io::utils::read_last_block(reader.as_ref())
         .await
         .unwrap();
@@ -4183,6 +4597,58 @@ async fn test_raw_index_commit_opens_legacy_v1_segments(
     }
 }
 
+/// A legacy IVF_HNSW_PQ segment has no incremental writer: optimize refuses
+/// it with an error naming the index type, and the retrain the error suggests
+/// rebuilds it as one current-format segment over every fragment.
+#[tokio::test]
+async fn test_optimize_legacy_v1_hnsw_pq_refuses_incremental_optimize_and_retrains() {
+    let dataset = write_legacy_v1_dataset("memory://").await;
+    let segment = build_legacy_v1_segment(&dataset, DistanceType::L2, vec![0, 1]).await;
+    let dataset = commit_raw_index_segments(&dataset, vec![("shared", segment)], vec![], false)
+        .await
+        .unwrap();
+    let appended = gen_batch()
+        .col("vector", array::rand_vec::<Float32Type>(Dimension::from(8)))
+        .into_batch_rows(RowCount::from(64))
+        .unwrap();
+    let mut dataset = InsertBuilder::new(Arc::new(dataset))
+        .with_params(&WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        })
+        .execute(vec![appended])
+        .await
+        .unwrap();
+
+    let err = dataset
+        .optimize_indices(&OptimizeOptions::default())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, lance_core::Error::NotSupported { .. }),
+        "expected NotSupported, got {err:?}"
+    );
+    assert!(
+        err.to_string().contains("IVF_HNSW_PQ") && err.to_string().contains("retrain"),
+        "{err}"
+    );
+
+    dataset
+        .optimize_indices(&OptimizeOptions::retrain())
+        .await
+        .unwrap();
+    let segments = dataset.load_indices_by_name("shared").await.unwrap();
+    assert_eq!(segments.len(), 1);
+    assert!(matches!(
+        index_file_version(&dataset, &segments[0]).await,
+        (0, 3) | (2, _)
+    ));
+    assert_eq!(
+        segments[0].fragment_bitmap.as_ref().unwrap(),
+        dataset.table_state.fragment_bitmap.as_ref()
+    );
+}
+
 #[tokio::test]
 async fn test_distributed_vector_build_supports_hnsw_variants() {
     let test_dir = TempStrDir::default();
@@ -4255,6 +4721,9 @@ async fn test_merge_existing_hnsw_segments_rebuilds_graph(
     let (schema, batches, max_rows_per_file) = if expected_index_type == "IVF_HNSW_PQ" {
         let (batch, schema) = make_seeded_vector_batch(LIGHTWEIGHT_PQ_ROWS * 2);
         (schema, vec![batch], LIGHTWEIGHT_PQ_ROWS)
+    } else if expected_index_type == "IVF_HNSW_SQ" {
+        let (schema, batches) = make_sq_merge_batches();
+        (schema, batches, 500)
     } else {
         let (schema, batches) = make_two_fragment_batches();
         (schema, batches, TWO_FRAG_ROWS_PER_FILE)
@@ -4455,7 +4924,7 @@ async fn test_merge_index_metadata_reports_progress() {
 
     let progress = Arc::new(RecordingProgress::default());
     let merged_segment = crate::index::vector::ivf::merge_segments_with_progress(
-        dataset.object_store.as_ref(),
+        dataset.table_state.object_store.as_ref(),
         &dataset.indices_dir(),
         segments,
         progress.clone(),
@@ -4589,7 +5058,7 @@ async fn test_distributed_ivf_sq_worker_training_respects_fragment_filter() {
         .unwrap();
 
     let scheduler = ScanScheduler::new(
-        Arc::new(dataset.object_store.as_ref().clone()),
+        Arc::new(dataset.table_state.object_store.as_ref().clone()),
         SchedulerConfig::default_for_testing(),
     );
     let sq_meta = get_sq_metadata(&dataset, scheduler, &segment.uuid.to_string()).await;
@@ -5125,6 +5594,98 @@ async fn test_legacy_ivf_pq_cosine_multivec_smoke() {
     test_index_multivec_impl::<Float32Type>(params, 1, 0.5, 0.0..1.0).await;
 }
 
+/// With every partition of an IVF_FLAT index probed, WARP scores every token
+/// exactly and every document is observed by every query token, so it returns
+/// the exact multivector top k; a prefilter restricts it like ANN search.
+#[tokio::test]
+async fn test_multivector_search_uses_warp() {
+    let test_dir = TempStrDir::default();
+    let (mut dataset, vectors) =
+        generate_multivec_test_dataset::<Float32Type>(test_dir.as_str(), 0.0..1.0).await;
+    let num_partitions = 2;
+    let params = VectorIndexParams::ivf_flat(num_partitions, DistanceType::Cosine);
+    dataset
+        .create_index(&["vector"], IndexType::Vector, None, &params, true)
+        .await
+        .unwrap();
+
+    let k = 10;
+    let query = vectors.value(0);
+    let search = |filter: Option<&str>| {
+        let mut scanner = dataset.scan();
+        scanner
+            .nearest("vector", &query, k)
+            .unwrap()
+            .nprobes(num_partitions);
+        if let Some(filter) = filter {
+            scanner.prefilter(true).filter(filter).unwrap();
+        }
+        scanner
+    };
+
+    // Python's `nprobes` reaches the scanner as minimum and maximum nprobes.
+    let mut scanner = dataset.scan();
+    scanner
+        .nearest("vector", &query, k)
+        .unwrap()
+        .minimum_nprobes(1)
+        .maximum_nprobes(num_partitions);
+    let plan = scanner.explain_plan(false).await.unwrap();
+    assert!(
+        plan.contains(&format!("Warp: k={k}, nprobes={num_partitions}")),
+        "{plan}"
+    );
+
+    let warp = search(None).try_into_batch().await.unwrap();
+    let ground_truth = multivec_ground_truth(&vectors, query.as_ref(), k, DistanceType::Cosine);
+    let ids = warp["id"].as_primitive::<UInt64Type>().values();
+    let distances = warp[DIST_COL].as_primitive::<Float32Type>().values();
+    assert_eq!(
+        ids.to_vec(),
+        ground_truth.iter().map(|(_, id)| *id).collect::<Vec<_>>()
+    );
+    for (distance, (expected, id)) in distances.iter().zip(&ground_truth) {
+        assert!(
+            (distance - expected).abs() < 1e-4,
+            "row {id}: {distance} vs {expected}"
+        );
+    }
+
+    let filtered = search(Some("id >= 100")).try_into_batch().await.unwrap();
+    assert_eq!(filtered.num_rows(), k);
+    assert!(
+        filtered["id"]
+            .as_primitive::<UInt64Type>()
+            .values()
+            .iter()
+            .all(|&id| id >= 100)
+    );
+}
+
+/// Multivector search falls back to XTR for an index WARP does not support.
+#[tokio::test]
+async fn test_multivector_search_falls_back_to_xtr() {
+    let test_dir = TempStrDir::default();
+    let (mut dataset, vectors) =
+        generate_multivec_test_dataset::<Float32Type>(test_dir.as_str(), 0.0..1.0).await;
+    let params = VectorIndexParams::ivf_hnsw(
+        DistanceType::Cosine,
+        IvfBuildParams::new(2),
+        HnswBuildParams::default(),
+    );
+    dataset
+        .create_index(&["vector"], IndexType::Vector, None, &params, true)
+        .await
+        .unwrap();
+
+    let query = vectors.value(0);
+    let mut scanner = dataset.scan();
+    scanner.nearest("vector", &query, 10).unwrap();
+    let plan = scanner.explain_plan(false).await.unwrap();
+    assert!(!plan.contains("Warp:"), "{plan}");
+    assert_eq!(scanner.try_into_batch().await.unwrap().num_rows(), 10);
+}
+
 #[tokio::test]
 async fn test_ivf_pq_delete_all_rows_lifecycle() {
     let params = pq_matrix_params(1, DistanceType::L2, IndexFileVersion::V3);
@@ -5231,6 +5792,7 @@ async fn test_score_partition_candidates_matches_accurate_native_search(
         query_parallelism: DEFAULT_QUERY_PARALLELISM,
         dist_q_c: f32::NAN,
         approx_mode: ApproxMode::Fast,
+        rq_graph_scoring: Default::default(),
     };
     let (partition_ids, centroid_distances) = index.find_partitions(&query).unwrap();
     let partition_position = (0..partition_ids.len())
@@ -5440,6 +6002,7 @@ async fn test_selected_scoring_excludes_null_and_non_finite_stored_vectors(#[cas
         query_parallelism: DEFAULT_QUERY_PARALLELISM,
         dist_q_c: 0.0,
         approx_mode: ApproxMode::Accurate,
+        rq_graph_scoring: Default::default(),
     };
     let scored = index
         .score_partition_candidates(0, &query, &[0, 1, 2, 3], &NoOpMetricsCollector)
@@ -5724,37 +6287,46 @@ async fn test_create_ivf_hnsw_rq(
     }
 }
 
+/// Searches with both [`RqGraphScoring`] modes, which must each use the index
+/// and recall the true neighbors.
 async fn assert_ivf_hnsw_rq_search(dataset: &Dataset, query: &dyn Array, nlist: usize) {
     const K: usize = 10;
 
-    let mut scan = dataset.scan();
-    scan.nearest("vector", query, K)
-        .unwrap()
-        .minimum_nprobes(nlist)
-        .maximum_nprobes(nlist);
-    scan.with_row_id();
-    let plan = scan.explain_plan(false).await.unwrap();
-    assert!(
-        plan.contains("ANNSubIndex"),
-        "IVF_HNSW_RQ scan should use the vector index, got:\n{plan}"
-    );
-
-    let result = scan.try_into_batch().await.unwrap();
-    assert_eq!(result.num_rows(), K);
-    let row_ids = result[ROW_ID].as_primitive::<UInt64Type>().values();
-    assert_eq!(
-        row_ids.iter().copied().collect::<HashSet<_>>().len(),
-        K,
-        "IVF_HNSW_RQ returned duplicate row ids"
-    );
-
     let ground_truth = ground_truth(dataset, "vector", query, K, DistanceType::L2).await;
-    let recall = row_ids
-        .iter()
-        .filter(|row_id| ground_truth.contains(row_id))
-        .count() as f32
-        / K as f32;
-    assert_ge!(recall, 0.8, "recall: {recall}, row_ids: {row_ids:?}");
+    for scoring in [RqGraphScoring::MultiBit, RqGraphScoring::OneBitRerank] {
+        let mut scan = dataset.scan();
+        scan.nearest("vector", query, K)
+            .unwrap()
+            .minimum_nprobes(nlist)
+            .maximum_nprobes(nlist)
+            .rq_graph_scoring(scoring);
+        scan.with_row_id();
+        let plan = scan.explain_plan(false).await.unwrap();
+        assert!(
+            plan.contains("ANNSubIndex"),
+            "IVF_HNSW_RQ scan with {scoring:?} should use the vector index, got:\n{plan}"
+        );
+
+        let result = scan.try_into_batch().await.unwrap();
+        assert_eq!(result.num_rows(), K);
+        let row_ids = result[ROW_ID].as_primitive::<UInt64Type>().values();
+        assert_eq!(
+            row_ids.iter().copied().collect::<HashSet<_>>().len(),
+            K,
+            "IVF_HNSW_RQ with {scoring:?} returned duplicate row ids"
+        );
+
+        let recall = row_ids
+            .iter()
+            .filter(|row_id| ground_truth.contains(row_id))
+            .count() as f32
+            / K as f32;
+        assert_ge!(
+            recall,
+            0.8,
+            "{scoring:?} recall: {recall}, row_ids: {row_ids:?}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -6087,7 +6659,7 @@ async fn test_storage_open_fetches_ivf_and_quantizer_buffers_together() {
 
     let in_flight = Arc::new(AtomicUsize::new(0));
     let max_in_flight = Arc::new(AtomicUsize::new(0));
-    let mut probed = dataset.object_store.as_ref().clone();
+    let mut probed = dataset.table_state.object_store.as_ref().clone();
     probed.inner = Arc::new(ConcurrencyProbeStore {
         target: probed.inner.clone(),
         in_flight: in_flight.clone(),
@@ -6196,6 +6768,77 @@ async fn test_hnsw_partition_load_reads_only_graph_columns() {
     assert_hnsw_columns(&dataset, "after delta merge").await;
 }
 
+/// HNSW may leave storage rows its graph never reached, so a graph shorter
+/// than its partition's storage must still load when no row-ID remapping
+/// dropped any row.
+#[tokio::test]
+async fn test_hnsw_prefix_graph_loads_without_dropped_rows() {
+    use lance_arrow::RecordBatchExt;
+    use lance_index::vector::hnsw::builder::HnswQueryParams;
+
+    let test_dir = TempStrDir::default();
+    let dataset = build_ivf_hnsw_sq(test_dir.as_str(), 1).await;
+    let index = open_ivf_hnsw_sq(&dataset).await;
+    let original = index.as_any().downcast_ref::<IvfHnswSqIndex>().unwrap();
+    let storage = original.load_partition_storage(0, None).await.unwrap();
+    let prefix = storage.len() / 2;
+
+    let mut metadata: HnswMetadata = serde_json::from_str(&original.sub_index_metadata[0]).unwrap();
+    metadata.entry_point = 0;
+    metadata.params.max_level = 1;
+    metadata.level_offsets = vec![0, prefix];
+    let metadata_json = serde_json::to_string(&metadata).unwrap();
+    let graph_batch = original
+        .read_sub_index_batch(0, None, None)
+        .await
+        .unwrap()
+        .slice(0, prefix)
+        .add_metadata(HNSW_METADATA_KEY.to_owned(), metadata_json.clone())
+        .unwrap();
+    let graph = HNSW::load(graph_batch).unwrap();
+    assert_eq!(graph.len(), prefix);
+    let query = Arc::new(Float32Array::from(vec![0.5; DIM])) as ArrayRef;
+    let params = HnswQueryParams {
+        ef: 50,
+        lower_bound: None,
+        upper_bound: None,
+        dist_q_c: 0.0,
+        use_acorn: false,
+        rq_graph_scoring: Default::default(),
+    };
+    let (found, _) = graph
+        .search_basic(query, 10, &params, None, &storage)
+        .unwrap();
+    assert!(!found.is_empty(), "the prefix graph should be searchable");
+
+    let mut ivf = original.ivf.clone();
+    ivf.lengths[0] = prefix as u32;
+    let shorter = IvfHnswSqIndex::from_cached_state(
+        original.uri.clone(),
+        original.index_path.clone(),
+        original.uuid,
+        ivf,
+        original.reader.clone(),
+        lance_index::vector::storage::IvfQuantizationStorage::<ScalarQuantizer>::try_new(
+            original.storage.reader().clone(),
+            None,
+        )
+        .await
+        .unwrap(),
+        vec![metadata_json].into(),
+        original.distance_type,
+        LanceCache::no_cache(),
+        original.raw_cache.clone(),
+        original.io_parallelism,
+        original.rq_search_cache.clone(),
+        original.origin_latency,
+    )
+    .unwrap();
+    let entry = shorter.load_partition_entry(0, None).await.unwrap();
+    assert_eq!(entry.index.len(), prefix);
+    assert_eq!(entry.storage.len(), storage.len());
+}
+
 /// The saving is the point of the change, so pin it: reading a real
 /// partition range through the declared projection must move strictly fewer
 /// bytes than the full-schema read the index used to perform.
@@ -6219,7 +6862,7 @@ async fn test_hnsw_read_projection_moves_fewer_bytes() {
 
     let row_range = hnsw.ivf.row_range(0);
     assert!(!row_range.is_empty(), "partition 0 should hold rows");
-    let store = dataset.object_store.as_ref();
+    let store = dataset.table_state.object_store.as_ref();
 
     let read_bytes_for = async |projection: lance_file::reader::ReaderProjection| {
         let _ = store.io_stats_incremental();
@@ -6715,6 +7358,7 @@ async fn test_global_topk_search_bounds_in_flight_prepared_partitions() {
         query_parallelism: DEFAULT_QUERY_PARALLELISM,
         dist_q_c: 0.0,
         approx_mode: Default::default(),
+        rq_graph_scoring: Default::default(),
     };
     let (partitions, q_c_dists) = index.find_partitions(&query).unwrap();
     assert_eq!(partitions.len(), num_partitions);
@@ -7351,6 +7995,121 @@ async fn test_pq_storage_backwards_compat() {
     assert!(pq_meta.buffer_index().is_some());
 }
 
+/// IVF_HNSW_PQ indices that 0.18.2 and 0.24.1 wrote in the v3 index layout,
+/// whose PQ storage metadata names the bit width `num_bits` and, before
+/// 0.19.2, has no `transposed`. The 0.24.1 index has empty details that are
+/// filled in from this metadata, so without it the search silently scans. See
+/// `datagen.py` next to each fixture.
+#[rstest]
+#[case::v0_18_2("v0.18.2/ivf_hnsw_pq")]
+#[case::v0_24_1("v0.24.1/ivf_hnsw_pq")]
+#[tokio::test]
+async fn test_pre_0_25_ivf_hnsw_pq_search(#[case] fixture: &str) {
+    const K: usize = 10;
+    let test_dir = copy_test_data_to_tmp(fixture).unwrap();
+    let dataset = Dataset::open(&test_dir.path_str()).await.unwrap();
+    assert_eq!(dataset.get_fragments().len(), 2);
+    let rows = dataset
+        .scan()
+        .project(&["vector"])
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let vectors = rows["vector"].as_fixed_size_list();
+
+    let mut found = 0;
+    let mut expected = 0;
+    for row in (0..rows.num_rows()).step_by(32) {
+        let query = vectors.value(row);
+        let search = |use_index: bool| {
+            let dataset = dataset.clone();
+            let query = query.clone();
+            async move {
+                let mut scanner = dataset.scan();
+                scanner
+                    .project(&["i"])
+                    .unwrap()
+                    .nearest("vector", query.as_ref(), K)
+                    .unwrap()
+                    .use_index(use_index);
+                let plan = scanner.explain_plan(false).await.unwrap();
+                let ids = scanner.try_into_batch().await.unwrap()["i"]
+                    .as_primitive::<Int32Type>()
+                    .values()
+                    .to_vec();
+                (plan, ids)
+            }
+        };
+        let (plan, ids) = search(true).await;
+        assert!(plan.contains("ANNSubIndex: name=vector_idx,"), "{plan}");
+        let (_, exact) = search(false).await;
+        found += ids.iter().filter(|id| exact.contains(id)).count();
+        expected += exact.len();
+    }
+    let recall = found as f32 / expected as f32;
+    assert!(recall >= 0.5, "recall {recall} over {expected} neighbors");
+}
+
+/// Legacy (0,2) IVF_HNSW_PQ files from releases before 0.25 are refused with a
+/// request to rebuild. Compaction still succeeds, with or without deferred
+/// remap, leaving these indices unremapped as before, and searches keep asking
+/// for a rebuild instead of silently returning no rows.
+#[rstest]
+#[case::eager_remap(false)]
+#[case::deferred_remap(true)]
+#[tokio::test]
+async fn test_pre_0_25_legacy_ivf_hnsw_pq_asks_for_rebuild(#[case] defer_index_remap: bool) {
+    let test_dir = copy_test_data_to_tmp("v0.16.1/legacy_ivf_hnsw_pq").unwrap();
+    let mut dataset = Dataset::open(&test_dir.path_str()).await.unwrap();
+    let query = Float32Array::from(vec![0.0; 8]);
+    let search_error = |dataset: Dataset, metric: DistanceType| {
+        let query = query.clone();
+        async move {
+            let mut scanner = dataset.scan();
+            scanner
+                .nearest("vector", &query, 10)
+                .unwrap()
+                .distance_metric(metric);
+            scanner.try_into_batch().await.unwrap_err().to_string()
+        }
+    };
+    for (index_name, metric) in [("l2_idx", DistanceType::L2), ("dot_idx", DistanceType::Dot)] {
+        let index = dataset
+            .load_index_by_name(index_name)
+            .await
+            .unwrap()
+            .unwrap();
+        let err = dataset
+            .open_vector_index("vector", &index.uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, lance_core::Error::NotSupported { .. }),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("rebuild the index"), "{err}");
+        let err = search_error(dataset.clone(), metric).await;
+        assert!(err.contains("rebuild the index"), "{err}");
+    }
+
+    compact_files(
+        &mut dataset,
+        CompactionOptions {
+            defer_index_remap,
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 1);
+    for metric in [DistanceType::L2, DistanceType::Dot] {
+        let err = search_error(dataset.clone(), metric).await;
+        assert!(err.contains("rebuild the index"), "{err}");
+    }
+}
+
 #[tokio::test]
 async fn test_optimize_with_empty_partition() {
     let test_dir = TempStrDir::default();
@@ -7952,6 +8711,17 @@ async fn test_join_partition_on_delete_multivec() {
     let index_ctx = load_vector_index_context(&dataset, "vector", INDEX_NAME).await;
     assert_eq!(index_ctx.num_partitions(), 3);
 
+    // Every query reopens the index from its cached state. The per-partition
+    // metadata must be shared with that state, not copied: one `String` per
+    // partition, cloned and freed per query, dominates warm queries on indices
+    // with ~100k partitions.
+    let reopened_ctx = load_vector_index_context(&dataset, "vector", INDEX_NAME).await;
+    assert!(!Arc::ptr_eq(&index_ctx.index, &reopened_ctx.index));
+    assert!(Arc::ptr_eq(
+        &index_ctx.ivf().sub_index_metadata,
+        &reopened_ctx.ivf().sub_index_metadata
+    ));
+
     let mut logical_row_ids = {
         let ivf = index_ctx.ivf();
         let mut smallest: Option<HashSet<u64>> = None;
@@ -8276,7 +9046,11 @@ async fn test_prewarm_vector_index(#[case] params: VectorIndexParams) {
     let before_prewarm = dataset.session().cache_diagnostics();
 
     // Reset IO stats after index creation.
-    dataset.object_store.as_ref().io_stats_incremental();
+    dataset
+        .table_state
+        .object_store
+        .as_ref()
+        .io_stats_incremental();
 
     // Concurrent prewarms should single-flight each partition through the
     // cache loader and leave a complete warm cache for both callers.
@@ -8290,7 +9064,11 @@ async fn test_prewarm_vector_index(#[case] params: VectorIndexParams) {
     .expect("concurrent prewarms deadlocked");
     first.unwrap();
     second.unwrap();
-    let stats = dataset.object_store.as_ref().io_stats_incremental();
+    let stats = dataset
+        .table_state
+        .object_store
+        .as_ref()
+        .io_stats_incremental();
     assert!(
         stats.read_iops > 0,
         "prewarm should have read from disk, but read_iops was 0"
@@ -8319,7 +9097,11 @@ async fn test_prewarm_vector_index(#[case] params: VectorIndexParams) {
         .try_into_batch()
         .await
         .unwrap();
-    let stats = dataset.object_store.as_ref().io_stats_incremental();
+    let stats = dataset
+        .table_state
+        .object_store
+        .as_ref()
+        .io_stats_incremental();
     assert_io_eq!(
         stats,
         read_iops,
@@ -8339,7 +9121,11 @@ async fn test_prewarm_vector_index(#[case] params: VectorIndexParams) {
 
     // Second prewarm should not need IO (already cached).
     dataset.prewarm_index(INDEX_NAME).await.unwrap();
-    let stats = dataset.object_store.as_ref().io_stats_incremental();
+    let stats = dataset
+        .table_state
+        .object_store
+        .as_ref()
+        .io_stats_incremental();
     assert_io_eq!(stats, read_iops, 0, "second prewarm should not perform IO");
 }
 
@@ -8599,9 +9385,17 @@ async fn test_prewarm_and_query_with_serializing_backend(
         "prewarm should have serialized entries into the backend"
     );
     assert_eq!(
-        passthrough, 0,
-        "all index cache entries should have codecs (nothing in passthrough), \
-             but found {passthrough} passthrough entries"
+        passthrough, 1,
+        "only the reader-dependent query listing should remain in memory"
+    );
+    let query_key = QueryIndexListingKey(DerivedIndexListingKey {
+        version: dataset.manifest.version,
+        store_identity: &dataset.table_state.object_store.store_prefix,
+        e_tag: dataset.table_state.manifest_location.e_tag.as_deref(),
+    });
+    assert!(
+        dataset.index_cache.get_with_key(&query_key).await.is_some(),
+        "the in-memory entry must be the query listing"
     );
 
     drop(dataset);
@@ -8678,7 +9472,11 @@ async fn test_prewarm_and_query_with_serializing_backend(
         "serialized IVF query recall is below threshold: {recall}"
     );
 
-    dataset.object_store.as_ref().io_stats_incremental();
+    dataset
+        .table_state
+        .object_store
+        .as_ref()
+        .io_stats_incremental();
     dataset
         .scan()
         .nearest("vector", &q, 10)
@@ -8690,7 +9488,11 @@ async fn test_prewarm_and_query_with_serializing_backend(
         .try_into_batch()
         .await
         .unwrap();
-    let stats = dataset.object_store.as_ref().io_stats_incremental();
+    let stats = dataset
+        .table_state
+        .object_store
+        .as_ref()
+        .io_stats_incremental();
     assert_io_eq!(
         stats,
         read_iops,
@@ -8758,6 +9560,14 @@ async fn test_shallow_clone_ivf_rq_uses_resolved_index_directory() {
         .load()
         .await
         .unwrap();
+
+    assert_eq!(
+        cloned
+            .vector_index_types("vector", &[index_meta.uuid])
+            .await
+            .unwrap(),
+        [IndexType::IvfRq]
+    );
 
     let results = cloned
         .scan()

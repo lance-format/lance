@@ -20,7 +20,7 @@ use crate::{Error, Result};
 pub use field::{
     BlobVersion, Encoding, Field, LANCE_FIELD_ID_KEY, LANCE_UNENFORCED_CLUSTERING_KEY_POSITION,
     LANCE_UNENFORCED_PRIMARY_KEY, LANCE_UNENFORCED_PRIMARY_KEY_POSITION, NullabilityComparison,
-    OnTypeMismatch, SchemaCompareOptions,
+    OnTypeMismatch, SchemaCompareOptions, stamp_field_id,
 };
 pub use schema::{
     BlobHandling, FieldRef, NEW_TABLE_FIELD_ID_LIMIT, OnMissing, Projectable, Projection, Schema,

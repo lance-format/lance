@@ -8,17 +8,17 @@ use lance_index_core::remapping::{BatchRowIdRemapper, remap_row_addrs_tree_map_a
 use std::{
     any::Any,
     fmt::Debug,
-    pin::Pin,
     sync::{Arc, Mutex},
 };
 
 use arrow::array::AsArray;
-use arrow_array::{Array, RecordBatch, UInt64Array};
-use arrow_schema::{DataType, Field, Fields, Schema, SchemaRef, SortOptions};
+use arrow_array::{
+    Array, ArrayRef, GenericListArray, OffsetSizeTrait, RecordBatch, UInt64Array, types::UInt64Type,
+};
+use arrow_schema::{DataType, Field, Schema, SortOptions};
 use async_trait::async_trait;
 use bytes::Bytes;
 use datafusion_common::{DataFusionError, ScalarValue};
-use datafusion_execution::RecordBatchStream;
 use datafusion_physical_expr::{PhysicalSortExpr, expressions::Column};
 use datafusion_physical_plan::{
     ExecutionPlan, SendableRecordBatchStream, sorts::sort::SortExec,
@@ -26,6 +26,7 @@ use datafusion_physical_plan::{
 };
 use futures::{StreamExt, TryStream, TryStreamExt, future::Either, stream::BoxStream};
 use lance_arrow::deepcopy::deep_copy_batch_sliced;
+use lance_arrow::list::ListArrayExt;
 use lance_core::cache::{
     CacheCodec, CacheCodecImpl, CacheEntryReader, CacheEntryWriter, CacheKey, CacheKeySchema,
     KeyBuilder, LanceCache,
@@ -42,7 +43,7 @@ use tracing::instrument;
 
 use super::{
     AnyQuery, IndexFile, IndexStore, LabelListQuery, OldIndexDataFilter, ScalarIndex,
-    bitmap::BitmapIndex,
+    SearchOptions, bitmap::BitmapIndex,
 };
 use super::{BuiltinIndexType, SargableQuery, ScalarIndexParams};
 use super::{MetricsCollector, SearchResult};
@@ -95,7 +96,13 @@ trait LabelListSubIndex: ScalarIndex + DeepSizeOf {
         query: &dyn AnyQuery,
         metrics: &dyn MetricsCollector,
     ) -> Result<NullableRowAddrSet> {
-        let result = self.search(query, metrics).await?;
+        let result = self
+            .search_with_options(
+                query,
+                SearchOptions::default().with_track_nulls(false),
+                metrics,
+            )
+            .await?;
         match result {
             SearchResult::Exact(row_ids) => {
                 // Label list semantics treat NULL elements as non-matches, so only TRUE/FALSE
@@ -241,7 +248,16 @@ impl LabelListIndex {
         if single_set {
             return Ok(intersect_bitmap);
         }
-        while let Some(next) = sets.try_next().await? {
+        // An empty intersection can never recover, so stop pulling the stream
+        // once the accumulator is empty: every remaining pull is a per-label
+        // bitmap search (a disk round trip on a cold cache) for a result that
+        // is already decided. This is exact here because `search_exact`
+        // clears nulls on every element, so `is_empty` (which tests only the
+        // selected set) cannot miss rows hiding in `nulls`, and `&=` cannot
+        // make an empty selected set non-empty again.
+        while !intersect_bitmap.is_empty()
+            && let Some(next) = sets.try_next().await?
+        {
             intersect_bitmap &= &next;
         }
         Ok(intersect_bitmap)
@@ -295,6 +311,16 @@ impl ScalarIndex for LabelListIndex {
         query: &dyn AnyQuery,
         metrics: &dyn MetricsCollector,
     ) -> Result<SearchResult> {
+        self.search_with_options(query, SearchOptions::default(), metrics)
+            .await
+    }
+
+    async fn search_with_options(
+        &self,
+        query: &dyn AnyQuery,
+        options: SearchOptions,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<SearchResult> {
         let query = query.as_any().downcast_ref::<LabelListQuery>().unwrap();
 
         let row_ids = match query {
@@ -308,7 +334,7 @@ impl ScalarIndex for LabelListIndex {
                 self.set_union(values_results, labels.len() == 1).await
             }
         }?;
-        let row_ids = if self.list_nulls.as_ref().is_empty() {
+        let row_ids = if !options.track_nulls() || self.list_nulls.as_ref().is_empty() {
             row_ids
         } else {
             let mut nulls = row_ids.null_rows().clone();
@@ -374,163 +400,84 @@ impl ScalarIndex for LabelListIndex {
     }
 }
 
-fn extract_flatten_indices(list_arr: &dyn Array) -> UInt64Array {
-    if let Some(list_arr) = list_arr.as_list_opt::<i32>() {
-        let mut indices = Vec::with_capacity(list_arr.values().len());
-        let offsets = list_arr.value_offsets();
-        for (offset_idx, w) in offsets.windows(2).enumerate() {
-            let size = (w[1] - w[0]) as u64;
-            indices.extend((0..size).map(|_| offset_idx as u64));
+fn expand_labels<O: OffsetSizeTrait>(
+    lists: &GenericListArray<O>,
+    rows: &UInt64Array,
+    list_nulls: &Mutex<RowAddrTreeMap>,
+) -> Vec<ArrayRef> {
+    let mut labels = lists.trimmed_values();
+    let mut identifiers = Vec::with_capacity(labels.len());
+    let mut nulls = RowAddrTreeMap::new();
+    for (i, len) in lists.offsets().lengths().enumerate() {
+        if lists.is_null(i) {
+            nulls.insert(rows.value(i));
+        } else {
+            identifiers.extend(std::iter::repeat_n(rows.value(i), len));
         }
-        UInt64Array::from(indices)
-    } else if let Some(list_arr) = list_arr.as_list_opt::<i64>() {
-        let mut indices = Vec::with_capacity(list_arr.values().len());
-        let offsets = list_arr.value_offsets();
-        for (offset_idx, w) in offsets.windows(2).enumerate() {
-            let size = (w[1] - w[0]) as u64;
-            indices.extend((0..size).map(|_| offset_idx as u64));
-        }
-        UInt64Array::from(indices)
-    } else {
-        unreachable!(
-            "Should verify that the first column is a list earlier. Got array of type: {}",
-            list_arr.data_type()
-        )
     }
+    if !nulls.is_empty() {
+        *list_nulls.lock().unwrap() |= &nulls;
+        // Arrow permits null lists to contain child slots; those labels have no owner.
+        if identifiers.len() != labels.len() {
+            labels = lists.filter_garbage_nulls().trimmed_values();
+        }
+    }
+    vec![labels, Arc::new(UInt64Array::from(identifiers))]
 }
 
-/// Collect row_ids for list-level NULLs before unnest; unnest drops NULL lists entirely.
-fn track_list_nulls(
+/// Expand each list into (label, identifier) pairs. A null list emits no labels,
+/// so record its identifier separately before expanding the batch.
+fn unnest_labels(
     source: SendableRecordBatchStream,
     list_nulls: Arc<Mutex<RowAddrTreeMap>>,
-) -> SendableRecordBatchStream {
-    let schema = source.schema();
-    let stream = source.try_filter_map(move |batch| {
-        let list_nulls = list_nulls.clone();
-        async move {
-            record_list_nulls(&batch, &list_nulls)?;
-            Ok(Some(batch))
-        }
-    });
-
-    Box::pin(RecordBatchStreamAdapter::new(schema, stream))
-}
-
-fn record_list_nulls(
-    batch: &RecordBatch,
-    list_nulls: &Arc<Mutex<RowAddrTreeMap>>,
-) -> datafusion_common::Result<()> {
-    let values = batch.column_by_name(VALUE_COLUMN_NAME).expect_ok()?;
-    let row_addrs = batch.column_by_name(ROW_ADDR).expect_ok()?;
-    let row_addrs = row_addrs.as_any().downcast_ref::<UInt64Array>().unwrap();
-
-    let mut local_nulls = RowAddrTreeMap::new();
-    for i in 0..values.len() {
-        if values.is_null(i) {
-            local_nulls.insert(row_addrs.value(i));
-        }
-    }
-    if !local_nulls.is_empty() {
-        let mut guard = list_nulls.lock().unwrap();
-        *guard |= &local_nulls;
-    }
-    Ok(())
-}
-
-fn unnest_schema(schema: &Schema) -> SchemaRef {
-    let mut fields_iter = schema.fields.iter().cloned();
-    let key_field = fields_iter.next().unwrap();
-    let remaining_fields = fields_iter.collect::<Vec<_>>();
-
-    let new_key_field = match key_field.data_type() {
-        DataType::List(item_field) | DataType::LargeList(item_field) => Field::new(
-            key_field.name(),
-            item_field.data_type().clone(),
-            item_field.is_nullable() || key_field.is_nullable(),
-        ),
-        other_type => {
-            unreachable!(
-                "The first field in the schema must be a List or LargeList type. \
-                Found: {}. This should have been verified earlier in the code.",
-                other_type
-            )
-        }
-    };
-
-    let all_fields = vec![Arc::new(new_key_field)]
-        .into_iter()
-        .chain(remaining_fields)
-        .collect::<Vec<_>>();
-
-    Arc::new(Schema::new(Fields::from(all_fields)))
-}
-
-fn unnest_batch(
-    batch: arrow::record_batch::RecordBatch,
-    unnest_schema: SchemaRef,
-) -> datafusion_common::Result<RecordBatch> {
-    let mut columns_iter = batch.columns().iter().cloned();
-    let key_col = columns_iter.next().unwrap();
-    let remaining_cols = columns_iter.collect::<Vec<_>>();
-
-    let remaining_fields = unnest_schema
-        .fields
-        .iter()
-        .skip(1)
-        .cloned()
-        .collect::<Vec<_>>();
-
-    let remaining_batch = RecordBatch::try_new(
-        Arc::new(Schema::new(Fields::from(remaining_fields))),
-        remaining_cols,
-    )?;
-
-    let flatten_indices = extract_flatten_indices(key_col.as_ref());
-
-    let flattened_remaining =
-        arrow_select::take::take_record_batch(&remaining_batch, &flatten_indices)?;
-
-    let new_key_values = if let Some(key_list) = key_col.as_list_opt::<i32>() {
-        let value_start = key_list.value_offsets()[key_list.offset()] as usize;
-        let value_stop = key_list.value_offsets()[key_list.len()] as usize;
-        key_list
-            .values()
-            .slice(value_start, value_stop - value_start)
-            .clone()
-    } else if let Some(key_list) = key_col.as_list_opt::<i64>() {
-        let value_start = key_list.value_offsets()[key_list.offset()] as usize;
-        let value_stop = key_list.value_offsets()[key_list.len()] as usize;
-        key_list
-            .values()
-            .slice(value_start, value_stop - value_start)
-            .clone()
-    } else {
-        unreachable!("Should verify that the first column is a list earlier")
-    };
-
-    let all_columns = vec![new_key_values]
-        .into_iter()
-        .chain(flattened_remaining.columns().iter().cloned())
-        .collect::<Vec<_>>();
-
-    datafusion_common::Result::Ok(arrow::record_batch::RecordBatch::try_new(
-        unnest_schema,
-        all_columns,
-    )?)
-}
-
-fn unnest_chunks(
-    source: Pin<Box<dyn RecordBatchStream + Send>>,
+    row_column: &'static str,
 ) -> Result<SendableRecordBatchStream> {
-    let unnest_schema = unnest_schema(source.schema().as_ref());
-    let unnest_schema_copy = unnest_schema.clone();
-    let source = source.try_filter_map(move |batch| {
-        std::future::ready(Some(unnest_batch(batch, unnest_schema.clone())).transpose())
+    let schema = source.schema();
+    let values = schema.field_with_name(VALUE_COLUMN_NAME)?;
+    let (DataType::List(item) | DataType::LargeList(item)) = values.data_type() else {
+        return Err(Error::invalid_input(format!(
+            "LabelList requires a List or LargeList {VALUE_COLUMN_NAME} column, got {}",
+            values.data_type()
+        )));
+    };
+    let id = schema
+        .field_with_name(row_column)
+        .ok()
+        .filter(|f| f.data_type() == &DataType::UInt64)
+        .ok_or_else(|| {
+            Error::invalid_input(format!("LabelList requires a UInt64 {row_column} column"))
+        })?;
+    let output = Arc::new(Schema::new(vec![
+        Field::new(
+            VALUE_COLUMN_NAME,
+            item.data_type().clone(),
+            item.is_nullable() || values.is_nullable(),
+        ),
+        id.clone(),
+    ]));
+    let output_schema = output.clone();
+    let batches = source.map(move |batch| {
+        let batch = batch?;
+        let values = batch.column_by_name(VALUE_COLUMN_NAME).expect_ok()?;
+        let rows = batch
+            .column_by_name(row_column)
+            .expect_ok()?
+            .as_primitive::<UInt64Type>();
+        if rows.null_count() != 0 {
+            return Err(DataFusionError::Execution(format!(
+                "LabelList {row_column} contains null identifiers"
+            )));
+        }
+        let columns = if let Some(lists) = values.as_list_opt::<i32>() {
+            expand_labels(lists, rows, &list_nulls)
+        } else {
+            expand_labels(values.as_list::<i64>(), rows, &list_nulls)
+        };
+        Ok(RecordBatch::try_new(output.clone(), columns)?)
     });
-
     Ok(Box::pin(RecordBatchStreamAdapter::new(
-        unnest_schema_copy,
-        source,
+        output_schema,
+        batches,
     )))
 }
 
@@ -680,7 +627,7 @@ fn sort_labels_by_value(
 /// `list_nulls` set as a global buffer in the same file.
 ///
 /// `list_nulls` is a closure, not a value, because it is only correct to read
-/// after `sorted_labels` is drained -- `track_list_nulls` fills its set as rows
+/// after `sorted_labels` is drained -- `unnest_labels` fills its set as rows
 /// flow through it, and the sort upstream means no row reaches here until every
 /// input row has passed it. The buffer is attached after the data pages for the
 /// same reason; `add_global_buffer` records its index in the file metadata, so
@@ -729,17 +676,22 @@ async fn train_label_list_index_with_plan(
     data: SendableRecordBatchStream,
     index_store: &dyn IndexStore,
     mem_pool_size: Option<u64>,
+    progress: &dyn crate::progress::IndexBuildProgress,
 ) -> Result<(IndexFile, Arc<dyn ExecutionPlan>)> {
     let list_nulls = Arc::new(Mutex::new(RowAddrTreeMap::new()));
-    let data = track_list_nulls(data, list_nulls.clone());
-    let data = unnest_chunks(data)?;
+    let data = unnest_labels(data, list_nulls.clone(), ROW_ADDR)?;
     let value_type = data.schema().field(0).data_type().clone();
     let (sorted, sort_plan) = sort_labels_by_value(data, mem_pool_size)?;
+    let sorted = crate::progress::stage_until_first_batch(progress, "sort_values", sorted).await?;
 
+    progress
+        .stage_start("write_label_list_index", None, "files")
+        .await?;
     let file = write_label_list_index(index_store, &value_type, sorted, None, None, || {
         Ok(list_nulls.lock().unwrap().clone())
     })
     .await?;
+    progress.stage_complete("write_label_list_index").await?;
     Ok((file, sort_plan))
 }
 
@@ -747,8 +699,9 @@ async fn train_label_list_index_with_plan(
 async fn train_label_list_index(
     data: SendableRecordBatchStream,
     index_store: &dyn IndexStore,
+    progress: &dyn crate::progress::IndexBuildProgress,
 ) -> Result<IndexFile> {
-    train_label_list_index_with_plan(data, index_store, None)
+    train_label_list_index_with_plan(data, index_store, None, progress)
         .await
         .map(|(file, _sort_plan)| file)
 }
@@ -768,8 +721,7 @@ async fn update_label_list_index(
     old_data_filter: Option<&OldIndexDataFilter>,
 ) -> Result<IndexFile> {
     let list_nulls = Arc::new(Mutex::new(RowAddrTreeMap::new()));
-    let new_data = track_list_nulls(new_data, list_nulls.clone());
-    let new_data = unnest_chunks(new_data)?;
+    let new_data = unnest_labels(new_data, list_nulls.clone(), ROW_ADDR)?;
 
     // The destination file's schema is declared from the existing index while
     // every new key comes from the stream. If the two disagree the written
@@ -1080,7 +1032,7 @@ impl BasicTrainer for LabelListIndexPlugin {
         // index covering exactly those rows is produced. Segments are recombined by
         // `merge_label_list_indices`.
         _fragment_ids: Option<Vec<u32>>,
-        _progress: Arc<dyn crate::progress::IndexBuildProgress>,
+        progress: Arc<dyn crate::progress::IndexBuildProgress>,
     ) -> Result<CreatedIndex> {
         let schema = data.schema();
         let field = schema
@@ -1096,7 +1048,7 @@ impl BasicTrainer for LabelListIndexPlugin {
 
         validate_label_list_data_type(field.data_type())?;
 
-        let file = train_label_list_index(data, index_store).await?;
+        let file = train_label_list_index(data, index_store, progress.as_ref()).await?;
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pbold::LabelListIndexDetails::default())
                 .unwrap(),
@@ -1235,6 +1187,10 @@ mod tests {
     use lance_core::utils::row_addr_remap::RowAddrRemap;
     use std::collections::BTreeMap;
 
+    use std::sync::atomic::Ordering;
+
+    use arrow_array::builder::{GenericListBuilder, LargeListBuilder, ListBuilder, StringBuilder};
+    use arrow_schema::SchemaRef;
     use datafusion_common::ScalarValue;
     use lance_core::cache::CacheCodec;
     use lance_core::utils::address::RowAddress;
@@ -1243,6 +1199,8 @@ mod tests {
     use super::super::bitmap::BitmapIndexState;
     use super::super::btree::OrderableScalarValue;
     use super::*;
+    use crate::metrics::{LocalMetricsCollector, NoOpMetricsCollector};
+    use crate::progress::NoopIndexBuildProgress;
     use crate::scalar::bitmap::test_util::{self, row_addrs};
     use lance_core::utils::tempfile::TempObjDir;
 
@@ -1378,9 +1336,14 @@ mod tests {
         ));
 
         let (_tmpdir, store) = test_util::index_store();
-        train_label_list_index_with_plan(stream, store.as_ref(), Some(32 * 1024 * 1024))
-            .await
-            .expect("the wide-list fixture must build with the selected pool");
+        train_label_list_index_with_plan(
+            stream,
+            store.as_ref(),
+            Some(32 * 1024 * 1024),
+            &NoopIndexBuildProgress,
+        )
+        .await
+        .expect("the wide-list fixture must build with the selected pool");
 
         // Every row carries every label, so each posting covers all rows.
         let expected = IndexContents {
@@ -1527,9 +1490,13 @@ mod tests {
 
     async fn build_label_list_index(rows: &[SampleRow]) -> IndexContents {
         let (_tmpdir, store) = test_util::index_store();
-        train_label_list_index(sample_rows_to_stream(rows), store.as_ref())
-            .await
-            .unwrap();
+        train_label_list_index(
+            sample_rows_to_stream(rows),
+            store.as_ref(),
+            &NoopIndexBuildProgress,
+        )
+        .await
+        .unwrap();
         read_index_contents(store.as_ref()).await
     }
 
@@ -1581,6 +1548,7 @@ mod tests {
             sample_rows_to_stream(&rows),
             store.as_ref(),
             Some(SPILL_FORCING_POOL_BYTES),
+            &NoopIndexBuildProgress,
         )
         .await
         .unwrap();
@@ -1646,10 +1614,14 @@ mod tests {
         ));
 
         let (_tmpdir, store) = test_util::index_store();
-        let (_file, sort_plan) =
-            train_label_list_index_with_plan(stream, store.as_ref(), Some(POOL_BYTES))
-                .await
-                .expect("wide labels must build when a large pool's sort spills");
+        let (_file, sort_plan) = train_label_list_index_with_plan(
+            stream,
+            store.as_ref(),
+            Some(POOL_BYTES),
+            &NoopIndexBuildProgress,
+        )
+        .await
+        .expect("wide labels must build when a large pool's sort spills");
 
         let metrics = sort_plan.metrics().expect("SortExec must report metrics");
         assert!(
@@ -1677,13 +1649,56 @@ mod tests {
 
     async fn build_label_list_segment(rows: &[SampleRow]) -> (TempObjDir, Arc<LabelListIndex>) {
         let (tmpdir, store) = test_util::index_store();
-        train_label_list_index(sample_rows_to_stream(rows), store.as_ref())
-            .await
-            .unwrap();
+        train_label_list_index(
+            sample_rows_to_stream(rows),
+            store.as_ref(),
+            &NoopIndexBuildProgress,
+        )
+        .await
+        .unwrap();
         let index = LabelListIndex::load(store, None, &LanceCache::no_cache(), true)
             .await
             .unwrap();
         (tmpdir, index)
+    }
+
+    #[rstest]
+    #[case::any(LabelListQuery::HasAnyLabel(vec![ScalarValue::Utf8(Some("a".into()))]))]
+    #[case::all(LabelListQuery::HasAllLabels(vec![ScalarValue::Utf8(Some("a".into()))]))]
+    #[tokio::test]
+    #[serial_test::serial(LANCE_DF_SPILL_POOL)]
+    async fn test_search_options_preserve_true_rows_without_tracking_list_nulls(
+        #[case] query: LabelListQuery,
+    ) {
+        let other_fragment = 1u64 << 32;
+        let rows: Vec<SampleRow> = vec![
+            (0, Some(vec![Some("a".into())])),
+            (1, None),
+            (other_fragment, Some(vec![Some("a".into()), None])),
+            (other_fragment + 1, Some(vec![])),
+            (other_fragment + 2, Some(vec![None])),
+        ];
+        let (_dir, index) = build_label_list_segment(&rows).await;
+        let SearchResult::Exact(tracked) =
+            index.search(&query, &NoOpMetricsCollector).await.unwrap()
+        else {
+            panic!("label-list search must be exact");
+        };
+        let SearchResult::Exact(untracked) = index
+            .search_with_options(
+                &query,
+                SearchOptions::default().with_track_nulls(false),
+                &NoOpMetricsCollector,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("label-list search must be exact");
+        };
+        assert_eq!(row_addrs(tracked.null_rows()), vec![1]);
+        assert!(untracked.null_rows().is_empty());
+        assert_eq!(row_addrs(&tracked.true_rows()), vec![0, other_fragment]);
+        assert_eq!(untracked.true_rows(), tracked.true_rows());
     }
 
     /// `calculate_included_frags` reports that coverage cannot be rebuilt from
@@ -1708,6 +1723,56 @@ mod tests {
         );
     }
 
+    /// `set_intersection` must stop pulling the per-label search stream once
+    /// the accumulator is empty: each remaining pull is a bitmap load (a disk
+    /// round trip on a cold cache) whose result cannot revive an empty
+    /// intersection. Counted through the metrics collector, so the assertion
+    /// is deterministic rather than a timing claim.
+    #[tokio::test]
+    #[serial_test::serial(LANCE_DF_SPILL_POOL)]
+    async fn test_has_all_labels_stops_searching_once_intersection_is_empty() {
+        // 'a' covers rows 0, 1 and 12 and 'b' covers rows 2-3 -- disjoint, so
+        // the accumulator empties after the second label and none of
+        // 'c'..='j', each present in the index, can change the answer. Row 12
+        // (a null element) must not leak into the null rows; row 13 (a null
+        // list) must stay NULL after the early stop.
+        let mut rows: Vec<SampleRow> = vec![
+            (0, Some(vec![Some("a".to_string())])),
+            (1, Some(vec![Some("a".to_string())])),
+            (2, Some(vec![Some("b".to_string())])),
+            (3, Some(vec![Some("b".to_string())])),
+        ];
+        for (offset, label) in ('c'..='j').enumerate() {
+            rows.push((4 + offset as u64, Some(vec![Some(label.to_string())])));
+        }
+        rows.push((12, Some(vec![Some("a".to_string()), None])));
+        rows.push((13, None));
+        let (_dir, index) = build_label_list_segment(&rows).await;
+
+        let labels: Vec<ScalarValue> = ('a'..='j')
+            .map(|label| ScalarValue::Utf8(Some(label.to_string())))
+            .collect();
+        let query = LabelListQuery::HasAllLabels(labels);
+        // The segment loads through a no-op cache, so every label search that
+        // runs records exactly one part load.
+        let metrics = LocalMetricsCollector::default();
+        let result = index.search(&query, &metrics).await.unwrap();
+
+        let SearchResult::Exact(found) = result else {
+            panic!("label list search must be exact");
+        };
+        assert!(
+            found.true_rows().is_empty(),
+            "disjoint 'a' and 'b' must select no rows"
+        );
+        assert_eq!(row_addrs(found.null_rows()), vec![13]);
+        assert_eq!(
+            metrics.parts_loaded.load(Ordering::Relaxed),
+            2,
+            "the search must stop after the label that empties the intersection"
+        );
+    }
+
     /// `remap` carries `list_nulls` in a global buffer written through the
     /// streaming writer, and nothing else covers that path. If the buffer or its
     /// metadata key were dropped, `read_list_nulls` would return an empty set and
@@ -1724,9 +1789,13 @@ mod tests {
         // Built here rather than via build_label_list_segment so the source
         // store stays reachable, to compare against after the remap.
         let (_src_dir, src_store) = test_util::index_store();
-        train_label_list_index(sample_rows_to_stream(&rows), src_store.as_ref())
-            .await
-            .unwrap();
+        train_label_list_index(
+            sample_rows_to_stream(&rows),
+            src_store.as_ref(),
+            &NoopIndexBuildProgress,
+        )
+        .await
+        .unwrap();
         let index = LabelListIndex::load(src_store.clone(), None, &LanceCache::no_cache(), true)
             .await
             .unwrap();
@@ -2193,15 +2262,47 @@ mod tests {
         );
     }
 
-    /// A null *element* inside a list, a null *list*, and an empty list are three
-    /// different things and must land in three different places. `track_list_nulls`
-    /// runs ahead of the unnest, where the list column's validity is still present,
-    /// which is the only reason they are separable -- after unnesting, a null list
-    /// and an empty list are both zero rows.
-    ///
-    /// Asserted through every path that writes an index, so moving the unnest
-    /// upstream of the null tracking fails here rather than silently misfiling
-    /// rows and breaking NOT filters on nullable list columns.
+    #[rstest]
+    #[case::list(ListBuilder::new(StringBuilder::new()))]
+    #[case::large_list(LargeListBuilder::new(StringBuilder::new()))]
+    #[tokio::test]
+    async fn test_build_ignores_children_of_null_lists<O: OffsetSizeTrait>(
+        #[case] mut lists: GenericListBuilder<O, StringBuilder>,
+    ) {
+        lists.values().append_value("outside slice");
+        lists.append(true);
+        lists.values().append_value("hidden");
+        lists.append(false);
+        lists.append(true);
+        lists.values().append_null();
+        lists.values().append_value("visible");
+        lists.append(true);
+
+        let lists = lists.finish().slice(1, 3);
+        let batch = RecordBatch::try_from_iter([
+            (VALUE_COLUMN_NAME, Arc::new(lists) as ArrayRef),
+            (ROW_ADDR, Arc::new(UInt64Array::from(vec![10, 11, 12]))),
+        ])
+        .unwrap();
+        let stream = Box::pin(RecordBatchStreamAdapter::new(
+            batch.schema(),
+            futures::stream::iter([Ok(batch)]),
+        ));
+        let (_dir, store) = test_util::index_store();
+        train_label_list_index(stream, store.as_ref(), &NoopIndexBuildProgress)
+            .await
+            .unwrap();
+        assert_eq!(
+            read_index_contents(store.as_ref()).await,
+            IndexContents {
+                labels: vec![(None, vec![12]), (Some("visible".into()), vec![12])],
+                list_nulls: vec![10],
+            }
+        );
+    }
+
+    /// A null element has a posting, a null list is recorded in the list-null
+    /// bitmap, and an empty list contributes to neither.
     #[rstest]
     #[case::build("build")]
     #[case::update("update")]
@@ -2271,9 +2372,13 @@ mod tests {
             }
             "remap" => {
                 let (_src_dir, src_store) = test_util::index_store();
-                train_label_list_index(sample_rows_to_stream(&rows), src_store.as_ref())
-                    .await
-                    .unwrap();
+                train_label_list_index(
+                    sample_rows_to_stream(&rows),
+                    src_store.as_ref(),
+                    &NoopIndexBuildProgress,
+                )
+                .await
+                .unwrap();
                 let index = LabelListIndex::load(src_store, None, &LanceCache::no_cache(), true)
                     .await
                     .unwrap();

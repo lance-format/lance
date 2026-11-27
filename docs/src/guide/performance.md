@@ -89,6 +89,24 @@ debugging query performance.
 | `lance::execution` | `indices_loaded`    | The number of indices loaded by the plan                       |
 | `lance::execution` | `parts_loaded`      | The number of index partitions loaded by the plan              |
 | `lance::execution` | `index_comparisons` | The number of comparisons performed inside the various indices |
+| `lance::execution` | `peak_reserved_bytes` | The most bytes the plan's operators held reserved at once in DataFusion's memory pool: sort, aggregation and join buffers, batches queued for repartitioning, and the merge headroom of a sort that may spill. Lance's own read buffers are not included |
+
+### Memory Events
+
+Memory events are emitted while memory observation is on, which works on Linux only; [Observability](observability.md#memory-metrics) describes how `LANCE_MEMORY_OBSERVE` or a call switches it on, and the index builds it observes. Every stage of an observed build emits an event when it starts and another when it completes, and so does the whole build, which `create_index` completes only after its commit. All events of one build carry its `operation_id`, unique within the process, and the `pid` of the process, which together tell apart builds that run at the same time. Ids start from a random value in every process, so a process that restarts with the same pid, as in a container, does not repeat them. A start without a completion marks work that failed, was cancelled, or was still running when the process died, for example because it exceeded its memory limit. For most scalar indices the `load_data` stage completes before the index is sorted or trained, so a build that dies in that work leaves only the start of the build itself open. A field without a value, such as the cgroup fields of a process outside a memory cgroup, is left out. In `pylance`, `LANCE_MEMORY_OBSERVE=1 LANCE_LOG="warn,lance::events::memory=info"` logs these events and no other Lance events. Peaks are lower bounds and cover the whole process, like the memory metrics.
+
+| Event           | Parameter            | Description                                                                                        |
+| --------------- | -------------------- | -------------------------------------------------------------------------------------------------- |
+| `lance::memory` | `event`              | The event type (operation_start, operation_complete, stage_start, stage_complete)                  |
+| `lance::memory` | `pid`                | The id of the process that emitted the event                                                       |
+| `lance::memory` | `operation_id`       | An id unique within the process, shared by every event of one operation                            |
+| `lance::memory` | `operation`          | The observed operation (create_index, merge_index_metadata)                                        |
+| `lance::memory` | `index_type`         | The lowercase type of the index being built (btree, inverted, ivf_pq, ...)                         |
+| `lance::memory` | `stage`              | The stage of the build, on stage events                                                            |
+| `lance::memory` | `peak_bytes`         | The peak resident set size of the process while the stage or build ran, on completion events       |
+| `lance::memory` | `rss_bytes`          | The resident set size of the process when the event was emitted                                    |
+| `lance::memory` | `cgroup_bytes`       | The memory charged to the cgroup that sets the tightest limit on the process, or to its own cgroup |
+| `lance::memory` | `cgroup_limit_bytes` | The tightest memory limit over the process's cgroup and its ancestors, when one is set             |
 
 ## Threading Model
 
@@ -110,8 +128,15 @@ providers. The `LANCE_IO_THREADS` environment variable can be used to override t
 threads. If you increase this variable you may also want to increase the `io_buffer_size`.
 
 The compute thread pool is used for performing computations on data. The number of threads in the
-compute thread pool is determined by the number of cores on the machine. The number of threads in
-the compute thread pool can be overridden by setting the `LANCE_CPU_THREADS` environment variable.
+compute thread pool is determined by the number of cores on the machine: it is the number of logical
+CPUs minus a reservation for I/O and control tasks, with a minimum of 1. The reservation defaults to
+a quarter of the logical CPUs, rounded down and capped at 2, so a 4-CPU machine gets 3 compute threads
+and a machine with 8 or more CPUs gets `num_cpus - 2`. The reservation can be set with the
+`LANCE_IO_CORE_RESERVATION` environment variable (`0` reserves nothing). Machines with 3 or fewer
+CPUs reserve nothing by default; small deployments that want dedicated I/O headroom can set
+`LANCE_IO_CORE_RESERVATION=1`, which holds one core back from the compute pool (a 3-CPU machine then
+gets 2 compute threads). The number of threads in the compute thread pool can be overridden by
+setting the `LANCE_CPU_THREADS` environment variable.
 This is commonly done when running multiple Lance processes on the same machine (e.g when working with
 tools like Ray). Keep in mind that decoding data is a compute intensive operation, even if a workload
 seems I/O bound (like scanning a table) it may still need quite a few compute threads to achieve peak
@@ -162,6 +187,11 @@ Use `dataset.session().cache_diagnostics()` to inspect the index and metadata ca
 
 The index cache is not shared between tables. For best performance you should create a single table and
 share it across your application.
+
+A session's cache capacities can be changed after construction with
+`session.set_index_cache_capacity(...)` and `session.set_metadata_cache_capacity(...)`. Shrinking a
+capacity evicts entries as needed, so an application that manages several sessions can bound their
+combined memory usage without dropping or recreating them.
 
 **Note**: `index_cache_size` (specified in entries) was deprecated since version 0.30.0. Use
 `index_cache_size_bytes` (specified in bytes) for new code.
@@ -367,22 +397,46 @@ multiplicatively. During sustained success, the rate increases additively. This 
 
 Local and in-memory stores are **not** throttled.
 
-The AIMD throttle can be tuned via storage options or environment variables. Storage options take precedence
-over environment variables:
+Tune each AIMD controller independently using `lance_aimd_<category>_<setting>` or its
+uppercase environment variable. The categories are `read` (GET and HEAD), `write`,
+`delete`, and `list`. Lance resolves each controller setting in this order.
 
-| Setting            | Storage Option Key              | Env Var                         | Default |
+1. Category storage option, for example `lance_aimd_read_max_rate`.
+2. Category environment variable, for example `LANCE_AIMD_READ_MAX_RATE`.
+3. Generic storage option, for example `lance_aimd_max_rate`.
+4. Generic environment variable, for example `LANCE_AIMD_MAX_RATE`.
+5. Category default.
+
+| Controller setting | Generic storage option          | Generic environment variable    | Default |
 | ------------------ | ------------------------------- | ------------------------------- | ------- |
 | Initial rate       | `lance_aimd_initial_rate`       | `LANCE_AIMD_INITIAL_RATE`       | 2000    |
 | Min rate           | `lance_aimd_min_rate`           | `LANCE_AIMD_MIN_RATE`           | 1       |
-| Max rate           | `lance_aimd_max_rate`           | `LANCE_AIMD_MAX_RATE`           | 10000   |
+| Max rate           | `lance_aimd_max_rate`           | `LANCE_AIMD_MAX_RATE`           | 10000 (11000 for native S3 reads) |
 | Decrease factor    | `lance_aimd_decrease_factor`    | `LANCE_AIMD_DECREASE_FACTOR`    | 0.5     |
 | Additive increment | `lance_aimd_additive_increment` | `LANCE_AIMD_ADDITIVE_INCREMENT` | 300     |
-| Burst capacity     | `lance_aimd_burst_capacity`     | `LANCE_AIMD_BURST_CAPACITY`     | 100     |
 
-Under sustained success, the default rate grows from 2000 to 10000 requests/s
-in about 27 seconds. Each operation category has its own rate controller.
-The ceiling is a client-side tuning parameter, not a storage-provider limit;
-override it to match the workload and the store's throttling behavior.
+Burst capacity and retry settings are shared across categories. Each takes its
+generic storage option first, then its uppercase environment variable, then its default.
+
+| Shared setting       | Storage option              | Environment variable       | Default |
+| -------------------- | --------------------------- | -------------------------- | ------- |
+| Burst capacity       | `lance_aimd_burst_capacity` | `LANCE_AIMD_BURST_CAPACITY` | 100     |
+| Max retries          | `lance_aimd_max_retries`    | `LANCE_AIMD_MAX_RETRIES`    | 3       |
+| Min backoff (ms)     | `lance_aimd_min_backoff_ms` | `LANCE_AIMD_MIN_BACKOFF_MS` | 100     |
+| Max backoff (ms)     | `lance_aimd_max_backoff_ms` | `LANCE_AIMD_MAX_BACKOFF_MS` | 300     |
+
+Rates are in requests per second. The controller adds the increment after each
+one-second success window. Setting the max rate to `0` removes the client-side
+ceiling while leaving AIMD feedback active. Cloud stores with the same bucket
+and store parameters share each category's budget within a process.
+
+The 11000 requests/s read ceiling applies to the built-in Amazon S3 client for
+general purpose buckets using the default AWS endpoint. S3 Express, custom S3
+endpoints, OpenDAL, GCS, and Azure use the 10000 requests/s default ceiling.
+AWS reports at least 11000 GET/HEAD requests/s per partitioned prefix. The Lance
+ceiling applies per bucket and store configuration in each process, so several
+processes can send more than one controller's ceiling to a shared prefix.
+See [the AWS S3 announcement](https://aws.amazon.com/about-aws/whats-new/2026/11/amazon-s3-increases-read-request-rate/).
 
 ## Fragment Sizing
 
@@ -562,6 +616,19 @@ comparison.
 
 If the dataset has fewer rows than `num_partitions * sample_rate`, the entire dataset is used for training instead.
 
+The sample of a fixed-size-list vector column is drawn as independent random rows. On object storage this costs about
+one request per sampled row once the sample is sparse, which can dominate training time on large tables. Set
+`LANCE_IVF_TRAINING_SAMPLE_BLOCK_ROWS` to read the IVF sample as random contiguous runs of that many rows instead:
+
+```shell
+export LANCE_IVF_TRAINING_SAMPLE_BLOCK_ROWS=64
+```
+
+Each run costs about one request, so the request count drops by roughly the run length. Rows inside a run are neighbors
+in the table, so when neighbors are similar (for example consecutive video frames) a longer run trains slightly worse
+centroids. The value must be a positive integer; unset or `1` keeps independent rows. Quantizer training samples are
+small and always use independent rows.
+
 #### Quantizer Training
 
 After IVF training, a quantizer (e.g. PQ, SQ) is trained to compress vectors. This phase may sample some of the
@@ -575,8 +642,9 @@ it), and writes the results into per-partition files on disk. This is a streamin
 memory.
 
 The input scan uses a 2 GiB I/O readahead buffer by default (configurable via `LANCE_DEFAULT_IO_BUFFER_SIZE`) and reads
-batches of 8,192 rows. Incoming batches are transformed in parallel, with `num_cpus - 2` batches in flight at a time
-(configurable via `LANCE_CPU_THREADS`). Each batch is sorted by partition ID and the slices are written directly to the
+batches of 8,192 rows. Incoming batches are transformed in parallel, with one batch in flight per compute thread (by
+default `num_cpus - min(2, num_cpus / 4)`; see [Threading Model](#threading-model) for the `LANCE_IO_CORE_RESERVATION`
+and `LANCE_CPU_THREADS` overrides). Each batch is sorted by partition ID and the slices are written directly to the
 corresponding partition file. The in-flight memory during this phase is roughly:
 
 ```

@@ -3,6 +3,8 @@
 
 //! Index descriptions and serialized index statistics.
 
+use super::field_dependencies::described_field_ids;
+
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 
@@ -164,20 +166,30 @@ impl IndexDescriptionImpl {
             ));
         }
 
-        let field_ids = &example_metadata.fields;
-        if !segments.iter().all(|shard| shard.fields == *field_ids) {
-            return Err(Error::index(
-                "Index fields should be identical across all segments".to_string(),
-            ));
+        if let Some(mismatched) = segments
+            .iter()
+            .find(|shard| !shard.declares_same_fields(example_metadata))
+        {
+            return Err(Error::index(format!(
+                "Index '{}' segments should declare identical keyed and carried fields, but \
+                 segment {} declares fields {:?} (carried {:?}) and segment {} declares \
+                 fields {:?} (carried {:?})",
+                name,
+                example_metadata.uuid,
+                example_metadata.fields,
+                example_metadata.covering_fields,
+                mismatched.uuid,
+                mismatched.fields,
+                mismatched.covering_fields,
+            )));
         }
-        // Only the keyed prefix. `fields` also lists the columns the index merely
-        // carries values for, which it cannot be searched on, and this list is what
+        // Only the query inputs. `fields` can also list additional dependencies
+        // and carried columns, which it cannot be searched on, and this list is what
         // every binding advertises as the index's columns -- Python's
         // `_default_vector_index_for_column` matches on membership of it, so
         // including a carried column here would hand back the keyed column's IVF
         // model for a query about the carried one.
-        let field_ids_vec: Vec<u32> = example_metadata
-            .keyed_fields()
+        let field_ids_vec: Vec<u32> = described_field_ids(example_metadata)
             .iter()
             .map(|id| *id as u32)
             .collect();
@@ -357,6 +369,10 @@ impl IndexDescription for IndexDescriptionImpl {
     }
 
     fn details(&self) -> Result<String> {
+        // System index metadata is internal and has no scalar index plugin.
+        if is_system_index(&self.segments[0]) {
+            return Ok("{}".to_string());
+        }
         let Some(details) = self.details.as_ref() else {
             return Ok("{}".to_string());
         };

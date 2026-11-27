@@ -23,7 +23,7 @@ use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
 use lance_table::format::{BasePath, DataFile, Fragment, IndexFile, IndexMetadata};
 use lance_table::system_index::mem_wal::CompactedSsTable;
 use pyo3::exceptions::PyValueError;
-use pyo3::types::{PyDict, PyList};
+use pyo3::types::{PyBytes, PyDict, PyList};
 use pyo3::{Bound, FromPyObject, PyAny, PyResult, Python};
 use pyo3::{intern, prelude::*};
 use roaring::RoaringBitmap;
@@ -918,8 +918,12 @@ impl FromPyObject<'_, '_> for PyLance<Operation> {
             }
             "DataReplacement" => {
                 let replacements = extract_vec(&ob.getattr("replacements")?)?;
+                let data_change = ob.getattr("data_change")?.extract::<bool>()?;
 
-                let op = Operation::DataReplacement { replacements };
+                let op = Operation::DataReplacement {
+                    replacements,
+                    data_change,
+                };
 
                 Ok(Self(op))
             }
@@ -1115,12 +1119,15 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
                     inserted_rows_filter,
                 ))
             }
-            Operation::DataReplacement { replacements } => {
+            Operation::DataReplacement {
+                replacements,
+                data_change,
+            } => {
                 let replacements = export_vec(py, replacements.as_slice())?;
                 let cls = namespace
                     .getattr("DataReplacement")
                     .expect("Failed to get DataReplacement class");
-                cls.call1((replacements,))
+                cls.call1((replacements, *data_change))
             }
             Operation::DataOverlay { groups } => {
                 let groups = export_vec(py, groups.as_slice())?;
@@ -1414,7 +1421,16 @@ impl<'py> IntoPyObject<'py> for PyLance<&RewrittenIndex> {
 
         let old_id = self.0.old_id.to_string();
         let new_id = self.0.new_id.to_string();
-        cls.call1((old_id, new_id))
+        let new_details_type_url = self.0.new_index_details.type_url.clone();
+        let new_details_value = PyBytes::new(py, &self.0.new_index_details.value);
+        let new_index_version = self.0.new_index_version;
+        cls.call1((
+            old_id,
+            new_id,
+            new_details_type_url,
+            new_details_value,
+            new_index_version,
+        ))
     }
 }
 

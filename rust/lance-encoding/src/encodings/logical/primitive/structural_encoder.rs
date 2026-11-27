@@ -28,10 +28,13 @@ use crate::constants::{
     COMPRESSION_LEVEL_META_KEY, COMPRESSION_META_KEY, DICT_DIVISOR_META_KEY,
     DICT_MAX_SIZE_META_KEY, DICT_SIZE_RATIO_META_KEY, DICT_VALUES_COMPRESSION_ENV_VAR,
     DICT_VALUES_COMPRESSION_LEVEL_ENV_VAR, DICT_VALUES_COMPRESSION_LEVEL_META_KEY,
-    DICT_VALUES_COMPRESSION_META_KEY, STRUCTURAL_ENCODING_FULLZIP, STRUCTURAL_ENCODING_META_KEY,
-    STRUCTURAL_ENCODING_MINIBLOCK, STRUCTURAL_ENCODING_SPARSE,
+    DICT_VALUES_COMPRESSION_META_KEY, PCODEC_COMPRESSION, STRUCTURAL_ENCODING_FULLZIP,
+    STRUCTURAL_ENCODING_META_KEY, STRUCTURAL_ENCODING_MINIBLOCK, STRUCTURAL_ENCODING_SPARSE,
 };
-use crate::data::{BlockInfo, DataBlock, FixedWidthDataBlock, VariableWidthBlock};
+use crate::data::{
+    BlockInfo, DataBlock, FixedSizeListBlock, FixedWidthDataBlock, NullableDataBlock,
+    VariableWidthBlock,
+};
 use crate::decoder::PageEncoding;
 use crate::encoder::{
     EncodeTask, EncodedColumn, EncodedPage, EncodingOptions, FieldEncoder, OutOfLineBuffers,
@@ -393,6 +396,15 @@ impl PrimitiveStructuralEncoder {
     //   too large and we prefer zipped.
     pub(super) fn is_narrow(data_block: &DataBlock) -> bool {
         const MINIBLOCK_MAX_BYTE_LENGTH_PER_VALUE: u64 = 256;
+
+        // `MaxLength` counts whole bytes, so a fixed-size list of bit-packed booleans
+        // reports zero however wide it is. Such a list is narrow only while mini-block
+        // chunks can hold its rows.
+        if let DataBlock::FixedSizeList(fsl) = data_block
+            && !ValueEncoder::fsl_fits_miniblock(fsl)
+        {
+            return false;
+        }
 
         if let Some(max_len_array) = data_block.get_stat(Stat::MaxLength) {
             let max_len_array = max_len_array
@@ -1471,6 +1483,67 @@ impl PrimitiveStructuralEncoder {
         }
     }
 
+    /// Whether a fixed-size list of booleans must store a byte per item in full-zip.
+    ///
+    /// Full-zip copies whole bytes per row, so a row of bit-packed items must be a whole
+    /// number of bytes, and the per-value decoder only splits byte-wide items away from
+    /// item validity. A null-free list whose rows fill whole bytes stays bit-packed, the
+    /// layout earlier writers produce for it.
+    fn fsl_booleans_need_bytes(fsl: &FixedSizeListBlock) -> bool {
+        let mut items_per_row = fsl.dimension;
+        let mut has_item_validity = false;
+        let mut child = fsl.child.as_ref();
+        loop {
+            match child {
+                DataBlock::Nullable(nullable) => {
+                    has_item_validity = true;
+                    child = nullable.data.as_ref();
+                }
+                DataBlock::FixedSizeList(inner) => {
+                    items_per_row = items_per_row.saturating_mul(inner.dimension);
+                    child = inner.child.as_ref();
+                }
+                DataBlock::FixedWidth(fixed) => {
+                    return fixed.bits_per_value == 1
+                        && (has_item_validity || !items_per_row.is_multiple_of(8));
+                }
+                _ => return false,
+            }
+        }
+    }
+
+    /// Why a fixed-size list of booleans that needs byte-wide items cannot be
+    /// written with a strategy that does not allow them.
+    fn byte_wide_fsl_booleans_error(field: &Field) -> String {
+        format!(
+            "field '{}': this FixedSizeList<Boolean> column needs one byte per item in the \
+             full-zip layout because its rows do not fill whole bytes or its items can be null. \
+             Released 2.1 and 2.2 readers cannot read that layout, so write it with file \
+             version 2.3",
+            field.name
+        )
+    }
+
+    /// Expands the bit-packed boolean items of a fixed-size list to one byte each,
+    /// keeping every layer's validity.
+    fn expand_fsl_booleans_to_bytes(data: DataBlock) -> DataBlock {
+        match data {
+            DataBlock::FixedWidth(fixed) if fixed.bits_per_value == 1 => {
+                DataBlock::FixedWidth(Self::expand_boolean_to_bytes(fixed))
+            }
+            DataBlock::Nullable(nullable) => DataBlock::Nullable(NullableDataBlock {
+                data: Box::new(Self::expand_fsl_booleans_to_bytes(*nullable.data)),
+                nulls: nullable.nulls,
+                block_info: nullable.block_info,
+            }),
+            DataBlock::FixedSizeList(fsl) => DataBlock::FixedSizeList(FixedSizeListBlock {
+                child: Box::new(Self::expand_fsl_booleans_to_bytes(*fsl.child)),
+                dimension: fsl.dimension,
+            }),
+            other => other,
+        }
+    }
+
     pub(super) fn encode_full_zip(
         column_idx: u32,
         field: &Field,
@@ -1542,6 +1615,14 @@ impl PrimitiveStructuralEncoder {
         let data = match data {
             DataBlock::FixedWidth(fixed) if fixed.bits_per_value == 1 => {
                 DataBlock::FixedWidth(Self::expand_boolean_to_bytes(fixed))
+            }
+            DataBlock::FixedSizeList(fsl) if Self::fsl_booleans_need_bytes(&fsl) => {
+                if !compression_strategy.allows_byte_wide_fsl_booleans() {
+                    return Err(Error::not_supported_source(
+                        Self::byte_wide_fsl_booleans_error(field).into(),
+                    ));
+                }
+                Self::expand_fsl_booleans_to_bytes(DataBlock::FixedSizeList(fsl))
             }
             other => other,
         };
@@ -1688,6 +1769,15 @@ impl PrimitiveStructuralEncoder {
         policy: DictionaryEncodingPolicy,
         num_fallback_values: u64,
     ) -> Result<Option<(DataBlock, DataBlock)>> {
+        // pcodec encodes repeated values cheaply and compresses far better than a
+        // dictionary of float vectors, so an explicit pcodec request wins.
+        if field
+            .metadata
+            .get(COMPRESSION_META_KEY)
+            .is_some_and(|scheme| scheme == PCODEC_COMPRESSION)
+        {
+            return Ok(None);
+        }
         if policy == DictionaryEncodingPolicy::Planar
             && let DataBlock::FixedSizeList(fsl) = data
         {
@@ -1891,6 +1981,60 @@ impl PrimitiveStructuralEncoder {
     /// support dictionary encoding. Returns `None` for malformed data.
     fn sample_unique_ratio(data_block: &DataBlock, max_samples: usize) -> Option<Option<f64>> {
         use std::collections::HashSet;
+        use std::hash::{BuildHasherDefault, Hasher};
+
+        #[derive(Default)]
+        struct FastSampleHasher(u64);
+
+        impl Hasher for FastSampleHasher {
+            #[inline]
+            fn finish(&self) -> u64 {
+                self.0
+            }
+
+            #[inline]
+            fn write(&mut self, bytes: &[u8]) {
+                self.0 = xxhash_rust::xxh3::xxh3_64(bytes);
+            }
+
+            #[inline]
+            fn write_u64(&mut self, i: u64) {
+                let mut x = i;
+                x = (x ^ (x >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+                x = (x ^ (x >> 27)).wrapping_mul(0x94d049bb133111eb);
+                self.0 = x ^ (x >> 31);
+            }
+
+            #[inline]
+            fn write_u128(&mut self, i: u128) {
+                let lo = i as u64;
+                let hi = (i >> 64) as u64;
+                self.write_u64(lo ^ hi.wrapping_mul(0x9e3779b97f4a7c15));
+            }
+        }
+
+        #[derive(Default)]
+        struct IdentityU64Hasher(u64);
+
+        impl Hasher for IdentityU64Hasher {
+            #[inline]
+            fn finish(&self) -> u64 {
+                self.0
+            }
+
+            #[inline]
+            fn write(&mut self, bytes: &[u8]) {
+                self.0 = xxhash_rust::xxh3::xxh3_64(bytes);
+            }
+
+            #[inline]
+            fn write_u64(&mut self, i: u64) {
+                self.0 = i;
+            }
+        }
+
+        type FastSampleSet<K> = HashSet<K, BuildHasherDefault<FastSampleHasher>>;
+        type PrehashedSet = HashSet<u64, BuildHasherDefault<IdentityU64Hasher>>;
 
         const NUM_SAMPLE_BLOCKS: usize = 32;
         const MIN_RELIABLE_SAMPLES: usize = 1024;
@@ -1907,87 +2051,129 @@ impl PrimitiveStructuralEncoder {
 
         let block_count = NUM_SAMPLE_BLOCKS.min(sample_count).min(num_values).max(1);
         let samples_per_block = (sample_count / block_count).max(1);
-        let mut indices = Vec::with_capacity(sample_count);
+
+        let mut total_samples = 0usize;
         for block_idx in 0..block_count {
             let block_start = block_idx * num_values / block_count;
             let next_block_start = ((block_idx + 1) * num_values / block_count).min(num_values);
             let block_len = next_block_start.saturating_sub(block_start);
-            let samples_in_block = samples_per_block.min(block_len);
-            indices.extend((0..samples_in_block).map(|offset| block_start + offset));
+            total_samples += samples_per_block.min(block_len);
         }
 
-        if indices.len() < MIN_RELIABLE_SAMPLES {
+        if total_samples < MIN_RELIABLE_SAMPLES {
             return Some(None);
         }
+
+        let for_each_block = |visit: &mut dyn FnMut(usize, usize) -> Option<()>| -> Option<()> {
+            for block_idx in 0..block_count {
+                let block_start = block_idx * num_values / block_count;
+                let next_block_start = ((block_idx + 1) * num_values / block_count).min(num_values);
+                let block_len = next_block_start.saturating_sub(block_start);
+                let count = samples_per_block.min(block_len);
+                if count > 0 {
+                    visit(block_start, block_start + count)?;
+                }
+            }
+            Some(())
+        };
 
         let ratio = match data_block {
             DataBlock::FixedWidth(fixed) => match fixed.bits_per_value {
                 64 => {
                     let values = fixed.data.borrow_to_typed_slice::<u64>();
                     let values = values.as_ref();
-                    let mut unique: HashSet<u64> =
-                        HashSet::with_capacity(indices.len().min(MIN_RELIABLE_SAMPLES));
-                    for idx in indices.iter().copied() {
-                        unique.insert(values.get(idx).copied()?);
-                    }
-                    unique.len() as f64 / indices.len() as f64
+                    let mut unique = FastSampleSet::<u64>::with_capacity_and_hasher(
+                        total_samples,
+                        BuildHasherDefault::default(),
+                    );
+                    for_each_block(&mut |start, end| {
+                        let slice = values.get(start..end)?;
+                        for &v in slice {
+                            unique.insert(v);
+                        }
+                        Some(())
+                    })?;
+                    unique.len() as f64 / total_samples as f64
                 }
                 128 => {
                     let values = fixed.data.borrow_to_typed_slice::<u128>();
                     let values = values.as_ref();
-                    let mut unique: HashSet<u128> =
-                        HashSet::with_capacity(indices.len().min(MIN_RELIABLE_SAMPLES));
-                    for idx in indices.iter().copied() {
-                        unique.insert(values.get(idx).copied()?);
-                    }
-                    unique.len() as f64 / indices.len() as f64
+                    let mut unique = FastSampleSet::<u128>::with_capacity_and_hasher(
+                        total_samples,
+                        BuildHasherDefault::default(),
+                    );
+                    for_each_block(&mut |start, end| {
+                        let slice = values.get(start..end)?;
+                        for &v in slice {
+                            unique.insert(v);
+                        }
+                        Some(())
+                    })?;
+                    unique.len() as f64 / total_samples as f64
                 }
                 bits if bits > 0 && bits.is_multiple_of(8) => {
                     let width = usize::try_from(bits / 8).ok()?;
-                    let mut unique = HashSet::with_capacity(indices.len());
-                    for &index in &indices {
-                        let start = index.checked_mul(width)?;
-                        let end = start.checked_add(width)?;
-                        unique.insert(xxhash_rust::xxh3::xxh3_64(fixed.data.get(start..end)?));
-                    }
-                    unique.len() as f64 / indices.len() as f64
+                    let mut unique = PrehashedSet::with_capacity_and_hasher(
+                        total_samples,
+                        BuildHasherDefault::default(),
+                    );
+                    for_each_block(&mut |start, end| {
+                        let byte_start = start.checked_mul(width)?;
+                        let byte_end = end.checked_mul(width)?;
+                        let bytes = fixed.data.get(byte_start..byte_end)?;
+                        for chunk in bytes.chunks_exact(width) {
+                            unique.insert(xxhash_rust::xxh3::xxh3_64(chunk));
+                        }
+                        Some(())
+                    })?;
+                    unique.len() as f64 / total_samples as f64
                 }
                 _ => return Some(None),
             },
             DataBlock::VariableWidth(var) => {
                 use xxhash_rust::xxh3::xxh3_64;
 
-                // Hash variable-width slices instead of storing borrowed slice keys.
-                let mut unique: HashSet<u64> =
-                    HashSet::with_capacity(indices.len().min(MIN_RELIABLE_SAMPLES));
+                let mut unique = PrehashedSet::with_capacity_and_hasher(
+                    total_samples,
+                    BuildHasherDefault::default(),
+                );
+                let raw_data = var.data.as_ref();
                 match var.bits_per_offset {
                     32 => {
                         let offsets_ref = var.offsets.borrow_to_typed_slice::<u32>();
                         let offsets: &[u32] = offsets_ref.as_ref();
-                        for i in indices.iter().copied() {
-                            let start = usize::try_from(*offsets.get(i)?).ok()?;
-                            let end = usize::try_from(*offsets.get(i + 1)?).ok()?;
-                            if start > end || end > var.data.len() {
-                                return None;
+                        for_each_block(&mut |start, end| {
+                            let win_slice = offsets.get(start..=end)?;
+                            for win in win_slice.windows(2) {
+                                let s = usize::try_from(win[0]).ok()?;
+                                let e = usize::try_from(win[1]).ok()?;
+                                if s > e || e > raw_data.len() {
+                                    return None;
+                                }
+                                unique.insert(xxh3_64(&raw_data[s..e]));
                             }
-                            unique.insert(xxh3_64(&var.data[start..end]));
-                        }
+                            Some(())
+                        })?;
                     }
                     64 => {
                         let offsets_ref = var.offsets.borrow_to_typed_slice::<u64>();
                         let offsets: &[u64] = offsets_ref.as_ref();
-                        for i in indices.iter().copied() {
-                            let start = usize::try_from(*offsets.get(i)?).ok()?;
-                            let end = usize::try_from(*offsets.get(i + 1)?).ok()?;
-                            if start > end || end > var.data.len() {
-                                return None;
+                        for_each_block(&mut |start, end| {
+                            let win_slice = offsets.get(start..=end)?;
+                            for win in win_slice.windows(2) {
+                                let s = usize::try_from(win[0]).ok()?;
+                                let e = usize::try_from(win[1]).ok()?;
+                                if s > e || e > raw_data.len() {
+                                    return None;
+                                }
+                                unique.insert(xxh3_64(&raw_data[s..e]));
                             }
-                            unique.insert(xxh3_64(&var.data[start..end]));
-                        }
+                            Some(())
+                        })?;
                     }
                     _ => return Some(None),
                 }
-                unique.len() as f64 / indices.len() as f64
+                unique.len() as f64 / total_samples as f64
             }
             _ => return Some(None),
         };
@@ -2226,6 +2412,11 @@ impl PrimitiveStructuralEncoder {
             let requested_encoding = encoding_metadata
                 .get(STRUCTURAL_ENCODING_META_KEY)
                 .map(|requested| requested.to_lowercase());
+            let needs_byte_wide_booleans = matches!(
+                &data_block,
+                DataBlock::FixedSizeList(fsl) if Self::fsl_booleans_need_bytes(fsl)
+            ) && !compression_strategy
+                .allows_byte_wide_fsl_booleans();
             let fullzip_error = match &data_block {
                 // 1-bit booleans are widened to bytes inside `encode_full_zip`.
                 DataBlock::FixedWidth(fixed)
@@ -2254,6 +2445,11 @@ impl PrimitiveStructuralEncoder {
                 }
                 DataBlock::Dictionary(_) => {
                     Some("Full-zip does not encode dictionary data blocks directly".to_string())
+                }
+                // Full-zip widens these booleans to a byte each when the strategy
+                // allows it, so the same check decides here.
+                DataBlock::FixedSizeList(fsl) if Self::fsl_booleans_need_bytes(fsl) => {
+                    needs_byte_wide_booleans.then(|| Self::byte_wide_fsl_booleans_error(&field))
                 }
                 DataBlock::FixedSizeList(fsl) => match fsl.clone().try_into_flat() {
                     Some(flat) if flat.bits_per_value.is_multiple_of(8) => None,
@@ -2293,6 +2489,11 @@ impl PrimitiveStructuralEncoder {
                         return Ok(DensePageEncoding::FullZip(full_zip_request(
                             data_block, repdef,
                         )?));
+                    }
+                    if requested_encoding.is_none() && needs_byte_wide_booleans {
+                        return Err(Error::not_supported_source(
+                            Self::byte_wide_fsl_booleans_error(&field).into(),
+                        ));
                     }
                     return Err(Error::invalid_input_source(
                         format!(

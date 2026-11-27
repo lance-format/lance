@@ -21,16 +21,18 @@ use lance::dataset::mem_wal::scanner::{
     LsmDataSourceCollector, LsmPointLookupPlanner, LsmVectorSearchPlanner, SsTable,
     parse_filter_expr as parse_lsm_filter_expr,
 };
-use lance::dataset::mem_wal::write::{MemTableStats, ShardMemory, WriteStatsSnapshot};
+use lance::dataset::mem_wal::write::{
+    MemTableStats, ShardMemory, WriteBatchBuffer, WriteStatsSnapshot,
+};
 use lance::dataset::mem_wal::{
     DatasetMemWalExt, LsmScanner, ShardSnapshot, ShardWriter, arrow_schema_with_field_ids,
     evaluate_sharding_spec,
 };
 use lance::dataset::scanner::DatasetRecordBatchStream;
+use lance_arrow::deepcopy::deep_copy_batch;
 use lance_index::mem_wal::{
     CompactedSsTable as LanceCompactedSsTable, ShardingField, ShardingSpec,
 };
-use lance_linalg::distance::DistanceType;
 use pyo3::exceptions::{PyIOError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
@@ -41,6 +43,7 @@ use crate::dataset::Dataset as PyDataset;
 use crate::reader::LanceReader;
 use crate::rt;
 use crate::schema::LanceSchema as PyLanceSchema;
+use crate::utils::parse_distance_type;
 
 /// Evaluate a MemWAL sharding spec against one PyArrow RecordBatch.
 #[pyfunction(name = "_evaluate_sharding_spec", signature = (batch, spec, schema))]
@@ -244,12 +247,58 @@ struct ClosedShardWriterState {
     memtable_stats: MemTableStats,
 }
 
-fn collect_record_batches(data: &Bound<'_, PyAny>) -> PyResult<Vec<RecordBatch>> {
-    let reader = ArrowArrayStreamReader::from_pyarrow_bound(data)
-        .map_err(|e| PyValueError::new_err(format!("Cannot read data as Arrow: {}", e)))?;
-    reader
-        .collect::<Result<_, _>>()
-        .map_err(|e| PyIOError::new_err(format!("Failed to read batches: {}", e)))
+const DEFAULT_MAX_WRITE_BYTES: usize = 256 * 1024 * 1024;
+
+impl PyShardWriter {
+    fn collect_record_batches(
+        &self,
+        py: Python<'_>,
+        data: &Bound<'_, PyAny>,
+        max_bytes: usize,
+    ) -> PyResult<Vec<RecordBatch>> {
+        let inner = self.inner.clone();
+        let mut buffer = rt()
+            .block_on(Some(py), async move {
+                let guard = inner.lock().await;
+                let writer = guard.as_ref().ok_or_else(|| {
+                    lance_core::Error::invalid_input("ShardWriter is already closed")
+                })?;
+                WriteBatchBuffer::new(writer.config(), max_bytes)
+            })?
+            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        // Iterating Python readers directly preserves their exceptions, including
+        // KeyboardInterrupt; exporting through the C stream turns them into strings.
+        let mut reader: Box<dyn Iterator<Item = PyResult<RecordBatch>> + '_> = if data
+            .is_instance(&py.import("pyarrow")?.getattr("RecordBatchReader")?)?
+        {
+            Box::new(
+                data.try_iter()?
+                    .map(|batch| RecordBatch::from_pyarrow_bound(&batch?)),
+            )
+        } else {
+            let reader = ArrowArrayStreamReader::from_pyarrow_bound(data)
+                .map_err(|e| PyValueError::new_err(format!("Cannot read data as Arrow: {}", e)))?;
+            Box::new(reader.map(|batch| {
+                batch.map_err(|e| PyIOError::new_err(format!("Failed to read batches: {}", e)))
+            }))
+        };
+        loop {
+            py.check_signals()?;
+            let Some(batch) = reader.next() else {
+                break;
+            };
+            // FFI buffer lengths cannot reveal opaque owners such as NumPy
+            // allocations. Copy every buffer, including nulls and dictionary
+            // children, so buffered batches cannot retain those foreign owners.
+            let batch = deep_copy_batch(&batch?)
+                .map_err(|e| PyIOError::new_err(format!("Failed to copy batch: {e}")))?;
+            buffer
+                .push(batch)
+                .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        }
+        py.check_signals()?;
+        Ok(buffer.into_batches())
+    }
 }
 
 #[pymethods]
@@ -258,8 +307,9 @@ impl PyShardWriter {
     ///
     /// Accepts any PyArrow-compatible data source (RecordBatch, Table,
     /// or an Arrow stream reader).
-    pub fn put(&self, py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<()> {
-        let batches = collect_record_batches(data)?;
+    #[pyo3(signature = (data, *, max_bytes=DEFAULT_MAX_WRITE_BYTES))]
+    pub fn put(&self, py: Python<'_>, data: &Bound<'_, PyAny>, max_bytes: usize) -> PyResult<()> {
+        let batches = self.collect_record_batches(py, data, max_bytes)?;
 
         if batches.is_empty() {
             return Ok(());
@@ -283,8 +333,14 @@ impl PyShardWriter {
     /// Accepts any PyArrow-compatible data source carrying the shard's primary
     /// key column(s). Rust core validates that primary keys exist and builds the
     /// tombstone rows.
-    pub fn delete(&self, py: Python<'_>, keys: &Bound<'_, PyAny>) -> PyResult<()> {
-        let batches = collect_record_batches(keys)?;
+    #[pyo3(signature = (keys, *, max_bytes=DEFAULT_MAX_WRITE_BYTES))]
+    pub fn delete(
+        &self,
+        py: Python<'_>,
+        keys: &Bound<'_, PyAny>,
+        max_bytes: usize,
+    ) -> PyResult<()> {
+        let batches = self.collect_record_batches(py, keys, max_bytes)?;
 
         if batches.is_empty() {
             return Ok(());
@@ -839,7 +895,20 @@ impl PyLsmVectorSearchPlanner {
         // See the point-lookup planner: a rename moves a name and keeps the id.
         let identity_schema = Arc::new(arrow_schema_with_field_ids(ds.schema()));
 
-        let dist_type = parse_distance_type(distance_type.as_deref().unwrap_or("l2"))?;
+        let distance_type = distance_type.as_deref().unwrap_or("l2");
+        // MemWAL callers historically used `inner_product` for dot. Keep that
+        // alias here instead of broadening the shared DistanceType parser.
+        let normalized_distance_type = if distance_type.eq_ignore_ascii_case("inner_product") {
+            "dot"
+        } else {
+            distance_type
+        };
+        let dist_type = parse_distance_type(normalized_distance_type).map_err(|_| {
+            PyValueError::new_err(format!(
+                "Unknown distance_type '{}'. Valid values: 'l2', 'cosine', 'dot', 'hamming'",
+                distance_type
+            ))
+        })?;
 
         let vector_dim = get_vector_dim(&ds, &vector_column)?;
         let filter = filter
@@ -954,20 +1023,6 @@ pub(crate) fn get_pk_columns(ds: &LanceDataset) -> PyResult<Vec<String>> {
         ));
     }
     Ok(pk_fields.iter().map(|f| f.name.clone()).collect())
-}
-
-/// Parse distance type string to DistanceType enum.
-fn parse_distance_type(s: &str) -> PyResult<DistanceType> {
-    match s.to_lowercase().as_str() {
-        "l2" | "euclidean" => Ok(DistanceType::L2),
-        "cosine" => Ok(DistanceType::Cosine),
-        "dot" | "inner_product" => Ok(DistanceType::Dot),
-        "hamming" => Ok(DistanceType::Hamming),
-        _ => Err(PyValueError::new_err(format!(
-            "Unknown distance_type '{}'. Valid values: 'l2', 'cosine', 'dot', 'hamming'",
-            s
-        ))),
-    }
 }
 
 /// Get the vector dimension from the dataset schema for a given column.

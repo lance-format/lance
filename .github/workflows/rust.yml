@@ -18,6 +18,7 @@ on:
       - python/Cargo.lock
       - java/lance-jni/Cargo.lock
       - .cargo/config.toml
+      - .config/nextest.toml
       - clippy.toml
       - deny.toml
       - ci/check_dependency_age.py
@@ -79,8 +80,7 @@ jobs:
       # Catches manifest problems that only surface at publish time (missing
       # readme/license files, path dependencies without a version, excluded
       # files a crate needs). `--no-verify` skips building each packaged crate,
-      # which the other jobs already cover. Package the Arrow-versioned helper
-      # crates too even though releases publish them separately.
+      # which the other jobs already cover.
       - name: Package crates
         run: |
           cargo package --workspace --no-verify --all-features
@@ -186,7 +186,7 @@ jobs:
           # also run the fixtures so the check is never merged untested.
           self_changed=$(git diff --name-only "$base_sha" HEAD -- \
             rust/lance/tests/arrow_ordering.rs rust/lance/Cargo.toml ci/arrow_upgrade.py .github/workflows/rust.yml \
-            rust/arrow-scalar rust/arrow-stats)
+            rust/lance-arrow/src/scalar.rs rust/lance-arrow/src/scalar rust/lance-arrow/src/stats.rs rust/lance-arrow/src/stats)
           if [ -n "$self_changed" ]; then
             echo "fixtures or the paths they exercise changed:"
             echo "$self_changed"
@@ -309,10 +309,24 @@ jobs:
         run: |
           ALL_FEATURES=$(cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v -e protoc | sort | uniq | paste -s -d "," -)
           cargo nextest run \
+            --profile ci \
             --cargo-profile ci \
             --locked \
             --workspace \
             --features "${ALL_FEATURES}"
+      - name: Upload test timings
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: nextest-junit-linux
+          path: target/nextest/ci/junit.xml
+      - name: Upload test results to Codecov
+        if: ${{ !cancelled() }}
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          report_type: test_results
+          files: target/nextest/ci/junit.xml
 
   linux-arm:
     runs-on: ubuntu-24.04-arm64-8x
@@ -339,31 +353,6 @@ jobs:
         run: |
           ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v -e protoc | sort | uniq | paste -s -d "," -`
           cargo test --profile ci --locked --features ${ALL_FEATURES}
-  build-no-lock:
-    runs-on: ubuntu-24.04-8x
-    timeout-minutes: 30
-    env:
-      # Need up-to-date compilers for kernels
-      CC: clang
-      CXX: clang++
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - name: Set up Rust
-        run: |
-          rustup update stable
-          rustup default stable
-      # Remote cargo.lock to force a fresh build
-      - name: Remove Cargo.lock
-        run: rm -f Cargo.lock
-      - uses: rui314/setup-mold@725a8794d15fc7563f59595bd9556495c0564878 # v1
-      - name: Install protoc
-        uses: taiki-e/install-action@66068bfca13dcb2ea07c3f613ca2836a37c755d5 # protoc
-        with:
-          tool: protoc
-      - name: Build all
-        run: |
-          ALL_FEATURES=`cargo metadata --format-version=1 --no-deps | jq -r '.packages[] | .features | keys | .[]' | grep -v -e protoc | sort | uniq | paste -s -d "," -`
-          cargo build --profile ci --benches --features ${ALL_FEATURES} --tests
   mac-build:
     # Standard macOS runners are free for public repos; Warp runners are billed.
     # Only lance-io is tested here to keep PR feedback fast on 3 cores. The full
@@ -562,7 +551,7 @@ jobs:
     runs-on: ubuntu-24.04
     strategy:
       matrix:
-        msrv: ["1.95.0"] # This should match up with rust-version in Cargo.toml
+        msrv: ["1.98.0"] # This should match up with rust-version in Cargo.toml
     env:
       # Need up-to-date compilers for kernels
       CC: clang

@@ -10,21 +10,18 @@ use futures::future::BoxFuture;
 use futures::stream::BoxStream;
 use futures::{FutureExt, StreamExt, TryStreamExt};
 use itertools::Itertools;
-use lance_index::metrics::NoOpMetricsCollector;
+use lance_index::progress::{IndexBuildProgress, NoopIndexBuildProgress};
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::zonemap::{
     HarvestedZoneSeed, NULL_BITMAP_POLICY_META_KEY, ReusedZones, ScannedZones, SeedOutcome,
     ZONEMAP_INDEX_FILENAME, ZoneMapIndex, ZoneMapIndexBuilderParams, ZoneMapSegmentBase,
     train_zonemap_scan, write_zonemap_segment,
 };
-use lance_index::scalar::{
-    CreatedIndex, IndexStore, ScalarIndex, TrainingCriteria, index_files_to_table,
-};
+use lance_index::scalar::{CreatedIndex, IndexStore, ScalarIndex, TrainingCriteria};
 use lance_select::RowAddrTreeMap;
 use lance_table::format::{Fragment, IndexMetadata};
-use roaring::RoaringBitmap;
-use uuid::Uuid;
 
+use super::segment_merge::{SegmentMerge, downcast_sources, open_dyn_sources};
 use crate::index::append::SeedHarvester;
 use crate::index::scalar::{TrainingRows, TrainingScanOptions, scan_training_data};
 use crate::{Dataset, Error, Result, dataset::index::LanceIndexStoreExt};
@@ -35,60 +32,13 @@ pub(in crate::index) async fn merge_segments(
     segments: Vec<IndexMetadata>,
     staged: Option<&crate::index::frag_reuse::StagedRemappingPlans>,
 ) -> Result<IndexMetadata> {
-    if segments.is_empty() {
-        return Err(Error::index("No segment metadata was provided".to_string()));
-    }
+    let merge = SegmentMerge::new(dataset, "ZoneMap", &segments)?;
+    let (fragment_bitmap, _) = merge.coverage_union(dataset)?;
 
-    let field_id = *segments[0].fields.first().ok_or_else(|| {
-        Error::invalid_input(format!(
-            "CreateIndex: segment {} is missing field ids",
-            segments[0].uuid
-        ))
-    })?;
-    let field_path = dataset.schema().field_path(field_id)?;
+    let opened = open_dyn_sources(dataset, merge.field_path(), merge.segments(), staged).await?;
+    let source_indices = downcast_sources::<ZoneMapIndex>(&opened, merge.segments(), "ZoneMap")?;
 
-    let mut scalar_indices = Vec::with_capacity(segments.len());
-    let mut fragment_bitmap = RoaringBitmap::new();
-    let dataset_fragments = dataset.fragment_bitmap.as_ref();
-    for segment in &segments {
-        let effective = segment
-            .effective_fragment_bitmap(dataset_fragments)
-            .ok_or_else(|| {
-                Error::invalid_input(format!(
-                    "CreateIndex: segment {} is missing fragment coverage",
-                    segment.uuid
-                ))
-            })?;
-        fragment_bitmap |= effective;
-        let scalar_index = super::open_scalar_index_with_plan(
-            dataset,
-            &field_path,
-            segment,
-            staged.and_then(|plans| plans.get(&segment.uuid)),
-            crate::index::frag_reuse::OpenPurpose::Maintenance,
-            &NoOpMetricsCollector,
-        )
-        .await?;
-        scalar_indices.push((segment.uuid, scalar_index));
-    }
-
-    let mut source_indices = Vec::with_capacity(scalar_indices.len());
-    for (segment_uuid, scalar_index) in &scalar_indices {
-        let zonemap_index = scalar_index
-            .as_any()
-            .downcast_ref::<ZoneMapIndex>()
-            .ok_or_else(|| {
-                Error::index(format!(
-                    "merge_existing_index_segments: expected zonemap segment {}, got {:?}",
-                    segment_uuid,
-                    scalar_index.index_type()
-                ))
-            })?;
-        source_indices.push(zonemap_index);
-    }
-
-    let new_uuid = Uuid::new_v4();
-    let new_store = LanceIndexStore::from_dataset_for_new(dataset, &new_uuid)?;
+    let (new_uuid, new_store) = merge.new_store(dataset)?;
     let created_index = lance_index::scalar::zonemap::merge_zonemap_indices(
         &source_indices,
         &new_store,
@@ -96,19 +46,12 @@ pub(in crate::index) async fn merge_segments(
     )
     .await?;
 
-    Ok(IndexMetadata {
-        uuid: new_uuid,
-        dataset_version: dataset.manifest.version,
-        fragment_bitmap: Some(fragment_bitmap),
-        index_details: Some(Arc::new(created_index.index_details)),
-        index_version: created_index.index_version as i32,
-        created_at: Some(chrono::Utc::now()),
-        base_id: None,
-        files: Some(index_files_to_table(created_index.files)),
-        clustering_id: None,
-        metadata: Default::default(),
-        ..segments[0].clone()
-    })
+    Ok(merge.build_metadata(
+        new_uuid,
+        dataset.manifest.version,
+        fragment_bitmap,
+        created_index,
+    ))
 }
 
 /// What a seed-aware segment build reused and scanned, recorded for tests.
@@ -166,6 +109,7 @@ const ZONEMAP_HARVEST_CONCURRENCY_CAP: usize = 16;
 
 pub fn harvest_concurrency(dataset: &Dataset) -> usize {
     dataset
+        .table_state
         .object_store
         .io_parallelism()
         .clamp(1, ZONEMAP_HARVEST_CONCURRENCY_CAP)
@@ -216,7 +160,7 @@ const ZONEMAP_SCAN_BATCH_FRAGMENTS: usize = 16;
 const ZONEMAP_SCAN_CONCURRENCY_CAP: usize = 2;
 
 fn scan_concurrency(dataset: &Dataset) -> usize {
-    (dataset.object_store.io_parallelism() / 16).clamp(1, ZONEMAP_SCAN_CONCURRENCY_CAP)
+    (dataset.table_state.object_store.io_parallelism() / 16).clamp(1, ZONEMAP_SCAN_CONCURRENCY_CAP)
 }
 
 /// How a fragment's rows are read once its seed is decided.
@@ -407,6 +351,7 @@ async fn assemble_segment(
     harvester: Option<SeedHarvester<'_>>,
     criteria: &TrainingCriteria,
     store: &dyn IndexStore,
+    progress: &dyn IndexBuildProgress,
 ) -> Result<CreatedIndex> {
     let rows_per_zone = base.rows_per_zone();
     let keep_positions = base.keeps_null_positions();
@@ -454,6 +399,7 @@ async fn assemble_segment(
     let mut scanned_rows = 0u64;
     let mut total_seed_bytes = 0usize;
     let mut scan_count = 0usize;
+    progress.stage_start("train_zones", None, "rows").await?;
     while let Some(BatchResult {
         plans,
         scanned: pieces,
@@ -474,6 +420,7 @@ async fn assemble_segment(
     }
     // The pipeline is drained; release its borrow of the counters.
     drop(results);
+    progress.stage_complete("train_zones").await?;
     #[cfg(test)]
     let masked = !legacy_storage && !scanned_fragments.is_empty();
     let max_live_seed_bytes = counters.max_live_seed_bytes.into_inner();
@@ -503,7 +450,13 @@ async fn assemble_segment(
         })
     });
     let refreshed: Vec<u64> = fragments.iter().map(|fragment| fragment.id).collect();
-    write_zonemap_segment(base, data_type, reused, scanned, &refreshed, store).await
+    progress
+        .stage_start("write_zonemap_index", None, "files")
+        .await?;
+    let created =
+        write_zonemap_segment(base, data_type, reused, scanned, &refreshed, store).await?;
+    progress.stage_complete("write_zonemap_index").await?;
+    Ok(created)
 }
 
 /// The fragments with these ids, in id order, erroring on an unknown id.
@@ -522,6 +475,7 @@ fn fragments_by_id(dataset: &Dataset, ids: Vec<u32>) -> Result<Vec<Fragment>> {
 /// Train a new ZoneMap segment over `fragment_ids` (all fragments when
 /// `None`), reusing the write seeds those fragments already carry and
 /// scanning only the rows they do not cover.
+#[allow(clippy::too_many_arguments)]
 pub(in crate::index) async fn build_segment_with_seeds(
     dataset: &Dataset,
     column: &str,
@@ -530,7 +484,9 @@ pub(in crate::index) async fn build_segment_with_seeds(
     fragment_ids: Option<Vec<u32>>,
     criteria: &TrainingCriteria,
     store: &dyn IndexStore,
+    progress: &dyn IndexBuildProgress,
 ) -> Result<CreatedIndex> {
+    progress.stage_start("load_data", None, "rows").await?;
     let fragments = match fragment_ids {
         Some(ids) => fragments_by_id(dataset, ids)?,
         None => dataset.fragments().as_ref().clone(),
@@ -540,6 +496,7 @@ pub(in crate::index) async fn build_segment_with_seeds(
         .use_seeds_for(data_type)
         .then(|| SeedHarvester::for_column(dataset, column))
         .flatten();
+    progress.stage_complete("load_data").await?;
     assemble_segment(
         dataset,
         column,
@@ -549,6 +506,7 @@ pub(in crate::index) async fn build_segment_with_seeds(
         harvester,
         criteria,
         store,
+        progress,
     )
     .await
 }
@@ -588,6 +546,7 @@ pub(in crate::index) async fn update_segment(
         harvester,
         criteria,
         store,
+        &NoopIndexBuildProgress,
     )
     .await
     .map(Some)

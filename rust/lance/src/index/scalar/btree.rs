@@ -4,55 +4,15 @@
 #![allow(clippy::redundant_pub_crate)]
 
 //! BTree-specific helpers for the segmented index workflow.
-use std::sync::Arc;
-
-use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
 use datafusion::execution::SendableRecordBatchStream;
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use lance_core::ROW_ADDR;
-use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::pbold::BTreeIndexDetails;
 use lance_index::scalar::btree::BTreeIndex;
 use lance_index::scalar::lance_format::LanceIndexStore;
-use lance_index::scalar::registry::VALUE_COLUMN_NAME;
-use lance_index::scalar::{CreatedIndex, OldIndexDataFilter, index_files_to_table};
+use lance_index::scalar::{CreatedIndex, OldIndexDataFilter};
 use lance_table::format::IndexMetadata;
-use uuid::Uuid;
 
-use crate::{Dataset, Error, Result, dataset::index::LanceIndexStoreExt};
-
-/// Build a row-empty `new_data` stream for the segment-merge APIs.
-pub(super) fn empty_value_row_id_stream(
-    dataset: &Dataset,
-    field_id: i32,
-) -> Result<SendableRecordBatchStream> {
-    let field = dataset.schema().field_by_id(field_id).ok_or_else(|| {
-        Error::invalid_input(format!(
-            "merge_existing_index_segments: field id {} does not exist",
-            field_id
-        ))
-    })?;
-    let schema = Arc::new(ArrowSchema::new(vec![
-        ArrowField::new(VALUE_COLUMN_NAME, field.data_type(), true),
-        ArrowField::new(ROW_ADDR, arrow_schema::DataType::UInt64, false),
-    ]));
-    Ok(Box::pin(RecordBatchStreamAdapter::new(
-        schema,
-        futures::stream::empty(),
-    )))
-}
-
-fn ensure_btree_details(segment: &IndexMetadata) -> Result<()> {
-    if let Some(details) = segment.index_details.as_ref()
-        && !details.type_url.ends_with("BTreeIndexDetails")
-    {
-        return Err(Error::invalid_input(format!(
-            "Segment '{}' is not a BTree segment (details type_url = '{}')",
-            segment.uuid, details.type_url
-        )));
-    }
-    Ok(())
-}
+use super::segment_merge::{SegmentMerge, empty_value_row_id_stream, open_sources};
+use crate::{Dataset, Error, Result};
 
 /// Open the given BTree `segments` and k-way merge their already-sorted page
 /// data, together with `new_data`, into a single canonical BTree written to
@@ -66,29 +26,8 @@ pub(crate) async fn open_and_merge_segments(
     old_data_filters: &[Option<OldIndexDataFilter>],
     staged: Option<&crate::index::frag_reuse::StagedRemappingPlans>,
 ) -> Result<CreatedIndex> {
-    let mut source_indices = Vec::with_capacity(segments.len());
-    for &segment in segments {
-        let scalar_index = super::open_scalar_index_with_plan(
-            dataset,
-            field_path,
-            segment,
-            staged.and_then(|plans| plans.get(&segment.uuid)),
-            crate::index::frag_reuse::OpenPurpose::Maintenance,
-            &NoOpMetricsCollector,
-        )
-        .await?;
-        let btree = scalar_index
-            .as_any()
-            .downcast_ref::<BTreeIndex>()
-            .ok_or_else(|| {
-                Error::index(format!(
-                    "BTree merge: expected BTree segment {}, got {:?}",
-                    segment.uuid,
-                    scalar_index.index_type()
-                ))
-            })?;
-        source_indices.push(Arc::new(btree.clone()));
-    }
+    let source_indices =
+        open_sources::<BTreeIndex>(dataset, field_path, segments, staged, "BTree").await?;
     BTreeIndex::merge_segments(&source_indices, new_data, new_store, old_data_filters).await
 }
 
@@ -99,68 +38,20 @@ pub(crate) async fn merge_segments(
     segments: Vec<IndexMetadata>,
     staged: Option<&crate::index::frag_reuse::StagedRemappingPlans>,
 ) -> Result<IndexMetadata> {
-    if segments.is_empty() {
-        return Err(Error::index("No segment metadata was provided".to_string()));
-    }
-
-    for segment in &segments {
-        ensure_btree_details(segment)?;
-    }
-
-    // A pre-migration segment stores row ids directly, which on a
-    // stable-row-id dataset are a different domain than the row addresses a
-    // modern segment stores; merging the two into one segment would silently
-    // combine incompatible values in the `ids` column. This path never
-    // rescans the dataset to repair that, so refuse rather than corrupt --
-    // the caller should fully rebuild the legacy segment first (e.g. via
-    // `create_index(..., replace: true)`).
-    if dataset.manifest.uses_stable_row_ids() {
-        for segment in &segments {
-            if !segment.results_are_row_addrs() {
-                return Err(Error::invalid_input(format!(
-                    "BTree merge_segments: segment {} predates row-address-domain support and \
-                     cannot be merged on a dataset with stable row IDs; rebuild it first (e.g. \
-                     with create_index(..., replace: true))",
-                    segment.uuid,
-                )));
-            }
-        }
-    }
-
-    // All source segments must belong to the same column.
-    let reference_fields = segments[0].fields.as_slice();
-    for segment in segments.iter().skip(1) {
-        if segment.fields.as_slice() != reference_fields {
-            return Err(Error::invalid_input(format!(
-                "BTree merge_segments: segment {} has fields {:?}, expected {:?}",
-                segment.uuid, segment.fields, reference_fields,
-            )));
-        }
-    }
-
-    let field_id = *segments[0].fields.first().ok_or_else(|| {
-        Error::invalid_input(format!(
-            "CreateIndex: segment {} is missing field ids",
-            segments[0].uuid
-        ))
-    })?;
-    let field_path = dataset.schema().field_path(field_id)?;
-
-    let segment_refs: Vec<&IndexMetadata> = segments.iter().collect();
+    let merge = SegmentMerge::new(dataset, "BTree", &segments)?;
+    merge.reject_legacy_segments_on_stable(dataset, "BTree")?;
     let (fragment_bitmap, old_data_filters) =
-        crate::index::append::build_per_segment_filters(dataset, &segment_refs, staged, true)
-            .await?;
+        merge.per_segment_filters(dataset, staged, true).await?;
 
-    let output_uuid = Uuid::new_v4();
-    let new_store = LanceIndexStore::from_dataset_for_new(dataset, &output_uuid)?;
+    let (output_uuid, new_store) = merge.new_store(dataset)?;
     // Pure segment consolidation: no dataset scan, so `new_data` is an empty
     // stream and the merge is driven entirely by the source page data.
-    let empty_new_data = empty_value_row_id_stream(dataset, field_id)?;
+    let new_data = empty_value_row_id_stream(dataset, merge.field_id())?;
     let created_index = open_and_merge_segments(
         dataset,
-        &field_path,
-        &segment_refs,
-        empty_new_data,
+        merge.field_path(),
+        merge.segments(),
+        new_data,
         &new_store,
         &old_data_filters,
         staged,
@@ -182,19 +73,10 @@ pub(crate) async fn merge_segments(
         prost_types::Any::from_msg(&BTreeIndexDetails::default()).unwrap(),
     );
 
-    Ok(IndexMetadata {
-        uuid: output_uuid,
-        name: segments[0].name.clone(),
-        fields: segments[0].fields.clone(),
-        covering_fields: segments[0].covering_fields.clone(),
-        dataset_version: dataset.manifest.version,
-        fragment_bitmap: Some(fragment_bitmap),
-        index_details: Some(Arc::new(created_index.index_details)),
-        index_version: created_index.index_version as i32,
-        created_at: Some(chrono::Utc::now()),
-        base_id: None,
-        files: Some(index_files_to_table(created_index.files)),
-        clustering_id: None,
-        metadata: Default::default(),
-    })
+    Ok(merge.build_metadata(
+        output_uuid,
+        dataset.manifest.version,
+        fragment_bitmap,
+        created_index,
+    ))
 }
