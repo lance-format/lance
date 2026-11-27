@@ -86,14 +86,15 @@ use std::sync::Arc;
 use arrow::datatypes::i256;
 use arrow_array::cast::AsArray;
 use arrow_array::types::{
-    ArrowPrimitiveType, Date32Type, Decimal128Type, Decimal256Type, Float16Type, Float32Type,
-    Float64Type, Int64Type, TimestampNanosecondType, UInt64Type,
+    ArrowPrimitiveType, Date32Type, Decimal32Type, Decimal64Type, Decimal128Type, Decimal256Type,
+    Float16Type, Float32Type, Float64Type, Int64Type, TimestampNanosecondType, UInt64Type,
 };
 use arrow_array::{
     Array, ArrayRef, ArrowNativeTypeOp, BinaryArray, BooleanArray, Date32Array, Date64Array,
-    Decimal128Array, Decimal256Array, Float16Array, Float32Array, Float64Array, Int8Array,
-    Int16Array, Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, RecordBatch,
-    StringArray, TimestampNanosecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    Decimal32Array, Decimal64Array, Decimal128Array, Decimal256Array, Float16Array, Float32Array,
+    Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, LargeBinaryArray,
+    LargeStringArray, RecordBatch, StringArray, TimestampNanosecondArray, UInt8Array, UInt16Array,
+    UInt32Array, UInt64Array,
 };
 use arrow_ord::ord::make_comparator;
 use arrow_ord::sort::{SortColumn, lexsort_to_indices, sort_to_indices};
@@ -683,6 +684,68 @@ fn timestamp_ns_utc() -> Fixture {
     )
 }
 
+fn decimal32() -> Fixture {
+    build(
+        "Decimal32(9, 2)",
+        vec![
+            ("-(10^9 - 1)", -999_999_999),
+            ("-1", -1),
+            ("0", 0),
+            ("1", 1),
+            ("10^9 - 1", 999_999_999),
+        ],
+        1,
+        |v: &i32| v.to_le_bytes().to_vec(),
+        no_nan,
+        |values| {
+            Arc::new(
+                Decimal32Array::from(values)
+                    .with_precision_and_scale(9, 2)
+                    .unwrap(),
+            )
+        },
+        |array, row| {
+            array
+                .as_primitive::<Decimal32Type>()
+                .value(row)
+                .to_le_bytes()
+                .to_vec()
+        },
+        Some(native_cmp::<Decimal32Type>),
+    )
+}
+
+fn decimal64() -> Fixture {
+    build(
+        "Decimal64(18, 2)",
+        vec![
+            ("-(10^18 - 1)", -999_999_999_999_999_999),
+            ("-1", -1),
+            ("0", 0),
+            ("1", 1),
+            ("10^18 - 1", 999_999_999_999_999_999),
+        ],
+        1,
+        |v: &i64| v.to_le_bytes().to_vec(),
+        no_nan,
+        |values| {
+            Arc::new(
+                Decimal64Array::from(values)
+                    .with_precision_and_scale(18, 2)
+                    .unwrap(),
+            )
+        },
+        |array, row| {
+            array
+                .as_primitive::<Decimal64Type>()
+                .value(row)
+                .to_le_bytes()
+                .to_vec()
+        },
+        Some(native_cmp::<Decimal64Type>),
+    )
+}
+
 /// The largest magnitude representable at precision 38: thirty-eight nines.
 const DECIMAL38_MAX: i128 = 99_999_999_999_999_999_999_999_999_999_999_999_999;
 
@@ -779,6 +842,8 @@ fn fixtures() -> Vec<Fixture> {
         uint64(),
         date32(),
         timestamp_ns_utc(),
+        decimal32(),
+        decimal64(),
         decimal128(),
         decimal256(),
         boolean(),

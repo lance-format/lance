@@ -7,8 +7,8 @@ use crate::dataset::{
     WriteMode, WriteParams,
 };
 use arrow_array::{
-    Array, ArrayRef, FixedSizeListArray, Int32Array, Int64Array, ListArray, NullArray, RecordBatch,
-    RecordBatchIterator, StringArray, StructArray,
+    Array, ArrayRef, Decimal32Array, Decimal64Array, FixedSizeListArray, Int32Array, Int64Array,
+    ListArray, NullArray, RecordBatch, RecordBatchIterator, StringArray, StructArray,
 };
 use arrow_schema::{
     DataType, Field as ArrowField, Field, Fields as ArrowFields, Fields, Schema as ArrowSchema,
@@ -1229,4 +1229,90 @@ async fn test_filter_on_added_struct_child(
             .unwrap(),
         1
     );
+}
+
+/// An all-null column is added without writing data, so the version check cannot
+/// rely on the file writer alone; a column with data is checked before it is written.
+#[rstest]
+#[case::v2_2(LanceFileVersion::V2_2, false)]
+#[case::v2_3(LanceFileVersion::V2_3, true)]
+#[tokio::test]
+async fn add_decimal32_and_decimal64_columns_requires_2_3(
+    #[case] version: LanceFileVersion,
+    #[case] is_supported: bool,
+    #[values(false, true)] is_all_nulls: bool,
+) {
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(
+            vec![Ok(RecordBatch::try_from_iter([(
+                "id",
+                Arc::new(Int32Array::from(vec![0, 1, 2])) as ArrayRef,
+            )])
+            .unwrap())],
+            Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                "id",
+                DataType::Int32,
+                true,
+            )])),
+        ),
+        "memory://",
+        Some(WriteParams {
+            data_storage_version: Some(version),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    let d32: ArrayRef = Arc::new(
+        Decimal32Array::from(vec![Some(-999_999_999), None, Some(12)])
+            .with_precision_and_scale(9, 2)
+            .unwrap(),
+    );
+    let d64: ArrayRef = Arc::new(
+        Decimal64Array::from(vec![None, Some(999_999_999_999_999_999), Some(-7)])
+            .with_precision_and_scale(18, 2)
+            .unwrap(),
+    );
+    let added = RecordBatch::try_from_iter([("d32", d32), ("d64", d64)]).unwrap();
+    let transform = if is_all_nulls {
+        NewColumnTransform::AllNulls(added.schema())
+    } else {
+        NewColumnTransform::Reader(Box::new(RecordBatchIterator::new(
+            vec![Ok(added.clone())],
+            added.schema(),
+        )))
+    };
+    let result = dataset.add_columns(transform, None, None).await;
+
+    if !is_supported {
+        let error = result.unwrap_err();
+        assert!(
+            matches!(error, crate::Error::InvalidInput { .. }),
+            "{error}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("'d32'")
+                && message.contains("Decimal32(9, 2)")
+                && message.contains("require data storage version 2.3"),
+            "{message}"
+        );
+        return;
+    }
+    result.unwrap();
+    let scanned = dataset
+        .scan()
+        .project(&["d32", "d64"])
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    if is_all_nulls {
+        assert_eq!(scanned.schema(), added.schema());
+        assert_eq!(scanned["d32"].null_count(), 3);
+        assert_eq!(scanned["d64"].null_count(), 3);
+    } else {
+        assert_eq!(scanned, added);
+    }
 }

@@ -622,7 +622,10 @@ impl Planner {
         }
         if !matches!(
             self.column_type(column)?,
-            ArrowDataType::Decimal128(..) | ArrowDataType::Decimal256(..)
+            ArrowDataType::Decimal32(..)
+                | ArrowDataType::Decimal64(..)
+                | ArrowDataType::Decimal128(..)
+                | ArrowDataType::Decimal256(..)
         ) {
             return None;
         }

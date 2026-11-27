@@ -425,9 +425,15 @@ pub fn test_encoding_strategy(encoding: TestEncoding) -> Box<dyn FieldEncodingSt
         TestEncoding::StructuralSparse => vec![PrimitivePageEncoding::planar(compression)],
         TestEncoding::Array => unreachable!(),
     };
+    let primitive = PrimitiveFieldEncoding::new(page_encodings);
+    let primitive = if encoding == TestEncoding::StructuralSparse {
+        primitive.with_decimal32_and_decimal64()
+    } else {
+        primitive
+    };
     Box::new(TestFieldEncodingStrategy {
         encoding,
-        primitive: PrimitiveFieldEncoding::new(page_encodings),
+        primitive,
     })
 }
 

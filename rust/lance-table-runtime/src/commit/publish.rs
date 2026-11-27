@@ -28,6 +28,7 @@ use crate::frag_reuse::{
     apply_frag_reuse_with_stable_row_ids_flag, validate_stable_row_id_fri_shape,
 };
 use crate::paths::TRANSACTIONS_DIR;
+use crate::write::schema::validate_decimal32_and_decimal64;
 
 use super::CommitHooks;
 use super::conflict_resolver::AppendIdempotencyKey;
@@ -377,6 +378,12 @@ pub async fn write_manifest_file(
             .verify_primary_key()
             .map_err(CommitError::OtherError)?;
         validate_blob_threshold_metadata(&manifest.schema).map_err(CommitError::OtherError)?;
+        // Adding an all-null column writes no data file, so no file writer checks it.
+        validate_decimal32_and_decimal64(
+            &manifest.schema,
+            manifest.data_storage_format.lance_file_format(),
+        )
+        .map_err(CommitError::OtherError)?;
     }
     if config.auto_set_feature_flags() {
         // build_manifest may have already set FLAG_STABLE_ROW_IDS on the manifest.

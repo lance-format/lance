@@ -84,7 +84,10 @@ fn comparison_expr(column: &Expr, data_type: &DataType, comparison: Comparison) 
 fn is_decimal(data_type: &DataType) -> bool {
     matches!(
         data_type,
-        DataType::Decimal128(..) | DataType::Decimal256(..)
+        DataType::Decimal32(..)
+            | DataType::Decimal64(..)
+            | DataType::Decimal128(..)
+            | DataType::Decimal256(..)
     )
 }
 
@@ -162,6 +165,12 @@ fn out_of_range(op: Operator, is_above: bool) -> Option<Comparison> {
 /// operand is `value * 10^-scale`.
 fn exact_value(scalar: &ScalarValue) -> Option<(i256, i8)> {
     match scalar {
+        ScalarValue::Decimal32(Some(value), _, scale) => {
+            Some((i256::from_i128(i128::from(*value)), *scale))
+        }
+        ScalarValue::Decimal64(Some(value), _, scale) => {
+            Some((i256::from_i128(i128::from(*value)), *scale))
+        }
         ScalarValue::Decimal128(Some(value), _, scale) => Some((i256::from_i128(*value), *scale)),
         ScalarValue::Decimal256(Some(value), _, scale) => Some((*value, *scale)),
         _ if scalar.data_type().is_integer() => {
@@ -181,6 +190,16 @@ fn exact_value(scalar: &ScalarValue) -> Option<(i256, i8)> {
 /// `units` of a decimal column type's scale, as a value of that type.
 fn decimal_scalar(units: i256, data_type: &DataType) -> Option<ScalarValue> {
     match data_type {
+        DataType::Decimal32(precision, scale) => Some(ScalarValue::Decimal32(
+            Some(i32::try_from(units.to_i128()?).ok()?),
+            *precision,
+            *scale,
+        )),
+        DataType::Decimal64(precision, scale) => Some(ScalarValue::Decimal64(
+            Some(i64::try_from(units.to_i128()?).ok()?),
+            *precision,
+            *scale,
+        )),
         DataType::Decimal128(precision, scale) => Some(ScalarValue::Decimal128(
             Some(units.to_i128()?),
             *precision,
@@ -208,8 +227,10 @@ fn lower_decimal(
     data_type: DataType,
 ) -> Option<Lowered> {
     use Operator::*;
-    let (DataType::Decimal128(precision, scale) | DataType::Decimal256(precision, scale)) =
-        data_type
+    let (DataType::Decimal32(precision, scale)
+    | DataType::Decimal64(precision, scale)
+    | DataType::Decimal128(precision, scale)
+    | DataType::Decimal256(precision, scale)) = data_type
     else {
         return None;
     };
@@ -698,8 +719,8 @@ mod tests {
     use super::*;
     use crate::planner::Planner;
     use arrow_array::{
-        ArrayRef, BooleanArray, Decimal128Array, Decimal256Array, Float32Array, Int64Array,
-        RecordBatch, UInt64Array, cast::AsArray, record_batch,
+        ArrayRef, BooleanArray, Decimal32Array, Decimal64Array, Decimal128Array, Decimal256Array,
+        Float32Array, Int64Array, RecordBatch, UInt64Array, cast::AsArray, record_batch,
     };
     use datafusion::prelude::col;
     use datafusion_common::tree_node::TreeNodeRecursion;
@@ -842,6 +863,16 @@ mod tests {
     /// `d` holds `units` of the type's scale and a NULL.
     fn decimal_batch(data_type: &DataType, units: i128) -> RecordBatch {
         let array: ArrayRef = match data_type {
+            DataType::Decimal32(precision, scale) => Arc::new(
+                Decimal32Array::from(vec![Some(i32::try_from(units).unwrap()), None])
+                    .with_precision_and_scale(*precision, *scale)
+                    .unwrap(),
+            ),
+            DataType::Decimal64(precision, scale) => Arc::new(
+                Decimal64Array::from(vec![Some(i64::try_from(units).unwrap()), None])
+                    .with_precision_and_scale(*precision, *scale)
+                    .unwrap(),
+            ),
             DataType::Decimal128(precision, scale) => Arc::new(
                 Decimal128Array::from(vec![Some(units), None])
                     .with_precision_and_scale(*precision, *scale)
@@ -861,6 +892,8 @@ mod tests {
     const FINE: DataType = DataType::Decimal128(38, 18);
     const WIDE: DataType = DataType::Decimal256(76, 20);
     const WHOLE: DataType = DataType::Decimal128(20, 0);
+    const PRICE32: DataType = DataType::Decimal32(9, 2);
+    const PRICE64: DataType = DataType::Decimal64(18, 2);
 
     #[rstest]
     #[case::eq(PRICE, "d = 0.05", 5, Some(true))]
@@ -919,6 +952,24 @@ mod tests {
     )]
     #[case::negative_past_i64(WHOLE, "d > -9223372036854775809", -9_223_372_036_854_775_808, Some(true))]
     #[case::unsigned_integer_scaled(FINE, "d < 18446744073709551615", 1, Some(true))]
+    #[case::decimal32_eq(PRICE32, "d = 0.05", 5, Some(true))]
+    #[case::decimal32_eq_between_units(PRICE32, "d = 0.055", 5, Some(false))]
+    #[case::decimal32_lt_between_units(PRICE32, "d < 0.055", 6, Some(false))]
+    #[case::decimal32_integer(PRICE32, "d < 0", -1, Some(true))]
+    #[case::decimal32_max(PRICE32, "d <= 9999999.99", 999_999_999, Some(true))]
+    #[case::decimal32_above_precision(PRICE32, "d < 10000000.001", 999_999_999, Some(true))]
+    #[case::decimal32_below_precision(PRICE32, "d > -10000000", -999_999_999, Some(true))]
+    #[case::decimal32_in_list(PRICE32, "d IN (0.055, 0.05)", 5, Some(true))]
+    #[case::decimal64_eq(PRICE64, "d = -0.05", -5, Some(true))]
+    #[case::decimal64_gte_between_units(PRICE64, "d >= 0.055", 5, Some(false))]
+    #[case::decimal64_max(
+        PRICE64,
+        "d <= 9999999999999999.99",
+        999_999_999_999_999_999,
+        Some(true)
+    )]
+    #[case::decimal64_above_precision(PRICE64, "d = 10000000000000000.5", 0, Some(false))]
+    #[case::decimal64_between(PRICE64, "d BETWEEN 0.051 AND 0.07", 5, Some(false))]
     fn decimal_predicates(
         #[case] data_type: DataType,
         #[case] sql: &str,

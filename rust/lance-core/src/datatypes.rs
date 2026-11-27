@@ -343,6 +343,8 @@ impl TryFrom<&DataType> for LogicalType {
             DataType::Float16 => "halffloat".to_string(),
             DataType::Float32 => "float".to_string(),
             DataType::Float64 => "double".to_string(),
+            DataType::Decimal32(precision, scale) => format!("decimal:32:{precision}:{scale}"),
+            DataType::Decimal64(precision, scale) => format!("decimal:64:{precision}:{scale}"),
             DataType::Decimal128(precision, scale) => format!("decimal:128:{precision}:{scale}"),
             DataType::Decimal256(precision, scale) => format!("decimal:256:{precision}:{scale}"),
             DataType::Utf8 | DataType::Utf8View => "string".to_string(),
@@ -536,14 +538,14 @@ impl TryFrom<&LogicalType> for DataType {
                             .parse::<i8>()
                             .map_err(|err| Error::schema(err.to_string()))?;
 
-                        if bits == 128 {
-                            Ok(Decimal128(precision, scale))
-                        } else if bits == 256 {
-                            Ok(Decimal256(precision, scale))
-                        } else {
-                            Err(Error::schema(format!(
-                                "Only Decimal128 and Decimal256 is supported. Found {bits}"
-                            )))
+                        match bits {
+                            32 => Ok(Decimal32(precision, scale)),
+                            64 => Ok(Decimal64(precision, scale)),
+                            128 => Ok(Decimal128(precision, scale)),
+                            256 => Ok(Decimal256(precision, scale)),
+                            _ => Err(Error::schema(format!(
+                                "Only Decimal32, Decimal64, Decimal128 and Decimal256 are supported. Found {bits}"
+                            ))),
                         }
                     }
                 }
@@ -922,6 +924,45 @@ mod tests {
         );
         assert!(
             err.to_string().contains("does not parse back"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Pins the on-disk spelling of each decimal width and parses it back.
+    #[rstest]
+    #[case::decimal32(DataType::Decimal32(9, 2), "decimal:32:9:2")]
+    #[case::decimal64(DataType::Decimal64(18, 3), "decimal:64:18:3")]
+    #[case::decimal128(DataType::Decimal128(38, 10), "decimal:128:38:10")]
+    #[case::decimal256(DataType::Decimal256(76, 0), "decimal:256:76:0")]
+    #[case::fixed_size_list_decimal32(
+        DataType::FixedSizeList(
+            Arc::new(ArrowField::new("item", DataType::Decimal32(9, 2), true)),
+            4
+        ),
+        "fixed_size_list:decimal:32:9:2:4"
+    )]
+    fn test_decimal_logical_type_encoding(#[case] data_type: DataType, #[case] expected: &str) {
+        let logical_type = LogicalType::try_from(&data_type).unwrap();
+        assert_eq!(logical_type.to_string(), expected);
+        assert_eq!(DataType::try_from(&logical_type).unwrap(), data_type);
+    }
+
+    #[rstest]
+    #[case::bits_16("decimal:16:4:2", 16)]
+    #[case::bits_512("decimal:512:10:2", 512)]
+    fn test_decimal_logical_type_rejects_unknown_bit_width(
+        #[case] encoded: &str,
+        #[case] bits: i16,
+    ) {
+        let err = DataType::try_from(&LogicalType::from(encoded)).unwrap_err();
+        assert!(
+            matches!(err, Error::Schema { .. }),
+            "unexpected error: {err}"
+        );
+        assert!(
+            err.to_string().contains(&format!(
+                "Only Decimal32, Decimal64, Decimal128 and Decimal256 are supported. Found {bits}"
+            )),
             "unexpected error: {err}"
         );
     }

@@ -7336,3 +7336,21 @@ def test_row_address_index_maintenance(tmp_path, index_type):
     # both rows remain available through physical-address coverage as well.
     dataset.optimize.optimize_indices()
     _assert_row_address_case(index_type, dataset, 16)
+
+
+@pytest.mark.skipif(
+    not hasattr(pa, "decimal32"), reason="pyarrow before 19 has no decimal32"
+)
+@pytest.mark.parametrize("index_type", ["BTREE", "BITMAP", "ZONEMAP"])
+@pytest.mark.parametrize("width", [32, 64])
+def test_decimal32_and_decimal64_scalar_index(tmp_path, index_type, width):
+    data_type = pa.decimal32(9, 2) if width == 32 else pa.decimal64(18, 2)
+    values = pa.array([Decimal("1.00"), Decimal("-2.00"), None], data_type)
+    ds = lance.write_dataset(
+        pa.table({"value": values}), tmp_path, data_storage_version="2.3"
+    )
+    ds.create_scalar_index("value", index_type)
+
+    scanner = ds.scanner(filter="value = -2")
+    assert "ScalarIndexQuery" in scanner.explain_plan()
+    assert scanner.to_table()["value"].to_pylist() == [Decimal("-2.00")]

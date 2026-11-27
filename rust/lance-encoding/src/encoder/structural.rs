@@ -27,6 +27,10 @@ use super::{ColumnIndexSequence, FieldEncoder, FieldEncodingContext};
 #[derive(Debug, Clone)]
 pub struct PrimitiveFieldEncoding {
     page_encodings: Arc<[PrimitivePageEncoding]>,
+    /// Whether `Decimal32` and `Decimal64` values get an encoder; when false they are
+    /// rejected. File versions whose released readers cannot parse the `decimal:32` and
+    /// `decimal:64` logical types leave this off.
+    allows_decimal32_and_decimal64: bool,
 }
 
 impl PrimitiveFieldEncoding {
@@ -34,7 +38,15 @@ impl PrimitiveFieldEncoding {
     pub fn new(page_encodings: impl IntoIterator<Item = PrimitivePageEncoding>) -> Self {
         Self {
             page_encodings: page_encodings.into_iter().collect(),
+            allows_decimal32_and_decimal64: false,
         }
+    }
+
+    /// Accept `Decimal32` and `Decimal64` values, including inside fixed-size lists and
+    /// packed structs.
+    pub fn with_decimal32_and_decimal64(mut self) -> Self {
+        self.allows_decimal32_and_decimal64 = true;
+        self
     }
 
     fn is_primitive_type(data_type: &DataType) -> bool {
@@ -45,6 +57,8 @@ impl PrimitiveFieldEncoding {
                 DataType::Boolean
                     | DataType::Date32
                     | DataType::Date64
+                    | DataType::Decimal32(_, _)
+                    | DataType::Decimal64(_, _)
                     | DataType::Decimal128(_, _)
                     | DataType::Decimal256(_, _)
                     | DataType::Duration(_)
@@ -70,6 +84,20 @@ impl PrimitiveFieldEncoding {
                     | DataType::Utf8
                     | DataType::LargeUtf8,
             ),
+        }
+    }
+
+    /// Whether a value this mechanism encodes holds a `Decimal32` or `Decimal64` anywhere.
+    fn contains_decimal32_or_decimal64(data_type: &DataType) -> bool {
+        match data_type {
+            DataType::Decimal32(_, _) | DataType::Decimal64(_, _) => true,
+            DataType::FixedSizeList(inner, _) => {
+                Self::contains_decimal32_or_decimal64(inner.data_type())
+            }
+            DataType::Struct(fields) => fields
+                .iter()
+                .any(|child| Self::contains_decimal32_or_decimal64(child.data_type())),
+            _ => false,
         }
     }
 
@@ -127,6 +155,14 @@ impl PrimitiveFieldEncoding {
         }
         if field.is_packed_struct() {
             validate_packed_struct_children(field)?;
+        }
+        if !self.allows_decimal32_and_decimal64 && Self::contains_decimal32_or_decimal64(&data_type)
+        {
+            return Err(Error::invalid_input(format!(
+                "field '{}' has data type {}, which the selected file format cannot store; \
+                 write Decimal32 and Decimal64 columns with file version 2.3 or later",
+                field.name, data_type
+            )));
         }
 
         Ok(Some(self.create_at(

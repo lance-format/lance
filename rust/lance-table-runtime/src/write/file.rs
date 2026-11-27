@@ -27,6 +27,7 @@ use object_store::ObjectStoreExt;
 use object_store::path::Path;
 
 use super::bases::blob_v2_external_base_resolver;
+use super::schema::validate_decimal32_and_decimal64;
 use super::schema_adapter::SchemaAdapter;
 use super::{ExternalBlobMode, WriteParams};
 use crate::Table;
@@ -605,6 +606,7 @@ pub async fn open_writer(
     base_dir: &Path,
     options: WriterOptions,
 ) -> Result<Box<dyn GenericWriter>> {
+    validate_decimal32_and_decimal64(schema, version)?;
     match version {
         ConcreteFileVersion::V1 => open_v1_writer(object_store, schema, base_dir, options).await,
         ConcreteFileVersion::V2_0 | ConcreteFileVersion::V2_1 => {

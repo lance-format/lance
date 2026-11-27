@@ -51,6 +51,8 @@ impl TryFrom<&DataType> for JsonDataType {
             | DataType::Float16
             | DataType::Float32
             | DataType::Float64
+            | DataType::Decimal32(_, _)
+            | DataType::Decimal64(_, _)
             | DataType::Decimal128(_, _)
             | DataType::Decimal256(_, _)
             | DataType::Utf8
@@ -344,6 +346,8 @@ mod test {
         assert_primitive_types(DataType::Date32, "date32:day");
         assert_primitive_types(DataType::Date64, "date64:ms");
         assert_primitive_types(DataType::Time32(TimeUnit::Second), "time32:s");
+        assert_primitive_types(DataType::Decimal32(9, 2), "decimal:32:9:2");
+        assert_primitive_types(DataType::Decimal64(18, 4), "decimal:64:18:4");
         assert_primitive_types(DataType::Decimal128(38, 10), "decimal:128:38:10");
         assert_primitive_types(DataType::Decimal256(76, 20), "decimal:256:76:20");
         assert_primitive_types(DataType::Decimal128(18, 6), "decimal:128:18:6");

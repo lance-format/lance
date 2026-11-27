@@ -206,6 +206,44 @@ mod tests {
         );
     }
 
+    /// The legacy writer is opened without the dataset writer, so the fragment
+    /// builder checks the version itself, for one fragment and for many.
+    #[rstest]
+    #[tokio::test]
+    async fn test_fragment_write_rejects_decimal32_before_2_3(
+        #[values(LanceFileVersion::Legacy, LanceFileVersion::V2_2)] version: LanceFileVersion,
+        #[values(false, true)] multi: bool,
+    ) {
+        let decimals = arrow_array::Decimal32Array::from(vec![1, -2])
+            .with_precision_and_scale(9, 2)
+            .unwrap();
+        let batch =
+            RecordBatch::try_from_iter([("d", Arc::new(decimals) as arrow_array::ArrayRef)])
+                .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+        let tmp_dir = TempStrDir::default();
+        let params = WriteParams {
+            data_storage_version: Some(version),
+            ..Default::default()
+        };
+        let builder = FragmentCreateBuilder::new(&tmp_dir).write_params(&params);
+        let error = if multi {
+            builder.write_fragments(reader).await.unwrap_err()
+        } else {
+            builder.write(reader, None).await.unwrap_err()
+        };
+        assert!(
+            matches!(error, Error::InvalidInput { .. }),
+            "{version:?}: {error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("require data storage version 2.3 or later"),
+            "{version:?}: {error}"
+        );
+    }
+
     #[tokio::test]
     async fn test_fragment_write_default_schema() {
         // Infers schema and uses 0 as default field id

@@ -233,7 +233,10 @@ pub fn safe_coerce_scalar(value: &ScalarValue, ty: &DataType) -> Option<ScalarVa
             }
             DataType::Float32 => val.map(|v| ScalarValue::Float32(Some(v as f32))),
             DataType::Float64 => val.map(|v| ScalarValue::Float64(Some(v as f64))),
-            DataType::Decimal128(_, _) | DataType::Decimal256(_, _) => value.cast_to(ty).ok(),
+            DataType::Decimal32(_, _)
+            | DataType::Decimal64(_, _)
+            | DataType::Decimal128(_, _)
+            | DataType::Decimal256(_, _) => value.cast_to(ty).ok(),
             DataType::Time32(TimeUnit::Second) => val.and_then(|v| {
                 i32::try_from(v)
                     .ok()
@@ -589,6 +592,14 @@ pub fn safe_coerce_scalar(value: &ScalarValue, ty: &DataType) -> Option<ScalarVa
         },
         ScalarValue::LargeBinary(_) => match ty {
             DataType::LargeBinary => Some(value.clone()),
+            _ => None,
+        },
+        ScalarValue::Decimal32(_, _, _) => match ty {
+            DataType::Decimal32(_, _) => value.cast_to(ty).ok(),
+            _ => None,
+        },
+        ScalarValue::Decimal64(_, _, _) => match ty {
+            DataType::Decimal64(_, _) => value.cast_to(ty).ok(),
             _ => None,
         },
         ScalarValue::Decimal128(_, _, _) => match ty {
@@ -1256,6 +1267,24 @@ mod tests {
                 &DataType::Decimal256(76, 2),
             ),
             Some(ScalarValue::Decimal256(Some(i256::from_i128(200)), 76, 2))
+        );
+        assert_eq!(
+            safe_coerce_scalar(&ScalarValue::Int64(Some(2)), &DataType::Decimal32(9, 2)),
+            Some(ScalarValue::Decimal32(Some(200), 9, 2))
+        );
+        assert_eq!(
+            safe_coerce_scalar(
+                &ScalarValue::Decimal64(Some(2), 18, 0),
+                &DataType::Decimal64(18, 2),
+            ),
+            Some(ScalarValue::Decimal64(Some(200), 18, 2))
+        );
+        assert_eq!(
+            safe_coerce_scalar(
+                &ScalarValue::Int64(Some(10_000_000)),
+                &DataType::Decimal32(9, 2)
+            ),
+            None
         );
     }
 
