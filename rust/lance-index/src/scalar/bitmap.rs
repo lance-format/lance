@@ -1911,8 +1911,7 @@ impl<'a> OldSegments<'a> {
             let index = segments[source_idx].index;
             let reader = if bound_local_readers && index.store.readers_may_pin_local_files() {
                 MergeBitmapReader::Window {
-                    start: 0,
-                    bitmaps: BinaryArray::new_null(0),
+                    window: BitmapWindow::default(),
                     rows_per_read: if index.rows_follow_key_order() {
                         MERGE_BITMAP_BATCH_ROWS as usize
                     } else {
@@ -2460,10 +2459,63 @@ enum MergeBitmapReader<'a> {
     Stream(SequentialBitmapReader<'a>),
     Random,
     Window {
-        start: usize,
-        bitmaps: BinaryArray,
+        window: BitmapWindow,
         rows_per_read: usize,
     },
+}
+
+// Binary offsets are relative to one Arrow array. Keep the decoded batches
+// separate even when their combined payload exceeds the i32 offset range.
+#[derive(Default)]
+struct BitmapWindow {
+    range: std::ops::Range<usize>,
+    batches: Vec<(usize, BinaryArray)>,
+}
+
+impl BitmapWindow {
+    async fn load(reader: &dyn IndexReader, range: std::ops::Range<usize>) -> Result<Self> {
+        let batch_rows = if reader.guarantees_byte_splitting() {
+            range.len() as u64
+        } else {
+            1
+        };
+        let mut stream = reader
+            .read_range_stream(range.clone(), Some(&["bitmaps"]), batch_rows, 1)
+            .await?;
+        let mut batches = Vec::new();
+        let mut next = range.start;
+        while let Some(batch) = stream.try_next().await? {
+            let values = batch
+                .column_by_name("bitmaps")
+                .expect_ok()?
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .ok_or_else(|| Error::internal("Invalid bitmap column type".to_string()))?;
+            if values.len() > range.end - next {
+                return Err(Error::corrupt_file(
+                    Path::from(BITMAP_LOOKUP_NAME),
+                    "excess rows in bitmap range",
+                ));
+            }
+            if !values.is_empty() {
+                batches.push((next, values.clone()));
+                next += values.len();
+            }
+        }
+        if next != range.end {
+            return Err(Error::corrupt_file(
+                Path::from(BITMAP_LOOKUP_NAME),
+                "incomplete bitmap range",
+            ));
+        }
+        Ok(Self { range, batches })
+    }
+
+    fn bitmap(&self, row: usize) -> Result<RowAddrTreeMap> {
+        let position = self.batches.partition_point(|(start, _)| *start <= row);
+        let (start, batch) = &self.batches[position - 1];
+        deserialize_bitmap(batch.value(row - start), BITMAP_LOOKUP_NAME)
+    }
 }
 
 impl MergeBitmapReader<'_> {
@@ -2472,12 +2524,10 @@ impl MergeBitmapReader<'_> {
             Self::Stream(reader) => reader.read(row).await,
             Self::Random => index.read_bitmap_at(row).await,
             Self::Window {
-                start,
-                bitmaps,
+                window,
                 rows_per_read,
             } => {
-                if row < *start || row - *start >= bitmaps.len() {
-                    // Query readers retain their file for the lifetime of the index.
+                if !window.range.contains(&row) {
                     let reader = index.store.open_index_file(BITMAP_LOOKUP_NAME).await?;
                     let first = row / *rows_per_read * *rows_per_read;
                     let end = first.saturating_add(*rows_per_read).min(reader.num_rows());
@@ -2487,23 +2537,9 @@ impl MergeBitmapReader<'_> {
                             format!("bitmap row {row} exceeds lookup file length"),
                         ));
                     }
-                    let batch = reader.read_range(first..end, Some(&["bitmaps"])).await?;
-                    let values = batch
-                        .column_by_name("bitmaps")
-                        .expect_ok()?
-                        .as_any()
-                        .downcast_ref::<BinaryArray>()
-                        .ok_or_else(|| Error::internal("Invalid bitmap column type".to_string()))?;
-                    if values.len() != end - first {
-                        return Err(Error::corrupt_file(
-                            Path::from(BITMAP_LOOKUP_NAME),
-                            "incomplete bitmap range",
-                        ));
-                    }
-                    *start = first;
-                    *bitmaps = values.clone();
+                    *window = BitmapWindow::load(reader.as_ref(), first..end).await?;
                 }
-                let bitmap = deserialize_bitmap(bitmaps.value(row - *start), BITMAP_LOOKUP_NAME)?;
+                let bitmap = window.bitmap(row)?;
                 index.remap_stored_bitmap(bitmap).await
             }
         }
@@ -5537,6 +5573,69 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(read_bitmap_contents(dest.as_ref()).await, expected);
+    }
+
+    #[tokio::test]
+    async fn bitmap_window_reads_postings_across_a_decoder_split() -> Result<()> {
+        struct SplitReader;
+        #[async_trait]
+        impl IndexReader for SplitReader {
+            async fn read_range_stream(
+                &self,
+                range: std::ops::Range<usize>,
+                projection: Option<&[&str]>,
+                batch_size: u64,
+                _: u32,
+            ) -> Result<Pin<Box<dyn RecordBatchStream>>> {
+                assert_eq!(range, 8..12);
+                assert_eq!(projection, Some(&["bitmaps"][..]));
+                assert_eq!(batch_size, 4);
+                let mut batches = Vec::new();
+                for start in [8, 10] {
+                    let mut builder = BinaryBuilder::new();
+                    for row in start..start + 2 {
+                        let mut bytes = Vec::new();
+                        RowAddrTreeMap::from_iter([row]).serialize_into(&mut bytes)?;
+                        builder.append_value(bytes);
+                    }
+                    batches.push(RecordBatch::try_from_iter([(
+                        "bitmaps",
+                        Arc::new(builder.finish()) as ArrayRef,
+                    )])?);
+                }
+                Ok(Box::pin(lance_io::stream::RecordBatchStreamAdapter::new(
+                    batches[0].schema(),
+                    stream::iter(batches.into_iter().map(Ok)),
+                )))
+            }
+            fn guarantees_byte_splitting(&self) -> bool {
+                true
+            }
+            async fn read_record_batch(&self, _: u64, _: u64) -> Result<RecordBatch> {
+                unreachable!()
+            }
+            async fn read_range(
+                &self,
+                _: std::ops::Range<usize>,
+                _: Option<&[&str]>,
+            ) -> Result<RecordBatch> {
+                unreachable!()
+            }
+            async fn num_batches(&self, _: u64) -> u32 {
+                unreachable!()
+            }
+            fn schema(&self) -> &lance_core::datatypes::Schema {
+                unreachable!()
+            }
+            fn num_rows(&self) -> usize {
+                12
+            }
+        }
+        let window = BitmapWindow::load(&SplitReader, 8..12).await?;
+        for row in [10, 9, 11, 8] {
+            assert_eq!(window.bitmap(row)?, RowAddrTreeMap::from_iter([row as u64]));
+        }
+        Ok(())
     }
 
     #[tokio::test]
