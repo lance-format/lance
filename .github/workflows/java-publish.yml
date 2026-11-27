@@ -160,12 +160,21 @@ jobs:
         with:
           distribution: corretto
           java-version: 11
-          cache: "maven"
           server-id: ossrh
           server-username: SONATYPE_USER
           server-password: SONATYPE_TOKEN
           gpg-private-key: ${{ secrets.GPG_PRIVATE_KEY }}
           gpg-passphrase: ${{ secrets.GPG_PASSPHRASE }}
+      # Reuse the warm test cache from main rather than saving one-shot tag caches
+      # that future release tags cannot read due to GitHub Actions cache scoping.
+      - name: Restore Maven dependencies
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        env:
+          MAVEN_CACHE_PREFIX: maven-java-tests-${{ runner.os }}-${{ runner.arch }}-with-spotless-
+        with:
+          path: ~/.m2/repository
+          key: ${{ env.MAVEN_CACHE_PREFIX }}${{ hashFiles('java/**/pom.xml', 'java/.mvn/**') }}
+          restore-keys: ${{ env.MAVEN_CACHE_PREFIX }}
       - name: Set up Maven
         working-directory: java
         run: |
@@ -197,7 +206,10 @@ jobs:
           inputs.mode == 'dry_run'
         working-directory: java
         run: |
-          ./mvnw --batch-mode -DskipTests -Dskip.build.jni=true package
+          # Use Maven Resolver's simple local repository manager so the wrapper's
+          # Maven 3.9.9 reuses ~/.m2/repository populated by java.yml without
+          # re-verifying _remote.repositories entries against Maven Central.
+          ./mvnw --batch-mode -Daether.priority.SimpleLocalRepositoryManagerFactory=100 -Daether.connector.http.retryHandler.count=6 -DskipTests -Dskip.build.jni=true package
       - name: Publish with Java 11
         if: |
           github.event_name == 'release' ||
@@ -207,7 +219,7 @@ jobs:
           echo "use-agent" >> ~/.gnupg/gpg.conf
           echo "pinentry-mode loopback" >> ~/.gnupg/gpg.conf
           export GPG_TTY=$(tty)
-          ./mvnw --batch-mode -DskipTests -Dskip.build.jni=true -DpushChanges=false -Dgpg.passphrase=${{ secrets.GPG_PASSPHRASE }} deploy -P deploy-to-ossrh
+          ./mvnw --batch-mode -Daether.priority.SimpleLocalRepositoryManagerFactory=100 -Daether.connector.http.retryHandler.count=6 -DskipTests -Dskip.build.jni=true -DpushChanges=false -Dgpg.passphrase=${{ secrets.GPG_PASSPHRASE }} deploy -P deploy-to-ossrh
         env:
           SONATYPE_USER: ${{ secrets.SONATYPE_USER }}
           SONATYPE_TOKEN: ${{ secrets.SONATYPE_TOKEN }}
