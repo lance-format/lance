@@ -3,6 +3,8 @@
 // SPDX-FileCopyrightText: Copyright 2023 Datafuse Labs
 // Adapted from databendlabs/jsonb at commit fba895c5ebe77ce2539e187f9c652f51cbf195c3.
 
+#![warn(clippy::undocumented_unsafe_blocks)]
+
 //! JSONB encoding for Lance JSON columns.
 //!
 //! Lance stores `lance.json` columns as JSONB values in `LargeBinary` arrays.

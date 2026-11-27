@@ -129,7 +129,7 @@ impl<'de> Deserializer<'de> {
     fn read_payload_str(&mut self, length: usize) -> Result<Cow<'_, str>> {
         let start = self.index;
         let end = self.index + length;
-        let s = unsafe { std::str::from_utf8_unchecked(&self.raw.data[start..end]) };
+        let s = std::str::from_utf8(&self.raw.data[start..end])?;
         self.index = end;
         Ok(Cow::Borrowed(s))
     }

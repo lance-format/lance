@@ -12,6 +12,7 @@ use lance_jsonb::Date;
 use lance_jsonb::Decimal64;
 use lance_jsonb::Decimal128;
 use lance_jsonb::Decimal256;
+use lance_jsonb::Error;
 use lance_jsonb::Interval;
 use lance_jsonb::Number;
 use lance_jsonb::OwnedJsonb;
@@ -19,6 +20,7 @@ use lance_jsonb::RawJsonb;
 use lance_jsonb::Timestamp;
 use lance_jsonb::TimestampTz;
 use lance_jsonb::Value;
+use lance_jsonb::from_raw_jsonb;
 use lance_jsonb::jsonpath::Selector;
 use lance_jsonb::jsonpath::parse_json_path;
 use lance_jsonb::parse_value;
@@ -360,6 +362,61 @@ fn test_array_elements_stops_after_a_decode_error() {
     assert!(elements.next().unwrap().is_err());
     assert!(elements.next().is_none());
     assert_eq!(elements.size_hint(), (0, Some(0)));
+}
+
+#[test]
+fn test_invalid_utf8_is_rejected() {
+    fn with_invalid_utf8(json: &str, payload_offset: usize) -> OwnedJsonb {
+        let mut data = json.parse::<OwnedJsonb>().unwrap().to_vec();
+        data[payload_offset] = 0xff;
+        OwnedJsonb::from(data)
+    }
+
+    fn assert_invalid_utf8<T: std::fmt::Debug>(result: Result<T, Error>) {
+        let error = result.unwrap_err();
+        assert!(matches!(error, Error::InvalidUtf8));
+        assert_eq!(error.to_string(), "InvalidUtf8");
+    }
+
+    fn assert_serde_invalid_utf8(raw: &RawJsonb<'_>) {
+        let error = serde_json::to_string(raw).unwrap_err();
+        assert!(
+            error.to_string().contains("invalid utf-8"),
+            "unexpected error: {error}"
+        );
+    }
+
+    // A scalar header and its JEntry occupy the first eight bytes.
+    let scalar = with_invalid_utf8(r#""a""#, 8);
+    let raw = scalar.as_raw();
+    assert_invalid_utf8(from_raw_jsonb::<String>(&raw));
+    assert_invalid_utf8(raw.to_str());
+    assert_serde_invalid_utf8(&raw);
+
+    // A one-element array header and its JEntry also occupy eight bytes.
+    let array = with_invalid_utf8(r#"["a"]"#, 8);
+    let raw = array.as_raw();
+    assert_invalid_utf8(raw.get_by_index(0));
+    let mut elements = raw.array_elements().unwrap().unwrap();
+    assert_invalid_utf8(elements.next().unwrap());
+    assert!(elements.next().is_none());
+    assert_serde_invalid_utf8(&raw);
+
+    // An object header and two JEntries occupy twelve bytes. The one-byte key
+    // precedes the value payload.
+    let object_value = with_invalid_utf8(r#"{"a":"b"}"#, 13);
+    let raw = object_value.as_raw();
+    assert_invalid_utf8(raw.get_by_name("a", false));
+    let path = parse_json_path(b"$.*").unwrap();
+    assert_invalid_utf8(Selector::new(raw).select_values(&path));
+    assert_serde_invalid_utf8(&raw);
+
+    let object_key = with_invalid_utf8(r#"{"a":"b"}"#, 12);
+    assert_serde_invalid_utf8(&object_key.as_raw());
+
+    let unicode = r#"{"emoji":"💎","ключ":"значение"}"#;
+    let valid = unicode.parse::<OwnedJsonb>().unwrap();
+    assert_eq!(valid.as_raw().to_string(), unicode);
 }
 
 #[test]

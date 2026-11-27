@@ -42,7 +42,7 @@ impl<'a> JsonbItem<'a> {
                     FALSE_TAG => JsonbItem::Boolean(false),
                     NUMBER_TAG => JsonbItem::Number(NumberItem::Raw(data)),
                     STRING_TAG => {
-                        let s = Cow::Borrowed(unsafe { std::str::from_utf8_unchecked(data) });
+                        let s = Cow::Borrowed(std::str::from_utf8(data)?);
                         JsonbItem::String(s)
                     }
                     EXTENSION_TAG => JsonbItem::Extension(ExtensionItem::Raw(data)),
@@ -156,7 +156,7 @@ impl<'a> RawJsonb<'a> {
             end: item_offset + value_len,
         };
         let value_data = self.slice(value_range)?;
-        let value_item = jentry_to_jsonb_item(value_jentry, value_data);
+        let value_item = jentry_to_jsonb_item(value_jentry, value_data)?;
         Ok(Some(value_item))
     }
 
@@ -544,18 +544,16 @@ impl ExtensionValue<'_> {
     }
 }
 
-pub(super) fn jentry_to_jsonb_item(jentry: JEntry, data: &[u8]) -> JsonbItem<'_> {
-    match jentry.type_code {
+pub(super) fn jentry_to_jsonb_item(jentry: JEntry, data: &[u8]) -> Result<JsonbItem<'_>> {
+    let item = match jentry.type_code {
         NULL_TAG => JsonbItem::Null,
         TRUE_TAG => JsonbItem::Boolean(true),
         FALSE_TAG => JsonbItem::Boolean(false),
         NUMBER_TAG => JsonbItem::Number(NumberItem::Raw(data)),
-        STRING_TAG => {
-            let s = Cow::Borrowed(unsafe { std::str::from_utf8_unchecked(data) });
-            JsonbItem::String(s)
-        }
+        STRING_TAG => JsonbItem::String(Cow::Borrowed(std::str::from_utf8(data)?)),
         EXTENSION_TAG => JsonbItem::Extension(ExtensionItem::Raw(data)),
         CONTAINER_TAG => JsonbItem::Raw(RawJsonb::new(data)),
         _ => unreachable!(),
-    }
+    };
+    Ok(item)
 }

@@ -71,7 +71,7 @@ impl<'a> Iterator for ArrayIterator<'a> {
         self.jentry_offset += 4;
         self.item_offset += item_length;
 
-        Some(Ok(item))
+        Some(item)
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -151,7 +151,7 @@ impl<'a> Iterator for ObjectValueIterator<'a> {
         self.jentry_offset += 4;
         self.item_offset += val_length;
 
-        Some(Ok(val_item))
+        Some(val_item)
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -235,7 +235,7 @@ impl<'a> Iterator for ObjectIterator<'a> {
             Ok(data) => data,
             Err(err) => return Some(Err(err)),
         };
-        let key = unsafe { std::str::from_utf8_unchecked(key_data) };
+        let key = std::str::from_utf8(key_data);
 
         let val_range = Range {
             start: self.val_offset,
@@ -245,7 +245,9 @@ impl<'a> Iterator for ObjectIterator<'a> {
             Ok(data) => data,
             Err(err) => return Some(Err(err)),
         };
-        let val_item = jentry_to_jsonb_item(val_jentry, val_data);
+        let item = key
+            .map_err(crate::error::Error::from)
+            .and_then(|key| jentry_to_jsonb_item(val_jentry, val_data).map(|value| (key, value)));
 
         self.index += 1;
         self.key_jentry_offset += 4;
@@ -253,7 +255,7 @@ impl<'a> Iterator for ObjectIterator<'a> {
         self.key_offset += key_length;
         self.val_offset += val_length;
 
-        Some(Ok((key, val_item)))
+        Some(item)
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -267,7 +269,7 @@ impl ExactSizeIterator for ObjectIterator<'_> {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::OwnedJsonb;
+    use crate::{Error, OwnedJsonb};
 
     fn owned(json: &str) -> OwnedJsonb {
         json.parse().unwrap()
@@ -337,6 +339,32 @@ mod tests {
         assert_eq!(key, "third");
         assert_eq!(value, JsonbItem::Boolean(true));
         assert_eq!(iter.size_hint(), (0, Some(0)));
+        assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn object_iterator_rejects_invalid_utf8_key() {
+        let mut data = owned(r#"{"a":1}"#).to_vec();
+        data[12] = 0xff;
+        let jsonb = OwnedJsonb::from(data);
+        let mut iter = ObjectIterator::new(jsonb.as_raw()).unwrap().unwrap();
+
+        let error = iter.next().unwrap().unwrap_err();
+        assert!(matches!(error, Error::InvalidUtf8));
+        assert_eq!(error.to_string(), "InvalidUtf8");
+        assert!(iter.next().is_none());
+        assert_eq!(iter.size_hint(), (0, Some(0)));
+    }
+
+    #[test]
+    fn object_iterator_returns_key_error_before_decoding_value() {
+        let mut data = owned(r#"{"a":1}"#).to_vec();
+        data[8..12].copy_from_slice(&0x70000000_u32.to_be_bytes());
+        data[12] = 0xff;
+        let jsonb = OwnedJsonb::from(data);
+        let mut iter = ObjectIterator::new(jsonb.as_raw()).unwrap().unwrap();
+
+        assert_eq!(iter.next().unwrap().unwrap_err(), Error::InvalidUtf8);
         assert!(iter.next().is_none());
     }
 

@@ -109,6 +109,8 @@ fn test_parse_f64() {
     let i64_min_minus_one = format!("{}", (i64::MIN as f64) - 1.0);
     let u64_max_plus_one = format!("{}", (u64::MAX as f64) + 1.0);
     let epsilon = format!("{}", f64::EPSILON);
+    let decimal128_digit_limit = "9".repeat(38);
+    let decimal256_digit_limit = "9".repeat(76);
 
     let tests = vec![
         (
@@ -182,6 +184,14 @@ fn test_parse_f64() {
             Value::Number(Number::Float64((u64::MAX as f64) + 1.0)),
         ),
         (&epsilon, Value::Number(Number::Float64(f64::EPSILON))),
+        (
+            &decimal128_digit_limit,
+            Value::Number(Number::Float64(1e38)),
+        ),
+        (
+            &decimal256_digit_limit,
+            Value::Number(Number::Float64(1e76)),
+        ),
         (
             "0.0000000000000000000000000000000000000000000000000123e50",
             Value::Number(Number::Float64(1.23)),

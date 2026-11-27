@@ -51,9 +51,8 @@ impl Serialize for RawJsonb<'_> {
                         num.serialize(serializer)
                     }
                     STRING_TAG => {
-                        let s = unsafe {
-                            std::str::from_utf8_unchecked(&self.data[payload_start..payload_end])
-                        };
+                        let s = std::str::from_utf8(&self.data[payload_start..payload_end])
+                            .map_err(|e| ser::Error::custom(format!("{e}")))?;
                         serializer.serialize_str(s)
                     }
                     EXTENSION_TAG => {
@@ -90,11 +89,8 @@ impl Serialize for RawJsonb<'_> {
                             serialize_seq.serialize_element(&num)?;
                         }
                         STRING_TAG => {
-                            let s = unsafe {
-                                std::str::from_utf8_unchecked(
-                                    &self.data[payload_start..payload_end],
-                                )
-                            };
+                            let s = std::str::from_utf8(&self.data[payload_start..payload_end])
+                                .map_err(|e| ser::Error::custom(format!("{e}")))?;
                             serialize_seq.serialize_element(&s)?;
                         }
                         EXTENSION_TAG => {
@@ -131,11 +127,8 @@ impl Serialize for RawJsonb<'_> {
                     let payload_end = payload_start + jentry.length as usize;
                     match jentry.type_code {
                         STRING_TAG => {
-                            let s = unsafe {
-                                std::str::from_utf8_unchecked(
-                                    &self.data[payload_start..payload_end],
-                                )
-                            };
+                            let s = std::str::from_utf8(&self.data[payload_start..payload_end])
+                                .map_err(|e| ser::Error::custom(format!("{e}")))?;
                             keys.push_back(s);
                         }
                         _ => {
@@ -163,11 +156,8 @@ impl Serialize for RawJsonb<'_> {
                             serialize_map.serialize_entry(&k, &num)?;
                         }
                         STRING_TAG => {
-                            let s = unsafe {
-                                std::str::from_utf8_unchecked(
-                                    &self.data[payload_start..payload_end],
-                                )
-                            };
+                            let s = std::str::from_utf8(&self.data[payload_start..payload_end])
+                                .map_err(|e| ser::Error::custom(format!("{e}")))?;
                             serialize_map.serialize_entry(&k, &s)?;
                         }
                         EXTENSION_TAG => {
