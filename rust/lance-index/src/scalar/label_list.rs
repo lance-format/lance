@@ -49,8 +49,8 @@ use super::{BuiltinIndexType, SargableQuery, ScalarIndexParams};
 use super::{MetricsCollector, SearchResult};
 use crate::pbold;
 use crate::scalar::bitmap::{
-    BitmapIndexState, OldSegment, build_index_map, merge_index_maps, merge_source_entry_count,
-    new_bitmap_batch_writer, remap_index_map, remap_row_addrs_with,
+    BitmapIndexState, OldSegment, PostingRemap, build_index_map, merge_index_maps,
+    merge_source_entry_count, new_bitmap_batch_writer, remap_index_map,
 };
 use crate::scalar::expression::{LabelListQueryParser, ScalarQueryParser};
 use crate::scalar::registry::{
@@ -273,7 +273,8 @@ impl LabelListIndex {
         mapping: RowAddrTranslatorRef<'_>,
         dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex> {
-        let remapped_nulls = remap_row_addrs_with(&self.list_nulls, mapping).await?;
+        let mut mapping = PostingRemap::new(mapping);
+        let remapped_nulls = mapping.apply(&self.list_nulls).await?;
         let mut writer = new_bitmap_batch_writer(
             dest_store,
             BITMAP_LOOKUP_NAME,
@@ -286,7 +287,7 @@ impl LabelListIndex {
                 serialize_list_nulls(&remapped_nulls)?,
             )
             .await?;
-        remap_index_map(&self.values_index, mapping, &mut writer).await?;
+        remap_index_map(&self.values_index, &mut mapping, &mut writer).await?;
         let file = writer.finish().await?;
 
         Ok(CreatedIndex {

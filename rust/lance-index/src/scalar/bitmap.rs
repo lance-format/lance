@@ -37,7 +37,7 @@ use lance_core::{
 };
 use lance_io::object_store::ObjectStore;
 use lance_io::stream::RecordBatchStream;
-use lance_select::{NullableRowAddrSet, RowAddrTreeMap, RowSetOps};
+use lance_select::{NullableRowAddrSet, RowAddrSelection, RowAddrTreeMap, RowSetOps};
 use object_store::path::Path;
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
@@ -1120,7 +1120,7 @@ impl BitmapIndex {
     ) -> Result<CreatedIndex> {
         let mut writer =
             new_bitmap_batch_writer(dest_store, BITMAP_LOOKUP_NAME, &self.value_type).await?;
-        remap_index_map(self, mapping, &mut writer).await?;
+        remap_index_map(self, &mut PostingRemap::new(mapping), &mut writer).await?;
         let file = writer.finish().await?;
 
         Ok(CreatedIndex {
@@ -2359,76 +2359,107 @@ pub(crate) async fn build_index_map(
 ///
 /// A key whose remapped bitmap comes out empty (every one of its rows deleted)
 /// is not written, the rule [`BitmapBatchWriter::emit`] applies to every path.
-pub(crate) async fn remap_index_map(
+pub(super) async fn remap_index_map(
     index: &BitmapIndex,
-    mapping: RowAddrTranslatorRef<'_>,
+    mapping: &mut PostingRemap<'_>,
     writer: &mut BitmapBatchWriter,
 ) -> Result<()> {
     if !index.null_map.is_empty() {
         let null_key = new_null_array(index.value_type(), 1);
         let null_key = ScalarValue::try_from_array(null_key.as_ref(), 0)?;
         writer
-            .emit(
-                null_key,
-                &remap_row_addrs_with(&index.null_map, mapping).await?,
-            )
+            .emit(null_key, &mapping.apply(&index.null_map).await?)
             .await?;
     }
 
     for key in index.index_map.keys() {
         let bitmap = index.load_bitmap(key, None).await?;
         writer
-            .emit(
-                key.0.clone(),
-                &remap_row_addrs_with(&bitmap, mapping).await?,
-            )
+            .emit(key.0.clone(), &mapping.apply(&bitmap).await?)
             .await?;
     }
-
     Ok(())
 }
 
-/// [`remap_row_addrs`] through a [`RowAddrTranslator`]: a synchronous map
-/// remaps directly; a batch translator translates the posting in bounded
-/// batches (`remap_row_addrs_tree_map_async`) and never resolves it into a
-/// map, so one posting list is the unit of work here.
-pub(crate) async fn remap_row_addrs_with(
-    bitmap: &RowAddrTreeMap,
-    translator: RowAddrTranslatorRef<'_>,
-) -> Result<RowAddrTreeMap> {
-    match translator {
-        RowAddrTranslatorRef::Sync(mapping) => remap_row_addrs(bitmap, mapping),
-        RowAddrTranslatorRef::Batch(remapper) => {
-            remap_row_addrs_tree_map_async(remapper, bitmap).await
+/// Share the source fragment filter across all postings, including nulls.
+/// A direct map takes one visit per mapped address to build the filter. Defer
+/// that cost until the postings justify it (a sparse index may never do so).
+pub(super) struct PostingRemap<'a> {
+    translator: RowAddrTranslatorRef<'a>,
+    affected: Option<RoaringBitmap>,
+    rows_before_filter: u64,
+}
+
+impl<'a> PostingRemap<'a> {
+    pub(super) fn new(translator: RowAddrTranslatorRef<'a>) -> Self {
+        let rows_before_filter = match translator {
+            RowAddrTranslatorRef::Sync(RowAddrRemap::Direct(map)) => map.len() as u64,
+            _ => 0,
+        };
+        Self {
+            translator,
+            affected: None,
+            rows_before_filter,
         }
-        #[allow(unreachable_patterns)]
-        _ => Err(Error::not_supported(
-            "this build does not know how to translate through this row address translator",
-        )),
+    }
+
+    pub(super) async fn apply(&mut self, bitmap: &RowAddrTreeMap) -> Result<RowAddrTreeMap> {
+        match self.translator {
+            RowAddrTranslatorRef::Sync(mapping) => {
+                if self.affected.is_none() {
+                    self.rows_before_filter = self
+                        .rows_before_filter
+                        .saturating_sub(bitmap.len().unwrap_or(0));
+                    if self.rows_before_filter == 0 {
+                        self.affected = Some(mapping.affected_fragments());
+                    }
+                }
+                remap_posting(bitmap, mapping, self.affected.as_ref())
+            }
+            RowAddrTranslatorRef::Batch(remapper) => {
+                remap_row_addrs_tree_map_async(remapper, bitmap).await
+            }
+            #[allow(unreachable_patterns)]
+            _ => Err(Error::not_supported(
+                "this build does not know how to translate through this row address translator",
+            )),
+        }
     }
 }
 
-pub(crate) fn remap_row_addrs(
+fn remap_posting(
     bitmap: &RowAddrTreeMap,
     mapping: &RowAddrRemap,
+    affected: Option<&RoaringBitmap>,
 ) -> Result<RowAddrTreeMap> {
-    // `row_addrs` yields `None` when any fragment is a whole-fragment selection,
-    // which `RowAddrTreeMap::deserialize_from` produces for a zero-length
-    // per-fragment bitmap. Such a posting cannot be remapped address by address
-    // -- the individual addresses are not known -- so this is an error rather
-    // than something to paper over, and an error rather than the panic this
-    // inherited, since it crosses an FFI boundary.
-    let addrs = bitmap.row_addrs().ok_or_else(|| {
-        Error::invalid_input(
-            "Cannot remap a bitmap posting holding a whole-fragment selection; \
-             its individual row addresses are not enumerable"
-                .to_string(),
-        )
-    })?;
-    Ok(RowAddrTreeMap::from_iter(addrs.filter_map(|addr| {
-        let addr_as_u64 = u64::from(addr);
-        mapping.get(addr_as_u64).unwrap_or(Some(addr_as_u64))
-    })))
+    let mut moved = RowAddrTreeMap::new();
+    let mut unchanged = RowAddrTreeMap::new();
+    for (&fragment, selection) in bitmap.iter() {
+        let RowAddrSelection::Partial(offsets) = selection else {
+            return Err(Error::invalid_input(
+                "Cannot remap a bitmap posting holding a whole-fragment selection; its individual row addresses are not enumerable".to_string(),
+            ));
+        };
+        if affected.is_some_and(|ids| !ids.contains(fragment)) {
+            if !offsets.is_empty() {
+                unchanged.insert_bitmap(fragment, offsets.clone());
+            }
+        } else {
+            let base = u64::from(fragment) << 32;
+            moved.extend(offsets.iter().filter_map(|offset| {
+                let addr = base | u64::from(offset);
+                mapping.get(addr).unwrap_or(Some(addr))
+            }));
+        }
+    }
+    // A mapped address can land in a fragment which was not a source.
+    // Union (rather than replacing that fragment) preserves both sets.
+    if unchanged.is_empty() {
+        Ok(moved)
+    } else {
+        unchanged |= moved;
+        Ok(unchanged)
+    }
 }
 
 /// Total source entries a merge of `sources` will consume.
@@ -4021,6 +4052,44 @@ mod tests {
                 })
                 .collect(),
         )
+    }
+
+    #[tokio::test]
+    async fn posting_remap_preserves_unaffected_offsets_and_unions_destinations() {
+        let addr = |f, o| u64::from(RowAddress::new_from_parts(f, o));
+        let mapping = RowAddrRemap::direct(HashMap::from([
+            (addr(2, 0), Some(addr(1, 0))),
+            (addr(2, 1), Some(addr(3, 0))),
+            (addr(2, 2), None),
+        ]));
+        let mut remap = PostingRemap::new((&mapping).into());
+        let sparse = RowAddrTreeMap::from_iter([addr(1, 0)]);
+        assert_eq!(remap.apply(&sparse).await.unwrap(), sparse);
+        let mut mixed = RowAddrTreeMap::from_iter([
+            addr(1, 0),
+            addr(1, 1),
+            addr(2, 0),
+            addr(2, 1),
+            addr(2, 2),
+            addr(2, 3),
+            addr(3, 1),
+        ]);
+        mixed.insert_bitmap(4, RoaringBitmap::new());
+        assert_eq!(
+            remap.apply(&mixed).await.unwrap(),
+            RowAddrTreeMap::from_iter(
+                [addr(1, 0), addr(1, 1), addr(2, 3), addr(3, 0), addr(3, 1),]
+            )
+        );
+        mixed.insert_fragment(4);
+        assert!(
+            remap
+                .apply(&mixed)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("whole-fragment selection")
+        );
     }
 
     // remap must behave identically whether the mapping is compact or explicit.
