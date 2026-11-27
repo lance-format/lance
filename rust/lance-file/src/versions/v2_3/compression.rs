@@ -16,7 +16,7 @@ use lance_encoding::{
         try_raw_fixed_size_list_miniblock, try_raw_fixed_width_miniblock, try_raw_per_value,
         try_uncompressed_fixed_width_miniblock, try_variable_rle_block,
         try_variable_width_miniblock_with_generic_offsets, try_variable_width_per_value,
-        try_wide_bitpacking_block, try_wide_bitpacking_miniblock,
+        try_wide_bitpacking_block, try_wide_bitpacking_miniblock_with_target,
     },
     compression_config::{CompressionFieldParams, CompressionParams},
     data::DataBlock,
@@ -55,6 +55,10 @@ impl Strategy {
 }
 
 impl CompressionStrategy for Strategy {
+    fn minichunk_size(&self, field: &Field) -> Result<Option<u64>> {
+        self.params.minichunk_size(field, None)
+    }
+
     fn allows_byte_wide_fsl_booleans(&self) -> bool {
         true
     }
@@ -85,36 +89,37 @@ impl CompressionStrategy for Strategy {
         if let Some(compressor) = try_pcodec_miniblock(field, data, &params)? {
             return Ok(compressor);
         }
-        let compressor =
-            if let Some(compressor) = try_uncompressed_fixed_width_miniblock(data, &params) {
-                compressor
-            } else if let Some(compressor) = try_alp_miniblock(field, data, &params) {
-                compressor
-            } else if let Some(compressor) = try_byte_stream_split_miniblock(data, &params) {
-                compressor
-            } else if let Some(compressor) = try_child_rle_miniblock(data, &params) {
-                compressor
-            } else if let Some(compressor) = try_wide_bitpacking_miniblock(data) {
-                compressor
-            } else if let Some(compressor) = try_raw_fixed_width_miniblock(data) {
-                compressor
-            } else if let Some(compressor) =
-                try_variable_width_miniblock_with_generic_offsets(field, data, &params)?
-            {
-                compressor
-            } else if let Some(compressor) = try_fixed_packed_struct_miniblock(data)? {
-                compressor
-            } else if let Some(compressor) = try_raw_fixed_size_list_miniblock(data) {
-                compressor
-            } else {
-                return Err(Error::not_supported_source(
-                    format!(
-                        "Mini-block compression not yet supported for block type {}",
-                        data.name()
-                    )
-                    .into(),
-                ));
-            };
+        let compressor = if let Some(compressor) =
+            try_uncompressed_fixed_width_miniblock(data, &params)
+        {
+            compressor
+        } else if let Some(compressor) = try_alp_miniblock(field, data, &params) {
+            compressor
+        } else if let Some(compressor) = try_byte_stream_split_miniblock(data, &params) {
+            compressor
+        } else if let Some(compressor) = try_child_rle_miniblock(data, &params) {
+            compressor
+        } else if let Some(compressor) = try_wide_bitpacking_miniblock_with_target(data, &params) {
+            compressor
+        } else if let Some(compressor) = try_raw_fixed_width_miniblock(data) {
+            compressor
+        } else if let Some(compressor) =
+            try_variable_width_miniblock_with_generic_offsets(field, data, &params)?
+        {
+            compressor
+        } else if let Some(compressor) = try_fixed_packed_struct_miniblock(data)? {
+            compressor
+        } else if let Some(compressor) = try_raw_fixed_size_list_miniblock(data) {
+            compressor
+        } else {
+            return Err(Error::not_supported_source(
+                format!(
+                    "Mini-block compression not yet supported for block type {}",
+                    data.name()
+                )
+                .into(),
+            ));
+        };
         finalize_miniblock_compressor(data, compressor, &params)
     }
 
@@ -234,6 +239,35 @@ mod tests {
             debug_str.contains("OutOfLineBitpacking")
                 && debug_str.contains("uncompressed_bit_width: 128"),
             "2.3 must bitpack 128-bit blocks, got: {debug_str}"
+        );
+    }
+
+    /// A 128-bit inline chunk is 1024 values (16 KiB raw), so it yields to an explicit
+    /// General chunk target of any other size, as narrower values do.
+    #[rstest::rstest]
+    #[case::conflicting_target(4096, false)]
+    #[case::matching_target(16384, true)]
+    fn u128_bitpacking_honors_explicit_chunk_target(
+        #[case] minichunk_size: i64,
+        #[case] is_bitpacked: bool,
+    ) {
+        let mut params = CompressionParams::default();
+        params.columns.insert(
+            "decimal".into(),
+            CompressionFieldParams {
+                compression: Some("lz4".into()),
+                minichunk_size: Some(minichunk_size),
+                ..Default::default()
+            },
+        );
+        let miniblock = Strategy::new(params)
+            .create_miniblock_compressor(&decimal_field(), &decimal128_block())
+            .unwrap();
+        let debug_str = format!("{miniblock:?}");
+        assert_eq!(
+            debug_str.contains("InlineBitpacking { uncompressed_bit_width: 128 }"),
+            is_bitpacked,
+            "{debug_str}"
         );
     }
 }
