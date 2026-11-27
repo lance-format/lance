@@ -827,7 +827,7 @@ impl<'a> CommitBuilder<'a> {
                             .await?,
                     )
                 };
-                let table_state = TableState::new(
+                let mut table_state = TableState::new(
                     object_store,
                     base_path,
                     uri.to_string(),
@@ -841,6 +841,7 @@ impl<'a> CommitBuilder<'a> {
                     self.store_params.clone(),
                     None,
                 );
+                table_state.is_manifest_generation_verified = true;
                 Ok(Table::from_parts(table_state, Arc::new(manifest), refs))
             }
         }

@@ -83,6 +83,7 @@ pub use lance_table_runtime::refs;
 pub mod rowids;
 pub mod scanner;
 mod schema_evolution;
+pub mod snapshot;
 pub mod sql;
 pub mod statistics;
 mod take;
@@ -250,6 +251,7 @@ pub use lance_table_runtime::session::DEFAULT_METADATA_CACHE_SIZE;
 pub struct Dataset {
     pub(crate) table_state: TableState,
     pub manifest: Arc<Manifest>,
+    pub(crate) snapshot_digest: Arc<tokio::sync::OnceCell<[u8; 32]>>,
     pub refs: Refs,
     pub(crate) session: Arc<Session>,
     pub(crate) index_cache: Arc<DSIndexCache>,
@@ -525,9 +527,11 @@ impl Dataset {
         session: Arc<Session>,
         index_cache: Arc<DSIndexCache>,
     ) -> Self {
+        let snapshot_digest = table.snapshot_digest();
         let (table_state, manifest, refs) = table.into_parts();
         Self {
             table_state,
+            snapshot_digest,
             manifest,
             refs,
             session,
@@ -574,14 +578,19 @@ impl Dataset {
 
     /// Check out the latest version of the dataset
     pub async fn checkout_latest(&mut self) -> Result<()> {
-        let (manifest, manifest_location) = self.latest_manifest().await?;
+        let (manifest, manifest_location, digest) = self
+            .table_view()
+            .latest_manifest_with_digest(self.snapshot_digest.clone())
+            .await?;
         self.set_manifest(manifest, manifest_location);
+        self.snapshot_digest = digest;
         Ok(())
     }
 
     /// Replace the manifest, refreshing derived state. Base stores are kept
     /// when `base_paths` is unchanged.
     fn set_manifest(&mut self, manifest: Arc<Manifest>, manifest_location: ManifestLocation) {
+        self.snapshot_digest = Default::default();
         self.table_state
             .set_manifest(&mut self.manifest, manifest, manifest_location);
     }
@@ -1103,9 +1112,8 @@ impl Dataset {
     /// `checkout_version`) is reused instead of being downloaded again.
     ///
     /// Neither path consults or populates the session's transaction cache
-    /// (unlike [`Self::read_transaction`]): that cache is keyed only by
-    /// version number, which is not safe to reuse across a dataset dropped
-    /// and recreated at the same URI within the same session (see #8916).
+    /// (unlike [`Self::read_transaction`]). Reads use the resolved generation
+    /// directly and do not retain transaction entries while walking history.
     ///
     /// Returns an error if the version does not exist (for example, if it has
     /// been cleaned up).

@@ -135,6 +135,7 @@ fn generate_table(
             proto_dir.join("table.proto"),
             proto_dir.join("transaction/transaction.proto"),
             proto_dir.join("rowids.proto"),
+            proto_dir.join("snapshot.proto"),
         ],
         &[&proto_dir],
     )?;
@@ -152,7 +153,11 @@ fn generate_table(
     install_generated(
         &out_dir,
         &repo_root.join("rust/lance-table/src/pb"),
-        &["lance.table.rs", "lance.transaction.rs"],
+        &[
+            "lance.table.rs",
+            "lance.transaction.rs",
+            "lance.snapshot.rs",
+        ],
         check,
     )
 }

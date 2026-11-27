@@ -3295,9 +3295,9 @@ async fn test_index_creation_racing_deferred_compaction_with_stable_row_ids(
             results.push(task.execute(&dataset).await.unwrap());
         }
         create_index(&mut other).await.unwrap();
-        let index_key = TransactionKey {
-            version: other.version().version,
-        };
+        let index_location = other.table_state.manifest_location.clone();
+        let index_store = other.table_state.object_store.clone();
+        let index_key = ManifestTransactionKey::new(&index_store, &index_location).unwrap();
         let committed_index = dataset
             .table_state
             .metadata_cache
@@ -3358,9 +3358,9 @@ async fn test_index_creation_racing_deferred_compaction_with_stable_row_ids(
         }
     } else {
         compact_files(&mut dataset, options, None).await.unwrap();
-        let rewrite_key = TransactionKey {
-            version: dataset.version().version,
-        };
+        let rewrite_location = dataset.table_state.manifest_location.clone();
+        let rewrite_store = dataset.table_state.object_store.clone();
+        let rewrite_key = ManifestTransactionKey::new(&rewrite_store, &rewrite_location).unwrap();
         let cached_rewrite = other
             .table_state
             .metadata_cache

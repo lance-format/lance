@@ -120,6 +120,16 @@ impl OSObjectStore for OpendalStore {
         location: &Path,
         options: GetOptions,
     ) -> object_store::Result<GetResult> {
+        let capability = self.inner.info().capability();
+        if options.if_match.is_some()
+            && !(capability.read_with_if_match && capability.stat_with_if_match)
+        {
+            return Err(object_store::Error::NotSupported {
+                source:
+                    "OpenDAL backend cannot enforce If-Match on both reads and metadata requests"
+                        .into(),
+            });
+        }
         let mut result = self
             .inner
             .get_opts(location, options)
@@ -129,7 +139,6 @@ impl OSObjectStore for OpendalStore {
             })?;
         // The bridge can fall back to stat, passing the same conditions to both
         // operations. Require support on both before using a guard to resume.
-        let capability = self.inner.info().capability();
         result.extensions.insert(ConditionalGetSupport {
             has_if_match: capability.read_with_if_match && capability.stat_with_if_match,
             has_version: capability.read_with_version && capability.stat_with_version,
@@ -241,6 +250,45 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+
+    #[tokio::test]
+    async fn conditional_read_requires_backend_support() {
+        let operator = Operator::new(Memory::default()).unwrap();
+        assert!(!operator.info().capability().read_with_if_match);
+        let store = OpendalStore::new(operator);
+        let path = Path::from("manifest");
+        store
+            .put(&path, Bytes::from_static(b"manifest").into())
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .get(&path)
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap()
+                .as_ref(),
+            b"manifest"
+        );
+        let error = store
+            .get_opts(
+                &path,
+                GetOptions {
+                    if_match: Some("observed-etag".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            matches!(error, object_store::Error::NotSupported { .. }),
+            "{error}"
+        );
+        assert!(error.to_string().contains("If-Match"), "{error}");
+    }
 
     #[rstest]
     #[case::raw_reserved_character("tables/run~1/t.lance")]

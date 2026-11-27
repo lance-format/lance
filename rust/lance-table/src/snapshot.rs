@@ -1,0 +1,502 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
+//! Lightweight, engine-independent references to exact table snapshots.
+
+use bytes::Buf;
+use lance_core::{Error, Result};
+use lance_io::object_store::uri_to_url;
+use object_store::path::Path;
+use prost::Message;
+
+use crate::io::commit::ManifestLocation;
+
+#[doc(hidden)]
+pub mod pb {
+    include!("pb/lance.snapshot.rs");
+}
+
+/// Verification requested when capturing an execution snapshot reference.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SnapshotVerification {
+    /// Use an authoritative commit identity or conditional-read ETag when
+    /// available. Fall back to a full-file digest when neither is available.
+    #[default]
+    Identity,
+    /// Verify every byte of the original manifest file with BLAKE3.
+    FullManifestDigest,
+}
+
+/// A portable snapshot identity whose size does not depend on the manifest size.
+///
+/// The caller supplies a table incarnation identity that distinguishes tables
+/// recreated at the same URI and different storage/catalog authorities. Resolving
+/// credentials and checking that authority remain the application's responsibility.
+/// This reference neither authenticates a worker nor protects files from cleanup.
+///
+/// ```
+/// # use lance_core::Result;
+/// # use lance_table::{snapshot::SnapshotRef, io::commit::ManifestLocation};
+/// # fn example(location: &ManifestLocation, digest: [u8; 32]) -> Result<()> {
+/// let snapshot = SnapshotRef::try_new(
+///     "catalog/table-incarnation", "s3://bucket/table.lance", None, location, digest,
+/// )?;
+/// assert_eq!(snapshot, SnapshotRef::decode(&snapshot.encode())?);
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Clone, Debug, PartialEq)]
+pub struct SnapshotRef {
+    proto: pb::SnapshotRef,
+    snapshot_id: [u8; 32],
+}
+
+impl SnapshotRef {
+    /// Describe a resolved manifest using a digest of its complete original file.
+    ///
+    /// `branch = None` identifies the main branch; a named branch must be resolved
+    /// to `location.version`. `table_uri` is the absolute root, without a branch
+    /// suffix. `table_identity` must include the table incarnation and authority.
+    pub fn try_new(
+        table_identity: impl Into<String>,
+        table_uri: impl AsRef<str>,
+        branch: Option<String>,
+        location: &ManifestLocation,
+        manifest_digest: [u8; 32],
+    ) -> Result<Self> {
+        Self::try_from(pb::SnapshotRef {
+            protocol_version: 1,
+            table_identity: table_identity.into(),
+            table_uri: canonical_uri(table_uri.as_ref())?,
+            branch,
+            version: location.version,
+            manifest_path: location.path.to_string(),
+            manifest_digest: manifest_digest.to_vec(),
+            manifest_identity: location.identity.clone(),
+            manifest_etag: None,
+        })
+    }
+
+    /// Describe an immutable committed snapshot using its storage identity.
+    ///
+    /// An authoritative commit-record identity takes precedence over an ETag.
+    /// An ETag requires conditional manifest reads. If neither is available,
+    /// capture a full-file digest and use [`Self::try_new`] instead.
+    ///
+    /// ```
+    /// # use lance_core::Result;
+    /// # use lance_table::{snapshot::SnapshotRef, io::commit::ManifestLocation};
+    /// # fn example(location: &ManifestLocation) -> Result<()> {
+    /// if location.identity.is_some() || location.e_tag.is_some() {
+    ///     let snapshot = SnapshotRef::try_new_with_identity(
+    ///         "catalog/table-incarnation", "s3://bucket/table.lance", None, location,
+    ///     )?;
+    ///     assert!(snapshot.manifest_digest().is_empty());
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn try_new_with_identity(
+        table_identity: impl Into<String>,
+        table_uri: impl AsRef<str>,
+        branch: Option<String>,
+        location: &ManifestLocation,
+    ) -> Result<Self> {
+        Self::try_from(pb::SnapshotRef {
+            protocol_version: 1,
+            table_identity: table_identity.into(),
+            table_uri: canonical_uri(table_uri.as_ref())?,
+            branch,
+            version: location.version,
+            manifest_path: location.path.to_string(),
+            manifest_digest: Vec::new(),
+            manifest_identity: location.identity.clone(),
+            manifest_etag: if location.identity.is_none() {
+                location.e_tag.clone()
+            } else {
+                None
+            },
+        })
+    }
+
+    /// Check that a resolved table location names this reference's root.
+    ///
+    /// Local paths and equivalent file URIs are accepted. A trailing directory
+    /// slash is normalized while URI query parameters remain part of the authority.
+    ///
+    /// ```
+    /// # use lance_core::Result;
+    /// # use lance_table::snapshot::SnapshotRef;
+    /// # fn example(snapshot: &SnapshotRef) -> Result<()> {
+    /// snapshot.validate_table_uri(snapshot.table_uri())?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn validate_table_uri(&self, uri: impl AsRef<str>) -> Result<()> {
+        let observed = canonical_uri(uri.as_ref())?;
+        if observed != self.table_uri() {
+            return Err(Error::invalid_input(format!(
+                "Snapshot table_uri {} does not match table_uri {}",
+                self.table_uri(),
+                observed,
+            )));
+        }
+        Ok(())
+    }
+
+    /// Serialize identity only; the manifest remains in source storage.
+    pub fn encode(&self) -> Vec<u8> {
+        self.proto.encode_to_vec()
+    }
+
+    /// Decode and validate the transport contract without accessing storage.
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let proto = pb::SnapshotRef::decode(bytes).map_err(|error| {
+            Error::invalid_input(format!("Invalid snapshot reference: {error}"))
+        })?;
+        Self::try_from(proto)
+    }
+
+    /// Identity fingerprint, independent of worker storage bindings and capabilities.
+    /// Hashes the canonical encoding of validated known fields, not the incoming
+    /// transport spelling; unknown fields and incoming field order are ignored.
+    pub fn snapshot_id(&self) -> &[u8; 32] {
+        &self.snapshot_id
+    }
+    /// Caller-supplied table incarnation and authority.
+    pub fn table_identity(&self) -> &str {
+        &self.proto.table_identity
+    }
+    /// Canonical absolute table root URI.
+    pub fn table_uri(&self) -> &str {
+        &self.proto.table_uri
+    }
+    /// Exact branch; `None` identifies the main branch.
+    pub fn branch(&self) -> Option<&str> {
+        self.proto.branch.as_deref()
+    }
+    /// Exact version within the resolved branch, never an unresolved latest version.
+    pub fn version(&self) -> u64 {
+        self.proto.version
+    }
+    /// Resolved manifest object path in the source object store.
+    pub fn manifest_path(&self) -> &str {
+        &self.proto.manifest_path
+    }
+    /// BLAKE3 digest of the complete original manifest file, including all sections.
+    /// Empty when the reference uses commit identity or conditional ETag validation.
+    pub fn manifest_digest(&self) -> &[u8] {
+        &self.proto.manifest_digest
+    }
+    /// Authoritative commit-store record identity, when the handler supplies one.
+    pub fn manifest_identity(&self) -> Option<&str> {
+        self.proto.manifest_identity.as_deref()
+    }
+    /// Conditional-read ETag; independent of the table incarnation and content digest.
+    pub fn manifest_etag(&self) -> Option<&str> {
+        self.proto.manifest_etag.as_deref()
+    }
+}
+
+impl TryFrom<pb::SnapshotRef> for SnapshotRef {
+    type Error = Error;
+
+    fn try_from(proto: pb::SnapshotRef) -> Result<Self> {
+        if proto.protocol_version != 1 {
+            return Err(Error::invalid_input(format!(
+                "Unsupported snapshot reference protocol version {}",
+                proto.protocol_version
+            )));
+        }
+        if proto.table_identity.trim().is_empty() {
+            return Err(Error::invalid_input(
+                "Snapshot table_identity cannot be empty",
+            ));
+        }
+        if proto.table_uri != canonical_uri(&proto.table_uri)? {
+            return Err(Error::invalid_input(format!(
+                "Noncanonical snapshot table URI {}",
+                proto.table_uri
+            )));
+        }
+        if let Some(branch) = &proto.branch
+            && (branch.is_empty()
+                || branch == "main"
+                || branch.contains("..")
+                || branch.contains('\\')
+                || branch.ends_with(".lock")
+                || branch.split('/').any(|part| {
+                    part.is_empty()
+                        || part == "."
+                        || !part
+                            .chars()
+                            .all(|c| c.is_alphanumeric() || matches!(c, '.' | '-' | '_'))
+                }))
+        {
+            return Err(Error::invalid_input(format!(
+                "Invalid snapshot branch {branch:?}; use None for main"
+            )));
+        }
+        if proto.version == 0 {
+            return Err(Error::invalid_input(
+                "Snapshot version must be greater than 0, got 0",
+            ));
+        }
+        if proto.manifest_path.trim().is_empty() {
+            return Err(Error::invalid_input(
+                "Snapshot manifest_path cannot be empty",
+            ));
+        }
+        Path::parse(&proto.manifest_path)?;
+        if !proto.manifest_digest.is_empty() && proto.manifest_digest.len() != 32 {
+            return Err(Error::invalid_input(format!(
+                "Snapshot manifest_digest has {} bytes, expected 32",
+                proto.manifest_digest.len()
+            )));
+        }
+        if proto.manifest_digest.is_empty()
+            && proto.manifest_identity.is_none()
+            && proto.manifest_etag.is_none()
+        {
+            return Err(Error::invalid_input(
+                "Snapshot requires manifest_digest, manifest_identity, or manifest_etag",
+            ));
+        }
+        if proto.manifest_etag.as_ref().is_some_and(String::is_empty) {
+            return Err(Error::invalid_input(
+                "Snapshot manifest_etag cannot be empty when present",
+            ));
+        }
+        if proto
+            .manifest_identity
+            .as_ref()
+            .is_some_and(String::is_empty)
+        {
+            return Err(Error::invalid_input(
+                "Snapshot manifest_identity cannot be empty when present",
+            ));
+        }
+        let snapshot_id = *blake3::hash(&proto.encode_to_vec()).as_bytes();
+        Ok(Self { proto, snapshot_id })
+    }
+}
+
+impl From<&SnapshotRef> for pb::SnapshotRef {
+    fn from(snapshot: &SnapshotRef) -> Self {
+        snapshot.proto.clone()
+    }
+}
+
+/// Hash a complete original manifest file without joining its storage chunks.
+///
+/// Include index metadata, inline transactions, dictionaries, length prefixes, and
+/// the footer. Do not re-encode a decoded manifest: protobuf map ordering and
+/// hydrated dictionaries can change its bytes.
+///
+/// ```
+/// use lance_table::snapshot::digest_manifest;
+/// let digest = digest_manifest(b"original manifest file bytes".as_slice());
+/// assert_eq!(digest.len(), 32);
+/// ```
+pub fn digest_manifest(mut bytes: impl Buf) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    while bytes.has_remaining() {
+        let chunk = bytes.chunk();
+        hasher.update(chunk);
+        let length = chunk.len();
+        bytes.advance(length);
+    }
+    *hasher.finalize().as_bytes()
+}
+
+fn canonical_uri(uri: &str) -> Result<String> {
+    if url::Url::parse(uri).is_err() && !std::path::Path::new(uri).is_absolute() {
+        return Err(Error::invalid_input(format!(
+            "Snapshot URI must be absolute: {uri}"
+        )));
+    }
+    let mut url = uri_to_url(uri)?;
+    let has_username = !url.username().is_empty() && !matches!(url.scheme(), "az" | "abfss");
+    if url.fragment().is_some() || has_username || url.password().is_some() {
+        return Err(Error::invalid_input(
+            "Snapshot URI must not contain credentials or a fragment",
+        ));
+    }
+    // Native directory paths gain a slash in uri_to_url, whereas an existing
+    // URI need not have one. Normalize just the root path, preserving queries.
+    let path = url.path().trim_end_matches('/').to_string();
+    url.set_path(&path);
+    Ok(url.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::io::commit::ManifestNamingScheme;
+    use lance_io::utils::ChunkedBuf;
+    use rstest::rstest;
+
+    fn snapshot() -> SnapshotRef {
+        SnapshotRef::try_new(
+            "catalog/incarnation",
+            "s3://bucket/table",
+            None,
+            &ManifestLocation {
+                version: 7,
+                path: Path::from("table/_versions/7.manifest"),
+                size: None,
+                naming_scheme: ManifestNamingScheme::V1,
+                e_tag: None,
+                identity: None,
+                last_modified: None,
+            },
+            [42; 32],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn transport_preserves_snapshot_identity() {
+        let snapshot = snapshot();
+        let decoded = SnapshotRef::decode(&snapshot.encode()).unwrap();
+        assert_eq!(snapshot, decoded);
+        assert_eq!(snapshot.snapshot_id(), decoded.snapshot_id());
+        assert!(snapshot.encode().len() < 256);
+        let mut proto = snapshot.proto.clone();
+        proto.table_identity = "catalog/recreated".into();
+        assert_ne!(
+            snapshot.snapshot_id(),
+            SnapshotRef::try_from(proto).unwrap().snapshot_id()
+        );
+    }
+
+    #[rstest]
+    #[case::full_main(
+        "08011213636174616c6f672f696e6361726e6174696f6e1a1173333a2f2f6275636b65742f7461626c652807321a7461626c652f5f76657273696f6e732f372e6d616e69666573743a202a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a",
+        "103d7010e5016fc37a4e73761a3f186d13dca77aa21b86f0bb5d2555760a411c"
+    )]
+    #[case::etag_branch(
+        "08011213636174616c6f672f696e6361726e6174696f6e1a1173333a2f2f6275636b65742f7461626c65220c666561747572652f746573742807321a7461626c652f5f76657273696f6e732f372e6d616e69666573744a0c67656e65726174696f6e2d31",
+        "597c8e5b98ae26de7edcca9e5a2357bb327e0b46e4067c635f4e0c6446d6c7ac"
+    )]
+    #[case::commit_main(
+        "08011213636174616c6f672f696e6361726e6174696f6e1a1173333a2f2f6275636b65742f7461626c652807321a7461626c652f5f76657273696f6e732f372e6d616e696665737442087265636f72642d31",
+        "38c6c30fe651071d470d210a0cafce9461e6f6543c9b87d499542d41e7fc2b11"
+    )]
+    fn snapshot_id_matches_fixed_encoding(#[case] encoded_hex: &str, #[case] expected_id: &str) {
+        // The fixtures were encoded directly from field tags, without prost.
+        let (digits, remainder) = encoded_hex.as_bytes().as_chunks::<2>();
+        assert!(remainder.is_empty());
+        let encoded = digits
+            .iter()
+            .map(|digits| u8::from_str_radix(std::str::from_utf8(digits).unwrap(), 16).unwrap())
+            .collect::<Vec<_>>();
+        let reference = SnapshotRef::decode(&encoded).unwrap();
+        assert_eq!(reference.encode(), encoded);
+        assert_eq!(
+            blake3::Hash::from_bytes(*reference.snapshot_id())
+                .to_hex()
+                .as_str(),
+            expected_id
+        );
+
+        // Identity covers canonical known fields, not the incoming wire spelling.
+        let mut reordered = encoded[2..].to_vec();
+        reordered.extend_from_slice(&encoded[..2]);
+        reordered.extend_from_slice(&[0xf8, 0x01, 0x01]); // Unknown field 31.
+        let restored = SnapshotRef::decode(&reordered).unwrap();
+        assert_eq!(restored.encode(), encoded);
+        assert_eq!(restored.snapshot_id(), reference.snapshot_id());
+
+        let mut non_minimal = vec![0x08, 0x81, 0x00];
+        non_minimal.extend_from_slice(&encoded[2..]);
+        let restored = SnapshotRef::decode(&non_minimal).unwrap();
+        assert_eq!(restored.encode(), encoded);
+        assert_eq!(restored.snapshot_id(), reference.snapshot_id());
+    }
+
+    #[rstest]
+    #[case::commit_identity(true)]
+    #[case::etag(false)]
+    fn lightweight_identity_survives_transport(#[case] has_commit_identity: bool) {
+        let original = snapshot();
+        let location = ManifestLocation {
+            version: original.version(),
+            path: Path::from(original.manifest_path()),
+            size: Some(1 << 30),
+            naming_scheme: ManifestNamingScheme::V1,
+            e_tag: Some("observed-generation".into()),
+            identity: has_commit_identity.then(|| "immutable-record".into()),
+            last_modified: None,
+        };
+        let reference = SnapshotRef::try_new_with_identity(
+            "catalog/incarnation",
+            original.table_uri(),
+            None,
+            &location,
+        )
+        .unwrap();
+        assert!(reference.manifest_digest().is_empty());
+        assert_eq!(reference.manifest_etag().is_none(), has_commit_identity);
+        assert_eq!(reference, SnapshotRef::decode(&reference.encode()).unwrap());
+        assert_ne!(original.snapshot_id(), reference.snapshot_id());
+    }
+
+    #[rstest]
+    #[case::protocol(|p: &mut pb::SnapshotRef| p.protocol_version = 2, "protocol version 2")]
+    #[case::identity(|p: &mut pb::SnapshotRef| p.table_identity.clear(), "table_identity")]
+    #[case::uri(|p: &mut pb::SnapshotRef| p.table_uri = "relative/table".into(), "absolute")]
+    #[case::credentials(|p: &mut pb::SnapshotRef| p.table_uri = "s3://user:secret@bucket/table".into(), "credentials")]
+    #[case::branch(|p: &mut pb::SnapshotRef| p.branch = Some("../other".into()), "branch")]
+    #[case::dot_segment(|p: &mut pb::SnapshotRef| p.branch = Some("a/./b".into()), "branch")]
+    #[case::trailing_dot_segment(|p: &mut pb::SnapshotRef| p.branch = Some("a/.".into()), "branch")]
+    #[case::single_dot(|p: &mut pb::SnapshotRef| p.branch = Some(".".into()), "branch")]
+    #[case::leading_dot_segment(|p: &mut pb::SnapshotRef| p.branch = Some("./a".into()), "branch")]
+    #[case::main(|p: &mut pb::SnapshotRef| p.branch = Some("main".into()), "branch")]
+    #[case::version(|p: &mut pb::SnapshotRef| p.version = 0, "version")]
+    #[case::path(|p: &mut pb::SnapshotRef| p.manifest_path.clear(), "manifest_path")]
+    #[case::digest(|p: &mut pb::SnapshotRef| p.manifest_digest.clear(), "manifest_digest")]
+    #[case::record(|p: &mut pb::SnapshotRef| p.manifest_identity = Some(String::new()), "manifest_identity")]
+    #[case::etag(|p: &mut pb::SnapshotRef| p.manifest_etag = Some(String::new()), "manifest_etag")]
+    #[case::short_digest(|p: &mut pb::SnapshotRef| p.manifest_digest = vec![1], "manifest_digest")]
+    fn rejects_invalid_reference(#[case] change: fn(&mut pb::SnapshotRef), #[case] message: &str) {
+        let mut proto = snapshot().proto;
+        change(&mut proto);
+        let error = SnapshotRef::decode(&proto.encode_to_vec()).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains(message), "{error}");
+    }
+
+    #[rstest]
+    #[case::storage("s3://bucket/table/", "s3://bucket/table")]
+    #[case::local_uri("file:///tmp/table/", "file:///tmp/table")]
+    #[case::query(
+        "s3+ddb://bucket/table/?ddbTableName=commits",
+        "s3+ddb://bucket/table?ddbTableName=commits"
+    )]
+    #[case::escaped("s3://bucket/a%20table/", "s3://bucket/a%20table")]
+    fn table_root_normalization(#[case] uri: &str, #[case] expected: &str) {
+        assert_eq!(canonical_uri(uri).unwrap(), expected);
+        let mut proto = snapshot().proto;
+        proto.table_uri = expected.into();
+        let snapshot = SnapshotRef::try_from(proto).unwrap();
+        snapshot.validate_table_uri(uri).unwrap();
+        let error = snapshot.validate_table_uri("s3://other/table").unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(
+            error.to_string().contains("does not match table_uri"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn digest_is_independent_of_chunk_boundaries() {
+        let mut chunks = ChunkedBuf::default();
+        chunks.push(bytes::Bytes::from_static(b"original "));
+        chunks.push(bytes::Bytes::from_static(b"manifest"));
+        assert_eq!(
+            digest_manifest(chunks),
+            digest_manifest(b"original manifest".as_slice())
+        );
+    }
+}
