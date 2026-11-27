@@ -4,7 +4,9 @@
 use super::*;
 use async_trait::async_trait;
 use datafusion::execution::memory_pool::PeakRecordingPool;
-use lance_datafusion::exec::{ExecutionMetricValue, new_session_context_with_memory_tracking};
+use lance_datafusion::exec::{
+    ExecutionMetricValue, new_session_context, new_session_context_with_memory_tracking,
+};
 
 #[tokio::test]
 async fn test_indexed_merge_insert_spills_wide_source() {
@@ -177,6 +179,53 @@ async fn test_indexed_merge_insert_spills_wide_source() {
             assert!(untouched.is_null(i));
         }
     }
+}
+
+#[tokio::test]
+async fn test_indexed_merge_insert_updates_row_above_rechunk_target() {
+    // Omit "untouched" from the update so the payload goes through the fragment sort.
+    let target = record_batch!(
+        ("id", UInt32, [1]),
+        ("payload", Utf8, ["old"]),
+        ("untouched", UInt32, [7])
+    )
+    .unwrap();
+    let schema = target.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(target)], schema),
+        "memory://",
+        None,
+    )
+    .await
+    .unwrap();
+    dataset
+        .create_index(
+            &["id"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+    let mut job = MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".into()])
+        .unwrap()
+        .when_matched(WhenMatched::UpdateAll)
+        .when_not_matched(WhenNotMatched::DoNothing)
+        .try_build()
+        .unwrap();
+    job.spill_execution_options.mem_pool_size = Some(512 * 1024);
+    job.spill_session_context = new_session_context(&job.spill_execution_options);
+    let budget = MergeInsertBudget::new(&job.spill_execution_options);
+    let payload = "x".repeat(budget.batch_bytes + 1);
+    let source = record_batch!(("id", UInt32, [1]), ("payload", Utf8, [payload.as_str()])).unwrap();
+
+    let (dataset, stats) = job.execute_batches(vec![source]).await.unwrap();
+    assert_eq!(stats.num_updated_rows, 1);
+    let batch = dataset.scan().try_into_batch().await.unwrap();
+    assert_eq!(batch.num_rows(), 1);
+    assert_eq!(batch["payload"].as_string::<i32>().value(0), payload);
+    assert_eq!(batch["untouched"].as_primitive::<UInt32Type>().value(0), 7);
 }
 
 #[tokio::test]
