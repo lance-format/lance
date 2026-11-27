@@ -11,9 +11,8 @@ use std::sync::Arc;
 
 use arrow_array::{ArrayRef, RecordBatch};
 use async_trait::async_trait;
-use futures::StreamExt;
-use futures::future::try_join_all;
 use futures::stream::{self, BoxStream};
+use futures::{StreamExt, TryStreamExt};
 use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_core::{Error, ROW_ADDR, ROW_ID, Result};
 use lance_index::metrics::MetricsCollector;
@@ -59,6 +58,18 @@ pub struct LogicalScalarIndex {
     index_type: IndexType,
     segments: Vec<Arc<dyn ScalarIndex>>,
     coverage: Option<SegmentCoverage>,
+    segment_concurrency: usize,
+}
+
+// Concurrent local segment operations may each hold an open file. Use the
+// store's I/O parallelism for local fan-out and keep cloud fan-out unchanged.
+fn segment_concurrency(dataset: &Dataset, count: usize) -> usize {
+    let store = &dataset.table_state.object_store;
+    if store.is_local() {
+        store.io_parallelism().clamp(1, count)
+    } else {
+        count
+    }
 }
 
 impl LogicalScalarIndex {
@@ -121,6 +132,7 @@ impl LogicalScalarIndex {
             name,
             column,
             index_type,
+            segment_concurrency: segment_concurrency(dataset, segments.len()),
             segments: segments.into_iter().map(|(_, segment)| segment).collect(),
             coverage,
         })
@@ -159,8 +171,11 @@ impl Index for LogicalScalarIndex {
     }
 
     async fn prewarm(&self) -> Result<()> {
-        try_join_all(self.segments.iter().map(|segment| segment.prewarm())).await?;
-        Ok(())
+        stream::iter(0..self.segments.len())
+            .map(|i| self.segments[i].prewarm())
+            .buffer_unordered(self.segment_concurrency)
+            .try_collect::<()>()
+            .await
     }
 
     fn index_type(&self) -> IndexType {
@@ -168,15 +183,12 @@ impl Index for LogicalScalarIndex {
     }
 
     async fn calculate_included_frags(&self) -> Result<RoaringBitmap> {
-        let fragment_sets = try_join_all(
-            self.segments
-                .iter()
-                .map(|segment| segment.calculate_included_frags()),
-        )
-        .await?;
+        let mut sets = stream::iter(0..self.segments.len())
+            .map(|i| self.segments[i].calculate_included_frags())
+            .buffer_unordered(self.segment_concurrency);
         let mut combined = RoaringBitmap::new();
-        for fragment_set in fragment_sets {
-            combined |= fragment_set;
+        while let Some(set) = sets.try_next().await? {
+            combined |= set;
         }
         Ok(combined)
     }
@@ -199,16 +211,19 @@ impl ScalarIndex for LogicalScalarIndex {
         options: SearchOptions,
         metrics: &dyn MetricsCollector,
     ) -> Result<SearchResult> {
-        let results = try_join_all(self.segments.iter().enumerate().map(
-            |(i, segment)| async move {
-                let result = segment.search_with_options(query, options, metrics).await?;
+        let results = stream::iter(0..self.segments.len())
+            .map(|i| async move {
+                let result = self.segments[i]
+                    .search_with_options(query, options, metrics)
+                    .await?;
                 match &self.coverage {
                     Some(coverage) => coverage.restrict(i, result).await,
                     None => Ok(result),
                 }
-            },
-        ))
-        .await?;
+            })
+            .buffer_unordered(self.segment_concurrency)
+            .try_collect()
+            .await?;
         combine_search_results(results)
     }
 
@@ -235,7 +250,9 @@ impl ScalarIndex for LogicalScalarIndex {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        Ok(stream::select_all(segments).boxed())
+        Ok(stream::iter(segments)
+            .flatten_unordered(self.segment_concurrency)
+            .boxed())
     }
 
     fn results_are_row_addresses(&self) -> bool {
@@ -471,12 +488,11 @@ pub async fn open_scalar_index_segments(
                 .await
         }
         _ => {
-            let segments = try_join_all(indices.iter().map(|index| async move {
-                dataset
-                    .open_scalar_index(column, &index.uuid, metrics)
-                    .await
-            }))
-            .await?;
+            let segments: Vec<_> = stream::iter(0..indices.len())
+                .map(|i| dataset.open_scalar_index(column, &indices[i].uuid, metrics))
+                .buffered(segment_concurrency(dataset, indices.len()))
+                .try_collect()
+                .await?;
 
             Ok(Arc::new(
                 LogicalScalarIndex::try_new(
@@ -857,6 +873,89 @@ mod tests {
             combined_bitmap,
             dataset.table_state.fragment_bitmap.as_ref().clone()
         );
+    }
+
+    #[tokio::test]
+    async fn test_wide_local_btree_search_and_lookup() -> Result<()> {
+        // Lower only the child test's descriptor limit; sibling tests share this process.
+        #[cfg(unix)]
+        if std::env::var_os("LANCE_TEST_WIDE_BTREE_CHILD").is_none() {
+            const TEST: &str =
+                "index::scalar_logical::tests::test_wide_local_btree_search_and_lookup";
+            let output = std::process::Command::new("sh")
+                .args([
+                    "-c",
+                    r#"ulimit -S -n 64 && exec "$0" --exact "$1" --nocapture"#,
+                ])
+                .arg(std::env::current_exe()?)
+                .arg(TEST)
+                .env("LANCE_TEST_WIDE_BTREE_CHILD", "1")
+                .output()?;
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return Ok(());
+        }
+        const SEGMENTS: usize = 96;
+        let dir = TempStrDir::default();
+        let keys =
+            arrow_array::StringArray::from_iter_values((0..1024).map(|i| format!("key-{i:08}")));
+        let batch = RecordBatch::try_from_iter([("key", Arc::new(keys) as ArrayRef)])?;
+        let reader = arrow_array::RecordBatchIterator::new(
+            std::iter::repeat_n(batch.clone(), SEGMENTS).map(Ok),
+            batch.schema(),
+        );
+        let mut dataset = Dataset::write(
+            reader,
+            dir.as_str(),
+            Some(WriteParams {
+                max_rows_per_file: batch.num_rows(),
+                ..Default::default()
+            }),
+        )
+        .await?;
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree);
+        let mut segments = Vec::new();
+        for fragment in dataset.get_fragments() {
+            segments.push(
+                CreateIndexBuilder::new(&mut dataset, &["key"], IndexType::BTree, &params)
+                    .name("key_idx".to_owned())
+                    .fragments(vec![fragment.id() as u32])
+                    .execute_uncommitted()
+                    .await?,
+            );
+        }
+        assert_eq!(segments.len(), SEGMENTS);
+        dataset
+            .commit_existing_index_segments("key_idx", "key", segments)
+            .await?;
+
+        // Each probe starts with a cold session. Every segment contains this key.
+        let key = "key-00000512";
+        let metrics = NoOpMetricsCollector;
+        let open = || async {
+            let dataset = Dataset::open(dir.as_str()).await?;
+            open_named_scalar_index(&dataset, "key", "key_idx", &metrics).await
+        };
+        let hits = open()
+            .await?
+            .search(&SargableQuery::Equals(ScalarValue::from(key)), &metrics)
+            .await?;
+        assert_eq!(
+            hits.row_addrs().selected_rows().len(),
+            Some(SEGMENTS as u64)
+        );
+        let index = open().await?;
+        let keys = Arc::new(arrow_array::StringArray::from(vec![key]));
+        let rows: Vec<_> = index.lookup(keys, &metrics)?.try_collect().await?;
+        assert_eq!(
+            rows.iter().map(RecordBatch::num_rows).sum::<usize>(),
+            SEGMENTS
+        );
+        Ok(())
     }
 
     #[tokio::test]
