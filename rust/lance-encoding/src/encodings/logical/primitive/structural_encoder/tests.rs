@@ -1518,7 +1518,7 @@ async fn test_v2_3_generic_offsets_preserve_legacy_and_take_io() {
     ));
     assert!(matches!(
         variable_offset_compression(&v2_3),
-        Compression::Delta(_)
+        Compression::MonotonicDelta(_)
     ));
     assert!(variable_value_wire_bytes(&v2_3) < variable_value_wire_bytes(&v2_2));
     assert_eq!(miniblock_layout(&v2_2).num_buffers, 1);

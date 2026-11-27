@@ -24,7 +24,7 @@ use uuid::Uuid;
 use super::BlobV2BatchRewritePlan;
 use super::locate::join_base_and_relative_path;
 use super::managed::field_contains_blob;
-use crate::{Table, WriteSeedHook, paths::BLOBS_DIR};
+use crate::{FragReadConfig, Table, WriteSeedHook, paths::BLOBS_DIR};
 
 type BlobCopies = HashMap<(Option<u32>, String), String>;
 
@@ -167,6 +167,7 @@ async fn rewrite_blob_columns(
                 Some(BlobHandling::BlobsDescriptions),
                 target.manifest.data_storage_format.lance_file_format(),
                 || 1024,
+                FragReadConfig::default(),
             )
             .await?;
         if let Some(hook) = seed_hook {

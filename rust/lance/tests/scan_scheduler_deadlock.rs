@@ -31,12 +31,13 @@ use arrow_array::{Int64Array, LargeBinaryArray, RecordBatch, RecordBatchIterator
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use futures::TryStreamExt;
 use lance::Dataset;
-use lance::dataset::optimize::{CompactionOptions, compact_files};
+use lance::dataset::optimize::{CompactionOptions, CompactionScope, compact_files};
 use lance::dataset::{BatchUDF, NewColumnTransform, WriteParams};
 use lance_core::utils::tempfile::TempStrDir;
 use lance_datagen::{ByteCount, RowCount, array, gen_batch};
 use lance_file::version::LanceFileVersion;
 use lance_file::writer::FileWriterOptions;
+use rstest::rstest;
 
 const NUM_FRAGMENTS: i64 = 10;
 const ROWS_PER_FRAGMENT: i64 = 600;
@@ -170,18 +171,29 @@ async fn make_fragmented_dataset(test_uri: &str, num_wide_columns: i64) -> Datas
 
 /// Runs compaction with a tiny `io_buffer_size` against a dataset built by
 /// [`make_fragmented_dataset`], panicking with a description of the deadlock
-/// if it times out, and otherwise verifying the result.
-async fn compact_and_check_for_deadlock(mut dataset: Dataset, num_wide_columns: i64) {
+/// if it times out, and otherwise verifying the result. A rewrite merges the
+/// whole dataset into one fragment; a repack merges each fragment's files into
+/// one, reading all of them through one scheduler.
+async fn compact_and_check_for_deadlock(mut dataset: Dataset, num_wide_columns: i64, repack: bool) {
     let total_rows = (NUM_FRAGMENTS * ROWS_PER_FRAGMENT) as usize;
 
-    let options = CompactionOptions {
-        // Big enough that every fragment is a compaction candidate, so the
-        // whole dataset gets merged into a single new fragment and the
-        // per-fragment, multi-file merge path in the scan scheduler is
-        // actually exercised.
-        target_rows_per_fragment: total_rows * 2,
-        io_buffer_size: Some(TINY_IO_BUFFER_SIZE),
-        ..Default::default()
+    let options = if repack {
+        CompactionOptions {
+            scope: CompactionScope::RepackColumns,
+            max_data_files_per_fragment: Some(1),
+            io_buffer_size: Some(TINY_IO_BUFFER_SIZE),
+            ..Default::default()
+        }
+    } else {
+        CompactionOptions {
+            // Big enough that every fragment is a compaction candidate, so the
+            // whole dataset gets merged into a single new fragment and the
+            // per-fragment, multi-file merge path in the scan scheduler is
+            // actually exercised.
+            target_rows_per_fragment: total_rows * 2,
+            io_buffer_size: Some(TINY_IO_BUFFER_SIZE),
+            ..Default::default()
+        }
     };
 
     // The deadlock, if reproduced, is a permanent park with nothing on the
@@ -206,7 +218,14 @@ async fn compact_and_check_for_deadlock(mut dataset: Dataset, num_wide_columns: 
         ),
         Ok(result) => result.unwrap(),
     };
-    assert_eq!(metrics.fragments_removed, NUM_FRAGMENTS as usize);
+    if repack {
+        assert_eq!(metrics.files_added, NUM_FRAGMENTS as usize);
+        for fragment in dataset.get_fragments() {
+            assert_eq!(fragment.metadata().files.len(), 1);
+        }
+    } else {
+        assert_eq!(metrics.fragments_removed, NUM_FRAGMENTS as usize);
+    }
 
     // Sanity check: once compaction completes, all rows and columns must
     // still be there and correct.
@@ -222,12 +241,17 @@ async fn compact_and_check_for_deadlock(mut dataset: Dataset, num_wide_columns: 
     assert_eq!(scanned_rows, total_rows);
 }
 
+#[rstest]
+#[case::rewrite(false)]
+#[case::repack(true)]
 #[tokio::test]
-async fn test_compact_multi_file_fragments_with_tiny_io_buffer_does_not_deadlock() {
+async fn test_compact_multi_file_fragments_with_tiny_io_buffer_does_not_deadlock(
+    #[case] repack: bool,
+) {
     let test_dir = TempStrDir::default();
     let test_uri: &str = &test_dir;
     let dataset = make_fragmented_dataset(test_uri, 1).await;
-    Box::pin(compact_and_check_for_deadlock(dataset, 1)).await;
+    Box::pin(compact_and_check_for_deadlock(dataset, 1, repack)).await;
 }
 
 /// Same shape, but with *two* multi-page "wide" columns per fragment instead
@@ -236,12 +260,17 @@ async fn test_compact_multi_file_fragments_with_tiny_io_buffer_does_not_deadlock
 /// one multi-page file alongside several already-fully-loaded single-page
 /// ones. See the discussion of whether a stream sitting on leftover rows
 /// could still stall a sibling's forward progress.
+#[rstest]
+#[case::rewrite(false)]
+#[case::repack(true)]
 #[tokio::test]
-async fn test_compact_multi_file_fragments_with_two_wide_columns_does_not_deadlock() {
+async fn test_compact_multi_file_fragments_with_two_wide_columns_does_not_deadlock(
+    #[case] repack: bool,
+) {
     let test_dir = TempStrDir::default();
     let test_uri: &str = &test_dir;
     let dataset = make_fragmented_dataset(test_uri, 2).await;
-    Box::pin(compact_and_check_for_deadlock(dataset, 2)).await;
+    Box::pin(compact_and_check_for_deadlock(dataset, 2, repack)).await;
 }
 
 #[tokio::test]

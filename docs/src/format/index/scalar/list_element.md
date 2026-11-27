@@ -85,7 +85,10 @@ holds the version of the list element index itself, which is 0.
 
 Every segment of one logical index has the same `key_field_ids`, `key_types`
 and `key_encoding`. Their `keys` may differ, if they were written on either
-side of a rename.
+side of a rename. To combine segments with these matching key definitions
+and disjoint fragment coverage, merge their target BTrees over the encoded
+tuples. The merged segment retains the shared key definition and records the
+resulting BTree's details and version.
 
 ## Storage Layout
 
