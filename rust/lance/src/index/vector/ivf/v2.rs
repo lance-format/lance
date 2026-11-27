@@ -1627,6 +1627,8 @@ pub struct IVFIndex<S: IvfSubIndex + 'static, Q: Quantization + 'static> {
     use_residual_scratch: bool,
     rq_search_cache: Option<Arc<RabitSearchCache>>,
     prepared_partitions: Arc<PreparedPartitionTracker>,
+    #[cfg(test)]
+    test_prepare_budget: std::sync::OnceLock<Arc<tokio::sync::Semaphore>>,
     rabit_scan: Option<Arc<dyn RabitScan>>,
     /// Latency class of reads from the index's files, resolved when the
     /// index opens; the storage carries the same class.
@@ -2224,6 +2226,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             io_parallelism,
             open_io_stats,
             prepared_partitions: Arc::default(),
+            #[cfg(test)]
+            test_prepare_budget: Default::default(),
             rabit_scan,
             origin_latency,
             _marker: PhantomData,
@@ -2275,6 +2279,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             // and the first open via `try_new` already accounts for it).
             open_io_stats: ScanStats::default(),
             prepared_partitions: Arc::default(),
+            #[cfg(test)]
+            test_prepare_budget: Default::default(),
             rabit_scan: None,
             origin_latency,
             _marker: PhantomData,
@@ -3159,14 +3165,15 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         pre_filter: Arc<dyn PreFilter>,
         metrics: &dyn MetricsCollector,
     ) -> Result<RecordBatch> {
+        {
+            let _wait_timer = IndexTimer::new(metrics, IndexTiming::PrefilterWait);
+            pre_filter.wait_for_ready().await?;
+        }
+        let permit = partition_search::acquire_prepare(self.prepare_budget()).await;
         let (part_entry, pre_filter) = {
             // Match split preparation without counting CPU queueing or search.
             let _prepare_timer = IndexTimer::new(metrics, IndexTiming::PartitionPrepare);
             let part_entry = self.load_query_partition(partition_id, metrics).await?;
-            {
-                let _wait_timer = IndexTimer::new(metrics, IndexTiming::PrefilterWait);
-                pre_filter.wait_for_ready().await?;
-            }
             let pre_filter = Self::prefilter_for_partition(
                 &self.index_cache,
                 partition_id,
@@ -3195,6 +3202,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         let use_residual_scratch = self.use_residual_scratch;
         let queued = Instant::now();
         let (batch, local_metrics) = spawn_cpu(move || {
+            drop(permit);
             let local_metrics = LocalMetricsCollector::default();
             local_metrics.record_timing(IndexTiming::CpuQueueWait, queued.elapsed());
             let search_timer = IndexTimer::new(&local_metrics, IndexTiming::Search);
@@ -3954,7 +3962,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> PartitionSearchSource 
         pre_filter: Arc<dyn PreFilter>,
         metrics: Arc<dyn MetricsCollector>,
         raw_query_context: Option<Arc<RabitRawQueryContext>>,
-        wait_for_prefilter: bool,
     ) -> BoxFuture<'static, Result<Box<dyn PreparedPartition>>> {
         async move {
             let prepared = self
@@ -3965,7 +3972,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> PartitionSearchSource 
                     pre_filter,
                     metrics.as_ref(),
                     raw_query_context,
-                    wait_for_prefilter,
+                    false,
                 )
                 .await?;
             Ok(Box::new(prepared) as Box<dyn PreparedPartition>)
@@ -4002,6 +4009,14 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> PartitionSearchSource 
 
     fn raw_query_context(&self, query: &ArrayRef) -> Result<Option<Arc<RabitRawQueryContext>>> {
         self.prepare_rq_raw_query_context(query)
+    }
+
+    fn prepare_budget(&self) -> Arc<tokio::sync::Semaphore> {
+        #[cfg(test)]
+        if let Some(budget) = self.test_prepare_budget.get() {
+            return budget.clone();
+        }
+        partition_search::PREPARE_BUDGET.clone()
     }
 
     fn scratch_pool(&self) -> Arc<QueryScratchPool> {

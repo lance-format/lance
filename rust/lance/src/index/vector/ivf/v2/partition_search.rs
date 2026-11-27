@@ -14,7 +14,7 @@
 use std::any::Any;
 use std::collections::{BinaryHeap, HashMap};
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 
 use arrow_array::{ArrayRef, Float32Array, RecordBatch, UInt32Array};
@@ -29,7 +29,7 @@ use lance_index::metrics::{IndexTimer, IndexTiming, MetricsCollector};
 use lance_index::vector::graph::OrderedNode;
 use lance_index::vector::storage::{QueryScratch, QueryScratchPool, RabitRawQueryContext};
 use lance_index::vector::{PartitionSearchControl, Query, VECTOR_RESULT_SCHEMA};
-use tokio::sync::mpsc;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 
 use super::rabit_scan::{self, RabitIndex, RabitScan, RabitScanContext};
@@ -40,9 +40,77 @@ use super::{
 };
 use crate::index::PreFilter;
 
+/// Count loads and ordered completions that have yet to reach a scorer's
+/// bounded input. All built-in IVF v2 searches share this preparation window.
+pub(super) static PREPARE_BUDGET: LazyLock<Arc<Semaphore>> = LazyLock::new(|| {
+    let slots = std::env::var("LANCE_IVF_PREPARE_PARTITION_BUDGET")
+        .ok()
+        .map(|value| {
+            value
+                .parse()
+                .expect("invalid LANCE_IVF_PREPARE_PARTITION_BUDGET")
+        })
+        .unwrap_or_else(|| 2 * get_num_compute_intensive_cpus().max(1));
+    assert!(
+        slots > 0,
+        "LANCE_IVF_PREPARE_PARTITION_BUDGET must be positive"
+    );
+    Arc::new(Semaphore::new(slots))
+});
+
+pub(super) async fn acquire_prepare(budget: Arc<Semaphore>) -> OwnedSemaphorePermit {
+    budget
+        .acquire_owned()
+        .await
+        .expect("the preparation semaphore is never closed")
+}
+
+/// Admit in input order. Later completions retain their permits while waiting
+/// for the head. Acquiring inside the buffered futures could let later probes
+/// monopolize the whole budget while earlier probes wait to enter.
+fn buffered_preparations<T, F: Future>(
+    items: impl Stream<Item = T>,
+    budget: Arc<Semaphore>,
+    parallelism: usize,
+    mut prepare: impl FnMut(T) -> F,
+) -> impl Stream<Item = F::Output> {
+    async fn admit<T>(item: T, budget: Arc<Semaphore>) -> (T, OwnedSemaphorePermit) {
+        (item, acquire_prepare(budget).await)
+    }
+    async fn load<F: Future>(
+        permit: OwnedSemaphorePermit,
+        job: F,
+    ) -> (OwnedSemaphorePermit, F::Output) {
+        (permit, job.await)
+    }
+    items
+        .then(move |item| admit(item, budget.clone()))
+        .map(move |(item, permit)| load(permit, prepare(item)))
+        .buffered(parallelism)
+        .map(|(_permit, output)| output)
+}
+
+struct ScoringSlots {
+    remaining: Range<usize>,
+    sender: mpsc::Sender<Result<Box<dyn PreparedPartition>>>,
+}
+
+struct ScoringSlot {
+    idx: usize,
+    slot: mpsc::OwnedPermit<Result<Box<dyn PreparedPartition>>>,
+}
+
+impl ScoringSlots {
+    async fn next(mut self) -> Option<(ScoringSlot, Self)> {
+        let idx = self.remaining.next()?;
+        let slot = self.sender.clone().reserve_owned().await.ok()?;
+        Some((ScoringSlot { idx, slot }, self))
+    }
+}
+
 /// A partition loaded and filtered for one query, ready to score on the CPU
 /// pool. It pins the partition's storage until it is scored or dropped.
-pub(super) trait PreparedPartition: Send {
+pub(super) trait PreparedPartition: Send + 'static {
     /// Bytes of partition storage this value keeps alive.
     fn size_bytes(&self) -> usize;
 
@@ -64,7 +132,7 @@ pub(super) trait PreparedPartition: Send {
 
 /// A partition loaded once for a batch of queries; each probing query scores
 /// it into its own heap.
-pub(super) trait BatchPartition: Send + Sync {
+pub(super) trait BatchPartition: Send + Sync + 'static {
     fn accumulate_topk(
         &self,
         query: &Arc<Query>,
@@ -78,10 +146,7 @@ pub(super) trait BatchPartition: Send + Sync {
 
 /// What the search schedulers need from an IVF index.
 pub(super) trait PartitionSearchSource: Send + Sync + 'static {
-    /// Load and filter one partition for `query`. With `wait_for_prefilter`
-    /// the prefilter wait is overlapped with the partition load; without it
-    /// the caller must have waited already.
-    #[allow(clippy::too_many_arguments)]
+    /// Load and filter one partition for `query`. The prefilter must be ready.
     fn prepare_scored_partition(
         self: Arc<Self>,
         partition_id: usize,
@@ -90,7 +155,6 @@ pub(super) trait PartitionSearchSource: Send + Sync + 'static {
         pre_filter: Arc<dyn PreFilter>,
         metrics: Arc<dyn MetricsCollector>,
         raw_query_context: Option<Arc<RabitRawQueryContext>>,
-        wait_for_prefilter: bool,
     ) -> BoxFuture<'static, Result<Box<dyn PreparedPartition>>>;
 
     /// Load and filter one partition for a batch of queries. The prefilter
@@ -103,6 +167,8 @@ pub(super) trait PartitionSearchSource: Send + Sync + 'static {
     ) -> BoxFuture<'static, Result<Box<dyn BatchPartition>>>;
 
     fn raw_query_context(&self, query: &ArrayRef) -> Result<Option<Arc<RabitRawQueryContext>>>;
+
+    fn prepare_budget(&self) -> Arc<Semaphore>;
 
     fn scratch_pool(&self) -> Arc<QueryScratchPool>;
 }
@@ -304,8 +370,11 @@ pub(super) async fn search_partitions(
         // partitions in the same order as before (which decides which of
         // several rows tied at the k-th distance the capped heap keeps).
         let shared_query = Arc::new(query.clone());
-        let mut prepared = stream::iter(start_idx..end_idx)
-            .map(move |idx| {
+        let prepared = buffered_preparations(
+            stream::iter(start_idx..end_idx),
+            source.prepare_budget(),
+            prepare_parallelism,
+            move |idx| {
                 prepare_source.clone().prepare_scored_partition(
                     partitions.value(idx) as usize,
                     shared_query.clone(),
@@ -313,11 +382,10 @@ pub(super) async fn search_partitions(
                     pre_filter.clone(),
                     prepare_metrics.clone(),
                     prepare_raw_query_context.clone(),
-                    false,
                 )
-            })
-            .buffered(prepare_parallelism)
-            .fuse();
+            },
+        );
+        let mut prepared = Box::pin(prepared.fuse());
         let chunk_bytes = *GLOBAL_TOPK_CHUNK_BYTES;
 
         let mut heap = BinaryHeap::with_capacity(heap_capacity);
@@ -383,28 +451,61 @@ pub(super) async fn search_partitions(
     let prepare_source = source.clone();
     let prepare_metrics = metrics.clone();
     let prepare_raw_query_context = raw_query_context.clone();
+    let budget = source.prepare_budget();
+    let output = batch_tx.clone();
     lance_core::utils::tokio::spawn(async move {
-        let shared_query = Arc::new(query.clone());
-        let prepare_stream = stream::iter(start_idx..end_idx)
-            .map(move |idx| {
-                prepare_source.clone().prepare_scored_partition(
-                    partitions.value(idx) as usize,
-                    shared_query.clone(),
-                    q_c_dists.value(idx),
-                    pre_filter.clone(),
-                    prepare_metrics.clone(),
-                    prepare_raw_query_context.clone(),
-                    true,
-                )
-            })
-            .buffered(prepare_parallelism);
-
-        futures::pin_mut!(prepare_stream);
-        while let Some(prepared) = prepare_stream.next().await {
-            let has_error = prepared.is_err();
-            if prepared_tx.send(prepared).await.is_err() || has_error {
-                break;
+        let produce = async {
+            if start_idx == end_idx {
+                return;
             }
+            // A filter can depend on another search. Resolve it before taking
+            // a shared permit, even when the process has only one slot.
+            let ready = {
+                let _timer = IndexTimer::new(prepare_metrics.as_ref(), IndexTiming::PrefilterWait);
+                pre_filter.wait_for_ready().await
+            };
+            if let Err(error) = ready {
+                let _ = prepared_tx.send(Err(error)).await;
+                return;
+            }
+            let shared_query = Arc::new(query);
+            let slots = stream::unfold(
+                ScoringSlots {
+                    remaining: start_idx..end_idx,
+                    sender: prepared_tx.clone(),
+                },
+                ScoringSlots::next,
+            );
+            let prepared = buffered_preparations(
+                slots,
+                budget,
+                prepare_parallelism,
+                move |slot: ScoringSlot| {
+                    let prepare = prepare_source.clone().prepare_scored_partition(
+                        partitions.value(slot.idx) as usize,
+                        shared_query.clone(),
+                        q_c_dists.value(slot.idx),
+                        pre_filter.clone(),
+                        prepare_metrics.clone(),
+                        prepare_raw_query_context.clone(),
+                    );
+                    async move { (slot, prepare.await) }
+                },
+            );
+            futures::pin_mut!(prepared);
+            while let Some((slot, partition)) = prepared.next().await {
+                let failed = partition.is_err();
+                slot.slot.send(partition);
+                if failed {
+                    break;
+                }
+            }
+        };
+        tokio::select! {
+            biased;
+            _ = output.closed() => {}
+            _ = prepared_tx.closed() => {}
+            _ = produce => {}
         }
     });
 
@@ -678,17 +779,20 @@ pub(super) async fn search_partitions_batch(
     let load_parallelism = get_num_compute_intensive_cpus().max(1);
     let load_source = source.clone();
     let load_metrics = metrics.clone();
-    let mut loaded_chunks = stream::iter(assignment_list)
-        .map(move |(part_id, probing_queries)| {
+    let loaded = buffered_preparations(
+        stream::iter(assignment_list),
+        source.prepare_budget(),
+        load_parallelism,
+        move |(part_id, probing_queries)| {
             let loaded = load_source.clone().load_batch_partition(
                 part_id as usize,
                 pre_filter.clone(),
                 load_metrics.clone(),
             );
             async move { Result::Ok((loaded.await?, probing_queries)) }
-        })
-        .buffered(load_parallelism)
-        .chunks(*STREAMING_SEARCH_BATCH_SIZE);
+        },
+    );
+    let mut loaded_chunks = Box::pin(loaded.chunks(*STREAMING_SEARCH_BATCH_SIZE));
 
     let heap_capacity = query.k * query.refine_factor.unwrap_or(1) as usize;
     let mut heaps: Vec<BinaryHeap<OrderedNode<u64>>> = (0..query_count)
