@@ -13,6 +13,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::OnceLock;
 
 use async_trait::async_trait;
 use futures::FutureExt;
@@ -36,8 +37,11 @@ use crate::Result;
 use crate::dataset::fragment::FileFragment;
 use crate::dataset::rowids::load_row_id_sequence;
 use crate::utils::future::SharedPrerequisite;
+use lookup::PreparedRowAddrMask;
 
 pub use lance_index::prefilter::{FilterLoader, PreFilter};
+
+pub(crate) mod lookup;
 
 /// Hash of a fragment set for mask cache keys, so masks restricted to different
 /// fragment sets do not share an entry. `RoaringBitmap` doesn't implement `Hash`,
@@ -71,6 +75,7 @@ pub struct DatasetPreFilter {
     pub(super) overlay_block: Option<Arc<RowAddrMask>>,
     // When the tasks are finished this is the combined filter
     pub(super) final_mask: Mutex<OnceCell<Arc<RowAddrMask>>>,
+    pub(super) lookup_mask: OnceLock<PreparedRowAddrMask>,
 }
 
 impl DatasetPreFilter {
@@ -112,6 +117,7 @@ impl DatasetPreFilter {
             deleted_fragments: None,
             overlay_block: None,
             final_mask: Mutex::new(OnceCell::new()),
+            lookup_mask: OnceLock::new(),
         }
     }
 
@@ -139,6 +145,7 @@ impl DatasetPreFilter {
             deleted_fragments: None,
             overlay_block: None,
             final_mask: Mutex::new(OnceCell::new()),
+            lookup_mask: OnceLock::new(),
         }
     }
 
@@ -311,6 +318,7 @@ impl DatasetPreFilter {
             deleted_fragments,
             overlay_block,
             final_mask: _,
+            lookup_mask: _,
         } = self;
         filtered_ids.is_none() && deleted_fragments.is_none() && overlay_block.is_none()
     }
@@ -468,6 +476,16 @@ impl DatasetPreFilter {
             Self::do_create_deletion_mask(dataset, missing_frags, frags_with_deletion_files).boxed()
         }
     }
+
+    fn prepared_lookup(&self, num_rows_lower_bound: usize) -> Option<&PreparedRowAddrMask> {
+        self.lookup_mask.get().or_else(|| {
+            (num_rows_lower_bound >= 65536).then(|| {
+                self.lookup_mask.get_or_init(|| {
+                    PreparedRowAddrMask::for_probe_rows(self.mask(), num_rows_lower_bound)
+                })
+            })
+        })
+    }
 }
 
 /// Whether `mask` is known to pass no row: an empty allow list. Block lists
@@ -589,7 +607,17 @@ impl PreFilter for DatasetPreFilter {
     /// This method must be called after `wait_for_ready`
     #[instrument(level = "debug", skip_all)]
     fn filter_row_ids<'a>(&self, row_ids: Box<dyn Iterator<Item = &'a u64> + 'a>) -> Vec<u64> {
-        self.mask().selected_indices(row_ids)
+        match self.prepared_lookup(row_ids.size_hint().0) {
+            Some(mask) => mask.selected_indices(row_ids),
+            None => self.mask().selected_indices(row_ids),
+        }
+    }
+
+    fn filter_row_offsets_into(&self, row_ids: &[u64], out: &mut Vec<u32>) {
+        match self.prepared_lookup(row_ids.len()) {
+            Some(mask) => mask.selected_offsets_into(row_ids, out),
+            None => self.mask().selected_offsets_into(row_ids.iter(), out),
+        }
     }
 }
 
@@ -685,6 +713,94 @@ mod test {
         deletions_no_missing_frags: Arc<Dataset>,
         deletions_missing_frags: Arc<Dataset>,
         only_missing_frags: Arc<Dataset>,
+    }
+
+    #[rstest]
+    #[case::allow(true)]
+    #[case::block(false)]
+    #[test]
+    fn test_dataset_prepared_mask_reuses_offsets(#[case] allow: bool) {
+        let rows = (0..70000_u64).rev().collect::<Vec<_>>();
+        let selected = rows.iter().copied().filter(|row| row % 3 == 0).collect();
+        let mask = Arc::new(if allow {
+            RowAddrMask::from_allowed(selected)
+        } else {
+            RowAddrMask::from_block(selected)
+        });
+        let filter = DatasetPreFilter {
+            deleted_ids: None,
+            filtered_ids: None,
+            deleted_fragments: None,
+            overlay_block: Some(mask.clone()),
+            final_mask: Mutex::new(OnceCell::from(mask.clone())),
+            lookup_mask: OnceLock::new(),
+        };
+        let mut offsets = vec![u32::MAX];
+        filter.filter_row_offsets_into(&rows[..8], &mut offsets);
+        assert!(filter.lookup_mask.get().is_none());
+        assert_eq!(
+            offsets
+                .iter()
+                .map(|&offset| u64::from(offset))
+                .collect::<Vec<_>>(),
+            mask.selected_indices(rows[..8].iter())
+        );
+        filter.filter_row_offsets_into(&rows, &mut offsets);
+        let prepared = filter.lookup_mask.get().unwrap();
+        assert_eq!(
+            offsets
+                .iter()
+                .map(|&offset| u64::from(offset))
+                .collect::<Vec<_>>(),
+            mask.selected_indices(rows.iter())
+        );
+        assert_eq!(
+            filter.filter_row_ids(Box::new(rows.iter())),
+            mask.selected_indices(rows.iter())
+        );
+        filter.filter_row_offsets_into(&rows[..8], &mut offsets);
+        assert_eq!(
+            offsets
+                .iter()
+                .map(|&offset| u64::from(offset))
+                .collect::<Vec<_>>(),
+            mask.selected_indices(rows[..8].iter())
+        );
+        assert!(std::ptr::eq(prepared, filter.lookup_mask.get().unwrap()));
+        filter.filter_row_offsets_into(&[], &mut offsets);
+        assert!(offsets.is_empty());
+    }
+
+    #[test]
+    fn test_dataset_prepared_mask_skips_large_domain() {
+        let (mask, probes) = lookup::tests::broad_mask_and_probes();
+        let filter = DatasetPreFilter {
+            deleted_ids: None,
+            filtered_ids: None,
+            deleted_fragments: None,
+            overlay_block: Some(mask.clone()),
+            final_mask: Mutex::new(OnceCell::from(mask.clone())),
+            lookup_mask: OnceLock::new(),
+        };
+        let mut offsets = Vec::new();
+        for probe in &probes {
+            filter.filter_row_offsets_into(probe, &mut offsets);
+            assert_eq!(
+                offsets
+                    .iter()
+                    .map(|&row| u64::from(row))
+                    .collect::<Vec<_>>(),
+                mask.selected_indices(probe.iter())
+            );
+            assert_eq!(
+                filter.filter_row_ids(Box::new(probe.iter())),
+                mask.selected_indices(probe.iter())
+            );
+        }
+        assert!(Arc::ptr_eq(
+            filter.lookup_mask.get().unwrap().original_mask().unwrap(),
+            &mask
+        ));
     }
 
     async fn test_datasets(use_stable_row_id: bool) -> TestDatasets {

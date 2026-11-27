@@ -353,6 +353,39 @@ impl<'a> RabitDistCalculator<'a> {
         )
     }
 
+    /// Prepare scalar-precision sign bounds only for rows selected by a prefilter.
+    pub fn filtered_partition_sign_stage_for_mask(
+        &self,
+        out: &mut SignStage,
+        accept: &[bool],
+    ) -> std::result::Result<(), &'static str> {
+        if let Some(reason) = self.raw_query_lower_bound_gating_disabled_reason() {
+            return Err(reason);
+        }
+        let Some(error_factors) = self.error_factors else {
+            return Err("missing_error_factors");
+        };
+        let code_len = rabit_binary_code_bytes(self.dim);
+        let n = self.codes.len() / code_len;
+        if accept.len() != n {
+            return Err("mask_length");
+        }
+        out.binary_ips.clear();
+        out.binary_ips.resize(n, 0.0);
+        out.lower_bounds.clear();
+        out.lower_bounds.resize(n, f32::INFINITY);
+        for (id, &accepted) in accept.iter().enumerate() {
+            if accepted {
+                let binary_ip =
+                    compute_single_rq_distance(self.codes, id, n, code_len, &self.dist_table);
+                out.binary_ips[id] = binary_ip;
+                out.lower_bounds[id] = self.raw_query_binary_distance(id, binary_ip)
+                    - error_factors[id] * self.query_error;
+            }
+        }
+        Ok(())
+    }
+
     fn sign_stage_with_scratch(
         &self,
         out: &mut SignStage,

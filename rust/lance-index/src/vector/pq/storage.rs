@@ -819,6 +819,10 @@ impl VectorStore for ProductQuantizationStorage {
         self.row_ids.values().iter()
     }
 
+    fn row_ids_slice(&self) -> Option<&[u64]> {
+        Some(self.row_ids.values().as_ref())
+    }
+
     fn dist_calculator(&self, query: ArrayRef, _dist_q_c: f32) -> Self::DistanceCalculator<'_> {
         let codebook = self.metadata.codebook.as_ref().unwrap();
         match codebook.value_type() {

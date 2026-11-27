@@ -173,9 +173,13 @@ fn search_candidates_with_scratch(
             }
         }
     } else {
-        prefilter
-            .mask()
-            .selected_offsets_into(row_ids, &mut scratch.u32);
+        if let Some(rows) = storage.row_ids_slice() {
+            prefilter.filter_row_offsets_into(rows, &mut scratch.u32);
+        } else {
+            prefilter
+                .mask()
+                .selected_offsets_into(row_ids, &mut scratch.u32);
+        }
         if is_range_query {
             let lower_bound = params.lower_bound.unwrap_or(f32::MIN).into();
             let upper_bound = params.upper_bound.unwrap_or(f32::MAX).into();
@@ -324,9 +328,13 @@ impl IvfSubIndex for FlatIndex {
                 }
             }
             false => {
-                prefilter
-                    .mask()
-                    .selected_offsets_into(row_ids, &mut scratch.u32);
+                if let Some(rows) = storage.row_ids_slice() {
+                    prefilter.filter_row_offsets_into(rows, &mut scratch.u32);
+                } else {
+                    prefilter
+                        .mask()
+                        .selected_offsets_into(row_ids, &mut scratch.u32);
+                }
                 if is_range_query {
                     let lower_bound = params.lower_bound.unwrap_or(f32::MIN).into();
                     let upper_bound = params.upper_bound.unwrap_or(f32::MAX).into();
@@ -493,9 +501,13 @@ impl IvfSubIndex for FlatIndex {
             // The selection and the calculator's candidate buffer share the
             // u32 scratch: take it for the selection and keep the larger of
             // the two afterwards.
-            prefilter
-                .mask()
-                .selected_offsets_into(row_ids, &mut scratch.u32);
+            if let Some(rows) = storage.row_ids_slice() {
+                prefilter.filter_row_offsets_into(rows, &mut scratch.u32);
+            } else {
+                prefilter
+                    .mask()
+                    .selected_offsets_into(row_ids, &mut scratch.u32);
+            }
             let selected = std::mem::take(&mut scratch.u32);
             dist_calc.accumulate_filtered_topk_with_scratch(
                 k,
@@ -723,6 +735,8 @@ impl TryFrom<Quantizer> for FlatBinQuantizer {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
 
     use arrow_array::{FixedSizeListArray, UInt32Array};
@@ -755,6 +769,7 @@ mod tests {
     struct MaskPreFilter {
         mask: Arc<RowAddrMask>,
         deletions_only: bool,
+        offset_calls: AtomicUsize,
     }
 
     #[async_trait]
@@ -777,6 +792,11 @@ mod tests {
 
         fn filter_row_ids<'a>(&self, row_ids: Box<dyn Iterator<Item = &'a u64> + 'a>) -> Vec<u64> {
             self.mask.selected_indices(row_ids)
+        }
+
+        fn filter_row_offsets_into(&self, row_ids: &[u64], out: &mut Vec<u32>) {
+            self.offset_calls.fetch_add(1, Ordering::Relaxed);
+            self.mask.selected_offsets_into(row_ids.iter(), out);
         }
     }
 
@@ -866,6 +886,7 @@ mod tests {
                 0_u64, 3, 4,
             ]))),
             deletions_only: false,
+            offset_calls: AtomicUsize::new(0),
         });
         let search_results = batch_results(
             index
@@ -887,7 +908,7 @@ mod tests {
                 k,
                 FlatQueryParams::default(),
                 &storage,
-                filter,
+                filter.clone(),
                 &mut heap,
                 &NoOpMetricsCollector,
             )
@@ -898,6 +919,21 @@ mod tests {
             search_results.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
             vec![0, 3]
         );
+        let candidates = index
+            .search_with_candidates_with_scratch(
+                query(),
+                k,
+                FlatQueryParams::default(),
+                &storage,
+                filter.clone(),
+                &NoOpMetricsCollector,
+                7,
+                None,
+                &mut QueryScratch::new(),
+            )
+            .unwrap();
+        assert_eq!(batch_results(candidates.batch), search_results);
+        assert_eq!(filter.offset_calls.load(Ordering::Relaxed), 3);
     }
 
     /// Scanning past a deletions-only mask returns what the masked scan
@@ -924,6 +960,7 @@ mod tests {
                     deleted,
                 ]))),
                 deletions_only,
+                offset_calls: AtomicUsize::new(0),
             });
             index
                 .accumulate_topk(
@@ -1012,6 +1049,7 @@ mod tests {
             let filter = Arc::new(MaskPreFilter {
                 mask: Arc::new(RowAddrMask::from_block(RowAddrTreeMap::from_iter([100]))),
                 deletions_only,
+                offset_calls: AtomicUsize::new(0),
             });
             let mut heap = BinaryHeap::new();
             FlatIndex::default()
