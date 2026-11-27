@@ -239,21 +239,29 @@ async fn independent_search_progresses_with_stalled_reader(#[case] cancel: bool)
 }
 
 #[tokio::test]
-async fn batch_returns_ordered_topk_with_one_prepare_slot() {
+async fn batch_matches_single_queries_with_one_prepare_slot() {
     let mut f = Fixture::new(1).await;
-    let expected = search_global(&f.reference, &f.query, Arc::new(NoFilter))
-        .await
-        .unwrap();
-    let (parts, dists) = f.reference.find_partitions(&f.query).unwrap();
+    let second = lazy_test_query(Arc::new(Float32Array::from_value(0.5, DIM)), f.query.k, 4);
+    let mut partitions = Vec::new();
+    let mut distances = Vec::new();
+    let mut expected = Vec::new();
+    for query in [&f.query, &second] {
+        let (parts, dists) = f.reference.find_partitions(query).unwrap();
+        partitions.push(Arc::new(parts));
+        distances.push(Arc::new(dists));
+        expected.push(
+            search_global(&f.reference, query, Arc::new(NoFilter))
+                .await
+                .unwrap(),
+        );
+    }
     let mut batch_query = f.query.clone();
     batch_query.key =
-        arrow_select::concat::concat(&[f.query.key.as_ref(), f.query.key.as_ref()]).unwrap();
-    let parts = Arc::new(parts);
-    let dists = Arc::new(dists);
+        arrow_select::concat::concat(&[f.query.key.as_ref(), second.key.as_ref()]).unwrap();
     let run = f.paused.clone().search_partitions_batch(
         batch_query,
-        vec![parts.clone(), parts],
-        vec![dists.clone(), dists],
+        partitions,
+        distances,
         Arc::new(NoFilter),
         Arc::new(NoOpMetricsCollector),
     );
@@ -272,8 +280,16 @@ async fn batch_returns_ordered_topk_with_one_prepare_slot() {
         tokio::select! { result = run => result.unwrap(), _ = drive => panic!("load source closed") }
     }).await.unwrap();
     assert_eq!(batches.len(), 2);
-    for batch in batches {
-        assert_eq!(result_bits(&batch), result_bits(&expected));
+    // Single and batch search visit partitions in different orders and emit
+    // their heaps in internal order. Compare exact ID/distance pairs per query.
+    let rows = |batch: &RecordBatch| {
+        let (ids, distances) = result_bits(batch);
+        let mut rows = ids.into_iter().zip(distances).collect::<Vec<_>>();
+        rows.sort_unstable();
+        rows
+    };
+    for (batch, reference) in batches.iter().zip(&expected) {
+        assert_eq!(rows(batch), rows(reference));
     }
     assert_eq!(f.budget.available_permits(), 1);
 }
