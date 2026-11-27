@@ -246,6 +246,9 @@ impl NullableIndexExprResult {
     /// Under a `WHERE` clause NULL is treated as FALSE, so `drop_nulls`
     /// folds NULL rows out of the answer at each endpoint.
     pub fn drop_nulls(self) -> IndexExprResult {
+        if self.exact {
+            return IndexExprResult::exact(self.lower.drop_nulls()).with_domain(self.domain);
+        }
         IndexExprResult {
             lower: self.lower.drop_nulls(),
             upper: self.upper.drop_nulls(),
@@ -280,6 +283,9 @@ impl std::ops::BitAnd<Self> for NullableIndexExprResult {
             "combined NullableIndexExprResult masks with mismatched domains — \
              caller must reconcile domains first"
         );
+        if self.exact && rhs.exact {
+            return Self::exact(self.lower & rhs.lower).with_domain(self.domain);
+        }
         Self {
             lower: self.lower & rhs.lower,
             upper: self.upper & rhs.upper,
@@ -301,6 +307,9 @@ impl std::ops::BitOr<Self> for NullableIndexExprResult {
             "combined NullableIndexExprResult masks with mismatched domains — \
              caller must reconcile domains first"
         );
+        if self.exact && rhs.exact {
+            return Self::exact(self.lower | rhs.lower).with_domain(self.domain);
+        }
         Self {
             lower: self.lower | rhs.lower,
             upper: self.upper | rhs.upper,
@@ -462,6 +471,9 @@ impl std::ops::BitAnd<Self> for IndexExprResult {
             "combined IndexExprResult masks with mismatched domains — \
              caller must reconcile domains first"
         );
+        if self.exact && rhs.exact {
+            return Self::exact(self.lower & rhs.lower).with_domain(self.domain);
+        }
         Self {
             lower: self.lower & rhs.lower,
             upper: self.upper & rhs.upper,
@@ -483,6 +495,9 @@ impl std::ops::BitOr<Self> for IndexExprResult {
             "combined IndexExprResult masks with mismatched domains — \
              caller must reconcile domains first"
         );
+        if self.exact && rhs.exact {
+            return Self::exact(self.lower | rhs.lower).with_domain(self.domain);
+        }
         Self {
             lower: self.lower | rhs.lower,
             upper: self.upper | rhs.upper,
@@ -693,6 +708,53 @@ mod tests {
             RowAddrTreeMap::from_iter(rows.iter().copied()),
             RowAddrTreeMap::new(),
         ))
+    }
+
+    #[test]
+    fn exact_algebra_preserves_nulls_bounds_and_domains() {
+        for domain in [MaskDomain::RowAddress, MaskDomain::RowId] {
+            for left_blocked in [false, true] {
+                for right_blocked in [false, true] {
+                    let make = |rows, nulls, blocked| {
+                        let set = NullableRowAddrSet::new(
+                            RowAddrTreeMap::from_iter(rows),
+                            RowAddrTreeMap::from_iter(nulls),
+                        );
+                        if blocked {
+                            NullableRowAddrMask::BlockList(set)
+                        } else {
+                            NullableRowAddrMask::AllowList(set)
+                        }
+                    };
+                    let left = make(vec![0, 1, 1 << 32], vec![1, 2], left_blocked);
+                    let right = make(vec![1, 2, 1 << 32], vec![0, 2], right_blocked);
+                    let lhs = NullableIndexExprResult::exact(left.clone()).with_domain(domain);
+                    let rhs = NullableIndexExprResult::exact(right.clone()).with_domain(domain);
+                    for (result, expected) in [
+                        (lhs.clone() & rhs.clone(), left.clone() & right.clone()),
+                        (lhs | rhs, left.clone() | right.clone()),
+                    ] {
+                        assert!(result.is_exact());
+                        assert_eq!(result.domain, domain);
+                        assert_eq!(result.lower, expected);
+                        assert_eq!(result.upper, expected);
+                        let dropped = result.drop_nulls();
+                        let expected = expected.drop_nulls();
+                        assert!(dropped.is_exact());
+                        assert_eq!(dropped.domain, domain);
+                        assert_eq!(dropped.lower, expected);
+                        assert_eq!(dropped.upper, expected);
+                    }
+                    let lhs = IndexExprResult::exact(left.drop_nulls()).with_domain(domain);
+                    let rhs = IndexExprResult::exact(right.drop_nulls()).with_domain(domain);
+                    for result in [lhs.clone() & rhs.clone(), lhs | rhs] {
+                        assert!(result.is_exact());
+                        assert_eq!(result.domain, domain);
+                        assert_eq!(result.lower, result.upper);
+                    }
+                }
+            }
+        }
     }
 
     #[test]
