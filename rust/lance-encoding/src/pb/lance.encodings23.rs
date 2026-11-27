@@ -499,15 +499,20 @@ impl ::prost::Name for Variable {
         "/lance.encodings23.Variable".into()
     }
 }
-/// Compression algorithm where all values have a constant value (encoded in the description)
-///
-/// This is a leaf encoding, there is no compression applied to the data.
-///
-/// The input can be any kind of data block.
-/// There is no output.
+/// Metadata-only block or per-value encoding. The enclosing layout or codec
+/// supplies the number of values. Constant has no value payload buffer.
+/// `ConstantValue` is the constant codec for the page's value plane.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Constant {
-    /// The value (TODO: define encoding for literals?)
+    /// For unsigned blocks, the repeated value is one little-endian u32
+    /// (4 bytes) or u64 (8 bytes). The field is absent exactly when the
+    /// decoding unit has zero values.
+    ///
+    /// Generic block and fixed per-value Constant decoders pass present bytes
+    /// through as an opaque scalar and produce all nulls when the field is
+    /// absent. For all-null leaves in per-value fixed-size-list encodings,
+    /// writers omit the field and readers use the Constant variant as the
+    /// all-null marker.
     #[prost(bytes = "bytes", optional, tag = "1")]
     pub value: ::core::option::Option<::prost::bytes::Bytes>,
 }
@@ -912,11 +917,10 @@ impl ::prost::Name for ByteStreamSplit {
         "/lance.encodings23.ByteStreamSplit".into()
     }
 }
-/// ALP: Adaptive Lossless floating-Point encoding
+/// ALP (Adaptive Lossless floating-Point) mini-block compression.
 ///
-/// Unstable 2.3 mirror of the stable 2.1/2.2 ALP compression message. Each
-/// mini-block chunk is self-describing (mode, exponents, bit width, base
-/// values), so only the input width is declared here.
+/// Unstable 2.3. This message declares the input width. Each chunk stores
+/// its mode and mode-specific parameters in its header.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Alp {
     /// 32 for f32 and 64 for f64
