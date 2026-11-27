@@ -19,7 +19,9 @@
 use crate::encodings::physical::axis_delta::AxisDeltaDecompressor;
 pub use crate::encodings::physical::axis_delta::try_tensor_per_value;
 #[cfg(feature = "bitpacking")]
-use crate::encodings::physical::bitpacking::{InlineBitpacking, OutOfLineBitpacking};
+use crate::encodings::physical::bitpacking::{
+    ELEMS_PER_CHUNK, InlineBitpacking, OutOfLineBitpacking,
+};
 #[cfg(feature = "pcodec")]
 use crate::encodings::physical::pcodec::{PcodecMiniBlockDecompressor, PcodecMiniBlockEncoder};
 use crate::{
@@ -35,7 +37,7 @@ use crate::{
     encodings::{
         logical::primitive::{
             fullzip::PerValueCompressor,
-            miniblock::{MAX_MINIBLOCK_VALUES, MiniBlockCompressor},
+            miniblock::{MAX_MINIBLOCK_VALUES, MiniBlockCompressionContext, MiniBlockCompressor},
         },
         physical::{
             alp::{AlpMiniBlockDecompressor, AlpMiniBlockEncoder, should_use_alp},
@@ -145,6 +147,12 @@ pub trait CompressionStrategy: Send + Sync + std::fmt::Debug {
         data: &DataBlock,
     ) -> Result<Box<dyn PerValueCompressor>>;
 
+    /// Resolve and validate the byte target for mini-block chunks of this field.
+    /// `None` leaves the chunk size to the selected codec.
+    fn minichunk_size(&self, _field: &Field) -> Result<Option<u64>> {
+        Ok(None)
+    }
+
     /// Create a mini-block compressor for the given data
     fn create_miniblock_compressor(
         &self,
@@ -216,6 +224,17 @@ fn try_alp_for_mini_block(
     // before the candidate scan, and the page-level fallback already guarantees
     // ALP never enlarges data. Only v2.3 writers call this path.
     let mode = params.alp.unwrap_or(AlpMode::Auto);
+    // ALP packets and inline bitpacking both use 1024-value groups. An
+    // explicitly selected ALP codec keeps that framing. Automatic ALP
+    // yields to a different requested General compression unit, or to
+    // an explicit BSS request paired with that byte target.
+    if mode == AlpMode::Auto
+        && let Some(target) = explicit_general_chunk_target(params)
+        && (params.bss == Some(BssMode::On)
+            || general_chunk_target_conflicts(data, target, AlpMiniBlockEncoder::VALUES_PER_CHUNK))
+    {
+        return None;
+    }
     if !should_use_alp(data, mode) {
         return None;
     }
@@ -352,15 +371,23 @@ fn try_child_rle_for_mini_block(
     )
     .ok()?;
     let child_compression = rle_child_compression_config(params);
-    let encoder = || {
-        RleEncoder::with_child_encoding(
-            run_length_width,
-            child_compression,
-            child_compression,
-            true,
-        )
-        .with_max_miniblock_values(max_values as usize)
-    };
+    let encoder = RleEncoder::with_child_encoding(
+        run_length_width,
+        child_compression,
+        child_compression,
+        true,
+    )
+    .with_max_miniblock_values(max_values as usize);
+    if params.rle_threshold.is_none()
+        && let Some(target) = explicit_general_chunk_target(params)
+        && data.expect_single_stat::<UInt64Type>(Stat::RunCount) == data.num_values
+        && general_chunk_target_values(data, target)
+            .is_none_or(|values| !encoder.singleton_chunks_match(data, values))
+    {
+        // A singleton run adds a length entry to every value. Give General
+        // the requested chunk boundaries when RLE would change them.
+        return None;
+    }
 
     #[cfg(feature = "bitpacking")]
     let bitpack_bytes = estimate_inline_bitpacking_bytes(data).map(u128::from);
@@ -371,12 +398,12 @@ fn try_child_rle_for_mini_block(
         && (estimated_bytes >= raw_bytes
             || bitpack_bytes.is_some_and(|bytes| bytes < estimated_bytes));
     let selected_bytes = if should_measure_children {
-        encoder().estimated_payload_size(data).ok()?
+        encoder.estimated_payload_size(data).ok()?
     } else {
         estimated_bytes
     };
 
-    rle_beats_raw_and_bitpacking(data, selected_bytes, raw_bytes).then(|| Box::new(encoder()) as _)
+    rle_beats_raw_and_bitpacking(data, selected_bytes, raw_bytes).then(|| Box::new(encoder) as _)
 }
 
 fn rle_child_compression_config(params: &CompressionFieldParams) -> Option<CompressionConfig> {
@@ -695,15 +722,9 @@ pub fn field_metadata_params(field: &Field) -> CompressionFieldParams {
             None => log::warn!("Invalid ALP mode '{}', using default", alp_str),
         }
     }
-    if let Some(minichunk_size_str) = field
-        .metadata
-        .get(super::constants::MINICHUNK_SIZE_META_KEY)
-    {
-        if let Ok(minichunk_size) = minichunk_size_str.parse::<i64>() {
-            params.minichunk_size = Some(minichunk_size);
-        } else {
-            log::warn!("Invalid minichunk_size '{}', skipping", minichunk_size_str);
-        }
+    match crate::compression_config::minichunk_size_from_metadata(field) {
+        Ok(size) => params.minichunk_size = size,
+        Err(error) => log::warn!("{error}"),
     }
 
     params
@@ -742,6 +763,42 @@ pub fn try_byte_stream_split_miniblock(
     try_bss_for_mini_block(data, params)
 }
 
+fn explicit_general_chunk_target(params: &CompressionFieldParams) -> Option<u64> {
+    if matches!(params.compression.as_deref(), Some("lz4" | "zstd")) {
+        params
+            .minichunk_size
+            .filter(|&size| size > 0)
+            .map(|size| size as u64)
+    } else {
+        None
+    }
+}
+
+fn general_chunk_target_values(data: &FixedWidthDataBlock, target: u64) -> Option<u64> {
+    let context =
+        MiniBlockCompressionContext::new(0, true, true).with_fixed_width_chunk_target(target);
+    context
+        .fixed_width_values_per_chunk(data.num_values, 1, 1, |values| {
+            values * (data.bits_per_value / 8)
+        })
+        .ok()
+        .flatten()
+}
+
+fn general_chunk_target_conflicts(
+    data: &FixedWidthDataBlock,
+    target: u64,
+    codec_chunk_values: u64,
+) -> bool {
+    if !matches!(data.bits_per_value, 8 | 16 | 32 | 64) {
+        return false;
+    }
+    // Let the encoder that handles explicit targets report an unusable budget.
+    general_chunk_target_values(data, target).is_none_or(|values| {
+        values != codec_chunk_values && data.num_values > values.min(codec_chunk_values)
+    })
+}
+
 /// Select modern ALP compression for an applicable floating-point miniblock.
 pub fn try_alp_miniblock(
     field: &Field,
@@ -754,10 +811,12 @@ pub fn try_alp_miniblock(
     try_alp_for_mini_block(field, data, params)
 }
 
-/// Select pcodec compression when the field requests `compression=pcodec`.
+/// Select Pcodec compression when the field requests `compression=pcodec`.
 ///
-/// pcodec applies to float16/float32/float64 values and fixed-size lists of them. A
-/// request for any other type is rejected instead of silently ignored.
+/// Pcodec applies to float16/float32/float64 values and fixed-size lists of them.
+/// Requests for other types return an error. Lists with null items fall back to
+/// another encoding. For an eligible page, a build that omits the `pcodec` Cargo
+/// feature returns [`Error::NotSupported`].
 pub fn try_pcodec_miniblock(
     field: &Field,
     data: &DataBlock,
@@ -799,7 +858,13 @@ pub fn try_pcodec_miniblock(
     #[cfg(not(feature = "pcodec"))]
     {
         Err(Error::not_supported_source(
-            "package was not built with pcodec support".into(),
+            format!(
+                "Cannot write Pcodec-compressed values for field '{}' because this Lance binary was \
+                 built without the `pcodec` Cargo feature. Enable `lance-encoding/pcodec` and rebuild \
+                 or choose another compression scheme.",
+                field.name
+            )
+            .into(),
         ))
     }
 }
@@ -832,6 +897,22 @@ pub fn try_bitpacking_miniblock(data: &DataBlock) -> Option<Box<dyn MiniBlockCom
         return None;
     };
     try_bitpack_for_mini_block(data)
+}
+
+/// Select inline bitpacking unless its fixed group size conflicts with an
+/// explicit General compression byte target.
+pub fn try_bitpacking_miniblock_with_target(
+    data: &DataBlock,
+    _params: &CompressionFieldParams,
+) -> Option<Box<dyn MiniBlockCompressor>> {
+    #[cfg(feature = "bitpacking")]
+    if let DataBlock::FixedWidth(data) = data
+        && let Some(target) = explicit_general_chunk_target(_params)
+        && general_chunk_target_conflicts(data, target, ELEMS_PER_CHUNK)
+    {
+        return None;
+    }
+    try_bitpacking_miniblock(data)
 }
 
 /// Store fixed-width miniblock values without a value codec.
@@ -1591,7 +1672,9 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
             )),
             #[cfg(not(feature = "pcodec"))]
             Compression::Pcodec(_) => Err(Error::not_supported_source(
-                "package was not built with pcodec support".into(),
+                "Cannot read Pcodec-compressed values because this Lance binary was built without \
+                 the `pcodec` Cargo feature. Use a build with `lance-encoding/pcodec` enabled."
+                    .into(),
             )),
             Compression::General(general) => {
                 // Create inner decompressor
@@ -1920,7 +2003,17 @@ pub(crate) fn infer_fixed_width_block_bits(description: &CompressiveEncoding) ->
 /// This is intentionally separate from [`DecompressionStrategy::create_block_decompressor`]:
 /// stable 2.1/2.2 block readers keep their existing grammar and framing, while
 /// the 2.3 offset and sparse containers opt into this typed grammar explicitly.
-pub(crate) fn create_fixed_width_block_decompressor(
+/// The expected output width must be 32 or 64 bits. Construction validates the
+/// codec tree; payloads are checked by [`BlockDecompressor::decompress`].
+///
+/// ```
+/// use lance_encoding::{compression::create_fixed_width_block_decompressor, format::EncodingUtils};
+///
+/// let decoder = create_fixed_width_block_decompressor(&EncodingUtils::flat(32, None), 32)?;
+/// assert!(decoder.requires_payload());
+/// # Ok::<(), lance_core::Error>(())
+/// ```
+pub fn create_fixed_width_block_decompressor(
     description: &CompressiveEncoding,
     expected_bits_per_value: u64,
 ) -> Result<Box<dyn BlockDecompressor>> {
@@ -2427,8 +2520,71 @@ mod tests {
     use crate::format::EncodingUtils;
     use crate::statistics::ComputeStat;
     use crate::testing::{TestEncoding, extract_array_encoding_chain, test_compression_strategy};
+    #[cfg(not(feature = "pcodec"))]
+    use arrow_array::{ArrayRef, FixedSizeListArray, Float32Array};
     use arrow_schema::{DataType, Field as ArrowField};
     use std::collections::HashMap;
+
+    #[cfg(not(feature = "pcodec"))]
+    #[rstest::rstest]
+    #[case::direct(None)]
+    #[case::wrapped(Some(CompressionScheme::Zstd))]
+    fn pcodec_miniblock_read_without_feature(#[case] wrapper: Option<CompressionScheme>) {
+        let values = EncodingUtils::pcodec(EncodingUtils::flat(32, None));
+        let encoding = if let Some(scheme) = wrapper {
+            EncodingUtils::wrapped(CompressionConfig::new(scheme, None), values).unwrap()
+        } else {
+            values
+        };
+
+        let strategy = DefaultDecompressionStrategy::default();
+        let error = strategy
+            .create_miniblock_decompressor(&encoding, &strategy)
+            .unwrap_err();
+        assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+        let message = error.to_string();
+        assert!(
+            message.contains("this Lance binary was built without the `pcodec` Cargo feature"),
+            "{message}"
+        );
+        assert!(message.contains("`lance-encoding/pcodec`"), "{message}");
+    }
+
+    #[cfg(not(feature = "pcodec"))]
+    #[rstest::rstest]
+    #[case::eligible(Some(2.0))]
+    #[case::null_item(None)]
+    fn pcodec_miniblock_write_without_feature(#[case] second_item: Option<f32>) {
+        let item_field = Arc::new(ArrowField::new("item", DataType::Float32, true));
+        let items = Arc::new(Float32Array::from(vec![
+            Some(1.0),
+            second_item,
+            Some(3.0),
+            Some(4.0),
+        ]));
+        let array: ArrayRef = Arc::new(FixedSizeListArray::new(item_field, 2, items, None));
+        let field = create_test_field("signal", array.data_type().clone());
+        let data = DataBlock::from_arrays(&[array], 2);
+        let params = CompressionFieldParams {
+            compression: Some(PCODEC_COMPRESSION.to_string()),
+            ..Default::default()
+        };
+
+        let result = try_pcodec_miniblock(&field, &data, &params);
+        if second_item.is_none() {
+            assert!(result.unwrap().is_none());
+            return;
+        }
+        let error = result.unwrap_err();
+        assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+        let message = error.to_string();
+        assert!(message.contains("field 'signal'"), "{message}");
+        assert!(
+            message.contains("this Lance binary was built without the `pcodec` Cargo feature"),
+            "{message}"
+        );
+        assert!(message.contains("`lance-encoding/pcodec`"), "{message}");
+    }
 
     #[rstest::rstest]
     #[case(EncodingUtils::flat(0, None), "positive bit width")]
