@@ -687,7 +687,8 @@ mod float_miniblocks {
             .enable_all()
             .build()
             .unwrap();
-        // Place the edges near an ALP or 8 x Float32 Pcodec chunk boundary.
+        // Row 1024 is a chunk boundary for ALP and for Pcodec with eight
+        // Float32 items per row. Scalar Pcodec uses one chunk at these row counts.
         let strategy = (
             1280..=1536usize,
             1020..=1024usize,
@@ -704,6 +705,9 @@ mod float_miniblocks {
                 &strategy,
                 |(num_rows, first_edge_row, nulls_per_eight, offset, seeds)| {
                     let edge_rows = first_edge_row..first_edge_row + NUM_EDGE_VALUES;
+                    // Keep the next row null so planar validity is nontrivial
+                    // even if the generated null pattern contributes no nulls.
+                    // The range and take below both include this row.
                     let row_validity = NullBuffer::from_iter((0..num_rows).map(|row| {
                         edge_rows.contains(&row)
                             || (row != edge_rows.end && row % 8 >= nulls_per_eight)
