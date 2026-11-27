@@ -88,12 +88,14 @@ pub struct CloudObjectReader {
     io_parallelism: usize,
     download_retry_count: usize,
     observe_transport: bool,
+    if_match: Option<String>,
 }
 
 impl DeepSizeOf for CloudObjectReader {
     fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         // Skipping object_store because there is no easy way to do that and it shouldn't be too big
         self.path.as_ref().deep_size_of_children(context)
+            + self.if_match.deep_size_of_children(context)
     }
 }
 
@@ -114,6 +116,7 @@ impl CloudObjectReader {
             io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
             download_retry_count,
             observe_transport: true,
+            if_match: None,
         })
     }
 
@@ -125,6 +128,12 @@ impl CloudObjectReader {
     /// configured request limit instead of the hardcoded cloud default.
     pub fn with_io_parallelism(mut self, io_parallelism: usize) -> Self {
         self.io_parallelism = io_parallelism;
+        self
+    }
+
+    /// Require the observed ETag on every object read, including retries.
+    pub(crate) fn with_if_match(mut self, e_tag: String) -> Self {
+        self.if_match = Some(e_tag);
         self
     }
 
@@ -147,6 +156,7 @@ impl CloudObjectReader {
             path: self.path.clone(),
             options: GetOptions {
                 range: Some(range.clone().into()),
+                if_match: self.if_match.clone(),
                 ..Default::default()
             },
         });
@@ -170,7 +180,10 @@ impl CloudObjectReader {
         let get_request = Arc::new(GetRequest {
             object_store: self.object_store.clone(),
             path: self.path.clone(),
-            options: GetOptions::default(),
+            options: GetOptions {
+                if_match: self.if_match.clone(),
+                ..Default::default()
+            },
         });
         let download_retry_count = self.download_retry_count;
         Box::pin(async move {
@@ -376,9 +389,18 @@ impl Reader for CloudObjectReader {
         Box::pin(async move {
             self.size
                 .get_or_try_init(|| async move {
-                    let meta =
-                        do_with_retry(|| Box::pin(self.object_store.head(&self.path))).await?;
-                    Ok(meta.size as usize)
+                    let result = do_with_retry(|| {
+                        Box::pin(self.object_store.get_opts(
+                            &self.path,
+                            GetOptions {
+                                head: true,
+                                if_match: self.if_match.clone(),
+                                ..Default::default()
+                            },
+                        ))
+                    })
+                    .await?;
+                    Ok(result.meta.size as usize)
                 })
                 .await
                 .cloned()
@@ -416,7 +438,10 @@ impl Reader for CloudObjectReader {
         let get_request = GetRequest {
             object_store: self.object_store.clone(),
             path: self.path.clone(),
-            options: GetOptions::default(),
+            options: GetOptions {
+                if_match: self.if_match.clone(),
+                ..Default::default()
+            },
         };
         Box::pin(streaming::get_stream(
             get_request,
@@ -429,6 +454,7 @@ impl Reader for CloudObjectReader {
             object_store: self.object_store.clone(),
             path: self.path.clone(),
             options: GetOptions {
+                if_match: self.if_match.clone(),
                 range: Some(
                     Range {
                         start: range.start as u64,
@@ -491,6 +517,29 @@ impl std::fmt::Debug for SmallReaderState {
 }
 
 impl SmallReader {
+    /// Read an already fetched complete object without issuing another request.
+    ///
+    /// ```
+    /// use bytes::Bytes;
+    /// use lance_io::{object_reader::SmallReader, traits::Reader};
+    /// use object_store::path::Path;
+    /// # async fn example() -> object_store::Result<()> {
+    /// let reader = SmallReader::from_bytes(Path::from("manifest"), Bytes::from_static(b"data"));
+    /// assert_eq!(reader.get_range(1..3).await?, Bytes::from_static(b"at"));
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn from_bytes(path: Path, bytes: Bytes) -> Self {
+        Self {
+            inner: Arc::new(SmallReaderInner {
+                path,
+                size: bytes.len(),
+                observe_transport: false,
+                state: std::sync::Mutex::new(SmallReaderState::Finished(Ok(bytes))),
+            }),
+        }
+    }
+
     pub fn new(
         store: Arc<dyn ObjectStore>,
         path: Path,
@@ -895,6 +944,36 @@ mod tests {
     use super::*;
     use crate::traits::{WriteExt, Writer};
     use crate::utils::tracking_store::{IoStats, IoTrackingStore};
+
+    #[rstest]
+    #[tokio::test]
+    async fn conditional_reader_rejects_replacement_between_requests(
+        #[values(false, true)] is_stream: bool,
+    ) {
+        let store = Arc::new(InMemory::new());
+        let path = Path::from("manifest");
+        let written = store
+            .put(&path, Bytes::from_static(b"old content").into())
+            .await
+            .unwrap();
+        let reader = CloudObjectReader::new(store.clone(), path.clone(), 4, Some(11), 0)
+            .unwrap()
+            .with_if_match(written.e_tag.unwrap());
+        assert_eq!(reader.get_range(0..3).await.unwrap(), "old");
+        store
+            .put(&path, Bytes::from_static(b"new content").into())
+            .await
+            .unwrap();
+        let error = if is_stream {
+            reader.get_range_stream(4..11).await.err().unwrap()
+        } else {
+            reader.get_range(4..11).await.unwrap_err()
+        };
+        assert!(
+            matches!(error, object_store::Error::Precondition { .. }),
+            "{error}"
+        );
+    }
 
     /// Injects request failures, response metadata, and partial streaming bodies.
     #[derive(Debug)]

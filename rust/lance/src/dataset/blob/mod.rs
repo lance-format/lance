@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+pub mod capture;
 pub mod clone;
 #[cfg(test)]
 mod compaction;
 mod managed;
 mod materialize;
+mod read;
 mod rewrite;
 #[cfg(test)]
 mod rewrite_tests;
@@ -35,9 +37,12 @@ pub(super) use locate::data_file_key_from_path;
 pub use managed::preserve_managed_descriptors;
 pub(super) use managed::{managed_paths, may_be_same_store};
 pub use materialize::{
-    BlobMaterializationAdmission, BlobMaterializationContext, MaterializedBlobBatch,
-    blob_v2_descriptor_schema, materialize_blob_v2_binary_batch,
+    BlobMaterializationAdmission, BlobMaterializationContext, BlobMaterializationReservation,
+    MaterializedBlobBatch, blob_v2_descriptor_schema, materialize_blob_v2_binary_batch,
     materialize_blob_v2_binary_batch_with_admission, public_blob_v2_binary_output_schema,
     schema_has_blob_v2_binary_view, split_batch_by_bytes,
+};
+pub use read::{
+    BlobRefBinding, BlobRefDemand, BlobRefReadStream, BlobRefReader, BlobRefRequest, ReadBlobRef,
 };
 pub use rewrite::{BlobV2BatchRewritePlan, field_contains_blob_v2, transform_blob_v2_batch};

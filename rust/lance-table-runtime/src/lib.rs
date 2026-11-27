@@ -18,6 +18,7 @@ pub mod overlay;
 pub mod refs;
 pub mod rowids;
 pub mod session;
+pub mod snapshot;
 pub mod take;
 pub mod write;
 

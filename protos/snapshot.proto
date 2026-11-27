@@ -1,0 +1,40 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
+syntax = "proto3";
+
+package lance.snapshot;
+
+/* Execution-only reference to an exact table snapshot, not a persisted Lance
+ * format. No manifest contents, credentials, storage bindings, or retention
+ * rights are transported. Unknown protocol versions must fail.
+ */
+message SnapshotRef {
+  uint32 protocol_version = 1;
+  // Caller-supplied table incarnation and catalog/storage authority.
+  string table_identity = 2;
+  // Canonical absolute table root URI, without a branch suffix or credentials.
+  string table_uri = 3;
+  // Absent identifies the main branch. Tags and unresolved heads are not accepted.
+  optional string branch = 4;
+  uint64 version = 5;
+  // Exact resolved manifest object path in the source object store.
+  string manifest_path = 6;
+  /* Optional BLAKE3 of the complete original manifest file, including index metadata,
+   * inline transactions, dictionaries, length prefixes, and the footer.
+   * Hash the original bytes: protobuf re-encoding is not canonical. Empty means
+   * validation uses the authoritative commit identity or manifest_etag instead.
+   * At least one validation mechanism must be present.
+   */
+  bytes manifest_digest = 7;
+  /* Optional authoritative commit-store record identity. The resolver must
+   * validate it against the exact committed record. It relies on immutable
+   * committed manifests; it does not verify their complete file contents.
+   */
+  optional string manifest_identity = 8;
+  /* Optional opaque storage ETag observed at manifest_path. Reopening must
+   * apply If-Match to every manifest read, including range requests. This is
+   * an object-generation condition, not a content checksum or table identity.
+   */
+  optional string manifest_etag = 9;
+}

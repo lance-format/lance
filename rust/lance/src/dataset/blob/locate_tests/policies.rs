@@ -2,14 +2,20 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use super::*;
+use crate::blob::reference::{
+    BlobMaterializationContext, BlobRefBinding, BlobRefCapture, BlobRefDemand, BlobRefReader,
+    BlobRefRequest, BlobSourceContext,
+};
 use crate::blob::{BlobArrayBuilder, blob_field};
 use crate::dataset::blob::test_util::create_multi_base_blob_v2_fixture;
 use crate::dataset::{DatasetBuilder, ReadParams, WriteParams};
 use crate::session::{Session, UnregisteredExternalBlobPolicy};
-use arrow_array::{RecordBatch, RecordBatchIterator};
+use arrow_array::{Array, RecordBatch, RecordBatchIterator};
 use arrow_schema::Schema;
 use async_trait::async_trait;
+use futures::TryStreamExt;
 use futures::stream::BoxStream;
+use lance_core::utils::address::RowAddress;
 use lance_core::utils::tempfile::TempStdDir;
 use lance_file::version::LanceFileVersion;
 use lance_io::object_store::{
@@ -454,6 +460,58 @@ async fn test_unregistered_external_blob_policy(#[case] size: u64, #[case] prefe
         assert!(err.to_string().contains("base_id=0"), "{err}");
         assert!(err.to_string().contains("registered storage base"), "{err}");
     }
+    let source = BlobSourceContext::from_dataset(&dataset, "catalog/table", "workers")
+        .await
+        .unwrap()
+        .with_external_immutability_assumption();
+    let descriptions = super::descriptor(
+        Some(BlobKind::External),
+        0,
+        size,
+        0,
+        "probe://bucket/secret",
+        true,
+    );
+    let field = blob_field("blob", true).with_data_type(descriptions.data_type().clone());
+    let dataset = Arc::new(dataset);
+    let mut capture =
+        BlobRefCapture::try_new(dataset.clone(), source.clone(), field_id as i32).unwrap();
+    let error = capture
+        .capture(&source, &field, &[RowAddress::from(0)], &descriptions)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+    assert!(
+        error.to_string().contains("registered storage base"),
+        "{error}"
+    );
+    let reference = source
+        .reference(
+            "probe://bucket/secret".to_owned(),
+            0,
+            (size > 0).then_some(size),
+            BlobKind::External,
+            None,
+        )
+        .unwrap();
+    let reader = BlobRefReader::try_new(
+        vec![BlobRefBinding::try_new(source, dataset).unwrap()],
+        BlobMaterializationContext::try_new(64, 64).unwrap(),
+    )
+    .unwrap();
+    let error = reader
+        .read([BlobRefRequest::new(
+            0,
+            Some(reference),
+            BlobRefDemand::Whole,
+        )])
+        .err()
+        .unwrap();
+    assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+    assert!(
+        error.to_string().contains("registered storage base"),
+        "{error}"
+    );
     assert_eq!(provider.calls.load(Ordering::Relaxed), 0);
     assert_eq!(provider.tracker.stats().read_iops, 0);
     assert!(provider.params.lock().unwrap().is_empty());
@@ -797,6 +855,40 @@ async fn test_external_bypasses_cache_and_managed_keeps_cache(
         assert_eq!(provider.tracker.incremental_stats().read_iops, 0);
         assert_eq!(provider.params.lock().unwrap().len(), expected_bindings);
     }
+    let source = BlobSourceContext::from_dataset(&dataset, "catalog/table", "workers")
+        .await
+        .unwrap()
+        .with_external_immutability_assumption();
+    let captured = locator.capture_location(&external, 0).unwrap();
+    let reference = source
+        .reference(
+            captured.object_uri.as_str().to_owned(),
+            captured.offset,
+            captured.length,
+            captured.kind,
+            captured.base_id,
+        )
+        .unwrap();
+    let reader = BlobRefReader::try_new(
+        vec![BlobRefBinding::try_new(source, Arc::new(dataset.clone())).unwrap()],
+        BlobMaterializationContext::try_new(64, 64).unwrap(),
+    )
+    .unwrap();
+    observer.incremental_stats();
+    let read = reader
+        .read([BlobRefRequest::new(
+            42,
+            Some(reference),
+            BlobRefDemand::Whole,
+        )])
+        .unwrap()
+        .try_next()
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(read.request_index, 42);
+    assert_eq!(read.data.unwrap().as_ref(), b"now");
+    assert!(provider.tracker.incremental_stats().read_iops > 0);
     assert!(observer.stats().read_iops > 0);
     assert!(cache.external_wraps.load(Ordering::Relaxed) > 0);
     assert_eq!(provider.params.lock().unwrap().len(), expected_bindings);

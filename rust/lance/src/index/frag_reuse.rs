@@ -5464,9 +5464,11 @@ mod tests {
             .table_state
             .metadata_cache
             .insert_with_key(
-                &crate::session::caches::TransactionKey {
-                    version: trim_version,
-                },
+                &crate::session::caches::ManifestTransactionKey::new(
+                    &dataset.table_state.object_store,
+                    &dataset.table_state.manifest_location,
+                )
+                .unwrap(),
                 Arc::new(Transaction::new(
                     trim_version - 1,
                     Operation::ReserveFragments { num_fragments: 0 },
