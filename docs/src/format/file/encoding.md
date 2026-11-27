@@ -848,11 +848,11 @@ value buffers still have a length entry. When `General` wraps `Alp`, decompress 
 general codec before interpreting its ALP contents.
 
 Each little-endian `u32` in the mini-block metadata describes a chunk of `8 * ((word >> 4) + 1)` bytes including
-alignment. Its low four bits store `log2(n)` for a non-final chunk of `n` values. The final chunk gets its count
-from the page total minus the preceding chunk counts. If its low four bits are nonzero, they must agree with
-that count. The page total comes from `ChunkedValues.num_items` for dense pages and the terminal slot domain
-for sparse pages. The writer emits 1024 values per chunk, with a shorter final chunk if needed. It writes `10`
-for a full chunk and `0` for the shorter final chunk.
+alignment. For a non-final chunk of `n` values, the low four bits store `log2(n)` and must be nonzero. The final
+chunk gets its count from the page total minus the preceding chunk counts. If its low four bits are nonzero,
+they must agree with that count. The page total comes from `ChunkedValues.num_items` for dense pages and the
+terminal slot domain for sparse pages. The writer emits 1024 values per chunk, with a shorter final chunk
+if needed. It writes `10` for a full chunk and `0` for the shorter final chunk.
 
 The reader rejects a mismatched declared buffer count, truncated outer chunk headers, and buffers that extend
 past the chunk boundary. The chunk lengths must sum to the size of the page's chunk data buffer. A zero-value
