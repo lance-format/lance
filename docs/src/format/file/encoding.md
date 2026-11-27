@@ -398,6 +398,10 @@ packed structs can compose with sparse structure. Codec selection is a writer po
 ```
 
 ```protobuf
+%%% proto.message.DenseStructure %%%
+```
+
+```protobuf
 %%% proto.message.ValuePlane %%%
 ```
 
@@ -410,7 +414,23 @@ packed structs can compose with sparse structure. Codec selection is a writer po
 ```
 
 ```protobuf
+%%% proto.message.DenseChunkLevels %%%
+```
+
+```protobuf
 %%% proto.message.ZippedValues %%%
+```
+
+```protobuf
+%%% proto.message.DenseZipLevels %%%
+```
+
+```protobuf
+%%% proto.message.ConstantValue %%%
+```
+
+```protobuf
+%%% proto.message.NoValues %%%
 ```
 
 #### Sparse Structural Domains
@@ -812,6 +832,12 @@ effective when a column stores values with few significant decimal digits (price
 scaled to a fixed precision) and is used in the mini-block context of the unstable Lance 2.3 format. It is not
 transparent (the chunk layout is not a single value buffer), so it cannot be used in the full zip context.
 
+The `Alp` message declares the input width. Each chunk stores its mode and mode-specific parameters in its header.
+
+```protobuf
+%%% proto.message.Alp %%%
+```
+
 ALP maps each finite-decimal floating point value onto an integer with a base-10 exponent transform, then
 bit-packs the Frame-of-Reference (FOR) or Delta stream. Two reconstruction paths are supported per chunk:
 
@@ -902,6 +928,10 @@ dictionary encoded, since pcodec stores repeated values cheaply. Values wider th
 mostly-null pages also use the dense mini-block layout, because full zip compresses each value on its own and
 cannot exploit similarity between rows; a request that also sets `lance-encoding:structural-encoding=fullzip`
 is rejected. Pages of fixed-size lists with null items are stored without pcodec.
+
+```protobuf
+%%% proto.message.Pcodec %%%
+```
 
 ### General
 
@@ -1120,3 +1150,7 @@ This descriptor is valid only in per-value positions, including inside General
 compression. General compression retains one frame per tensor. Selecting and
 reading a tensor does not require other tensors; selecting an individual element
 still requires decoding that tensor's frame.
+
+```protobuf
+%%% proto.message.AxisDelta %%%
+```
