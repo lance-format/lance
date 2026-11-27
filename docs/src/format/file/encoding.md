@@ -56,7 +56,8 @@ scheduling so that compression libraries can focus on compression. This keeps ou
 without sacrificing our ability to perform random access.
 
 Lance 2.1 and 2.2 describe structural encodings with `lance.encodings21.PageLayout`.
-Their protobuf schema contains only stable layouts and codecs; sparse planes, Range, and Delta belong to 2.3.
+Their protobuf schema contains only stable layouts and codecs.
+Sparse planes, Range, and MonotonicDelta belong to 2.3.
 Lance 2.3 uses the independent planes described in [Planar Page Layout](#planar-page-layout).
 
 ```protobuf
@@ -336,8 +337,8 @@ is not supported. Lance 2.0, 2.1, and 2.2 retain their original metadata and phy
 
 `encodings_v2_3.proto` defines the complete 2.3 metadata grammar, including the recursive
 `lance.encodings23.CompressiveEncoding` tree and repetition/definition layer interpretations.
-It does not import the stable `encodings_v2_1.proto`. Range, Delta, generic variable-width offsets,
-and generic unsigned sequence compositions belong to 2.3. The stable `lance.encodings21` package
+It does not import the stable `encodings_v2_1.proto`. Range, MonotonicDelta, generic variable-width
+offsets, and generic unsigned sequence compositions belong to 2.3. The stable `lance.encodings21` package
 contains only the 2.1/2.2 grammar; matching codec names across packages do not imply that their
 allowed compositions are interchangeable.
 
@@ -398,6 +399,10 @@ packed structs can compose with sparse structure. Codec selection is a writer po
 ```
 
 ```protobuf
+%%% proto.message.DenseStructure %%%
+```
+
+```protobuf
 %%% proto.message.ValuePlane %%%
 ```
 
@@ -410,24 +415,42 @@ packed structs can compose with sparse structure. Codec selection is a writer po
 ```
 
 ```protobuf
+%%% proto.message.DenseChunkLevels %%%
+```
+
+```protobuf
 %%% proto.message.ZippedValues %%%
+```
+
+```protobuf
+%%% proto.message.DenseZipLevels %%%
+```
+
+```protobuf
+%%% proto.message.ConstantValue %%%
+```
+
+```protobuf
+%%% proto.message.NoValues %%%
 ```
 
 #### Fixed-Size List Values
 
 A `FixedSizeList` compression descriptor preserves one layer of a fixed-size list of fixed-width items
-in the value plane. Its nested dimensions must match the fixed-size list layers of the leaf column, which
-may be enclosed by structs or variable-size lists. Let `c_i` be the product of the dimensions from the outermost layer
-through layer `i`, and let `D` be the product through the innermost layer. Dimensions are positive. A
-value-plane row is one complete fixed-size list value, with `D` leaf items. Counts and byte sizes derived
-from dimensions must fit without overflow.
+in the value plane. Its nested dimensions must match the fixed-size list layers of the leaf column.
+Let `c_i` be the product of the dimensions from the outermost value layer through layer `i`, and let
+`D` be the product through the innermost layer. Dimensions are positive. A value-plane row is one
+complete fixed-size list value, with `D` leaf items. Counts and byte sizes derived from dimensions
+must fit without overflow.
 
 The structure plane represents enclosing lists and structs and the validity of the fixed-size list value
 itself. Each `has_validity` flag describes that layer's *children*, with `c_i` validity bits per value-plane
 row. Child validity beneath this boundary is stored in the value-plane bitmaps. In sparse structure the
-terminal domain contains complete fixed-size list values in leaf-column order. These value dimensions
-are absent from the sparse layers. `SparseFixedSizeListLayer` represents a structural fixed-size list
-ancestor of a separate leaf column, such as a fixed-size list of structs.
+terminal domain contains complete fixed-size list values in leaf-column order. Each dimension belongs
+to its matching schema layer in exactly one plane. For a fixed-size list of structs with a fixed-size
+list field, the outer dimension belongs to a `SparseFixedSizeListLayer`, and the field's dimensions
+belong to `FixedSizeList` compression descriptors. Readers validate the structural layers and the
+value descriptor against their respective portions of the schema path.
 
 In `ChunkedValues`, each mini-block contains whole value-plane rows. The chunk count in Buffer 0
 counts those rows, so a chunk with `N` rows decodes `N * D` leaf items. With dense structure,
@@ -489,8 +512,10 @@ Frames follow the materialized positions in order, without control words or fram
 Outer `General` wraps each complete fixed-width row independently in variable-width `ZippedValues`.
 It requires `bits_per_offset` addressing, with the usual variable-width length prefixes and byte index.
 The child describes the uncompressed row width, including child validity and the leaf frame. In dense
-streams the control word remains outside the compressed frame. Only valid visible events carry a
-length and a frame.
+streams the control word remains outside the compressed frame. A valid visible event carries a length
+prefix and a frame. A visible null event stores its control word alone and contributes one slot to
+`num_visible_items`. The reader reconstructs an empty payload for that slot, represented by equal
+adjacent offsets in memory, and restores null validity from the control word.
 
 `Pcodec` and `AxisDelta` retain their own plain `Flat` leaf grammar when wrapping fixed-size list
 layers. The new leaf codecs and compositions apply only to unstable Lance 2.3 planar values. Stable
@@ -690,8 +715,8 @@ free to pretend that the fixed-size list data type does not exist.
 
 ## Compression
 
-Generic block compression (including Range, Delta, block dictionary compositions and generic mini-block
-offsets) belongs to the **unstable Lance 2.3** file format. It is not part of the stable 2.0, 2.1 or 2.2
+Generic block compression (including Range, MonotonicDelta, block dictionary compositions and generic
+mini-block offsets) belongs to the **unstable Lance 2.3** file format. It is not part of the stable 2.0, 2.1 or 2.2
 contracts. The complete 2.3 format will undergo a consolidated format vote when it is proposed for stable
 status; intermediate unstable revisions do not establish compatibility requirements.
 
@@ -714,7 +739,7 @@ on a per-value basis. We use ☑️ to mark a technique that is applied on a per
 | Variable        | ✅ (2.1)              | ✅ (2.1)                 | ✅ (2.1)                   |
 | Constant        | ✅ (2.1)              | ❓                       | ❓                         |
 | Range           | ✅ (2.3)              | ❌                       | ❌                         |
-| Delta           | ✅ (2.3)              | ❌                       | ❌                         |
+| MonotonicDelta  | ✅ (2.3)              | ❌                       | ❌                         |
 | Dictionary      | ✅ (2.3)              | ❌                       | ❌                         |
 | Bitpacking      | ✅ (2.1)              | ❓                       | ✅ (2.1)                   |
 | Fsst            | ❓                    | ✅ (2.1)                 | ✅ (2.1)                   |
@@ -787,21 +812,21 @@ child grammar and payload framing; the container defines the meaning and constra
 
 An empty sequence uses `Constant` with an absent scalar and no payload. Non-empty `Constant` stores one little-endian
 scalar of the declared width. `Range` and other metadata-only expressions consume no payload, including
-`Delta(Constant)`. Each payload-bearing root consumes exactly one buffer; RLE and dictionary roots frame their
-children inside that buffer. These rules apply to both variable-width offsets and sparse structural sequences.
+`MonotonicDelta(Constant)`. Each payload-bearing root consumes exactly one buffer. RLE and dictionary roots frame
+their children inside that buffer. These rules apply to both variable-width offsets and sparse structural sequences.
 
 The generic fixed-width decoder accepts one composite root at most:
 
 ```text
 generic unsigned block root
 ├── leaf: Flat, Constant, Range, InlineBitpacking, OutOfLineBitpacking
-├── Delta(leaf)
+├── MonotonicDelta(leaf)
 ├── General(Flat)
 ├── Rle(values=leaf, run_lengths=u32 leaf)
 └── Dictionary(indices=u32 leaf, items=sequence-width leaf)
 ```
 
-`Delta` decodes `num_values - 1` child values. RLE children have the same run cardinality, all run lengths are
+`MonotonicDelta` decodes `num_values - 1` child values. RLE children have the same run cardinality, all run lengths are
 positive, and their checked sum equals `num_values`. Dictionary indices have `num_values` entries and every index
 is less than the declared dictionary item count. General compression must decode exactly the byte length implied by
 the containing cardinality and sequence width. Readers reject missing children, incompatible widths, unsupported
@@ -820,17 +845,17 @@ value and a positive step; the containing block supplies the number of values. R
 `start + step * i` and reject invalid widths or arithmetic overflow.
 
 ```protobuf
-%%% proto.message.Range %%%
+--8<-- "protos/encodings_v2_3.proto:encoding-range"
 ```
 
-### Delta
+### MonotonicDelta
 
-Delta encodes a non-decreasing unsigned `u32` or `u64` sequence as its first value and the `n - 1` adjacent
-differences. The differences are represented by a child block codec. Delta has a payload exactly when its child
-has one, and readers reconstruct values with checked prefix sums.
+MonotonicDelta encodes a non-decreasing unsigned `u32` or `u64` sequence as its first value and the `n - 1`
+adjacent differences. A child block codec represents those differences. MonotonicDelta has a payload exactly
+when its child has one. Readers reconstruct values with checked prefix sums.
 
 ```protobuf
-%%% proto.message.Delta %%%
+%%% proto.message.MonotonicDelta %%%
 ```
 
 ### Block Dictionary
@@ -895,6 +920,12 @@ ALP (Adaptive Lossless floating-Point) is a lossless compression technique for f
 effective when a column stores values with few significant decimal digits (prices, sensor readings, timestamps
 scaled to a fixed precision) and is used in the mini-block context of the unstable Lance 2.3 format. It is not
 transparent (the chunk layout is not a single value buffer), so it cannot be used in the full zip context.
+
+The `Alp` message declares the input width. Each chunk stores its mode and mode-specific parameters in its header.
+
+```protobuf
+%%% proto.message.Alp %%%
+```
 
 ALP maps each finite-decimal floating point value onto an integer with a base-10 exponent transform, then
 bit-packs the Frame-of-Reference (FOR) or Delta stream. Two reconstruction paths are supported per chunk:
@@ -986,6 +1017,10 @@ dictionary encoded, since pcodec stores repeated values cheaply. Values wider th
 mostly-null pages also use the dense mini-block layout, because full zip compresses each value on its own and
 cannot exploit similarity between rows; a request that also sets `lance-encoding:structural-encoding=fullzip`
 is rejected. Pages of fixed-size lists with null items are stored without pcodec.
+
+```protobuf
+%%% proto.message.Pcodec %%%
+```
 
 ### General
 
@@ -1204,3 +1239,7 @@ This descriptor is valid only in per-value positions, including inside General
 compression. General compression retains one frame per tensor. Selecting and
 reading a tensor does not require other tensors; selecting an individual element
 still requires decoding that tensor's frame.
+
+```protobuf
+%%% proto.message.AxisDelta %%%
+```
