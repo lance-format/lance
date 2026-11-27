@@ -727,23 +727,25 @@ impl ::prost::Name for Rle {
         "/lance.encodings23.Rle".into()
     }
 }
-/// Converts a fixed-size-list of values into a flattened list of values
-///
-/// This encoding does not actually compress the data, it just flattens out the FSL layers.
-///
-/// This is a transparent encoding.
-///
-/// The input is a single block of fixed-width data (with a wide width and few items)
-/// The output is a single block of fixed-width data (with a narrow width and many items)
+/// Preserves one fixed-size list layer in the unstable 2.3 value plane.
+/// In ChunkedValues, chunks contain whole rows. Child validity buffers appear
+/// outermost first, followed by the leaf codec's buffers. The leaf is plain
+/// Flat, null Constant, OutOfLineBitpacking, InlineBitpacking, Rle,
+/// ByteStreamSplit, Alp, or General wrapping one of those payload codecs.
+/// InlineBitpacking holds consecutive 1024-item segments within each chunk.
+/// In fixed ZippedValues, OutOfLineBitpacking restarts at each row, with a
+/// raw tail when raw and padded sizes are equal. Child validity bytes precede
+/// the leaf frame in each row. General can wrap those rows in ZippedValues
+/// addressed by byte offsets.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct FixedSizeList {
-    /// The number of items in this layer of FSL
+    /// The positive number of children per value at this layer.
     #[prost(uint64, tag = "1")]
     pub items_per_value: u64,
-    /// Whether or not there is a validity buffer
+    /// Whether this layer stores a validity bitmap for its children.
     #[prost(bool, tag = "3")]
     pub has_validity: bool,
-    /// The compression used to store the flattened values data block
+    /// The next FixedSizeList layer or the flattened leaf codec.
     #[prost(message, optional, boxed, tag = "2")]
     pub values: ::core::option::Option<::prost::alloc::boxed::Box<CompressiveEncoding>>,
 }

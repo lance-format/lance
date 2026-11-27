@@ -413,6 +413,59 @@ packed structs can compose with sparse structure. Codec selection is a writer po
 %%% proto.message.ZippedValues %%%
 ```
 
+#### Fixed-Size List Values
+
+A `FixedSizeList` compression descriptor preserves one fixed-size list layer in the value plane. Let
+`c_i` be the product of the dimensions from the outermost layer through layer `i`, and let `D` be the
+product through the innermost layer. Dimensions are positive. `has_validity` at layer `i` describes
+that layer's *children*, with `c_i` validity bits per value-plane row. The structure plane records
+whether the row itself is valid. Counts and byte sizes derived from dimensions must fit without overflow.
+
+In `ChunkedValues`, each mini-block contains whole fixed-size list rows. The chunk count in Buffer 0
+counts rows, so a chunk with `N` rows decodes `N * D` leaf items. Each chunk stores the validity buffers
+in outermost-to-innermost order, followed by the leaf codec's buffers. Each validity buffer occupies
+`ceil(N * c_i / 8)` bytes, with the least significant bit of the first byte describing the first child.
+`ChunkedValues.num_buffers` is the number of present validity buffers plus the number of leaf buffers.
+
+The innermost descriptor uses one of these leaf codecs:
+
+- `Flat` with a positive bit width and absent `data` uses one buffer.
+- `Constant` with absent `value` represents all-null children and uses zero leaf buffers.
+- `OutOfLineBitpacking` uses one buffer of 1024-item FastLanes blocks. Its `values` is a `Flat` width
+  descriptor with absent `data` and a width no greater than the original 8-, 16-, 32-, or 64-bit width.
+  The final partial block can be raw or padded to 1024 items and packed. Its byte length selects the
+  representation, with equal lengths interpreted as raw.
+- `InlineBitpacking` with absent `values` uses one buffer. It consists of `ceil(N * D / 1024)`
+  consecutive segments. Each segment starts with its packed bit width as an unsigned little-endian
+  word of the original 8-, 16-, 32-, or 64-bit width, followed by `128 * packed_width` bytes containing
+  1024 FastLanes-packed items. Its packed width is at most the original width. Only the last segment
+  may contain padding items. Readers consume exactly the number of segments and bytes implied by the
+  item count and segment widths. Each standalone scalar `InlineBitpacking` mini-block still has one
+  segment.
+- `Rle` uses the mini-block run values and run lengths buffers, in that order, with the existing
+  fixed-width child grammar.
+- `ByteStreamSplit` uses one buffer and wraps plain `Flat` of 32 or 64 bits.
+- `Alp` uses four buffers for 32- or 64-bit floating-point items. All chunks share the page's ALP
+  descriptor and buffer count.
+- `General` wraps one of the payload-bearing leaf codecs above and compresses its first buffer.
+  It appears inside the fixed-size list layers, after all validity buffers. The other leaf buffers
+  retain the inner codec's framing.
+
+In fixed-width `ZippedValues`, a fixed-size list can also use `OutOfLineBitpacking` with the same
+width descriptor. Each row starts a fresh sequence of 1024-item blocks. With original width `w` and
+packed width `b`, each complete block uses `128 * b` bytes. A tail of `r = D % 1024` items uses
+`min(r * w / 8, 128 * b)` bytes, and uses raw items when those sizes are equal. A row starts with
+one `ceil(c_i / 8)`-byte validity bitmap for each layer with `has_validity`, in outermost-to-innermost
+order, followed by the packed leaf frame. `bits_per_value` is the exact width of this physical row
+in bits and must be positive and divisible by eight. In variable-width `ZippedValues`, outer
+`General` can compress each of these complete rows independently, using `bits_per_offset` to address
+its compressed frames.
+
+`Pcodec` and `AxisDelta` retain their own plain `Flat` leaf grammar when wrapping fixed-size list
+layers. The new leaf codecs and compositions apply only to unstable Lance 2.3 planar values. Stable
+Lance 2.1 and 2.2 fixed-size list descriptors retain nested `FixedSizeList` with a `Flat` or `Constant`
+leaf.
+
 #### Sparse Structural Domains
 
 A domain is a layer-local coordinate space `[0, size)`. Layers are ordered from outer-most to inner-most:
