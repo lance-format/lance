@@ -2943,7 +2943,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
     /// [`Index::prewarm`] of an index that is not native: its partitions,
     /// in byte windows ([`IVF_PREWARM_WINDOW_SIZE_ENV`]) read with bounded
     /// parallelism.
-    async fn prewarm_partitions(&self) -> Result<()> {
+    async fn prewarm_all_partitions(&self) -> Result<()> {
         prewarm_partitions(
             &|partitions| self.prewarm_partition_window(partitions).boxed(),
             &self.uuid,
@@ -3030,7 +3030,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> Index for IVFIndex<S, 
             let index_cache = self.raw_cache.with_load_origin(CacheLoadOrigin::Warm);
             self.storage.prewarm_planes(&index_cache).await?;
         } else {
-            self.prewarm_partitions().await?;
+            self.prewarm_all_partitions().await?;
         }
         Ok(())
     }
@@ -3124,6 +3124,36 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> Index for IVFIndex<S, 
 
 #[async_trait]
 impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFIndex<S, Q> {
+    async fn prewarm_partitions(&self, partition_ids: &[usize]) -> Result<()> {
+        if let Some(partition_id) = partition_ids
+            .iter()
+            .find(|&&id| id >= self.ivf.num_partitions())
+        {
+            return Err(Error::invalid_input(format!(
+                "partition_id={partition_id} out of range 0..{}",
+                self.ivf.num_partitions()
+            )));
+        }
+        let mut selected = partition_ids.to_vec();
+        selected.sort_unstable();
+        selected.dedup();
+        if self.uses_rabit_plane_cache() {
+            let cache = self.raw_cache.with_load_origin(CacheLoadOrigin::Warm);
+            return self
+                .storage
+                .prewarm_partition_planes(&cache, &selected)
+                .await;
+        }
+        let parallelism =
+            prewarm_parallelism(self.io_parallelism, get_num_compute_intensive_cpus());
+        stream::iter(selected)
+            .map(|partition_id| self.prewarm_partition_window(partition_id..partition_id + 1))
+            .buffer_unordered(parallelism)
+            .try_collect::<Vec<_>>()
+            .await?;
+        Ok(())
+    }
+
     async fn search(
         &self,
         _query: &Query,
