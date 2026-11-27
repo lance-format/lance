@@ -6,13 +6,14 @@
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_index::scalar::RowAddrTranslator;
 use std::any::Any;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::sync::Arc;
 
 use arrow_array::{ArrayRef, RecordBatch};
 use async_trait::async_trait;
 use futures::stream::{self, BoxStream};
-use futures::{StreamExt, TryStreamExt};
+use futures::{Stream, StreamExt, TryStreamExt};
 use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_core::{Error, ROW_ADDR, ROW_ID, Result};
 use lance_index::metrics::MetricsCollector;
@@ -58,17 +59,78 @@ pub struct LogicalScalarIndex {
     index_type: IndexType,
     segments: Vec<Arc<dyn ScalarIndex>>,
     coverage: Option<SegmentCoverage>,
-    segment_concurrency: usize,
+    fanout: SegmentFanout,
 }
 
-// Concurrent local segment operations may each hold an open file. Use the
-// store's I/O parallelism for local fan-out and keep cloud fan-out unchanged.
-fn segment_concurrency(dataset: &Dataset, count: usize) -> usize {
-    let store = &dataset.table_state.object_store;
-    if store.is_local() {
-        store.io_parallelism().clamp(1, count)
-    } else {
-        count
+// Keep original ordinals for coverage and metadata. All local bases share a
+// descriptor budget; remote work can progress while the local lane is full.
+#[derive(Debug, Default, DeepSizeOf)]
+struct SegmentFanout {
+    local: Vec<usize>,
+    remote: Vec<usize>,
+    local_limit: usize,
+}
+
+impl SegmentFanout {
+    async fn resolve<'a>(
+        dataset: &Dataset,
+        indices: impl Iterator<Item = &'a IndexMetadata>,
+    ) -> Result<Self> {
+        let mut plan = Self {
+            local_limit: usize::MAX,
+            ..Self::default()
+        };
+        let mut by_base = HashMap::new();
+        for (i, index) in indices.enumerate() {
+            let limit = match by_base.entry(index.base_id) {
+                std::collections::hash_map::Entry::Occupied(entry) => *entry.get(),
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    let store = dataset.object_store_for_index(index).await?;
+                    *entry.insert(store.is_local().then(|| store.io_parallelism()))
+                }
+            };
+            if let Some(limit) = limit {
+                plan.local_limit = plan.local_limit.min(limit);
+                plan.local.push(i);
+            } else {
+                plan.remote.push(i);
+            }
+        }
+        Ok(plan)
+    }
+
+    fn run<F: Future>(&self, op: impl Fn(usize) -> F + Copy) -> impl Stream<Item = F::Output> {
+        stream::select(
+            stream::iter(self.local.iter().copied())
+                .map(op)
+                .buffer_unordered(self.local_limit),
+            stream::iter(self.remote.iter().copied())
+                .map(op)
+                .buffer_unordered(self.remote.len().max(1)),
+        )
+    }
+
+    fn lookup<'a>(
+        &self,
+        open: impl Fn(usize) -> Result<BoxStream<'a, Result<RecordBatch>>>,
+    ) -> Result<BoxStream<'a, Result<RecordBatch>>> {
+        let local = self
+            .local
+            .iter()
+            .copied()
+            .map(&open)
+            .collect::<Result<Vec<_>>>()?;
+        let remote = self
+            .remote
+            .iter()
+            .copied()
+            .map(open)
+            .collect::<Result<Vec<_>>>()?;
+        Ok(stream::select(
+            stream::iter(local).flatten_unordered(self.local_limit),
+            stream::select_all(remote),
+        )
+        .boxed())
     }
 }
 
@@ -88,6 +150,17 @@ impl LogicalScalarIndex {
         name: String,
         column: String,
         segments: Vec<(IndexMetadata, Arc<dyn ScalarIndex>)>,
+    ) -> Result<Self> {
+        let fanout = SegmentFanout::resolve(dataset, segments.iter().map(|(meta, _)| meta)).await?;
+        Self::with_fanout(dataset, name, column, segments, fanout).await
+    }
+
+    async fn with_fanout(
+        dataset: &Dataset,
+        name: String,
+        column: String,
+        segments: Vec<(IndexMetadata, Arc<dyn ScalarIndex>)>,
+        fanout: SegmentFanout,
     ) -> Result<Self> {
         let Some((_, first)) = segments.first() else {
             return Err(Error::invalid_input(format!(
@@ -132,7 +205,7 @@ impl LogicalScalarIndex {
             name,
             column,
             index_type,
-            segment_concurrency: segment_concurrency(dataset, segments.len()),
+            fanout,
             segments: segments.into_iter().map(|(_, segment)| segment).collect(),
             coverage,
         })
@@ -144,6 +217,7 @@ impl DeepSizeOf for LogicalScalarIndex {
         self.name.deep_size_of_children(context)
             + self.column.deep_size_of_children(context)
             + self.segments.deep_size_of_children(context)
+            + self.fanout.deep_size_of_children(context)
             + self
                 .coverage
                 .as_ref()
@@ -171,9 +245,8 @@ impl Index for LogicalScalarIndex {
     }
 
     async fn prewarm(&self) -> Result<()> {
-        stream::iter(0..self.segments.len())
-            .map(|i| self.segments[i].prewarm())
-            .buffer_unordered(self.segment_concurrency)
+        self.fanout
+            .run(|i| self.segments[i].prewarm())
             .try_collect::<()>()
             .await
     }
@@ -183,9 +256,9 @@ impl Index for LogicalScalarIndex {
     }
 
     async fn calculate_included_frags(&self) -> Result<RoaringBitmap> {
-        let mut sets = stream::iter(0..self.segments.len())
-            .map(|i| self.segments[i].calculate_included_frags())
-            .buffer_unordered(self.segment_concurrency);
+        let mut sets = self
+            .fanout
+            .run(|i| self.segments[i].calculate_included_frags());
         let mut combined = RoaringBitmap::new();
         while let Some(set) = sets.try_next().await? {
             combined |= set;
@@ -211,8 +284,9 @@ impl ScalarIndex for LogicalScalarIndex {
         options: SearchOptions,
         metrics: &dyn MetricsCollector,
     ) -> Result<SearchResult> {
-        let results = stream::iter(0..self.segments.len())
-            .map(|i| async move {
+        let results = self
+            .fanout
+            .run(|i| async move {
                 let result = self.segments[i]
                     .search_with_options(query, options, metrics)
                     .await?;
@@ -221,7 +295,6 @@ impl ScalarIndex for LogicalScalarIndex {
                     None => Ok(result),
                 }
             })
-            .buffer_unordered(self.segment_concurrency)
             .try_collect()
             .await?;
         combine_search_results(results)
@@ -238,21 +311,13 @@ impl ScalarIndex for LogicalScalarIndex {
         } else {
             ROW_ID
         };
-        let segments = self
-            .segments
-            .iter()
-            .enumerate()
-            .map(|(i, segment)| {
-                let matches = segment.lookup(keys.clone(), metrics)?;
-                Ok(match &self.coverage {
-                    Some(coverage) => coverage.restrict_lookup(i, row_column, matches),
-                    None => matches,
-                })
+        self.fanout.lookup(|i| {
+            let matches = self.segments[i].lookup(keys.clone(), metrics)?;
+            Ok(match &self.coverage {
+                Some(coverage) => coverage.restrict_lookup(i, row_column, matches),
+                None => matches,
             })
-            .collect::<Result<Vec<_>>>()?;
-        Ok(stream::iter(segments)
-            .flatten_unordered(self.segment_concurrency)
-            .boxed())
+        })
     }
 
     fn results_are_row_addresses(&self) -> bool {
@@ -488,18 +553,33 @@ pub async fn open_scalar_index_segments(
                 .await
         }
         _ => {
-            let segments: Vec<_> = stream::iter(0..indices.len())
-                .map(|i| dataset.open_scalar_index(column, &indices[i].uuid, metrics))
-                .buffered(segment_concurrency(dataset, indices.len()))
+            let fanout = SegmentFanout::resolve(dataset, indices.iter()).await?;
+            let mut opened: Vec<_> = fanout
+                .run(|i| {
+                    let index = &indices[i];
+                    async move {
+                        Ok::<_, Error>((
+                            i,
+                            dataset
+                                .open_scalar_index(column, &index.uuid, metrics)
+                                .await?,
+                        ))
+                    }
+                })
                 .try_collect()
                 .await?;
-
+            opened.sort_unstable_by_key(|(i, _)| *i);
+            let segments = indices
+                .into_iter()
+                .zip(opened.into_iter().map(|(_, s)| s))
+                .collect();
             Ok(Arc::new(
-                LogicalScalarIndex::try_new(
+                LogicalScalarIndex::with_fanout(
                     dataset,
                     index_name.to_string(),
                     column.to_string(),
-                    indices.into_iter().zip(segments).collect(),
+                    segments,
+                    fanout,
                 )
                 .await?,
             ) as Arc<dyn ScalarIndex>)
@@ -873,6 +953,119 @@ mod tests {
             combined_bitmap,
             dataset.table_state.fragment_bitmap.as_ref().clone()
         );
+    }
+
+    #[rstest]
+    #[case::local_source(true)]
+    #[case::local_clone(false)]
+    #[tokio::test]
+    async fn shallow_clone_schedules_segments_on_their_backing_store(
+        #[case] local_source: bool,
+    ) -> Result<()> {
+        let dir = TempStrDir::default();
+        let (source_uri, clone_uri) = if local_source {
+            (dir.as_str(), "memory:///fanout-clone")
+        } else {
+            ("memory:///fanout-source", dir.as_str())
+        };
+        // The memory provider creates a fresh store on open. Give the clone
+        // the same source store when it resolves the inherited index base.
+        let mut params = WriteParams {
+            max_rows_per_file: 1,
+            ..Default::default()
+        };
+        if !local_source {
+            #[allow(deprecated)]
+            let store = lance_io::object_store::ObjectStoreParams {
+                object_store: Some((
+                    Arc::new(object_store::memory::InMemory::new()),
+                    lance_io::object_store::uri_to_url(source_uri)?,
+                )),
+                ..Default::default()
+            };
+            params.store_params = Some(store);
+            params.commit_handler = Some(Arc::new(
+                lance_table::io::commit::ConditionalPutCommitHandler,
+            ));
+        }
+        let keys = arrow_array::Int32Array::from(vec![1, 1]);
+        let batch = RecordBatch::try_from_iter([("key", Arc::new(keys) as ArrayRef)])?;
+        let schema = batch.schema();
+        let mut source = Dataset::write(
+            arrow_array::RecordBatchIterator::new([Ok(batch)], schema),
+            source_uri,
+            Some(params),
+        )
+        .await?;
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree);
+        let mut segments = Vec::new();
+        for fragment in source.get_fragments() {
+            segments.push(
+                source
+                    .create_index_builder(&["key"], IndexType::BTree, &params)
+                    .name("key_idx".into())
+                    .fragments(vec![fragment.id() as u32])
+                    .execute_uncommitted()
+                    .await?,
+            );
+        }
+        source
+            .commit_existing_index_segments("key_idx", "key", segments)
+            .await?;
+        let clone = source
+            .shallow_clone(clone_uri, source.version_id(), Some(Default::default()))
+            .await?;
+        let index =
+            open_named_scalar_index(&clone, "key", "key_idx", &NoOpMetricsCollector).await?;
+        let logical = index.as_any().downcast_ref::<LogicalScalarIndex>().unwrap();
+        let plan = &logical.fanout;
+        assert_eq!(clone.table_state.object_store.is_local(), !local_source);
+        if local_source {
+            assert_eq!(plan.local, [0, 1]);
+            assert_eq!(
+                plan.local_limit,
+                source.table_state.object_store.io_parallelism()
+            );
+            assert!(plan.remote.is_empty());
+        } else {
+            assert_eq!(plan.remote, [0, 1]);
+            assert!(plan.local.is_empty());
+        }
+        let hits = index
+            .search(
+                &SargableQuery::Equals(ScalarValue::Int32(Some(1))),
+                &NoOpMetricsCollector,
+            )
+            .await?;
+        assert_eq!(hits.row_addrs().selected_rows().len(), Some(2));
+        Ok(())
+    }
+
+    #[test]
+    fn mixed_lookup_holds_local_slots_until_the_child_stream_finishes() {
+        use futures::FutureExt;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let polled = [const { AtomicUsize::new(0) }; 4];
+        let plan = SegmentFanout {
+            local: vec![0, 1],
+            remote: vec![2, 3],
+            local_limit: 1,
+        };
+        let polled = &polled;
+        let mut lookup = plan
+            .lookup(|i| {
+                Ok(stream::poll_fn(move |_| {
+                    polled[i].fetch_add(1, Ordering::Relaxed);
+                    std::task::Poll::Pending
+                })
+                .boxed())
+            })
+            .unwrap();
+        assert!(lookup.next().now_or_never().is_none());
+        assert!(polled[0].load(Ordering::Relaxed) > 0);
+        assert_eq!(polled[1].load(Ordering::Relaxed), 0);
+        assert!(polled[2].load(Ordering::Relaxed) > 0);
+        assert!(polled[3].load(Ordering::Relaxed) > 0);
     }
 
     #[tokio::test]
