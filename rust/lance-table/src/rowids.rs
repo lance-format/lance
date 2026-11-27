@@ -18,6 +18,7 @@ use std::ops::{Range, RangeInclusive};
 mod bitmap;
 mod encoded_array;
 mod index;
+mod offsets;
 mod runs;
 pub mod segment;
 mod serde;
@@ -30,9 +31,11 @@ pub use index::RowIdIndex;
 use lance_core::{Error, Result};
 use lance_io::ReadBatchParams;
 use lance_select::{RowAddrMask, RowAddrTreeMap, RowSetOps};
+pub use offsets::{FragmentRowOffset, compute_row_offset_array};
 pub use serde::{read_row_ids, write_row_ids};
 
 use crate::utils::LanceIteratorExtension;
+use roaring::RoaringTreemap;
 use segment::{SegmentCursorState, U64Segment};
 use tracing::instrument;
 
@@ -274,6 +277,22 @@ impl RowIdSequence {
 
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
+    }
+
+    /// The row ids as a set, for comparing sequences by membership rather
+    /// than by their bounding ranges. A contiguous segment is inserted as one
+    /// range.
+    pub fn to_treemap(&self) -> RoaringTreemap {
+        let mut set = RoaringTreemap::new();
+        for segment in &self.0 {
+            match segment {
+                U64Segment::Range(range) => {
+                    set.insert_range(range.clone());
+                }
+                other => set.extend(other.iter()),
+            }
+        }
+        set
     }
 
     /// Returns the bounding range `[min, max]` across all row IDs in this sequence,

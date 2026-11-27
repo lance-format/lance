@@ -1,83 +1,40 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use crate::dataset::fragment::{
-    FileFragment, FragReadConfig, FragmentReader, resolve_actual_row_ids,
-};
+use std::sync::Arc;
+
 use arrow_array::RecordBatch;
 use lance_core::Result;
 use lance_core::datatypes::Schema;
-use std::borrow::Cow;
-use std::sync::Arc;
+
+use super::FileFragment;
 
 /// A [`FragmentSession`] manages a short-lived session of [`FileFragment`], allowing us to maintain
 /// internal states instead of creating new ones each time.
 ///
 /// This API works well for users making repeated requests over the same projected schema.
 #[derive(Debug)]
-pub struct FragmentSession {
-    reader: FragmentReader,
-    sorted_deleted_ids: Option<Vec<u32>>,
-}
+pub struct FragmentSession(lance_table_runtime::FragmentSession);
 
 impl FragmentSession {
+    /// Open a reusable reader for logical takes with the supplied projection.
     pub async fn open(
         fragment: Arc<FileFragment>,
         projection: &Schema,
         with_row_address: bool,
     ) -> Result<Self> {
-        let reader = fragment
-            .open(
-                projection,
-                FragReadConfig::default().with_row_address(with_row_address),
-            )
-            .await?;
-
-        let sorted_deleted_ids = fragment.get_deletion_vector().await?.map(|dv| {
-            let mut ids = dv.as_ref().clone().into_iter().collect::<Vec<_>>();
-            ids.sort();
-            ids
-        });
-
-        Ok(Self {
-            reader,
-            sorted_deleted_ids,
-        })
+        let session = lance_table_runtime::FragmentSession::open(
+            &fragment.core,
+            projection,
+            with_row_address,
+        )
+        .await?;
+        Ok(Self(session))
     }
 
+    /// Take logical row positions in input order, skipping deleted positions.
     pub async fn take(&self, indices: &[u32]) -> Result<RecordBatch> {
-        // Remap row ids if needed
-        let row_ids = if let Some(sorted_deleted_ids) = &self.sorted_deleted_ids {
-            Cow::Owned(resolve_actual_row_ids(indices, sorted_deleted_ids))
-        } else {
-            Cow::Borrowed(indices)
-        };
-
-        // Then call take rows
-        let batch = self.take_rows(&row_ids).await?;
-
-        // Convert Lance JSON columns (LargeBinary/JSONB) back to Arrow JSON (Utf8)
-        // for user-facing output, mirroring FileFragment::take.
-        if batch
-            .schema()
-            .fields()
-            .iter()
-            .any(|f| lance_arrow::json::is_json_field(f) || lance_arrow::json::has_json_fields(f))
-        {
-            Ok(lance_arrow::json::convert_lance_json_to_arrow(&batch)?)
-        } else {
-            Ok(batch)
-        }
-    }
-
-    pub(crate) async fn take_rows(&self, row_offsets: &[u32]) -> Result<RecordBatch> {
-        if row_offsets.len() > 1 && FileFragment::row_ids_contiguous(row_offsets) {
-            let range =
-                (row_offsets[0] as usize)..(row_offsets[row_offsets.len() - 1] as usize + 1);
-            self.reader.read_range_as_batch(range).await
-        } else {
-            self.reader.take_as_batch(row_offsets, None).await
-        }
+        self.0.take(indices).await
     }
 }
 
@@ -167,7 +124,7 @@ mod tests {
             .open_session(dataset.schema(), false)
             .await
             .unwrap();
-        let batch = take_session.take_rows(&[1, 2, 4, 5, 5, 8]).await.unwrap();
+        let batch = take_session.0.take_rows(&[1, 2, 4, 5, 5, 8]).await.unwrap();
         pretty_assertions::assert_eq!(
             batch.column_by_name("i").unwrap().as_ref(),
             &Int32Array::from(vec![121, 122, 124, 125, 125, 128])
@@ -187,7 +144,7 @@ mod tests {
             .open_session(dataset.schema(), false)
             .await
             .unwrap();
-        let batch = take_session.take_rows(&[1, 2, 4, 5, 8]).await.unwrap();
+        let batch = take_session.0.take_rows(&[1, 2, 4, 5, 8]).await.unwrap();
         pretty_assertions::assert_eq!(
             batch.column_by_name("i").unwrap().as_ref(),
             &Int32Array::from(vec![121, 125, 128])
@@ -198,7 +155,7 @@ mod tests {
             .open_session(dataset.schema(), false)
             .await
             .unwrap();
-        let batch = take_session.take_rows(&[]).await.unwrap();
+        let batch = take_session.0.take_rows(&[]).await.unwrap();
         pretty_assertions::assert_eq!(
             batch.column_by_name("i").unwrap().as_ref(),
             &Int32Array::from(Vec::<i32>::new())
@@ -206,7 +163,7 @@ mod tests {
 
         // Can get row ids
         let take_session = fragment.open_session(dataset.schema(), true).await.unwrap();
-        let batch = take_session.take_rows(&[1, 2, 4, 5, 8]).await.unwrap();
+        let batch = take_session.0.take_rows(&[1, 2, 4, 5, 8]).await.unwrap();
         pretty_assertions::assert_eq!(
             batch.column_by_name("i").unwrap().as_ref(),
             &Int32Array::from(vec![121, 125, 128])

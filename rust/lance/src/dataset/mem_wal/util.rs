@@ -7,6 +7,8 @@ use lance_io::object_store::ObjectStoreParams;
 use object_store::path::Path;
 use uuid::Uuid;
 
+pub use lance_table::system_index::mem_wal::mem_wal_dir_name;
+
 // ============================================================================
 // Watchable Cell
 // ============================================================================
@@ -148,29 +150,6 @@ pub(crate) fn derived_store_params(params: &ObjectStoreParams) -> ObjectStorePar
     ObjectStoreParams {
         object_store: None,
         ..params.clone()
-    }
-}
-
-/// Name of the legacy MemWAL directory, used when the index carries no `dir_id`.
-const LEGACY_MEM_WAL_DIR: &str = "_mem_wal";
-
-/// Returns whether `name` is a directory owned by a MemWAL index.
-pub(crate) fn is_mem_wal_dir_name(name: &str) -> bool {
-    let name = name.to_ascii_lowercase();
-    name == LEGACY_MEM_WAL_DIR
-        || name
-            .strip_prefix('_')
-            .and_then(|name| name.strip_suffix("_mem_wal"))
-            .is_some_and(|dir_id| !dir_id.is_empty())
-}
-
-/// Name of the MemWAL directory for `dir_id`: `_{dir_id}_mem_wal`, or the
-/// legacy `_mem_wal` when `dir_id` is empty.
-pub fn mem_wal_dir_name(dir_id: &str) -> String {
-    if dir_id.is_empty() {
-        LEGACY_MEM_WAL_DIR.to_string()
-    } else {
-        format!("_{dir_id}_mem_wal")
     }
 }
 

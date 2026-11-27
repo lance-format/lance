@@ -343,3 +343,21 @@ The process gauges are best-effort readings of the live process. They cannot be 
 | `lance_memory_stage_peak_bytes` | histogram | `operation`, `index_type`, `stage` | Peak RSS during each stage of an index build, in bytes. |
 | `lance_memory_operation_peak_bytes` | histogram | `operation`, `index_type` | Peak RSS during each index build, in bytes. |
 | `lance_memory_component_bytes` | gauge | `component` | Bytes that a part of Lance holds right now: `io_scheduler`, `datafusion_pool` or `mem_wal`. |
+
+### IVF partition backing
+
+With memory observation and the metrics feature enabled, the unlabeled gauge
+`lance_ivf_partition_backing_bytes` tracks live capacity of fresh fixed-width
+copies made while materializing exact-sized IVF partition columns. This covers
+native IVF_RQ whole-partition reads, including code-only entries. An Arrow
+clone or slice shares the charge.
+Eviction can therefore leave bytes live until a reader drops its last slice.
+An independent copy adds its own capacity. Disabling observation stops tracking
+new reads; existing buffers release their original charges when dropped.
+
+The coverage excludes zero-copy decoder output, generic concat and fallback
+layouts, separately compacted prewarm copies, resident-store construction,
+index models, execution scratch and outbound transport buffers. The gauge is a lower bound on IVF backing.
+A materialization copying at least 8 MiB can emit a DEBUG event on
+`lance::memory` with `ivf_partition_copied_bytes`, limited to one event per
+process per minute. This field counts new copies in that materialization.

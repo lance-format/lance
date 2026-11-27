@@ -8,17 +8,13 @@
 use lance_core::{Error, Result};
 use lance_index::mem_wal::MEM_WAL_INDEX_NAME;
 use lance_index::registry::display_type_from_url;
-use lance_table::feature_flags::{
-    FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS, frag_reuse_with_stable_row_ids_enabled,
-};
 use lance_table::format::{IndexMetadata, Manifest, pb as table_pb};
-use lance_table::system_index::frag_reuse::metadata::uses_tagged_fri;
-use lance_table::system_index::frag_reuse::{FRAG_REUSE_INDEX_NAME, is_frag_reuse_index_entry};
+use lance_table::system_index::frag_reuse::is_frag_reuse_index_entry;
 use prost::Name;
 use prost_types::Any;
 
 use super::scalar::IndexDetails;
-use super::{segment::index_is_usable, segment::unsupported_index_version};
+use super::segment::{index_details_have_reader, index_is_usable, unsupported_index_version};
 
 pub mod history;
 
@@ -37,10 +33,11 @@ fn is_mem_wal_index_entry(index: &IndexMetadata) -> bool {
         })
 }
 
-/// An empty fragment reuse index counts.
-pub fn has_frag_reuse_with_stable_row_ids(manifest: &Manifest, indices: &[IndexMetadata]) -> bool {
-    manifest.uses_stable_row_ids() && indices.iter().any(is_frag_reuse_index_entry)
-}
+#[cfg(test)]
+use lance_table::feature_flags::FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS;
+#[cfg(test)]
+pub use lance_table_runtime::frag_reuse::apply_frag_reuse_with_stable_row_ids_flag;
+pub use lance_table_runtime::frag_reuse::has_frag_reuse_with_stable_row_ids;
 
 /// `supports_batch_row_id_remapping` is only a proxy for applying the legacy
 /// fragment reuse index on load, so every admitted type needs a query test on
@@ -51,8 +48,7 @@ fn address_index_incompatibility(index: &IndexMetadata) -> Option<String> {
     };
     let type_name = details_type_name(details);
     let display_type = display_type_from_url(&details.type_url);
-    let details = IndexDetails(details.clone());
-    if !details.has_reader() {
+    if !index_details_have_reader(&details.type_url) {
         return Some(format!(
             "an index of type `{type_name}`, which is not known to this build of Lance"
         ));
@@ -72,7 +68,7 @@ fn address_index_incompatibility(index: &IndexMetadata) -> Option<String> {
             "a {display_type} index, which stores stable row IDs"
         ));
     }
-    let applies_frag_reuse = details
+    let applies_frag_reuse = IndexDetails(details.clone())
         .get_plugin()
         .is_ok_and(|plugin| plugin.supports_batch_row_id_remapping());
     if !applies_frag_reuse {
@@ -105,65 +101,28 @@ fn list_incompatible(incompatible: &[(&IndexMetadata, String)]) -> String {
         .join("; ")
 }
 
-pub fn apply_frag_reuse_with_stable_row_ids_flag(
-    manifest: &mut Manifest,
-    indices: &[IndexMetadata],
-) {
-    if has_frag_reuse_with_stable_row_ids(manifest, indices) {
-        manifest.reader_feature_flags |= FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS;
-        manifest.writer_feature_flags |= FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS;
-    } else {
-        manifest.reader_feature_flags &= !FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS;
-        manifest.writer_feature_flags &= !FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS;
-    }
-}
-
-pub fn validate_frag_reuse_with_stable_row_ids(
-    manifest: &Manifest,
-    indices: &[IndexMetadata],
-) -> Result<()> {
-    validate_frag_reuse_with_stable_row_ids_when(
-        manifest,
-        indices,
-        frag_reuse_with_stable_row_ids_enabled(),
-    )
-}
-
 /// Split out so the release-build refusal is testable from a debug build.
+#[cfg(test)]
 fn validate_frag_reuse_with_stable_row_ids_when(
     manifest: &Manifest,
     indices: &[IndexMetadata],
     is_supported: bool,
 ) -> Result<()> {
-    if !has_frag_reuse_with_stable_row_ids(manifest, indices) {
+    if !lance_table_runtime::frag_reuse::validate_stable_row_id_fri_shape(
+        manifest,
+        indices,
+        is_supported,
+    )? {
         return Ok(());
     }
+    validate_stable_row_id_user_indices(manifest, indices)
+}
+
+pub fn validate_stable_row_id_user_indices(
+    manifest: &Manifest,
+    indices: &[IndexMetadata],
+) -> Result<()> {
     let version = manifest.version;
-    if !is_supported {
-        return Err(Error::not_supported(format!(
-            "Cannot commit version {version}: the dataset uses stable row IDs and carries a \
-             fragment reuse index, which this build of Lance does not support"
-        )));
-    }
-    let frag_reuse_entries: Vec<_> = indices
-        .iter()
-        .filter(|index| is_frag_reuse_index_entry(index))
-        .collect();
-    if frag_reuse_entries.len() != 1 {
-        return Err(Error::invalid_input(format!(
-            "Cannot commit version {version}: the dataset carries {} fragment reuse index \
-             entries, but exactly one is allowed",
-            frag_reuse_entries.len()
-        )));
-    }
-    let frag_reuse_version = frag_reuse_entries[0].index_version;
-    if frag_reuse_version != 0 {
-        return Err(Error::invalid_input(format!(
-            "Cannot commit version {version}: the dataset uses stable row IDs and carries a \
-             fragment reuse index with index_version {frag_reuse_version}, but datasets with \
-             stable row IDs support only index_version 0"
-        )));
-    }
     let incompatible = incompatible_indices(indices);
     if incompatible.is_empty() {
         return Ok(());
@@ -177,41 +136,21 @@ fn validate_frag_reuse_with_stable_row_ids_when(
     )))
 }
 
-pub fn ensure_frag_reuse_recording_allowed(
-    manifest: &Manifest,
-    indices: &[IndexMetadata],
-) -> Result<()> {
-    ensure_frag_reuse_recording_allowed_when(
-        manifest,
-        indices,
-        frag_reuse_with_stable_row_ids_enabled(),
-    )
-}
-
+#[cfg(test)]
 fn ensure_frag_reuse_recording_allowed_when(
     manifest: &Manifest,
     indices: &[IndexMetadata],
     is_supported: bool,
 ) -> Result<()> {
-    if !is_supported {
-        return Err(Error::not_supported(
-            "Cannot compact with defer_index_remap: the dataset uses stable row IDs, and \
-             recording their row-address moves in a fragment reuse index is not supported by \
-             this build of Lance",
-        ));
-    }
-    // The tagged-history flag is sticky, so it can outlive a trim and a
-    // migration to stable row ids.
-    let frag_reuse_entry = indices
-        .iter()
-        .find(|index| index.name == FRAG_REUSE_INDEX_NAME);
-    if uses_tagged_fri(manifest, frag_reuse_entry) {
-        return Err(Error::not_supported(
-            "Cannot compact with defer_index_remap: the dataset uses stable row IDs, and its \
-             manifest requires a tagged fragment reuse history, which stable row IDs do not \
-             support",
-        ));
-    }
+    lance_table_runtime::frag_reuse::validate_stable_row_id_recording_format(
+        manifest,
+        indices,
+        is_supported,
+    )?;
+    validate_compaction_index_recording(indices)
+}
+
+pub fn validate_compaction_index_recording(indices: &[IndexMetadata]) -> Result<()> {
     let incompatible = incompatible_indices(indices);
     if incompatible.is_empty() {
         return Ok(());
@@ -316,6 +255,7 @@ mod tests {
     use lance_datagen::{Dimension, array, gen_batch};
     use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
     use lance_index::metrics::NoOpMetricsCollector;
+    use lance_index::scalar::btree::BTREE_INDEX_VERSION;
     use lance_index::scalar::{BuiltinIndexType, InvertedIndexParams, ScalarIndexParams};
     use lance_index::{IndexType, pb, pbold};
     use lance_linalg::distance::MetricType;
@@ -364,6 +304,19 @@ mod tests {
         Some(Any::from_msg(message).unwrap())
     }
 
+    /// What a list-element index records today: a B-tree target at its
+    /// current version, with Arrow row key encoding.
+    fn list_element_details() -> Option<Any> {
+        details(&pb::ListElementIndexDetails {
+            key_field_ids: vec![2, 3],
+            keys: vec!["label".to_string(), "confidence".to_string()],
+            key_types: vec!["string".to_string(), "float".to_string()],
+            key_encoding: pb::ListElementKeyEncoding::ArrowRowV1.into(),
+            target_details: details(&pbold::BTreeIndexDetails::default()),
+            target_index_version: BTREE_INDEX_VERSION,
+        })
+    }
+
     fn foreign(type_name: &str) -> Option<Any> {
         Some(Any {
             type_url: format!("type.googleapis.com/{type_name}"),
@@ -397,6 +350,7 @@ mod tests {
     #[case::bloom_filter(details(&pb::BloomFilterIndexDetails::default()), 0, true)]
     #[case::btree(details(&pbold::BTreeIndexDetails::default()), 1, true)]
     #[case::legacy_btree(details(&pbold::BTreeIndexDetails::default()), 0, false)]
+    #[case::list_element(list_element_details(), 0, true)]
     #[case::bitmap(details(&pbold::BitmapIndexDetails::default()), 0, false)]
     #[case::label_list(details(&pbold::LabelListIndexDetails::default()), 0, false)]
     #[case::ngram(details(&pbold::NGramIndexDetails::default()), 0, false)]
@@ -529,12 +483,20 @@ mod tests {
         )
         .unwrap();
 
+        // A tagged history is allowed beside indices storing row addresses.
+        validate_frag_reuse_with_stable_row_ids_when(
+            &manifest,
+            &[frag_reuse_entry(1), zone_map.clone()],
+            true,
+        )
+        .unwrap();
+
         for (indices, expected) in [
             (
                 vec![frag_reuse_entry(0), frag_reuse_entry(0)],
                 "exactly one is allowed",
             ),
-            (vec![frag_reuse_entry(1)], "support only index_version 0"),
+            (vec![frag_reuse_entry(2)], "index_version 2"),
             (vec![frag_reuse_entry(0), zone_map, bitmap], "`bitmap`"),
         ] {
             let error = validate_frag_reuse_with_stable_row_ids_when(&manifest, &indices, true)
@@ -587,6 +549,18 @@ mod tests {
                 .contains("`zone_map`")
         );
         assert_rejected(result, "`bitmap`");
+
+        // Field dependencies are maintained by ordinary schema commits. The
+        // recording gate only needs to establish row-address compatibility.
+        let mut list_index = index_with("detections_idx", list_element_details(), 0);
+        list_index.fields.extend([2, 3]);
+        assert!(address_index_incompatibility(&list_index).is_none());
+        ensure_frag_reuse_recording_allowed_when(
+            &manifest,
+            std::slice::from_ref(&list_index),
+            true,
+        )
+        .unwrap();
     }
 
     async fn stable_row_id_dataset(uri: &str) -> Dataset {
@@ -647,14 +621,15 @@ mod tests {
         manifest.transaction_section = None;
         apply_frag_reuse_with_stable_row_ids_flag(&mut manifest, &indices);
         let location = dataset
+            .table_state
             .commit_handler
             .commit(
                 &mut manifest,
                 Some(indices),
-                &dataset.base,
-                &dataset.object_store,
+                &dataset.table_state.base,
+                &dataset.table_state.object_store,
                 write_manifest_file_to_path,
-                dataset.manifest_location.naming_scheme,
+                dataset.table_state.manifest_location.naming_scheme,
                 None,
             )
             .await

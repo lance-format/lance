@@ -22,11 +22,11 @@ from typing import (
     cast,
 )
 
-import numpy as np
 import pyarrow as pa
 from pyarrow import RecordBatch, Schema
 
 from ..dependencies import _check_for_numpy
+from ..dependencies import numpy as np
 from ..dependencies import pandas as pd
 from ..fragment import LanceFragment
 from ..lance import (
@@ -420,8 +420,9 @@ def serialize_row_addrs(addrs: Iterable[int]) -> bytes:
 
 def _coerce_query_vector(query: QueryVectorLike) -> tuple[pa.Array, int]:
     # if the query is a multivector, convert it to pa.ListArray
-    if hasattr(query, "__getitem__") and isinstance(
-        query[0], (list, tuple, np.ndarray, pa.Array)
+    if hasattr(query, "__getitem__") and (
+        isinstance(query[0], (list, tuple, pa.Array))
+        or (_check_for_numpy(query[0]) and isinstance(query[0], np.ndarray))
     ):
         dim = len(query[0])
         multivector_query = []
@@ -441,9 +442,9 @@ def _coerce_query_vector(query: QueryVectorLike) -> tuple[pa.Array, int]:
             query = query.value
         if isinstance(query.type, pa.FixedSizeListType):
             query = query.values
-    elif isinstance(query, (list, tuple)) or (
-        _check_for_numpy(query) and isinstance(query, np.ndarray)
-    ):
+    elif isinstance(query, (list, tuple)):
+        query = pa.array(query, type=pa.float32(), from_pandas=True)
+    elif _check_for_numpy(query) and isinstance(query, np.ndarray):
         query = np.array(query).astype("float64")  # workaround for GH-608
         query = pa.FloatingPointArray.from_pandas(query, type=pa.float32())
     elif not isinstance(query, pa.Array):
@@ -491,6 +492,7 @@ def _build_vector_search_query(
     refine_q: Optional[QueryVectorLike] = None,
     refine_metric: Optional[str] = None,
     warp_imputation_rank: Optional[int] = None,
+    rq_graph_scoring: Literal["multi_bit", "one_bit_rerank"] = "multi_bit",
 ) -> dict:
     """Configure nearest neighbor search.
 
@@ -596,6 +598,12 @@ def _build_vector_search_query(
         or 100,000 when ``k`` exceeds 100, beyond that. It is not a latency knob:
         it reads no extra data. Larger values impute lower similarities, so
         documents that only some query tokens observe rank lower.
+    rq_graph_scoring: {"multi_bit", "one_bit_rerank"}, default "multi_bit"
+        How an IVF_HNSW_RQ graph search scores the nodes it visits. Other index
+        types ignore this setting. ``multi_bit`` scores every visited node with
+        the full multi-bit RQ codes. ``one_bit_rerank`` walks the graph with
+        the 1-bit sign codes and rescores only the ``ef`` finalists with the
+        full codes, which is faster but can lower recall at a given ``ef``.
 
     Returns
     -------
@@ -693,6 +701,7 @@ def _build_vector_search_query(
         "ef": ef,
         "query_parallelism": query_parallelism,
         "approx_mode": approx_mode,
+        "rq_graph_scoring": rq_graph_scoring,
         "search_effort": search_effort,
         "distance_range": distance_range,
         "warp_imputation_rank": warp_imputation_rank,
@@ -743,6 +752,20 @@ class ScannerBuilder:
 
     def apply_defaults(self, default_opts: Dict[str, Any]) -> ScannerBuilder:
         for key, value in default_opts.items():
+            if key == "fragments":
+                self.with_fragments(value)
+                continue
+            if key == "index_segments":
+                self.with_index_segments(value)
+                continue
+            if key == "full_text_query":
+                # Match scanner(): None does not set a full-text query.
+                if value is None:
+                    continue
+                key = "full_text_search"
+            if key == "nearest" and isinstance(value, MinHashQuery):
+                self.minhash_search(value)
+                continue
             setter = getattr(self, key, None)
             if setter is None:
                 raise ValueError(f"Unknown option {key}")
@@ -1073,6 +1096,7 @@ class ScannerBuilder:
         refine_q: Optional[QueryVectorLike] = None,
         refine_metric: Optional[str] = None,
         warp_imputation_rank: Optional[int] = None,
+        rq_graph_scoring: Literal["multi_bit", "one_bit_rerank"] = "multi_bit",
     ) -> ScannerBuilder:
         """Configure nearest neighbor search.
 
@@ -1166,6 +1190,12 @@ class ScannerBuilder:
             or 100,000 when ``k`` exceeds 100, beyond that. It is not a latency knob:
             it reads no extra data. Larger values impute lower similarities, so
             documents that only some query tokens observe rank lower.
+        rq_graph_scoring: {"multi_bit", "one_bit_rerank"}, default "multi_bit"
+            How an IVF_HNSW_RQ graph search scores the nodes it visits. Other index
+            types ignore this setting. ``multi_bit`` scores every visited node with
+            the full multi-bit RQ codes. ``one_bit_rerank`` walks the graph with
+            the 1-bit sign codes and rescores only the ``ef`` finalists with the
+            full codes, which is faster but can lower recall at a given ``ef``.
 
         Examples
         --------
@@ -1202,6 +1232,7 @@ class ScannerBuilder:
             refine_column=refine_column,
             refine_q=refine_q,
             refine_metric=refine_metric,
+            rq_graph_scoring=rq_graph_scoring,
         )
         return self
 
@@ -1317,19 +1348,26 @@ class ScannerBuilder:
         self._strict_batch_size = strict_batch_size
         return self
 
-    def order_by(self, orderings: Optional[list[ColumnOrdering]]) -> ScannerBuilder:
+    def order_by(
+        self, orderings: Optional[Iterable[ColumnOrdering | str]]
+    ) -> ScannerBuilder:
+        if isinstance(orderings, str):
+            raise TypeError(
+                "orderings must be a list of column names or ColumnOrdering"
+            )
+        normalized_orderings = None
         if orderings is not None:
-            inner_orderings = []
+            normalized_orderings = []
             for order in orderings:
-                if isinstance(order, ColumnOrdering):
-                    inner_orderings.append(order)
-                else:
+                if isinstance(order, str):
+                    order = ColumnOrdering(order)
+                if not isinstance(order, ColumnOrdering):
                     raise TypeError(
-                        f"orderings must be a list of ColumnOrdering. "
+                        f"orderings must contain column names or ColumnOrdering. "
                         f"Got {type(order)} instead."
                     )
-            orderings = inner_orderings
-        self._orderings = orderings
+                normalized_orderings.append(order)
+        self._orderings = normalized_orderings
         return self
 
     def disable_scoring_autoprojection(self, disable: bool = True) -> ScannerBuilder:
@@ -1554,7 +1592,14 @@ class LanceScanner(pa.dataset.Scanner):
         indices = list(indices)
         if not indices:
             raise ValueError("take requires at least one index")
-        if any(not isinstance(i, (int, np.integer)) or i < 0 for i in indices):
+        if any(
+            not (
+                isinstance(i, int)
+                or (_check_for_numpy(i) and isinstance(i, np.integer))
+            )
+            or i < 0
+            for i in indices
+        ):
             raise ValueError(f"indices must be non-negative integers, got {indices}")
 
         # Collect the rows at the requested filtered-relative positions. Rows
@@ -1679,6 +1724,7 @@ class VectorSearchQuery:
         query_parallelism: Optional[int] = None,
         approx_mode: Literal["fast", "normal", "accurate"] = "normal",
         search_effort: Optional[float] = None,
+        rq_graph_scoring: Literal["multi_bit", "one_bit_rerank"] = "multi_bit",
     ):
         self._inner = _build_vector_search_query(
             column,
@@ -1694,6 +1740,7 @@ class VectorSearchQuery:
             query_parallelism=query_parallelism,
             approx_mode=approx_mode,
             search_effort=search_effort,
+            rq_graph_scoring=rq_graph_scoring,
         )
 
     def inner(self):

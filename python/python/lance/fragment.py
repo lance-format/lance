@@ -592,7 +592,7 @@ class LanceFragment(pa.dataset.Fragment):
         offset: Optional[int] = None,
         with_row_id: bool = False,
         with_row_address: bool = False,
-        batch_readahead: int = 16,
+        batch_readahead: Optional[int] = None,
         blob_handling: Optional[
             Literal["all_binary", "blobs_descriptions", "all_descriptions"]
         ] = None,
@@ -730,7 +730,7 @@ class LanceFragment(pa.dataset.Fragment):
         offset: Optional[int] = None,
         with_row_id: bool = False,
         with_row_address: bool = False,
-        batch_readahead: int = 16,
+        batch_readahead: Optional[int] = None,
         blob_handling: Optional[
             Literal["all_binary", "blobs_descriptions", "all_descriptions"]
         ] = None,

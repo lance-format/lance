@@ -6,8 +6,11 @@
 // These helpers stay crate-visible so callers do not depend on private parameter types.
 #![allow(clippy::redundant_pub_crate)]
 
+use super::field_dependencies::input_field_ids;
+
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Instant;
 
 use arrow_schema::{DataType, Field as ArrowField, Fields};
 use async_trait::async_trait;
@@ -20,9 +23,10 @@ use lance_file::reader::FileReaderOptions;
 use lance_file::versions::v1::reader::FileReader as V1FileReader;
 use lance_index::scalar::ScalarIndex;
 use lance_index::scalar::expression::{
-    IndexInformationProvider, MultiQueryParser, ScalarIndexPlanner,
+    IndexInformationProvider, MultiQueryParser, ScalarIndexPlanner, ScalarQueryParser,
 };
-use lance_index::scalar::registry::ScalarIndexPlugin;
+use lance_index::scalar::lance_format::LanceIndexStore;
+use lance_index::scalar::registry::{QueryDomain, ScalarIndexPlugin};
 use lance_index::vector::bq::builder::RabitQuantizer;
 use lance_index::vector::flat::index::{FlatBinQuantizer, FlatIndex, FlatQuantizer};
 use lance_index::vector::hnsw::HNSW;
@@ -46,30 +50,28 @@ use lance_io::utils::{
     CachedFileSize, read_last_block, read_message, read_message_from_buf, read_metadata_offset,
     read_version,
 };
-use lance_table::format::{Fragment, IndexMetadata, SelfDescribingFileReader};
-use lance_table::io::manifest::read_manifest_indexes;
+use lance_table::format::{Fragment, IndexMetadata, Manifest, SelfDescribingFileReader};
 use roaring::RoaringBitmap;
 use tracing::{info, instrument};
 use uuid::Uuid;
 
+use crate::dataset::index::LanceIndexStoreExt;
 use crate::index::api::DatasetIndexExt;
 use crate::index::frag_reuse::{self, load_frag_reuse_index_details, open_frag_reuse_index};
 use crate::index::frag_reuse_with_stable_row_ids::warn_about_indices_hidden_by_frag_reuse;
 use crate::index::mem_wal::open_mem_wal_index;
 use crate::index::scalar::{self, IndexDetails, fetch_index_details, list_element};
 use crate::index::segment::{
-    index_is_usable, index_type_is_known, segment_has_vector_details, unsupported_index_version,
+    index_has_supported_field_dependencies, index_is_usable, index_type_is_known,
+    segment_has_vector_details, unsupported_index_version,
 };
 use crate::index::vector;
 use crate::index::vector::{
     LogicalVectorIndex,
-    details::{infer_missing_vector_details, needs_vector_details_inference},
     ivf::v2::{IVFIndex, IvfOpenContext, IvfStateEntryBox, aux_file_key},
     utils::get_vector_type,
 };
-use crate::session::index_caches::{
-    DerivedIndexListingKey, FragReuseIndexKey, IndexMetadataKey, write_index_identity,
-};
+use crate::session::index_caches::{FragReuseIndexKey, write_index_identity};
 use crate::{Dataset, Error, Result};
 
 // Cache keys for different index types
@@ -109,25 +111,19 @@ impl CacheKey for LegacyVectorIndexCacheKey<'_> {
     }
 }
 
-/// Sized cache key for `IvfIndexState`.
-///
-/// Used for v0.3+ indices that support serialization. This key has a codec,
-/// so custom cache backends can serialize the state to disk/Redis/etc.
-/// Legacy indices use `LegacyVectorIndexCacheKey` instead (in-memory only).
-///
-/// Note: legacy entries hold live readers bound to the object store that
-/// opened them, so they are only valid for credential setups that refresh
-/// internally (e.g. a credentials provider). Deployments that pass fresh
-/// static credentials per dataset open should use v0.3+ index formats.
+/// Portable state is tied to the physical files, not their current row remapping.
+/// Dataset scoping is supplied by `DSIndexCache`; store and path distinguish
+/// external index locations and fresh bindings to a different physical store.
 #[derive(Debug, Clone)]
 pub(crate) struct IvfIndexStateCacheKey<'a> {
     uuid: &'a Uuid,
-    fri_uuid: Option<&'a Uuid>,
+    store: &'a str,
+    path: &'a str,
 }
 
 impl<'a> IvfIndexStateCacheKey<'a> {
-    fn new(uuid: &'a Uuid, fri_uuid: Option<&'a Uuid>) -> Self {
-        Self { uuid, fri_uuid }
+    pub(crate) fn new(uuid: &'a Uuid, store: &'a str, path: &'a str) -> Self {
+        Self { uuid, store, path }
     }
 }
 
@@ -139,19 +135,24 @@ impl CacheKey for IvfIndexStateCacheKey<'_> {
     }
 
     fn key(&self) -> std::borrow::Cow<'_, str> {
-        if let Some(fri_uuid) = self.fri_uuid {
-            format!("{}-{}", self.uuid, fri_uuid).into()
-        } else {
-            self.uuid.to_string().into()
-        }
+        format!(
+            "{}:{}:{}:{}",
+            self.uuid,
+            self.store.len(),
+            self.store,
+            self.path
+        )
+        .into()
     }
 
     fn schema() -> CacheKeySchema {
-        CacheKeySchema::new("lance.index.ivf-state-key", 1)
+        CacheKeySchema::new("lance.index.ivf-state-key", 2)
     }
 
     fn write_key(&self, builder: &mut KeyBuilder) {
-        write_index_identity(builder, self.uuid, self.fri_uuid);
+        builder.write_fixed_bytes(self.uuid.as_bytes());
+        builder.write_str(self.store);
+        builder.write_str(self.path);
     }
 
     fn codec() -> Option<lance_core::cache::CacheCodec> {
@@ -309,7 +310,7 @@ pub(crate) async fn open_index_proto(reader: &dyn Reader) -> Result<pb::Index> {
 /// runs on every call, and `load_indices` sits on the query-planning path and on
 /// merge_insert's per-batch path. Warning there would cost an operator one line
 /// per hidden index per query for as long as the dataset carries one.
-pub(crate) fn warn_about_unsupported_indices(indices: &[IndexMetadata]) {
+pub(crate) fn warn_about_unsupported_indices(manifest: &Manifest, indices: &[IndexMetadata]) {
     for idx in indices {
         if !index_type_is_known(idx) {
             let type_url = idx
@@ -329,7 +330,7 @@ pub(crate) fn warn_about_unsupported_indices(indices: &[IndexMetadata]) {
                 idx.index_version,
                 max_supported_version,
             );
-        } else if !index_is_usable(idx) {
+        } else if !index_has_supported_field_dependencies(idx) {
             log::warn!(
                 "Index {} has unsupported field dependencies {:?}, ignoring it",
                 idx.name,
@@ -337,6 +338,7 @@ pub(crate) fn warn_about_unsupported_indices(indices: &[IndexMetadata]) {
             );
         }
     }
+    warn_about_indices_hidden_by_frag_reuse(manifest, indices);
 }
 
 /// Every index the manifest names, including any this build has no reader for.
@@ -351,113 +353,9 @@ pub(crate) fn warn_about_unsupported_indices(indices: &[IndexMetadata]) {
 /// reservation, replace and removal selection, explicit drop - answers that
 /// second question too: a name it cannot see is a name it will hand out twice.
 pub(crate) async fn load_all_indices(dataset: &Dataset) -> Result<Arc<Vec<IndexMetadata>>> {
-    let metadata_key = IndexMetadataKey {
-        version: dataset.manifest.version,
-        store_identity: &dataset.object_store.store_prefix,
-        e_tag: dataset.manifest_location.e_tag.as_deref(),
-    };
-    let mut indices = dataset
-        .index_cache
-        .get_or_insert_with_key(metadata_key, || async {
-            let loaded = read_manifest_indexes(
-                &dataset.object_store,
-                &dataset.manifest_location,
-                &dataset.manifest,
-            )
-            .await?;
-            warn_about_unsupported_indices(&loaded);
-            warn_about_indices_hidden_by_frag_reuse(&dataset.manifest, &loaded);
-            Ok(loaded)
-        })
-        .await?;
-
-    // Infer details for legacy vector indices (once per index name, concurrently).
-    // This may run on indices that were opportunistically cached during Dataset::open
-    // before the full Dataset was available for inference.
-    {
-        let schema = dataset.schema();
-        if indices
-            .iter()
-            .any(|idx| needs_vector_details_inference(idx, schema))
-        {
-            let mut updated = indices.as_ref().clone();
-            infer_missing_vector_details(dataset, &mut updated).await;
-            if updated != *indices {
-                indices = Arc::new(updated);
-                dataset
-                    .index_cache
-                    .insert_with_key(&metadata_key, indices.clone())
-                    .await;
-            }
-        }
-    }
-
-    // Legacy FRI index version 0 is handled below by directly remapping fragment coverage.
-    // For version 1 and above, load_indices handles version checks and filters index
-    // segments for query use; keep their metadata unchanged here.
-    if indices
-        .iter()
-        .any(lance_table::system_index::frag_reuse::metadata::is_tagged)
-    {
-        if indices
-            .iter()
-            .filter(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
-            .count()
-            != 1
-        {
-            return Err(Error::corrupt_file_named(
-                "FRI metadata",
-                "tagged history requires a single FRI entry",
-            ));
-        }
-        // Commit bookkeeping carries the original Any unchanged. Only query
-        // loading or an operation consuming FRI needs to interpret its encoding.
-        return Ok(indices);
-    }
-    if let Some(frag_reuse_index_meta) =
-        indices.iter().find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
-    {
-        // Query planning loads the listing several times per scan, and each
-        // remap walks the whole reuse history.
-        let remapped_key = DerivedIndexListingKey {
-            version: metadata_key.version,
-            store_identity: metadata_key.store_identity,
-            e_tag: metadata_key.e_tag,
-        };
-        if let Some(remapped) = dataset.index_cache.get_with_key(&remapped_key).await {
-            return Ok(remapped);
-        }
-        let identity = frag_reuse::v0_cache_identity(dataset, frag_reuse_index_meta);
-        let fri_key = FragReuseIndexKey { uuid: &identity };
-        let frag_reuse_index = dataset
-            .index_cache
-            .get_or_insert_with_key(fri_key, || async move {
-                let index_details =
-                    load_frag_reuse_index_details(dataset, frag_reuse_index_meta).await?;
-                open_frag_reuse_index(frag_reuse_index_meta.uuid, index_details.as_ref()).await
-            })
-            .await?;
-        let mut remapped = indices.as_ref().clone();
-        for idx in remapped.iter_mut() {
-            if let Some(bitmap) = idx.fragment_bitmap.as_mut() {
-                frag_reuse_index.remap_fragment_bitmap(bitmap)?;
-            }
-        }
-        let remapped = Arc::new(remapped);
-        // A later call may still infer the missing details; don't pin this list.
-        if !indices
-            .iter()
-            .any(|idx| needs_vector_details_inference(idx, dataset.schema()))
-        {
-            dataset
-                .index_cache
-                .insert_with_key(&remapped_key, remapped.clone())
-                .await;
-        }
-        Ok(remapped)
-    } else {
-        Ok(indices)
-    }
+    let hook = crate::io::commit::LanceCommitHook::new(dataset.session.clone());
+    lance_table_runtime::commit::load_all_indices(&dataset.table_view().to_table(), Some(&hook))
+        .await
 }
 
 /// The segments named `name`, including any this build has no reader for.
@@ -628,6 +526,194 @@ pub(crate) async fn frag_reuse_cache_scope(dataset: &Dataset) -> Option<Uuid> {
         })
 }
 
+/// A resolved single-key index: the column it answers for, and its parser
+/// together with that column's Arrow type.
+type IndexedFieldParser = (String, (DataType, Box<dyn ScalarQueryParser>));
+
+/// One single-key index segment awaiting a routing decision shared with the
+/// other segments registered under the same name.
+struct PendingQueryParser<'a> {
+    field_path: String,
+    column_type: DataType,
+    index: &'a IndexMetadata,
+    index_details: IndexDetails,
+    parser: Option<Box<dyn ScalarQueryParser>>,
+    /// The domain the details declare, which is free to read. `None` leaves it
+    /// to [`ScalarIndexPlugin::recover_query_domain`] or to the scan.
+    domain: Option<QueryDomain>,
+}
+
+/// Union one segment's coverage into its `(column, index_name)` entry. If any
+/// contributing segment has no bitmap, the entry becomes `None` so callers know
+/// coverage is partial/unknown.
+fn union_fragment_bitmap(
+    fragment_bitmaps: &mut HashMap<(String, String), Option<RoaringBitmap>>,
+    field_path: &str,
+    index: &IndexMetadata,
+) {
+    fragment_bitmaps
+        .entry((field_path.to_string(), index.name.clone()))
+        .and_modify(|entry| {
+            if let (Some(acc), Some(seg)) = (entry.as_mut(), index.fragment_bitmap.as_ref()) {
+                *acc |= seg;
+            } else {
+                *entry = None;
+            }
+        })
+        .or_insert_with(|| index.fragment_bitmap.clone());
+}
+
+/// Resolve the single-key query parsers of one planning call, per index name.
+///
+/// Planning decides what to route per column, but a [`ScalarIndexSearch`]
+/// records only an index name, and execution opens every segment registered
+/// under that name -- across columns -- and asks each one. So a name may only
+/// be planned when all of its segments establish the same [`QueryDomain`]: the
+/// same value type alone is not enough, because a JSON index's keys of one
+/// type can have been extracted from different paths or keyed by targets whose
+/// queries mean different things. Routing on type alone would hand a query
+/// planned from one segment to a segment that holds other values, which loses
+/// or invents rows.
+///
+/// A name whose details state no domain asks its plugin to recover one from
+/// persisted index metadata. That is the only path that reads anything; a name
+/// whose segments all answered from their details never touches the store.
+///
+/// [`ScalarIndexSearch`]: lance_index::scalar::expression::ScalarIndexSearch
+async fn resolve_query_parsers(
+    dataset: &Dataset,
+    plugin_for: &impl Fn(&IndexDetails) -> Result<&dyn ScalarIndexPlugin>,
+    mut pending: Vec<PendingQueryParser<'_>>,
+    indexed_fields: &mut Vec<IndexedFieldParser>,
+    fragment_bitmaps: &mut HashMap<(String, String), Option<RoaringBitmap>>,
+) -> Result<()> {
+    // Group by name in first-seen order. The final loop below walks `pending` in
+    // metadata order, so grouping decides recovery order, not parser order.
+    let mut group_ids: HashMap<&str, usize> = HashMap::new();
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    for (position, pending) in pending.iter().enumerate() {
+        let group_id = *group_ids
+            .entry(pending.index.name.as_str())
+            .or_insert_with(|| {
+                groups.push(Vec::new());
+                groups.len() - 1
+            });
+        groups[group_id].push(position);
+    }
+
+    let mut routed = vec![false; pending.len()];
+    for members in &groups {
+        recover_missing_parsers(dataset, plugin_for, &mut pending, members).await;
+
+        // A name that states no domain anywhere keeps the per-segment decisions
+        // this function has always made; every plugin that never declares a
+        // domain takes this path. Once one segment states a domain, the others
+        // must prove they share it before any of them may answer.
+        let domain = members
+            .iter()
+            .find_map(|&position| pending[position].domain.as_ref());
+        let unanimous = match domain {
+            None => true,
+            Some(domain) => members.iter().all(|&position| {
+                let segment = &pending[position];
+                segment.parser.is_some() && segment.domain.as_ref() == Some(domain)
+            }),
+        };
+        if !unanimous {
+            let declared: Vec<Option<&DataType>> = members
+                .iter()
+                .map(|&position| pending[position].domain.as_ref().map(|d| &d.data_type))
+                .collect();
+            log::debug!(
+                "Not routing queries to index '{}': its segments do not establish one query \
+                 domain (value types {:?}). Queries on its columns will fall back to a full \
+                 scan.",
+                pending[members[0]].index.name,
+                declared,
+            );
+            continue;
+        }
+        for &position in members {
+            routed[position] = true;
+        }
+    }
+
+    for (position, pending) in pending.into_iter().enumerate() {
+        if !routed[position] {
+            continue;
+        }
+        // A name that states no domain may still have a segment whose plugin
+        // declined to parse; that segment contributes no coverage, as before.
+        let Some(parser) = pending.parser else {
+            continue;
+        };
+        union_fragment_bitmap(fragment_bitmaps, &pending.field_path, pending.index);
+        indexed_fields.push((pending.field_path, (pending.column_type, parser)));
+    }
+    Ok(())
+}
+
+/// Ask the plugin of every segment that answered no parser to recover one from
+/// persisted index metadata.
+async fn recover_missing_parsers(
+    dataset: &Dataset,
+    plugin_for: &impl Fn(&IndexDetails) -> Result<&dyn ScalarIndexPlugin>,
+    pending: &mut [PendingQueryParser<'_>],
+    members: &[usize],
+) {
+    for &position in members {
+        if pending[position].parser.is_some() {
+            continue;
+        }
+        let recovered = recover_one_query_parser(dataset, plugin_for, &pending[position]).await;
+        match recovered {
+            Ok(Some((parser, domain))) => {
+                let segment = &mut pending[position];
+                segment.parser = Some(parser);
+                segment.domain = Some(domain);
+            }
+            // The details and the persisted files both leave the domain
+            // unstated, which is the pre-recovery outcome: scan.
+            Ok(None) => {
+                let segment = &pending[position];
+                log::debug!(
+                    "No persisted value domain for index '{}' on column '{}'; queries on \
+                     this column will fall back to a full scan.",
+                    segment.index.name,
+                    segment.field_path,
+                );
+            }
+            Err(error) => {
+                let segment = &pending[position];
+                log::warn!(
+                    "Could not read the persisted value domain of index '{}' on column \
+                     '{}': {}. Queries on this column will fall back to a full scan.",
+                    segment.index.name,
+                    segment.field_path,
+                    error,
+                );
+            }
+        }
+    }
+}
+
+async fn recover_one_query_parser(
+    dataset: &Dataset,
+    plugin_for: &impl Fn(&IndexDetails) -> Result<&dyn ScalarIndexPlugin>,
+    segment: &PendingQueryParser<'_>,
+) -> Result<Option<(Box<dyn ScalarQueryParser>, QueryDomain)>> {
+    let plugin = plugin_for(&segment.index_details)?;
+    let store = Arc::new(LanceIndexStore::from_dataset_for_existing(dataset, segment.index).await?);
+    plugin
+        .recover_query_domain(
+            segment.index.name.clone(),
+            &segment.index_details.0,
+            u32::try_from(segment.index.index_version).unwrap_or(0),
+            store,
+        )
+        .await
+}
+
 impl Dataset {
     #[instrument(level = "trace", skip_all)]
     pub(crate) async fn scalar_index_info_ignoring(
@@ -662,9 +748,8 @@ impl Dataset {
             .await
     }
 
-    // Production passes `IndexDetails::get_plugin`. Tests pass a lookup that
-    // adds plugins the process-wide registry lacks, so `plugin_for` stays until
-    // a registration API replaces `SCALAR_INDEX_PLUGIN_REGISTRY`.
+    // Production passes `IndexDetails::get_plugin`. Tests can inject a lookup
+    // while keeping the process-wide registry shared across tests.
     pub(crate) async fn scalar_index_info_with_plugins(
         &self,
         indices: &[IndexMetadata],
@@ -684,16 +769,27 @@ impl Dataset {
         // entry has a bitmap; if any are missing, we leave the entry absent
         // so the optimizer treats coverage as unknown.
         let mut fragment_bitmaps: HashMap<(String, String), Option<RoaringBitmap>> = HashMap::new();
-        for index in indices.iter().filter(|idx| {
-            if ignored_index_names.contains(&idx.name) {
-                return false;
+        // Single-key parsers are resolved after this loop, together with the
+        // other segments registered under the same name, because a search opens
+        // every segment of the name a parser reports and asks all of them.
+        let mut pending_parsers = Vec::new();
+        for index in indices {
+            if ignored_index_names.contains(&index.name) {
+                continue;
             }
-            if idx.keyed_fields().len() > 1 && !registers_planners {
-                return false;
+            let input_fields = match input_field_ids(index) {
+                Ok(fields) => fields,
+                Err(error) => {
+                    log::warn!("Skipping index '{}': {error}", index.name);
+                    continue;
+                }
+            };
+            if input_fields.len() > 1 && !registers_planners {
+                continue;
             }
 
             // Check if this is an FTS index by looking at index details
-            let is_fts_index = if let Some(details) = &idx.index_details {
+            let is_fts_index = if let Some(details) = &index.index_details {
                 IndexDetails(details.clone()).supports_fts()
             } else {
                 false
@@ -701,17 +797,16 @@ impl Dataset {
 
             // Only include indices with non-empty fragment bitmaps, except for FTS indices
             // which need to be discoverable even when empty
-            let has_non_empty_bitmap = idx.fragment_bitmap.as_ref().is_some_and(|bitmap| {
-                !bitmap.is_empty() && !(bitmap & self.fragment_bitmap.as_ref()).is_empty()
+            let has_non_empty_bitmap = index.fragment_bitmap.as_ref().is_some_and(|bitmap| {
+                !bitmap.is_empty()
+                    && !(bitmap & self.table_state.fragment_bitmap.as_ref()).is_empty()
             });
 
-            // Same name-collision rationale as `CreateIndexBuilder`'s
-            // default-name loop in create.rs: only the keyed prefix decides
-            // which column this index answers for.
-            !idx.keyed_fields().is_empty() && (has_non_empty_bitmap || is_fts_index)
-        }) {
-            let keyed_columns = index
-                .keyed_fields()
+            // Dependencies and carried columns do not add query inputs.
+            if input_fields.is_empty() || !(has_non_empty_bitmap || is_fts_index) {
+                continue;
+            }
+            let keyed_columns = input_fields
                 .iter()
                 .map(|&field_id| {
                     schema.field_by_id(field_id).ok_or_else(|| {
@@ -791,34 +886,31 @@ impl Dataset {
                     };
                     planners.insert(index.name.clone(), planner);
                 }
+                union_fragment_bitmap(&mut fragment_bitmaps, &field_path, index);
             } else {
-                let query_parser = plugin.new_query_parser(index.name.clone(), &index_details.0);
-                let Some(query_parser) = query_parser else {
-                    continue;
-                };
-                indexed_fields.push((
-                    field_path.clone(),
-                    (keys[0].data_type().clone(), query_parser),
-                ));
+                let parser = plugin.new_query_parser(index.name.clone(), &index_details.0);
+                let domain = plugin.recorded_query_domain(
+                    &index_details.0,
+                    u32::try_from(index.index_version).unwrap_or(0),
+                );
+                pending_parsers.push(PendingQueryParser {
+                    field_path,
+                    column_type: keys[0].data_type().clone(),
+                    index,
+                    index_details,
+                    parser,
+                    domain,
+                });
             }
-
-            // Union the per-segment fragment bitmap into this
-            // (column, index_name) entry. If any segment is missing a
-            // bitmap, downgrade the entry to None so callers know
-            // coverage is partial/unknown.
-            let key = (field_path, index.name.clone());
-            fragment_bitmaps
-                .entry(key)
-                .and_modify(|entry| {
-                    if let (Some(acc), Some(seg)) = (entry.as_mut(), index.fragment_bitmap.as_ref())
-                    {
-                        *acc |= seg;
-                    } else {
-                        *entry = None;
-                    }
-                })
-                .or_insert_with(|| index.fragment_bitmap.clone());
         }
+        resolve_query_parsers(
+            self,
+            &plugin_for,
+            pending_parsers,
+            &mut indexed_fields,
+            &mut fragment_bitmaps,
+        )
+        .await?;
         let mut index_info_map = HashMap::with_capacity(indexed_fields.len());
         for indexed_field in indexed_fields {
             // Need to wrap in an option here because we know that only one of and_modify and or_insert will be called
@@ -893,16 +985,9 @@ impl Dataset {
         // key is a plugin detail), so there is no cheap scalar check here.
         let frag_reuse_uuid = v0_frag_reuse_cache_id(self).await;
 
-        // Check sized cache for IvfIndexState (v2+ indices).
-        let state_key = IvfIndexStateCacheKey::new(uuid, frag_reuse_uuid.as_ref());
-        if self.index_cache.get_with_key(&state_key).await.is_some() {
-            // Reconstruct via open_vector_index which will hit the same sized key.
-            let index = self
-                .open_vector_index_with_purpose(column, uuid, metrics, purpose)
-                .await?;
-            return Ok(index.as_index());
-        }
-
+        // Portable state is looked up after resolving the segment's physical
+        // location and current remapping below. A UUID-only probe cannot check
+        // either, and must not bypass the current segment's visibility rules.
         // Fallback: in-memory cache for legacy indices.
         let vector_cache_key = LegacyVectorIndexCacheKey::new(uuid, frag_reuse_uuid.as_ref());
         if let Some(cached) = self.index_cache.get_with_key(&vector_cache_key).await {
@@ -945,7 +1030,7 @@ impl Dataset {
 
         if is_vector_index {
             let index = self
-                .open_vector_index_with_purpose(column, uuid, metrics, purpose)
+                .open_vector_index_from_metadata_with_purpose(column, &index_meta, metrics, purpose)
                 .await?;
             Ok(index.as_index())
         } else {
@@ -1015,6 +1100,10 @@ impl Dataset {
         let uuid = &index_meta.uuid;
         let object_store = self.object_store_for_index(index_meta).await?;
         let index_dir = self.indice_files_dir(index_meta)?;
+        let index_file = index_dir
+            .clone()
+            .join(uuid.to_string())
+            .join(INDEX_FILE_NAME);
         // Hold the shared allocation before cache accesses can evict it.
         // The handle is dropped if this index does not use resident columns.
         // Physical file keys also let shallow clones share immutable columns.
@@ -1039,17 +1128,16 @@ impl Dataset {
         let resolved =
             frag_reuse::open_row_id_remapping_with_plan(self, index_meta, staged, purpose, metrics)
                 .await?;
-        // The index state (paths, model, quantizer metadata) and a legacy
-        // whole-index entry embed no translated rows: they live in the plain
-        // per-index namespace and stay warm across appends and unrelated
-        // rewrites. Partitions decoded through a translating remapper live in
-        // the translated namespace of `query_cache`.
+        // Portable file state is independent of this mapping. Legacy live
+        // indices and decoded partitions still use the resolved translation
+        // identity, including the current v0 history or tagged fingerprint.
         let frag_reuse_uuid = frag_reuse::fri_cache_id(&resolved).copied();
         let query_cache = frag_reuse::scoped_index_cache(self, &resolved);
         let remapping = resolved.map(|(_, remapping)| remapping);
 
         // Check sized cache first (v2+ indices with serializable state).
-        let state_key = IvfIndexStateCacheKey::new(uuid, frag_reuse_uuid.as_ref());
+        let state_key =
+            IvfIndexStateCacheKey::new(uuid, &object_store.store_prefix, index_file.as_ref());
         if let Some(entry) = self.index_cache.get_with_key(&state_key).await {
             log::debug!("Found IvfIndexState in cache uuid: {}", uuid);
             let partition_cache = query_cache.for_index(uuid, frag_reuse_uuid.as_ref());
@@ -1057,7 +1145,7 @@ impl Dataset {
                 .0
                 .reconstruct(
                     object_store,
-                    self.metadata_cache.as_ref(),
+                    self.table_state.metadata_cache.as_ref(),
                     partition_cache,
                     remapping,
                     open_context,
@@ -1071,6 +1159,7 @@ impl Dataset {
             return Ok(cached.0.clone());
         }
 
+        let prepare_start = Instant::now();
         // Only legacy vector file readers consume the V1 handle. A tagged
         // history is handled by the shared remapper above, including identity.
         let has_tagged_history = load_all_indices(self)
@@ -1082,10 +1171,6 @@ impl Dataset {
         } else {
             self.open_frag_reuse_index(metrics).await?
         };
-        let index_file = index_dir
-            .clone()
-            .join(uuid.to_string())
-            .join(INDEX_FILE_NAME);
         let file_sizes = index_meta.file_size_map();
         let reader: Arc<dyn Reader> = vector::open_index_file(
             object_store.as_ref(),
@@ -1131,7 +1216,7 @@ impl Dataset {
             minor_version,
         ) {
             (0, 1) | (0, 0) => {
-                info!(target: TRACE_IO_EVENTS, index_uuid=%uuid, r#type=IO_TYPE_OPEN_VECTOR, version="0.1", index_type="IVF_PQ");
+                info!(target: TRACE_IO_EVENTS, index_uuid=%uuid, r#type=IO_TYPE_OPEN_VECTOR, prepare_us=i64::try_from(prepare_start.elapsed().as_micros()).unwrap_or(i64::MAX), version="0.1", index_type="IVF_PQ");
                 let proto = open_index_proto(reader.as_ref()).await?;
                 match &proto.implementation {
                     Some(Implementation::VectorIndex(vector_index)) => {
@@ -1153,10 +1238,15 @@ impl Dataset {
             }
 
             (0, 2) => {
-                info!(target: TRACE_IO_EVENTS, index_uuid=%uuid, r#type=IO_TYPE_OPEN_VECTOR, version="0.2", index_type="IVF_PQ");
+                info!(target: TRACE_IO_EVENTS, index_uuid=%uuid, r#type=IO_TYPE_OPEN_VECTOR, prepare_us=i64::try_from(prepare_start.elapsed().as_micros()).unwrap_or(i64::MAX), version="0.2", index_type="IVF_PQ");
                 let reader = V1FileReader::try_new_self_described_from_reader(
                     lazy_reader,
-                    Some(&self.metadata_cache.file_metadata_cache(&index_file)),
+                    Some(
+                        &self
+                            .table_state
+                            .metadata_cache
+                            .file_metadata_cache(&index_file),
+                    ),
                 )
                 .await?;
                 let idx = vector::open_vector_index_v2(
@@ -1180,7 +1270,7 @@ impl Dataset {
 
                 let (_, element_type) = get_vector_type(self.schema(), &field_path)?;
 
-                info!(target: TRACE_IO_EVENTS, index_uuid=%uuid, r#type=IO_TYPE_OPEN_VECTOR, version="0.3", index_type=index_metadata.index_type);
+                info!(target: TRACE_IO_EVENTS, index_uuid=%uuid, r#type=IO_TYPE_OPEN_VECTOR, prepare_us=i64::try_from(prepare_start.elapsed().as_micros()).unwrap_or(i64::MAX), version="0.3", index_type=index_metadata.index_type);
 
                 match index_metadata.index_type.as_str() {
                     "IVF_FLAT" => match element_type {
@@ -1190,7 +1280,7 @@ impl Dataset {
                                 index_dir,
                                 uuid.to_owned(),
                                 remapping,
-                                self.metadata_cache.as_ref(),
+                                self.table_state.metadata_cache.as_ref(),
                                 index_cache,
                                 file_sizes,
                                 open_context,
@@ -1204,7 +1294,7 @@ impl Dataset {
                                 index_dir,
                                 uuid.to_owned(),
                                 remapping,
-                                self.metadata_cache.as_ref(),
+                                self.table_state.metadata_cache.as_ref(),
                                 index_cache,
                                 file_sizes,
                                 open_context,
@@ -1224,7 +1314,7 @@ impl Dataset {
                             index_dir,
                             uuid.to_owned(),
                             remapping,
-                            self.metadata_cache.as_ref(),
+                            self.table_state.metadata_cache.as_ref(),
                             index_cache,
                             file_sizes,
                             open_context,
@@ -1239,7 +1329,7 @@ impl Dataset {
                             index_dir,
                             uuid.to_owned(),
                             remapping,
-                            self.metadata_cache.as_ref(),
+                            self.table_state.metadata_cache.as_ref(),
                             index_cache,
                             file_sizes,
                             open_context,
@@ -1254,7 +1344,7 @@ impl Dataset {
                             index_dir,
                             uuid.to_owned(),
                             remapping,
-                            self.metadata_cache.as_ref(),
+                            self.table_state.metadata_cache.as_ref(),
                             index_cache,
                             file_sizes,
                             open_context,
@@ -1270,7 +1360,7 @@ impl Dataset {
                                 index_dir,
                                 uuid.to_owned(),
                                 remapping,
-                                self.metadata_cache.as_ref(),
+                                self.table_state.metadata_cache.as_ref(),
                                 index_cache,
                                 file_sizes,
                                 open_context,
@@ -1284,7 +1374,7 @@ impl Dataset {
                                 index_dir,
                                 uuid.to_owned(),
                                 remapping,
-                                self.metadata_cache.as_ref(),
+                                self.table_state.metadata_cache.as_ref(),
                                 index_cache,
                                 file_sizes,
                                 open_context,
@@ -1300,7 +1390,7 @@ impl Dataset {
                             index_dir,
                             uuid.to_owned(),
                             remapping,
-                            self.metadata_cache.as_ref(),
+                            self.table_state.metadata_cache.as_ref(),
                             index_cache,
                             file_sizes,
                             open_context,
@@ -1315,7 +1405,7 @@ impl Dataset {
                             index_dir,
                             uuid.to_owned(),
                             remapping,
-                            self.metadata_cache.as_ref(),
+                            self.table_state.metadata_cache.as_ref(),
                             index_cache,
                             file_sizes,
                             open_context,
@@ -1330,7 +1420,7 @@ impl Dataset {
                             index_dir,
                             uuid.to_owned(),
                             remapping,
-                            self.metadata_cache.as_ref(),
+                            self.table_state.metadata_cache.as_ref(),
                             index_cache,
                             file_sizes,
                             open_context,
@@ -1395,7 +1485,10 @@ impl Dataset {
             file,
             None,
             Default::default(),
-            &self.metadata_cache.file_metadata_cache(index_file),
+            &self
+                .table_state
+                .metadata_cache
+                .file_metadata_cache(index_file),
             FileReaderOptions::default(),
         )
         .await?;
@@ -1741,11 +1834,9 @@ impl DatasetIndexInternalExt for Dataset {
                 ))
             })?;
 
-        // Only the keyed prefix matters here. The rebuild below writes fresh,
-        // non-covered metadata and never reads the carried columns, so requiring
-        // them to exist and type-match would reject a target that can hold this
-        // index perfectly well.
-        let keyed_fields = source_index.keyed_fields();
+        // Rebuild from the query inputs. The target build records its own field
+        // IDs for additional dependencies and does not read carried columns.
+        let keyed_fields = input_field_ids(source_index)?;
         let mut field_paths = Vec::with_capacity(keyed_fields.len());
         for field_id in keyed_fields.iter() {
             let source_field = source_dataset

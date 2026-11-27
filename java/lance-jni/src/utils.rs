@@ -221,9 +221,18 @@ pub fn build_compaction_options(
     excluded_fragment_ids: &JObject,           // List<Long>
     data_storage_version: &JObject,            // Optional<String>
     source_budget_mode: Option<&JObject>,      // Optional<String>
+    data_cache_bytes: &JObject,                // Optional<Long>
     config: &std::collections::HashMap<String, String>,
 ) -> Result<CompactionOptions> {
     let mut compaction_options = CompactionOptions::from_dataset_config(config)?;
+
+    if let Some(bytes) = env.get_long_opt(data_cache_bytes)? {
+        compaction_options.data_cache_bytes = Some(u64::try_from(bytes).map_err(|_| {
+            lance::Error::invalid_input(format!(
+                "data_cache_bytes must be non-negative, got {bytes}"
+            ))
+        })?);
+    }
 
     if let Some(target_rows_per_fragment_val) = env.get_long_opt(target_rows_per_fragment)? {
         compaction_options.target_rows_per_fragment = target_rows_per_fragment_val as usize;
@@ -384,6 +393,8 @@ pub fn get_query(env: &mut JNIEnv, query_obj: JObject) -> Result<Option<Query>> 
             dist_q_c: 0.0,
             query_parallelism,
             approx_mode,
+            // Java does not expose `rq_graph_scoring` yet.
+            rq_graph_scoring: Default::default(),
         };
         query.validate_search_effort()?;
         Ok(query)

@@ -38,6 +38,7 @@ use lance_linalg::simd::{
     target_arch = "loongarch64"
 ))]
 use lance_linalg::simd::{SIMD, f32::f32x16};
+use lance_select::RowAddrMask;
 use lance_table::utils::LanceIteratorExtension;
 use num_traits::AsPrimitive;
 use prost::Message;
@@ -1584,7 +1585,17 @@ impl<'a> RabitDistCalculator<'a> {
             hacc_quantized_dists,
         );
 
-        Some(RawQueryTopkContext {
+        Some(self.raw_query_topk_parameters(k, lower_bound, upper_bound, n))
+    }
+
+    fn raw_query_topk_parameters(
+        &self,
+        k: usize,
+        lower_bound: Option<f32>,
+        upper_bound: Option<f32>,
+        n: usize,
+    ) -> RawQueryTopkContext<'_> {
+        RawQueryTopkContext {
             n,
             k,
             ex_bits: self.num_bits - 1,
@@ -1599,7 +1610,7 @@ impl<'a> RabitDistCalculator<'a> {
                 .expect("raw-query multi-bit RQ requires ex scale factors"),
             query_lower_bound: lower_bound.unwrap_or(f32::MIN),
             query_upper_bound: upper_bound.unwrap_or(f32::MAX),
-        })
+        }
     }
 
     /// Process one candidate row given its lower bound: the bound checks,
@@ -1611,7 +1622,7 @@ impl<'a> RabitDistCalculator<'a> {
         &self,
         ctx: &RawQueryTopkContext<'_>,
         id: usize,
-        row_id: u64,
+        row_id: impl FnOnce() -> Option<u64>,
         binary_ip: f32,
         raw_lower_bound: f32,
         res: &mut BinaryHeap<OrderedNode<u64>>,
@@ -1627,6 +1638,9 @@ impl<'a> RabitDistCalculator<'a> {
             return;
         }
 
+        let Some(row_id) = row_id() else {
+            return;
+        };
         counters.exact += 1;
         let dist = self.raw_query_multi_bit_exact_distance(
             id,
@@ -1669,23 +1683,63 @@ impl<'a> RabitDistCalculator<'a> {
         quantized_dists_table: &mut Vec<u8>,
         hacc_quantized_dists: &mut Vec<u32>,
     ) {
-        let Some(ctx) = self.raw_query_multi_bit_topk_context(
-            k,
-            lower_bound,
-            upper_bound,
-            dists,
-            quantized_dists,
-            quantized_dists_table,
-            hacc_quantized_dists,
-        ) else {
-            return;
+        let code_len = rabit_binary_code_bytes(self.dim);
+        let n = self.codes.len() / code_len;
+        let sparse = (n > 0
+            && self.approx_mode == ApproxMode::Normal
+            && self.sign_row_ids.is_none()
+            && row_ids.size_hint().1.is_some_and(|count| count <= n / 16))
+        .then(|| self.raw_query.map(|query| query.normal_lut()))
+        .flatten()
+        .and_then(|lut| match lut.dequant {
+            DistTableDequant::Affine { qmin, qmax } => Some((
+                lut.table.as_slice(),
+                (qmax - qmin) / 255.0,
+                lut.num_tables as f32 * qmin,
+            )),
+            DistTableDequant::Exact => None,
+        });
+        let ctx = if sparse.is_some() {
+            dists.clear();
+            quantized_dists.clear();
+            hacc_quantized_dists.clear();
+            self.raw_query_topk_parameters(k, lower_bound, upper_bound, n)
+        } else {
+            let Some(ctx) = self.raw_query_multi_bit_topk_context(
+                k,
+                lower_bound,
+                upper_bound,
+                dists,
+                quantized_dists,
+                quantized_dists_table,
+                hacc_quantized_dists,
+            ) else {
+                return;
+            };
+            ctx
         };
         let mut max_dist = res.peek().map(|node| node.dist);
         let mut counters = RabitPruneCounters::default();
 
         for (id, row_id) in row_ids {
-            let Some(binary_ip) = dists.get(id).copied() else {
+            if id >= ctx.n {
                 continue;
+            }
+            let binary_ip = if let Some((table, range, sum_min)) = sparse {
+                if id < n - n % BATCH_SIZE {
+                    let sum: u32 = get_rq_code(self.codes, id, n, code_len)
+                        .enumerate()
+                        .map(|(byte, code)| {
+                            u32::from(table[byte * 32 + usize::from(code & 15)])
+                                + u32::from(table[byte * 32 + 16 + usize::from(code >> 4)])
+                        })
+                        .sum();
+                    sum as f32 * range + sum_min
+                } else {
+                    compute_single_rq_distance(self.codes, id, n, code_len, &self.dist_table)
+                }
+            } else {
+                dists[id]
             };
             counters.candidates += 1;
             let Some(raw_lower_bound) = self.raw_query_lower_bound(id, binary_ip) else {
@@ -1694,7 +1748,7 @@ impl<'a> RabitDistCalculator<'a> {
             self.accumulate_raw_query_multi_bit_row(
                 &ctx,
                 id,
-                row_id,
+                || Some(row_id),
                 binary_ip,
                 raw_lower_bound,
                 res,
@@ -1714,7 +1768,7 @@ impl<'a> RabitDistCalculator<'a> {
         k: usize,
         lower_bound: Option<f32>,
         upper_bound: Option<f32>,
-        row_id: impl Fn(u32) -> u64,
+        row_id: impl Fn(u32) -> Option<u64>,
         res: &mut BinaryHeap<OrderedNode<u64>>,
         dists: &mut Vec<f32>,
         quantized_dists: &mut Vec<u16>,
@@ -1790,7 +1844,7 @@ impl<'a> RabitDistCalculator<'a> {
                 self.accumulate_raw_query_multi_bit_row(
                     &ctx,
                     id,
-                    row_id(id as u32),
+                    || row_id(id as u32),
                     binary_ip,
                     lower_bound_of(id, binary_ip),
                     res,
@@ -1807,7 +1861,7 @@ impl<'a> RabitDistCalculator<'a> {
             self.accumulate_raw_query_multi_bit_row(
                 &ctx,
                 id,
-                row_id(id as u32),
+                || row_id(id as u32),
                 binary_ip,
                 lower_bound_of(id, binary_ip),
                 res,
@@ -2253,12 +2307,13 @@ impl DistCalculator for RabitDistCalculator<'_> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn accumulate_topk_with_scratch(
+    fn accumulate_topk_with_mask(
         &self,
         k: usize,
         lower_bound: Option<f32>,
         upper_bound: Option<f32>,
         row_id: impl Fn(u32) -> u64,
+        mask: Option<&RowAddrMask>,
         res: &mut BinaryHeap<OrderedNode<u64>>,
         dists: &mut Vec<f32>,
         quantized_dists: &mut Vec<u16>,
@@ -2268,6 +2323,11 @@ impl DistCalculator for RabitDistCalculator<'_> {
         if k == 0 {
             return;
         }
+        let eligible_row = |id| {
+            let address = row_id(id);
+            mask.is_none_or(|mask| mask.selected(address))
+                .then_some(address)
+        };
         if let Some(reason) = self.raw_query_lower_bound_gating_disabled_reason() {
             record_rabit_prune_bypass(reason);
             self.distance_all_with_scratch(
@@ -2277,7 +2337,7 @@ impl DistCalculator for RabitDistCalculator<'_> {
                 quantized_dists_table,
                 hacc_quantized_dists,
             );
-            accumulate_distances_into_heap(k, lower_bound, upper_bound, row_id, res, dists);
+            accumulate_distances_into_heap(k, lower_bound, upper_bound, eligible_row, res, dists);
             return;
         }
 
@@ -2285,7 +2345,7 @@ impl DistCalculator for RabitDistCalculator<'_> {
             k,
             lower_bound,
             upper_bound,
-            row_id,
+            eligible_row,
             res,
             dists,
             quantized_dists,
@@ -2352,7 +2412,7 @@ fn accumulate_distances_into_heap(
     k: usize,
     lower_bound: Option<f32>,
     upper_bound: Option<f32>,
-    row_id: impl Fn(u32) -> u64,
+    row_id: impl Fn(u32) -> Option<u64>,
     res: &mut BinaryHeap<OrderedNode<u64>>,
     dists: &[f32],
 ) {
@@ -2365,14 +2425,20 @@ fn accumulate_distances_into_heap(
             continue;
         }
         if res.len() < k {
-            res.push(OrderedNode::new(row_id(id as u32), dist));
+            let Some(row_id) = row_id(id as u32) else {
+                continue;
+            };
+            res.push(OrderedNode::new(row_id, dist));
             if res.len() == k {
                 max_dist = res.peek().map(|node| node.dist);
             }
         } else if max_dist.is_some_and(|max_dist| max_dist > dist) {
+            let Some(row_id) = row_id(id as u32) else {
+                continue;
+            };
             {
                 let mut top = res.peek_mut().unwrap();
-                top.id = row_id(id as u32);
+                top.id = row_id;
                 top.dist = dist;
             }
             max_dist = res.peek().map(|node| node.dist);
@@ -2448,6 +2514,10 @@ impl VectorStore for RabitQuantizationStorage {
 
     fn row_ids(&self) -> impl Iterator<Item = &u64> {
         self.row_ids.values().iter()
+    }
+
+    fn row_ids_slice(&self) -> Option<&[u64]> {
+        Some(self.row_ids.values().as_ref())
     }
 
     fn distance_type(&self) -> DistanceType {
@@ -3264,7 +3334,7 @@ mod tests {
     use crate::vector::quantizer::{Quantization, QuantizerStorage};
     use crate::vector::transform::Transformer;
     use crate::vector::v3::subindex::IvfSubIndex;
-    use crate::vector::{CENTROID_DIST_COLUMN, DIST_COL, PART_ID_COLUMN};
+    use crate::vector::{CENTROID_DIST_COLUMN, DIST_COL, PART_ID_COLUMN, RqGraphScoring};
 
     fn build_dist_table_not_optimized<T: ArrowFloatType>(
         sub_vec: &[T::Native],
@@ -3594,6 +3664,55 @@ mod tests {
                 &mut Vec::new(),
             )
             .unwrap();
+            let mut scalar = SignStage::default();
+            calc.filtered_partition_sign_stage_with_scratch(
+                &mut scalar,
+                &mut Vec::new(),
+                &mut Vec::new(),
+                &mut Vec::new(),
+            )
+            .unwrap();
+            for pattern in 0..4 {
+                let accept = (0..storage.len())
+                    .map(|row| match pattern {
+                        0 => false,
+                        1 => true,
+                        2 => {
+                            row % 3 == 1 && storage.row_id(row as u32) != RowAddress::TOMBSTONE_ROW
+                        }
+                        _ => row + 1 == storage.len(),
+                    })
+                    .collect::<Vec<_>>();
+                let mut masked = SignStage::default();
+                calc.filtered_partition_sign_stage_for_mask(&mut masked, &accept)
+                    .unwrap();
+                for (row, &accepted) in accept.iter().enumerate() {
+                    if accepted {
+                        assert_eq!(
+                            masked.binary_ips[row].to_bits(),
+                            scalar.binary_ips[row].to_bits()
+                        );
+                        assert_eq!(
+                            masked.lower_bounds[row].to_bits(),
+                            scalar.lower_bounds[row].to_bits()
+                        );
+                    } else {
+                        assert_eq!(masked.binary_ips[row], 0.0);
+                        assert_eq!(masked.lower_bounds[row], f32::INFINITY);
+                    }
+                }
+                let before_ips = masked.binary_ips.clone();
+                let before_bounds = masked.lower_bounds.clone();
+                assert_eq!(
+                    calc.filtered_partition_sign_stage_for_mask(
+                        &mut masked,
+                        &vec![true; storage.len() + 1]
+                    ),
+                    Err("mask_length")
+                );
+                assert_eq!(masked.binary_ips, before_ips);
+                assert_eq!(masked.lower_bounds, before_bounds);
+            }
             stage
         };
         let actual = prepare(&sign);
@@ -4160,6 +4279,16 @@ mod tests {
             calc.raw_query_lower_bound_gating_disabled_reason(),
             Some("approx_mode_fast")
         );
+        let mut stage = SignStage {
+            binary_ips: vec![7.0],
+            lower_bounds: vec![8.0],
+        };
+        assert_eq!(
+            calc.filtered_partition_sign_stage_for_mask(&mut stage, &[true, false]),
+            Err("approx_mode_fast")
+        );
+        assert_eq!(stage.binary_ips, vec![7.0]);
+        assert_eq!(stage.lower_bounds, vec![8.0]);
     }
 
     #[test]
@@ -4759,6 +4888,106 @@ mod tests {
             .collect::<Vec<_>>();
         rows.sort_unstable();
         rows
+    }
+
+    #[rstest]
+    fn test_filtered_sparse_binary_ips_match_bulk(
+        #[values(ApproxMode::Normal, ApproxMode::Accurate)] approx_mode: ApproxMode,
+        #[values(false, true)] sign_planes: bool,
+    ) {
+        for n in [0usize, 17, 33, 65, 129] {
+            let mut rng = SmallRng::seed_from_u64(771 + n as u64);
+            let exact = (0..n)
+                .map(|_| rng.random_range(0.0..20.0))
+                .collect::<Vec<_>>();
+            let mut data = CraftedTopkData::new(&exact, &vec![1.0; n], vec![0.7; n], &mut rng);
+            data.scale_factors.fill(0.3);
+            data.ex_scale_factors.fill(0.2);
+            let raw = RabitRawQueryContext::new(
+                CRAFTED_TOPK_DIM,
+                CRAFTED_TOPK_NUM_BITS - 1,
+                data.ex_query.clone(),
+                data.dist_table.clone(),
+                Vec::new(),
+                0.7,
+            );
+            let row_ids = (0..n as u64).collect::<Vec<_>>();
+            let mut calc = data.calculator(approx_mode);
+            calc.raw_query = Some(&raw);
+            calc.sign_row_ids = sign_planes.then_some(row_ids.as_slice());
+            let selections = if n == 0 {
+                vec![Vec::new()]
+            } else {
+                vec![
+                    vec![],
+                    vec![0],
+                    vec![n - 1],
+                    vec![0, n / 2, n - 1],
+                    vec![0, 0, n - 1],
+                    vec![n + 1, 0],
+                    (0..n).step_by(3).collect(),
+                ]
+            };
+            for selected in selections {
+                for k in [1, 3] {
+                    for (lower, upper) in [(None, None), (Some(-1.0), Some(100.0))] {
+                        let mut sparse_heap = BinaryHeap::new();
+                        let mut bulk_heap = BinaryHeap::new();
+                        let mut dists = vec![123.0];
+                        let mut u16_scratch = Vec::new();
+                        let mut u8_scratch = Vec::new();
+                        let mut u32_scratch = Vec::new();
+                        for pass in 0..2u64 {
+                            calc.accumulate_filtered_topk_with_scratch(
+                                k,
+                                lower,
+                                upper,
+                                selected
+                                    .iter()
+                                    .map(|&id| (id as u32, id as u64 + pass * 1000)),
+                                |_| true,
+                                &mut sparse_heap,
+                                &mut dists,
+                                &mut u16_scratch,
+                                &mut u8_scratch,
+                                &mut u32_scratch,
+                            );
+                            if n > 0
+                                && approx_mode == ApproxMode::Normal
+                                && !sign_planes
+                                && selected.len() <= n / 16
+                            {
+                                assert!(dists.is_empty());
+                            } else {
+                                assert_eq!(dists.len(), n);
+                            }
+                            let mut iter = selected.iter();
+                            let unknown_length = std::iter::from_fn(|| {
+                                iter.next().map(|&id| (id as u32, id as u64 + pass * 1000))
+                            });
+                            calc.accumulate_filtered_topk_with_scratch(
+                                k,
+                                lower,
+                                upper,
+                                unknown_length,
+                                |_| true,
+                                &mut bulk_heap,
+                                &mut dists,
+                                &mut u16_scratch,
+                                &mut u8_scratch,
+                                &mut u32_scratch,
+                            );
+                            assert_eq!(dists.len(), n);
+                        }
+                        assert_eq!(
+                            canonical_heap_rows(sparse_heap),
+                            canonical_heap_rows(bulk_heap),
+                            "n={n} selected={selected:?} k={k} mode={approx_mode:?} planes={sign_planes}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// The dense (SIMD-pruned) scan must reproduce the sparse scalar scan
@@ -5718,6 +5947,32 @@ mod tests {
         }
     }
 
+    /// A multi-bit search scores visited nodes with the full multi-bit
+    /// estimator and a reranking search with the 1-bit walk.
+    #[test]
+    fn test_rq_graph_scoring_selects_search_calculator() {
+        let num_rows = 32;
+        let storage = hnsw_partition(5, DistanceType::L2, num_rows as usize);
+        let (query, dist_q_c) = residual_query_array(storage.code_dim());
+        let full = storage.dist_calculator(query.clone(), dist_q_c);
+        let walk = storage.graph_dist_calculator(query.clone(), dist_q_c);
+        let params = |rq_graph_scoring| HnswQueryParams {
+            ef: num_rows as usize,
+            lower_bound: None,
+            upper_bound: None,
+            dist_q_c,
+            use_acorn: false,
+            rq_graph_scoring,
+        };
+        let multi_bit = params(RqGraphScoring::MultiBit).dist_calculator(&storage, query.clone());
+        let one_bit = params(RqGraphScoring::OneBitRerank).dist_calculator(&storage, query);
+        for id in 0..num_rows {
+            assert_eq!(multi_bit.distance(id), full.distance(id), "row {id}");
+            assert_eq!(one_bit.distance(id), walk.distance(id), "row {id}");
+        }
+        assert!((0..num_rows).any(|id| full.distance(id) != walk.distance(id)));
+    }
+
     #[derive(Clone, Copy)]
     enum RangeSearchPath {
         Graph,
@@ -5726,7 +5981,8 @@ mod tests {
     }
 
     /// HNSW range bounds judge the reranked score, not the walk score, on the
-    /// graph search, the sparse-mask flat scan and the ACORN search. 32 rows
+    /// graph search, the sparse-mask flat scan and the ACORN search, and the
+    /// full multi-bit score when the search never walks. 32 rows
     /// put a one-row mask below HNSW's 10% flat-scan threshold.
     #[rstest]
     #[case::graph_drops_reranked_out(RangeSearchPath::Graph, false)]
@@ -5739,6 +5995,8 @@ mod tests {
         #[case] path: RangeSearchPath,
         #[case] reranked_in_range: bool,
         #[values(1, 5)] num_bits: u8,
+        #[values(RqGraphScoring::MultiBit, RqGraphScoring::OneBitRerank)]
+        rq_graph_scoring: RqGraphScoring,
     ) {
         let num_rows = 32u64;
         let storage = hnsw_partition(num_bits, DistanceType::L2, num_rows as usize);
@@ -5780,6 +6038,7 @@ mod tests {
             upper_bound: upper,
             dist_q_c,
             use_acorn: matches!(path, RangeSearchPath::Acorn),
+            rq_graph_scoring,
         };
         let batch = hnsw
             .search(

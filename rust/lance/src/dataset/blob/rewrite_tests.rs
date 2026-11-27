@@ -34,11 +34,11 @@ use crate::dataset::Dataset;
 use crate::dataset::blob::rewrite::BlobV2BatchRewritePlan;
 use crate::dataset::blob::test_util::managed_blob_schema;
 use crate::dataset::cleanup::{CleanupPolicy, cleanup_old_versions};
-use crate::dataset::optimize::execution::rechunk_row_lineage;
 use crate::dataset::rowids::{RowLineage, place_row_lineage};
 use crate::dataset::scanner::ColumnOrdering;
 use crate::dataset::transaction::{Operation, RewriteGroup, Transaction};
 use crate::dataset::{CommitBuilder, InsertBuilder, WriteMode, WriteParams};
+use lance_table_runtime::optimize::execution::rechunk_row_lineage;
 
 /// Destinations here are written at V2_2, which is the version at which
 /// compaction turns managed preservation on.
@@ -801,7 +801,12 @@ async fn publish_rewrite(
         unreachable!("an uncommitted insert always carries Append");
     };
     if dataset.manifest.uses_stable_row_ids() {
-        rechunk_row_lineage(dataset.as_ref(), &mut new_fragments, &old_fragments).await?;
+        rechunk_row_lineage(
+            &dataset.table_view().to_table(),
+            &mut new_fragments,
+            &old_fragments,
+        )
+        .await?;
     }
     CommitBuilder::new(dataset.clone())
         .execute(Transaction::new_from_version(

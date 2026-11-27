@@ -13,6 +13,7 @@ use lance_arrow::json::{ARROW_JSON_EXT_NAME, JsonArray, is_arrow_json_field, jso
 use lance_arrow::{ARROW_EXT_NAME_KEY, FixedSizeListArrayExt, RecordBatchExt};
 
 use crate::index::DatasetIndexExt;
+use crate::index::frag_reuse_with_stable_row_ids::is_hidden_by_frag_reuse;
 use arrow::compute::concat_batches;
 use arrow::datatypes::Int32Type;
 use arrow_array::cast::AsArray;
@@ -30,6 +31,7 @@ use lance_datafusion::exec::{ExecutionSummaryCounts, execute_plan};
 use lance_encoding::decoder::DecoderPlugins;
 use lance_file::reader::{FileReader, FileReaderOptions, describe_encoding};
 use lance_file::version::LanceFileVersion;
+use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::inverted::{
     SCORE_FIELD,
@@ -43,14 +45,21 @@ use lance_io::utils::CachedFileSize;
 use lance_linalg::distance::MetricType;
 use uuid::Uuid;
 
+use crate::dataset::index::frag_reuse::cleanup_frag_reuse_index;
+use crate::dataset::optimize::remapping::remap_column_index;
 use crate::dataset::optimize::{CompactionOptions, compact_files};
 use crate::dataset::scanner::{ColumnOrdering, DatasetRecordBatchStream, QueryFilter};
+use crate::dataset::transaction::{Operation, RewriteGroup, Transaction};
+use crate::dataset::write::CommitBuilder;
 use crate::dataset::write::WriteParams;
 use crate::dataset::{ColumnAlteration, NewColumnTransform};
+use crate::index::frag_reuse::frag_reuse_entry_appending;
+use crate::index::frag_reuse_reader::tests::prepare_partition;
 use crate::{Dataset, Error};
 use lance_index::vector::ivf::IvfBuildParams;
 use lance_index::vector::pq::PQBuildParams;
 use lance_index::vector::{DEFAULT_QUERY_PARALLELISM, Query};
+use lance_table::format::Fragment;
 use pretty_assertions::assert_eq;
 use rstest::rstest;
 use tracing_mock::{expect, subscriber};
@@ -421,6 +430,7 @@ async fn test_vector_filter_fts_search() {
         query_parallelism: DEFAULT_QUERY_PARALLELISM,
         dist_q_c: 0.0,
         approx_mode: Default::default(),
+        rq_graph_scoring: Default::default(),
     };
 
     // Refine the approximate IVF-PQ distances so adjacent vectors have a
@@ -1226,8 +1236,8 @@ async fn test_scan_miniblock_dictionary_out_of_line_bitpacking_does_not_panic() 
 
     let file_path = dataset.data_dir().join(data_file.path.as_str());
     let scheduler = ScanScheduler::new(
-        dataset.object_store.clone(),
-        SchedulerConfig::max_bandwidth(&dataset.object_store),
+        dataset.table_state.object_store.clone(),
+        SchedulerConfig::max_bandwidth(&dataset.table_state.object_store),
     );
     let file_scheduler = scheduler
         .open_file(&file_path, &CachedFileSize::unknown())
@@ -1592,6 +1602,17 @@ fn detection_batch(ids: std::ops::Range<i32>) -> RecordBatch {
 /// list-element index on `detections`, then a fourth fragment the indices do
 /// not cover.
 async fn detection_dataset(element_index: bool, enable_stable_row_ids: bool) -> Dataset {
+    detection_dataset_with(element_index, enable_stable_row_ids, false).await
+}
+
+/// [`detection_dataset`]; with `tagged`, a stable partition of the three
+/// fragments is committed before the indices exist, which gives the table a
+/// tagged fragment reuse history.
+async fn detection_dataset_with(
+    element_index: bool,
+    enable_stable_row_ids: bool,
+    tagged: bool,
+) -> Dataset {
     let params = WriteParams {
         max_rows_per_file: 500,
         enable_stable_row_ids,
@@ -1606,6 +1627,9 @@ async fn detection_dataset(element_index: bool, enable_stable_row_ids: bool) -> 
     )
     .await
     .unwrap();
+    if tagged {
+        stable_partition(&mut dataset).await;
+    }
     dataset
         .create_index(
             &["width"],
@@ -1636,8 +1660,48 @@ async fn detection_dataset(element_index: bool, enable_stable_row_ids: bool) -> 
         )
         .await
         .unwrap();
-    assert_eq!(dataset.get_fragments().len(), 4);
+    // A partition leaves two fragments for the three it rewrote.
+    assert_eq!(dataset.get_fragments().len(), if tagged { 3 } else { 4 });
     dataset
+}
+
+/// Partitions every live fragment into two destinations through the commit
+/// path, recording a stable-partition transition (a tagged history).
+async fn stable_partition(dataset: &mut Dataset) {
+    let reserve = Transaction::new(
+        dataset.manifest.version,
+        Operation::ReserveFragments { num_fragments: 2 },
+        None,
+    );
+    dataset
+        .apply_commit(reserve, &Default::default(), &Default::default())
+        .await
+        .unwrap();
+    let dest_base_id = dataset.manifest.max_fragment_id().unwrap() - 1;
+    let old_fragments: Vec<Fragment> = dataset.fragments().iter().cloned().collect();
+    let source_ids: Vec<u64> = old_fragments.iter().map(|fragment| fragment.id).collect();
+    let (transition, new_fragments) = prepare_partition(dataset, &source_ids, dest_base_id).await;
+    let read_version = dataset.manifest.version;
+    let frag_reuse_index = Some(
+        frag_reuse_entry_appending(dataset, vec![transition])
+            .await
+            .unwrap(),
+    );
+    *dataset = CommitBuilder::new(Arc::new(dataset.clone()))
+        .execute(Transaction::new(
+            read_version,
+            Operation::Rewrite {
+                groups: vec![RewriteGroup {
+                    old_fragments,
+                    new_fragments,
+                }],
+                rewritten_indices: vec![],
+                frag_reuse_index,
+            },
+            None,
+        ))
+        .await
+        .unwrap();
 }
 
 async fn any_element_ids(dataset: &Dataset, filter: &str, use_scalar_index: bool) -> Vec<i32> {
@@ -1912,6 +1976,188 @@ async fn test_element_index_delete_and_compaction(
     );
 }
 
+/// Compacts with `defer_index_remap`, which on a table with stable row IDs
+/// records the row-address moves in a fragment reuse index instead of
+/// remapping the indices. The list-element index applies that index, so
+/// readers keep using it.
+async fn compact_with_frag_reuse(dataset: &mut Dataset) {
+    let metrics = compact_files(
+        dataset,
+        CompactionOptions {
+            defer_index_remap: true,
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(metrics.fragments_removed > 0);
+    assert!(dataset.manifest.uses_stable_row_ids());
+    assert!(
+        dataset
+            .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    // `load_indices_by_name` already drops the segments hidden by the fragment
+    // reuse index, so only the unfiltered list can show one. Commit validation
+    // (`validate_frag_reuse_with_stable_row_ids`) makes the hidden assert
+    // defense in depth.
+    let segments = crate::index::loading::load_all_indices_by_name(dataset, "detections_idx")
+        .await
+        .unwrap();
+    assert!(!segments.is_empty(), "the manifest must keep the index");
+    for segment in &segments {
+        assert!(
+            !is_hidden_by_frag_reuse(segment),
+            "segment {} is hidden by the fragment reuse index",
+            segment.uuid
+        );
+    }
+    let uuids = |segments: &[lance_table::format::IndexMetadata]| {
+        let mut uuids = segments
+            .iter()
+            .map(|segment| segment.uuid)
+            .collect::<Vec<_>>();
+        uuids.sort();
+        uuids
+    };
+    let read = dataset
+        .load_indices_by_name("detections_idx")
+        .await
+        .unwrap();
+    assert_eq!(
+        uuids(&read),
+        uuids(&segments),
+        "readers must keep every segment"
+    );
+}
+
+/// Filters asked of a list-element index that applies a fragment reuse
+/// index, with the rows each keeps and whether the index answers it without a
+/// recheck: a match, its negation, which keeps neither the NULL lists nor the
+/// lists with a NULL detection, and one with a condition on a non-key field.
+fn frag_reuse_filters() -> [(String, DetectionCheck, bool); 3] {
+    [
+        (
+            CAR_ABOVE_09.to_string(),
+            |_, d| any_detection(d, is_car_above_09) == Some(true),
+            true,
+        ),
+        (
+            format!("NOT {CAR_ABOVE_09}"),
+            |_, d| any_detection(d, is_car_above_09) == Some(false),
+            true,
+        ),
+        (
+            "any_element(detections, 'label = ''car'' AND confidence > 0.9 AND area > 10000')"
+                .to_string(),
+            |_, d| any_detection(d, |d| is_car_above_09(d) && d.2 > 10000.0) == Some(true),
+            false,
+        ),
+    ]
+}
+
+/// Asserts, for each of [`frag_reuse_filters`], that the list-element index
+/// alone (`fast_search`) keeps the fixture's answer over `indexed`, and
+/// that the index with a scan of the unindexed fragments, and a scan alone,
+/// keep the rows of `live`. The index-only answer excludes the rows it does
+/// not cover, at the append step. `fast_search` skips unindexed fragments only
+/// while the plan uses the index, which the plan assert checks.
+async fn assert_frag_reuse_answers(dataset: &Dataset, live: &[i32], indexed: &[i32], step: &str) {
+    let keeps = |ids: &[i32], keep: DetectionCheck| {
+        ids.iter()
+            .copied()
+            .filter(|id| {
+                let (width, detections) = detection_row(*id);
+                keep(width, &detections)
+            })
+            .collect::<Vec<_>>()
+    };
+    for (filter, keep, exact) in frag_reuse_filters() {
+        let expected_indexed = keeps(indexed, keep);
+        let expected_live = keeps(live, keep);
+        assert!(
+            !expected_indexed.is_empty(),
+            "{step}: `{filter}` should match"
+        );
+        if indexed.len() < live.len() {
+            assert!(
+                expected_live.len() > expected_indexed.len(),
+                "{step}: appended rows must match `{filter}`"
+            );
+        }
+        let plan = explain(dataset, &filter).await;
+        assert!(
+            plan.contains("ListElement(detections"),
+            "{step}: `{filter}`: {plan}"
+        );
+        assert_eq!(
+            !plan.contains("recheck"),
+            exact,
+            "{step}: `{filter}`: {plan}"
+        );
+        assert_eq!(
+            scan_any_element_ids(dataset, &filter, true, true).await,
+            expected_indexed,
+            "{step}: `{filter}`, index only"
+        );
+        for use_scalar_index in [true, false] {
+            assert_eq!(
+                any_element_ids(dataset, &filter, use_scalar_index).await,
+                expected_live,
+                "{step}: `{filter}`, index: {use_scalar_index}"
+            );
+        }
+    }
+}
+
+/// On a table with stable row IDs, a compaction may defer the index remap:
+/// the list-element index then answers through the fragment reuse index,
+/// alone (`fast_search`) for the rewritten fragments, and its answers match a
+/// scan after the compaction, after `optimize_indices`, and after an append.
+#[tokio::test]
+async fn test_element_index_applies_frag_reuse_with_stable_row_ids() {
+    let mut dataset = detection_dataset(true, true).await;
+    dataset
+        .optimize_indices(&OptimizeOptions::default())
+        .await
+        .unwrap();
+    dataset.delete("id >= 100 AND id < 600").await.unwrap();
+    let mut live = (0..DETECTION_ROWS)
+        .filter(|id| !(100..600).contains(id))
+        .collect::<Vec<_>>();
+
+    compact_with_frag_reuse(&mut dataset).await;
+    assert_eq!(
+        scan_any_element_ids(&dataset, CAR_ABOVE_09, true, true).await,
+        live.iter()
+            .copied()
+            .filter(|id| any_detection(&detection_row(*id).1, is_car_above_09) == Some(true))
+            .collect::<Vec<_>>()
+    );
+    assert_frag_reuse_answers(&dataset, &live, &live, "deferred compaction").await;
+
+    dataset
+        .optimize_indices(&OptimizeOptions::default())
+        .await
+        .unwrap();
+    assert_frag_reuse_answers(&dataset, &live, &live, "optimize_indices").await;
+
+    let appended = DETECTION_ROWS..DETECTION_ROWS + 300;
+    let batch = detection_batch(appended.clone());
+    let schema = batch.schema();
+    dataset
+        .append(RecordBatchIterator::new(vec![Ok(batch)], schema), None)
+        .await
+        .unwrap();
+    // The appended rows are not indexed: only a scan sees them.
+    let indexed = live.clone();
+    live.extend(appended);
+    assert_frag_reuse_answers(&dataset, &live, &indexed, "append").await;
+}
+
 /// The `detections` column of `detection_batch(ids)` with its element fields
 /// named `names` in place, values unmoved.
 fn detections_named(ids: std::ops::Range<i32>, names: [&str; 3]) -> RecordBatch {
@@ -1964,9 +2210,29 @@ async fn explain(dataset: &Dataset, filter: &str) -> String {
 /// (a key) and `area` (not a key), both floats, must not let `confidence`
 /// conditions use the index; `area` conditions now do. An update after the swap,
 /// through an index opened before it, reads the key from its new name.
+///
+/// With `has_frag_reuse`, the table has stable row IDs and a compaction first
+/// records its row-address moves in a fragment reuse index, which the index
+/// applies whenever it is loaded, the reload after the renames included.
+#[rstest]
 #[tokio::test]
-async fn test_element_index_follows_renamed_key_fields() {
-    let mut dataset = detection_dataset(true, false).await;
+async fn test_element_index_follows_renamed_key_fields(
+    #[values(false, true)] has_frag_reuse: bool,
+) {
+    let mut dataset = detection_dataset(true, has_frag_reuse).await;
+    if has_frag_reuse {
+        dataset
+            .optimize_indices(&OptimizeOptions::default())
+            .await
+            .unwrap();
+        compact_with_frag_reuse(&mut dataset).await;
+    }
+    let fields_before = crate::index::loading::load_all_indices_by_name(&dataset, "detections_idx")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|segment| segment.fields)
+        .collect::<Vec<_>>();
     // Open the index before the renames, so it is cached under the old names.
     assert_eq!(
         any_element_ids(&dataset, CAR_ABOVE_09, true).await,
@@ -1984,6 +2250,16 @@ async fn test_element_index_follows_renamed_key_fields() {
             .await
             .unwrap();
     }
+    let fields_after = crate::index::loading::load_all_indices_by_name(&dataset, "detections_idx")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|segment| segment.fields)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        fields_after, fields_before,
+        "renames changed dependency IDs"
+    );
     let batch = detections_named(
         DETECTION_ROWS..DETECTION_ROWS + 400,
         ["label", "area", "confidence"],
@@ -2034,17 +2310,116 @@ async fn test_element_index_follows_renamed_key_fields() {
     assert!(plan.contains("recheck"), "{plan}");
 }
 
-/// Dropping a key field leaves the index in place but unusable: queries scan,
-/// and optimizing skips it.
+/// The history the table carries when its list-element key field is dropped.
+#[derive(Clone, Copy, Debug)]
+enum KeyDropHistory {
+    None,
+    /// A tagged fragment reuse history, recorded before the indices exist.
+    Tagged,
+    /// Stable row IDs with a deferred compaction already recorded.
+    StableRowIds,
+    /// A tagged history whose deferred compaction ran while the key still
+    /// resolved, so the segment kept provenance until the key was dropped.
+    TaggedAfterDefer,
+}
+
+async fn frag_reuse_entry_version(dataset: &Dataset) -> Option<i32> {
+    crate::index::loading::load_all_indices(dataset)
+        .await
+        .unwrap()
+        .iter()
+        .find(|index| index.name == FRAG_REUSE_INDEX_NAME)
+        .map(|index| index.index_version)
+}
+
+/// The number of versions in a v0 (stable row ID) history.
+async fn stable_history_len(dataset: &Dataset) -> usize {
+    let entry = crate::index::loading::load_all_indices(dataset)
+        .await
+        .unwrap()
+        .iter()
+        .find(|index| index.name == FRAG_REUSE_INDEX_NAME)
+        .cloned()
+        .unwrap();
+    assert_eq!(entry.index_version, 0, "the history is not the v0 form");
+    crate::index::frag_reuse::load_frag_reuse_index_details(dataset, &entry)
+        .await
+        .unwrap()
+        .versions
+        .len()
+}
+
+/// Dropping an indexed nested key removes the index through ordinary schema
+/// dependency checks, before or after deferred compaction. Queries scan and
+/// later compaction and cleanup need no remap of the removed index.
+#[rstest]
 #[tokio::test]
-async fn test_element_index_dropped_key_field() {
-    let mut dataset = detection_dataset(true, false).await;
+async fn test_element_index_dropped_key_field(
+    #[values(
+        KeyDropHistory::None,
+        KeyDropHistory::Tagged,
+        KeyDropHistory::StableRowIds,
+        KeyDropHistory::TaggedAfterDefer
+    )]
+    history: KeyDropHistory,
+) {
+    let mut dataset = match history {
+        KeyDropHistory::None => detection_dataset(true, false).await,
+        KeyDropHistory::Tagged => {
+            let mut dataset = detection_dataset_with(true, false, true).await;
+            assert!(frag_reuse_entry_version(&dataset).await.unwrap() >= 1);
+            // Only the list-element index may pin the history.
+            dataset.drop_index("width_idx").await.unwrap();
+            dataset
+        }
+        KeyDropHistory::StableRowIds => {
+            let mut dataset = detection_dataset(true, true).await;
+            // Allowed: the key field still resolves.
+            compact_with_frag_reuse(&mut dataset).await;
+            // Leave the compacted fragment a rewrite candidate after the drop.
+            dataset.delete("id % 4 = 0").await.unwrap();
+            dataset
+        }
+        KeyDropHistory::TaggedAfterDefer => {
+            let mut dataset = detection_dataset_with(true, false, true).await;
+            dataset.drop_index("width_idx").await.unwrap();
+            // Only indexed fragments remain, so every source is covered.
+            dataset.delete("id >= 1500").await.unwrap();
+            // The key still resolves: the segment keeps its provenance.
+            let metrics = compact_files(
+                &mut dataset,
+                CompactionOptions {
+                    defer_index_remap: true,
+                    target_rows_per_fragment: 1000,
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+            assert!(metrics.fragments_removed > 0);
+            assert!(frag_reuse_entry_version(&dataset).await.unwrap() >= 1);
+            dataset
+        }
+    };
     dataset
         .drop_columns(&["detections.item.confidence"])
         .await
         .unwrap();
+    assert!(
+        crate::index::loading::load_all_indices_by_name(&dataset, "detections_idx")
+            .await
+            .unwrap()
+            .is_empty(),
+        "the dropped key's segment remains in the manifest"
+    );
     let filter = "any_element(detections, 'label = ''carrot''')";
-    let expected = detection_ids(|_, d| any_detection(d, |d| d.0 == "carrot") == Some(true));
+    let mut expected = detection_ids(|_, d| any_detection(d, |d| d.0 == "carrot") == Some(true));
+    match history {
+        KeyDropHistory::StableRowIds => expected.retain(|id| id % 4 != 0),
+        KeyDropHistory::TaggedAfterDefer => expected.retain(|id| *id < 1500),
+        KeyDropHistory::None | KeyDropHistory::Tagged => {}
+    }
     assert_eq!(any_element_ids(&dataset, filter, true).await, expected);
     assert!(!explain(&dataset, filter).await.contains("ListElement("));
     dataset
@@ -2052,6 +2427,80 @@ async fn test_element_index_dropped_key_field() {
         .await
         .unwrap();
     assert_eq!(any_element_ids(&dataset, filter, true).await, expected);
+
+    match history {
+        KeyDropHistory::None => {}
+        KeyDropHistory::TaggedAfterDefer => {
+            // The removed index no longer pins its retired provenance.
+            cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+            assert_eq!(frag_reuse_entry_version(&dataset).await, None);
+            // Give the eager compaction something to rewrite.
+            dataset.delete("id % 4 = 0").await.unwrap();
+            expected.retain(|id| id % 4 != 0);
+            let metrics = compact_files(
+                &mut dataset,
+                CompactionOptions {
+                    defer_index_remap: false,
+                    target_rows_per_fragment: 2000,
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+            assert!(metrics.fragments_removed > 0);
+            assert_eq!(any_element_ids(&dataset, filter, true).await, expected);
+        }
+        KeyDropHistory::Tagged => {
+            let metrics = compact_files(
+                &mut dataset,
+                CompactionOptions {
+                    defer_index_remap: true,
+                    target_rows_per_fragment: 1000,
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+            assert!(metrics.fragments_removed > 0);
+            cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+            assert_eq!(frag_reuse_entry_version(&dataset).await, None);
+            compact_files(
+                &mut dataset,
+                CompactionOptions {
+                    defer_index_remap: false,
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(any_element_ids(&dataset, filter, true).await, expected);
+        }
+        KeyDropHistory::StableRowIds => {
+            let metrics = compact_files(
+                &mut dataset,
+                CompactionOptions {
+                    defer_index_remap: true,
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+            assert!(metrics.fragments_removed > 0);
+            // The independent width index can still pin the stable history.
+            remap_column_index(&mut dataset, &["width"], None)
+                .await
+                .unwrap();
+            assert!(stable_history_len(&dataset).await > 0);
+            cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+            // The entry stays, empty.
+            assert_eq!(stable_history_len(&dataset).await, 0);
+            assert_eq!(any_element_ids(&dataset, filter, true).await, expected);
+        }
+    }
 }
 
 /// label, confidence, area, each possibly NULL.
@@ -2351,4 +2800,288 @@ async fn test_lambda_filter_rejects_unsupported_forms(#[case] filter: &str, #[ca
         .await
         .unwrap_err();
     assert!(err.to_string().contains(reason), "{err}");
+}
+
+/// A nested struct can be NULL in the scanner's input while one of its children
+/// still holds a live value. A normal write pushes a struct's NULL down into its
+/// children, so this fixture uses the overlay read path: the overlay stages
+/// `info.details.label` while `info.details` has only `label`, then schema
+/// evolution adds `tag`. On read, the overlay restores `details`' NULL validity
+/// and splices the staged `label` into the base struct, leaving the base `tag`
+/// live below the NULL struct.
+///
+/// `any_element` evaluates its predicate against that input, so a field below a
+/// NULL struct must read as NULL. Before `any_element` pushed each struct's
+/// nulls down recursively, `details.tag = 'car'` selected row 0 even though
+/// `details` is NULL, and `details.tag IS NULL` missed it.
+#[tokio::test]
+async fn test_any_element_nested_hidden_values_under_null_struct() {
+    use crate::dataset::transaction::{DataOverlayGroup, Operation};
+    use crate::dataset::{NewColumnTransform, WriteDestination};
+    use arrow_array::UInt64Array;
+    use lance_core::ROW_ADDR;
+    use lance_core::utils::address::RowAddress;
+
+    let label = ArrowField::new("label", DataType::Utf8, true);
+    let details_fields = Fields::from(vec![label.clone()]);
+    let info_fields = Fields::from(vec![ArrowField::new(
+        "details",
+        DataType::Struct(details_fields.clone()),
+        true,
+    )]);
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, false),
+        ArrowField::new("info", DataType::Struct(info_fields.clone()), true),
+    ]));
+    // Rows 0..4 are fragment 0 and 4..8 are fragment 1. `tag` is added after the
+    // overlay, so the overlay file holds only `label`.
+    let labels = ["car", "car", "car", "car", "x", "x", "x", "x"];
+    let tags: [Option<&str>; 8] = [
+        Some("car"),
+        Some("car"),
+        Some("car"),
+        Some("truck"),
+        Some("car"),
+        Some("dog"),
+        Some("car"),
+        None,
+    ];
+    let details = StructArray::try_new(
+        details_fields,
+        vec![Arc::new(StringArray::from(labels.to_vec())) as ArrayRef],
+        None,
+    )
+    .unwrap();
+    let info =
+        StructArray::try_new(info_fields, vec![Arc::new(details) as ArrayRef], None).unwrap();
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from_iter_values(0..8)) as ArrayRef,
+            Arc::new(info) as ArrayRef,
+        ],
+    )
+    .unwrap();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 4,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 2);
+
+    // Nulls at each level for the overlaid rows: row 0 has a NULL `details`
+    // under a valid `info`; row 1 has a NULL `info`; row 2 has only `label`
+    // NULL, leaving `tag` visible.
+    let label_id = dataset.schema().field("info.details.label").unwrap().id;
+    let overlay_schema = dataset.schema().project_by_ids(&[label_id], true);
+    let fragment = dataset.get_fragment(0).unwrap();
+    let mut writer = fragment.write_overlay(&overlay_schema).await.unwrap();
+    let overlay_label = ArrowField::new("label", DataType::Utf8, true);
+    let overlay_details = StructArray::try_new(
+        Fields::from(vec![overlay_label.clone()]),
+        vec![Arc::new(StringArray::from(vec![None::<&str>, None, None])) as ArrayRef],
+        Some(NullBuffer::from(vec![false, false, true])),
+    )
+    .unwrap();
+    let overlay_info = StructArray::try_new(
+        Fields::from(vec![ArrowField::new(
+            "details",
+            DataType::Struct(Fields::from(vec![overlay_label])),
+            true,
+        )]),
+        vec![Arc::new(overlay_details) as ArrayRef],
+        Some(NullBuffer::from(vec![true, false, true])),
+    )
+    .unwrap();
+    let addresses: ArrayRef = Arc::new(UInt64Array::from_iter_values(
+        (0..3).map(|offset| u64::from(RowAddress::new_from_parts(0, offset))),
+    ));
+    writer
+        .write_batch(
+            &RecordBatch::try_from_iter_with_nullable([
+                (ROW_ADDR, addresses, false),
+                ("info", Arc::new(overlay_info) as ArrayRef, true),
+            ])
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let group = writer.finish().await.unwrap().unwrap();
+    let read_version = dataset.version().version;
+    dataset = Dataset::commit(
+        WriteDestination::Dataset(Arc::new(dataset)),
+        Operation::DataOverlay {
+            groups: vec![DataOverlayGroup {
+                fragment_id: 0,
+                overlays: group.overlays,
+            }],
+        },
+        Some(read_version),
+        None,
+        None,
+        Arc::new(Default::default()),
+        false,
+    )
+    .await
+    .unwrap();
+
+    // Add the sibling `tag` after the overlay. The overlay file still holds only
+    // `label`; the base read supplies `tag` for the scanner's `info` column.
+    let tag = ArrowField::new("tag", DataType::Utf8, true);
+    let new_details_fields = Fields::from(vec![tag]);
+    let new_info_fields = Fields::from(vec![ArrowField::new(
+        "details",
+        DataType::Struct(new_details_fields.clone()),
+        true,
+    )]);
+    let new_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "info",
+        DataType::Struct(new_info_fields.clone()),
+        true,
+    )]));
+    let new_details = StructArray::try_new(
+        new_details_fields,
+        vec![Arc::new(StringArray::from(tags.to_vec())) as ArrayRef],
+        None,
+    )
+    .unwrap();
+    let new_info = StructArray::try_new(
+        new_info_fields,
+        vec![Arc::new(new_details) as ArrayRef],
+        None,
+    )
+    .unwrap();
+    let new_batch =
+        RecordBatch::try_new(new_schema.clone(), vec![Arc::new(new_info) as ArrayRef]).unwrap();
+    dataset
+        .add_columns(
+            NewColumnTransform::Reader(Box::new(RecordBatchIterator::new(
+                vec![Ok(new_batch)],
+                new_schema,
+            ))),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 2);
+    assert_eq!(
+        dataset.get_fragment(0).unwrap().metadata().overlays.len(),
+        1
+    );
+
+    // Prove the scanner input carries `tag` below a NULL `details` and a NULL
+    // `info`: the filter below can only tell the fix from the bug if it does.
+    let mut scanner = dataset.scan();
+    scanner.project(&["id", "info"]).unwrap();
+    let out = scanner.try_into_batch().await.unwrap();
+    let infos = out["info"].as_struct();
+    let details = infos.column(0).as_struct();
+    let tag_column = details.column(1).as_string::<i32>();
+    assert!(infos.is_valid(0) && infos.is_null(1));
+    assert!(details.is_null(0) && details.is_null(1) && details.is_valid(2));
+    assert!(tag_column.is_valid(0) && tag_column.value(0) == "car");
+    assert!(tag_column.is_valid(1) && tag_column.value(1) == "car");
+    assert!(details.column(0).as_string::<i32>().is_null(0));
+
+    // `any_element` needs a list; `make_array` wraps the scanned struct as a
+    // one-element list without rebuilding it, so the hidden `tag` stays live.
+    //
+    // Expected ids by hand: hidden `tag` under NULL `details` (row 0) and NULL
+    // `info` (row 1) must not match `= 'car'`; row 2's `tag` is visible; row 3
+    // is a truck; rows 4 and 6 are cars in the second fragment; row 5 is a dog;
+    // row 7's `tag` is NULL. For `IS NULL`, a NULL element reads as NULL in every
+    // field, so row 1 matches, as does row 0's hidden `tag` and row 7's NULL.
+    for (filter, expected) in [
+        (
+            r#"any_element(make_array(info), 'details.tag = ''car''')"#,
+            vec![2, 4, 6],
+        ),
+        (
+            r#"any_element(make_array(info), 'details.tag IS NULL')"#,
+            vec![0, 1, 7],
+        ),
+        (
+            r#"any_element(make_array(info), 'details.label IS NULL')"#,
+            vec![0, 1, 2],
+        ),
+        (
+            r#"any_element(make_array(info), 'details IS NULL')"#,
+            vec![0, 1],
+        ),
+    ] {
+        assert!(!expected.is_empty(), "`{filter}` should match some rows");
+        let mut scanner = dataset.scan();
+        scanner.project(&["id"]).unwrap().filter(filter).unwrap();
+        let batch = scanner.try_into_batch().await.unwrap();
+        let mut ids = batch["id"].as_primitive::<Int32Type>().values().to_vec();
+        ids.sort_unstable();
+        assert_eq!(ids, expected, "`{filter}`");
+        assert_eq!(
+            dataset.count_rows(Some(filter.to_string())).await.unwrap(),
+            expected.len(),
+            "count_rows(`{filter}`)"
+        );
+    }
+}
+
+/// A fragment-scoped flat (unindexed) full-text search with a scoped BTree
+/// scalar-index prefilter combines through `PrefilterUnionExec`, whose output
+/// is row-id domain. The flat FTS node (`FlatMatchQueryExec`) must recognize
+/// that and skip re-converting it, or it misreads stable row ids as physical
+/// offsets and fails a live fragment.
+#[tokio::test]
+async fn test_stable_flat_fts_scoped_scalar_prefilter() {
+    let batch = record_batch!(
+        ("id", Int32, (0..9).collect::<Vec<_>>()),
+        ("text", Utf8, vec!["token"; 9])
+    )
+    .unwrap();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+        "memory://",
+        Some(WriteParams {
+            enable_stable_row_ids: true,
+            max_rows_per_file: 3,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    dataset
+        .create_index(
+            &["id"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+
+    let query = FullTextSearchQuery::new("token".to_owned())
+        .with_column("text".to_owned())
+        .unwrap();
+    let mut baseline = dataset.scan();
+    baseline
+        .with_fragments(vec![dataset.fragments()[1].clone()])
+        .use_scalar_index(false)
+        .filter("id >= 3 AND id < 6")
+        .unwrap();
+    baseline.full_text_search(query.clone()).unwrap();
+    assert_eq!(baseline.try_into_batch().await.unwrap().num_rows(), 3);
+
+    let mut scanner = dataset.scan();
+    scanner
+        .with_fragments(vec![dataset.fragments()[1].clone()])
+        .prefilter(true)
+        .filter("id >= 3 AND id < 6")
+        .unwrap();
+    scanner.full_text_search(query).unwrap();
+    assert_eq!(scanner.try_into_batch().await.unwrap().num_rows(), 3);
 }
