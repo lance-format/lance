@@ -659,6 +659,7 @@ on a per-value basis. We use ☑️ to mark a technique that is applied on a per
 | ByteStreamSplit | ❓                    | ❌                       | ✅ (2.1)                   |
 | ALP             | ❓                    | ❌                       | ✅ (2.3)                   |
 | Pcodec          | ❓                    | ❌                       | ✅ (2.3)                   |
+| AxisDelta       | ❌                    | ☑️ (2.3)                 | ❌                         |
 | General         | ✅ (2.2)              | ☑️ (2.1)                 | ✅ (2.1)                   |
 
 In the following sections we will describe each technique in a bit more detail and explain how it is utilized
@@ -869,74 +870,134 @@ sensitivity parameter. A sensitivity of 0.0 means never apply BSS and a sensitiv
 
 ### ALP
 
-ALP (Adaptive Lossless floating-Point) is a lossless compression technique for floating point data. It is most
-effective when a column stores values with few significant decimal digits (prices, sensor readings, timestamps
-scaled to a fixed precision) and is used in the mini-block context of the unstable Lance 2.3 format. It is not
-transparent (the chunk layout is not a single value buffer), so it cannot be used in the full zip context.
-
-The `Alp` message declares the input width. Each chunk stores its mode and mode-specific parameters in its header.
+ALP (Adaptive Lossless floating-Point) losslessly compresses IEEE-754 `f32` and `f64` mini-block values in the
+**unstable Lance 2.3** format. The `Alp` message declares the value width, 32 or 64 bits. Each chunk stores its
+own reconstruction parameters.
 
 ```protobuf
 %%% proto.message.Alp %%%
 ```
 
-ALP maps each finite-decimal floating point value onto an integer with a base-10 exponent transform, then
-bit-packs the Frame-of-Reference (FOR) or Delta stream. Two reconstruction paths are supported per chunk:
+#### ALP Chunk Framing
 
-- **Multiply** (classic `(e, f)` pair): `enc = round_ties_even(v * 10^e * 10^-f)` and
-  `v = enc * 10^f * 10^-e`.
-- **Divide** (`use_div`): `enc = round_ties_even(v * 10^e)` and `v = enc / 10^e`. The single correctly-rounded
-  division repairs the `f32` truncation failures of the multiply chain.
+An ALP chunk has four value buffers, so `ChunkedValues.num_buffers` is `4`. Their lengths use the `u32` mini-block
+framing of the [planar page layout](#planar-page-layout). The outer chunk header starts with a little-endian `u16`
+level count, followed by a little-endian `u16` byte length for each present repetition and definition stream in
+that order, then four little-endian `u32` value buffer lengths. The buffers follow in the same order. Sparse
+chunks write zero for the level count, then the four value lengths. The writer aligns the end of the outer
+header and of each buffer to 8 bytes using `0xFE`. The declared lengths exclude that alignment padding. Empty
+value buffers still have a length entry. When `General` wraps `Alp`, decompress value buffer 0 with the declared
+general codec before interpreting its ALP contents.
 
-Every value is validated with a bitwise round-trip check before it is admitted to the integer stream. Values that
-cannot be reconstructed bitwise are stored verbatim as exceptions, which preserves NaN payloads, signed zeros and
-subnormals.
+Each little-endian `u32` in the mini-block metadata describes a chunk of `8 * ((word >> 4) + 1)` bytes including
+alignment. For a non-final chunk of `n` values, the low four bits store `log2(n)` and must be nonzero. The final
+chunk gets its count from the page total minus the preceding chunk counts. If its low four bits are nonzero,
+they must agree with that count. The page total comes from `ChunkedValues.num_items` for dense pages and the
+terminal slot domain for sparse pages. The writer emits 1024 values per chunk, with a shorter final chunk
+if needed. It writes `10` for a full chunk and `0` for the shorter final chunk.
 
-Each chunk uses the same four-buffer shape as other mini-block codecs:
+The reader rejects a mismatched declared buffer count, truncated outer chunk headers, and buffers that extend
+past the chunk boundary. The chunk lengths must sum to the size of the page's chunk data buffer. A zero-value
+call to the ALP codec returns an empty result before inspecting its value buffers.
 
-```text
-chunk buffer
-├── Buffer 0: bitpacked integer offsets (payload)
-├── Buffer 1: per-chunk header
-├── Buffer 2: exception positions (u16, chunk-relative)
-└── Buffer 3: exception values (original IEEE-754 bit patterns)
-```
+The first byte of value buffer 1 is the control byte. Exactly `0x04` selects ALP-RD, which requires `f64`.
+All other bytes select decimal ALP. For decimal ALP, bit 0 selects Delta when set and Frame-of-Reference
+(FOR) when clear. Bit 1 selects divide when set and multiply when clear. The writer clears bits 2 through 7 in
+decimal mode. The reader uses bits 0 and 1 for decimal headers.
 
-The header is a single byte with two extra mode bits, followed by the mode-specific fields:
+| Value buffer | Decimal ALP | ALP-RD |
+| ------------ | ----------- | ------ |
+| 0 | Unsigned FOR or Delta offsets | Unsigned right parts |
+| 1 | Decimal header | ALP-RD header |
+| 2 | Exception positions | Dictionary of high parts |
+| 3 | Original IEEE-754 bits for exceptions | Unsigned dictionary indices |
 
-```text
-header
-├── mode: bit 0 = Delta, bit 1 = use_div, bit 2 = ALP-RD
-├── e / f: base-10 exponents (f is ignored when use_div is set)
-├── bit_width: bits per packed offset
-├── FOR: min  |  Delta: first then min_delta
-└── ALP-RD: right_width d, index_bits, then dict_len (u32)
-```
+#### Decimal ALP
 
-`mode`, `d`, `index_bits` and a reserved zero byte are single-byte fields; the ALP-RD `dict_len` is a little-endian
-`u32` that follows them, keeping the header self-describing. The payload packs `enc - min` (FOR) or
-`delta - min_delta` (Delta). The out-of-line bitpack layout pads chunks to 1024-value blocks, so the encoder emits
-chunks of at most 1024 values.
+Value buffer 1 stores the control byte, exponent `e`, exponent `f`, and packed offset width `w` as one-byte
+fields at offsets 0, 1, 2, and 3, respectively. The remaining fields are signed little-endian two's-complement
+integers.
 
-For `f64` the encoder additionally tries **ALP-RD**: it splits each word into a dictionary-coded left part (high
-bits) and a bit-packed right part, sweeping right widths of 8, 16, 24, 32, 40, 48 and 56 bits and keeping the
-cheapest split that is smaller than the raw bytes. An ALP-RD chunk reinterprets the four buffers:
+| Value type | Mode | Header bytes | Field at byte 4 | Second field |
+| ---------- | ---- | ------------ | --------------- | ------------ |
+| `f32` | FOR | 8 | `min` (`i32`) | |
+| `f32` | Delta | 12 | `first` (`i32`) | `min_delta` (`i32`) at byte 8 |
+| `f64` | FOR | 12 | `min` (`i64`) | |
+| `f64` | Delta | 20 | `first` (`i64`) | `min_delta` (`i64`) at byte 12 |
 
-```text
-ALP-RD chunk buffer
-├── Buffer 0: bitpacked right parts
-├── Buffer 1: [mode RD][d][index_bits][0][dict_len u32]
-├── Buffer 2: dictionary of left parts (8 bytes per entry)
-└── Buffer 3: bitpacked index stream (omitted when index_bits == 0)
-```
+The reader requires the exact header length. Both exponents must be at most 10 for `f32` or 18 for `f64`.
+Multiply requires `f < e`. Divide checks the bound on `f` and ignores it during reconstruction. The writer
+sets `f = 0` in divide mode. The reader accepts `w` from 0 to 31 for `f32` and from 0 to 63 for `f64`.
+The writer uses widths of at least 1 and only emits `f64` FOR widths up to 62.
 
-When every value shares the same left part the dictionary has one entry, `index_bits` is 0, and no index stream is
-written.
+- FOR stores `n` offsets in value buffer 0. For each unsigned offset `o[i]`, reconstruct the integer
+  `x[i] = min + o[i]`.
+- Delta stores `n - 1` offsets in value buffer 0. Start with `x[0] = first` and reconstruct
+  `x[i + 1] = x[i] + min_delta + o[i]` for each unsigned offset `o[i]`. A one-value Delta chunk has an empty
+  offset buffer.
 
-ALP is selected with `AlpMode` (`off`, `on`, `auto`). The default for v2.3 float columns is `auto`, which runs a
-cheap byte-position entropy pre-gate (threshold 4.6 bits per byte position) to reject incompressible pages before
-the candidate scan. A page that cannot be encoded (no encodable values, packed size at or above the raw size, or
-any chunk exceeding the mini-block byte budget) falls back to the flat encoding, so ALP never enlarges data.
+Use modulo `2^32` or `2^64` addition according to the value width, and interpret each result as a signed
+integer. The offset stream uses [ALP packed streams](#alp-packed-streams) with the word width set to the value
+width.
+
+Convert the signed integer to the declared floating-point type. Let `p(k)` be the exact decimal power `10^k`
+rounded to that type. Multiply mode multiplies by `p(f)` and then by `p(-e)`, rounding after each operation.
+Divide mode divides by `p(e)` in a single operation. The conversion and each operation use round-to-nearest,
+ties-to-even in the declared type. The writer checks that the decimal transform round-trips the original
+bits and stores exceptions for values it cannot represent this way.
+
+Value buffer 2 holds zero-based chunk-relative positions as consecutive little-endian `u16` entries. Value
+buffer 3 holds one raw little-endian IEEE-754 word per position, in the same order. Each word is 4 bytes for
+`f32` or 8 bytes for `f64`. After reconstructing the whole chunk, replace the value at each position with those
+bits. This preserves patterns such as NaN payloads, subnormals, and negative zero. The integer placeholders
+at exception positions participate in the Delta calculation.
+
+For `k` exceptions the buffers must have lengths `2 * k` and `(bits_per_value / 8) * k`, and every position
+must be less than `n`. The writer emits positions in strictly increasing order. The reader applies entries in
+stored order, so on a repeated position the last entry takes effect.
+
+#### ALP-RD
+
+The ALP-RD header is exactly 8 bytes. Bytes 0 through 3 hold `0x04`, the right-part width `d`, the index width
+`index_bits`, and a reserved byte set to zero by the writer and skipped by the reader. Bytes 4 through 7 hold
+the little-endian `u32` dictionary length `dict_len`.
+
+Treat each original `f64` word `b` as an unsigned bit pattern. Its right part is `b & ((1 << d) - 1)` and its
+high part is `(b >> d) << d`. Value buffer 2 stores the distinct high parts in ascending unsigned order as
+`dict_len` little-endian `u64` words. The stored words already have their low `d` bits cleared. Value buffer 0
+stores `n` right parts with packed width `d`. When `index_bits > 0`, value buffer 3 stores `n` zero-based
+indices into the dictionary at that packed width. Both streams use 64-bit words in the
+[ALP packed streams](#alp-packed-streams) layout.
+
+The writer uses the number of bits needed to represent `dict_len - 1` for `index_bits`. A one-entry dictionary
+has `index_bits = 0` and a zero-length buffer 3. Reconstruct each word as `dictionary[index] | right`, using
+index 0 for every value when `index_bits = 0`. This split represents every IEEE-754 bit pattern, including
+NaNs, infinities, and signed zero. The writer sweeps right-part widths from 8 to 56 in steps of 8 and chooses
+the candidate with the fewest value-buffer bytes that fits the chunk budget and is smaller than the raw chunk.
+
+The reader requires `1 <= d <= 63`, `0 <= index_bits <= 31`, `dict_len > 0`, and a dictionary buffer of
+exactly `8 * dict_len` bytes. With `index_bits > 0` the width must cover `dict_len - 1`, the stream must have
+the expected length, and each decoded index must be less than `dict_len`. With `index_bits = 0` the reader
+uses the first entry and skips buffer 3 even if the dictionary contains more entries or buffer 3 has bytes.
+
+#### ALP Packed Streams
+
+ALP uses out-of-line FastLanes bitpacking. The following layout specializes [Bitpacking](#bitpacking) to the
+32-bit and 64-bit words used by ALP. For `m` unsigned values in `B`-bit words and packed width `w` from the
+chunk header, each complete group of 1024 values takes exactly `128 * w` bytes.
+
+Each complete packed group consists of `w * L` little-endian `B`-bit words, where `L = 1024 / B` is the lane
+count. For a lane `l` from 0 to `L - 1`, words `l`, `L + l`, through `(w - 1) * L + l` form one bitstream,
+least significant bit first in each word. Row `r` from 0 to `B - 1` occupies `w` bits at bit offset `r * w`
+in this lane. It holds the logical group value at `16 * O[floor(r / 8)] + 128 * (r mod 8) + l`, where
+`O = [0, 4, 2, 6, 1, 5, 3, 7]`. With `w = 0` a packed group takes zero bytes and yields zeros.
+
+The `floor(m / 1024)` complete groups come first. If `t = m mod 1024` is nonzero, the writer pads the tail
+with zero values to 1024 and packs it when `128 * w < t * (B / 8)`. Otherwise it stores the `t` full-width
+little-endian words in logical order. The reader infers the tail form from the exact buffer length after
+accounting for the complete groups. A remainder of `t * (B / 8)` bytes selects raw words, including ties.
+Otherwise a remainder of `128 * w` bytes selects a packed group whose first `t` values are kept. Any other
+length is invalid. With `t = 0` the buffer ends after the complete groups.
 
 ### Pcodec
 
@@ -975,6 +1036,30 @@ is rejected. Pages of fixed-size lists with null items are stored without pcodec
 %%% proto.message.Pcodec %%%
 ```
 
+### Axis delta (unstable 2.3)
+
+`AxisDelta` wraps a fixed-size-list encoding, optionally nested, whose leaf is
+plain 8-, 16-, 32-, or 64-bit data. Child validity and other transforms are not
+allowed. The writer restricts input to signed and unsigned integer tensors.
+Outer tensor validity remains in the structural plane.
+
+The descriptor stores positive `axis_length` and `inner_stride`. Their product
+must divide the positive number of elements per tensor. Partition each tensor
+into spans of that product. Preserve the first `inner_stride` elements of each
+span. For every later element, subtract the original element `inner_stride`
+positions earlier, modulo two to the element bit width. Decode by adding the
+reconstructed predecessor with the same modulus. Elements remain little endian
+and retain their order and width. No state crosses tensor boundaries.
+
+This descriptor is valid only in per-value positions, including inside General
+compression. General compression retains one frame per tensor. Selecting and
+reading a tensor does not require other tensors; selecting an individual element
+still requires decoding that tensor's frame.
+
+```protobuf
+%%% proto.message.AxisDelta %%%
+```
+
 ### General
 
 General compression is a catch-all term for classical opaque compression techniques such as LZ4, ZStandard, Snappy,
@@ -1008,6 +1093,7 @@ options. However, they can also be set in the field metadata in the schema.
 | `lance-encoding:dict-values-compression-level` | Integers (scheme dependent) | Varies by scheme | Compression level for dictionary values general compression                             |
 | `lance-encoding:general`             | `off`, `on`                          | `off`            | Whether to apply general compression.                                                   |
 | `lance-encoding:alp`                 | `off`, `on`, `auto`                  | `auto`           | Whether to apply ALP for floating point data (unstable 2.3 format only).                |
+| `lance-encoding:axis-delta`          | `off`, `auto`, `auto:<axis>`, `on:<axis>` | `auto`      | Configures [AxisDelta](#axis-delta-unstable-23) for integer tensors. See [AxisDelta mode](#axisdelta-mode). |
 | `lance-encoding:packed`              | Any string                           | Not set          | Whether to apply packed struct encoding (see above).                                    |
 | `lance-encoding:structural-encoding` | `miniblock`, `fullzip`, `sparse`     | Not set          | Select a structural policy; `sparse` requires Lance 2.3 and retains canonical dense all-valid pages.                                |
 
@@ -1094,15 +1180,29 @@ the unstable Lance 2.3 format.
 - Maximum chunk size: 1024 values
 - `auto` mode: Uses the `BytePositionEntropy` statistic; pages whose average entropy is below the threshold enter
   the ALP candidate scan, the rest skip it
-- ALP never enlarges data: pages that cannot be encoded (or where the packed size is not smaller) fall back to the
-  flat encoding
-- `f64` additionally tries the ALP-RD dictionary split (see the ALP section above)
+- For `f64`, the writer tries [ALP-RD](#alp-rd) for the entire page when decimal ALP fails or its value buffers
+  total at least as many bytes as the raw values.
+- The writer falls back to flat encoding if ALP cannot encode a page within the chunk budget with fewer
+  value-buffer bytes than the raw values.
 
 ALP is particularly effective for:
 - Finite-decimal values such as prices and rounded sensor readings
 - Columns where the raw floating point bytes are high-entropy but the values have few significant digits
 - Time-series data with consistent precision
 - Scientific data with correlated mantissa patterns
+
+#### AxisDelta Mode
+
+The unstable Lance 2.3 per-value writer checks `lance-encoding:axis-delta` field metadata first, then the
+per-column `axis_delta` setting, then the per-type setting.
+
+- `auto` (default) samples eligible tensors when LZ4 or Zstandard is configured. It tries the longest physical
+  dimension (innermost on ties) and chooses between raw storage, direct compression, and compression with prediction.
+- `auto:<axis>` makes the same selection using the specified axis.
+- `on:<axis>` requires prediction along the specified axis, with or without general compression.
+- `off` disables prediction and sampling while keeping the configured codec.
+
+Axis numbers are zero-based logical axes within the tensor. The writer rejects invalid metadata values.
 
 #### Dictionary Encoding Controls
 
@@ -1172,27 +1272,3 @@ The maximum number of values per mini-block can be tuned via an environment vari
 Reducing this value produces smaller mini-blocks, which reduces the amount of data fetched per read at the
 cost of more mini-blocks and slightly more metadata overhead. Increasing it can reduce metadata overhead and
 improve throughput for highly compressible data, but it may increase random-read amplification.
-
-#### Axis delta (unstable 2.3)
-
-`AxisDelta` wraps a fixed-size-list encoding, optionally nested, whose leaf is
-plain 8-, 16-, 32-, or 64-bit data. Child validity and other transforms are not
-allowed. The writer restricts input to signed and unsigned integer tensors.
-Outer tensor validity remains in the structural plane.
-
-The descriptor stores positive `axis_length` and `inner_stride`. Their product
-must divide the positive number of elements per tensor. Partition each tensor
-into spans of that product. Preserve the first `inner_stride` elements of each
-span. For every later element, subtract the original element `inner_stride`
-positions earlier, modulo two to the element bit width. Decode by adding the
-reconstructed predecessor with the same modulus. Elements remain little endian
-and retain their order and width. No state crosses tensor boundaries.
-
-This descriptor is valid only in per-value positions, including inside General
-compression. General compression retains one frame per tensor. Selecting and
-reading a tensor does not require other tensors; selecting an individual element
-still requires decoding that tensor's frame.
-
-```protobuf
-%%% proto.message.AxisDelta %%%
-```

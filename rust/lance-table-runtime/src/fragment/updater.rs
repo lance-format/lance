@@ -891,7 +891,11 @@ impl DeletionRestorer {
 }
 
 impl FileFragment {
+    /// Reads the fragment with `read_config`, of which callers set only
+    /// `scan_scheduler`, `base_schedulers`, `reader_priority` and
+    /// `file_reader_options`: the row id and row address flags follow `columns`.
     #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
     pub async fn updater_with_version<T: AsRef<str>>(
         &self,
         columns: Option<&[T]>,
@@ -900,6 +904,7 @@ impl FileFragment {
         blob_handling: Option<BlobHandling>,
         write_version: ConcreteFileVersion,
         default_batch_size: impl FnOnce() -> usize,
+        read_config: FragReadConfig,
     ) -> Result<Updater> {
         let mut schema = self.schema().clone();
 
@@ -932,7 +937,7 @@ impl FileFragment {
 
         let reader = self.open(
             &schema,
-            FragReadConfig::default()
+            read_config
                 .with_row_address(with_row_addr)
                 .with_row_id(with_row_id),
         );

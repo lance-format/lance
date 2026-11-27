@@ -1518,7 +1518,7 @@ pub(crate) fn require_no_block_payload(data: Option<LanceBuffer>, codec: &str) -
 
 /// Checks an `InlineBitpacking` description before any payload is read, so an empty block,
 /// which the decoder returns without reading its buffer, cannot carry an invalid width.
-pub fn validate_inline_bitpacking(
+fn validate_inline_bitpacking(
     description: &crate::format::metadata::InlineBitpacking,
 ) -> Result<()> {
     let width = description.uncompressed_bits_per_value;
@@ -1995,7 +1995,17 @@ pub(crate) fn infer_fixed_width_block_bits(description: &CompressiveEncoding) ->
 /// This is intentionally separate from [`DecompressionStrategy::create_block_decompressor`]:
 /// stable 2.1/2.2 block readers keep their existing grammar and framing, while
 /// the 2.3 offset and sparse containers opt into this typed grammar explicitly.
-pub(crate) fn create_fixed_width_block_decompressor(
+/// The expected output width must be 32 or 64 bits. Construction validates the
+/// codec tree; payloads are checked by [`BlockDecompressor::decompress`].
+///
+/// ```
+/// use lance_encoding::{compression::create_fixed_width_block_decompressor, format::EncodingUtils};
+///
+/// let decoder = create_fixed_width_block_decompressor(&EncodingUtils::flat(32, None), 32)?;
+/// assert!(decoder.requires_payload());
+/// # Ok::<(), lance_core::Error>(())
+/// ```
+pub fn create_fixed_width_block_decompressor(
     description: &CompressiveEncoding,
     expected_bits_per_value: u64,
 ) -> Result<Box<dyn BlockDecompressor>> {
