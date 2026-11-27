@@ -9,7 +9,9 @@ use std::sync::Arc;
 
 use crate::exec::{LanceExecutionOptions, get_session_context};
 use crate::expr::safe_coerce_scalar;
-use crate::logical_expr::{coerce_filter_type_to_boolean, get_as_string_scalar_opt, resolve_expr};
+use crate::logical_expr::{
+    ColumnTypes, coerce_filter_type_to_boolean, get_as_string_scalar_opt, resolve_expr,
+};
 use crate::membership::simplify_membership_regions;
 use crate::numeric_coercion::unwrap_widening_casts;
 use crate::signed_zero::{normalize_float_comparisons, rewrite_float_comparisons};
@@ -1214,8 +1216,7 @@ impl Planner {
     /// Note: the returned expression must be passed through `optimize_expr()`
     /// before being passed to `create_physical_expr()`.
     pub fn parse_filter(&self, filter: &str) -> Result<Expr> {
-        let schema = Schema::try_from(self.schema.as_ref())?;
-        self.parse_filter_with_schema(filter, &schema)
+        self.parse_filter_resolving(filter, self.schema.as_ref())
     }
 
     /// Like [`Self::parse_filter`], but resolves column types against `schema`
@@ -1223,6 +1224,10 @@ impl Planner {
     ///
     /// `schema` must describe the same fields as the planner's Arrow schema.
     pub fn parse_filter_with_schema(&self, filter: &str, schema: &Schema) -> Result<Expr> {
+        self.parse_filter_resolving(filter, schema)
+    }
+
+    fn parse_filter_resolving(&self, filter: &str, schema: &dyn ColumnTypes) -> Result<Expr> {
         // Allow sqlparser to parse filter as part of ONE SQL statement.
         let mut ast_expr = parse_sql_filter(filter)?;
         self.rewrite_filter_lambdas(&mut ast_expr)?;

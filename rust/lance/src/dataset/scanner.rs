@@ -22,7 +22,7 @@ mod source;
 pub mod test_dataset;
 mod vector;
 
-use filter_schema::{FilterSchema, FilterSchemaKey, ScannerFilterSchemas, SharedFilterSchema};
+pub(crate) use filter_schema::TableFilterSchema;
 
 pub use aggregate::{AggregateExpr, AggregateExprBuilder};
 pub use source::TakeOperation;
@@ -352,26 +352,21 @@ impl ExprFilter {
     #[allow(unused)]
     #[instrument(level = "trace", name = "filter_to_df", skip_all)]
     pub fn to_datafusion(&self, dataset_schema: &Schema, full_schema: &Schema) -> Result<Expr> {
-        self.to_datafusion_with_arrow(
-            dataset_schema,
-            full_schema,
-            Arc::new(ArrowSchema::from(full_schema)),
-        )
+        self.to_datafusion_with_arrow(dataset_schema, Arc::new(ArrowSchema::from(full_schema)))
     }
 
-    /// Like [`Self::to_datafusion`], with `full_arrow_schema` the Arrow form of `full_schema`.
+    /// Like [`Self::to_datafusion`], with the full schema in Arrow form.
     #[allow(unused)]
     pub(crate) fn to_datafusion_with_arrow(
         &self,
         dataset_schema: &Schema,
-        full_schema: &Schema,
         full_arrow_schema: SchemaRef,
     ) -> Result<Expr> {
         match self {
             Self::Sql(sql) => {
                 let schema = full_arrow_schema;
                 let planner = Planner::new(schema.clone());
-                let filter = planner.parse_filter_with_schema(sql, full_schema)?;
+                let filter = planner.parse_filter(sql)?;
 
                 let df_schema = DFSchema::try_from(schema)?;
                 let ret_field = filter.to_field(&df_schema)?.1;
@@ -615,9 +610,6 @@ pub struct Scanner {
     explicit_projection: bool,
     /// Whether the user wants to use the legacy projection behavior.
     autoproject_scoring_columns: bool,
-
-    /// Filter schemas this scanner has looked up.
-    filter_schemas: ScannerFilterSchemas,
 }
 
 impl Dataset {

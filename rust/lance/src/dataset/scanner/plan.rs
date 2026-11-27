@@ -33,7 +33,7 @@ use futures::future::BoxFuture;
 use futures::stream::StreamExt;
 use futures::{FutureExt, TryStreamExt};
 use lance_arrow::DataTypeExt;
-use lance_core::datatypes::{Field, OnMissing, Projection, Schema};
+use lance_core::datatypes::{Field, OnMissing, Projection};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{ROW_ADDR, ROW_ID, ROW_OFFSET};
 use lance_datafusion::exec::{
@@ -53,8 +53,6 @@ use crate::io::exec::{
     AddRowOffsetExec, FilterPlan as ExprFilterPlan, LanceScanExec, Planner, get_physical_optimizer,
 };
 use crate::{Error, Result};
-
-use super::{FilterSchema, FilterSchemaKey, SharedFilterSchema};
 
 use super::aggregate::AggregateExpr;
 use super::source::TakeOperation;
@@ -78,11 +76,9 @@ impl Scanner {
     /// after setting all other options.
     pub fn get_expr_filter(&self) -> Result<Option<Expr>> {
         if let Some(filter) = &self.filter.expr_filter {
-            let filter_schema = self.filterable_schema()?;
             Ok(Some(filter.to_datafusion_with_arrow(
                 self.dataset.schema(),
-                &filter_schema.schema,
-                filter_schema.arrow,
+                self.filterable_schema()?,
             )?))
         } else {
             Ok(None)
@@ -122,7 +118,7 @@ impl Scanner {
     ///
     /// This is the schema of the dataset, any metadata columns like _rowid or _rowaddr
     /// and any extra columns like _distance or _score
-    fn filterable_schema(&self) -> Result<FilterSchema> {
+    fn filterable_schema(&self) -> Result<SchemaRef> {
         let fts_document_granularity = self
             .full_text_query
             .as_ref()
@@ -133,67 +129,9 @@ impl Scanner {
     fn filterable_schema_with_fts_granularity(
         &self,
         fts_document_granularity: Option<DocumentGranularity>,
-    ) -> Result<FilterSchema> {
-        let extra_columns = self.extra_columns(fts_document_granularity);
-        if let Some(found) = self.filter_schemas.get(&extra_columns) {
-            return Ok(found);
-        }
-        let built = FilterSchema::new(self.build_filterable_schema(&extra_columns)?);
-        self.filter_schemas.insert(extra_columns, built.clone());
-        Ok(built)
-    }
-
-    /// Like [`Self::filterable_schema_with_fts_granularity`], sharing the
-    /// schema through the session's metadata cache.
-    async fn load_filterable_schema(
-        &self,
-        fts_document_granularity: Option<DocumentGranularity>,
-    ) -> Result<FilterSchema> {
-        let extra_columns = self.extra_columns(fts_document_granularity);
-        if let Some(found) = self.filter_schemas.get(&extra_columns) {
-            return Ok(found);
-        }
-        let location = self.dataset.manifest_location();
-        // The key only narrows the lookup; `is_for` decides whether an entry applies.
-        let loaded = if location.size.is_some() && location.version == self.dataset.version_id() {
-            let key = FilterSchemaKey {
-                version: location.version,
-                e_tag: location.e_tag.as_deref(),
-                extra_columns: &extra_columns,
-            };
-            let manifest = &self.dataset.manifest;
-            let build = || -> Result<SharedFilterSchema> {
-                Ok(SharedFilterSchema::new(
-                    manifest,
-                    FilterSchema::new(self.build_filterable_schema(&extra_columns)?),
-                ))
-            };
-            let cache = &self.dataset.table_state.metadata_cache;
-            let cached = cache
-                .get_or_insert_with_key(key, || async { build() })
-                .await?;
-            if cached.is_for(manifest) {
-                cached.filter.clone()
-            } else {
-                let rebuilt = Arc::new(build()?);
-                cache.insert_with_key(&key, rebuilt.clone()).await;
-                rebuilt.filter.clone()
-            }
-        } else {
-            FilterSchema::new(self.build_filterable_schema(&extra_columns)?)
-        };
-        self.filter_schemas.insert(extra_columns, loaded.clone());
-        Ok(loaded)
-    }
-
-    fn build_filterable_schema(&self, extra_columns: &[ArrowField]) -> Result<Schema> {
-        Projection::full(self.dataset.clone())
-            .with_row_id()
-            .with_row_addr()
-            .with_row_last_updated_at_version()
-            .with_row_created_at_version()
-            .to_schema()
-            .merge(&ArrowSchema::new(extra_columns.to_vec()))
+    ) -> Result<SchemaRef> {
+        self.dataset
+            .filterable_schema(&self.extra_columns(fts_document_granularity))
     }
 
     /// This takes the current output, and the user's requested projection, and calculates the
@@ -615,15 +553,12 @@ impl Scanner {
     ) -> Result<FilterPlan> {
         // Check expr filter
         let filter_plan = if let Some(filter) = self.filter.expr_filter.as_ref() {
-            let filter_schema = self
-                .load_filterable_schema(fts_document_granularity)
-                .await?;
-            let planner = Planner::new(filter_schema.arrow.clone());
-            let expr = planner.optimize_expr(filter.to_datafusion_with_arrow(
-                self.dataset.schema(),
-                &filter_schema.schema,
-                filter_schema.arrow.clone(),
-            )?)?;
+            let filter_schema =
+                self.filterable_schema_with_fts_granularity(fts_document_granularity)?;
+            let planner = Planner::new(filter_schema.clone());
+            let expr = planner.optimize_expr(
+                filter.to_datafusion_with_arrow(self.dataset.schema(), filter_schema)?,
+            )?;
             let index_info = match self.scalar_index_selection.as_ref() {
                 Some(selection) => {
                     self.dataset
@@ -2078,51 +2013,45 @@ mod tests {
         }
     }
 
-    fn uncached_filterable_schema(scan: &Scanner) -> Schema {
-        Projection::full(scan.dataset.clone())
+    fn uncached_filterable_schema(scan: &Scanner) -> ArrowSchema {
+        let schema = Projection::full(scan.dataset.clone())
             .with_row_id()
             .with_row_addr()
             .with_row_last_updated_at_version()
             .with_row_created_at_version()
             .to_schema()
             .merge(&ArrowSchema::new(scan.extra_columns(None)))
-            .unwrap()
+            .unwrap();
+        ArrowSchema::from(&schema)
     }
 
     #[tokio::test]
-    async fn test_filterable_schema_is_shared_per_manifest() {
+    async fn test_filterable_schema_shares_the_table_fields() {
         let test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
             .await
             .unwrap();
         let dataset = Arc::new(test_ds.dataset);
 
-        let filterable = dataset.scan().load_filterable_schema(None).await.unwrap();
-        assert_eq!(
-            *filterable.arrow,
-            ArrowSchema::from(filterable.schema.as_ref())
-        );
-        let plain = filterable.schema;
-        assert_eq!(*plain, uncached_filterable_schema(&dataset.scan()));
-        let again = dataset.scan().load_filterable_schema(None).await.unwrap();
-        assert!(Arc::ptr_eq(&plain, &again.schema));
+        let plain = dataset.scan();
+        let schema = plain.filterable_schema_with_fts_granularity(None).unwrap();
+        assert_eq!(*schema, uncached_filterable_schema(&plain));
 
         let mut knn = dataset.scan();
         knn.nearest("vec", &batch_knn_two_queries().0.value(0), 2)
             .unwrap();
-        let knn_schema = knn.load_filterable_schema(None).await.unwrap().schema;
+        let knn_schema = knn.filterable_schema_with_fts_granularity(None).unwrap();
         assert_eq!(*knn_schema, uncached_filterable_schema(&knn));
-        assert!(knn_schema.field(DIST_COL).is_some());
-        assert!(plain.field(DIST_COL).is_none());
-        let again = dataset.scan().load_filterable_schema(None).await.unwrap();
-        assert!(Arc::ptr_eq(&plain, &again.schema));
+        assert!(knn_schema.field_with_name(DIST_COL).is_ok());
+        assert!(schema.field_with_name(DIST_COL).is_err());
 
-        // The synchronous path reuses what the scanner loaded.
-        let scan = dataset.scan();
-        let loaded = scan.load_filterable_schema(None).await.unwrap();
-        assert!(Arc::ptr_eq(
-            &loaded.schema,
-            &scan.filterable_schema().unwrap().schema
-        ));
+        // Every scan of the version shares the table's fields.
+        let again = dataset
+            .scan()
+            .filterable_schema_with_fts_granularity(None)
+            .unwrap();
+        for other in [&again, &knn_schema] {
+            assert!(Arc::ptr_eq(&schema.fields()[0], &other.fields()[0]));
+        }
     }
 
     #[tokio::test]
@@ -2134,10 +2063,8 @@ mod tests {
             .unwrap();
         let before = Arc::new(dataset.clone())
             .scan()
-            .load_filterable_schema(None)
-            .await
-            .unwrap()
-            .schema;
+            .filterable_schema_with_fts_granularity(None)
+            .unwrap();
 
         dataset
             .add_columns(
@@ -2148,9 +2075,9 @@ mod tests {
             .await
             .unwrap();
         let mut scan = Arc::new(dataset).scan();
-        assert!(before.field("b").is_none());
-        let after = scan.load_filterable_schema(None).await.unwrap().schema;
-        assert!(after.field("b").is_some());
+        assert!(before.field_with_name("b").is_err());
+        let after = scan.filterable_schema_with_fts_granularity(None).unwrap();
+        assert!(after.field_with_name("b").is_ok());
         scan.filter("b = 4").unwrap();
         assert_eq!(scan.try_into_batch().await.unwrap().num_rows(), 1);
     }
@@ -2202,18 +2129,9 @@ mod tests {
         assert_eq!(scan.try_into_batch().await.unwrap().num_rows(), 3);
     }
 
-    fn filter_schema_key<'a>(dataset: &'a Dataset, extra: &'a [ArrowField]) -> FilterSchemaKey<'a> {
-        let location = dataset.manifest_location();
-        FilterSchemaKey {
-            version: location.version,
-            e_tag: location.e_tag.as_deref(),
-            extra_columns: extra,
-        }
-    }
-
-    /// An entry whose key collides with another table's is not served to it.
+    /// A manifest assigned directly, without `set_manifest`, gets its own schema.
     #[tokio::test]
-    async fn test_filterable_schema_ignores_an_entry_for_another_manifest() {
+    async fn test_filterable_schema_follows_an_assigned_manifest() {
         let old = Arc::new(
             gen_batch()
                 .col("a", array::step::<Int32Type>())
@@ -2221,61 +2139,54 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let new = Arc::new(
+        let new = gen_batch()
+            .col("a", array::step::<Int32Type>())
+            .col("b", array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(1), FragmentRowCount::from(4))
+            .await
+            .unwrap();
+        let warm = old
+            .scan()
+            .filterable_schema_with_fts_granularity(None)
+            .unwrap();
+        assert!(warm.field_with_name("b").is_err());
+
+        // The clone shares the slot `old` filled.
+        let mut assigned = (*old).clone();
+        assigned.manifest = new.manifest.clone();
+        let schema = Arc::new(assigned)
+            .scan()
+            .filterable_schema_with_fts_granularity(None)
+            .unwrap();
+        assert!(schema.field_with_name("b").is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_filterable_schema_merges_a_colliding_extra_column() {
+        let dataset = Arc::new(
             gen_batch()
                 .col("a", array::step::<Int32Type>())
-                .col("b", array::step::<Int32Type>())
                 .into_ram_dataset(FragmentCount::from(1), FragmentRowCount::from(4))
                 .await
                 .unwrap(),
         );
-        let stale = old.scan().load_filterable_schema(None).await.unwrap();
-        let extra = new.scan().extra_columns(None);
-        let cache = &new.table_state.metadata_cache;
-        let key = filter_schema_key(&new, &extra);
-        cache
-            .insert_with_key(
-                &key,
-                Arc::new(SharedFilterSchema::new(&old.manifest, stale)),
-            )
-            .await;
-
-        let mut scan = new.scan();
-        scan.filter("b > 0").unwrap();
-        assert_eq!(scan.try_into_batch().await.unwrap().num_rows(), 3);
-        let replaced = cache.get_with_key(&key).await.unwrap();
-        assert!(replaced.is_for(&new.manifest));
-        assert!(replaced.filter.schema.field("b").is_some());
-    }
-
-    /// Handles opened in one session share the cached manifest, and so its
-    /// filter schema.
-    #[tokio::test]
-    async fn test_filterable_schema_is_shared_across_handles_in_a_session() {
-        let tmp = TempStrDir::default();
-        let uri = tmp.as_str().to_string();
-        let written = gen_batch()
-            .col("a", array::step::<Int32Type>())
-            .into_dataset(&uri, FragmentCount::from(1), FragmentRowCount::from(4))
-            .await
+        let extra = [ArrowField::new("a", DataType::Int32, true)];
+        let expected = Projection::full(dataset.clone())
+            .with_row_id()
+            .with_row_addr()
+            .with_row_last_updated_at_version()
+            .with_row_created_at_version()
+            .to_schema()
+            .merge(&ArrowSchema::new(extra.to_vec()))
             .unwrap();
-        let open = || async {
-            Arc::new(
-                DatasetBuilder::from_uri(&uri)
-                    .with_session(written.session())
-                    .load()
-                    .await
-                    .unwrap(),
-            )
-        };
-        let (first, second) = (open().await, open().await);
-        let a = first.scan().load_filterable_schema(None).await.unwrap();
-        let b = second.scan().load_filterable_schema(None).await.unwrap();
-        assert!(Arc::ptr_eq(&a.schema, &b.schema));
+        assert_eq!(
+            *dataset.filterable_schema(&extra).unwrap(),
+            ArrowSchema::from(&expected)
+        );
     }
 
     #[tokio::test]
-    async fn test_unfiltered_scan_does_not_load_filterable_schema() {
+    async fn test_unfiltered_scan_does_not_build_filterable_schema() {
         let dataset = Arc::new(
             gen_batch()
                 .col("a", array::step::<Int32Type>())
@@ -2285,41 +2196,11 @@ mod tests {
         );
         let scan = dataset.scan();
         assert_eq!(scan.try_into_batch().await.unwrap().num_rows(), 4);
-        let extra = scan.extra_columns(None);
-        let key = filter_schema_key(&dataset, &extra);
-        let cache = &dataset.table_state.metadata_cache;
-        assert!(cache.get_with_key(&key).await.is_none());
+        assert!(!dataset.filter_schema.is_built());
 
         let mut filtered = dataset.scan();
         filtered.filter("a > 0").unwrap();
         filtered.try_into_batch().await.unwrap();
-        assert!(cache.get_with_key(&key).await.is_some());
-    }
-
-    #[tokio::test]
-    async fn test_filterable_schema_counts_toward_metadata_cache() {
-        let mut batch = gen_batch();
-        for i in 0..300 {
-            batch = batch.col(format!("c{i}"), array::step::<Int32Type>());
-        }
-        let dataset = Arc::new(
-            batch
-                .into_ram_dataset(FragmentCount::from(1), FragmentRowCount::from(4))
-                .await
-                .unwrap(),
-        );
-        assert!(dataset.manifest_location().size.is_some());
-        let cache = &dataset.table_state.metadata_cache;
-        let before = cache.size_bytes().await;
-        let loaded = dataset.scan().load_filterable_schema(None).await.unwrap();
-        let schema_bytes = lance_core::deepsize::DeepSizeOf::deep_size_of(&loaded);
-        assert!(schema_bytes > 2 * loaded.schema.fields.len() * size_of::<Field>());
-        assert!(cache.size_bytes().await >= before + schema_bytes);
-
-        // Only the cache entry keeps the schema alive.
-        let weak = Arc::downgrade(&loaded.schema);
-        drop(loaded);
-        cache.clear().await;
-        assert!(weak.upgrade().is_none());
+        assert!(dataset.filter_schema.is_built());
     }
 }

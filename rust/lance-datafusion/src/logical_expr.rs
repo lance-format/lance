@@ -15,8 +15,65 @@ use datafusion_functions::core::expr_ext::FieldAccessor;
 use datafusion_functions::core::getfield::GetFieldFunc;
 use lance_arrow::DataTypeExt;
 
-use lance_core::datatypes::Schema;
+use arrow_schema::Schema as ArrowSchema;
+use lance_core::datatypes::{Schema, parse_field_path};
 use lance_core::{Error, Result};
+
+/// Column type lookup for resolving filter expressions.
+pub trait ColumnTypes {
+    /// The type of the field at `path`: a column name, which may itself be a
+    /// field path, then the names of nested struct fields.
+    fn column_type(&self, path: &[&str]) -> Option<DataType>;
+}
+
+impl ColumnTypes for Schema {
+    fn column_type(&self, path: &[&str]) -> Option<DataType> {
+        let (first, rest) = path.split_first()?;
+        let mut field = self.field(first)?;
+        for name in rest {
+            if field.data_type().is_struct() {
+                field = field.children.iter().find(|f| &f.name == name)?;
+            } else {
+                return None;
+            }
+        }
+        Some(field.data_type())
+    }
+}
+
+impl ColumnTypes for ArrowSchema {
+    /// Resolves like the Lance [`Schema`] the Arrow schema converts to.
+    fn column_type(&self, path: &[&str]) -> Option<DataType> {
+        fn children(data_type: &DataType) -> &[arrow_schema::FieldRef] {
+            match data_type {
+                DataType::Struct(fields) => fields,
+                // Lance keeps no child for a fixed-size list's item.
+                DataType::List(item) | DataType::LargeList(item) | DataType::Map(item, _) => {
+                    std::slice::from_ref(item)
+                }
+                _ => &[],
+            }
+        }
+        let (first, rest) = path.split_first()?;
+        let segments = parse_field_path(first).ok()?;
+        let (top, nested) = segments.split_first()?;
+        let mut field = self.fields().iter().find(|f| f.name() == top)?;
+        for name in nested {
+            field = children(field.data_type())
+                .iter()
+                .find(|f| f.name() == name)?;
+        }
+        for name in rest {
+            match field.data_type() {
+                DataType::Struct(fields) => {
+                    field = fields.iter().find(|f| f.name() == name)?;
+                }
+                _ => return None,
+            }
+        }
+        Some(field.data_type().clone())
+    }
+}
 /// Resolve a Value
 fn resolve_value(expr: &Expr, data_type: &DataType) -> Result<Expr> {
     match expr {
@@ -41,7 +98,7 @@ pub fn get_as_string_scalar_opt(expr: &Expr) -> Option<&str> {
 ///
 /// If the column is not found in the schema, return None. If the expression is
 /// not a field reference, also returns None.
-pub fn resolve_column_type(expr: &Expr, schema: &Schema) -> Option<DataType> {
+pub fn resolve_column_type(expr: &Expr, schema: &dyn ColumnTypes) -> Option<DataType> {
     let mut field_path = Vec::new();
     let mut current_expr = expr;
     // We are looping from outer-most reference to inner-most.
@@ -60,16 +117,8 @@ pub fn resolve_column_type(expr: &Expr, schema: &Schema) -> Option<DataType> {
         }
     }
 
-    let mut path_iter = field_path.iter().rev();
-    let mut field = schema.field(path_iter.next()?)?;
-    for name in path_iter {
-        if field.data_type().is_struct() {
-            field = field.children.iter().find(|f| &f.name == name)?;
-        } else {
-            return None;
-        }
-    }
-    Some(field.data_type())
+    field_path.reverse();
+    schema.column_type(&field_path)
 }
 
 fn is_literal_only_same_type_expr(expr: &Expr) -> bool {
@@ -96,7 +145,7 @@ fn is_literal_only_same_type_expr(expr: &Expr) -> bool {
 ///
 /// - *expr*: a datafusion logical expression
 /// - *schema*: lance schema.
-pub fn resolve_expr(expr: &Expr, schema: &Schema) -> Result<Expr> {
+pub fn resolve_expr(expr: &Expr, schema: &dyn ColumnTypes) -> Result<Expr> {
     if let Some(rewritten) = rewrite_numeric(expr, schema) {
         return Ok(rewritten);
     }
@@ -329,6 +378,82 @@ mod tests {
 
     use arrow_schema::{Field, Schema as ArrowSchema};
     use datafusion::common::Column;
+
+    #[test]
+    fn test_arrow_column_types_match_lance() {
+        let leaf = |name: &str| Arc::new(Field::new(name, DataType::Int32, true));
+        let inner = DataType::Struct(vec![leaf("x"), leaf("y.z")].into());
+        let arrow = ArrowSchema::new(vec![
+            Field::new("a", DataType::Int64, true),
+            Field::new(
+                "s",
+                DataType::Struct(
+                    vec![leaf("x"), Arc::new(Field::new("t", inner.clone(), true))].into(),
+                ),
+                true,
+            ),
+            Field::new(
+                "l",
+                DataType::List(Arc::new(Field::new("item", inner, true))),
+                true,
+            ),
+            Field::new("fl", DataType::FixedSizeList(leaf("item"), 2), true),
+            Field::new(
+                "m",
+                DataType::Map(
+                    Arc::new(Field::new(
+                        "entries",
+                        DataType::Struct(
+                            vec![
+                                Arc::new(Field::new("key", DataType::Utf8, false)),
+                                leaf("value"),
+                            ]
+                            .into(),
+                        ),
+                        false,
+                    )),
+                    false,
+                ),
+                true,
+            ),
+            Field::new(
+                "d",
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+                true,
+            ),
+        ]);
+        let lance = Schema::try_from(&arrow).unwrap();
+        let paths: &[&[&str]] = &[
+            &["a"],
+            &["missing"],
+            &["dotted.name"],
+            &["`dotted.name`"],
+            &["s"],
+            &["s", "x"],
+            &["s", "t", "y.z"],
+            &["s.x"],
+            &["s.t.x"],
+            &["s.t.`y.z`"],
+            &["s", "missing"],
+            &["s.missing"],
+            &["a", "x"],
+            &["l"],
+            &["l.item"],
+            &["l.item.x"],
+            &["l", "item"],
+            &["fl.item"],
+            &["m.entries"],
+            &["m.entries.value"],
+            &["m", "entries"],
+            &["d"],
+            &["`s`.x"],
+            &[""],
+            &[],
+        ];
+        for path in paths {
+            assert_eq!(arrow.column_type(path), lance.column_type(path), "{path:?}");
+        }
+    }
 
     #[test]
     fn test_field_path_to_expr_preserves_case_sensitive_root_column() {
