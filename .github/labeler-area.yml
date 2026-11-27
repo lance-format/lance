@@ -38,6 +38,7 @@ A-format:
   - changed-files:
       - any-glob-to-any-file:
           - "protos/snapshot.proto"
+          - "protos/blob_reference.proto"
           - "protos/clustering.proto"
           - "protos/encodings_v2_0.proto"
           - "protos/encodings_v2_1.proto"
@@ -60,6 +61,7 @@ format-change:
   - changed-files:
       - any-glob-to-any-file:
           - "protos/snapshot.proto"
+          - "protos/blob_reference.proto"
           - "protos/clustering.proto"
           - "protos/encodings_v2_0.proto"
           - "protos/encodings_v2_1.proto"

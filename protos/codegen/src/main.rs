@@ -232,10 +232,13 @@ fn generate_lance(
     config.extern_path(".lance.table", "::lance_table::format::pb");
     config.extern_path(".lance.index.pb", "::lance_index::pb");
     config.extern_path(".lance.datafusion", "::lance_datafusion::pb");
+    config.extern_path(".lance.snapshot", "::lance_table::snapshot::pb");
     config.enable_type_names();
+    config.bytes([".lance.blob.reference"]);
     config.compile_protos(
         &[
             proto_dir.join("ann.proto"),
+            proto_dir.join("blob_reference.proto"),
             proto_dir.join("fts.proto"),
             proto_dir.join("cache_diagnostics.proto"),
             proto_dir.join("merge_analysis.proto"),
@@ -245,7 +248,7 @@ fn generate_lance(
     install_generated(
         &out_dir,
         &repo_root.join("rust/lance/src/pb"),
-        &["lance.pb.rs", "lance.cache.rs"],
+        &["lance.pb.rs", "lance.cache.rs", "lance.blob.reference.rs"],
         check,
     )
 }
