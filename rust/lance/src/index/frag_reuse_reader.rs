@@ -3,6 +3,7 @@
 
 //! Compose mapping readers along fragment lineage to reach live fragments.
 
+use super::lifecycle::DerivedIndexListing;
 use crate::Dataset;
 use lance_core::utils::address::RowAddress;
 use lance_core::{Error, Result};
@@ -10,7 +11,7 @@ use lance_index::scalar::inverted::is_inverted_details_type;
 use lance_table::format::IndexMetadata;
 use lance_table::system_index::frag_reuse::ledger::FragReuseLedger;
 use roaring::RoaringBitmap;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 mod cache;
@@ -35,15 +36,11 @@ fn check_reader_path() -> Result<()> {
 /// never be persisted back to a manifest: stored segment metadata keeps its
 /// original provenance.
 ///
-/// The second element names the logical indices with a segment excluded only
-/// because its format marker could not be read. Those exclusions hold for THIS
-/// call alone: the caller records the listing as needing re-derivation, so the
-/// next call re-probes instead of treating the exclusion as final.
 pub(super) async fn load_indices(
     dataset: &Dataset,
     fri: &IndexMetadata,
     indices: &[IndexMetadata],
-) -> Result<(Arc<Vec<IndexMetadata>>, BTreeSet<String>)> {
+) -> Result<DerivedIndexListing> {
     let mapping = FragmentReuseIndex::open(dataset, fri).await?;
     let mut groups: HashMap<&str, Vec<(usize, &IndexMetadata)>> = HashMap::new();
     let mut result = vec![None; indices.len()];
@@ -79,6 +76,7 @@ pub(super) async fn load_indices(
     // explicitly here without consulting the plugin registry per segment.
     let unsupported_history = mapping.ledger.has_unsupported_transitions();
     let mut unverifiable = BTreeSet::new();
+    let mut empty_segments = HashSet::new();
     for members in groups.into_values() {
         let mut supported = Vec::with_capacity(members.len());
         for (position, index) in members {
@@ -130,6 +128,7 @@ pub(super) async fn load_indices(
             .zip(mapping.segment_coverage(&provenance))
         {
             if coverage.is_empty() {
+                empty_segments.insert(index.uuid);
                 continue;
             }
             let mut index = index.clone();
@@ -137,10 +136,11 @@ pub(super) async fn load_indices(
             result[position] = Some(index);
         }
     }
-    Ok((
-        Arc::new(result.into_iter().flatten().collect()),
+    Ok(DerivedIndexListing {
+        indices: Arc::new(result.into_iter().flatten().collect()),
         unverifiable,
-    ))
+        empty_segments,
+    })
 }
 
 impl FragmentReuseIndex {
@@ -1548,11 +1548,13 @@ pub mod tests {
         orphan_user_index.fragment_bitmap = None;
 
         let indices = vec![fri.clone(), mem_wal.clone(), orphan_user_index.clone()];
-        let (listing, unverifiable) = load_indices(&dataset, &fri, &indices).await.unwrap();
+        let derived = load_indices(&dataset, &fri, &indices).await.unwrap();
         assert!(
-            unverifiable.is_empty(),
+            derived.unverifiable.is_empty(),
             "every marker is readable in this fixture"
         );
+        assert!(derived.empty_segments.is_empty());
+        let listing = derived.indices;
 
         assert!(
             listing.iter().any(|i| i.name == MEM_WAL_INDEX_NAME),

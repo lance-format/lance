@@ -541,18 +541,14 @@ impl Dataset {
             None | Some(0) => Ok(DerivedIndexListing {
                 indices: filter_unusable(indices),
                 unverifiable: BTreeSet::new(),
+                empty_segments: HashSet::new(),
             }),
             Some(1) => {
                 let fri = indices
                     .iter()
                     .find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
                     .expect("the v1 FRI entry was just located");
-                let (derived, unverifiable) =
-                    frag_reuse_reader::load_indices(self, fri, &indices).await?;
-                Ok(DerivedIndexListing {
-                    indices: derived,
-                    unverifiable,
-                })
+                frag_reuse_reader::load_indices(self, fri, &indices).await
             }
             Some(version) => Err(Error::not_supported(format!(
                 "FRI index_version {version} is unsupported. Please upgrade to a newer version",
@@ -670,6 +666,8 @@ impl Dataset {
 /// decide whether to cache it.
 pub struct DerivedIndexListing {
     pub indices: Arc<Vec<IndexMetadata>>,
+    /// Usable segments omitted from the query listing after deriving empty coverage.
+    pub empty_segments: HashSet<Uuid>,
     /// Logical indices with at least one segment whose format marker could not
     /// be read; empty when every segment was verified. Those indices' listings
     /// hold for this call alone.

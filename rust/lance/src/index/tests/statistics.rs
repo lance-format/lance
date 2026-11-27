@@ -2204,17 +2204,27 @@ fn assert_only_manifest_requests(dataset: &Dataset, requests: &ScanRequests) {
 }
 
 #[rstest]
-#[case::v0_21_0_vector_marker(false)]
-#[case::v0_18_2_pre_details_manifest(true)]
+#[case::v0_21_0_vector_marker(false, false)]
+#[case::v0_18_2_pre_details_manifest(true, false)]
+#[case::v0_21_0_stable_row_ids(false, true)]
 #[tokio::test]
-async fn test_index_scan_statistics_reads_only_pinned_manifest(#[case] pre_details: bool) {
-    let temp = copy_test_data_to_tmp("v0.21.0/bad_index_fragment_bitmap").unwrap();
+async fn test_index_scan_statistics_reads_only_pinned_manifest(
+    #[case] pre_details: bool,
+    #[case] stable_row_ids: bool,
+) {
+    let fixture = if stable_row_ids {
+        "v0.21.0/bad_index_fragment_bitmap_stable_row_ids"
+    } else {
+        "v0.21.0/bad_index_fragment_bitmap"
+    };
+    let temp = copy_test_data_to_tmp(fixture).unwrap();
     let mut dataset = DatasetBuilder::from_uri(temp.path_str())
         .with_session(Arc::new(Session::default()))
         .load()
         .await
         .unwrap();
     assert_eq!(dataset.manifest.version, 4);
+    assert_eq!(dataset.manifest.uses_stable_row_ids(), stable_row_ids);
     if pre_details {
         // Reproduce the 0.18.2 manifest with the fixture's unchanged IVF-PQ files.
         let mut segments = raw_manifest_indices(&dataset).await;
@@ -2234,19 +2244,17 @@ async fn test_index_scan_statistics_reads_only_pinned_manifest(#[case] pre_detai
         );
     }
     let name = &original[0].name;
-    let full = uuid::uuid!("dc833a6e-a710-48aa-af24-9ab80f30700c");
-    let delta = uuid::uuid!("ca9b1111-abfc-4fde-b4cc-8e667b84e65d");
-    let declared = |indices: &[IndexMetadata], uuid| {
-        indices
+    assert_eq!(original.len(), 2);
+    let uuid_for_coverage = |ids: &[u32]| {
+        let bitmap: RoaringBitmap = ids.iter().copied().collect();
+        original
             .iter()
-            .find(|index| index.uuid == uuid)
+            .find(|index| index.fragment_bitmap.as_ref() == Some(&bitmap))
             .unwrap()
-            .fragment_bitmap
-            .clone()
-            .unwrap()
+            .uuid
     };
-    assert_eq!(declared(&original, full), [0].into_iter().collect());
-    assert_eq!(declared(&original, delta), [0, 1].into_iter().collect());
+    let full = uuid_for_coverage(&[0]);
+    let delta = uuid_for_coverage(&[0, 1]);
     let version = dataset.manifest.version;
     let (tracked, requests) = observe_scan_requests(&dataset);
     dataset.index_cache.clear().await;
@@ -2263,29 +2271,35 @@ async fn test_index_scan_statistics_reads_only_pinned_manifest(#[case] pre_detai
         assert_eq!(stats.metric_type, None);
         assert_eq!(stats.live_rows, Some(288));
         assert_eq!(stats.segments.len(), 2);
+        let verifies_coverage = detailed && !stable_row_ids;
         for (uuid, fragment, rows) in [(full, 0, 256), (delta, 1, 32)] {
             let segment = stats.segments.iter().find(|s| s.uuid == uuid).unwrap();
             if detailed {
+                assert_eq!(segment.ivf.as_ref().unwrap().partition_entry_counts, [rows]);
+            } else {
+                assert!(segment.ivf.is_none());
+            }
+            if verifies_coverage {
                 assert_eq!(
                     segment.covered_fragment_ids,
                     Some([fragment].into_iter().collect())
                 );
                 assert_eq!(segment.covered_fragment_live_rows, Some(rows));
-                assert_eq!(segment.ivf.as_ref().unwrap().partition_entry_counts, [rows]);
             } else {
                 assert_eq!(segment.covered_fragment_ids, None);
                 assert_eq!(segment.covered_fragment_live_rows, None);
                 assert_eq!(segment.covered_fragment_deleted_rows, None);
-                assert!(segment.ivf.is_none());
             }
         }
-        if detailed {
+        if verifies_coverage {
             let coverage = stats.coverage.unwrap();
             assert_eq!(coverage.covered_fragment_live_rows, Some(288));
             assert_eq!(coverage.uncovered_fragment_live_rows, Some(0));
             assert!(coverage.uncovered_fragment_ids.is_empty());
         } else {
             assert!(stats.coverage.is_none());
+        }
+        if !detailed {
             assert_only_manifest_requests(&tracked, &requests);
         }
     }
@@ -2293,6 +2307,123 @@ async fn test_index_scan_statistics_reads_only_pinned_manifest(#[case] pre_detai
     let latest = Dataset::open(&temp.path_str()).await.unwrap();
     assert_eq!(latest.manifest.version, version);
     assert_eq!(raw_manifest_indices(&latest).await, original);
+}
+
+#[rstest]
+#[case::derived_empty(false, false)]
+#[case::withdrawn(true, false)]
+#[case::unsupported(false, true)]
+#[tokio::test]
+async fn test_index_scan_statistics_tagged_empty_segment(
+    #[case] withdrawn: bool,
+    #[case] unsupported: bool,
+) {
+    let batch = arrow_array::record_batch!(("i", Int32, (0..12).collect::<Vec<_>>())).unwrap();
+    let schema = batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch)], schema),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 4,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let params = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree);
+    let name = "i_idx";
+    let mut segments = Vec::new();
+    for fragment in [0, 2] {
+        segments.push(
+            dataset
+                .create_index_builder(&["i"], IndexType::BTree, &params)
+                .name(name.into())
+                .fragments(vec![fragment])
+                .execute_uncommitted()
+                .await
+                .unwrap(),
+        );
+    }
+    if withdrawn {
+        segments[0].fragment_bitmap = Some(RoaringBitmap::new());
+    }
+    if unsupported {
+        segments[0].index_version = i32::MAX;
+    }
+    let first = segments[0].uuid;
+    let sibling = segments[1].uuid;
+    let (transition, mut destinations) = prepare_partition(&dataset, &[0, 1], 10).await;
+    destinations.push(dataset.fragments()[2].clone());
+    let fri = install(
+        &mut dataset,
+        InlineContent {
+            legacy_versions: vec![],
+            transitions: vec![transition],
+        }
+        .encode_to_vec(),
+        destinations,
+        true,
+    )
+    .await;
+    segments.push(fri);
+    persist_fixture(&mut dataset, segments).await;
+    let original = raw_manifest_indices(&dataset).await;
+    let version = dataset.manifest().version;
+    let (tracked, requests) = observe_scan_requests(&dataset);
+    tracked.index_cache.clear().await;
+
+    for detailed in [false, true, false] {
+        requests.lock().unwrap().clear();
+        let stats = tracked
+            .index_scan_statistics(
+                name,
+                IndexScanStatisticsOptions::default().with_segment_stats(detailed),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stats.dataset_version, version);
+        assert_eq!(stats.segments.len(), 2);
+        let first_stats = stats.segments.iter().find(|s| s.uuid == first).unwrap();
+        let sibling_stats = stats.segments.iter().find(|s| s.uuid == sibling).unwrap();
+        assert!(first_stats.size_bytes.is_some());
+        assert_eq!(first_stats.index_type.as_deref(), Some("BTree"));
+        if detailed {
+            let query = tracked.load_indices().await.unwrap();
+            assert!(query.iter().all(|index| index.uuid != first));
+            assert!(query.iter().any(|index| index.uuid == sibling));
+            assert_eq!(
+                sibling_stats.covered_fragment_ids,
+                Some([2].into_iter().collect())
+            );
+            assert_eq!(sibling_stats.covered_fragment_live_rows, Some(4));
+        } else {
+            assert_only_manifest_requests(&tracked, &requests);
+            assert!(sibling_stats.covered_fragment_ids.is_none());
+        }
+        if detailed && !unsupported {
+            assert_eq!(first_stats.covered_fragment_ids, Some(RoaringBitmap::new()));
+            assert_eq!(first_stats.covered_fragment_live_rows, Some(0));
+            assert_eq!(first_stats.covered_fragment_deleted_rows, Some(0));
+            let coverage = stats.coverage.unwrap();
+            assert_eq!(coverage.covered_fragment_count, 1);
+            assert_eq!(coverage.covered_fragment_live_rows, Some(4));
+            assert_eq!(coverage.uncovered_fragment_live_rows, Some(8));
+            assert_eq!(
+                coverage.uncovered_fragment_ids,
+                [10, 11].into_iter().collect()
+            );
+            assert_eq!(coverage.overlay_stale_row_slots, 0);
+        } else {
+            assert!(first_stats.covered_fragment_ids.is_none());
+            assert!(first_stats.covered_fragment_live_rows.is_none());
+            assert!(first_stats.covered_fragment_deleted_rows.is_none());
+            assert!(stats.coverage.is_none());
+        }
+        let mut latest = dataset.clone();
+        latest.checkout_latest().await.unwrap();
+        assert_eq!(latest.manifest().version, version);
+        assert_eq!(raw_manifest_indices(&latest).await, original);
+    }
 }
 
 #[tokio::test]
@@ -2936,7 +3067,11 @@ async fn test_index_scan_statistics_json_target_agreement() {
         JsonTargetDataType::Unspecified as i32,
     );
     let bitmap_zero = wrapper(bitmap, Some(0), JsonTargetDataType::Unspecified as i32);
-    let blocked = wrapper(btree, Some(0), JsonTargetDataType::LargeBinary as i32);
+    let blocked = wrapper(
+        btree.clone(),
+        Some(0),
+        JsonTargetDataType::LargeBinary as i32,
+    );
     let nested = wrapper(blocked, None, JsonTargetDataType::Int64 as i32);
     let segment = |name: &str, details: prost_types::Any| IndexMetadata {
         uuid: Uuid::new_v4(),
@@ -2945,6 +3080,12 @@ async fn test_index_scan_statistics_json_target_agreement() {
         index_version: 0,
         ..prototype.clone()
     };
+    let mut empty = segment(
+        "empty_sibling",
+        wrapper(btree.clone(), Some(0), JsonTargetDataType::Utf8 as i32),
+    );
+    empty.fragment_bitmap = Some(RoaringBitmap::new());
+    let empty_uuid = empty.uuid;
     persist_fixture(
         &mut dataset,
         vec![
@@ -2955,6 +3096,11 @@ async fn test_index_scan_statistics_json_target_agreement() {
             segment("matching", btree_zero.clone()),
             segment("matching", btree_zero),
             segment("nested", nested),
+            empty,
+            segment(
+                "empty_sibling",
+                wrapper(btree, Some(0), JsonTargetDataType::Int64 as i32),
+            ),
         ],
     )
     .await;
@@ -3010,6 +3156,20 @@ async fn test_index_scan_statistics_json_target_agreement() {
         assert_eq!(
             details["target_details"]["target_data_type"],
             "large_binary"
+        );
+        let with_empty = dataset
+            .index_scan_statistics("empty_sibling", options)
+            .await
+            .unwrap();
+        let empty = with_empty
+            .segments
+            .iter()
+            .find(|s| s.uuid == empty_uuid)
+            .unwrap();
+        assert_eq!(empty.covered_fragment_ids, Some(RoaringBitmap::new()));
+        assert_eq!(
+            with_empty.coverage.unwrap().covered_fragment_live_rows,
+            Some(8)
         );
     }
 }

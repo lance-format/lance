@@ -471,6 +471,108 @@ async fn test_index_scan_statistics_legacy_json_overlay_scope(
     assert_eq!(coverage.overlay_stale_row_slots, stale_slots);
 }
 
+#[rstest]
+#[case::different_path_verified_empty("q", Some(2), false)]
+#[case::same_path_verified_empty("p", Some(2), true)]
+#[case::different_path_declared_empty("q", None, true)]
+#[tokio::test]
+async fn test_index_scan_statistics_legacy_json_domain_before_verification(
+    #[case] first_path: &str,
+    #[case] declared_fragment: Option<u32>,
+    #[case] uses_index: bool,
+) {
+    let batch = json_id_batch(vec![
+        r#"{"p":0,"q":10}"#,
+        r#"{"p":0,"q":11}"#,
+        r#"{"p":7,"q":12}"#,
+        r#"{"p":0,"q":13}"#,
+        r#"{"p":7,"q":14}"#,
+        r#"{"p":0,"q":15}"#,
+    ]);
+    let schema = batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch)], schema),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 2,
+            enable_stable_row_ids: true,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let name = "json_legacy_domain";
+    let mut segments = Vec::new();
+    for (fragment, path) in [(0, first_path), (1, "p")] {
+        let params = ScalarIndexParams::new("json".into()).with_params(&serde_json::json!({
+            "target_index_type": "zonemap",
+            "target_data_type": "Int64",
+            "path": path,
+        }));
+        let mut segment = dataset
+            .create_index_builder(&["json"], IndexType::Scalar, &params)
+            .name(name.into())
+            .fragments(vec![fragment])
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        assert_eq!(
+            segment.fragment_bitmap,
+            Some([fragment].into_iter().collect())
+        );
+        segment.index_version = JSON_ROW_ID_DOMAIN_VERSION as i32;
+        assert!(segment.legacy_json_coverage_requires_verification());
+        segments.push(segment);
+    }
+    segments[0].fragment_bitmap = Some(declared_fragment.into_iter().collect());
+    let first_uuid = segments[0].uuid;
+    let second_uuid = segments[1].uuid;
+    persist_fixture(&mut dataset, segments).await;
+
+    let stats = dataset
+        .index_scan_statistics(
+            name,
+            IndexScanStatisticsOptions::default().with_segment_stats(true),
+        )
+        .await
+        .unwrap();
+    let first = stats
+        .segments
+        .iter()
+        .find(|s| s.uuid == first_uuid)
+        .unwrap();
+    assert_eq!(first.covered_fragment_ids, Some(Default::default()));
+    assert_eq!(first.covered_fragment_live_rows, Some(0));
+    let second = stats
+        .segments
+        .iter()
+        .find(|s| s.uuid == second_uuid)
+        .unwrap();
+    assert_eq!(second.covered_fragment_ids, Some([1].into_iter().collect()));
+    assert_eq!(second.covered_fragment_live_rows, Some(2));
+    assert_eq!(stats.coverage.is_some(), uses_index);
+    if let Some(coverage) = stats.coverage {
+        assert_eq!(coverage.covered_fragment_live_rows, Some(2));
+        assert_eq!(coverage.uncovered_fragment_live_rows, Some(4));
+        assert_eq!(
+            coverage.uncovered_fragment_ids,
+            [0, 2].into_iter().collect()
+        );
+    }
+
+    let filter = "json_get_int(json, 'p') = 7";
+    let plan = dataset
+        .scan()
+        .filter(filter)
+        .unwrap()
+        .explain_plan(false)
+        .await
+        .unwrap();
+    assert_eq!(plan.contains(name), uses_index, "{plan}");
+    assert_eq!(json_filter_ids(&dataset, filter, true).await, vec![2, 4]);
+    assert_eq!(json_filter_ids(&dataset, filter, false).await, vec![2, 4]);
+}
+
 async fn assert_json_scan_coverage(
     dataset: &Dataset,
     name: &str,

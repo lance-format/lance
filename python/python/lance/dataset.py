@@ -520,13 +520,15 @@ class LanceDataset(pa.dataset.Dataset):
         """Inspect a named data index at this dataset version.
 
         The default reads only the pinned manifest. Unknown measurements are
-        returned as ``None``. Set ``include_segment_stats=True`` to resolve
-        fragment-reuse coverage, verify legacy JSON and overlapping legacy
-        vector coverage, and inspect IVF models. This may read index files,
-        including partitions when verifying legacy vector coverage. Detailed
-        statistics return one entry count per partition of each eligible
-        vector segment. Each data byte total counts a file once by storage
-        base and path.
+        returned as ``None``. An empty ``covered_fragment_ids`` bitmap means
+        the segment covers zero fragments. Set ``include_segment_stats=True``
+        to resolve fragment-reuse coverage, verify legacy JSON and legacy
+        vector address coverage, and inspect IVF models. This may read index
+        files, including partitions when verifying legacy vector coverage.
+        For overlapping legacy vector segments that store stable row IDs,
+        coverage remains unknown even in detailed mode. Detailed statistics
+        return one entry count per partition of each eligible vector segment.
+        Each data byte total counts a file once by storage base and path.
         JSON details report ``target_index_type`` and include
         ``target_index_version`` when the wrapper recorded a version.
 

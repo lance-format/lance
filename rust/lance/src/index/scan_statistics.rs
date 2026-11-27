@@ -150,7 +150,8 @@ pub struct IndexScanSegmentStatistics {
     pub metric_type: Option<DistanceType>,
     /// Recorded configuration, if understood by the reader.
     pub details: Option<Value>,
-    /// Current fragment membership, if interpretable.
+    /// Current fragment membership. An empty bitmap means known zero coverage.
+    /// `None` means coverage is unavailable.
     pub covered_fragment_ids: Option<RoaringBitmap>,
     /// Live rows in those fragments, if known. Segments may overlap.
     pub covered_fragment_live_rows: Option<u64>,
@@ -180,7 +181,8 @@ impl Dataset {
     /// By default, only the pinned manifest may be read. Missing facts remain
     /// absent. This includes current coverage on fragment-reuse snapshots,
     /// some legacy JSON indices, and legacy vector segments with overlapping
-    /// declared coverage.
+    /// declared coverage. Coverage for overlapping legacy vector segments
+    /// that store stable row IDs also remains unavailable in detailed mode.
     /// [IndexScanStatisticsOptions::with_segment_stats] permits additional
     /// query-visible metadata and index reads, including partition reads to
     /// verify legacy vector coverage. Both modes are read-only. Each data
@@ -273,17 +275,20 @@ impl Dataset {
         // Fragment reuse requires its own coverage derivation. An empty map
         // for a reuse snapshot leaves all current coverage unknown.
         let no_coverage = HashMap::new();
-        let reuse_coverage = has_reuse.then_some(
-            if listing
+        let reuse_coverage = has_reuse.then(|| {
+            let verified = listing
                 .as_ref()
-                .is_some_and(|listing| listing.unverifiable.contains(index_name))
-            {
-                &no_coverage
-            } else {
-                &query_segments
-            },
-        );
-        let mut legacy_vector_coverage = if !has_reuse && !self.manifest().uses_stable_row_ids() {
+                .filter(|listing| !listing.unverifiable.contains(index_name));
+            ReuseCoverage {
+                segments: if verified.is_some() {
+                    &query_segments
+                } else {
+                    &no_coverage
+                },
+                empty_segments: verified.map(|listing| &listing.empty_segments),
+            }
+        });
+        let mut legacy_vector_coverage = if !has_reuse {
             overlapping_legacy_vector_segments(self, &segments)
         } else {
             HashMap::new()
@@ -373,11 +378,16 @@ fn overlapping_legacy_vector_segments(
         .collect()
 }
 
+struct ReuseCoverage<'a> {
+    segments: &'a HashMap<Uuid, &'a IndexMetadata>,
+    empty_segments: Option<&'a HashSet<Uuid>>,
+}
+
 async fn collect_manifest_statistics(
     dataset: &Dataset,
     first: &IndexMetadata,
     segments: &[&IndexMetadata],
-    reuse_coverage: Option<&HashMap<Uuid, &IndexMetadata>>,
+    reuse_coverage: Option<ReuseCoverage<'_>>,
     legacy_vector_coverage: &HashMap<Uuid, Option<RoaringBitmap>>,
     include_segment_stats: bool,
     context: &str,
@@ -400,13 +410,17 @@ async fn collect_manifest_statistics(
             configuration.identity,
             Some(ConfigurationIdentity::Json(..))
         );
-        has_json |= is_json;
         identities.push(configuration.identity);
         let mut json_domain = configuration.json_domain;
-        let coverage_metadata = match reuse_coverage {
+        let derived_empty = reuse_coverage
+            .as_ref()
+            .and_then(|reuse| reuse.empty_segments)
+            .is_some_and(|empty| empty.contains(&stored.uuid));
+        let coverage_metadata = match reuse_coverage.as_ref() {
             None => Some(*stored),
-            Some(segments) if stored.index_details.is_none() || index_is_usable(stored) => {
-                segments.get(&stored.uuid).copied()
+            Some(_) if derived_empty => Some(*stored),
+            Some(reuse) if stored.index_details.is_none() || index_is_usable(stored) => {
+                reuse.segments.get(&stored.uuid).copied()
             }
             Some(_) => None,
         };
@@ -415,15 +429,22 @@ async fn collect_manifest_statistics(
                 && index_is_usable(metadata)
                 && metadata.fragment_bitmap.as_ref().is_some_and(|bitmap| {
                     !bitmap.is_empty()
-                        || (metadata.index_details.is_some()
+                        || ((derived_empty || metadata.index_details.is_some())
                             && !empty_fragment_bitmap_has_unknown_coverage(metadata))
                 })
         });
-        let registered = coverage_metadata
-            .and_then(|segment| segment.effective_fragment_bitmap(dataset.fragment_bitmap()));
-        let needs_type_recovery = is_json
-            && json_domain.is_none()
-            && registered.as_ref().is_some_and(|bitmap| !bitmap.is_empty());
+        let registered = coverage_metadata.and_then(|segment| {
+            if derived_empty {
+                Some(RoaringBitmap::new())
+            } else {
+                segment.effective_fragment_bitmap(dataset.fragment_bitmap())
+            }
+        });
+        // The scanner checks domains before verifying legacy JSON coverage.
+        let participates_in_domain_agreement =
+            registered.as_ref().is_some_and(|bitmap| !bitmap.is_empty());
+        let needs_type_recovery =
+            is_json && json_domain.is_none() && participates_in_domain_agreement;
         if include_segment_stats
             && needs_type_recovery
             && let Some(details) = &stored.index_details
@@ -448,7 +469,7 @@ async fn collect_manifest_statistics(
             None
         } else if dataset.manifest().uses_stable_row_ids()
             && stored.legacy_json_coverage_requires_verification()
-            && registered.as_ref().is_some_and(|bitmap| !bitmap.is_empty())
+            && participates_in_domain_agreement
         {
             if include_segment_stats && reuse_coverage.is_none() {
                 dataset.verified_legacy_json_query_fragments(stored).await
@@ -458,7 +479,10 @@ async fn collect_manifest_statistics(
         } else {
             registered
         };
-        json_domains.push(json_domain);
+        if participates_in_domain_agreement {
+            has_json |= is_json;
+            json_domains.push(json_domain);
+        }
         let counts = if let (Some(metadata), Some(bitmap)) = (coverage_metadata, &bitmap) {
             covered |= bitmap;
             if !overlaid.is_empty() && !bitmap.is_empty() {
@@ -514,10 +538,9 @@ async fn collect_manifest_statistics(
 
     let current = dataset.fragment_bitmap();
     let totals = fragments.sum_rows(current, context)?;
-    // The scanner routes a logical JSON index only when all of its segments
-    // prove one query domain, including any type recovered from storage.
+    // All scanner candidates must prove one query domain.
     let agrees_on_json_domain = !has_json
-        || segments.len() == 1
+        || json_domains.len() <= 1
         || common_value(json_domains.iter().map(Option::as_ref)).is_some();
     let coverage = if agrees_on_json_domain
         && result_segments
@@ -826,7 +849,9 @@ async fn inspect_ivf<'a>(
             .open_vector_index_from_metadata(&column, query, &NoOpMetricsCollector)
             .await
             .map_err(open_error)?;
-        if let Some(coverage) = legacy_vector_coverage.get_mut(&stored.uuid)
+        // The legacy PQ reader derives fragment IDs from physical addresses.
+        if !dataset.manifest().uses_stable_row_ids()
+            && let Some(coverage) = legacy_vector_coverage.get_mut(&stored.uuid)
             && let Some(index) = handle.as_any().downcast_ref::<IVFIndex>()
             && index.index_type() == IndexType::IvfPq
         {
