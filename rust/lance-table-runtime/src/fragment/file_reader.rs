@@ -19,6 +19,7 @@ use lance_core::cache::{CacheKey, CacheKeySchema, KeyBuilder};
 use lance_core::utils::io_stats::IoStatsRecorder;
 use lance_core::{Result, datatypes::Schema};
 use lance_encoding::decoder::DecoderPlugins;
+use lance_file::reader::ReadEstimate;
 use lance_file::reader::{CachedFileMetadata, FileMetadataIndex, ProjectedFileReader};
 use lance_file::version::ConcreteFileVersion;
 use lance_file::{LanceEncodingsIo, versions as file_versions};
@@ -67,6 +68,14 @@ pub trait GenericFileReader: std::fmt::Debug + Send + Sync {
         projection: Arc<lance_core::datatypes::Schema>,
         take_priority: Option<u32>,
     ) -> BoxFuture<'_, Result<ReadBatchTaskStream>>;
+
+    fn estimate_read(
+        &self,
+        _ranges: Arc<[Range<u64>]>,
+        _projection: Arc<lance_core::datatypes::Schema>,
+    ) -> BoxFuture<'_, Result<ReadEstimate>> {
+        futures::future::ready(Ok(ReadEstimate::default())).boxed()
+    }
 
     /// Return the number of rows in the file
     fn len(&self) -> u32;

@@ -283,7 +283,19 @@ impl std::fmt::Display for FragmentReader {
     }
 }
 
+use lance_file::reader::ReadEstimate;
+
 impl FragmentReader {
+    pub async fn estimate_read(&self, ranges: Arc<[Range<u64>]>) -> Result<ReadEstimate> {
+        let estimates = futures::future::try_join_all(
+            self.readers
+                .iter()
+                .map(|reader| reader.estimate_read(ranges.clone(), reader.projection().clone())),
+        )
+        .await?;
+        Ok(estimates.into_iter().sum())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn try_new(
         fragment_id: usize,

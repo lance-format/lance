@@ -286,7 +286,25 @@ impl Reader {
     }
 }
 
+use lance_file::reader::ReadEstimate;
+
 impl GenericFileReader for Reader {
+    fn estimate_read(
+        &self,
+        ranges: Arc<[Range<u64>]>,
+        projection: Arc<Schema>,
+    ) -> BoxFuture<'_, Result<ReadEstimate>> {
+        async move {
+            let projection = file_versions::reader_projection_from_field_ids(
+                self.reader.version(),
+                projection.as_ref(),
+                self.field_id_to_column_idx.as_ref(),
+            )?;
+            self.reader.estimate_read(&ranges, Some(projection)).await
+        }
+        .boxed()
+    }
+
     fn read_range_tasks(
         &self,
         range: Range<u64>,

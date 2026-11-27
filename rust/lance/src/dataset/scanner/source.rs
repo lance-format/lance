@@ -398,6 +398,7 @@ impl Scanner {
         if let Some(batch_size) = self.batch_size {
             read_options = read_options.with_batch_size(validate_batch_size(batch_size)?);
         }
+        read_options.keep_batch_size = self.keep_batch_size;
 
         if let Some(file_reader_options) = self.resolved_file_reader_options() {
             read_options = read_options.with_file_reader_options(file_reader_options);
@@ -1174,6 +1175,7 @@ impl Scanner {
             ordered_output: options.ordered,
             file_reader_options: self.resolved_file_reader_options(),
             parallelism_cap: None,
+            keep_batch_size: self.keep_batch_size,
         };
         Arc::new(LanceScanExec::new(
             self.dataset.clone(),
