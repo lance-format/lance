@@ -20,7 +20,7 @@ import uuid
 from datetime import date, datetime, timedelta, timezone, tzinfo
 from enum import Enum
 from pathlib import Path
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 from typing import List, Optional
 from unittest import mock
 
@@ -11149,6 +11149,106 @@ class TestLanceScannerTake:
         ds = self._make_dataset(tmp_path)
         scanner = ds.scanner(filter="id >= 4")
         assert scanner.take(pa.array([0, 2]))["id"].to_pylist() == [4, 6]
+
+
+@pytest.mark.parametrize(
+    "method,keyword,error_type",
+    [
+        ("cleanup_old_versions", "older_than", OSError),
+        ("explain_cleanup_old_versions", "older_than", OSError),
+        ("expire_versions", "before", ValueError),
+        ("explain_expire_versions", "before", ValueError),
+    ],
+)
+def test_cleanup_rejects_negative_age(tmp_path: Path, method, keyword, error_type):
+    # A negative age puts the cutoff in the future, which would remove every old
+    # version without any error.
+    data = pa.table({"a": [1]})
+    lance.write_dataset(data, tmp_path)
+    ds = lance.write_dataset(data, tmp_path, mode="append")
+
+    with pytest.raises(error_type, match=f"{keyword} must be non-negative"):
+        getattr(ds, method)(**{keyword: timedelta(days=-1)})
+    assert len(lance.dataset(tmp_path).versions()) == 2
+
+
+@pytest.mark.parametrize(
+    "options,error_type,match",
+    [
+        (
+            {"interval": "5"},
+            TypeError,
+            r"auto_cleanup_options\['interval'\]: .*cannot be interpreted as an int",
+        ),
+        (
+            {"older_than_seconds": "2592000"},
+            TypeError,
+            r"auto_cleanup_options\['older_than_seconds'\]: ",
+        ),
+        (
+            {"interval": -1},
+            OverflowError,
+            r"auto_cleanup_options\['interval'\]: ",
+        ),
+        (
+            {"older_than_seconds": 2**62},
+            ValueError,
+            r"auto_cleanup_options\['older_than_seconds'\] is out of range",
+        ),
+        (True, TypeError, "Mapping"),
+    ],
+)
+def test_auto_cleanup_options_reject_invalid_values(
+    tmp_path, options, error_type, match
+):
+    # Falling back to the default would configure a retention the caller never asked
+    # for.
+    with pytest.raises(error_type, match=match):
+        lance.write_dataset(
+            pa.table({"a": [1]}), tmp_path, mode="create", auto_cleanup_options=options
+        )
+
+
+def test_auto_cleanup_options_partial_and_mapping(tmp_path):
+    table = pa.table({"a": [1]})
+    # A key whose value is None gets its default, like a key that is left out.
+    lance.write_dataset(
+        table,
+        tmp_path / "a",
+        auto_cleanup_options={"interval": None, "older_than_seconds": 3600},
+    )
+    config = lance.dataset(tmp_path / "a").config()
+    assert config["lance.auto_cleanup.interval"] == "20"
+    assert config["lance.auto_cleanup.older_than"] == "1h"
+
+    # Any mapping is accepted, not only a dict.
+    lance.write_dataset(
+        table,
+        tmp_path / "b",
+        auto_cleanup_options=MappingProxyType({"interval": 5}),
+    )
+    assert lance.dataset(tmp_path / "b").config()["lance.auto_cleanup.interval"] == "5"
+
+
+def test_auto_cleanup_options_keep_errors_from_index(tmp_path):
+    # Only pyo3's own conversion errors get the option name. A ValueError or a
+    # TypeError subclass raised by a user's __index__ reaches the caller unchanged.
+    class CustomTypeError(TypeError):
+        pass
+
+    for raised in [ValueError("bad interval"), CustomTypeError("bad interval")]:
+
+        class Interval:
+            def __index__(self):
+                raise raised
+
+        with pytest.raises(type(raised)) as exc_info:
+            lance.write_dataset(
+                pa.table({"a": [1]}),
+                tmp_path / type(raised).__name__,
+                auto_cleanup_options={"interval": Interval()},
+            )
+        assert exc_info.value is raised
 
 
 @pytest.mark.parametrize("retryable", [True, False])

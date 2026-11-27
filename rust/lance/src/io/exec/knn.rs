@@ -6,7 +6,7 @@ use lance_core::utils::row_addr_remap::RowAddrRemap;
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::Instant;
 
 use arrow::array::{Float32Builder, Int32Builder};
@@ -71,6 +71,7 @@ use uuid::Uuid;
 
 use crate::dataset::Dataset;
 use crate::index::loading::DatasetIndexInternalExt;
+use crate::index::prefilter::lookup::PreparedRowAddrMask;
 use crate::index::prefilter::{DatasetPreFilter, mask_selects_nothing};
 use crate::index::vector::ivf::VectorQueryContract;
 use crate::index::vector::utils::{get_vector_type, validate_distance_type_for};
@@ -1817,6 +1818,7 @@ struct SegmentPreFilter {
     base: Arc<DatasetPreFilter>,
     ownership_mask: Arc<RowAddrMask>,
     final_mask: Mutex<Option<Arc<RowAddrMask>>>,
+    lookup_mask: OnceLock<PreparedRowAddrMask>,
 }
 
 impl SegmentPreFilter {
@@ -1825,7 +1827,18 @@ impl SegmentPreFilter {
             base,
             ownership_mask,
             final_mask: Mutex::new(None),
+            lookup_mask: OnceLock::new(),
         }
+    }
+
+    fn prepared_lookup(&self, num_rows_lower_bound: usize) -> Option<&PreparedRowAddrMask> {
+        self.lookup_mask.get().or_else(|| {
+            (num_rows_lower_bound >= 65536).then(|| {
+                self.lookup_mask.get_or_init(|| {
+                    PreparedRowAddrMask::for_probe_rows(self.mask(), num_rows_lower_bound)
+                })
+            })
+        })
     }
 }
 
@@ -1886,7 +1899,17 @@ impl PreFilter for SegmentPreFilter {
     }
 
     fn filter_row_ids<'a>(&self, row_ids: Box<dyn Iterator<Item = &'a u64> + 'a>) -> Vec<u64> {
+        if let Some(mask) = self.prepared_lookup(row_ids.size_hint().0) {
+            return mask.selected_indices(row_ids);
+        }
         self.mask().selected_indices(row_ids)
+    }
+
+    fn filter_row_offsets_into(&self, row_ids: &[u64], out: &mut Vec<u32>) {
+        match self.prepared_lookup(row_ids.len()) {
+            Some(mask) => mask.selected_offsets_into(row_ids, out),
+            None => self.mask().selected_offsets_into(row_ids.iter(), out),
+        }
     }
 }
 
@@ -3846,6 +3869,121 @@ mod tests {
         prefilter
     }
 
+    #[rstest]
+    #[case::indices_first(false)]
+    #[case::offsets_first(true)]
+    #[tokio::test]
+    async fn test_segment_prepared_mask_preserves_ownership_and_offsets(
+        #[case] offsets_first: bool,
+    ) {
+        let selected = (0..70000_u64)
+            .filter(|row| row % 3 == 0)
+            .collect::<RowAddrTreeMap>();
+        for query_mask in [
+            RowAddrMask::from_allowed(selected.clone()),
+            RowAddrMask::from_block(selected),
+        ] {
+            let base = prefilter_with_mask(Some(query_mask)).await;
+            let mut rows = (0..70000_u64).rev().collect::<Vec<_>>();
+            rows.extend([3, 7, u64::MAX, 3_u64 << 32]);
+            let mut offsets = vec![u32::MAX];
+            base.filter_row_offsets_into(&rows[..8], &mut offsets);
+            assert_eq!(
+                offsets
+                    .iter()
+                    .map(|&offset| u64::from(offset))
+                    .collect::<Vec<_>>(),
+                base.mask().selected_indices(rows[..8].iter())
+            );
+            base.filter_row_offsets_into(&rows, &mut offsets);
+            assert_eq!(
+                offsets
+                    .iter()
+                    .map(|&offset| u64::from(offset))
+                    .collect::<Vec<_>>(),
+                base.mask().selected_indices(rows.iter())
+            );
+            assert_eq!(
+                base.filter_row_ids(Box::new(rows.iter())),
+                base.mask().selected_indices(rows.iter())
+            );
+            let ownership = Arc::new(RowAddrMask::from_block([3, 4, 6, 7].into_iter().collect()));
+            let filter = SegmentPreFilter::new(base, ownership);
+            filter.wait_for_ready().await.unwrap();
+            let expected = filter.mask().selected_indices(rows.iter());
+            assert_eq!(
+                filter.filter_row_ids(Box::new(rows[..8].iter())),
+                filter.mask().selected_indices(rows[..8].iter())
+            );
+            let mut offsets = vec![u32::MAX];
+            filter.filter_row_offsets_into(&rows[..8], &mut offsets);
+            assert_eq!(
+                offsets
+                    .iter()
+                    .map(|&offset| u64::from(offset))
+                    .collect::<Vec<_>>(),
+                filter.mask().selected_indices(rows[..8].iter())
+            );
+            assert!(filter.lookup_mask.get().is_none());
+            if offsets_first {
+                filter.filter_row_offsets_into(&rows, &mut offsets);
+                assert_eq!(
+                    offsets
+                        .iter()
+                        .map(|&offset| u64::from(offset))
+                        .collect::<Vec<_>>(),
+                    expected
+                );
+                assert!(filter.lookup_mask.get().is_some());
+            }
+            assert_eq!(filter.filter_row_ids(Box::new(rows.iter())), expected);
+            assert!(filter.lookup_mask.get().is_some());
+            filter.filter_row_offsets_into(&rows, &mut offsets);
+            assert_eq!(
+                offsets
+                    .iter()
+                    .map(|&offset| u64::from(offset))
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            filter.filter_row_offsets_into(&[], &mut offsets);
+            assert!(offsets.is_empty());
+            assert_eq!(
+                filter.filter_row_ids(Box::new(rows[..8].iter())),
+                filter.mask().selected_indices(rows[..8].iter())
+            );
+            assert!(!filter.needs_partition_row_ids());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_segment_prepared_mask_skips_large_domain() {
+        let (mask, probes) = crate::index::prefilter::lookup::tests::broad_mask_and_probes();
+        let base = prefilter_with_mask(Some(mask.as_ref().clone())).await;
+        let filter = SegmentPreFilter::new(base, Arc::new(RowAddrMask::all_rows()));
+        filter.wait_for_ready().await.unwrap();
+        let mask = filter.mask();
+        let mut offsets = Vec::new();
+        for probe in &probes {
+            filter.filter_row_offsets_into(probe, &mut offsets);
+            assert_eq!(
+                offsets
+                    .iter()
+                    .map(|&row| u64::from(row))
+                    .collect::<Vec<_>>(),
+                mask.selected_indices(probe.iter())
+            );
+            assert_eq!(
+                filter.filter_row_ids(Box::new(probe.iter())),
+                mask.selected_indices(probe.iter())
+            );
+        }
+        assert!(Arc::ptr_eq(
+            filter.lookup_mask.get().unwrap().original_mask().unwrap(),
+            &mask
+        ));
+    }
+
     #[tokio::test]
     async fn test_append_only_deltas_keep_empty_prefilter_fast_path() {
         let first = lance_datagen::gen_batch()
@@ -4055,6 +4193,44 @@ mod tests {
             .unwrap();
         assert_eq!(owned, unfiltered);
         assert!(owned.iter().all(|batch| batch.num_rows() == 5));
+
+        let mut retired = dataset.as_ref().clone();
+        retired.delete("_rowid < 4294967296").await.unwrap();
+        let deleted_row = u64::from(appended_fragment_id) << 32;
+        retired
+            .delete(&format!("_rowid = {deleted_row}"))
+            .await
+            .unwrap();
+        let retired = Arc::new(retired);
+        let retired_base = Arc::new(DatasetPreFilter::new(
+            retired.clone(),
+            std::slice::from_ref(&new_segment),
+            None,
+        ));
+        retired_base.wait_for_ready().await.unwrap();
+        assert!(!retired_base.is_empty());
+        assert!(retired_base.only_deletions());
+        let retired_segment = prefilter_for_segment(retired, &new_segment, retired_base)
+            .await
+            .unwrap();
+        retired_segment.wait_for_ready().await.unwrap();
+        let live_rows = (1..20_u64)
+            .map(|offset| deleted_row | offset)
+            .collect::<RowAddrTreeMap>();
+        assert!(retired_segment.needs_partition_row_ids());
+        assert!(retired_segment.is_empty_for(&live_rows));
+        let live_ids = (1..20_u64)
+            .map(|offset| deleted_row | offset)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            retired_segment.filter_row_ids(Box::new(live_ids.iter())),
+            (0..live_ids.len() as u64).collect::<Vec<_>>()
+        );
+        let mut stale_rows = live_rows;
+        stale_rows.insert(deleted_row);
+        assert!(!retired_segment.is_empty_for(&stale_rows));
+        stale_rows.insert(0);
+        assert!(!retired_segment.is_empty_for(&stale_rows));
 
         let ordinary_base = Arc::new(
             DatasetPreFilter::new(dataset, &[old_segment, new_segment], None)

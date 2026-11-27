@@ -693,17 +693,26 @@ impl BlobPreprocessor {
         dedicated_threshold: usize,
         pack_file_threshold: usize,
     ) -> Result<BlobDescriptor> {
+        // A whole uploaded object that fits in one copy request can have its
+        // length checked by the GET. Keep the metadata check for adoption,
+        // empty blobs, and copies that need a bounded range reader.
+        let check_length_with_get = self.managed_base.is_none()
+            && self.object_store.is_cloud()
+            && matches!(source, BlobWriteObject::Upload { size, .. }
+                if (1..=BLOB_SOURCE_MAX_REQUEST_SIZE as u64).contains(size));
         let (store, path, start, size) = match source {
             BlobWriteObject::Upload {
                 relative_path,
                 size,
             } => {
                 let path = root.parts().chain(relative_path.parts()).collect();
-                let actual_size = self.object_store.size(&path).await?;
-                if actual_size != *size {
-                    return Err(Error::invalid_input(format!(
-                        "Blob upload '{relative_path}' has size {actual_size}, expected {size}"
-                    )));
+                if !check_length_with_get {
+                    let actual_size = self.object_store.size(&path).await?;
+                    if actual_size != *size {
+                        return Err(Error::invalid_input(format!(
+                            "Blob upload '{relative_path}' has size {actual_size}, expected {size}"
+                        )));
+                    }
                 }
                 if let Some((base_id, _)) = &self.managed_base {
                     return Ok(BlobDescriptor::Managed {
@@ -725,8 +734,16 @@ impl BlobPreprocessor {
         if size == 0 {
             return Ok(BlobDescriptor::Inline { data: Bytes::new() });
         }
+        let reader = if check_length_with_get {
+            store
+                .with_block_size(BLOB_SOURCE_MAX_REQUEST_SIZE)
+                .open_with_expected_size(&path, size)
+                .await?
+        } else {
+            store.open(&path).await?
+        };
         let source = BlobReaderSource {
-            reader: store.open(&path).await?,
+            reader,
             start,
             size,
             max_request_size: BLOB_SOURCE_MAX_REQUEST_SIZE,
@@ -1477,13 +1494,77 @@ impl BlobPreprocessor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::blob::test_util::reject_empty_range_store;
+    use crate::blob::test_util::{RecordingRangeObjectStore, reject_empty_range_store};
     use crate::blob::{BlobArrayBuilder, blob_field};
     use arrow_schema::{Field, Schema};
     use lance_arrow::{
         BLOB_DEDICATED_SIZE_THRESHOLD_META_KEY, BLOB_INLINE_SIZE_THRESHOLD_META_KEY,
         BLOB_PACK_FILE_SIZE_THRESHOLD_META_KEY,
     };
+    use rstest::rstest;
+    use std::sync::atomic::Ordering;
+
+    #[rstest]
+    #[case::exact(4096)]
+    #[case::short(4095)]
+    #[case::long(4097)]
+    #[tokio::test]
+    async fn cloud_blob_upload_validates_size_with_one_get(#[case] actual_size: usize) {
+        let expected_size = 4096;
+        let body = Bytes::from(vec![7; actual_size]);
+        let root = Path::from("table");
+        let relative_path = Path::from("_blobs/ingest/attempt/value.payload");
+        let cloud = Arc::new(RecordingRangeObjectStore::new(body.clone()));
+        let store = ObjectStore::new(
+            cloud.clone(),
+            url::Url::parse(concat!("s3", "://", "fixture")).unwrap(),
+            Some(1024),
+            None,
+            false,
+            true,
+            1,
+            0,
+            None,
+        );
+        let schema =
+            lance_core::datatypes::Schema::try_from(&Schema::new(vec![blob_field("blob", true)]))
+                .unwrap();
+        let mut writer = BlobPreprocessor::new(
+            store,
+            Path::from("table/data"),
+            "output".into(),
+            &schema,
+            None,
+            false,
+            ExternalBlobMode::Reference,
+            Arc::new(ObjectStoreRegistry::default()),
+            ObjectStoreParams::default(),
+            None,
+        )
+        .unwrap();
+        let source = BlobWriteObject::Upload {
+            relative_path,
+            size: expected_size as u64,
+        };
+        let result = writer
+            .write_registered_blob(&source, &root, expected_size, usize::MAX, usize::MAX)
+            .await;
+        assert_eq!(cloud.head_requests.load(Ordering::Relaxed), 0);
+        assert_eq!(cloud.requested_ranges(), vec![0..actual_size as u64]);
+        if actual_size == expected_size {
+            let BlobDescriptor::Inline { data } = result.unwrap() else {
+                panic!("the fixture should be inlined");
+            };
+            assert_eq!(data, body);
+        } else {
+            let error = result.unwrap_err();
+            assert!(matches!(error.find_root(), Error::InvalidInput { .. }));
+            assert!(
+                error.to_string().contains("expected complete file"),
+                "{error}"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn compaction_rewrites_empty_packed_blob_without_source_io() {

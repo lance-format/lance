@@ -25,12 +25,13 @@ use lance_core::{Error, Result};
 use lance_table::transaction::{DataReplacementGroup, Operation, TransactionBuilder};
 
 use super::commit::publish_compaction;
+use super::reader::with_read_budget;
 use super::{
     CompactionHooks, CompactionMetrics, CompactionOptions, RepackedFiles, RewriteResult, TaskData,
 };
 use crate::fragment::{read_defaults::get_default_batch_size, validate_write_version};
 use crate::write::cleanup_data_fragments;
-use crate::{FileFragment, Table, WriteSeedHook};
+use crate::{FileFragment, FragReadConfig, Table, WriteSeedHook};
 
 /// The ids of the leaf fields at and beneath `field`. The planner places a
 /// column by where its leaves are: a V2.0 file can keep a struct's header
@@ -265,6 +266,7 @@ pub(super) async fn execute_repack(
     let schema = dataset.schema();
     let batch_size = options.batch_size.map(|size| size as u32);
     let file_writer_options = options.file_writer_options();
+    let read_config = task_read_config(dataset, options);
 
     let mut written: Vec<DataFile> = Vec::with_capacity(files.len());
     for column_ids in files {
@@ -281,6 +283,7 @@ pub(super) async fn execute_repack(
             batch_size,
             write_version,
             &file_writer_options,
+            &read_config,
             hooks.write_seeds.clone(),
         )
         .await;
@@ -334,7 +337,20 @@ async fn discard(dataset: &Table, fragment_id: u64, files: Vec<DataFile>) {
     .await;
 }
 
+/// How a repack task reads its fragment: through one scheduler for the
+/// dataset's own files and one per base for files in other bases, such as the
+/// source of a shallow clone, each sized from `io_buffer_size` the way a
+/// rewrite's scan is.
+fn task_read_config(table: &Table, options: &CompactionOptions) -> FragReadConfig {
+    with_read_budget(
+        FragReadConfig::default(),
+        &table.state.object_store,
+        options.io_buffer_size,
+    )
+}
+
 /// Write `columns` of `source` to one new data file.
+#[allow(clippy::too_many_arguments)]
 async fn write_one_file(
     source: &FileFragment,
     schema: &Schema,
@@ -342,6 +358,7 @@ async fn write_one_file(
     batch_size: Option<u32>,
     write_version: ConcreteFileVersion,
     file_writer_options: &FileWriterOptions,
+    read_config: &FragReadConfig,
     seed_hook: Option<Arc<dyn WriteSeedHook>>,
 ) -> Result<DataFile> {
     let write_schema = schema.project(columns)?;
@@ -353,6 +370,7 @@ async fn write_one_file(
             None,
             write_version,
             || get_default_batch_size().unwrap_or(1024),
+            read_config.clone(),
         )
         .await?;
     if let Some(hook) = seed_hook {

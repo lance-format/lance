@@ -2198,6 +2198,8 @@ impl ObjectStore {
             .unwrap_or(usize::MAX)
             .max(1);
         Span::current().record("read_chunk_size", read_chunk_size as u64);
+        let uses_object_writer =
+            destination_store.scheme != "file" || !destination_store.has_direct_local_paths();
         let mut bytes_transferred = 0usize;
         if source_size > 0 {
             let first_range = 0..read_chunk_size.min(source_size);
@@ -2241,7 +2243,15 @@ impl ObjectStore {
                             CopyOperation::Write {
                                 offset: current_range.start,
                             },
-                            writer.write_all(&current_bytes),
+                            async {
+                                writer.write_all(&current_bytes).await?;
+                                // Keep polling multipart creation while the next read is in flight.
+                                // ObjectWriter::flush lets already spawned parts continue in parallel.
+                                if bytes_transferred < source_size && uses_object_writer {
+                                    writer.flush().await?;
+                                }
+                                Ok::<_, std::io::Error>(())
+                            },
                         )
                         .await
                         .map_err(|source| {
@@ -4589,6 +4599,8 @@ mod tests {
             location: &Path,
             opts: PutMultipartOptions,
         ) -> OSResult<Box<dyn MultipartUpload>> {
+            // Model an asynchronous create even though the backing store is in memory.
+            tokio::task::yield_now().await;
             let inner = self.inner.put_multipart_opts(location, opts).await?;
             Ok(Box::new(ObservedMultipartUpload {
                 inner,
@@ -5234,7 +5246,8 @@ mod tests {
     #[tokio::test]
     async fn test_bulk_copy_reports_bytes_while_multipart_completion_is_pending() {
         let mut source_store = ObjectStore::memory();
-        source_store.max_iop_size = 1024 * 1024;
+        // End the first write exactly at the multipart boundary.
+        source_store.max_iop_size = crate::object_writer::initial_upload_size() as u64;
         let observations = Arc::new(MultipartObservations {
             pause_first_part: Some(Default::default()),
             pause_completion: Some(Default::default()),
@@ -5359,7 +5372,14 @@ mod tests {
                 .map(|op| op.operation)
                 .collect();
             assert_eq!(finished.first(), Some(&CopyOperation::SourceMetadata));
-            assert!(finished.contains(&CopyOperation::CreateMultipart));
+            let first_write = finished
+                .iter()
+                .position(|op| *op == CopyOperation::Write { offset: 0 })
+                .unwrap();
+            assert!(
+                finished[..first_write].contains(&CopyOperation::CreateMultipart),
+                "the first chunk should drive multipart creation to completion"
+            );
             assert!(finished.contains(&CopyOperation::ReadRange {
                 start: 0,
                 end: source_store.max_iop_size() as usize

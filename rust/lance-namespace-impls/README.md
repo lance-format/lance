@@ -35,11 +35,12 @@ place an existing table in a nested namespace.
 To read the full version history with `list_table_versions`, omit `limit`.
 The directory namespace lists manifest metadata once and returns the versions in
 ascending order. For ascending listings, a positive limit bounds the size of
-each response and the memory used to select it. Each page lists the version
-directory again because V1 and V2 manifest names can coexist and sort differently.
-Larger pages reduce the number of storage requests during a full traversal. For the latest
-version of a V2 table, use `descending=true` and `limit=1` so an ordered store
-can stop at the first committed manifest.
+each response and the memory used to select it. On ordered S3 stores, a
+continuation can seek directly to consecutive V2 versions. If a version is
+missing, the page crosses a decimal digit boundary, or a V1 filename could
+overlap the window, the namespace scans the directory and selects the page in
+numeric order. For the latest version of a V2 table, use `descending=true` and
+`limit=1` so an ordered store can stop at the first committed manifest.
 
 Supported storage backends:
 - Local filesystem (always available)
