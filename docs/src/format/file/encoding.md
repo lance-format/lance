@@ -737,7 +737,7 @@ value and a positive step; the containing block supplies the number of values. R
 `start + step * i` and reject invalid widths or arithmetic overflow.
 
 ```protobuf
-%%% proto.message.Range %%%
+--8<-- "protos/encodings_v2_3.proto:encoding-range"
 ```
 
 ### MonotonicDelta

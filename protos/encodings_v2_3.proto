@@ -261,6 +261,8 @@ message Constant {
   optional bytes value = 1;
 }
 
+// --8<-- [start:encoding-range]
+
 /* A metadata-only arithmetic sequence for unstable Lance 2.3 only.
  *
  * The value at index i is `start + step * i`. The container supplies the
@@ -278,6 +280,8 @@ message Range {
   // The positive difference between adjacent values.
   uint64 step = 3;
 }
+
+// --8<-- [end:encoding-range]
 
 /* An unstable Lance 2.3 non-decreasing unsigned fixed-width sequence
  * represented by its first value and the differences between adjacent values.
