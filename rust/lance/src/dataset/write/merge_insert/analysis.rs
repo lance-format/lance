@@ -31,7 +31,20 @@ use lance_datafusion::spill::{
 };
 
 use super::{MergeInsertJoin, collect_merge_joins};
+#[cfg(test)]
+use datafusion::execution::memory_pool::{
+    FairSpillPool, MemoryConsumerMetrics, TrackConsumersPool,
+};
 mod wire;
+
+#[cfg(test)]
+#[derive(Debug)]
+pub(super) struct SubplanStart {
+    pub purpose: &'static str,
+    pub completed: Vec<String>,
+    pub consumers: Option<Vec<MemoryConsumerMetrics>>,
+    pub replay_bytes_written: u64,
+}
 
 /// A separately executed plan. Paths are local to this subplan, identified by `id`.
 #[derive(Clone, Debug)]
@@ -65,6 +78,8 @@ pub struct MergeOperatorSpills {
 
 #[derive(Debug, Default)]
 pub struct AnalysisScope {
+    #[cfg(test)]
+    pub(super) subplan_starts: Option<Mutex<Vec<SubplanStart>>>,
     pub target_uri: String,
     target_reads: Mutex<(Option<usize>, Option<usize>)>,
     pub materializations: Mutex<Vec<ExecutionPlanMetricsSet>>,
@@ -82,6 +97,14 @@ impl AnalysisScope {
             target_uri: target_uri.into(),
             ..Default::default()
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn observing_subplan_starts(target_uri: &str) -> Arc<Self> {
+        Arc::new(Self {
+            subplan_starts: Some(Default::default()),
+            ..Self::new(target_uri)
+        })
     }
 
     pub fn record_target_reads(&self, plan: &dyn ExecutionPlan) {
@@ -171,6 +194,27 @@ pub(super) fn execute(
     let Some(scope) = scope(session) else {
         return execute_plan_with_session_context(plan, options, session);
     };
+    #[cfg(test)]
+    if let Some(starts) = &scope.subplan_starts {
+        let completed = scope
+            .plans
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|p| p.execution.outcome == lance_datafusion::exec::ExecutionOutcome::Complete)
+            .map(|p| p.purpose.clone())
+            .collect();
+        starts.lock().unwrap().push(SubplanStart {
+            purpose,
+            completed,
+            consumers: session
+                .runtime_env()
+                .memory_pool
+                .downcast_ref::<TrackConsumersPool<FairSpillPool>>()
+                .map(TrackConsumersPool::metrics),
+            replay_bytes_written: scope.replay.snapshot().bytes_written,
+        });
+    }
     let id = scope
         .next_plan
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))

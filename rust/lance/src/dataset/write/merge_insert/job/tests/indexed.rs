@@ -6,6 +6,202 @@ use arrow_array::record_batch;
 use arrow_array::types::Int32Type;
 use lance_core::utils::address::RowAddress;
 
+#[tokio::test]
+async fn test_stable_row_order_releases_staged_inserts() {
+    let scope = Arc::new(analysis::AnalysisScope::new("memory://"));
+    let session = new_session_context(&merge_insert_execution_options());
+    let session = SessionContext::new_with_config_rt(
+        session.copied_config().with_extension(scope.clone()),
+        session.runtime_env(),
+    );
+
+    let make_batch = |id: Option<u64>, value: i32| {
+        record_batch!((ROW_ID, UInt64, [id]), ("value", Int32, [value])).unwrap()
+    };
+    let schema = make_batch(None, 0).schema();
+    let mut previous: Option<std::sync::Weak<dyn Array>> = None;
+    let batches = stream::iter([(None, 8), (None, 7), (Some(91), 6), (Some(80), 5)]).map(
+        move |(id, value)| {
+            // The first pass must release each input before asking for another,
+            // including inserts whose output is deferred until the second pass.
+            if previous
+                .as_ref()
+                .is_some_and(|array| array.upgrade().is_some())
+            {
+                return Err(DataFusionError::Execution(
+                    "row-ID staging retained its previous input batch".into(),
+                ));
+            }
+            let batch = make_batch(id, value);
+            previous = Some(Arc::downgrade(&batch["value"]));
+            Ok(batch)
+        },
+    );
+    let source = RecordBatchStreamAdapter::new(schema, batches);
+    let mut output = row_ids::updates_before_inserts(Box::pin(source), &session)
+        .await
+        .unwrap();
+    for expected in [6, 5, 8, 7] {
+        let batch = output.try_next().await.unwrap().unwrap();
+        assert_eq!(batch.schema().fields().len(), 1);
+        assert_eq!(
+            batch["value"].as_primitive::<Int32Type>().values(),
+            &[expected]
+        );
+    }
+    assert!(output.try_next().await.unwrap().is_none());
+    let replay = scope.replay.snapshot();
+    assert!(replay.spill_count > 0);
+    assert!(replay.bytes_written > 0 && replay.bytes_read > 0);
+}
+
+#[tokio::test]
+async fn test_indexed_merge_releases_reservations_between_stages() {
+    let indexed = record_batch!(
+        ("id", Int32, [1, 3]),
+        ("value", Int32, [0, 0]),
+        ("other", Int32, [7, 7])
+    )
+    .unwrap();
+    let tail = record_batch!(
+        ("id", Int32, [2]),
+        ("value", Int32, [0]),
+        ("other", Int32, [7])
+    )
+    .unwrap();
+    let reader = |batch: RecordBatch| RecordBatchIterator::new([Ok(batch.clone())], batch.schema());
+    let mut dataset = Dataset::write(reader(indexed), "memory://", None)
+        .await
+        .unwrap();
+    dataset
+        .create_index(
+            &["id"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+    dataset.append(reader(tail), None).await.unwrap();
+
+    let mut job = MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".into()])
+        .unwrap()
+        .when_matched(WhenMatched::UpdateAll)
+        .when_not_matched(WhenNotMatched::InsertAll)
+        .conflict_retries(0)
+        .try_build()
+        .unwrap();
+    job.spill_execution_options.mem_pool_size = Some(4 * 1024 * 1024);
+    let session = new_session_context(&job.spill_execution_options);
+    let scope = analysis::AnalysisScope::observing_subplan_starts(job.dataset.uri());
+    job.spill_session_context = SessionContext::new_with_config_rt(
+        session.copied_config().with_extension(scope.clone()),
+        session.runtime_env(),
+    );
+
+    let source = record_batch!(
+        ("id", Int32, [3, 0, 2, 1]),
+        ("value", Int32, [30, 0, 20, 10])
+    )
+    .unwrap();
+    let (dataset, stats) = job.execute_reader(reader(source)).await.unwrap();
+    assert_eq!((stats.num_updated_rows, stats.num_inserted_rows), (3, 1));
+    let merged = dataset
+        .scan()
+        .project(&["id", "value"])
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let mut actual: Vec<_> = merged["id"]
+        .as_primitive::<Int32Type>()
+        .values()
+        .iter()
+        .copied()
+        .zip(
+            merged["value"]
+                .as_primitive::<Int32Type>()
+                .values()
+                .iter()
+                .copied(),
+        )
+        .collect();
+    actual.sort_unstable();
+    assert_eq!(actual, [(0, 0), (1, 10), (2, 20), (3, 30)]);
+    let starts = scope.subplan_starts.as_ref().unwrap().lock().unwrap();
+    for (previous, next) in [
+        ("index_probe", "indexed_source_sort"),
+        ("indexed_source_sort", "indexed_join"),
+        ("indexed_join", "fragment_update_sort"),
+    ] {
+        let start = starts.iter().find(|start| start.purpose == next).unwrap();
+        assert!(
+            start.completed.iter().any(|name| name == previous),
+            "{previous} must finish before {next}"
+        );
+        let consumers = start.consumers.as_ref().unwrap();
+        assert!(
+            consumers.iter().all(|c| c.reserved == 0),
+            "{next} started with live reservations: {consumers:?}"
+        );
+    }
+    let plans = scope.plans();
+    // Gathering the fallback scan through a repartition would take a third share
+    // of the pool. The union must feed a coalescer without its own reservation.
+    let join = plans
+        .iter()
+        .find(|plan| plan.purpose == "indexed_join")
+        .unwrap();
+    let nodes = &join.execution.operators;
+    let union = nodes.iter().find(|node| node.name == "UnionExec").unwrap();
+    let (_, parent_path) = union.path.split_last().unwrap();
+    assert!(
+        nodes
+            .iter()
+            .any(|node| node.path == parent_path && node.name == "CoalescePartitionsExec")
+    );
+}
+
+#[tokio::test]
+async fn test_sequential_source_pulls_only_on_demand() {
+    let reads = Arc::new(AtomicU32::new(0));
+    let partitions = [0, 2].map(|first| {
+        let reads = reads.clone();
+        let batch = record_batch!(("id", Int32, [first])).unwrap();
+        let schema = batch.schema();
+        let stream = stream::iter([batch.clone(), batch]).map(move |batch| {
+            reads.fetch_add(1, Ordering::Relaxed);
+            Ok(batch)
+        });
+        Arc::new(OneShotExec::new(Box::pin(RecordBatchStreamAdapter::new(
+            schema, stream,
+        )))) as Arc<dyn ExecutionPlan>
+    });
+    let plan = UnionExec::try_new(partitions.to_vec()).unwrap();
+    let source = SequentialSourcePartitionStream::try_new(
+        plan,
+        Some(Field::new("ordinal", DataType::UInt64, false)),
+        None,
+    )
+    .unwrap();
+    let mut output = source.execute(SessionContext::new().task_ctx());
+    assert_eq!(reads.load(Ordering::Relaxed), 0);
+    for ordinal in 0..4 {
+        let batch = output.try_next().await.unwrap().unwrap();
+        assert_eq!(
+            batch["id"].as_primitive::<Int32Type>().value(0),
+            if ordinal < 2 { 0 } else { 2 }
+        );
+        assert_eq!(
+            batch["ordinal"].as_primitive::<UInt64Type>().value(0),
+            u64::from(ordinal)
+        );
+        assert_eq!(reads.load(Ordering::Relaxed), ordinal + 1);
+    }
+    assert!(output.try_next().await.unwrap().is_none());
+}
+
 #[rstest::rstest]
 #[case::first_key("key", false, true)]
 #[case::second_key("other_key", false, true)]

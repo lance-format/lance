@@ -8,13 +8,13 @@ use super::inserted_rows::{KeyExistenceFilter, KeyExistenceFilterBuilder};
 
 use super::merger::Merger;
 use super::{
-    DeduplicatingSourcePartitionStream, INDEXED_JOIN_BATCH_ROWS, MAX_FRAGMENT_UPDATE_BATCH_BYTES,
-    MAX_INDEXED_JOIN_BATCH_BYTES, MERGE_ACTION_COLUMN, MERGE_SOURCE_SENTINEL, MergeInsertAnalysis,
-    MergeInsertJob, MergeInsertWriteMode, MergeInsertWriteStrategy, MergeStats, PatchedFragments,
-    SchemaComparison, SourceDedupeBehavior, UncommittedMergeInsert, WhenMatched,
-    WhenNotMatchedBySource, canonical_source_schema, check_source_schema, collect_merge_joins,
-    created_blob_payloads, exec, fill_missing_target_columns, logical_plan, one_shot_provider,
-    resolve_target_bases, target_blob_handling, uncommitted_transaction,
+    DeduplicatingSourcePartitionStream, INDEXED_JOIN_BATCH_ROWS, MERGE_ACTION_COLUMN,
+    MERGE_SOURCE_SENTINEL, MergeInsertAnalysis, MergeInsertBudget, MergeInsertJob,
+    MergeInsertWriteMode, MergeInsertWriteStrategy, MergeStats, PatchedFragments, SchemaComparison,
+    SourceDedupeBehavior, UncommittedMergeInsert, WhenMatched, WhenNotMatchedBySource,
+    canonical_source_schema, check_source_schema, collect_merge_joins, created_blob_payloads, exec,
+    fill_missing_target_columns, logical_plan, one_shot_provider, resolve_target_bases,
+    target_blob_handling, uncommitted_transaction,
 };
 use super::{analysis, row_ids};
 use crate::dataset::rowids::get_row_id_index;
@@ -293,8 +293,7 @@ impl MergeInsertJob {
                 name
             });
         let execution_options = self.spill_execution_options.clone();
-        let max_batch_bytes = ((execution_options.mem_pool_size() as usize) / 8)
-            .clamp(1, MAX_INDEXED_JOIN_BATCH_BYTES);
+        let budget = MergeInsertBudget::new(&execution_options);
         let session_ctx = &self.spill_session_context;
         let ordinal_field = source_ordinal_column
             .as_ref()
@@ -335,7 +334,8 @@ impl MergeInsertJob {
             )
             .await?;
             let source = provider_to_stream(normalized_source).await?;
-            let replayable_source = analysis::replay(source, max_batch_bytes, session_ctx).await?;
+            let replayable_source =
+                analysis::replay(source, budget.batch_bytes, session_ctx).await?;
             (
                 replayable_source
                     .scan(&session_ctx.state(), None, &[], None)
@@ -387,7 +387,7 @@ impl MergeInsertJob {
             execution_options.clone(),
             session_ctx,
         )?;
-        let mapped_rows = analysis::replay(mapped_rows, max_batch_bytes, session_ctx).await?;
+        let mapped_rows = analysis::replay(mapped_rows, budget.batch_bytes, session_ctx).await?;
         let mut initial_scan = provider_to_stream(mapped_rows.clone()).await?;
         while initial_scan.try_next().await?.is_some() {}
         drop(initial_scan);
@@ -525,8 +525,8 @@ impl MergeInsertJob {
                 "indexed merge-insert target must have exactly one partition before sorting, got {target_partition_count}"
             )));
         }
-        let source_input = Arc::new(HardCapBatchSizeExec::new(source_input, max_batch_bytes));
-        let target = Arc::new(HardCapBatchSizeExec::new(target, max_batch_bytes));
+        let source_input = Arc::new(HardCapBatchSizeExec::new(source_input, budget.batch_bytes));
+        let target = Arc::new(HardCapBatchSizeExec::new(target, budget.batch_bytes));
         // A sort spilled to several runs keeps a merge reservation until its output is read,
         // and that reservation grows with the number of runs, up to the whole pool. Finish
         // the source sort first, so that each sort has the pool to itself.
@@ -539,7 +539,7 @@ impl MergeInsertJob {
         let (sorted_source, materialization_metrics) = materialize_stream(
             sorted_source,
             session_ctx.runtime_env(),
-            execution_options.mem_pool_size() as usize / 8,
+            budget.sorted_source_bytes,
             "materializing sorted merge insert source",
         )
         .await?;
@@ -2620,28 +2620,13 @@ pub(super) fn merge_insert_execution_options() -> LanceExecutionOptions {
     }
 }
 
-fn max_fragment_update_partitions(memory_pool_size: u64) -> usize {
-    // The joined update stream is staged before this sort, so no upstream sort
-    // reservation remains live. Budget each downstream partition for its merge
-    // reservation plus one capped input and output/fragment-grouping batch.
-    let sort_spill_reservation = (memory_pool_size / 3).clamp(1, 40 * 1024 * 1024);
-    let working_memory = u64::try_from(MAX_FRAGMENT_UPDATE_BATCH_BYTES)
-        .unwrap_or(u64::MAX)
-        .saturating_mul(2);
-    let partition_budget = sort_spill_reservation.saturating_add(working_memory);
-    usize::try_from((memory_pool_size / partition_budget).max(1)).unwrap_or(usize::MAX)
-}
-
 pub(super) fn fragment_update_session_context(
     spill_session_context: &SessionContext,
     spill_execution_options: &LanceExecutionOptions,
 ) -> SessionContext {
-    let target_partitions =
-        get_num_compute_intensive_cpus()
-            .min(8)
-            .min(max_fragment_update_partitions(
-                spill_execution_options.mem_pool_size(),
-            ));
+    let target_partitions = get_num_compute_intensive_cpus()
+        .min(8)
+        .min(MergeInsertBudget::new(spill_execution_options).fragment_partitions);
     let config = spill_session_context
         .copied_config()
         .with_target_partitions(target_partitions);

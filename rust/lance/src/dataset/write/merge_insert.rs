@@ -884,11 +884,34 @@ mod tests;
 /// Row cap for indexed external-sort output batches; payload rows may be wide.
 const INDEXED_JOIN_BATCH_ROWS: usize = 128;
 
-/// Byte cap for indexed sort input batches and in-memory replay buffers.
-const MAX_INDEXED_JOIN_BATCH_BYTES: usize = 25 * 1024 * 1024;
+/// Working limits shared by the indexed join and the downstream fragment sort.
+struct MergeInsertBudget {
+    batch_bytes: usize,
+    sorted_source_bytes: usize,
+    fragment_partitions: usize,
+}
 
-/// Byte cap for each batch entering the partial-update fragment sort.
-const MAX_FRAGMENT_UPDATE_BATCH_BYTES: usize = 25 * 1024 * 1024;
+impl MergeInsertBudget {
+    const MAX_BATCH_BYTES: usize = 25 * 1024 * 1024;
+
+    fn new(options: &LanceExecutionOptions) -> Self {
+        let pool = options.mem_pool_size();
+        let sorted_source_bytes = pool as usize / 8;
+        // A sort accounts for both the input and its sorted copy. Keep capped batches
+        // within a fair share of the pool and avoid very large copies in larger pools.
+        let batch_bytes = sorted_source_bytes.clamp(1, Self::MAX_BATCH_BYTES);
+        // Each fragment partition needs one merge reservation and two working batches.
+        let partition_bytes =
+            options.sort_spill_reservation_bytes().max(1) + 2 * Self::MAX_BATCH_BYTES;
+        let fragment_partitions =
+            usize::try_from((pool / partition_bytes as u64).max(1)).unwrap_or(usize::MAX);
+        Self {
+            batch_bytes,
+            sorted_source_bytes,
+            fragment_partitions,
+        }
+    }
+}
 
 /// The transaction a merge insert write node built during execution, if the
 /// node ran to completion.
