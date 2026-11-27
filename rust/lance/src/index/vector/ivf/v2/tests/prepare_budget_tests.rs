@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use super::native_storage_tests::{lazy_test_query, result_bits, search_global};
+use super::super::IVFIndex;
+use super::native_storage_tests::{lazy_test_query, native_fixture, result_bits, search_global};
 use super::*;
 use lance_core::cache::{CacheCodec, CacheEntry, CacheLoader, InternalCacheKey};
 use lance_index::vector::PartitionSearchControl;
@@ -68,6 +69,10 @@ impl Fixture {
             )
             .await
             .unwrap();
+        Self::open::<FlatQuantizer>(dataset, query, slots).await
+    }
+
+    async fn open<Q: Quantization + 'static>(dataset: Dataset, query: Query, slots: usize) -> Self {
         let uuid = dataset.load_indices().await.unwrap()[0].uuid;
         let reference = dataset
             .open_vector_index("vector", &uuid, &NoOpMetricsCollector)
@@ -77,7 +82,7 @@ impl Fixture {
         let cache = LanceCache::with_backend(Arc::new(PausedCache(loads_tx)));
         let state = reference
             .as_any()
-            .downcast_ref::<IvfFlatIndex>()
+            .downcast_ref::<IVFIndex<FlatIndex, Q>>()
             .unwrap()
             .to_state_entry();
         let paused = state
@@ -95,7 +100,7 @@ impl Fixture {
         for index in [&reference, &paused] {
             index
                 .as_any()
-                .downcast_ref::<IvfFlatIndex>()
+                .downcast_ref::<IVFIndex<FlatIndex, Q>>()
                 .unwrap()
                 .test_prepare_budget
                 .set(budget.clone())
@@ -111,6 +116,96 @@ impl Fixture {
             dataset,
         }
     }
+}
+
+/// Hold the only slot until the stage has been polled, then stop it inside
+/// the partition load to check that it still owns the slot.
+async fn run_after_admission<T>(
+    stage: impl Future<Output = Result<T>>,
+    budget: &Semaphore,
+    loads: &mut mpsc::UnboundedReceiver<oneshot::Sender<()>>,
+) -> T {
+    let held = budget.try_acquire().unwrap();
+    let mut stage = std::pin::pin!(stage);
+    assert!(futures::poll!(&mut stage).is_pending());
+    assert!(matches!(
+        loads.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+    drop(held);
+    assert!(futures::poll!(&mut stage).is_pending());
+    let load = loads
+        .try_recv()
+        .expect("admitted stage must start its partition load");
+    assert_eq!(budget.available_permits(), 0);
+    load.send(()).unwrap();
+    let result = timeout(Duration::from_secs(3), stage)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(budget.available_permits(), 1);
+    result
+}
+
+#[tokio::test]
+async fn quantized_refine_stages_wait_before_loading() {
+    let (dataset, batch) = native_fixture("memory://").await;
+    let mut query = lazy_test_query(batch["vector"].as_fixed_size_list().value(0), 5, 1);
+    query.approx_mode = ApproxMode::Fast;
+    let mut f = Fixture::open::<RabitQuantizer>(dataset, query, 1).await;
+    let (partitions, distances) = f.reference.find_partitions(&f.query).unwrap();
+    let partition = partitions.value(0) as usize;
+    f.query.dist_q_c = distances.value(0);
+    let limit = 2 * f.query.k;
+    let expected = f
+        .reference
+        .search_in_partition_with_candidates(
+            partition,
+            &f.query,
+            Arc::new(NoFilter),
+            &NoOpMetricsCollector,
+            limit,
+        )
+        .await
+        .unwrap();
+    let candidates = run_after_admission(
+        f.paused.search_in_partition_with_candidates(
+            partition,
+            &f.query,
+            Arc::new(NoFilter),
+            &NoOpMetricsCollector,
+            limit,
+        ),
+        &f.budget,
+        &mut f.loads,
+    )
+    .await;
+    assert!(!candidates.candidates.is_empty());
+    assert_eq!(
+        candidates.batch.num_rows(),
+        limit.min(f.reference.partition_size(partition))
+    );
+    assert_eq!(candidates.candidates, expected.candidates);
+    assert_eq!(result_bits(&candidates.batch), result_bits(&expected.batch));
+
+    let offsets = candidates
+        .candidates
+        .iter()
+        .map(|candidate| candidate.offset_in_partition)
+        .collect::<Vec<_>>();
+    let expected = f
+        .reference
+        .score_partition_candidates(partition, &f.query, &offsets, &NoOpMetricsCollector)
+        .await
+        .unwrap();
+    let scored = run_after_admission(
+        f.paused
+            .score_partition_candidates(partition, &f.query, &offsets, &NoOpMetricsCollector),
+        &f.budget,
+        &mut f.loads,
+    )
+    .await;
+    assert_eq!(result_bits(&scored), result_bits(&expected));
 }
 
 #[tokio::test]

@@ -3668,8 +3668,9 @@ impl RabitIndex {
                 "partition id {partition_id} exceeds the candidate identity limit"
             ))
         })?;
-        let part_entry = self.load_partition(partition_id, true, metrics).await?;
         pre_filter.wait_for_ready().await?;
+        let permit = partition_search::acquire_prepare(self.prepare_budget()).await;
+        let part_entry = self.load_partition(partition_id, true, metrics).await?;
 
         let partition_centroid = self.ivf.centroid(partition_id);
         let rq_search_cache = self.rq_search_cache.clone();
@@ -3685,6 +3686,7 @@ impl RabitIndex {
         let use_query_residual = self.use_query_residual;
         let use_residual_scratch = self.use_residual_scratch;
         let (result, local_metrics) = spawn_cpu(move || {
+            drop(permit);
             let param = (&query).into();
             let local_metrics = LocalMetricsCollector::default();
             let part = part_entry
@@ -3733,6 +3735,7 @@ impl RabitIndex {
     ) -> Result<RecordBatch> {
         let mut query = query.clone();
         query.dist_q_c = self.query_centroid_distance(partition_id, &query)?;
+        let permit = partition_search::acquire_prepare(self.prepare_budget()).await;
         let part_entry = self.load_partition(partition_id, true, metrics).await?;
         let partition_centroid = self.ivf.centroid(partition_id);
         let rq_search_cache = self.rq_search_cache.clone();
@@ -3749,6 +3752,7 @@ impl RabitIndex {
         let use_query_residual = self.use_query_residual;
         let use_residual_scratch = self.use_residual_scratch;
         let (batch, local_metrics) = spawn_cpu(move || {
+            drop(permit);
             let local_metrics = LocalMetricsCollector::default();
             let part = part_entry
                 .as_any()
