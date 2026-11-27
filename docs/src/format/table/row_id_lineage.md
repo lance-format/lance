@@ -126,7 +126,7 @@ Used for new fragments where row IDs are assigned sequentially.
 <summary>Range protobuf message</summary>
 
 ```protobuf
---8<-- "protos/rowids.proto:range"
+--8<-- "protos/rowids.proto:row-id-range"
 ```
 
 </details>

@@ -942,7 +942,7 @@ fn tag(e: &Compression) -> &'static str {
         PackedStruct(_) => "packed_struct",
         VariablePackedStruct(_) => "variable_packed_struct",
         Range(_) => "range",
-        Delta(_) => "delta",
+        MonotonicDelta(_) => "monotonic_delta",
         AxisDelta(_) => "axis_delta",
         Alp(_) => "alp",
         Pcodec(_) => "pcodec",

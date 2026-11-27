@@ -20,7 +20,7 @@ message RowIdSequence {
 /// Different ways to encode a sequence of u64 values.
 message U64Segment {
 
-    // --8<-- [start:range]
+    // --8<-- [start:row-id-range]
 
     /// A range of u64 values.
     message Range {
@@ -30,7 +30,7 @@ message U64Segment {
         uint64 end = 2;
     }
 
-    // --8<-- [end:range]
+    // --8<-- [end:row-id-range]
 
     /// A range of u64 values with holes.
     message RangeWithHoles {
