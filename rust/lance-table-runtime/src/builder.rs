@@ -216,33 +216,34 @@ impl TableBuilder {
         let mut manifest_location = commit_handler
             .resolve_version_location(&location.path, snapshot.version(), &object_store.inner)
             .await?;
-        let (manifest, digest) = if snapshot.manifest_digest().is_empty() {
-            if let Some(expected) = snapshot.manifest_etag() {
-                // Enforce the reference on the actual reads. A local listing may
-                // omit HTTP quotes, so comparing it to a HEAD token is insufficient.
-                manifest_location.e_tag = Some(expected.to_owned());
-            }
-            let (manifest, digest) = Table::load_manifest_impl(
-                &object_store,
-                &manifest_location,
-                &location.uri,
-                &session,
-                crate::manifest::ManifestRead::Metadata,
-            )
-            .await?;
-            (
-                Arc::new(manifest),
-                Arc::new(tokio::sync::OnceCell::new_with(digest)),
-            )
-        } else {
-            Table::get_manifest_with_digest(
-                &object_store,
-                &manifest_location,
-                &location.uri,
-                &session,
-            )
-            .await?
-        };
+        let (manifest, digest) =
+            if snapshot.manifest_digest().is_empty() && snapshot.manifest_etag().is_some() {
+                if let Some(expected) = snapshot.manifest_etag() {
+                    // Enforce the reference on the actual reads. A local listing may
+                    // omit HTTP quotes, so comparing it to a HEAD token is insufficient.
+                    manifest_location.e_tag = Some(expected.to_owned());
+                }
+                let (manifest, digest) = Table::load_manifest_impl(
+                    &object_store,
+                    &manifest_location,
+                    &location.uri,
+                    &session,
+                    crate::manifest::ManifestRead::Metadata,
+                )
+                .await?;
+                (
+                    Arc::new(manifest),
+                    Arc::new(tokio::sync::OnceCell::new_with(digest)),
+                )
+            } else {
+                Table::get_manifest_for_open(
+                    &object_store,
+                    &mut manifest_location,
+                    &location.uri,
+                    &session,
+                )
+                .await?
+            };
         let mut table = Table::checkout_manifest(
             object_store,
             location.path,
@@ -879,9 +880,9 @@ impl TableBuilder {
 
             crate::manifest::resolve_manifest_generation(&object_store, &mut manifest_location)
                 .await?;
-            let (manifest, digest) = Table::get_manifest_with_digest(
+            let (manifest, digest) = Table::get_manifest_for_open(
                 &object_store,
-                &manifest_location,
+                &mut manifest_location,
                 &table_uri,
                 session.as_ref(),
             )

@@ -84,14 +84,173 @@ mod tests {
         ArrayRef, RecordBatch, RecordBatchIterator, builder::StringDictionaryBuilder, record_batch,
         types::Int8Type,
     };
+    use async_trait::async_trait;
     use byteorder::{ByteOrder, LittleEndian};
+    use futures::stream::BoxStream;
     use lance_core::Error;
     use lance_index::{IndexType, scalar::ScalarIndexParams};
+    use lance_io::object_store::{ObjectStoreParams, WrappingObjectStore};
     use lance_table::format::pb;
     use object_store::ObjectStoreExt;
+    use object_store::{
+        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
+        PutMultipartOptions, PutOptions, PutPayload, PutResult, path::Path,
+    };
     use prost::Message;
     use rstest::rstest;
     use std::sync::Arc;
+
+    #[derive(Debug)]
+    struct ConditionalReadWrapper(bool);
+
+    impl WrappingObjectStore for ConditionalReadWrapper {
+        fn wrap(
+            &self,
+            _: &str,
+            inner: Arc<dyn object_store::ObjectStore>,
+        ) -> Arc<dyn object_store::ObjectStore> {
+            Arc::new(ConditionalReadStore {
+                inner,
+                supports_if_match: self.0,
+            })
+        }
+
+        fn wrap_paginated(
+            &self,
+            _: &str,
+            _: Arc<dyn object_store::list::PaginatedListStore>,
+        ) -> Option<Arc<dyn object_store::list::PaginatedListStore>> {
+            None
+        }
+    }
+
+    #[derive(Debug)]
+    struct ConditionalReadStore {
+        inner: Arc<dyn object_store::ObjectStore>,
+        supports_if_match: bool,
+    }
+
+    impl std::fmt::Display for ConditionalReadStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "ConditionalReadStore")
+        }
+    }
+
+    #[async_trait]
+    impl object_store::ObjectStore for ConditionalReadStore {
+        async fn get_opts(
+            &self,
+            path: &Path,
+            options: GetOptions,
+        ) -> object_store::Result<GetResult> {
+            if !self.supports_if_match && options.if_match.is_some() {
+                return Err(object_store::Error::NotSupported {
+                    source: "backend does not support If-Match".into(),
+                });
+            }
+            self.inner.get_opts(path, options).await
+        }
+        async fn put_opts(
+            &self,
+            path: &Path,
+            data: PutPayload,
+            options: PutOptions,
+        ) -> object_store::Result<PutResult> {
+            self.inner.put_opts(path, data, options).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            path: &Path,
+            options: PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(path, options).await
+        }
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, object_store::Result<Path>>,
+        ) -> BoxStream<'static, object_store::Result<Path>> {
+            self.inner.delete_stream(locations)
+        }
+        fn list(
+            &self,
+            prefix: Option<&Path>,
+        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> object_store::Result<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    #[rstest]
+    #[case::wrapped_local(true)]
+    #[case::etag_without_conditions(false)]
+    #[tokio::test]
+    async fn ordinary_open_preserves_store_conditional_read_capabilities(
+        #[case] supports_if_match: bool,
+        #[values(false, true)] explicit_version: bool,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let uri = directory.path().to_str().unwrap();
+        let written = write_indexed_dataset(uri, 2, "id_idx", true).await;
+        let snapshot = written.snapshot_ref("catalog/table").await.unwrap();
+        assert!(snapshot.manifest_etag().is_some());
+        let params = ObjectStoreParams {
+            object_store_wrapper: Some(Arc::new(ConditionalReadWrapper(supports_if_match))),
+            ..Default::default()
+        };
+        let builder = DatasetBuilder::from_uri(uri)
+            .with_store_params(params.clone())
+            .with_block_size(256)
+            .with_metadata_cache_size_bytes(0);
+        let builder = if explicit_version {
+            builder.with_version(written.version().version)
+        } else {
+            builder
+        };
+        let opened = builder.load().await.unwrap();
+        assert_eq!(opened.fragments().len(), 3);
+        assert_eq!(opened.count_rows(None).await.unwrap(), 6);
+        assert_eq!(opened.load_indices().await.unwrap().len(), 1);
+        assert_eq!(
+            opened.table_state.manifest_location.e_tag.is_some(),
+            supports_if_match
+        );
+        let worker = DatasetBuilder::from_snapshot(snapshot)
+            .with_store_params(params.clone())
+            .with_block_size(256)
+            .with_metadata_cache_size_bytes(0)
+            .load()
+            .await;
+        if supports_if_match {
+            assert_eq!(worker.unwrap().count_rows(None).await.unwrap(), 6);
+        } else {
+            let error = worker.err().unwrap();
+            assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+            assert!(error.to_string().contains("If-Match"), "{error}");
+            let full = opened.snapshot_ref("catalog/table").await.unwrap();
+            assert_eq!(full.manifest_digest().len(), 32);
+            assert!(full.manifest_etag().is_none());
+            let worker = DatasetBuilder::from_snapshot(full)
+                .with_store_params(params)
+                .with_metadata_cache_size_bytes(0)
+                .load()
+                .await
+                .unwrap();
+            assert_eq!(worker.count_rows(None).await.unwrap(), 6);
+        }
+    }
 
     #[cfg_attr(coverage, coverage(off))]
     async fn write_dataset(uri: &str, max_rows_per_file: usize) -> Dataset {

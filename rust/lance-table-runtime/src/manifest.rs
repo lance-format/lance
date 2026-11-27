@@ -37,7 +37,7 @@ pub enum ManifestRead {
 }
 
 pub fn conditional_etag<'a>(store: &ObjectStore, token: &'a str) -> Cow<'a, str> {
-    if store.has_direct_local_paths() && !token.starts_with('"') {
+    if store.is_local() && !token.starts_with('"') {
         Cow::Owned(format!("\"{token}\""))
     } else {
         Cow::Borrowed(token)
@@ -173,6 +173,7 @@ impl Table {
             object_store::Error::NotFound { path, source } => {
                 Error::dataset_not_found(path, source)
             }
+            object_store::Error::NotSupported { source } => Error::not_supported_source(source),
             _ => Error::io(format!(
                 "failed to read manifest {}: {}",
                 manifest_location.path, err
@@ -208,7 +209,9 @@ impl Table {
                     !block.ends_with(MAGIC)
                         || block.len() != manifest_size.min(object_reader.block_size())
                 }
-                Err(object_store::Error::NotFound { .. }) => false,
+                Err(
+                    object_store::Error::NotFound { .. } | object_store::Error::NotSupported { .. },
+                ) => false,
                 Err(_) => true,
             };
         if should_retry_size {
@@ -229,6 +232,7 @@ impl Table {
             object_store::Error::NotFound { path, source } => {
                 Error::dataset_not_found(path, source)
             }
+            object_store::Error::NotSupported { source } => Error::not_supported_source(source),
             _ => Error::io(format!(
                 "failed to read manifest {}: {}",
                 manifest_location.path, err
@@ -389,6 +393,24 @@ impl Table {
                 .await?
                 .0,
         )
+    }
+
+    /// Ordinary opens may use stores that publish ETags but cannot enforce them.
+    /// Remove that unusable evidence before retrying or caching metadata. Snapshot
+    /// reopens bound to an ETag call the strict loader without this fallback.
+    pub(crate) async fn get_manifest_for_open(
+        object_store: &ObjectStore,
+        manifest_location: &mut ManifestLocation,
+        uri: &str,
+        session: &TableSession,
+    ) -> Result<(Arc<Manifest>, Arc<tokio::sync::OnceCell<[u8; 32]>>)> {
+        match Self::get_manifest_with_digest(object_store, manifest_location, uri, session).await {
+            Err(Error::NotSupported { .. }) if manifest_location.e_tag.is_some() => {
+                manifest_location.e_tag = None;
+                Self::get_manifest_with_digest(object_store, manifest_location, uri, session).await
+            }
+            result => result,
+        }
     }
 
     /// Fetch a manifest with a shared digest cell, initialized when all bytes were read.

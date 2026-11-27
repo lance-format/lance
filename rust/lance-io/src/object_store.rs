@@ -1418,7 +1418,7 @@ impl ObjectStore {
                 "Conditional reader ETag cannot be empty",
             ));
         }
-        let e_tag = if self.has_direct_local_paths() && !e_tag.starts_with('"') {
+        let e_tag = if self.is_local() && !e_tag.starts_with('"') {
             format!("\"{e_tag}\"")
         } else {
             e_tag

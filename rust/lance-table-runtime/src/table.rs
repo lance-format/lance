@@ -303,9 +303,9 @@ impl<'a> TableView<'a> {
             return Ok(None);
         }
 
-        let (manifest, digest) = Table::get_manifest_with_digest(
+        let (manifest, digest) = Table::get_manifest_for_open(
             self.state.object_store.as_ref(),
-            &manifest_location,
+            &mut manifest_location,
             &new_location.uri,
             self.state.session.as_ref(),
         )
@@ -385,7 +385,7 @@ impl<'a> TableView<'a> {
         Arc<tokio::sync::OnceCell<[u8; 32]>>,
     )> {
         self.ensure_branch_exists().await?;
-        let location = self
+        let mut location = self
             .state
             .commit_handler
             .resolve_latest_location(&self.state.base, &self.state.object_store)
@@ -400,9 +400,9 @@ impl<'a> TableView<'a> {
                 current_digest,
             ));
         }
-        let (manifest, digest) = Table::get_manifest_with_digest(
+        let (manifest, digest) = Table::get_manifest_for_open(
             &self.state.object_store,
-            &location,
+            &mut location,
             &self.state.uri,
             &self.state.session,
         )

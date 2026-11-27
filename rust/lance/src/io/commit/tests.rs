@@ -1909,8 +1909,10 @@ async fn test_append_idempotency_after_recreate_at_same_uri(
 
     let recreated = create_append_test_dataset(uri).await;
     let mut new_append = stage_append(recreated.clone(), 1, "new-job").await;
+    let new_uuid = new_append.uuid.clone();
     // A spilled transaction is not prefetched when version 2 is loaded.
-    // This leaves the original table's cached version 2 in the session.
+    // This leaves the original table's cached version 2 in the session under
+    // its original generation; the recreated table must resolve its own entry.
     Arc::make_mut(new_append.transaction_properties.as_mut().unwrap())
         .insert("padding".into(), "x".repeat(MAX_INLINE_TRANSACTION_BYTES));
     let recreated = CommitBuilder::new(recreated)
@@ -1934,7 +1936,24 @@ async fn test_append_idempotency_after_recreate_at_same_uri(
         .unwrap();
     assert_eq!(cached.len(), 1);
     assert_eq!(cached[0].0, 2);
-    assert_eq!(cached[0].1.uuid, old_uuid);
+    assert_eq!(cached[0].1.uuid, new_uuid);
+    assert_ne!(cached[0].1.uuid, old_uuid);
+    let old_key = crate::session::caches::ManifestTransactionKey::new(
+        &original.table_state.object_store,
+        &original.table_state.manifest_location,
+    )
+    .unwrap();
+    assert_eq!(
+        original
+            .table_state
+            .metadata_cache
+            .get_with_key(&old_key)
+            .await
+            .unwrap()
+            .uuid,
+        old_uuid,
+        "the original transaction remains cached under its own generation",
+    );
 
     let append = stage_append(base.clone(), 2, key).await;
     let result = CommitBuilder::new(base)

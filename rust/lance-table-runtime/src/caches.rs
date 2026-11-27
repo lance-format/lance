@@ -224,8 +224,10 @@ pub struct TransactionKey {
     pub version: u64,
 }
 
+/// Runtime-only transaction key scoped to a resolved manifest generation.
+#[doc(hidden)]
 #[derive(Debug)]
-pub(crate) struct ManifestTransactionKey<'a> {
+pub struct ManifestTransactionKey<'a> {
     pub version: u64,
     pub manifest_path: &'a Path,
     pub store_identity: &'a str,
@@ -233,7 +235,8 @@ pub(crate) struct ManifestTransactionKey<'a> {
 }
 
 impl<'a> ManifestTransactionKey<'a> {
-    pub(crate) fn new(
+    /// Return no cache key when the manifest has no observed generation token.
+    pub fn new(
         store: &'a lance_io::object_store::ObjectStore,
         location: &'a lance_table::io::commit::ManifestLocation,
     ) -> Option<Self> {

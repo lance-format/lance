@@ -16,6 +16,7 @@ pub mod tests {
     use lance_table::format::pb::{ExternalFile, FragmentReuseIndexDetails};
     use lance_table::io::commit::write_manifest_file_to_path;
     use lance_table::system_index::frag_reuse::FRAG_REUSE_DETAILS_FILE_NAME;
+    use object_store::ObjectStoreExt;
     use prost::Message;
     use roaring::{RoaringBitmap, RoaringTreemap};
     use rstest::rstest;
@@ -42,7 +43,7 @@ pub mod tests {
     use crate::index::frag_reuse_with_stable_row_ids::apply_frag_reuse_with_stable_row_ids_flag;
     use crate::index::loading::load_all_indices;
     use crate::session::Session;
-    use crate::session::caches::TransactionKey;
+    use crate::session::caches::ManifestTransactionKey;
     use crate::utils::test::{
         DatagenExt, FragmentCount, FragmentRowCount, inline_padding_capacity,
         padding_reuse_versions,
@@ -1459,10 +1460,31 @@ pub mod tests {
     /// Whether `dataset`'s session caches the transaction of `version` with
     /// the history a rewrite carries in memory; `None` if it caches none.
     async fn cached_rewrite_history(dataset: &Dataset, version: u64) -> Option<bool> {
+        let mut location = dataset
+            .table_state
+            .commit_handler
+            .resolve_version_location(
+                &dataset.table_state.base,
+                version,
+                &dataset.table_state.object_store.inner,
+            )
+            .await
+            .unwrap();
+        if location.e_tag.is_none() {
+            location.e_tag = dataset
+                .table_state
+                .object_store
+                .inner
+                .head(&location.path)
+                .await
+                .unwrap()
+                .e_tag;
+        }
+        let key = ManifestTransactionKey::new(&dataset.table_state.object_store, &location)?;
         let transaction = dataset
             .table_state
             .metadata_cache
-            .get_with_key(&TransactionKey { version })
+            .get_with_key(&key)
             .await?;
         let Operation::Rewrite {
             frag_reuse_index, ..
