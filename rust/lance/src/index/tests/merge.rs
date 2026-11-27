@@ -4,6 +4,119 @@
 use super::support::*;
 use super::*;
 
+#[tokio::test]
+async fn test_merge_list_element_segments() {
+    let item = DataType::Struct(
+        vec![
+            Field::new("a", DataType::Int32, true),
+            Field::new("b", DataType::Int32, true),
+        ]
+        .into(),
+    );
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("items", DataType::new_list(item, true), true),
+    ]));
+    let rows = br#"{"id":0,"items":[{"a":1,"b":2},null]}
+                   {"id":1,"items":null}
+                   {"id":2,"items":[]}
+                   {"id":3,"items":[{"a":0,"b":2}]}
+                   {"id":4,"items":[{"a":1,"b":2},{"a":1,"b":2}]}
+                   {"id":5,"items":[null]}
+                   {"id":6,"items":[{"a":1,"b":null}]}
+                   {"id":7,"items":[{"a":1,"b":3}]}"#;
+    let reader = arrow::json::ReaderBuilder::new(schema)
+        .build(&rows[..])
+        .unwrap();
+    let mut dataset = Dataset::write(
+        reader,
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 4,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let params = |keys| {
+        ScalarIndexParams::new("listelement".into()).with_params(&serde_json::json!({"keys": keys}))
+    };
+    let keys = params(["a", "b"]);
+    let mut segments = Vec::new();
+    for fragment in dataset.get_fragments() {
+        segments.push(
+            dataset
+                .create_index_builder(&["items"], IndexType::Scalar, &keys)
+                .fragments(vec![fragment.id() as u32])
+                .execute_uncommitted()
+                .await
+                .unwrap(),
+        );
+    }
+    assert_eq!(segments.len(), 2);
+    let reversed = dataset
+        .create_index_builder(&["items"], IndexType::Scalar, &params(["b", "a"]))
+        .fragments(vec![1])
+        .execute_uncommitted()
+        .await
+        .unwrap();
+    let merged = dataset
+        .merge_existing_index_segments(segments.clone())
+        .await
+        .unwrap();
+    assert_eq!(merged.fields, segments[0].fields);
+    assert_eq!(merged.index_details, segments[0].index_details);
+    assert_eq!(
+        merged.fragment_bitmap,
+        Some(RoaringBitmap::from_iter([0, 1]))
+    );
+    let err = dataset
+        .merge_existing_index_segments(vec![segments.remove(0), reversed])
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("must share their keys"), "{err}");
+
+    dataset
+        .commit_existing_index_segments("items_idx", "items", vec![merged])
+        .await
+        .unwrap();
+    for single_build in [false, true] {
+        if single_build {
+            dataset
+                .create_index(
+                    &["items"],
+                    IndexType::Scalar,
+                    Some("items_idx".into()),
+                    &keys,
+                    true,
+                )
+                .await
+                .unwrap();
+        }
+        for (filter, expected) in [
+            ("any_element(items, 'a = 1 AND b = 2')", vec![0, 4]),
+            ("NOT any_element(items, 'a = 1 AND b = 2')", vec![2, 3, 7]),
+        ] {
+            for indexed in [false, true] {
+                let mut scan = dataset.scan();
+                scan.project(&["id"])
+                    .unwrap()
+                    .filter(filter)
+                    .unwrap()
+                    .use_scalar_index(indexed);
+                if indexed {
+                    let plan = scan.explain_plan(true).await.unwrap();
+                    assert!(plan.contains("ListElement("), "{plan}");
+                }
+                let batch = scan.try_into_batch().await.unwrap();
+                let mut ids = batch["id"].as_primitive::<Int32Type>().values().to_vec();
+                ids.sort_unstable();
+                assert_eq!(ids, expected);
+            }
+        }
+    }
+}
+
 /// Premise guard, not a regression test: confirms that a broken merged
 /// shape (the carried field appended once per merged segment) is actually
 /// rejected by `validate_covering_fields` under either covering layout, and

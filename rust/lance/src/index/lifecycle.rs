@@ -312,6 +312,12 @@ impl Dataset {
         let all_fmindex = source_segments.iter().all(segment_has_fmindex_details);
         let all_zonemap = source_segments.iter().all(segment_has_zonemap_details);
         let all_label_list = source_segments.iter().all(segment_has_label_list_details);
+        let all_list_element = source_segments.iter().all(|segment| {
+            segment
+                .index_details
+                .as_deref()
+                .is_some_and(scalar::list_element::is_list_element)
+        });
         let all_rtree = source_segments.iter().all(segment_has_rtree_details);
         let all_ngram = source_segments.iter().all(segment_has_ngram_details);
         let all_minhashlsh = source_segments.iter().all(segment_has_minhashlsh_details);
@@ -323,6 +329,7 @@ impl Dataset {
             && !all_fmindex
             && !all_zonemap
             && !all_label_list
+            && !all_list_element
             && !all_rtree
             && !all_ngram
             && !all_minhashlsh
@@ -428,6 +435,8 @@ impl Dataset {
             crate::index::scalar::label_list::merge_segments(self, source_segments, staged).await?
         } else if all_zonemap {
             crate::index::scalar::zonemap::merge_segments(self, source_segments, staged).await?
+        } else if all_list_element {
+            scalar::list_element::merge_segments(self, &source_segments, staged).await?
         } else if all_ngram {
             crate::index::scalar::ngram::merge_segments(self, source_segments, staged).await?
         } else if all_minhashlsh {

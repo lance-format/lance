@@ -92,7 +92,7 @@ use crate::{
     scalar::{
         AnyQuery, CreatedIndex, IndexStore, OldIndexDataFilter, RowIdRemapper, SargableQuery,
         ScalarIndex, ScalarIndexParams, SearchOptions, SearchResult, UpdateCriteria,
-        btree::{BTREE_ROW_ADDR_DOMAIN_VERSION, BTreeIndexPlugin},
+        btree::{BTREE_ROW_ADDR_DOMAIN_VERSION, BTreeIndex, BTreeIndexPlugin},
         expression::{IndexedExpression, ScalarQueryParser},
         registry::{
             BasicTrainer, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
@@ -930,6 +930,36 @@ impl ListElementIndex {
 
     fn wrap_target(&self, target: CreatedIndex) -> Result<CreatedIndex> {
         wrap_target(&self.codec, target)
+    }
+
+    /// Merge the encoded B-trees of segments with the same key definition.
+    pub async fn merge_segments(
+        segments: &[&Self],
+        dest_store: &dyn IndexStore,
+        filters: &[Option<OldIndexDataFilter>],
+    ) -> Result<CreatedIndex> {
+        let first = segments.first().ok_or_else(|| {
+            Error::invalid_input("cannot merge a list-element index without source segments")
+        })?;
+        let targets = segments
+            .iter()
+            .map(|segment| {
+                let target = segment
+                    .target
+                    .as_any()
+                    .downcast_ref::<BTreeIndex>()
+                    .ok_or_else(|| {
+                        Error::internal("expected a B-tree target for list-element merge")
+                    })?;
+                Ok(Arc::new(target.clone()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let new_data = Box::pin(RecordBatchStreamAdapter::new(
+            training_schema(),
+            futures::stream::empty(),
+        ));
+        let merged = BTreeIndex::merge_segments(&targets, new_data, dest_store, filters).await?;
+        first.wrap_target(merged)
     }
 
     /// TRUE rows of a B-tree search, ignoring the B-tree's own NULL tracking.
