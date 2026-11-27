@@ -25,20 +25,20 @@ pub struct BlobEntry {
 pub(super) struct ResolvedBlobSelection {
     pub(super) row_address: u64,
     pub(super) file: Option<BlobFile>,
-    pub(super) requested_range: Option<BlobReadRange>,
+    pub requested_range: Option<BlobReadRange>,
 }
 
 /// Physical read input derived from one [`BlobEntry`].
 #[derive(Debug)]
-pub(super) struct PlannedBlobRead {
-    pub(super) selection_index: usize,
-    pub(super) requested_range: Option<BlobReadRange>,
+pub struct PlannedBlobRead {
+    pub selection_index: usize,
+    pub requested_range: Option<BlobReadRange>,
     physical_range: Range<u64>,
 }
 
 /// A slice of one disjoint physical range submitted to the file scheduler.
 #[derive(Debug)]
-pub(super) struct PlannedBlobReadSlice {
+pub struct PlannedBlobReadSlice {
     pub(super) read_index: usize,
     pub(super) physical_range_index: usize,
     pub(super) relative_range: Range<u64>,
@@ -54,16 +54,18 @@ struct SourcePlannedBlobRead {
 
 /// One per-source read plan emitted by `read_blobs`.
 #[derive(Debug)]
-pub(super) struct BlobReadPlan {
+pub struct BlobReadPlan {
     source_key: BlobSourceKey,
-    pub(super) source: Arc<BlobSource>,
-    pub(super) reads: Vec<PlannedBlobRead>,
+    pub source: Arc<BlobSource>,
+    pub reads: Vec<PlannedBlobRead>,
 }
 
 /// A payload-bounded group of per-source plans.
 #[derive(Debug)]
-pub(super) struct BlobReadBatch {
-    pub(super) plans: Vec<BlobReadPlan>,
+pub struct BlobReadBatch {
+    pub plans: Vec<BlobReadPlan>,
+    pub physical_bytes: u64,
+    pub materialized_bytes: u64,
 }
 
 #[derive(Debug)]
@@ -184,8 +186,18 @@ impl BlobReadBatchFootprint {
 /// by physical source. Each batch accounts for the physical spans that the file
 /// scheduler will read after coalescing nearby ranges.
 pub(super) fn plan_blob_read_batches(
+    entries: Vec<BlobEntry>,
+    physical_buffer_size: u64,
+) -> Result<Vec<BlobReadBatch>> {
+    plan_blob_read_batches_with_limits(entries, physical_buffer_size, None)
+}
+
+/// Bound both physical spans and the logical output, charging duplicate results
+/// separately even when their payload buffers can share one physical read.
+pub fn plan_blob_read_batches_with_limits(
     mut entries: Vec<BlobEntry>,
     physical_buffer_size: u64,
+    materialization_limit: Option<u64>,
 ) -> Result<Vec<BlobReadBatch>> {
     debug_assert!(physical_buffer_size > 0);
     entries.sort_by_key(|entry| entry.selection_index);
@@ -194,17 +206,41 @@ pub(super) fn plan_blob_read_batches(
     let mut batches = Vec::new();
     let mut current_reads = Vec::new();
     let mut footprint = BlobReadBatchFootprint::default();
+    let mut logical_bytes = 0_u64;
     for planned in planned_reads {
-        if !footprint.try_insert(&planned, physical_buffer_size, current_reads.is_empty())? {
-            batches.push(into_blob_read_batch(std::mem::take(&mut current_reads)));
+        let bytes = planned.read.physical_range.end - planned.read.physical_range.start;
+        let next_logical = logical_bytes.checked_add(bytes).ok_or_else(|| {
+            Error::invalid_input("Blob reference logical output size overflows u64")
+        })?;
+        let physical_limit = materialization_limit
+            .map(|limit| limit.saturating_sub(next_logical).min(physical_buffer_size))
+            .unwrap_or(physical_buffer_size);
+        let fits = materialization_limit.is_none_or(|limit| {
+            next_logical <= limit && footprint.physical_bytes <= physical_limit
+        });
+        if !(current_reads.is_empty() || fits)
+            || !footprint.try_insert(&planned, physical_limit, current_reads.is_empty())?
+        {
+            batches.push(into_blob_read_batch(
+                std::mem::take(&mut current_reads),
+                footprint.physical_bytes,
+                logical_bytes,
+            )?);
             footprint = BlobReadBatchFootprint::default();
             let inserted = footprint.try_insert(&planned, physical_buffer_size, true)?;
             debug_assert!(inserted, "an empty batch must accept one physical read");
+            logical_bytes = bytes;
+        } else {
+            logical_bytes = next_logical;
         }
         current_reads.push(planned);
     }
     if !current_reads.is_empty() {
-        batches.push(into_blob_read_batch(current_reads));
+        batches.push(into_blob_read_batch(
+            current_reads,
+            footprint.physical_bytes,
+            logical_bytes,
+        )?);
     }
 
     Ok(batches)
@@ -238,10 +274,18 @@ fn plan_blob_reads(entries: Vec<BlobEntry>) -> Result<Vec<SourcePlannedBlobRead>
     Ok(planned_reads)
 }
 
-fn into_blob_read_batch(planned_reads: Vec<SourcePlannedBlobRead>) -> BlobReadBatch {
-    BlobReadBatch {
+fn into_blob_read_batch(
+    planned_reads: Vec<SourcePlannedBlobRead>,
+    physical_bytes: u64,
+    logical_bytes: u64,
+) -> Result<BlobReadBatch> {
+    Ok(BlobReadBatch {
         plans: group_blob_read_plans(planned_reads),
-    }
+        physical_bytes,
+        materialized_bytes: physical_bytes.checked_add(logical_bytes).ok_or_else(|| {
+            Error::invalid_input("Blob reference materialization charge overflows u64")
+        })?,
+    })
 }
 
 /// Group selected blobs by physical source and sort each group's ranges by
@@ -334,6 +378,7 @@ pub(super) fn plan_disjoint_blob_reads(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
 
     use crate::blob::file::{BlobFile, BlobSource};
     use crate::blob::read::{BlobReadRange, ReadBlobsExecution, execute_blob_read_batches_stream};
@@ -391,6 +436,41 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(selection_indices, vec![vec![0], vec![1]]);
+    }
+
+    #[rstest]
+    #[case::below(11, 2)]
+    #[case::exact(12, 1)]
+    #[case::above(13, 1)]
+    fn duplicate_output_budget_boundary(
+        #[case] materialization_limit: u64,
+        #[case] expected_batches: usize,
+        #[values(3, 4, 5)] io_limit: u64,
+    ) {
+        let (store, _) = recording_range_store(Bytes::from_static(b"abcd"));
+        let source = Arc::new(BlobSource::new(store, Path::from("blobs/test.bin")));
+        let entries = (0..2)
+            .map(|selection_index| BlobEntry {
+                selection_index,
+                file: BlobFile::with_source(source.clone(), 0, 4, BlobKind::Packed, None),
+                requested_range: None,
+            })
+            .collect();
+        let batches =
+            plan_blob_read_batches_with_limits(entries, io_limit, Some(materialization_limit))
+                .unwrap();
+        let expected_batches = if io_limit < 4 { 2 } else { expected_batches };
+        assert_eq!(batches.len(), expected_batches);
+        for batch in &batches {
+            assert_eq!(batch.physical_bytes, 4);
+            let count = batch
+                .plans
+                .iter()
+                .map(|plan| plan.reads.len())
+                .sum::<usize>();
+            assert_eq!(batch.materialized_bytes, 4 + count as u64 * 4);
+            assert_eq!(count, if expected_batches == 1 { 2 } else { 1 });
+        }
     }
 
     #[tokio::test]

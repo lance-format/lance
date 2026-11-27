@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-mod plan;
+pub(super) mod plan;
+pub(super) mod reservation;
 mod selection;
 
 use std::{
@@ -15,7 +16,7 @@ use bytes::Bytes;
 use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt, stream};
 use lance_io::object_store::ObjectStore;
-use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
+use lance_io::scheduler::{IoStats, ScanScheduler, SchedulerConfig};
 
 pub use self::plan::BlobEntry;
 use self::plan::{
@@ -706,22 +707,25 @@ impl ReadBlobFilesBuilder {
     }
 }
 
-/// Operation-scoped scheduler cache for one [`ReadBlobsBuilder`] execution.
+/// Scheduler cache shared by one operation or materialization context.
 ///
-/// We reuse one [`ScanScheduler`] per store instance, keeping different
-/// credentials and endpoints isolated without retaining a scheduler for every
-/// object visited by a streaming scan. Payload grouping remains per source.
+/// Each authenticated object-store instance gets its own [`ScanScheduler`]. A
+/// reference-reader batch can attach reservations retained by its active readers.
 #[derive(Debug)]
 pub struct ReadBlobsExecution {
-    io_buffer_size_bytes: Option<u64>,
-    schedulers: std::sync::Mutex<HashMap<usize, Arc<ScanScheduler>>>,
+    pub io_buffer_size_bytes: Option<u64>,
+    pub schedulers: Arc<std::sync::Mutex<HashMap<usize, Arc<ScanScheduler>>>>,
+    pub reservation: Option<Arc<reservation::ReadReservation>>,
+    pub io_stats: Option<IoStats>,
 }
 
 impl ReadBlobsExecution {
     pub fn new(io_buffer_size_bytes: Option<u64>) -> Self {
         Self {
             io_buffer_size_bytes,
-            schedulers: std::sync::Mutex::new(HashMap::new()),
+            schedulers: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            reservation: None,
+            io_stats: None,
         }
     }
 
@@ -999,7 +1003,7 @@ fn into_read_blob_range(blob: IndexedReadBlob, row_address: u64) -> Result<ReadB
 }
 
 /// Execute one per-source blob read plan with a single scheduler submission.
-async fn execute_blob_read_plan(
+pub async fn execute_blob_read_plan(
     task: BlobReadPlan,
     execution: Arc<ReadBlobsExecution>,
 ) -> Result<Vec<IndexedReadBlob>> {
@@ -1010,7 +1014,17 @@ async fn execute_blob_read_plan(
         // The plan already bounds physical reads; probing the backing object's
         // size would add a metadata request without validating the blob slice.
         let reader = task.source.object_store.open(&task.source.path).await?;
-        let file_scheduler = scheduler.open_reader(reader.into());
+        let reader = match &execution.reservation {
+            Some(reservation) => Arc::new(reservation::ReservedReader {
+                reader: reader.into(),
+                reservation: reservation.clone(),
+            }) as Arc<dyn lance_io::traits::Reader>,
+            None => reader.into(),
+        };
+        let mut file_scheduler = scheduler.open_reader(reader);
+        if let Some(stats) = &execution.io_stats {
+            file_scheduler = file_scheduler.with_io_stats(stats.recorder());
+        }
         let priority = first_range.start;
         let physical_range_count = physical_ranges.len();
         let returned = file_scheduler

@@ -10,7 +10,7 @@ use lance_core::{Error, Result};
 use lance_table::transaction::Transaction;
 
 use crate::Table;
-use crate::caches::TransactionKey;
+use crate::caches::ManifestTransactionKey;
 
 struct NewTransactionResult<'a> {
     dataset: BoxFuture<'a, Result<Table>>,
@@ -96,26 +96,32 @@ fn load_new_transactions(
                 return Ok((version, Arc::new(transaction)));
             }
 
-            let tx_key = TransactionKey { version };
-            let transaction =
-                if let Some(cached) = dataset.state.metadata_cache.get_with_key(&tx_key).await {
-                    cached
-                } else {
-                    let mut dataset_version = dataset.clone();
-                    dataset_version.set_manifest(manifest, location);
-                    let loaded = Arc::new(
-                        dataset_version
-                            .read_transaction()
-                            .await?
-                            .ok_or_else(missing_transaction)?,
-                    );
+            let tx_key = ManifestTransactionKey::new(&dataset.state.object_store, &location);
+            let cached = if let Some(key) = &tx_key {
+                dataset.state.metadata_cache.get_with_key(key).await
+            } else {
+                None
+            };
+            let transaction = if let Some(cached) = cached {
+                cached
+            } else {
+                let mut dataset_version = dataset.clone();
+                dataset_version.set_manifest(manifest, location.clone());
+                let loaded = Arc::new(
+                    dataset_version
+                        .read_transaction()
+                        .await?
+                        .ok_or_else(missing_transaction)?,
+                );
+                if let Some(key) = &tx_key {
                     dataset
                         .state
                         .metadata_cache
-                        .insert_with_key(&tx_key, loaded.clone())
+                        .insert_with_key(key, loaded.clone())
                         .await;
-                    loaded
-                };
+                }
+                loaded
+            };
             Ok((version, transaction))
         })
         .try_buffer_unordered(stage_parallelism);

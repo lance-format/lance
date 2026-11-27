@@ -29,20 +29,25 @@ impl Table {
     /// This listing retains the stored coverage. A legacy fragment-reuse
     /// history can translate that coverage to different fragment IDs.
     pub async fn load_index_metadata(&self) -> Result<Arc<Vec<IndexMetadata>>> {
-        self.index_cache()
-            .get_or_insert_with_key(self.index_metadata_key(), || async {
-                let indices = read_manifest_indexes(
-                    &self.state.object_store,
-                    &self.state.manifest_location,
-                    &self.manifest,
-                )
-                .await?;
-                self.state
-                    .session
-                    .observe_index_metadata(&self.manifest, &indices);
-                Ok(indices)
-            })
-            .await
+        let load = || async {
+            let indices = read_manifest_indexes(
+                &self.state.object_store,
+                &self.state.manifest_location,
+                &self.manifest,
+            )
+            .await?;
+            self.state
+                .session
+                .observe_index_metadata(&self.manifest, &indices);
+            Ok(indices)
+        };
+        if self.state.manifest_location.e_tag.is_some() {
+            self.index_cache()
+                .get_or_insert_with_key(self.index_metadata_key(), load)
+                .await
+        } else {
+            Ok(Arc::new(load().await?))
+        }
     }
 
     pub(crate) fn index_metadata_key(&self) -> IndexMetadataKey<'_> {
@@ -100,12 +105,13 @@ pub async fn load_all_indices(
             .iter()
             .any(|index| hook.needs_legacy_details(table, index))
     {
-        let inferred_key =
-            hook.legacy_details_cache_namespace()
-                .map(|namespace| InferredIndexListingKey {
-                    snapshot: key,
-                    namespace,
-                });
+        let inferred_key = hook
+            .legacy_details_cache_namespace()
+            .filter(|_| key.e_tag.is_some())
+            .map(|namespace| InferredIndexListingKey {
+                snapshot: key,
+                namespace,
+            });
         if let Some(key) = &inferred_key
             && let Some(cached) = table.index_cache().get_with_key(key).await
         {
@@ -168,7 +174,9 @@ async fn listing_with_v0_coverage(
         }
         return Ok(raw);
     }
-    if let Some(cached) = table.index_cache().get_with_key(&key).await {
+    if key.e_tag.is_some()
+        && let Some(cached) = table.index_cache().get_with_key(&key).await
+    {
         return Ok(cached);
     }
     let history = open_v0_frag_reuse_index(table, fri).await?;
@@ -179,10 +187,12 @@ async fn listing_with_v0_coverage(
         }
     }
     let remapped = Arc::new(remapped);
-    table
-        .index_cache()
-        .insert_with_key(&key, remapped.clone())
-        .await;
+    if key.e_tag.is_some() {
+        table
+            .index_cache()
+            .insert_with_key(&key, remapped.clone())
+            .await;
+    }
     Ok(remapped)
 }
 
@@ -266,4 +276,45 @@ pub(super) async fn validate_new_segments(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::TableBuilder;
+
+    #[tokio::test]
+    async fn legacy_derived_listing_does_not_reuse_cache_without_generation() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test_data/fri_straddle_pre_6610/fri_straddle_dataset");
+        let mut table = TableBuilder::from_uri(path.to_str().unwrap())
+            .load()
+            .await
+            .unwrap();
+        table.state.manifest_location.e_tag = None;
+        let raw = table.load_index_metadata().await.unwrap();
+        assert!(
+            raw.iter()
+                .any(|index| { index.name == FRAG_REUSE_INDEX_NAME && index.index_version == 0 })
+        );
+        let key = DerivedIndexListingKey {
+            version: table.version_id(),
+            store_identity: &table.state.object_store.store_prefix,
+            e_tag: None,
+        };
+        // An earlier incarnation at this URI/version left an empty listing.
+        table
+            .index_cache()
+            .insert_with_key(&key, Arc::new(Vec::new()))
+            .await;
+        let actual = listing_with_v0_coverage(&table, raw.clone(), key)
+            .await
+            .unwrap();
+        assert_eq!(actual.len(), raw.len());
+        assert!(
+            actual
+                .iter()
+                .any(|index| index.name == FRAG_REUSE_INDEX_NAME)
+        );
+    }
 }

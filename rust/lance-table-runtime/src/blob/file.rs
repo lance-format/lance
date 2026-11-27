@@ -30,9 +30,9 @@ use lance_core::{Error, Result};
 /// concurrent reads can be opportunistically grouped before reaching Lance's
 /// existing I/O scheduler.
 #[derive(Debug)]
-pub(super) struct BlobSource {
-    pub(super) object_store: Arc<ObjectStore>,
-    pub(super) path: Path,
+pub struct BlobSource {
+    pub object_store: Arc<ObjectStore>,
+    pub path: Path,
     scheduler: OnceCell<FileScheduler>,
     pending_reads: Mutex<PendingBlobReads>,
     /// Calls to [`BlobSource::read_ranges`]. Shared by every handle on this
@@ -42,7 +42,7 @@ pub(super) struct BlobSource {
 
 impl BlobSource {
     /// Create a shared read context for one physical backing object.
-    pub(super) fn new(object_store: Arc<ObjectStore>, path: Path) -> Self {
+    pub fn new(object_store: Arc<ObjectStore>, path: Path) -> Self {
         Self {
             object_store,
             path,
@@ -232,7 +232,7 @@ async fn fulfill_pending_blob_reads(scheduler: &FileScheduler, batch: Vec<Pendin
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(super) struct BlobSourceKey {
     pub(super) store_id: usize,
-    pub(super) path: String,
+    pub path: String,
 }
 
 impl BlobSourceKey {
@@ -280,7 +280,7 @@ impl BlobFile {
     /// Default sequential read-ahead size in bytes.
     pub const DEFAULT_READ_BUFFER_SIZE: usize = 512 * 1024;
 
-    pub(super) fn with_source(
+    pub fn with_source(
         source: Arc<BlobSource>,
         position: u64,
         size: u64,

@@ -26,8 +26,10 @@ use lance_core::datatypes::{BlobVersion, Field as LanceField, Schema};
 use lance_core::{Error, ROW_ADDR, Result};
 
 #[derive(Debug)]
-pub(super) struct BlobMaterializationBudget {
-    limit: u64,
+#[doc(hidden)]
+pub struct BlobMaterializationBudget {
+    #[doc(hidden)]
+    pub limit: u64,
     pub(super) state: std::sync::Mutex<BlobMaterializationBudgetState>,
     notify: Notify,
 }
@@ -38,7 +40,6 @@ pub(super) struct BlobMaterializationBudgetState {
     next_ticket: u64,
     serving_ticket: u64,
     cancelled_tickets: HashSet<u64>,
-    #[cfg(any(test, feature = "test-util"))]
     peak_reserved: u64,
 }
 
@@ -51,7 +52,7 @@ impl BlobMaterializationBudgetState {
 }
 
 impl BlobMaterializationBudget {
-    fn admission(self: &Arc<Self>) -> BlobMaterializationAdmission {
+    pub fn admission(self: &Arc<Self>) -> BlobMaterializationAdmission {
         let ticket = {
             let mut state = self.state.lock().unwrap();
             let ticket = state.next_ticket;
@@ -71,6 +72,8 @@ impl BlobMaterializationBudget {
     }
 }
 
+/// A FIFO position for reserving materialization bytes. Dropping an unfulfilled
+/// admission cancels its position without blocking later callers.
 pub struct BlobMaterializationAdmission {
     budget: Option<Arc<BlobMaterializationBudget>>,
     ticket: u64,
@@ -78,7 +81,10 @@ pub struct BlobMaterializationAdmission {
 }
 
 impl BlobMaterializationAdmission {
-    async fn reserve(mut self, bytes: u64) -> Option<BlobMaterializationReservation> {
+    /// Wait for `bytes` of capacity. The returned reservation releases capacity
+    /// when dropped. One oversized reservation may run alone when the budget is idle.
+    /// An internally unbounded context returns `None`.
+    pub async fn reserve(mut self, bytes: u64) -> Option<BlobMaterializationReservation> {
         let Some(budget) = self.budget.clone() else {
             self.acquired = true;
             return None;
@@ -91,10 +97,7 @@ impl BlobMaterializationAdmission {
                 let oversized_and_idle = state.reserved == 0 && bytes > budget.limit;
                 if self.ticket == state.serving_ticket && (fits || oversized_and_idle) {
                     state.reserved = state.reserved.saturating_add(bytes);
-                    #[cfg(any(test, feature = "test-util"))]
-                    {
-                        state.peak_reserved = state.peak_reserved.max(state.reserved);
-                    }
+                    state.peak_reserved = state.peak_reserved.max(state.reserved);
                     state.serving_ticket = state.serving_ticket.wrapping_add(1);
                     state.skip_cancelled();
                     self.acquired = true;
@@ -131,9 +134,18 @@ impl Drop for BlobMaterializationAdmission {
 }
 
 #[derive(Debug)]
-struct BlobMaterializationReservation {
+/// Ownership of reserved materialization bytes. Drop this value after the
+/// corresponding output has been consumed, including any copies made by an adapter.
+pub struct BlobMaterializationReservation {
     budget: Arc<BlobMaterializationBudget>,
     bytes: u64,
+}
+
+impl BlobMaterializationReservation {
+    /// Number of bytes held until this reservation is dropped.
+    pub fn bytes(&self) -> u64 {
+        self.bytes
+    }
 }
 
 impl Drop for BlobMaterializationReservation {
@@ -148,8 +160,12 @@ impl Drop for BlobMaterializationReservation {
 /// Shared state for asynchronously materializing blob v2 descriptor batches.
 #[derive(Debug)]
 pub struct BlobMaterializationContext {
-    execution: Arc<ReadBlobsExecution>,
-    pub(super) budget: Option<Arc<BlobMaterializationBudget>>,
+    #[doc(hidden)]
+    pub execution: Arc<ReadBlobsExecution>,
+    #[doc(hidden)]
+    pub budget: Option<Arc<BlobMaterializationBudget>>,
+    #[doc(hidden)]
+    pub io_budget: Option<Arc<BlobMaterializationBudget>>,
 }
 
 impl BlobMaterializationContext {
@@ -167,10 +183,55 @@ impl BlobMaterializationContext {
                     notify: Notify::new(),
                 })
             }),
+            io_budget: io_buffer_size_bytes.map(|limit| {
+                Arc::new(BlobMaterializationBudget {
+                    limit,
+                    state: std::sync::Mutex::new(BlobMaterializationBudgetState::default()),
+                    notify: Notify::new(),
+                })
+            }),
         })
     }
 
-    #[doc(hidden)]
+    /// Create a shared context with finite, nonzero I/O and materialization limits.
+    ///
+    /// Reference readers sharing this context share both budgets and schedulers.
+    /// A single request larger than a limit is admitted alone; these limits do
+    /// not impose a hard cap on the size of one blob.
+    ///
+    /// ```
+    /// use lance_table_runtime::blob::BlobMaterializationContext;
+    /// let context = BlobMaterializationContext::try_new(1 << 20, 8 << 20)?;
+    /// # Ok::<(), lance_core::Error>(())
+    /// ```
+    pub fn try_new(
+        io_buffer_size_bytes: u64,
+        materialization_readahead_bytes: u64,
+    ) -> Result<Arc<Self>> {
+        if io_buffer_size_bytes == 0 || materialization_readahead_bytes == 0 {
+            return Err(Error::invalid_input(format!(
+                "Blob budgets must be nonzero: io_buffer_size_bytes={io_buffer_size_bytes}, materialization_readahead_bytes={materialization_readahead_bytes}"
+            )));
+        }
+        Ok(Self::new(
+            Some(io_buffer_size_bytes),
+            Some(materialization_readahead_bytes),
+        ))
+    }
+
+    /// Reserve a FIFO position before waiting for materialization capacity.
+    ///
+    /// ```
+    /// # use lance_table_runtime::blob::BlobMaterializationContext;
+    /// # async fn example() -> lance_core::Result<()> {
+    /// let budget = BlobMaterializationContext::try_new(1024, 4096)?;
+    /// let reservation = budget.admission().reserve(128).await;
+    /// assert_eq!(reservation.as_ref().map(|reservation| reservation.bytes()), Some(128));
+    /// // Retain this reservation alongside an adapter's separately allocated output.
+    /// drop(reservation);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn admission(&self) -> BlobMaterializationAdmission {
         match &self.budget {
             Some(budget) => budget.admission(),
@@ -180,6 +241,55 @@ impl BlobMaterializationContext {
                 acquired: false,
             },
         }
+    }
+
+    /// Materialization bytes currently owned by active reads or returned buffers.
+    pub fn reserved_bytes(&self) -> Result<u64> {
+        self.budget
+            .as_ref()
+            .map(|budget| {
+                budget
+                    .state
+                    .lock()
+                    .map(|state| state.reserved)
+                    .map_err(|_| Error::internal("Blob materialization budget lock was poisoned"))
+            })
+            .transpose()
+            .map(|bytes| bytes.unwrap_or(0))
+    }
+
+    /// Physical bytes admitted by reference readers and still in flight.
+    pub fn io_reserved_bytes(&self) -> Result<u64> {
+        self.io_budget
+            .as_ref()
+            .map(|budget| {
+                budget
+                    .state
+                    .lock()
+                    .map(|state| state.reserved)
+                    .map_err(|_| Error::internal("Blob I/O budget lock was poisoned"))
+            })
+            .transpose()
+            .map(|bytes| bytes.unwrap_or(0))
+    }
+
+    /// Peak materialization and I/O reservations across readers sharing this context.
+    #[doc(hidden)]
+    pub fn reservation_peaks(&self) -> Result<(u64, u64)> {
+        let peak = |budget: &Option<Arc<BlobMaterializationBudget>>| -> Result<u64> {
+            budget
+                .as_ref()
+                .map(|budget| {
+                    budget
+                        .state
+                        .lock()
+                        .map(|state| state.peak_reserved)
+                        .map_err(|_| Error::internal("Blob reservation budget lock was poisoned"))
+                })
+                .transpose()
+                .map(|value| value.unwrap_or(0))
+        };
+        Ok((peak(&self.budget)?, peak(&self.io_budget)?))
     }
 
     #[cfg(any(test, feature = "test-util"))]

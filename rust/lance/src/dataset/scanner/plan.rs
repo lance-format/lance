@@ -24,6 +24,7 @@ use datafusion::logical_expr::Expr;
 use datafusion::physical_expr::PhysicalSortExpr;
 use datafusion::physical_optimizer::output_requirements::OutputRequirementExec;
 use datafusion::physical_plan::display::DisplayableExecutionPlan;
+use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::physical_plan::projection::ProjectionExec as DFProjectionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::{ExecutionPlan, SendableRecordBatchStream, expressions};
@@ -33,7 +34,7 @@ use futures::future::BoxFuture;
 use futures::stream::StreamExt;
 use futures::{FutureExt, TryStreamExt};
 use lance_arrow::DataTypeExt;
-use lance_core::datatypes::{Field, OnMissing, Projection};
+use lance_core::datatypes::{BlobHandling, Field, OnMissing, Projection};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{ROW_ADDR, ROW_ID, ROW_OFFSET};
 use lance_datafusion::exec::{
@@ -426,13 +427,87 @@ impl Scanner {
             self.collect_late_field_ids(field, false, &mut late_ids);
         }
 
-        // Start with the desired fields
-        Ok(desired_projection
+        let mut projection = desired_projection
             .clone()
-            // Subtract columns that are expensive
             .subtract_predicate(|f| late_ids.contains(&f.id))
-            // Add back columns that we need for filtering
-            .union_schema(&filter_schema))
+            .union_schema(&filter_schema);
+        let descriptor_ids = filter_schema
+            .fields_pre_order()
+            .filter(|field| field.is_blob_v2())
+            .map(|field| field.id)
+            .collect::<HashSet<_>>();
+        if !descriptor_ids.is_empty() {
+            // Filter expressions use descriptors; fetch requested payloads after refinement.
+            // Preserve the caller's handling for all other blob and binary fields.
+            let binary_ids = self
+                .dataset
+                .schema()
+                .fields_pre_order()
+                .filter(|field| {
+                    !desired_projection.blob_handling.returns_description(field)
+                        && !descriptor_ids.contains(&field.id)
+                })
+                .map(|field| field.id as u32)
+                .collect();
+            projection.blob_handling = BlobHandling::SomeBinary(binary_ids);
+        }
+        Ok(projection)
+    }
+
+    pub(super) fn ordering_projection(&self, ordering: &[ColumnOrdering]) -> Result<Projection> {
+        // Descriptor fields such as `size` are synthesized and may be absent
+        // from the stored schema. Resolve sort keys against their read schema.
+        let descriptor_schema = self
+            .dataset
+            .full_projection()
+            .with_blob_handling(BlobHandling::AllDescriptions)
+            .into_schema();
+        let descriptor_ids = ordering
+            .iter()
+            .filter_map(|column| descriptor_schema.resolve_case_insensitive(&column.column_name))
+            .flat_map(|fields| fields.into_iter().rev().skip(1))
+            .filter(|field| field.is_blob_v2())
+            .map(|field| field.id)
+            .collect::<HashSet<_>>();
+        let binary_ids = self
+            .dataset
+            .schema()
+            .fields_pre_order()
+            .filter(|field| {
+                !self.blob_handling.returns_description(field)
+                    && !descriptor_ids.contains(&field.id)
+            })
+            .map(|field| field.id as u32)
+            .collect();
+        self.dataset
+            .empty_projection()
+            .with_blob_handling(BlobHandling::SomeBinary(binary_ids))
+            .union_columns(
+                ordering.iter().map(|col| &col.column_name),
+                OnMissing::Error,
+            )
+    }
+
+    pub(super) fn ordering_content_projection(
+        &self,
+        ordering: &[ColumnOrdering],
+    ) -> Result<Projection> {
+        let descriptor_schema = self
+            .dataset
+            .full_projection()
+            .with_blob_handling(BlobHandling::AllDescriptions)
+            .into_schema();
+        self.dataset
+            .empty_projection()
+            .with_blob_handling(self.blob_handling.clone())
+            .union_columns(
+                ordering.iter().filter_map(|column| {
+                    let fields = descriptor_schema.resolve_case_insensitive(&column.column_name)?;
+                    (!fields.iter().rev().skip(1).any(|field| field.is_blob_v2()))
+                        .then_some(&column.column_name)
+                }),
+                OnMissing::Error,
+            )
     }
 
     // Collects the ids of the fields that should be materialized late (see calc_eager_projection).
@@ -451,6 +526,25 @@ impl Scanner {
     }
 
     fn validate_options(&self) -> Result<()> {
+        if let Some(ordering) = &self.ordering {
+            for column in ordering {
+                let mut fields = self
+                    .dataset
+                    .schema()
+                    .field_case_insensitive(&column.column_name)
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                while let Some(field) = fields.pop() {
+                    if field.is_blob_v2() && self.blob_handling.returns_description(field) {
+                        return Err(Error::invalid_input(format!(
+                            "Ordering by Blob V2 contents in '{}' requires binary blob handling; order by an explicit descriptor subfield for metadata ordering",
+                            column.column_name
+                        )));
+                    }
+                    fields.extend(&field.children);
+                }
+            }
+        }
         if let Some(query) = &self.nearest {
             query.validate_search_effort()?;
         }
@@ -923,7 +1017,7 @@ impl Scanner {
             }
         };
 
-        // Load columns needed for filter and ordering
+        // Filters use the descriptor schema, independently of the requested output representation.
         let mut pre_filter_projection = self.dataset.empty_projection();
 
         // We may need to take filter columns if we are going to refine
@@ -933,17 +1027,6 @@ impl Scanner {
             pre_filter_projection = pre_filter_projection.union_columns(
                 filter_plan.refine_columns(&self.dataset).await?,
                 OnMissing::Ignore,
-            )?;
-        }
-
-        // TODO: Does it always make sense to take the ordering columns here?  If there is a filter then
-        // maybe we wait until after the filter to take the ordering columns?  Maybe it would be better to
-        // grab the ordering column in the initial scan (if it is eager) and if it isn't then we should
-        // take it after the filtering phase, if any (we already have a take there).
-        if let Some(ordering) = &self.ordering {
-            pre_filter_projection = pre_filter_projection.union_columns(
-                ordering.iter().map(|col| &col.column_name),
-                OnMissing::Error,
             )?;
         }
 
@@ -979,24 +1062,70 @@ impl Scanner {
             return Ok(plan);
         }
 
-        // Sort
+        // Descriptor subfields remain metadata even when the output requests bytes.
         if let Some(ordering) = &self.ordering {
-            let ordering_columns = ordering.iter().map(|col| &col.column_name);
-            let projection_with_ordering = self
-                .dataset
-                .empty_projection()
-                .union_columns(ordering_columns, OnMissing::Error)?;
-            // We haven't loaded the sort column yet so take it now
-            plan = self.take(plan, projection_with_ordering)?;
+            let projection_with_ordering = self.ordering_projection(ordering)?;
+            plan = self.take(plan, projection_with_ordering.clone())?;
+            let content_projection = self.ordering_content_projection(ordering)?;
+            let needs_both_representations =
+                self.dataset.schema().fields_pre_order().any(|field| {
+                    field.is_blob_v2()
+                        && content_projection.field_ids.contains(&field.id)
+                        && !content_projection.blob_handling.returns_description(field)
+                        && projection_with_ordering
+                            .blob_handling
+                            .returns_description(field)
+                });
+            let mut metadata_aliases = vec![None; ordering.len()];
+            if needs_both_representations {
+                // Preserve metadata keys before taking the same blob as bytes.
+                // A column's descriptor and payload cannot share one physical field.
+                let input_schema = plan.schema();
+                let mut projection_exprs = input_schema
+                    .fields()
+                    .iter()
+                    .map(|field| {
+                        Ok((
+                            expressions::col(field.name(), input_schema.as_ref())?,
+                            field.name().clone(),
+                        ))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                for (index, column) in ordering.iter().enumerate() {
+                    let Some(fields) = self
+                        .dataset
+                        .schema()
+                        .resolve_case_insensitive(&column.column_name)
+                    else {
+                        continue;
+                    };
+                    if !fields.iter().rev().skip(1).any(|field| field.is_blob_v2()) {
+                        continue;
+                    }
+                    let mut alias = format!("__lance_blob_sort_{index}");
+                    while projection_exprs.iter().any(|(_, name)| name == &alias) {
+                        alias.push('_');
+                    }
+                    projection_exprs.push((
+                        Self::create_column_expr(&column.column_name, input_schema.as_ref())?,
+                        alias.clone(),
+                    ));
+                    metadata_aliases[index] = Some(alias);
+                }
+                plan = Arc::new(DFProjectionExec::try_new(projection_exprs, plan)?);
+                plan = self.take(plan, content_projection)?;
+            }
             let col_exprs = ordering
                 .iter()
-                .map(|col| {
+                .enumerate()
+                .map(|(index, col)| {
                     Ok(PhysicalSortExpr {
-                        expr: Self::create_column_expr(
-                            &col.column_name,
-                            &self.dataset,
-                            plan.schema().as_ref(),
-                        )?,
+                        expr: match &metadata_aliases[index] {
+                            Some(alias) => expressions::col(alias, plan.schema().as_ref())?,
+                            None => {
+                                Self::create_column_expr(&col.column_name, plan.schema().as_ref())?
+                            }
+                        },
                         options: SortOptions {
                             descending: !col.ascending,
                             nulls_first: col.nulls_first,
@@ -1032,6 +1161,11 @@ impl Scanner {
             .and_then(|ordering| Self::ordering_in_output(ordering, &final_projection));
 
         plan = Arc::new(DFProjectionExec::try_new(final_projection, plan)?);
+
+        // Avoid zero-capacity Top-K sorting and payload reads while preserving the output schema.
+        if self.limit == Some(0) {
+            return Ok(Arc::new(EmptyExec::new(plan.schema())));
+        }
 
         // If requested, apply a strict batch size to the final output
         if self.strict_batch_size {

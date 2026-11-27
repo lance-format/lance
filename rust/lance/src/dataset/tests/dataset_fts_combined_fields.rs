@@ -26,6 +26,7 @@ use arrow_array::{
 use arrow_buffer::{OffsetBuffer, ScalarBuffer};
 use arrow_schema::{DataType, Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema};
 use lance_core::ROW_ID;
+use lance_core::datatypes::format_field_path_minimal;
 use lance_core::utils::tempfile::TempStrDir;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::FullTextSearchQuery;
@@ -2591,12 +2592,19 @@ async fn test_fts_combined_fields_deletions_then_optimize() {
     }
 }
 
+#[rstest]
+#[case::distinct_names(["a", "b"])]
+#[case::distinct_mixed_case(["A", "b"])]
+#[case::case_distinct_names(["A", "a"])]
+#[case::case_distinct_quoted_names(["A.x", "a.x"])]
 #[tokio::test]
-async fn test_fts_combined_fields_nested_columns() {
+async fn test_fts_combined_fields_nested_columns(
+    #[case] names: [&str; 2],
+    #[values(false, true)] reverse_fields: bool,
+) {
     // Nested target columns: the flat plan projects the struct column from storage,
-    // so it calls `ensure_column_alias` once per target column to expose `s.a` and
-    // `s.b` as top-level names the exec can resolve. Both aliases survive only
-    // because one projection is nested inside the other.
+    // so it calls `ensure_column_alias` once per target column. An existing alias
+    // must not shadow the next exact nested path, even if only its case differs.
     let params = combined_fields_test_params();
     let a_values = [
         Some("zz zz"),
@@ -2604,6 +2612,9 @@ async fn test_fts_combined_fields_nested_columns() {
         Some("aa"),
         Some("zz"),
         Some("aa aa"),
+        None,
+        Some(""),
+        Some("aa"),
     ];
     let b_values = [
         Some("zz"),
@@ -2611,19 +2622,31 @@ async fn test_fts_combined_fields_nested_columns() {
         Some("zz"),
         Some("aa aa"),
         Some("aa"),
+        Some("aa"),
+        Some("aa"),
+        None,
     ];
 
-    let first = nested_fts_batch(vec![0, 1], a_values[..2].to_vec(), b_values[..2].to_vec());
-    let test_uri = TempStrDir::default();
-    let mut dataset = write_fts_dataset(&test_uri, first, None).await;
-    create_inverted_indices(&mut dataset, &["s.a", "s.b"], &params).await;
+    let batch = nested_fts_batch((0..8).collect(), a_values.to_vec(), b_values.to_vec());
+    let nested = batch["s"].as_struct();
+    let nested = StructArray::new(
+        names
+            .map(|name| Arc::new(ArrowField::new(name, DataType::Utf8, true)))
+            .into(),
+        nested.columns().to_vec(),
+        nested.nulls().cloned(),
+    );
+    let batch = RecordBatch::try_from_iter([
+        ("id", batch["id"].clone()),
+        ("s", Arc::new(nested) as ArrayRef),
+    ])
+    .unwrap();
+    let columns = names.map(|name| format_field_path_minimal(&["s", name]));
+    let mut dataset = write_fts_dataset("memory://", batch.slice(0, 2), None).await;
+    create_inverted_indices(&mut dataset, &[&columns[0], &columns[1]], &params).await;
     // Rows 0-1 are indexed and match nothing, so the appended rows are the ones
     // returned and the flat path owns every score.
-    let second = nested_fts_batch(
-        vec![2, 3, 4],
-        a_values[2..].to_vec(),
-        b_values[2..].to_vec(),
-    );
+    let second = batch.slice(2, 6);
     let schema = second.schema();
     dataset
         .append(
@@ -2652,11 +2675,19 @@ async fn test_fts_combined_fields_nested_columns() {
         .filter(|&i| expected[i].is_some())
         .map(|i| i as u64)
         .collect();
-    assert_eq!(expected_ids, HashSet::from([2, 3, 4]));
+    assert_eq!(expected_ids, HashSet::from([2, 3, 4, 5, 6, 7]));
 
+    let (columns, weights) = if reverse_fields {
+        (
+            [columns[1].as_str(), columns[0].as_str()],
+            [weights[1], weights[0]],
+        )
+    } else {
+        ([columns[0].as_str(), columns[1].as_str()], weights)
+    };
     let mut scan = dataset.scan();
     scan.full_text_search(FullTextSearchQuery::new_query(combined_query_over(
-        &["s.a", "s.b"],
+        &columns,
         "aa",
         Operator::Or,
         Some(weights.to_vec()),
