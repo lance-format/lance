@@ -20,6 +20,8 @@ use crate::blob::reference::{BlobRefBatch, BlobSourceContext};
 /// store, and registered-base resolution across batches. Capture neither reads
 /// payloads nor looks up descriptors again. External whole-object lengths remain
 /// unknown until a reader resolves them; capture performs no object HEAD requests.
+/// The session's policy requiring registered external storage bases also applies
+/// during capture, before producing portable references.
 ///
 /// The caller must retain the source snapshot through all deferred reads and
 /// retries. This session does not acquire a cleanup protection or retention lease.

@@ -23,6 +23,7 @@ use crate::blob::reference::{BlobRef, BlobSourceContext, pb};
 use crate::dataset::blob::materialize::{
     BlobMaterializationContext, BlobMaterializationReservation,
 };
+use crate::session::UnregisteredExternalBlobPolicy;
 use lance_table_runtime::blob::BlobFile;
 use lance_table_runtime::blob::BlobReadRange;
 use lance_table_runtime::blob::execution::{
@@ -58,6 +59,15 @@ impl BlobRefBinding {
     }
 
     fn object_path(&self, object: &pb::ObjectLocator) -> Result<Path> {
+        if object.origin == pb::object_locator::Origin::ExternalImmutable as i32
+            && object.base_id.is_none()
+            && self.dataset.session.unregistered_external_blob_policy()
+                == UnregisteredExternalBlobPolicy::Deny
+        {
+            return Err(Error::invalid_input(
+                "Unregistered external blob is not allowed by this session; external blobs must reference a registered storage base",
+            ));
+        }
         let path = ObjectStore::extract_path_from_uri(
             self.dataset.session.store_registry(),
             &object.object_uri,
@@ -197,6 +207,8 @@ impl Stream for BlobRefReadStream {
 /// fingerprint associates a locator with a context; it does not authenticate the
 /// locator's contents. Standalone external URIs are opened with the worker
 /// snapshot's storage settings and may point outside the table's storage root.
+/// The session's unregistered-external-blob policy still applies. External reads
+/// use the configured external-blob wrapper view, including registered bases.
 ///
 /// ```
 /// # use std::sync::Arc;
@@ -432,6 +444,12 @@ impl BlobRefReader {
                 .await?
                 .0
             };
+            let store =
+                if locator.object.origin == pb::object_locator::Origin::ExternalImmutable as i32 {
+                    store.for_external_blobs()
+                } else {
+                    store
+                };
             Ok::<_, Error>(CachedObject {
                 source: Arc::new(BlobSource::new(store, locator.path.clone())),
                 size: OnceCell::new(),

@@ -499,6 +499,13 @@ impl<'a> BlobLocator<'a> {
                 position,
                 size,
             } => {
+                if self.table.state.session.unregistered_external_blob_policy()
+                    == UnregisteredExternalBlobPolicy::Deny
+                {
+                    return Err(Error::invalid_input(
+                        "External blob with base_id=0 is not allowed by this session; external blobs must reference a registered storage base",
+                    ));
+                }
                 return Ok(BlobReferenceLocation {
                     object_uri: uri.to_string(),
                     offset: position,
