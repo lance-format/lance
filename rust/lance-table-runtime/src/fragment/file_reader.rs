@@ -26,6 +26,7 @@ use lance_io::scheduler::{FileScheduler, ScanScheduler, SchedulerConfig};
 use lance_table::format::DataFile;
 use lance_table::utils::stream::{ReadBatchTask, ReadBatchTaskStream};
 
+use super::FragmentOpenCache;
 use super::open_cache::{FileOpenState, PhysicalProjection};
 use super::{FileFragment, FragReadConfig};
 
@@ -101,6 +102,7 @@ impl FileFragment {
             data_file,
             projection,
             read_config,
+            None,
             MetadataMode::LazyAllowed,
             io_stats,
         )
@@ -115,8 +117,15 @@ impl FileFragment {
         projection: Option<&Schema>,
         read_config: &FragReadConfig,
     ) -> Result<Option<Box<dyn GenericFileReader>>> {
-        self.open_reader_impl(data_file, projection, read_config, MetadataMode::Full, None)
-            .await
+        self.open_reader_impl(
+            data_file,
+            projection,
+            read_config,
+            None,
+            MetadataMode::Full,
+            None,
+        )
+        .await
     }
 
     fn open_reader_impl<'a>(
@@ -124,6 +133,7 @@ impl FileFragment {
         data_file: &'a DataFile,
         projection: Option<&'a Schema>,
         read_config: &'a FragReadConfig,
+        open_cache: Option<&'a FragmentOpenCache>,
         metadata_mode: MetadataMode,
         io_stats: Option<Arc<dyn IoStatsRecorder>>,
     ) -> BoxFuture<'a, Result<Option<Box<dyn GenericFileReader>>>> {
@@ -141,6 +151,7 @@ impl FileFragment {
                         data_file,
                         projection,
                         read_config,
+                        open_cache,
                         metadata_mode,
                         io_stats,
                     )
@@ -152,14 +163,14 @@ impl FileFragment {
     }
 
     /// Layout-dependent state for opening `data_file`, served from
-    /// `read_config.open_cache` when it applies to this manifest and projection.
+    /// `open_cache` when it applies to this manifest and projection.
     pub(super) fn file_open_state(
         &self,
         data_file: &DataFile,
         projection: Option<&Schema>,
-        read_config: &FragReadConfig,
+        open_cache: Option<&FragmentOpenCache>,
     ) -> Result<Arc<FileOpenState>> {
-        let cache = match (projection, read_config.open_cache.as_ref()) {
+        let cache = match (projection, open_cache) {
             (Some(projection), Some(cache))
                 if cache.applies_to(&self.table.manifest, projection) =>
             {
@@ -251,10 +262,11 @@ impl FileFragment {
         data_file: &DataFile,
         projection: Option<&Schema>,
         read_config: &FragReadConfig,
+        open_cache: Option<&FragmentOpenCache>,
         metadata_mode: MetadataMode,
         io_stats: Option<Arc<dyn IoStatsRecorder>>,
     ) -> Result<Option<Box<dyn GenericFileReader>>> {
-        let open_state = self.file_open_state(data_file, projection, read_config)?;
+        let open_state = self.file_open_state(data_file, projection, open_cache)?;
         let schema_per_file = open_state.schema_per_file.clone();
         if schema_per_file.fields.is_empty() {
             return Ok(None);
@@ -426,10 +438,17 @@ impl FileFragment {
         &self,
         projection: &Schema,
         read_config: &FragReadConfig,
+        open_cache: Option<&FragmentOpenCache>,
         io_stats: Option<Arc<dyn IoStatsRecorder>>,
     ) -> Result<Vec<Box<dyn GenericFileReader>>> {
-        self.open_readers_impl(projection, read_config, MetadataMode::LazyAllowed, io_stats)
-            .await
+        self.open_readers_impl(
+            projection,
+            read_config,
+            open_cache,
+            MetadataMode::LazyAllowed,
+            io_stats,
+        )
+        .await
     }
 
     /// The id of `field` and of every field under it.
@@ -447,7 +466,7 @@ impl FileFragment {
         projection: &Schema,
         read_config: &FragReadConfig,
     ) -> Result<Vec<Box<dyn GenericFileReader>>> {
-        self.open_readers_impl(projection, read_config, MetadataMode::Full, None)
+        self.open_readers_impl(projection, read_config, None, MetadataMode::Full, None)
             .await
     }
 
@@ -455,6 +474,7 @@ impl FileFragment {
         &'a self,
         projection: &'a Schema,
         read_config: &'a FragReadConfig,
+        open_cache: Option<&'a FragmentOpenCache>,
         metadata_mode: MetadataMode,
         io_stats: Option<Arc<dyn IoStatsRecorder>>,
     ) -> BoxFuture<'a, Result<Vec<Box<dyn GenericFileReader>>>> {
@@ -489,8 +509,15 @@ impl FileFragment {
                     async move {
                         match metadata_mode {
                             MetadataMode::LazyAllowed => {
-                                self.open_reader(data_file, Some(projection), read_config, io_stats)
-                                    .await
+                                self.open_reader_impl(
+                                    data_file,
+                                    Some(projection),
+                                    read_config,
+                                    open_cache,
+                                    MetadataMode::LazyAllowed,
+                                    io_stats,
+                                )
+                                .await
                             }
                             MetadataMode::Full => {
                                 self.open_reader_with_full_metadata(

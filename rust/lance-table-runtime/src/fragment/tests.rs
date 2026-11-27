@@ -324,7 +324,6 @@ mod open_cache {
 
     use super::super::FileFragment;
     use super::super::open_cache::FileOpenState;
-    use super::FragReadConfig;
     use crate::fragment::FragmentOpenCache;
     use crate::test_util::test_commit_table;
 
@@ -334,7 +333,7 @@ mod open_cache {
         projection: &Schema,
     ) -> Arc<FileOpenState> {
         fragment
-            .file_open_state(data_file, Some(projection), &FragReadConfig::default())
+            .file_open_state(data_file, Some(projection), None)
             .unwrap()
     }
 
@@ -384,13 +383,13 @@ mod open_cache {
             table.manifest.clone(),
             projection.clone(),
         ));
-        let config = FragReadConfig::default().with_open_cache(cache.clone());
+        let config = Some(cache.as_ref());
 
         let first = fragment
-            .file_open_state(&data_file, Some(projection.as_ref()), &config)
+            .file_open_state(&data_file, Some(projection.as_ref()), config)
             .unwrap();
         let second = fragment
-            .file_open_state(&data_file, Some(projection.as_ref()), &config)
+            .file_open_state(&data_file, Some(projection.as_ref()), config)
             .unwrap();
         assert!(Arc::ptr_eq(&first, &second));
         assert!(first.physical.is_some());
@@ -413,11 +412,11 @@ mod open_cache {
             .map(|f| FileFragment::new(table.clone(), f.clone()))
             .map(|f| {
                 let file = with_version(&f.metadata().files[0], version);
-                f.file_open_state(&file, Some(projection.as_ref()), &config)
+                f.file_open_state(&file, Some(projection.as_ref()), config)
                     .unwrap()
             })
             .chain([fragment
-                .file_open_state(&by_value, Some(projection.as_ref()), &config)
+                .file_open_state(&by_value, Some(projection.as_ref()), config)
                 .unwrap()])
         {
             assert!(Arc::ptr_eq(&first, &state));
@@ -442,7 +441,7 @@ mod open_cache {
             table.manifest.clone(),
             projection.clone(),
         ));
-        let config = FragReadConfig::default().with_open_cache(cache.clone());
+        let config = Some(cache.as_ref());
 
         let mut other_version = data_file.clone();
         (
@@ -453,10 +452,10 @@ mod open_cache {
             _ => (0, 3),
         };
         let first = fragment
-            .file_open_state(&data_file, Some(projection.as_ref()), &config)
+            .file_open_state(&data_file, Some(projection.as_ref()), config)
             .unwrap();
         let second = fragment
-            .file_open_state(&other_version, Some(projection.as_ref()), &config)
+            .file_open_state(&other_version, Some(projection.as_ref()), config)
             .unwrap();
         assert!(!Arc::ptr_eq(&first, &second));
         assert_eq!(cache.num_entries(), 2);
@@ -470,13 +469,13 @@ mod open_cache {
             table.manifest.clone(),
             projection.clone(),
         ));
-        let config = FragReadConfig::default().with_open_cache(cache.clone());
+        let config = Some(cache.as_ref());
 
         let num_layouts = FragmentOpenCache::MAX_ENTRIES as i32 + 4;
         for shift in 0..num_layouts {
             let variant = layout_variant(&data_file, shift);
             let state = fragment
-                .file_open_state(&variant, Some(projection.as_ref()), &config)
+                .file_open_state(&variant, Some(projection.as_ref()), config)
                 .unwrap();
             assert!(same_open_state(
                 &state,
@@ -487,10 +486,10 @@ mod open_cache {
 
         let overflow = layout_variant(&data_file, num_layouts - 1);
         let first = fragment
-            .file_open_state(&overflow, Some(projection.as_ref()), &config)
+            .file_open_state(&overflow, Some(projection.as_ref()), config)
             .unwrap();
         let second = fragment
-            .file_open_state(&overflow, Some(projection.as_ref()), &config)
+            .file_open_state(&overflow, Some(projection.as_ref()), config)
             .unwrap();
         assert!(!Arc::ptr_eq(&first, &second));
         assert!(same_open_state(&first, &second));
@@ -505,14 +504,14 @@ mod open_cache {
             table.manifest.clone(),
             projection.clone(),
         ));
-        let config = FragReadConfig::default().with_open_cache(cache.clone());
+        let config = Some(cache.as_ref());
 
         // An equal projection at another address is not the cache's projection.
         let equal_projection = Arc::new(table.schema().clone());
         let narrow_projection = Arc::new(table.schema().project(&["a"]).unwrap());
         for other in [&equal_projection, &narrow_projection] {
             let state = fragment
-                .file_open_state(&data_file, Some(other.as_ref()), &config)
+                .file_open_state(&data_file, Some(other.as_ref()), config)
                 .unwrap();
             assert!(same_open_state(
                 &state,
@@ -524,7 +523,7 @@ mod open_cache {
         // An equal table with another manifest.
         let (_, other_fragment, _) = first_file(1).await;
         other_fragment
-            .file_open_state(&data_file, Some(projection.as_ref()), &config)
+            .file_open_state(&data_file, Some(projection.as_ref()), config)
             .unwrap();
         assert_eq!(cache.num_entries(), 0);
     }

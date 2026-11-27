@@ -28,7 +28,7 @@ use lance_table::utils::stream::{
 };
 use tokio::sync::OnceCell;
 
-use super::{FileFragment, FragReadConfig, GenericFileReader};
+use super::{FileFragment, FragReadConfig, FragmentOpenCache, GenericFileReader};
 use crate::overlay::{
     OverlayReadPlanner, OverlayReadSelection, merge_overlay_batch, plan_overlays, resolve_overlays,
 };
@@ -50,10 +50,33 @@ impl FileFragment {
         self.open_with_io_stats(projection, read_config, None).await
     }
 
+    /// Like [`Self::open`], sharing per-file open state with the other
+    /// fragments a scan opens with `open_cache`.
+    pub async fn open_with_open_cache(
+        &self,
+        projection: &Schema,
+        read_config: FragReadConfig,
+        open_cache: &FragmentOpenCache,
+    ) -> Result<FragmentReader> {
+        self.open_impl(projection, read_config, Some(open_cache), None)
+            .await
+    }
+
     pub(crate) async fn open_with_io_stats(
         &self,
         projection: &Schema,
         read_config: FragReadConfig,
+        io_stats: Option<Arc<dyn IoStatsRecorder>>,
+    ) -> Result<FragmentReader> {
+        self.open_impl(projection, read_config, None, io_stats)
+            .await
+    }
+
+    async fn open_impl(
+        &self,
+        projection: &Schema,
+        read_config: FragReadConfig,
+        open_cache: Option<&FragmentOpenCache>,
         io_stats: Option<Arc<dyn IoStatsRecorder>>,
     ) -> Result<FragmentReader> {
         if read_config.make_deletions_null
@@ -64,7 +87,7 @@ impl FileFragment {
                 "make_deletions_null requires with_row_id or with_row_address".to_string(),
             ));
         }
-        let open_files = self.open_readers(projection, &read_config, io_stats.clone());
+        let open_files = self.open_readers(projection, &read_config, open_cache, io_stats.clone());
         let deletion_vec_load = if read_config.ignore_deletions {
             futures::future::Either::Left(futures::future::ready(Ok(None)))
         } else {
