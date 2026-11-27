@@ -49,7 +49,7 @@ struct Fixture {
     loads: mpsc::UnboundedReceiver<oneshot::Sender<()>>,
     budget: Arc<Semaphore>,
     _cache: LanceCache,
-    _dataset: Dataset,
+    dataset: Dataset,
 }
 
 impl Fixture {
@@ -108,7 +108,7 @@ impl Fixture {
             loads,
             budget,
             _cache: cache,
-            _dataset: dataset,
+            dataset,
         }
     }
 }
@@ -154,6 +154,41 @@ async fn direct_probes_share_admission_until_scoring() {
         .unwrap();
     assert_eq!(result_bits(&result), result_bits(&expected));
     assert_eq!(f.budget.available_permits(), 2);
+}
+
+#[tokio::test]
+async fn direct_prefilter_can_depend_on_another_probe_with_one_slot() {
+    let f = Fixture::new(1).await;
+    let inner_index = f.reference.clone();
+    let inner_query = f.query.clone();
+    let (start, ready) = oneshot::channel();
+    let filter = DatasetPreFilter::new_with_filter_future(
+        Arc::new(f.dataset.clone()),
+        &f.dataset.load_indices().await.unwrap(),
+        Some(Box::pin(async move {
+            ready.await.unwrap();
+            inner_index
+                .search_in_partition(0, &inner_query, Arc::new(NoFilter), &NoOpMetricsCollector)
+                .await?;
+            Ok(Arc::new(RowAddrMask::default()))
+        })),
+    );
+    let mut outer =
+        f.reference
+            .search_in_partition(0, &f.query, Arc::new(filter), &NoOpMetricsCollector);
+    assert!(futures::poll!(&mut outer).is_pending());
+    assert_eq!(f.budget.available_permits(), 1);
+    start.send(()).unwrap();
+    let result = timeout(Duration::from_secs(3), outer)
+        .await
+        .unwrap()
+        .unwrap();
+    let expected = f
+        .reference
+        .search_in_partition(0, &f.query, Arc::new(NoFilter), &NoOpMetricsCollector)
+        .await
+        .unwrap();
+    assert_eq!(result_bits(&result), result_bits(&expected));
 }
 
 struct KeepSearching;
