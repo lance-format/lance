@@ -1081,7 +1081,7 @@ mod tests {
     }
 
     #[test]
-    fn selects_delta_and_round_trips() {
+    fn selects_monotonic_delta_and_round_trips() {
         let data = fixed_u32(&[0, 2, 5, 9, 14]);
         let codec = select_block_codec(
             &data,
@@ -1096,7 +1096,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             codec.expected_encoding().compression,
-            Some(Compression::Delta(_))
+            Some(Compression::MonotonicDelta(_))
         ));
         assert_eq!(round_trip(&codec, &data, 0..5), vec![0, 2, 5, 9, 14]);
     }

@@ -55,6 +55,10 @@ impl Strategy {
 }
 
 impl CompressionStrategy for Strategy {
+    fn allows_byte_wide_fsl_booleans(&self) -> bool {
+        true
+    }
+
     fn create_dictionary_index_compressor(
         &self,
         field: &Field,
