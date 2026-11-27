@@ -623,7 +623,7 @@ pub(super) async fn update_columns_with_options(
                 stats,
             );
             Ok(FragmentUpdateColumnsResult {
-                fragment: fragment.metadata.clone(),
+                fragment: fragment.metadata().clone(),
                 fields_modified: Vec::new(),
                 matched_offsets: RoaringBitmap::new(),
             })
@@ -1430,10 +1430,10 @@ impl SortedPatchCursor {
 }
 
 fn fragment_id(fragment: &FileFragment) -> Result<u32> {
-    u32::try_from(fragment.metadata.id).map_err(|_| {
+    u32::try_from(fragment.metadata().id).map_err(|_| {
         Error::invalid_input(format!(
             "Fragment id {} does not fit RowAddress fragment id",
-            fragment.metadata.id
+            fragment.metadata().id
         ))
     })
 }

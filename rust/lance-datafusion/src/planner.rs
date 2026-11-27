@@ -458,6 +458,10 @@ impl Planner {
             BinaryOperator::Or => Operator::Or,
             BinaryOperator::PGBitwiseShiftLeft => Operator::BitwiseShiftLeft,
             BinaryOperator::PGBitwiseShiftRight => Operator::BitwiseShiftRight,
+            BinaryOperator::PGRegexMatch => Operator::RegexMatch,
+            BinaryOperator::PGRegexIMatch => Operator::RegexIMatch,
+            BinaryOperator::PGRegexNotMatch => Operator::RegexNotMatch,
+            BinaryOperator::PGRegexNotIMatch => Operator::RegexNotIMatch,
             _ => {
                 return Err(Error::invalid_input(format!(
                     "Operator {op} is not supported"
@@ -3781,6 +3785,35 @@ mod tests {
         let expr = planner.parse_filter(filter).unwrap();
         let physical_expr = planner.create_physical_expr(&expr).unwrap();
         let result = physical_expr.evaluate(&batch).unwrap();
+
+        assert_eq!(
+            result.into_array(batch.num_rows()).unwrap().as_ref(),
+            &BooleanArray::from(expected.to_vec())
+        );
+    }
+
+    #[rstest]
+    #[case::matches("name ~ 'e[12]'", [Some(false), Some(true), Some(false), None])]
+    #[case::imatches("name ~* 'e[12]'", [Some(false), Some(true), Some(true), None])]
+    #[case::not_matches("name !~ 'e[12]'", [Some(true), Some(false), Some(true), None])]
+    #[case::not_imatches("name !~* 'e[12]'", [Some(true), Some(false), Some(false), None])]
+    #[case::negated("NOT name ~ 'e[12]'", [Some(true), Some(false), Some(true), None])]
+    fn test_regex_operators(#[case] filter: &str, #[case] expected: [Option<bool>; 4]) {
+        let batch = arrow_array::record_batch!((
+            "name",
+            Utf8,
+            [Some("name0"), Some("name1"), Some("NAME2"), None]
+        ))
+        .unwrap();
+        let planner = Planner::new(batch.schema());
+        let expr = planner
+            .optimize_expr(planner.parse_filter(filter).unwrap())
+            .unwrap();
+        let result = planner
+            .create_physical_expr(&expr)
+            .unwrap()
+            .evaluate(&batch)
+            .unwrap();
 
         assert_eq!(
             result.into_array(batch.num_rows()).unwrap().as_ref(),

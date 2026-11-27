@@ -87,8 +87,24 @@ impl LanceBuffer {
     /// never going to be reinterpret into another type and we can safely
     /// ignore the alignment.
     ///
-    /// This is a zero-copy operation when the buffer is properly aligned.
+    /// Properly aligned buffers do not require a new allocation. A uniquely
+    /// owned byte slice may be rebased within its original allocation so its
+    /// full capacity remains visible to Arrow consumers.
     pub fn from_bytes(bytes: bytes::Bytes, bytes_per_value: u64) -> Self {
+        // Preserve standard allocation ownership for byte payloads. Wrapping
+        // every Bytes in a custom Arrow owner hides its allocation capacity
+        // and prevents consumers from safely reusing uniquely owned decodes.
+        // The consuming conversion rejects shared and external owners. A
+        // sliced Vec may move within its allocation, so restrict this path to
+        // bytes: wider values must preserve the alignment checked below.
+        let bytes = if bytes_per_value == 1 {
+            match bytes.try_into_mut() {
+                Ok(bytes) => return Self(Buffer::from_vec(Vec::<u8>::from(bytes))),
+                Err(bytes) => bytes,
+            }
+        } else {
+            bytes
+        };
         if is_pwr_two(bytes_per_value) && bytes.as_ptr().align_offset(bytes_per_value as usize) != 0
         {
             // The original buffer is not aligned, cannot zero-copy
@@ -412,6 +428,38 @@ mod tests {
     use lance_core::Error;
 
     use super::LanceBuffer;
+
+    #[rstest::rstest]
+    #[case::exact(0, 1024)]
+    #[case::spare_capacity(0, 4096)]
+    #[case::sliced(64, 4096)]
+    fn test_from_bytes_preserves_owned_capacity(#[case] offset: usize, #[case] capacity: usize) {
+        let mut data = Vec::with_capacity(capacity);
+        data.extend((0..offset + 1024).map(|i| (i % 251) as u8));
+        let expected = data[offset..].to_vec();
+        let pointer = data.as_ptr();
+        let capacity = data.capacity();
+        let bytes = bytes::Bytes::from(data).slice(offset..offset + 1024);
+        let buffer = LanceBuffer::from_bytes(bytes, 1).into_buffer();
+        assert_eq!(buffer.as_slice(), expected);
+        assert_eq!(buffer.as_ptr(), pointer, "reuse the original allocation");
+        assert_eq!(buffer.capacity(), capacity, "charge its full capacity");
+        let data = buffer.into_vec::<u8>().unwrap();
+        assert_eq!(data, expected);
+        assert_eq!(data.capacity(), capacity);
+    }
+
+    #[test]
+    fn test_from_bytes_preserves_shared_owner() {
+        let bytes = bytes::Bytes::from(vec![7_u8; 1024]);
+        let alias = bytes.clone();
+        let pointer = bytes.as_ptr();
+        let buffer = LanceBuffer::from_bytes(bytes, 1).into_buffer();
+        assert_eq!(buffer.as_ptr(), pointer);
+        let buffer = buffer.into_vec::<u8>().unwrap_err();
+        drop(alias);
+        assert_eq!(buffer.as_slice(), &[7_u8; 1024]);
+    }
 
     #[test]
     fn test_eq() {

@@ -68,7 +68,9 @@ Here is the list of current subprojects:
 
 | Project Name      | Repository                                        | Contents                                                               |
 |-------------------|---------------------------------------------------|------------------------------------------------------------------------|
+| lance-c           | https://github.com/lance-format/lance-c           | C ABI and header-only C++ RAII bindings for Lance                      |
 | lance-duckdb      | https://github.com/lance-format/lance-duckdb      | DuckDB extension for Lance                                             |
+| lance-go          | https://github.com/lance-format/lance-go          | Pure-Go bindings for Lance built on `lance-c`                          |
 | lance-huggingface | https://github.com/lance-format/lance-huggingface | Hugging Face integration for Lance                                     |
 | lance-namespace   | https://github.com/lance-format/lance-namespace   | Lance namespace format specification, Rust/Python/Java Codegen SDKs    |
 | lance-namespace-impls | https://github.com/lance-format/lance-namespace-impls | Lance Namespace Implementations - Apache Hive, Apache Polaris, Apache Gravitino, Unity Catalog, AWS Glue and more |

@@ -1,9 +1,9 @@
 [package]
 name = "lance-jni"
-version = "15.0.0-beta.25"
+version = "16.0.0-beta.4"
 edition = "2024"
 authors = ["Lance Devs <dev@lance.org>"]
-rust-version = "1.94"
+rust-version = "1.98.0"
 license = "Apache-2.0"
 repository = "https://github.com/lance-format/lance"
 readme = "../../README.md"
