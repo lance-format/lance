@@ -599,7 +599,10 @@ async fn generic_offsets_are_gated_by_file_version(
             .unwrap();
         if version == ConcreteFileVersion::V2_3 && page.num_rows > 1 {
             if variable_lengths {
-                assert!(matches!(offsets, Compression::Delta(_)), "{offsets:?}");
+                assert!(
+                    matches!(offsets, Compression::MonotonicDelta(_)),
+                    "{offsets:?}"
+                );
             } else {
                 assert!(matches!(offsets, Compression::Range(_)), "{offsets:?}");
             }

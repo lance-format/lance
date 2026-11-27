@@ -1616,7 +1616,7 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
                     compression_config,
                 )))
             }
-            compression @ (Compression::Range(_) | Compression::Delta(_)) => {
+            compression @ (Compression::Range(_) | Compression::MonotonicDelta(_)) => {
                 Err(Error::not_supported_source(
                     format!(
                         "{} compression is only supported in block positions",
@@ -1843,7 +1843,7 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
                 description,
                 range.uncompressed_bits_per_value,
             ),
-            Compression::Delta(delta) => create_fixed_width_block_decompressor(
+            Compression::MonotonicDelta(delta) => create_fixed_width_block_decompressor(
                 description,
                 delta.uncompressed_bits_per_value,
             ),
@@ -1876,7 +1876,7 @@ pub(crate) fn infer_fixed_width_block_bits(description: &CompressiveEncoding) ->
                 .map(|value| value.len() as u64 * 8)
                 .ok_or_else(|| Error::invalid_input("Typed Constant is missing its scalar value")),
             Compression::Range(range) => Ok(range.uncompressed_bits_per_value),
-            Compression::Delta(delta) => Ok(delta.uncompressed_bits_per_value),
+            Compression::MonotonicDelta(delta) => Ok(delta.uncompressed_bits_per_value),
             Compression::InlineBitpacking(bitpacking) => Ok(bitpacking.uncompressed_bits_per_value),
             Compression::OutOfLineBitpacking(bitpacking) => {
                 Ok(bitpacking.uncompressed_bits_per_value)
@@ -2057,15 +2057,15 @@ fn create_fixed_width_block_decompressor_inner(
                 ))
             }
         }
-        Compression::Delta(delta) if allow_composite => {
+        Compression::MonotonicDelta(delta) if allow_composite => {
             if delta.uncompressed_bits_per_value != expected_bits_per_value {
                 return Err(Error::invalid_input(format!(
-                    "Delta declares {}-bit values, expected {expected_bits_per_value}",
+                    "MonotonicDelta declares {}-bit values, expected {expected_bits_per_value}",
                     delta.uncompressed_bits_per_value
                 )));
             }
             let child = delta.deltas.as_deref().ok_or_else(|| {
-                Error::invalid_input("Delta is missing its deltas child encoding")
+                Error::invalid_input("MonotonicDelta is missing its deltas child encoding")
             })?;
             let child =
                 create_fixed_width_block_decompressor_inner(child, expected_bits_per_value, false)?;
@@ -2222,19 +2222,19 @@ pub(crate) fn validate_delta_child_encoding(
         }
         Some(other) => {
             return Err(Error::invalid_input(format!(
-                "Delta does not support a {} child",
+                "MonotonicDelta does not support a {} child",
                 compression_name(other)
             )));
         }
         None => {
             return Err(Error::invalid_input(
-                "Delta child is missing its compression variant",
+                "MonotonicDelta child is missing its compression variant",
             ));
         }
     };
     if child_bits_per_value != expected_bits_per_value {
         return Err(Error::invalid_input(format!(
-            "Delta child declares {child_bits_per_value}-bit values, expected {expected_bits_per_value}"
+            "MonotonicDelta child declares {child_bits_per_value}-bit values, expected {expected_bits_per_value}"
         )));
     }
     Ok(())
@@ -2410,7 +2410,7 @@ fn compression_name(compression: &Compression) -> &'static str {
         Compression::VariablePackedStruct(_) => "variable packed struct",
         Compression::Rle(_) => "rle",
         Compression::Range(_) => "range",
-        Compression::Delta(_) => "delta",
+        Compression::MonotonicDelta(_) => "monotonic delta",
         Compression::Alp(_) => "alp",
         Compression::Pcodec(_) => "pcodec",
         Compression::IntegerBitpacking(_) => "integer bitpacking",
