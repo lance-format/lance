@@ -125,12 +125,16 @@ impl From<&Self> for ReadBatchParams {
 }
 
 impl ReadBatchParams {
-    /// Validate that the selection is valid given the length of the batch
+    /// Validate that the selection is valid given the length of the batch.
+    ///
+    /// Reject ranges whose start exceeds their end.
     pub fn valid_given_len(&self, len: usize) -> bool {
         match self {
             Self::Indices(indices) => indices.iter().all(|i| i.unwrap_or(0) < len as u32),
-            Self::Range(r) => r.start < len && r.end <= len,
-            Self::Ranges(ranges) => ranges.iter().all(|r| r.end <= len as u64),
+            Self::Range(r) => r.start <= r.end && r.start < len && r.end <= len,
+            Self::Ranges(ranges) => ranges
+                .iter()
+                .all(|r| r.start <= r.end && r.end <= len as u64),
             Self::RangeFull => true,
             Self::RangeTo(r) => r.end <= len,
             Self::RangeFrom(r) => r.start < len,
@@ -306,11 +310,34 @@ impl ReadBatchParams {
 
 #[cfg(test)]
 mod test {
-    use std::ops::{RangeFrom, RangeTo};
+    use std::ops::{Range, RangeFrom, RangeTo};
 
     use arrow_array::UInt32Array;
+    use rstest::rstest;
 
     use crate::ReadBatchParams;
+
+    #[rstest]
+    #[case::valid_range(ReadBatchParams::Range(2..5), true)]
+    #[case::empty_range(ReadBatchParams::Range(2..2), true)]
+    #[case::reversed_range(ReadBatchParams::Range(Range { start: 5, end: 3 }), false)]
+    #[case::range_past_end(ReadBatchParams::Range(2..11), false)]
+    #[case::valid_ranges(ReadBatchParams::Ranges(vec![0..3, 7..10].into()), true)]
+    #[case::unsorted_ranges(ReadBatchParams::Ranges(vec![7..10, 0..3].into()), true)]
+    #[case::empty_ranges(ReadBatchParams::Ranges(vec![].into()), true)]
+    #[case::empty_run(ReadBatchParams::Ranges(vec![0..3, 5..5].into()), true)]
+    #[case::reversed_run(
+        ReadBatchParams::Ranges(vec![0..3, Range { start: 8, end: 5 }].into()),
+        false
+    )]
+    #[case::reversed_run_past_end(
+        ReadBatchParams::Ranges(vec![Range { start: 20, end: 3 }].into()),
+        false
+    )]
+    #[case::run_past_end(ReadBatchParams::Ranges(vec![0..3, 7..11].into()), false)]
+    fn test_params_valid_given_len(#[case] params: ReadBatchParams, #[case] expected: bool) {
+        assert_eq!(params.valid_given_len(10), expected);
+    }
 
     #[test]
     fn test_params_slice() {
