@@ -799,30 +799,37 @@ impl<'a> PageBufferReader<'a> {
         let prefetched = if ranges.is_empty() {
             VecDeque::new()
         } else {
-            let expected = ranges.len();
-            // Columns may have interleaved pages on disk. The scheduler needs
-            // physical order; copying still needs column/page/buffer order.
-            let mut order = (0..expected).collect::<Vec<_>>();
-            order.sort_unstable_by_key(|&index| (ranges[index].start, index));
-            let requests = order.iter().map(|&index| ranges[index].clone()).collect();
-            let buffers = scheduler.submit_request(requests, 0).await?;
-            if buffers.len() != expected {
-                return Err(Error::io(format!(
-                    "prefetched input at '{}' returned {} page buffers, expected {expected}",
-                    scheduler.reader().path(),
-                    buffers.len()
-                )));
-            }
-            let mut restored = vec![Bytes::new(); expected];
-            for (index, buffer) in order.into_iter().zip(buffers) {
-                restored[index] = buffer;
-            }
-            restored.into()
+            Self::read_in_page_order(scheduler, ranges).await?.into()
         };
         Ok(Self {
             scheduler,
             prefetched: Some(prefetched),
         })
+    }
+
+    async fn read_in_page_order(
+        scheduler: &FileScheduler,
+        ranges: Vec<Range<u64>>,
+    ) -> Result<Vec<Bytes>> {
+        // The scheduler requires physical offset order and returns bytes in
+        // request order. Concat consumes buffers in column, page, and buffer order.
+        let expected = ranges.len();
+        let mut order = (0..expected).collect::<Vec<_>>();
+        order.sort_unstable_by_key(|&index| (ranges[index].start, index));
+        let requests = order.iter().map(|&index| ranges[index].clone()).collect();
+        let buffers = scheduler.submit_request(requests, 0).await?;
+        if buffers.len() != expected {
+            return Err(Error::io(format!(
+                "input at '{}' returned {} page buffers, expected {expected}",
+                scheduler.reader().path(),
+                buffers.len()
+            )));
+        }
+        let mut restored = vec![Bytes::new(); expected];
+        for (index, buffer) in order.into_iter().zip(buffers) {
+            restored[index] = buffer;
+        }
+        Ok(restored)
     }
 
     async fn read(&mut self, ranges: Vec<Range<u64>>) -> Result<Vec<Bytes>> {
@@ -840,8 +847,10 @@ impl<'a> PageBufferReader<'a> {
                 .collect()
         } else if ranges.is_empty() {
             Ok(Vec::new())
+        } else if ranges.is_sorted_by_key(|range| range.start) {
+            scheduler.submit_request(ranges, 0).await
         } else {
-            self.scheduler.submit_request(ranges, 0).await
+            Self::read_in_page_order(scheduler, ranges).await
         }
     }
 }
