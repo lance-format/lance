@@ -659,6 +659,7 @@ on a per-value basis. We use ☑️ to mark a technique that is applied on a per
 | ByteStreamSplit | ❓                    | ❌                       | ✅ (2.1)                   |
 | ALP             | ❓                    | ❌                       | ✅ (2.3)                   |
 | Pcodec          | ❓                    | ❌                       | ✅ (2.3)                   |
+| AxisDelta       | ❌                    | ☑️ (2.3)                 | ❌                         |
 | General         | ✅ (2.2)              | ☑️ (2.1)                 | ✅ (2.1)                   |
 
 In the following sections we will describe each technique in a bit more detail and explain how it is utilized
@@ -994,6 +995,30 @@ is rejected. Pages of fixed-size lists with null items are stored without pcodec
 %%% proto.message.Pcodec %%%
 ```
 
+### Axis delta (unstable 2.3)
+
+`AxisDelta` wraps a fixed-size-list encoding, optionally nested, whose leaf is
+plain 8-, 16-, 32-, or 64-bit data. Child validity and other transforms are not
+allowed. The writer restricts input to signed and unsigned integer tensors.
+Outer tensor validity remains in the structural plane.
+
+The descriptor stores positive `axis_length` and `inner_stride`. Their product
+must divide the positive number of elements per tensor. Partition each tensor
+into spans of that product. Preserve the first `inner_stride` elements of each
+span. For every later element, subtract the original element `inner_stride`
+positions earlier, modulo two to the element bit width. Decode by adding the
+reconstructed predecessor with the same modulus. Elements remain little endian
+and retain their order and width. No state crosses tensor boundaries.
+
+This descriptor is valid only in per-value positions, including inside General
+compression. General compression retains one frame per tensor. Selecting and
+reading a tensor does not require other tensors; selecting an individual element
+still requires decoding that tensor's frame.
+
+```protobuf
+%%% proto.message.AxisDelta %%%
+```
+
 ### General
 
 General compression is a catch-all term for classical opaque compression techniques such as LZ4, ZStandard, Snappy,
@@ -1027,6 +1052,7 @@ options. However, they can also be set in the field metadata in the schema.
 | `lance-encoding:dict-values-compression-level` | Integers (scheme dependent) | Varies by scheme | Compression level for dictionary values general compression                             |
 | `lance-encoding:general`             | `off`, `on`                          | `off`            | Whether to apply general compression.                                                   |
 | `lance-encoding:alp`                 | `off`, `on`, `auto`                  | `auto`           | Whether to apply ALP for floating point data (unstable 2.3 format only).                |
+| `lance-encoding:axis-delta`          | `off`, `auto`, `auto:<axis>`, `on:<axis>` | `auto`      | Configures [AxisDelta](#axis-delta-unstable-23) for integer tensors. See [AxisDelta mode](#axisdelta-mode). |
 | `lance-encoding:packed`              | Any string                           | Not set          | Whether to apply packed struct encoding (see above).                                    |
 | `lance-encoding:structural-encoding` | `miniblock`, `fullzip`, `sparse`     | Not set          | Select a structural policy; `sparse` requires Lance 2.3 and retains canonical dense all-valid pages.                                |
 
@@ -1124,6 +1150,19 @@ ALP is particularly effective for:
 - Time-series data with consistent precision
 - Scientific data with correlated mantissa patterns
 
+#### AxisDelta Mode
+
+The unstable Lance 2.3 per-value writer checks `lance-encoding:axis-delta` field metadata first, then the
+per-column `axis_delta` setting, then the per-type setting.
+
+- `auto` (default) samples eligible tensors when LZ4 or Zstandard is configured. It tries the longest physical
+  dimension (innermost on ties) and chooses between raw storage, direct compression, and compression with prediction.
+- `auto:<axis>` makes the same selection using the specified axis.
+- `on:<axis>` requires prediction along the specified axis, with or without general compression.
+- `off` disables prediction and sampling while keeping the configured codec.
+
+Axis numbers are zero-based logical axes within the tensor. The writer rejects invalid metadata values.
+
 #### Dictionary Encoding Controls
 
 Dictionary encoding is gated by a few heuristics.
@@ -1192,27 +1231,3 @@ The maximum number of values per mini-block can be tuned via an environment vari
 Reducing this value produces smaller mini-blocks, which reduces the amount of data fetched per read at the
 cost of more mini-blocks and slightly more metadata overhead. Increasing it can reduce metadata overhead and
 improve throughput for highly compressible data, but it may increase random-read amplification.
-
-#### Axis delta (unstable 2.3)
-
-`AxisDelta` wraps a fixed-size-list encoding, optionally nested, whose leaf is
-plain 8-, 16-, 32-, or 64-bit data. Child validity and other transforms are not
-allowed. The writer restricts input to signed and unsigned integer tensors.
-Outer tensor validity remains in the structural plane.
-
-The descriptor stores positive `axis_length` and `inner_stride`. Their product
-must divide the positive number of elements per tensor. Partition each tensor
-into spans of that product. Preserve the first `inner_stride` elements of each
-span. For every later element, subtract the original element `inner_stride`
-positions earlier, modulo two to the element bit width. Decode by adding the
-reconstructed predecessor with the same modulus. Elements remain little endian
-and retain their order and width. No state crosses tensor boundaries.
-
-This descriptor is valid only in per-value positions, including inside General
-compression. General compression retains one frame per tensor. Selecting and
-reading a tensor does not require other tensors; selecting an individual element
-still requires decoding that tensor's frame.
-
-```protobuf
-%%% proto.message.AxisDelta %%%
-```
