@@ -277,11 +277,12 @@ message Range {
  * represented by its first value and the differences between adjacent values.
  *
  * The child contains one fewer value than the input. The container supplies
- * the input cardinality. Delta has a payload exactly when its child has one.
+ * the input cardinality. MonotonicDelta has a payload exactly when its child
+ * has one.
  *
  * The input is a u32 or u64 fixed-width data block.
  */
-message Delta {
+message MonotonicDelta {
   // The width of each decompressed value. Must be 32 or 64.
   uint64 uncompressed_bits_per_value = 1;
   // The first uncompressed value.
@@ -555,7 +556,7 @@ message CompressiveEncoding {
         PackedStruct packed_struct = 12;
         VariablePackedStruct variable_packed_struct = 13;
         Range range = 14;
-        Delta delta = 15;
+        MonotonicDelta monotonic_delta = 15;
         AxisDelta axis_delta = 16;
         Alp alp = 17;
         Pcodec pcodec = 18;

@@ -92,14 +92,16 @@ fn metadata(
                 step: r.step,
             })
         }
-        Some(Compression::Delta(d)) => {
+        Some(Compression::MonotonicDelta(d)) => {
             if count < 2 || (bits == 32 && d.base > u32::MAX as u64) {
-                return Err(Error::invalid_input("Invalid Delta cardinality or base"));
+                return Err(Error::invalid_input(
+                    "Invalid MonotonicDelta cardinality or base",
+                ));
             }
             let child = d
                 .deltas
                 .as_deref()
-                .ok_or_else(|| Error::invalid_input("Missing Delta child"))?;
+                .ok_or_else(|| Error::invalid_input("Missing MonotonicDelta child"))?;
             match metadata(child, bits, count - 1)? {
                 Some(SequenceMetadata::Constant(0)) => Some(SequenceMetadata::Constant(d.base)),
                 Some(SequenceMetadata::Constant(step)) => {
