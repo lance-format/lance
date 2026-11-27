@@ -182,8 +182,11 @@ pub struct CompactionOptions {
     /// `LANCE_DEFAULT_BATCH_SIZE`) will be used.
     pub batch_size: Option<usize>,
     /// The number of bytes to allow to queue up in the I/O buffer when scanning
-    /// the input fragments.  If not specified then the default (see
-    /// `LANCE_DEFAULT_IO_BUFFER_SIZE`) will be used.
+    /// the input fragments.  Column repacks read with it too; binary-copy
+    /// rewrites do not (see `binary_copy_read_batch_bytes`).  If unset, reads
+    /// choose a default based on the object store and
+    /// `LANCE_DEFAULT_IO_BUFFER_SIZE` can override that default.  Only used
+    /// when reading v2 files.
     ///
     /// Increasing this can avoid a deadlock that occurs when a single batch of
     /// data is larger than the I/O buffer size.
