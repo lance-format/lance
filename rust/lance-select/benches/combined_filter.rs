@@ -67,6 +67,23 @@ fn bench_combined_filter(c: &mut Criterion) {
         }
     }
     group.finish();
+
+    let mut group = c.benchmark_group("exact_drop_nulls");
+    for track_nulls in [false, true] {
+        let masks = fixture(100, track_nulls);
+        group.bench_with_input(
+            BenchmarkId::from_parameter(track_nulls),
+            &masks[2],
+            |b, mask| {
+                b.iter_batched(
+                    || mask.clone(),
+                    |mask| black_box(mask.drop_nulls()),
+                    BatchSize::PerIteration,
+                );
+            },
+        );
+    }
+    group.finish();
 }
 
 criterion_group!(benches, bench_combined_filter);
