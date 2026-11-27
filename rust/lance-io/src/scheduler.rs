@@ -2283,6 +2283,9 @@ mod tests {
             .await
             .unwrap();
 
+        drop(file_scheduler);
+        drop(scheduler);
+
         assert_eq!(bytes.len(), ranges.len());
         for (bytes, range) in bytes.iter().zip(&ranges) {
             assert_eq!(
@@ -2290,6 +2293,13 @@ mod tests {
                 &source[range.start as usize..range.end as usize]
             );
         }
+        let last_slice = bytes[0].slice(1..);
+        drop(bytes);
+        let first = &ranges[0];
+        assert_eq!(
+            last_slice.as_ref(),
+            &source[first.start as usize + 1..first.end as usize]
+        );
     }
 
     #[rstest]

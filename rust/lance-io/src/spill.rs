@@ -601,29 +601,35 @@ impl Default for LocalSpillStore {
 #[async_trait]
 impl SpillStore for LocalSpillStore {
     async fn new_spill(&self) -> Result<(Box<dyn Writer>, Box<dyn Spill>)> {
-        let temp_dir = self.ensure_temp_dir()?;
-        let idx = self
-            .file_counter
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-                value.checked_add(1)
-            })
-            .map_err(|_| Error::invalid_input("spill file counter overflow"))?;
-        let fs_path = temp_dir.path().join(format!("spill_{idx:06}.bin"));
-        let os_path = Path::from_absolute_path(&fs_path)?;
-        let backing = Arc::new(SpillBacking {
-            fs_path,
+        let state = Self {
+            temp_dir: self.temp_dir.clone(),
+            file_counter: self.file_counter.clone(),
             quota: self.quota.clone(),
-            accepted: AtomicU64::new(0),
-            finished: AtomicBool::new(false),
-            directory: temp_dir,
+            parent_dir: self.parent_dir.clone(),
             metrics: self.metrics.clone(),
-        });
-        self.metrics.allocated();
-        let write_backing = backing.clone();
-        let inner = tokio::task::spawn_blocking(move || {
+        };
+        let (inner, backing, os_path) = tokio::task::spawn_blocking(move || {
+            let temp_dir = state.ensure_temp_dir()?;
+            let idx = state
+                .file_counter
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                    value.checked_add(1)
+                })
+                .map_err(|_| Error::invalid_input("spill file counter overflow"))?;
+            let fs_path = temp_dir.path().join(format!("spill_{idx:06}.bin"));
+            let os_path = Path::from_absolute_path(&fs_path)?;
+            let backing = Arc::new(SpillBacking {
+                fs_path,
+                quota: state.quota,
+                accepted: AtomicU64::new(0),
+                finished: AtomicBool::new(false),
+                directory: temp_dir,
+                metrics: state.metrics.clone(),
+            });
+            state.metrics.allocated();
             // Recreate the scratch directory and its immediate parent after
             // external cleanup, requiring higher ancestors to still exist.
-            let directory_path = write_backing.directory.path();
+            let directory_path = backing.directory.path();
             let create_directory = directory_path
                 .parent()
                 .into_iter()
@@ -635,27 +641,28 @@ impl SpillStore for LocalSpillStore {
                     format!(
                         "failed to create spill directory {} for spill {}: {err}",
                         directory_path.display(),
-                        write_backing.fs_path.display(),
+                        backing.fs_path.display(),
                     ),
                 )
             })?;
-            let file = File::create(&write_backing.fs_path).map_err(|err| {
+            let file = File::create(&backing.fs_path).map_err(|err| {
                 io::Error::new(
                     err.kind(),
                     format!(
                         "failed to create spill file {}: {err}",
-                        write_backing.fs_path.display(),
+                        backing.fs_path.display(),
                     ),
                 )
             })?;
-            Ok::<_, io::Error>(LocalSpillWriter {
+            let inner = LocalSpillWriter {
                 file: Arc::new(SpillWriteFile {
                     file,
-                    _backing: write_backing,
+                    _backing: backing.clone(),
                 }),
                 pending: None,
                 position: 0,
-            })
+            };
+            Ok::<_, Error>((inner, backing, os_path))
         })
         .await??;
         let writer = Box::new(SpillWriter {
@@ -1275,6 +1282,50 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_cancelled_first_spill_initializes_in_blocking_job() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("spill-parent");
+        let store = LocalSpillStore::with_cap(8)
+            .unwrap()
+            .with_parent_dir(&parent);
+        let scope = store.scope();
+        runtime.block_on(async {
+            let (release, wait) = std::sync::mpsc::channel();
+            let (started, ready) = tokio::sync::oneshot::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                started.send(()).unwrap();
+                let _ = wait.recv();
+            });
+            ready.await.unwrap();
+
+            let mut create = scope.new_spill();
+            assert!(futures::poll!(&mut create).is_pending());
+            drop(create);
+            assert!(!parent.exists(), "filesystem work ran on the async caller");
+            release.send(()).unwrap();
+            blocker.await.unwrap();
+
+            let (writer, spill) = store.new_spill().await.unwrap();
+            let directory = store.ensure_temp_dir().unwrap().path().to_owned();
+            assert_eq!(scope.ensure_temp_dir().unwrap().path(), directory);
+            assert_eq!(scope.metrics().snapshot().live_files, 0);
+            assert_eq!(scope.metrics().snapshot().files_created, 1);
+            assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
+            finish_writer(writer, b"retained").await.unwrap();
+            let reader = spill.reader().await.unwrap();
+            assert_eq!(reader.get_all().await.unwrap().as_ref(), b"retained");
+            drop((reader, spill, scope, store));
+            assert!(!directory.exists());
+            assert!(parent.is_dir());
+        });
+    }
+
     #[tokio::test]
     async fn test_raii_cleanup() {
         let store = LocalSpillStore::new().unwrap();
@@ -1613,8 +1664,10 @@ mod tests {
         finish_writer(writer, &[0; 100]).await.unwrap();
     }
 
-    #[test]
-    fn test_cancelled_running_read_keeps_quota_until_io_finishes() {
+    #[rstest]
+    #[case::range(false)]
+    #[case::stream(true)]
+    fn test_cancelled_queued_read_keeps_quota_until_io_finishes(#[case] is_stream: bool) {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .max_blocking_threads(1)
@@ -1632,11 +1685,17 @@ mod tests {
                 wait.recv().unwrap();
             });
             ready.await.unwrap();
-            let mut read = reader.get_range(0..100);
+            let mut stream = if is_stream {
+                reader.get_range_stream(0..100).await.unwrap()
+            } else {
+                futures::stream::once(reader.get_range(0..100)).boxed()
+            };
+            let mut read = stream.next();
             // Polling queues the read behind the blocker, so cancellation is
             // deterministic and cannot race an already completed disk read.
             assert!(futures::poll!(&mut read).is_pending());
             drop(read);
+            drop(stream);
             drop(reader);
             drop(spill);
             let quota = store.quota.as_ref().unwrap();
