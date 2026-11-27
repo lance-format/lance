@@ -22,13 +22,9 @@
 //! benchmark in this PR shows it carries a real latency penalty, so the
 //! local path lands first and the global option is optimized separately.
 //!
-//! Staleness: within an SSTable, the deletion vector written
-//! at flush time (see #6929) already masks rows superseded by a newer
-//! generation, so per-source results are clean within each tier. The
-//! same primary key can still appear across tiers (active vs SSTable)
-//! when an updated row sits in the active memtable while the older
-//! copy lives in an SSTable; cross-tier deduplication is
-//! left to the caller in local mode.
+//! A row superseded by a newer generation is filtered by primary key before
+//! the global top-k. By default, sources subject to that filter do not cap
+//! their candidates early.
 //!
 //! Fuzzy expansion is also per source: each spends `max_expansions` over its
 //! own vocabulary, not the merged one, so under a binding cap a source can
@@ -51,7 +47,8 @@ use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use datafusion::physical_plan::union::UnionExec;
 use datafusion::prelude::Expr;
-use lance_core::{Error, Result, is_system_column};
+use lance_core::datatypes::parse_field_path;
+use lance_core::{Error, ROW_ADDR, Result, is_system_column};
 use lance_index::scalar::FullTextSearchQuery;
 use lance_index::scalar::InvertedIndexParams;
 use lance_index::scalar::inverted::query::{
@@ -62,8 +59,8 @@ use tracing::instrument;
 
 use super::block_list::compute_source_block_lists;
 use super::collector::LsmDataSourceCollector;
-use super::data_source::LsmDataSource;
-use super::exec::{FirstByPkExec, PkBlockFilterExec};
+use super::data_source::{LsmDataSource, LsmGeneration};
+use super::exec::{FirstByPkExec, MEMTABLE_GEN_COLUMN, MemtableGenTagExec, PkBlockFilterExec};
 use super::generation_read::{GenerationRead, memtable_matches_table};
 use super::projection::{
     project_to_canonical, resolve_data_fields, top_level_of, validate_projection_names,
@@ -87,10 +84,13 @@ use lance_io::object_store::ObjectStoreParams;
 /// require an import for one string constant.
 pub const SCORE_COLUMN: &str = "_score";
 
-/// Default over-fetch multiple for blocked sources. `1.0` keeps cross-generation
-/// dedup on with no over-fetch; callers (e.g. the sophon WAL handler) raise it
-/// so a blocked source still yields `k` live rows after the block-list filter.
-const DEFAULT_OVERFETCH_FACTOR: f64 = 1.0;
+fn computed_columns(granularity: DocumentGranularity) -> &'static [&'static str] {
+    if granularity.is_list_element() {
+        &[SCORE_COLUMN, DOC_INDEX_COL]
+    } else {
+        &[SCORE_COLUMN]
+    }
+}
 
 fn requested_query_document_granularity(
     query: &IndexFtsQuery,
@@ -675,8 +675,10 @@ pub struct LsmFtsSearchPlanner {
     sstable_cache: Option<Arc<dyn DatasetCache>>,
     /// Optional warmer fired on first open of an SSTable.
     warmer: Option<Arc<dyn SsTableWarmer>>,
-    /// Over-fetch multiple for blocked sources.
-    overfetch_factor: f64,
+    /// Optional candidate budget for a source whose hits may be superseded.
+    overfetch_factor: Option<f64>,
+    with_row_address: bool,
+    with_memtable_gen: bool,
     /// Optional prefilter predicate applied to every source arm so FTS hits
     /// failing the predicate are dropped. Base/SSTable arms use the dataset
     /// scanner's native filter; memtable arms filter the materialized hits.
@@ -699,7 +701,9 @@ impl LsmFtsSearchPlanner {
             store_params: None,
             sstable_cache: None,
             warmer: None,
-            overfetch_factor: DEFAULT_OVERFETCH_FACTOR,
+            overfetch_factor: None,
+            with_row_address: false,
+            with_memtable_gen: false,
             filter: None,
         }
     }
@@ -712,11 +716,22 @@ impl LsmFtsSearchPlanner {
         self
     }
 
-    /// Set the over-fetch multiple for blocked sources so they still yield `k`
-    /// live rows after cross-generation block-list filtering. Values below
-    /// `1.0` are rejected by [`Self::plan_search`].
+    /// Opt into a bounded candidate fetch on blocked sources. A finite
+    /// multiple can return fewer than `k` live hits when higher-ranked rows
+    /// are stale. By default the limit applies after filtering those rows.
+    /// Values below `1.0` are rejected by [`Self::plan_search`].
     pub fn with_overfetch_factor(mut self, factor: f64) -> Self {
-        self.overfetch_factor = factor;
+        self.overfetch_factor = Some(factor);
+        self
+    }
+
+    pub(super) fn with_system_columns(
+        mut self,
+        with_row_address: bool,
+        with_memtable_gen: bool,
+    ) -> Self {
+        self.with_row_address = with_row_address;
+        self.with_memtable_gen = with_memtable_gen;
         self
     }
 
@@ -759,17 +774,15 @@ impl LsmFtsSearchPlanner {
     ///
     /// # Arguments
     ///
-    /// * `query` — the FTS query (match / phrase / boolean / fuzzy for
-    ///   base/SSTable Lance sources; the active memtable currently
-    ///   supports `MatchQuery`). It names the columns to search; bind them
-    ///   with [`FullTextSearchQuery::with_columns`] if they arrive separately.
-    /// * `limit` — optional global top-k to return.
-    /// * `projection` — user columns to project. PK columns are
-    ///   auto-included; `_score` is always appended.
+    /// * `query` names the columns to search. Bind them with
+    ///   [`FullTextSearchQuery::with_columns`] if supplied separately.
+    ///   In-memory sources cannot evaluate a combined-fields clause.
+    /// * `limit` bounds the number of merged hits.
+    /// * `projection` selects the output columns. Results also include the
+    ///   primary key and `_score`.
     ///
     /// Each source is scored independently (local BM25), normalized to a
-    /// canonical schema, unioned, and merged by `_score` DESC. When a finite
-    /// limit is supplied, top-k caps are pushed into each partition.
+    /// canonical schema, unioned, and merged by `_score` DESC.
     #[instrument(name = "lsm_fts_search", level = "info", skip_all, fields(limit))]
     pub async fn plan_search(
         &self,
@@ -800,7 +813,8 @@ impl LsmFtsSearchPlanner {
                 }
                 return self
                     .plan_bound_search(&columns, query, limit, projection)
-                    .await;
+                    .await
+                    .map(|(plan, _)| plan);
             }
             FtsPlanShape::PerColumn(per_column) => per_column,
         };
@@ -836,38 +850,20 @@ impl LsmFtsSearchPlanner {
             let mut bounded = FullTextSearchQuery::new_query(sub_query);
             bounded.limit = query.limit;
             bounded.wand_factor = query.wand_factor;
-            per_column_plans.push(
-                Box::pin(self.plan_bound_search(
-                    std::slice::from_ref(&field),
-                    bounded,
-                    candidate_limit,
-                    projection,
-                ))
-                .await?,
-            );
-        }
-
-        // Enforce the row-only contract on what each arm *resolved*, not on what
-        // the query asked for. A default multi-match requests no granularity, so
-        // the check in `cross_column_targets` sees nothing to reject; if every
-        // column happens to carry a list-element index, each arm resolves to
-        // `ListElement` independently and their schemas agree, so a
-        // schema-equality check passes too. The result would be element hits
-        // collapsed by row primary key — which silently discards every matching
-        // element of a row but one, because a row PK is not an element identity.
-        //
-        // `_doc_index` in the output is the observable form of that resolution,
-        // so key on it rather than re-deriving the granularity.
-        if per_column_plans
-            .iter()
-            .any(|plan| plan.schema().column_with_name(DOC_INDEX_COL).is_some())
-        {
-            return Err(Error::not_supported(
-                "cross-column full-text search supports row documents only: element hits \
-                 carry a per-element coordinate that a row primary key cannot collapse by, \
-                 so matching elements would be silently dropped"
-                    .to_string(),
-            ));
+            let (plan, granularity) = Box::pin(self.plan_bound_search(
+                std::slice::from_ref(&field),
+                bounded,
+                candidate_limit,
+                projection,
+            ))
+            .await?;
+            // Collapsing by row key would discard distinct matching elements.
+            if granularity.is_list_element() {
+                return Err(Error::not_supported(
+                    "cross-column full-text search supports row documents only: element hits carry a per-element coordinate".to_string(),
+                ));
+            }
+            per_column_plans.push(plan);
         }
 
         // `UnionExec::try_new` only rejects inputs with different field counts
@@ -924,7 +920,7 @@ impl LsmFtsSearchPlanner {
         mut query: FullTextSearchQuery,
         limit: Option<usize>,
         projection: Option<&[String]>,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
+    ) -> Result<(Arc<dyn ExecutionPlan>, DocumentGranularity)> {
         let sources = self.collector.collect()?;
         let requested = requested_query_document_granularity(&query.query)?;
 
@@ -983,17 +979,29 @@ impl LsmFtsSearchPlanner {
         }) {
             validate_lsm_fts_query(&query)?;
         }
-        let allowed_system_columns: &[&str] = if document_granularity.is_list_element() {
-            &[SCORE_COLUMN, DOC_INDEX_COL]
-        } else {
-            &[SCORE_COLUMN]
-        };
-        validate_projection_names(projection, &self.base_schema, allowed_system_columns)?;
-        let target_schema = self.canonical_fts_schema(projection, document_granularity)?;
-        let overfetch = super::validate_overfetch_factor(self.overfetch_factor)?;
+        let (target_schema, data_columns) =
+            self.fts_projection(projection, document_granularity)?;
+        let overfetch = self
+            .overfetch_factor
+            .map(super::validate_overfetch_factor)
+            .transpose()?;
 
+        // A physical generation field wins when the caller projects it. A
+        // field read only for a deferred filter is dropped before tagging.
+        let include_generation = self.with_memtable_gen
+            && target_schema
+                .column_with_name(MEMTABLE_GEN_COLUMN)
+                .is_none();
+        let tag = |plan: Arc<dyn ExecutionPlan>, generation| -> Arc<dyn ExecutionPlan> {
+            if include_generation {
+                Arc::new(MemtableGenTagExec::new(plan, generation))
+            } else {
+                plan
+            }
+        };
         if sources.is_empty() {
-            return self.empty_plan(&target_schema);
+            let empty = self.empty_plan(&target_schema)?;
+            return Ok((tag(empty, LsmGeneration::BASE_TABLE), document_granularity));
         }
 
         // Per-source PK block sets for cross-generation dedup (NEWER(G) per
@@ -1014,7 +1022,6 @@ impl LsmFtsSearchPlanner {
         let arm_inputs: Vec<_> = sources
             .iter()
             .map(|source| {
-                let is_active = matches!(source, LsmDataSource::ActiveMemTable { .. });
                 let blocked = block_lists.get(&(source.shard_id(), source.generation()));
                 let active_needs_uncapped_recency = match source {
                     LsmDataSource::ActiveMemTable { index_store, .. }
@@ -1027,28 +1034,32 @@ impl LsmFtsSearchPlanner {
                 // Active PK arms only need to stay uncapped when recency
                 // filtering may drop hits. Append-only PK memtables can safely
                 // pass the limit through and let FtsIndexExec use WAND/top-k.
-                // Blocked non-active sources use heuristic over-fetch because
-                // their newer generation membership may also drop candidates.
-                let fetch_limit = if active_needs_uncapped_recency {
+                // A newer generation can shadow every candidate of a bounded
+                // fetch. Only impose that budget when explicitly requested.
+                let fetch_limit = if limit == Some(0) {
+                    Some(0)
+                } else if active_needs_uncapped_recency {
                     None
                 } else if blocked.is_some() && !self.pk_columns.is_empty() {
-                    limit.map(|limit| ((limit as f64) * overfetch).ceil() as usize)
+                    limit
+                        .zip(overfetch)
+                        .map(|(limit, factor)| ((limit as f64) * factor).ceil() as usize)
                 } else {
                     limit
                 };
-                (source, is_active, blocked, fetch_limit)
+                (source, blocked, fetch_limit)
             })
             .collect();
         // Type-erased for the reason the vector planner's arm gives.
         let built =
-            futures::future::try_join_all(arm_inputs.iter().map(|(source, _, _, fetch_limit)| {
+            futures::future::try_join_all(arm_inputs.iter().map(|(source, _, fetch_limit)| {
                 let arm: futures::future::BoxFuture<'_, Result<Arc<dyn ExecutionPlan>>> =
                     Box::pin(self.build_source_plan(
                         source,
                         columns,
                         &query,
                         *fetch_limit,
-                        projection,
+                        &data_columns,
                         &index_params,
                         &target_schema,
                     ));
@@ -1057,7 +1068,7 @@ impl LsmFtsSearchPlanner {
             .await?;
 
         let mut per_source_plans: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(sources.len());
-        for ((_, _, blocked, _), plan) in arm_inputs.iter().zip(built) {
+        for ((source, blocked, fetch_limit), plan) in arm_inputs.iter().zip(built) {
             let blocked = *blocked;
             // Dedup, mirroring LsmVectorSearchPlanner:
             //  * each memtable: `FtsIndexExec` drops superseded PK versions
@@ -1072,15 +1083,18 @@ impl LsmFtsSearchPlanner {
                     plan,
                     self.pk_columns.clone(),
                     set.clone(),
-                    limit.unwrap_or(usize::MAX),
+                    if fetch_limit.is_some() {
+                        limit.unwrap_or(0)
+                    } else {
+                        0
+                    },
                 )) as Arc<dyn ExecutionPlan>
             } else {
                 plan
             };
 
-            // Normalize to the canonical FTS schema before merging sources.
             let normalized = project_to_canonical(deduped, &target_schema)?;
-            per_source_plans.push(normalized);
+            per_source_plans.push(tag(normalized, source.generation()));
         }
 
         // A single source is returned as is, without a union. Otherwise the
@@ -1090,7 +1104,7 @@ impl LsmFtsSearchPlanner {
         // extra repartition.
         let merged = UnionExec::try_new(per_source_plans)?;
 
-        self.sort_by_score(merged, limit)
+        Ok((self.sort_by_score(merged, limit)?, document_granularity))
     }
 
     /// Resolve one column's document granularity across every source, plus the
@@ -1249,7 +1263,7 @@ impl LsmFtsSearchPlanner {
         columns: &[String],
         query: &FullTextSearchQuery,
         limit: Option<usize>,
-        projection: Option<&[String]>,
+        data_columns: &[String],
         index_params: &HashMap<&str, InvertedIndexParams>,
         // What every arm is normalized to, so an arm with nothing to offer can
         // stand in for itself.
@@ -1273,14 +1287,19 @@ impl LsmFtsSearchPlanner {
                 None => bound.limit(None),
             })
         };
+        let document_granularity = query_document_granularity(query)?;
         match source {
             LsmDataSource::BaseTable { dataset } => {
                 let mut scanner = dataset.scan();
-                let cols = self.fts_scanner_projection(projection);
                 // Resolve against the *source* schema so a nested path narrows the
                 // struct rather than flattening it; expressions cannot express a
                 // partial nested projection, only a schema can.
-                scanner.project_with_schema(&dataset.schema().project(&cols)?)?;
+                scanner.project_with_schema(&dataset.schema().project(data_columns)?)?;
+                // An address in any other source belongs to a different dataset.
+                // Those arms leave it absent for the canonical typed NULL.
+                if target_schema.column_with_name(ROW_ADDR).is_some() {
+                    scanner.with_row_address();
+                }
                 if let Some(ref filter) = self.filter {
                     // `prefilter(true)` is required: without it the scanner
                     // post-filters the unfiltered BM25 top-k, dropping matching
@@ -1303,12 +1322,11 @@ impl LsmFtsSearchPlanner {
                 let mut scanner = dataset.scan();
                 // Asked of this generation under its own names: a rename moved
                 // the table's name while the file still holds the old one.
-                let asked_for = self.fts_scanner_projection(projection);
                 let mut generation = GenerationRead::new(
                     dataset.schema(),
                     &self.identity_schema,
                     &self.pk_columns,
-                    asked_for,
+                    data_columns.to_vec(),
                 );
                 // A rename moves the table's name while the file still holds
                 // the old one; a column added since is absent.
@@ -1321,7 +1339,10 @@ impl LsmFtsSearchPlanner {
                 let query = &narrowed.query;
                 // A predicate this generation cannot answer as written runs
                 // above the reconciliation, where the columns it names exist.
-                let (stored_filter, above) = generation.split_filter(self.filter.as_ref());
+                let (stored_filter, above) = generation.split_fts_filter(
+                    self.filter.as_ref(),
+                    computed_columns(document_granularity),
+                )?;
                 // Resolve against the *source* schema so a nested path narrows the
                 // struct rather than flattening it; expressions cannot express a
                 // partial nested projection, only a schema can.
@@ -1356,7 +1377,6 @@ impl LsmFtsSearchPlanner {
                 visible_batch_count,
                 ..
             } => {
-                let document_granularity = query_document_granularity(query)?;
                 // `Some` only for a memtable created before a schema change.
                 let mut generation =
                     (!memtable_matches_table(schema, &self.identity_schema)).then(|| {
@@ -1364,7 +1384,7 @@ impl LsmFtsSearchPlanner {
                             schema,
                             &self.identity_schema,
                             &self.pk_columns,
-                            self.fts_scanner_projection(projection),
+                            data_columns.to_vec(),
                         )
                     });
                 let Some(narrowed) = narrow_to_source(query, |column| match &generation {
@@ -1372,8 +1392,7 @@ impl LsmFtsSearchPlanner {
                     Some(generation) => generation.stored_fts_name(column).map(str::to_string),
                 })?
                 else {
-                    return self
-                        .empty_plan(&self.canonical_fts_schema(projection, document_granularity)?);
+                    return self.empty_plan(target_schema);
                 };
                 let query = &narrowed.query;
                 let stored_columns = narrowed.stored_columns.as_slice();
@@ -1421,9 +1440,7 @@ impl LsmFtsSearchPlanner {
                     )? {
                         Some(store) => store,
                         None => {
-                            return self.empty_plan(
-                                &self.canonical_fts_schema(projection, document_granularity)?,
-                            );
+                            return self.empty_plan(target_schema);
                         }
                     }
                 };
@@ -1444,8 +1461,7 @@ impl LsmFtsSearchPlanner {
                 }
 
                 let Some(generation) = generation.as_mut() else {
-                    let cols = self.fts_scanner_projection(projection);
-                    scanner.project(&cols.iter().map(|s| s.as_str()).collect::<Vec<_>>())?;
+                    scanner.project(data_columns)?;
                     if let Some(ref filter) = self.filter {
                         // Honored inside `plan_fts_search`: the materialized hits
                         // are masked by the predicate before projection.
@@ -1457,7 +1473,10 @@ impl LsmFtsSearchPlanner {
 
                 // If part of the filter runs after the search, don't limit the
                 // search: the limit would drop rows before that filter sees them.
-                let (stored_filter, above) = generation.split_filter(self.filter.as_ref());
+                let (stored_filter, above) = generation.split_fts_filter(
+                    self.filter.as_ref(),
+                    computed_columns(document_granularity),
+                )?;
                 scanner.project(&generation.stored_projection())?;
                 if let Some(stored) = stored_filter {
                     scanner.filter_expr(stored);
@@ -1472,30 +1491,7 @@ impl LsmFtsSearchPlanner {
         }
     }
 
-    /// Columns to pass to the underlying scanner: user projection minus
-    /// system / `_score`, with PK columns appended.
-    fn fts_scanner_projection(&self, user_projection: Option<&[String]>) -> Vec<String> {
-        let mut cols: Vec<String> = if let Some(p) = user_projection {
-            p.iter()
-                .filter(|c| !is_system_column(c) && c.as_str() != SCORE_COLUMN)
-                .cloned()
-                .collect()
-        } else {
-            self.base_schema
-                .fields()
-                .iter()
-                .map(|f| f.name().clone())
-                .collect()
-        };
-        for pk in &self.pk_columns {
-            if !cols.contains(pk) {
-                cols.push(pk.clone());
-            }
-        }
-        cols
-    }
-
-    /// Canonical FTS output: user-projected cols + PK + `_score`.
+    /// The merged output schema and the physical columns each source must read.
     ///
     /// Data columns resolve through [`resolve_data_fields`], the same
     /// nested-path resolver [`canonical_output_schema`] uses, so `meta.a`
@@ -1504,13 +1500,41 @@ impl LsmFtsSearchPlanner {
     /// columns (`_score`, `_doc_index`) are appended around it.
     ///
     /// [`canonical_output_schema`]: super::projection::canonical_output_schema
-    fn canonical_fts_schema(
+    fn fts_projection(
         &self,
         user_projection: Option<&[String]>,
         document_granularity: DocumentGranularity,
-    ) -> Result<SchemaRef> {
-        let mut ordered: Vec<String> = if let Some(p) = user_projection {
-            p.to_vec()
+    ) -> Result<(SchemaRef, Vec<String>)> {
+        let computed_columns = computed_columns(document_granularity);
+        if let Some(pk) = self
+            .pk_columns
+            .iter()
+            .find(|pk| computed_columns.contains(&pk.as_str()))
+        {
+            return Err(Error::invalid_input(format!(
+                "full-text search cannot return both the primary key and a computed column named {pk}"
+            )));
+        }
+        let mut ordered: Vec<String> = if let Some(projection) = user_projection {
+            let mut names = Vec::with_capacity(projection.len());
+            for path in projection {
+                let parts = parse_field_path(path)?;
+                let root = &parts[0];
+                if computed_columns.contains(&root.as_str()) || is_system_column(root) {
+                    if parts.len() > 1 {
+                        return Err(Error::invalid_input(format!(
+                            "cannot project {path} within full-text search output column {root}"
+                        )));
+                    }
+                    if !names.contains(root) {
+                        names.push(root.clone());
+                    }
+                } else {
+                    names.push(path.clone());
+                }
+            }
+            validate_projection_names(Some(&names), &self.base_schema, computed_columns)?;
+            names
         } else {
             self.base_schema
                 .fields()
@@ -1530,11 +1554,12 @@ impl LsmFtsSearchPlanner {
             ordered.push(SCORE_COLUMN.to_string());
         }
 
+        if self.with_row_address && !ordered.iter().any(|name| name == ROW_ADDR) {
+            ordered.push(ROW_ADDR.to_owned());
+        }
         let data_names: Vec<String> = ordered
             .iter()
-            .filter(|n| {
-                n.as_str() != SCORE_COLUMN && n.as_str() != DOC_INDEX_COL && !is_system_column(n)
-            })
+            .filter(|name| !computed_columns.contains(&name.as_str()) && !is_system_column(name))
             .cloned()
             .collect();
         let mut by_name: HashMap<String, Arc<Field>> =
@@ -1547,7 +1572,7 @@ impl LsmFtsSearchPlanner {
         for name in &ordered {
             if name == SCORE_COLUMN {
                 fields.push(Arc::new(Field::new(SCORE_COLUMN, DataType::Float32, true)));
-            } else if name == DOC_INDEX_COL {
+            } else if document_granularity.is_list_element() && name == DOC_INDEX_COL {
                 fields.push(Arc::new(DOC_INDEX_FIELD.clone()));
             } else if is_system_column(name) {
                 fields.push(Arc::new(Field::new(name.clone(), DataType::UInt64, true)));
@@ -1557,7 +1582,7 @@ impl LsmFtsSearchPlanner {
                 fields.push(field);
             }
         }
-        Ok(Arc::new(Schema::new(fields)))
+        Ok((Arc::new(Schema::new(fields)), data_names))
     }
 
     fn empty_plan(&self, schema: &SchemaRef) -> Result<Arc<dyn ExecutionPlan>> {
@@ -2166,7 +2191,7 @@ mod tests {
             },
         );
         let planner = LsmFtsSearchPlanner::new(collector, vec!["id".to_string()], schema);
-        let projection = vec!["id".to_string()];
+        let projection = vec!["id".to_string(), DOC_INDEX_COL.to_string()];
         let plan = planner
             .plan_search(
                 FullTextSearchQuery::new_query(IndexFtsQuery::Match(MatchQuery::new(
@@ -2681,8 +2706,7 @@ mod tests {
                     frozen: vec![],
                 },
             );
-        let planner = LsmFtsSearchPlanner::new(collector, vec!["id".to_string()], base_schema)
-            .with_overfetch_factor(2.0);
+        let planner = LsmFtsSearchPlanner::new(collector, vec!["id".to_string()], base_schema);
 
         let plan = planner
             .plan_search(

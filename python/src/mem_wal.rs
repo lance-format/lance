@@ -33,6 +33,7 @@ use lance_arrow::deepcopy::deep_copy_batch;
 use lance_index::mem_wal::{
     CompactedSsTable as LanceCompactedSsTable, ShardingField, ShardingSpec,
 };
+use lance_index::scalar::FullTextSearchQuery;
 use pyo3::exceptions::{PyIOError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
@@ -42,6 +43,7 @@ use uuid::Uuid;
 use crate::dataset::Dataset as PyDataset;
 use crate::reader::LanceReader;
 use crate::rt;
+use crate::scanner::PyFullTextQuery;
 use crate::schema::LanceSchema as PyLanceSchema;
 use crate::utils::parse_distance_type;
 
@@ -673,6 +675,23 @@ impl PyLsmScanner {
         slf.inner = Some(
             scanner
                 .filter(&expr)
+                .map_err(|e| PyValueError::new_err(e.to_string()))?,
+        );
+        Ok(slf)
+    }
+
+    /// Find rows matching a full-text query across all LSM levels.
+    pub fn full_text_search(
+        mut slf: PyRefMut<'_, Self>,
+        query: PyFullTextQuery,
+    ) -> PyResult<PyRefMut<'_, Self>> {
+        let scanner = slf
+            .inner
+            .take()
+            .ok_or_else(|| PyRuntimeError::new_err("Scanner has already been consumed"))?;
+        slf.inner = Some(
+            scanner
+                .full_text_search(FullTextSearchQuery::new_query(query.inner))
                 .map_err(|e| PyValueError::new_err(e.to_string()))?,
         );
         Ok(slf)

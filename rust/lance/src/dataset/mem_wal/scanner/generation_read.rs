@@ -14,8 +14,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Fields, Schema, SchemaRef};
-use datafusion::common::DFSchema;
 use datafusion::common::tree_node::{Transformed, TreeNode};
+use datafusion::common::{DFSchema, ScalarValue};
 use datafusion::execution::context::ExecutionProps;
 use datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext;
 use datafusion::physical_plan::ExecutionPlan;
@@ -27,7 +27,7 @@ use lance_core::is_system_column;
 use lance_core::{Error, Result};
 
 use super::exec::ReconcileExec;
-use super::projection::{is_auto_managed, resolve_data_fields_or_drop};
+use super::projection::{is_auto_managed, resolve_data_fields_or_drop, top_level_of};
 use crate::dataset::mem_wal::reconcile::{Plan, field_id_of, without_field_id};
 use crate::dataset::mem_wal::{TOMBSTONE, arrow_schema_with_field_ids};
 
@@ -233,6 +233,50 @@ impl GenerationRead {
             }
         }
         (pushed, deferred)
+    }
+
+    /// Bind filters to the physical data while keeping homonymous search outputs
+    /// available for ranking and element coordinates.
+    pub(super) fn split_fts_filter(
+        &mut self,
+        filter: Option<&Expr>,
+        computed_columns: &[&str],
+    ) -> Result<(Option<Expr>, Option<Expr>)> {
+        let filter = filter
+            .map(|expr| {
+                expr.clone().transform(|expr| {
+                    // A physical field added after this generation has a known value.
+                    // Projecting it to evaluate the filter would overwrite the FTS output.
+                    if let Expr::Column(column) = &expr
+                        && computed_columns.contains(&column.name.as_str())
+                        && self.stored_name(&column.name).is_none()
+                        && let Ok(field) = self.table_schema.field_with_name(&column.name)
+                    {
+                        return Ok(Transformed::yes(Expr::Literal(
+                            ScalarValue::try_from(field.data_type())?,
+                            None,
+                        )));
+                    }
+                    Ok(Transformed::no(expr))
+                })
+            })
+            .transpose()?;
+        let filters = self.split_filter(filter.as_ref().map(|f| &f.data));
+
+        // A computed output has no stored field id, even when the generation
+        // contains a physical field with the same name.
+        for &name in computed_columns {
+            if self.stored_columns.remove(name) {
+                for stored in self.stored_projection() {
+                    if top_level_of(stored)? == name {
+                        return Err(Error::invalid_input(format!(
+                            "the scan requests both a stored and a computed column named {name}"
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(filters)
     }
 
     /// Whether the generation stores `column` exactly as the table declares

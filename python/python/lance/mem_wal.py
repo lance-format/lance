@@ -31,6 +31,7 @@ from .lance import (
     _ShardSnapshot,
     _ShardWriter,
 )
+from .query import FullTextQuery
 from .types import _coerce_reader
 
 if TYPE_CHECKING:
@@ -366,7 +367,7 @@ class LsmScanner:
     Obtain an instance from `ShardWriter.lsm_scanner` (includes
     active MemTable) or `LsmScanner.from_snapshots` (SSTables only).
 
-    The builder methods (`project`, `filter`, `limit`)
+    The builder methods (`project`, `filter`, `full_text_search`, `limit`)
     return ``self`` for chaining.
 
     Examples
@@ -409,6 +410,45 @@ class LsmScanner:
         self._raw = self._raw.filter(expr)
         return self
 
+    def full_text_search(self, query: FullTextQuery) -> "LsmScanner":
+        """Find rows matching a full-text query across all LSM levels.
+
+        The query names the columns to search. Each source (the base table,
+        an SSTable, or an active or frozen MemTable) computes BM25 scores
+        using its own term statistics. The scanner merges hits by descending
+        ``_score``, so their order can change after a flush or compaction.
+
+        In-memory MemTables do not support :class:`~lance.query.CombinedFieldsQuery`,
+        including when it appears inside a compound query.
+
+        Parameters
+        ----------
+        query : FullTextQuery
+            The full-text query to execute, such as
+            :class:`~lance.query.MatchQuery`.
+
+        Returns
+        -------
+        LsmScanner
+            This scanner, for chaining.
+
+        Examples
+        --------
+        ::
+
+            from lance.query import MatchQuery
+
+            table = scanner.full_text_search(
+                MatchQuery("user", "code")
+            ).to_table()
+        """
+        if not isinstance(query, FullTextQuery):
+            raise TypeError(
+                f"full_text_search expects a FullTextQuery, got {type(query).__name__}"
+            )
+        self._raw = self._raw.full_text_search(query.inner)
+        return self
+
     def limit(
         self, n: Optional[int] = None, offset: Optional[int] = None
     ) -> "LsmScanner":
@@ -417,12 +457,15 @@ class LsmScanner:
         return self
 
     def with_row_address(self) -> "LsmScanner":
-        """Include the ``_rowaddr`` internal column in results."""
+        """Include ``_rowaddr``, the base row address or null for a MemWAL row."""
         self._raw = self._raw.with_row_address()
         return self
 
     def with_memtable_gen(self) -> "LsmScanner":
-        """Include the ``_memtable_gen`` internal column in results."""
+        """Include the source generation (zero for the base) as ``_memtable_gen``.
+
+        If the projection includes a data field with this name, it keeps its value.
+        """
         self._raw = self._raw.with_memtable_gen()
         return self
 
