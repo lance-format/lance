@@ -924,6 +924,8 @@ impl InvertedIndex {
             .try_flatten();
         while let Some(partition) = parts.try_next().await? {
             for (row_id, score) in rescore_partition_candidates(partition, scorer) {
+                // The merge must see the constant the collector ranked with.
+                let score = if params.constant_score { 0.0 } else { score };
                 push_top_k_document(&mut ranked, limit, ScoredDoc::new(row_id, score));
             }
         }
@@ -1134,7 +1136,8 @@ impl InvertedIndex {
                                 &context,
                                 &mask,
                                 partition_term_ids,
-                                false,
+                                // A constant-score walk selects ties by address and needs it on the first pass.
+                                context.params.constant_score,
                             )
                             .await
                         }

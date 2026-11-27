@@ -388,19 +388,20 @@ fn normalize_fts_zero_boosts(query: &mut FtsQuery) {
     }
 }
 
-/// Search parameters for a Match leaf, with no pushed limit when the boost is
-/// not positive.
+/// Search parameters for a Match leaf: pushed limit kept, score ranking off at
+/// a zero boost.
 ///
-/// The collector ranks hits by its own BM25 score and cuts its top-k there,
-/// while `MatchQueryExec` multiplies the emitted scores by `MatchQuery::boost`.
-/// A boost of 0.0 puts every hit at 0.0, so a collector-side cut drops rows the
-/// final order keeps. Such a leaf returns every match and the plan sorts them.
-/// `validate_fts_query_contract` admits no other non-positive boost.
+/// The collector ranks hits by its own BM25 score and cuts top-k there, while
+/// `MatchQueryExec` multiplies emitted scores by `MatchQuery::boost`. A boost
+/// of 0.0 ranks nothing, so a collector-side cut would drop rows the final
+/// order keeps. `constant_score` tells the index to rank on the tie order and
+/// return that constant. `validate_fts_query_contract` admits no other
+/// non-positive boost.
 fn match_leaf_params(query: &MatchQuery, params: &FtsSearchParams) -> FtsSearchParams {
     if query.boost > 0.0 {
         params.clone()
     } else {
-        params.clone().with_limit(None)
+        params.clone().with_constant_score(true)
     }
 }
 

@@ -4445,6 +4445,106 @@ async fn test_match_query_zero_score_tie_is_a_stable_prefix_with_an_unindexed_ro
     }
 }
 
+/// A boost of 0.0 scores every hit alike, and the tie order picks the page. Each
+/// fragment holds its worst-scoring document at its lowest row address.
+#[tokio::test]
+async fn test_match_query_zero_boost_orders_by_row_id_and_bounds_the_leaf_walk() {
+    const ROWS: usize = 128;
+    const LIMIT: i64 = 5;
+
+    // Fragment 0 is indexed and owns the lowest row addresses, fragment 1 is left
+    // unindexed so its hits arrive through the flat arm, and fragment 2 is
+    // indexed and owns the highest. In each fragment only the first row carries
+    // filler terms, so a fragment's lowest address is its worst BM25 hit.
+    let fragment = || {
+        let texts = std::iter::once("common filler filler filler".to_string())
+            .chain(std::iter::repeat_n("common".to_string(), ROWS - 1))
+            .collect::<Vec<_>>();
+        arrow_array::record_batch!(("text", Utf8, texts)).unwrap()
+    };
+    let batches = vec![fragment(), fragment(), fragment()];
+    let schema = batches[0].schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(batches.into_iter().map(Ok), schema),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: ROWS,
+            max_rows_per_group: ROWS,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let fragment_ids = dataset
+        .get_fragments()
+        .iter()
+        .map(|fragment| fragment.id() as u32)
+        .collect::<Vec<_>>();
+    create_fragmented_fts_index_with_groups(
+        &mut dataset,
+        "text",
+        false,
+        vec![vec![fragment_ids[0]], vec![fragment_ids[2]]],
+    )
+    .await;
+
+    // Tied results page through in row address order.
+    let mut scan = dataset.scan();
+    scan.with_row_id();
+    let expected = scan.try_into_batch().await.unwrap()[ROW_ID]
+        .as_primitive::<UInt64Type>()
+        .values()
+        .to_vec();
+
+    let query = compound_match_query("common", "text", 0.0);
+    let row_ids = |hits: &[(u64, f32)]| hits.iter().map(|(row_id, _)| *row_id).collect::<Vec<_>>();
+
+    // Premise: BM25 order and address order disagree.
+    let scored = compound_fts_results(
+        &dataset,
+        compound_match_query("common", "text", 1.0),
+        Some(LIMIT),
+    )
+    .await;
+    assert_ne!(
+        row_ids(&scored)[0],
+        expected[0],
+        "premise: the best BM25 hit must not be the lowest row address, got {scored:?}"
+    );
+
+    for limit in [1_i64, LIMIT, (ROWS + 2) as i64] {
+        let hits = compound_fts_results(&dataset, query.clone(), Some(limit)).await;
+        assert_tied_scores(&hits, |(_, score)| *score);
+        assert_eq!(
+            row_ids(&hits),
+            expected[..limit as usize],
+            "a zero-boost page at limit {limit} must be the first row addresses, indexed and unindexed"
+        );
+    }
+
+    // The leaf keeps its limit and stops at the k-th row address.
+    let stats = Arc::new(Mutex::new(None));
+    let captured = stats.clone();
+    let mut scan = dataset.scan();
+    scan.with_row_id()
+        .full_text_search(FullTextSearchQuery::new_query(query))
+        .unwrap()
+        .limit(Some(LIMIT), None)
+        .unwrap()
+        .scan_stats_callback(Arc::new(move |summary| {
+            *captured.lock().unwrap() = Some(summary.clone());
+        }));
+    let page = scan.try_into_batch().await.unwrap();
+    assert_eq!(page.num_rows(), LIMIT as usize);
+    let summary = stats.lock().unwrap().take().unwrap();
+    assert!(
+        summary.index_comparisons <= 2 * (LIMIT as usize + 1),
+        "a zero-boost leaf must stop at the k-th row address, got {} comparisons for {} matches per indexed fragment",
+        summary.index_comparisons,
+        ROWS
+    );
+}
+
 #[tokio::test]
 async fn test_match_query_tie_is_a_stable_prefix_without_an_index() {
     // With no FTS index every hit is scored on the flat path, and the leaf top-k

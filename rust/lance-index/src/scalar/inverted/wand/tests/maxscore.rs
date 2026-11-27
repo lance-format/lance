@@ -208,7 +208,7 @@ fn maxscore_block_skip_stops_at_the_end_of_the_span() {
     }];
     let ess_term = clauses[0].posting.term_index();
     let mut scratch = MaxScoreSoaScratch::new();
-    let mut candidates = TopKCollector::new(10, 10, TieOrdering::ByRowAddress, None);
+    let mut candidates = TopKCollector::new(10, 10, TieOrdering::ByRowAddress, None, false);
     let mut chunk: Vec<(u64, u32)> = Vec::new();
     let mut comparisons = 0usize;
     // 200 lands inside the second block (128..=255), whose end is 255.
@@ -316,7 +316,7 @@ fn maxscore_skips_a_dead_essential_block() {
     ];
     let ess_term = clauses[1].posting.term_index();
     let mut scratch = MaxScoreSoaScratch::new();
-    let mut candidates = TopKCollector::new(10, 10, TieOrdering::ByRowAddress, None);
+    let mut candidates = TopKCollector::new(10, 10, TieOrdering::ByRowAddress, None, false);
     let mut chunk: Vec<(u64, u32)> = Vec::new();
     let mut comparisons = 0usize;
     wand.score_single_essential_upto(

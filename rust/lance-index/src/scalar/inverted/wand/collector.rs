@@ -237,6 +237,8 @@ pub(super) struct TopKCollector {
     /// Element ranks past the packed key. Heap records hold a cloned handle: the
     /// compare path allocates nothing.
     deeper_coordinates: Option<ResidentDocCoordinates>,
+    /// True when every score is the caller's constant: BM25 ranks nothing.
+    constant_score: bool,
     /// Set when the collector gave up on the pass rather than merely dropping
     /// candidates, so a later improvement cannot make the flag obsolete.
     aborted: bool,
@@ -248,6 +250,7 @@ impl TopKCollector {
         initial_capacity: usize,
         tie_ordering: TieOrdering,
         deeper_coordinates: Option<ResidentDocCoordinates>,
+        constant_score: bool,
     ) -> Self {
         let initial_capacity = initial_capacity.min(limit);
         Self {
@@ -259,6 +262,7 @@ impl TopKCollector {
             tie_band: Vec::new(),
             band_truncated: false,
             deeper_coordinates,
+            constant_score,
             aborted: false,
         }
     }
@@ -304,6 +308,16 @@ impl TopKCollector {
         if doc.score.0.is_nan() {
             return Ok(false);
         }
+
+        // Store the constant: a later merge ranks on the stored score.
+        let doc = if self.constant_score {
+            ScoredDoc {
+                score: OrderedFloat(0.0),
+                ..doc
+            }
+        } else {
+            doc
+        };
 
         if self.heap.len() < self.limit {
             let mut candidate = self.new_candidate(doc, order, doc_length, posting_doc_id);
@@ -489,6 +503,10 @@ impl TopKCollector {
         if score.is_nan() {
             return true;
         }
+        if self.constant_score {
+            // Score floors are inert: the k-th score is the caller's constant.
+            return false;
+        }
         self.kth_score_if_full()
             .is_some_and(|kth| match self.tie_ordering {
                 TieOrdering::AscendingRowAddresses => score <= kth,
@@ -502,6 +520,18 @@ impl TopKCollector {
         } else {
             None
         }
+    }
+
+    /// True when a constant-score walk has nothing left to find: addresses ascend
+    /// with DocId, and every document past the k-th entry's address loses.
+    pub(super) fn constant_score_walk_is_done(&self, address: u64) -> bool {
+        self.constant_score
+            && self.tie_ordering == TieOrdering::AscendingRowAddresses
+            && self.heap.len() == self.limit
+            && self
+                .heap
+                .peek()
+                .is_some_and(|Reverse(worst)| address > worst.order.address)
     }
 
     pub(super) fn into_candidates<C>(

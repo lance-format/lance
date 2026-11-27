@@ -349,6 +349,8 @@ pub struct Wand<'a, S: Scorer, D: WandDocuments> {
     // Which tiebreak the document adapter allows, fixed at construction so the
     // collector and every score floor treat a k-th-score tie the same way.
     tie_ordering: TieOrdering,
+    // From `FtsSearchParams::constant_score`.
+    constant_score: bool,
     // Coordinate columns for the ranks past one packed key; `None` when the key
     // covers every rank or the walk ranks no coordinates.
     deeper_coordinates: Option<ResidentDocCoordinates>,
@@ -506,6 +508,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             documents,
             scorer,
             tie_ordering,
+            constant_score: false,
             deeper_coordinates,
             shared_threshold: None,
             shared_norm_addends: None,
@@ -522,6 +525,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             initial_capacity,
             self.tie_ordering,
             self.deeper_coordinates.clone(),
+            self.constant_score,
         )
     }
 
@@ -693,6 +697,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         if limit == 0 {
             return Ok(vec![]);
         }
+        self.constant_score = params.constant_score;
 
         if params.phrase_slop.is_some() {
             self.invalidate_score_first_and_window();
@@ -711,7 +716,10 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         // MAXSCORE path (Lucene MaxScoreBulkScorer style): it streams whole
         // blocks of the essential clauses into a window accumulator instead of
         // advancing doc-at-a-time through a heap.
+        //
+        // The bulk path has no stop on the tie order and scores every match.
         if *USE_MAXSCORE_SEARCH
+            && !self.constant_score
             && self.operator == Operator::Or
             && params.phrase_slop.is_none()
             && !self.head.is_empty()
@@ -727,6 +735,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         // from a slice-level merge over decompressed blocks instead of per-doc
         // `next()` leapfrogging through boxed iterators.
         if self.operator == Operator::And
+            && !self.constant_score
             && !self.lead.is_empty()
             && self
                 .lead
@@ -768,6 +777,12 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
                 }
                 continue;
             };
+
+            let tie_order = self.documents.tie_order(document_key);
+            if candidates.constant_score_walk_is_done(tie_order.address) {
+                // Addresses ascend: every document ahead of this one loses.
+                break;
+            }
 
             let doc_length = self.documents.doc_length(&doc);
 
@@ -832,7 +847,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
 
             if candidates.insert(
                 ScoredDoc::new(document_key, score),
-                self.documents.tie_order(document_key),
+                tie_order,
                 doc_length,
                 posting_doc_id,
                 self.iter_term_freqs(),

@@ -938,3 +938,109 @@ async fn test_fts_topk_tied_scores_retry_every_overflowed_partition() {
     )
     .await;
 }
+
+/// Documents differ in `num_tokens`. BM25 order and row address order disagree.
+async fn build_partition_with_doc_lengths(
+    store: &Arc<LanceIndexStore>,
+    partition_id: u64,
+    row_ids: &[u64],
+    num_tokens: &[u32],
+) {
+    let mut builder = InnerBuilder::new(partition_id, false, TokenSetFormat::default());
+    builder.tokens.get_or_add("alpha");
+    builder.posting_lists.push(PostingListBuilder::new(false));
+    for (doc_id, (&row_id, &tokens)) in row_ids.iter().zip(num_tokens).enumerate() {
+        builder.posting_lists[0].add(doc_id as u32, PositionRecorder::Count(1));
+        builder.docs.append(row_id, tokens);
+    }
+    builder.write(store.as_ref()).await.unwrap();
+}
+
+async fn search_alpha_with_params(
+    index: &InvertedIndex,
+    params: FtsSearchParams,
+) -> Vec<(u64, f32)> {
+    let (row_ids, scores) = index
+        .bm25_search(
+            Arc::new(Tokens::new(vec!["alpha".to_owned()], DocType::Text)),
+            Arc::new(params),
+            Operator::Or,
+            Arc::new(NoFilter),
+            Arc::new(NoOpMetricsCollector),
+            None,
+        )
+        .await
+        .unwrap();
+    row_ids.into_iter().zip(scores).collect()
+}
+
+/// A zero boost scores every hit alike, and the search selects on the tie order.
+#[tokio::test]
+async fn test_fts_constant_score_search_selects_row_addresses_over_scores() {
+    let tmpdir = TempObjDir::default();
+    let store = Arc::new(LanceIndexStore::new(
+        ObjectStore::local().into(),
+        tmpdir.clone(),
+        Arc::new(LanceCache::no_cache()),
+    ));
+    // Partition 0 owns the lowest row addresses and the longest documents; partition
+    // 1 the highest addresses and the best scores. A limit under one partition's
+    // document count exercises both cuts.
+    build_partition_with_doc_lengths(&store, 0, &[0, 1, 2, 3, 4], &[100; 5]).await;
+    build_partition_with_doc_lengths(&store, 1, &[100, 101, 102, 103, 104], &[1; 5]).await;
+    write_test_metadata(&store, vec![0, 1], InvertedIndexParams::default()).await;
+    let index = InvertedIndex::load(store, None, &Arc::new(LanceCache::no_cache()))
+        .await
+        .unwrap();
+
+    let row_ids = |hits: &[(u64, f32)]| hits.iter().map(|(row_id, _)| *row_id).collect::<Vec<_>>();
+    let scored = search_alpha_with_params(&index, FtsSearchParams::new().with_limit(Some(3))).await;
+    assert_eq!(
+        row_ids(&scored),
+        vec![100, 101, 102],
+        "premise: the BM25 order must rank the highest row addresses first, got {scored:?}"
+    );
+
+    let tied = search_alpha_with_params(
+        &index,
+        FtsSearchParams::new()
+            .with_limit(Some(3))
+            .with_constant_score(true),
+    )
+    .await;
+    assert_eq!(
+        row_ids(&tied),
+        vec![0, 1, 2],
+        "a constant-score search must keep the lowest row addresses, got {tied:?}"
+    );
+    assert!(
+        tied.iter().all(|(_, score)| *score == 0.0),
+        "a constant-score search must hand back its constant, got {tied:?}"
+    );
+
+    // Each limit's top-k is an ordered prefix of the next. A tied page skips no row
+    // and repeats none.
+    let mut previous: Vec<u64> = Vec::new();
+    for limit in [1, 3, 5, 8] {
+        let hits = row_ids(
+            &search_alpha_with_params(
+                &index,
+                FtsSearchParams::new()
+                    .with_limit(Some(limit))
+                    .with_constant_score(true),
+            )
+            .await,
+        );
+        assert_eq!(
+            hits,
+            ascending_row_ids(&[(0, vec![0, 1, 2, 3, 4]), (1, vec![100, 101, 102, 103, 104])])
+                [..limit],
+            "top-k at limit {limit} must be the first page of the tied order"
+        );
+        assert!(
+            hits.starts_with(&previous),
+            "limit {limit} must extend the smaller limit"
+        );
+        previous = hits;
+    }
+}

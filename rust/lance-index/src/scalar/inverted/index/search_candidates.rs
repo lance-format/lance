@@ -366,9 +366,9 @@ pub(super) struct LoadedModernPartition {
     pub(super) lengths: Arc<DocLengths>,
     pub(super) visibility: DocVisibility,
     pub(super) postings: FetchedPostings,
-    /// Row addresses the walk orders k-th-score ties by: the resident ones, or
-    /// those read for the retry after a tie overflow. Without them the walk
-    /// defers ties to the global merge.
+    /// Row addresses the walk orders k-th-score ties by: the resident ones, those
+    /// read for a tie retry, or those read for a constant-score walk. Without them
+    /// the walk defers ties to the global merge.
     pub(super) addresses: Option<ResidentAddressProjection>,
     /// Element coordinates the walk orders one row's ties by: read when the
     /// partition holds list elements and the addresses are resident. Without them
@@ -427,9 +427,7 @@ pub(super) async fn load_modern_partition(
         None => documents.lengths().await?,
     };
     let addresses = if load_addresses {
-        // The retry reads addresses so it can order the tie band exactly with a
-        // heap bounded by `limit`. A partition that reaches the final top-k pays
-        // that read either way.
+        // A constant-score walk orders ties by address and needs the projection up front.
         Some(documents.address_projection().await?)
     } else {
         documents.resident_address_projection()
@@ -539,7 +537,7 @@ pub(super) fn score_modern_partition(
             "FTS element tie band truncated; elements tied on the whole `doc_index` path past the cap order by DocId"
         );
     }
-    let scored = rescore_partition_candidates(
+    let mut scored = rescore_partition_candidates(
         PartitionCandidates {
             idf_by_position,
             grouped_expansions,
@@ -547,6 +545,10 @@ pub(super) fn score_modern_partition(
         },
         context.impact_scorer.as_ref(),
     );
+    if context.params.constant_score {
+        // Zero the score: not a ranking key downstream.
+        scored.iter_mut().for_each(|(_, score)| *score = 0.0);
+    }
     Ok(
         (!scored.is_empty()).then_some(ModernPartitionOutcome::Scored {
             partition_ordinal,

@@ -392,3 +392,78 @@ fn test_ascending_row_addresses_prune_a_tied_walk_at_the_raw_kth_score() {
         "a tied address-ascending walk must stop after the first posting block of {BLOCK_SIZE} documents, scored {scored} of {total}"
     );
 }
+
+/// A constant score ranks nothing: the walk selects on the tie order and stops
+/// early.
+#[rstest]
+#[case::small_top_k(4)]
+#[case::one_block_top_k(BLOCK_SIZE)]
+#[case::past_one_block(BLOCK_SIZE + 5)]
+fn test_a_constant_score_walk_selects_the_lowest_row_addresses(#[case] limit: usize) {
+    use crate::metrics::MetricsCollector;
+
+    #[derive(Default)]
+    struct CountWalkSteps(AtomicUsize);
+    impl MetricsCollector for CountWalkSteps {
+        fn record_parts_loaded(&self, _: usize) {}
+        fn record_index_loads(&self, _: usize) {}
+        fn record_comparisons(&self, n: usize) {
+            self.0.fetch_add(n, Ordering::Relaxed);
+        }
+    }
+
+    const NUM_DOCS: u32 = 4 * BLOCK_SIZE as u32;
+    let mut docs = DocSet::default();
+    for row_id in 0..NUM_DOCS {
+        docs.append(u64::from(row_id), 1);
+    }
+    // The higher frequencies sit in the last half of the posting list, so a
+    // collector that ranked on this score would answer with the highest row
+    // addresses, exactly the rows the caller's constant order keeps last.
+    let freqs = (0..NUM_DOCS)
+        .map(|doc_id| if doc_id < NUM_DOCS / 2 { 1 } else { 4 })
+        .collect::<Vec<_>>();
+    let posting = PostingIterator::with_query_weight(
+        String::from("term"),
+        0,
+        0,
+        1.0,
+        generate_posting_list_with_freqs(
+            (0..NUM_DOCS).collect(),
+            freqs,
+            4.0,
+            Some(vec![4.0; (NUM_DOCS / BLOCK_SIZE as u32) as usize]),
+            true,
+        ),
+        docs.len(),
+    );
+
+    let params = FtsSearchParams::new()
+        .with_limit(Some(limit))
+        .with_constant_score(true);
+    let steps = CountWalkSteps::default();
+    let hits = Wand::new(
+        Operator::Or,
+        std::iter::once(posting),
+        &docs,
+        CountingScorer {
+            scored: Arc::new(AtomicUsize::new(0)),
+        },
+    )
+    .search(&params, &steps)
+    .unwrap();
+
+    // `search` hands back its candidates unordered; the caller ranks them.
+    let mut addresses = hits.iter().map(|hit| hit.document).collect::<Vec<_>>();
+    addresses.sort_unstable();
+    assert_eq!(
+        addresses,
+        (0..limit as u64).collect::<Vec<_>>(),
+        "a constant-score walk must keep the lowest row addresses, not the best BM25 scores"
+    );
+    let steps = steps.0.load(Ordering::Relaxed);
+    assert!(
+        steps <= limit + 1,
+        "a constant-score walk must stop at the k-th row address, walked {steps} of {NUM_DOCS} documents"
+    );
+}

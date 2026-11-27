@@ -17,7 +17,13 @@ use crate::scalar::inverted::documents::ElementCoordinateKey;
 /// Collector for a walk whose row addresses are resident and strictly ascend with
 /// the DocId order the walk visits.
 fn ascending_address_collector(limit: usize) -> TopKCollector {
-    TopKCollector::new(limit, limit, TieOrdering::AscendingRowAddresses, None)
+    TopKCollector::new(
+        limit,
+        limit,
+        TieOrdering::AscendingRowAddresses,
+        None,
+        false,
+    )
 }
 
 /// Collector for a walk whose row addresses are resident but whose DocId order
@@ -25,13 +31,19 @@ fn ascending_address_collector(limit: usize) -> TopKCollector {
 /// coordinates are attached: the partition is row granularity, or its adapter
 /// loaded no coordinate columns.
 fn row_address_collector(limit: usize) -> TopKCollector {
-    TopKCollector::new(limit, limit, TieOrdering::ByRowAddress, None)
+    TopKCollector::new(limit, limit, TieOrdering::ByRowAddress, None, false)
+}
+
+/// Collector for a walk with resident addresses, a DocId order that does not
+/// follow them, and a caller that scores every hit with a constant.
+fn constant_score_collector(limit: usize) -> TopKCollector {
+    TopKCollector::new(limit, limit, TieOrdering::ByRowAddress, None, true)
 }
 
 /// Collector for an address-ordered walk over a partition of `coordinate_rank`
 /// at most four: the packed key covers every rank and needs no columns.
 fn ranked_element_collector(limit: usize) -> TopKCollector {
-    TopKCollector::new(limit, limit, TieOrdering::ByRowAddress, None)
+    TopKCollector::new(limit, limit, TieOrdering::ByRowAddress, None, false)
 }
 
 /// Collector for an address-ordered walk whose element paths run past one packed
@@ -42,12 +54,94 @@ fn deep_element_collector(limit: usize, columns: Vec<UInt32Array>) -> TopKCollec
         limit,
         TieOrdering::ByRowAddress,
         Some(resident_coordinates_for_test(columns)),
+        false,
     )
 }
 
 /// Collector for a walk that has no resident row addresses.
 fn deferred_address_collector(limit: usize) -> TopKCollector {
-    TopKCollector::new(limit, limit, TieOrdering::DeferredAddresses, None)
+    TopKCollector::new(limit, limit, TieOrdering::DeferredAddresses, None, false)
+}
+
+/// A caller that scores every hit with a constant: the tie order fills the heap,
+/// and the k-th score is that constant.
+#[test]
+fn test_constant_score_collector_ranks_on_the_tie_order() -> Result<()> {
+    let mut collector = constant_score_collector(2);
+    for (address, score) in [(5_u64, 9.0), (2, 1.0), (7, 8.0), (4, 0.0)] {
+        collector.insert(
+            ScoredDoc::new(address, score),
+            TieOrder {
+                address,
+                coordinate: None,
+            },
+            1,
+            address,
+            std::iter::empty(),
+        )?;
+    }
+
+    assert_eq!(
+        collector.kth_score_if_full(),
+        Some(0.0),
+        "the walk's floor must come from the caller's constant, not from a BM25 score"
+    );
+    assert!(
+        !collector.rejects_score(1_000.0) && !collector.rejects_score(-1_000.0),
+        "a constant-score walk may not prune a document on its score"
+    );
+    let mut selected = collector
+        .into_candidates(|row_id| row_id)?
+        .into_iter()
+        .map(|candidate| candidate.document)
+        .collect::<Vec<_>>();
+    selected.sort_unstable();
+    assert_eq!(
+        selected,
+        vec![2, 4],
+        "the heap holds the lowest row addresses, whichever scored best"
+    );
+    Ok(())
+}
+
+/// The stop needs ascending addresses and a full heap.
+#[test]
+fn test_constant_score_walk_stops_past_the_kth_address() -> Result<()> {
+    let mut collector = TopKCollector::new(2, 2, TieOrdering::AscendingRowAddresses, None, true);
+    assert!(!collector.constant_score_walk_is_done(999));
+    for address in 0..2_u64 {
+        collector.insert(
+            ScoredDoc::new(address, 0.0),
+            TieOrder {
+                address,
+                coordinate: None,
+            },
+            1,
+            address,
+            std::iter::empty(),
+        )?;
+    }
+    assert!(!collector.constant_score_walk_is_done(1));
+    assert!(collector.constant_score_walk_is_done(2));
+
+    let mut scored = ascending_address_collector(2);
+    for address in 0..2_u64 {
+        scored.insert(
+            ScoredDoc::new(address, 1.0),
+            TieOrder {
+                address,
+                coordinate: None,
+            },
+            1,
+            address,
+            std::iter::empty(),
+        )?;
+    }
+    assert!(
+        !scored.constant_score_walk_is_done(999),
+        "a scored walk is bounded by its score floor, not by the address order"
+    );
+    Ok(())
 }
 
 #[test]
