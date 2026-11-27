@@ -999,6 +999,34 @@ impl RowAddrTreeMap {
         }
     }
 
+    /// Prefer array or bitmap containers for repeated point lookups, limiting
+    /// the run-container expansion to four times their current allocation.
+    ///
+    /// ```
+    /// use lance_select::RowAddrTreeMap;
+    ///
+    /// let mut rows = RowAddrTreeMap::from_iter((0..32768).filter(|row| row % 64 < 32));
+    /// rows.optimize();
+    /// let expected = rows.clone();
+    /// rows.optimize_for_lookup();
+    /// assert_eq!(rows, expected);
+    /// ```
+    pub fn optimize_for_lookup(&mut self) {
+        for selection in self.inner.values_mut() {
+            if let RowAddrSelection::Partial(bitmap) = selection {
+                if bitmap.is_full() {
+                    continue;
+                }
+                let stats = bitmap.statistics();
+                let expanded_bytes = (u64::from(stats.n_run_containers) * 8192)
+                    .min(u64::from(stats.n_values_run_containers) * 2);
+                if expanded_bytes <= stats.n_bytes_run_containers * 4 {
+                    bitmap.remove_run_compression();
+                }
+            }
+        }
+    }
+
     /// Compute the serialized size of the set.
     pub fn serialized_size(&self) -> usize {
         // Starts at 4 because of the u32 num_entries
@@ -2084,6 +2112,39 @@ mod tests {
         assert!(
             err.to_string().contains("only 0 bytes remain"),
             "expected a length complaint, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_row_addr_tree_map_optimize_for_lookup() {
+        let mut bitmap = RoaringBitmap::from_iter((0..32768).filter(|row| row % 64 < 32));
+        bitmap.optimize();
+        assert!(bitmap.statistics().n_run_containers > 0);
+        let mut rows = RowAddrTreeMap::new();
+        rows.insert_bitmap(7, bitmap);
+        rows.insert_fragment(8);
+        rows.insert_bitmap(11, RoaringBitmap::full());
+        rows.insert_bitmap(9, RoaringBitmap::from_iter([1, 3, 5]));
+        let expected = rows.clone();
+        rows.optimize_for_lookup();
+        assert_eq!(rows, expected);
+        assert_eq!(
+            rows.get_fragment_bitmap(7)
+                .unwrap()
+                .statistics()
+                .n_run_containers,
+            0
+        );
+
+        let mut long_range = RoaringBitmap::new();
+        long_range.insert_range(0..10_000_000);
+        long_range.optimize();
+        let size = long_range.serialized_size();
+        rows.insert_bitmap(10, long_range);
+        rows.optimize_for_lookup();
+        assert_eq!(
+            rows.get_fragment_bitmap(10).unwrap().serialized_size(),
+            size
         );
     }
 

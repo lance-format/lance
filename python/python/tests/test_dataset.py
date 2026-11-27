@@ -20,7 +20,7 @@ import uuid
 from datetime import date, datetime, timedelta, timezone, tzinfo
 from enum import Enum
 from pathlib import Path
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 from typing import List, Optional
 from unittest import mock
 
@@ -8332,6 +8332,33 @@ def test_stats(tmp_path: Path):
     assert data_stats.fields[2].bytes_on_disk > 0
 
 
+def test_column_value_range(tmp_path: Path):
+    table = pa.table({"x": list(range(100)), "y": ["a"] * 100})
+    dataset = lance.write_dataset(table, tmp_path)
+    dataset.create_scalar_index("x", index_type="ZONEMAP", name="x_zonemap")
+
+    value_range = dataset.stats.column_value_range("x")
+    assert value_range == (0, 99)
+    assert dataset.stats.column_value_range("y") is None
+
+    dataset.insert(pa.table({"x": [1000], "y": ["b"]}))
+    # The new fragment is not covered by the index built before the insert.
+    assert dataset.stats.column_value_range("x") is None
+
+    with pytest.raises(ValueError, match="not found"):
+        dataset.stats.column_value_range("missing")
+
+
+def test_column_value_range_time64_ns_keeps_live_values(tmp_path: Path):
+    values = pa.array([1, 2, 3], type=pa.time64("ns"))
+    dataset = lance.write_dataset(pa.table({"x": values}), tmp_path)
+    dataset.create_scalar_index("x", index_type="ZONEMAP")
+    value_range = dataset.stats.column_value_range("x")
+    assert value_range is not None
+    _, hi = value_range
+    assert not pc.any(pc.greater(values, pa.scalar(hi, type=values.type))).as_py()
+
+
 def test_column_layout_stats(tmp_path: Path):
     table = pa.table({"x": range(8), "y": range(8)})
     dataset = lance.write_dataset(table, tmp_path, max_rows_per_file=4)
@@ -10008,6 +10035,21 @@ def test_read_transaction_properties(tmp_path):
     assert props.get("custom_prop") == "custom_value"
 
 
+def test_disable_transaction_file(tmp_path: Path):
+    table = pa.table({"id": [1, 2, 3]})
+    transactions_dir = tmp_path / "_transactions"
+
+    dataset = lance.write_dataset(table, tmp_path, disable_transaction_file=True)
+    assert not transactions_dir.exists() or not any(transactions_dir.iterdir())
+    # The transaction is still readable from the manifest's inline section.
+    operation = dataset.read_transaction(1).operation
+    assert isinstance(operation, lance.LanceOperation.Overwrite)
+
+    dataset = lance.write_dataset(table, tmp_path, mode="append")
+    assert len(list(transactions_dir.iterdir())) == 1
+    assert dataset.count_rows() == 6
+
+
 def test_get_properties_with_no_properties(tmp_path):
     """Test retrieving properties when none were set."""
     # Create a test dataset without properties
@@ -11093,3 +11135,103 @@ class TestLanceScannerTake:
         ds = self._make_dataset(tmp_path)
         scanner = ds.scanner(filter="id >= 4")
         assert scanner.take(pa.array([0, 2]))["id"].to_pylist() == [4, 6]
+
+
+@pytest.mark.parametrize(
+    "method,keyword,error_type",
+    [
+        ("cleanup_old_versions", "older_than", OSError),
+        ("explain_cleanup_old_versions", "older_than", OSError),
+        ("expire_versions", "before", ValueError),
+        ("explain_expire_versions", "before", ValueError),
+    ],
+)
+def test_cleanup_rejects_negative_age(tmp_path: Path, method, keyword, error_type):
+    # A negative age puts the cutoff in the future, which would remove every old
+    # version without any error.
+    data = pa.table({"a": [1]})
+    lance.write_dataset(data, tmp_path)
+    ds = lance.write_dataset(data, tmp_path, mode="append")
+
+    with pytest.raises(error_type, match=f"{keyword} must be non-negative"):
+        getattr(ds, method)(**{keyword: timedelta(days=-1)})
+    assert len(lance.dataset(tmp_path).versions()) == 2
+
+
+@pytest.mark.parametrize(
+    "options,error_type,match",
+    [
+        (
+            {"interval": "5"},
+            TypeError,
+            r"auto_cleanup_options\['interval'\]: .*cannot be interpreted as an int",
+        ),
+        (
+            {"older_than_seconds": "2592000"},
+            TypeError,
+            r"auto_cleanup_options\['older_than_seconds'\]: ",
+        ),
+        (
+            {"interval": -1},
+            OverflowError,
+            r"auto_cleanup_options\['interval'\]: ",
+        ),
+        (
+            {"older_than_seconds": 2**62},
+            ValueError,
+            r"auto_cleanup_options\['older_than_seconds'\] is out of range",
+        ),
+        (True, TypeError, "Mapping"),
+    ],
+)
+def test_auto_cleanup_options_reject_invalid_values(
+    tmp_path, options, error_type, match
+):
+    # Falling back to the default would configure a retention the caller never asked
+    # for.
+    with pytest.raises(error_type, match=match):
+        lance.write_dataset(
+            pa.table({"a": [1]}), tmp_path, mode="create", auto_cleanup_options=options
+        )
+
+
+def test_auto_cleanup_options_partial_and_mapping(tmp_path):
+    table = pa.table({"a": [1]})
+    # A key whose value is None gets its default, like a key that is left out.
+    lance.write_dataset(
+        table,
+        tmp_path / "a",
+        auto_cleanup_options={"interval": None, "older_than_seconds": 3600},
+    )
+    config = lance.dataset(tmp_path / "a").config()
+    assert config["lance.auto_cleanup.interval"] == "20"
+    assert config["lance.auto_cleanup.older_than"] == "1h"
+
+    # Any mapping is accepted, not only a dict.
+    lance.write_dataset(
+        table,
+        tmp_path / "b",
+        auto_cleanup_options=MappingProxyType({"interval": 5}),
+    )
+    assert lance.dataset(tmp_path / "b").config()["lance.auto_cleanup.interval"] == "5"
+
+
+def test_auto_cleanup_options_keep_errors_from_index(tmp_path):
+    # Only pyo3's own conversion errors get the option name. A ValueError or a
+    # TypeError subclass raised by a user's __index__ reaches the caller unchanged.
+    class CustomTypeError(TypeError):
+        pass
+
+    for raised in [ValueError("bad interval"), CustomTypeError("bad interval")]:
+
+        class Interval:
+            def __index__(self):
+                raise raised
+
+        with pytest.raises(type(raised)) as exc_info:
+            lance.write_dataset(
+                pa.table({"a": [1]}),
+                tmp_path / type(raised).__name__,
+                auto_cleanup_options={"interval": Interval()},
+            )
+        assert exc_info.value is raised

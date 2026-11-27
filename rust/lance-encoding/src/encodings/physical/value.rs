@@ -181,30 +181,81 @@ impl ValueEncoder {
         buffer_sizes
     }
 
-    fn chunk_fsl(
-        data: FixedWidthDataBlock,
-        layers: Vec<MiniblockFslLayer>,
-        num_rows: u64,
-    ) -> Result<(MiniBlockCompressed, CompressiveEncoding)> {
-        // Count size to calculate rows per chunk
+    /// Estimated bytes and rows in the smallest unit of a fixed-size-list mini-block chunk.
+    ///
+    /// A row is one unit when its bits fill whole bytes, otherwise eight rows are, so that
+    /// chunks never split a byte. `layers` yields each layer's dimension and whether it
+    /// carries item validity. It's an estimate because validity buffers may have some
+    /// padding bits.
+    fn fsl_word_size(
+        bits_per_value: u64,
+        layers: impl IntoIterator<Item = (u64, bool)>,
+    ) -> (u64, u64) {
         let mut ceil_bytes_validity = 0;
         let mut cum_dim = 1;
-        let mut num_validity_buffers = 0;
-        for layer in &layers {
-            cum_dim *= layer.dimension;
-            if layer.validity.is_some() {
+        for (dimension, has_validity) in layers {
+            cum_dim *= dimension;
+            if has_validity {
                 ceil_bytes_validity += cum_dim.div_ceil(8);
-                num_validity_buffers += 1;
             }
         }
-        // It's an estimate because validity buffers may have some padding bits
-        let cum_bits_per_value = data.bits_per_value * cum_dim;
+        let cum_bits_per_value = bits_per_value * cum_dim;
         let (cum_bytes_per_word, vals_per_word) = if cum_bits_per_value.is_multiple_of(8) {
             (cum_bits_per_value / 8, 1)
         } else {
             (cum_bits_per_value, 8)
         };
-        let est_bytes_per_word = (ceil_bytes_validity * vals_per_word) + cum_bytes_per_word;
+        (
+            (ceil_bytes_validity * vals_per_word) + cum_bytes_per_word,
+            vals_per_word,
+        )
+    }
+
+    /// Whether mini-block chunks can hold this fixed-size list of fixed-width values.
+    ///
+    /// A chunk must fit two units of rows (see [`Self::fsl_word_size`]). Lists that do
+    /// not fit have to be written with the full-zip layout instead.
+    pub(crate) fn fsl_fits_miniblock(fsl: &FixedSizeListBlock) -> bool {
+        let mut layers = Vec::new();
+        let mut dimension = fsl.dimension;
+        let mut child = fsl.child.as_ref();
+        loop {
+            let has_validity = if let DataBlock::Nullable(nullable) = child {
+                child = nullable.data.as_ref();
+                true
+            } else {
+                false
+            };
+            layers.push((dimension, has_validity));
+            match child {
+                DataBlock::FixedSizeList(inner) => {
+                    dimension = inner.dimension;
+                    child = inner.child.as_ref();
+                }
+                DataBlock::FixedWidth(fixed) => {
+                    let (bytes_per_word, _) = Self::fsl_word_size(fixed.bits_per_value, layers);
+                    return 2 * bytes_per_word < MAX_MINIBLOCK_BYTES;
+                }
+                _ => return true,
+            }
+        }
+    }
+
+    fn chunk_fsl(
+        data: FixedWidthDataBlock,
+        layers: Vec<MiniblockFslLayer>,
+        num_rows: u64,
+    ) -> Result<(MiniBlockCompressed, CompressiveEncoding)> {
+        let num_validity_buffers = layers
+            .iter()
+            .filter(|layer| layer.validity.is_some())
+            .count();
+        let (est_bytes_per_word, vals_per_word) = Self::fsl_word_size(
+            data.bits_per_value,
+            layers
+                .iter()
+                .map(|layer| (layer.dimension, layer.validity.is_some())),
+        );
         let (log_rows_per_chunk, rows_per_chunk) =
             Self::find_log_vals_per_chunk(est_bytes_per_word, vals_per_word)?;
 
@@ -213,7 +264,7 @@ impl ValueEncoder {
         // Allocate buffers for validity, these will be slightly bigger than the input validity buffers
         let mut chunks = Vec::with_capacity(num_chunks);
         let mut validity_buffers: Vec<Vec<u8>> = Vec::with_capacity(num_validity_buffers);
-        cum_dim = 1;
+        let mut cum_dim = 1;
         for layer in &layers {
             cum_dim *= layer.dimension;
             if let Some(validity) = &layer.validity {

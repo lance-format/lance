@@ -161,19 +161,23 @@ fn validate_compressive_encoding(
             Ok(())
         }
         Some(Compression::Range(_)) if position == EncodingPosition::OptionalPayloadBlock => Ok(()),
-        Some(Compression::Delta(delta)) if position == EncodingPosition::OptionalPayloadBlock => {
+        Some(Compression::MonotonicDelta(delta))
+            if position == EncodingPosition::OptionalPayloadBlock =>
+        {
             validate_compressive_encoding(
-                required(delta.deltas.as_deref(), "delta values")?,
+                required(delta.deltas.as_deref(), "monotonic delta values")?,
                 EncodingPosition::OptionalPayloadBlock,
             )
         }
-        Some(Compression::Range(_) | Compression::Delta(_)) => Err(Error::invalid_input_source(
-            format!(
-                "Range and delta compression are not supported in {} positions",
-                position.name()
-            )
-            .into(),
-        )),
+        Some(Compression::Range(_) | Compression::MonotonicDelta(_)) => {
+            Err(Error::invalid_input_source(
+                format!(
+                    "Range and MonotonicDelta compression are not supported in {} positions",
+                    position.name()
+                )
+                .into(),
+            ))
+        }
         None => Err(Error::invalid_input_source(
             "Lance v2.3 compressive encoding is missing its compression variant".into(),
         )),
@@ -503,7 +507,7 @@ mod grammar_tests {
     }
 
     #[test]
-    fn accepts_range_and_delta() {
+    fn accepts_range_and_monotonic_delta() {
         let range = CompressiveEncoding {
             compression: Some(Compression::Range(metadata::Range {
                 uncompressed_bits_per_value: 32,
@@ -512,11 +516,13 @@ mod grammar_tests {
             })),
         };
         let delta = CompressiveEncoding {
-            compression: Some(Compression::Delta(Box::new(metadata::Delta {
-                uncompressed_bits_per_value: 32,
-                base: 0,
-                deltas: Some(Box::new(range.clone())),
-            }))),
+            compression: Some(Compression::MonotonicDelta(Box::new(
+                metadata::MonotonicDelta {
+                    uncompressed_bits_per_value: 32,
+                    base: 0,
+                    deltas: Some(Box::new(range.clone())),
+                },
+            ))),
         };
 
         validate_compressive_encoding(&range, EncodingPosition::OptionalPayloadBlock).unwrap();
@@ -533,11 +539,13 @@ mod grammar_tests {
             })),
         };
         let delta = CompressiveEncoding {
-            compression: Some(Compression::Delta(Box::new(metadata::Delta {
-                uncompressed_bits_per_value: 32,
-                base: 0,
-                deltas: Some(Box::new(range.clone())),
-            }))),
+            compression: Some(Compression::MonotonicDelta(Box::new(
+                metadata::MonotonicDelta {
+                    uncompressed_bits_per_value: 32,
+                    base: 0,
+                    deltas: Some(Box::new(range.clone())),
+                },
+            ))),
         };
         let wrapped_range = CompressiveEncoding {
             compression: Some(Compression::FixedSizeList(Box::new(FixedSizeList {
@@ -564,7 +572,7 @@ mod grammar_tests {
     }
 
     #[test]
-    fn rejects_range_and_delta_outside_block_positions() {
+    fn rejects_range_and_monotonic_delta_outside_block_positions() {
         let range = CompressiveEncoding {
             compression: Some(Compression::Range(metadata::Range {
                 uncompressed_bits_per_value: 32,
@@ -573,11 +581,13 @@ mod grammar_tests {
             })),
         };
         let delta = CompressiveEncoding {
-            compression: Some(Compression::Delta(Box::new(metadata::Delta {
-                uncompressed_bits_per_value: 32,
-                base: 0,
-                deltas: Some(Box::new(range.clone())),
-            }))),
+            compression: Some(Compression::MonotonicDelta(Box::new(
+                metadata::MonotonicDelta {
+                    uncompressed_bits_per_value: 32,
+                    base: 0,
+                    deltas: Some(Box::new(range.clone())),
+                },
+            ))),
         };
 
         for encoding in [range, delta] {
