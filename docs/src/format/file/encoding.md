@@ -906,7 +906,7 @@ to `k - 1`) occupies bits `r * w` to `(r + 1) * w - 1`. Row `r` of lane `l` hold
 `O[r / 8] * 16 + (r % 8) * 128 + l`, where `O = [0, 4, 2, 6, 1, 5, 3, 7]`. When `w = k` the block is still this
 permutation of the values, not a plain copy. A block with `w = 0` is empty.
 
-An `InlineBitpacking` buffer is a mini-block chunk, or a block of at most 1024 values. It is one word of the
+A standalone `InlineBitpacking` buffer holds at most 1024 values. It is one word of the
 uncompressed width holding `w`, little-endian, followed by one packed block; for 128-bit values the header is 16 bytes
 and `w` is from 0 to 128. Each chunk has its own `w`. A buffer of fewer than 1024 values is zero-padded to 1024 before
 packing, and readers keep the leading values. A buffer that holds no values (`num_values = 0`) is 0 bytes, with no
@@ -923,9 +923,8 @@ values and packed, or stored as `t` raw little-endian values. Lance writers pack
 is smaller than the raw values; for 128-bit values that is `128 * w < 16 * t`. Readers pick the tail layout from the
 payload length, treat the tail as raw when both lengths are equal, and reject any other length.
 
-Bitpacking is, in theory, usable in a full zip context. However, values in this context are so large that shaving
-off a few bits is unlikely to have any meaningful impact. Also, the full-zip context keeps things byte-aligned and
-so we would have to remove at least 8 bits per value.
+Fixed-width Zipped values in unstable Lance 2.3 support out-of-line bitpacking for fixed-size list leaves,
+with one independently addressable frame per row. See [Fixed-Size List Values](#fixed-size-list-values).
 
 ### Fsst
 
@@ -968,7 +967,7 @@ own reconstruction parameters.
 
 #### ALP Chunk Framing
 
-An ALP chunk has four value buffers, so `ChunkedValues.num_buffers` is `4`. Their lengths use the `u32` mini-block
+A standalone ALP chunk has four value buffers, so `ChunkedValues.num_buffers` is `4`. Their lengths use the `u32` mini-block
 framing of the [planar page layout](#planar-page-layout). The outer chunk header starts with a little-endian `u16`
 level count, followed by a little-endian `u16` byte length for each present repetition and definition stream in
 that order, then four little-endian `u32` value buffer lengths. The buffers follow in the same order. Sparse
@@ -981,8 +980,11 @@ Each little-endian `u32` in the mini-block metadata describes a chunk of `8 * ((
 alignment. For a non-final chunk of `n` values, the low four bits store `log2(n)` and must be nonzero. The final
 chunk gets its count from the page total minus the preceding chunk counts. If its low four bits are nonzero,
 they must agree with that count. The page total comes from `ChunkedValues.num_items` for dense pages and the
-terminal slot domain for sparse pages. The writer emits 1024 values per chunk, with a shorter final chunk
-if needed. It writes `10` for a full chunk and `0` for the shorter final chunk.
+terminal slot domain for sparse pages. The standalone ALP writer emits 1024 values per chunk, with a shorter final
+chunk if needed. It writes `10` for a full chunk and `0` for the shorter final chunk.
+
+For a fixed-size list leaf, the four ALP buffers follow the child validity buffers, and `n` is the flattened
+item count for the chunk. See [Fixed-Size List Values](#fixed-size-list-values).
 
 The reader rejects a mismatched declared buffer count, truncated outer chunk headers, and buffers that extend
 past the chunk boundary. The chunk lengths must sum to the size of the page's chunk data buffer. A zero-value
