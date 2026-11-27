@@ -154,8 +154,7 @@ impl Scanner {
             return Ok(found);
         }
         let location = self.dataset.manifest_location();
-        // Mirror `Dataset::get_manifest`: only a location with a known size
-        // identifies a version precisely enough to share.
+        // The key only narrows the lookup; `is_for` decides whether an entry applies.
         let loaded = if location.size.is_some() && location.version == self.dataset.version_id() {
             let key = FilterSchemaKey {
                 version: location.version,
