@@ -71,7 +71,13 @@ message DenseChunkLevels {
   CompressiveEncoding repetition = 1;
   // Absent when the page has no definition stream.
   CompressiveEncoding definition = 2;
+  // Zero without an index. The writer uses one for top-level row lookup.
   uint32 repetition_index_depth = 3;
+  /* Optional unsigned u32 block of packed pairs from the repetition index.
+   * When absent at positive depth, the index contains flat little-endian u64 values.
+   * At zero depth, both this descriptor and the index buffer are absent.
+   */
+  CompressiveEncoding repetition_index = 4;
 }
 
 message ZippedValues {

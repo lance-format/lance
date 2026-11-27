@@ -170,8 +170,14 @@ pub struct DenseChunkLevels {
     /// Absent when the page has no definition stream.
     #[prost(message, optional, tag = "2")]
     pub definition: ::core::option::Option<CompressiveEncoding>,
+    /// Zero without an index. The writer uses one for top-level row lookup.
     #[prost(uint32, tag = "3")]
     pub repetition_index_depth: u32,
+    /// Optional unsigned u32 block of packed pairs from the repetition index.
+    /// When absent at positive depth, the index contains flat little-endian u64 values.
+    /// At zero depth, both this descriptor and the index buffer are absent.
+    #[prost(message, optional, tag = "4")]
+    pub repetition_index: ::core::option::Option<CompressiveEncoding>,
 }
 impl ::prost::Name for DenseChunkLevels {
     const NAME: &'static str = "DenseChunkLevels";
