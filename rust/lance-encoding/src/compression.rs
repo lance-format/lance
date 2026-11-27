@@ -162,6 +162,16 @@ pub trait CompressionStrategy: Send + Sync + std::fmt::Debug {
     ) -> Result<Box<dyn MiniBlockCompressor>> {
         self.create_miniblock_compressor(field, data)
     }
+
+    /// Whether a full-zip page may store the boolean items of a fixed-size list
+    /// as one byte each.
+    ///
+    /// Released 2.1 and 2.2 readers expect those items bit-packed and return
+    /// wrong values for byte-wide ones without an error, so only strategies for
+    /// file versions after 2.2 allow it.
+    fn allows_byte_wide_fsl_booleans(&self) -> bool {
+        false
+    }
 }
 
 pub(crate) fn compress_required_block(

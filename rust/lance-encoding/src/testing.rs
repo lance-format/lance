@@ -120,6 +120,10 @@ impl TestCompressionStrategy {
 }
 
 impl CompressionStrategy for TestCompressionStrategy {
+    fn allows_byte_wide_fsl_booleans(&self) -> bool {
+        self.encoding == TestEncoding::StructuralSparse
+    }
+
     fn create_miniblock_compressor(
         &self,
         field: &LanceField,
