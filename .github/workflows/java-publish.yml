@@ -166,6 +166,17 @@ jobs:
           server-password: SONATYPE_TOKEN
           gpg-private-key: ${{ secrets.GPG_PRIVATE_KEY }}
           gpg-passphrase: ${{ secrets.GPG_PASSPHRASE }}
+      - name: Set up Maven
+        working-directory: java
+        run: |
+          for attempt in 1 2 3; do
+            ./mvnw --version && exit 0
+            if [ "$attempt" -lt 3 ]; then
+              echo "Maven setup failed on attempt $attempt. Retrying in 5 seconds."
+              sleep 5
+            fi
+          done
+          exit 1
       - name: Download artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
       - name: Copy native libs
