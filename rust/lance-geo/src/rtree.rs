@@ -46,10 +46,10 @@ use lance_index::scalar::{
     UpdateCriteria,
 };
 use lance_index::{Index, IndexType, pb};
-use lance_index_core::remapping::RowAddrTranslator;
 use lance_index_core::remapping::{
     BatchRowIdRemapper, remap_record_batch_async, remap_row_addrs_tree_map_async,
 };
+use lance_index_core::remapping::{RowAddrTranslator, RowAddrTranslatorRef};
 use lance_io::object_store::ObjectStore;
 use lance_select::{NullableRowAddrSet, RowAddrTreeMap, RowSetOps};
 use roaring::RoaringBitmap;
@@ -788,6 +788,141 @@ impl RTreeIndex {
     }
 }
 
+impl RTreeIndex {
+    /// The one remap implementation: the legacy `remap` (an in-memory
+    /// mapping, borrowed as a synchronous translator) and `remap_streaming`
+    /// both come here, so neither copies a map nor delegates to the other.
+    ///
+    /// Moving a row changes neither its bounding box nor whether it is null,
+    /// so the stored entries are translated as they are and deleted rows are
+    /// dropped. The tree is then rebuilt, because dropping rows can shrink the
+    /// total bounds and the leaf layout.
+    async fn remap_with(
+        &self,
+        mapping: RowAddrTranslatorRef<'_>,
+        dest_store: &dyn IndexStore,
+    ) -> Result<CreatedIndex> {
+        // A legacy segment may store a page size of 1, which is only valid
+        // while it holds at most one item. Such a tree is a single page at any
+        // page size, so repack it with the smallest one the writer accepts
+        // rather than failing the compaction that remaps it.
+        let page_size = self.metadata.page_size.max(2);
+        let null_map =
+            remap_null_map(&self.search_null(&NoOpMetricsCollector).await?, mapping).await?;
+
+        // The translator is borrowed, so the remapped entries are spilled and
+        // read back as the owned stream the tree builder consumes.
+        let tmpdir = Arc::new(TempDir::default());
+        let spill_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.obj_path(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let mut writer = spill_store
+            .new_index_file("remap.tmp", BBOX_ROWADDR_SCHEMA.clone())
+            .await?;
+        let mut total_bbox = BoundingBox::new();
+        let mut num_items = 0;
+        let mut data = self.clone().into_data_stream().await?;
+        while let Some(batch) = data.try_next().await? {
+            let row_addrs = batch
+                .column_by_name(ROW_ADDR)
+                .and_then(|column| column.as_primitive_opt::<UInt64Type>())
+                .ok_or_else(|| Error::internal("expected UInt64Array for RTree row addresses"))?;
+            let remapped = mapping.remap_row_addrs(row_addrs.values()).await?;
+            let mut retained = Vec::with_capacity(remapped.len());
+            let mut new_row_addrs = Vec::with_capacity(remapped.len());
+            for (position, row_addr) in remapped.into_iter().enumerate() {
+                if let Some(row_addr) = row_addr {
+                    retained.push(position as u32);
+                    new_row_addrs.push(row_addr);
+                }
+            }
+            if retained.is_empty() {
+                continue;
+            }
+            let bboxes = if retained.len() == batch.num_rows() {
+                batch.column(0).clone()
+            } else {
+                arrow_select::take::take(batch.column(0), &UInt32Array::from(retained), None)?
+            };
+            let remapped_batch = RecordBatch::try_new(
+                BBOX_ROWADDR_SCHEMA.clone(),
+                vec![bboxes, Arc::new(UInt64Array::from(new_row_addrs))],
+            )?;
+            total_bbox.add_geo_arrow_array(&extract_bounding_boxes(
+                remapped_batch.column(0).as_ref(),
+                BBOX_ROWADDR_SCHEMA.field(0),
+            )?)?;
+            num_items += remapped_batch.num_rows();
+            writer.write_record_batch(remapped_batch).await?;
+        }
+        writer.finish().await?;
+
+        let reader = spill_store.open_index_file("remap.tmp").await?;
+        let stream = IndexReaderStream::new(reader, page_size as u64)
+            .await
+            .map(|fut| fut.map_err(DataFusionError::from))
+            .buffered(spill_store.io_parallelism())
+            .boxed();
+        let remapped_data = Box::pin(RecordBatchStreamAdapter::new(
+            BBOX_ROWADDR_SCHEMA.clone(),
+            stream,
+        ));
+        let stats = BboxStreamStats {
+            null_map,
+            total_bbox,
+            num_items,
+        };
+        let files = RTreeIndexPlugin::train_rtree_index(
+            remapped_data,
+            stats,
+            page_size,
+            dest_store,
+            &NoopIndexBuildProgress,
+        )
+        .await?;
+
+        Ok(CreatedIndex {
+            index_details: prost_types::Any::from_msg(&pb::RTreeIndexDetails::default())?,
+            // Preserve this segment's own domain: remapping a row-id-domain
+            // segment (valid without stable row ids, where a row id already
+            // is a row address) must not silently flip it to address domain.
+            index_version: rtree_index_version(self.results_are_row_addresses),
+            files,
+        })
+    }
+}
+
+/// Translate a stored null map through `mapping`, dropping deleted rows.
+///
+/// Addresses are translated in bounded slices, so the temporary storage does
+/// not grow with the number of null rows.
+async fn remap_null_map(
+    null_map: &RowAddrTreeMap,
+    mapping: RowAddrTranslatorRef<'_>,
+) -> Result<RowAddrTreeMap> {
+    const TRANSLATION_SLICE: usize = 64 * 1024;
+    let Some(row_addrs) = null_map.row_addrs() else {
+        return Err(Error::invalid_input(
+            "RTree null map selects whole fragments, so it cannot be remapped row by row",
+        ));
+    };
+    let mut row_addrs = row_addrs.map(u64::from);
+    let mut remapped = RowAddrTreeMap::new();
+    let mut slice = Vec::with_capacity(TRANSLATION_SLICE.min(null_map.len().unwrap_or(0) as usize));
+    loop {
+        slice.clear();
+        slice.extend(row_addrs.by_ref().take(TRANSLATION_SLICE));
+        if slice.is_empty() {
+            return Ok(remapped);
+        }
+        for row_addr in mapping.remap_row_addrs(&slice).await?.into_iter().flatten() {
+            remapped.insert(row_addr);
+        }
+    }
+}
+
 fn filter_keeps_nothing(filter: &Option<OldIndexDataFilter>) -> bool {
     match filter {
         Some(
@@ -979,28 +1114,23 @@ impl ScalarIndex for RTreeIndex {
     }
 
     fn can_remap(&self) -> bool {
-        false
+        true
     }
 
     async fn remap(
         &self,
-        _mapping: &RowAddrRemap,
-        _dest_store: &dyn IndexStore,
+        mapping: &RowAddrRemap,
+        dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex> {
-        Err(Error::invalid_input_source(
-            "RTree does not support remap".into(),
-        ))
+        self.remap_with(mapping.into(), dest_store).await
     }
 
     async fn remap_streaming(
         &self,
-        _translator: &RowAddrTranslator,
-        _dest_store: &dyn IndexStore,
+        translator: &RowAddrTranslator,
+        dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex> {
-        // No mapping to materialize for an index that cannot be remapped.
-        Err(Error::invalid_input_source(
-            "RTree does not support remap".into(),
-        ))
+        self.remap_with(translator.as_ref(), dest_store).await
     }
 
     async fn update(
@@ -1416,7 +1546,7 @@ impl BasicTrainer for RTreeIndexPlugin {
 #[async_trait]
 impl ScalarIndexPlugin for RTreeIndexPlugin {
     fn can_remap(&self, _details: &prost_types::Any) -> Result<bool> {
-        Ok(false)
+        Ok(true)
     }
 
     fn basic_trainer(&self) -> Option<&dyn BasicTrainer> {
@@ -2164,6 +2294,185 @@ mod tests {
             .unwrap();
         assert_eq!(updated.metadata.num_items, 0);
         assert_eq!(updated.metadata.num_pages, 0);
+    }
+
+    #[derive(Debug)]
+    struct MapRemapper(HashMap<u64, Option<u64>>);
+
+    #[async_trait]
+    impl BatchRowIdRemapper for MapRemapper {
+        async fn remap_row_ids(&self, row_ids: &[u64]) -> Result<Vec<Option<u64>>> {
+            Ok(row_ids
+                .iter()
+                .map(|id| self.0.get(id).copied().unwrap_or(Some(*id)))
+                .collect())
+        }
+    }
+
+    #[rstest::rstest]
+    #[tokio::test]
+    #[serial_test::serial(LANCE_DF_SPILL_POOL)]
+    async fn test_remap(
+        #[values("legacy", "sync", "batch")] translator: &str,
+        #[values(false, true)] delete_all: bool,
+    ) {
+        let addr =
+            |fragment: u32, offset: u32| u64::from(RowAddress::new_from_parts(fragment, offset));
+        let point_type = PointType::new(Dimension::XY, Default::default());
+        let mut points = PointBuilder::new(point_type);
+        for id in 0..20 {
+            if id % 5 == 0 {
+                points.push_null();
+            } else {
+                let xy = id as f64;
+                points.push_point(Some(&geo_types::point!(x: xy, y: xy)));
+            }
+        }
+        // A small page size gives the stored tree several levels.
+        let (index, _store, _tmpdir) = train_index(&points.finish(), Some(4)).await;
+        assert!(
+            RTreeIndexPlugin
+                .can_remap(&prost_types::Any::default())
+                .unwrap()
+        );
+
+        // Rows 0..10 move to fragment 7, a point (1) and a NULL (5) among
+        // them are deleted, and so is the last point (19), so the bounds
+        // shrink. Rows the mapping does not name keep their address.
+        let mapping: HashMap<u64, Option<u64>> = if delete_all {
+            (0..20).map(|id| (id, None)).collect()
+        } else {
+            (0..10)
+                .map(|id| (id, Some(addr(7, id as u32))))
+                .chain([(1, None), (5, None), (19, None)])
+                .collect()
+        };
+        let remapped_tmpdir = TempObjDir::default();
+        let remapped_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            remapped_tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let created = match translator {
+            "legacy" => index
+                .remap(&RowAddrRemap::direct(mapping), remapped_store.as_ref())
+                .await
+                .unwrap(),
+            "sync" => index
+                .remap_streaming(
+                    &RowAddrTranslator::sync(RowAddrRemap::direct(mapping)),
+                    remapped_store.as_ref(),
+                )
+                .await
+                .unwrap(),
+            _ => index
+                .remap_streaming(
+                    &RowAddrTranslator::batch(Arc::new(MapRemapper(mapping))),
+                    remapped_store.as_ref(),
+                )
+                .await
+                .unwrap(),
+        };
+        assert_eq!(
+            created.index_version,
+            rtree_index_version(index.results_are_row_addresses)
+        );
+        let remapped = RTreeIndex::load(remapped_store, None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+        assert_eq!(remapped.metadata.page_size, 4);
+
+        let everything = BoundingBox::new_with_rect(&Rect::new(
+            coord! { x: -100.0, y: -100.0 },
+            coord! { x: 100.0, y: 100.0 },
+        ));
+        let geometry = remapped
+            .search_bbox(everything, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let nulls = remapped.search_null(&NoOpMetricsCollector).await.unwrap();
+        if delete_all {
+            assert_eq!(remapped.metadata.num_items, 0);
+            assert_eq!(remapped.metadata.num_pages, 0);
+            assert_eq!(geometry, RowAddrTreeMap::new());
+            assert_eq!(nulls, RowAddrTreeMap::new());
+            return;
+        }
+        let expected_geometry: RowAddrTreeMap = [2, 3, 4, 6, 7, 8, 9]
+            .into_iter()
+            .map(|id| addr(7, id))
+            .chain([11, 12, 13, 14, 16, 17, 18])
+            .collect();
+        assert_eq!(geometry, expected_geometry);
+        assert_eq!(nulls, RowAddrTreeMap::from_iter([addr(7, 0), 10, 15]));
+        assert_eq!(remapped.metadata.num_items, 14);
+        assert_eq!(remapped.metadata.num_pages, expected_num_pages(14, 4));
+        assert_eq!(remapped.metadata.bbox.minx(), 2.0);
+        assert_eq!(remapped.metadata.bbox.miny(), 2.0);
+        assert_eq!(remapped.metadata.bbox.maxx(), 18.0);
+        assert_eq!(remapped.metadata.bbox.maxy(), 18.0);
+
+        // A query narrower than the whole tree still finds the moved rows.
+        let narrow = BoundingBox::new_with_rect(&Rect::new(
+            coord! { x: 2.5, y: 2.5 },
+            coord! { x: 6.5, y: 6.5 },
+        ));
+        assert_eq!(
+            remapped
+                .search_bbox(narrow, &NoOpMetricsCollector)
+                .await
+                .unwrap(),
+            RowAddrTreeMap::from_iter([addr(7, 3), addr(7, 4), addr(7, 6)])
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(LANCE_DF_SPILL_POOL)]
+    async fn test_remap_legacy_single_item_page_size() {
+        let point_type = PointType::new(Dimension::XY, Default::default());
+        let mut points = PointBuilder::new(point_type);
+        points.push_point(Some(&geo_types::point!(x: 1.0, y: 1.0)));
+        points.push_null();
+        let (index, _store, _tmpdir) = train_index(&points.finish(), Some(2)).await;
+        // Older writers accepted a page size of 1 for a single item.
+        let mut legacy = index.as_ref().clone();
+        Arc::make_mut(&mut legacy.metadata).page_size = 1;
+
+        let moved = u64::from(RowAddress::new_from_parts(3, 0));
+        let moved_null = u64::from(RowAddress::new_from_parts(3, 1));
+        let remapped_tmpdir = TempObjDir::default();
+        let remapped_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            remapped_tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        legacy
+            .remap(
+                &RowAddrRemap::direct(HashMap::from([(0, Some(moved)), (1, Some(moved_null))])),
+                remapped_store.as_ref(),
+            )
+            .await
+            .unwrap();
+        let remapped = RTreeIndex::load(remapped_store, None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+        assert_eq!(remapped.metadata.num_items, 1);
+        assert_eq!(remapped.metadata.num_pages, 1);
+        let everything = BoundingBox::new_with_rect(&Rect::new(
+            coord! { x: -100.0, y: -100.0 },
+            coord! { x: 100.0, y: 100.0 },
+        ));
+        assert_eq!(
+            remapped
+                .search_bbox(everything, &NoOpMetricsCollector)
+                .await
+                .unwrap(),
+            RowAddrTreeMap::from_iter([moved])
+        );
+        assert_eq!(
+            remapped.search_null(&NoOpMetricsCollector).await.unwrap(),
+            RowAddrTreeMap::from_iter([moved_null])
+        );
     }
 
     #[derive(Debug)]

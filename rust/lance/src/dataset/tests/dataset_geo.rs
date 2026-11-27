@@ -30,6 +30,7 @@ use geoarrow_array::{
     builder::{LineStringBuilder, PointBuilder, PolygonBuilder},
 };
 use geoarrow_schema::{Dimension, LineStringType, PointType, PolygonType};
+use itertools::Itertools;
 use lance_arrow::RecordBatchExt;
 use lance_core::utils::tempfile::TempStrDir;
 use lance_core::{ROW_ADDR, ROW_ID};
@@ -37,6 +38,7 @@ use lance_index::IndexType;
 use lance_index::optimize::OptimizeOptions;
 use lance_index::registry::IndexPluginRegistry;
 use lance_index::scalar::ScalarIndexParams;
+use roaring::RoaringBitmap;
 use rstest::rstest;
 
 #[tokio::test]
@@ -960,6 +962,108 @@ async fn test_rtree_optimize_drops_rewritten_rows(
         scanned_ids.sort_unstable();
         assert_eq!(indexed_ids, expected, "indexed predicate: {predicate}");
         assert_eq!(indexed_ids, scanned_ids, "predicate: {predicate}");
+    }
+}
+
+/// An eager compaction remaps the RTree onto the fragments it writes, so the
+/// index keeps covering them and drops the deleted rows, on datasets with and
+/// without stable row ids.
+#[rstest]
+#[tokio::test]
+async fn test_rtree_eager_compaction_keeps_coverage(
+    #[values(false, true)] enable_stable_row_ids: bool,
+) {
+    let point_type = PointType::new(Dimension::XY, Default::default());
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::UInt32, false),
+        point_type.clone().to_field("point", true),
+    ]));
+    let mut points = PointBuilder::new(point_type);
+    for id in 0..12 {
+        if id % 3 == 0 {
+            points.push_null();
+        } else {
+            let xy = id as f64;
+            points.push_point(Some(&geo_types::point!(x: xy, y: xy)));
+        }
+    }
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(UInt32Array::from_iter_values(0..12)),
+            points.finish().to_array_ref(),
+        ],
+    )
+    .unwrap();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch)], schema),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 4,
+            enable_stable_row_ids,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 3);
+    dataset
+        .create_index(
+            &["point"],
+            IndexType::RTree,
+            Some("rtree_index".to_string()),
+            &ScalarIndexParams::new("RTree".to_string()),
+            true,
+        )
+        .await
+        .unwrap();
+    // Delete one indexed point and one NULL, so the remap must drop both.
+    dataset.delete("id IN (3, 4)").await.unwrap();
+
+    compact_files(&mut dataset, CompactionOptions::default(), None)
+        .await
+        .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 1);
+
+    let live_fragments: RoaringBitmap = dataset
+        .get_fragments()
+        .iter()
+        .map(|fragment| fragment.id() as u32)
+        .collect();
+    let index = dataset
+        .load_indices_by_name("rtree_index")
+        .await
+        .unwrap()
+        .into_iter()
+        .exactly_one()
+        .unwrap();
+    assert_eq!(
+        index.effective_fragment_bitmap(&live_fragments),
+        Some(live_fragments),
+        "the RTree must keep covering the rewritten fragments"
+    );
+
+    for (predicate, expected) in [
+        ("point IS NULL", vec![0, 6, 9]),
+        (
+            "ST_Intersects(point, ST_GeomFromText('POLYGON ((0 0, 20 0, 20 20, 0 20, 0 0))'))",
+            vec![1, 2, 5, 7, 8, 10, 11],
+        ),
+        (
+            "ST_Intersects(point, ST_GeomFromText('POLYGON ((3.5 3.5, 7.5 3.5, 7.5 7.5, 3.5 7.5, 3.5 3.5))'))",
+            vec![5, 7],
+        ),
+    ] {
+        let mut indexed = dataset.scan();
+        indexed.project(&["id"]).unwrap().filter(predicate).unwrap();
+        assert_contains!(
+            indexed.explain_plan(false).await.unwrap(),
+            "ScalarIndexQuery"
+        );
+        let indexed = indexed.try_into_batch().await.unwrap();
+        let mut indexed_ids = indexed["id"].as_primitive::<UInt32Type>().values().to_vec();
+        indexed_ids.sort_unstable();
+        assert_eq!(indexed_ids, expected, "predicate: {predicate}");
     }
 }
 
