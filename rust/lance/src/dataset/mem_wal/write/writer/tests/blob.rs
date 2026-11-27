@@ -14,7 +14,6 @@ use arrow_array::{
     Array, ArrayRef, DictionaryArray, Float32Array, StructArray, UInt8Array, UInt32Array,
 };
 use lance_core::datatypes::{BlobKind, BlobV2Layout};
-use object_store::ObjectStoreExt;
 use rstest::rstest;
 
 #[tokio::test]
@@ -91,8 +90,7 @@ async fn test_dictionary_capacity_rejection_preserves_shared_blob_pack() {
     let sidecars = blob_sidecars(store.as_ref(), &data_dir).await;
     assert_eq!(sidecars.len(), 1);
     let payload = store
-        .inner
-        .get(&sidecars[0])
+        .read_object(&sidecars[0])
         .await
         .unwrap()
         .bytes()
@@ -150,8 +148,7 @@ async fn test_durable_blob_puts_share_pack_until_wal_flush() {
     let sidecars = blob_sidecars(store.as_ref(), &data_dir).await;
     assert_eq!(sidecars.len(), 1, "both puts must share one packed object");
     let payload = store
-        .inner
-        .get(&sidecars[0])
+        .read_object(&sidecars[0])
         .await
         .unwrap()
         .bytes()
@@ -500,8 +497,7 @@ async fn test_blob_v2_target_is_reused_across_replay_and_flush() {
         }
 
         let first_wal = store
-            .inner
-            .head(&writer.wal_flusher.wal_appender().wal_entry_path(1))
+            .stat(&writer.wal_flusher.wal_appender().wal_entry_path(1))
             .await
             .unwrap();
         assert!(first_wal.size < 128 * 1024);

@@ -12,7 +12,16 @@ use pin_project::pin_project;
 
 use lance_core::Result;
 
+pub mod background_iterator;
+pub mod chunker;
+mod write_source;
+
+pub use write_source::{StreamingWriteSource, infer_write_schema, reader_to_stream};
+
 pub type BatchStream = BoxStream<'static, Result<RecordBatch>>;
+
+/// An owned, schema-bearing stream of Lance record batch results.
+pub type SendableRecordBatchStream = Pin<Box<dyn RecordBatchStream>>;
 
 pub fn arrow_stream_to_lance_stream(
     arrow_stream: BoxStream<'static, std::result::Result<RecordBatch, ArrowError>>,

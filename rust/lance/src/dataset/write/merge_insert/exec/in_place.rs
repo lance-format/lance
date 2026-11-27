@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -25,6 +24,7 @@ use datafusion_physical_expr::{EquivalenceProperties, Partitioning};
 use futures::{StreamExt, stream};
 use lance_core::{ROW_ADDR, ROW_ID};
 use lance_datafusion::exec::LanceExecutionOptions;
+use roaring::RoaringTreemap;
 
 use crate::Dataset;
 use crate::dataset::transaction::UpdateMode::RewriteColumns;
@@ -246,7 +246,7 @@ impl InPlaceMergeInsertExec {
         let on_columns = self.params.on.clone();
         let updated_rows = metrics.num_updated_rows.clone();
         let skipped_duplicates = metrics.num_skipped_duplicates.clone();
-        let mut seen_row_ids = HashSet::new();
+        let mut seen_row_ids = RoaringTreemap::new();
 
         let schema = output_schema.clone();
         let stream = input_stream.map(move |batch_result| -> DFResult<RecordBatch> {

@@ -44,10 +44,13 @@ use url::Url;
 use super::local::LocalObjectReader;
 #[cfg(target_os = "linux")]
 use crate::uring::{UringCurrentThreadReader, UringReader};
+pub mod copy_diagnostics;
 #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
 pub(crate) mod dynamic_credentials;
 #[cfg(any(feature = "oss", feature = "huggingface", feature = "tos"))]
 pub(crate) mod dynamic_opendal;
+use copy_diagnostics::{CopyDiagnostics, CopyOperation, CopyOperationObserver};
+pub(crate) mod hf_throttle;
 mod list_retry;
 mod local_staging;
 #[cfg(feature = "metrics")]
@@ -73,7 +76,7 @@ mod tracing;
 use crate::object_reader::SmallReader;
 use crate::object_writer::{LocalWriter, WriteResult};
 use crate::scheduler::{SCHEDULER_ERROR_MODE_STORAGE_OPTION, SchedulerErrorMode};
-use crate::traits::{WriteExt, Writer};
+use crate::traits::{Writer, copy_reader_with_progress};
 use crate::utils::tracking_store::{IOTracker, IoStats};
 use crate::{object_reader::CloudObjectReader, object_writer::ObjectWriter, traits::Reader};
 use lance_core::{Error, Result};
@@ -86,6 +89,39 @@ use local_staging::{LocalStagingPaths, remove_local_staging_file};
 pub const DEFAULT_LOCAL_IO_PARALLELISM: usize = 8;
 // Cloud disks often need many many threads to saturate the network
 pub const DEFAULT_CLOUD_IO_PARALLELISM: usize = 64;
+
+/// State observed for one bulk copy. Streamed byte counts advance after the
+/// destination writer accepts a chunk, which may still be buffered locally.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum CopyEvent {
+    /// Cumulative bytes accepted by the writer. Native copies report only the start.
+    Transferring(u64),
+    /// All input bytes have been accepted. The writer is about to shut down.
+    Completing,
+    /// The copy or shutdown returned. Destination size verification is pending.
+    Validating,
+    /// Destination size verification succeeded.
+    Complete,
+}
+
+/// Optional per-operation diagnostics. Concurrent files have distinct destination paths.
+/// Implementations should return promptly and keep file paths out of metric labels.
+pub trait CopyObserver: Send + Sync {
+    /// Receives ordered events for this destination and its expected size.
+    fn observe(&self, destination: &Path, total_bytes: u64, event: CopyEvent);
+
+    /// Optionally observe individual futures for this copy, including spawned upload
+    /// tasks. Called once, before the source size is known. Capture the file and claim
+    /// identity in the returned callback. Keep identifiers out of metric labels.
+    fn operation_observer(
+        &self,
+        _source: &Path,
+        _destination: &Path,
+    ) -> Option<CopyOperationObserver> {
+        None
+    }
+}
 
 const SERVER_SIDE_COPY_ENABLED_ENV: &str = "LANCE_IO_SERVER_SIDE_COPY_ENABLED";
 
@@ -265,6 +301,7 @@ pub struct ObjectStore {
     external_blob_inner: Option<ExternalBlobStore>,
     // Keep the registry's weak binding alive while only an external view is held.
     _external_blob_origin: Option<Arc<Self>>,
+    direct_local_io: bool,
     // Provider-owned native directory operations for rooted local stores.
     local_dir_operations: Option<Arc<dyn LocalDirOperations>>,
     // Whether local writes sync file data and directory entries before returning.
@@ -735,43 +772,222 @@ fn local_path_to_url(str_path: &str) -> Result<Url> {
     })
 }
 
+/// Repository type prefixes accepted by Hugging Face URLs, mapped to the
+/// singular names OpenDAL expects.
 #[cfg(feature = "huggingface")]
-fn parse_hf_repo_id(url: &Url) -> Result<String> {
-    // Accept forms with repo type prefix (models/datasets/spaces) or legacy without.
-    let mut segments: Vec<String> = Vec::new();
-    if let Some(host) = url.host_str() {
-        segments.push(host.to_string());
-    }
-    segments.extend(
-        url.path()
-            .trim_start_matches('/')
-            .split('/')
-            .map(|s| s.to_string()),
-    );
+const HF_REPO_TYPE_PREFIXES: [(&str, &str); 8] = [
+    ("datasets", "dataset"),
+    ("dataset", "dataset"),
+    ("models", "model"),
+    ("model", "model"),
+    ("spaces", "space"),
+    ("space", "space"),
+    ("buckets", "bucket"),
+    ("bucket", "bucket"),
+];
 
-    if segments.len() < 2 {
-        return Err(Error::invalid_input(
-            "Huggingface URL must contain at least owner and repo",
-        ));
-    }
+#[cfg(feature = "huggingface")]
+pub(crate) fn is_hf_repo_type_prefix(host: &str) -> bool {
+    HF_REPO_TYPE_PREFIXES
+        .iter()
+        .any(|(prefix, _)| *prefix == host)
+}
 
-    let repo_type_candidates = ["models", "datasets", "spaces"];
-    let (owner, repo_with_rev) = if repo_type_candidates.contains(&segments[0].as_str()) {
-        if segments.len() < 3 {
-            return Err(Error::invalid_input(
-                "Huggingface URL missing owner/repo after repo type",
-            ));
+/// The components of an `hf://` URL.
+///
+/// The supported form is
+/// `hf://(datasets|models|spaces|buckets)/<owner>/<repo>@<revision>/<path>`,
+/// where `@<revision>` is optional and singular repository type aliases are
+/// accepted. The legacy `hf://<owner>/<repo>/<path>` form is accepted and
+/// treated as a model repository. Only the repository segment is split on `@`,
+/// so an `@` in the path remains part of the path.
+#[cfg(feature = "huggingface")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ParsedHfUrl {
+    pub repo_type: String,
+    pub repo_id: String,
+    pub revision: Option<String>,
+    pub relative_path: String,
+}
+
+#[cfg(feature = "huggingface")]
+pub(crate) fn parse_hf_url(url: &Url) -> Result<ParsedHfUrl> {
+    let host = url.host_str().ok_or_else(|| {
+        Error::invalid_input("Huggingface URL must contain a repository type or owner")
+    })?;
+    let mut segments = url.path().trim_start_matches('/').split('/');
+
+    let (repo_type, owner, repo_with_revision) = match HF_REPO_TYPE_PREFIXES
+        .iter()
+        .find(|(prefix, _)| *prefix == host)
+    {
+        Some((_, canonical)) => {
+            let owner = segments
+                .next()
+                .filter(|segment| !segment.is_empty())
+                .ok_or_else(|| Error::invalid_input("Huggingface URL must contain owner"))?;
+            let repo = segments
+                .next()
+                .filter(|segment| !segment.is_empty())
+                .ok_or_else(|| {
+                    Error::invalid_input("Huggingface URL must contain repository name")
+                })?;
+            (canonical.to_string(), owner, repo)
         }
-        (segments[1].as_str(), segments[2].as_str())
-    } else {
-        (segments[0].as_str(), segments[1].as_str())
+        // A host that is not a known repository type is the legacy owner form.
+        None => {
+            let repo = segments
+                .next()
+                .filter(|segment| !segment.is_empty())
+                .ok_or_else(|| {
+                    Error::invalid_input("Huggingface URL must contain repository name")
+                })?;
+            ("model".to_string(), host, repo)
+        }
     };
 
-    let repo = repo_with_rev
-        .split_once('@')
-        .map(|(r, _)| r)
-        .unwrap_or(repo_with_rev);
-    Ok(format!("{owner}/{repo}"))
+    let relative_path = segments.collect::<Vec<_>>().join("/");
+    // Bucket repositories have no revision and use `namespace/name` before the
+    // path. Keep `@` literal there, matching how bucket URLs resolved before
+    // this parser was centralized.
+    if repo_type == "bucket" {
+        return Ok(ParsedHfUrl {
+            repo_type,
+            repo_id: format!("{owner}/{repo_with_revision}"),
+            revision: None,
+            relative_path,
+        });
+    }
+
+    let (repo_name, revision) = match repo_with_revision.split_once('@') {
+        Some((repo_name, revision)) => {
+            if repo_name.is_empty() {
+                return Err(Error::invalid_input(
+                    "Huggingface URL must contain repository name before '@'",
+                ));
+            }
+            validate_hf_url_revision(revision)?;
+            (repo_name, Some(revision.to_string()))
+        }
+        None => (repo_with_revision, None),
+    };
+
+    Ok(ParsedHfUrl {
+        repo_type,
+        repo_id: format!("{owner}/{repo_name}"),
+        revision,
+        relative_path,
+    })
+}
+
+/// Reject revisions that cannot be represented unambiguously in an `hf://`
+/// path. A revision that needs a slash or URL escaping can still be selected
+/// with the `hf_revision` or `revision` storage option.
+#[cfg(feature = "huggingface")]
+fn validate_hf_url_revision(revision: &str) -> Result<()> {
+    if revision.is_empty() {
+        return Err(Error::invalid_input(
+            "Huggingface URL revision must not be empty; write '<repo>@<revision>/<path>' or omit '@'",
+        ));
+    }
+    if let Some(character) = revision
+        .chars()
+        .find(|character| !character.is_ascii_graphic() || matches!(character, '@' | '/' | '%'))
+    {
+        return Err(Error::invalid_input(format!(
+            "Invalid Huggingface URL revision {revision:?}: character {character:?} is not supported; pass the revision through the hf_revision or revision storage option instead"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "huggingface")]
+pub(crate) fn validate_hf_revision_option(key: &str, revision: &str) -> Result<()> {
+    if revision.is_empty() || revision.chars().all(char::is_whitespace) {
+        return Err(Error::invalid_input(format!(
+            "Huggingface storage option {key} must not be empty"
+        )));
+    }
+    if revision.chars().any(char::is_control) {
+        return Err(Error::invalid_input(format!(
+            "Huggingface storage option {key} contains control characters: {revision:?}"
+        )));
+    }
+    Ok(())
+}
+
+/// The revision selected for one `hf://` base, or the option that contradicts
+/// a revision in the URL.
+#[cfg(feature = "huggingface")]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum HfRevisionResolution {
+    Selected(Option<String>),
+    Conflict {
+        key: &'static str,
+        option_revision: String,
+        url_revision: String,
+    },
+}
+
+/// Select the revision used by an `hf://` base.
+///
+/// A revision in the URL wins over storage options. Supplying the same revision
+/// under either option name is accepted, while a different revision is
+/// reported as a conflict so a pin cannot silently change. Without a URL
+/// revision, `hf_revision` keeps precedence over `revision`, matching the
+/// documented option aliases.
+#[cfg(feature = "huggingface")]
+pub(crate) fn resolve_hf_revision_inner(
+    url_revision: Option<&str>,
+    storage_options: Option<&HashMap<String, String>>,
+) -> Result<HfRevisionResolution> {
+    let prefixed = storage_options.and_then(|options| options.get("hf_revision"));
+    let unprefixed = storage_options.and_then(|options| options.get("revision"));
+
+    if let Some(revision) = prefixed {
+        validate_hf_revision_option("hf_revision", revision)?;
+    }
+    if let Some(revision) = unprefixed {
+        validate_hf_revision_option("revision", revision)?;
+    }
+
+    if let Some(url_revision) = url_revision {
+        for (key, option_revision) in [("hf_revision", prefixed), ("revision", unprefixed)] {
+            if let Some(option_revision) = option_revision
+                && option_revision != url_revision
+            {
+                return Ok(HfRevisionResolution::Conflict {
+                    key,
+                    option_revision: option_revision.clone(),
+                    url_revision: url_revision.to_string(),
+                });
+            }
+        }
+        return Ok(HfRevisionResolution::Selected(Some(
+            url_revision.to_string(),
+        )));
+    }
+
+    Ok(HfRevisionResolution::Selected(
+        prefixed.or(unprefixed).cloned(),
+    ))
+}
+
+#[cfg(feature = "huggingface")]
+pub(crate) fn resolve_hf_revision(
+    url_revision: Option<&str>,
+    storage_options: Option<&HashMap<String, String>>,
+) -> Result<Option<String>> {
+    match resolve_hf_revision_inner(url_revision, storage_options)? {
+        HfRevisionResolution::Selected(revision) => Ok(revision),
+        HfRevisionResolution::Conflict {
+            key,
+            option_revision,
+            url_revision,
+        } => Err(Error::invalid_input(format!(
+            "Huggingface storage option {key}={option_revision:?} conflicts with revision {url_revision:?} in the URL"
+        ))),
+    }
 }
 
 impl ObjectStore {
@@ -835,7 +1051,7 @@ impl ObjectStore {
                 let (wrapped, external) =
                     wrapper.wrap_with_external_blobs(&store_prefix, inner.clone(), inner);
                 inner = wrapped;
-                Some(ExternalBlobStore::new(external))
+                Some(ExternalBlobStore::new(io_tracker.wrap("", external)))
             } else {
                 None
             };
@@ -847,6 +1063,7 @@ impl ObjectStore {
                 inner: tracked_store,
                 external_blob_inner,
                 _external_blob_origin: None,
+                direct_local_io: false,
                 local_dir_operations: None,
                 local_fsync: false,
                 scheme: path.scheme().to_string(),
@@ -941,7 +1158,15 @@ impl ObjectStore {
     /// Local stores rooted below the filesystem root, such as UNC-backed stores, use
     /// their inner object-store implementation instead of direct filesystem access.
     pub fn has_direct_local_paths(&self) -> bool {
-        self.is_local() && self.store_prefix == self.scheme
+        self.has_absolute_local_mapping() && self.is_local() && !self.has_wrapper()
+    }
+
+    fn has_absolute_local_mapping(&self) -> bool {
+        self.direct_local_io && self.store_prefix == self.scheme
+    }
+
+    fn has_wrapper(&self) -> bool {
+        self.external_blob_inner.is_some() || self._external_blob_origin.is_some()
     }
 
     /// Canonicalize a local object path, resolving rooted and UNC stores through
@@ -965,7 +1190,7 @@ impl ObjectStore {
         if let Some(local_dir_operations) = &self.local_dir_operations {
             return local_dir_operations.canonicalize(path).await;
         }
-        if self.has_direct_local_paths() || self.scheme == "file-object-store" {
+        if self.has_absolute_local_mapping() {
             return canonicalize_local_io_result(
                 tokio::fs::canonicalize(super::local::to_local_path(path)).await,
             );
@@ -985,7 +1210,7 @@ impl ObjectStore {
     /// The lite scheduler is designed for backends like io_uring where
     /// tasks should only be polled when the consumer polls them.
     pub fn prefers_lite_scheduler(&self) -> bool {
-        self.scheme == "file+uring"
+        self.scheme == "file+uring" && self.has_direct_local_paths()
     }
 
     pub fn scheme(&self) -> &str {
@@ -1140,7 +1365,7 @@ impl ObjectStore {
             return store;
         }
         let mut store = self.as_ref().clone();
-        store.inner = self.io_tracker.wrap("", external.inner.clone());
+        store.inner = external.inner.clone();
         store.paginated_lister = None;
         store.external_blob_inner = None;
         store._external_blob_origin = Some(self.clone());
@@ -1165,7 +1390,7 @@ impl ObjectStore {
                 .await
             }
             #[cfg(target_os = "linux")]
-            "file+uring" => {
+            "file+uring" if self.has_direct_local_paths() => {
                 // Check if current-thread mode enabled
                 let use_current_thread = std::env::var("LANCE_URING_CURRENT_THREAD")
                     .map(|v| str_is_truthy(&v))
@@ -1197,6 +1422,7 @@ impl ObjectStore {
                     None,
                     self.download_retry_count,
                 )?
+                .with_transport_stats(self.is_cloud())
                 .with_io_parallelism(self.io_parallelism()),
             )),
         }
@@ -1211,12 +1437,22 @@ impl ObjectStore {
         // If we know the file is really small, we can read the whole thing
         // as a single request.
         if known_size <= self.block_size {
-            return Ok(Box::new(SmallReader::new(
-                self.inner.clone(),
-                path.clone(),
-                self.download_retry_count,
-                known_size,
-            )));
+            let reader = if self.is_cloud() {
+                SmallReader::new_with_transport_stats(
+                    self.inner.clone(),
+                    path.clone(),
+                    self.download_retry_count,
+                    known_size,
+                )
+            } else {
+                SmallReader::new(
+                    self.inner.clone(),
+                    path.clone(),
+                    self.download_retry_count,
+                    known_size,
+                )
+            };
+            return Ok(Box::new(reader));
         }
 
         match self.scheme.as_str() {
@@ -1230,7 +1466,7 @@ impl ObjectStore {
                 .await
             }
             #[cfg(target_os = "linux")]
-            "file+uring" => {
+            "file+uring" if self.has_direct_local_paths() => {
                 // Check if current-thread mode enabled
                 let use_current_thread = std::env::var("LANCE_URING_CURRENT_THREAD")
                     .map(|v| str_is_truthy(&v))
@@ -1262,6 +1498,7 @@ impl ObjectStore {
                     Some(known_size),
                     self.download_retry_count,
                 )?
+                .with_transport_stats(self.is_cloud())
                 .with_io_parallelism(self.io_parallelism()),
             )),
         }
@@ -1329,6 +1566,15 @@ impl ObjectStore {
 
     /// Create a new file.
     pub async fn create(&self, path: &Path) -> Result<Box<dyn Writer>> {
+        self.create_with_diagnostics(path, &CopyDiagnostics::default())
+            .await
+    }
+
+    async fn create_with_diagnostics(
+        &self,
+        path: &Path,
+        diagnostics: &CopyDiagnostics,
+    ) -> Result<Box<dyn Writer>> {
         match self.scheme.as_str() {
             "file" if self.has_direct_local_paths() => {
                 let local_path = super::local::to_local_path(path);
@@ -1368,8 +1614,75 @@ impl ObjectStore {
                     .with_fsync(local_fsync),
                 ))
             }
-            _ => Ok(Box::new(ObjectWriter::new(self, path).await?)),
+            _ => {
+                let mut writer = ObjectWriter::new(self, path).await?;
+                writer.diagnostics = diagnostics.clone();
+                Ok(Box::new(writer))
+            }
         }
+    }
+
+    /// Read an object directly, preserving request and body errors separately.
+    pub async fn read_object(&self, path: &Path) -> object_store::Result<object_store::GetResult> {
+        self.inner.get(path).await
+    }
+
+    /// Publish a payload without buffering it through a Lance writer.
+    pub async fn put_payload(
+        &self,
+        path: &Path,
+        payload: PutPayload,
+    ) -> object_store::Result<WriteResult> {
+        self.put_payload_opts(path, payload, Default::default())
+            .await
+    }
+
+    /// Publish a payload with the caller's preconditions.
+    pub async fn put_payload_opts(
+        &self,
+        path: &Path,
+        payload: PutPayload,
+        options: object_store::PutOptions,
+    ) -> object_store::Result<WriteResult> {
+        let size = payload.content_length();
+        let result = self.inner.put_opts(path, payload, options).await?;
+        Ok(WriteResult {
+            size,
+            e_tag: result.e_tag,
+        })
+    }
+
+    /// List objects with a single backend stream.
+    pub fn list_objects(
+        &self,
+        prefix: Option<&Path>,
+    ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    /// Read one byte range in a single backend request.
+    pub async fn read_range(&self, path: &Path, range: Range<u64>) -> object_store::Result<Bytes> {
+        self.inner.get_range(path, range).await
+    }
+
+    /// Read metadata without fetching the object body.
+    pub async fn stat(&self, path: &Path) -> object_store::Result<ObjectMeta> {
+        self.inner.head(path).await
+    }
+
+    /// Rename an object using the provider's replacement semantics.
+    pub async fn rename(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+        self.inner.rename(from, to).await
+    }
+
+    /// Publish by rename only if the destination is absent.
+    pub async fn rename_if_not_exists(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+        self.inner.rename_if_not_exists(from, to).await
+    }
+
+    /// Copy only if the destination is absent.
+    pub async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+        self.inner.copy_if_not_exists(from, to).await
     }
 
     /// A helper function to create a file and write content to it.
@@ -1401,8 +1714,8 @@ impl ObjectStore {
         }
 
         if self.is_local() {
-            let staging_path =
-                Path::from(format!("{}.tmp.{}", path, uuid::Uuid::new_v4().simple()));
+            let name = format!("lance-io.staging.{}", uuid::Uuid::new_v4().simple());
+            let staging_path = path.parent().unwrap_or_default().join(name.as_str());
             self.inner.put(&staging_path, content).await?;
             let result = self.inner.rename_if_not_exists(&staging_path, path).await;
             if result.is_err()
@@ -1499,12 +1812,14 @@ impl ObjectStore {
         // (https://github.com/apache/arrow-rs-object-store/issues/563). Azure and
         // other blob stores don't have this limit, so we only pay for the fallback
         // (an extra size lookup) on S3 and GCS.
-        let multipart_copy_fallback = matches!(self.scheme.as_str(), "s3" | "s3+ddb" | "gs");
+        let multipart_copy_fallback = self.requires_multipart_copy();
         self.copy_impl(
             from,
             to,
             multipart_copy_fallback,
             Self::MAX_SINGLE_COPY_BYTES,
+            None,
+            &CopyDiagnostics::default(),
         )
         .await
     }
@@ -1538,13 +1853,43 @@ impl ObjectStore {
         destination_store: &Self,
         destination_path: &Path,
     ) -> Result<WriteResult> {
+        self.copy_bulk_with_observer(source_path, destination_store, destination_path, None)
+            .await
+    }
+
+    /// Copy with the bulk policy and an optional file-scoped observer. A failed or
+    /// cancelled copy does not report [`CopyEvent::Complete`].
+    ///
+    /// ```no_run
+    /// # use lance_core::Result;
+    /// # use lance_io::object_store::{CopyObserver, ObjectStore};
+    /// # use object_store::path::Path;
+    /// # async fn copy(store: &ObjectStore, observer: &dyn CopyObserver) -> Result<()> {
+    /// store.copy_bulk_with_observer(
+    ///     &Path::from("staging/data"), store, &Path::from("final/data"), Some(observer),
+    /// ).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn copy_bulk_with_observer(
+        &self,
+        source_path: &Path,
+        destination_store: &Self,
+        destination_path: &Path,
+        observer: Option<&dyn CopyObserver>,
+    ) -> Result<WriteResult> {
         self.copy_bulk_with_server_side_copy(
             source_path,
             destination_store,
             destination_path,
             self.uses_server_side_copy(destination_store),
+            observer,
         )
         .await
+    }
+
+    fn requires_multipart_copy(&self) -> bool {
+        matches!(self.scheme.as_str(), "s3" | "s3+ddb" | "gs")
     }
 
     fn uses_server_side_copy(&self, destination_store: &Self) -> bool {
@@ -1558,24 +1903,55 @@ impl ObjectStore {
         destination_store: &Self,
         destination_path: &Path,
         server_side_copy_enabled: bool,
+        observer: Option<&dyn CopyObserver>,
     ) -> Result<WriteResult> {
+        let diagnostics = CopyDiagnostics(
+            observer
+                .and_then(|observer| observer.operation_observer(source_path, destination_path)),
+        );
         if !server_side_copy_enabled || !self.can_server_side_copy_to(destination_store) {
             return self
-                .copy_via_stream(source_path, destination_store, destination_path)
+                .copy_via_stream_inner(
+                    source_path,
+                    destination_store,
+                    destination_path,
+                    observer,
+                    &diagnostics,
+                )
                 .await;
         }
 
-        let source_size = self.size(source_path).await?;
+        let source_size = diagnostics
+            .run(CopyOperation::SourceMetadata, self.size(source_path))
+            .await?;
         let result_size = usize::try_from(source_size).map_err(|source| {
             Error::io(format!(
                 "server-side copy source size conversion failed from {source_path} to \
                  {destination_path}: source_size={source_size}, error={source}"
             ))
         })?;
+        if let Some(observer) = observer {
+            observer.observe(destination_path, source_size, CopyEvent::Transferring(0));
+        }
         destination_store
-            .copy(source_path, destination_path)
+            .copy_impl(
+                source_path,
+                destination_path,
+                destination_store.requires_multipart_copy(),
+                Self::MAX_SINGLE_COPY_BYTES,
+                observer,
+                &diagnostics,
+            )
             .await?;
-        let destination_size = destination_store.size(destination_path).await?;
+        if let Some(observer) = observer {
+            observer.observe(destination_path, source_size, CopyEvent::Validating);
+        }
+        let destination_size = diagnostics
+            .run(
+                CopyOperation::DestinationMetadata,
+                destination_store.size(destination_path),
+            )
+            .await?;
         if destination_size != source_size {
             return Err(Error::io(format!(
                 "server-side copy destination size mismatch from {source_path} to \
@@ -1584,6 +1960,9 @@ impl ObjectStore {
             )));
         }
 
+        if let Some(observer) = observer {
+            observer.observe(destination_path, source_size, CopyEvent::Complete);
+        }
         Ok(WriteResult {
             size: result_size,
             e_tag: None,
@@ -1622,40 +2001,27 @@ impl ObjectStore {
     /// # Ok(())
     /// # }
     /// ```
-    #[instrument(
-        name = "multipart_stream_copy",
-        level = "info",
-        skip(self, source_path, destination_store, destination_path),
-        fields(
-            source = %source_path,
-            destination = %destination_path,
-            source_size = Empty,
-            read_chunk_size = Empty,
-            multipart_part_size = crate::object_writer::initial_upload_size(),
-            multipart_concurrency = crate::object_writer::max_upload_parallelism(),
-            part_count = Empty,
-            bytes_transferred = Empty,
-            destination_size = Empty,
-            validation = Empty,
-            elapsed_ms = Empty,
-        ),
-        err
-    )]
     pub async fn copy_via_stream(
         &self,
         source_path: &Path,
         destination_store: &Self,
         destination_path: &Path,
     ) -> Result<WriteResult> {
-        self.copy_via_stream_inner(source_path, destination_store, destination_path)
-            .await
+        self.copy_via_stream_inner(
+            source_path,
+            destination_store,
+            destination_path,
+            None,
+            &CopyDiagnostics::default(),
+        )
+        .await
     }
 
     /// Copy within this store without replacing an existing destination.
     ///
     /// This uses the provider's native conditional copy. An existing destination
     /// with the same size is treated as a successful retry.
-    pub async fn copy_if_not_exists(
+    pub async fn copy_if_not_exists_or_same_size(
         &self,
         source_path: &Path,
         destination_path: &Path,
@@ -1692,18 +2058,48 @@ impl ObjectStore {
         })
     }
 
+    #[instrument(
+        name = "multipart_stream_copy",
+        level = "info",
+        skip_all,
+        fields(
+            source = %source_path,
+            destination = %destination_path,
+            source_size = Empty,
+            read_chunk_size = Empty,
+            multipart_part_size = crate::object_writer::initial_upload_size(),
+            multipart_concurrency = crate::object_writer::max_upload_parallelism(),
+            part_count = Empty,
+            bytes_transferred = Empty,
+            destination_size = Empty,
+            validation = Empty,
+            elapsed_ms = Empty,
+        ),
+        err
+    )]
     async fn copy_via_stream_inner(
         &self,
         source_path: &Path,
         destination_store: &Self,
         destination_path: &Path,
+        observer: Option<&dyn CopyObserver>,
+        diagnostics: &CopyDiagnostics,
     ) -> Result<WriteResult> {
         let started_at = Instant::now();
+        let report = |size: usize, event| {
+            if let Some(observer) = observer {
+                observer.observe(destination_path, size as u64, event);
+            }
+        };
         if self.has_direct_local_paths()
             && destination_store.has_direct_local_paths()
             && !destination_store.local_fsync
         {
-            let source_size = std::fs::metadata(super::local::to_local_path(source_path))
+            let source_size = diagnostics
+                .run(CopyOperation::SourceMetadata, async {
+                    std::fs::metadata(super::local::to_local_path(source_path))
+                })
+                .await
                 .map_err(|source| {
                     let source = if source.kind() == std::io::ErrorKind::NotFound {
                         Error::not_found(source_path.to_string())
@@ -1723,8 +2119,13 @@ impl ObjectStore {
             })?;
             Span::current().record("source_size", source_size as u64);
 
+            report(source_size, CopyEvent::Transferring(0));
             let metrics = destination_store.io_tracker.begin_io("copy");
-            let result = super::local::copy_file(source_path, destination_path);
+            let result = diagnostics
+                .run(CopyOperation::NativeCopy, async {
+                    super::local::copy_file(source_path, destination_path)
+                })
+                .await;
             metrics.record(&result, source_size as u64);
             result.map_err(|source| {
                 stream_copy_error(
@@ -1735,18 +2136,21 @@ impl ObjectStore {
                 )
             })?;
 
-            let destination_size =
-                destination_store
-                    .size(destination_path)
-                    .await
-                    .map_err(|source| {
-                        stream_copy_error(
-                            "destination validation",
-                            source_path,
-                            destination_path,
-                            source,
-                        )
-                    })?;
+            report(source_size, CopyEvent::Validating);
+            let destination_size = diagnostics
+                .run(
+                    CopyOperation::DestinationMetadata,
+                    destination_store.size(destination_path),
+                )
+                .await
+                .map_err(|source| {
+                    stream_copy_error(
+                        "destination validation",
+                        source_path,
+                        destination_path,
+                        source,
+                    )
+                })?;
             Span::current().record("bytes_transferred", source_size as u64);
             Span::current().record("destination_size", destination_size);
             if destination_size != source_size as u64 {
@@ -1760,6 +2164,7 @@ impl ObjectStore {
 
             Span::current().record("validation", "passed");
             Span::current().record("elapsed_ms", started_at.elapsed().as_millis() as u64);
+            report(source_size, CopyEvent::Complete);
             return Ok(WriteResult {
                 size: source_size,
                 e_tag: None,
@@ -1769,13 +2174,17 @@ impl ObjectStore {
         let reader = self.open(source_path).await.map_err(|source| {
             stream_copy_error("source open", source_path, destination_path, source)
         })?;
-        let source_size = reader.size().await.map_err(|source| {
-            stream_copy_error("source metadata", source_path, destination_path, source)
-        })?;
+        let source_size = diagnostics
+            .run(CopyOperation::SourceMetadata, reader.size())
+            .await
+            .map_err(|source| {
+                stream_copy_error("source metadata", source_path, destination_path, source)
+            })?;
         Span::current().record("source_size", source_size as u64);
 
+        report(source_size, CopyEvent::Transferring(0));
         let mut writer = destination_store
-            .create(destination_path)
+            .create_with_diagnostics(destination_path, diagnostics)
             .await
             .map_err(|source| {
                 stream_copy_error(
@@ -1789,11 +2198,22 @@ impl ObjectStore {
             .unwrap_or(usize::MAX)
             .max(1);
         Span::current().record("read_chunk_size", read_chunk_size as u64);
+        let uses_object_writer =
+            destination_store.scheme != "file" || !destination_store.has_direct_local_paths();
         let mut bytes_transferred = 0usize;
         if source_size > 0 {
             let first_range = 0..read_chunk_size.min(source_size);
             let mut current_range = first_range.clone();
-            let mut current_bytes = reader.get_range(first_range).await.map_err(|source| {
+            let read_range = |range: Range<usize>| {
+                diagnostics.run(
+                    CopyOperation::ReadRange {
+                        start: range.start,
+                        end: range.end,
+                    },
+                    reader.get_range(range),
+                )
+            };
+            let mut current_bytes = read_range(first_range).await.map_err(|source| {
                 stream_copy_error("source read", source_path, destination_path, source)
             })?;
 
@@ -1817,15 +2237,39 @@ impl ObjectStore {
                         ))
                     })?;
 
-                if bytes_transferred == source_size {
-                    writer.write_all(&current_bytes).await.map_err(|source| {
-                        stream_copy_error(
-                            "destination write",
-                            source_path,
-                            destination_path,
-                            source,
+                let write_chunk = async {
+                    diagnostics
+                        .run(
+                            CopyOperation::Write {
+                                offset: current_range.start,
+                            },
+                            async {
+                                writer.write_all(&current_bytes).await?;
+                                // Keep polling multipart creation while the next read is in flight.
+                                // ObjectWriter::flush lets already spawned parts continue in parallel.
+                                if bytes_transferred < source_size && uses_object_writer {
+                                    writer.flush().await?;
+                                }
+                                Ok::<_, std::io::Error>(())
+                            },
                         )
-                    })?;
+                        .await
+                        .map_err(|source| {
+                            stream_copy_error(
+                                "destination write",
+                                source_path,
+                                destination_path,
+                                source,
+                            )
+                        })?;
+                    report(
+                        source_size,
+                        CopyEvent::Transferring(bytes_transferred as u64),
+                    );
+                    Result::Ok(())
+                };
+                if bytes_transferred == source_size {
+                    write_chunk.await?;
                     break;
                 }
 
@@ -1834,12 +2278,9 @@ impl ObjectStore {
                     .unwrap_or(source_size)
                     .min(source_size);
                 let next_range = bytes_transferred..range_end;
-                let next_read = reader.get_range(next_range.clone());
-                let (write_result, next_bytes) =
-                    tokio::join!(writer.write_all(&current_bytes), next_read);
-                write_result.map_err(|source| {
-                    stream_copy_error("destination write", source_path, destination_path, source)
-                })?;
+                let next_read = read_range(next_range.clone());
+                let (write_result, next_bytes) = tokio::join!(write_chunk, next_read);
+                write_result?;
                 current_bytes = next_bytes.map_err(|source| {
                     stream_copy_error("source read", source_path, destination_path, source)
                 })?;
@@ -1848,14 +2289,18 @@ impl ObjectStore {
         }
         Span::current().record("bytes_transferred", bytes_transferred as u64);
 
-        let write_result = Writer::shutdown(writer.as_mut()).await.map_err(|source| {
-            stream_copy_error(
-                "destination completion",
-                source_path,
-                destination_path,
-                source,
-            )
-        })?;
+        report(source_size, CopyEvent::Completing);
+        let write_result = diagnostics
+            .run(CopyOperation::Shutdown, Writer::shutdown(writer.as_mut()))
+            .await
+            .map_err(|source| {
+                stream_copy_error(
+                    "destination completion",
+                    source_path,
+                    destination_path,
+                    source,
+                )
+            })?;
         if write_result.size != source_size {
             Span::current().record("validation", "failed");
             return Err(Error::io(format!(
@@ -1866,18 +2311,21 @@ impl ObjectStore {
             )));
         }
 
-        let destination_size =
-            destination_store
-                .size(destination_path)
-                .await
-                .map_err(|source| {
-                    stream_copy_error(
-                        "destination validation",
-                        source_path,
-                        destination_path,
-                        source,
-                    )
-                })?;
+        report(source_size, CopyEvent::Validating);
+        let destination_size = diagnostics
+            .run(
+                CopyOperation::DestinationMetadata,
+                destination_store.size(destination_path),
+            )
+            .await
+            .map_err(|source| {
+                stream_copy_error(
+                    "destination validation",
+                    source_path,
+                    destination_path,
+                    source,
+                )
+            })?;
         Span::current().record("destination_size", destination_size);
         if destination_size != source_size as u64 {
             Span::current().record("validation", "failed");
@@ -1890,6 +2338,7 @@ impl ObjectStore {
 
         Span::current().record("validation", "passed");
         Span::current().record("elapsed_ms", started_at.elapsed().as_millis() as u64);
+        report(source_size, CopyEvent::Complete);
         Ok(write_result)
     }
 
@@ -1904,6 +2353,8 @@ impl ObjectStore {
         to: &Path,
         multipart_copy_fallback: bool,
         max_single_copy: u64,
+        observer: Option<&dyn CopyObserver>,
+        diagnostics: &CopyDiagnostics,
     ) -> Result<()> {
         if self.has_direct_local_paths() {
             // Native filesystem copies bypass the writer's file and directory syncs.
@@ -1921,14 +2372,34 @@ impl ObjectStore {
             // Reuse the reader for both the size lookup (a single cached HEAD)
             // and the streamed copy, avoiding a separate HEAD request.
             let reader = self.open(from).await?;
-            if reader.size().await? as u64 > max_single_copy {
-                let mut writer = self.create(to).await?;
-                writer.copy_from_reader(reader.as_ref()).await?;
-                Writer::shutdown(writer.as_mut()).await?;
+            let size = diagnostics
+                .run(CopyOperation::SourceMetadata, reader.size())
+                .await? as u64;
+            if size > max_single_copy {
+                let mut writer = self.create_with_diagnostics(to, diagnostics).await?;
+                copy_reader_with_progress(
+                    writer.as_mut(),
+                    reader.as_ref(),
+                    diagnostics,
+                    |accepted| {
+                        if let Some(observer) = observer {
+                            observer.observe(to, size, CopyEvent::Transferring(accepted as u64));
+                        }
+                    },
+                )
+                .await?;
+                if let Some(observer) = observer {
+                    observer.observe(to, size, CopyEvent::Completing);
+                }
+                diagnostics
+                    .run(CopyOperation::Shutdown, Writer::shutdown(writer.as_mut()))
+                    .await?;
                 return Ok(());
             }
         }
-        Ok(self.inner.copy(from, to).await?)
+        Ok(diagnostics
+            .run(CopyOperation::NativeCopy, self.inner.copy(from, to))
+            .await?)
     }
 
     /// Read a directory (start from base directory) and returns all sub-paths in the directory.
@@ -1993,7 +2464,7 @@ impl ObjectStore {
             metrics.record(&result, 0);
             return result;
         }
-        if self.has_direct_local_paths() {
+        if self.has_absolute_local_mapping() && self.is_local() {
             // The local file system provider needs to delete both files and directories.
             // Counted as a single delete request, matching how `delete_stream`
             // counts one batched request regardless of how many paths it removes.
@@ -2028,7 +2499,7 @@ impl ObjectStore {
         for location in deferred {
             self.inner.delete(&location).await?;
         }
-        if self.scheme == "file-object-store" {
+        if self.has_absolute_local_mapping() && self.scheme == "file-object-store" {
             // file-object-store tries to do everything as similarly as possible to the remote
             // object stores. But we still have to delete the directory entries afterwards.
             return super::local::remove_dir_all(&path);
@@ -2068,7 +2539,7 @@ impl ObjectStore {
         verified_dirs: HashSet<Path>,
         unmodified_since: Option<DateTime<Utc>>,
     ) -> Result<()> {
-        if !self.has_direct_local_paths() && self.scheme != "file-object-store" {
+        if !self.has_absolute_local_mapping() {
             return Ok(());
         }
 
@@ -2542,7 +3013,10 @@ impl ObjectStore {
             Some(wrapper) => {
                 let (store, external) =
                     wrapper.wrap_with_external_blobs(&store_prefix, store.clone(), store);
-                (store, Some(ExternalBlobStore::new(external)))
+                (
+                    store,
+                    Some(ExternalBlobStore::new(io_tracker.wrap("", external))),
+                )
             }
             None => (store, None),
         };
@@ -2554,6 +3028,7 @@ impl ObjectStore {
             inner: tracked_store,
             external_blob_inner,
             _external_blob_origin: None,
+            direct_local_io: false,
             local_dir_operations: None,
             local_fsync: false,
             scheme: scheme.into(),
@@ -2769,7 +3244,9 @@ mod tests {
     #[tokio::test]
     async fn test_put_if_absent() {
         let temp_dir = TempStrDir::default();
-        let path = Path::from(format!("{}/atomic-create", temp_dir.as_str()));
+        let parent = Path::from(temp_dir.as_str()).join("目录");
+        let basename = format!(".{}", "x".repeat(240));
+        let path = parent.join(basename.as_str());
         let store = ObjectStore::local();
         store
             .put_if_absent(&path, Bytes::from_static(b"first").into())
@@ -3405,6 +3882,141 @@ mod tests {
         assert!(!path.join("verified").exists());
     }
 
+    #[rstest]
+    #[tokio::test]
+    async fn test_external_view_counts_reads_once(#[values(false, true)] apply_late: bool) {
+        let wrapper = Arc::new(IOTracker::default());
+        let params = ObjectStoreParams {
+            object_store_wrapper: (!apply_late)
+                .then(|| wrapper.clone() as Arc<dyn WrappingObjectStore>),
+            ..Default::default()
+        };
+        let (store, _) = ObjectStore::from_uri_and_params(
+            Arc::new(ObjectStoreRegistry::default()),
+            "memory:///",
+            &params,
+        )
+        .await
+        .unwrap();
+        let mut store = store.as_ref().clone();
+        if apply_late {
+            store.apply_wrapper(wrapper.as_ref());
+        }
+        let store = Arc::new(store);
+        let path = Path::from("payload");
+        store.put(&path, b"blob").await.unwrap();
+        for view in [store.clone(), store.for_external_blobs()] {
+            store.io_stats_incremental();
+            wrapper.incremental_stats();
+            assert_eq!(
+                view.inner.get_range(&path, 0..4).await.unwrap(),
+                b"blob".as_slice()
+            );
+            let stats = store.io_stats_snapshot();
+            assert_eq!(stats.read_iops, 1);
+            assert_eq!(stats.read_bytes, 4);
+            assert_eq!(wrapper.stats().read_iops, 1);
+        }
+    }
+
+    #[rstest]
+    #[case::file("file")]
+    #[case::storage("file-object-store")]
+    #[cfg_attr(target_os = "linux", case::uring("file+uring"))]
+    #[tokio::test]
+    async fn test_local_io_uses_wrapped_backend(
+        #[case] scheme: &str,
+        #[values(false, true)] apply_late: bool,
+    ) {
+        let directory = TempStdDir::default();
+        std::fs::write(directory.join("source"), b"disk").unwrap();
+        let file_url = Url::from_directory_path(&directory).unwrap();
+        let mut url = Url::parse(&format!("{scheme}:///")).unwrap();
+        url.set_path(file_url.path());
+        let replacement = Arc::new(InMemory::new());
+        let wrapper = Arc::new(TestWrapper {
+            called: AtomicBool::new(false),
+            return_value: replacement.clone(),
+        });
+        let params = ObjectStoreParams {
+            object_store_wrapper: (!apply_late)
+                .then(|| wrapper.clone() as Arc<dyn WrappingObjectStore>),
+            ..Default::default()
+        };
+        let (store, base) = ObjectStore::from_uri_and_params(
+            Arc::new(ObjectStoreRegistry::default()),
+            url.as_ref(),
+            &params,
+        )
+        .await
+        .unwrap();
+        let store = if apply_late {
+            let mut store = store.as_ref().clone();
+            store.apply_wrapper(wrapper.as_ref());
+            Arc::new(store)
+        } else {
+            store
+        };
+        assert!(!store.has_direct_local_paths());
+        let source = base.clone().join("source");
+        replacement
+            .put(&source, Bytes::from_static(b"wrapped").into())
+            .await
+            .unwrap();
+
+        // Both ordinary and external views must reach the selected backend,
+        // including the known-size reader and local copy shortcuts.
+        for view in [store.clone(), store.for_external_blobs()] {
+            assert_eq!(
+                view.open(&source).await.unwrap().get_all().await.unwrap(),
+                b"wrapped".as_slice()
+            );
+            assert_eq!(
+                view.open_with_size(&source, 7)
+                    .await
+                    .unwrap()
+                    .get_all()
+                    .await
+                    .unwrap(),
+                b"wrapped".as_slice()
+            );
+            let destination = base.clone().join("copy");
+            view.copy(&source, &destination).await.unwrap();
+            assert_eq!(
+                replacement
+                    .get(&destination)
+                    .await
+                    .unwrap()
+                    .bytes()
+                    .await
+                    .unwrap(),
+                b"wrapped".as_slice()
+            );
+            view.copy_via_stream(&source, &view, &base.clone().join("streamed"))
+                .await
+                .unwrap();
+            view.put(&base.clone().join("new"), b"new").await.unwrap();
+            assert_eq!(
+                replacement
+                    .get(&base.clone().join("new"))
+                    .await
+                    .unwrap()
+                    .bytes()
+                    .await
+                    .unwrap(),
+                b"new".as_slice()
+            );
+        }
+        assert_eq!(std::fs::read(directory.join("source")).unwrap(), b"disk");
+        for name in ["copy", "streamed", "new"] {
+            assert!(
+                !directory.join(name).exists(),
+                "wrapper was bypassed for {name}"
+            );
+        }
+        assert!(wrapper.called());
+    }
+
     #[derive(Debug)]
     struct TestWrapper {
         called: AtomicBool,
@@ -3886,6 +4498,8 @@ mod tests {
 
     #[derive(Debug, Default)]
     struct MultipartObservations {
+        pause_first_part: Option<(tokio::sync::Notify, tokio::sync::Notify)>,
+        pause_completion: Option<(tokio::sync::Notify, tokio::sync::Notify)>,
         part_count: AtomicUsize,
         abort_count: AtomicUsize,
         native_copy_count: AtomicUsize,
@@ -3914,7 +4528,7 @@ mod tests {
     #[async_trait]
     impl MultipartUpload for ObservedMultipartUpload {
         fn put_part(&mut self, data: PutPayload) -> UploadPart {
-            self.observations.part_count.fetch_add(1, Ordering::SeqCst);
+            let index = self.observations.part_count.fetch_add(1, Ordering::SeqCst);
             if self.fail_parts {
                 return Box::pin(async {
                     Err(object_store::Error::Generic {
@@ -3923,10 +4537,29 @@ mod tests {
                     })
                 });
             }
-            self.inner.put_part(data)
+            let future = self.inner.put_part(data);
+            if index == 0 && self.observations.pause_first_part.is_some() {
+                let observations = self.observations.clone();
+                let submitted = copy_diagnostics::CopyOperationId::current().unwrap();
+                return Box::pin(async move {
+                    assert_eq!(
+                        copy_diagnostics::CopyOperationId::current(),
+                        Some(submitted)
+                    );
+                    let (paused, resume) = observations.pause_first_part.as_ref().unwrap();
+                    paused.notify_one();
+                    resume.notified().await;
+                    future.await
+                });
+            }
+            future
         }
 
         async fn complete(&mut self) -> OSResult<PutResult> {
+            if let Some((paused, resume)) = &self.observations.pause_completion {
+                paused.notify_one();
+                resume.notified().await;
+            }
             self.inner.complete().await
         }
 
@@ -3966,6 +4599,8 @@ mod tests {
             location: &Path,
             opts: PutMultipartOptions,
         ) -> OSResult<Box<dyn MultipartUpload>> {
+            // Model an asynchronous create even though the backing store is in memory.
+            tokio::task::yield_now().await;
             let inner = self.inner.put_multipart_opts(location, opts).await?;
             Ok(Box::new(ObservedMultipartUpload {
                 inner,
@@ -4112,7 +4747,24 @@ mod tests {
         // Source size (61 bytes) exceeds the threshold -> must stream via a
         // multipart write rather than a single-shot server-side copy.
         let streamed = Path::from("streamed.bin");
-        store.copy_impl(&from, &streamed, true, 8).await.unwrap();
+        let events = CopyEvents::default();
+        store
+            .copy_impl(
+                &from,
+                &streamed,
+                true,
+                8,
+                Some(&events),
+                &CopyDiagnostics::default(),
+            )
+            .await
+            .unwrap();
+        let events = events.0.into_inner().unwrap();
+        let size = contents.len() as u64;
+        assert!(events.ends_with(&[
+            (streamed.clone(), size, CopyEvent::Transferring(size)),
+            (streamed.clone(), size, CopyEvent::Completing)
+        ]));
         let copied = store.read_one_all(&streamed).await.unwrap();
         assert_eq!(copied.as_ref(), contents.as_slice());
 
@@ -4122,7 +4774,14 @@ mod tests {
         let native = Path::from("native.bin");
         assert!(
             store
-                .copy_impl(&from, &native, true, u64::MAX)
+                .copy_impl(
+                    &from,
+                    &native,
+                    true,
+                    u64::MAX,
+                    None,
+                    &CopyDiagnostics::default()
+                )
                 .await
                 .is_err()
         );
@@ -4164,7 +4823,7 @@ mod tests {
         store.put(&destination, b"old").await.unwrap();
 
         let result = store
-            .copy_if_not_exists(&source, &destination)
+            .copy_if_not_exists_or_same_size(&source, &destination)
             .await
             .unwrap();
 
@@ -4193,7 +4852,7 @@ mod tests {
         observations.part_count.store(0, Ordering::SeqCst);
 
         let result = store
-            .copy_if_not_exists(&source, &destination)
+            .copy_if_not_exists_or_same_size(&source, &destination)
             .await
             .unwrap();
 
@@ -4329,7 +4988,7 @@ mod tests {
         store.put(&source, contents).await.unwrap();
 
         let result = store
-            .copy_bulk_with_server_side_copy(&source, &store, &destination, false)
+            .copy_bulk_with_server_side_copy(&source, &store, &destination, false, None)
             .await
             .unwrap();
 
@@ -4385,13 +5044,27 @@ mod tests {
         let contents = b"use native copy when explicitly enabled";
         source_store.put(&source, contents).await.unwrap();
 
+        let events = CopyEvents::default();
         let result = source_store
-            .copy_bulk_with_server_side_copy(&source, &destination_store, &destination, true)
+            .copy_bulk_with_server_side_copy(
+                &source,
+                &destination_store,
+                &destination,
+                true,
+                Some(&events),
+            )
             .await
             .unwrap();
 
         assert_eq!(result.size, contents.len());
         assert_eq!(observations.native_copy_count.load(Ordering::SeqCst), 1);
+        let expected = [
+            CopyEvent::Transferring(0),
+            CopyEvent::Validating,
+            CopyEvent::Complete,
+        ]
+        .map(|event| (destination.clone(), contents.len() as u64, event));
+        assert_eq!(events.0.lock().unwrap().as_slice(), expected);
         assert_eq!(
             destination_store
                 .read_one_all(&destination)
@@ -4432,7 +5105,7 @@ mod tests {
         source_store.put(&source, contents).await.unwrap();
 
         let result = source_store
-            .copy_bulk_with_server_side_copy(&source, &destination_store, &destination, true)
+            .copy_bulk_with_server_side_copy(&source, &destination_store, &destination, true, None)
             .await
             .unwrap();
 
@@ -4478,7 +5151,7 @@ mod tests {
             .unwrap();
 
         let error = source_store
-            .copy_bulk_with_server_side_copy(&source, &destination_store, &destination, true)
+            .copy_bulk_with_server_side_copy(&source, &destination_store, &destination, true, None)
             .await
             .unwrap_err();
 
@@ -4507,7 +5180,7 @@ mod tests {
         source_store.put(&source, contents).await.unwrap();
 
         let result = source_store
-            .copy_bulk_with_server_side_copy(&source, &destination_store, &destination, true)
+            .copy_bulk_with_server_side_copy(&source, &destination_store, &destination, true, None)
             .await
             .unwrap();
 
@@ -4543,11 +5216,43 @@ mod tests {
         );
     }
 
+    #[derive(Default)]
+    struct CopyEvents(
+        std::sync::Mutex<Vec<(Path, u64, CopyEvent)>>,
+        Option<CopyOperationObserver>,
+    );
+
+    impl CopyObserver for CopyEvents {
+        fn operation_observer(
+            &self,
+            source: &Path,
+            destination: &Path,
+        ) -> Option<CopyOperationObserver> {
+            if self.1.is_some() {
+                assert_eq!(source.as_ref(), "source.bin");
+                assert_eq!(destination.as_ref(), "destination.bin");
+            }
+            self.1.clone()
+        }
+
+        fn observe(&self, destination: &Path, total: u64, event: CopyEvent) {
+            self.0
+                .lock()
+                .unwrap()
+                .push((destination.clone(), total, event));
+        }
+    }
+
     #[tokio::test]
-    async fn test_copy_via_stream_uses_multiple_parts() {
+    async fn test_bulk_copy_reports_bytes_while_multipart_completion_is_pending() {
         let mut source_store = ObjectStore::memory();
-        source_store.max_iop_size = 1024 * 1024;
-        let observations = Arc::new(MultipartObservations::default());
+        // End the first write exactly at the multipart boundary.
+        source_store.max_iop_size = crate::object_writer::initial_upload_size() as u64;
+        let observations = Arc::new(MultipartObservations {
+            pause_first_part: Some(Default::default()),
+            pause_completion: Some(Default::default()),
+            ..Default::default()
+        });
         let mut destination_store = ObjectStore::memory();
         destination_store.inner = Arc::new(ObservedMultipartStore {
             inner: InMemory::new(),
@@ -4561,11 +5266,133 @@ mod tests {
         let contents = vec![42; crate::object_writer::initial_upload_size() * 2 + 1];
         source_store.put(&source, &contents).await.unwrap();
 
-        let result = source_store
-            .copy_via_stream(&source, &destination_store, &destination)
-            .await
-            .unwrap();
-
+        use copy_diagnostics::CopyOperationEvent as Event;
+        let (diagnostics, operations) = CopyDiagnostics::recording();
+        let returned = Arc::new(tokio::sync::Notify::new());
+        let part_returned = returned.clone();
+        let record = diagnostics.0.unwrap();
+        let events = CopyEvents(
+            Default::default(),
+            Some(Arc::new(move |obs| {
+                let first_returned =
+                    matches!(obs.operation, CopyOperation::UploadPart { index: 0, .. })
+                        && obs.event == (Event::Returned { success: true });
+                record(obs);
+                if first_returned {
+                    part_returned.notify_one();
+                }
+            })),
+        );
+        let copy = source_store.copy_bulk_with_observer(
+            &source,
+            &destination_store,
+            &destination,
+            Some(&events),
+        );
+        tokio::pin!(copy);
+        let (uploading, release_part) = observations.pause_first_part.as_ref().unwrap();
+        tokio::select! {
+            _ = uploading.notified() => {},
+            result = &mut copy => panic!("copy returned with a blocked part: {result:?}"),
+        }
+        release_part.notify_one();
+        // The part task can finish while the copy (and therefore the writer) is unpolled.
+        returned.notified().await;
+        let first_part = CopyOperation::UploadPart {
+            index: 0,
+            bytes: crate::object_writer::initial_upload_size(),
+        };
+        {
+            let ops = operations.lock().unwrap();
+            let submitted = ops
+                .iter()
+                .find(|op| op.operation == first_part && op.event == Event::Submitted)
+                .unwrap();
+            let child = ops
+                .iter()
+                .find(|op| op.id == submitted.id && op.event == Event::Wake)
+                .unwrap()
+                .task;
+            assert!(child.is_some());
+            assert_ne!(child, submitted.task);
+            assert!(
+                ops.iter()
+                    .any(|op| op.id == submitted.id && op.task == child && op.event == Event::Poll)
+            );
+            assert!(
+                !ops.iter()
+                    .any(|op| op.id == submitted.id && op.event == Event::Collected)
+            );
+            assert!(
+                !ops.iter()
+                    .any(|op| op.operation == CopyOperation::CompleteMultipart)
+            );
+        }
+        let (paused, resume) = observations.pause_completion.as_ref().unwrap();
+        tokio::select! {
+            _ = paused.notified() => {},
+            result = &mut copy => panic!("copy returned before multipart completion: {result:?}"),
+        }
+        let total = contents.len() as u64;
+        let mut expected = vec![(destination.clone(), total, CopyEvent::Transferring(0))];
+        for start in (0..contents.len()).step_by(source_store.max_iop_size() as usize) {
+            let accepted = (start as u64 + source_store.max_iop_size()).min(total);
+            expected.push((
+                destination.clone(),
+                total,
+                CopyEvent::Transferring(accepted),
+            ));
+        }
+        expected.push((destination.clone(), total, CopyEvent::Completing));
+        assert_eq!(*events.0.lock().unwrap(), expected);
+        {
+            let ops = operations.lock().unwrap();
+            assert!(
+                ops.iter()
+                    .any(|op| op.operation == first_part && op.event == Event::Collected)
+            );
+            assert!(
+                ops.iter()
+                    .any(|op| op.operation == CopyOperation::CompleteMultipart
+                        && op.event == Event::Poll)
+            );
+            assert!(
+                !ops.iter()
+                    .any(|op| op.operation == CopyOperation::DestinationMetadata)
+            );
+        }
+        assert!(!destination_store.exists(&destination).await.unwrap());
+        resume.notify_one();
+        let result = copy.await.unwrap();
+        {
+            let ops = operations.lock().unwrap();
+            let finished: Vec<_> = ops
+                .iter()
+                .filter(|op| op.event == (Event::Returned { success: true }))
+                .map(|op| op.operation)
+                .collect();
+            assert_eq!(finished.first(), Some(&CopyOperation::SourceMetadata));
+            let first_write = finished
+                .iter()
+                .position(|op| *op == CopyOperation::Write { offset: 0 })
+                .unwrap();
+            assert!(
+                finished[..first_write].contains(&CopyOperation::CreateMultipart),
+                "the first chunk should drive multipart creation to completion"
+            );
+            assert!(finished.contains(&CopyOperation::ReadRange {
+                start: 0,
+                end: source_store.max_iop_size() as usize
+            }));
+            assert!(finished.ends_with(&[
+                CopyOperation::CompleteMultipart,
+                CopyOperation::Shutdown,
+                CopyOperation::DestinationMetadata
+            ]));
+        }
+        expected.push((destination.clone(), total, CopyEvent::Validating));
+        expected.push((destination.clone(), total, CopyEvent::Complete));
+        assert_eq!(*events.0.lock().unwrap(), expected);
         assert_eq!(result.size, contents.len());
         assert!(
             observations.part_count.load(Ordering::SeqCst) >= 2,
@@ -4644,11 +5471,15 @@ mod tests {
         let contents = b"validate the destination after completion";
         source_store.put(&source, contents).await.unwrap();
 
+        let events = CopyEvents::default();
         let error = source_store
-            .copy_via_stream(&source, &destination_store, &destination)
+            .copy_bulk_with_observer(&source, &destination_store, &destination, Some(&events))
             .await
             .unwrap_err();
-
+        assert_eq!(
+            events.0.lock().unwrap().last().unwrap().2,
+            CopyEvent::Validating
+        );
         assert!(
             error.to_string().contains("destination size mismatch"),
             "expected validation failure, got: {error}"

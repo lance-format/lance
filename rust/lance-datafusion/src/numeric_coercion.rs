@@ -100,11 +100,22 @@ fn lower(column: &Expr, op: Operator, operand: &Expr, schema: &Schema) -> Option
         scalar,
         ScalarValue::Float16(_) | ScalarValue::Float32(_) | ScalarValue::Float64(_)
     );
+    let mut needs_rewrite = is_float;
     let comparison = if scalar.is_null() {
         Comparison::Literal(op, ScalarValue::try_new_null(&data_type).ok()?)
     } else if !is_float {
-        // Operands the existing coercion already handles keep its behavior.
-        Comparison::Literal(op, safe_coerce_scalar(&scalar, &data_type)?)
+        match safe_coerce_scalar(&scalar, &data_type) {
+            // Operands the existing coercion already handles keep its behavior.
+            Some(value) => Comparison::Literal(op, value),
+            // An integer operand the column type cannot hold lies below its
+            // minimum when negative and above its maximum otherwise.
+            None if scalar.data_type().is_integer() => {
+                needs_rewrite = true;
+                let (value, _) = exact_value(&scalar)?;
+                out_of_range(op, !value.is_negative())?
+            }
+            None => return None,
+        }
     } else {
         let ScalarValue::Float64(Some(value)) = scalar.cast_to(&DataType::Float64).ok()? else {
             return None;
@@ -130,7 +141,7 @@ fn lower(column: &Expr, op: Operator, operand: &Expr, schema: &Schema) -> Option
         column: column.clone(),
         data_type,
         comparison,
-        needs_rewrite: is_float,
+        needs_rewrite,
     })
 }
 
@@ -280,7 +291,8 @@ fn lower_decimal(
 }
 
 /// Rewrites integer and decimal column comparisons against operands the
-/// existing coercion rejects or rounds: floats for integer columns, and
+/// existing coercion rejects or rounds: floats and integers outside the column
+/// type for integer columns, and
 /// integers and decimals whose exact value differs from what the coercion
 /// produces for decimal columns. Returns `None` for any other filter, so it
 /// keeps its current shape.
@@ -735,6 +747,63 @@ mod tests {
     #[case::above_unsigned("u < 255.5", col("u").lt_eq(lit(255_u8)))]
     fn plans_on_column(#[case] sql: &str, #[case] expected: Expr) {
         let batch = record_batch!(("i", Int64, [Some(1)]), ("u", UInt8, [Some(1)])).unwrap();
+        let planner = Planner::new(batch.schema());
+        assert_eq!(planner.parse_filter(sql).unwrap(), expected, "{sql}");
+    }
+
+    /// Integer literals outside an integer column's type compare by value, the
+    /// same way `u > -1.0` or `i < 200.0` already do.
+    #[rstest]
+    #[case::eq_above("u = 256", [Some(false), Some(false), None])]
+    #[case::ne_above("u != 256", [Some(true), Some(true), None])]
+    #[case::lt_above("u < 256", [Some(true), Some(true), None])]
+    #[case::gt_below("u > -1", [Some(true), Some(true), None])]
+    #[case::lte_below("u <= -1", [Some(false), Some(false), None])]
+    #[case::reversed("-1 < u", [Some(true), Some(true), None])]
+    #[case::gte_above_signed("i >= 128", [Some(false), Some(false), None])]
+    #[case::gt_below_signed("i > -129", [Some(true), Some(true), None])]
+    #[case::not_eq("NOT (i = 200)", [Some(true), Some(true), None])]
+    #[case::in_list("i IN (127, 200)", [Some(false), Some(true), None])]
+    #[case::not_in_list("i NOT IN (127, 200)", [Some(true), Some(false), None])]
+    #[case::only_out_of_range_in_list("i IN (200, -200)", [Some(false), Some(false), None])]
+    #[case::between_low("i BETWEEN -1000 AND 0", [Some(true), Some(false), None])]
+    #[case::between_high("u BETWEEN 1 AND 300", [Some(false), Some(true), None])]
+    #[case::unsigned_literal_on_i64("l < 18446744073709551615", [Some(true), Some(true), None])]
+    #[case::above_i64("l = 9223372036854775808", [Some(false), Some(false), None])]
+    fn integer_literals_outside_column_type(
+        #[case] sql: &str,
+        #[case] expected: [Option<bool>; 3],
+    ) {
+        let batch = record_batch!(
+            ("u", UInt8, [Some(0), Some(255), None]),
+            ("i", Int8, [Some(-128), Some(127), None]),
+            ("l", Int64, [Some(i64::MIN), Some(i64::MAX), None])
+        )
+        .unwrap();
+        let planner = Planner::new(batch.schema());
+        let expr = planner
+            .parse_filter(sql)
+            .unwrap_or_else(|error| panic!("{sql}: {error}"));
+        let expr = planner.optimize_expr(expr).unwrap();
+        let result = planner.create_physical_expr(&expr).unwrap();
+        let result = result.evaluate(&batch).unwrap().into_array(3).unwrap();
+        assert_eq!(
+            result.as_boolean(),
+            &BooleanArray::from(expected.to_vec()),
+            "{sql}"
+        );
+    }
+
+    /// The comparison stays on the bare column, so a scalar index still applies.
+    #[rstest]
+    #[case::always_true("u > -1", col("u").gt_eq(lit(0_u8)))]
+    #[case::never_true("u = 256", col("u").lt(lit(0_u8)))]
+    #[case::in_list("i IN (1, 200)", col("i").in_list(vec![lit(1_i8)], false))]
+    fn integer_literals_outside_column_type_plan_on_column(
+        #[case] sql: &str,
+        #[case] expected: Expr,
+    ) {
+        let batch = record_batch!(("u", UInt8, [Some(1)]), ("i", Int8, [Some(1)])).unwrap();
         let planner = Planner::new(batch.schema());
         assert_eq!(planner.parse_filter(sql).unwrap(), expected, "{sql}");
     }

@@ -6,7 +6,7 @@ description: Connect Lance to query engines, ML frameworks, databases, and catal
 # Integrations
 
 Because Lance is built on Apache Arrow and exposes
-a stable Rust core with Python and Java bindings, it can be consumed from query engines, ML frameworks, databases,
+a stable Rust core with Python, Java, C/C++, and Go bindings, it can be consumed from query engines, ML frameworks, databases,
 and catalog systems without copying or converting data.
 
 This page lists the integrations maintained by the Lance community. Some live in this repository as first-party
@@ -45,6 +45,13 @@ GitHub organization.
 |---|---|---|
 | [Lance Namespace](../format/namespace/index.md) | Specification and codegen SDKs (Rust, Python, Java) for catalog-backed Lance tables. | [lance-format/lance-namespace](https://github.com/lance-format/lance-namespace) |
 | [Catalog implementations](../format/namespace/supported-catalogs/index.md) | Reference implementations for Apache Hive, Apache Polaris, Apache Gravitino, Unity Catalog, AWS Glue, and others. | [lance-format/lance-namespace-impls](https://github.com/lance-format/lance-namespace-impls) |
+
+## Language Bindings
+
+| Binding | Description | Source |
+|---|---|---|
+| [C / C++](https://lance-format.github.io/lance-c/) | C11 ABI and header-only C++20 RAII bindings over the Lance Rust core. | [lance-format/lance-c](https://github.com/lance-format/lance-c) |
+| [Go](https://pkg.go.dev/github.com/lance-format/lance-go) | Pure-Go (`CGO_ENABLED=0`) bindings for Lance built on `lance-c`. | [lance-format/lance-go](https://github.com/lance-format/lance-go) |
 
 ## Other Ecosystem Projects
 

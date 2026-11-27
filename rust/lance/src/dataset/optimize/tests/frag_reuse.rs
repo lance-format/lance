@@ -4,8 +4,8 @@
 //! Compaction tests for the frag reuse contract area.
 
 use super::*;
-use crate::dataset::optimize::commit::reserve_fragment_ids;
-use crate::dataset::optimize::execution::{can_use_binary_copy, live_row_addrs};
+use lance_table_runtime::optimize::commit::reserve_fragment_ids;
+use lance_table_runtime::optimize::execution::live_row_addrs;
 
 // Regression test for https://github.com/lancedb/lance/issues/6161
 // When FragReuseIndexDetails exceeds 204800 bytes it is written to an external
@@ -662,7 +662,7 @@ async fn test_recording_refuses_moves_it_cannot_pair() {
     fragments.reverse();
     let mut rewritten = fragments.clone();
     rewritten[0].physical_rows = Some(9);
-    let error = live_row_addrs(&dataset, &fragments, &rewritten)
+    let error = live_row_addrs(&dataset.table_view().to_table(), &fragments, &rewritten)
         .await
         .unwrap_err();
     assert!(
@@ -780,9 +780,13 @@ async fn test_defer_index_remap() {
             .iter_mut()
             .flat_map(|r| r.new_fragments.iter_mut())
             .collect();
-        reserve_fragment_ids(&dataset2, frags.into_iter())
-            .await
-            .unwrap();
+        reserve_fragment_ids(
+            &dataset2.table_view().to_table(),
+            frags.into_iter(),
+            &LanceCompactionHooks::new(&dataset2, None).runtime(),
+        )
+        .await
+        .unwrap();
     }
 
     // Build expected values by transposing using the immediate results
@@ -1930,9 +1934,9 @@ async fn test_deferred_compaction_writes_reuse_details_once(
         .await
         .unwrap();
     let dirs_before = reuse_details_dirs(dir.as_str());
-    dataset.object_store.io_stats_incremental();
+    dataset.table_state.object_store.io_stats_incremental();
     commit_one(&mut dataset, result, &options).await.unwrap();
-    let stats = dataset.object_store.io_stats_incremental();
+    let stats = dataset.table_state.object_store.io_stats_incremental();
 
     assert_eq!(reuse_details_requests(&stats, "put"), 1);
     // With a cache, only the stored history is read, once.
@@ -2080,7 +2084,7 @@ async fn test_deferred_compaction_rechecks_the_reuse_history_on_every_attempt(
     )
     .await;
     let handler = Arc::new(RaceBeforeRewrite::default());
-    dataset.commit_handler = handler.clone();
+    dataset.table_state.commit_handler = handler.clone();
     let before = values_by_address(&dataset).await;
     let options = deferred_compaction_excluding(&[2, 3, 4, 5]);
     let result = plan_one_task(&dataset, &options).await;
@@ -2643,7 +2647,7 @@ async fn test_first_recorded_compaction_rebases_over_an_unrecorded_rewrite() {
     let dir = TempStrDir::default();
     let mut dataset = stable_row_id_dataset(dir.as_str(), 4).await;
     let handler = Arc::new(RaceBeforeRewrite::default());
-    dataset.commit_handler = handler.clone();
+    dataset.table_state.commit_handler = handler.clone();
     let before = rows_by_addr(&dataset).await;
     let options = deferred_compaction_excluding(&[]);
     let result = execute_first_fragment_pair(&dataset, &options).await;
@@ -2665,7 +2669,7 @@ async fn test_unrecorded_compaction_rebases_over_the_first_recording() {
     let dir = TempStrDir::default();
     let mut dataset = stable_row_id_dataset(dir.as_str(), 4).await;
     let handler = Arc::new(RaceBeforeRewrite::default());
-    dataset.commit_handler = handler.clone();
+    dataset.table_state.commit_handler = handler.clone();
     let before = rows_by_addr(&dataset).await;
     let options = eager_compaction_excluding(&[]);
     let result = execute_first_fragment_pair(&dataset, &options).await;
@@ -3244,12 +3248,12 @@ async fn test_index_creation_racing_deferred_compaction_with_stable_row_ids(
     };
     let dir = TempStrDir::default();
     let mut dataset = stable_row_id_dataset(dir.as_str(), 3).await;
-    dataset.commit_handler = Arc::new(RenameCommitHandler);
+    dataset.table_state.commit_handler = Arc::new(RenameCommitHandler);
     dataset.delete("i IN (1, 2)").await.unwrap();
     let before = rows_by_addr(&dataset).await;
     let mut other = if is_separate_session {
         let mut other = Dataset::open(dir.as_str()).await.unwrap();
-        other.commit_handler = Arc::new(RenameCommitHandler);
+        other.table_state.commit_handler = Arc::new(RenameCommitHandler);
         other
     } else {
         dataset.clone()
@@ -3294,7 +3298,11 @@ async fn test_index_creation_racing_deferred_compaction_with_stable_row_ids(
         let index_key = TransactionKey {
             version: other.version().version,
         };
-        let committed_index = dataset.metadata_cache.get_with_key(&index_key).await;
+        let committed_index = dataset
+            .table_state
+            .metadata_cache
+            .get_with_key(&index_key)
+            .await;
         if is_separate_session {
             assert!(committed_index.is_none());
         } else {
@@ -3306,6 +3314,7 @@ async fn test_index_creation_racing_deferred_compaction_with_stable_row_ids(
             };
             assert!(
                 dataset
+                    .table_state
                     .metadata_cache
                     .get_with_key(&listed_key)
                     .await
@@ -3322,6 +3331,7 @@ async fn test_index_creation_racing_deferred_compaction_with_stable_row_ids(
         .await
         .map(|_| ());
         let seen = dataset
+            .table_state
             .metadata_cache
             .get_with_key(&index_key)
             .await
@@ -3351,7 +3361,11 @@ async fn test_index_creation_racing_deferred_compaction_with_stable_row_ids(
         let rewrite_key = TransactionKey {
             version: dataset.version().version,
         };
-        let cached_rewrite = other.metadata_cache.get_with_key(&rewrite_key).await;
+        let cached_rewrite = other
+            .table_state
+            .metadata_cache
+            .get_with_key(&rewrite_key)
+            .await;
         if is_separate_session {
             assert!(cached_rewrite.is_none());
             let from_storage = Dataset::open(dir.as_str())
@@ -3383,6 +3397,7 @@ async fn test_index_creation_racing_deferred_compaction_with_stable_row_ids(
             };
             assert!(
                 other
+                    .table_state
                     .metadata_cache
                     .get_with_key(&listed_key)
                     .await
@@ -3392,6 +3407,7 @@ async fn test_index_creation_racing_deferred_compaction_with_stable_row_ids(
         }
         let result = create_index(&mut other).await;
         let seen = other
+            .table_state
             .metadata_cache
             .get_with_key(&rewrite_key)
             .await

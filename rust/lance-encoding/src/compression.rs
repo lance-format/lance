@@ -162,6 +162,16 @@ pub trait CompressionStrategy: Send + Sync + std::fmt::Debug {
     ) -> Result<Box<dyn MiniBlockCompressor>> {
         self.create_miniblock_compressor(field, data)
     }
+
+    /// Whether a full-zip page may store the boolean items of a fixed-size list
+    /// as one byte each.
+    ///
+    /// Released 2.1 and 2.2 readers expect those items bit-packed and return
+    /// wrong values for byte-wide ones without an error, so only strategies for
+    /// file versions after 2.2 allow it.
+    fn allows_byte_wide_fsl_booleans(&self) -> bool {
+        false
+    }
 }
 
 pub(crate) fn compress_required_block(
@@ -1013,6 +1023,63 @@ pub fn try_raw_per_value(data: &DataBlock) -> Option<Box<dyn PerValueCompressor>
     raw.then(|| Box::new(ValueEncoder::default()) as _)
 }
 
+/// Reject a packed struct whose children cannot be stored as one packed value.
+///
+/// Packed structs are encoded as a single primitive column, so every child,
+/// including the children of nested structs and fixed-size lists, must be a
+/// value type. A list, map or similar child would otherwise panic while the
+/// column is converted into a data block, so this runs when the encoder is
+/// created, before any data is written.
+pub fn validate_packed_struct_children(field: &Field) -> Result<()> {
+    fn find_unsupported<'a>(
+        path: &mut Vec<&'a str>,
+        name: &'a str,
+        data_type: &'a DataType,
+    ) -> Option<&'a DataType> {
+        path.push(name);
+        let found = match data_type {
+            DataType::Struct(fields) => fields
+                .iter()
+                .find_map(|child| find_unsupported(path, child.name(), child.data_type())),
+            DataType::FixedSizeList(item, _) => {
+                find_unsupported(path, item.name(), item.data_type())
+            }
+            DataType::List(_)
+            | DataType::LargeList(_)
+            | DataType::ListView(_)
+            | DataType::LargeListView(_)
+            | DataType::Map(_, _)
+            | DataType::RunEndEncoded(_, _)
+            | DataType::Union(_, _) => Some(data_type),
+            _ => None,
+        };
+        if found.is_none() {
+            path.pop();
+        }
+        found
+    }
+
+    let DataType::Struct(fields) = field.data_type() else {
+        return Ok(());
+    };
+    let mut path = Vec::new();
+    if let Some(data_type) = fields
+        .iter()
+        .find_map(|child| find_unsupported(&mut path, child.name(), child.data_type()))
+    {
+        return Err(Error::not_supported_source(
+            format!(
+                "Packed struct field '{}' has a child '{}' of type {}, which packed struct encoding does not support",
+                field.name,
+                path.join("."),
+                data_type,
+            )
+            .into(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_packed_struct(field: &Field, data: &DataBlock) -> Result<Option<bool>> {
     let DataBlock::Struct(data) = data else {
         return Ok(None);
@@ -1610,7 +1677,7 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
                     compression_config,
                 )))
             }
-            compression @ (Compression::Range(_) | Compression::Delta(_)) => {
+            compression @ (Compression::Range(_) | Compression::MonotonicDelta(_)) => {
                 Err(Error::not_supported_source(
                     format!(
                         "{} compression is only supported in block positions",
@@ -1837,7 +1904,7 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
                 description,
                 range.uncompressed_bits_per_value,
             ),
-            Compression::Delta(delta) => create_fixed_width_block_decompressor(
+            Compression::MonotonicDelta(delta) => create_fixed_width_block_decompressor(
                 description,
                 delta.uncompressed_bits_per_value,
             ),
@@ -1870,7 +1937,7 @@ pub(crate) fn infer_fixed_width_block_bits(description: &CompressiveEncoding) ->
                 .map(|value| value.len() as u64 * 8)
                 .ok_or_else(|| Error::invalid_input("Typed Constant is missing its scalar value")),
             Compression::Range(range) => Ok(range.uncompressed_bits_per_value),
-            Compression::Delta(delta) => Ok(delta.uncompressed_bits_per_value),
+            Compression::MonotonicDelta(delta) => Ok(delta.uncompressed_bits_per_value),
             Compression::InlineBitpacking(bitpacking) => Ok(bitpacking.uncompressed_bits_per_value),
             Compression::OutOfLineBitpacking(bitpacking) => {
                 Ok(bitpacking.uncompressed_bits_per_value)
@@ -2051,15 +2118,15 @@ fn create_fixed_width_block_decompressor_inner(
                 ))
             }
         }
-        Compression::Delta(delta) if allow_composite => {
+        Compression::MonotonicDelta(delta) if allow_composite => {
             if delta.uncompressed_bits_per_value != expected_bits_per_value {
                 return Err(Error::invalid_input(format!(
-                    "Delta declares {}-bit values, expected {expected_bits_per_value}",
+                    "MonotonicDelta declares {}-bit values, expected {expected_bits_per_value}",
                     delta.uncompressed_bits_per_value
                 )));
             }
             let child = delta.deltas.as_deref().ok_or_else(|| {
-                Error::invalid_input("Delta is missing its deltas child encoding")
+                Error::invalid_input("MonotonicDelta is missing its deltas child encoding")
             })?;
             let child =
                 create_fixed_width_block_decompressor_inner(child, expected_bits_per_value, false)?;
@@ -2216,19 +2283,19 @@ pub(crate) fn validate_delta_child_encoding(
         }
         Some(other) => {
             return Err(Error::invalid_input(format!(
-                "Delta does not support a {} child",
+                "MonotonicDelta does not support a {} child",
                 compression_name(other)
             )));
         }
         None => {
             return Err(Error::invalid_input(
-                "Delta child is missing its compression variant",
+                "MonotonicDelta child is missing its compression variant",
             ));
         }
     };
     if child_bits_per_value != expected_bits_per_value {
         return Err(Error::invalid_input(format!(
-            "Delta child declares {child_bits_per_value}-bit values, expected {expected_bits_per_value}"
+            "MonotonicDelta child declares {child_bits_per_value}-bit values, expected {expected_bits_per_value}"
         )));
     }
     Ok(())
@@ -2404,7 +2471,7 @@ fn compression_name(compression: &Compression) -> &'static str {
         Compression::VariablePackedStruct(_) => "variable packed struct",
         Compression::Rle(_) => "rle",
         Compression::Range(_) => "range",
-        Compression::Delta(_) => "delta",
+        Compression::MonotonicDelta(_) => "monotonic delta",
         Compression::Alp(_) => "alp",
         Compression::Pcodec(_) => "pcodec",
     }
