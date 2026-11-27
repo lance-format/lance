@@ -22,7 +22,7 @@ mod source;
 pub mod test_dataset;
 mod vector;
 
-use filter_schema::{FilterSchema, FilterSchemaKey, ScannerFilterSchemas};
+use filter_schema::{FilterSchema, FilterSchemaKey, ScannerFilterSchemas, SharedFilterSchema};
 
 pub use aggregate::{AggregateExpr, AggregateExprBuilder};
 pub use source::TakeOperation;

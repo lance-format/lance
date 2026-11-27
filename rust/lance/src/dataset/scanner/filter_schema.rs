@@ -11,12 +11,13 @@
 //! byte budget like any other entry.
 
 use std::borrow::Cow;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use arrow_schema::{Field as ArrowField, Schema as ArrowSchema, SchemaRef};
 use lance_core::cache::{CacheKey, CacheKeySchema, KeyBuilder};
 use lance_core::datatypes::Schema;
 use lance_core::deepsize::{Context, DeepSizeOf};
+use lance_table::format::Manifest;
 
 /// The table schema plus system and search columns, in Lance and Arrow form.
 #[derive(Debug, Clone)]
@@ -41,8 +42,39 @@ impl DeepSizeOf for FilterSchema {
     }
 }
 
-/// The filter schema of one manifest version, for one set of search columns.
+/// A filter schema in the session cache, with the manifest it was built from.
+///
+/// A key's version and e_tag need not identify a manifest: a table recreated
+/// at the same URI and version can repeat them, or leave the e_tag unset. An
+/// entry only answers for the manifest allocation it holds a `Weak` to, which
+/// that `Weak` keeps from being reused.
 #[derive(Debug)]
+pub struct SharedFilterSchema {
+    manifest: Weak<Manifest>,
+    pub filter: FilterSchema,
+}
+
+impl SharedFilterSchema {
+    pub fn new(manifest: &Arc<Manifest>, filter: FilterSchema) -> Self {
+        Self {
+            manifest: Arc::downgrade(manifest),
+            filter,
+        }
+    }
+
+    pub fn is_for(&self, manifest: &Arc<Manifest>) -> bool {
+        std::ptr::eq(self.manifest.as_ptr(), Arc::as_ptr(manifest))
+    }
+}
+
+impl DeepSizeOf for SharedFilterSchema {
+    fn deep_size_of_children(&self, context: &mut Context) -> usize {
+        self.filter.deep_size_of_children(context)
+    }
+}
+
+/// The filter schema of one manifest version, for one set of search columns.
+#[derive(Debug, Clone, Copy)]
 pub struct FilterSchemaKey<'a> {
     pub version: u64,
     pub e_tag: Option<&'a str>,
@@ -50,7 +82,7 @@ pub struct FilterSchemaKey<'a> {
 }
 
 impl CacheKey for FilterSchemaKey<'_> {
-    type ValueType = FilterSchema;
+    type ValueType = SharedFilterSchema;
     fn key(&self) -> Cow<'_, str> {
         let extra = self
             .extra_columns
