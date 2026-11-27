@@ -825,8 +825,7 @@ Lance 2.1 and later bitpack values whose `uncompressed_bits_per_value` is 8, 16,
 16-byte fixed-width values such as `Decimal128`. Readers of 2.1 and 2.2 files reject a bitpacking encoding whose
 `uncompressed_bits_per_value` is greater than 64.
 
-In Lance 2.3 mini-block positions, the current reader requires `InlineBitpacking.uncompressed_bits_per_value`
-to be 8, 16, 32, or 64; the 128-bit layout does not extend that mini-block decoder contract.
+In Lance 2.3 mini-block positions, `InlineBitpacking.uncompressed_bits_per_value` must be 8, 16, 32, 64, or 128.
 `InlineBitpacking.values` must be absent in mini-block and generic unsigned block positions.
 
 Values are packed in blocks of 1024. Every value in a block is below `2^w`, where `w` is the packed width. Values of

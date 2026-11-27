@@ -640,8 +640,9 @@ impl ::prost::Name for OutOfLineBitpacking {
 ///
 /// This is an opaque encoding.
 ///
-/// In mini-block positions, uncompressed_bits_per_value must be 8, 16, 32, or
-/// 64. In mini-block and generic unsigned block positions, values must be absent.
+/// In mini-block positions, uncompressed_bits_per_value must be 8, 16, 32, 64,
+/// or 128. In mini-block and generic unsigned block positions, values must be
+/// absent.
 ///
 /// The input is a fixed-width data block.
 /// The output is a single buffer.

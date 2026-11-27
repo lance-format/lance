@@ -523,6 +523,21 @@ mod grammar_tests {
         }
     }
 
+    #[test]
+    fn rejects_inline_bitpacking_with_invalid_width() {
+        let encoding = EncodingUtils::inline_bitpacking(7, None);
+        for position in [
+            EncodingPosition::BufferBackedBlock,
+            EncodingPosition::MiniBlock,
+        ] {
+            let error = validate_compressive_encoding(&encoding, position).unwrap_err();
+            assert!(matches!(error, Error::InvalidInput { .. }));
+            assert!(error.to_string().contains("got 7"), "{error}");
+        }
+        let encoding = EncodingUtils::inline_bitpacking(128, None);
+        validate_compressive_encoding(&encoding, EncodingPosition::MiniBlock).unwrap();
+    }
+
     #[rstest::rstest]
     #[case::dictionary_offsets(
         EncodingUtils::variable(EncodingUtils::dictionary(flat(32), flat(32), 1), None),
