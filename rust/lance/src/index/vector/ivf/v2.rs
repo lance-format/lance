@@ -3358,22 +3358,47 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         metrics: &dyn MetricsCollector,
         candidate_limit: usize,
     ) -> Result<PartitionSearchResult> {
-        let Some(index) = (self as &dyn Any).downcast_ref::<RabitIndex>() else {
-            return Err(Error::not_supported(format!(
-                "candidate-producing search is not supported for IVF_{}_{}",
-                S::name(),
-                Q::quantization_type()
-            )));
-        };
-        index
-            .search_rabit_partition_with_candidates(
-                partition_id,
-                query,
-                pre_filter,
-                metrics,
-                candidate_limit,
-            )
-            .await
+        // Dispatch only the supported concrete types, keeping the scoring
+        // machinery out of every other S × Q instantiation.
+        if let Some(index) = (self as &dyn Any).downcast_ref::<RabitIndex>() {
+            return index
+                .search_quantized_partition_with_candidates(
+                    partition_id,
+                    query,
+                    pre_filter,
+                    metrics,
+                    candidate_limit,
+                )
+                .await;
+        }
+        if let Some(index) =
+            (self as &dyn Any).downcast_ref::<IVFIndex<FlatIndex, ScalarQuantizer>>()
+        {
+            return index
+                .search_quantized_partition_with_candidates(
+                    partition_id,
+                    query,
+                    pre_filter,
+                    metrics,
+                    candidate_limit,
+                )
+                .await;
+        }
+        if let Some(index) = (self as &dyn Any).downcast_ref::<IvfHnswSqIndex>() {
+            return index
+                .search_quantized_partition_with_candidates(
+                    partition_id,
+                    query,
+                    pre_filter,
+                    metrics,
+                    candidate_limit,
+                )
+                .await;
+        }
+        Err(Error::not_supported(format!(
+            "candidate-producing search is not supported for {}",
+            self.index_type()
+        )))
     }
 
     async fn score_partition_candidates(
@@ -3383,16 +3408,42 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         offsets_in_partition: &[u32],
         metrics: &dyn MetricsCollector,
     ) -> Result<RecordBatch> {
-        let Some(index) = (self as &dyn Any).downcast_ref::<RabitIndex>() else {
-            return Err(Error::not_supported(format!(
-                "selected-candidate scoring is not supported for IVF_{}_{}",
-                S::name(),
-                Q::quantization_type()
-            )));
-        };
-        index
-            .score_rabit_partition_candidates(partition_id, query, offsets_in_partition, metrics)
-            .await
+        if let Some(index) = (self as &dyn Any).downcast_ref::<RabitIndex>() {
+            return index
+                .score_quantized_partition_candidates(
+                    partition_id,
+                    query,
+                    offsets_in_partition,
+                    metrics,
+                )
+                .await;
+        }
+        if let Some(index) =
+            (self as &dyn Any).downcast_ref::<IVFIndex<FlatIndex, ScalarQuantizer>>()
+        {
+            return index
+                .score_quantized_partition_candidates(
+                    partition_id,
+                    query,
+                    offsets_in_partition,
+                    metrics,
+                )
+                .await;
+        }
+        if let Some(index) = (self as &dyn Any).downcast_ref::<IvfHnswSqIndex>() {
+            return index
+                .score_quantized_partition_candidates(
+                    partition_id,
+                    query,
+                    offsets_in_partition,
+                    metrics,
+                )
+                .await;
+        }
+        Err(Error::not_supported(format!(
+            "selected-candidate scoring is not supported for {}",
+            self.index_type()
+        )))
     }
 
     async fn prepare_partition_search(
@@ -3644,10 +3695,9 @@ pub type IvfPq = IVFIndex<FlatIndex, ProductQuantizer>;
 pub type IvfHnswSqIndex = IVFIndex<HNSW, ScalarQuantizer>;
 pub type IvfHnswPqIndex = IVFIndex<HNSW, ProductQuantizer>;
 
-/// Candidate search exists only for IVF_RQ with a flat sub-index, so it is
-/// compiled for that type alone instead of for every `S × Q` pair.
-impl RabitIndex {
-    async fn search_rabit_partition_with_candidates(
+// Only the concrete RQ and SQ dispatch above instantiates these methods.
+impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IVFIndex<S, Q> {
+    async fn search_quantized_partition_with_candidates(
         &self,
         partition_id: usize,
         query: &Query,
@@ -3679,12 +3729,6 @@ impl RabitIndex {
         let (result, local_metrics) = spawn_cpu(move || {
             let param = (&query).into();
             let local_metrics = LocalMetricsCollector::default();
-            let part = part_entry
-                .as_any()
-                .downcast_ref::<PartitionEntry<FlatIndex, RabitQuantizer>>()
-                .ok_or(Error::internal(
-                    "failed to downcast partition entry".to_string(),
-                ))?;
             let rotated_partition_centroid =
                 rotated_partition_centroid_slice(rq_search_cache.as_deref(), partition_id);
             let residual = Self::query_context_for_scratch(
@@ -3696,11 +3740,11 @@ impl RabitIndex {
                 raw_query_context.as_deref(),
             )?;
             let result = scratch_pool.with_scratch(|scratch| {
-                part.index.search_with_candidates_with_scratch(
+                part_entry.index.search_with_candidates_with_scratch(
                     query.key,
                     candidate_limit,
                     param,
-                    &part.storage,
+                    &part_entry.storage,
                     pre_filter,
                     &local_metrics,
                     partition_id_u32,
@@ -3716,7 +3760,7 @@ impl RabitIndex {
         Ok(result)
     }
 
-    async fn score_rabit_partition_candidates(
+    async fn score_quantized_partition_candidates(
         &self,
         partition_id: usize,
         query: &Query,
@@ -3742,13 +3786,7 @@ impl RabitIndex {
         let use_residual_scratch = self.use_residual_scratch;
         let (batch, local_metrics) = spawn_cpu(move || {
             let local_metrics = LocalMetricsCollector::default();
-            let part = part_entry
-                .as_any()
-                .downcast_ref::<PartitionEntry<FlatIndex, RabitQuantizer>>()
-                .ok_or(Error::internal(
-                    "failed to downcast partition entry".to_string(),
-                ))?;
-            let partition_len = part.storage.len();
+            let partition_len = part_entry.storage.len();
             for &offset in &offsets_in_partition {
                 if offset as usize >= partition_len {
                     return Err(Error::index(format!(
@@ -3768,7 +3806,7 @@ impl RabitIndex {
                 raw_query_context.as_deref(),
             )?;
             let batch = scratch_pool.with_scratch(|scratch| {
-                let dist_calc = part.storage.dist_calculator_with_scratch(
+                let dist_calc = part_entry.storage.dist_calculator_with_scratch(
                     query.key,
                     query.dist_q_c,
                     residual,
@@ -3780,7 +3818,7 @@ impl RabitIndex {
                 let mut row_ids = Vec::with_capacity(offsets_in_partition.len());
                 let mut distances = Vec::with_capacity(offsets_in_partition.len());
                 for &offset in &offsets_in_partition {
-                    row_ids.push(part.storage.row_id(offset));
+                    row_ids.push(part_entry.storage.row_id(offset));
                     distances.push(dist_calc.distance(offset));
                 }
                 Result::Ok(RecordBatch::try_new(

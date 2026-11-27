@@ -1960,6 +1960,160 @@ def test_create_ivf_sq_index(dataset, tmp_path):
     assert ann_ds.describe_indices()[0].field_names == ["vector"]
 
 
+@pytest.mark.parametrize("index_type", ["IVF_SQ", "IVF_HNSW_SQ"])
+@pytest.mark.parametrize("metric", ["L2", "cosine", "dot"])
+@pytest.mark.parametrize("factor", [1, 3])
+@pytest.mark.parametrize("exact_refine", [False, True])
+def test_sq_quantized_refinement(index_type, metric, factor, exact_refine):
+    rng = np.random.default_rng(42)
+    mat = rng.standard_normal((64, 8)).astype(np.float32)
+    table = vec_to_table(data=mat).append_column("id", pa.array(range(64)))
+    ds = lance.write_dataset(table, "memory://", max_rows_per_file=32)
+    ds.create_index(
+        "vector",
+        index_type=index_type,
+        metric=metric,
+        num_partitions=2,
+        max_iters=2,
+        m=4,
+        ef_construction=16,
+    )
+    nearest = {
+        "column": "vector",
+        "q": mat[5],
+        "k": 5,
+        "metric": metric,
+        "nprobes": 2,
+        "ef": 64,
+    }
+    truth = ds.to_table(nearest={**nearest, "use_index": False}, columns=["id"])
+    native = ds.to_table(nearest=nearest, columns=["id"])
+    options = {**nearest, "quantized_refine_factor": factor}
+    if exact_refine:
+        options["refine_factor"] = 2
+    result = ds.to_table(nearest=options, columns=["id"])
+    expected = truth if exact_refine else native
+    assert result["id"].to_pylist() == expected["id"].to_pylist()
+    np.testing.assert_allclose(result["_distance"], expected["_distance"], atol=1e-6)
+    assert len(set(result["id"].to_pylist()) & set(truth["id"].to_pylist())) / 5 >= 0.5
+
+    # SQ bounds and selective filters keep native search semantics.
+    lower = result["_distance"][1].as_py()
+    bounded = ds.to_table(
+        nearest={**options, "distance_range": (lower, None)},
+        filter="id % 3 = 0",
+        prefilter=True,
+        columns=["id"],
+    )
+    assert all(value >= lower for value in bounded["_distance"].to_pylist())
+    assert all(value % 3 == 0 for value in bounded["id"].to_pylist())
+
+
+@pytest.mark.parametrize("index_type", ["IVF_SQ", "IVF_HNSW_SQ"])
+def test_sq_quantized_refinement_invalid_rows_and_fallback(index_type):
+    rng = np.random.default_rng(7)
+    mat = rng.standard_normal((32, 8)).astype(np.float32)
+    vectors = mat.tolist() + [None, [float("nan")] * 8, [float("inf")] * 8]
+    table = pa.table(
+        {
+            "vector": pa.array(vectors, type=pa.list_(pa.float32(), 8)),
+            "id": range(len(vectors)),
+        }
+    )
+    ds = lance.write_dataset(table, "memory://", max_rows_per_file=16)
+    ds.create_index(
+        "vector",
+        index_type=index_type,
+        num_partitions=2,
+        max_iters=2,
+        m=4,
+        ef_construction=16,
+    )
+    nearest = {
+        "column": "vector",
+        "q": mat[0],
+        "k": 5,
+        "nprobes": 2,
+        "quantized_refine_factor": 2,
+    }
+    result = ds.to_table(nearest=nearest, columns=["id"])
+    assert result.num_rows == 5
+    assert set(result["id"].to_pylist()).issubset(set(range(32)))
+    assert np.isfinite(result["_distance"].to_numpy()).all()
+    ds.delete("id = 0")
+    assert 0 not in ds.to_table(nearest=nearest, columns=["id"])["id"].to_pylist()
+
+    append = pa.table(
+        {
+            "vector": pa.array([mat[0].tolist()], type=pa.list_(pa.float32(), 8)),
+            "id": [35],
+        }
+    )
+    ds = lance.write_dataset(append, ds, mode="append")
+    result = ds.to_table(nearest=nearest, columns=["id"])
+    assert result["id"][0].as_py() == 35
+    exact = ds.to_table(nearest={**nearest, "refine_factor": 2}, columns=["id"])
+    assert exact["id"][0].as_py() == 35
+    assert exact["_distance"][0].as_py() == 0.0
+
+
+@pytest.mark.parametrize("index_type", ["IVF_SQ", "IVF_HNSW_SQ"])
+@pytest.mark.parametrize("rows", [[], [None] * 4])
+def test_sq_quantized_refinement_empty(index_type, rows):
+    ds = lance.write_dataset(
+        pa.table({"vector": pa.array(rows, type=pa.list_(pa.float32(), 8))}),
+        "memory://",
+    )
+    if rows:
+        with pytest.raises(
+            RuntimeError, match="cannot train 1 centroids with 0 vectors"
+        ):
+            ds.create_index("vector", index_type=index_type, num_partitions=1)
+        return
+    ds.create_index("vector", index_type=index_type, num_partitions=1)
+    result = ds.to_table(
+        nearest={
+            "column": "vector",
+            "q": [0.5] * 8,
+            "k": 5,
+            "quantized_refine_factor": 2,
+        }
+    )
+    assert result.num_rows == 0
+    segment = ds.describe_indices()[0].segments[0].uuid
+    selected = ds.scanner(
+        index_segments=[segment],
+        nearest={
+            "column": "vector",
+            "q": [0.5] * 8,
+            "k": 5,
+            "quantized_refine_factor": 2,
+        },
+    ).to_table()
+    assert selected.num_rows == 0
+
+
+def test_sq_quantized_refinement_validates_ef():
+    mat = np.random.default_rng(42).standard_normal((32, 8)).astype(np.float32)
+    ds = lance.write_dataset(vec_to_table(data=mat), "memory://")
+    ds.create_index(
+        "vector", index_type="IVF_HNSW_SQ", num_partitions=1, m=4, ef_construction=16
+    )
+    nearest = {
+        "column": "vector",
+        "q": mat[0],
+        "k": 5,
+        "quantized_refine_factor": 3,
+        "ef": 14,
+    }
+    with pytest.raises((ValueError, OSError), match="ef=14, candidate_count=15"):
+        ds.to_table(nearest=nearest)
+    nearest["ef"] = 15
+    assert ds.to_table(nearest=nearest).num_rows == 5
+    with pytest.raises((ValueError, OSError), match="candidate_count=30"):
+        ds.to_table(nearest={**nearest, "refine_factor": 2})
+
+
 def test_create_ivf_rq_index():
     ds = lance.write_dataset(create_table(), "memory://")
     ds = ds.create_index(
@@ -3796,6 +3950,16 @@ def test_vector_index_invalid_quantized_refine_factor(indexed_dataset):
                 "q": np.random.randn(128),
                 "k": 10,
                 "quantized_refine_factor": 0,
+            }
+        )
+
+    with pytest.raises(ValueError, match="IVF_SQ, or IVF_HNSW_SQ"):
+        indexed_dataset.to_table(
+            nearest={
+                "column": "vector",
+                "q": np.zeros(128),
+                "k": 5,
+                "quantized_refine_factor": 2,
             }
         )
 

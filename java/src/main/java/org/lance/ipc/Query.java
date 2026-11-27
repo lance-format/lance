@@ -397,6 +397,7 @@ public class Query {
     /**
      * Sets the number of candidates to reserve while searching. This is an optional parameter for
      * HNSW related index types. Defaults to {@code 1.5 * k * refineFactor}, floored at 256.
+     * IVF_HNSW_SQ quantized refinement includes the quantized factor before applying that floor.
      *
      * @param ef The number of candidates to reserve.
      * @return The Builder instance for method chaining.
@@ -418,7 +419,10 @@ public class Query {
     }
 
     /**
-     * Reranks overfetched IVF_RQ candidates with the index's most accurate stored RQ data.
+     * Scores IVF_RQ or SQ8 candidates using stored index data.
+     *
+     * <p>IVF_RQ overfetches one-bit candidates and reranks them with its most accurate stored
+     * multi-bit representation.
      *
      * <p>Indexed candidates are reranked without reading their original vectors. Unindexed
      * fragments and stale overlay rows still use flat fallback and may read original vectors. It
@@ -427,7 +431,18 @@ public class Query {
      * selected partitions use Accurate RQ search directly so the range applies before top-k
      * truncation.
      *
-     * @param quantizedRefineFactor One-bit candidate overfetch factor; must be greater than zero.
+     * <p>IVF_SQ uses its native eight-bit scan directly. IVF_HNSW_SQ expands the graph candidate
+     * pool and scores selected storage offsets at the native eight-bit precision. Explicit ef must
+     * cover k * quantizedRefineFactor * refineFactor (missing factors are 1). The default grows
+     * with that budget. Legacy indices, other quantizers, and multivectors are unsupported.
+     *
+     * <pre>{@code
+     * Query query = new Query.Builder()
+     *     .setColumn("vector").setKey(new float[128]).setK(10)
+     *     .setQuantizedRefineFactor(4).build();
+     * }</pre>
+     *
+     * @param quantizedRefineFactor Candidate overfetch factor; must be greater than zero.
      * @return The Builder instance for method chaining.
      */
     public Builder setQuantizedRefineFactor(int quantizedRefineFactor) {

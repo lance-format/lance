@@ -16,6 +16,9 @@ package org.lance;
 import org.lance.index.DistanceType;
 import org.lance.index.IndexParams;
 import org.lance.index.IndexType;
+import org.lance.index.vector.HnswBuildParams;
+import org.lance.index.vector.IvfBuildParams;
+import org.lance.index.vector.SQBuildParams;
 import org.lance.index.vector.VectorIndexParams;
 import org.lance.ipc.Query;
 import org.lance.ipc.ScanOptions;
@@ -35,9 +38,9 @@ import org.apache.arrow.vector.types.pojo.Schema;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
-import java.io.IOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -169,10 +172,88 @@ public class VectorSearchTest {
     }
   }
 
+  @ParameterizedTest
+  @CsvSource({"false, 1, false", "false, 3, true", "true, 1, false", "true, 3, true"})
+  void test_sq_quantized_refinement(boolean hnsw, int factor, boolean exact) throws Exception {
+    try (TestVectorDataset fixture = new TestVectorDataset(tempDir.resolve("sq_refinement"));
+        Dataset dataset = fixture.create()) {
+      VectorIndexParams.Builder params =
+          new VectorIndexParams.Builder(new IvfBuildParams.Builder().setNumPartitions(2).build())
+              .setDistanceType(DistanceType.L2)
+              .setSqParams(new SQBuildParams.Builder().build());
+      if (hnsw) {
+        params.setHnswParams(new HnswBuildParams.Builder().build());
+      }
+      dataset.createIndex(
+          Collections.singletonList(TestVectorDataset.vectorColumnName),
+          IndexType.VECTOR,
+          Optional.of("sq"),
+          IndexParams.builder().setVectorIndexParams(params.build()).build(),
+          true);
+      float[] key = new float[32];
+      for (int i = 0; i < key.length; i++) {
+        key[i] = 32 + i;
+      }
+      Query.Builder query =
+          new Query.Builder()
+              .setColumn(TestVectorDataset.vectorColumnName)
+              .setKey(key)
+              .setK(5)
+              .setNprobes(2)
+              .setQuantizedRefineFactor(factor)
+              .setEf(5 * factor * (exact ? 2 : 1));
+      if (exact) {
+        query.setRefineFactor(2);
+      }
+      ScanOptions options =
+          new ScanOptions.Builder()
+              .columns(Collections.singletonList("i"))
+              .nearest(query.build())
+              .build();
+      try (Scanner scanner = dataset.newScan(options);
+          ArrowReader reader = scanner.scanBatches()) {
+        assertTrue(reader.loadNextBatch());
+        VectorSchemaRoot root = reader.getVectorSchemaRoot();
+        assertEquals(5, root.getRowCount());
+        IntVector ids = (IntVector) root.getVector("i");
+        Set<Integer> actual = new HashSet<>();
+        for (int i = 0; i < ids.getValueCount(); i++) {
+          actual.add(ids.get(i));
+        }
+        assertEquals(new HashSet<>(Arrays.asList(1, 81, 161, 241, 321)), actual);
+        Float4Vector distances = (Float4Vector) root.getVector("_distance");
+        for (int i = 0; i < distances.getValueCount(); i++) {
+          assertTrue(Float.isFinite(distances.get(i)));
+          if (exact) {
+            assertEquals(0.0f, distances.get(i));
+          }
+        }
+      }
+      if (hnsw) {
+        ScanOptions invalid =
+            new ScanOptions.Builder()
+                .nearest(query.setEf(5 * factor * (exact ? 2 : 1) - 1).build())
+                .build();
+        IllegalArgumentException error =
+            assertThrows(
+                IllegalArgumentException.class,
+                () -> {
+                  try (Scanner scanner = dataset.newScan(invalid);
+                      ArrowReader reader = scanner.scanBatches()) {
+                    reader.loadNextBatch();
+                  }
+                });
+        assertTrue(
+            error.getMessage().contains("quantized refinement candidate count"),
+            error.getMessage());
+      }
+    }
+  }
+
   @Test
-  void test_quantized_refine_rejects_non_rq_index() throws Exception {
+  void test_quantized_refine_rejects_unsupported_index() throws Exception {
     try (TestVectorDataset testVectorDataset =
-        new TestVectorDataset(tempDir.resolve("test_quantized_refine_rejects_non_rq_index"))) {
+        new TestVectorDataset(tempDir.resolve("test_quantized_refine_rejects_unsupported_index"))) {
       try (Dataset dataset = testVectorDataset.create()) {
         testVectorDataset.createIndex(dataset);
         ScanOptions options =
@@ -186,9 +267,9 @@ public class VectorSearchTest {
                         .build())
                 .build();
 
-        IOException error =
+        UnsupportedOperationException error =
             assertThrows(
-                IOException.class,
+                UnsupportedOperationException.class,
                 () -> {
                   try (Scanner scanner = dataset.newScan(options);
                       ArrowReader reader = scanner.scanBatches()) {
@@ -196,7 +277,8 @@ public class VectorSearchTest {
                   }
                 });
         assertTrue(
-            error.getMessage().contains("requires an IVF_RQ flat index"), error.getMessage());
+            error.getMessage().contains("requires an IVF_RQ flat, IVF_SQ, or IVF_HNSW_SQ index"),
+            error.getMessage());
       }
     }
   }

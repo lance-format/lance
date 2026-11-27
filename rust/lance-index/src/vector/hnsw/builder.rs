@@ -44,9 +44,12 @@ use crate::vector::graph::{
     Visited, beam_search_acorn, beam_search_borrowed, greedy_search, greedy_search_borrowed,
     range_filter,
 };
-use crate::vector::storage::{DistCalculator, VectorStore};
+use crate::vector::storage::{DistCalculator, QueryResidual, QueryScratch, VectorStore};
 use crate::vector::v3::subindex::IvfSubIndex;
-use crate::vector::{ApproxMode, Query, RqGraphScoring, VECTOR_RESULT_SCHEMA};
+use crate::vector::{
+    ApproxMode, PartitionSearchCandidate, PartitionSearchResult, Query, RqGraphScoring,
+    VECTOR_RESULT_SCHEMA,
+};
 
 /// Rows [`HNSW::search_past_deletions`] samples to size its over-fetch.
 const DELETION_SAMPLES: usize = 64;
@@ -250,6 +253,94 @@ impl Debug for HNSW {
 }
 
 impl HNSW {
+    fn search_nodes(
+        &self,
+        query: ArrayRef,
+        k: usize,
+        params: HnswQueryParams,
+        storage: &impl VectorStore,
+        prefilter: Arc<dyn PreFilter>,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Vec<OrderedNode>> {
+        if params.ef < k {
+            return Err(Error::invalid_input(format!(
+                "ef must be greater than or equal to k: ef={}, k={k}",
+                params.ef
+            )));
+        }
+
+        if self.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut prefilter_generator = self
+            .inner
+            .visited_generator_queue
+            .pop()
+            .unwrap_or_else(|| VisitedGenerator::new(storage.len()));
+        let rerank_query = query.clone();
+        // A reranking search keeps `ef` candidates on every path for `VectorStore::rerank`.
+        let (top_k, k) = (k, if params.reranks() { params.ef } else { k });
+        let (past_deletions, deletion_comparisons) =
+            if !prefilter.is_empty() && prefilter.deletions_only() {
+                self.search_past_deletions(&query, k, &params, storage, prefilter.as_ref())?
+            } else {
+                (None, 0)
+            };
+        let (mut results, comparisons) = if let Some(results) = past_deletions {
+            (results, 0)
+        } else if prefilter.is_empty() {
+            self.search_basic(query, k, &params, None, storage)?
+        } else {
+            // the bitset must be moved into a callee on every path so its
+            // borrow of `prefilter_generator` ends before the push below
+            let indices = prefilter.filter_row_ids(Box::new(storage.row_ids()));
+            let mut prefilter_bitset = prefilter_generator.generate(storage.len());
+            for index in indices {
+                prefilter_bitset.insert(index as u32);
+            }
+            let remained = prefilter_bitset.count_ones();
+            if remained == storage.len() {
+                // mask passes every row: same as unfiltered
+                drop(prefilter_bitset);
+                self.search_basic(query, k, &params, None, storage)?
+            } else if remained < self.len() * 10 / 100 {
+                // few matching rows: brute force is cheaper and exact
+                self.flat_search(storage, query, k, prefilter_bitset, &params)
+            } else if params.use_acorn {
+                let (acorn_results, acorn_comparisons) =
+                    self.search_acorn(query.clone(), k, &params, &prefilter_bitset, storage)?;
+                // under-delivery means the budget ran out on a fragmented
+                // mask, except range-bounded queries which return short
+                // legitimately
+                let bounded = params.lower_bound.is_some() || params.upper_bound.is_some();
+                if !bounded && acorn_results.len() < top_k.min(remained) {
+                    // the abandoned ACORN traversal still cost its distances
+                    let (results, basic_comparisons) =
+                        self.search_basic(query, k, &params, Some(prefilter_bitset), storage)?;
+                    (results, acorn_comparisons + basic_comparisons)
+                } else {
+                    drop(prefilter_bitset);
+                    (acorn_results, acorn_comparisons)
+                }
+            } else {
+                self.search_basic(query, k, &params, Some(prefilter_bitset), storage)?
+            }
+        };
+        metrics.record_comparisons(deletion_comparisons + comparisons);
+        // if the queue is full, we just don't push it back, so ignore the error here
+        let _ = self.inner.visited_generator_queue.push(prefilter_generator);
+        if params.reranks() && storage.rerank(rerank_query, params.dist_q_c, &mut results) {
+            // The search applied the bounds to the scores rerank replaced.
+            let lower = params.lower_bound.unwrap_or(f32::MIN);
+            let upper = params.upper_bound.unwrap_or(f32::MAX);
+            results.retain(|node| node.dist.0 >= lower && node.dist.0 < upper);
+        }
+        results.truncate(top_k);
+
+        Ok(results)
+    }
+
     /// Construct an HNSW from its constituent parts. Used by the online
     /// builder when finalizing.
     pub(crate) fn from_parts(
@@ -1844,82 +1935,8 @@ impl IvfSubIndex for HNSW {
         prefilter: Arc<dyn PreFilter>,
         metrics: &dyn MetricsCollector,
     ) -> Result<RecordBatch> {
-        if params.ef < k {
-            return Err(Error::invalid_input(format!(
-                "ef must be greater than or equal to k: ef={}, k={k}",
-                params.ef
-            )));
-        }
-
         let schema = VECTOR_RESULT_SCHEMA.clone();
-        if self.is_empty() {
-            return Ok(RecordBatch::new_empty(schema));
-        }
-
-        let mut prefilter_generator = self
-            .inner
-            .visited_generator_queue
-            .pop()
-            .unwrap_or_else(|| VisitedGenerator::new(storage.len()));
-        let rerank_query = query.clone();
-        // A reranking search keeps `ef` candidates on every path for `VectorStore::rerank`.
-        let (top_k, k) = (k, if params.reranks() { params.ef } else { k });
-        let (past_deletions, deletion_comparisons) =
-            if !prefilter.is_empty() && prefilter.deletions_only() {
-                self.search_past_deletions(&query, k, &params, storage, prefilter.as_ref())?
-            } else {
-                (None, 0)
-            };
-        let (mut results, comparisons) = if let Some(results) = past_deletions {
-            (results, 0)
-        } else if prefilter.is_empty() {
-            self.search_basic(query, k, &params, None, storage)?
-        } else {
-            // the bitset must be moved into a callee on every path so its
-            // borrow of `prefilter_generator` ends before the push below
-            let indices = prefilter.filter_row_ids(Box::new(storage.row_ids()));
-            let mut prefilter_bitset = prefilter_generator.generate(storage.len());
-            for index in indices {
-                prefilter_bitset.insert(index as u32);
-            }
-            let remained = prefilter_bitset.count_ones();
-            if remained == storage.len() {
-                // mask passes every row: same as unfiltered
-                drop(prefilter_bitset);
-                self.search_basic(query, k, &params, None, storage)?
-            } else if remained < self.len() * 10 / 100 {
-                // few matching rows: brute force is cheaper and exact
-                self.flat_search(storage, query, k, prefilter_bitset, &params)
-            } else if params.use_acorn {
-                let (acorn_results, acorn_comparisons) =
-                    self.search_acorn(query.clone(), k, &params, &prefilter_bitset, storage)?;
-                // under-delivery means the budget ran out on a fragmented
-                // mask, except range-bounded queries which return short
-                // legitimately
-                let bounded = params.lower_bound.is_some() || params.upper_bound.is_some();
-                if !bounded && acorn_results.len() < top_k.min(remained) {
-                    // the abandoned ACORN traversal still cost its distances
-                    let (results, basic_comparisons) =
-                        self.search_basic(query, k, &params, Some(prefilter_bitset), storage)?;
-                    (results, acorn_comparisons + basic_comparisons)
-                } else {
-                    drop(prefilter_bitset);
-                    (acorn_results, acorn_comparisons)
-                }
-            } else {
-                self.search_basic(query, k, &params, Some(prefilter_bitset), storage)?
-            }
-        };
-        metrics.record_comparisons(deletion_comparisons + comparisons);
-        // if the queue is full, we just don't push it back, so ignore the error here
-        let _ = self.inner.visited_generator_queue.push(prefilter_generator);
-        if params.reranks() && storage.rerank(rerank_query, params.dist_q_c, &mut results) {
-            // The search applied the bounds to the scores rerank replaced.
-            let lower = params.lower_bound.unwrap_or(f32::MIN);
-            let upper = params.upper_bound.unwrap_or(f32::MAX);
-            results.retain(|node| node.dist.0 >= lower && node.dist.0 < upper);
-        }
-        results.truncate(top_k);
+        let results = self.search_nodes(query, k, params, storage, prefilter, metrics)?;
 
         // need to unique by row ids in case of searching multivector
         let (row_ids, dists): (Vec<_>, Vec<_>) = results
@@ -1931,6 +1948,41 @@ impl IvfSubIndex for HNSW {
         let distances = Arc::new(Float32Array::from(dists));
 
         Ok(RecordBatch::try_new(schema, vec![distances, row_ids])?)
+    }
+
+    fn search_with_candidates_with_scratch(
+        &self,
+        query: ArrayRef,
+        candidate_limit: usize,
+        params: Self::QueryParams,
+        storage: &impl VectorStore,
+        prefilter: Arc<dyn PreFilter>,
+        metrics: &dyn MetricsCollector,
+        partition_id: u32,
+        _residual: Option<QueryResidual<'_>>,
+        _scratch: &mut QueryScratch,
+    ) -> Result<PartitionSearchResult> {
+        let results =
+            self.search_nodes(query, candidate_limit, params, storage, prefilter, metrics)?;
+        let mut candidates = Vec::with_capacity(results.len());
+        let mut row_ids = Vec::with_capacity(results.len());
+        let mut distances = Vec::with_capacity(results.len());
+        for result in results {
+            candidates.push(PartitionSearchCandidate {
+                partition_id,
+                offset_in_partition: result.id,
+            });
+            row_ids.push(storage.row_id(result.id));
+            distances.push(result.dist.0);
+        }
+        let batch = RecordBatch::try_new(
+            VECTOR_RESULT_SCHEMA.clone(),
+            vec![
+                Arc::new(Float32Array::from(distances)),
+                Arc::new(UInt64Array::from(row_ids)),
+            ],
+        )?;
+        Ok(PartitionSearchResult { batch, candidates })
     }
 
     /// Given a vector storage, containing all the data for the IVF partition, build the sub index.
@@ -2100,7 +2152,8 @@ mod tests {
     use crate::prefilter::{NoFilter, PreFilter, sample_blocked_share};
     use crate::vector::Query;
     use crate::vector::graph::builder::GraphBuilderNode;
-    use crate::vector::storage::{DistCalculator, VectorStore};
+    use crate::vector::sq::storage::ScalarQuantizationStorage;
+    use crate::vector::storage::{DistCalculator, QueryScratch, VectorStore};
     use crate::vector::v3::subindex::IvfSubIndex;
     use crate::vector::{
         flat::storage::{FlatBinStorage, FlatFloatDistanceCalc, FlatFloatStorage},
@@ -2337,6 +2390,116 @@ mod tests {
             .map(u64::from)
             .collect::<Vec<_>>();
         assert_eq!(rows.values().as_ref(), expected.as_slice());
+    }
+
+    #[rstest]
+    #[case::built(false)]
+    #[case::loaded(true)]
+    fn candidate_search_preserves_storage_offsets(
+        #[case] loaded: bool,
+        #[values(8, 16)] ef: usize,
+    ) {
+        let vectors = FixedSizeListArray::try_new_from_values(
+            Float32Array::from((0..32).map(|v| v as f32 / 32.0).collect::<Vec<_>>()),
+            2,
+        )
+        .unwrap();
+        let batch = RecordBatch::try_from_iter([
+            (
+                lance_core::ROW_ID,
+                Arc::new(arrow_array::UInt64Array::from(
+                    (0..16)
+                        .map(|v| 1000 + ((v * 7) % 16) as u64)
+                        .collect::<Vec<_>>(),
+                )) as ArrayRef,
+            ),
+            (
+                crate::vector::SQ_CODE_COLUMN,
+                Arc::new(
+                    FixedSizeListArray::try_new_from_values(
+                        UInt8Array::from(
+                            (0..32).map(|value| (value * 8) as u8).collect::<Vec<_>>(),
+                        ),
+                        2,
+                    )
+                    .unwrap(),
+                ) as ArrayRef,
+            ),
+        ])
+        .unwrap();
+        let store =
+            ScalarQuantizationStorage::try_new(8, DistanceType::L2, 0.0..1.0, [batch], None)
+                .unwrap();
+        let built = HNSW::index_vectors(
+            &store,
+            HnswBuildParams::default().num_edges(4).ef_construction(16),
+        )
+        .unwrap();
+        let index = if loaded {
+            HNSW::load(built.to_batch().unwrap()).unwrap()
+        } else {
+            built
+        };
+        let params = HnswQueryParams {
+            ef,
+            lower_bound: Some(0.0),
+            upper_bound: Some(1.0),
+            dist_q_c: 0.0,
+            use_acorn: false,
+            rq_graph_scoring: Default::default(),
+        };
+        let query = vectors.value(4);
+        let expected = index
+            .search(
+                query.clone(),
+                8,
+                params,
+                &store,
+                Arc::new(NoFilter),
+                &NoOpMetricsCollector,
+            )
+            .unwrap();
+        let result = index
+            .search_with_candidates_with_scratch(
+                query.clone(),
+                8,
+                params,
+                &store,
+                Arc::new(NoFilter),
+                &NoOpMetricsCollector,
+                3,
+                None,
+                &mut QueryScratch::default(),
+            )
+            .unwrap();
+        assert_eq!(result.batch, expected);
+        assert_eq!(result.batch.num_rows(), 8);
+        assert_eq!(result.candidates.len(), result.batch.num_rows());
+        let calculator = store.dist_calculator(query, 0.0);
+        for (row, candidate) in result.candidates.iter().enumerate() {
+            assert_eq!(candidate.partition_id, 3);
+            assert_eq!(
+                store.row_id(candidate.offset_in_partition),
+                result.batch[lance_core::ROW_ID]
+                    .as_primitive::<UInt64Type>()
+                    .value(row)
+            );
+            assert_eq!(
+                calculator.distance(candidate.offset_in_partition),
+                result.batch[crate::vector::DIST_COL]
+                    .as_primitive::<Float32Type>()
+                    .value(row)
+            );
+        }
+        assert_eq!(result.candidates[0].offset_in_partition, 4);
+        let mut truth: Vec<_> = (0..store.len() as u32).collect();
+        truth.sort_unstable_by(|&a, &b| calculator.distance(a).total_cmp(&calculator.distance(b)));
+        let overlap = result
+            .candidates
+            .iter()
+            .filter(|candidate| truth[..8].contains(&candidate.offset_in_partition))
+            .count();
+        assert!(overlap >= 4, "recall={overlap}/8");
     }
 
     #[rstest]

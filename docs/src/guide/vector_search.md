@@ -332,6 +332,50 @@ Use `nprobes` and `refine_factor` to trade recall for query work:
 - `minimum_nprobes`, `maximum_nprobes`: bounds for adaptive probing.
 - `ef`: HNSW search breadth for HNSW-based indexes.
 
+Use `quantized_refine_factor` for refinement from stored index data. For flat
+`IVF_RQ`, it overfetches one-bit candidates and reranks them with the most accurate
+stored RQ representation. `IVF_SQ` already scans at its full eight-bit precision,
+so it uses that scan directly. For `IVF_HNSW_SQ`, the factor expands the graph
+candidate pool and scores it at the native eight-bit precision.
+An explicit `ef` must be at least `k * quantized_refine_factor * refine_factor`
+(missing factors are 1). The default grows with that candidate budget.
+
+=== "Python"
+
+    ```python
+    result = dataset.to_table(
+        nearest={
+            "column": "vector", "q": query_vector, "k": 10,
+            "quantized_refine_factor": 4,
+        }
+    )
+    ```
+
+=== "Rust"
+
+    ```rust
+    let mut scanner = dataset.scan();
+    scanner.nearest("vector", &query_vector, 10)?.quantized_refine(4);
+    let result = scanner.try_into_batch().await?;
+    ```
+
+=== "Java"
+
+    ```java
+    Query query = new Query.Builder()
+        .setColumn("vector").setKey(queryVector).setK(10)
+        .setQuantizedRefineFactor(4).build();
+    ```
+
+The quantized stage scores indexed candidates without reading original vectors.
+Projecting original vector columns still reads them. Adding `refine_factor` performs
+exact refinement afterward and reads originals for those candidates. Unindexed
+fragments and stale overlay rows also read original vectors. Distance bounds
+apply before truncation. Other quantizers, legacy indices, and multivectors are
+unsupported. Fully indexed queries without filters, fragment subsets, external
+masks, or stale overlays can reuse completed partition results within the same
+snapshot and session cache budget. Immutable index data is cached independently.
+
 Measure recall against exact search:
 
 ```python
