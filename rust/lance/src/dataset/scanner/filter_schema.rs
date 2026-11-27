@@ -8,7 +8,7 @@
 //! Arrow once per manifest and kept on the dataset; a scan appends its search
 //! columns, which only clones the fields' `Arc`s.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use arrow_schema::{Field as ArrowField, Fields, Schema as ArrowSchema, SchemaRef};
 use lance_core::datatypes::{Projection, Schema};
@@ -38,7 +38,7 @@ impl TableFilterSchema {
         manifest: &Arc<Manifest>,
         build: impl FnOnce() -> SchemaRef,
     ) -> SchemaRef {
-        let mut slot = self.0.lock().unwrap();
+        let mut slot = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         match slot.as_ref() {
             Some((built_for, schema)) if Arc::ptr_eq(built_for, manifest) => schema.clone(),
             _ => {

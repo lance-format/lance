@@ -2183,6 +2183,10 @@ mod tests {
             *dataset.filterable_schema(&extra).unwrap(),
             ArrowSchema::from(&expected)
         );
+
+        // An incompatible type fails to merge, as before.
+        let incompatible = [ArrowField::new("a", DataType::Utf8, true)];
+        assert!(dataset.filterable_schema(&incompatible).is_err());
     }
 
     #[tokio::test]

@@ -1216,18 +1216,15 @@ impl Planner {
     /// Note: the returned expression must be passed through `optimize_expr()`
     /// before being passed to `create_physical_expr()`.
     pub fn parse_filter(&self, filter: &str) -> Result<Expr> {
-        self.parse_filter_resolving(filter, self.schema.as_ref())
+        let schema = Schema::try_from(self.schema.as_ref())?;
+        self.parse_filter_with_schema(filter, &schema)
     }
 
     /// Like [`Self::parse_filter`], but resolves column types against `schema`
     /// instead of converting the planner's Arrow schema on every call.
     ///
     /// `schema` must describe the same fields as the planner's Arrow schema.
-    pub fn parse_filter_with_schema(&self, filter: &str, schema: &Schema) -> Result<Expr> {
-        self.parse_filter_resolving(filter, schema)
-    }
-
-    fn parse_filter_resolving(&self, filter: &str, schema: &dyn ColumnTypes) -> Result<Expr> {
+    pub fn parse_filter_with_schema(&self, filter: &str, schema: &dyn ColumnTypes) -> Result<Expr> {
         // Allow sqlparser to parse filter as part of ONE SQL statement.
         let mut ast_expr = parse_sql_filter(filter)?;
         self.rewrite_filter_lambdas(&mut ast_expr)?;

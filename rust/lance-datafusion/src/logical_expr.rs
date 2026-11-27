@@ -42,13 +42,16 @@ impl ColumnTypes for Schema {
 }
 
 impl ColumnTypes for ArrowSchema {
-    /// Resolves like the Lance [`Schema`] the Arrow schema converts to.
+    /// Resolves like the Lance [`Schema`] converted to it.
     fn column_type(&self, path: &[&str]) -> Option<DataType> {
         fn children(data_type: &DataType) -> &[arrow_schema::FieldRef] {
             match data_type {
                 DataType::Struct(fields) => fields,
-                // Lance keeps no child for a fixed-size list's item.
                 DataType::List(item) | DataType::LargeList(item) | DataType::Map(item, _) => {
+                    std::slice::from_ref(item)
+                }
+                // Lance keeps a fixed-size list's item only when it is a struct.
+                DataType::FixedSizeList(item, _) if item.data_type().is_struct() => {
                     std::slice::from_ref(item)
                 }
                 _ => &[],
@@ -394,10 +397,16 @@ mod tests {
             ),
             Field::new(
                 "l",
-                DataType::List(Arc::new(Field::new("item", inner, true))),
+                DataType::List(Arc::new(Field::new("item", inner.clone(), true))),
                 true,
             ),
             Field::new("fl", DataType::FixedSizeList(leaf("item"), 2), true),
+            Field::new(
+                "fs",
+                DataType::FixedSizeList(Arc::new(Field::new("item", inner, true)), 2),
+                true,
+            ),
+            Field::new("ll", DataType::LargeList(leaf("item")), true),
             Field::new(
                 "m",
                 DataType::Map(
@@ -442,6 +451,11 @@ mod tests {
             &["l.item.x"],
             &["l", "item"],
             &["fl.item"],
+            &["fs.item"],
+            &["fs.item.x"],
+            &["fs", "item"],
+            &["ll.item"],
+            &["m.entries.key"],
             &["m.entries"],
             &["m.entries.value"],
             &["m", "entries"],
