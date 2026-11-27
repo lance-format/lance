@@ -128,6 +128,9 @@ fn validate_compressive_encoding(
                 .create_miniblock_decompressor(encoding, &DefaultDecompressionStrategy::default())
                 .map(|_| ())
         }
+        Some(Compression::IntegerBitpacking(_)) => Err(Error::not_supported_source(
+            "This runtime does not support integer bitpacking".into(),
+        )),
         Some(Compression::AxisDelta(_)) => {
             if position != EncodingPosition::PerValue {
                 return Err(Error::invalid_input(format!(

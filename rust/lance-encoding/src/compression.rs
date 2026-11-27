@@ -2413,6 +2413,7 @@ fn compression_name(compression: &Compression) -> &'static str {
         Compression::Delta(_) => "delta",
         Compression::Alp(_) => "alp",
         Compression::Pcodec(_) => "pcodec",
+        Compression::IntegerBitpacking(_) => "integer bitpacking",
     }
 }
 

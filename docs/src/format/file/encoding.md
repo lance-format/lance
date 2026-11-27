@@ -413,6 +413,52 @@ packed structs can compose with sparse structure. Codec selection is a writer po
 %%% proto.message.ZippedValues %%%
 ```
 
+#### Integer Bitpacking
+
+`IntegerBitpacking` is a value codec in unstable Lance 2.3. It may appear directly in
+`ChunkedValues.compression`, with `num_buffers = 1` and no dictionary. It supports 8-, 16-, 32-, and
+64-bit integer and temporal leaf values. `bits_per_value` is the physical width `W` of that leaf.
+The codec treats the original value bits as words modulo `2^W`. Signedness, time unit, and time zone
+are defined by the column schema. The dense or sparse structure determines which slots are null.
+
+Let `n` be the value count given by the enclosing mini-block metadata. Each chunk has `1 <= n <= 1024`.
+The writer uses a uniform power-of-two count for nonfinal chunks on a page, with at most that count
+in the final chunk. The existing mini-block index locates chunks by their byte ranges. Flat pages with
+uniform counts locate a value's chunk by division. The codec can decode each chunk independently.
+
+The first `W / 8` bytes of the sole value buffer hold a little-endian control word. Its low two bits
+are the mode, and all remaining bits give the unsigned packed width `b`. The mode determines the
+reference words and logical residuals that follow. Reference words are little-endian and `W` bits wide.
+
+- Mode 0 (frame of reference) stores a base word `a` and `n` residuals `x[i] - a`, in value order.
+  Restore `x[i]` by adding the base to residual `i`.
+- Mode 1 (delta with frame of reference) requires at least two values. It stores the first value `x[0]`,
+  a reference delta `d`, and `n - 1` residuals. Residual `i - 1` is `x[i] - x[i - 1] - d` for
+  `1 <= i < n`. Restore `x[i]` by adding `d` and residual `i - 1` to the restored `x[i - 1]`.
+
+All subtractions and additions wrap modulo `2^W`. The writer chooses the reference words and can
+use any reference for which every residual fits in `b` bits. The width must be in `0..=W`. At width
+zero all residuals are zero and the packed payload is empty. For delta mode this represents a constant
+stride, so a reader can compute `x[i] = x[0] + i * d` modulo `2^W` directly.
+
+A chunk with `n = 1024` packs 1024 residual positions. Delta mode fills the final residual position
+with zero. For `b > 0`, the payload is `128 * b` bytes organized as little-endian `W`-bit words.
+Set `L = 1024 / W` and `O = [0, 4, 2, 6, 1, 5, 3, 7]`. Lane `l`, for `0 <= l < L`, owns words
+`j * L + l` for `0 <= j < b`. Read those words in that order, least significant bit first within each
+word. Row `r`, for `0 <= r < W`, occupies bits `r * b` through `(r + 1) * b - 1` of that lane's
+bit stream. It holds the residual at position `O[floor(r / 8)] * 16 + (r mod 8) * 128 + l`.
+This ordering applies at width `W` too.
+
+For `n < 1024`, pack just the logical residuals consecutively, least significant bit first within each
+residual and within each byte. A count of `m` residuals uses `ceil(m * b / 8)` bytes. The high unused
+bits in the final byte are zero. This layout also applies to shorter nonfinal chunks.
+
+The buffer length is exactly the control word, the mode's reference words, and the packed payload,
+with a maximum of 8186 bytes. The enclosing mini-block applies its usual 8-byte buffer alignment.
+Readers reject unsupported leaf widths and locations, invalid counts, modes 2 and 3, widths above
+`W`, nonzero payload padding, and lengths that differ from the expected length or exceed the maximum.
+Lance 2.0–2.2 retain their existing value codecs and on-disk representations.
+
 #### Sparse Structural Domains
 
 A domain is a layer-local coordinate space `[0, size)`. Layers are ordered from outer-most to inner-most:

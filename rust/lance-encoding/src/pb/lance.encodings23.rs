@@ -992,12 +992,34 @@ impl ::prost::Name for Pcodec {
         "/lance.encodings23.Pcodec".into()
     }
 }
+/// Unstable 2.3 frame-of-reference and delta bitpacking for integer and
+/// temporal mini-block values. Use only as the direct ChunkedValues compression
+/// with one value buffer per chunk and no dictionary. Each buffer begins with
+/// a little-endian word holding the mode in the low two bits and packed width
+/// above it, followed by the mode's reference words and residual bits.
+/// See Integer Bitpacking in the file encoding specification for the layout.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct IntegerBitpacking {
+    /// The physical width of the leaf values. Must be 8, 16, 32 or 64.
+    #[prost(uint32, tag = "1")]
+    pub bits_per_value: u32,
+}
+impl ::prost::Name for IntegerBitpacking {
+    const NAME: &'static str = "IntegerBitpacking";
+    const PACKAGE: &'static str = "lance.encodings23";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lance.encodings23.IntegerBitpacking".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lance.encodings23.IntegerBitpacking".into()
+    }
+}
 /// An encoding that compresses a data block into buffers
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CompressiveEncoding {
     #[prost(
         oneof = "compressive_encoding::Compression",
-        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18"
+        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19"
     )]
     pub compression: ::core::option::Option<compressive_encoding::Compression>,
 }
@@ -1041,6 +1063,8 @@ pub mod compressive_encoding {
         Alp(super::Alp),
         #[prost(message, tag = "18")]
         Pcodec(::prost::alloc::boxed::Box<super::Pcodec>),
+        #[prost(message, tag = "19")]
+        IntegerBitpacking(super::IntegerBitpacking),
     }
 }
 impl ::prost::Name for CompressiveEncoding {
