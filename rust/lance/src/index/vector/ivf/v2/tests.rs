@@ -9134,12 +9134,12 @@ async fn test_prewarm_vector_index(#[case] params: VectorIndexParams) {
 #[rstest]
 #[case::ivf_pq(VectorIndexParams::with_ivf_pq_params(
     DistanceType::L2,
-    IvfBuildParams { max_iters: 4, ..IvfBuildParams::new(4) },
+    IvfBuildParams { max_iters: 4, sample_rate: LIGHTWEIGHT_IVF_SAMPLE_RATE, ..IvfBuildParams::new(4) },
     PQBuildParams { max_iters: 4, ..PQBuildParams::new(16, 4) },
 ))]
 #[case::ivf_rq(VectorIndexParams::with_ivf_rq_params(
     DistanceType::L2,
-    IvfBuildParams { max_iters: 4, ..IvfBuildParams::new(4) },
+    IvfBuildParams { max_iters: 4, sample_rate: LIGHTWEIGHT_IVF_SAMPLE_RATE, ..IvfBuildParams::new(4) },
     RQBuildParams::with_rotation_type(5, RQRotationType::Fast),
 ))]
 #[tokio::test]
