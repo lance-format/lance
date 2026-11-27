@@ -321,6 +321,7 @@ impl Dataset {
     #[allow(clippy::too_many_arguments)]
     async fn cleanup_operation(
         &self,
+        older_than_micros: Option<i64>,
         before_timestamp: Option<DateTime<Utc>>,
         retain_versions: Option<usize>,
         delete_unverified: Option<bool>,
@@ -330,6 +331,14 @@ impl Dataset {
         policy_json: Option<String>,
     ) -> lance_core::Result<lance::dataset::cleanup::CleanupOperation<'_>> {
         let mut builder = CleanupPolicyBuilder::default();
+        if let Some(v) = older_than_micros
+            && v < 0
+        {
+            // A negative age moves the cutoff into the future.
+            return Err(lance::Error::invalid_input(format!(
+                "older_than must be non-negative, got {v} microseconds"
+            )));
+        }
         if let Some(timestamp) = before_timestamp {
             builder = builder.before_timestamp(timestamp);
         }
@@ -360,7 +369,7 @@ impl Dataset {
             operation = operation.with_keep_one(period, std::time::Duration::from_micros(age))?;
         }
         if let Some(value) = policy_json {
-            if before_timestamp.is_some() || keep_one_micros.is_some() {
+            if older_than_micros.is_some() || keep_one_micros.is_some() {
                 return Err(lance::Error::invalid_input(
                     "policy cannot be combined with older_than or keep_one",
                 ));
@@ -410,6 +419,12 @@ fn expire_versions_policy(
 ) -> PyResult<lance::dataset::expire::ExpireVersionsPolicy> {
     let mut builder = lance::dataset::expire::ExpireVersionsPolicyBuilder::default();
     if let Some(micros) = before_micros {
+        if micros < 0 {
+            // A negative age moves the cutoff into the future.
+            return Err(PyValueError::new_err(format!(
+                "before must be non-negative, got {micros} microseconds"
+            )));
+        }
         // A duration, not an absolute time, matching `cleanup_policy`: the caller says
         // "older than this" and the cutoff is computed here against one clock.
         builder = builder.before_timestamp(cutoff_before_now(micros, "before").infer_error()?);
@@ -2153,7 +2168,9 @@ impl Dataset {
         keep_one_micros: Option<(i64, i64)>,
         policy_json: Option<String>,
     ) -> PyResult<CleanupStats> {
+        // A negative age is rejected inside the cleanup operation.
         let before_timestamp = older_than_micros
+            .filter(|micros| *micros >= 0)
             .map(|micros| cutoff_before_now(micros, "older_than"))
             .transpose()
             .infer_error()?;
@@ -2161,6 +2178,7 @@ impl Dataset {
             .block_on(None, async {
                 let mut operation = self
                     .cleanup_operation(
+                        older_than_micros,
                         before_timestamp,
                         retain_versions,
                         delete_unverified,
@@ -2252,7 +2270,9 @@ impl Dataset {
         policy_json: Option<String>,
     ) -> PyResult<CleanupExplanation> {
         let _ = delete_rate_limit; // Retained in the signature for existing callers.
+        // A negative age is rejected inside the cleanup operation.
         let before_timestamp = older_than_micros
+            .filter(|micros| *micros >= 0)
             .map(|micros| cutoff_before_now(micros, "older_than"))
             .transpose()
             .infer_error()?;
@@ -2260,6 +2280,7 @@ impl Dataset {
             .block_on(None, async {
                 let operation = self
                     .cleanup_operation(
+                        older_than_micros,
                         before_timestamp,
                         retain_versions,
                         delete_unverified,

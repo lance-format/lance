@@ -51,6 +51,12 @@ async fn write(uri: &str, version: LanceFileVersion) -> Dataset {
 /// files, `[a, b, c]`, `[d]` and `[e]`.
 async fn write_backfilled() -> Dataset {
     let mut dataset = write("memory://", LanceFileVersion::V2_0).await;
+    backfill(&mut dataset).await;
+    dataset
+}
+
+/// Add `d` and `e`, each in a new file of every fragment.
+async fn backfill(dataset: &mut Dataset) {
     for (name, expr) in [("d", "a + 1"), ("e", "a + 2")] {
         dataset
             .add_columns(
@@ -61,7 +67,6 @@ async fn write_backfilled() -> Dataset {
             .await
             .unwrap();
     }
-    dataset
 }
 
 fn repack_options(max_files: Option<usize>) -> CompactionOptions {
@@ -1168,16 +1173,7 @@ async fn repack_applies_data_cache_bytes(#[case] version: LanceFileVersion) {
         data_cache_bytes: Option<u64>,
     ) -> usize {
         let mut dataset = write("memory://", version).await;
-        for (name, expr) in [("d", "a + 1"), ("e", "a + 2")] {
-            dataset
-                .add_columns(
-                    NewColumnTransform::SqlExpressions(vec![(name.into(), expr.into())]),
-                    None,
-                    None,
-                )
-                .await
-                .unwrap();
-        }
+        backfill(&mut dataset).await;
         let options = CompactionOptions {
             batch_size: Some(1),
             data_cache_bytes,
@@ -1209,6 +1205,142 @@ async fn repack_applies_data_cache_bytes(#[case] version: LanceFileVersion) {
     assert!(
         bounded_pages > default_pages,
         "default={default_pages}, bounded={bounded_pages}"
+    );
+}
+
+/// The budget and bytes read of every I/O scheduler state event fired while
+/// it is the default subscriber.
+#[derive(Clone, Default)]
+struct SchedulerStates(Arc<std::sync::Mutex<Vec<SchedulerState>>>);
+
+#[derive(Debug, Default)]
+struct SchedulerState {
+    io_buffer_size_bytes: u64,
+    bytes_read: u64,
+}
+
+impl tracing::field::Visit for SchedulerState {
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+        match field.name() {
+            "io_buffer_size_bytes" => self.io_buffer_size_bytes = value,
+            "scheduler_bytes_read" => self.bytes_read = value,
+            _ => {}
+        }
+    }
+    fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for SchedulerStates {
+    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+        if event.metadata().target() != "lance_io::scheduler::state" {
+            return;
+        }
+        let mut state = SchedulerState::default();
+        event.record(&mut state);
+        self.0.lock().unwrap().push(state);
+    }
+}
+
+/// Sets an environment variable until dropped, then restores its old value,
+/// so a failing assertion does not leave it set for later tests.
+struct EnvVar {
+    key: &'static str,
+    old: Option<std::ffi::OsString>,
+}
+
+impl EnvVar {
+    fn set(key: &'static str, value: &str) -> Self {
+        let old = std::env::var_os(key);
+        unsafe { std::env::set_var(key, value) };
+        Self { key, old }
+    }
+}
+
+impl Drop for EnvVar {
+    fn drop(&mut self) {
+        unsafe {
+            match &self.old {
+                Some(old) => std::env::set_var(self.key, old),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+}
+
+/// A repack reads with `io_buffer_size`, or `LANCE_DEFAULT_IO_BUFFER_SIZE`
+/// when that is unset, as a rewrite does, both the files of the dataset and,
+/// in a shallow clone, the source files it references.
+#[rstest]
+#[case::own_files(false, false)]
+#[case::shallow_clone(true, false)]
+#[case::env_var(false, true)]
+#[case::env_var_shallow_clone(true, true)]
+// The events are recorded on this thread only, so the scheduler's I/O loop
+// has to run on it too.
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial(LANCE_DEFAULT_IO_BUFFER_SIZE)]
+async fn repack_reads_with_io_buffer_size(#[case] shallow_clone: bool, #[case] from_env: bool) {
+    use tracing_subscriber::layer::SubscriberExt;
+
+    let source_dir = TempStrDir::default();
+    let clone_dir = TempStrDir::default();
+    let dataset = if shallow_clone {
+        let mut source = write(&source_dir, LanceFileVersion::V2_0).await;
+        backfill(&mut source).await;
+        source
+            .tags()
+            .create("to_clone", source.version().version)
+            .await
+            .unwrap();
+        let clone = source
+            .shallow_clone(&clone_dir, "to_clone", None)
+            .await
+            .unwrap();
+        let files = &clone.manifest.fragments[0].files;
+        assert!(files.iter().all(|file| file.base_id.is_some()), "{files:?}");
+        clone
+    } else {
+        write_backfilled().await
+    };
+
+    let io_buffer_size = 3 * 1024 * 1024 + 1;
+    let options = CompactionOptions {
+        io_buffer_size: (!from_env).then_some(io_buffer_size),
+        ..repack_options(Some(1))
+    };
+    let plan = plan_compaction(&dataset, &options).await.unwrap();
+    let task = plan.compaction_tasks().next().unwrap();
+    // `DEFAULT_IO_BUFFER_SIZE` reads the variable once and caches it, so read
+    // it before setting the variable, or a scan elsewhere could cache this value.
+    let _ = *crate::dataset::scanner::DEFAULT_IO_BUFFER_SIZE;
+    let _env =
+        from_env.then(|| EnvVar::set("LANCE_DEFAULT_IO_BUFFER_SIZE", &io_buffer_size.to_string()));
+
+    // tracing caches each callsite's interest from the firing thread's default
+    // dispatcher while exactly one dispatcher is registered; a second live
+    // dispatcher makes it consult every registered dispatcher, including this
+    // thread-local one.
+    let states = SchedulerStates::default();
+    let _second_dispatcher = tracing::Dispatch::new(tracing_subscriber::registry());
+    {
+        let subscriber = tracing_subscriber::registry().with(states.clone());
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let result = task.execute(&dataset).await.unwrap();
+        assert!(result.repacked_files.is_some(), "{result:?}");
+    }
+
+    // A scheduler reports its budget when it closes even if it read nothing,
+    // so look for one that read.
+    let states = states.0.lock().unwrap();
+    assert!(
+        states.iter().any(|state| state.bytes_read > 0),
+        "{states:?}"
+    );
+    assert!(
+        states
+            .iter()
+            .all(|state| state.io_buffer_size_bytes == io_buffer_size),
+        "{states:?}"
     );
 }
 

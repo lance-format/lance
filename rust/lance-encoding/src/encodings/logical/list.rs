@@ -1564,6 +1564,96 @@ mod tests {
         check_round_trip_encoding_of_data(vec![list], &test_cases, HashMap::new()).await;
     }
 
+    fn boolean_fsl_items(dimension: i32, has_null_items: bool) -> ArrayRef {
+        let num_lists = 4;
+        let items = BooleanArray::from_iter(
+            (0..num_lists * dimension)
+                .map(|i| (!has_null_items || i % 5 != 0).then_some(i % 3 == 0)),
+        );
+        Arc::new(arrow_array::FixedSizeListArray::new(
+            Arc::new(Field::new("item", DataType::Boolean, true)),
+            dimension,
+            Arc::new(items),
+            None,
+        ))
+    }
+
+    /// A row too nested for mini-block falls back to full-zip. A list of booleans
+    /// that full-zip has to widen to a byte each only takes that path in 2.3, and
+    /// 2.1 and 2.2 return the same error as a requested full-zip page.
+    #[rstest]
+    #[case::partial_byte_rows(3, false)]
+    #[case::null_items(8, true)]
+    #[test_log::test(tokio::test)]
+    async fn test_nested_single_row_byte_wide_boolean_fsl(
+        #[case] dimension: i32,
+        #[case] has_null_items: bool,
+    ) {
+        use crate::encoder::{EncodingOptions, encode_batch};
+        use crate::testing::test_encoding_strategy;
+        use arrow_array::RecordBatch;
+
+        let list = unsplittable_nested_list(boolean_fsl_items(dimension, has_null_items), 70_000);
+        let batch = RecordBatch::try_new(
+            Arc::new(arrow_schema::Schema::new(vec![Field::new(
+                "lists",
+                list.data_type().clone(),
+                true,
+            )])),
+            vec![list.clone()],
+        )
+        .unwrap();
+        let schema =
+            Arc::new(lance_core::datatypes::Schema::try_from(batch.schema().as_ref()).unwrap());
+        for encoding in [TestEncoding::StructuralU16, TestEncoding::StructuralU32] {
+            let strategy = test_encoding_strategy(encoding);
+            let err = encode_batch(
+                &batch,
+                schema.clone(),
+                strategy.as_ref(),
+                &EncodingOptions::default(),
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                err.to_string().contains("write it with file version 2.3"),
+                "{encoding}: {err}"
+            );
+        }
+
+        // 2.3 writes it on its own, and also when full-zip is requested, which
+        // takes the same fallback check as 2.1 and 2.2.
+        let test_cases = TestCases::default()
+            .with_range(0..1)
+            .with_indices(vec![0])
+            .with_encoding(TestEncoding::StructuralSparse);
+        check_round_trip_encoding_of_data(vec![list.clone()], &test_cases, HashMap::new()).await;
+        check_round_trip_encoding_of_data(
+            vec![list],
+            &test_cases,
+            HashMap::from([(
+                STRUCTURAL_ENCODING_META_KEY.to_string(),
+                STRUCTURAL_ENCODING_FULLZIP.to_string(),
+            )]),
+        )
+        .await;
+    }
+
+    /// A null-free list of booleans whose rows fill whole bytes keeps the
+    /// bit-packed full-zip fallback in 2.1 and 2.2.
+    #[test_log::test(tokio::test)]
+    async fn test_nested_single_row_bit_packed_boolean_fsl_falls_back_to_fullzip() {
+        let list = unsplittable_nested_list(boolean_fsl_items(8, false), 70_000);
+        let pages = encode_v22_pages(list.clone()).await;
+        assert_has_fullzip_layout(&pages);
+
+        let test_cases = TestCases::default()
+            .with_range(0..1)
+            .with_indices(vec![0])
+            .with_structural_encodings();
+        check_round_trip_encoding_of_data(vec![list], &test_cases, HashMap::new()).await;
+    }
+
     /// Builds the HNSW-flush repro shape: a dense prefix where every row has
     /// `NEIGHBORS_PER_ROW` distinct values, followed by a long tail of empty
     /// lists. Mirrors `HNSW::schema()` `__neighbors` / `__dists` columns:

@@ -3584,7 +3584,9 @@ mod tests {
                 } else {
                     assert!(matches!(
                         offsets,
-                        Some(metadata::compressive_encoding::Compression::Delta(_))
+                        Some(metadata::compressive_encoding::Compression::MonotonicDelta(
+                            _
+                        ))
                     ));
                 }
             }
