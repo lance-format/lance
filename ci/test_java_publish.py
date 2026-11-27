@@ -86,3 +86,15 @@ def test_maven_cache_contract_across_java_workflows():
         publish_prefix
         == "maven-java-tests-${{ runner.os }}-${{ runner.arch }}-with-spotless-"
     )
+
+    for step_name in ("Dry run", "Publish with Java 11"):
+        step = next(
+            s
+            for s in publish_workflow["jobs"]["publish"]["steps"]
+            if s.get("name") == step_name
+        )
+        run_script = step["run"]
+        assert "--legacy-local-repository" not in run_script
+        assert " -llr" not in run_script
+        assert "-Daether.priority.SimpleLocalRepositoryManagerFactory=100" in run_script
+        assert "-Daether.connector.http.retryHandler.count=6" in run_script

@@ -206,10 +206,10 @@ jobs:
           inputs.mode == 'dry_run'
         working-directory: java
         run: |
-          # Ignore _remote.repositories written by the runner's newer mvn in java.yml
-          # so the wrapper's Maven 3.9.9 reuses the restored cache without re-verifying
-          # every artifact against Maven Central.
-          ./mvnw --batch-mode --legacy-local-repository -Daether.connector.http.retryHandler.count=6 -DskipTests -Dskip.build.jni=true package
+          # Use Maven Resolver's simple local repository manager so the wrapper's
+          # Maven 3.9.9 reuses ~/.m2/repository populated by java.yml without
+          # re-verifying _remote.repositories entries against Maven Central.
+          ./mvnw --batch-mode -Daether.priority.SimpleLocalRepositoryManagerFactory=100 -Daether.connector.http.retryHandler.count=6 -DskipTests -Dskip.build.jni=true package
       - name: Publish with Java 11
         if: |
           github.event_name == 'release' ||
@@ -219,7 +219,7 @@ jobs:
           echo "use-agent" >> ~/.gnupg/gpg.conf
           echo "pinentry-mode loopback" >> ~/.gnupg/gpg.conf
           export GPG_TTY=$(tty)
-          ./mvnw --batch-mode --legacy-local-repository -Daether.connector.http.retryHandler.count=6 -DskipTests -Dskip.build.jni=true -DpushChanges=false -Dgpg.passphrase=${{ secrets.GPG_PASSPHRASE }} deploy -P deploy-to-ossrh
+          ./mvnw --batch-mode -Daether.priority.SimpleLocalRepositoryManagerFactory=100 -Daether.connector.http.retryHandler.count=6 -DskipTests -Dskip.build.jni=true -DpushChanges=false -Dgpg.passphrase=${{ secrets.GPG_PASSPHRASE }} deploy -P deploy-to-ossrh
         env:
           SONATYPE_USER: ${{ secrets.SONATYPE_USER }}
           SONATYPE_TOKEN: ${{ secrets.SONATYPE_TOKEN }}
