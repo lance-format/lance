@@ -287,6 +287,10 @@ name = "scalar_prefilter"
 harness = false
 
 [[bench]]
+name = "combined_filter"
+harness = false
+
+[[bench]]
 name = "vector_throughput"
 harness = false
 
