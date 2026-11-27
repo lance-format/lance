@@ -158,6 +158,8 @@ impl SnapshotRef {
     }
 
     /// Identity fingerprint, independent of worker storage bindings and capabilities.
+    /// Hashes the canonical encoding of validated known fields, not the incoming
+    /// transport spelling; unknown fields and incoming field order are ignored.
     pub fn snapshot_id(&self) -> &[u8; 32] {
         &self.snapshot_id
     }
@@ -225,6 +227,7 @@ impl TryFrom<pb::SnapshotRef> for SnapshotRef {
                 || branch.ends_with(".lock")
                 || branch.split('/').any(|part| {
                     part.is_empty()
+                        || part == "."
                         || !part
                             .chars()
                             .all(|c| c.is_alphanumeric() || matches!(c, '.' | '-' | '_'))
@@ -368,6 +371,51 @@ mod tests {
     }
 
     #[rstest]
+    #[case::full_main(
+        "08011213636174616c6f672f696e6361726e6174696f6e1a1173333a2f2f6275636b65742f7461626c652807321a7461626c652f5f76657273696f6e732f372e6d616e69666573743a202a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a",
+        "103d7010e5016fc37a4e73761a3f186d13dca77aa21b86f0bb5d2555760a411c"
+    )]
+    #[case::etag_branch(
+        "08011213636174616c6f672f696e6361726e6174696f6e1a1173333a2f2f6275636b65742f7461626c65220c666561747572652f746573742807321a7461626c652f5f76657273696f6e732f372e6d616e69666573744a0c67656e65726174696f6e2d31",
+        "597c8e5b98ae26de7edcca9e5a2357bb327e0b46e4067c635f4e0c6446d6c7ac"
+    )]
+    #[case::commit_main(
+        "08011213636174616c6f672f696e6361726e6174696f6e1a1173333a2f2f6275636b65742f7461626c652807321a7461626c652f5f76657273696f6e732f372e6d616e696665737442087265636f72642d31",
+        "38c6c30fe651071d470d210a0cafce9461e6f6543c9b87d499542d41e7fc2b11"
+    )]
+    fn snapshot_id_matches_fixed_encoding(#[case] encoded_hex: &str, #[case] expected_id: &str) {
+        // The fixtures were encoded directly from field tags, without prost.
+        let (digits, remainder) = encoded_hex.as_bytes().as_chunks::<2>();
+        assert!(remainder.is_empty());
+        let encoded = digits
+            .iter()
+            .map(|digits| u8::from_str_radix(std::str::from_utf8(digits).unwrap(), 16).unwrap())
+            .collect::<Vec<_>>();
+        let reference = SnapshotRef::decode(&encoded).unwrap();
+        assert_eq!(reference.encode(), encoded);
+        assert_eq!(
+            blake3::Hash::from_bytes(*reference.snapshot_id())
+                .to_hex()
+                .as_str(),
+            expected_id
+        );
+
+        // Identity covers canonical known fields, not the incoming wire spelling.
+        let mut reordered = encoded[2..].to_vec();
+        reordered.extend_from_slice(&encoded[..2]);
+        reordered.extend_from_slice(&[0xf8, 0x01, 0x01]); // Unknown field 31.
+        let restored = SnapshotRef::decode(&reordered).unwrap();
+        assert_eq!(restored.encode(), encoded);
+        assert_eq!(restored.snapshot_id(), reference.snapshot_id());
+
+        let mut non_minimal = vec![0x08, 0x81, 0x00];
+        non_minimal.extend_from_slice(&encoded[2..]);
+        let restored = SnapshotRef::decode(&non_minimal).unwrap();
+        assert_eq!(restored.encode(), encoded);
+        assert_eq!(restored.snapshot_id(), reference.snapshot_id());
+    }
+
+    #[rstest]
     #[case::commit_identity(true)]
     #[case::etag(false)]
     fn lightweight_identity_survives_transport(#[case] has_commit_identity: bool) {
@@ -400,6 +448,10 @@ mod tests {
     #[case::uri(|p: &mut pb::SnapshotRef| p.table_uri = "relative/table".into(), "absolute")]
     #[case::credentials(|p: &mut pb::SnapshotRef| p.table_uri = "s3://user:secret@bucket/table".into(), "credentials")]
     #[case::branch(|p: &mut pb::SnapshotRef| p.branch = Some("../other".into()), "branch")]
+    #[case::dot_segment(|p: &mut pb::SnapshotRef| p.branch = Some("a/./b".into()), "branch")]
+    #[case::trailing_dot_segment(|p: &mut pb::SnapshotRef| p.branch = Some("a/.".into()), "branch")]
+    #[case::single_dot(|p: &mut pb::SnapshotRef| p.branch = Some(".".into()), "branch")]
+    #[case::leading_dot_segment(|p: &mut pb::SnapshotRef| p.branch = Some("./a".into()), "branch")]
     #[case::main(|p: &mut pb::SnapshotRef| p.branch = Some("main".into()), "branch")]
     #[case::version(|p: &mut pb::SnapshotRef| p.version = 0, "version")]
     #[case::path(|p: &mut pb::SnapshotRef| p.manifest_path.clear(), "manifest_path")]
