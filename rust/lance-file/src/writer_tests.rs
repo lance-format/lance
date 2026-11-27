@@ -352,8 +352,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_v2_3_rle_singleton_minichunk_size_respects_final_chunk() {
+        // No adjacent values are equal. The repeated bit patterns still let
+        // the RLE child codecs win when their chunk boundaries are compatible.
+        let values: ArrayRef = Arc::new(Int64Array::from_iter_values(
+            (0..800).map(|row| i64::MIN + row % 2),
+        ));
+        let fields = [("two_chunks", "4096"), ("one_chunk", "8192")].map(|(name, target)| {
+            ArrowField::new(name, DataType::Int64, false).with_metadata(HashMap::from([
+                (COMPRESSION_META_KEY.into(), "zstd".into()),
+                (BSS_META_KEY.into(), "off".into()),
+                (DICT_DIVISOR_META_KEY.into(), "1000000".into()),
+                (MINICHUNK_SIZE_META_KEY.into(), target.into()),
+            ]))
+        });
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(fields.to_vec())),
+            vec![values; fields.len()],
+        )
+        .unwrap();
+        let version = ConcreteFileVersion::V2_3;
+        let fs = FsFixture::default();
+        let reader = write_minichunk_fixture(&fs, version, &batch, CompressionParams::new()).await;
+        let pages = &reader.metadata().column_infos;
+        let two_chunks = &pages[0].page_infos[0];
+        let words = minichunk_words(&fs, two_chunks, version).await;
+        assert_eq!(
+            words.iter().map(|word| word & 15).collect::<Vec<_>>(),
+            [9, 0]
+        );
+        let Compression::General(general) = minichunk_value_encoding(two_chunks) else {
+            panic!("expected General on the requested 512-value chunks");
+        };
+        assert!(matches!(
+            general.values.as_ref().unwrap().compression.as_ref(),
+            Some(Compression::Flat(_))
+        ));
+
+        // The RLE byte budget fits all 800 singleton runs in one final chunk.
+        let one_chunk = &pages[1].page_infos[0];
+        assert_eq!(minichunk_words(&fs, one_chunk, version).await.len(), 1);
+        let encoding = minichunk_value_encoding(one_chunk);
+        let inner = match encoding {
+            Compression::General(general) => general
+                .values
+                .as_ref()
+                .unwrap()
+                .compression
+                .as_ref()
+                .unwrap(),
+            other => other,
+        };
+        assert!(matches!(inner, Compression::Rle(_)), "{encoding:?}");
+        assert_minichunk_scan_and_take(&reader, &batch).await;
+    }
+
+    #[tokio::test]
     async fn test_v2_3_minichunk_float_codec_precedence() {
         let rows = 16 * 1024 + 37;
+        // The first 64 values used in the entropy check vary in only two bytes,
+        // each with eight equally frequent byte values (1.5 bits/byte on average).
         let values: ArrayRef = Arc::new(Float32Array::from_iter_values(
             (0..rows).map(|i| (i + 1024) as f32 * 0.25),
         ));
@@ -571,19 +629,105 @@ mod tests {
     }
 
     #[rstest]
-    #[case::malformed_metadata(ConcreteFileVersion::V2_2, Some("32KiB"), None, "positive integer")]
-    #[case::zero_metadata(ConcreteFileVersion::V2_3, Some("0"), None, "positive byte count")]
-    #[case::negative_programmatic(ConcreteFileVersion::V2_3, None, Some(-1), "positive byte count")]
-    #[case::v2_1_metadata(ConcreteFileVersion::V2_1, Some("8187"), None, "at most 8186")]
-    #[case::v2_1_programmatic(ConcreteFileVersion::V2_1, None, Some(32768), "at most 8186")]
+    #[case::malformed_metadata(ConcreteFileVersion::V2_2, "32KiB", 4u32)]
+    #[case::negative_metadata(ConcreteFileVersion::V2_3, "-1", 2u32)]
+    #[case::oversized_v2_1_metadata(ConcreteFileVersion::V2_1, "32768", 4u32)]
+    #[tokio::test]
+    async fn test_variable_minichunk_size_retains_legacy_metadata(
+        #[case] version: ConcreteFileVersion,
+        #[case] target: &str,
+        #[case] values_per_chunk: u32,
+    ) {
+        let field = ArrowField::new("data", DataType::Utf8, false).with_metadata(HashMap::from([
+            (MINICHUNK_SIZE_META_KEY.into(), target.into()),
+            (COMPRESSION_META_KEY.into(), "none".into()),
+            (DICT_DIVISOR_META_KEY.into(), "1000000".into()),
+        ]));
+        let array = StringArray::from_iter_values((0..12).map(|row| format!("{row:04}")));
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![field])),
+            vec![Arc::new(array)],
+        )
+        .unwrap();
+        let mut params = CompressionParams::new();
+        params.columns.insert(
+            "data".into(),
+            CompressionFieldParams {
+                // Four strings with their offsets fit, but eight are over budget.
+                minichunk_size: Some(64),
+                ..Default::default()
+            },
+        );
+        let fs = FsFixture::default();
+        let reader = write_minichunk_fixture(&fs, version, &batch, params).await;
+        let page = &reader.metadata().column_infos[0].page_infos[0];
+        let words = minichunk_words(&fs, page, version).await;
+        assert_eq!(words.len(), batch.num_rows() / values_per_chunk as usize);
+        let (last, nonfinal) = words.split_last().unwrap();
+        assert_eq!(last & 15, 0);
+        assert!(
+            nonfinal
+                .iter()
+                .all(|word| word & 15 == values_per_chunk.ilog2()),
+            "{words:?}"
+        );
+        assert_minichunk_scan_and_take(&reader, &batch).await;
+    }
+
+    #[rstest]
+    #[case::malformed_metadata(
+        ConcreteFileVersion::V2_2,
+        DataType::Int64,
+        Some("32KiB"),
+        None,
+        "positive integer"
+    )]
+    #[case::zero_metadata(
+        ConcreteFileVersion::V2_3,
+        DataType::Int64,
+        Some("0"),
+        None,
+        "positive byte count"
+    )]
+    #[case::negative_programmatic(ConcreteFileVersion::V2_3, DataType::Int64, None, Some(-1), "positive byte count")]
+    #[case::v2_1_metadata(
+        ConcreteFileVersion::V2_1,
+        DataType::Int64,
+        Some("8187"),
+        None,
+        "at most 8186"
+    )]
+    #[case::v2_1_shared_metadata(
+        ConcreteFileVersion::V2_1,
+        DataType::Int64,
+        Some("32768"),
+        None,
+        "at most 8186"
+    )]
+    #[case::v2_1_programmatic(
+        ConcreteFileVersion::V2_1,
+        DataType::Int64,
+        None,
+        Some(32768),
+        "at most 8186"
+    )]
+    #[case::v2_1_binary_programmatic(
+        ConcreteFileVersion::V2_1,
+        DataType::Utf8,
+        Some("32768"),
+        Some(32768),
+        "at most 32767"
+    )]
+    #[case::binary_negative_programmatic(ConcreteFileVersion::V2_3, DataType::Utf8, Some("32KiB"), Some(-1), "positive byte count")]
     #[tokio::test]
     async fn test_minichunk_size_rejects_invalid_and_unsupported_settings(
         #[case] version: ConcreteFileVersion,
+        #[case] data_type: DataType,
         #[case] metadata: Option<&str>,
         #[case] target: Option<i64>,
         #[case] message: &str,
     ) {
-        let mut field = ArrowField::new("data", DataType::Int64, false);
+        let mut field = ArrowField::new("data", data_type, false);
         if let Some(metadata) = metadata {
             field = field.with_metadata(HashMap::from([(
                 MINICHUNK_SIZE_META_KEY.into(),

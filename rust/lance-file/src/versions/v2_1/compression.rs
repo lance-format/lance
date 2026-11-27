@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use arrow_schema::DataType;
+use lance_arrow::DataTypeExt;
 use lance_core::{Error, Result, datatypes::Field};
 use lance_encoding::compression::PerValueGeneralCompression;
 use lance_encoding::{
@@ -22,6 +22,9 @@ use lance_encoding::{
     },
 };
 
+// Binary metadata has historically ignored hints at or above 32 KiB.
+const MAX_BINARY_MINICHUNK_BYTES: i64 = 32 * 1024 - 1;
+
 #[derive(Debug, Clone)]
 pub(super) struct Strategy {
     params: CompressionParams,
@@ -36,21 +39,32 @@ impl Strategy {
         let mut params = self
             .params
             .get_field_params(&field.name, &field.data_type());
-        params.merge(&field_metadata_params(field));
+        let mut metadata = field_metadata_params(field);
+        if let Some(size) = metadata.minichunk_size
+            && size > MAX_BINARY_MINICHUNK_BYTES
+        {
+            log::warn!(
+                "minichunk_size '{size}' is too large for the selected u16 miniblock layout, using default"
+            );
+            metadata.minichunk_size = None;
+        }
+        params.merge(&metadata);
         params
     }
 }
 
 impl CompressionStrategy for Strategy {
     fn minichunk_size(&self, field: &Field) -> Result<Option<u64>> {
-        let Some(size) = self.params.minichunk_size(field)? else {
+        let Some(size) = self
+            .params
+            .minichunk_size(field, Some(MAX_BINARY_MINICHUNK_BYTES))?
+        else {
             return Ok(None);
         };
-        let max = match field.data_type() {
-            DataType::Binary | DataType::LargeBinary | DataType::Utf8 | DataType::LargeUtf8 => {
-                32 * 1024 - 1
-            }
-            _ => MAX_MINIBLOCK_BYTES,
+        let max = if field.data_type().is_binary_like() {
+            MAX_BINARY_MINICHUNK_BYTES as u64
+        } else {
+            MAX_MINIBLOCK_BYTES
         };
         if size > max {
             return Err(Error::invalid_input(format!(

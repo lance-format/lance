@@ -9,6 +9,7 @@
 use std::collections::HashMap;
 
 use arrow_schema::DataType;
+use lance_arrow::DataTypeExt;
 use lance_core::{Error, Result, datatypes::Field};
 
 use crate::constants::MINICHUNK_SIZE_META_KEY;
@@ -173,17 +174,42 @@ impl CompressionParams {
         params
     }
 
-    /// Resolve the positive mini-block byte target, with field metadata taking precedence
-    /// over programmatic column and type settings. `None` uses the codec default.
-    pub fn minichunk_size(&self, field: &Field) -> Result<Option<u64>> {
-        let size = match minichunk_size_from_metadata(field)? {
-            Some(size) => Some(size),
-            None if self.columns.is_empty() && self.types.is_empty() => None,
-            None => {
-                self.get_field_params(&field.name, &field.data_type())
-                    .minichunk_size
+    /// Validate the effective mini-block byte target, with field metadata taking
+    /// precedence over programmatic column and type settings. Binary-like fields
+    /// keep their historical metadata parsing. `max_binary_metadata_size` sets
+    /// the largest binary metadata hint accepted by the selected file version.
+    /// A nonpositive legacy hint is handled by the binary encoder and returns `None`.
+    pub fn minichunk_size(
+        &self,
+        field: &Field,
+        max_binary_metadata_size: Option<i64>,
+    ) -> Result<Option<u64>> {
+        let metadata = minichunk_size_from_metadata(field);
+        if matches!(&metadata, Ok(None)) && self.columns.is_empty() && self.types.is_empty() {
+            return Ok(None);
+        }
+        let data_type = field.data_type();
+        let metadata_size = if data_type.is_binary_like() {
+            let metadata_size = metadata
+                .ok()
+                .flatten()
+                .filter(|&size| max_binary_metadata_size.is_none_or(|max| size <= max));
+            if let Some(size) = metadata_size {
+                // The binary codec accepts signed metadata hints. In particular,
+                // a nonpositive hint still selects its minimum chunk cardinality.
+                return Ok(u64::try_from(size).ok().filter(|&size| size > 0));
             }
+            None
+        } else if data_type.is_fixed_stride() || matches!(data_type, DataType::Interval(_)) {
+            metadata?
+        } else {
+            // Dictionary and packed columns do not use the field's value target.
+            return Ok(None);
         };
+        let size = metadata_size.or_else(|| {
+            self.get_field_params(&field.name, &data_type)
+                .minichunk_size
+        });
         size.map(|size| {
             if size <= 0 {
                 return Err(Error::invalid_input(format!(

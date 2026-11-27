@@ -56,7 +56,7 @@ impl Strategy {
 
 impl CompressionStrategy for Strategy {
     fn minichunk_size(&self, field: &Field) -> Result<Option<u64>> {
-        self.params.minichunk_size(field)
+        self.params.minichunk_size(field, None)
     }
 
     fn allows_byte_wide_fsl_booleans(&self) -> bool {

@@ -37,31 +37,24 @@ impl Strategy {
         params.merge(&field_metadata_params(field));
         params
     }
-}
 
-impl CompressionStrategy for Strategy {
-    fn minichunk_size(&self, field: &Field) -> Result<Option<u64>> {
-        self.params.minichunk_size(field)
-    }
-
-    fn create_miniblock_compressor(
-        &self,
+    fn select_miniblock_compressor(
         field: &Field,
         data: &DataBlock,
+        params: &CompressionFieldParams,
     ) -> Result<Box<dyn MiniBlockCompressor>> {
-        let params = self.field_params(field);
         let compressor =
-            if let Some(compressor) = try_uncompressed_fixed_width_miniblock(data, &params) {
+            if let Some(compressor) = try_uncompressed_fixed_width_miniblock(data, params) {
                 compressor
-            } else if let Some(compressor) = try_byte_stream_split_miniblock(data, &params) {
+            } else if let Some(compressor) = try_byte_stream_split_miniblock(data, params) {
                 compressor
-            } else if let Some(compressor) = try_fixed_u8_rle_miniblock(data, &params) {
+            } else if let Some(compressor) = try_fixed_u8_rle_miniblock(data, params) {
                 compressor
-            } else if let Some(compressor) = try_bitpacking_miniblock_with_target(data, &params) {
+            } else if let Some(compressor) = try_bitpacking_miniblock_with_target(data, params) {
                 compressor
             } else if let Some(compressor) = try_raw_fixed_width_miniblock(data) {
                 compressor
-            } else if let Some(compressor) = try_variable_width_miniblock(field, data, &params)? {
+            } else if let Some(compressor) = try_variable_width_miniblock(field, data, params)? {
                 compressor
             } else if let Some(compressor) = try_fixed_packed_struct_miniblock(data)? {
                 compressor
@@ -76,7 +69,32 @@ impl CompressionStrategy for Strategy {
                     .into(),
                 ));
             };
-        finalize_miniblock_compressor(data, compressor, &params)
+        finalize_miniblock_compressor(data, compressor, params)
+    }
+}
+
+impl CompressionStrategy for Strategy {
+    fn minichunk_size(&self, field: &Field) -> Result<Option<u64>> {
+        self.params.minichunk_size(field, None)
+    }
+
+    fn create_miniblock_compressor(
+        &self,
+        field: &Field,
+        data: &DataBlock,
+    ) -> Result<Box<dyn MiniBlockCompressor>> {
+        Self::select_miniblock_compressor(field, data, &self.field_params(field))
+    }
+
+    fn create_dictionary_index_compressor(
+        &self,
+        field: &Field,
+        data: &DataBlock,
+    ) -> Result<Box<dyn MiniBlockCompressor>> {
+        let mut params = self.field_params(field);
+        // Value chunk targets do not control the dictionary index codec.
+        params.minichunk_size = None;
+        Self::select_miniblock_compressor(field, data, &params)
     }
 
     fn create_per_value(

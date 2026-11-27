@@ -37,10 +37,7 @@ use crate::{
     encodings::{
         logical::primitive::{
             fullzip::PerValueCompressor,
-            miniblock::{
-                MAX_MINIBLOCK_BYTES, MAX_MINIBLOCK_VALUES, MiniBlockCompressionContext,
-                MiniBlockCompressor,
-            },
+            miniblock::{MAX_MINIBLOCK_VALUES, MiniBlockCompressionContext, MiniBlockCompressor},
         },
         physical::{
             alp::{AlpMiniBlockDecompressor, AlpMiniBlockEncoder, should_use_alp},
@@ -365,20 +362,6 @@ fn try_child_rle_for_mini_block(
     params: &CompressionFieldParams,
 ) -> Option<Box<dyn MiniBlockCompressor>> {
     let raw_bytes = rle_is_applicable(data, params)?;
-    if params.rle_threshold.is_none()
-        && let Some(target) = explicit_general_chunk_target(params)
-        && data.expect_single_stat::<UInt64Type>(Stat::RunCount) == data.num_values
-    {
-        // With only singleton runs, RLE adds a length byte to each value
-        // before applying the child codecs. Use General directly when that
-        // extra byte and the legacy RLE budget would change the chunk count.
-        let run_bytes = data.bits_per_value / 8 + 1;
-        let max_values = (*MAX_MINIBLOCK_VALUES).min(MAX_MINIBLOCK_BYTES / run_bytes);
-        let chunk_values = 1 << max_values.ilog2();
-        if general_chunk_target_conflicts(data, target, chunk_values) {
-            return None;
-        }
-    }
     // Plain u8 runs retain full blocks. Composite RLE uses smaller blocks to
     // bound child materialization during random reads; estimate both in one pass.
     let (run_length_width, estimated_bytes, max_values) = select_miniblock_run_length_width(
@@ -388,15 +371,23 @@ fn try_child_rle_for_mini_block(
     )
     .ok()?;
     let child_compression = rle_child_compression_config(params);
-    let encoder = || {
-        RleEncoder::with_child_encoding(
-            run_length_width,
-            child_compression,
-            child_compression,
-            true,
-        )
-        .with_max_miniblock_values(max_values as usize)
-    };
+    let encoder = RleEncoder::with_child_encoding(
+        run_length_width,
+        child_compression,
+        child_compression,
+        true,
+    )
+    .with_max_miniblock_values(max_values as usize);
+    if params.rle_threshold.is_none()
+        && let Some(target) = explicit_general_chunk_target(params)
+        && data.expect_single_stat::<UInt64Type>(Stat::RunCount) == data.num_values
+        && general_chunk_target_values(data, target)
+            .is_none_or(|values| !encoder.singleton_chunks_match(data, values))
+    {
+        // A singleton run adds a length entry to every value. Give General
+        // the requested chunk boundaries when RLE would change them.
+        return None;
+    }
 
     #[cfg(feature = "bitpacking")]
     let bitpack_bytes = estimate_inline_bitpacking_bytes(data).map(u128::from);
@@ -407,12 +398,12 @@ fn try_child_rle_for_mini_block(
         && (estimated_bytes >= raw_bytes
             || bitpack_bytes.is_some_and(|bytes| bytes < estimated_bytes));
     let selected_bytes = if should_measure_children {
-        encoder().estimated_payload_size(data).ok()?
+        encoder.estimated_payload_size(data).ok()?
     } else {
         estimated_bytes
     };
 
-    rle_beats_raw_and_bitpacking(data, selected_bytes, raw_bytes).then(|| Box::new(encoder()) as _)
+    rle_beats_raw_and_bitpacking(data, selected_bytes, raw_bytes).then(|| Box::new(encoder) as _)
 }
 
 fn rle_child_compression_config(params: &CompressionFieldParams) -> Option<CompressionConfig> {
@@ -776,10 +767,22 @@ fn explicit_general_chunk_target(params: &CompressionFieldParams) -> Option<u64>
     if matches!(params.compression.as_deref(), Some("lz4" | "zstd")) {
         params
             .minichunk_size
-            .and_then(|size| u64::try_from(size).ok())
+            .filter(|&size| size > 0)
+            .map(|size| size as u64)
     } else {
         None
     }
+}
+
+fn general_chunk_target_values(data: &FixedWidthDataBlock, target: u64) -> Option<u64> {
+    let context =
+        MiniBlockCompressionContext::new(0, true, true).with_fixed_width_chunk_target(target);
+    context
+        .fixed_width_values_per_chunk(data.num_values, 1, 1, |values| {
+            values * (data.bits_per_value / 8)
+        })
+        .ok()
+        .flatten()
 }
 
 fn general_chunk_target_conflicts(
@@ -790,18 +793,10 @@ fn general_chunk_target_conflicts(
     if !matches!(data.bits_per_value, 8 | 16 | 32 | 64) {
         return false;
     }
-    let context =
-        MiniBlockCompressionContext::new(0, true, true).with_fixed_width_chunk_target(target);
-    match context.fixed_width_values_per_chunk(data.num_values, 1, 1, |values| {
-        values * (data.bits_per_value / 8)
-    }) {
-        Ok(Some(values)) => {
-            values != codec_chunk_values && data.num_values > values.min(codec_chunk_values)
-        }
-        Ok(None) => false,
-        // Let the encoder that handles explicit targets report an unusable budget.
-        Err(_) => true,
-    }
+    // Let the encoder that handles explicit targets report an unusable budget.
+    general_chunk_target_values(data, target).is_none_or(|values| {
+        values != codec_chunk_values && data.num_values > values.min(codec_chunk_values)
+    })
 }
 
 /// Select modern ALP compression for an applicable floating-point miniblock.

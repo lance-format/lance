@@ -1023,9 +1023,14 @@ automatic inline bitpacking or ALP chunk size lower priority. Explicit ALP
 and Pcodec requests retain their codec-specific chunk sizing. Automatic RLE
 with only singleton runs also yields when its chunk size conflicts with the
 target. RLE with repeated values, dictionaries, and FullZip keep their own
-sizing policies. Unset uses the selected codec's default. Lance 2.1 uses default
-fixed-width chunking for targets up to 8,186 bytes and rejects larger
-fixed-width targets.
+sizing policies. An unset target uses the selected codec's default.
+
+Lance 2.1 uses its default fixed-width chunking for targets up to 8,186 bytes.
+Reusing a schema with a larger fixed-width target, such as 32 KiB on an
+`int64` list item, now returns an error in 2.1 where earlier writers used
+default chunking. For binary and string values, Lance 2.1 continues to ignore
+field metadata hints of 32 KiB or more. An effective programmatic target for
+those values must be smaller than 32 KiB in 2.1.
 
 #### Run Length Encoding (RLE) Threshold
 
