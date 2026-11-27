@@ -415,9 +415,9 @@ packed structs can compose with sparse structure. Codec selection is a writer po
 
 #### Integer Bitpacking
 
-`IntegerBitpacking` is a value codec in unstable Lance 2.3. It may appear directly in
-`ChunkedValues.compression`, with `num_buffers = 1` and no dictionary. It supports 8-, 16-, 32-, and
-64-bit integer and temporal leaf values. `bits_per_value` is the physical width `W` of that leaf.
+`IntegerBitpacking` is a value codec in unstable Lance 2.3. It is valid only as the direct
+`ChunkedValues.compression` in `PlanarLayout`, with `num_buffers = 1` and no dictionary. It supports
+8-, 16-, 32-, and 64-bit integer and temporal leaf values. `bits_per_value` is the leaf's physical width `W`.
 The codec treats the original value bits as words modulo `2^W`. Signedness, time unit, and time zone
 are defined by the column schema. The dense or sparse structure determines which slots are null.
 
@@ -437,26 +437,31 @@ reference words and logical residuals that follow. Reference words are little-en
   `1 <= i < n`. Restore `x[i]` by adding `d` and residual `i - 1` to the restored `x[i - 1]`.
 
 All subtractions and additions wrap modulo `2^W`. The writer chooses the reference words and can
-use any reference for which every residual fits in `b` bits. The width must be in `0..=W`. At width
-zero all residuals are zero and the packed payload is empty. For delta mode this represents a constant
-stride, so a reader can compute `x[i] = x[0] + i * d` modulo `2^W` directly.
+use any reference for which every residual fits in `b` bits. A chunk must satisfy both `0 <= b <= W`
+and the 8186-byte value buffer limit below. At width zero all residuals are zero and the packed
+payload is empty. For delta mode this represents a constant stride, so a reader can compute
+`x[i] = x[0] + i * d` modulo `2^W` directly.
 
-A chunk with `n = 1024` packs 1024 residual positions. Delta mode fills the final residual position
-with zero. For `b > 0`, the payload is `128 * b` bytes organized as little-endian `W`-bit words.
+A chunk with `n = 1024` packs 1024 residual positions. Delta mode requires the entire final residual
+position to be zero. For `b > 0`, the payload is `128 * b` bytes organized as little-endian `W`-bit words.
 Set `L = 1024 / W` and `O = [0, 4, 2, 6, 1, 5, 3, 7]`. Lane `l`, for `0 <= l < L`, owns words
 `j * L + l` for `0 <= j < b`. Read those words in that order, least significant bit first within each
 word. Row `r`, for `0 <= r < W`, occupies bits `r * b` through `(r + 1) * b - 1` of that lane's
 bit stream. It holds the residual at position `O[floor(r / 8)] * 16 + (r mod 8) * 128 + l`.
-This ordering applies at width `W` too.
+This ordering applies at `b = W` whenever the resulting buffer fits the length limit.
 
 For `n < 1024`, pack just the logical residuals consecutively, least significant bit first within each
-residual and within each byte. A count of `m` residuals uses `ceil(m * b / 8)` bytes. The high unused
-bits in the final byte are zero. This layout also applies to shorter nonfinal chunks.
+residual and within each byte. A count of `m` residuals uses `ceil(m * b / 8)` bytes. All unused high
+bits in the final payload byte must be zero. This layout also applies to shorter nonfinal chunks.
 
-The buffer length is exactly the control word, the mode's reference words, and the packed payload,
-with a maximum of 8186 bytes. The enclosing mini-block applies its usual 8-byte buffer alignment.
+The exact value buffer length is `2 * (W / 8) + payload_bytes` in mode 0 and
+`3 * (W / 8) + payload_bytes` in mode 1. It must be at most 8186 bytes before the enclosing
+mini-block applies its usual 8-byte buffer alignment. With `n = 1024` and `b = W = 64`, the value
+buffer would require 8208 bytes in mode 0 or 8216 bytes in mode 1, so both chunks are invalid.
 Readers reject unsupported leaf widths and locations, invalid counts, modes 2 and 3, widths above
-`W`, nonzero payload padding, and lengths that differ from the expected length or exceed the maximum.
+`W`, and lengths that differ from the expected length or exceed the maximum. Readers must also reject
+a nonzero final residual position in a 1024-value delta chunk or nonzero unused high bits in the
+final payload byte of a shorter chunk.
 Lance 2.0–2.2 retain their existing value codecs and on-disk representations.
 
 #### Sparse Structural Domains
