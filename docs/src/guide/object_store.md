@@ -510,19 +510,19 @@ The following keys can be used as both environment variables or keys in the
 ### Dataset URIs
 
 Lance uses the same Azure URI resolver in Rust, Python, and Java builds with Azure
-support. The built-in Azure provider handles `az://` and `abfss://` dataset URIs.
+support. The table and examples below use the default Azure backend.
 
 | Service | Dataset URI | Account configuration |
 |---------|-------------|-----------------------|
 | Azure Blob Storage | `az://<container>/<path>` | Set `account_name` in storage options or `AZURE_STORAGE_ACCOUNT_NAME` in the environment. |
-| Azure Blob Storage, native backend | `az://<container>@<account>.blob.core.windows.net/<path>` | The URI supplies the account. The native backend also accepts the `dfs.core.windows.net` suffix in this form. |
+| Azure Blob Storage | `az://<container>@<account>.blob.core.windows.net/<path>` | The URI supplies the account. This form also accepts the `dfs.core.windows.net` suffix. |
 | Azure Data Lake Storage Gen2 | `abfss://<filesystem>@<account>.dfs.core.windows.net/<path>` | The URI supplies the account. |
-| Azure Data Lake Storage Gen2, native backend | `abfss://<filesystem>/<path>` | Set `account_name` in storage options or `AZURE_STORAGE_ACCOUNT_NAME` in the environment. |
-| Microsoft Fabric OneLake, native backend | `abfss://<workspace>@onelake.dfs.fabric.microsoft.com/<item>.lakehouse/Files/<path>` | The URI supplies the account and selects the Fabric endpoint. |
+| Azure Data Lake Storage Gen2 | `abfss://<filesystem>/<path>` | Set `account_name` in storage options or `AZURE_STORAGE_ACCOUNT_NAME` in the environment. |
+| Microsoft Fabric OneLake | `abfss://<workspace>@onelake.dfs.fabric.microsoft.com/<item>.lakehouse/Files/<path>` | The URI supplies the account and selects the Fabric endpoint. |
 
-When using `use_opendal=true`, use `az://<container>/<path>` with the account and
-`azure_endpoint` in storage options for Blob Storage. For ADLS Gen2, use the
-qualified `abfss://<filesystem>@<account>.dfs.core.windows.net/<path>` form.
+Use the default Azure backend (`use_opendal=false`) for datasets with a non-empty
+URI path. With `use_opendal=true`, requests for `az://` and `abfss://` can repeat
+the dataset prefix in the object path.
 
 The qualified `az://` form requires a full account hostname. A bare authority
 such as `az://container@account/path` fails Azure URL validation. The default

@@ -739,7 +739,7 @@ mod tests {
         "azdls"
     )]
     #[tokio::test]
-    async fn test_azure_uris_with_opendal(
+    async fn test_azure_uris_construct_opendal_store(
         #[case] uri: &str,
         #[case] expected_scheme: &str,
         #[case] expected_backend: &str,
