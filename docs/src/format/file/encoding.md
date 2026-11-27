@@ -1214,6 +1214,7 @@ options. However, they can also be set in the field metadata in the schema.
 | ------------------------------------ | ------------------------------------ | ---------------- | --------------------------------------------------------------------------------------- |
 | `lance-encoding:compression`         | `lz4`, `zstd`, `none`, ...           | `none`           | Opt-in to general compression. The value indicates the scheme.                          |
 | `lance-encoding:compression-level`   | Integers (range is scheme dependent) | Varies by scheme | Higher indicates more work should be done to compress the data.                         |
+| `lance-encoding:minichunk-size`      | Positive integer byte count          | Codec default    | Target uncompressed value bytes per MiniBlock chunk. See below.                         |
 | `lance-encoding:rle-threshold`       | `0.0-1.0`                            | `0.5`            | See below                                                                               |
 | `lance-encoding:bss`                 | `off`, `on`, `auto`                  | `auto`           | See below                                                                               |
 | `lance-encoding:dict-divisor`        | Integers greater than 1              | `2`              | See below                                                                               |
@@ -1255,6 +1256,38 @@ The compression level is scheme dependent. Currently the following schemes suppo
 Higher compression levels generally provide better compression at the cost of slower encoding speed. Decoding speed
 is typically less affected by the compression level.
 
+#### MiniBlock Chunk Size
+
+Lance 2.2 and later apply `lance-encoding:minichunk-size` to flat fixed-width,
+plain fixed-size-list, and byte-stream-split MiniBlock values. Set it on the
+field that owns the value buffers. For a variable-length list, this is the
+leaf item field, such as the `int64` item of `struct<value: list<int64>>`.
+A fixed-size list stored as one value takes the option on the fixed-size-list
+field.
+
+Non-final chunks contain the largest power-of-two count that fits the target,
+up to 32,768 values. `LANCE_MINIBLOCK_MAX_VALUES` can set a lower count limit.
+Targets that cannot fit a full chunk for the input are rejected.
+A fixed-size-list value counts as one complete list, including its item
+validity buffers in the byte budget. Dense nested chunks may use fewer values
+to fit repetition and definition levels. The 32,768-value cap limits flat
+`int64` and `float64` chunks to 256 KiB of uncompressed values, `int32` and
+`float32` to 128 KiB, and `int16` to 64 KiB.
+
+For an explicit `zstd` or `lz4` request, the writer gives an incompatible
+automatic inline bitpacking or ALP chunk size lower priority. Explicit ALP
+and Pcodec requests retain their codec-specific chunk sizing. Automatic RLE
+with only singleton runs also yields when its chunk size conflicts with the
+target. RLE with repeated values, dictionaries, and FullZip keep their own
+sizing policies. An unset target uses the selected codec's default.
+
+Lance 2.1 uses its default fixed-width chunking for targets up to 8,186 bytes.
+Reusing a schema with a larger fixed-width target, such as 32 KiB on an
+`int64` list item, now returns an error in 2.1 where earlier writers used
+default chunking. For binary and string values, Lance 2.1 continues to ignore
+field metadata hints of 32 KiB or more. An effective programmatic target for
+those values must be smaller than 32 KiB in 2.1.
+
 #### Run Length Encoding (RLE) Threshold
 
 The RLE threshold is used to determine whether or not to apply run-length encoding. The threshold is a ratio
@@ -1285,7 +1318,7 @@ BSS is a data transformation that makes floating-point data more compressible; i
 
 **Key points:**
 - Supported types: Only 32-bit and 64-bit data (f32, f64, timestamps)
-- Maximum chunk sizes: 1024 values (f32), 512 values (f64)
+- Default chunk sizes: 1024 values (f32), 512 values (f64). Lance 2.2 and later support an explicit MiniBlock byte target.
 - `auto` mode: Uses entropy analysis with 0.5 sensitivity threshold
 - `on` mode: Always applies BSS for supported types
 - `off` mode: Never applies BSS
