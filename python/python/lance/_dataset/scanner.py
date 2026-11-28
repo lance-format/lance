@@ -527,10 +527,10 @@ def _build_vector_search_query(
         Use stored IVF_RQ or SQ8 data without reading indexed original vectors.
         IVF_RQ overfetches this many one-bit candidates per result and reranks
         with its most accurate stored RQ data. IVF_SQ uses its native eight-bit
-        scan directly. IVF_HNSW_SQ expands the graph candidate pool and scores it
-        at the native eight-bit precision. Explicit ``ef`` must cover
-        ``k * quantized_refine_factor * refine_factor`` (missing factors are 1).
-        Its default grows with that budget. The factor must be positive.
+        scan directly. IVF_HNSW_SQ expands the graph candidate pool and reuses
+        graph search distances at the native eight-bit precision. Explicit ``ef``
+        must cover ``k * quantized_refine_factor * refine_factor`` (missing factors
+        are 1). Its default grows with that budget. The factor must be positive.
         Bounds apply before truncation. Exact refinement remains optional and
         reads original vectors, as do unindexed fragments and stale overlays.
         Legacy indices, other quantizers and multivectors are unsupported.
@@ -1162,8 +1162,8 @@ class ScannerBuilder:
             Use stored IVF_RQ or SQ8 data without reading indexed original vectors.
             IVF_RQ overfetches one-bit candidates and reranks with its most accurate
             stored representation. IVF_SQ uses its native eight-bit scan directly.
-            IVF_HNSW_SQ expands the graph candidate pool and scores selected
-            offsets at the native eight-bit precision. Explicit ``ef`` must cover
+            IVF_HNSW_SQ expands the graph candidate pool and reuses graph search
+            distances at the native eight-bit precision. Explicit ``ef`` must cover
             ``k * quantized_refine_factor * refine_factor`` (missing factors are 1).
             The default grows with that budget. The factor must be positive.
             Bounds apply before truncation. Combining with ``refine_factor`` adds

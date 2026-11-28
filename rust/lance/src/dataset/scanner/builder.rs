@@ -1265,8 +1265,8 @@ impl Scanner {
     /// use flat fallback and may read original vectors. If exact refinement is also
     /// configured, the quantized stage emits enough candidates for that exact stage.
     /// IVF_SQ uses its native eight-bit scan directly. IVF_HNSW_SQ expands
-    /// the graph candidate pool by `factor` and scores those storage offsets
-    /// at the native eight-bit precision. Explicit `ef` must be at least
+    /// the graph candidate pool by `factor` and reuses distances computed
+    /// during graph search at the native eight-bit precision. Explicit `ef` must be at least
     /// `k * factor * exact_refine_factor`, where the exact factor defaults
     /// to 1. The default `ef` grows with that budget. The factor must be positive.
     /// Unsupported quantizers, legacy indices and multivectors are rejected.

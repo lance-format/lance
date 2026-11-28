@@ -42,6 +42,7 @@ use roaring::RoaringBitmap;
 use rstest::rstest;
 
 use crate::Error;
+use crate::dataset::builder::DatasetBuilder;
 use crate::dataset::optimize::remapping::remap_column_index;
 use crate::dataset::optimize::{CompactionOptions, compact_files};
 use crate::dataset::scanner::test_dataset::{
@@ -4383,6 +4384,112 @@ async fn test_quantized_refinement_scores_selective_prefilter_shortcut_rows() {
             .iter()
             .all(|distance| distance.is_finite())
     );
+}
+
+#[tokio::test]
+async fn sq_hnsw_quantized_refinement_reuses_distances() {
+    let path = TempStrDir::default();
+    let mut dataset = gen_batch()
+        .col("vec", array::rand_vec::<Float32Type>(Dimension::from(8)))
+        .into_dataset_with_params(
+            path.as_str(),
+            FragmentCount::from(2),
+            FragmentRowCount::from(64),
+            Some(WriteParams {
+                max_rows_per_file: 64,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(dataset.fragments().len(), 2);
+    RefinementIndex::HnswSq.build(&mut dataset).await;
+    let dataset = DatasetBuilder::from_uri(path.as_str())
+        .with_index_cache_size_bytes(0)
+        .load()
+        .await
+        .unwrap();
+    let query = Float32Array::from(vec![0.3; 8]);
+    let scan = |k| {
+        let mut scan = dataset.scan();
+        scan.nearest("vec", &query, k)
+            .unwrap()
+            .nprobes(2)
+            .ef(64)
+            .with_row_id()
+            .project(&[ROW_ID])
+            .unwrap();
+        scan
+    };
+    let run_with_stats = |mut scan: Scanner| async move {
+        let stats = Arc::new(Mutex::new(ExecutionSummaryCounts::default()));
+        let captured = stats.clone();
+        scan.scan_stats_callback(Arc::new(move |summary| {
+            *captured.lock().unwrap() = summary.clone();
+        }));
+        let batch = scan.try_into_batch().await.unwrap();
+        let stats = stats.lock().unwrap().clone();
+        (batch, stats)
+    };
+    let scored_rows = |batch: &RecordBatch| {
+        batch_row_ids(batch)
+            .into_iter()
+            .zip(
+                batch[DIST_COL]
+                    .as_primitive::<Float32Type>()
+                    .values()
+                    .iter()
+                    .map(|distance| distance.to_bits()),
+            )
+            .collect::<Vec<_>>()
+    };
+    let (native, native_stats) = run_with_stats(scan(32)).await;
+    let mut refined = scan(8);
+    refined.quantized_refine(4);
+    let (refined, refined_stats) = run_with_stats(refined).await;
+    assert_eq!(refined.num_rows(), 8);
+    let native_distances = native[DIST_COL].as_primitive::<Float32Type>().values();
+    assert!(
+        native_distances[..9]
+            .windows(2)
+            .all(|pair| pair[0] < pair[1])
+    );
+    let native_rows = scored_rows(&native);
+    assert_eq!(scored_rows(&refined), native_rows[..8]);
+
+    let mut exact = scan(8);
+    exact.use_index(false);
+    let exact_ids = batch_row_ids(&exact.try_into_batch().await.unwrap());
+    let matches = batch_row_ids(&refined)
+        .iter()
+        .filter(|id| exact_ids.contains(id))
+        .count();
+    assert!(matches >= 4, "recall@8 = {matches}/8");
+    let loads = (native_stats.parts_loaded, refined_stats.parts_loaded);
+    let comparisons = (
+        native_stats.index_comparisons,
+        refined_stats.index_comparisons,
+    );
+    assert_eq!(
+        loads,
+        (2, 2),
+        "native and refined comparisons: {comparisons:?}"
+    );
+    assert_eq!(comparisons.0, comparisons.1);
+
+    let lower = Some(native_distances[2]);
+    let upper = Some(native_distances[7]);
+    let mut native_bounded = scan(32);
+    native_bounded.distance_range(lower, upper);
+    let native_bounded = native_bounded.try_into_batch().await.unwrap();
+    assert_eq!(scored_rows(&native_bounded), native_rows[2..7]);
+
+    let mut refined_bounded = scan(8);
+    refined_bounded
+        .quantized_refine(4)
+        .distance_range(lower, upper);
+    let refined_bounded = refined_bounded.try_into_batch().await.unwrap();
+    assert_eq!(scored_rows(&refined_bounded), scored_rows(&native_bounded));
 }
 
 #[rstest]

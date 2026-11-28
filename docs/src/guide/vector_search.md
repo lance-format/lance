@@ -336,7 +336,8 @@ Use `quantized_refine_factor` for refinement from stored index data. For flat
 `IVF_RQ`, it overfetches one-bit candidates and reranks them with the most accurate
 stored RQ representation. `IVF_SQ` already scans at its full eight-bit precision,
 so it uses that scan directly. For `IVF_HNSW_SQ`, the factor expands the graph
-candidate pool and scores it at the native eight-bit precision.
+candidate pool and reuses distances computed during graph search at the native
+eight-bit precision.
 An explicit `ef` must be at least `k * quantized_refine_factor * refine_factor`
 (missing factors are 1). The default grows with that candidate budget.
 

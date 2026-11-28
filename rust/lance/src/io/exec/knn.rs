@@ -2255,6 +2255,7 @@ impl ANNIvfSubIndexExec {
         candidate_limit: Option<usize>,
     ) -> DataFusionResult<RecordBatch> {
         let batch = if let Some(candidate_limit) = candidate_limit {
+            let index_type = index.index_type();
             let candidate_prefilter: Arc<dyn PreFilter> = match &seg_mask {
                 Some(restriction) => Arc::new(RestrictedPreFilter {
                     inner: pre_filter,
@@ -2262,7 +2263,7 @@ impl ANNIvfSubIndexExec {
                 }),
                 None => pre_filter,
             };
-            if index.index_type() == IndexType::IvfSq {
+            if index_type == IndexType::IvfSq {
                 // SQ8 already scores every selected row at its full precision.
                 // Native flat search applies bounds before truncating the heap.
                 let mut sq_query = query.clone();
@@ -2276,7 +2277,7 @@ impl ANNIvfSubIndexExec {
                     )
                     .await?;
                 restrict_to_segment(batch, seg_mask.as_deref())?
-            } else if index.index_type() == IndexType::IvfRq
+            } else if index_type == IndexType::IvfRq
                 && (query.lower_bound.is_some() || query.upper_bound.is_some())
             {
                 // Fast and Accurate scores use different scales. Let the
@@ -2301,7 +2302,7 @@ impl ANNIvfSubIndexExec {
             } else {
                 let mut coarse_query = query.clone();
                 coarse_query.refine_factor = None;
-                if index.index_type() == IndexType::IvfRq {
+                if index_type == IndexType::IvfRq {
                     coarse_query.approx_mode = ApproxMode::Fast;
                     coarse_query.lower_bound = None;
                     coarse_query.upper_bound = None;
@@ -2319,18 +2320,29 @@ impl ANNIvfSubIndexExec {
                         DataFusionError::from(e)
                             .context("failed to discover quantized refinement candidates")
                     })?;
-                let offsets = candidates
-                    .candidates
-                    .iter()
-                    .map(|candidate| candidate.offset_in_partition)
-                    .collect::<Vec<_>>();
-                let scored = index
-                    .score_partition_candidates(part_id, &query, &offsets, &metrics.index_metrics)
-                    .await
-                    .map_err(|e| {
-                        DataFusionError::from(e)
-                            .context("failed to score quantized refinement candidates")
-                    })?;
+                let scored = if index_type == IndexType::IvfRq {
+                    // Fast RQ discovery scores need to be recomputed at Accurate precision.
+                    let offsets = candidates
+                        .candidates
+                        .iter()
+                        .map(|candidate| candidate.offset_in_partition)
+                        .collect::<Vec<_>>();
+                    index
+                        .score_partition_candidates(
+                            part_id,
+                            &query,
+                            &offsets,
+                            &metrics.index_metrics,
+                        )
+                        .await
+                        .map_err(|e| {
+                            DataFusionError::from(e)
+                                .context("failed to score quantized refinement candidates")
+                        })?
+                } else {
+                    // HNSW already computed distances at the stored SQ8 precision.
+                    candidates.batch
+                };
                 let scored = restrict_to_segment(scored, seg_mask.as_deref())?;
                 quantized_top_k(&scored, &query).map_err(|e| {
                     DataFusionError::from(e)

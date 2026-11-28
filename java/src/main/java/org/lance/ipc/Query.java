@@ -432,7 +432,7 @@ public class Query {
      * truncation.
      *
      * <p>IVF_SQ uses its native eight-bit scan directly. IVF_HNSW_SQ expands the graph candidate
-     * pool and scores selected storage offsets at the native eight-bit precision. Explicit ef must
+     * pool and reuses graph search distances at the native eight-bit precision. Explicit ef must
      * cover k * quantizedRefineFactor * refineFactor (missing factors are 1). The default grows
      * with that budget. Legacy indices, other quantizers, and multivectors are unsupported.
      *
