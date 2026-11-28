@@ -10403,6 +10403,36 @@ def test_field_metadata_multiple_fields(tmp_path: Path):
     assert str_field.metadata["encoding"] == "utf8"
 
 
+@pytest.mark.parametrize("data_storage_version", ["2.0", "2.1", "2.2"])
+def test_field_metadata_rejects_decoding_change(tmp_path: Path, data_storage_version):
+    """A metadata update cannot change how a column's stored data decodes."""
+    struct_type = pa.struct([("a", pa.int32()), ("b", pa.int32())])
+    tbl = pa.table(
+        {
+            "s": pa.array([{"a": 1, "b": 2}, {"a": 3, "b": 4}], struct_type),
+            "l": pa.array([[1, 2], [3]], pa.list_(pa.int32())),
+            "bin": pa.array([b"x", b"yy"], pa.large_binary()),
+        }
+    )
+    ds = lance.write_dataset(tbl, tmp_path, data_storage_version=data_storage_version)
+    version = ds.version
+
+    with pytest.raises(OSError, match="'s'.*packed"):
+        ds.update_field_metadata({"s": {"packed": "true"}})
+    with pytest.raises(OSError, match="'l'.*packed"):
+        ds.update_field_metadata({"l": {"packed": "true"}})
+    with pytest.raises(OSError, match="'bin'.*lance-encoding:blob"):
+        ds.update_field_metadata({"bin": {"lance-encoding:blob": "true"}})
+
+    ds = lance.dataset(tmp_path)
+    assert ds.version == version
+    assert ds.to_table() == tbl
+
+    # Other keys on the same columns are still updatable.
+    ds.update_field_metadata({"s": {"description": "a struct"}})
+    assert ds.to_table() == tbl
+
+
 def test_metadata_apis_return_post_image(tmp_path: Path):
     """Test that metadata update methods return the post-update state."""
     arr = pa.array([1, 2, 3])

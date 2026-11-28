@@ -52,7 +52,9 @@ use crate::transaction::UpdateMode::{RewriteColumns, RewriteRows};
 use crate::transaction::prepare::{FragReuseUpdate, PreparedIndices};
 use crate::transaction::row_version::resolve_update_version_metadata;
 use crate::transaction::update_map::apply_update_map;
-use crate::transaction::validate::merge_fragment_physically_rewritten;
+use crate::transaction::validate::{
+    check_field_decoding_unchanged, merge_fragment_physically_rewritten,
+};
 use crate::transaction::{
     CoverageIdentity, DataReplacementGroup, LogicalIndexSegments, Operation, ReadVersionState,
     RewriteGroup, Transaction, UpdatedFragmentOffsets,
@@ -1935,6 +1937,9 @@ impl Transaction {
             inherit_sticky_feature_flags(&mut manifest, current_manifest)?;
         }
 
+        // Refusing a field metadata update that changes how a field decodes
+        // waits for the blob nesting check, which has the more specific error.
+        let mut decoding_check = Ok(());
         match &self.operation {
             Operation::Overwrite {
                 config_upsert_values: Some(tm),
@@ -2026,6 +2031,8 @@ impl Transaction {
                         .iter()
                         .any(|entry| entry.key == LANCE_UNENFORCED_CLUSTERING_KEY_POSITION)
                 });
+                let schema_before_field_updates =
+                    (!field_metadata_updates.is_empty()).then(|| manifest.schema.clone());
                 for (field_id, field_metadata_update) in field_metadata_updates {
                     if let Some(field) = manifest.schema.field_by_id_mut(*field_id) {
                         apply_update_map(&mut field.metadata, field_metadata_update);
@@ -2052,6 +2059,9 @@ impl Transaction {
                             format!("Field with id {} does not exist", field_id).into(),
                         ));
                     }
+                }
+                if let Some(before) = &schema_before_field_updates {
+                    decoding_check = check_field_decoding_unchanged(before, &manifest.schema);
                 }
                 let primary_key_after: Vec<i32> = manifest
                     .schema
@@ -2113,6 +2123,7 @@ impl Transaction {
             &manifest,
             current_manifest.filter(|_| !matches!(self.operation, Operation::Overwrite { .. })),
         )?;
+        decoding_check?;
 
         if changes_auto_cleanup_config(&self.operation) {
             validate_auto_cleanup_config(&manifest)?;

@@ -255,12 +255,15 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+    use crate::blob::{BlobArrayBuilder, blob_field};
     use crate::dataset::WriteParams;
     use crate::dataset::builder::DatasetBuilder;
+    use arrow_array::cast::AsArray;
     use arrow_array::{
         ArrayRef, Int32Array, RecordBatch, RecordBatchIterator, UInt32Array, types::Int32Type,
     };
     use arrow_schema::{DataType, Field as ArrowField, Fields, Schema as ArrowSchema};
+    use lance_file::version::LanceFileVersion;
 
     struct AppendBeforeCommit {
         inner: Arc<dyn CommitHandler>,
@@ -1380,5 +1383,246 @@ mod tests {
             .await
             .expect("the repairing delete must not be blocked");
         assert_eq!(dataset.count_rows(None).await.unwrap(), 1);
+    }
+
+    /// A dataset of `num_rows` rows across fragments of two. `s` is a struct,
+    /// `l` a list, `n` a struct nesting a struct, and `bin` a binary column;
+    /// `packed` and `blob` choose whether `s` and `bin` are written with the
+    /// encoding that field metadata selects.
+    async fn dataset_with_encoded_columns(
+        version: LanceFileVersion,
+        packed: bool,
+        blob: bool,
+        num_rows: usize,
+    ) -> Dataset {
+        let struct_fields = Fields::from(vec![
+            ArrowField::new("a", DataType::Int32, true),
+            ArrowField::new("b", DataType::Int32, true),
+        ]);
+        let mut s = ArrowField::new("s", DataType::Struct(struct_fields.clone()), true);
+        if packed {
+            s = s.with_metadata(HashMap::from([("packed".to_string(), "true".to_string())]));
+        }
+        let inner_fields = Fields::from(vec![ArrowField::new("x", DataType::Int32, true)]);
+        let inner = ArrowField::new("inner", DataType::Struct(inner_fields.clone()), true);
+        let mut bin = ArrowField::new("bin", DataType::LargeBinary, true);
+        if blob {
+            bin = bin.with_metadata(HashMap::from([(
+                lance_arrow::BLOB_META_KEY.to_string(),
+                "true".to_string(),
+            )]));
+        }
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            s,
+            ArrowField::new_list("l", ArrowField::new_list_field(DataType::Int32, true), true),
+            ArrowField::new("n", DataType::Struct(vec![inner.clone()].into()), true),
+            bin,
+        ]));
+        let ids = (0..num_rows as i32).collect::<Vec<_>>();
+        let inner_array = arrow_array::StructArray::new(
+            inner_fields,
+            vec![Arc::new(Int32Array::from(ids.clone())) as ArrayRef],
+            None,
+        );
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(ids.clone())),
+                Arc::new(arrow_array::StructArray::new(
+                    struct_fields,
+                    vec![
+                        Arc::new(Int32Array::from(ids.clone())) as ArrayRef,
+                        Arc::new(Int32Array::from_iter_values(ids.iter().map(|i| i * 10))),
+                    ],
+                    None,
+                )),
+                Arc::new(
+                    arrow_array::ListArray::from_iter_primitive::<Int32Type, _, _>(
+                        ids.iter().map(|i| Some(vec![Some(*i), Some(i + 1)])),
+                    ),
+                ),
+                Arc::new(arrow_array::StructArray::new(
+                    vec![inner].into(),
+                    vec![Arc::new(inner_array) as ArrayRef],
+                    None,
+                )),
+                Arc::new(arrow_array::LargeBinaryArray::from_iter_values(
+                    ids.iter().map(|i| format!("payload-{i}").into_bytes()),
+                )),
+            ],
+        )
+        .unwrap();
+        let params = WriteParams {
+            data_storage_version: Some(version),
+            max_rows_per_file: 2,
+            ..Default::default()
+        };
+        Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            "memory://",
+            Some(params),
+        )
+        .await
+        .unwrap()
+    }
+
+    /// The values of every column but `bin`, and the `bin` payloads, read the
+    /// way a user reads them.
+    async fn read_encoded_columns(dataset: &Dataset) -> (Vec<ArrayRef>, Vec<Vec<u8>>) {
+        let batch = dataset
+            .scan()
+            .project(&["id", "s", "l", "n"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let num_rows = batch.num_rows() as u64;
+        let payloads = if dataset.schema().field("bin").unwrap().is_blob() {
+            let blobs = Arc::new(dataset.clone())
+                .take_blobs_by_indices(&(0..num_rows).collect::<Vec<_>>(), "bin")
+                .await
+                .unwrap();
+            let mut payloads = Vec::with_capacity(blobs.len());
+            for blob in blobs {
+                payloads.push(blob.unwrap().read().await.unwrap().to_vec());
+            }
+            payloads
+        } else {
+            let bins = dataset
+                .scan()
+                .project(&["bin"])
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap();
+            let bin = bins["bin"].as_binary::<i64>();
+            bin.iter().map(|v| v.unwrap().to_vec()).collect()
+        };
+        (batch.columns().to_vec(), payloads)
+    }
+
+    /// A field metadata update must not change how a field's data decodes:
+    /// data files keep the layout they were written with, so such an update
+    /// makes reads of the column fail or silently return it as nulls. Which
+    /// values count as a change is covered by the unit tests of the check.
+    #[rstest]
+    #[case::mark_struct_packed(false, false, "s", Some(("packed", "true")))]
+    #[case::mark_list_packed(false, false, "l", Some(("packed", "true")))]
+    #[case::replace_drops_packed(true, false, "s", None)]
+    #[case::mark_binary_blob(false, false, "bin", Some((lance_arrow::BLOB_META_KEY, "true")))]
+    #[tokio::test]
+    async fn test_update_field_metadata_rejects_decoding_change(
+        #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1, LanceFileVersion::V2_2)]
+        version: LanceFileVersion,
+        #[case] packed: bool,
+        #[case] blob: bool,
+        #[case] column: &str,
+        #[case] update: Option<(&str, &str)>,
+    ) {
+        let mut dataset = dataset_with_encoded_columns(version, packed, blob, 5).await;
+        let expected = read_encoded_columns(&dataset).await;
+        let version_before = dataset.version_id();
+
+        let builder = dataset.update_field_metadata();
+        let builder = match update {
+            Some(entry) => builder.update(column, [entry]),
+            None => builder.replace(column, [("description", "a column")]),
+        }
+        .unwrap();
+        let err = builder.await.unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "{err:?}");
+        let message = err.to_string();
+        assert!(message.contains(&format!("field '{column}'")), "{message}");
+        assert!(message.contains("read back wrong"), "{message}");
+
+        assert_eq!(dataset.version_id(), version_before);
+        assert_eq!(dataset.latest_version_id().await.unwrap(), version_before);
+        assert_eq!(read_encoded_columns(&dataset).await, expected);
+    }
+
+    /// The change is refused before any data is written too: a concurrent
+    /// writer that read the old schema can still commit a file in the old
+    /// layout, so whether data exists when the update lands proves nothing.
+    #[tokio::test]
+    async fn test_update_field_metadata_rejects_decoding_change_without_data() {
+        let mut dataset =
+            dataset_with_encoded_columns(LanceFileVersion::V2_1, false, false, 0).await;
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 0);
+
+        let err = dataset
+            .update_field_metadata()
+            .update("n.inner", [("packed", "true")])
+            .unwrap()
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "{err:?}");
+        assert!(err.to_string().contains("field 'n.inner'"), "{err}");
+    }
+
+    /// Updates that leave a field's decoding alone still apply to packed and
+    /// blob columns: other keys, and a replace that restates the encoding
+    /// under the other spelling of the packed key.
+    #[rstest]
+    #[tokio::test]
+    async fn test_update_field_metadata_keeps_decoding_when_allowed(
+        #[values(LanceFileVersion::V2_0, LanceFileVersion::V2_1, LanceFileVersion::V2_2)]
+        version: LanceFileVersion,
+    ) {
+        let mut dataset = dataset_with_encoded_columns(version, true, true, 5).await;
+        let expected = read_encoded_columns(&dataset).await;
+        dataset
+            .update_field_metadata()
+            .update("s", [("description", "a struct")])
+            .unwrap()
+            .update("bin", [("description", "a blob")])
+            .unwrap()
+            .await
+            .unwrap();
+        dataset
+            .update_field_metadata()
+            .replace("s", [("lance-encoding:packed", "true")])
+            .unwrap()
+            .await
+            .unwrap();
+        assert!(dataset.schema().field("s").unwrap().is_packed_struct());
+        assert!(dataset.schema().field("bin").unwrap().is_blob());
+        assert_eq!(read_encoded_columns(&dataset).await, expected);
+    }
+
+    /// Replacing a Blob v2 column's metadata cannot drop its extension name.
+    #[tokio::test]
+    async fn test_update_field_metadata_rejects_dropping_blob_v2() {
+        let schema = Arc::new(ArrowSchema::new(vec![blob_field("blob", true)]));
+        let mut blobs = BlobArrayBuilder::new(2);
+        blobs.push_bytes(b"first").unwrap();
+        blobs.push_bytes(b"second").unwrap();
+        let batch = RecordBatch::try_new(schema.clone(), vec![blobs.finish().unwrap()]).unwrap();
+        let params = WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        };
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            "memory://",
+            Some(params),
+        )
+        .await
+        .unwrap();
+        let version_before = dataset.version_id();
+
+        let err = dataset
+            .update_field_metadata()
+            .replace("blob", [("description", "a blob")])
+            .unwrap()
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "{err:?}");
+        assert!(
+            err.to_string().contains(lance_arrow::ARROW_EXT_NAME_KEY),
+            "{err}"
+        );
+        assert_eq!(dataset.latest_version_id().await.unwrap(), version_before);
+        assert!(dataset.schema().field("blob").unwrap().is_blob_v2());
     }
 }

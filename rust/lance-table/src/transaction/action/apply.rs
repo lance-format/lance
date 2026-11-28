@@ -41,7 +41,7 @@ use crate::system_index::mem_wal::{
     CompactedSsTable, MEM_WAL_INDEX_NAME, update_mem_wal_index_compacted_sstables,
 };
 use crate::transaction::manifest_build::{apply_range_segments, check_blob_nesting};
-use crate::transaction::validate::schema_fragments_valid;
+use crate::transaction::validate::{check_field_decoding_unchanged, schema_fragments_valid};
 use crate::transaction::{FragReuseUpdate, LogicalIndexSegments, ReadVersionState, Transaction};
 use lance_core::datatypes::{Field, Schema};
 use lance_core::{Error, Result, is_system_column};
@@ -393,6 +393,10 @@ impl<'a> ApplyState<'a> {
             )?;
         }
 
+        // Compared before assembly, which may promote a blob to v2 on its own,
+        // and raised after the blob nesting check, which has the more specific
+        // error.
+        let decoding_check = check_field_decoding_unchanged(&current_manifest.schema, &schema);
         let mut manifest = transaction.assemble_manifest(
             Some(current_manifest),
             schema,
@@ -406,6 +410,7 @@ impl<'a> ApplyState<'a> {
         )?;
         // After assembly, which may promote a blob to v2.
         check_blob_nesting(&manifest, Some(current_manifest))?;
+        decoding_check?;
         // Checked on the final schema because several actions shape the key: a
         // ConfigUpdate declares it, an AlterField can loosen a key column's
         // nullability. A table whose key was invalid before this check existed
