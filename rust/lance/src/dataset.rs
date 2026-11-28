@@ -1244,7 +1244,8 @@ impl Dataset {
     /// Once a version is removed it can no longer be checked out or restored.  Any data unique
     /// to that version will be lost.
     ///
-    /// Returns an invalid-input error when this dataset is checked out at a detached version.
+    /// Returns an invalid-input error when this dataset is checked out at a detached version,
+    /// or when `older_than` reaches past the earliest representable timestamp.
     ///
     /// # Arguments
     ///
@@ -1266,8 +1267,14 @@ impl Dataset {
         delete_unverified: Option<bool>,
         error_if_tagged_old_versions: Option<bool>,
     ) -> BoxFuture<'_, Result<RemovalStats>> {
+        let Some(before_timestamp) = utc_now().checked_sub_signed(older_than) else {
+            return futures::future::ready(Err(Error::invalid_input(format!(
+                "older_than {older_than} reaches past the earliest representable timestamp"
+            ))))
+            .boxed();
+        };
         let mut builder = CleanupPolicyBuilder::default();
-        builder = builder.before_timestamp(utc_now() - older_than);
+        builder = builder.before_timestamp(before_timestamp);
         if let Some(v) = delete_unverified {
             builder = builder.delete_unverified(v);
         }

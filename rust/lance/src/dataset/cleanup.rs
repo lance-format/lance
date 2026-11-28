@@ -3106,7 +3106,15 @@ async fn build_cleanup_operation<'a>(
                 });
             }
         };
-        let timestamp = utc_now() - TimeDelta::from_std(std_older_than).unwrap_or(TimeDelta::MAX);
+        let timestamp = TimeDelta::from_std(std_older_than)
+            .ok()
+            .and_then(|age| utc_now().checked_sub_signed(age))
+            .ok_or_else(|| Error::Cleanup {
+                message: format!(
+                    "lance.auto_cleanup.older_than={older_than:?} reaches past the earliest \
+                     representable timestamp"
+                ),
+            })?;
         builder = builder.before_timestamp(timestamp);
     }
     if let Some(retain_versions) = manifest.config.get("lance.auto_cleanup.retain_versions") {
