@@ -32,6 +32,7 @@ pub struct TableSession {
     metadata_cache: GlobalMetadataCache,
     index_cache: LanceCache,
     store_registry: Arc<ObjectStoreRegistry>,
+    pub(crate) require_manifest_etag: bool,
     unregistered_external_blob_policy: UnregisteredExternalBlobPolicy,
     index_metadata_observer: Option<fn(&Manifest, &[IndexMetadata])>,
 }
@@ -51,8 +52,39 @@ impl TableSession {
             metadata_cache: GlobalMetadataCache(metadata_cache),
             index_cache,
             store_registry,
+            require_manifest_etag: false,
             unregistered_external_blob_policy: UnregisteredExternalBlobPolicy::Allow,
             index_metadata_observer: None,
+        }
+    }
+
+    /// Scope both caches to a snapshot identity. An unknown identity disables
+    /// caching for this handle, so discovery cannot evict reusable entries.
+    /// A scoped manifest read also needs an ETag to distinguish two commits
+    /// when a namespace deletes and republishes the same version.
+    ///
+    /// ```
+    /// use lance_table_runtime::session::TableSession;
+    /// let session = TableSession::default();
+    /// let branch = session.with_cache_identity(Some("generation-1"));
+    /// assert!(std::sync::Arc::ptr_eq(&session.store_registry(), &branch.store_registry()));
+    /// ```
+    pub fn with_cache_identity(&self, identity: Option<&str>) -> Self {
+        let scope = |cache: &LanceCache, role| match identity {
+            Some(key) => cache.with_key_prefix(key),
+            None => LanceCache::with_backend_and_metrics_kind(
+                Arc::new(QuickCacheBackend::with_capacity(0)),
+                role,
+            ),
+        };
+        Self {
+            require_manifest_etag: identity.is_some(),
+            metadata_cache: GlobalMetadataCache(scope(
+                self.metadata_cache.cache(),
+                CacheMetricsKind::Metadata,
+            )),
+            index_cache: scope(&self.index_cache, CacheMetricsKind::Index),
+            ..self.clone()
         }
     }
 

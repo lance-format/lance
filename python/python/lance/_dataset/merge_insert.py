@@ -191,9 +191,10 @@ class MergeInsertBuilder(_MergeInsertBuilder):
     ) -> Tuple[Transaction, Dict[str, Any]]:
         """Executes the merge insert operation without committing
 
-        This function updates the original dataset and returns a dictionary with
-        information about merge statistics - i.e. the number of inserted, updated,
-        and deleted rows.
+        Returns a transaction and merge statistics. Pass the transaction to
+        :meth:`LanceDataset.commit` to publish it, including after pickling it
+        on a worker. A staged row rewrite carries its physical write set so
+        disjoint row changes in the same fragment can commit concurrently.
 
         Parameters
         ----------

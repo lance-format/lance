@@ -3141,6 +3141,764 @@ def test_merge_insert_with_commit():
     )
 
 
+@pytest.mark.parametrize(
+    "handoff,other_id,conflicts",
+    [
+        ("staged", 0, False),
+        ("staged", 2, True),
+        ("reader", 0, False),
+        ("dataset", 0, False),
+        ("legacy", 0, True),
+        ("legacy", 4, False),
+        ("edited", 1, True),
+        ("edited_layout", 0, True),
+    ],
+)
+def test_staged_merge_row_conflicts_after_pickle(
+    tmp_path, handoff, other_id, conflicts
+):
+    from lance.commit import CommitConflictError
+
+    uri = tmp_path / "target"
+    ds = lance.write_dataset(
+        pa.table({"id": range(6), "value": [0] * 6}), uri, max_rows_per_file=3
+    )
+
+    def stage(key):
+        source = pa.table({"id": [key], "value": [20]})
+        if handoff == "reader":
+            source = source.to_reader()
+        elif handoff == "dataset":
+            source = lance.write_dataset(source, tmp_path / "source")
+        return (
+            ds.merge_insert("id")
+            .when_matched_update_all()
+            .execute_uncommitted(source)[0]
+        )
+
+    txn = stage(2)
+    if handoff == "legacy":
+        txn = lance.Transaction(txn.read_version, txn.operation, txn.uuid)
+    elif handoff == "edited":
+        txn.operation = stage(1).operation
+    elif handoff == "edited_layout":
+        txn.operation.updated_fragments[0].physical_rows += 1
+    txn = pickle.loads(pickle.dumps(txn))
+    ds.delete(f"id = {other_id}")
+    if conflicts:
+        with pytest.raises(CommitConflictError):
+            lance.LanceDataset.commit(uri, txn)
+        assert lance.dataset(uri).version == ds.version
+    else:
+        lance.LanceDataset.commit(uri, txn)
+    result = lance.dataset(uri).to_table().sort_by("id")
+    ids = [key for key in range(6) if key != other_id]
+    assert result == pa.table(
+        {"id": ids, "value": [20 if key == 2 and not conflicts else 0 for key in ids]}
+    )
+
+
+@pytest.fixture
+def keyed_merge_schema():
+    return pa.schema(
+        [
+            pa.field(
+                "id",
+                pa.int32(),
+                nullable=False,
+                metadata={b"lance-schema:unenforced-primary-key": b"true"},
+            ),
+            pa.field("value", pa.int32(), nullable=False),
+        ]
+    )
+
+
+def test_staged_merge_untracked_inserts_keep_fragment_conflict(tmp_path):
+    from lance.commit import CommitConflictError
+
+    ds = lance.write_dataset(pa.table({"id": [0, 1, 2], "value": [0, 0, 0]}), tmp_path)
+    builder = (
+        ds.merge_insert("id").when_matched_update_all().when_not_matched_insert_all()
+    )
+
+    def stage(key):
+        txn, _ = builder.execute_uncommitted(
+            pa.table({"id": [key, 3], "value": [key + 1] * 2})
+        )
+        return pickle.loads(pickle.dumps(txn))
+
+    first, second = stage(0), stage(1)
+    current = lance.LanceDataset.commit(tmp_path, first)
+    with pytest.raises(CommitConflictError):
+        lance.LanceDataset.commit(tmp_path, second)
+    assert lance.dataset(tmp_path).version == current.version
+    assert current.to_table().sort_by("id").to_pydict() == {
+        "id": [0, 1, 2, 3],
+        "value": [1, 0, 0, 1],
+    }
+
+
+@pytest.mark.parametrize(
+    "updated_key, delete_key, restore, legacy",
+    [
+        pytest.param(1, None, True, False, id="same_fragment"),
+        pytest.param(3, None, True, False, id="other_fragment"),
+        pytest.param(3, 4, True, False, id="two_concurrent_deletes"),
+        pytest.param(3, None, True, True, id="legacy_other_fragment"),
+        pytest.param(3, 4, False, False, id="disjoint_delete"),
+        pytest.param(3, 2, False, False, id="other_fragment_preserves_deletions"),
+    ],
+)
+def test_staged_merge_conflicts_when_an_inserted_key_is_revived(
+    tmp_path, keyed_merge_schema, updated_key, delete_key, restore, legacy
+):
+    from lance.commit import CommitConflictError
+
+    schema = keyed_merge_schema
+    initial = pa.table({"id": range(6), "value": [0] * 6}, schema=schema)
+    ds = lance.write_dataset(initial, tmp_path, max_rows_per_file=3)
+    original = ds.get_fragments()[0].metadata
+    ds.delete("id = 0")
+    txn, stats = (
+        ds.merge_insert("id")
+        .when_matched_update_all()
+        .when_not_matched_insert_all()
+        .execute_uncommitted(
+            pa.table({"id": [0, updated_key], "value": [10, 20]}, schema=schema)
+        )
+    )
+    assert stats["num_inserted_rows"] == stats["num_updated_rows"] == 1
+    assert txn.operation.inserted_rows_filter is not None
+    if legacy:
+        txn = lance.Transaction(txn.read_version, txn.operation, txn.uuid)
+    if delete_key is not None:
+        ds.delete(f"id = {delete_key}")
+    if restore:
+        restored = lance.LanceDataset.commit(
+            tmp_path,
+            lance.LanceOperation.Delete([original], [], ""),
+            read_version=ds.version,
+        )
+        with pytest.raises(CommitConflictError):
+            lance.LanceDataset.commit(tmp_path, pickle.loads(pickle.dumps(txn)))
+        assert lance.dataset(tmp_path).version == restored.version
+    else:
+        lance.LanceDataset.commit(tmp_path, pickle.loads(pickle.dumps(txn)))
+    ids = [key for key in range(6) if key != delete_key]
+    changes = {} if restore else {0: 10, updated_key: 20}
+    assert lance.dataset(tmp_path).to_table().sort_by("id") == pa.table(
+        {"id": ids, "value": [changes.get(key, 0) for key in ids]}, schema=schema
+    )
+
+
+@pytest.mark.parametrize(
+    "updated_key,keep_deleted,restore,include_key,allow_insert",
+    [
+        pytest.param(1, False, True, True, True, id="same_fragment_empty_mask"),
+        pytest.param(4, True, True, True, True, id="other_fragment_nonempty_mask"),
+        pytest.param(1, False, False, True, True, id="disjoint_rewrite"),
+        pytest.param(1, False, True, False, False, id="update_only"),
+        pytest.param(4, True, True, False, True, id="upsert_without_inserts"),
+    ],
+)
+def test_staged_merge_after_relocated_key(
+    tmp_path,
+    keyed_merge_schema,
+    updated_key,
+    keep_deleted,
+    restore,
+    include_key,
+    allow_insert,
+):
+    from lance.commit import CommitConflictError
+
+    def table(keys, values):
+        return pa.table({"id": keys, "value": values}, schema=keyed_merge_schema)
+
+    ds = lance.write_dataset(table(range(8), [0] * 8), tmp_path, max_rows_per_file=4)
+    if keep_deleted:
+        ds.delete("id = 2")
+    before = ds.get_fragments()[0].metadata
+    ds.delete("id = 0")
+    source = (
+        table([0, updated_key], [10, 30]) if include_key else table([updated_key], [30])
+    )
+
+    def stage(snapshot):
+        merge = snapshot.merge_insert("id").when_matched_update_all()
+        if allow_insert:
+            merge = merge.when_not_matched_insert_all()
+        return merge.execute_uncommitted(source)
+
+    txn, stats = stage(ds)
+    assert stats["num_updated_rows"] == 1
+    assert stats["num_inserted_rows"] == int(include_key)
+    if allow_insert:
+        assert txn.operation.inserted_rows_filter is not None
+    if restore:
+        ds = lance.LanceDataset.commit(
+            tmp_path,
+            lance.LanceOperation.Delete([before], [], ""),
+            read_version=ds.version,
+        )
+    moved = 0 if restore else 3
+    stats = (
+        ds.merge_insert("id")
+        .when_matched_update_all()
+        .when_not_matched_insert_all()
+        .execute(table([moved], [99]))
+    )
+    assert stats["num_updated_rows"] == 1
+    assert stats["num_inserted_rows"] == 0
+    txn = pickle.loads(pickle.dumps(txn))
+    keys = [key for key in range(8) if key != 2 or not keep_deleted]
+    if restore and include_key:
+        with pytest.raises(CommitConflictError):
+            lance.LanceDataset.commit(tmp_path, txn)
+        current = lance.dataset(tmp_path)
+        assert current.version == ds.version
+        assert current.to_table().sort_by("id") == table(
+            keys, [99 if key == moved else 0 for key in keys]
+        )
+        txn, stats = stage(current)
+        assert stats["num_updated_rows"] == 2
+        assert stats["num_inserted_rows"] == 0
+    result = lance.LanceDataset.commit(tmp_path, txn)
+    changes = {moved: 99, updated_key: 30}
+    if include_key:
+        changes[0] = 10
+    assert result.to_table().sort_by("id") == table(
+        keys, [changes.get(key, 0) for key in keys]
+    )
+
+
+@pytest.fixture
+def composite_merge_schema():
+    def key_field(name, position):
+        return pa.field(
+            name,
+            pa.int32(),
+            nullable=False,
+            metadata={b"lance-schema:unenforced-primary-key:position": position},
+        )
+
+    return pa.schema(
+        [key_field("id", b"1"), key_field("part", b"2"), pa.field("value", pa.int32())]
+    )
+
+
+@pytest.mark.parametrize("columns", [["user-id", "part"], ["part", "user-id"]])
+def test_merge_insert_explicit_primary_key_names(
+    tmp_path, composite_merge_schema, columns
+):
+    schema = composite_merge_schema.set(
+        0, composite_merge_schema.field(0).with_name("user-id")
+    )
+
+    def table(ids, values):
+        return pa.table(
+            {"user-id": ids, "part": [7] * len(ids), "value": values}, schema
+        )
+
+    ds = lance.write_dataset(table([1, 2, 3], [0, 0, 0]), tmp_path, max_rows_per_file=2)
+    txn, _ = (
+        ds.merge_insert(columns)
+        .when_matched_update_all()
+        .when_not_matched_insert_all()
+        .execute_uncommitted(table([1, 90], [4, 5]))
+    )
+    assert txn.operation.inserted_rows_filter.field_ids == [0, 1]
+    result = lance.LanceDataset.commit(tmp_path, txn)
+    assert result.to_table().sort_by("user-id") == table([1, 2, 3, 90], [4, 0, 0, 5])
+
+
+@pytest.mark.parametrize("reverse_commit", [False, True])
+@pytest.mark.parametrize(
+    "same_key,old_writer", [(False, False), (True, False), (True, True)]
+)
+@pytest.mark.parametrize("indexed_partial", [False, True])
+def test_staged_merge_composite_key_order(
+    tmp_path,
+    composite_merge_schema,
+    reverse_commit,
+    same_key,
+    old_writer,
+    indexed_partial,
+):
+    from lance.commit import CommitConflictError
+
+    schema = composite_merge_schema
+    if indexed_partial:
+        schema = schema.append(pa.field("extra", pa.int32()))
+
+    def table(ids, values):
+        columns = {"id": ids, "part": [7] * len(ids), "value": values}
+        if indexed_partial:
+            columns["extra"] = [None] * len(ids)
+        return pa.table(columns, schema=schema)
+
+    ds = lance.write_dataset(table(range(1, 7), [0] * 6), tmp_path, max_rows_per_file=3)
+    if indexed_partial:
+        ds.create_scalar_index("id", "BTREE")
+        ds.create_scalar_index("part", "BTREE")
+    stages = []
+    # Exercise retained rows in one fragment and disjoint indexed/historical writers.
+    matched = [1, 4 if indexed_partial or old_writer else 2]
+    new_keys = [90, 90 if same_key else 91]
+    for i, columns in enumerate((["id", "part"], ["part", "id"])):
+        source = table([matched[i], new_keys[i]], [i + 1] * 2)
+        if indexed_partial:
+            source = source.drop_columns(["extra"])
+        txn, _ = (
+            ds.merge_insert(columns)
+            .when_matched_update_all()
+            .when_not_matched_insert_all()
+            .execute_uncommitted(source)
+        )
+        assert txn.operation.update_mode == (
+            "rewrite_columns" if indexed_partial else "rewrite_rows"
+        )
+        assert txn.operation.inserted_rows_filter.field_ids == [0, 1]
+        if i == 1 and old_writer:
+            # A worker using the old reversed ON order sent neither the
+            # inserted-key filter nor a staged row set to the coordinator.
+            txn.operation.inserted_rows_filter = None
+            txn = lance.Transaction(txn.read_version, txn.operation, txn.uuid)
+        stages.append(pickle.loads(pickle.dumps(txn)))
+    first = int(reverse_commit)
+    lance.LanceDataset.commit(tmp_path, stages[first])
+    expected = [0] * 6
+    expected[matched[first] - 1] = first + 1
+    if same_key:
+        with pytest.raises(CommitConflictError):
+            lance.LanceDataset.commit(tmp_path, stages[1 - first])
+        assert lance.dataset(tmp_path).to_table().sort_by("id") == table(
+            [1, 2, 3, 4, 5, 6, 90], expected + [first + 1]
+        )
+    else:
+        lance.LanceDataset.commit(tmp_path, stages[1 - first])
+        expected[matched[1 - first] - 1] = 2 - first
+        assert lance.dataset(tmp_path).to_table().sort_by("id") == table(
+            [1, 2, 3, 4, 5, 6, 90, 91], expected + [1, 2]
+        )
+
+
+@pytest.mark.parametrize("drop", [True, False], ids=["drop_key", "rename_key"])
+def test_staged_merge_after_composite_key_projection(
+    tmp_path, drop, composite_merge_schema
+):
+    from lance.commit import CommitConflictError
+
+    schema = composite_merge_schema
+    ds = lance.write_dataset(
+        pa.table({"id": range(6), "part": [0] * 6, "value": [0] * 6}, schema=schema),
+        tmp_path,
+        max_rows_per_file=3,
+    )
+    txn, stats = (
+        ds.merge_insert(["id", "part"])
+        .when_matched_update_all()
+        .when_not_matched_insert_all()
+        .execute_uncommitted(
+            pa.table({"id": [0, 3], "part": [1, 0], "value": [10, 30]}, schema=schema)
+        )
+    )
+    assert stats["num_inserted_rows"] == stats["num_updated_rows"] == 1
+    if drop:
+        ds.drop_columns(["part"])
+    else:
+        ds.alter_columns({"path": "part", "name": "renamed"})
+    ds.delete("id = 4")
+    txn = pickle.loads(pickle.dumps(txn))
+    if drop:
+        with pytest.raises(CommitConflictError):
+            lance.LanceDataset.commit(tmp_path, txn)
+        assert lance.dataset(tmp_path).version == ds.version
+        assert lance.dataset(tmp_path).to_table().sort_by("id").to_pydict() == {
+            "id": [0, 1, 2, 3, 5],
+            "value": [0] * 5,
+        }
+    else:
+        committed = lance.LanceDataset.commit(tmp_path, txn)
+        sorted_rows = committed.to_table().sort_by(
+            [("id", "ascending"), ("renamed", "ascending")]
+        )
+        assert sorted_rows.to_pydict() == {
+            "id": [0, 0, 1, 2, 3, 5],
+            "renamed": [0, 1, 0, 0, 0, 0],
+            "value": [0, 10, 0, 0, 30, 0],
+        }
+
+
+@pytest.mark.parametrize("insert", [False, True])
+def test_staged_merge_after_delete_in_new_fragment(
+    tmp_path, keyed_merge_schema, insert
+):
+    def table(keys, values):
+        return pa.table({"id": keys, "value": values}, schema=keyed_merge_schema)
+
+    ds = lance.write_dataset(table(range(6), [0] * 6), tmp_path, max_rows_per_file=3)
+    builder = (
+        ds.merge_insert("id").when_matched_update_all().when_not_matched_insert_all()
+    )
+    keys = [0, 7] if insert else [0]
+    txn, _ = builder.execute_uncommitted(table(keys, [10] * len(keys)))
+    builder.execute(table([3, 4, 6], [20] * 3))
+    current = lance.dataset(tmp_path)
+    current.delete("id = 3")
+    committed = lance.LanceDataset.commit(tmp_path, pickle.loads(pickle.dumps(txn)))
+    assert committed.to_table().sort_by("id") == table(
+        [0, 1, 2, 4, 5, 6] + ([7] if insert else []),
+        [10, 0, 0, 20, 0, 20] + ([10] if insert else []),
+    )
+
+
+@pytest.mark.parametrize("restore", [False, True])
+def test_staged_merge_checks_mask_on_first_version_of_new_fragment(
+    tmp_path, keyed_merge_schema, restore
+):
+    from dataclasses import replace
+
+    from lance.commit import CommitConflictError
+
+    def table(keys, values):
+        return pa.table({"id": keys, "value": values}, schema=keyed_merge_schema)
+
+    ds = lance.write_dataset(table(range(6), [0] * 6), tmp_path, max_rows_per_file=3)
+    ds.update_config({"lance.deletions.inline_max_bytes": "4096"})
+    ds.delete("id = 3")
+    stale, _ = (
+        ds.merge_insert("id")
+        .when_matched_update_all()
+        .when_not_matched_insert_all()
+        .execute_uncommitted(table([0, 3], [10, 10]))
+    )
+    original = ds.get_fragments()[1].metadata
+    assert original.deletion_file.inline is not None
+    # Publish the same physical rows and tombstone under a new fragment ID.
+    group = lance.LanceOperation.RewriteGroup([original], [replace(original, id=0)])
+    ds = lance.LanceDataset.commit(
+        tmp_path, lance.LanceOperation.Rewrite([group], []), read_version=ds.version
+    )
+    introduced = ds.get_fragments()[1].metadata
+    assert introduced.id != original.id
+    if restore:
+        ds = lance.LanceDataset.commit(
+            tmp_path,
+            lance.LanceOperation.Delete(
+                [replace(introduced, deletion_file=None)], [], ""
+            ),
+            read_version=ds.version,
+        )
+        # Moving the revived key hides its offset again before the stale commit.
+        ds.merge_insert(
+            "id"
+        ).when_matched_update_all().when_not_matched_insert_all().execute(
+            table([3], [90])
+        )
+        with pytest.raises(CommitConflictError):
+            lance.LanceDataset.commit(tmp_path, stale)
+        expected = table(range(6), [0, 0, 0, 90, 0, 0])
+    else:
+        ds.delete("id = 5")
+        lance.LanceDataset.commit(tmp_path, stale)
+        expected = table([0, 1, 2, 3, 4], [10, 0, 0, 10, 0])
+    assert lance.dataset(tmp_path).to_table().sort_by("id") == expected
+
+
+@pytest.mark.parametrize(
+    "key_type, first_type, second_type, other_insert, conflicts",
+    [
+        pytest.param(pa.int16(), None, None, 90, True, id="key_missing_from_bloom"),
+        pytest.param(pa.int32(), None, None, 90, True, id="same_insert"),
+        pytest.param(pa.int32(), None, None, 91, False, id="disjoint_inserts"),
+        pytest.param(pa.string(), "string_view", None, 90, True, id="string_view"),
+        pytest.param(pa.binary(), None, "binary_view", 90, True, id="binary_view"),
+        pytest.param(pa.string(), None, None, 91, False, id="disjoint_strings"),
+        pytest.param(pa.binary(), None, None, 91, False, id="disjoint_binary"),
+        pytest.param(pa.string(), None, None, None, False, id="string_no_insert"),
+        pytest.param(pa.binary(), None, None, None, False, id="binary_no_insert"),
+        pytest.param(
+            pa.large_string(), None, None, None, False, id="large_string_no_insert"
+        ),
+        pytest.param(
+            pa.large_binary(), None, None, None, False, id="large_binary_no_insert"
+        ),
+    ],
+)
+@pytest.mark.parametrize("rows_per_file", [1, 4])
+def test_staged_merge_with_concurrent_insert(
+    tmp_path,
+    keyed_merge_schema,
+    key_type,
+    first_type,
+    second_type,
+    other_insert,
+    conflicts,
+    rows_per_file,
+):
+    from lance.commit import CommitConflictError
+
+    schema = keyed_merge_schema.set(0, keyed_merge_schema.field(0).with_type(key_type))
+
+    def table(keys, values, source_type=None):
+        if not pa.types.is_integer(key_type):
+            keys = [str(key) for key in keys]
+        source = schema
+        if source_type is not None:
+            arrow = pytest.importorskip("pyarrow", minversion="16.0.0")
+            source = schema.set(
+                0, schema.field(0).with_type(getattr(arrow, source_type)())
+            )
+        return pa.table({"id": keys, "value": values}, schema=source)
+
+    ds = lance.write_dataset(
+        table([1, 2, 3, 4], [0] * 4), tmp_path, max_rows_per_file=rows_per_file
+    )
+
+    def stage(keys, value, source_type):
+        txn, stats = (
+            ds.merge_insert("id")
+            .when_matched_update_all()
+            .when_not_matched_insert_all()
+            .execute_uncommitted(table(keys, [value] * len(keys), source_type))
+        )
+        assert stats["num_inserted_rows"] == len(keys) - 1
+        assert stats["num_updated_rows"] == 1
+        return pickle.loads(pickle.dumps(txn))
+
+    first = stage([1, 90], 10, first_type)
+    second = stage([2] if other_insert is None else [2, other_insert], 20, second_type)
+    committed = lance.LanceDataset.commit(tmp_path, first)
+    if conflicts:
+        with pytest.raises(CommitConflictError):
+            lance.LanceDataset.commit(tmp_path, second)
+        assert lance.dataset(tmp_path).version == committed.version
+        ids, values = [1, 2, 3, 4, 90], [10, 0, 0, 0, 10]
+    else:
+        lance.LanceDataset.commit(tmp_path, second)
+        ids, values = [1, 2, 3, 4, 90], [10, 20, 0, 0, 10]
+        if other_insert is not None:
+            ids.append(other_insert)
+            values.append(20)
+    assert lance.dataset(tmp_path).to_table().sort_by("id") == table(ids, values)
+
+
+@pytest.mark.parametrize(("first", "second"), [("slot", "id"), ("id", "slot")])
+@pytest.mark.parametrize("patch", ["row_key", "column_key", "column_value"])
+def test_staged_merge_retries_mixed_key_filters(
+    tmp_path, keyed_merge_schema, first, second, patch
+):
+    from lance.commit import CommitConflictError
+
+    schema = keyed_merge_schema.append(pa.field("slot", pa.int32())).append(
+        pa.field("extra", pa.int32())
+    )
+
+    def table(ids, values, slots):
+        return pa.table(
+            {"id": ids, "value": values, "slot": slots, "extra": [0] * len(ids)},
+            schema=schema,
+        )
+
+    ds = lance.write_dataset(
+        table(range(6), [0] * 6, range(6)), tmp_path, max_rows_per_file=3
+    )
+    sources = {"slot": table([90], [77], [1]), "id": table([4, 90], [22, 22], [4, 1])}
+    if patch == "column_key":
+        sources["slot"] = sources["slot"].select(["id", "value", "slot"])
+    elif patch == "column_value":
+        sources["slot"] = sources["slot"].select(["value", "slot"])
+        sources["id"] = table([1, 4, 90], [22] * 3, [1, 4, 1])
+
+    def stage(dataset, on):
+        condition = (
+            "target.value = 77 OR target.id = 4"
+            if patch == "column_value" and on == "id"
+            else None
+        )
+        builder = dataset.merge_insert(on).when_matched_update_all(condition)
+        if on == "slot" and patch != "row_key":
+            builder = builder.write_mode("rewrite_columns")
+        else:
+            builder = builder.when_not_matched_insert_all()
+        return builder.execute_uncommitted(sources[on])
+
+    txns = {}
+    for on, fragment in [("slot", 0), ("id", 1)]:
+        txn, stats = stage(ds, on)
+        assert stats["num_inserted_rows"] == int(on == "id")
+        assert (txn.operation.inserted_rows_filter is not None) == (on == "id")
+        assert [f.id for f in txn.operation.updated_fragments] == [fragment]
+        if on == "slot" and patch != "row_key":
+            assert txn.operation.update_mode == "rewrite_columns"
+            assert not txn.operation.new_fragments
+            assert (0 in txn.operation.fields_modified) == (patch == "column_key")
+        txns[on] = pickle.loads(pickle.dumps(txn))
+
+    current = lance.LanceDataset.commit(tmp_path, txns[first])
+    with pytest.raises(CommitConflictError):
+        lance.LanceDataset.commit(tmp_path, txns[second])
+    if first == "slot":
+        ids = range(6) if patch == "column_value" else [0, 90, 2, 3, 4, 5]
+        expected = table(ids, [0, 77, 0, 0, 0, 0], range(6))
+    else:
+        expected = table(
+            [0, 1, 2, 3, 4, 5, 90], [0, 0, 0, 0, 22, 0, 22], [*range(6), 1]
+        )
+    reopened = lance.dataset(tmp_path)
+    assert reopened.version == current.version
+    assert reopened.to_table().sort_by("id") == expected.sort_by("id")
+    if patch == "column_value":
+        # The predicate reads id 1's value, and the slot join reads the new row.
+        # Restaging sees both dependencies in the actual publication order.
+        retry, _ = stage(reopened, second)
+        lance.LanceDataset.commit(tmp_path, retry)
+        value = 22 if first == "slot" else 77
+        assert lance.dataset(tmp_path).to_table().sort_by("id") == table(
+            [0, 1, 2, 3, 4, 5, 90], [0, value, 0, 0, 22, 0, value], [*range(6), 1]
+        )
+
+
+@pytest.mark.parametrize("inserting", [None, 0, 1])
+def test_staged_merge_indexed_column_patch_without_insert_evidence(
+    tmp_path, keyed_merge_schema, inserting
+):
+    schema = keyed_merge_schema.set(
+        0, keyed_merge_schema.field(0).with_type(pa.string())
+    ).append(pa.field("extra", pa.int32()))
+    ds = lance.write_dataset(
+        pa.table(
+            {"id": list("abcdef"), "value": [0] * 6, "extra": [None] * 6}, schema=schema
+        ),
+        tmp_path,
+        max_rows_per_file=3,
+    )
+    ds.create_scalar_index("id", "BTREE")
+    txns = []
+    for i, key in enumerate(["a", "d"]):
+        keys = [key, "z"] if i == inserting else [key]
+        source = pa.table(
+            {"id": keys, "value": [i + 1] * len(keys)},
+            schema=pa.schema(list(schema)[:2]),
+        )
+        txn, stats = (
+            ds.merge_insert("id")
+            .when_matched_update_all()
+            .when_not_matched_insert_all()
+            .execute_uncommitted(source)
+        )
+        assert txn.operation.update_mode == "rewrite_columns"
+        assert bool(txn.operation.new_fragments) == (i == inserting)
+        assert stats["num_inserted_rows"] == int(i == inserting)
+        # A coordinator may receive just the wire operation from an older worker.
+        txns.append(lance.Transaction(txn.read_version, txn.operation, txn.uuid))
+    for txn in txns:
+        lance.LanceDataset.commit(tmp_path, txn)
+    ids = list("abcdef")
+    values = [1, 0, 0, 2, 0, 0]
+    if inserting is not None:
+        ids.append("z")
+        values.append(inserting + 1)
+    assert lance.dataset(tmp_path).to_table().sort_by("id").to_pydict() == {
+        "id": ids,
+        "value": values,
+        "extra": [None] * len(ids),
+    }
+
+
+def test_staged_merge_edited_output_drops_zero_insert_count(
+    tmp_path, keyed_merge_schema
+):
+    from lance.commit import CommitConflictError
+
+    arrow = pytest.importorskip("pyarrow", minversion="16.0.0")
+    schema = keyed_merge_schema.set(
+        0, keyed_merge_schema.field(0).with_type(pa.string())
+    )
+    source_schema = schema.set(0, schema.field(0).with_type(arrow.string_view()))
+    ds = lance.write_dataset(
+        pa.table({"id": ["a", "b", "c"], "value": [0, 0, 0]}, schema=schema), tmp_path
+    )
+
+    def stage(keys, value):
+        txn, _ = (
+            ds.merge_insert("id")
+            .when_matched_update_all()
+            .when_not_matched_insert_all()
+            .execute_uncommitted(
+                pa.table(
+                    {"id": keys, "value": [value] * len(keys)}, schema=source_schema
+                )
+            )
+        )
+        return txn
+
+    stale = stage(["a"], 1)
+    stale.operation.new_fragments = stage(["a", "x"], 1).operation.new_fragments
+    winner = lance.LanceDataset.commit(tmp_path, stage(["b", "x"], 2))
+    with pytest.raises(CommitConflictError):
+        lance.LanceDataset.commit(tmp_path, pickle.loads(pickle.dumps(stale)))
+    assert lance.dataset(tmp_path).version == winner.version
+    assert winner.to_table().sort_by("id").to_pydict() == {
+        "id": ["a", "b", "c", "x"],
+        "value": [0, 2, 0, 2],
+    }
+
+
+def test_staged_merge_with_json_text_and_jsonb_keys(tmp_path, keyed_merge_schema):
+    from lance.commit import CommitConflictError
+
+    arrow = pytest.importorskip("pyarrow", minversion="19.0.0")
+    key = keyed_merge_schema.field("id").with_type(arrow.json_())
+    schema = keyed_merge_schema.set(0, key)
+    ds = lance.write_dataset(
+        pa.table({"id": ["2"], "value": [0]}, schema=schema), tmp_path
+    )
+    text = pa.table({"id": [" 90 "], "value": [10]}, schema=schema)
+    raw_key = pa.field(
+        "id",
+        pa.large_binary(),
+        nullable=False,
+        metadata={
+            **key.metadata,
+            b"ARROW:extension:name": b"lance.json",
+            b"ARROW:extension:metadata": b"",
+        },
+    )
+    raw_keys = [
+        ds.to_table(columns={"value": "value", "raw": f"jsonb '{value}'"})["raw"][
+            0
+        ].as_py()
+        for value in ("2", "90")
+    ]
+    raw = pa.table({"id": raw_keys, "value": [20, 20]}, schema=schema.set(0, raw_key))
+
+    def stage(dataset, source):
+        return (
+            dataset.merge_insert("id")
+            .when_matched_update_all()
+            .when_not_matched_insert_all()
+            .execute_uncommitted(source)
+        )
+
+    first, first_stats = stage(ds, text)
+    second, second_stats = stage(ds, raw)
+    assert first_stats["num_inserted_rows"] == 1
+    assert second_stats["num_inserted_rows"] == second_stats["num_updated_rows"] == 1
+    latest = lance.LanceDataset.commit(tmp_path, first)
+    with pytest.raises(CommitConflictError):
+        lance.LanceDataset.commit(tmp_path, pickle.loads(pickle.dumps(second)))
+    assert lance.dataset(tmp_path).version == latest.version
+    fresh, fresh_stats = stage(latest, raw)
+    assert (
+        fresh_stats["num_updated_rows"] == 2 and fresh_stats["num_inserted_rows"] == 0
+    )
+    completed = lance.LanceDataset.commit(tmp_path, fresh)
+    rows = completed.to_table().to_pylist()
+    assert sorted((row["id"], row["value"]) for row in rows) == [("2", 20), ("90", 20)]
+
+
 def test_update_with_commit_updated_fragment_offsets():
     table = pa.table({"id": range(10), "updated": [False] * 10})
     dataset = lance.write_dataset(table, "memory://test")
@@ -4322,21 +5080,13 @@ def test_inserted_rows_filter_rejects_invalid_payload(tmp_path, kind, payload, e
         )
 
 
-def test_inserted_rows_filter_rejects_reconstructed_conflict(tmp_path):
+def test_inserted_rows_filter_rejects_reconstructed_conflict(
+    tmp_path, keyed_merge_schema
+):
     from lance.commit import CommitConflictError
 
     base_dir = tmp_path / "inserted_rows_filter_conflict"
-    schema = pa.schema(
-        [
-            pa.field(
-                "id",
-                pa.int32(),
-                nullable=False,
-                metadata={b"lance-schema:unenforced-primary-key": b"true"},
-            ),
-            pa.field("value", pa.int32(), nullable=False),
-        ]
-    )
+    schema = keyed_merge_schema
     dataset = lance.write_dataset(
         pa.table({"id": [1, 2], "value": [10, 20]}, schema=schema), base_dir
     )
@@ -4367,6 +5117,91 @@ def test_inserted_rows_filter_rejects_reconstructed_conflict(tmp_path):
         max_retries=0,
     )
     assert committed.version == 3
+    assert sorted(committed.to_table(filter="id = 100")["value"].to_pylist()) == [1, 2]
+
+
+@pytest.mark.parametrize(
+    ("options", "error"),
+    [
+        ({"update_mode": "rewrite_row"}, ValueError),
+        ({"update_mode": None}, TypeError),
+        ({"fields_for_preserving_frag_bitmap": ["wrong"]}, TypeError),
+        ({"fields_for_preserving_frag_bitmap": [-1]}, OverflowError),
+    ],
+)
+def test_raw_update_rejects_invalid_options(
+    tmp_path, keyed_merge_schema, options, error
+):
+    def table(key):
+        return pa.table({"id": [key], "value": [0]}, schema=keyed_merge_schema)
+
+    ds = lance.write_dataset(table(1), tmp_path)
+    ds.merge_insert("id").when_not_matched_insert_all().execute(table(100))
+    fragment = lance.fragment.LanceFragment.create(ds.uri, table(100))
+    update = lance.LanceOperation.Update(new_fragments=[fragment], **options)
+    with pytest.raises(error):
+        lance.LanceDataset.commit(tmp_path, update, read_version=1, max_retries=0)
+    reopened = lance.dataset(tmp_path)
+    assert reopened.version == 2
+    assert sorted(reopened.to_table()["id"].to_pylist()) == [1, 100]
+
+
+@pytest.mark.parametrize("keyed_first", [True, False])
+@pytest.mark.parametrize(
+    "other_kind", ["blind_append", "staged_merge", "disjoint_keyed"]
+)
+def test_inserted_rows_filter_commit_orders(
+    tmp_path, keyed_merge_schema, keyed_first, other_kind
+):
+    from lance.commit import CommitConflictError
+
+    def table(key, value):
+        return pa.table({"id": [key], "value": [value]}, schema=keyed_merge_schema)
+
+    ds = lance.write_dataset(table(1, 0), tmp_path)
+
+    def stage(on, key, value):
+        txn, _ = (
+            ds.merge_insert(on)
+            .when_not_matched_insert_all()
+            .execute_uncommitted(table(key, value))
+        )
+        return txn
+
+    def reconstruct(txn):
+        return lance.Transaction(
+            txn.read_version,
+            lance.LanceOperation.Update(
+                new_fragments=txn.operation.new_fragments,
+                inserted_rows_filter=pickle.loads(
+                    pickle.dumps(txn.operation.inserted_rows_filter)
+                ),
+            ),
+        )
+
+    keyed = reconstruct(stage("id", 100, 1))
+    if other_kind == "disjoint_keyed":
+        other_key = 101
+        other = reconstruct(stage("id", other_key, 2))
+        assert other.operation.inserted_rows_filter is not None
+    else:
+        other_key = 100
+        other = stage("value", other_key, 2)
+        assert other.operation.inserted_rows_filter is None
+        if other_kind == "blind_append":
+            other = reconstruct(other)
+    first, second = (keyed, other) if keyed_first else (other, keyed)
+    lance.LanceDataset.commit(tmp_path, first)
+    if other_kind == "disjoint_keyed" or (other_kind == "blind_append" and keyed_first):
+        lance.LanceDataset.commit(tmp_path, second, max_retries=0)
+        expected = [(1, 0), (100, 1), (other_key, 2)]
+    else:
+        with pytest.raises(CommitConflictError) as exc_info:
+            lance.LanceDataset.commit(tmp_path, second, max_retries=0)
+        assert exc_info.value.retryable
+        expected = [(1, 0), (100, 1 if keyed_first else 2)]
+    rows = lance.dataset(tmp_path).to_table().to_pylist()
+    assert sorted((row["id"], row["value"]) for row in rows) == expected
 
 
 def test_merge_insert_raises_without_pk_and_on_omitted(tmp_path):
@@ -8700,6 +9535,114 @@ def test_data_overlay_dense(tmp_path: Path, enable_unstable_data_overlay_files):
     assert result.column("val").to_pylist() == [0, 111, 20, 30, 444, 50, 60, 70, 80, 90]
     # The unrelated `id` column is untouched.
     assert result.column("id").to_pylist() == list(range(10))
+
+
+def test_staged_merge_after_disjoint_overlay_and_delete(
+    tmp_path: Path, enable_unstable_data_overlay_files
+):
+    table = pa.table({"id": range(4), "value": [0] * 4})
+    ds = lance.write_dataset(table, tmp_path)
+    txn, _ = (
+        ds.merge_insert("id")
+        .when_matched_update_all()
+        .execute_uncommitted(pa.table({"id": [2], "value": [20]}))
+    )
+    file = _write_overlay_file(
+        ds, tmp_path, "overlay.lance", pa.table({"value": [10]}), fields=[1]
+    )
+    overlay = lance.LanceOperation.DataOverlayFile(file, offsets=[0])
+    operation = lance.LanceOperation.DataOverlay(
+        [lance.LanceOperation.DataOverlayGroup(0, [overlay])]
+    )
+    current = lance.LanceDataset.commit(ds, operation, read_version=ds.version)
+    current.delete("id = 1")
+    committed = lance.LanceDataset.commit(tmp_path, pickle.loads(pickle.dumps(txn)))
+    assert committed.to_table().sort_by("id") == pa.table(
+        {"id": [0, 2, 3], "value": [10, 20, 0]}
+    )
+
+
+@pytest.mark.parametrize(
+    "change", ["overlay_key", "overlay_value", "replace_key", "repack", "update_key"]
+)
+def test_staged_merge_after_key_or_value_change(
+    tmp_path, keyed_merge_schema, enable_unstable_data_overlay_files, change
+):
+    from lance.commit import CommitConflictError
+
+    def table(ids, values):
+        return pa.table({"id": ids, "value": values}, schema=keyed_merge_schema)
+
+    ds = lance.write_dataset(table(range(6), [0] * 6), tmp_path, max_rows_per_file=3)
+    txn, stats = (
+        ds.merge_insert("id")
+        .when_matched_update_all()
+        .when_not_matched_insert_all()
+        .execute_uncommitted(table([90, 3], [10, 30]))
+    )
+    assert stats["num_inserted_rows"] == stats["num_updated_rows"] == 1
+    if change.startswith("overlay"):
+        column = "id" if change == "overlay_key" else "value"
+        file = _write_overlay_file(
+            ds,
+            tmp_path,
+            "concurrent.lance",
+            pa.table({column: pa.array([90], type=pa.int32())}),
+            fields=[keyed_merge_schema.get_field_index(column)],
+        )
+        overlay = lance.LanceOperation.DataOverlayFile(file, offsets=[1])
+        operation = lance.LanceOperation.DataOverlay(
+            [lance.LanceOperation.DataOverlayGroup(1, [overlay])]
+        )
+    elif change == "update_key":
+        rewritten, fields = ds.get_fragment(0).update_columns(
+            pa.table(
+                {
+                    "_rowid": pa.array([0], pa.uint64()),
+                    "id": pa.array([90], pa.int32()),
+                }
+            )
+        )
+        no_insert, stats = (
+            ds.merge_insert("id")
+            .when_matched_update_all()
+            .when_not_matched_insert_all()
+            .execute_uncommitted(table([1], [0]))
+        )
+        assert stats["num_inserted_rows"] == 0
+        assert no_insert.operation.inserted_rows_filter is not None
+        operation = lance.LanceOperation.Update(
+            updated_fragments=[rewritten],
+            fields_modified=fields,
+            update_mode="rewrite_columns",
+            inserted_rows_filter=no_insert.operation.inserted_rows_filter,
+        )
+    else:
+        changes_keys = change == "replace_key"
+        values = table([90, 91, 92] if changes_keys else [0, 1, 2], [0] * 3)
+        file = lance.fragment.LanceFragment.create(tmp_path, values).files[0]
+        operation = lance.LanceOperation.DataReplacement(
+            [lance.LanceOperation.DataReplacementGroup(0, file)],
+            data_change=changes_keys,
+        )
+    latest = lance.LanceDataset.commit(ds, operation, read_version=ds.version)
+    if change in ("replace_key", "repack"):
+        latest.delete("id = 4")
+    before = latest.to_table().sort_by("id")
+    txn = pickle.loads(pickle.dumps(txn))
+    if change in ("overlay_key", "replace_key", "update_key"):
+        with pytest.raises(CommitConflictError):
+            lance.LanceDataset.commit(tmp_path, txn)
+        assert lance.dataset(tmp_path).version == latest.version
+        assert lance.dataset(tmp_path).to_table().sort_by("id") == before
+    else:
+        committed = lance.LanceDataset.commit(tmp_path, txn)
+        rows = before.to_pylist()
+        next(row for row in rows if row["id"] == 3)["value"] = 30
+        rows.append({"id": 90, "value": 10})
+        assert committed.to_table().sort_by("id") == pa.Table.from_pylist(
+            rows, schema=keyed_merge_schema
+        )
 
 
 def test_data_overlay_newest_wins(tmp_path: Path, enable_unstable_data_overlay_files):

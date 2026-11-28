@@ -233,6 +233,7 @@ pub struct CommitTransactionOptions<'a> {
     pub retry_timeout: Duration,
     pub manifest_naming_scheme: ManifestNamingScheme,
     pub affected_rows: Option<&'a RowAddrTreeMap>,
+    inserted_row_count: Option<u64>,
     append_idempotency_key: Option<AppendIdempotencyKey<'a>>,
     pub expected_latest_version: Option<u64>,
     /// Whether this commit is a tagged fragment-reuse-index trim derived by the
@@ -252,6 +253,7 @@ impl<'a> CommitTransactionOptions<'a> {
             retry_timeout: default_commit_retry_timeout(),
             manifest_naming_scheme,
             affected_rows: None,
+            inserted_row_count: None,
             append_idempotency_key: None,
             expected_latest_version: None,
             tagged_frag_reuse_trim: false,
@@ -265,6 +267,11 @@ impl<'a> CommitTransactionOptions<'a> {
 
     pub fn with_affected_rows(mut self, affected_rows: Option<&'a RowAddrTreeMap>) -> Self {
         self.affected_rows = affected_rows;
+        self
+    }
+
+    pub(super) fn with_inserted_row_count(mut self, count: Option<u64>) -> Self {
+        self.inserted_row_count = count;
         self
     }
 
@@ -302,6 +309,7 @@ pub async fn commit_transaction(
         retry_timeout,
         manifest_naming_scheme,
         affected_rows,
+        inserted_row_count,
         append_idempotency_key,
         expected_latest_version,
         tagged_frag_reuse_trim,
@@ -360,6 +368,12 @@ pub async fn commit_transaction(
         indices: read_version_indices.as_slice(),
     });
 
+    let submitted_transaction = transaction;
+    let row_write = affected_rows.is_some()
+        && matches!(
+            &transaction.operation,
+            Operation::Update { .. } | Operation::Delete { .. }
+        );
     let mut transaction = transaction.clone();
     // What a rewrite on a tagged fragment reuse history assembled for the
     // attempt; handed to the manifest build, never written back into
@@ -427,10 +441,15 @@ pub async fn commit_transaction(
             // Use small amount of backoff to handle transactions that all
             // started at exact same time better.
 
-            let mut rebase =
-                TransactionRebase::try_new(&original_dataset, transaction, affected_rows)
-                    .await?
-                    .with_read_version_dataset(&read_version_dataset);
+            let mut rebase = TransactionRebase::for_commit_attempt(
+                &original_dataset,
+                transaction,
+                affected_rows,
+                (!other_transactions.is_empty()).then_some(&read_version_dataset),
+                inserted_row_count,
+            )
+            .await?
+            .with_read_version_dataset(&read_version_dataset);
             rebase.load_current_lineage(&dataset).await?;
             let seen = other_transactions
                 .iter()
@@ -491,6 +510,9 @@ pub async fn commit_transaction(
                 rebase.check_txn(other_transaction, *other_version)?;
             }
 
+            if row_write && checked_since != read_version && !other_transactions.is_empty() {
+                rebase.recheck_fragment_removals(submitted_transaction);
+            }
             let (rebased, assembly) = rebase.finish_with_index_hook(&dataset, hooks.index).await?;
             transaction = rebased;
             tagged_rewrite = assembly;

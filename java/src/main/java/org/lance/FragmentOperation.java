@@ -56,7 +56,7 @@ public abstract class FragmentOperation {
       Preconditions.checkNotNull(allocator);
       Preconditions.checkNotNull(path);
       Preconditions.checkNotNull(readVersion);
-      return Dataset.commitAppend(path, readVersion, fragments, storageOptions);
+      return Dataset.commitAppend(allocator, path, readVersion, fragments, storageOptions);
     }
   }
 
@@ -83,7 +83,7 @@ public abstract class FragmentOperation {
       try (ArrowSchema arrowSchema = ArrowSchema.allocateNew(allocator)) {
         Data.exportSchema(allocator, schema, null, arrowSchema);
         return Dataset.commitOverwrite(
-            path, arrowSchema.memoryAddress(), readVersion, fragments, storageOptions);
+            allocator, path, arrowSchema.memoryAddress(), readVersion, fragments, storageOptions);
       }
     }
   }

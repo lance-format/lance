@@ -8,8 +8,8 @@ use std::vec;
 use crate::dataset::builder::DatasetBuilder;
 use crate::dataset::transaction::{Operation, Transaction, UpdateMode, UpdatedFragmentOffsets};
 use crate::dataset::{
-    ColumnAlteration, NewColumnTransform, ReadParams, TRANSACTIONS_DIR, UpdateBuilder,
-    write_manifest_file,
+    ColumnAlteration, MergeInsertBuilder, NewColumnTransform, ReadParams, TRANSACTIONS_DIR,
+    UncommittedMergeInsert, UpdateBuilder, WhenMatched, write_manifest_file,
 };
 use crate::io::ObjectStoreParams;
 use crate::session::Session;
@@ -1664,6 +1664,248 @@ impl CommitHandler for GateNextCommitHandler {
             )
             .await
     }
+}
+
+async fn stage_one_row_update(dir: &str) -> (Dataset, UncommittedMergeInsert) {
+    let dataset = InsertBuilder::new(dir)
+        .execute(vec![
+            record_batch!(("id", Int32, [0, 1, 2, 3]), ("value", Int32, [0, 0, 0, 0])).unwrap(),
+        ])
+        .await
+        .unwrap();
+    let staged = MergeInsertBuilder::try_new(Arc::new(dataset.clone()), vec!["id".into()])
+        .unwrap()
+        .when_matched(WhenMatched::UpdateAll)
+        .try_build()
+        .unwrap()
+        .execute_uncommitted_batches(vec![
+            record_batch!(("id", Int32, [1]), ("value", Int32, [10])).unwrap(),
+        ])
+        .await
+        .unwrap();
+    (dataset, staged)
+}
+
+#[rstest::rstest]
+#[case::another_delete("id = 0", false)]
+#[case::restore_rows("id = 0", true)]
+#[case::restore_after_tentative_removal("id IN (0, 2, 3)", true)]
+#[tokio::test]
+async fn test_staged_merge_row_conflicts_retry_after_publication_race(
+    #[case] first_delete: &str,
+    #[case] restore: bool,
+) {
+    let dir = TempStrDir::default();
+    let (mut dataset, staged) = stage_one_row_update(&dir).await;
+    let read = Arc::new(dataset.clone());
+    let original_fragment = read.fragments()[0].clone();
+    dataset.delete(first_delete).await.unwrap();
+
+    let handler = Arc::new(GateNextCommitHandler {
+        inner: Arc::new(ConditionalPutCommitHandler),
+        gate_next: AtomicBool::new(true),
+        entered: Notify::new(),
+        release: Notify::new(),
+    });
+    let commit = CommitBuilder::new(read)
+        .with_commit_handler(handler.clone())
+        .with_affected_rows(staged.affected_rows.unwrap())
+        .with_inserted_row_count(staged.stats.num_inserted_rows)
+        .execute(staged.transaction);
+    tokio::pin!(commit);
+    tokio::select! {
+        _ = handler.entered.notified() => {}
+        result = &mut commit => panic!("expected staged disjoint rows to commit after retry: {result:?}"),
+    }
+    if restore {
+        let txn = Transaction::new(
+            dataset.version_id(),
+            Operation::Delete {
+                updated_fragments: vec![original_fragment],
+                deleted_fragment_ids: vec![],
+                predicate: String::new(),
+            },
+            None,
+        );
+        CommitBuilder::new(Arc::new(dataset))
+            .execute(txn)
+            .await
+            .unwrap();
+    } else {
+        dataset.delete("id = 2").await.unwrap();
+    }
+    handler.release.notify_one();
+    let committed = commit
+        .await
+        .expect("expected staged disjoint rows to commit after retry");
+    assert_eq!(committed.version().version, 4);
+    let expected = if restore {
+        vec![(0, 0), (1, 10), (2, 0), (3, 0)]
+    } else {
+        vec![(1, 10), (3, 0)]
+    };
+    assert_eq!(sorted_id_values(&committed).await, expected);
+}
+
+async fn sorted_id_values(dataset: &Dataset) -> Vec<(i32, i32)> {
+    let rows = dataset.scan().try_into_batch().await.unwrap();
+    let ids = rows["id"].as_primitive::<Int32Type>();
+    let values = rows["value"].as_primitive::<Int32Type>();
+    let mut rows: Vec<_> = ids
+        .values()
+        .iter()
+        .zip(values.values())
+        .map(|(&id, &value)| (id, value))
+        .collect();
+    rows.sort_unstable();
+    rows
+}
+
+#[derive(Clone, Copy, Debug)]
+enum RowCommitPath {
+    Commit,
+    Rebase,
+    RebaseNewestFirst,
+}
+
+#[rstest::rstest]
+#[case::cleared(false, false)]
+#[case::cleared_then_deleted(false, true)]
+#[case::different_inline_mask(true, false)]
+#[tokio::test]
+async fn test_staged_merge_row_conflicts_after_intermediate_undelete(
+    #[values(false, true)] supply_rows: bool,
+    #[values(0, 1)] concurrent_id: i32,
+    #[values(
+        RowCommitPath::Commit,
+        RowCommitPath::Rebase,
+        RowCommitPath::RebaseNewestFirst
+    )]
+    path: RowCommitPath,
+    #[case] replace_inline: bool,
+    #[case] delete_again: bool,
+) {
+    let dir = TempStrDir::default();
+    let (mut dataset, staged) = stage_one_row_update(&dir).await;
+    let read = Arc::new(dataset.clone());
+    let mut restored = read.fragments()[0].clone();
+    if replace_inline {
+        dataset
+            .update_config([(
+                crate::dataset::deletions::INLINE_DELETIONS_MAX_BYTES_CONFIG_KEY,
+                "4096",
+            )])
+            .await
+            .unwrap();
+    }
+    dataset
+        .delete(&format!("id = {concurrent_id}"))
+        .await
+        .unwrap();
+    if replace_inline {
+        // The row set of an inline deletion file lives in the manifest itself.
+        restored = dataset.fragments()[0].clone();
+        let file = restored.deletion_file.as_mut().unwrap();
+        assert!(file.inline.is_some());
+        let mut bytes = Vec::new();
+        RoaringBitmap::from_iter([2])
+            .serialize_into(&mut bytes)
+            .unwrap();
+        file.inline = Some(bytes.into());
+    }
+    // The final mask omits the concurrent writer's original deletion.
+    let restore_rows = Transaction::new(
+        dataset.version().version,
+        Operation::Delete {
+            updated_fragments: vec![restored],
+            deleted_fragment_ids: vec![],
+            predicate: String::new(),
+        },
+        None,
+    );
+    dataset = CommitBuilder::new(Arc::new(dataset))
+        .execute(restore_rows)
+        .await
+        .unwrap();
+    if delete_again {
+        dataset.delete("id = 2").await.unwrap();
+    }
+    let latest_version = dataset.version().version;
+    let affected = supply_rows.then(|| staged.affected_rows.unwrap());
+    let result = if !matches!(path, RowCommitPath::Commit) {
+        async {
+            let mut rebase = crate::io::commit::conflict_resolver::TransactionRebase::try_new_with_inserted_row_count(
+                &read,
+                staged.transaction,
+                affected.as_ref(),
+                Some(staged.stats.num_inserted_rows),
+            )
+            .await?;
+            let mut versions: Vec<_> = (read.version_id() + 1..=latest_version).collect();
+            if matches!(path, RowCommitPath::RebaseNewestFirst) {
+                versions.reverse();
+            }
+            for version in versions {
+                let other = dataset.read_transaction_by_version(version).await?.unwrap();
+                rebase.check_txn(&other, version)?;
+            }
+            let transaction = rebase.finish(&dataset).await?;
+            CommitBuilder::new(Arc::new(dataset.clone()))
+                .execute(transaction)
+                .await
+        }
+        .await
+    } else {
+        let mut commit =
+            CommitBuilder::new(read).with_inserted_row_count(staged.stats.num_inserted_rows);
+        if let Some(affected) = affected {
+            commit = commit.with_affected_rows(affected);
+        }
+        commit.execute(staged.transaction).await
+    };
+    let conflicts = !supply_rows || concurrent_id == 1;
+    if conflicts {
+        assert!(
+            matches!(result, Err(Error::RetryableCommitConflict { .. })),
+            "{result:?}"
+        );
+    } else {
+        result.expect("the transient deletion was disjoint from the staged write");
+    }
+    dataset.checkout_latest().await.unwrap();
+    assert_eq!(
+        dataset.version().version,
+        latest_version + u64::from(!conflicts)
+    );
+    let value = if conflicts { 0 } else { 10 };
+    let mut expected = vec![(0, 0), (1, value), (3, 0)];
+    if !replace_inline && !delete_again {
+        expected.insert(2, (2, 0));
+    }
+    assert_eq!(sorted_id_values(&dataset).await, expected);
+}
+
+#[tokio::test]
+async fn test_staged_merge_row_conflicts_out_of_bounds_deletion() {
+    let dir = TempStrDir::default();
+    let (mut dataset, staged) = stage_one_row_update(&dir).await;
+    let read = Arc::new(dataset.clone());
+    dataset.delete("id IN (0, 2)").await.unwrap();
+    let mut rows = staged.affected_rows.unwrap();
+    // Cardinality alone is insufficient to prove that every physical row was deleted.
+    rows.insert(RowAddress::new_from_parts(0, 4).into());
+    let result = CommitBuilder::new(read)
+        .with_affected_rows(rows)
+        .with_inserted_row_count(staged.stats.num_inserted_rows)
+        .execute(staged.transaction)
+        .await;
+    assert!(
+        matches!(result, Err(Error::RetryableCommitConflict { .. })),
+        "{result:?}"
+    );
+    let latest = Dataset::open(&dir).await.unwrap();
+    assert_eq!(latest.version_id(), dataset.version_id());
+    assert_eq!(latest.count_rows(Some("id = 3".into())).await.unwrap(), 1);
 }
 
 /// Once the restore has checked its predecessor, a commit that wins the next

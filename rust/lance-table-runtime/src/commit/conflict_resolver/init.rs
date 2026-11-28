@@ -11,6 +11,50 @@ impl<'a> TransactionRebase<'a> {
         transaction: Transaction,
         affected_rows: Option<&'a RowAddrTreeMap>,
     ) -> Result<Self> {
+        Self::try_new_with_inserted_row_count(dataset, transaction, affected_rows, None).await
+    }
+
+    /// Capture a staged write with its observed number of inserted rows.
+    /// Pass `None` when the writer did not supply a count. Physical addresses
+    /// alone identify removed rows but cannot account for untracked inserts.
+    ///
+    /// ```
+    /// # use lance_table::transaction::Transaction;
+    /// # use lance_table_runtime::{Table, commit::conflict_resolver::TransactionRebase};
+    /// # async fn rebase(table: &Table, tx: Transaction, count: u64) -> lance_core::Result<()> {
+    /// let rebase = TransactionRebase::try_new_with_inserted_row_count(table, tx, None, Some(count)).await?;
+    /// # Ok(()) }
+    /// ```
+    pub async fn try_new_with_inserted_row_count(
+        dataset: &Table,
+        transaction: Transaction,
+        affected_rows: Option<&'a RowAddrTreeMap>,
+        inserted_row_count: Option<u64>,
+    ) -> Result<Self> {
+        let read = if staged_update::needs_row_history(&transaction, affected_rows)
+            && dataset.version_id() != transaction.read_version
+        {
+            Cow::Owned(dataset.checkout_version(transaction.read_version).await?)
+        } else {
+            Cow::Borrowed(dataset)
+        };
+        Self::for_commit_attempt(
+            &read,
+            transaction,
+            affected_rows,
+            Some(&read),
+            inserted_row_count,
+        )
+        .await
+    }
+
+    pub(in crate::commit) async fn for_commit_attempt(
+        dataset: &Table,
+        transaction: Transaction,
+        affected_rows: Option<&'a RowAddrTreeMap>,
+        row_read: Option<&Table>,
+        inserted_row_count: Option<u64>,
+    ) -> Result<Self> {
         match &transaction.operation {
             // These operations add new fragments or don't modify any.
             Operation::Append { .. }
@@ -51,6 +95,7 @@ impl<'a> TransactionRebase<'a> {
                     transaction,
                     affected_rows,
                     initial_fragments: HashMap::new(),
+                    row_history: None,
                     modified_fragment_ids: HashSet::new(),
                     frag_reuse_base,
                     conflicting_mem_wal_compacted_sstables: Vec::new(),
@@ -80,15 +125,26 @@ impl<'a> TransactionRebase<'a> {
                     .chain(deleted_fragment_ids.iter().copied())
                     .collect::<HashSet<_>>();
 
-                // short circuit for full fragment update or delete case
-                // set affected_rows as None with non-empty modified_fragment_ids
-                // to indicate this condition to be used in [check_delete_update_txn]
+                // A column patch that publishes no new fragments cannot insert
+                // rows, including when staged by a writer without MERGE statistics.
+                let inserted_row_count = match &transaction.operation {
+                    Operation::Update { new_fragments, .. } if new_fragments.is_empty() => Some(0),
+                    _ => inserted_row_count,
+                };
+                let row_history = row_read
+                    .filter(|_| staged_update::needs_row_history(&transaction, affected_rows))
+                    .map(|read| staged_update::RowHistory::new(read, inserted_row_count));
+
                 if updated_fragments.is_empty() && affected_rows.is_some() {
+                    // Removed fragments conflict as a whole. A fragment-only append,
+                    // however, must distinguish a supplied row map from omission.
+                    let affected_rows = affected_rows.filter(|_| deleted_fragment_ids.is_empty());
                     return Ok(Self {
                         transaction,
+                        row_history,
                         initial_fragments: HashMap::new(),
                         modified_fragment_ids,
-                        affected_rows: None,
+                        affected_rows,
                         frag_reuse_base: None,
                         conflicting_mem_wal_compacted_sstables: Vec::new(),
                         current_lineage: None,
@@ -105,8 +161,9 @@ impl<'a> TransactionRebase<'a> {
                 let initial_fragments =
                     initial_fragments_for_rebase(dataset, &transaction, &modified_fragment_ids)
                         .await?;
-                Ok(Self {
+                let mut rebase = Self {
                     transaction,
+                    row_history,
                     affected_rows,
                     initial_fragments,
                     modified_fragment_ids,
@@ -120,7 +177,11 @@ impl<'a> TransactionRebase<'a> {
                     read_schema: None,
                     reuse: Default::default(),
                     staged_replay: false,
-                })
+                };
+                if rebase.row_history.is_some() {
+                    rebase.validate_row_rewrite(inserted_row_count);
+                }
+                Ok(rebase)
             }
             Operation::Rewrite {
                 groups,
@@ -146,6 +207,7 @@ impl<'a> TransactionRebase<'a> {
                 let reuse = rewrite_reuse_state(dataset, &transaction).await?;
                 Ok(Self {
                     transaction,
+                    row_history: None,
                     affected_rows,
                     initial_fragments,
                     modified_fragment_ids,
@@ -169,6 +231,7 @@ impl<'a> TransactionRebase<'a> {
                         .await?;
                 Ok(Self {
                     transaction,
+                    row_history: None,
                     affected_rows,
                     initial_fragments,
                     modified_fragment_ids,
@@ -192,6 +255,7 @@ impl<'a> TransactionRebase<'a> {
                         .await?;
                 Ok(Self {
                     transaction,
+                    row_history: None,
                     affected_rows,
                     initial_fragments,
                     modified_fragment_ids,
@@ -214,6 +278,7 @@ impl<'a> TransactionRebase<'a> {
                         .await?;
                 Ok(Self {
                     transaction,
+                    row_history: None,
                     affected_rows,
                     initial_fragments,
                     modified_fragment_ids,

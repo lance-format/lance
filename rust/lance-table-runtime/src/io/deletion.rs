@@ -51,17 +51,35 @@ where
     Before: std::future::Future<Output = lance_core::Result<Arc<DeletionVector>>>,
     After: std::future::Future<Output = lance_core::Result<Arc<DeletionVector>>>,
 {
-    let Some(deleted_then) = &then.deletion_file else {
+    deletion_mask_shrank(
+        then.deletion_file.as_ref(),
+        now.deletion_file.as_ref(),
+        before,
+        after,
+    )
+    .await
+}
+
+pub(crate) async fn deletion_mask_shrank<'a, 'b, Before, After>(
+    then: Option<&'a DeletionFile>,
+    now: Option<&'b DeletionFile>,
+    before: impl FnOnce(&'a DeletionFile) -> Before,
+    after: impl FnOnce(&'b DeletionFile) -> After,
+) -> lance_core::Result<bool>
+where
+    Before: std::future::Future<Output = lance_core::Result<Arc<DeletionVector>>>,
+    After: std::future::Future<Output = lance_core::Result<Arc<DeletionVector>>>,
+{
+    let Some(deleted_then) = then else {
         return Ok(false);
     };
-    let Some(deleted_now) = &now.deletion_file else {
+    let Some(deleted_now) = now else {
         return Ok(true);
     };
-    if deleted_now.id == deleted_then.id && deleted_now.read_version == deleted_then.read_version {
+    if deleted_now == deleted_then {
         return Ok(false);
     }
-    let rows_then = before(deleted_then).await?;
-    let rows_now = after(deleted_now).await?;
+    let (rows_then, rows_now) = futures::try_join!(before(deleted_then), after(deleted_now))?;
     Ok(rows_then.iter().any(|row| !rows_now.contains(row)))
 }
 

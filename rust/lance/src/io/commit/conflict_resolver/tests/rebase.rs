@@ -389,7 +389,7 @@ async fn test_non_conflicting_rebase_delete_update() {
             LanceFileVersion::Stable.resolve(),
             NonZero::new(10),
         )
-        .with_physical_rows(3);
+        .with_physical_rows(1);
     let operations = [
         Operation::Update {
             updated_fragments: vec![apply_deletion(&[0], &mut fragment, &dataset).await],
@@ -428,10 +428,14 @@ async fn test_non_conflicting_rebase_delete_update() {
         let previous_transactions = transactions.iter().take(i).cloned().collect::<Vec<_>>();
 
         let affected_rows = RowAddrTreeMap::from_iter([i as u64]);
-        let mut rebase =
-            TransactionRebase::try_new(&dataset, transaction.clone(), Some(&affected_rows))
-                .await
-                .unwrap();
+        let mut rebase = TransactionRebase::try_new_with_inserted_row_count(
+            &dataset,
+            transaction.clone(),
+            Some(&affected_rows),
+            Some(0),
+        )
+        .await
+        .unwrap();
 
         dataset
             .table_state

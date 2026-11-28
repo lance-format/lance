@@ -747,6 +747,7 @@ impl UpdateJob {
 
         let new_dataset = CommitBuilder::new(dataset)
             .with_affected_rows(update_data.affected_rows)
+            .with_inserted_row_count(0)
             .execute(transaction)
             .await?;
 

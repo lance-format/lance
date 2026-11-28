@@ -51,6 +51,7 @@ fn test_mem_wal_install_conflicts_with_merge() {
             None,
         );
         let mut rebase = TransactionRebase {
+            row_history: None,
             transaction: txn,
             initial_fragments: HashMap::new(),
             modified_fragment_ids: HashSet::new(),
@@ -80,6 +81,7 @@ fn test_mem_wal_install_conflicts_with_merge() {
         None,
     );
     let mut rebase = TransactionRebase {
+        row_history: None,
         transaction: merge,
         initial_fragments: HashMap::new(),
         modified_fragment_ids: HashSet::new(),
@@ -134,6 +136,7 @@ fn test_create_index_conflicts_only_on_same_name() {
         None,
     );
     let mut rebase = TransactionRebase {
+        row_history: None,
         transaction: txn,
         initial_fragments: HashMap::new(),
         modified_fragment_ids: HashSet::new(),
@@ -178,6 +181,7 @@ fn test_create_index_conflicts_only_on_same_name() {
     );
 
     let mut rebase = TransactionRebase {
+        row_history: None,
         transaction: Transaction::new(
             0,
             Operation::CreateIndex {
@@ -267,6 +271,7 @@ fn test_create_index_conflicts_with_concurrent_drop(
     };
 
     let mut rebase = TransactionRebase {
+        row_history: None,
         transaction: Transaction::new(0, current_operation, None),
         initial_fragments: HashMap::new(),
         modified_fragment_ids: HashSet::new(),
@@ -317,6 +322,7 @@ fn test_concurrent_index_drops_are_compatible() {
         removed_indices: vec![existing],
     };
     let mut rebase = TransactionRebase {
+        row_history: None,
         transaction: Transaction::new(0, drop_operation.clone(), None),
         initial_fragments: HashMap::new(),
         modified_fragment_ids: HashSet::new(),
@@ -369,6 +375,7 @@ fn test_index_replacement_compatible_with_removing_disjoint_segment() {
         removed_indices: vec![concurrently_removed],
     };
     let mut rebase = TransactionRebase {
+        row_history: None,
         transaction: Transaction::new(0, replacement_operation, None),
         initial_fragments: HashMap::new(),
         modified_fragment_ids: HashSet::new(),
@@ -443,6 +450,7 @@ fn test_create_ngram_index_conflicts_with_overlapping_deferred_rewrite() {
 
     for (covered_fragment, expect_conflict) in [(1u32, true), (3u32, false)] {
         let mut rebase = TransactionRebase {
+            row_history: None,
             transaction: Transaction::new(
                 1,
                 Operation::CreateIndex {
@@ -526,6 +534,7 @@ fn test_create_index_conflicts_with_deferred_rewrite_under_stable_row_ids() {
         old_fragment.row_id_meta = row_id_meta;
 
         let mut rebase = TransactionRebase {
+            row_history: None,
             transaction: Transaction::new(
                 1,
                 Operation::Rewrite {
@@ -1084,6 +1093,7 @@ fn test_compacted_sstables_conflict_lower_generation_fails() {
     );
 
     let mut rebase = TransactionRebase {
+        row_history: None,
         transaction: to_commit_txn,
         initial_fragments: HashMap::new(),
         modified_fragment_ids: HashSet::new(),
@@ -1132,6 +1142,7 @@ fn test_compacted_sstables_conflict_equal_generation_fails() {
     );
 
     let mut rebase = TransactionRebase {
+        row_history: None,
         transaction: to_commit_txn,
         initial_fragments: HashMap::new(),
         modified_fragment_ids: HashSet::new(),
@@ -1181,6 +1192,7 @@ fn test_compacted_sstables_conflict_higher_generation_retryable() {
     );
 
     let mut rebase = TransactionRebase {
+        row_history: None,
         transaction: to_commit_txn,
         initial_fragments: HashMap::new(),
         modified_fragment_ids: HashSet::new(),
@@ -1230,6 +1242,7 @@ fn test_compacted_sstables_different_shards_ok() {
     );
 
     let mut rebase = TransactionRebase {
+        row_history: None,
         transaction: to_commit_txn,
         initial_fragments: HashMap::new(),
         modified_fragment_ids: HashSet::new(),
@@ -1289,6 +1302,7 @@ fn test_update_mem_wal_state_vs_create_index_with_compacted_sstables() {
     );
 
     let mut rebase = TransactionRebase {
+        row_history: None,
         transaction: to_commit_txn,
         initial_fragments: HashMap::new(),
         modified_fragment_ids: HashSet::new(),
@@ -1323,6 +1337,7 @@ fn test_update_mem_wal_state_vs_create_index_with_compacted_sstables() {
     );
 
     let mut rebase_higher = TransactionRebase {
+        row_history: None,
         transaction: to_commit_txn_higher,
         initial_fragments: HashMap::new(),
         modified_fragment_ids: HashSet::new(),
@@ -1378,6 +1393,7 @@ fn test_create_index_vs_update_mem_wal_state_rebase() {
     );
 
     let mut rebase = TransactionRebase {
+        row_history: None,
         transaction: to_commit_txn,
         initial_fragments: HashMap::new(),
         modified_fragment_ids: HashSet::new(),
