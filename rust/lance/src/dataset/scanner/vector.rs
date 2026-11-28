@@ -610,8 +610,7 @@ impl Scanner {
     /// same initial probe budget and sequential late-search cut. Across deltas
     /// it consumes results round-robin, while single-query search follows their
     /// nondeterministic completion order. Explicit parallel adaptive probing
-    /// falls back because it can search beyond the sequential cut. Adaptive RQ
-    /// also falls back until its scalar and batch scoring paths agree.
+    /// falls back because it can search beyond the sequential cut.
     async fn batch_index_search_supported(
         &self,
         index_name: &str,
@@ -654,9 +653,9 @@ impl Scanner {
         // to call `supports_batch_partition_search()`: this is a planning-time
         // gate and the single-query path likewise avoids opening the index here.
         // An IVF index with a flat-style sub-index (i.e. not HNSW) is exactly the
-        // set for which `supports_batch_partition_search()` is true; adaptive RQ
-        // compatibility further restricts eligibility below. The exec re-checks
-        // the trait as a defensive invariant. Legacy segments without details fall back.
+        // set for which `supports_batch_partition_search()` is true. The exec
+        // re-checks the trait as a defensive invariant. Legacy segments without
+        // details fall back.
         let all_support_batch_search = index_segments.iter().all(|index| {
             index
                 .index_details
@@ -665,13 +664,7 @@ impl Scanner {
                 .map(|details| {
                     let index_type =
                         crate::index::vector::details::derive_vector_index_type(details);
-                    // RQ's filtered batch accumulator can differ from scalar
-                    // single-query scoring. Preserve the per-query adaptive path.
-                    let is_adaptive_rq =
-                        index_type == "IVF_RQ" && q.maximum_nprobes != Some(q.minimum_nprobes);
-                    index_type.starts_with("IVF_")
-                        && !index_type.contains("HNSW")
-                        && !is_adaptive_rq
+                    index_type.starts_with("IVF_") && !index_type.contains("HNSW")
                 })
                 .unwrap_or(false)
         });
