@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use lance_arrow::DataTypeExt;
 use lance_core::{Error, Result, datatypes::Field};
 use lance_encoding::compression::PerValueGeneralCompression;
 use lance_encoding::{
@@ -13,9 +14,16 @@ use lance_encoding::{
         try_variable_width_miniblock, try_variable_width_per_value,
     },
     compression_config::{CompressionFieldParams, CompressionParams},
+    constants::MINICHUNK_SIZE_META_KEY,
     data::DataBlock,
-    encodings::logical::primitive::{fullzip::PerValueCompressor, miniblock::MiniBlockCompressor},
+    encodings::logical::primitive::{
+        fullzip::PerValueCompressor,
+        miniblock::{MAX_MINIBLOCK_BYTES, MiniBlockCompressor},
+    },
 };
+
+// Binary metadata has historically ignored hints at or above 32 KiB.
+const MAX_BINARY_MINICHUNK_BYTES: i64 = 32 * 1024 - 1;
 
 #[derive(Debug, Clone)]
 pub(super) struct Strategy {
@@ -32,13 +40,11 @@ impl Strategy {
             .params
             .get_field_params(&field.name, &field.data_type());
         let mut metadata = field_metadata_params(field);
-        if metadata
-            .minichunk_size
-            .is_some_and(|size| size >= 32 * 1024)
+        if let Some(size) = metadata.minichunk_size
+            && size > MAX_BINARY_MINICHUNK_BYTES
         {
             log::warn!(
-                "minichunk_size '{}' is too large for the selected u16 miniblock layout, using default",
-                metadata.minichunk_size.unwrap()
+                "minichunk_size '{size}' is too large for the selected u16 miniblock layout, using default"
             );
             metadata.minichunk_size = None;
         }
@@ -48,6 +54,27 @@ impl Strategy {
 }
 
 impl CompressionStrategy for Strategy {
+    fn minichunk_size(&self, field: &Field) -> Result<Option<u64>> {
+        let Some(size) = self
+            .params
+            .minichunk_size(field, Some(MAX_BINARY_MINICHUNK_BYTES))?
+        else {
+            return Ok(None);
+        };
+        let max = if field.data_type().is_binary_like() {
+            MAX_BINARY_MINICHUNK_BYTES as u64
+        } else {
+            MAX_MINIBLOCK_BYTES
+        };
+        if size > max {
+            return Err(Error::invalid_input(format!(
+                "Field '{}' has {MINICHUNK_SIZE_META_KEY}={size}; Lance 2.1 supports at most {max} bytes for this field",
+                field.name
+            )));
+        }
+        Ok(Some(size))
+    }
+
     fn create_miniblock_compressor(
         &self,
         field: &Field,

@@ -416,6 +416,10 @@ impl ::prost::Name for SparseValiditySet {
 /// zstd, lz4, etc.  The entire buffer is compressed as a single unit.  If this happens
 /// then any parent encoding becomes opaque, even if it would normally be transparent.
 ///
+/// BufferCompression is valid only where the enclosing codec permits it. In
+/// mini-block positions, Flat.data, InlineBitpacking.values, and Variable.values
+/// must be absent. General provides wrapper compression as described below.
+///
 /// This is a leaf, no further compression is applied to the data.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct BufferCompression {
@@ -443,9 +447,9 @@ impl ::prost::Name for BufferCompression {
 }
 /// Fixed width items placed contiguously in a single buffer
 ///
-/// This is a leaf encoding, there is no compression applied to the data.
+/// This is a leaf encoding, transparent when data is absent.
 ///
-/// This is a transparent encoding by definition.
+/// In mini-block and generic unsigned block positions, data must be absent.
 ///
 /// The input is a fixed-width data block.
 /// The output is a single buffer.
@@ -455,7 +459,7 @@ pub struct Flat {
     /// not need to be a multiple of 8
     #[prost(uint64, tag = "1")]
     pub bits_per_value: u64,
-    /// The compression applied to the data
+    /// Buffer compression; must be absent in mini-block and generic unsigned block positions.
     #[prost(message, optional, tag = "2")]
     pub data: ::core::option::Option<BufferCompression>,
 }
@@ -477,6 +481,15 @@ impl ::prost::Name for Flat {
 ///
 /// This is a transparent encoding by definition.
 ///
+/// In buffer-backed block and variable-width Zipped value positions, offsets
+/// must be Flat with bits_per_value equal to 32 or 64 and Flat.data absent.
+/// In both positions, values must be absent.
+///
+/// In mini-block positions, values must be absent. Offsets use plain 32/64-bit
+/// Flat for the interleaved layout, or a non-Flat generic unsigned block codec
+/// for separate chunk-relative offsets and value buffers. Generic offsets are
+/// supported only in mini-block positions.
+///
 /// The input is a variable-width data block.
 /// The output is a single fixed-width data block (the offsets) and
 /// a single buffer (the values)
@@ -485,7 +498,8 @@ pub struct Variable {
     /// Describes how the offsets data block is compressed
     #[prost(message, optional, boxed, tag = "1")]
     pub offsets: ::core::option::Option<::prost::alloc::boxed::Box<CompressiveEncoding>>,
-    /// The compression applied to the values
+    /// Buffer compression; must be absent in mini-block, buffer-backed block,
+    /// and variable-width Zipped value positions.
     #[prost(message, optional, tag = "2")]
     pub values: ::core::option::Option<BufferCompression>,
 }
@@ -530,7 +544,8 @@ impl ::prost::Name for Constant {
 ///
 /// The value at index i is `start + step * i`. The container supplies the
 /// number of values. Writers use this encoding only when step is positive and
-/// the final value fits in the declared bit width.
+/// the final value fits in the declared bit width. The sequence must contain
+/// at least two values; empty and singleton sequences use Constant.
 ///
 /// The input is a u32 or u64 fixed-width data block.
 /// There is no output buffer.
@@ -559,9 +574,9 @@ impl ::prost::Name for Range {
 /// An unstable Lance 2.3 non-decreasing unsigned fixed-width sequence
 /// represented by its first value and the differences between adjacent values.
 ///
-/// The child contains one fewer value than the input. The container supplies
-/// the input cardinality. MonotonicDelta has a payload exactly when its child
-/// has one.
+/// The input must contain at least two values. The child contains one fewer
+/// value than the input. The container supplies the input cardinality.
+/// MonotonicDelta has a payload exactly when its child has one.
 ///
 /// The input is a u32 or u64 fixed-width data block.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -625,6 +640,10 @@ impl ::prost::Name for OutOfLineBitpacking {
 ///
 /// This is an opaque encoding.
 ///
+/// In mini-block positions, uncompressed_bits_per_value must be 8, 16, 32, 64,
+/// or 128. In mini-block and generic unsigned block positions, values must be
+/// absent.
+///
 /// The input is a fixed-width data block.
 /// The output is a single buffer.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
@@ -632,7 +651,7 @@ pub struct InlineBitpacking {
     /// the number of bits of the uncompressed value. e.g. for a u32, this will be 32
     #[prost(uint64, tag = "1")]
     pub uncompressed_bits_per_value: u64,
-    /// The compression applied to the values
+    /// Buffer compression; must be absent in mini-block and generic unsigned block positions.
     #[prost(message, optional, tag = "2")]
     pub values: ::core::option::Option<BufferCompression>,
 }
@@ -714,6 +733,16 @@ impl ::prost::Name for Dictionary {
 /// There are two outputs:
 /// - A data block of the same kind as the input (the run values)
 /// - A fixed-width data block containing the lengths of the runs
+///
+/// In generic unsigned blocks, a payload starts with the values payload length
+/// as an 8-byte little-endian integer, followed by values, then run_lengths
+/// through the end. A metadata-only child contributes zero payload bytes. If
+/// both children are metadata-only, the entire frame is omitted.
+///
+/// Both children have the same run cardinality. Recover it from Constant/Range
+/// run_lengths or a plain Flat child's payload length and width. Run lengths
+/// must be positive and sum to the input cardinality. A Range child requires
+/// at least two recovered runs.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Rle {
     /// The compression used to store the run values data block
@@ -844,27 +873,23 @@ impl ::prost::Name for VariablePackedStruct {
 }
 /// A compression scheme that wraps the underlying data with general compression
 ///
-/// Note: The application of wrapped compression will depend on the layout of the data.
-/// If we apply it to mini-block data then we compress entire mini-blocks.  If we apply
-/// it to full-zip data then we compress each value individually.
+/// Compression is applied to the output of the inner encoding. Its scope depends
+/// on the layout:
+/// - Mini-block: when wrapping the whole mini-block codec, values must be a valid
+///    mini-block codec. Compress only the first buffer of each chunk, independently.
+///    Preserve buffer count and order, leaving remaining buffers unchanged.
+///    Decompress the first buffer before invoking the inner codec. This covers
+///    the entire chunk only for single-buffer codecs.
+/// - Full-zip: compress each value individually.
+/// - Generic unsigned block: allowed only at the root, wrapping plain Flat of the
+///    sequence width, without Flat.data compression.
 ///
-/// Note: Wrapped compression is somewhat unique at the moment as it is applied to the
-/// output of the inner encoding and not the input like all other compressive encodings.
+/// Within mini-block Rle, values and run_lengths may each independently use
+/// General(Flat), compressing their respective child buffers.
 ///
-/// Note: General compression can usually be applied in two spots.  We can apply
-/// it to individual buffers or we can apply it here, to the entire array.
-///
-/// For example, let's say we are storing mini-blocks of strings and we are using
-/// FSST and bitpacking the offsets.  We have something like this...
-///
-/// WRAPPED(†3) -> FSST -> VARIABLE -(offsets)-> INLINE_BITPACKING -(data)-> FLAT -> BUFFER (†1)
-///                                  -(data)-> BUFFER (†2)
-///
-/// General compression can be applied at †1, †2, or †3 (or any combination of these).
-///
-/// If we apply it at †1 then we apply it just to the bitpacked offsets
-/// If we apply it at †2 then we apply it just to the FSST compressed data
-/// If we apply it at †3 then we apply it to the entire mini-block (both offsets and data)
+/// A General wrapper does not permit leaf BufferCompression in mini-block
+/// Flat.data, InlineBitpacking.values, or Variable.values. Variable offsets must
+/// still follow their interleaved or generic unsigned block contract.
 ///
 /// The input is a single data block of any kind.
 /// The output is a single data block of the same kind as the input.

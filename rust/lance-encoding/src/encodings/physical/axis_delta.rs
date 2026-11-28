@@ -22,6 +22,7 @@ use crate::{
     buffer::LanceBuffer,
     compression::{FixedPerValueDecompressor, try_raw_per_value},
     compression_config::{AxisDeltaMode, CompressionFieldParams},
+    constants::AXIS_DELTA_META_KEY,
     data::{DataBlock, FixedWidthDataBlock},
     encodings::logical::primitive::fullzip::{PerValueCompressor, PerValueDataBlock},
     format::{
@@ -30,7 +31,6 @@ use crate::{
     },
 };
 
-const META_KEY: &str = "lance-encoding:axis-delta";
 // Whole frames preserve predictor resets and the downstream codec's dictionary scope.
 const MAX_SAMPLE_ROWS: usize = 4;
 const MAX_SAMPLE_BYTES: usize = 4 * 1024 * 1024;
@@ -245,7 +245,7 @@ impl AxisLayout {
 }
 
 fn request(field: &Field, params: &CompressionFieldParams) -> Result<AxisDeltaMode> {
-    let Some(raw) = field.metadata.get(META_KEY) else {
+    let Some(raw) = field.metadata.get(AXIS_DELTA_META_KEY) else {
         return Ok(params
             .axis_delta
             .unwrap_or(AxisDeltaMode::Auto { axis: None }));
@@ -266,7 +266,7 @@ fn request(field: &Field, params: &CompressionFieldParams) -> Result<AxisDeltaMo
         }
     }
     Err(Error::invalid_input(format!(
-        "Invalid {META_KEY} {raw:?}; expected off, auto, auto:<axis>, or on:<axis>"
+        "Invalid {AXIS_DELTA_META_KEY} {raw:?}; expected off, auto, auto:<axis>, or on:<axis>"
     )))
 }
 
@@ -376,7 +376,7 @@ pub fn try_tensor_per_value(
     data: &DataBlock,
     params: &CompressionFieldParams,
 ) -> Result<Option<Box<dyn PerValueCompressor>>> {
-    let implicit = params.axis_delta.is_none() && !field.metadata.contains_key(META_KEY);
+    let implicit = params.axis_delta.is_none() && !field.metadata.contains_key(AXIS_DELTA_META_KEY);
     let mode = request(field, params)?;
     let compression = match params.compression.as_deref() {
         Some("lz4") => Some(CompressionConfig::new(
@@ -993,19 +993,28 @@ mod tests {
             axis_delta: Some(AxisDeltaMode::On { axis: 0 }),
             ..Default::default()
         };
-        field.metadata.insert(META_KEY.into(), "off".into());
+        field
+            .metadata
+            .insert(AXIS_DELTA_META_KEY.into(), "off".into());
         assert!(
             try_tensor_per_value(&field, &data, &params)
                 .unwrap()
                 .is_none()
         );
         for value in ["invalid", "auto:-1", "on:99", "auto:99"] {
-            field.metadata.insert(META_KEY.into(), value.into());
+            field
+                .metadata
+                .insert(AXIS_DELTA_META_KEY.into(), value.into());
             let error = try_tensor_per_value(&field, &data, &params).unwrap_err();
             assert!(matches!(error, Error::InvalidInput { .. }));
-            assert!(error.to_string().contains("Axis") || error.to_string().contains(META_KEY));
+            assert!(
+                error.to_string().contains("Axis")
+                    || error.to_string().contains(AXIS_DELTA_META_KEY)
+            );
         }
-        field.metadata.insert(META_KEY.into(), "auto:0".into());
+        field
+            .metadata
+            .insert(AXIS_DELTA_META_KEY.into(), "auto:0".into());
         field.metadata.insert(
             "ARROW:extension:metadata".into(),
             r#"{"shape":[2,3,6]}"#.into(),

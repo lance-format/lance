@@ -106,6 +106,10 @@ pub(super) struct PlanarPrimitiveEncoding {
 }
 
 impl PrimitivePageEncodingBehavior for PlanarPrimitiveEncoding {
+    fn validate_field(&self, field: &Field, _metadata: &HashMap<String, String>) -> Result<()> {
+        self.compression.minichunk_size(field).map(|_| ())
+    }
+
     fn try_plan_pages(
         &self,
         ctx: &PrimitivePlanContext<'_>,
