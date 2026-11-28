@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use arrow_array::cast::AsArray;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicU64, Ordering},
@@ -116,6 +117,7 @@ impl DeleteOnlyMergeInsertExec {
         metrics: MergeInsertMetrics,
         source_dedupe_behavior: SourceDedupeBehavior,
         on_columns: &[String],
+        unmatched_only: bool,
     ) -> DFResult<RoaringTreemap> {
         let schema = input_stream.schema();
 
@@ -124,6 +126,18 @@ impl DeleteOnlyMergeInsertExec {
                 "Expected _rowaddr column in delete-only merge insert input".to_string(),
             )
         })?;
+
+        if unmatched_only {
+            let mut addresses = RoaringTreemap::new();
+            while let Some(batch) = input_stream.next().await.transpose()? {
+                let rows = batch
+                    .column(rowaddr_idx)
+                    .as_primitive::<arrow_array::types::UInt64Type>();
+                addresses.extend(rows.values().iter().copied());
+                metrics.num_deleted_rows.add(rows.len());
+            }
+            return Ok(addresses);
+        }
 
         let (action_idx, _) = schema
             .column_with_name(MERGE_ACTION_COLUMN)
@@ -208,6 +222,12 @@ impl DisplayAs for DeleteOnlyMergeInsertExec {
             datafusion::physical_plan::DisplayFormatType::Default
             | datafusion::physical_plan::DisplayFormatType::Verbose => {
                 let on_keys = self.params.on.join(", ");
+                if self.params.deletes_only_unmatched_targets() {
+                    return write!(
+                        f,
+                        "DeleteOnlyMergeInsert: on=[{on_keys}], when_not_matched_by_source=Delete"
+                    );
+                }
                 write!(
                     f,
                     "DeleteOnlyMergeInsert: on=[{}], when_matched=Delete, when_not_matched=DoNothing",
@@ -314,9 +334,14 @@ impl ExecutionPlan for DeleteOnlyMergeInsertExec {
             // `metrics` is moved into `collect_deletions`; keep a handle on the
             // skipped-duplicate counter so it can be folded into the stats below.
             let skipped_duplicates = metrics.num_skipped_duplicates.clone();
-            let delete_row_addrs =
-                Self::collect_deletions(input_stream, metrics, source_dedupe_behavior, &on_columns)
-                    .await?;
+            let delete_row_addrs = Self::collect_deletions(
+                input_stream,
+                metrics,
+                source_dedupe_behavior,
+                &on_columns,
+                params.deletes_only_unmatched_targets(),
+            )
+            .await?;
 
             let (updated_fragments, removed_fragment_ids) =
                 apply_deletions(&dataset, &delete_row_addrs)

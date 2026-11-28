@@ -1190,18 +1190,28 @@ impl MergeInsertJob {
         let (update_condition, deferred_update_if) =
             split(parse_update_condition(&self.params, &dataset_schema)?);
         let (delete_condition, deferred_delete_if) = split(parse_delete_condition(&self.params)?);
-        let mut df = scan_aliased
-            .join(
-                source_df_aliased,
-                join_type,
-                &on_cols_refs,
-                &on_cols_refs,
-                None,
-            )?
-            .with_column(
+        let delete_unmatched = self.params.deletes_only_unmatched_targets();
+        let mut df = scan_aliased.join(
+            source_df_aliased,
+            if delete_unmatched {
+                JoinType::LeftAnti
+            } else {
+                join_type
+            },
+            &on_cols_refs,
+            &on_cols_refs,
+            None,
+        )?;
+        df = if delete_unmatched {
+            // An anti join emits each orphan once, regardless of duplicate source keys.
+            // The deletion writer needs only its physical address, even with stable row IDs.
+            df.select_columns(&[ROW_ADDR])?
+        } else {
+            df.with_column(
                 MERGE_ACTION_COLUMN,
                 merge_insert_action(&self.params, update_condition, delete_condition)?,
-            )?;
+            )?
+        };
 
         // Partial-schema upsert: fill the dataset columns the source does not
         // carry from the target side of the join.
@@ -1217,7 +1227,7 @@ impl MergeInsertJob {
         // filled with NULL and not scanned. A deferred `DeleteIf` reads its
         // columns through the fill (`MergeConditionExec`), so those are still
         // filled from the target.
-        if write_sink == WriteSink::RewriteRows {
+        if write_sink == WriteSink::RewriteRows && !delete_unmatched {
             // Exhaustive, so a new variant has to decide whether it updates.
             let updates = match self.params.when_matched {
                 WhenMatched::UpdateAll
