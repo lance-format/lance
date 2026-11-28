@@ -31,6 +31,9 @@ use std::io::ErrorKind;
 use std::path::PathBuf;
 use uuid::Uuid;
 
+mod local_branch_operation;
+use local_branch_operation::LocalBranchOperation;
+
 pub const MAIN_BRANCH: &str = "main";
 
 /// Lance Ref
@@ -485,6 +488,19 @@ impl Branches<'_> {
         let source_branch = source_branch.and_then(standardize_branch);
         let root_location = self.refs.root()?;
         let branch_file = branch_contents_path(&root_location.path, branch_name);
+        let operation =
+            LocalBranchOperation::acquire(self.object_store(), &root_location.path, branch_name)
+                .await?;
+        if operation
+            .as_ref()
+            .is_some_and(|operation| operation.pending.is_some())
+        {
+            return Err(Error::RefConflict {
+                message: format!(
+                    "Deletion of branch {branch_name} is incomplete. Retry branch deletion before reusing the name"
+                ),
+            });
+        }
 
         let branch_location = self
             .refs
@@ -535,12 +551,12 @@ impl Branches<'_> {
             metadata: HashMap::new(),
         };
 
-        put_ref_if_absent(
-            self.object_store(),
-            &branch_file,
-            serde_json::to_vec_pretty(&branch_contents)?,
-            format!("branch {} already exists", branch_name),
-        )
+        let store = self.refs.object_store.clone();
+        let bytes = serde_json::to_vec_pretty(&branch_contents)?;
+        let conflict = format!("branch {branch_name} already exists");
+        LocalBranchOperation::publish(operation, async move {
+            put_ref_if_absent(&store, &branch_file, bytes, conflict).await
+        })
         .await?;
         Ok(branch_contents)
     }
@@ -553,6 +569,8 @@ impl Branches<'_> {
         check_valid_branch(branch)?;
 
         let root_location = self.refs.root()?;
+        let operation =
+            LocalBranchOperation::acquire(self.object_store(), &root_location.path, branch).await?;
         let branch_file = branch_contents_path(&root_location.path, branch);
         if !self.object_store().exists(&branch_file).await? {
             return Err(Error::RefNotFound {
@@ -564,28 +582,45 @@ impl Branches<'_> {
             BranchContents::from_path(&branch_file, self.object_store(), branch).await?;
         branch_contents.metadata = metadata;
 
-        self.object_store()
-            .put(
-                &branch_file,
-                serde_json::to_string_pretty(&branch_contents)?.as_bytes(),
-            )
-            .await
-            .map(|_| ())
+        let store = self.refs.object_store.clone();
+        LocalBranchOperation::publish(operation, async move {
+            store
+                .put(&branch_file, &serde_json::to_vec_pretty(&branch_contents)?)
+                .await
+                .map(|_| ())
+        })
+        .await
     }
 
     /// Delete a branch
     ///
-    /// If the `BranchContents` does not exist, it will return an error directly unless `force` is true.
+    /// A missing ref can be retried when a previous deletion left a cleanup marker.
     /// If `force` is true, it will try to delete the branch directories no matter `BranchContents` exists or not.
     pub async fn delete(&self, branch: &str, force: bool) -> Result<()> {
         check_valid_branch(branch)?;
 
+        if self.object_store().is_local() || self.object_store().scheme() == "file-object-store" {
+            // A caller dropping its future must not release the name while a
+            // blocking filesystem removal is still running.
+            let refs = self.refs.clone();
+            let branch = branch.to_owned();
+            return tokio::spawn(async move { refs.branches().delete_inner(&branch, force).await })
+                .await
+                .map_err(|error| Error::io(format!("Local branch deletion failed: {error}")))?;
+        }
+        self.delete_inner(branch, force).await
+    }
+
+    async fn delete_inner(&self, branch: &str, force: bool) -> Result<()> {
+        let root = self.refs.root()?.path;
+        let mut operation =
+            LocalBranchOperation::acquire(self.object_store(), &root, branch).await?;
         let all_branches = self.list().await?;
-        let branch_id = all_branches
-            .get(branch)
-            .map(|contents| contents.identifier.clone());
-        if let Some(branch_id) = branch_id {
-            let referenced_versions = branch_id.collect_referenced_versions(&all_branches);
+        let contents = all_branches.get(branch);
+        if let Some(contents) = contents {
+            let referenced_versions = contents
+                .identifier
+                .collect_referenced_versions(&all_branches);
             if !referenced_versions.is_empty() {
                 return Err(Error::RefConflict {
                     message: format!(
@@ -594,12 +629,10 @@ impl Branches<'_> {
                     ),
                 });
             }
-        } else if !force {
+        } else if !force && !operation.as_ref().is_some_and(|op| op.pending.is_some()) {
             return Err(Error::RefNotFound {
-                message: format!("Branch {} does not exist", branch),
+                message: format!("Branch {branch} does not exist"),
             });
-        } else {
-            log::warn!("BranchContents of {} does not exist", branch);
         }
 
         // Tags identify snapshots by (branch, version). Deleting a branch removes its entire version chain,
@@ -624,15 +657,49 @@ impl Branches<'_> {
             });
         }
 
-        let root_location = self.refs.root()?;
-        let branch_file = branch_contents_path(&root_location.path, branch);
-        if self.object_store().exists(&branch_file).await? {
-            self.object_store().delete(&branch_file).await?;
+        if let Some(contents) = contents {
+            if let Some(operation) = &mut operation {
+                let remaining = all_branches
+                    .keys()
+                    .map(String::as_str)
+                    .filter(|name| *name != branch)
+                    .collect_vec();
+                // Only a pending directory introduces alias conflicts. Avoid
+                // walking materialized branches' data twice on ordinary deletes.
+                for name in &remaining {
+                    let path = self.refs.base_location.find_branch(Some(name))?.path;
+                    if self
+                        .object_store()
+                        .canonicalize_local_path(&path)
+                        .await?
+                        .is_none()
+                    {
+                        self.cleanup_branch_directories(branch, &remaining, CleanupMode::Check)
+                            .await?;
+                        break;
+                    }
+                }
+                operation
+                    .begin_delete(self.object_store(), branch, &contents.identifier)
+                    .await?;
+            }
+            let branch_file = branch_contents_path(&root, branch);
+            if self.object_store().exists(&branch_file).await? {
+                self.object_store().delete(&branch_file).await?;
+            }
         }
 
-        // Callers must finish failed cleanup before reusing the branch name,
-        // since branch creation can otherwise expose retained version history.
-        self.cleanup_branch_directories(branch).await
+        // Include reservations made during unlink, including a same-name ref.
+        let surviving = self.list().await?;
+        if !surviving.contains_key(branch) {
+            let remaining = surviving.keys().map(String::as_str).collect_vec();
+            self.cleanup_branch_directories(branch, &remaining, CleanupMode::Remove)
+                .await?;
+        }
+        if let Some(operation) = &mut operation {
+            operation.finish_delete(self.object_store()).await?;
+        }
+        Ok(())
     }
 
     pub async fn list_ordered(
@@ -653,30 +720,59 @@ impl Branches<'_> {
     }
 
     /// Remove branch files while preserving branches that share directories.
-    async fn cleanup_branch_directories(&self, branch: &str) -> Result<()> {
-        // Discover namespaces created during deletion before removing shared directories.
-        let branches = self.list().await?;
-        let remaining_branches = branches.keys().map(String::as_str).collect_vec();
+    async fn cleanup_branch_directories(
+        &self,
+        branch: &str,
+        remaining_branches: &[&str],
+        mode: CleanupMode,
+    ) -> Result<()> {
         let mut cleanup =
-            Self::get_cleanup_path(branch, &remaining_branches, &self.refs.base_location)?;
+            Self::get_cleanup_path(branch, remaining_branches, &self.refs.base_location)?;
         if matches!(cleanup, BranchCleanup::Skip) {
             return Ok(());
         }
 
-        let has_local_paths =
-            self.object_store().is_local() || self.object_store().scheme() == "file-object-store";
+        let is_file_object_store = self.object_store().scheme() == "file-object-store";
+        let has_local_paths = self.object_store().is_local() || is_file_object_store;
+        let root = self.refs.root()?.path;
+        let canonical_root = if has_local_paths {
+            self.object_store().canonicalize_local_path(&root).await?
+        } else {
+            None
+        };
+        let mut has_pending_directory = false;
         let mut remaining_paths = Vec::with_capacity(remaining_branches.len() + 1);
-        for remaining in &remaining_branches {
+        for remaining in remaining_branches {
             let path = self.refs.base_location.find_branch(Some(remaining))?.path;
-            let canonical_path = self.object_store().canonicalize_local_path(&path).await?;
+            let mut canonical_path = self.object_store().canonicalize_local_path(&path).await?;
             let canonical_retained_dirs = if has_local_paths {
                 let retained_dirs = if canonical_path.is_some() {
                     self.collect_canonical_retained_dirs(&path, branch).await?
+                } else if let Some(local_root) = &canonical_root {
+                    let directory =
+                        Self::locate_reserved_directory(local_root, remaining, branch).await;
+                    if !self
+                        .object_store()
+                        .exists(&branch_contents_path(&root, remaining))
+                        .await?
+                    {
+                        continue;
+                    }
+                    match directory? {
+                        ReservedDirectory::Pending(directory) => {
+                            has_pending_directory = true;
+                            Some(vec![directory])
+                        }
+                        ReservedDirectory::Exists(directory) => {
+                            canonical_path = Some(directory);
+                            self.collect_canonical_retained_dirs(&path, branch).await?
+                        }
+                    }
                 } else {
                     None
                 };
                 let Some(retained_dirs) = retained_dirs else {
-                    let remaining_ref = branch_contents_path(&self.refs.root()?.path, remaining);
+                    let remaining_ref = branch_contents_path(&root, remaining);
                     if !self.object_store().exists(&remaining_ref).await? {
                         // Another delete finished after cleanup listed the refs.
                         continue;
@@ -698,9 +794,13 @@ impl Branches<'_> {
             });
         }
 
+        if mode == CleanupMode::Check && !(is_file_object_store && has_pending_directory) {
+            return Ok(());
+        }
+
         if has_local_paths {
-            let path = self.refs.root()?.path;
-            let canonical_path = self.object_store().canonicalize_local_path(&path).await?;
+            let path = root;
+            let canonical_path = canonical_root;
             if canonical_path.is_none() {
                 log::warn!(
                     "Keeping branch directories after deleting {branch}: cannot resolve main dataset at {path}"
@@ -738,7 +838,7 @@ impl Branches<'_> {
             };
         }
 
-        if self.object_store().scheme() == "file-object-store" {
+        if is_file_object_store {
             cleanup = match cleanup {
                 BranchCleanup::Recursive(path) => BranchCleanup::Selective(path),
                 cleanup => cleanup,
@@ -748,15 +848,7 @@ impl Branches<'_> {
         match cleanup {
             BranchCleanup::Skip => Ok(()),
             BranchCleanup::Recursive(path) => {
-                if let Err(e) = self.object_store().remove_dir_all(path).await {
-                    match &e {
-                        Error::NotFound { .. } => {
-                            log::debug!("Branch directory already deleted");
-                        }
-                        _ => return Err(e),
-                    }
-                }
-                Ok(())
+                mode.remove_directory(self.object_store(), path).await
             }
             BranchCleanup::Selective(delete_path) => {
                 let mut pending = vec![delete_path];
@@ -767,28 +859,20 @@ impl Branches<'_> {
                     if matches!(classification, SharedBranchPath::Remaining) {
                         continue;
                     }
-                    let traverse_unrelated =
-                        if matches!(classification, SharedBranchPath::Unrelated)
-                            && self.object_store().scheme() == "file-object-store"
-                        {
-                            self.recursive_delete_would_touch_retained_data(&path, &remaining_paths)
-                                .await?
-                        } else {
-                            false
-                        };
+                    // A dangling alias can acquire a target when a reservation completes
+                    // between the recursive listing and the recursive delete.
+                    let traverse_unrelated = matches!(classification, SharedBranchPath::Unrelated)
+                        && is_file_object_store
+                        && (has_pending_directory
+                            || self
+                                .recursive_delete_would_touch_retained_data(&path, &remaining_paths)
+                                .await?);
                     if matches!(classification, SharedBranchPath::Unrelated) && !traverse_unrelated
                     {
-                        if let Err(e) = self.object_store().remove_dir_all(path).await {
-                            match &e {
-                                Error::NotFound { .. } => {
-                                    log::debug!("Branch directory already deleted");
-                                }
-                                _ => return Err(e),
-                            }
-                        }
+                        mode.remove_directory(self.object_store(), path).await?;
                         continue;
                     }
-                    if traverse_unrelated {
+                    if traverse_unrelated && !has_pending_directory {
                         log::warn!(
                             "Inspecting branch subtree {path}: recursive deletion would reach retained dataset data"
                         );
@@ -796,12 +880,26 @@ impl Branches<'_> {
                     // A shared directory must remain, but the deleted branch's own
                     // files (especially its manifests) must not remain accessible.
                     let entries = self.object_store().list_with_delimiter(Some(&path)).await?;
-                    futures::stream::iter(entries.objects.into_iter().map(Ok))
-                        .try_for_each_concurrent(
-                            self.object_store().io_parallelism(),
-                            |file| async move { self.object_store().delete(&file.location).await },
-                        )
-                        .await?;
+                    if mode == CleanupMode::Remove {
+                        let deletes =
+                            futures::stream::iter(entries.objects)
+                                .map(|file| async move {
+                                    self.object_store().delete(&file.location).await
+                                })
+                                .buffer_unordered(self.object_store().io_parallelism());
+                        if has_local_paths {
+                            // Keep the branch name until every dispatched unlink finishes.
+                            deletes
+                                .fold(Ok(()), |first, next| {
+                                    futures::future::ready(first.and(next))
+                                })
+                                .await?;
+                        } else {
+                            deletes
+                                .try_for_each(|()| futures::future::ready(Ok(())))
+                                .await?;
+                        }
+                    }
                     // Hierarchical stores may include the listed directory's marker.
                     let canonical_path = if has_local_paths {
                         self.object_store().canonicalize_local_path(&path).await?
@@ -817,7 +915,15 @@ impl Branches<'_> {
                             let canonical_child =
                                 self.object_store().canonicalize_local_path(&child).await?;
                             match (&canonical_path, canonical_child) {
-                                (Some(parent), Some(child)) if child.starts_with(parent) => {}
+                                (Some(parent), Some(child))
+                                    if child != *parent && child.starts_with(parent) => {}
+                                _ if has_pending_directory && is_file_object_store => {
+                                    return Err(Error::RefConflict {
+                                        message: format!(
+                                            "Cannot safely clean up branch {branch}: local subtree {child} could not be resolved below {path} while another branch is reserved. Check the alias before retrying deletion"
+                                        ),
+                                    });
+                                }
                                 _ => {
                                     log::warn!(
                                         "Keeping aliased branch subtree {child}: canonical path leaves parent {path}"
@@ -832,6 +938,42 @@ impl Branches<'_> {
                 Ok(())
             }
         }
+    }
+
+    // A reservation can precede its directory. Retain the future path as well
+    // as its ancestors, since the creator can start writing during cleanup.
+    async fn locate_reserved_directory(
+        root: &std::path::Path,
+        remaining: &str,
+        deleted: &str,
+    ) -> Result<ReservedDirectory> {
+        check_valid_branch(remaining)?;
+        let mut directory = root.to_path_buf();
+        let mut components = std::iter::once(BRANCH_DIR).chain(remaining.split('/'));
+        while let Some(component) = components.next() {
+            let next = directory.join(component);
+            match tokio::fs::symlink_metadata(&next).await {
+                Ok(metadata) if metadata.is_dir() => directory = next,
+                Err(error) if error.kind() == ErrorKind::NotFound => {
+                    let mut projected = tokio::fs::canonicalize(directory).await?.join(component);
+                    projected.extend(components);
+                    return Ok(ReservedDirectory::Pending(projected));
+                }
+                Ok(_) => {
+                    return Err(Error::RefConflict {
+                        message: format!(
+                            "Cannot safely clean up branch {deleted}: reserved branch {remaining} uses an alias or non-directory at {}. Move or remove the conflicting route before retrying deletion",
+                            next.display()
+                        ),
+                    });
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        // The creator materialized its directory while cleanup was inspecting it.
+        Ok(ReservedDirectory::Exists(
+            tokio::fs::canonicalize(directory).await?,
+        ))
     }
 
     async fn collect_canonical_retained_dirs(
@@ -1089,6 +1231,29 @@ struct RemainingBranchPath {
     canonical_path: Option<PathBuf>,
     canonical_retained_dirs: Vec<PathBuf>,
     is_named_branch: bool,
+}
+
+enum ReservedDirectory {
+    Pending(PathBuf),
+    Exists(PathBuf),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CleanupMode {
+    Check,
+    Remove,
+}
+
+impl CleanupMode {
+    async fn remove_directory(self, store: &ObjectStore, path: Path) -> Result<()> {
+        if self == Self::Remove {
+            match store.remove_dir_all(path).await {
+                Err(Error::NotFound { .. }) => log::debug!("Branch directory already deleted"),
+                result => return result,
+            }
+        }
+        Ok(())
+    }
 }
 
 enum SharedBranchPath {
@@ -1669,6 +1834,62 @@ mod tests {
     use super::*;
 
     use rstest::rstest;
+
+    #[rstest]
+    #[case::local("file")]
+    #[case::file_object_store("file-object-store")]
+    #[tokio::test]
+    async fn test_local_cleanup_retry_owns_branch_name(#[case] scheme: &str) {
+        let dir = tempfile::tempdir().unwrap();
+        let url = url::Url::from_directory_path(dir.path()).unwrap();
+        let (store, root) = ObjectStore::from_uri(&format!("{scheme}://{}", url.path()))
+            .await
+            .unwrap();
+        let name = "release/é";
+        let acquire = || LocalBranchOperation::acquire(&store, &root, name);
+        let old = BranchIdentifier::new(&BranchIdentifier::main(), 1);
+        let new = BranchIdentifier::new(&BranchIdentifier::main(), 1);
+        let mut deleting = acquire().await.unwrap().unwrap();
+        deleting.begin_delete(&store, name, &old).await.unwrap();
+        let Err(error) = acquire().await else {
+            panic!("a second caller acquired the same name")
+        };
+        assert!(matches!(error, Error::RefConflict { .. }), "{error}");
+        assert!(error.to_string().contains(name), "{error}");
+        drop(deleting);
+
+        let mut retry = acquire().await.unwrap().unwrap();
+        assert_eq!(retry.pending.as_ref(), Some(&old));
+        let error = retry.begin_delete(&store, name, &new).await.unwrap_err();
+        assert!(matches!(error, Error::RefConflict { .. }), "{error}");
+        assert!(error.to_string().contains("recreated"), "{error}");
+        drop(retry);
+        assert!(acquire().await.unwrap().unwrap().pending.is_none());
+    }
+
+    #[cfg(unix)]
+    #[rstest]
+    #[case::lock("dev.lock")]
+    #[case::record("dev.json")]
+    #[tokio::test]
+    async fn test_aliased_cleanup_file_is_preserved(#[case] filename: &str) {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, root) = ObjectStore::from_uri(dir.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let records = dir.path().join("_refs/deleting");
+        std::fs::create_dir_all(&records).unwrap();
+        let unrelated = dir.path().join("unrelated");
+        std::fs::write(&unrelated, b"preserve").unwrap();
+        std::os::unix::fs::symlink(&unrelated, records.join(filename)).unwrap();
+        let Err(error) = LocalBranchOperation::acquire(&store, &root, "dev").await else {
+            panic!("accepted an aliased cleanup file")
+        };
+        assert!(matches!(error, Error::IO { .. }), "{error}");
+        assert!(error.to_string().contains(filename), "{error}");
+        assert!(records.join(filename).is_symlink());
+        assert_eq!(std::fs::read(unrelated).unwrap(), b"preserve");
+    }
 
     #[rstest]
     fn test_ok_ref(

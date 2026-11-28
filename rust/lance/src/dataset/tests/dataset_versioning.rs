@@ -1710,7 +1710,11 @@ async fn test_deleted_branch_cleanup_failure_keeps_ref_authoritative(
         root.commit_handler(),
         root.branch_location(),
     );
-    root.force_delete_branch("a").await.unwrap();
+    if local {
+        root.delete_branch("a").await.unwrap();
+    } else {
+        root.force_delete_branch("a").await.unwrap();
+    }
     let recreated = root.create_branch("a", 1, None).await.unwrap();
     assert_eq!(recreated.count_rows(None).await.unwrap(), 2);
     let reopened = root.checkout_branch("a").await.unwrap();
@@ -2041,6 +2045,111 @@ async fn test_reserve_branch_pins_source_until_completion() {
         dataset.branches().get("exp").await.unwrap().identifier,
         contents.identifier
     );
+}
+
+#[rstest]
+#[case::local(false)]
+#[case::file_object_store(true)]
+#[tokio::test]
+async fn test_delete_with_pending_reservation(#[case] use_object_store: bool) {
+    let dir = TempDir::default();
+    let uri = if use_object_store {
+        let prefix = if cfg!(windows) { "/" } else { "" };
+        format!("file-object-store://{prefix}{}", dir.path_str())
+    } else {
+        dir.path_str()
+    };
+    let mut root = Dataset::write(id_rows(0, 1), &uri, None).await.unwrap();
+    let expected = root.scan().try_into_batch().await.unwrap();
+    let mut target = root.create_branch("a", 1, None).await.unwrap();
+    target.append(id_rows(10, 1), None).await.unwrap();
+    let reservation = root.reserve_branch("b", 1).await.unwrap();
+
+    root.delete_branch("a").await.unwrap();
+    let branches = root.list_branches().await.unwrap();
+    assert!(!branches.contains_key("a"));
+    assert!(branches.contains_key("b"));
+    let error = root.checkout_branch("a").await.unwrap_err();
+    assert!(matches!(error, Error::RefNotFound { .. }), "{error}");
+    assert!(error.to_string().contains("branch a"), "{error}");
+    let replacement = root.create_branch("a", 1, None).await;
+    let completed = root.complete_branch(reservation, None).await.unwrap();
+    assert_eq!(completed.scan().try_into_batch().await.unwrap(), expected);
+    let replacement = replacement.expect("successful deletion must free the name");
+    assert_eq!(replacement.versions().await.unwrap().len(), 1);
+    assert_eq!(replacement.scan().try_into_batch().await.unwrap(), expected);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_delete_with_pending_reservation_through_symlink() {
+    let dir = TempDir::default();
+    let mut root = Dataset::write(id_rows(0, 1), &dir.path_str(), None)
+        .await
+        .unwrap();
+    let expected = root.scan().try_into_batch().await.unwrap();
+    root.create_branch("a", 1, None).await.unwrap();
+    let tree = dir.std_path().join("tree");
+    let destination = dir.std_path().join("destination");
+    std::fs::create_dir(&destination).unwrap();
+    std::os::unix::fs::symlink(&destination, tree.join("a/gateway")).unwrap();
+    std::os::unix::fs::symlink("a/gateway", tree.join("route")).unwrap();
+    let reservation = root.reserve_branch("route/b", 1).await.unwrap();
+
+    let error = root.delete_branch("a").await.unwrap_err();
+    assert!(matches!(error, Error::RefConflict { .. }), "{error}");
+    assert!(error.to_string().contains("route/b"), "{error}");
+    assert_eq!(
+        std::fs::canonicalize(tree.join("route")).unwrap(),
+        std::fs::canonicalize(&destination).unwrap()
+    );
+    let completed = root.complete_branch(reservation, None).await.unwrap();
+    assert_eq!(completed.scan().try_into_batch().await.unwrap(), expected);
+    assert_eq!(
+        root.checkout_branch("a")
+            .await
+            .unwrap()
+            .scan()
+            .try_into_batch()
+            .await
+            .unwrap(),
+        expected
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_delete_with_pending_reservation_and_relocated_versions() {
+    let dir = TempDir::default();
+    let uri = format!("file-object-store://{}", dir.path_str());
+    let mut root = Dataset::write(id_rows(0, 1), &uri, None).await.unwrap();
+    let expected = root.scan().try_into_batch().await.unwrap();
+    root.create_branch("a", 1, None).await.unwrap();
+    let versions = dir.std_path().join("tree/a/_versions");
+    let relocated = dir.std_path().join("relocated_versions");
+    std::fs::rename(&versions, &relocated).unwrap();
+    std::os::unix::fs::symlink(&relocated, &versions).unwrap();
+    let reservation = root.reserve_branch("b", 1).await.unwrap();
+
+    let error = root.delete_branch("a").await.unwrap_err();
+    assert!(matches!(error, Error::RefConflict { .. }), "{error}");
+    assert!(error.to_string().contains("_versions"), "{error}");
+    assert_eq!(
+        root.checkout_branch("a")
+            .await
+            .unwrap()
+            .scan()
+            .try_into_batch()
+            .await
+            .unwrap(),
+        expected
+    );
+    std::fs::remove_file(&versions).unwrap();
+    std::fs::rename(relocated, versions).unwrap();
+    root.delete_branch("a").await.unwrap();
+    root.create_branch("a", 1, None).await.unwrap();
+    let completed = root.complete_branch(reservation, None).await.unwrap();
+    assert_eq!(completed.scan().try_into_batch().await.unwrap(), expected);
 }
 
 #[tokio::test]

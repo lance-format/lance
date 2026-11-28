@@ -229,6 +229,7 @@ roaring = "0.11.4"
 rstest = "0.26.1"
 serde = { version = "^1" }
 serde_json = { version = "1" }
+same-file = "1.0"
 semver = "1.0"
 serial_test = "3"
 sha2 = "0.10"

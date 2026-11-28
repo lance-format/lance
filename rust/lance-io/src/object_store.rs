@@ -2490,10 +2490,18 @@ impl ObjectStore {
             }
         });
         // Feed one continuous stream so each backend retains its batching and concurrency.
-        self.inner
-            .delete_stream(files.boxed())
-            .try_for_each(|_| future::ready(Ok(())))
-            .await?;
+        let deletes = self.inner.delete_stream(files.boxed());
+        if self.scheme == "file-object-store" {
+            // A dispatched filesystem unlink can outlive a dropped future.
+            // Finish these operations before a caller retries or reuses the path.
+            deletes
+                .fold(Ok(()), |first, next| {
+                    future::ready(first.and(next.map(|_| ())))
+                })
+                .await?;
+        } else {
+            deletes.try_for_each(|_| future::ready(Ok(()))).await?;
+        }
         let mut deferred = std::mem::take(&mut *deferred.lock().await);
         deferred.sort_unstable_by_key(|location| std::cmp::Reverse(location.as_ref().len()));
         for location in deferred {
@@ -3644,6 +3652,7 @@ mod tests {
 
     #[derive(Debug, Default)]
     struct BatchedDeleteStore {
+        fail_first_delete: bool,
         active: Arc<AtomicUsize>,
         peak: Arc<AtomicUsize>,
         deleted: Arc<AtomicUsize>,
@@ -3701,7 +3710,7 @@ mod tests {
             let deleted = self.deleted.clone();
             let deferred = self.deferred.clone();
             // Match S3's batching and concurrency, without depending on cloud timing.
-            locations
+            let batches = locations
                 .try_chunks(1000)
                 .map(move |chunk| {
                     let active = active.clone();
@@ -3731,8 +3740,14 @@ mod tests {
                     }
                 })
                 .buffered(20)
-                .try_flatten()
-                .boxed()
+                .try_flatten();
+            let error = self.fail_first_delete.then(|| {
+                Err(object_store::Error::Generic {
+                    store: "test",
+                    source: "first unlink failed".into(),
+                })
+            });
+            futures::stream::iter(error).chain(batches).boxed()
         }
 
         async fn list_with_delimiter(&self, _: Option<&Path>) -> OSResult<ListResult> {
@@ -3760,6 +3775,22 @@ mod tests {
                 Path::from("dataset")
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn test_remove_dir_all_finishes_local_deletes_after_error() {
+        let backend = Arc::new(BatchedDeleteStore {
+            fail_first_delete: true,
+            ..Default::default()
+        });
+        let mut store = ObjectStore::memory();
+        store.scheme = "file-object-store".to_owned();
+        store.inner = backend.clone();
+        let error = store.remove_dir_all("dataset").await.unwrap_err();
+        assert!(matches!(error, Error::IO { .. }), "{error}");
+        assert!(error.to_string().contains("first unlink failed"), "{error}");
+        assert_eq!(backend.deleted.load(Ordering::SeqCst), 20_000);
+        assert!(backend.deferred.lock().await.is_empty());
     }
 
     #[tokio::test]

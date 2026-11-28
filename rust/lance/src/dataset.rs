@@ -752,9 +752,10 @@ impl Dataset {
 
     /// Deletes a branch and removes its directory when safe.
     ///
-    /// The ref is removed before directory cleanup. If cleanup fails, this
-    /// returns the cleanup error even though the ref may already be gone. Use
-    /// [`Self::force_delete_branch`] to retry failed cleanup.
+    /// On local stores, an existing alias conflict leaves the branch available.
+    /// If cleanup fails after removing the ref, clear the conflict and retry
+    /// deletion. On other stores, use [`Self::force_delete_branch`] to retry
+    /// cleanup when the ref is already gone.
     ///
     /// Legacy branches like `outer/data` may share a directory with another
     /// branch. Their files are intentionally retained, but checkout requires a
