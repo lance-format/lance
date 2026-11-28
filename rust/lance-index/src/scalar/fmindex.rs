@@ -227,6 +227,22 @@ impl RankBitVec {
         self.superblocks.push(cum);
     }
 
+    /// Number of set bits before `pos`, including the end position of a full block.
+    #[inline]
+    fn rank1(&self, pos: usize) -> usize {
+        let word = pos / 64;
+        let superblock = word / WORDS_PER_SUPERBLOCK;
+        let mut count = self.superblocks[superblock] as usize;
+        for w in &self.words[superblock * WORDS_PER_SUPERBLOCK..word] {
+            count += w.count_ones() as usize;
+        }
+        let bits = pos % 64;
+        if bits > 0 {
+            count += (self.words[word] & ((1u64 << bits) - 1)).count_ones() as usize;
+        }
+        count
+    }
+
     fn deep_size(&self) -> usize {
         self.words.len() * 8 + self.superblocks.len() * 4
     }
@@ -430,7 +446,7 @@ const BLOCK_BITS: usize = BLOCK_WORDS * 64;
 
 struct LazyRankBitVec {
     prefix_ranks: Vec<u64>,
-    blocks: Vec<OnceLock<Vec<u64>>>,
+    blocks: Vec<OnceLock<RankBitVec>>,
     reader: Arc<dyn crate::scalar::IndexReader>,
     block_row_offset: usize,
     len: usize,
@@ -538,7 +554,7 @@ impl LazyRankBitVec {
     }
 
     #[inline]
-    fn ensure_block(&self, idx: usize) -> &[u64] {
+    fn ensure_block(&self, idx: usize) -> &RankBitVec {
         self.blocks[idx].get_or_init(|| {
             tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(self.load_block(idx))
@@ -547,7 +563,7 @@ impl LazyRankBitVec {
         })
     }
 
-    async fn load_block(&self, idx: usize) -> Result<Vec<u64>> {
+    async fn load_block(&self, idx: usize) -> Result<RankBitVec> {
         let row = self.block_row_offset + idx;
         let batch = self
             .reader
@@ -565,33 +581,20 @@ impl LazyRankBitVec {
             .ok_or_else(|| Error::invalid_input("expected LargeBinary words column"))
     }
 
-    fn decode_words(raw: &[u8]) -> Vec<u64> {
-        raw.as_chunks::<8>()
+    fn decode_words(raw: &[u8]) -> RankBitVec {
+        let words = raw
+            .as_chunks::<8>()
             .0
             .iter()
             .map(|c| u64::from_le_bytes(*c))
-            .collect()
-    }
-
-    fn terminal_rank1(&self) -> usize {
-        if self.len == 0 {
-            return 0;
-        }
-        let Some(last_idx) = self.blocks.len().checked_sub(1) else {
-            return 0;
+            .collect();
+        let mut block = RankBitVec {
+            words,
+            superblocks: Vec::new(),
+            len: raw.len() * 8,
         };
-        let mut count = self.prefix_ranks.get(last_idx).copied().unwrap_or(0) as usize;
-        let block = self.ensure_block(last_idx);
-        let local = self.len - last_idx * BLOCK_BITS;
-        let full_words = local / 64;
-        let trailing_bits = local % 64;
-        for w in &block[..full_words] {
-            count += w.count_ones() as usize;
-        }
-        if trailing_bits > 0 {
-            count += (block[full_words] & ((1u64 << trailing_bits) - 1)).count_ones() as usize;
-        }
-        count
+        block.build_rank_index();
+        block
     }
 
     #[inline]
@@ -606,21 +609,11 @@ impl LazyRankBitVec {
             if let Some(prefix_rank) = self.prefix_ranks.get(bi) {
                 return *prefix_rank as usize;
             }
-            if pos == self.len {
-                return self.terminal_rank1();
-            }
+            // The end of an exactly full final block has no next prefix entry.
+            return self.prefix_ranks[bi - 1] as usize
+                + self.ensure_block(bi - 1).rank1(BLOCK_BITS);
         }
-        let mut count = self.prefix_ranks[bi] as usize;
-        let block = self.ensure_block(bi);
-        let wi = local / 64;
-        let bit = local % 64;
-        for w in &block[..wi] {
-            count += w.count_ones() as usize;
-        }
-        if bit > 0 {
-            count += (block[wi] & ((1u64 << bit) - 1)).count_ones() as usize;
-        }
-        count
+        self.prefix_ranks[bi] as usize + self.ensure_block(bi).rank1(local)
     }
 
     #[inline]
@@ -634,7 +627,7 @@ impl LazyRankBitVec {
         let bi = pos / BLOCK_BITS;
         let local = pos % BLOCK_BITS;
         let block = self.ensure_block(bi);
-        (block[local / 64] >> (local % 64)) & 1 != 0
+        (block.words[local / 64] >> (local % 64)) & 1 != 0
     }
 
     fn deep_size(&self) -> usize {
@@ -642,7 +635,7 @@ impl LazyRankBitVec {
             .blocks
             .iter()
             .filter_map(|b| b.get())
-            .map(|w| w.len() * 8)
+            .map(RankBitVec::deep_size)
             .sum();
         self.prefix_ranks.len() * 8 + loaded
     }
@@ -768,10 +761,11 @@ impl LazyHuffmanWaveletTree {
         Ok(())
     }
 
+    /// The position within the leaf is the exclusive rank of the accessed byte.
     #[inline]
-    fn access(&self, mut pos: usize) -> u8 {
+    fn access_rank(&self, mut pos: usize) -> (u8, usize) {
         if self.nodes.is_empty() {
-            return 0;
+            return (0, 0);
         }
         let mut node_idx = 0;
         loop {
@@ -780,22 +774,22 @@ impl LazyHuffmanWaveletTree {
             if bit {
                 pos = self.nodes[node_idx].rank1(pos);
                 match right {
-                    WaveletChild::Leaf(b) => return *b,
+                    WaveletChild::Leaf(b) => return (*b, pos),
                     WaveletChild::Node(next) => node_idx = *next,
                 }
             } else {
                 pos = self.nodes[node_idx].rank0(pos);
                 match left {
-                    WaveletChild::Leaf(b) => return *b,
+                    WaveletChild::Leaf(b) => return (*b, pos),
                     WaveletChild::Node(next) => node_idx = *next,
                 }
             }
         }
     }
 
-    async fn access_async(&self, mut pos: usize) -> Result<u8> {
+    async fn access_rank_async(&self, mut pos: usize) -> Result<(u8, usize)> {
         if self.nodes.is_empty() {
-            return Ok(0);
+            return Ok((0, 0));
         }
         let mut node_idx = 0;
         loop {
@@ -805,56 +799,17 @@ impl LazyHuffmanWaveletTree {
             if bit {
                 pos = self.nodes[node_idx].rank1(pos);
                 match right {
-                    WaveletChild::Leaf(b) => return Ok(*b),
+                    WaveletChild::Leaf(b) => return Ok((*b, pos)),
                     WaveletChild::Node(next) => node_idx = *next,
                 }
             } else {
                 pos = self.nodes[node_idx].rank0(pos);
                 match left {
-                    WaveletChild::Leaf(b) => return Ok(*b),
+                    WaveletChild::Leaf(b) => return Ok((*b, pos)),
                     WaveletChild::Node(next) => node_idx = *next,
                 }
             }
         }
-    }
-
-    #[inline]
-    fn rank(&self, c: u8, pos: usize) -> usize {
-        let code = &self.codes[c as usize];
-        if code.length == 0 {
-            return 0;
-        }
-        let (mut lo, mut hi) = (0, pos);
-        for (level, &nid) in code.node_path.iter().enumerate() {
-            if (code.bits >> (code.length - 1 - level as u8)) & 1 == 0 {
-                lo = self.nodes[nid].rank0(lo);
-                hi = self.nodes[nid].rank0(hi);
-            } else {
-                lo = self.nodes[nid].rank1(lo);
-                hi = self.nodes[nid].rank1(hi);
-            }
-        }
-        hi - lo
-    }
-
-    async fn rank_async(&self, c: u8, pos: usize) -> Result<usize> {
-        let code = &self.codes[c as usize];
-        if code.length == 0 {
-            return Ok(0);
-        }
-        let (mut lo, mut hi) = (0, pos);
-        for (level, &nid) in code.node_path.iter().enumerate() {
-            self.nodes[nid].load_block_for_rank(lo).await?;
-            self.nodes[nid].load_block_for_rank(hi).await?;
-            if (code.bits >> (code.length - 1 - level as u8)) & 1 == 0 {
-                lo = self.nodes[nid].rank0(lo);
-                hi = self.nodes[nid].rank0(hi);
-            } else {
-                lo = self.nodes[nid].rank1(lo);
-                hi = self.nodes[nid].rank1(hi);
-            }
-        }
-        Ok(hi - lo)
     }
 
     #[inline]
@@ -1215,8 +1170,8 @@ impl LazyFMIndex {
             {
                 return (self.sa_samples[pos / SA_SAMPLE_RATE] as usize + steps) % n;
             }
-            let c = self.wavelet.access(pos);
-            pos = self.c_table[c as usize] + self.wavelet.rank(c, pos);
+            let (c, rank) = self.wavelet.access_rank(pos);
+            pos = self.c_table[c as usize] + rank;
             steps += 1;
             if steps >= n {
                 log::warn!("FM-Index SA locate exceeded {n} steps, possible index corruption");
@@ -1233,8 +1188,8 @@ impl LazyFMIndex {
             {
                 return Ok((self.sa_samples[pos / SA_SAMPLE_RATE] as usize + steps) % n);
             }
-            let c = self.wavelet.access_async(pos).await?;
-            pos = self.c_table[c as usize] + self.wavelet.rank_async(c, pos).await?;
+            let (c, rank) = self.wavelet.access_rank_async(pos).await?;
+            pos = self.c_table[c as usize] + rank;
             steps += 1;
             if steps >= n {
                 log::warn!("FM-Index SA locate exceeded {n} steps, possible index corruption");
@@ -2857,7 +2812,7 @@ mod tests {
             DataType::LargeBinary,
             false,
         )]));
-        let words = vec![u64::MAX; BLOCK_WORDS];
+        let words = vec![0x5555_5555_5555_5555; BLOCK_WORDS];
         let bytes = FMIndex::u64_to_bytes(&words);
         let batch = RecordBatch::try_new(
             schema.clone(),
@@ -2872,8 +2827,20 @@ mod tests {
         let bitvec = LazyRankBitVec::new(vec![0], 1, reader, 0, BLOCK_BITS);
         bitvec.load_block_for_rank(BLOCK_BITS).await.unwrap();
 
-        assert_eq!(bitvec.rank1(BLOCK_BITS), BLOCK_BITS);
-        assert_eq!(bitvec.rank0(BLOCK_BITS), 0);
+        for pos in [
+            0,
+            1,
+            63,
+            64,
+            SUPERBLOCK_BITS - 1,
+            SUPERBLOCK_BITS,
+            SUPERBLOCK_BITS + 1,
+            BLOCK_BITS - 1,
+            BLOCK_BITS,
+        ] {
+            assert_eq!(bitvec.rank1(pos), pos.div_ceil(2));
+            assert_eq!(bitvec.rank0(pos), pos / 2);
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
