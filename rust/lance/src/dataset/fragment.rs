@@ -109,6 +109,7 @@ pub struct FileFragment {
     dataset: Arc<Dataset>,
 }
 
+pub(crate) use lance_table_runtime::fragment::FragmentOpenCache;
 pub(crate) use lance_table_runtime::fragment::V1FragmentReader;
 pub use lance_table_runtime::fragment::{
     BaseSchedulers, FragReadConfig, FragmentReader, GenericFileReader,
@@ -334,6 +335,19 @@ impl FileFragment {
         read_config: FragReadConfig,
     ) -> Result<FragmentReader> {
         self.core.open(projection, read_config).await
+    }
+
+    /// Like [`Self::open`], sharing per-file open state with the other
+    /// fragments a scan opens with `open_cache`.
+    pub(crate) async fn open_with_open_cache(
+        &self,
+        projection: &Schema,
+        read_config: FragReadConfig,
+        open_cache: &FragmentOpenCache,
+    ) -> Result<FragmentReader> {
+        self.core
+            .open_with_open_cache(projection, read_config, open_cache)
+            .await
     }
 
     pub(crate) async fn open_v1_fragment_reader(

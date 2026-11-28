@@ -26,6 +26,8 @@ use lance_io::scheduler::{FileScheduler, ScanScheduler, SchedulerConfig};
 use lance_table::format::DataFile;
 use lance_table::utils::stream::{ReadBatchTask, ReadBatchTaskStream};
 
+use super::FragmentOpenCache;
+use super::open_cache::{FileOpenState, PhysicalProjection};
 use super::{FileFragment, FragReadConfig};
 
 /// A trait for file readers to be implemented by both the v1 and v2 readers
@@ -100,6 +102,7 @@ impl FileFragment {
             data_file,
             projection,
             read_config,
+            None,
             MetadataMode::LazyAllowed,
             io_stats,
         )
@@ -114,8 +117,15 @@ impl FileFragment {
         projection: Option<&Schema>,
         read_config: &FragReadConfig,
     ) -> Result<Option<Box<dyn GenericFileReader>>> {
-        self.open_reader_impl(data_file, projection, read_config, MetadataMode::Full, None)
-            .await
+        self.open_reader_impl(
+            data_file,
+            projection,
+            read_config,
+            None,
+            MetadataMode::Full,
+            None,
+        )
+        .await
     }
 
     fn open_reader_impl<'a>(
@@ -123,6 +133,7 @@ impl FileFragment {
         data_file: &'a DataFile,
         projection: Option<&'a Schema>,
         read_config: &'a FragReadConfig,
+        open_cache: Option<&'a FragmentOpenCache>,
         metadata_mode: MetadataMode,
         io_stats: Option<Arc<dyn IoStatsRecorder>>,
     ) -> BoxFuture<'a, Result<Option<Box<dyn GenericFileReader>>>> {
@@ -140,6 +151,7 @@ impl FileFragment {
                         data_file,
                         projection,
                         read_config,
+                        open_cache,
                         metadata_mode,
                         io_stats,
                     )
@@ -150,19 +162,112 @@ impl FileFragment {
         .boxed()
     }
 
-    async fn open_current_file_reader(
+    /// Layout-dependent state for opening `data_file`, served from
+    /// `open_cache` when it applies to this manifest and projection.
+    pub(super) fn file_open_state(
         &self,
         data_file: &DataFile,
         projection: Option<&Schema>,
-        read_config: &FragReadConfig,
-        metadata_mode: MetadataMode,
-        io_stats: Option<Arc<dyn IoStatsRecorder>>,
-    ) -> Result<Option<Box<dyn GenericFileReader>>> {
+        open_cache: Option<&FragmentOpenCache>,
+    ) -> Result<Arc<FileOpenState>> {
+        let cache = match (projection, open_cache) {
+            (Some(projection), Some(cache))
+                if cache.applies_to(&self.table.manifest, projection) =>
+            {
+                Some(cache)
+            }
+            _ => None,
+        };
+        if let Some(state) = cache.and_then(|cache| cache.get(data_file)) {
+            return Ok(state);
+        }
+
         let full_schema = self.table.schema();
         let data_file_schema = Arc::new(data_file.schema(full_schema));
         let projection = projection.unwrap_or(full_schema);
         let schema_per_file =
             Arc::new(data_file_projection(projection, data_file_schema.as_ref())?);
+        let field_id_to_column_idx = Arc::new(BTreeMap::from_iter(
+            data_file
+                .fields
+                .iter()
+                .copied()
+                .zip(data_file.column_indices.iter().copied())
+                .filter_map(|(field_id, column_index)| {
+                    (column_index >= 0).then_some((field_id as u32, column_index as u32))
+                }),
+        ));
+        let mut state = FileOpenState {
+            fields: data_file.fields.clone(),
+            column_indices: data_file.column_indices.clone(),
+            file_major_version: data_file.file_major_version,
+            file_minor_version: data_file.file_minor_version,
+            data_file_schema,
+            schema_per_file,
+            field_id_to_column_idx,
+            physical: None,
+        };
+        if !state.schema_per_file.fields.is_empty() {
+            let file_version = data_file.file_version()?;
+            let has_blob_v2 = state
+                .schema_per_file
+                .fields_pre_order()
+                .any(|field| field.is_blob_v2());
+            let legacy_blobs = match file_version {
+                ConcreteFileVersion::V2_0 | ConcreteFileVersion::V2_1 => Some(
+                    state
+                        .schema_per_file
+                        .fields_pre_order()
+                        .filter(|field| field.is_blob_v2())
+                        .map(|field| field.id)
+                        .collect(),
+                ),
+                ConcreteFileVersion::V2_2 if has_blob_v2 => None,
+                _ => Some(HashSet::new()),
+            };
+            if let Some(legacy_blobs) = legacy_blobs {
+                state.physical = Some(Self::physical_projection(
+                    file_version,
+                    &state,
+                    legacy_blobs,
+                )?);
+            }
+        }
+        let state = Arc::new(state);
+        Ok(match cache {
+            Some(cache) => cache.insert(state),
+            None => state,
+        })
+    }
+
+    fn physical_projection(
+        file_version: ConcreteFileVersion,
+        state: &FileOpenState,
+        legacy_blobs: HashSet<i32>,
+    ) -> Result<PhysicalProjection> {
+        let physical_schema = v2::legacy_blob_read_schema(&state.schema_per_file, &legacy_blobs);
+        let reader_projection = file_versions::reader_projection_from_field_ids(
+            file_version,
+            &physical_schema,
+            state.field_id_to_column_idx.as_ref(),
+        )?;
+        Ok(PhysicalProjection {
+            legacy_blobs: Arc::new(legacy_blobs),
+            reader_projection,
+        })
+    }
+
+    async fn open_current_file_reader(
+        &self,
+        data_file: &DataFile,
+        projection: Option<&Schema>,
+        read_config: &FragReadConfig,
+        open_cache: Option<&FragmentOpenCache>,
+        metadata_mode: MetadataMode,
+        io_stats: Option<Arc<dyn IoStatsRecorder>>,
+    ) -> Result<Option<Box<dyn GenericFileReader>>> {
+        let open_state = self.file_open_state(data_file, projection, open_cache)?;
+        let schema_per_file = open_state.schema_per_file.clone();
         if schema_per_file.fields.is_empty() {
             return Ok(None);
         }
@@ -231,50 +336,32 @@ impl FileFragment {
         };
         let path = file_scheduler.reader().path().clone();
         let metadata_cache = self.table.state.metadata_cache.file_metadata_cache(&path);
-        let field_id_to_column_idx = Arc::new(BTreeMap::from_iter(
-            data_file
-                .fields
-                .iter()
-                .copied()
-                .zip(data_file.column_indices.iter().copied())
-                .filter_map(|(field_id, column_index)| {
-                    (column_index >= 0).then_some((field_id as u32, column_index as u32))
-                }),
-        ));
+        let field_id_to_column_idx = open_state.field_id_to_column_idx.clone();
         let file_version = data_file.file_version()?;
-        // Blob projections always open the reader with the full footer. A 2.2 file reads
-        // it first, to see which of its blob columns keep the legacy layout.
-        let blob_file_metadata = if file_version == ConcreteFileVersion::V2_2
-            && schema_per_file
-                .fields_pre_order()
-                .any(|field| field.is_blob_v2())
-        {
-            Some(self.get_file_metadata(&file_scheduler).await?)
-        } else {
-            None
+        let (legacy_blobs, reader_projection, blob_file_metadata) = match &open_state.physical {
+            Some(physical) => (
+                physical.legacy_blobs.clone(),
+                physical.reader_projection.clone(),
+                None,
+            ),
+            None => {
+                // Blob projections always open the reader with the full footer. A 2.2
+                // file reads it first, to see which of its blob columns keep the legacy
+                // layout.
+                let file_metadata = self.get_file_metadata(&file_scheduler).await?;
+                let legacy_blobs = v2::legacy_blob_fields(
+                    &schema_per_file,
+                    &field_id_to_column_idx,
+                    &file_metadata.column_infos,
+                );
+                let physical = Self::physical_projection(file_version, &open_state, legacy_blobs)?;
+                (
+                    physical.legacy_blobs,
+                    physical.reader_projection,
+                    Some(file_metadata),
+                )
+            }
         };
-        let legacy_blobs = match file_version {
-            ConcreteFileVersion::V2_0 | ConcreteFileVersion::V2_1 => schema_per_file
-                .fields_pre_order()
-                .filter(|field| field.is_blob_v2())
-                .map(|field| field.id)
-                .collect(),
-            _ => blob_file_metadata
-                .as_ref()
-                .map_or_else(HashSet::new, |file_metadata| {
-                    v2::legacy_blob_fields(
-                        &schema_per_file,
-                        &field_id_to_column_idx,
-                        &file_metadata.column_infos,
-                    )
-                }),
-        };
-        let physical_schema = v2::legacy_blob_read_schema(&schema_per_file, &legacy_blobs);
-        let reader_projection = file_versions::reader_projection_from_field_ids(
-            file_version,
-            &physical_schema,
-            field_id_to_column_idx.as_ref(),
-        )?;
         let prefer_indexed = metadata_mode == MetadataMode::LazyAllowed
             && reader_projection.column_indices.len().saturating_mul(4)
                 < data_file
@@ -285,7 +372,7 @@ impl FileFragment {
         let known_schema = self
             .metadata
             .physical_rows
-            .map(|num_rows| (data_file_schema.clone(), num_rows as u64));
+            .map(|num_rows| (open_state.data_file_schema.clone(), num_rows as u64));
 
         let encodings_io = Arc::new(
             LanceEncodingsIo::new(file_scheduler.clone())
@@ -322,10 +409,12 @@ impl FileFragment {
                     Some(file_metadata) => file_metadata,
                     None => self.get_file_metadata(&file_scheduler).await?,
                 };
+                // The adapter reads with an explicit projection, so a whole-file base
+                // projection would only be built and dropped.
                 ProjectedFileReader::try_open_with_file_metadata(
                     encodings_io.clone(),
                     path.clone(),
-                    None,
+                    Some(reader_projection.clone()),
                     Arc::<DecoderPlugins>::default(),
                     file_metadata,
                     &metadata_cache,
@@ -339,7 +428,7 @@ impl FileFragment {
             Arc::new(reader),
             schema_per_file,
             field_id_to_column_idx,
-            Arc::new(legacy_blobs),
+            legacy_blobs,
             reader_priority,
             file_scheduler,
         ))))
@@ -349,10 +438,17 @@ impl FileFragment {
         &self,
         projection: &Schema,
         read_config: &FragReadConfig,
+        open_cache: Option<&FragmentOpenCache>,
         io_stats: Option<Arc<dyn IoStatsRecorder>>,
     ) -> Result<Vec<Box<dyn GenericFileReader>>> {
-        self.open_readers_impl(projection, read_config, MetadataMode::LazyAllowed, io_stats)
-            .await
+        self.open_readers_impl(
+            projection,
+            read_config,
+            open_cache,
+            MetadataMode::LazyAllowed,
+            io_stats,
+        )
+        .await
     }
 
     /// The id of `field` and of every field under it.
@@ -370,7 +466,7 @@ impl FileFragment {
         projection: &Schema,
         read_config: &FragReadConfig,
     ) -> Result<Vec<Box<dyn GenericFileReader>>> {
-        self.open_readers_impl(projection, read_config, MetadataMode::Full, None)
+        self.open_readers_impl(projection, read_config, None, MetadataMode::Full, None)
             .await
     }
 
@@ -378,6 +474,7 @@ impl FileFragment {
         &'a self,
         projection: &'a Schema,
         read_config: &'a FragReadConfig,
+        open_cache: Option<&'a FragmentOpenCache>,
         metadata_mode: MetadataMode,
         io_stats: Option<Arc<dyn IoStatsRecorder>>,
     ) -> BoxFuture<'a, Result<Vec<Box<dyn GenericFileReader>>>> {
@@ -412,8 +509,15 @@ impl FileFragment {
                     async move {
                         match metadata_mode {
                             MetadataMode::LazyAllowed => {
-                                self.open_reader(data_file, Some(projection), read_config, io_stats)
-                                    .await
+                                self.open_reader_impl(
+                                    data_file,
+                                    Some(projection),
+                                    read_config,
+                                    open_cache,
+                                    MetadataMode::LazyAllowed,
+                                    io_stats,
+                                )
+                                .await
                             }
                             MetadataMode::Full => {
                                 self.open_reader_with_full_metadata(

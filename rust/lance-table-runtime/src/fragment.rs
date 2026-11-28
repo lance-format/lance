@@ -6,6 +6,7 @@
 mod columns;
 mod deletions;
 mod file_reader;
+mod open_cache;
 mod read_config;
 #[doc(hidden)]
 pub mod read_defaults;
@@ -38,6 +39,7 @@ pub use columns::{duplicate_field_path, relax_nullability, validate_write_versio
 pub use file_reader::GenericFileReader;
 #[doc(hidden)]
 pub use file_reader::V1FragmentReader;
+pub use open_cache::FragmentOpenCache;
 pub use read_config::{BaseSchedulers, FragReadConfig};
 pub use reader::FragmentReader;
 pub use session::FragmentSession;
