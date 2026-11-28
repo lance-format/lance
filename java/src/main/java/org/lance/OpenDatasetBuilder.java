@@ -18,7 +18,6 @@ import org.lance.namespace.model.DescribeTableRequest;
 import org.lance.namespace.model.DescribeTableResponse;
 
 import org.apache.arrow.memory.BufferAllocator;
-import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.util.Preconditions;
 
 import java.util.HashMap;
@@ -52,7 +51,6 @@ import java.util.Map;
  */
 public class OpenDatasetBuilder {
   private BufferAllocator allocator;
-  private boolean selfManagedAllocator = false;
   private String uri;
   private LanceNamespace namespaceClient;
   private List<String> tableId;
@@ -72,7 +70,6 @@ public class OpenDatasetBuilder {
   public OpenDatasetBuilder allocator(BufferAllocator allocator) {
     Preconditions.checkNotNull(allocator);
     this.allocator = allocator;
-    this.selfManagedAllocator = false;
     return this;
   }
 
@@ -199,19 +196,10 @@ public class OpenDatasetBuilder {
 
     Preconditions.checkNotNull(options, "options must be set");
 
-    // Create allocator if not provided
-    if (allocator == null) {
-      allocator = new RootAllocator(Long.MAX_VALUE);
-      selfManagedAllocator = true;
-    }
-
-    // Handle namespace client-based opening
     if (hasNamespaceClient) {
       return buildFromNamespaceClient();
     }
-
-    // Handle URI-based opening
-    return Dataset.open(allocator, selfManagedAllocator, uri, options, baseStoreParams, session);
+    return Dataset.open(allocator, allocator == null, uri, options, baseStoreParams, session);
   }
 
   private Dataset buildFromNamespaceClient() {
@@ -258,7 +246,7 @@ public class OpenDatasetBuilder {
     // - Create an external manifest commit handler when namespaceClientManagedVersioning is true
     return Dataset.open(
         allocator,
-        selfManagedAllocator,
+        allocator == null,
         location,
         optionsBuilder.build(),
         baseStoreParams,

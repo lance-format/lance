@@ -79,6 +79,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.stream.Collectors;
 
@@ -96,7 +97,10 @@ public class Dataset implements Closeable {
   private long nativeDatasetHandle;
 
   private BufferAllocator allocator;
-  private boolean selfManagedAllocator = false;
+  // Default opens give checkouts independent allocation budgets. Direct commits share the source's.
+  private boolean separateDerivedAllocators;
+  // Non-null when the last Dataset sharing this root is responsible for closing it.
+  private AtomicInteger allocatorOwners;
   private Session session;
   private boolean ownsSession = false;
 
@@ -340,13 +344,7 @@ public class Dataset implements Closeable {
    */
   @Deprecated
   public static Dataset open(String path) {
-    return open(
-        new RootAllocator(Long.MAX_VALUE),
-        true,
-        path,
-        new ReadOptions.Builder().build(),
-        new HashMap<>(),
-        null);
+    return open(null, true, path, new ReadOptions.Builder().build(), new HashMap<>(), null);
   }
 
   /**
@@ -360,8 +358,7 @@ public class Dataset implements Closeable {
    */
   @Deprecated
   public static Dataset open(String path, ReadOptions options) {
-    return open(
-        new RootAllocator(Long.MAX_VALUE), true, path, options, options.getBaseStoreParams(), null);
+    return open(null, true, path, options, options.getBaseStoreParams(), null);
   }
 
   /**
@@ -455,7 +452,9 @@ public class Dataset implements Closeable {
       List<String> tableId,
       boolean namespaceClientManagedVersioning) {
     Preconditions.checkNotNull(path);
-    Preconditions.checkNotNull(allocator);
+    if (!selfManagedAllocator) {
+      Preconditions.checkNotNull(allocator);
+    }
     Preconditions.checkNotNull(options);
 
     Session effectiveSession = session;
@@ -479,13 +478,16 @@ public class Dataset implements Closeable {
             namespaceClient,
             tableId,
             namespaceClientManagedVersioning);
-    dataset.allocator = allocator;
-    dataset.selfManagedAllocator = selfManagedAllocator;
+    dataset.separateDerivedAllocators = selfManagedAllocator;
+    if (selfManagedAllocator) {
+      dataset.ownAllocator(allocator == null ? new RootAllocator(Long.MAX_VALUE) : allocator);
+    } else {
+      dataset.allocator = allocator;
+    }
     if (effectiveSession != null) {
       dataset.session = effectiveSession;
     } else {
-      dataset.session = Session.fromHandle(dataset.nativeGetSessionHandle());
-      dataset.ownsSession = true;
+      dataset.initializeSession();
     }
     return dataset;
   }
@@ -636,6 +638,27 @@ public class Dataset implements Closeable {
     this.allocator = allocator;
   }
 
+  private void ownAllocator(BufferAllocator allocator) {
+    this.allocator = allocator;
+    allocatorOwners = new AtomicInteger(1);
+  }
+
+  void shareAllocator(Dataset source) {
+    allocator = source.allocator;
+    allocatorOwners = source.allocatorOwners;
+    if (allocatorOwners != null) {
+      allocatorOwners.incrementAndGet();
+    }
+  }
+
+  void initializeDerivedAllocator(Dataset source) {
+    if (source.separateDerivedAllocators) {
+      ownAllocator(new RootAllocator(Long.MAX_VALUE));
+    } else {
+      shareAllocator(source);
+    }
+  }
+
   /**
    * Create a new transaction builder at current version for the dataset. The dataset itself will
    * not refresh after the transaction committed.
@@ -673,17 +696,10 @@ public class Dataset implements Closeable {
   public Dataset commitTransaction(
       Transaction transaction, boolean detached, boolean enableV2ManifestPaths) {
     Preconditions.checkNotNull(transaction);
-    Dataset dataset =
-        new CommitBuilder(this)
-            .detached(detached)
-            .enableV2ManifestPaths(enableV2ManifestPaths)
-            .execute(transaction);
-    if (selfManagedAllocator) {
-      dataset.allocator = new RootAllocator(Long.MAX_VALUE);
-    } else {
-      dataset.allocator = allocator;
-    }
-    return dataset;
+    return new CommitBuilder(this)
+        .detached(detached)
+        .enableV2ManifestPaths(enableV2ManifestPaths)
+        .execute(transaction, true);
   }
 
   /**
@@ -722,6 +738,39 @@ public class Dataset implements Closeable {
   }
 
   private native void nativeMigrateManifestPathsV2();
+
+  /**
+   * Register additional base paths on this dataset.
+   *
+   * <p>The base paths are added to the manifest in a new version and can be targeted by later
+   * writes through {@link WriteParams.Builder#withTargetBases(List)}. See {@link #getBasePaths()}
+   * for the registered bases.
+   *
+   * @param newBases the base paths to register
+   * @throws IllegalArgumentException if {@code newBases} is null or the dataset is closed
+   */
+  public void addBases(List<BasePath> newBases) {
+    addBases(newBases, null);
+  }
+
+  /**
+   * Register additional base paths on this dataset.
+   *
+   * @param newBases the base paths to register
+   * @param transactionProperties optional key-value pairs recorded on the transaction, may be null
+   * @throws IllegalArgumentException if {@code newBases} is null or the dataset is closed
+   * @see #addBases(List)
+   */
+  public void addBases(List<BasePath> newBases, Map<String, String> transactionProperties) {
+    Preconditions.checkArgument(newBases != null, "newBases can not be null");
+    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      nativeAddBases(newBases, Optional.ofNullable(transactionProperties));
+    }
+  }
+
+  private native void nativeAddBases(
+      List<BasePath> newBases, Optional<Map<String, String>> transactionProperties);
 
   /**
    * Add columns to the dataset.
@@ -1227,14 +1276,24 @@ public class Dataset implements Closeable {
   private native Dataset nativeCheckoutTag(String tag);
 
   private Dataset initializeCheckoutDataset(Dataset checkedOutDataset) {
-    if (selfManagedAllocator) {
-      checkedOutDataset.allocator = new RootAllocator(Long.MAX_VALUE);
-    } else {
-      checkedOutDataset.allocator = allocator;
-    }
-    checkedOutDataset.session = Session.fromHandle(checkedOutDataset.nativeGetSessionHandle());
-    checkedOutDataset.ownsSession = true;
+    checkedOutDataset.initializeDerivedAllocator(this);
+    checkedOutDataset.initializeSession();
     return checkedOutDataset;
+  }
+
+  private void initializeSession() {
+    session = Session.fromHandle(nativeGetSessionHandle());
+    ownsSession = true;
+  }
+
+  private Dataset initializeIndependentDataset(Dataset result) {
+    if (allocatorOwners != null || allocator == null) {
+      result.ownAllocator(new RootAllocator(Long.MAX_VALUE));
+    } else {
+      result.shareAllocator(this);
+    }
+    result.initializeSession();
+    return result;
   }
 
   /**
@@ -2129,12 +2188,7 @@ public class Dataset implements Closeable {
     if (ContextIndexBuildProgress.isActive(this)) {
       throw new IllegalStateException("Dataset is busy in an index progress callback");
     }
-    UpdateMap configUpdate = UpdateMap.builder().updates(tableConfig).replace(true).build();
-
-    UpdateConfig operation = UpdateConfig.builder().configUpdates(configUpdate).build();
-
-    Dataset newDataset = newTransactionBuilder().operation(operation).build().commit();
-    updateToNewDataset(newDataset);
+    commitConfigUpdate(UpdateMap.builder().updates(tableConfig).replace(true).build());
   }
 
   /**
@@ -2150,29 +2204,25 @@ public class Dataset implements Closeable {
     }
     Map<String, String> deleteMap = new HashMap<>();
     deleteKeys.forEach(key -> deleteMap.put(key, null));
-    UpdateMap configUpdate = UpdateMap.builder().updates(deleteMap).replace(false).build();
-
-    UpdateConfig operation = UpdateConfig.builder().configUpdates(configUpdate).build();
-
-    Dataset newDataset = newTransactionBuilder().operation(operation).build().commit();
-    updateToNewDataset(newDataset);
+    commitConfigUpdate(UpdateMap.builder().updates(deleteMap).replace(false).build());
   }
 
   /**
-   * Updates the internal state of this dataset to match the provided new dataset. This is used by
-   * deprecated void methods that need to update the current dataset instance.
+   * Commits a config update and advances this handle without closing resources held by its readers.
    */
-  private void updateToNewDataset(Dataset newDataset) {
-    // Close the current handle to avoid resource leak
-    close();
-
-    // Replace all internal state with the new dataset
-    this.nativeDatasetHandle = newDataset.nativeDatasetHandle;
-    this.allocator = newDataset.allocator;
-    this.selfManagedAllocator = newDataset.selfManagedAllocator;
-
-    // Prevent the new dataset from closing the handle when it gets GC'd
-    newDataset.nativeDatasetHandle = 0;
+  private void commitConfigUpdate(UpdateMap updates) {
+    UpdateConfig operation = UpdateConfig.builder().configUpdates(updates).build();
+    try (Transaction transaction =
+            new Transaction.Builder().readVersion(version()).operation(operation).build();
+        Dataset newDataset = new CommitBuilder(this).execute(transaction);
+        LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+      // Another config commit or close can finish while this commit is returning.
+      if (nativeDatasetHandle != 0 && nativeGetVersion().getId() < newDataset.version()) {
+        long previous = nativeDatasetHandle;
+        nativeDatasetHandle = newDataset.nativeDatasetHandle;
+        newDataset.nativeDatasetHandle = previous;
+      }
+    }
   }
 
   /**
@@ -2206,13 +2256,17 @@ public class Dataset implements Closeable {
         releaseNativeDataset(nativeDatasetHandle);
         nativeDatasetHandle = 0;
       }
-      if (selfManagedAllocator) {
-        allocator.close();
-      }
       if (ownsSession && session != null) {
         session.close();
         session = null;
         ownsSession = false;
+      }
+      if (allocatorOwners != null) {
+        AtomicInteger owners = allocatorOwners;
+        allocatorOwners = null;
+        if (owners.decrementAndGet() == 0) {
+          allocator.close();
+        }
       }
     }
   }
@@ -2501,7 +2555,7 @@ public class Dataset implements Closeable {
     Preconditions.checkArgument(branch != null, "Branch cannot be null");
     try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
-      return nativeCreateBranch(branch, ref, storageOptions);
+      return initializeIndependentDataset(nativeCreateBranch(branch, ref, storageOptions));
     }
   }
 
@@ -2756,12 +2810,7 @@ public class Dataset implements Closeable {
     try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
       MergeInsertResult result = nativeMergeInsert(mergeInsert, source.memoryAddress());
 
-      Dataset newDataset = result.dataset();
-      if (selfManagedAllocator) {
-        newDataset.allocator = new RootAllocator(Long.MAX_VALUE);
-      } else {
-        newDataset.allocator = allocator;
-      }
+      result.dataset().initializeDerivedAllocator(this);
 
       return result;
     }
@@ -2821,12 +2870,7 @@ public class Dataset implements Closeable {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
       UpdateResult result = nativeUpdate(params);
 
-      Dataset newDataset = result.getDataset();
-      if (selfManagedAllocator) {
-        newDataset.allocator = new RootAllocator(Long.MAX_VALUE);
-      } else {
-        newDataset.allocator = allocator;
-      }
+      result.getDataset().initializeDerivedAllocator(this);
 
       return result;
     }
@@ -2935,16 +2979,52 @@ public class Dataset implements Closeable {
     try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
       Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
       Dataset newDataset = nativeShallowClone(targetPath, ref, Optional.ofNullable(storageOptions));
-      if (selfManagedAllocator) {
-        newDataset.allocator = new RootAllocator(Long.MAX_VALUE);
-      } else {
-        newDataset.allocator = allocator;
-      }
+      newDataset.initializeDerivedAllocator(this);
       return newDataset;
     }
   }
 
   private native Dataset nativeShallowClone(
+      String targetPath, Ref ref, Optional<Map<String, String>> storageOptions);
+
+  /**
+   * Deep clone the specified version into a new dataset at the target path, using default store
+   * parameters.
+   *
+   * @param targetPath the URI to clone the dataset into
+   * @param ref the referred version of the current dataset
+   * @return a new Dataset instance at the target path
+   * @see #deepClone(String, Ref, Map)
+   */
+  public Dataset deepClone(String targetPath, Ref ref) {
+    return deepClone(targetPath, ref, null);
+  }
+
+  /**
+   * Deep clone the specified version into a new dataset at the target path.
+   *
+   * <p>Unlike {@link #shallowClone(String, Ref, Map)}, this copies the data files, so the new
+   * dataset does not depend on the source. The target can live in a different object store. Other
+   * reads on this handle can continue during the copy. The returned handle can be used after the
+   * source is closed.
+   *
+   * @param targetPath the URI to clone the dataset into
+   * @param ref the referred version of the current dataset
+   * @param storageOptions Optional object store options for the destination dataset; empty uses
+   *     default store parameters
+   * @return a new Dataset instance at the target path
+   */
+  public Dataset deepClone(String targetPath, Ref ref, Map<String, String> storageOptions) {
+    Preconditions.checkArgument(targetPath != null, "Target path can not be null");
+    Preconditions.checkArgument(ref != null, "ref can not be null");
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return initializeIndependentDataset(
+          nativeDeepClone(targetPath, ref, Optional.ofNullable(storageOptions)));
+    }
+  }
+
+  private native Dataset nativeDeepClone(
       String targetPath, Ref ref, Optional<Map<String, String>> storageOptions);
 
   /**

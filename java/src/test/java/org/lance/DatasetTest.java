@@ -38,6 +38,7 @@ import org.lance.schema.ColumnAlteration;
 import org.lance.schema.LanceField;
 import org.lance.schema.SqlExpressions;
 
+import com.sun.net.httpserver.HttpServer;
 import org.apache.arrow.c.ArrowArrayStream;
 import org.apache.arrow.c.Data;
 import org.apache.arrow.memory.BufferAllocator;
@@ -59,6 +60,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
@@ -67,6 +69,7 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
+import java.net.InetSocketAddress;
 import java.net.URISyntaxException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
@@ -85,6 +88,12 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -94,7 +103,9 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
@@ -2207,6 +2218,288 @@ public class DatasetTest {
           assertNotNull(opened);
           assertEquals(srcSchema.getFields(), opened.getSchema().getFields());
           assertEquals(srcRowCount, opened.countRows());
+        }
+      }
+    }
+  }
+
+  @ParameterizedTest
+  @ValueSource(booleans = {false, true})
+  void testCreateBranchDataset(boolean callerOwnsResources, @TempDir Path tempDir)
+      throws Exception {
+    String path = tempDir.resolve("table").toString();
+    try (BufferAllocator allocator = new RootAllocator();
+        Session session = Session.builder().build()) {
+      TestUtils.SimpleTestDataset suite = new TestUtils.SimpleTestDataset(allocator, path);
+      try (Dataset empty = suite.createEmptyDataset()) {
+        Append append = Append.builder().fragments(suite.createNewFragment(4, 2)).build();
+        empty.newTransactionBuilder().operation(append).build().commit().close();
+      }
+      OpenDatasetBuilder open = Dataset.open().uri(path);
+      if (callerOwnsResources) {
+        open.allocator(allocator).session(session);
+      }
+      try (Dataset parent = open.build();
+          Dataset branch =
+              callerOwnsResources
+                  ? parent.createBranch("dev", Ref.ofMain(), Map.of("allow_http", "true"))
+                  : parent.createBranch("dev", Ref.ofMain())) {
+        Session branchSession = branch.session();
+        assertNotNull(branchSession, "expected an initialized branch session");
+        assertEquals(suite.getSchema(), branch.getSchema());
+        try (Dataset sibling = open.build()) {
+          assertEquals(suite.getSchema(), sibling.getSchema());
+        }
+        assertEquals(suite.getSchema(), parent.getSchema());
+        BufferAllocator branchAllocator = branch.allocator();
+        if (callerOwnsResources) {
+          assertSame(allocator, branchAllocator);
+        }
+        try (LanceScanner scanner = branch.newScan();
+            ArrowReader reader = scanner.scanBatches()) {
+          parent.close();
+          int rows = 0;
+          while (reader.loadNextBatch()) {
+            IntVector ids = (IntVector) reader.getVectorSchemaRoot().getVector("id");
+            for (int i = 0; i < ids.getValueCount(); i++) {
+              assertEquals(rows, ids.get(i));
+              rows++;
+            }
+          }
+          assertEquals(4, rows);
+          assertTrue(branchSession.sizeBytes() >= 0);
+        }
+        branch.close();
+        assertTrue(branchSession.isClosed());
+        if (!callerOwnsResources) {
+          assertThrows(IllegalStateException.class, branchAllocator::assertOpen);
+        }
+      }
+      allocator.assertOpen();
+      assertFalse(session.isClosed());
+    }
+  }
+
+  @ParameterizedTest
+  @CsvSource({"false,false", "true,false", "false,true", "true,true"})
+  void testCreateBranchFromCheckout(
+      boolean closeBranchFirst, boolean callerOwnsAllocator, @TempDir Path tempDir)
+      throws Exception {
+    String path = tempDir.resolve("table").toString();
+    try (BufferAllocator allocator = new RootAllocator()) {
+      TestUtils.SimpleTestDataset suite = new TestUtils.SimpleTestDataset(allocator, path);
+      try (Dataset empty = suite.createEmptyDataset()) {
+        suite.write(empty.version(), 2).close();
+      }
+      OpenDatasetBuilder open = Dataset.open().uri(path);
+      if (callerOwnsAllocator) {
+        open.allocator(allocator);
+      }
+      try (Dataset parent = open.build();
+          Dataset checkout = parent.checkoutVersion(parent.version());
+          Dataset branch = checkout.createBranch("dev", Ref.ofMain())) {
+        BufferAllocator checkoutAllocator = checkout.allocator();
+        BufferAllocator branchAllocator = branch.allocator();
+        Dataset readerSource = closeBranchFirst ? checkout : branch;
+        try (LanceScanner scanner = readerSource.newScan();
+            ArrowReader reader = scanner.scanBatches()) {
+          parent.close();
+          (closeBranchFirst ? branch : checkout).close();
+          if (callerOwnsAllocator) {
+            readerSource.close();
+          }
+          assertTrue(reader.loadNextBatch());
+          assertEquals(2, reader.getVectorSchemaRoot().getRowCount());
+          IntVector ids = (IntVector) reader.getVectorSchemaRoot().getVector("id");
+          assertEquals(0, ids.get(0));
+          assertEquals(1, ids.get(1));
+          assertFalse(reader.loadNextBatch());
+        }
+        readerSource.close();
+        if (callerOwnsAllocator) {
+          assertSame(allocator, checkoutAllocator);
+          assertSame(allocator, branchAllocator);
+          allocator.assertOpen();
+        } else {
+          assertThrows(IllegalStateException.class, checkoutAllocator::assertOpen);
+          assertThrows(IllegalStateException.class, branchAllocator::assertOpen);
+        }
+      }
+    }
+  }
+
+  @ParameterizedTest
+  @ValueSource(booleans = {false, true})
+  void testCreateBranchFromCommit(boolean nativeCommit, @TempDir Path tempDir) throws Exception {
+    String path = tempDir.resolve("table").toString();
+    try (BufferAllocator allocator = new RootAllocator()) {
+      TestUtils.SimpleTestDataset suite = new TestUtils.SimpleTestDataset(allocator, path);
+      suite.createEmptyDataset().close();
+      List<FragmentMetadata> fragments = suite.createNewFragment(4, 2);
+      try (Dataset parent = Dataset.open().uri(path).build();
+          Transaction update =
+              new Transaction.Builder()
+                  .readVersion(parent.version())
+                  .operation(Append.builder().fragments(fragments).build())
+                  .build();
+          Dataset committed =
+              nativeCommit
+                  ? Dataset.commitAppend(path, Optional.of(parent.version()), fragments, Map.of())
+                  : new CommitBuilder(parent).execute(update);
+          Dataset branch = committed.createBranch("dev", Ref.ofMain());
+          Dataset checkout = branch.checkoutVersion(branch.version())) {
+        if (!nativeCommit) {
+          assertSame(parent.allocator(), committed.allocator());
+        }
+        BufferAllocator branchAllocator = branch.allocator();
+        assertNotSame(parent.allocator(), branchAllocator);
+        committed.close();
+        parent.close();
+        assertEquals(suite.getSchema(), branch.getSchema());
+        branch.close();
+        try (LanceScanner scanner = checkout.newScan()) {
+          suite.validateScanResults(checkout, scanner, 4, 2, 0);
+        }
+        checkout.close();
+        assertThrows(IllegalStateException.class, branchAllocator::assertOpen);
+      }
+    }
+  }
+
+  @Test
+  void testCreateBranchConfig(@TempDir Path tempDir) throws Exception {
+    String path = tempDir.resolve("table").toString();
+    try (BufferAllocator allocator = new RootAllocator()) {
+      TestUtils.SimpleTestDataset suite = new TestUtils.SimpleTestDataset(allocator, path);
+      try (Dataset empty = suite.createEmptyDataset()) {
+        suite.write(empty.version(), 2).close();
+      }
+      try (Dataset parent = Dataset.open().uri(path).build();
+          Dataset branch = parent.createBranch("dev", Ref.ofMain());
+          LanceScanner scanner = branch.newScan();
+          ArrowReader reader = scanner.scanBatches()) {
+        Session branchSession = branch.session();
+        long version = branch.version();
+        branch.updateConfig(Map.of("key", "value"));
+        assertEquals("value", branch.getConfig().get("key"));
+        branch.deleteConfigKeys(Collections.singleton("key"));
+        assertFalse(branch.getConfig().containsKey("key"));
+        assertEquals(version + 2, branch.version());
+        assertSame(branchSession, branch.session());
+        assertFalse(branchSession.isClosed());
+        assertEquals(suite.getSchema(), branch.getSchema());
+        assertTrue(reader.loadNextBatch());
+        assertEquals(2, reader.getVectorSchemaRoot().getRowCount());
+      }
+    }
+  }
+
+  @Test
+  void testDeepCloneAllowsSourceReads(@TempDir Path tempDir) throws Exception {
+    HttpServer target = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+    CountDownLatch requestStarted = new CountDownLatch(1);
+    CountDownLatch releaseRequest = new CountDownLatch(1);
+    target.createContext(
+        "/",
+        exchange -> {
+          requestStarted.countDown();
+          try {
+            releaseRequest.await();
+            exchange.sendResponseHeaders(403, -1);
+          } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+          } finally {
+            exchange.close();
+          }
+        });
+    target.start();
+    ExecutorService executor = Executors.newFixedThreadPool(2);
+    try (BufferAllocator allocator = new RootAllocator();
+        Dataset source =
+            new TestUtils.SimpleTestDataset(allocator, tempDir.resolve("src").toString())
+                .createEmptyDataset()) {
+      Map<String, String> options =
+          Map.of(
+              "aws_endpoint", "http://127.0.0.1:" + target.getAddress().getPort(),
+              "allow_http", "true",
+              "aws_region", "us-east-1",
+              "client_max_retries", "0",
+              "aws_access_key_id", "test",
+              "aws_secret_access_key", "test");
+      Future<Dataset> clone =
+          executor.submit(() -> source.deepClone("s3://bucket/clone", Ref.ofMain(), options));
+      try {
+        assertTrue(requestStarted.await(10, TimeUnit.SECONDS), "clone did not reach destination");
+        Future<Long> rows = executor.submit(() -> source.countRows());
+        assertEquals(0L, rows.get(5, TimeUnit.SECONDS).longValue());
+      } finally {
+        releaseRequest.countDown();
+      }
+      ExecutionException failure =
+          assertThrows(ExecutionException.class, () -> clone.get(10, TimeUnit.SECONDS));
+      assertTrue(failure.getCause().getMessage().contains("403"), failure::toString);
+    } finally {
+      releaseRequest.countDown();
+      executor.shutdownNow();
+      target.stop(0);
+    }
+  }
+
+  @ParameterizedTest
+  @CsvSource({"false,false", "true,false", "false,true", "true,true"})
+  void testDeepClone(boolean callerOwnsResources, boolean checkoutSource, @TempDir Path tempDir)
+      throws Exception {
+    String srcPath = tempDir.resolve("deep_clone_src").toString();
+    String dstPath = tempDir.resolve("deep_clone_dst").toString();
+
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE);
+        Session session = Session.builder().build()) {
+      TestUtils.SimpleTestDataset suite = new TestUtils.SimpleTestDataset(allocator, srcPath);
+      try (Dataset empty = suite.createEmptyDataset()) {
+        assertEquals(1, empty.version());
+      }
+
+      suite.write(1, 5).close();
+      OpenDatasetBuilder open = Dataset.open().uri(srcPath);
+      if (callerOwnsResources) {
+        open.allocator(allocator).session(session);
+      }
+      try (Dataset parent = open.build();
+          Dataset src = checkoutSource ? parent.checkoutVersion(parent.version()) : parent) {
+        BufferAllocator sourceAllocator = src.allocator();
+        BufferAllocator cloneAllocator;
+        Session cloneSession;
+        try (Dataset clone = src.deepClone(dstPath, Ref.ofMain(src.version()))) {
+          assertEquals(dstPath, clone.uri());
+          cloneSession = clone.session();
+          assertNotNull(cloneSession);
+          cloneAllocator = clone.allocator();
+          try (Dataset checkout = clone.checkoutVersion(clone.version())) {
+            assertTrue(cloneSession.isSameAs(checkout.session()));
+          }
+          if (callerOwnsResources) {
+            assertSame(allocator, cloneAllocator);
+          }
+          src.close();
+          parent.close();
+          assertEquals(suite.getSchema().getFields(), clone.getSchema().getFields());
+          assertEquals(5, clone.countRows());
+        }
+        assertTrue(cloneSession.isClosed());
+        if (callerOwnsResources) {
+          allocator.assertOpen();
+          assertFalse(session.isClosed());
+        } else {
+          assertThrows(IllegalStateException.class, cloneAllocator::assertOpen);
+          assertThrows(IllegalStateException.class, sourceAllocator::assertOpen);
+        }
+
+        // A deep clone owns its data files, unlike a shallow clone that references the source.
+        try (Stream<Path> files = Files.walk(Path.of(dstPath, "data"))) {
+          assertTrue(files.anyMatch(file -> file.toString().endsWith(".lance")));
+        }
+        try (Dataset opened = Dataset.open(allocator, dstPath, new ReadOptions.Builder().build())) {
+          assertEquals(5, opened.countRows());
         }
       }
     }
