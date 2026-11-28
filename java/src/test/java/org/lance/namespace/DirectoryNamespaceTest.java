@@ -146,7 +146,7 @@ public class DirectoryNamespaceTest {
     }
   }
 
-  private byte[] createTestTableData() throws Exception {
+  protected byte[] createTestTableData() throws Exception {
     Schema schema =
         new Schema(
             Arrays.asList(
@@ -602,7 +602,7 @@ public class DirectoryNamespaceTest {
    * @param root The root path for the namespace
    * @return A DirectoryNamespace with table_version_tracking_enabled and ops_metrics_enabled
    */
-  private DirectoryNamespace createManagedVersioningNamespace(Path root) {
+  protected DirectoryNamespace createManagedVersioningNamespace(Path root) {
     Map<String, String> dirProps = new HashMap<>();
     dirProps.put("root", root.toString());
     dirProps.put("table_version_tracking_enabled", "true");

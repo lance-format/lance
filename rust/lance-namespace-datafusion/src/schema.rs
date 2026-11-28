@@ -58,20 +58,24 @@ impl SchemaProvider for LanceSchemaProvider {
     }
 
     async fn table(&self, table_name: &str) -> Result<Option<Arc<dyn TableProvider>>> {
-        if let Some(existing) = self.tables.get(table_name) {
-            // Reuse cached provider when still fresh; otherwise reload.
-            let ds = existing.dataset();
-            let latest = ds.latest_version_id().await.map_err(to_datafusion_error)?;
-            let is_stale = latest != ds.version().version;
-            if is_stale {
-                self.tables.remove(table_name);
-                self.load_and_cache_table(table_name).await
-            } else {
-                Ok(Some(Arc::clone(existing.value()) as Arc<dyn TableProvider>))
-            }
-        } else {
-            self.load_and_cache_table(table_name).await
+        // Only the handle leaves the map here. Checking the version is a remote
+        // read and reloading takes the map's write lock, so the read guard must
+        // not be held across either.
+        let cached = self
+            .tables
+            .get(table_name)
+            .map(|existing| Arc::clone(existing.value()));
+        let Some(existing) = cached else {
+            return self.load_and_cache_table(table_name).await;
+        };
+        let ds = existing.dataset();
+        let latest = ds.latest_version_id().await.map_err(to_datafusion_error)?;
+        if latest == ds.version().version {
+            return Ok(Some(existing as Arc<dyn TableProvider>));
         }
+        // The cached provider fell behind: replace it.
+        self.tables.remove(table_name);
+        self.load_and_cache_table(table_name).await
     }
 
     fn table_exist(&self, name: &str) -> bool {

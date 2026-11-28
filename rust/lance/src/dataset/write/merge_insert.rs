@@ -873,7 +873,13 @@ pub struct MergeStats {
 
 pub struct UncommittedMergeInsert {
     pub transaction: Transaction,
+    /// Physical row addresses removed by this merge. Pass these to
+    /// [`CommitBuilder::with_affected_rows`](crate::dataset::CommitBuilder::with_affected_rows) when committing the staged transaction
+    /// to distinguish disjoint row updates within the same fragment.
     pub affected_rows: Option<RowAddrTreeMap>,
+    /// Staging statistics. Pass the observed insert count to
+    /// [`CommitBuilder::with_inserted_row_count`](crate::dataset::CommitBuilder::with_inserted_row_count)
+    /// when committing the same transaction.
     pub stats: MergeStats,
     pub inserted_rows_filter: Option<KeyExistenceFilter>,
 }

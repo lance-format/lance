@@ -299,7 +299,20 @@ class ShardWriter:
         """Flush and close the writer.
 
         After ``close()``, calling :meth:`put` raises an error.
-        Automatically called when used as a context manager.
+
+        Leaving a ``with`` block closes the writer the same way. If the block is
+        exiting on an exception, an error recorded by an earlier ``close()`` is not
+        raised, and a failed flush replaces the propagating exception only if that
+        exception is an ``Exception``, ``SystemExit`` or ``GeneratorExit``, so
+        ``KeyboardInterrupt``, ``asyncio.CancelledError`` and other ``BaseException``
+        keep propagating. Call ``close()`` afterwards to see an error that was not
+        raised.
+
+        Raises
+        ------
+        IOError
+            If the flush fails. A ``close()`` that failed or was interrupted is
+            reported again by every later ``close()``.
         """
         self._raw.close()
 
@@ -353,8 +366,7 @@ class ShardWriter:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> bool:
-        self.close()
-        return False
+        return self._raw.__exit__(exc_type, exc_val, exc_tb)
 
 
 class LsmScanner:

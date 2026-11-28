@@ -10,6 +10,7 @@ use super::manifest_feature_flags::{
     FLAG_ESCAPED_OBJECT_IDS, READER_FEATURE_FLAGS_KEY, WRITER_FEATURE_FLAGS_KEY, ensure_readable,
     ensure_writable, reader_flags, writer_flags,
 };
+use super::snapshot::SnapshotReader;
 use arrow::array::builder::{ListBuilder, StringBuilder};
 use arrow::array::{Array, ListArray, RecordBatch, RecordBatchIterator, StringArray, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema as ArrowSchema, SchemaRef};
@@ -57,7 +58,6 @@ use lance_namespace::models::{
     ListTablesResponse, NamespaceExistsRequest, RegisterTableRequest, RegisterTableResponse,
     RenameTableRequest, RenameTableResponse, TableExistsRequest,
 };
-use lance_namespace::schema::arrow_schema_to_json;
 use lance_table::feature_flags::{apply_feature_flags, ensure_can_write_manifest};
 use lance_table::format::{Fragment, IndexMetadata, Manifest};
 use lance_table::io::commit::{
@@ -3288,95 +3288,42 @@ impl LanceNamespace for ManifestNamespace {
         // For backwards compatibility, only skip vending credentials when explicitly set to false
         let vend_credentials = request.vend_credentials.unwrap_or(true);
 
-        match table_info {
-            Some(info) => {
-                // Construct full URI from relative location
-                let table_uri = Self::construct_full_uri(&self.root, &info.location)?;
-
-                let storage_options = if vend_credentials {
-                    self.storage_options.clone()
-                } else {
-                    None
-                };
-                let is_only_declared = if should_check_declared {
-                    Some(!self.location_has_actual_manifests(&info.location).await?)
-                } else {
-                    None
-                };
-
-                if !load_detailed_metadata {
-                    return Ok(DescribeTableResponse {
-                        table: Some(table_name),
-                        namespace: Some(namespace_id),
-                        location: Some(table_uri.clone()),
-                        table_uri: Some(table_uri),
-                        storage_options,
-                        properties: info.metadata,
-                        is_only_declared,
-                        ..Default::default()
-                    });
-                }
-
-                if is_only_declared == Some(true) {
-                    return Ok(DescribeTableResponse {
-                        table: Some(table_name),
-                        namespace: Some(namespace_id),
-                        location: Some(table_uri.clone()),
-                        table_uri: Some(table_uri),
-                        storage_options,
-                        properties: info.metadata,
-                        is_only_declared,
-                        ..Default::default()
-                    });
-                }
-
-                let mut builder = DatasetBuilder::from_uri(&table_uri);
-                if let Some(opts) = &self.storage_options {
-                    builder = builder.with_storage_options(opts.clone());
-                }
-                if let Some(session) = &self.session {
-                    builder = builder.with_session(session.clone());
-                }
-
-                match builder.load().await {
-                    Ok(mut dataset) => {
-                        // If a specific version is requested, checkout that version
-                        if let Some(requested_version) = request.version {
-                            dataset = dataset.checkout_version(requested_version as u64).await?;
-                        }
-
-                        let version = dataset.version().version;
-                        let lance_schema = dataset.schema();
-                        let arrow_schema: arrow_schema::Schema = lance_schema.into();
-                        let json_schema = arrow_schema_to_json(&arrow_schema)?;
-
-                        Ok(DescribeTableResponse {
-                            table: Some(table_name.clone()),
-                            namespace: Some(namespace_id.clone()),
-                            version: Some(version as i64),
-                            location: Some(table_uri.clone()),
-                            table_uri: Some(table_uri),
-                            schema: Some(Box::new(json_schema)),
-                            storage_options,
-                            properties: info.metadata.clone(),
-                            is_only_declared,
-                            ..Default::default()
-                        })
-                    }
-                    Err(err) => Err(NamespaceError::Internal {
-                        message: format!(
-                            "Table exists in manifest but failed to load dataset '{}': {}",
-                            object_id, err
-                        ),
-                    }
-                    .into()),
-                }
-            }
-            None => Err(NamespaceError::TableNotFound {
-                message: Self::format_table_id(table_id),
-            }
-            .into()),
-        }
+        let info = table_info.ok_or_else(|| NamespaceError::TableNotFound {
+            message: Self::format_table_id(table_id),
+        })?;
+        let table_uri = Self::construct_full_uri(&self.root, &info.location)?;
+        let registered_path;
+        let (table_path, is_only_declared) = if should_check_declared {
+            registered_path = Self::join_location(&self.base_path, &info.location)?;
+            let materialized =
+                Self::path_has_actual_manifests(&self.object_store, &registered_path).await?;
+            (&registered_path, Some(!materialized))
+        } else {
+            // Shallow descriptions only validate selectors and never inspect the table path.
+            (&self.base_path, None)
+        };
+        let reader = SnapshotReader {
+            table_path,
+            storage_options: self.storage_options.as_ref(),
+            session: self.session.as_ref(),
+        };
+        let snapshot = reader
+            .describe(&request, &table_name, &table_uri, is_only_declared)
+            .await?;
+        Ok(DescribeTableResponse {
+            table: Some(table_name),
+            namespace: Some(namespace_id),
+            location: Some(table_uri.clone()),
+            table_uri: Some(table_uri),
+            storage_options: if vend_credentials {
+                self.storage_options.clone()
+            } else {
+                None
+            },
+            properties: info.metadata,
+            is_only_declared,
+            ..snapshot
+        })
     }
 
     async fn table_exists(&self, request: TableExistsRequest) -> Result<()> {

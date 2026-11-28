@@ -11,20 +11,20 @@ use arrow_schema::Schema as ArrowSchema;
 use lance::dataset::{
     MergeInsertAnalysis, MergeInsertBuilder as LanceMergeInsertBuilder, MergeInsertWriteMode,
     MergeInsertWriteStrategy, MergeStats, UncommittedMergeInsert, WhenMatched, WhenNotMatched,
-    WhenNotMatchedBySource, transaction::Transaction,
+    WhenNotMatchedBySource,
 };
 use lance_datafusion::exec::{ExecutionMetricValue, ExecutionOutcome};
 use lance_datafusion::utils::reader_to_stream;
 use pyo3::exceptions::{PyIOError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList, PyString};
+use pyo3::types::{PyBytes, PyDict, PyList, PyString};
 
 use crate::error::PythonErrorExt;
 use crate::rt;
 use crate::utils::PyLance;
 
 use super::replayable::replayable_provider;
-use super::{Dataset, convert_reader};
+use super::{Dataset, convert_reader, set_committed_dataset};
 
 #[pyclass(name = "_MergeInsertBuilder", module = "_lib", subclass)]
 pub struct MergeInsertBuilder {
@@ -202,9 +202,7 @@ impl MergeInsertBuilder {
             .spawn(Some(py), job.execute_reader(new_data))?
             .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
 
-        let dataset = self.dataset.bind(py);
-
-        dataset.borrow_mut().ds = new_dataset;
+        set_committed_dataset(self.dataset.bind(py), new_dataset);
 
         Ok(Self::build_stats(&stats, py)?.into())
     }
@@ -212,7 +210,7 @@ impl MergeInsertBuilder {
     pub fn execute_uncommitted<'a>(
         &mut self,
         new_data: &Bound<'a, PyAny>,
-    ) -> PyResult<(PyLance<Transaction>, Bound<'a, PyDict>)> {
+    ) -> PyResult<(Bound<'a, PyAny>, Bound<'a, PyDict>)> {
         let py = new_data.py();
         let new_data = convert_reader(new_data)?;
 
@@ -221,15 +219,10 @@ impl MergeInsertBuilder {
             .try_build()
             .map_err(|err| PyValueError::new_err(err.to_string()))?;
 
-        let UncommittedMergeInsert {
-            transaction, stats, ..
-        } = rt()
+        let staged = rt()
             .spawn(Some(py), job.execute_uncommitted(new_data))?
             .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
-
-        let stats = Self::build_stats(&stats, py)?;
-
-        Ok((PyLance(transaction), stats))
+        Self::uncommitted_result(py, staged)
     }
 
     pub fn execute_replayable(
@@ -247,7 +240,7 @@ impl MergeInsertBuilder {
         let (new_dataset, stats) = rt()
             .spawn(Some(py), job.execute_provider(provider))?
             .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
-        self.dataset.bind(py).borrow_mut().ds = new_dataset;
+        set_committed_dataset(self.dataset.bind(py), new_dataset);
         Ok(Self::build_stats(&stats, py)?.into())
     }
 
@@ -261,7 +254,7 @@ impl MergeInsertBuilder {
         let (dataset, stats) = rt()
             .spawn(Some(py), job.execute_dataset(source))?
             .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
-        self.dataset.bind(py).borrow_mut().ds = dataset;
+        set_committed_dataset(self.dataset.bind(py), dataset);
         Ok(Self::build_stats(&stats, py)?.into())
     }
 
@@ -286,8 +279,7 @@ impl MergeInsertBuilder {
             .spawn(Some(py), job.execute_batches(batches))?
             .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
 
-        let dataset = self.dataset.bind(py);
-        dataset.borrow_mut().ds = new_dataset;
+        set_committed_dataset(self.dataset.bind(py), new_dataset);
 
         Ok(Self::build_stats(&stats, py)?.into())
     }
@@ -296,27 +288,24 @@ impl MergeInsertBuilder {
     pub fn execute_uncommitted_dataset<'a>(
         &mut self,
         source: &Bound<'a, PyAny>,
-    ) -> PyResult<(PyLance<Transaction>, Bound<'a, PyDict>)> {
+    ) -> PyResult<(Bound<'a, PyAny>, Bound<'a, PyDict>)> {
         let py = source.py();
         let source = source.extract::<PyRef<'_, Dataset>>()?.ds.clone();
         let job = self
             .builder
             .try_build()
             .map_err(|err| PyValueError::new_err(err.to_string()))?;
-        let UncommittedMergeInsert {
-            transaction, stats, ..
-        } = rt()
+        let staged = rt()
             .spawn(Some(py), job.execute_uncommitted_dataset(source))?
             .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
-        let stats = Self::build_stats(&stats, py)?;
-        Ok((PyLance(transaction), stats))
+        Self::uncommitted_result(py, staged)
     }
 
     /// [`Self::execute_batches`] without committing; returns the transaction.
     pub fn execute_uncommitted_batches<'a>(
         &mut self,
         new_data: &Bound<'a, PyAny>,
-    ) -> PyResult<(PyLance<Transaction>, Bound<'a, PyDict>)> {
+    ) -> PyResult<(Bound<'a, PyAny>, Bound<'a, PyDict>)> {
         let py = new_data.py();
         let reader = convert_reader(new_data)?;
         let batches = reader
@@ -328,15 +317,10 @@ impl MergeInsertBuilder {
             .try_build()
             .map_err(|err| PyValueError::new_err(err.to_string()))?;
 
-        let UncommittedMergeInsert {
-            transaction, stats, ..
-        } = rt()
+        let staged = rt()
             .spawn(Some(py), job.execute_uncommitted_batches(batches))?
             .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
-
-        let stats = Self::build_stats(&stats, py)?;
-
-        Ok((PyLance(transaction), stats))
+        Self::uncommitted_result(py, staged)
     }
 
     #[pyo3(signature=(schema = None, verbose = false))]
@@ -666,6 +650,36 @@ impl MergeInsertBuilder {
             joins.append(value)?;
         }
         Ok(joins)
+    }
+
+    fn uncommitted_result(
+        py: Python<'_>,
+        staged: UncommittedMergeInsert,
+    ) -> PyResult<(Bound<'_, PyAny>, Bound<'_, PyDict>)> {
+        let retained_fragments = matches!(
+            &staged.transaction.operation,
+            lance::dataset::transaction::Operation::Update { updated_fragments, .. }
+                if !updated_fragments.is_empty()
+        );
+        let transaction = PyLance(staged.transaction).into_pyobject(py)?;
+        let encoded = staged
+            .affected_rows
+            .filter(|_| retained_fragments)
+            .map(|rows| {
+                PyBytes::new_with(py, rows.serialized_size(), |buffer| {
+                    rows.serialize_into(buffer).infer_error()
+                })
+            })
+            .transpose()?;
+        if encoded.is_some()
+            || (staged.stats.num_inserted_rows == 0 && staged.inserted_rows_filter.is_some())
+        {
+            transaction.call_method1(
+                "_set_staged_merge_write",
+                (encoded, staged.stats.num_inserted_rows),
+            )?;
+        }
+        Ok((transaction, Self::build_stats(&staged.stats, py)?))
     }
 
     fn build_stats<'a>(stats: &MergeStats, py: Python<'a>) -> PyResult<Bound<'a, PyDict>> {

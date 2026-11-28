@@ -33,7 +33,9 @@ use lance_arrow::deepcopy::deep_copy_batch;
 use lance_index::mem_wal::{
     CompactedSsTable as LanceCompactedSsTable, ShardingField, ShardingSpec,
 };
-use pyo3::exceptions::{PyIOError, PyRuntimeError, PyValueError};
+use pyo3::exceptions::{
+    PyException, PyGeneratorExit, PyIOError, PyRuntimeError, PySystemExit, PyValueError,
+};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use tokio::sync::Mutex as TokioMutex;
@@ -237,6 +239,8 @@ impl PyShardSnapshot {
 pub struct PyShardWriter {
     inner: Arc<TokioMutex<Option<ShardWriter>>>,
     closed_state: Arc<TokioMutex<Option<ClosedShardWriterState>>>,
+    /// The error of a `close()` that took the writer and did not finish cleanly.
+    close_error: Arc<TokioMutex<Option<String>>>,
     shard_id: Uuid,
     dataset: Arc<LanceDataset>,
 }
@@ -245,6 +249,21 @@ pub struct PyShardWriter {
 struct ClosedShardWriterState {
     stats: WriteStatsSnapshot,
     memtable_stats: MemTableStats,
+}
+
+/// Why a `close()` call did not return cleanly.
+enum CloseFailure {
+    /// This call's flush failed.
+    Flush(String),
+    /// An earlier call gave the writer up; this is the error it recorded.
+    Recorded(String),
+}
+
+impl CloseFailure {
+    fn into_py_err(self) -> PyErr {
+        let (Self::Flush(message) | Self::Recorded(message)) = self;
+        PyIOError::new_err(message)
+    }
 }
 
 const DEFAULT_MAX_WRITE_BYTES: usize = 256 * 1024 * 1024;
@@ -298,6 +317,63 @@ impl PyShardWriter {
         }
         py.check_signals()?;
         Ok(buffer.into_batches())
+    }
+
+    fn close_writer(&self, py: Python<'_>) -> PyResult<Result<(), CloseFailure>> {
+        rt().block_on(
+            Some(py),
+            Self::close_and_record(
+                self.inner.clone(),
+                self.closed_state.clone(),
+                self.close_error.clone(),
+            ),
+        )
+    }
+
+    /// The body of `close_writer`, apart from the interrupt handling `block_on` adds, which
+    /// drops this future wherever it is waiting.
+    async fn close_and_record(
+        inner: Arc<TokioMutex<Option<ShardWriter>>>,
+        closed_state: Arc<TokioMutex<Option<ClosedShardWriterState>>>,
+        close_error: Arc<TokioMutex<Option<String>>>,
+    ) -> Result<(), CloseFailure> {
+        let mut guard = inner.lock().await;
+        let mut close_error = close_error.lock().await;
+        let Some(writer) = guard.take() else {
+            // The writer is gone: Ok after a clean close, the stored error otherwise.
+            return close_error
+                .clone()
+                .map_or(Ok(()), |message| Err(CloseFailure::Recorded(message)));
+        };
+        // Recorded before the drain, so a close() cancelled by an interrupt is not
+        // reported as clean by the next call.
+        *close_error = Some(
+            "ShardWriter.close() was interrupted before it finished; \
+             unflushed rows may be lost"
+                .to_string(),
+        );
+        let result: lance::Result<()> = async {
+            let stats_handle = writer.stats_handle();
+            // Snapshot stats before close so the captured state reflects
+            // what was written, not any internal bookkeeping done by close().
+            let stats_snapshot = stats_handle.snapshot();
+            let memtable_stats_before_close = writer.memtable_stats().await?;
+            // Locked before the drain so that nothing awaits between a successful close
+            // and clearing the interrupted marker.
+            let mut closed_guard = closed_state.lock().await;
+            writer.close().await?;
+            let closed_memtable_stats = closed_memtable_stats(memtable_stats_before_close);
+            *closed_guard = Some(ClosedShardWriterState {
+                stats: stats_snapshot,
+                memtable_stats: closed_memtable_stats,
+            });
+            Ok(())
+        }
+        .await;
+        *close_error = result.err().map(|err| err.to_string());
+        close_error
+            .clone()
+            .map_or(Ok(()), |message| Err(CloseFailure::Flush(message)))
     }
 }
 
@@ -361,32 +437,11 @@ impl PyShardWriter {
 
     /// Flush pending data and close the writer.
     ///
-    /// After close(), calling put() will raise an error.
-    /// This is called automatically when using the context manager.
+    /// After close(), calling put() will raise an error. A close() that failed, or was
+    /// interrupted after it took the writer, is reported again by every later close(). Leaving
+    /// a `with` block closes the writer too; see `__exit__` for which errors it raises.
     pub fn close(&self, py: Python<'_>) -> PyResult<()> {
-        let inner = self.inner.clone();
-        let closed_state = self.closed_state.clone();
-        rt().block_on(Some(py), async move {
-            let mut guard = inner.lock().await;
-            if let Some(writer) = guard.take() {
-                let stats_handle = writer.stats_handle();
-                // Snapshot stats before close so the captured state reflects
-                // what was written, not any internal bookkeeping done by close().
-                let stats_snapshot = stats_handle.snapshot();
-                let memtable_stats_before_close = writer.memtable_stats().await?;
-                writer.close().await?;
-                let closed_memtable_stats = closed_memtable_stats(memtable_stats_before_close);
-                let mut closed_guard = closed_state.lock().await;
-                *closed_guard = Some(ClosedShardWriterState {
-                    stats: stats_snapshot,
-                    memtable_stats: closed_memtable_stats,
-                });
-                Ok(())
-            } else {
-                Ok(())
-            }
-        })?
-        .map_err(|e: lance::Error| PyIOError::new_err(e.to_string()))
+        self.close_writer(py)?.map_err(CloseFailure::into_py_err)
     }
 
     /// Return a snapshot of current write statistics.
@@ -525,11 +580,32 @@ impl PyShardWriter {
         &self,
         py: Python<'_>,
         _exc_type: &Bound<'_, PyAny>,
-        _exc_val: &Bound<'_, PyAny>,
+        exc_val: &Bound<'_, PyAny>,
         _exc_tb: &Bound<'_, PyAny>,
     ) -> PyResult<bool> {
-        self.close(py)?;
-        Ok(false)
+        let Err(failure) = self.close_writer(py)? else {
+            return Ok(false);
+        };
+        // With an exception propagating, raise only this call's own flush failure, and only
+        // over an `Exception`, `SystemExit` or `GeneratorExit`. Over KeyboardInterrupt or a
+        // cancellation, an OSError would let `except Exception` swallow it; not raising over
+        // SystemExit would let `sys.exit(0)` succeed with the rows unflushed. An error not
+        // raised here stays recorded for the next close().
+        let propagating = !exc_val.is_none();
+        let raise = match failure {
+            CloseFailure::Flush(_) => {
+                !propagating
+                    || exc_val.is_instance_of::<PyException>()
+                    || exc_val.is_instance_of::<PySystemExit>()
+                    || exc_val.is_instance_of::<PyGeneratorExit>()
+            }
+            CloseFailure::Recorded(_) => !propagating,
+        };
+        if raise {
+            Err(failure.into_py_err())
+        } else {
+            Ok(false)
+        }
     }
 }
 
@@ -539,6 +615,7 @@ impl PyShardWriter {
         Self {
             inner: Arc::new(TokioMutex::new(Some(writer))),
             closed_state: Arc::new(TokioMutex::new(None)),
+            close_error: Arc::new(TokioMutex::new(None)),
             shard_id,
             dataset,
         }
@@ -1201,5 +1278,80 @@ fn closed_memtable_stats(stats_before_close: MemTableStats) -> MemTableStats {
         pending_wal_row_count: 0,
         pending_wal_estimated_bytes: 0,
         frozen_count: 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use arrow_array::Int32Array;
+    use lance::dataset::mem_wal::ShardWriterConfig;
+    use lance_core::datatypes::LANCE_UNENFORCED_PRIMARY_KEY;
+
+    use super::*;
+
+    #[test]
+    fn interrupted_close_is_reported_by_the_next_close() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let primary_key = HashMap::from([(
+                LANCE_UNENFORCED_PRIMARY_KEY.to_string(),
+                "true".to_string(),
+            )]);
+            let schema = Arc::new(ArrowSchema::new(vec![
+                Field::new("id", DataType::Int32, false).with_metadata(primary_key),
+            ]));
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int32Array::from(vec![1]))],
+            )
+            .unwrap();
+            let uri = format!("memory://{}", Uuid::new_v4());
+            let mut dataset = LanceDataset::write(
+                RecordBatchIterator::new([Ok(batch.clone())], schema),
+                &uri,
+                None,
+            )
+            .await
+            .unwrap();
+            dataset
+                .initialize_mem_wal()
+                .unsharded()
+                .execute()
+                .await
+                .unwrap();
+            let writer = dataset
+                .mem_wal_writer(Uuid::new_v4(), ShardWriterConfig::default())
+                .await
+                .unwrap();
+            writer.put(vec![batch]).await.unwrap();
+
+            let inner = Arc::new(TokioMutex::new(Some(writer)));
+            let closed_state = Arc::new(TokioMutex::new(None));
+            let close_error = Arc::new(TokioMutex::new(None));
+            // Holding closed_state parks the close after it has taken the writer.
+            let held = closed_state.lock().await;
+            // Boxed so that dropping it below drops the future, not only a reference to it.
+            let mut close = Box::pin(PyShardWriter::close_and_record(
+                inner.clone(),
+                closed_state.clone(),
+                close_error.clone(),
+            ));
+            // The close holds close_error from the moment it takes the writer.
+            while close_error.try_lock().is_ok() {
+                assert!(futures::poll!(close.as_mut()).is_pending());
+                tokio::task::yield_now().await;
+            }
+            // Dropped where it waits, as `block_on` does on an interrupt.
+            drop(close);
+            drop(held);
+
+            let next = PyShardWriter::close_and_record(inner, closed_state.clone(), close_error)
+                .await;
+            assert!(
+                matches!(&next, Err(CloseFailure::Recorded(message)) if message.contains("interrupted")),
+                "the next close must report the interrupted one"
+            );
+            assert!(closed_state.lock().await.is_none());
+        });
     }
 }

@@ -400,3 +400,93 @@ async fn cte_view_customer_orders() -> DFResult<()> {
 
     Ok(())
 }
+
+/// A cached table that fell behind the committed version is replaced on the
+/// next lookup. The lookup runs on its own thread because the deadlock this
+/// guards against would otherwise never return.
+#[tokio::test]
+async fn stale_table_is_reloaded_without_deadlocking() -> DFResult<()> {
+    use std::time::Duration;
+
+    use datafusion::catalog::SchemaProvider;
+    use datafusion::datasource::TableProvider;
+    use lance::datafusion::LanceTableProvider;
+    use lance_namespace_datafusion::LanceSchemaProvider;
+
+    let dir = TempDir::new()?;
+    let (schema, batch) = customers_data();
+    let location = "retail$sales$customers.lance";
+    write_table(&dir, location, schema.clone(), batch.clone()).await?;
+
+    let root_path = dir.path().to_string_lossy().to_string();
+    let namespace = DirectoryNamespaceBuilder::new(root_path)
+        .manifest_enabled(true)
+        .dir_listing_enabled(true)
+        .build()
+        .await
+        .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+    for id in [vec!["retail"], vec!["retail", "sales"]] {
+        let mut request = CreateNamespaceRequest::new();
+        request.id = Some(id.into_iter().map(str::to_string).collect());
+        namespace
+            .create_namespace(request)
+            .await
+            .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+    }
+    let mut request = RegisterTableRequest::new(location.to_string());
+    request.id = Some(vec![
+        "retail".to_string(),
+        "sales".to_string(),
+        "customers".to_string(),
+    ]);
+    namespace
+        .register_table(request)
+        .await
+        .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+
+    let level = NamespaceLevel::from_namespace(
+        Arc::new(namespace) as Arc<dyn LanceNamespace>,
+        vec!["retail".to_string(), "sales".to_string()],
+    );
+    let provider = Arc::new(LanceSchemaProvider::try_new(level).await?);
+    let version_of = |table: &Arc<dyn TableProvider>| {
+        table
+            .downcast_ref::<LanceTableProvider>()
+            .unwrap()
+            .dataset()
+            .version()
+            .version
+    };
+    let first = provider.table("customers").await?.unwrap();
+    let first_version = version_of(&first);
+
+    // Another writer commits a new version.
+    let uri = dir.path().join(location).to_string_lossy().to_string();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+    Dataset::open(&uri)
+        .await?
+        .append(reader, None)
+        .await
+        .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let lookup = {
+        let provider = Arc::clone(&provider);
+        std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    tx.send(provider.table("customers").await).ok();
+                })
+        })
+    };
+    let reloaded = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("looking up a stale table must not deadlock")?
+        .unwrap();
+    assert!(version_of(&reloaded) > first_version);
+    lookup.join().unwrap();
+    Ok(())
+}
