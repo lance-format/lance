@@ -448,10 +448,18 @@ impl<'a> Parser<'a> {
                 // Parse digit and accumulate value
                 // Store in hi_value or lo_value based on precision
                 if precision < MAX_DECIMAL128_PRECISION {
+                    // SAFETY: At most 38 digits are accumulated, so the multiplicand is at
+                    // most `10^37 - 1` and the product is at most `10^38 - 10 < i128::MAX`.
                     hi_value = unsafe { hi_value.unchecked_mul(10_i128) };
+                    // SAFETY: The product above is at most `10^38 - 10` and the digit is at
+                    // most 9, so the sum is at most `10^38 - 1 < i128::MAX`.
                     hi_value = unsafe { hi_value.unchecked_add(digit as i128) };
                 } else {
+                    // SAFETY: The 76-digit total limit leaves at most 38 digits for this
+                    // accumulator, giving the same product bound as for `hi_value`.
                     lo_value = unsafe { lo_value.unchecked_mul(10_i128) };
+                    // SAFETY: As above, the product and digit sum to at most
+                    // `10^38 - 1 < i128::MAX`.
                     lo_value = unsafe { lo_value.unchecked_add(digit as i128) };
                 }
                 self.step();
@@ -631,6 +639,7 @@ impl<'a> Parser<'a> {
 
         // Final fallback strategy: Parse as Float64 using fast_float2 library
         // This handles scientific notation and very large/small numbers
+        // SAFETY: Every consumed byte is an ASCII sign, digit, decimal point, or exponent marker.
         let s = unsafe { std::str::from_utf8_unchecked(&self.buf[start_idx..self.idx]) };
         match fast_float2::parse(s) {
             Ok(v) => Ok(JsonAst::Number(Number::Float64(v))),
