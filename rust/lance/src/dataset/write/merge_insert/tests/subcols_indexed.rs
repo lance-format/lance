@@ -1063,3 +1063,89 @@ async fn test_update_if_float32_omitted_column_literal(
         .unwrap();
     assert_eq!(stats.num_updated_rows, 1);
 }
+
+/// A primary key nested in a struct the partial source omits must not stop the
+/// indexed join from planning a SQL condition: the condition is parsed against
+/// every dataset column, where the key's struct becomes a nullable field.
+#[rstest::rstest]
+#[tokio::test]
+async fn test_indexed_partial_update_if_omits_nested_primary_key(
+    #[values(false, true)] use_index: bool,
+) {
+    let pk = Field::new("pk", DataType::Utf8, false).with_metadata(
+        [(
+            lance_core::datatypes::LANCE_UNENFORCED_PRIMARY_KEY.to_string(),
+            "true".to_string(),
+        )]
+        .into(),
+    );
+    let info_fields: arrow_schema::Fields = vec![pk].into();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("info", DataType::Struct(info_fields.clone()), false),
+        Field::new("b", DataType::Utf8, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(vec![0, 1, 2, 3, 4, 5])),
+            Arc::new(StructArray::new(
+                info_fields,
+                vec![Arc::new(StringArray::from(vec![
+                    "p0", "p1", "p2", "p3", "p4", "p5",
+                ]))],
+                None,
+            )),
+            Arc::new(StringArray::from(vec!["b0", "b1", "b2", "b3", "b4", "b5"])),
+        ],
+    )
+    .unwrap();
+    let mut ds = Dataset::write(
+        RecordBatchIterator::new([Ok(batch)], schema),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 2,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    ds.create_index(
+        &["id"],
+        IndexType::BTree,
+        None,
+        &ScalarIndexParams::default(),
+        false,
+    )
+    .await
+    .unwrap();
+
+    let (ds, stats) = merge_on_id(
+        &ds,
+        partial_source(vec![1, 3]),
+        "target.b <> source.b",
+        false,
+        MergeInsertWriteMode::Auto,
+        use_index,
+    )
+    .await
+    .unwrap();
+    assert_eq!(stats.num_updated_rows, 2);
+    ds.schema().verify_primary_key().unwrap();
+    let b = ds
+        .scan()
+        .project(&["b"])
+        .unwrap()
+        .filter("id IN (1, 3)")
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let mut b = b["b"]
+        .as_string::<i32>()
+        .iter()
+        .map(|v| v.unwrap().to_string())
+        .collect::<Vec<_>>();
+    b.sort();
+    assert_eq!(b, ["B1", "B3"]);
+}

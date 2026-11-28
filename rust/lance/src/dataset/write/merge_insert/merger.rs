@@ -59,6 +59,29 @@ fn combined_schema(source: &Schema, target: &Schema) -> Schema {
     ])
 }
 
+/// `schema` without primary-key markers on any field, including struct children.
+fn without_primary_key_markers(schema: &Schema) -> Schema {
+    fn strip(field: &Field) -> Field {
+        let mut metadata = field.metadata().clone();
+        metadata.remove(LANCE_UNENFORCED_PRIMARY_KEY);
+        metadata.remove(LANCE_UNENFORCED_PRIMARY_KEY_POSITION);
+        let data_type = match field.data_type() {
+            DataType::Struct(children) => {
+                DataType::Struct(children.iter().map(|c| strip(c)).collect())
+            }
+            other => other.clone(),
+        };
+        field
+            .clone()
+            .with_data_type(data_type)
+            .with_metadata(metadata)
+    }
+    Schema::new_with_metadata(
+        schema.fields.iter().map(|f| strip(f)).collect::<Fields>(),
+        schema.metadata.clone(),
+    )
+}
+
 // This takes a double-wide table (e.g. the result of the outer join below) and takes the left
 // half, puts it into a struct, then takes the right half, and puts that into a struct.  This
 // makes the table match the "combined schema" so we can apply an "update if" expression
@@ -632,7 +655,13 @@ impl MergerCondition {
     ) -> Result<Option<Self>> {
         let expr = match &params.when_matched {
             WhenMatched::UpdateIf(condition) => {
-                let combined = combined_schema(source, &Schema::from(dataset_schema));
+                // The full dataset schema is only used to parse the condition, and a
+                // primary key nested in a struct the source omits must not make the
+                // conversion below reject the schema.
+                let combined = combined_schema(
+                    &without_primary_key_markers(source),
+                    &without_primary_key_markers(&Schema::from(dataset_schema)),
+                );
                 let combined_lance = lance_core::datatypes::Schema::try_from(&combined)?;
                 let expr = Planner::new(Arc::new(combined))
                     .parse_filter_with_schema(condition, &combined_lance)?;
