@@ -409,7 +409,7 @@ mod tests {
 
     use crate::object_store::test_utils::RecordingConnector;
     use crate::object_store::test_utils::StaticMockStorageOptionsProvider;
-    use crate::object_store::{ObjectStoreParams, StorageOptionsAccessor};
+    use crate::object_store::{ObjectStoreParams, ObjectStoreRegistry, StorageOptionsAccessor};
     use std::collections::HashMap;
 
     #[rstest::rstest]
@@ -731,31 +731,49 @@ mod tests {
         );
     }
 
+    #[rstest::rstest]
+    #[case::blob("az://container/path/dataset.lance", "az", "azblob")]
+    #[case::adls(
+        "abfss://testfs@testaccount.dfs.core.windows.net/path/dataset.lance",
+        "abfss",
+        "azdls"
+    )]
     #[tokio::test]
-    async fn test_abfss_with_opendal_uses_azdls() {
-        use crate::object_store::StorageOptionsAccessor;
-        let provider = AzureBlobStoreProvider;
-        let url = Url::parse("abfss://testfs@testaccount.dfs.core.windows.net/data").unwrap();
+    async fn test_azure_uris_construct_opendal_store(
+        #[case] uri: &str,
+        #[case] expected_scheme: &str,
+        #[case] expected_backend: &str,
+    ) {
         let params = ObjectStoreParams {
             storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
                 HashMap::from([
                     ("use_opendal".to_string(), "true".to_string()),
                     ("account_name".to_string(), "testaccount".to_string()),
                     ("account_key".to_string(), "dGVzdA==".to_string()),
+                    (
+                        "azure_endpoint".to_string(),
+                        "https://testaccount.blob.core.windows.net".to_string(),
+                    ),
                 ]),
             ))),
             ..Default::default()
         };
 
-        let store = provider.new_store(url, &params).await.unwrap();
-        assert_eq!(store.scheme, "abfss");
+        let (store, path) = ObjectStore::from_uri_and_params(
+            Arc::new(ObjectStoreRegistry::default()),
+            uri,
+            &params,
+        )
+        .await
+        .unwrap();
+        assert_eq!(store.scheme, expected_scheme);
+        assert_eq!(path.as_ref(), "path/dataset.lance");
         assert!(!store.is_local());
         assert!(store.is_cloud());
         let inner_desc = store.inner.to_string();
         assert!(
-            inner_desc.contains("Opendal") && inner_desc.contains("azdls"),
-            "abfss:// with use_opendal=true should use OpenDAL Azdls, got: {}",
-            inner_desc
+            inner_desc.contains("Opendal") && inner_desc.contains(expected_backend),
+            "{uri} with use_opendal=true should use {expected_backend}, got: {inner_desc}"
         );
     }
 
@@ -797,44 +815,133 @@ mod tests {
         assert!(!azblob_cap.rename, "Azblob should not support rename");
     }
 
+    #[rstest::rstest]
+    #[case::az_with_account_option(
+        "az://container/path/dataset.lance",
+        Some("account"),
+        "account.blob.core.windows.net/container",
+        "path/dataset.lance"
+    )]
+    #[case::az_with_blob_authority(
+        "az://container@account.blob.core.windows.net/path/dataset.lance",
+        None,
+        "account.blob.core.windows.net/container",
+        "path/dataset.lance"
+    )]
+    #[case::az_with_dfs_authority(
+        "az://container@account.dfs.core.windows.net/path/dataset.lance",
+        None,
+        "account.blob.core.windows.net/container",
+        "path/dataset.lance"
+    )]
+    #[case::abfss_with_account_option(
+        "abfss://filesystem/path/dataset.lance",
+        Some("account"),
+        "account.blob.core.windows.net/filesystem",
+        "path/dataset.lance"
+    )]
+    #[case::abfss_with_adls_authority(
+        "abfss://filesystem@account.dfs.core.windows.net/path/dataset.lance",
+        None,
+        "account.blob.core.windows.net/filesystem",
+        "path/dataset.lance"
+    )]
+    #[case::abfss_with_fabric_authority(
+        "abfss://workspace@onelake.dfs.fabric.microsoft.com/lakehouse.lakehouse/Files/dataset.lance",
+        None,
+        "onelake.blob.fabric.microsoft.com/workspace",
+        "lakehouse.lakehouse/Files/dataset.lance"
+    )]
+    #[case::abfss_with_fabric_guids(
+        concat!(
+            "abfss://11111111-1111-4111-8111-111111111111@onelake.dfs.fabric.microsoft.com/",
+            "22222222-2222-4222-8222-222222222222/Files/dataset.lance"
+        ),
+        None,
+        "onelake.blob.fabric.microsoft.com/11111111-1111-4111-8111-111111111111",
+        "22222222-2222-4222-8222-222222222222/Files/dataset.lance"
+    )]
     #[tokio::test]
-    async fn test_azure_store_opens_its_clients_with_the_given_http_connector() {
+    async fn test_azure_store_opens_its_clients_with_the_given_http_connector(
+        #[case] uri: &str,
+        #[case] account_name: Option<&str>,
+        #[case] expected_authority_and_container: &str,
+        #[case] expected_path: &str,
+    ) {
         let connector = Arc::new(RecordingConnector::default());
+        let mut options = HashMap::from([("azure_skip_signature".to_string(), "true".to_string())]);
+        if let Some(account_name) = account_name {
+            options.insert(
+                "azure_storage_account_name".to_string(),
+                account_name.to_string(),
+            );
+        }
         let params = ObjectStoreParams {
             storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
-                HashMap::from([
-                    (
-                        "azure_storage_account_name".to_string(),
-                        "account".to_string(),
-                    ),
-                    ("azure_skip_signature".to_string(), "true".to_string()),
-                ]),
+                options,
             ))),
             http_connector: Some(connector.clone()),
             ..Default::default()
         };
 
-        let url = Url::parse("az://container/path").unwrap();
-        let store = AzureBlobStoreProvider
-            .new_store(url, &params)
-            .await
-            .unwrap();
-        let found = object_store::ObjectStoreExt::get(
-            store.inner.as_ref(),
-            &object_store::path::Path::from("path/file"),
+        let (store, path) = ObjectStore::from_uri_and_params(
+            Arc::new(ObjectStoreRegistry::default()),
+            uri,
+            &params,
         )
-        .await;
-
-        assert!(
-            matches!(found, Err(object_store::Error::NotFound { .. })),
-            "{found:?}"
-        );
+        .await
+        .unwrap();
+        assert_eq!(path.as_ref(), expected_path);
+        assert!(!store.exists(&path).await.unwrap());
         assert!(connector.connects.load(std::sync::atomic::Ordering::SeqCst) >= 1);
-        let requests = connector.requests.lock().unwrap();
-        assert_eq!(requests.len(), 1, "{requests:?}");
+        assert_eq!(
+            connector.requests.lock().unwrap().as_slice(),
+            &[format!(
+                "https://{expected_authority_and_container}/{expected_path}"
+            )]
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::abfs("abfs://filesystem@account.dfs.core.windows.net/dataset.lance", "abfs")]
+    #[case::adl("adl://container/dataset.lance", "adl")]
+    #[case::blob_https(
+        "https://account.blob.core.windows.net/container/dataset.lance",
+        "https"
+    )]
+    #[case::adls_https(
+        "https://account.dfs.core.windows.net/filesystem/dataset.lance",
+        "https"
+    )]
+    #[case::fabric_https(
+        "https://onelake.dfs.fabric.microsoft.com/workspace/lakehouse.lakehouse/Files/dataset.lance",
+        "https"
+    )]
+    #[tokio::test]
+    async fn test_azure_dataset_uri_rejects_unregistered_scheme(
+        #[case] uri: &str,
+        #[case] scheme: &str,
+    ) {
+        let error = ObjectStore::from_uri(uri).await.unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
         assert!(
-            requests[0].ends_with("/container/path/file"),
-            "{requests:?}"
+            error.to_string().contains(&format!(
+                "No object store provider found for scheme: '{scheme}'"
+            )),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_azure_dataset_uri_rejects_bare_account_authority() {
+        let uri = "az://container@account/dataset.lance";
+        let error = ObjectStore::from_uri(uri).await.unwrap_err();
+        assert!(matches!(error, Error::IO { .. }), "{error}");
+        assert!(
+            error.to_string().contains(&format!(
+                "URL did not match any known pattern for scheme: {uri}"
+            )),
+            "{error}"
         );
     }
 }
