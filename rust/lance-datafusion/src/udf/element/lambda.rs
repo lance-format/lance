@@ -56,11 +56,8 @@ pub fn rewrite_element_lambdas(
     filter: &mut SQLExpr,
     type_of: impl Fn(&SQLExpr) -> Result<DataType>,
 ) -> Result<()> {
-    // The visitors below recurse over the AST, and a filter such as
-    // `a AND b AND ...` parses as a chain as deep as its number of operands.
-    // Balance those chains first; `Planner::binary_expr` rebuilds the same
-    // chains balanced after parsing, so the result is unchanged.
-    let _ = VisitMut::visit(filter, &mut BalanceLogicalBinaryExprs);
+    // The visitors below recurse over the AST, so balance it first.
+    balance_logical_binary_exprs(filter);
     if let ControlFlow::Break(err) = VisitMut::visit(filter, &mut LambdaRewriter { type_of }) {
         return Err(err);
     }
@@ -78,6 +75,16 @@ pub fn rewrite_element_lambdas(
         ))),
         None => Ok(()),
     }
+}
+
+/// Regroup each chain of one logical operator in `filter` into a balanced
+/// tree, so that a visitor recursing over it stays shallow.
+///
+/// A filter such as `a AND b AND ...` parses as a chain as deep as its number
+/// of operands. `Planner::binary_expr` rebuilds the same chains balanced after
+/// parsing, so the result is unchanged.
+pub fn balance_logical_binary_exprs(filter: &mut SQLExpr) {
+    let _ = VisitMut::visit(filter, &mut BalanceLogicalBinaryExprs);
 }
 
 struct BalanceLogicalBinaryExprs;
