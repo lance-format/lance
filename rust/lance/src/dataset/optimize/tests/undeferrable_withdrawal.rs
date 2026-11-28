@@ -17,7 +17,6 @@
 use super::*;
 use crate::dataset::CommitBuilder;
 use crate::dataset::builder::DatasetBuilder;
-use crate::dataset::optimize::commit::commit_compaction;
 use crate::index::frag_reuse::frag_reuse_entry_appending;
 use crate::index::frag_reuse_reader::tests::prepare_partition;
 use crate::index::vector::IndexFileVersion;
@@ -1873,7 +1872,12 @@ async fn a_missing_inverted_metadata_file_is_the_legacy_verdict() {
         .indices_dir()
         .join(index.uuid.to_string())
         .join(lance_index::scalar::inverted::METADATA_FILE);
-    dataset.object_store.delete(&metadata_path).await.unwrap();
+    dataset
+        .table_state
+        .object_store
+        .delete(&metadata_path)
+        .await
+        .unwrap();
     // Reopened so the classification reads storage rather than the handle's
     // caches, as a fresh writer would.
     let mut dataset = DatasetBuilder::from_uri(&path).load().await.unwrap();
@@ -2719,7 +2723,12 @@ async fn a_retired_source_reached_by_the_rewrite_is_withdrawn_one_hop_away() {
         .indices_dir()
         .join(fts_uuid.to_string())
         .join(lance_index::scalar::inverted::METADATA_FILE);
-    dataset.object_store.delete(&metadata_path).await.unwrap();
+    dataset
+        .table_state
+        .object_store
+        .delete(&metadata_path)
+        .await
+        .unwrap();
 
     let mut dataset = DatasetBuilder::from_uri(&path).load().await.unwrap();
     let stored = stored_segments(&dataset).await;
@@ -2985,7 +2994,7 @@ async fn staged_fts_preserves_stemming_with_direct_commit(
         .unwrap();
     let mut dataset = make_tagged(dataset).await;
     create_btree_index(&mut dataset).await;
-    let sources: Vec<u32> = dataset.fragment_bitmap.iter().collect();
+    let sources: Vec<u32> = dataset.table_state.fragment_bitmap.iter().collect();
     let params = InvertedIndexParams::default().stem(true);
     let mut staged = CreateIndexBuilder::new(&mut dataset, &["doc"], IndexType::Inverted, &params)
         .name(FTS_INDEX.to_string())
@@ -3001,9 +3010,9 @@ async fn staged_fts_preserves_stemming_with_direct_commit(
             crate::index::frag_reuse::undeferrable_segments_covering(
                 &dataset,
                 std::iter::once(&staged),
-                dataset.fragment_bitmap.as_ref(),
+                dataset.table_state.fragment_bitmap.as_ref(),
                 None,
-                dataset.fragment_bitmap.as_ref(),
+                dataset.table_state.fragment_bitmap.as_ref(),
             )
             .await
             .unwrap()
@@ -3018,7 +3027,7 @@ async fn staged_fts_preserves_stemming_with_direct_commit(
     }
     let options = deferred_options(4 * INDEX_ROWS_PER_FRAGMENT as usize);
     run_deferred_compaction(&mut dataset, &options, None).await;
-    let destinations = dataset.fragment_bitmap.as_ref().clone();
+    let destinations = dataset.table_state.fragment_bitmap.as_ref().clone();
     let merged = if direct_commit {
         staged
     } else {
@@ -3093,7 +3102,7 @@ async fn direct_staged_fts_retry_after_interrupted_finalize() {
         .unwrap();
     let mut dataset = make_tagged(dataset).await;
     create_btree_index(&mut dataset).await;
-    let sources: Vec<u32> = dataset.fragment_bitmap.iter().collect();
+    let sources: Vec<u32> = dataset.table_state.fragment_bitmap.iter().collect();
     let params = InvertedIndexParams::default().stem(true);
     let staged = CreateIndexBuilder::new(&mut dataset, &["doc"], IndexType::Inverted, &params)
         .name(FTS_INDEX.to_string())
@@ -3111,7 +3120,7 @@ async fn direct_staged_fts_retry_after_interrupted_finalize() {
     )
     .unwrap();
     let error = lance_index::scalar::inverted::builder::merge_index_files_with_options(
-        dataset.object_store.as_ref(),
+        dataset.table_state.object_store.as_ref(),
         &index_dir,
         Arc::new(store),
         lance_index::scalar::inverted::builder::FinalizeOptions::default(),
@@ -3124,9 +3133,12 @@ async fn direct_staged_fts_retry_after_interrupted_finalize() {
             .to_string()
             .contains("interrupted before root metadata")
     );
-    let files = lance_table::format::list_index_files_with_sizes(&dataset.object_store, &index_dir)
-        .await
-        .unwrap();
+    let files = lance_table::format::list_index_files_with_sizes(
+        &dataset.table_state.object_store,
+        &index_dir,
+    )
+    .await
+    .unwrap();
     assert!(files.iter().any(|f| f.path.starts_with("staging/")));
     assert!(files.iter().any(|f| !f.path.starts_with("staging/")));
     assert!(

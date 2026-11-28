@@ -14,7 +14,7 @@ use lance_io::traits::{ProtoStruct, Reader};
 use object_store::path::Path;
 use prost::Message;
 use prost_types::Timestamp;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -194,6 +194,12 @@ impl Manifest {
     /// Whether this table requires independently addressed Managed Blob support.
     pub fn has_managed_blobs(&self) -> bool {
         self.reader_feature_flags & crate::feature_flags::FLAG_MANAGED_BLOBS != 0
+    }
+
+    /// Whether this table has activated version 1 zone write seeds.
+    pub fn has_zone_write_seeds(&self) -> bool {
+        self.reader_feature_flags & crate::feature_flags::FLAG_ZONE_WRITE_SEEDS != 0
+            && self.writer_feature_flags & crate::feature_flags::FLAG_ZONE_WRITE_SEEDS != 0
     }
 
     pub fn new(
@@ -850,36 +856,50 @@ impl TryFrom<pb::manifest::DataStorageFormat> for DataStorageFormat {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum StableRowIdMode {
+    /// Inherit stable row IDs from the previous manifest; disabled for new datasets.
+    #[default]
+    Inherit,
+    /// Enable stable row IDs on new datasets (or keep enabled on existing ones).
+    Enable,
+    /// Second step of `migrate_to_stable_row_ids`: bypasses the existing-dataset
+    /// guard and initializes `manifest.next_row_id` to `next_row_id`.
+    Migrate { next_row_id: u64 },
+}
+
 /// Options controlling how a new [`Manifest`] is assembled from a transaction.
 ///
-/// The timestamp arrives already resolved to nanoseconds since the Unix epoch.
-/// Callers own the clock so that a caller wanting a mockable one keeps it: the
-/// `lance` crate mocks `SystemTime` under `cfg(test)`, which only takes effect in
-/// that crate.
+/// The timestamp arrives already resolved to nanoseconds since the Unix epoch
+/// via [`Self::with_timestamp_nanos`]. Callers own the clock so that a caller
+/// wanting a mockable one keeps it: the `lance` crate mocks `SystemTime` under
+/// `cfg(test)`, which only takes effect in that crate.
+///
+/// ```
+/// use lance_table::format::ManifestBuildConfig;
+///
+/// let config = ManifestBuildConfig::new()
+///     .with_timestamp_nanos(1_700_000_000_000_000_000)
+///     .with_use_stable_row_ids(true);
+/// assert!(config.use_stable_row_ids());
+/// assert_eq!(config.timestamp_nanos(), Some(1_700_000_000_000_000_000));
+/// ```
 #[derive(Debug, Clone)]
 pub struct ManifestBuildConfig {
     /// Recompute the manifest's feature flags from the fragments and settings
     /// below. False leaves whatever flags the previous manifest carried.
-    pub auto_set_feature_flags: bool,
+    auto_set_feature_flags: bool,
     /// Value for the new manifest's timestamp, in nanoseconds since the Unix epoch.
-    pub timestamp_nanos: u128,
-    /// Request the stable row id feature. The flag is also inherited from the
-    /// previous manifest, so false does not turn it off for a dataset that has it.
-    pub use_stable_row_ids: bool,
-    /// Overwrite only: force the legacy (true) or v2 (false) file format. `None`
-    /// keeps the format the dataset already had.
-    pub use_legacy_format: Option<bool>,
-    /// Overwrite only: force this storage format, taking precedence over
-    /// `use_legacy_format`. `None` keeps the format the dataset already had.
-    pub storage_format: Option<DataStorageFormat>,
+    timestamp_nanos: Option<u128>,
+    /// Stable row id request / migration activation state.
+    stable_row_ids: StableRowIdMode,
+    /// Overwrite only: force this storage format. `None` keeps the format the
+    /// dataset already had.
+    storage_format: Option<DataStorageFormat>,
     /// Skip writing a detached transaction file for this commit.
-    pub disable_transaction_file: bool,
-    /// When `Some`, this commit is the second step of `migrate_to_stable_row_ids`.
-    /// It bypasses the "cannot enable stable row ids on existing dataset" guard and
-    /// sets `manifest.next_row_id` to the provided value before activating the flag.
-    pub migration_next_row_id: Option<u64>,
+    disable_transaction_file: bool,
     /// Whether this commit atomically activates non-reusable field IDs.
-    pub activate_non_reusable_field_ids: bool,
+    activate_non_reusable_field_ids: bool,
     /// For an `UpdateConfig` commit only: the COMPLETE list of clustering
     /// definitions the writer wants the next manifest to hold, built from the
     /// manifest it read. A current definition the list keeps must be unchanged
@@ -897,19 +917,202 @@ pub struct ManifestBuildConfig {
     /// A list identical to the current one is a no-op. Allocating a definition
     /// on a table with reusable field ids activates non-reusable field ids in
     /// the same commit, since definitions key on field ids.
-    pub clustering_definitions: Option<Vec<ClusteringDefinition>>,
+    clustering_definitions: Option<Vec<ClusteringDefinition>>,
     /// Row lineage sequences of the current manifest's fragments that live
     /// outside the manifest, read ahead of the build. An update that rewrites
     /// rows needs the existing row ids and created-at versions to carry each
     /// row's lineage over, and a partial column rewrite needs the existing
     /// last-updated-at versions; the build cannot read a data file itself. Only
     /// consulted for fragments whose sequences are spilled.
-    pub spilled_row_lineage: std::sync::Arc<crate::rowids::version::SpilledRowLineage>,
-    /// Whether the active writer supports a segment's exact type and version.
-    /// Automatic coverage inference and coverage-only expansion consult this
-    /// before trusting the segment's identifier domain. A completed physical
-    /// remap supplies its own replacement metadata instead.
-    pub index_is_supported: fn(&IndexMetadata) -> bool,
+    spilled_row_lineage: Arc<crate::rowids::version::SpilledRowLineage>,
+    index_is_supported: fn(&IndexMetadata) -> bool,
+}
+
+impl Default for ManifestBuildConfig {
+    fn default() -> Self {
+        Self {
+            auto_set_feature_flags: true,
+            timestamp_nanos: None,
+            stable_row_ids: StableRowIdMode::Inherit,
+            storage_format: None,
+            disable_transaction_file: false,
+            activate_non_reusable_field_ids: false,
+            clustering_definitions: None,
+            spilled_row_lineage: Default::default(),
+            index_is_supported: crate::system_index::is_system_index,
+        }
+    }
+}
+
+impl ManifestBuildConfig {
+    /// Create a new [`ManifestBuildConfig`] with default settings.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Declare whether the active writer supports each segment's exact type
+    /// and version. Automatic coverage inference and coverage-only expansion
+    /// consult this before trusting identifier-domain metadata. A completed
+    /// physical remap supplies its own replacement metadata instead.
+    ///
+    /// Defaults to system indices only. Writers with user index readers must
+    /// provide their capabilities, including installed plugins and optional features.
+    ///
+    /// ```
+    /// use lance_table::format::ManifestBuildConfig;
+    /// // A metadata-only writer can keep every segment opaque.
+    /// let config = ManifestBuildConfig::new().with_index_is_supported(|_| false);
+    /// let predicate = config.index_is_supported();
+    /// ```
+    pub fn with_index_is_supported(
+        mut self,
+        index_is_supported: fn(&IndexMetadata) -> bool,
+    ) -> Self {
+        self.index_is_supported = index_is_supported;
+        self
+    }
+
+    /// The active writer's type and version capability predicate.
+    pub fn index_is_supported(&self) -> fn(&IndexMetadata) -> bool {
+        self.index_is_supported
+    }
+
+    /// Recompute the manifest's feature flags from the fragments and settings.
+    /// Passing `false` leaves whatever flags the previous manifest carried.
+    ///
+    /// Default is `true`.
+    pub fn with_auto_set_feature_flags(mut self, enabled: bool) -> Self {
+        self.auto_set_feature_flags = enabled;
+        self
+    }
+
+    /// Whether feature flags should be recomputed when building/writing the manifest.
+    pub fn auto_set_feature_flags(&self) -> bool {
+        self.auto_set_feature_flags
+    }
+
+    /// Set the timestamp for the new manifest, in nanoseconds since the Unix epoch.
+    pub fn with_timestamp_nanos(mut self, timestamp_nanos: u128) -> Self {
+        self.timestamp_nanos = Some(timestamp_nanos);
+        self
+    }
+
+    /// The resolved manifest timestamp in nanoseconds since the Unix epoch, if set.
+    pub fn timestamp_nanos(&self) -> Option<u128> {
+        self.timestamp_nanos
+    }
+
+    /// Request the stable row id feature. The flag is also inherited from the
+    /// previous manifest, so `false` does not turn it off for a dataset that
+    /// already has it.
+    pub fn with_use_stable_row_ids(mut self, enabled: bool) -> Self {
+        if enabled {
+            if matches!(self.stable_row_ids, StableRowIdMode::Inherit) {
+                self.stable_row_ids = StableRowIdMode::Enable;
+            }
+        } else {
+            self.stable_row_ids = StableRowIdMode::Inherit;
+        }
+        self
+    }
+
+    /// Whether stable row IDs are requested (including via migration activation).
+    pub fn use_stable_row_ids(&self) -> bool {
+        !matches!(self.stable_row_ids, StableRowIdMode::Inherit)
+    }
+
+    /// Configure this commit as the second step of `migrate_to_stable_row_ids`.
+    ///
+    /// Implies [`Self::use_stable_row_ids`] = `true`, bypasses the "cannot
+    /// enable stable row ids on existing dataset" guard, and initializes
+    /// `manifest.next_row_id` to `next_row_id` before activating the flag.
+    pub fn with_migration_next_row_id(mut self, next_row_id: u64) -> Self {
+        self.stable_row_ids = StableRowIdMode::Migrate { next_row_id };
+        self
+    }
+
+    /// The `next_row_id` seed for a stable row ID migration activation commit, if any.
+    pub fn migration_next_row_id(&self) -> Option<u64> {
+        match self.stable_row_ids {
+            StableRowIdMode::Migrate { next_row_id } => Some(next_row_id),
+            StableRowIdMode::Inherit | StableRowIdMode::Enable => None,
+        }
+    }
+
+    /// Overwrite only: force this storage format. `None` keeps the format the
+    /// dataset already had.
+    pub fn with_storage_format(
+        mut self,
+        storage_format: impl Into<Option<DataStorageFormat>>,
+    ) -> Self {
+        self.storage_format = storage_format.into();
+        self
+    }
+
+    /// The explicitly requested storage format for overwrite/create commits, if any.
+    pub fn storage_format(&self) -> Option<&DataStorageFormat> {
+        self.storage_format.as_ref()
+    }
+
+    /// Skip writing a detached transaction file for this commit.
+    pub fn with_disable_transaction_file(mut self, disabled: bool) -> Self {
+        self.disable_transaction_file = disabled;
+        self
+    }
+
+    /// Whether detached transaction file writing is disabled for this commit.
+    pub fn disable_transaction_file(&self) -> bool {
+        self.disable_transaction_file
+    }
+
+    /// Atomically activate non-reusable field IDs in this commit.
+    pub fn with_activate_non_reusable_field_ids(mut self, activate: bool) -> Self {
+        self.activate_non_reusable_field_ids = activate;
+        self
+    }
+
+    /// Whether this commit atomically activates non-reusable field IDs.
+    pub fn activate_non_reusable_field_ids(&self) -> bool {
+        self.activate_non_reusable_field_ids
+    }
+
+    /// Set the complete desired clustering definitions list for an `UpdateConfig` commit.
+    pub fn with_clustering_definitions(mut self, definitions: Vec<ClusteringDefinition>) -> Self {
+        self.clustering_definitions = Some(definitions);
+        self
+    }
+
+    /// The desired clustering definitions list for an `UpdateConfig` commit, if provided.
+    pub fn clustering_definitions(&self) -> Option<&[ClusteringDefinition]> {
+        self.clustering_definitions.as_deref()
+    }
+
+    /// Whether the definitions list names an id the `read` manifest does not
+    /// hold, i.e. the commit allocates new definitions. One pass over each
+    /// list; the allocation itself is validated during manifest build.
+    pub fn allocates_clustering_definitions(&self, read: &Manifest) -> bool {
+        self.clustering_definitions.as_ref().is_some_and(|desired| {
+            let current: HashSet<u32> = read.clustering.iter().map(|c| c.id).collect();
+            desired
+                .iter()
+                .any(|definition| !current.contains(&definition.id))
+        })
+    }
+
+    /// Attach preloaded external row lineage sequences for fragments whose
+    /// lineage lives outside the manifest.
+    pub fn with_spilled_row_lineage(
+        mut self,
+        lineage: Arc<crate::rowids::version::SpilledRowLineage>,
+    ) -> Self {
+        self.spilled_row_lineage = lineage;
+        self
+    }
+
+    /// Preloaded external row lineage sequences for this build attempt.
+    pub fn spilled_row_lineage(&self) -> &Arc<crate::rowids::version::SpilledRowLineage> {
+        &self.spilled_row_lineage
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2319,6 +2522,7 @@ mod tests {
             file_type: DeletionFileType::Array,
             num_deleted_rows: Some(10),
             base_id: None,
+            path: None,
             inline: None,
         });
 
@@ -2358,5 +2562,33 @@ mod tests {
         //Just verify the transformation is OK
         let stats_map: BTreeMap<String, String> = deletion_summary.into();
         assert_eq!(stats_map.len(), 7)
+    }
+
+    #[test]
+    fn test_manifest_build_config_stable_row_id_invariants() {
+        let default = ManifestBuildConfig::default();
+        assert!(default.auto_set_feature_flags());
+        assert_eq!(default.timestamp_nanos(), None);
+        assert!(!default.use_stable_row_ids());
+        assert_eq!(default.migration_next_row_id(), None);
+        assert!(default.storage_format().is_none());
+        assert!(!default.disable_transaction_file());
+        assert!(!default.activate_non_reusable_field_ids());
+        assert!(default.clustering_definitions().is_none());
+
+        // Migration activation always implies stable row IDs.
+        let migrating = ManifestBuildConfig::new().with_migration_next_row_id(42);
+        assert!(migrating.use_stable_row_ids());
+        assert_eq!(migrating.migration_next_row_id(), Some(42));
+
+        // Redundantly enabling stable row IDs keeps the migration seed intact.
+        let still_migrating = migrating.with_use_stable_row_ids(true);
+        assert!(still_migrating.use_stable_row_ids());
+        assert_eq!(still_migrating.migration_next_row_id(), Some(42));
+
+        // Explicitly disabling clears migration activation too so the pair stays coherent.
+        let disabled = still_migrating.with_use_stable_row_ids(false);
+        assert!(!disabled.use_stable_row_ids());
+        assert_eq!(disabled.migration_next_row_id(), None);
     }
 }

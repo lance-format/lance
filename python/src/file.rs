@@ -41,7 +41,7 @@ use lance_io::{
 use object_store::{ObjectStoreExt, path::Path};
 use pyo3::{
     Bound, IntoPyObjectExt, Py, PyErr, PyResult, Python,
-    exceptions::{PyIOError, PyRuntimeError},
+    exceptions::{PyIOError, PyRuntimeError, PyValueError},
     pyclass, pyfunction, pymethods,
     types::PyAny,
 };
@@ -974,20 +974,47 @@ impl LanceFileReader {
     }
 }
 
-struct LanceReaderAdapter(Pin<Box<dyn RecordBatchStream>>);
+struct LanceReaderAdapter {
+    stream: Pin<Box<dyn RecordBatchStream>>,
+    is_finished: bool,
+}
+
+impl LanceReaderAdapter {
+    fn finish_read(
+        &mut self,
+        result: PyResult<Option<lance::Result<RecordBatch>>>,
+    ) -> Option<std::result::Result<RecordBatch, arrow::error::ArrowError>> {
+        let batch = match result {
+            Ok(batch) => batch,
+            Err(error) => {
+                self.is_finished = true;
+                return Some(Err(arrow::error::ArrowError::ComputeError(format!(
+                    "File read interrupted: {error}"
+                ))));
+            }
+        };
+        if batch.is_none() {
+            self.is_finished = true;
+        }
+        batch.map(|b| b.map_err(|e| e.into()))
+    }
+}
 
 impl Iterator for LanceReaderAdapter {
     type Item = std::result::Result<RecordBatch, arrow::error::ArrowError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let batch = rt().block_on(None, self.0.next()).ok()?;
-        batch.map(|b| b.map_err(|e| e.into()))
+        if self.is_finished {
+            return None;
+        }
+        let result = rt().block_on(None, self.stream.next());
+        self.finish_read(result)
     }
 }
 
 impl RecordBatchReader for LanceReaderAdapter {
     fn schema(&self) -> std::sync::Arc<arrow_schema::Schema> {
-        self.0.schema().clone()
+        self.stream.schema().clone()
     }
 }
 
@@ -1010,7 +1037,10 @@ impl LanceFileReader {
                 .await
                 .infer_error()
         })??;
-        Ok(PyArrowType(Box::new(LanceReaderAdapter(stream))))
+        Ok(PyArrowType(Box::new(LanceReaderAdapter {
+            stream,
+            is_finished: false,
+        })))
     }
 }
 
@@ -1075,10 +1105,20 @@ impl LanceFileReader {
         batch_size: u32,
         batch_readahead: u32,
     ) -> PyResult<PyArrowType<Box<dyn RecordBatchReader + Send>>> {
+        // The reader takes u32 indices; reject larger values instead of letting
+        // them wrap around to a different, valid row.
         let indices = row_indices
             .into_iter()
-            .map(|idx| idx as u32)
-            .collect::<Vec<_>>();
+            .map(|idx| {
+                u32::try_from(idx).map_err(|_| {
+                    PyValueError::new_err(format!(
+                        "take_rows supports row indices up to {}, got {idx}; use read_range \
+                         for rows beyond that",
+                        u32::MAX
+                    ))
+                })
+            })
+            .collect::<PyResult<Vec<_>>>()?;
         let indices_arr = UInt32Array::from(indices);
         self.read_stream(
             lance_io::ReadBatchParams::Indices(indices_arr),
@@ -1118,6 +1158,27 @@ pub fn stable_version() -> PyResult<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interrupted_file_read_is_terminal_error() {
+        Python::initialize();
+        let stream = lance_io::stream::RecordBatchStreamAdapter::new(
+            Arc::new(arrow_schema::Schema::empty()),
+            futures::stream::pending(),
+        );
+        let mut reader = LanceReaderAdapter {
+            stream: Box::pin(stream),
+            is_finished: false,
+        };
+        let error = reader
+            .finish_read(Err(pyo3::exceptions::PyKeyboardInterrupt::new_err(
+                "injected interrupt",
+            )))
+            .unwrap()
+            .unwrap_err();
+        assert!(error.to_string().contains("interrupted"));
+        assert!(reader.next().is_none());
+    }
 
     #[test]
     fn test_lance_file_statistics_repr_empty() {

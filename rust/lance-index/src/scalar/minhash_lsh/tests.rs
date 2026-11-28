@@ -15,6 +15,7 @@ use rstest::rstest;
 
 use super::*;
 use crate::metrics::{LocalMetricsCollector, NoOpMetricsCollector};
+use crate::progress::noop_progress;
 use crate::scalar::lance_format::LanceIndexStore;
 
 fn test_store() -> (TempObjDir, Arc<LanceIndexStore>) {
@@ -831,9 +832,11 @@ async fn test_merge_segments() {
         (0..4u64).map(|i| (1u64 << 32) | i),
     ));
     let (_dir_merged, merged_store) = test_store();
-    let created = merge_minhash_indices(
+    let created = MinHashLshIndex::merge_segments(
         &[(&segment_a, None), (&segment_b, Some(&filter_b))],
+        None,
         merged_store.as_ref(),
+        noop_progress(),
     )
     .await
     .unwrap();
@@ -861,9 +864,11 @@ async fn test_merge_segments() {
     )
     .unwrap();
     let segment_c = build_and_load(&store_c, other, &rows_a, 3, &LanceCache::no_cache()).await;
-    let Err(err) = merge_minhash_indices(
+    let Err(err) = MinHashLshIndex::merge_segments(
         &[(&segment_a, None), (&segment_c, None)],
+        None,
         merged_store.as_ref(),
+        noop_progress(),
     )
     .await
     else {

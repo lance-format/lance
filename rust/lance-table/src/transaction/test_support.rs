@@ -17,24 +17,15 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use uuid::Uuid;
 
-/// A build config using the table layer's conservative built-in support bounds.
+/// Test build config using the table layer's conservative built-in support bounds.
 pub fn default_build_config() -> ManifestBuildConfig {
-    ManifestBuildConfig {
-        auto_set_feature_flags: true,
-        timestamp_nanos: std::time::SystemTime::now()
-            .duration_since(std::time::SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos(),
-        use_stable_row_ids: false,
-        use_legacy_format: None,
-        storage_format: None,
-        disable_transaction_file: false,
-        migration_next_row_id: None,
-        activate_non_reusable_field_ids: false,
-        clustering_definitions: None,
-        spilled_row_lineage: Default::default(),
-        index_is_supported: IndexMetadata::supports_fragment_bitmap_rewrite,
-    }
+    let now_nanos = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    ManifestBuildConfig::default()
+        .with_timestamp_nanos(now_nanos)
+        .with_index_is_supported(IndexMetadata::supports_fragment_bitmap_rewrite)
 }
 
 pub fn sample_manifest() -> Manifest {

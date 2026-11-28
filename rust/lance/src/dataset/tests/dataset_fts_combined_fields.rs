@@ -212,6 +212,31 @@ async fn fts_result_id_scores(
         .collect()
 }
 
+/// Assert an explicit zero candidate budget returns no rows and keeps the
+/// projected schema of the same unbounded query. The positive outer limit makes
+/// the inner budget the only reason the result is empty.
+async fn assert_zero_candidate_is_empty(dataset: &Dataset, query: FtsQuery) {
+    let mut positive = dataset.scan();
+    positive
+        .project(&["id"])
+        .unwrap()
+        .full_text_search(FullTextSearchQuery::new_query(query.clone()))
+        .unwrap();
+    let expected_schema = positive.schema().await.unwrap();
+
+    let mut zero = dataset.scan();
+    zero.project(&["id"])
+        .unwrap()
+        .full_text_search(FullTextSearchQuery::new_query(query).limit(Some(0)))
+        .unwrap()
+        .limit(Some(2), None)
+        .unwrap();
+    assert_eq!(zero.schema().await.unwrap(), expected_schema);
+    let batch = zero.try_into_batch().await.unwrap();
+    assert_eq!(batch.num_rows(), 0);
+    assert_eq!(batch.schema(), expected_schema);
+}
+
 /// The scan's ids as a set. A set compare on its own would hide a duplicate
 /// emission, so the count is pinned here.
 fn unique_ids(ids: Vec<i32>) -> HashSet<i32> {
@@ -990,12 +1015,38 @@ async fn test_fts_combined_fields_tokenizer_validation() {
     let rejected = combined_query_over(&["title", "alt"], "aa", Operator::Or, None);
     let result = dataset
         .scan()
-        .full_text_search(FullTextSearchQuery::new_query(rejected))
+        .full_text_search(FullTextSearchQuery::new_query(rejected.clone()))
         .unwrap()
         .try_into_batch()
         .await;
     let message = result
         .expect_err("expected a tokenizer-mismatch error")
+        .to_string();
+    assert!(
+        message.contains("combined_fields") && message.contains("tokenizer"),
+        "unexpected error: {message}"
+    );
+
+    // A zero candidate budget still has to execute the mixed plan far enough to
+    // report the same tokenizer mismatch; the empty result cannot mask it.
+    let appended = arrow_array::record_batch!(
+        ("id", Int32, [2]),
+        ("title", Utf8, ["aa"]),
+        ("body", Utf8, ["aa"]),
+        ("alt", Utf8, ["aa"])
+    )
+    .unwrap();
+    dataset = append_fts_dataset(&test_uri, appended, None).await;
+    let result = dataset
+        .scan()
+        .full_text_search(FullTextSearchQuery::new_query(rejected).limit(Some(0)))
+        .unwrap()
+        .limit(Some(1), None)
+        .unwrap()
+        .try_into_batch()
+        .await;
+    let message = result
+        .expect_err("expected the zero-budget mixed plan to report the tokenizer mismatch")
         .to_string();
     assert!(
         message.contains("combined_fields") && message.contains("tokenizer"),
@@ -1131,6 +1182,7 @@ async fn test_fts_combined_fields_covers_unindexed_fragments(#[case] operator: O
         &expected,
         "rows in unindexed fragments must be reached exactly once through the index/flat union",
     );
+    assert_zero_candidate_is_empty(&dataset, combined_query("alpha omega", operator)).await;
 }
 
 /// An external row-address prefilter
@@ -1477,6 +1529,11 @@ async fn test_fts_combined_fields_partially_indexed_columns() {
         vec![best],
         "limit=1 on the flat-only plan did not return the top-scoring row"
     );
+    assert_zero_candidate_is_empty(
+        &dataset,
+        combined_query_with_boosts("aa", Operator::Or, Some(weights.to_vec())),
+    )
+    .await;
 }
 
 /// Every row scores identically, so the whole result is one tie and

@@ -1,6 +1,52 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+/// A failed page must not drop another encoder's still-owned work. The
+/// second future stands in for an already-dispatched encoder join handle.
+pub async fn assert_page_encoder_failure_drains<F, Fut>(write: F)
+where
+    F: FnOnce(futures::stream::FuturesOrdered<lance_encoding::encoder::EncodeTask>) -> Fut,
+    Fut: std::future::Future<Output = lance_core::Result<()>>,
+{
+    let started = std::sync::Arc::new(tokio::sync::Notify::new());
+    let failed = std::sync::Arc::new(tokio::sync::Notify::new());
+    let release = std::sync::Arc::new(tokio::sync::Notify::new());
+    let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut tasks = futures::stream::FuturesOrdered::new();
+    let start_wait = started.clone();
+    let first_failed = failed.clone();
+    tasks.push_back(Box::pin(async move {
+        start_wait.notified().await;
+        first_failed.notify_one();
+        Err(lance_core::Error::execution("first page encoder failed"))
+    }) as lance_encoding::encoder::EncodeTask);
+    let finish = finished.clone();
+    let continue_work = release.clone();
+    tasks.push_back(Box::pin(async move {
+        started.notify_one();
+        continue_work.notified().await;
+        finish.store(true, std::sync::atomic::Ordering::SeqCst);
+        Err(lance_core::Error::execution("later page encoder failed"))
+    }) as lance_encoding::encoder::EncodeTask);
+    let operation = write(tasks);
+    tokio::pin!(operation);
+    tokio::select! {
+        biased;
+        result = &mut operation => panic!("writer returned before the remaining encoder drained: {result:?}"),
+        _ = failed.notified() => {},
+    }
+    assert!(!finished.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(matches!(
+        futures::poll!(&mut operation),
+        std::task::Poll::Pending
+    ));
+    release.notify_one();
+    let error = operation.await.unwrap_err();
+    assert!(matches!(error, lance_core::Error::Execution { .. }));
+    assert!(error.to_string().contains("first page encoder failed"));
+    assert!(finished.load(std::sync::atomic::Ordering::SeqCst));
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -19,13 +65,14 @@ mod tests {
     use arrow_array::types::{Float16Type, Float64Type, Int32Type};
     use arrow_array::{
         Array, ArrayRef, ArrowPrimitiveType, FixedSizeListArray, Float16Array, Float32Array,
-        Int32Array, LargeBinaryArray, ListArray, RecordBatch, RecordBatchReader, StringArray,
-        StructArray, UInt64Array,
+        Int32Array, Int64Array, LargeBinaryArray, ListArray, RecordBatch, RecordBatchReader,
+        StringArray, StructArray, UInt32Array, UInt64Array,
     };
     use arrow_buffer::{Buffer, NullBuffer, OffsetBuffer, ScalarBuffer};
     use arrow_schema::{
         DataType, Field, Field as ArrowField, Fields as ArrowFields, Schema, Schema as ArrowSchema,
     };
+    use futures::TryStreamExt;
     use lance_arrow::ARROW_EXT_NAME_KEY;
     use lance_arrow::json::{ARROW_JSON_EXT_NAME, JSON_EXT_NAME, JsonArray, json_field};
     use lance_core::cache::LanceCache;
@@ -34,14 +81,18 @@ mod tests {
     use lance_datagen::{BatchCount, RowCount, array, gen_batch};
     use lance_encoding::compression_config::{CompressionFieldParams, CompressionParams};
     use lance_encoding::constants::{
-        PACKED_STRUCT_META_KEY, STRUCTURAL_ENCODING_META_KEY, STRUCTURAL_ENCODING_SPARSE,
+        ALP_META_KEY, BSS_META_KEY, COMPRESSION_META_KEY, DICT_DIVISOR_META_KEY,
+        MINICHUNK_SIZE_META_KEY, PACKED_STRUCT_META_KEY, RLE_THRESHOLD_META_KEY,
+        STRUCTURAL_ENCODING_META_KEY, STRUCTURAL_ENCODING_MINIBLOCK, STRUCTURAL_ENCODING_SPARSE,
     };
-    use lance_encoding::decoder::DecoderPlugins;
+    use lance_encoding::decoder::{DecoderPlugins, FilterExpression, PageEncoding, PageInfo};
     use lance_encoding::encoder::{
         BatchEncoder, ColumnIndexSequence, EncodingOptions, FieldEncodingContext, OutOfLineBuffers,
         encode_batch,
     };
+    use lance_encoding::format::{metadata, metadata::compressive_encoding::Compression, pb23};
     use lance_encoding::repdef::RepDefBuilder;
+    use lance_io::ReadBatchParams;
     use lance_io::object_store::ObjectStore;
     use lance_io::traits::Writer;
     use lance_io::utils::CachedFileSize;
@@ -74,6 +125,659 @@ mod tests {
     ) -> lance_core::Result<FileWriter> {
         versions::v2_3::create_writer_with_compression(object_writer, schema, options, compression)
             .map(Into::into)
+    }
+
+    fn create_minichunk_writer(
+        version: ConcreteFileVersion,
+        writer: Box<dyn Writer>,
+        schema: LanceSchema,
+        params: CompressionParams,
+    ) -> lance_core::Result<FileWriter> {
+        let options = FileWriterOptions::default();
+        match version {
+            ConcreteFileVersion::V2_1 => {
+                create_v2_1_writer_with_compression(writer, schema, options, params)
+            }
+            ConcreteFileVersion::V2_2 => {
+                versions::v2_2::create_writer_with_compression(writer, schema, options, params)
+                    .map(Into::into)
+            }
+            ConcreteFileVersion::V2_3 => {
+                create_v2_3_writer_with_compression(writer, schema, options, params)
+            }
+            _ => panic!("expected a structural writer"),
+        }
+    }
+
+    async fn write_minichunk_fixture(
+        fs: &FsFixture,
+        version: ConcreteFileVersion,
+        batch: &RecordBatch,
+        params: CompressionParams,
+    ) -> FileReader {
+        let object_writer = fs.object_store.create(&fs.tmp_path).await.unwrap();
+        let schema = LanceSchema::try_from(batch.schema_ref().as_ref()).unwrap();
+        let mut writer = create_minichunk_writer(version, object_writer, schema, params).unwrap();
+        writer.write_batch(batch).await.unwrap();
+        let summary = writer.finish().await.unwrap();
+        let file = fs
+            .scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::new(summary.size_bytes))
+            .await
+            .unwrap();
+        FileReader::try_open(
+            file,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &LanceCache::no_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn minichunk_words(
+        fs: &FsFixture,
+        page: &PageInfo,
+        version: ConcreteFileVersion,
+    ) -> Vec<u32> {
+        let (offset, size) = page.buffer_offsets_and_sizes[0];
+        let bytes = fs
+            .object_store
+            .open(&fs.tmp_path)
+            .await
+            .unwrap()
+            .get_range(offset as usize..(offset + size) as usize)
+            .await
+            .unwrap();
+        if version == ConcreteFileVersion::V2_1 {
+            bytes
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|word| u32::from(u16::from_le_bytes(*word)))
+                .collect()
+        } else {
+            bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|word| u32::from_le_bytes(*word))
+                .collect()
+        }
+    }
+
+    fn minichunk_value_encoding(page: &PageInfo) -> &metadata::compressive_encoding::Compression {
+        let encoding = match &page.encoding {
+            PageEncoding::Structural(page) => {
+                let Some(metadata::page_layout::Layout::MiniBlockLayout(layout)) = &page.layout
+                else {
+                    panic!("expected a mini-block page");
+                };
+                &layout.value_compression
+            }
+            PageEncoding::Planar(page) => {
+                let Some(pb23::value_plane::Codec::Chunked(values)) =
+                    page.values.as_ref().unwrap().codec.as_ref()
+                else {
+                    panic!("expected chunked planar values");
+                };
+                &values.compression
+            }
+            _ => panic!("expected a structural page"),
+        };
+        encoding.as_ref().unwrap().compression.as_ref().unwrap()
+    }
+
+    async fn assert_minichunk_scan_and_take(reader: &FileReader, batch: &RecordBatch) {
+        let rows = batch.num_rows() as u32;
+        let indices = UInt32Array::from(vec![0, 1, rows / 4, rows / 2, rows * 3 / 4, rows - 1]);
+        let taken = arrow_select::take::take_record_batch(batch, &indices).unwrap();
+        for (selection, expected) in [
+            (ReadBatchParams::RangeFull, batch),
+            (ReadBatchParams::Indices(indices), &taken),
+        ] {
+            let batches = reader
+                .read_stream(selection, 4096, 2, FilterExpression::no_filter())
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            let actual =
+                arrow_select::concat::concat_batches(batch.schema_ref(), &batches).unwrap();
+            assert_eq!(&actual, expected);
+        }
+    }
+
+    #[rstest]
+    #[case::default_flat(None, "none", 9)]
+    #[case::default_inline(None, "zstd", 10)]
+    #[case::target_4k(Some(4096), "zstd", 9)]
+    #[case::target_8k_inline(Some(8192), "zstd", 10)]
+    #[case::target_32k(Some(32768), "zstd", 12)]
+    #[case::target_64k(Some(65536), "lz4", 13)]
+    #[case::target_256k(Some(262144), "zstd", 15)]
+    #[case::target_32k_uncompressed(Some(32768), "none", 12)]
+    #[case::above_count_limit(Some(1048576), "none", 15)]
+    #[tokio::test]
+    async fn test_fixed_width_minichunk_size_in_file(
+        #[values(ConcreteFileVersion::V2_2, ConcreteFileVersion::V2_3)]
+        version: ConcreteFileVersion,
+        #[case] target: Option<u64>,
+        #[case] codec: &str,
+        #[case] log_values: u32,
+    ) {
+        let values_per_chunk = 1usize << log_values;
+        // Give inline bitpacking whole 1024-value units, including when the
+        // requested General chunk size would be different. Its estimator
+        // charges a full packed unit for a partial tail.
+        let rows = (2 * values_per_chunk).max(4096) + 1024;
+        // All values need 63 bits and have shared high bytes. RLE and dictionary
+        // are inapplicable, but inline bitpacking and general compression both help.
+        let array = Int64Array::from_iter_values((0..rows).map(|row| (1_i64 << 62) | row as i64));
+        let mut metadata = HashMap::from([
+            (COMPRESSION_META_KEY.into(), codec.into()),
+            (BSS_META_KEY.into(), "off".into()),
+            (DICT_DIVISOR_META_KEY.into(), "1000000".into()),
+            (RLE_THRESHOLD_META_KEY.into(), "0".into()),
+        ]);
+        if let Some(target) = target {
+            metadata.insert(MINICHUNK_SIZE_META_KEY.into(), target.to_string());
+        }
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("data", DataType::Int64, false).with_metadata(metadata),
+        ]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(array)]).unwrap();
+        let fs = FsFixture::default();
+        let mut params = CompressionParams::new();
+        if target.is_some() {
+            params.columns.insert(
+                "data".into(),
+                CompressionFieldParams {
+                    minichunk_size: Some(16384),
+                    ..Default::default()
+                },
+            );
+        }
+        let reader = write_minichunk_fixture(&fs, version, &batch, params).await;
+        let pages = &reader.metadata().column_infos[0].page_infos;
+        assert_eq!(pages.len(), 1);
+        let page = &pages[0];
+        let words = minichunk_words(&fs, page, version).await;
+        assert_eq!(words.len(), rows.div_ceil(values_per_chunk));
+        let (tail, chunks) = words.split_last().unwrap();
+        assert!(
+            chunks.iter().all(|word| word & 15 == log_values),
+            "{words:?}"
+        );
+        if !rows.is_multiple_of(values_per_chunk) {
+            assert_eq!(tail & 15, 0);
+        }
+        let encoding = minichunk_value_encoding(page);
+        if codec == "none" {
+            assert!(matches!(encoding, Compression::Flat(_)), "{encoding:?}");
+            assert_eq!(((words[0] >> 4) + 1) as usize * 8, 8 + values_per_chunk * 8);
+        } else {
+            let Compression::General(general) = encoding else {
+                panic!("expected {codec} compression, got {encoding:?}");
+            };
+            let expected_scheme = if codec == "zstd" {
+                metadata::CompressionScheme::CompressionAlgorithmZstd
+            } else {
+                metadata::CompressionScheme::CompressionAlgorithmLz4
+            };
+            assert_eq!(
+                general.compression.as_ref().unwrap().scheme,
+                expected_scheme as i32
+            );
+            let inner = general
+                .values
+                .as_ref()
+                .unwrap()
+                .compression
+                .as_ref()
+                .unwrap();
+            if log_values == 10 {
+                assert!(
+                    matches!(inner, Compression::InlineBitpacking(_)),
+                    "{inner:?}"
+                );
+            } else {
+                assert!(matches!(inner, Compression::Flat(_)), "{inner:?}");
+            }
+            assert!(page.buffer_offsets_and_sizes[1].1 < (rows * 8) as u64);
+        }
+        assert_minichunk_scan_and_take(&reader, &batch).await;
+    }
+
+    #[tokio::test]
+    async fn test_v2_3_rle_singleton_minichunk_size_respects_final_chunk() {
+        // No adjacent values are equal. The repeated bit patterns still let
+        // the RLE child codecs win when their chunk boundaries are compatible.
+        let values: ArrayRef = Arc::new(Int64Array::from_iter_values(
+            (0..800).map(|row| i64::MIN + row % 2),
+        ));
+        let fields = [("two_chunks", "4096"), ("one_chunk", "8192")].map(|(name, target)| {
+            ArrowField::new(name, DataType::Int64, false).with_metadata(HashMap::from([
+                (COMPRESSION_META_KEY.into(), "zstd".into()),
+                (BSS_META_KEY.into(), "off".into()),
+                (DICT_DIVISOR_META_KEY.into(), "1000000".into()),
+                (MINICHUNK_SIZE_META_KEY.into(), target.into()),
+            ]))
+        });
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(fields.to_vec())),
+            vec![values; fields.len()],
+        )
+        .unwrap();
+        let version = ConcreteFileVersion::V2_3;
+        let fs = FsFixture::default();
+        let reader = write_minichunk_fixture(&fs, version, &batch, CompressionParams::new()).await;
+        let pages = &reader.metadata().column_infos;
+        let two_chunks = &pages[0].page_infos[0];
+        let words = minichunk_words(&fs, two_chunks, version).await;
+        assert_eq!(
+            words.iter().map(|word| word & 15).collect::<Vec<_>>(),
+            [9, 0]
+        );
+        let Compression::General(general) = minichunk_value_encoding(two_chunks) else {
+            panic!("expected General on the requested 512-value chunks");
+        };
+        assert!(matches!(
+            general.values.as_ref().unwrap().compression.as_ref(),
+            Some(Compression::Flat(_))
+        ));
+
+        // The RLE byte budget fits all 800 singleton runs in one final chunk.
+        let one_chunk = &pages[1].page_infos[0];
+        assert_eq!(minichunk_words(&fs, one_chunk, version).await.len(), 1);
+        let encoding = minichunk_value_encoding(one_chunk);
+        let inner = match encoding {
+            Compression::General(general) => general
+                .values
+                .as_ref()
+                .unwrap()
+                .compression
+                .as_ref()
+                .unwrap(),
+            other => other,
+        };
+        assert!(matches!(inner, Compression::Rle(_)), "{encoding:?}");
+        assert_minichunk_scan_and_take(&reader, &batch).await;
+    }
+
+    #[tokio::test]
+    async fn test_v2_3_minichunk_float_codec_precedence() {
+        let rows = 16 * 1024 + 37;
+        // The first 64 values used in the entropy check vary in only two bytes,
+        // each with eight equally frequent byte values (1.5 bits/byte on average).
+        let values: ArrayRef = Arc::new(Float32Array::from_iter_values(
+            (0..rows).map(|i| (i + 1024) as f32 * 0.25),
+        ));
+        let fields = [
+            ("auto_small", "zstd", "auto", "auto", 4096),
+            ("auto_large", "zstd", "auto", "off", 32768),
+            ("force_alp", "zstd", "on", "off", 32768),
+            ("force_split", "lz4", "auto", "on", 65536),
+            ("force_none", "none", "on", "on", 65536),
+        ]
+        .map(|(name, compression, alp, bss, target)| {
+            ArrowField::new(name, DataType::Float32, false).with_metadata(HashMap::from([
+                (COMPRESSION_META_KEY.into(), compression.into()),
+                (ALP_META_KEY.into(), alp.into()),
+                (BSS_META_KEY.into(), bss.into()),
+                (MINICHUNK_SIZE_META_KEY.into(), target.to_string()),
+            ]))
+        });
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(fields.to_vec())),
+            vec![values; fields.len()],
+        )
+        .unwrap();
+        let version = ConcreteFileVersion::V2_3;
+        let fs = FsFixture::default();
+        let reader = write_minichunk_fixture(&fs, version, &batch, CompressionParams::new()).await;
+        let columns = &reader.metadata().column_infos;
+        for (column, expected_log) in columns.iter().zip([10, 13, 10, 14, 14]) {
+            let page = &column.page_infos[0];
+            let words = minichunk_words(&fs, page, version).await;
+            assert_eq!(words[0] & 15, expected_log);
+        }
+        let encoding = |i: usize| minichunk_value_encoding(&columns[i].page_infos[0]);
+        let inner = |i| match encoding(i) {
+            Compression::General(general) => general
+                .values
+                .as_ref()
+                .unwrap()
+                .compression
+                .as_ref()
+                .unwrap(),
+            other => other,
+        };
+        assert!(matches!(inner(0), Compression::Alp(_)), "{:?}", encoding(0));
+        assert!(
+            matches!(encoding(1), Compression::General(_))
+                && matches!(inner(1), Compression::Flat(_)),
+            "{:?}",
+            encoding(1)
+        );
+        assert!(matches!(inner(2), Compression::Alp(_)), "{:?}", encoding(2));
+        assert!(
+            matches!(encoding(3), Compression::General(_))
+                && matches!(inner(3), Compression::ByteStreamSplit(_)),
+            "{:?}",
+            encoding(3)
+        );
+        assert!(
+            matches!(encoding(4), Compression::Flat(_)),
+            "{:?}",
+            encoding(4)
+        );
+        assert_minichunk_scan_and_take(&reader, &batch).await;
+    }
+
+    #[rstest]
+    #[case::v2_2_dense(ConcreteFileVersion::V2_2, false, false)]
+    #[case::v2_3_dense(ConcreteFileVersion::V2_3, false, false)]
+    #[case::v2_3_sparse(ConcreteFileVersion::V2_3, true, false)]
+    #[case::v2_3_sparse_split(ConcreteFileVersion::V2_3, true, true)]
+    #[tokio::test]
+    async fn test_nested_minichunk_size_at_leaf(
+        #[case] version: ConcreteFileVersion,
+        #[case] sparse: bool,
+        #[case] bss: bool,
+    ) {
+        let rows = 400;
+        let mut values = Vec::new();
+        let mut offsets = vec![0];
+        let mut validity = Vec::with_capacity(rows);
+        for row in 0..rows {
+            let valid = row % 11 != 0;
+            validity.push(valid);
+            if valid && row % 13 != 0 {
+                values.extend((0..257).map(|item| {
+                    (item % 61 != 0).then_some((1_i64 << 62) | (row * 257 + item) as i64)
+                }));
+            }
+            offsets.push(values.len() as i32);
+        }
+        let leaf: ArrayRef = if bss {
+            Arc::new(Float32Array::from_iter(values.into_iter().map(|value| {
+                value.map(|value| (value & ((1 << 62) - 1)) as f32 / 100.0)
+            })))
+        } else {
+            Arc::new(Int64Array::from(values))
+        };
+        let item = Arc::new(
+            ArrowField::new("item", leaf.data_type().clone(), true).with_metadata(HashMap::from([
+                (MINICHUNK_SIZE_META_KEY.into(), "262144".into()),
+                (
+                    COMPRESSION_META_KEY.into(),
+                    if bss { "lz4" } else { "zstd" }.into(),
+                ),
+                (BSS_META_KEY.into(), if bss { "on" } else { "off" }.into()),
+                (DICT_DIVISOR_META_KEY.into(), "1000000".into()),
+                (RLE_THRESHOLD_META_KEY.into(), "0".into()),
+            ])),
+        );
+        let list = ListArray::new(
+            item,
+            OffsetBuffer::new(offsets.into()),
+            leaf,
+            Some(validity.into()),
+        );
+        let value_field = Arc::new(ArrowField::new("value", list.data_type().clone(), true));
+        let structure = StructArray::from(vec![(value_field, Arc::new(list) as ArrayRef)]);
+        let root = ArrowField::new("data", structure.data_type().clone(), false).with_metadata(
+            HashMap::from([
+                (MINICHUNK_SIZE_META_KEY.into(), "4096".into()),
+                (
+                    STRUCTURAL_ENCODING_META_KEY.into(),
+                    if sparse {
+                        STRUCTURAL_ENCODING_SPARSE
+                    } else {
+                        STRUCTURAL_ENCODING_MINIBLOCK
+                    }
+                    .into(),
+                ),
+            ]),
+        );
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![root])),
+            vec![Arc::new(structure)],
+        )
+        .unwrap();
+        let fs = FsFixture::default();
+        let reader = write_minichunk_fixture(&fs, version, &batch, CompressionParams::new()).await;
+        let pages = &reader.metadata().column_infos[0].page_infos;
+        let mut saw_full_chunk = false;
+        for page in pages.iter() {
+            if let PageEncoding::Planar(layout) = &page.encoding {
+                assert_eq!(layout.sparse().is_some(), sparse);
+            }
+            let words = minichunk_words(&fs, page, version).await;
+            saw_full_chunk |= words.iter().any(|word| word & 15 == 15);
+            if words.len() > 1 {
+                let Compression::General(general) = minichunk_value_encoding(page) else {
+                    panic!("expected general compression on the list leaf");
+                };
+                let inner = general
+                    .values
+                    .as_ref()
+                    .unwrap()
+                    .compression
+                    .as_ref()
+                    .unwrap();
+                assert_eq!(matches!(inner, Compression::ByteStreamSplit(_)), bss);
+            }
+        }
+        assert!(saw_full_chunk, "expected a persisted 32,768-value chunk");
+        assert_minichunk_scan_and_take(&reader, &batch).await;
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_fixed_size_list_minichunk_size_in_file(
+        #[values(ConcreteFileVersion::V2_2, ConcreteFileVersion::V2_3)]
+        version: ConcreteFileVersion,
+    ) {
+        let rows = 4099;
+        let values = Int64Array::from_iter((0..rows * 4).map(|i| (i % 7 != 0).then_some(i as i64)));
+        let vectors = FixedSizeListArray::new(
+            Arc::new(ArrowField::new("item", DataType::Int64, true)),
+            4,
+            Arc::new(values),
+            None,
+        );
+        let field = ArrowField::new("vectors", vectors.data_type().clone(), false).with_metadata(
+            HashMap::from([
+                (COMPRESSION_META_KEY.into(), "none".into()),
+                (
+                    STRUCTURAL_ENCODING_META_KEY.into(),
+                    STRUCTURAL_ENCODING_MINIBLOCK.into(),
+                ),
+            ]),
+        );
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![field])),
+            vec![Arc::new(vectors)],
+        )
+        .unwrap();
+        let mut params = CompressionParams::new();
+        params.columns.insert(
+            "vectors".into(),
+            CompressionFieldParams {
+                // 2048 rows hold 64 KiB of values plus 1 KiB of item validity bits.
+                minichunk_size: Some(65 * 1024),
+                ..Default::default()
+            },
+        );
+        let fs = FsFixture::default();
+        let reader = write_minichunk_fixture(&fs, version, &batch, params).await;
+        let page = &reader.metadata().column_infos[0].page_infos[0];
+        let words = minichunk_words(&fs, page, version).await;
+        assert_eq!(
+            words.iter().map(|word| word & 15).collect::<Vec<_>>(),
+            [11, 11, 0]
+        );
+        assert!(matches!(
+            minichunk_value_encoding(page),
+            metadata::compressive_encoding::Compression::FixedSizeList(_)
+        ));
+        assert_minichunk_scan_and_take(&reader, &batch).await;
+    }
+
+    #[rstest]
+    #[case::malformed_metadata(ConcreteFileVersion::V2_2, "32KiB", 4u32)]
+    #[case::negative_metadata(ConcreteFileVersion::V2_3, "-1", 2u32)]
+    #[case::oversized_v2_1_metadata(ConcreteFileVersion::V2_1, "32768", 4u32)]
+    #[tokio::test]
+    async fn test_variable_minichunk_size_retains_legacy_metadata(
+        #[case] version: ConcreteFileVersion,
+        #[case] target: &str,
+        #[case] values_per_chunk: u32,
+    ) {
+        let field = ArrowField::new("data", DataType::Utf8, false).with_metadata(HashMap::from([
+            (MINICHUNK_SIZE_META_KEY.into(), target.into()),
+            (COMPRESSION_META_KEY.into(), "none".into()),
+            (DICT_DIVISOR_META_KEY.into(), "1000000".into()),
+        ]));
+        let array = StringArray::from_iter_values((0..12).map(|row| format!("{row:04}")));
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![field])),
+            vec![Arc::new(array)],
+        )
+        .unwrap();
+        let mut params = CompressionParams::new();
+        params.columns.insert(
+            "data".into(),
+            CompressionFieldParams {
+                // Four strings with their offsets fit, but eight are over budget.
+                minichunk_size: Some(64),
+                ..Default::default()
+            },
+        );
+        let fs = FsFixture::default();
+        let reader = write_minichunk_fixture(&fs, version, &batch, params).await;
+        let page = &reader.metadata().column_infos[0].page_infos[0];
+        let words = minichunk_words(&fs, page, version).await;
+        assert_eq!(words.len(), batch.num_rows() / values_per_chunk as usize);
+        let (last, nonfinal) = words.split_last().unwrap();
+        assert_eq!(last & 15, 0);
+        assert!(
+            nonfinal
+                .iter()
+                .all(|word| word & 15 == values_per_chunk.ilog2()),
+            "{words:?}"
+        );
+        assert_minichunk_scan_and_take(&reader, &batch).await;
+    }
+
+    #[rstest]
+    #[case::malformed_metadata(
+        ConcreteFileVersion::V2_2,
+        DataType::Int64,
+        Some("32KiB"),
+        None,
+        "positive integer"
+    )]
+    #[case::zero_metadata(
+        ConcreteFileVersion::V2_3,
+        DataType::Int64,
+        Some("0"),
+        None,
+        "positive byte count"
+    )]
+    #[case::negative_programmatic(ConcreteFileVersion::V2_3, DataType::Int64, None, Some(-1), "positive byte count")]
+    #[case::v2_1_metadata(
+        ConcreteFileVersion::V2_1,
+        DataType::Int64,
+        Some("8187"),
+        None,
+        "at most 8186"
+    )]
+    #[case::v2_1_shared_metadata(
+        ConcreteFileVersion::V2_1,
+        DataType::Int64,
+        Some("32768"),
+        None,
+        "at most 8186"
+    )]
+    #[case::v2_1_programmatic(
+        ConcreteFileVersion::V2_1,
+        DataType::Int64,
+        None,
+        Some(32768),
+        "at most 8186"
+    )]
+    #[case::v2_1_binary_programmatic(
+        ConcreteFileVersion::V2_1,
+        DataType::Utf8,
+        Some("32768"),
+        Some(32768),
+        "at most 32767"
+    )]
+    #[case::binary_negative_programmatic(ConcreteFileVersion::V2_3, DataType::Utf8, Some("32KiB"), Some(-1), "positive byte count")]
+    #[tokio::test]
+    async fn test_minichunk_size_rejects_invalid_and_unsupported_settings(
+        #[case] version: ConcreteFileVersion,
+        #[case] data_type: DataType,
+        #[case] metadata: Option<&str>,
+        #[case] target: Option<i64>,
+        #[case] message: &str,
+    ) {
+        let mut field = ArrowField::new("data", data_type, false);
+        if let Some(metadata) = metadata {
+            field = field.with_metadata(HashMap::from([(
+                MINICHUNK_SIZE_META_KEY.into(),
+                metadata.into(),
+            )]));
+        }
+        let schema = LanceSchema::try_from(&ArrowSchema::new(vec![field])).unwrap();
+        let mut params = CompressionParams::new();
+        params.columns.insert(
+            "data".into(),
+            CompressionFieldParams {
+                minichunk_size: target,
+                ..Default::default()
+            },
+        );
+        let fs = FsFixture::default();
+        let writer = fs.object_store.create(&fs.tmp_path).await.unwrap();
+        let result = create_minichunk_writer(version, writer, schema, params);
+        let error = result.err().expect("invalid configuration was accepted");
+        assert!(
+            matches!(error, lance_core::Error::InvalidInput { .. }),
+            "{error}"
+        );
+        let error = error.to_string();
+        assert!(
+            error.contains(MINICHUNK_SIZE_META_KEY) && error.contains(message),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_v2_1_fixed_width_minichunk_size_uses_stable_chunking() {
+        let field = ArrowField::new("data", DataType::Int64, false).with_metadata(HashMap::from([
+            (MINICHUNK_SIZE_META_KEY.into(), "2048".into()),
+            (COMPRESSION_META_KEY.into(), "none".into()),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![field])),
+            vec![Arc::new(Int64Array::from_iter_values(0..2049))],
+        )
+        .unwrap();
+        let version = ConcreteFileVersion::V2_1;
+        let fs = FsFixture::default();
+        let reader = write_minichunk_fixture(&fs, version, &batch, CompressionParams::new()).await;
+        let page = &reader.metadata().column_infos[0].page_infos[0];
+        let words = minichunk_words(&fs, page, version).await;
+        // This is the complete u16 metadata recorded by Lance 14.0.3 for
+        // the same input and option, including framed byte lengths.
+        assert_eq!(words, [8201, 8201, 8201, 8201, 16]);
+        assert_minichunk_scan_and_take(&reader, &batch).await;
     }
 
     #[tokio::test]
@@ -1003,6 +1707,91 @@ mod tests {
     }
 
     #[rstest]
+    #[case::mismatched_first(true)]
+    #[case::mismatched_unused(false)]
+    #[tokio::test]
+    async fn test_writer_checks_first_duplicate_column_type(
+        #[case] mismatched_first: bool,
+        #[values(
+            ConcreteFileVersion::V2_0,
+            ConcreteFileVersion::V2_1,
+            ConcreteFileVersion::V2_2,
+            ConcreteFileVersion::V2_3
+        )]
+        version: ConcreteFileVersion,
+    ) {
+        let expected =
+            arrow_array::record_batch!(("b", Int32, [7, 8]), ("a", Int32, [11, 12])).unwrap();
+        let schema = LanceSchema::try_from(expected.schema().as_ref()).unwrap();
+        let values: ArrayRef = Arc::new(Int32Array::from(vec![11, 12]));
+        let strings: ArrayRef = Arc::new(StringArray::from(vec!["first", "second"]));
+        let (first, second) = if mismatched_first {
+            (strings, values)
+        } else {
+            (values, strings)
+        };
+        let duplicate = RecordBatch::try_from_iter(vec![
+            ("a", first),
+            ("a", second),
+            ("b", expected["b"].clone()),
+        ])
+        .unwrap();
+        let fs = FsFixture::default();
+        let mut writer = create_writer(
+            fs.object_store.create(&fs.tmp_path).await.unwrap(),
+            schema,
+            version,
+            FileWriterOptions::default(),
+        )
+        .unwrap();
+        for _ in 0..2 {
+            if mismatched_first {
+                let mismatch =
+                    field_type_mismatch(writer.write_batch(&duplicate).await.unwrap_err());
+                assert_eq!(mismatch.field_path, "a");
+                assert!(mismatch.to_string().contains("field `a` does not match"));
+                assert_eq!(mismatch.expected.data_type(), &DataType::Int32);
+                assert_eq!(mismatch.actual.data_type(), &DataType::Utf8);
+                writer.write_batch(&expected).await.unwrap();
+            } else {
+                writer.write_batch(&duplicate).await.unwrap();
+            }
+        }
+        assert_eq!(writer.finish().await.unwrap().num_rows, 4);
+        let scheduler = fs
+            .scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let reader = FileReader::try_open(
+            scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &LanceCache::no_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+        let batches: Vec<RecordBatch> = reader
+            .read_stream(
+                lance_io::ReadBatchParams::RangeFull,
+                2,
+                1,
+                lance_encoding::decoder::FilterExpression::no_filter(),
+            )
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let actual = arrow_select::concat::concat_batches(&expected.schema(), &batches).unwrap();
+        let expected =
+            arrow_select::concat::concat_batches(&expected.schema(), &[expected.clone(), expected])
+                .unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    #[rstest]
     #[tokio::test]
     async fn test_write_column_rejects_mismatched_type(
         #[values(
@@ -1193,6 +1982,183 @@ mod tests {
             "{error}"
         );
         assert!(error.to_string().contains("FixedSizeList"), "{error}");
+    }
+
+    fn packed_metadata() -> HashMap<String, String> {
+        HashMap::from([(PACKED_STRUCT_META_KEY.to_owned(), "true".to_owned())])
+    }
+
+    /// A packed `{a: Int32, <name>: child}` struct of three rows.
+    fn packed_struct_with_child(name: &str, child: ArrayRef) -> StructArray {
+        let fields = ArrowFields::from(vec![
+            ArrowField::new("a", DataType::Int32, true),
+            ArrowField::new(name, child.data_type().clone(), true),
+        ]);
+        StructArray::new(
+            fields,
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3])), child],
+            None,
+        )
+    }
+
+    fn int32_lists() -> ListArray {
+        ListArray::from_iter_primitive::<Int32Type, _, _>(vec![
+            Some(vec![Some(1)]),
+            Some(vec![]),
+            Some(vec![Some(2), Some(3)]),
+        ])
+    }
+
+    async fn write_single_column(
+        fs: &FsFixture,
+        field: ArrowField,
+        column: ArrayRef,
+        version: ConcreteFileVersion,
+    ) -> lance_core::Result<()> {
+        let schema = Arc::new(ArrowSchema::new(vec![field]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![column]).unwrap();
+        let mut writer = create_writer(
+            fs.object_store.create(&fs.tmp_path).await?,
+            LanceSchema::try_from(schema.as_ref())?,
+            version,
+            FileWriterOptions::default(),
+        )?;
+        writer.write_batch(&batch).await?;
+        writer.finish().await?;
+        Ok(())
+    }
+
+    /// Packed structs are encoded as one primitive column, so a list-like
+    /// child, even inside a nested struct, is rejected with an error naming the
+    /// child instead of panicking while the column is converted to a data block.
+    #[rstest]
+    #[case::list("l", "List", false)]
+    #[case::large_list("l", "LargeList", false)]
+    #[case::map("m", "Map", false)]
+    #[case::nested_struct("inner.l", "List", false)]
+    #[case::packed_struct_in_list("l", "List", true)]
+    #[tokio::test]
+    async fn test_writer_rejects_packed_struct_with_list_child(
+        #[case] child_path: &str,
+        #[case] child_type: &str,
+        #[case] in_list: bool,
+        #[values(
+            ConcreteFileVersion::V2_0,
+            ConcreteFileVersion::V2_1,
+            ConcreteFileVersion::V2_2,
+            ConcreteFileVersion::V2_3
+        )]
+        version: ConcreteFileVersion,
+    ) {
+        use arrow_array::LargeListArray;
+        use arrow_array::builder::MapBuilder;
+
+        let child: ArrayRef = match (child_path, child_type) {
+            (_, "LargeList") => Arc::new(LargeListArray::from_iter_primitive::<Int32Type, _, _>(
+                vec![Some(vec![Some(1)]), Some(vec![]), Some(vec![Some(2)])],
+            )),
+            (_, "Map") => {
+                let mut builder = MapBuilder::new(None, Int32Builder::new(), Int32Builder::new());
+                for i in 0..3 {
+                    builder.keys().append_value(i);
+                    builder.values().append_value(i * 10);
+                    builder.append(true).unwrap();
+                }
+                Arc::new(builder.finish())
+            }
+            ("inner.l", _) => {
+                let lists: ArrayRef = Arc::new(int32_lists());
+                Arc::new(StructArray::new(
+                    ArrowFields::from(vec![
+                        ArrowField::new("b", DataType::Int32, true),
+                        ArrowField::new("l", lists.data_type().clone(), true),
+                    ]),
+                    vec![Arc::new(Int32Array::from(vec![4, 5, 6])), lists],
+                    None,
+                ))
+            }
+            _ => Arc::new(int32_lists()),
+        };
+        let top_name = child_path.split('.').next().unwrap();
+        let packed = packed_struct_with_child(top_name, child);
+        let packed_name = if in_list { "item" } else { "s" };
+        let packed_field = ArrowField::new(packed_name, packed.data_type().clone(), true)
+            .with_metadata(packed_metadata());
+        let (field, column): (ArrowField, ArrayRef) = if in_list {
+            let list = ListArray::new(
+                Arc::new(packed_field),
+                OffsetBuffer::new(ScalarBuffer::from(vec![0, 1, 3])),
+                Arc::new(packed),
+                None,
+            );
+            (
+                ArrowField::new("s", list.data_type().clone(), true),
+                Arc::new(list),
+            )
+        } else {
+            (packed_field, Arc::new(packed))
+        };
+
+        let fs = FsFixture::default();
+        let error = write_single_column(&fs, field, column, version)
+            .await
+            .expect_err("a packed struct with a list-like child was written");
+        assert!(
+            matches!(error, lance_core::Error::NotSupported { .. }),
+            "{error}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains(&format!("Packed struct field '{packed_name}'")),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!("child '{child_path}' of type {child_type}(")),
+            "{message}"
+        );
+    }
+
+    /// Packed structs whose children are values still round-trip: fixed-width
+    /// children on every version and variable-width children from 2.2 on.
+    #[rstest]
+    #[case::fixed_v2_0(ConcreteFileVersion::V2_0, false)]
+    #[case::fixed_v2_1(ConcreteFileVersion::V2_1, false)]
+    #[case::fixed_v2_2(ConcreteFileVersion::V2_2, false)]
+    #[case::fixed_v2_3(ConcreteFileVersion::V2_3, false)]
+    #[case::variable_v2_2(ConcreteFileVersion::V2_2, true)]
+    #[case::variable_v2_3(ConcreteFileVersion::V2_3, true)]
+    #[tokio::test]
+    async fn test_packed_struct_with_value_children_round_trips(
+        #[case] version: ConcreteFileVersion,
+        #[case] variable: bool,
+    ) {
+        let child: ArrayRef = if variable {
+            Arc::new(StringArray::from(vec!["x", "", "yz"]))
+        } else {
+            Arc::new(arrow_array::Float64Array::from(vec![0.5, 1.5, 2.5]))
+        };
+        let packed = packed_struct_with_child("c", child);
+        let field =
+            ArrowField::new("s", packed.data_type().clone(), true).with_metadata(packed_metadata());
+        let schema = Arc::new(ArrowSchema::new(vec![field]));
+        let expected = RecordBatch::try_new(schema.clone(), vec![Arc::new(packed)]).unwrap();
+
+        let fs = FsFixture::default();
+        crate::testing::write_lance_file(
+            arrow_array::RecordBatchIterator::new(vec![Ok(expected.clone())], schema.clone()),
+            &fs,
+            version,
+            FileWriterOptions::default(),
+        )
+        .await;
+        let output = crate::testing::read_lance_file(
+            &fs,
+            Arc::<DecoderPlugins>::default(),
+            lance_encoding::decoder::FilterExpression::no_filter(),
+        )
+        .await;
+        let actual = arrow_select::concat::concat_batches(&schema, &output).unwrap();
+        assert_eq!(actual.column(0), expected.column(0));
     }
 
     fn struct_array(fields: ArrowFields, nulls: Option<NullBuffer>) -> StructArray {
@@ -3038,8 +4004,10 @@ mod tests {
             let item = Arc::new(ArrowField::new("item", array.data_type().clone(), true));
             array = Arc::new(FixedSizeListArray::new(item, *dim, array, None));
         }
+        let mut compression_metadata = pcodec_metadata();
+        compression_metadata.insert(MINICHUNK_SIZE_META_KEY.into(), "65536".into());
         let (file_reader, lance_schema) =
-            write_v2_3_signal(&array, pcodec_metadata(), CompressionParams::new())
+            write_v2_3_signal(&array, compression_metadata, CompressionParams::new())
                 .await
                 .unwrap();
         for encoding in page_encodings(&file_reader) {
@@ -3165,5 +4133,93 @@ mod tests {
         )
         .await;
         assert_eq!(read.to_data(), array.to_data());
+    }
+    #[rstest]
+    #[case::mixed(false)]
+    #[case::all_null(true)]
+    #[tokio::test]
+    async fn test_write_fixed_size_list_masked_struct_nulls(
+        #[case] all_null: bool,
+        #[values(ConcreteFileVersion::V2_2, ConcreteFileVersion::V2_3)]
+        version: ConcreteFileVersion,
+        #[values(false, true)] sliced: bool,
+        #[values(false, true)] column_write: bool,
+    ) {
+        let valid = if all_null {
+            vec![false; 4]
+        } else {
+            vec![true, false, true, false]
+        };
+        let child_valid: Vec<bool> = valid.iter().flat_map(|valid| [*valid; 2]).collect();
+        let values = Int32Array::from(
+            child_valid
+                .iter()
+                .enumerate()
+                .map(|(i, valid)| valid.then_some(i as i32))
+                .collect::<Vec<_>>(),
+        );
+        let entries = Arc::new(StructArray::new(
+            vec![ArrowField::new("value", DataType::Int32, false)].into(),
+            vec![Arc::new(values)],
+            Some(NullBuffer::from(child_valid)),
+        ));
+        let lists = FixedSizeListArray::try_new(
+            Arc::new(ArrowField::new("item", entries.data_type().clone(), false)),
+            2,
+            entries,
+            Some(NullBuffer::from(valid)),
+        )
+        .unwrap();
+        let lists = if sliced { lists.slice(1, 2) } else { lists };
+        let batch =
+            RecordBatch::try_from_iter(vec![("lists", Arc::new(lists) as ArrayRef)]).unwrap();
+        let fs = FsFixture::default();
+        let mut writer = create_writer(
+            fs.object_store.create(&fs.tmp_path).await.unwrap(),
+            LanceSchema::try_from(batch.schema().as_ref()).unwrap(),
+            version,
+            FileWriterOptions::default(),
+        )
+        .unwrap();
+        if column_write {
+            writer
+                .write_column(0, batch["lists"].clone())
+                .await
+                .unwrap();
+        } else {
+            writer.write_batch(&batch).await.unwrap();
+        }
+        assert_eq!(
+            writer.finish().await.unwrap().num_rows,
+            batch.num_rows() as u64
+        );
+        let scheduler = fs
+            .scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let reader = FileReader::try_open(
+            scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &LanceCache::no_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+        let batches: Vec<RecordBatch> = reader
+            .read_stream(
+                lance_io::ReadBatchParams::RangeFull,
+                2,
+                1,
+                lance_encoding::decoder::FilterExpression::no_filter(),
+            )
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let actual = arrow_select::concat::concat_batches(&batch.schema(), &batches).unwrap();
+        assert_eq!(actual, batch);
     }
 }

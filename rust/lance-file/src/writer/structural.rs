@@ -4,8 +4,8 @@
 use core::panic;
 use std::{collections::HashMap, sync::Arc};
 
-use arrow_array::{Array, ArrayRef, RecordBatch, StructArray, make_array};
-use arrow_buffer::BooleanBuffer;
+use arrow_array::{Array, ArrayRef, FixedSizeListArray, RecordBatch, StructArray, make_array};
+use arrow_buffer::{BooleanBuffer, NullBuffer};
 use bytes::{Buf, Bytes, BytesMut};
 use futures::{StreamExt, stream::FuturesOrdered};
 use lance_core::{
@@ -245,8 +245,24 @@ impl StructuralFileSink {
         &mut self,
         mut encoding_tasks: FuturesOrdered<EncodeTask>,
     ) -> Result<()> {
+        // Encoding futures can already own work in the shared CPU pool.
+        // Dropping them on the first error would detach that work. Stop writes
+        // after failure but retain and drain every accepted encoder join.
+        let mut first_error = None;
         while let Some(encoding_task) = encoding_tasks.next().await {
-            self.write_page(encoding_task?).await?;
+            if first_error.is_some() {
+                continue;
+            }
+            let result = match encoding_task {
+                Ok(page) => self.write_page(page).await,
+                Err(error) => Err(error),
+            };
+            if let Err(error) = result {
+                first_error = Some(error);
+            }
+        }
+        if let Some(error) = first_error {
+            return Err(error);
         }
         // Reaps any upload that has already failed so the error is attributed to
         // this batch. This does not wait for in-flight uploads; see
@@ -473,7 +489,8 @@ impl EncodingPipeline {
     /// `reachable` marks the slots a valid parent can actually see, or `None`
     /// at the top level where every slot is reachable.
     ///
-    /// A null struct slot leaves its children undefined, so a child null there
+    /// A null struct or fixed-size-list slot leaves its children undefined, so
+    /// a child null there
     /// says nothing about whether the child is nullable. Arrow draws the line
     /// the same way -- `StructArray::try_new` rejects only nulls in a
     /// non-nullable child that the parent's null mask does not cover -- and a
@@ -505,9 +522,20 @@ impl EncodingPipeline {
         if field.children.is_empty() {
             return Ok(());
         }
-        // Only a struct's children sit one slot per parent slot. List-like
-        // children are addressed through offsets, so the parent's validity
-        // does not map onto them and they are checked as before.
+        if let Some(parent) = array.as_any().downcast_ref::<FixedSizeListArray>() {
+            // Each list slot covers a fixed number of child slots, including
+            // the undefined children under a null list or ancestor struct.
+            let ancestor_nulls = reachable.map(|reachable| NullBuffer::new(reachable.clone()));
+            let child_nulls = NullBuffer::union(nulls.as_ref(), ancestor_nulls.as_ref())
+                .map(|nulls| nulls.expand(parent.value_length() as usize));
+            return Self::verify_field_nullability_where_reachable(
+                parent.values().as_ref(),
+                &field.children[0],
+                child_nulls.as_ref().map(NullBuffer::inner),
+            );
+        }
+        // Variable-size list children are addressed through offsets, so the
+        // parent's validity does not map directly onto their slots.
         let Some(parent) = array.as_any().downcast_ref::<StructArray>() else {
             for (child_field, child_array) in
                 field.children.iter().zip(array.to_data().child_data())
@@ -940,6 +968,20 @@ mod tests {
 
     use super::{EncodingPipeline, FileWriterOptions};
 
+    #[tokio::test]
+    async fn page_encoder_failure_drains_remaining_work() {
+        let store = lance_io::object_store::ObjectStore::memory();
+        let writer = store
+            .create(&object_store::path::Path::from("failure.lance"))
+            .await
+            .unwrap();
+        let mut sink = super::StructuralFileSink::new(writer);
+        crate::writer::writer_tests::assert_page_encoder_failure_drains(move |tasks| async move {
+            sink.write_pages(tasks).await
+        })
+        .await;
+    }
+
     /// `analysis: struct<changed: bool>` where the child is declared
     /// non-nullable, built with a nullable child so the array can carry the
     /// nulls a reader hands back.
@@ -1054,5 +1096,58 @@ mod tests {
         // Dropping the first row leaves the null parent at slot 0.
         let sliced = array.slice(1, 3);
         EncodingPipeline::verify_field_nullability(sliced.as_ref(), &schema.fields[0]).unwrap();
+    }
+    #[rstest::rstest]
+    #[case::list_mask(vec![true, false], None, true)]
+    #[case::ancestor_mask(vec![true, true], Some(vec![true, false]), true)]
+    #[case::visible_null(vec![true, true], None, false)]
+    #[case::different_ancestor_slot(vec![true, true], Some(vec![false, true]), false)]
+    fn fixed_size_list_child_nulls_follow_reachability(
+        #[case] valid: Vec<bool>,
+        #[case] reachable: Option<Vec<bool>>,
+        #[case] accepted: bool,
+    ) {
+        let (entries, _) = analysis(
+            vec![true, true, false, false],
+            vec![Some(true), Some(false), None, None],
+        );
+        let lists = arrow_array::FixedSizeListArray::new(
+            Arc::new(ArrowField::new("item", entries.data_type().clone(), true)),
+            2,
+            entries,
+            Some(NullBuffer::from(valid)),
+        );
+        let declared = ArrowSchema::new(vec![ArrowField::new(
+            "lists",
+            DataType::FixedSizeList(
+                Arc::new(ArrowField::new(
+                    "item",
+                    DataType::Struct(
+                        vec![ArrowField::new("changed", DataType::Boolean, false)].into(),
+                    ),
+                    false,
+                )),
+                2,
+            ),
+            true,
+        )]);
+        let schema = Schema::try_from(&declared).unwrap();
+        let reachable = reachable.map(arrow_buffer::BooleanBuffer::from);
+        let result = EncodingPipeline::verify_field_nullability_where_reachable(
+            &lists,
+            &schema.fields[0],
+            reachable.as_ref(),
+        );
+        if accepted {
+            result.unwrap();
+        } else {
+            let error = result.unwrap_err();
+            assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
+            assert!(
+                error
+                    .to_string()
+                    .contains("field `item` contained null values")
+            );
+        }
     }
 }

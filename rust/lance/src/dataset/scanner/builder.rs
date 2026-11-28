@@ -58,7 +58,7 @@ use super::{
 impl Scanner {
     pub fn new(dataset: Arc<Dataset>) -> Self {
         let projection_plan = ProjectionPlan::full(dataset.clone()).unwrap();
-        let file_reader_options = dataset.file_reader_options.as_deref().cloned();
+        let file_reader_options = dataset.table_state.file_reader_options.as_deref().cloned();
         let mut scanner = Self {
             dataset,
             projection_plan,
@@ -72,7 +72,7 @@ impl Scanner {
             minhash_query: None,
             batch_size: None,
             batch_size_bytes: None,
-            batch_readahead: get_num_compute_intensive_cpus(),
+            batch_readahead: Self::default_batch_readahead(),
             fragment_readahead: None,
             io_buffer_size: None,
             materialization_readahead_bytes: None,
@@ -231,7 +231,7 @@ impl Scanner {
         get_default_batch_size().unwrap_or_else(|| {
             self.batch_size.unwrap_or_else(|| {
                 std::cmp::max(
-                    self.dataset.object_store.as_ref().block_size() / 4,
+                    self.dataset.table_state.object_store.as_ref().block_size() / 4,
                     BATCH_SIZE_FALLBACK,
                 )
             })
@@ -662,10 +662,15 @@ impl Scanner {
         self
     }
 
+    /// The number of batches decoded concurrently when no override is supplied.
+    pub fn default_batch_readahead() -> usize {
+        get_num_compute_intensive_cpus()
+    }
+
     /// Set the number of batches to decode concurrently.
     ///
     /// This bounds the decode fan-out of the scan: at most this many batch-decode
-    /// tasks run in flight at once. Defaults to `get_num_compute_intensive_cpus()`.
+    /// tasks run in flight at once. Defaults to [`Self::default_batch_readahead`].
     ///
     /// `nbatches` must be greater than zero.
     pub fn batch_readahead(&mut self, nbatches: usize) -> &mut Self {
@@ -1489,10 +1494,13 @@ impl Scanner {
     /// `file_reader_options`, the dataset-level defaults, and the `batch_size_bytes`
     /// setting.
     pub(super) fn resolved_file_reader_options(&self) -> Option<FileReaderOptions> {
-        let base = self
-            .file_reader_options
-            .clone()
-            .or_else(|| self.dataset.file_reader_options.as_deref().cloned());
+        let base = self.file_reader_options.clone().or_else(|| {
+            self.dataset
+                .table_state
+                .file_reader_options
+                .as_deref()
+                .cloned()
+        });
         match (base, self.batch_size_bytes) {
             (Some(mut opts), Some(bsb)) => {
                 opts.batch_size_bytes = Some(bsb);

@@ -403,11 +403,16 @@ impl DecodePageTask for ListStructureTask {
             .iter()
             .flat_map(|r| r.rep.iter().copied())
             .collect::<Vec<_>>();
-        let has_defs = self
-            .details
-            .def_meaning
-            .iter()
-            .any(|d| d.num_def_levels() > 0);
+        // A NIL page stores no def levels even when its layers are nullable: the writer picks
+        // NIL when every rep and def level of a page is zero (no nulls and no list layers), and
+        // writers before #9018 also padded such pages. Read every item as valid, as the value
+        // path does.
+        let has_defs = !matches!(self.details.ctrl_word_parser, ControlWordParser::NIL)
+            && self
+                .details
+                .def_meaning
+                .iter()
+                .any(|d| d.num_def_levels() > 0);
         let def = has_defs.then(|| {
             rows.iter()
                 .flat_map(|r| {
@@ -455,6 +460,7 @@ mod tests {
             def_meaning: layers.into(),
             ctrl_word_parser: ControlWordParser::new(1, def_bits),
             max_rep: 1,
+            is_padded: false,
         })
     }
 

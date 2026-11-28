@@ -84,6 +84,45 @@ impl EncodedPositionBlocks {
         Ok(len)
     }
 
+    pub(super) fn push_encoded_block_slice(&mut self, block: &[u8]) -> Result<usize> {
+        let len = block.len();
+        let offset = u32::try_from(self.byte_len).map_err(|_| {
+            Error::index(format!(
+                "position block offset {} exceeds the u32 format limit",
+                self.byte_len
+            ))
+        })?;
+        let byte_len = self.byte_len.checked_add(len).ok_or_else(|| {
+            Error::index(format!(
+                "position stream length {} + {len} overflows usize",
+                self.byte_len
+            ))
+        })?;
+        if !self.tail.is_empty() && len > POSITION_CHUNK_BYTES - self.tail.len() {
+            self.chunks.push(PositionChunk {
+                start: self.byte_len - self.tail.len(),
+                bytes: std::mem::take(&mut self.tail).into_boxed_slice(),
+            });
+        }
+        self.offsets.push(offset);
+        if len >= POSITION_CHUNK_BYTES {
+            self.chunks.push(PositionChunk {
+                start: self.byte_len,
+                bytes: block.to_vec().into_boxed_slice(),
+            });
+        } else {
+            if len > self.tail.capacity() - self.tail.len() {
+                let capacity = (self.tail.len() + len)
+                    .next_power_of_two()
+                    .min(POSITION_CHUNK_BYTES);
+                self.tail.reserve_exact(capacity - self.tail.len());
+            }
+            self.tail.extend_from_slice(block);
+        }
+        self.byte_len = byte_len;
+        Ok(len)
+    }
+
     pub(super) fn append_to(
         self,
         bytes: &mut LargeBinaryBuilder,

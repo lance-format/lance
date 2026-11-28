@@ -12,10 +12,11 @@
 
 use crate::feature_flags::{
     FLAG_COVERED_INDEX_METADATA, FLAG_FRAGMENT_REUSE_INDEX, FLAG_INDEPENDENT_COVERING_FIELDS,
-    FLAG_MANAGED_BLOBS, FLAG_NON_REUSABLE_FIELD_IDS, FLAG_STABLE_ROW_IDS, apply_feature_flags,
-    apply_index_object_metadata_flag, apply_row_addr_index_feature_flag, ensure_can_read_manifest,
-    ensure_can_write_manifest, inherit_sticky_feature_flags, managed_blobs_enabled,
-    validate_auto_cleanup_config, validate_non_reusable_field_id_flags,
+    FLAG_MANAGED_BLOBS, FLAG_NON_REUSABLE_FIELD_IDS, FLAG_STABLE_ROW_IDS,
+    ZONE_WRITE_SEEDS_VERSION_KEY, apply_feature_flags, apply_index_object_metadata_flag,
+    apply_row_addr_index_feature_flag, apply_zone_write_seeds_version_config,
+    ensure_can_read_manifest, ensure_can_write_manifest, inherit_sticky_feature_flags,
+    managed_blobs_enabled, validate_auto_cleanup_config, validate_non_reusable_field_id_flags,
 };
 use crate::format::clustering::{ChangedReferences, validate_clustering_of};
 
@@ -141,6 +142,26 @@ fn changes_auto_cleanup_config(operation: &Operation) -> bool {
     }
 }
 
+fn writes_zone_write_seeds_version_config(operation: &Operation) -> bool {
+    match operation {
+        Operation::Overwrite {
+            config_upsert_values: Some(values),
+            ..
+        } => values.contains_key(ZONE_WRITE_SEEDS_VERSION_KEY),
+        Operation::UpdateConfig {
+            config_updates: Some(update),
+            ..
+        } => {
+            update.replace
+                || update
+                    .update_entries
+                    .iter()
+                    .any(|entry| entry.key == ZONE_WRITE_SEEDS_VERSION_KEY)
+        }
+        _ => false,
+    }
+}
+
 /// Re-encode inline row id sequences in their smallest wire form when the
 /// table has opted in.
 ///
@@ -231,6 +252,43 @@ impl Transaction {
         Ok(version.map(DataStorageFormat::new).unwrap_or_default())
     }
 
+    /// Refuse a restore when the target or the current version has a MemWAL.
+    ///
+    /// A restore rolls back the base table and the MemWAL index but not shard
+    /// state (SSTables, WAL entries, MemTables), so the result matches no
+    /// point in time. Returns [`Error::NotSupported`].
+    async fn refuse_mem_wal_restore(
+        object_store: &ObjectStore,
+        commit_handler: &dyn CommitHandler,
+        base_path: &Path,
+        version: u64,
+        target_indices: &[IndexMetadata],
+        current_manifest: &Manifest,
+    ) -> Result<()> {
+        let has_mem_wal =
+            |indices: &[IndexMetadata]| indices.iter().any(|idx| idx.name == MEM_WAL_INDEX_NAME);
+        let holder = if has_mem_wal(target_indices) {
+            Some("target")
+        } else if current_manifest.index_section.is_some() {
+            let location = commit_handler
+                .resolve_version_location(base_path, current_manifest.version, &object_store.inner)
+                .await?;
+            let current_indices =
+                read_manifest_indexes(object_store, &location, current_manifest).await?;
+            has_mem_wal(&current_indices).then_some("current")
+        } else {
+            None
+        };
+        match holder {
+            Some(holder) => Err(Error::not_supported(format!(
+                "Cannot restore version {version}: the {holder} version (current is {}) has a \
+                 MemWAL, and restore cannot roll back MemWAL shard state",
+                current_manifest.version
+            ))),
+            None => Ok(()),
+        }
+    }
+
     pub async fn restore_old_manifest(
         object_store: &ObjectStore,
         commit_handler: &dyn CommitHandler,
@@ -243,7 +301,7 @@ impl Transaction {
         // Restore dispatches separately from the prepared build path, and it
         // has no use for a definitions list: ignoring one silently would lose
         // the caller's input.
-        if config.clustering_definitions.is_some() {
+        if config.clustering_definitions().is_some() {
             return Err(Error::invalid_input(
                 "a complete clustering definitions list can only be committed with UpdateConfig",
             ));
@@ -257,10 +315,19 @@ impl Transaction {
         // republish the referenced files as legacy-compatible.
         ensure_can_read_manifest(&manifest)?;
         ensure_can_write_manifest(&manifest)?;
-        manifest.set_timestamp(config.timestamp_nanos);
-        manifest.transaction_file = Some(tx_path.to_string());
+        manifest.set_timestamp(config.timestamp_nanos().unwrap_or(0));
+        manifest.transaction_file = (!tx_path.is_empty()).then(|| tx_path.to_string());
         let indices = read_manifest_indexes(object_store, &location, &manifest).await?;
         validate_flags(&manifest, &indices)?;
+        Self::refuse_mem_wal_restore(
+            object_store,
+            commit_handler,
+            base_path,
+            version,
+            &indices,
+            current_manifest,
+        )
+        .await?;
         manifest.max_fragment_id = manifest
             .max_fragment_id
             .max(current_manifest.max_fragment_id);
@@ -366,7 +433,7 @@ impl Transaction {
     /// the only proof available: nothing maps a generation to the fragments its
     /// rows landed in, so covering the table as the transaction read it is how
     /// an index shows it covered those rows. Fragments appended since are a
-    /// later gap.
+    /// later gap. Read-version progress counts only under the same `dir_id`.
     ///
     /// Deriving rather than transmitting means no claim can go stale between
     /// inspection and commit, the answer survives rebase (`read_version` is
@@ -420,7 +487,9 @@ impl Transaction {
                     .transpose()
             })
             .transpose()?
-            .flatten();
+            .flatten()
+            // A re-initialized MemWAL can reuse shard ids and generations.
+            .filter(|read| read.dir_id == details.dir_id);
         let shards: Vec<(Uuid, u64, u64)> = details
             .compacted_sstables
             .iter()
@@ -442,7 +511,8 @@ impl Transaction {
             .collect();
 
         // Every fragment live when the transaction read the table. An index
-        // spanning all of them holds every row compacted by then.
+        // spanning all of them holds every row compacted by then. An empty
+        // table is trivially covered: every compacted row has been deleted.
         let read_fragments: Option<RoaringBitmap> = read_version_state.map(|state| {
             state
                 .manifest
@@ -456,17 +526,6 @@ impl Transaction {
             let Some(required) = read_fragments.as_ref() else {
                 return false;
             };
-            if required.is_empty() {
-                // Subset-of-empty is trivially true, so this would credit every
-                // index on a table with no fragments. Refused because an empty
-                // fragment list is not only what an emptied table looks like:
-                // it is also what a manifest written before #8438 looks like,
-                // where UpdateMemWalState published no fragments at all. On
-                // such a table the SSTables are the last copy of those rows,
-                // and crediting coverage would retire them. The cost is that a
-                // genuinely emptied table keeps its SSTables.
-                return false;
-            }
             let mut covered = RoaringBitmap::new();
             for segment in segments {
                 match segment.fragment_bitmap.as_ref() {
@@ -613,7 +672,7 @@ impl Transaction {
             current_manifest,
             &current_indices,
             &frag_reuse,
-            config.migration_next_row_id,
+            config.migration_next_row_id(),
         )?;
         let mut prepared = current_indices.clone();
         if let Some(manifest) = current_manifest {
@@ -782,7 +841,7 @@ impl Transaction {
         // operation that applies a definitions list has to be enforced here
         // rather than in the convenience wrapper: anything else would ignore
         // the caller's list and report success.
-        if config.clustering_definitions.is_some()
+        if config.clustering_definitions().is_some()
             && !matches!(self.operation, Operation::UpdateConfig { .. })
         {
             return Err(Error::invalid_input(
@@ -805,7 +864,7 @@ impl Transaction {
             current_manifest,
             prepared.original(),
             prepared.frag_reuse_update(),
-            config.migration_next_row_id,
+            config.migration_next_row_id(),
         )?;
         let (original_indices, prepared_indices, frag_reuse) = prepared.into_parts();
         if let Operation::CompositeOperation(composite_operation) = &self.operation {
@@ -826,8 +885,8 @@ impl Transaction {
             );
         }
 
-        if config.use_stable_row_ids
-            && config.migration_next_row_id.is_none()
+        if config.use_stable_row_ids()
+            && config.migration_next_row_id().is_none()
             && current_manifest
                 .map(|m| !m.uses_stable_row_ids())
                 .unwrap_or_default()
@@ -849,7 +908,7 @@ impl Transaction {
             .filter(|idx| idx.name != FRAG_REUSE_INDEX_NAME)
             .map(|idx| idx.name.as_str())
             .collect();
-        if config.migration_next_row_id.is_some() && !blocking_indices.is_empty() {
+        if config.migration_next_row_id().is_some() && !blocking_indices.is_empty() {
             return Err(Error::invalid_input(format!(
                 "Cannot migrate to stable row IDs while indexes exist on the dataset. \
                  Drop the following indexes first, then re-run the migration, and \
@@ -923,7 +982,7 @@ impl Transaction {
 
         // Release builds refuse to publish a stable-row-id dataset with a fragment
         // reuse index, and no index needs it.
-        if config.migration_next_row_id.is_some() {
+        if config.migration_next_row_id().is_some() {
             final_indices.retain(|idx| idx.name != FRAG_REUSE_INDEX_NAME);
         }
 
@@ -940,7 +999,7 @@ impl Transaction {
         let mut next_row_id = {
             // Only use row ids if the feature flag is set already, or this is
             // a migration activation that explicitly provides the next_row_id.
-            match (current_manifest, config.use_stable_row_ids) {
+            match (current_manifest, config.use_stable_row_ids()) {
                 (Some(manifest), _) if manifest.reader_feature_flags & FLAG_STABLE_ROW_IDS != 0 => {
                     Some(manifest.next_row_id)
                 }
@@ -948,7 +1007,7 @@ impl Transaction {
                 (_, false) => None,
                 (Some(_), true) => {
                     // Migration activation: use the provided next_row_id.
-                    if let Some(migration_nri) = config.migration_next_row_id {
+                    if let Some(migration_nri) = config.migration_next_row_id() {
                         Some(migration_nri)
                     } else {
                         return Err(Error::not_supported_source(
@@ -1157,7 +1216,7 @@ impl Transaction {
                             &offsets,
                             new_version,
                             prev_version,
-                            &config.spilled_row_lineage,
+                            config.spilled_row_lineage(),
                         )?;
                     }
                 }
@@ -1189,11 +1248,11 @@ impl Transaction {
                         existing_fragments,
                         new_fragments.as_mut_slice(),
                         new_version,
-                        &config.spilled_row_lineage,
+                        config.spilled_row_lineage(),
                     )?;
                 }
 
-                if config.use_stable_row_ids
+                if config.use_stable_row_ids()
                     && update_mode.is_some()
                     && *update_mode == Some(RewriteRows)
                 {
@@ -1227,7 +1286,7 @@ impl Transaction {
                         fields_for_preserving_frag_bitmap,
                         &original_overlaid_frags,
                         &schema,
-                        config.index_is_supported,
+                        config.index_is_supported(),
                     )?;
                 }
 
@@ -1355,7 +1414,7 @@ impl Transaction {
                         {
                             continue;
                         }
-                        let is_supported = (config.index_is_supported)(index);
+                        let is_supported = (config.index_is_supported())(index);
                         let results_are_row_addrs = is_supported && index.results_are_row_addrs();
                         let can_follow_stable_row_ids =
                             is_supported && index.can_follow_stable_row_ids();
@@ -1765,7 +1824,7 @@ impl Transaction {
                                     &covered_offsets,
                                     new_version,
                                     1,
-                                    &config.spilled_row_lineage,
+                                    config.spilled_row_lineage(),
                                 )?;
                             }
                         }
@@ -1892,7 +1951,7 @@ impl Transaction {
                 schema_metadata_updates,
                 field_metadata_updates,
             } => {
-                if let Some(desired) = &config.clustering_definitions {
+                if let Some(desired) = config.clustering_definitions() {
                     // The definitions the writer planned against: the read
                     // snapshot when the commit path supplied one, else the
                     // landing base, which on a first attempt IS the read
@@ -2107,7 +2166,8 @@ impl Transaction {
             manifest.max_fragment_id = Some(manifest.max_fragment_id.unwrap_or(0) + num_fragments);
         }
 
-        manifest.transaction_file = Some(transaction_file_path.to_string());
+        manifest.transaction_file =
+            (!transaction_file_path.is_empty()).then(|| transaction_file_path.to_string());
 
         if let Some(next_row_id) = next_row_id {
             manifest.next_row_id = next_row_id;
@@ -2122,6 +2182,11 @@ impl Transaction {
             manifest.reader_feature_flags |= FLAG_MANAGED_BLOBS;
             manifest.writer_feature_flags |= FLAG_MANAGED_BLOBS;
         }
+
+        apply_zone_write_seeds_version_config(
+            &mut manifest,
+            writes_zone_write_seeds_version_config(&self.operation),
+        )?;
 
         apply_index_object_metadata_flag(&mut manifest, &final_indices);
         #[cfg(test)]
@@ -2205,15 +2270,6 @@ impl Transaction {
         Ok(cleaned_fragment_ids)
     }
 
-    fn user_requested_version(config: &ManifestBuildConfig) -> Option<ConcreteFileVersion> {
-        match (&config.storage_format, config.use_legacy_format) {
-            (Some(storage_format), _) => Some(storage_format.lance_file_format()),
-            (None, Some(true)) => Some(ConcreteFileVersion::V1),
-            (None, Some(false)) => Some(ConcreteFileVersion::V2_0),
-            (None, None) => None,
-        }
-    }
-
     /// Build the manifest itself from an already-decided schema and fragment
     /// list, and apply the settings that every operation shares: blob v2
     /// promotion, the tag, feature flags, timestamp, and the fragment and field
@@ -2244,7 +2300,9 @@ impl Transaction {
         changed_fragment_ids: Option<&[u64]>,
         config: &ManifestBuildConfig,
     ) -> Result<Manifest> {
-        let user_requested_version = Self::user_requested_version(config);
+        let user_requested_version = config
+            .storage_format()
+            .map(DataStorageFormat::lance_file_format);
 
         // Blob is one logical column across file versions. Publishing its first
         // 2.2+ file also publishes the logical v2 view, without replacing older files.
@@ -2316,7 +2374,7 @@ impl Transaction {
             )
         };
 
-        if config.activate_non_reusable_field_ids {
+        if config.activate_non_reusable_field_ids() {
             let already_active = current_manifest
                 .map(|manifest| manifest.uses_non_reusable_field_ids())
                 .unwrap_or(false);
@@ -2328,18 +2386,18 @@ impl Transaction {
 
         manifest.tag.clone_from(&self.tag);
 
-        if config.auto_set_feature_flags {
+        if config.auto_set_feature_flags() {
             // Internal operations (e.g. CreateIndex) build with the default config,
             // which has use_stable_row_ids = false. Without inheriting from the previous
             // manifest, apply_feature_flags would clear FLAG_STABLE_ROW_IDS.
             let inherited = current_manifest
                 .map(|m| m.uses_stable_row_ids())
                 .unwrap_or(false);
-            let use_stable_row_ids = config.use_stable_row_ids || inherited;
+            let use_stable_row_ids = config.use_stable_row_ids() || inherited;
             apply_feature_flags(
                 &mut manifest,
                 use_stable_row_ids,
-                config.disable_transaction_file,
+                config.disable_transaction_file(),
             )?;
         }
 
@@ -2378,7 +2436,7 @@ impl Transaction {
         }
         apply_row_addr_index_feature_flag(&mut manifest, indices);
 
-        manifest.set_timestamp(config.timestamp_nanos);
+        manifest.set_timestamp(config.timestamp_nanos().unwrap_or(0));
 
         manifest.update_max_fragment_id();
         manifest.update_max_field_id();
@@ -2509,7 +2567,7 @@ impl Transaction {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::feature_flags::FLAG_OBJECT_METADATA;
+    use crate::feature_flags::{FLAG_OBJECT_METADATA, FLAG_ZONE_WRITE_SEEDS};
     use crate::format::overlay::{OverlayCoverage, TOMBSTONE_FIELD_ID};
     use crate::format::pb;
     use crate::format::{
@@ -2642,10 +2700,7 @@ mod tests {
             },
             None,
         );
-        let config = ManifestBuildConfig {
-            migration_next_row_id: Some(100),
-            ..default_build_config()
-        };
+        let config = default_build_config().with_migration_next_row_id(100);
         let error = transaction
             .build_manifest(Some(&manifest), vec![fri], "txn", &config)
             .unwrap_err();
@@ -4277,9 +4332,9 @@ mod tests {
             },
             None,
         );
-        let mut config = default_build_config();
-        config.auto_set_feature_flags = false;
-        config.activate_non_reusable_field_ids = true;
+        let config = default_build_config()
+            .with_auto_set_feature_flags(false)
+            .with_activate_non_reusable_field_ids(true);
 
         let (activated, _) = transaction
             .build_manifest(Some(&manifest), vec![], "txn", &config)
@@ -4294,6 +4349,114 @@ mod tests {
             activated.writer_feature_flags & FLAG_NON_REUSABLE_FIELD_IDS,
             0
         );
+    }
+
+    #[test]
+    fn zone_write_seeds_version_config_validates_and_activates_flag() {
+        let manifest = sample_manifest();
+        let make_update = |key: &str, value: Option<&str>| {
+            Transaction::new(
+                manifest.version,
+                Operation::UpdateConfig {
+                    config_updates: Some(crate::transaction::UpdateMap {
+                        update_entries: vec![crate::transaction::update_map::UpdateMapEntry {
+                            key: key.to_string(),
+                            value: value.map(ToString::to_string),
+                        }],
+                        replace: false,
+                    }),
+                    table_metadata_updates: None,
+                    schema_metadata_updates: None,
+                    field_metadata_updates: HashMap::new(),
+                },
+                None,
+            )
+        };
+
+        // Explicit "0" leaves FLAG_ZONE_WRITE_SEEDS clear.
+        let (v0_manifest, _) = make_update(ZONE_WRITE_SEEDS_VERSION_KEY, Some("0"))
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
+            .unwrap();
+        assert!(!v0_manifest.has_zone_write_seeds());
+
+        // Invalid value is rejected when modified.
+        let error = make_update(ZONE_WRITE_SEEDS_VERSION_KEY, Some("2"))
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(
+            error.to_string().contains(ZONE_WRITE_SEEDS_VERSION_KEY),
+            "{error}"
+        );
+
+        // Explicit "1" atomically activates both reader and writer bits.
+        let (v1_manifest, _) = make_update(ZONE_WRITE_SEEDS_VERSION_KEY, Some("1"))
+            .build_manifest(Some(&manifest), vec![], "txn", &default_build_config())
+            .unwrap();
+        assert!(v1_manifest.has_zone_write_seeds());
+        assert_ne!(v1_manifest.reader_feature_flags & FLAG_ZONE_WRITE_SEEDS, 0);
+        assert_ne!(v1_manifest.writer_feature_flags & FLAG_ZONE_WRITE_SEEDS, 0);
+
+        // Once activated, resetting back to "0" or deleting the key keeps the flag sticky.
+        let (pinned_v0, _) = make_update(ZONE_WRITE_SEEDS_VERSION_KEY, Some("0"))
+            .build_manifest(Some(&v1_manifest), vec![], "txn", &default_build_config())
+            .unwrap();
+        assert!(pinned_v0.has_zone_write_seeds());
+        assert!(!crate::feature_flags::write_v1_zone_write_seeds(&pinned_v0));
+
+        // An inherited "1" is not an opt-in: an ordinary Append must not activate
+        // the flag for a table a v14 writer configured without knowing it.
+        let mut inherited_v1 = sample_manifest();
+        inherited_v1
+            .config
+            .insert(ZONE_WRITE_SEEDS_VERSION_KEY.to_string(), "1".into());
+        let (ordinary_manifest, _) = Transaction::new(
+            inherited_v1.version,
+            Operation::Append { fragments: vec![] },
+            None,
+        )
+        .build_manifest(Some(&inherited_v1), vec![], "txn", &default_build_config())
+        .unwrap();
+        assert!(
+            !ordinary_manifest.has_zone_write_seeds(),
+            "inherited config must not activate the flag"
+        );
+
+        // Writing the same "1" again is an explicit opt-in.
+        let (same_value_manifest, _) = make_update(ZONE_WRITE_SEEDS_VERSION_KEY, Some("1"))
+            .build_manifest(Some(&inherited_v1), vec![], "txn", &default_build_config())
+            .unwrap();
+        assert!(same_value_manifest.has_zone_write_seeds());
+
+        // An explicit attempt to rewrite an inherited invalid value is rejected,
+        // even though the value did not change.
+        let mut inherited_invalid_for_write = sample_manifest();
+        inherited_invalid_for_write
+            .config
+            .insert(ZONE_WRITE_SEEDS_VERSION_KEY.to_string(), "future".into());
+        let error = make_update(ZONE_WRITE_SEEDS_VERSION_KEY, Some("future"))
+            .build_manifest(
+                Some(&inherited_invalid_for_write),
+                vec![],
+                "txn",
+                &default_build_config(),
+            )
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+
+        // An inherited invalid value does not block an unrelated config commit.
+        let mut legacy_invalid = sample_manifest();
+        legacy_invalid
+            .config
+            .insert(ZONE_WRITE_SEEDS_VERSION_KEY.to_string(), "future".into());
+        make_update("unrelated", Some("1"))
+            .build_manifest(
+                Some(&legacy_invalid),
+                vec![],
+                "txn",
+                &default_build_config(),
+            )
+            .unwrap();
     }
 
     fn covered_index(name: &str, fields: Vec<i32>, covering_fields: Vec<i32>) -> IndexMetadata {
@@ -4658,6 +4821,7 @@ mod tests {
             file_type: DeletionFileType::Array,
             num_deleted_rows: Some(1),
             base_id: None,
+            path: None,
             inline: None,
         };
         updated2.deletion_file = Some(deletion_file.clone());
@@ -7190,6 +7354,34 @@ mod tests {
             assert_eq!(coverage_for(&after, "trained"), Some(compacted(shard, 10)));
         }
 
+        /// Every row deleted leaves no fragments. Refusing to credit that
+        /// retained the SSTables forever, so a checkpoint never returned.
+        #[test]
+        fn an_emptied_table_is_credited() {
+            let shard = Uuid::new_v4();
+            let read = table(&[], Uuid::new_v4(), progress(shard, 5));
+            let mut after = read.clone();
+            apply(&mut after, &read, &[], &read).unwrap();
+            assert_eq!(coverage_for(&after, "idx"), Some(compacted(shard, 5)));
+        }
+
+        /// Progress read under a replaced MemWAL credits nothing, even with a
+        /// matching shard and generation.
+        #[test]
+        fn progress_read_from_another_mem_wal_is_not_credited() {
+            let shard = Uuid::new_v4();
+            let uuid = Uuid::new_v4();
+            let mut old = progress(shard, 5);
+            old.dir_id = "old".into();
+            let mut new = progress(shard, 5);
+            new.dir_id = "new".into();
+            let read = table(&[0], uuid, old);
+            let head = table(&[0], uuid, new);
+            let mut after = head.clone();
+            apply(&mut after, &head, &[0], &read).unwrap();
+            assert_eq!(coverage_for(&after, "idx"), None);
+        }
+
         /// Shards move independently within one index: one advances on this
         /// commit's proof while another keeps the position it already had.
         #[test]
@@ -7428,6 +7620,7 @@ mod tests {
                     file_type: DeletionFileType::Array,
                     num_deleted_rows: Some(1),
                     base_id: None,
+                    path: None,
                     inline: None,
                 });
                 Operation::Delete {
@@ -7533,8 +7726,7 @@ mod tests {
             },
             None,
         );
-        let mut config = default_build_config();
-        config.clustering_definitions = Some(vec![]);
+        let config = default_build_config().with_clustering_definitions(vec![]);
         let prepared = transaction
             .prepare_indices(
                 Some(&manifest),
@@ -7714,8 +7906,7 @@ mod tests {
             },
             None,
         );
-        let mut config = default_build_config();
-        config.clustering_definitions = Some(desired);
+        let config = default_build_config().with_clustering_definitions(desired);
         (transaction, config)
     }
 
@@ -7790,8 +7981,8 @@ mod tests {
         };
         let current = sample_manifest();
         assert!(!current.uses_non_reusable_field_ids());
-        let (transaction, mut config) = definitions_update(&current, vec![definition(1)]);
-        config.auto_set_feature_flags = false;
+        let (transaction, config) = definitions_update(&current, vec![definition(1)]);
+        let config = config.with_auto_set_feature_flags(false);
         let (activated, _) = transaction
             .build_manifest(Some(&current), vec![], "txn", &config)
             .unwrap();
@@ -8187,6 +8378,7 @@ mod tests {
             file_type: DeletionFileType::Array,
             num_deleted_rows: Some(10),
             base_id: None,
+            path: None,
             inline: None,
         }
     }

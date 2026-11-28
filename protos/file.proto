@@ -128,14 +128,14 @@ message Field {
   }
   Type type = 1;
 
-  // Fully qualified name.
+  // Unqualified field name.
   string name = 2;
   /* Field Id.
    *
    * See the comment in `DataFile.fields` for how field ids are assigned.
    */
   int32 id = 3;
-  /// Parent Field ID. If not set, this is a top-level column.
+  // ID of the parent field, or -1 for a top-level field.
   int32 parent_id = 4;
 
   /* Logical types, support parameterized Arrow Type.

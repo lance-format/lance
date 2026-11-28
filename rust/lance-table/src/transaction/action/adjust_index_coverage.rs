@@ -88,7 +88,7 @@ impl AdjustIndexCoverage {
             resolve(&self.covering_fields)?,
         )?;
 
-        let index_is_supported = state.build_config.index_is_supported;
+        let index_is_supported = state.build_config.index_is_supported();
         let segment = state.index_segment_mut(self.uuid, &self.name)?;
         if segment.fields != fields || segment.covering_fields != covering_fields {
             return Err(Error::invalid_input(format!(

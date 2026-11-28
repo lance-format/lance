@@ -21,6 +21,7 @@ pub async fn write_vector_segment_metadata(
         .join(uuid.to_string())
         .join(INDEX_FILE_NAME);
     dataset
+        .table_state
         .object_store
         .as_ref()
         .put(&index_path, payload)
@@ -744,7 +745,7 @@ pub async fn hide_index_as(dataset: &mut Dataset, index_name: &str, kind: Unread
             unreadable[0].fields = vec![lance_table::format::ROW_ID_FIELD_ID];
         }
     }
-    unreadable[0].fragment_bitmap = Some(dataset.fragment_bitmap.as_ref().clone());
+    unreadable[0].fragment_bitmap = Some(dataset.table_state.fragment_bitmap.as_ref().clone());
     let transaction = Transaction::new(
         dataset.manifest.version,
         Operation::CreateIndex {
@@ -827,8 +828,8 @@ pub async fn dataset_with_an_index_from_a_newer_build(uri: &str, index_name: &st
 /// Indices the manifest itself carries, bypassing the usable-index filter.
 pub async fn raw_manifest_indices(dataset: &Dataset) -> Vec<IndexMetadata> {
     lance_table::io::manifest::read_manifest_indexes(
-        &dataset.object_store,
-        &dataset.manifest_location,
+        &dataset.table_state.object_store,
+        &dataset.table_state.manifest_location,
         &dataset.manifest,
     )
     .await
