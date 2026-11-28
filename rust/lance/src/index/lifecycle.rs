@@ -413,10 +413,20 @@ impl Dataset {
             )
             .await?
         } else if all_fmindex {
+            // V0 remapping checks that every carried fragment's indexed values
+            // are current. A tagged plan can be identity and says nothing about
+            // newer overlays on those fragments.
+            let v0_remapped = staged.is_none() && has_remapped_source_coverage;
+            let dataset_version = if v0_remapped {
+                merged_dataset_version
+            } else {
+                source_dataset_version
+            };
             crate::index::scalar::fmindex::merge_segments(
                 self,
                 source_segments,
-                has_remapped_source_coverage,
+                dataset_version,
+                v0_remapped,
                 staged,
             )
             .await?

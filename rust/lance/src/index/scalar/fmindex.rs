@@ -1,106 +1,117 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use datafusion::execution::SendableRecordBatchStream;
+use lance_index::progress::noop_progress;
+use lance_index::scalar::fmindex::FMIndexScalarIndex;
+use lance_index::scalar::lance_format::LanceIndexStore;
+use lance_index::scalar::{BuiltinIndexType, CreatedIndex, OldIndexDataFilter, ScalarIndexParams};
+use lance_table::format::IndexMetadata;
 use roaring::RoaringBitmap;
-use std::sync::Arc;
 use uuid::Uuid;
 
-use lance_table::format::IndexMetadata;
+use super::segment_merge::{SegmentMerge, downcast_sources, open_dyn_sources};
+use crate::index::frag_reuse::{SegmentRemappingPlan, StagedRemappingPlans};
+use crate::{Dataset, Error, Result};
 
-use super::segment_merge::SegmentMerge;
-use crate::{Dataset, Result};
+/// Merge existing partitions and optional newly appended text without rebuilding BWTs.
+pub(in crate::index) async fn open_and_merge_segments(
+    dataset: &Dataset,
+    field_path: &str,
+    segments: &[&IndexMetadata],
+    new_data: Option<SendableRecordBatchStream>,
+    new_store: &LanceIndexStore,
+    old_data_filters: &[Option<OldIndexDataFilter>],
+    staged: Option<&StagedRemappingPlans>,
+) -> Result<CreatedIndex> {
+    let sources = open_dyn_sources(dataset, field_path, segments, staged).await?;
+    let indices = downcast_sources::<FMIndexScalarIndex>(&sources, segments, "FMIndex")?;
+    FMIndexScalarIndex::merge_segments(&indices, new_data, new_store, old_data_filters).await
+}
 
-/// Merge one caller-defined group of source FM-Index segments into a single segment.
-///
-/// FM-Index merge requires rebuilding from source text — there is no cheap way
-/// to combine two BWT structures. This function re-reads text data from the
-/// dataset for all fragments covered by the source segments and builds a fresh
-/// FM-Index over the combined data.
-///
-/// As an exception, a single source segment whose fragment coverage is still
-/// fully live is returned as-is: rebuilding it would produce equivalent content
-/// over the same fragments, which makes distributed builds (one uncommitted
-/// segment per worker, merged 1:1 into final segments) pay for every segment
-/// twice. `is_rebuild_required` disables that passthrough when the caller has
-/// moved coverage into the current fragment space and the stored row addresses
-/// must be rebuilt to match it.
+/// Merge one caller-defined group after the lifecycle has reconciled its coverage.
 pub(in crate::index) async fn merge_segments(
     dataset: &Dataset,
     segments: Vec<IndexMetadata>,
-    is_rebuild_required: bool,
-    staged: Option<&crate::index::frag_reuse::StagedRemappingPlans>,
+    dataset_version: u64,
+    has_remapped_coverage: bool,
+    staged: Option<&StagedRemappingPlans>,
 ) -> Result<IndexMetadata> {
-    let merge = SegmentMerge::new(dataset, "FM-Index", &segments)?;
-    let column = merge.field_path();
-    let mut fragment_bitmap = merge.stored_coverage_union()?;
-
-    // Intersect with the dataset's current live fragments to drop retired/compacted
-    // fragments, mirroring the btree merge behavior. Under a tagged history the
-    // segments' stored bitmaps are provenance; the FM merge rebuilds from the
-    // dataset, so it rebuilds over the live coverage the tagged reader derives
-    // for them instead.
-    match crate::index::append::tagged_segment_coverage(dataset, merge.segments(), staged).await? {
-        Some(coverage) => {
-            fragment_bitmap = coverage
-                .values()
-                .fold(RoaringBitmap::new(), |acc, bitmap| acc | bitmap);
+    let merge = SegmentMerge::new(dataset, "FMIndex", &segments)?;
+    let live_fragments = &dataset.table_state.fragment_bitmap;
+    let mut fragment_bitmap = RoaringBitmap::new();
+    let mut sources = Vec::with_capacity(segments.len());
+    let mut filters = Vec::with_capacity(segments.len());
+    let mut needs_tagged_translation = false;
+    for &segment in merge.segments() {
+        let effective = segment
+            .effective_fragment_bitmap(live_fragments)
+            .ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "FMIndex segment {} is missing fragment coverage",
+                    segment.uuid
+                ))
+            })?;
+        if effective.is_empty() {
+            continue;
         }
-        None => fragment_bitmap &= dataset.table_state.fragment_bitmap.as_ref(),
+        fragment_bitmap |= &effective;
+        needs_tagged_translation |= matches!(
+            staged.and_then(|plans| plans.get(&segment.uuid)),
+            Some(SegmentRemappingPlan::Translate { .. })
+        );
+        sources.push(segment);
+        // Pure merges preserve values from the source snapshot. A deletion
+        // in a still-live fragment can be undone before committing this segment.
+        filters.push(Some(OldIndexDataFilter::Fragments {
+            to_keep: effective,
+            to_remove: segment
+                .deleted_fragment_bitmap(live_fragments)
+                .unwrap_or_default(),
+        }));
     }
 
-    if fragment_bitmap.is_empty() {
-        // All covered fragments have been retired; produce an empty index.
-        let new_uuid = Uuid::new_v4();
-        let created_index = super::build_scalar_index(
-            dataset,
-            column,
-            new_uuid,
-            &lance_index::scalar::ScalarIndexParams::for_builtin(
-                lance_index::scalar::BuiltinIndexType::Fm,
-            ),
-            false,
-            None,
-            None,
-            Arc::new(lance_index::progress::NoopIndexBuildProgress),
-        )
-        .await?;
-
-        return Ok(merge.build_metadata(
-            new_uuid,
-            dataset.manifest.version,
-            fragment_bitmap,
-            created_index,
-        ));
-    }
-
-    if !is_rebuild_required
-        && segments.len() == 1
+    // Returning the staged UUID is safe only if the lifecycle never touched
+    // its provenance and every covered fragment still exists.
+    if segments.len() == 1
+        && staged.is_none()
+        && !has_remapped_coverage
+        && !fragment_bitmap.is_empty()
         && segments[0].fragment_bitmap.as_ref() == Some(&fragment_bitmap)
     {
         return Ok(segments[0].clone());
     }
 
-    let fragment_ids: Vec<u32> = fragment_bitmap.iter().collect();
-    let new_uuid = Uuid::new_v4();
-
-    let created_index = super::build_scalar_index(
-        dataset,
-        column,
-        new_uuid,
-        &lance_index::scalar::ScalarIndexParams::for_builtin(
-            lance_index::scalar::BuiltinIndexType::Fm,
-        ),
-        true,
-        Some(fragment_ids),
-        None,
-        Arc::new(lance_index::progress::NoopIndexBuildProgress),
-    )
-    .await?;
-
-    Ok(merge.build_metadata(
-        new_uuid,
-        dataset.manifest.version,
-        fragment_bitmap,
-        created_index,
-    ))
+    let (uuid, created, dataset_version) = if needs_tagged_translation {
+        let uuid = Uuid::new_v4();
+        // The FMIndex reader cannot translate tagged addresses yet. Preserve
+        // the staged build API's ability to merge this derived coverage by
+        // training it at the snapshot whose addresses it describes.
+        let created = super::build_scalar_index(
+            dataset,
+            merge.field_path(),
+            uuid,
+            &ScalarIndexParams::for_builtin(BuiltinIndexType::Fm),
+            true,
+            Some(fragment_bitmap.iter().collect()),
+            None,
+            noop_progress(),
+        )
+        .await?;
+        (uuid, created, dataset.manifest.version)
+    } else {
+        let (uuid, store) = merge.new_store(dataset)?;
+        let created = open_and_merge_segments(
+            dataset,
+            merge.field_path(),
+            &sources,
+            None,
+            &store,
+            &filters,
+            staged,
+        )
+        .await?;
+        (uuid, created, dataset_version)
+    };
+    Ok(merge.build_metadata(uuid, dataset_version, fragment_bitmap, created))
 }

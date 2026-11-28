@@ -1692,6 +1692,39 @@ pub mod tests {
                 .unwrap(),
             1
         );
+        // Bounds used to fall back to one task for FMIndex. Preserve that
+        // path for readable sources on a tagged table, even with a named index.
+        let stored = crate::index::loading::load_all_indices(&dataset)
+            .await
+            .unwrap();
+        persist_fixture(&mut dataset, stored.as_ref().clone()).await;
+        let appended = arrow_array::record_batch!(("text", Utf8, ["gamma"])).unwrap();
+        dataset
+            .append(
+                RecordBatchIterator::new([Ok(appended.clone())], appended.schema()),
+                None,
+            )
+            .await
+            .unwrap();
+        let mut options = lance_index::optimize::OptimizeOptions::default();
+        options.max_rows_per_task = Some(1);
+        options.index_names = Some(vec!["text_idx".into()]);
+        dataset.optimize_indices(&options).await.unwrap();
+        assert!(
+            dataset
+                .unindexed_fragments("text_idx")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            dataset
+                .count_rows(Some("contains(text, 'gamma')".into()))
+                .await
+                .unwrap(),
+            1
+        );
+
         let mapping = FragmentReuseIndex::open(&dataset, &fri).await.unwrap();
 
         let current = u64::from(RowAddress::new_from_parts(0, 0));

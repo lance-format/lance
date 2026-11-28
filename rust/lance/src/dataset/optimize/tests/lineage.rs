@@ -350,7 +350,7 @@ async fn test_row_addrs_only_used_with_remappable_index(
 /// can remap in place (see `commit_compaction`'s `needs_remapping`).
 /// A dataset with no index, only row-id-domain ones (whose ids survive
 /// the rewrite on their own), or only an address-domain index whose type
-/// can never remap (ZoneMap, BloomFilter, FM) must not pay for a capture
+/// can never remap (e.g. ZoneMap or BloomFilter) must not pay for a capture
 /// nothing will use -- on a large compaction, that capture is an
 /// old-to-new move for every rewritten row.
 #[rstest::rstest]

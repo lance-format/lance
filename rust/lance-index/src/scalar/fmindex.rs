@@ -38,8 +38,9 @@ use lance_core::utils::address::RowAddress;
 use lance_core::utils::parse::str_is_truthy;
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
 use lance_core::{Error, ROW_ADDR, Result};
-use lance_index_core::remapping::RowAddrTranslator;
+use lance_index_core::remapping::{RowAddrTranslator, RowAddrTranslatorRef};
 use roaring::RoaringBitmap;
+use tokio::sync::OnceCell;
 
 use crate::metrics::MetricsCollector;
 use crate::pb;
@@ -49,8 +50,9 @@ use crate::scalar::registry::{
     TrainingRequest, VALUE_COLUMN_NAME,
 };
 use crate::scalar::{
-    AnyQuery, BuiltinIndexType, CreatedIndex, IndexFile, IndexStore, OldIndexDataFilter,
-    RowIdRemapper, ScalarIndex, ScalarIndexParams, SearchResult, TextQuery, UpdateCriteria,
+    AnyQuery, BuiltinIndexType, CreatedIndex, IndexFile, IndexReader, IndexStore,
+    OldIndexDataFilter, RowIdRemapper, ScalarIndex, ScalarIndexParams, SearchResult, TextQuery,
+    UpdateCriteria,
 };
 use crate::{Index, IndexType};
 
@@ -1433,46 +1435,62 @@ impl LazyFMIndex {
 
 // ── FMIndexScalarIndex ───────────────────────────────────────────────────────
 
+// Opening an index records only the partition statistics. Maintenance does not
+// need the suffix-array samples, wavelet ranks or document offsets of a query.
 #[derive(Debug)]
 struct FMIndexPartition {
-    #[allow(dead_code)]
-    id: u64,
-    fm: LazyFMIndex,
+    path: String,
+    bwt_len: usize,
+    num_docs: usize,
+    query_bytes: usize,
+    query: OnceCell<Arc<LazyFMIndex>>,
 }
 
 #[derive(Debug)]
 pub struct FMIndexScalarIndex {
+    store: Arc<dyn IndexStore>,
     partitions: Vec<Arc<FMIndexPartition>>,
+    fri: Option<Arc<dyn RowIdRemapper>>,
     io_parallelism: usize,
 }
 
 impl DeepSizeOf for FMIndexScalarIndex {
     fn deep_size_of_children(&self, _ctx: &mut lance_core::deepsize::Context) -> usize {
-        self.partitions.iter().map(|p| p.fm.deep_size()).sum()
+        // Reserve the decoded query cost up front. Cache admission happens
+        // before any queries initialize the partition cells.
+        self.partitions
+            .iter()
+            .map(|part| {
+                std::mem::size_of::<FMIndexPartition>()
+                    + part.path.capacity()
+                    + part
+                        .query
+                        .get()
+                        .map_or(part.query_bytes, |fm| fm.deep_size())
+            })
+            .sum()
     }
+}
+
+fn partition_metadata_usize(metadata: &HashMap<String, String>, key: &str) -> Result<usize> {
+    metadata
+        .get(key)
+        .ok_or_else(|| Error::invalid_input(format!("FMIndex partition is missing {key}")))?
+        .parse()
+        .map_err(|error| Error::invalid_input(format!("invalid FMIndex {key}: {error}")))
 }
 
 impl FMIndexScalarIndex {
     async fn load_partition(
-        store: &dyn IndexStore,
-        filename: &str,
-        pid: u64,
-    ) -> Result<FMIndexPartition> {
-        let reader = store.open_index_file(filename).await?;
+        reader: Arc<dyn IndexReader>,
+        row_addrs: Vec<u64>,
+    ) -> Result<LazyFMIndex> {
         let md = &reader.schema().metadata;
-
-        let parse = |key: &str| -> Result<usize> {
-            md.get(key)
-                .ok_or_else(|| Error::invalid_input(format!("missing {key}")))?
-                .parse()
-                .map_err(|e| Error::invalid_input(format!("invalid {key}: {e}")))
-        };
-
-        let num_bwt_nodes = parse("num_bwt_nodes")?;
-        let bwt_len = parse("bwt_len")?;
-        let num_sa_blocks = parse("num_sa_blocks")?;
-        let sa_samples_len = parse("sa_samples_len")?;
-        let total_wavelet_rows = parse("total_wavelet_rows")?;
+        let num_bwt_nodes = partition_metadata_usize(md, "num_bwt_nodes")?;
+        let bwt_len = partition_metadata_usize(md, "bwt_len")?;
+        let num_sa_blocks = partition_metadata_usize(md, "num_sa_blocks")?;
+        let sa_samples_len = partition_metadata_usize(md, "sa_samples_len")?;
+        let total_wavelet_rows = partition_metadata_usize(md, "total_wavelet_rows")?;
 
         let c_table = FMIndex::deserialize_c_table(&hex_decode(
             md.get("c_table")
@@ -1487,18 +1505,6 @@ impl FMIndexScalarIndex {
                 .ok_or_else(|| Error::invalid_input("missing tree_topology"))?,
         )?);
 
-        // row_ids and doc_start_positions stored in metadata (small)
-        let row_ids_hex = md
-            .get("row_ids")
-            .ok_or_else(|| Error::invalid_input("missing row_ids"))?;
-        let row_ids_bytes = hex_decode(row_ids_hex)?;
-        let row_ids: Vec<u64> = row_ids_bytes
-            .as_chunks::<8>()
-            .0
-            .iter()
-            .map(|c| u64::from_le_bytes(*c))
-            .collect();
-
         let doc_starts_hex = md
             .get("doc_start_positions")
             .ok_or_else(|| Error::invalid_input("missing doc_start_positions"))?;
@@ -1510,7 +1516,7 @@ impl FMIndexScalarIndex {
             .map(|c| u64::from_le_bytes(*c))
             .collect();
 
-        let fm = Box::pin(LazyFMIndex::from_reader(
+        Box::pin(LazyFMIndex::from_reader(
             reader,
             num_bwt_nodes,
             huffman_codes,
@@ -1520,11 +1526,10 @@ impl FMIndexScalarIndex {
             total_wavelet_rows,
             num_sa_blocks,
             sa_samples_len,
-            row_ids,
+            row_addrs,
             doc_start_positions,
         ))
-        .await?;
-        Ok(FMIndexPartition { id: pid, fm })
+        .await
     }
 
     async fn load(
@@ -1532,46 +1537,248 @@ impl FMIndexScalarIndex {
         fri: Option<Arc<dyn RowIdRemapper>>,
         _cache: &LanceCache,
     ) -> Result<Arc<Self>> {
-        let files = store.list_files_with_sizes().await?;
-        let mut pfiles: Vec<(u64, String)> = Vec::new();
-        for f in &files {
-            if let Some(id) = fmindex_partition_id_from_path(&f.path) {
-                pfiles.push((id, f.path.clone()));
-            }
-        }
-        if pfiles.is_empty() {
+        let mut files = store
+            .list_files_with_sizes()
+            .await?
+            .into_iter()
+            .filter_map(|file| fmindex_partition_id_from_path(&file.path).map(|id| (id, file.path)))
+            .collect::<Vec<_>>();
+        if files.is_empty() {
             return Err(Error::invalid_input("no FM-Index partition files found"));
         }
-        pfiles.sort_by_key(|(id, _)| *id);
+        files.sort_by_key(|(id, _)| *id);
         let io_parallelism = store.io_parallelism().max(1);
-        let mut parts = futures::stream::iter(pfiles)
-            .map(|(id, name)| {
-                let store = Arc::clone(&store);
-                let fri = fri.clone();
+        let partitions = futures::stream::iter(files)
+            .map(|(_, path)| {
+                let store = &store;
                 async move {
-                    let mut partition = Self::load_partition(store.as_ref(), &name, id).await?;
-                    if let Some(fri) = fri {
-                        for row_id in &mut partition.fm.row_ids {
-                            *row_id = fri
-                                .remap_row_id(*row_id)
-                                .unwrap_or(RowAddress::TOMBSTONE_ROW);
-                        }
-                    }
-                    Result::<_>::Ok((id, Arc::new(partition)))
+                    let reader = store.open_index_file(&path).await?;
+                    let metadata = &reader.schema().metadata;
+                    let row_addrs = metadata.get("row_ids").ok_or_else(|| {
+                        Error::invalid_input(format!("FMIndex partition {path} is missing row_ids"))
+                    })?;
+                    let num_docs = row_addrs.len() / (2 * size_of::<u64>());
+                    let bwt_len = partition_metadata_usize(metadata, "bwt_len")?;
+                    let sa_samples_len = partition_metadata_usize(metadata, "sa_samples_len")?;
+                    let wavelet_rows = partition_metadata_usize(metadata, "total_wavelet_rows")?;
+                    let query_bytes =
+                        sa_samples_len
+                            .saturating_mul(size_of::<u64>())
+                            .saturating_add(num_docs.saturating_mul(2 * size_of::<u64>()))
+                            .saturating_add(wavelet_rows.saturating_mul(
+                                size_of::<u64>() + size_of::<OnceLock<Arc<[u64]>>>(),
+                            ));
+                    Ok::<_, Error>(Arc::new(FMIndexPartition {
+                        path,
+                        bwt_len,
+                        num_docs,
+                        query_bytes,
+                        query: OnceCell::new(),
+                    }))
                 }
             })
-            .buffer_unordered(io_parallelism)
-            .try_collect::<Vec<_>>()
+            .buffered(io_parallelism)
+            .try_collect()
             .await?;
-        parts.sort_by_key(|(id, _)| *id);
-        let parts = parts
-            .into_iter()
-            .map(|(_, partition)| partition)
-            .collect::<Vec<_>>();
         Ok(Arc::new(Self {
-            partitions: parts,
+            store,
+            partitions,
+            fri,
             io_parallelism,
         }))
+    }
+
+    fn row_addresses(&self, reader: &dyn IndexReader) -> Result<Vec<u64>> {
+        let encoded = reader
+            .schema()
+            .metadata
+            .get("row_ids")
+            .ok_or_else(|| Error::invalid_input("FMIndex partition is missing row_ids"))?;
+        let bytes = hex_decode(encoded)?;
+        let (addresses, remainder) = bytes.as_chunks::<8>();
+        if !remainder.is_empty() {
+            return Err(Error::invalid_input(
+                "FMIndex partition has a truncated row address",
+            ));
+        }
+        Ok(addresses
+            .iter()
+            .map(|bytes| {
+                let address = u64::from_le_bytes(*bytes);
+                match &self.fri {
+                    Some(fri) if address != RowAddress::TOMBSTONE_ROW => fri
+                        .remap_row_id(address)
+                        .unwrap_or(RowAddress::TOMBSTONE_ROW),
+                    _ => address,
+                }
+            })
+            .collect())
+    }
+
+    async fn query_partition<'a>(
+        &self,
+        partition: &'a FMIndexPartition,
+    ) -> Result<&'a Arc<LazyFMIndex>> {
+        partition
+            .query
+            .get_or_try_init(|| async {
+                let reader = self.store.open_index_file(&partition.path).await?;
+                let row_addrs = self.row_addresses(reader.as_ref())?;
+                Self::load_partition(reader, row_addrs).await.map(Arc::new)
+            })
+            .await
+    }
+
+    // Suffix-array offsets are local to a partition. Keep its blocks and
+    // document positions, changing only the document-to-row-address mapping.
+    async fn write_partition(
+        &self,
+        partition: &FMIndexPartition,
+        reader: Arc<dyn IndexReader>,
+        row_addrs: &[u64],
+        dest: &dyn IndexStore,
+        partition_id: u64,
+    ) -> Result<Option<IndexFile>> {
+        if row_addrs
+            .iter()
+            .all(|&address| address == RowAddress::TOMBSTONE_ROW)
+        {
+            return Ok(None);
+        }
+
+        let mut metadata = reader.schema().metadata.clone();
+        let encoded = hex_encode(&FMIndex::u64_to_bytes(row_addrs));
+        let output_path = fmindex_partition_path(partition_id);
+        if metadata.get("row_ids") == Some(&encoded) {
+            return self
+                .store
+                .copy_index_file_to(&partition.path, &output_path, dest)
+                .await
+                .map(Some);
+        }
+        metadata.insert("row_ids".into(), encoded);
+        // A resumed build must not mistake a filtered/remapped partition for
+        // the original training input.
+        metadata.remove(FMINDEX_PARTITION_FINGERPRINT_KEY);
+        let mut writer = dest
+            .new_index_file(&output_path, BLOCK_SCHEMA.clone())
+            .await?;
+        // Decode up to 2 MiB of block payload per batch (64 blocks of 32 KiB).
+        let mut batches = reader.read_record_batch_stream(64, 1).await?;
+        while let Some(batch) = batches.try_next().await? {
+            writer.write_record_batch(batch).await?;
+        }
+        writer.finish_with_metadata(metadata).await.map(Some)
+    }
+
+    /// Merge independent partitions, optionally adding newly indexed text.
+    ///
+    /// Filters apply to row addresses. Removed documents retain their positions
+    /// as tombstones so suffix-array offsets still resolve to the same document.
+    /// This never reads the original text for existing partitions.
+    ///
+    /// ```no_run
+    /// # use lance_index::scalar::{fmindex::FMIndexScalarIndex, IndexStore};
+    /// # async fn example(index: &FMIndexScalarIndex, dest: &dyn IndexStore) -> lance_core::Result<()> {
+    /// FMIndexScalarIndex::merge_segments(&[index], None, dest, &[None]).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn merge_segments(
+        indices: &[&Self],
+        new_data: Option<SendableRecordBatchStream>,
+        dest: &dyn IndexStore,
+        filters: &[Option<OldIndexDataFilter>],
+    ) -> Result<CreatedIndex> {
+        if indices.len() != filters.len() {
+            return Err(Error::invalid_input(format!(
+                "FMIndex merge requires one filter per index: indices={}, filters={}",
+                indices.len(),
+                filters.len(),
+            )));
+        }
+        // Train first: the stream writer allocates partition IDs starting at zero.
+        let mut files = match new_data {
+            Some(data) => write_partitioned_fmindex_stream(data, dest).await?,
+            None => Vec::new(),
+        };
+        for (index, filter) in indices.iter().zip(filters) {
+            for partition in &index.partitions {
+                let reader = index.store.open_index_file(&partition.path).await?;
+                let row_addrs = index.row_addresses(reader.as_ref())?;
+                let row_addrs = if let Some(filter) = filter {
+                    let addresses = arrow_array::UInt64Array::from(row_addrs);
+                    let keep = filter.filter_row_ids(&addresses);
+                    addresses
+                        .values()
+                        .iter()
+                        .zip(keep.values().iter())
+                        .map(|(&addr, keep)| {
+                            if keep {
+                                addr
+                            } else {
+                                RowAddress::TOMBSTONE_ROW
+                            }
+                        })
+                        .collect()
+                } else {
+                    row_addrs
+                };
+                if let Some(file) = index
+                    .write_partition(partition, reader, &row_addrs, dest, files.len() as u64)
+                    .await?
+                {
+                    files.push(file);
+                }
+            }
+        }
+        if files.is_empty() {
+            files.push(write_empty_fmindex_partition(dest).await?);
+        }
+        Ok(CreatedIndex {
+            index_details: prost_types::Any::from_msg(&pb::FmIndexDetails {})?,
+            index_version: FMINDEX_INDEX_VERSION,
+            files,
+        })
+    }
+
+    async fn remap_with(
+        &self,
+        mapping: RowAddrTranslatorRef<'_>,
+        dest: &dyn IndexStore,
+    ) -> Result<CreatedIndex> {
+        let mut files = Vec::with_capacity(self.partitions.len());
+        for partition in &self.partitions {
+            let reader = self.store.open_index_file(&partition.path).await?;
+            let addresses = self.row_addresses(reader.as_ref())?;
+            let row_addrs = mapping
+                .remap_row_addrs(&addresses)
+                .await?
+                .into_iter()
+                .zip(addresses)
+                .map(|(mapped, address)| {
+                    if address == RowAddress::TOMBSTONE_ROW {
+                        address
+                    } else {
+                        mapped.unwrap_or(RowAddress::TOMBSTONE_ROW)
+                    }
+                })
+                .collect::<Vec<_>>();
+            if let Some(file) = self
+                .write_partition(partition, reader, &row_addrs, dest, files.len() as u64)
+                .await?
+            {
+                files.push(file);
+            }
+        }
+        if files.is_empty() {
+            files.push(write_empty_fmindex_partition(dest).await?);
+        }
+        Ok(CreatedIndex {
+            index_details: prost_types::Any::from_msg(&pb::FmIndexDetails {})?,
+            index_version: FMINDEX_INDEX_VERSION,
+            files,
+        })
     }
 
     fn partition_parallelism(&self) -> usize {
@@ -1580,7 +1787,7 @@ impl FMIndexScalarIndex {
 
     async fn prewarm_partitions(&self) -> Result<()> {
         futures::stream::iter(self.partitions.iter().cloned())
-            .map(|partition| async move { partition.fm.prewarm().await })
+            .map(|partition| async move { self.query_partition(&partition).await?.prewarm().await })
             .buffer_unordered(self.partition_parallelism())
             .try_collect::<Vec<_>>()
             .await?;
@@ -1604,13 +1811,12 @@ impl FMIndexScalarIndex {
             .map(|partition| {
                 let pattern = Arc::clone(&pattern);
                 async move {
-                    if partition.fm.fully_prewarmed.load(Ordering::Acquire) {
-                        spawn_cpu(move || {
-                            Result::<Vec<u64>>::Ok(partition.fm.search_row_addrs(pattern.as_ref()))
-                        })
-                        .await
+                    let query = self.query_partition(&partition).await?;
+                    if query.fully_prewarmed.load(Ordering::Acquire) {
+                        let query = Arc::clone(query);
+                        spawn_cpu(move || Ok(query.search_row_addrs(pattern.as_ref()))).await
                     } else {
-                        partition.fm.search_row_addrs_async(pattern.as_ref()).await
+                        query.search_row_addrs_async(pattern.as_ref()).await
                     }
                 }
             })
@@ -1647,8 +1853,8 @@ impl Index for FMIndexScalarIndex {
         Ok(serde_json::json!({
             "type": "Fm",
             "num_partitions": self.partitions.len(),
-            "total_bwt_len": self.partitions.iter().map(|p| p.fm.wavelet.len).sum::<usize>(),
-            "total_docs": self.partitions.iter().map(|p| p.fm.row_ids.len()).sum::<usize>(),
+            "total_bwt_len": self.partitions.iter().map(|p| p.bwt_len).sum::<usize>(),
+            "total_docs": self.partitions.iter().map(|p| p.num_docs).sum::<usize>(),
         }))
     }
     fn index_type(&self) -> IndexType {
@@ -1656,8 +1862,9 @@ impl Index for FMIndexScalarIndex {
     }
     async fn calculate_included_frags(&self) -> Result<RoaringBitmap> {
         let mut frags = RoaringBitmap::new();
-        for p in &self.partitions {
-            for &rid in &p.fm.row_ids {
+        for partition in &self.partitions {
+            let reader = self.store.open_index_file(&partition.path).await?;
+            for rid in self.row_addresses(reader.as_ref())? {
                 if rid != RowAddress::TOMBSTONE_ROW {
                     frags.insert(RowAddress::from(rid).fragment_id());
                 }
@@ -1694,37 +1901,30 @@ impl ScalarIndex for FMIndexScalarIndex {
     }
 
     fn can_remap(&self) -> bool {
-        false
+        true
     }
 
-    async fn remap(&self, _: &RowAddrRemap, _: &dyn IndexStore) -> Result<CreatedIndex> {
-        Err(Error::not_supported("Fm does not support remap"))
+    async fn remap(&self, mapping: &RowAddrRemap, dest: &dyn IndexStore) -> Result<CreatedIndex> {
+        self.remap_with(mapping.into(), dest).await
     }
 
     async fn remap_streaming(
         &self,
-        _: &RowAddrTranslator,
-        _: &dyn IndexStore,
+        mapping: &RowAddrTranslator,
+        dest: &dyn IndexStore,
     ) -> Result<CreatedIndex> {
-        Err(Error::not_supported("Fm does not support remap"))
+        self.remap_with(mapping.as_ref(), dest).await
     }
     async fn update(
         &self,
         new_data: SendableRecordBatchStream,
         dest: &dyn IndexStore,
-        _old_data_filter: Option<OldIndexDataFilter>,
+        old_data_filter: Option<OldIndexDataFilter>,
     ) -> Result<CreatedIndex> {
-        let files = write_partitioned_fmindex_stream(new_data, dest).await?;
-        Ok(CreatedIndex {
-            index_details: prost_types::Any::from_msg(&pb::FmIndexDetails {}).unwrap(),
-            index_version: FMINDEX_INDEX_VERSION,
-            files,
-        })
+        Self::merge_segments(&[self], Some(new_data), dest, &[old_data_filter]).await
     }
     fn update_criteria(&self) -> UpdateCriteria {
-        UpdateCriteria::requires_old_data(
-            TrainingCriteria::new(TrainingOrdering::None).with_row_addr(),
-        )
+        UpdateCriteria::only_new_data(TrainingCriteria::new(TrainingOrdering::None).with_row_addr())
     }
     fn derive_index_params(&self) -> Result<ScalarIndexParams> {
         Ok(ScalarIndexParams::for_builtin(BuiltinIndexType::Fm))
@@ -2348,7 +2548,7 @@ impl BasicTrainer for FMIndexPlugin {
 #[async_trait]
 impl ScalarIndexPlugin for FMIndexPlugin {
     fn can_remap(&self, _details: &prost_types::Any) -> Result<bool> {
-        Ok(false)
+        Ok(true)
     }
 
     fn basic_trainer(&self) -> Option<&dyn BasicTrainer> {
@@ -2495,7 +2695,8 @@ mod tests {
         index
             .partitions
             .iter()
-            .flat_map(|partition| partition.fm.wavelet.nodes.iter())
+            .filter_map(|partition| partition.query.get())
+            .flat_map(|query| query.wavelet.nodes.iter())
             .map(|node| {
                 node.blocks
                     .iter()
@@ -2509,7 +2710,8 @@ mod tests {
         index
             .partitions
             .iter()
-            .flat_map(|partition| partition.fm.wavelet.nodes.iter())
+            .filter_map(|partition| partition.query.get())
+            .flat_map(|query| query.wavelet.nodes.iter())
             .map(|node| node.blocks.len())
             .sum()
     }
@@ -2633,23 +2835,116 @@ mod tests {
             .unwrap();
 
         // Load
-        let part =
-            FMIndexScalarIndex::load_partition(store.as_ref(), &fmindex_partition_path(0), 0)
-                .await
-                .unwrap();
+        let index = FMIndexScalarIndex::load(store, None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+        let part = index.query_partition(&index.partitions[0]).await.unwrap();
 
         // Verify search results match
-        let r = part.fm.search(b"hello");
+        let r = part.search(b"hello");
         assert!(r.contains(0));
         assert!(r.contains(1));
         assert!(!r.contains(2));
 
-        let r = part.fm.search(b"world");
+        let r = part.search(b"world");
         assert!(r.contains(0));
         assert!(!r.contains(1));
         assert!(r.contains(2));
 
-        assert!(part.fm.search(b"xyz").is_empty());
+        assert!(part.search(b"xyz").is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_merge_preserves_live_partition_positions() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let store = |name: &str| {
+            Arc::new(LanceIndexStore::new(
+                Arc::new(ObjectStore::local()),
+                Path::from_filesystem_path(tempdir.path())
+                    .unwrap()
+                    .join(name),
+                Arc::new(LanceCache::no_cache()),
+            ))
+        };
+        let first = store("first");
+        let second = store("second");
+        for (dest, texts) in [
+            (
+                &first,
+                vec![
+                    (0, b"alpha needle".as_slice()),
+                    (1, b"beta needle".as_slice()),
+                    (2, b"gamma needle".as_slice()),
+                ],
+            ),
+            (&second, vec![(3, b"delta needle".as_slice())]),
+        ] {
+            write_fmindex(
+                &FMIndex::build(&texts).unwrap(),
+                dest.as_ref(),
+                &fmindex_partition_path(0),
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        write_fmindex(
+            &FMIndex::build(&[(4, b"retired needle")]).unwrap(),
+            first.as_ref(),
+            &fmindex_partition_path(1),
+            None,
+        )
+        .await
+        .unwrap();
+        let first = FMIndexScalarIndex::load(first, None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+        let second = FMIndexScalarIndex::load(second, None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+        let merged_store = store("merged");
+        let filter = OldIndexDataFilter::RowIds([0, 2].into_iter().collect());
+        let created = FMIndexScalarIndex::merge_segments(
+            &[&first, &second],
+            None,
+            merged_store.as_ref(),
+            &[Some(filter), None],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            created
+                .files
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>(),
+            ["part_0_fm.lance", "part_1_fm.lance"],
+            "the empty partition must be discarded and the live partitions renumbered"
+        );
+        assert!(
+            first
+                .partitions
+                .iter()
+                .chain(&second.partitions)
+                .all(|part| part.query.get().is_none())
+        );
+        let merged = FMIndexScalarIndex::load(merged_store, None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+        for (pattern, ids) in [("needle", vec![0, 2, 3]), ("beta", vec![])] {
+            let result = merged
+                .search(
+                    &TextQuery::StringContains(pattern.into()),
+                    &crate::metrics::NoOpMetricsCollector,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                result,
+                SearchResult::exact(ids.into_iter().collect::<lance_select::RowAddrTreeMap>()),
+                "pattern={pattern}"
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2820,11 +3115,11 @@ mod tests {
         let index = FMIndexScalarIndex::load(store, None, &LanceCache::no_cache())
             .await
             .unwrap();
-        let total_blocks = total_wavelet_blocks(index.as_ref());
-        assert!(total_blocks > 0);
         assert_eq!(loaded_wavelet_blocks(index.as_ref()), 0);
 
         index.prewarm().await.unwrap();
+        let total_blocks = total_wavelet_blocks(index.as_ref());
+        assert!(total_blocks > 0);
         assert_eq!(loaded_wavelet_blocks(index.as_ref()), total_blocks);
 
         let r = index
@@ -2903,12 +3198,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(loaded_wavelet_blocks(index.as_ref()), 0);
-        assert!(
-            index
-                .partitions
-                .iter()
-                .all(|partition| !partition.fm.fully_prewarmed.load(Ordering::Acquire))
-        );
+        assert!(index.partitions.iter().all(|partition| {
+            partition
+                .query
+                .get()
+                .is_none_or(|query| !query.fully_prewarmed.load(Ordering::Acquire))
+        }));
 
         let r = index
             .search(
@@ -2924,12 +3219,12 @@ mod tests {
             _ => panic!("expected candidate result"),
         }
 
-        assert!(
-            index
-                .partitions
-                .iter()
-                .all(|partition| !partition.fm.fully_prewarmed.load(Ordering::Acquire))
-        );
+        assert!(index.partitions.iter().all(|partition| {
+            partition
+                .query
+                .get()
+                .is_none_or(|query| !query.fully_prewarmed.load(Ordering::Acquire))
+        }));
     }
 
     #[tokio::test(flavor = "multi_thread")]
