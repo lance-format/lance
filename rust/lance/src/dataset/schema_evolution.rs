@@ -1566,7 +1566,7 @@ pub fn exclude_with(
     })?;
     let mut fields = vec![];
     for field in source.fields.iter() {
-        if let Some(other_field) = other.field(&field.name) {
+        if let Some(other_field) = other.fields.iter().find(|other| other.name == field.name) {
             if let Some(f) = exclude_nested_field(field, other_field) {
                 fields.push(f)
             }
@@ -5419,12 +5419,19 @@ mod test {
         Ok(())
     }
 
-    #[test]
-    fn test_exclude_fields() {
+    #[rstest]
+    #[case::plain("a", "b", &["a", "b.f2", "b.f3"])]
+    #[case::literal_backtick("a`b", "c`d", &["`a``b`", "`c``d`.f2", "`c``d`.f3"])]
+    #[case::quoted_name("`a`", "`b`", &["```a```", "```b```.f2", "```b```.f3"])]
+    fn test_exclude_fields(
+        #[case] scalar_name: &str,
+        #[case] struct_name: &str,
+        #[case] columns: &[&str],
+    ) {
         let arrow_schema = ArrowSchema::new(vec![
-            ArrowField::new("a", DataType::Int32, false),
+            ArrowField::new(scalar_name, DataType::Int32, false),
             ArrowField::new(
-                "b",
+                struct_name,
                 DataType::Struct(ArrowFields::from(vec![
                     ArrowField::new("f1", DataType::Utf8, true),
                     ArrowField::new("f2", DataType::Boolean, false),
@@ -5436,12 +5443,12 @@ mod test {
         ]);
         let schema = Schema::try_from(&arrow_schema).unwrap();
 
-        let projection = schema.project(&["a", "b.f2", "b.f3"]).unwrap();
+        let projection = schema.project(columns).unwrap();
         let excluded = exclude(&schema, &projection, &ConcreteFileVersion::V2_2).unwrap();
 
         let expected_arrow_schema = ArrowSchema::new(vec![
             ArrowField::new(
-                "b",
+                struct_name,
                 DataType::Struct(ArrowFields::from(vec![ArrowField::new(
                     "f1",
                     DataType::Utf8,
@@ -7479,6 +7486,48 @@ mod test {
         // Nothing was written by either attempt.
         assert_eq!(dataset.version().version, version);
         assert_eq!(Dataset::open(uri).await?.version().version, version);
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::literal_backtick("a`b", "`a``b`")]
+    #[case::quoted_name("`a`", "```a```")]
+    #[tokio::test]
+    async fn test_drop_columns_literal_field_names(
+        #[case] field_name: &str,
+        #[case] field_path: &str,
+    ) -> Result<()> {
+        let batch = record_batch!(
+            (field_name, Int32, [Some(7), None]),
+            ("keep", Int32, [9, 10])
+        )?;
+        let test_dir = TempStrDir::default();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+            &test_dir,
+            Some(WriteParams {
+                max_rows_per_file: 1,
+                ..Default::default()
+            }),
+        )
+        .await?;
+        let original_fragments = dataset.fragments().to_vec();
+        assert_eq!(original_fragments.len(), 2);
+        let expected_schema = dataset.schema().project(&["keep"])?;
+
+        assert_eq!(dataset.plan_drop_columns(&[field_path])?, expected_schema);
+        assert_eq!(Dataset::open(&test_dir).await?.version().version, 1);
+
+        dataset.drop_columns(&[field_path]).await?;
+        let reopened = Dataset::open(&test_dir).await?;
+        assert_eq!(reopened.version().version, 2);
+        assert_eq!(reopened.schema(), &expected_schema);
+        assert_eq!(reopened.fragments().as_ref(), &original_fragments);
+        assert_eq!(
+            reopened.scan().try_into_batch().await?,
+            batch.project(&[1])?
+        );
+        reopened.validate().await?;
         Ok(())
     }
 
