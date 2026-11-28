@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use super::*;
+use lance_table::io::commit::ManifestNamingScheme::{V1, V2};
 
 /// The early-stop path (ordered stores) and the collect-then-sort path
 /// must return the same results for every descending/limit combination.
@@ -82,6 +83,24 @@ async fn test_list_versions_under_ordering_and_limit() {
             .await
             .unwrap();
         assert_eq!(versions(&got), vec![7, 6, 5, 4, 3, 2, 1]);
+
+        // A descending page bound keeps the early stop and skips the
+        // versions at or above it.
+        let got = ns
+            .list_versions_below(&table_path, true, Some(2), Some(5))
+            .await
+            .unwrap();
+        assert_eq!(versions(&got), vec![4, 3]);
+        let got = ns
+            .list_versions_below(&table_path, true, Some(3), Some(100))
+            .await
+            .unwrap();
+        assert_eq!(versions(&got), vec![7, 6, 5]);
+        let got = ns
+            .list_versions_below(&table_path, true, None, Some(1))
+            .await
+            .unwrap();
+        assert!(got.is_empty());
     }
 
     /// V1 manifest names are unpadded (`10.manifest` sorts lexically before
@@ -125,6 +144,70 @@ async fn test_list_versions_under_ordering_and_limit() {
     let (ns_fs, _tmp) = create_test_namespace().await;
     assert!(!ns_fs.object_store.list_is_lexically_ordered);
     seed_and_check(&ns_fs).await;
+}
+
+/// A partly migrated table mixes V1 and V2 manifest names. On an ordered
+/// store, a V1 name can sort before the V2 names (`10.manifest`), between
+/// them (a 19-digit version), or after them (`2.manifest`). Whenever the
+/// early stop can meet that V1 name, every bounded descending walk must
+/// match the unbounded listing.
+#[rstest::rstest]
+#[case::v2_prefix_v1_tail(&[2, 3], &[4, 5])]
+#[case::v1_sorts_before_v2(&[3, 10], &[11, 12])]
+// `1844674407370955161.manifest` sorts between the V2 names of 6 and 1.
+#[case::v1_between_v2_names(&[1_844_674_407_370_955_161], &[1, 6])]
+#[case::v2_only(&[], &[1, 2, 3, 4, 5])]
+#[tokio::test]
+async fn test_descending_pages_across_manifest_layouts(
+    #[case] v1_versions: &[u64],
+    #[case] v2_versions: &[u64],
+) {
+    let ns = DirectoryNamespaceBuilder::new("memory://mixed-layout-pages")
+        .manifest_enabled(false)
+        .build()
+        .await
+        .unwrap();
+    assert!(ns.object_store.list_is_lexically_ordered);
+    let table = ns.table_path("events");
+    let manifests = v1_versions
+        .iter()
+        .map(|v| (V1, *v))
+        .chain(v2_versions.iter().map(|v| (V2, *v)));
+    for (scheme, version) in manifests {
+        ns.object_store
+            .put(&scheme.manifest_path(&table, version), b"m")
+            .await
+            .unwrap();
+    }
+    let request = ListTableVersionsRequest {
+        id: Some(vec!["events".into()]),
+        descending: Some(true),
+        ..Default::default()
+    };
+    let numbers = |rows: &[TableVersion]| rows.iter().map(|row| row.version).collect::<Vec<_>>();
+    let unbounded = ns.list_table_versions(request.clone()).await.unwrap();
+    let expected = numbers(&unbounded.versions);
+    let total = v1_versions.len() + v2_versions.len();
+    assert_eq!(expected.len(), total);
+    assert!(expected.windows(2).all(|pair| pair[0] > pair[1]));
+
+    for limit in 1..=total as i32 {
+        let mut page_request = ListTableVersionsRequest {
+            limit: Some(limit),
+            ..request.clone()
+        };
+        let mut walked = Vec::new();
+        loop {
+            let page = ns.list_table_versions(page_request.clone()).await.unwrap();
+            walked.extend(numbers(&page.versions));
+            match page.page_token {
+                Some(token) => page_request.page_token = Some(token),
+                None => break,
+            }
+            assert!(walked.len() <= total, "walk did not terminate");
+        }
+        assert_eq!(walked, expected, "limit = {limit}");
+    }
 }
 
 #[tokio::test]
@@ -185,6 +268,24 @@ async fn test_list_table_versions_pagination_mixed_manifests_and_cleanup() {
     assert_eq!(numbers(&history.versions), [20, 12, 11, 10, 7, 5, 2]);
     let latest = ns.list_table_versions(descending(Some(1))).await.unwrap();
     assert_eq!(numbers(&latest.versions), [20]);
+    assert_eq!(latest.page_token.as_deref(), Some("20"));
+    // Descending pages continue below the last version returned.
+    let mut pages = Vec::new();
+    let mut page_request = descending(Some(3));
+    loop {
+        let page = ns.list_table_versions(page_request.clone()).await.unwrap();
+        pages.push(numbers(&page.versions));
+        match page.page_token {
+            Some(token) => page_request.page_token = Some(token),
+            None => break,
+        }
+    }
+    assert_eq!(pages, [vec![20, 12, 11], vec![10, 7, 5], vec![2]]);
+    let invalid = ListTableVersionsRequest {
+        page_token: Some("01".into()),
+        ..descending(Some(3))
+    };
+    ns.list_table_versions(invalid).await.unwrap_err();
     let first = ns.list_table_versions(request.clone()).await.unwrap();
     assert_eq!(numbers(&first.versions), [2, 5]);
     let deleted = ns
