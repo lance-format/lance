@@ -530,7 +530,7 @@ fn build_listing_counting_session(listing_count: Arc<AtomicUsize>) -> Arc<Sessio
 // Fault-injection store: returns a runtime-toggleable result from
 // `list_with_delimiter` (the call `check_table_status` makes) and delegates
 // everything else, so a table can be created before failures are injected.
-use futures::stream::BoxStream;
+use futures::{TryStreamExt, stream::BoxStream};
 use object_store::{
     CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
     PutMultipartOptions, PutPayload, PutResult, Result as OSResult,
@@ -544,6 +544,13 @@ enum ListBehavior {
     Internal,
     NotFound,
     EmptyListing,
+    WithoutEtags,
+    RetargetTagOnBranchRead,
+    DeleteTagOnRead,
+    DeleteTagOnManifestRead,
+    DeleteBranchTagAfterLookup,
+    DeleteBranchTagOnManifestRead,
+    ReadUntaggedManifestOnce,
 }
 
 #[derive(Debug)]
@@ -578,7 +585,75 @@ impl OSObjectStore for FailingListStore {
     }
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
-        self.target.get_opts(location, options).await
+        let behavior = *self.behavior.lock().unwrap();
+        if matches!(behavior, Some(ListBehavior::ReadUntaggedManifestOnce))
+            && let Some((root, version)) = location.as_ref().rsplit_once("/users.lance/_versions/")
+        {
+            // Manifest reads use the length from HEAD to request the data range.
+            let other = Path::from(format!("{root}/untagged.lance/_versions/{version}"));
+            if !options.head {
+                self.behavior.lock().unwrap().take();
+            }
+            return self.target.get_opts(&other, options).await;
+        }
+        if !options.head {
+            match behavior {
+                Some(ListBehavior::DeleteBranchTagAfterLookup)
+                    if location
+                        .as_ref()
+                        .ends_with("/users.lance/_refs/tags/release.json") =>
+                {
+                    *self.behavior.lock().unwrap() =
+                        Some(ListBehavior::DeleteBranchTagOnManifestRead);
+                }
+                Some(ListBehavior::DeleteBranchTagOnManifestRead)
+                    if let Some((root, _)) =
+                        location.as_ref().rsplit_once("/tree/dev.lance/_versions/") =>
+                {
+                    self.target
+                        .delete(&lance::dataset::refs::tag_path(
+                            &Path::from(root),
+                            "release",
+                        ))
+                        .await?;
+                    self.behavior.lock().unwrap().take();
+                }
+                Some(ListBehavior::DeleteTagOnRead)
+                    if location.as_ref().ends_with("/_refs/tags/release.json") =>
+                {
+                    self.target.delete(location).await?;
+                }
+                Some(ListBehavior::RetargetTagOnBranchRead)
+                    if let Some(root) =
+                        location.as_ref().strip_suffix("/_refs/branches/dev.json") =>
+                {
+                    let root = Path::from(root);
+                    self.target
+                        .copy(
+                            &lance::dataset::refs::tag_path(&root, "replacement"),
+                            &lance::dataset::refs::tag_path(&root, "release"),
+                        )
+                        .await?;
+                }
+                Some(ListBehavior::DeleteTagOnManifestRead)
+                    if let Some((root, _)) = location.as_ref().rsplit_once("/_versions/") =>
+                {
+                    self.behavior.lock().unwrap().take();
+                    self.target
+                        .delete(&lance::dataset::refs::tag_path(
+                            &Path::from(root),
+                            "release",
+                        ))
+                        .await?;
+                }
+                _ => {}
+            }
+        }
+        let mut result = self.target.get_opts(location, options).await?;
+        if matches!(behavior, Some(ListBehavior::WithoutEtags)) {
+            result.meta.e_tag = None;
+        }
+        Ok(result)
     }
 
     async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> OSResult<Vec<Bytes>> {
@@ -593,13 +668,35 @@ impl OSObjectStore for FailingListStore {
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, OSResult<ObjectMeta>> {
-        self.target.list(prefix)
+        let entries = self.target.list(prefix);
+        if matches!(
+            *self.behavior.lock().unwrap(),
+            Some(ListBehavior::WithoutEtags)
+        ) {
+            entries
+                .map_ok(|mut meta| {
+                    meta.e_tag = None;
+                    meta
+                })
+                .boxed()
+        } else {
+            entries
+        }
     }
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OSResult<ListResult> {
         let behavior = *self.behavior.lock().unwrap();
         match behavior {
-            None => self.target.list_with_delimiter(prefix).await,
+            None
+            | Some(
+                ListBehavior::WithoutEtags
+                | ListBehavior::RetargetTagOnBranchRead
+                | ListBehavior::DeleteTagOnRead
+                | ListBehavior::DeleteTagOnManifestRead
+                | ListBehavior::DeleteBranchTagAfterLookup
+                | ListBehavior::DeleteBranchTagOnManifestRead
+                | ListBehavior::ReadUntaggedManifestOnce,
+            ) => self.target.list_with_delimiter(prefix).await,
             Some(ListBehavior::EmptyListing) => Ok(ListResult {
                 common_prefixes: Vec::new(),
                 objects: Vec::new(),
@@ -703,6 +800,375 @@ async fn create_named_dir_table(namespace: &DirectoryNamespace, name: &str) {
         .create_table(create_req, Bytes::from(ipc_data))
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn test_describe_table_snapshot_selectors_recreated_branch() {
+    use lance::dataset::ColumnAlteration;
+
+    let (writer, temp) = create_test_namespace().await;
+    create_scalar_table(&writer, "users").await;
+    let mut main = open_dataset(&writer, "users").await;
+    let registry =
+        build_failing_list_session(Arc::new(Mutex::new(Some(ListBehavior::WithoutEtags))))
+            .store_registry();
+    let session = Arc::new(Session::new(0, 1024 * 1024, registry));
+    let reader = DirectoryNamespaceBuilder::new(file_object_store_uri(temp.to_str().unwrap()))
+        .session(session.clone())
+        .manifest_enabled(false)
+        .build()
+        .await
+        .unwrap();
+    let request = DescribeTableRequest {
+        id: Some(vec!["users".into()]),
+        branch: Some("dev.lance".into()),
+        version: Some(2),
+        load_detailed_metadata: Some(true),
+        ..Default::default()
+    };
+    for field in ["old_id", "new_id"] {
+        let mut dev = main.create_branch("dev.lance", 1, None).await.unwrap();
+        dev.alter_columns(&[ColumnAlteration::new("id".into()).rename(field.into())])
+            .await
+            .unwrap();
+        dev.migrate_manifest_paths_v2().await.unwrap();
+        dev.tags().create("release", 2).await.unwrap();
+        let meta = reader
+            .object_store
+            .inner
+            .head(&dev.manifest_location().path)
+            .await
+            .unwrap();
+        assert!(meta.e_tag.is_none());
+        let described = reader.describe_table(request.clone()).await.unwrap();
+        assert_eq!(
+            described.schema.unwrap().fields[0].name,
+            field,
+            "DescribeTable must resolve the selected snapshot after a same-name branch recreation"
+        );
+        let listing = DirectoryNamespaceBuilder::new(file_object_store_uri(
+            temp.as_ref().join("users.lance/tree").to_str().unwrap(),
+        ))
+        .session(session.clone())
+        .manifest_enabled(false)
+        .build()
+        .await
+        .unwrap();
+        for (namespace, table) in [(&reader, "users"), (&listing, "dev")] {
+            let tagged = namespace
+                .describe_table(DescribeTableRequest {
+                    id: Some(vec![table.into()]),
+                    tag: Some("release".into()),
+                    branch: None,
+                    version: None,
+                    ..request.clone()
+                })
+                .await
+                .unwrap();
+            assert_eq!(tagged.schema.unwrap().fields[0].name, field);
+        }
+        for branch in [None, request.branch.clone()] {
+            let alias = listing
+                .describe_table(DescribeTableRequest {
+                    id: Some(vec!["dev".into()]),
+                    branch: branch.clone(),
+                    ..request.clone()
+                })
+                .await
+                .unwrap();
+            assert_eq!(alias.schema.unwrap().fields[0].name, field, "{branch:?}");
+        }
+        dev.tags().delete("release").await.unwrap();
+        main.delete_branch("dev.lance").await.unwrap();
+    }
+}
+
+#[rstest]
+#[case::with_etags(None)]
+#[case::without_etags(Some(ListBehavior::WithoutEtags))]
+#[tokio::test]
+async fn test_describe_republished_branch_version(#[case] behavior: Option<ListBehavior>) {
+    use lance::dataset::ColumnAlteration;
+    use lance_namespace::models::{BatchDeleteTableVersionsRequest, VersionRange};
+
+    let (writer, temp) = create_test_namespace().await;
+    create_scalar_table(&writer, "users").await;
+    let mut main = open_dataset(&writer, "users").await;
+    let mut dev = main.create_branch("dev", 1, None).await.unwrap();
+    dev.migrate_manifest_paths_v2().await.unwrap();
+    let registry = build_failing_list_session(Arc::new(Mutex::new(behavior))).store_registry();
+    let reader = DirectoryNamespaceBuilder::new(file_object_store_uri(temp.to_str().unwrap()))
+        .session(Arc::new(Session::new(0, 1024 * 1024, registry)))
+        .manifest_enabled(false)
+        .build()
+        .await
+        .unwrap();
+    let request = DescribeTableRequest {
+        id: Some(vec!["users".into()]),
+        branch: Some("dev".into()),
+        version: Some(2),
+        load_detailed_metadata: Some(true),
+        ..Default::default()
+    };
+    let publish_and_describe = async |dev: &mut Dataset, name: &str| {
+        dev.alter_columns(&[ColumnAlteration::new("id".into()).rename(name.into())])
+            .await
+            .unwrap();
+        assert_eq!(dev.version().version, 2);
+        let result = reader.describe_table(request.clone()).await.unwrap();
+        assert_eq!(result.schema.unwrap().fields[0].name, name);
+    };
+    publish_and_describe(&mut dev, "old_id").await;
+    let deleted = writer
+        .batch_delete_table_versions(BatchDeleteTableVersionsRequest {
+            id: request.id.clone(),
+            branch: request.branch.clone(),
+            ranges: vec![VersionRange::new(2, 3)],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(deleted.deleted_count, Some(1));
+    let mut reopened = Dataset::open(dev.uri()).await.unwrap();
+    assert_eq!(reopened.version().version, 1);
+    publish_and_describe(&mut reopened, "new_id").await;
+}
+
+#[rstest]
+#[case::retarget_branch(
+    ListBehavior::RetargetTagOnBranchRead,
+    ErrorCode::ConcurrentModification
+)]
+#[case::delete_before_tag_read(ListBehavior::DeleteTagOnRead, ErrorCode::TableTagNotFound)]
+#[case::delete_before_main_snapshot(
+    ListBehavior::DeleteTagOnManifestRead,
+    ErrorCode::TableTagNotFound
+)]
+#[tokio::test]
+async fn test_describe_table_snapshot_selectors_racing_tag(
+    #[case] event: ListBehavior,
+    #[case] expected: ErrorCode,
+) {
+    let (reader, temp, toggle) = failing_list_namespace().await;
+    let writer = DirectoryNamespaceBuilder::new(temp.to_str().unwrap())
+        .manifest_enabled(false)
+        .build()
+        .await
+        .unwrap();
+    create_scalar_table(&writer, "users").await;
+    let mut main = open_dataset(&writer, "users").await;
+    if matches!(event, ListBehavior::RetargetTagOnBranchRead) {
+        let dev = main.create_branch("dev", 1, None).await.unwrap();
+        dev.tags().create("release", 1).await.unwrap();
+        main.tags().create("replacement", 1).await.unwrap();
+    } else {
+        main.tags().create("release", 1).await.unwrap();
+    }
+    let request = DescribeTableRequest {
+        id: Some(vec!["users".into()]),
+        tag: Some("release".into()),
+        load_detailed_metadata: Some(true),
+        ..Default::default()
+    };
+    *toggle.lock().unwrap() = Some(event);
+    let error = reader.describe_table(request).await.unwrap_err();
+    assert_eq!(mutation_error_code(error), expected, "{event:?}");
+}
+
+#[rstest]
+#[case::table_root(false)]
+#[case::direct_branch(true)]
+#[tokio::test]
+async fn test_branch_tag_deleted_during_snapshot_open(#[case] direct: bool) {
+    let (reader, temp, toggle) = failing_list_namespace().await;
+    let writer = DirectoryNamespaceBuilder::new(temp.to_str().unwrap())
+        .manifest_enabled(false)
+        .build()
+        .await
+        .unwrap();
+    create_scalar_table(&writer, "users").await;
+    let mut main = open_dataset(&writer, "users").await;
+    let dev = main.create_branch("dev.lance", 1, None).await.unwrap();
+    dev.tags().create("release", 1).await.unwrap();
+    let (namespace, table) = if direct {
+        let tree = temp.as_ref().join("users.lance/tree");
+        let listed = DirectoryNamespaceBuilder::new(file_object_store_uri(tree.to_str().unwrap()))
+            .session(reader.session.clone().unwrap())
+            .manifest_enabled(false)
+            .build()
+            .await
+            .unwrap();
+        (listed, "dev")
+    } else {
+        (reader, "users")
+    };
+    *toggle.lock().unwrap() = Some(ListBehavior::DeleteBranchTagAfterLookup);
+    let error = namespace
+        .describe_table(DescribeTableRequest {
+            id: Some(vec![table.into()]),
+            tag: Some("release".into()),
+            load_detailed_metadata: Some(true),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert!(toggle.lock().unwrap().is_none());
+    assert_eq!(mutation_error_code(error), ErrorCode::TableTagNotFound);
+}
+
+#[rstest]
+#[case::modern(false)]
+#[case::legacy(true)]
+#[tokio::test]
+async fn test_tag_rejects_a_manifest_from_an_untagged_table(#[case] legacy: bool) {
+    use lance::dataset::ColumnAlteration;
+
+    let (reader, temp, toggle) = failing_list_namespace().await;
+    let writer = DirectoryNamespaceBuilder::new(temp.to_str().unwrap())
+        .manifest_enabled(false)
+        .build()
+        .await
+        .unwrap();
+    for (name, field) in [("users", "old_id"), ("untagged", "untagged_table_field")] {
+        create_scalar_table(&writer, name).await;
+        let mut dataset = open_dataset(&writer, name).await;
+        dataset
+            .alter_columns(&[ColumnAlteration::new("id".into()).rename(field.into())])
+            .await
+            .unwrap();
+    }
+    let main = open_dataset(&writer, "users").await;
+    main.tags().create("release", 2).await.unwrap();
+    if legacy {
+        let mut tag = main.tags().get("release").await.unwrap();
+        tag.created_at = None;
+        tag.updated_at = None;
+        std::fs::write(
+            temp.as_ref().join("users.lance/_refs/tags/release.json"),
+            serde_json::to_vec(&tag).unwrap(),
+        )
+        .unwrap();
+    }
+    let request = DescribeTableRequest {
+        id: Some(vec!["users".into()]),
+        tag: Some("release".into()),
+        load_detailed_metadata: Some(true),
+        ..Default::default()
+    };
+    // The tag reads agree, but the intervening manifest GET sees a different table.
+    *toggle.lock().unwrap() = Some(ListBehavior::ReadUntaggedManifestOnce);
+    let err = reader.describe_table(request.clone()).await.unwrap_err();
+    assert_eq!(mutation_error_code(err), ErrorCode::ConcurrentModification);
+    let stable = reader.describe_table(request).await.unwrap();
+    assert_eq!(stable.version, Some(2));
+    assert_eq!(stable.schema.unwrap().fields[0].name, "old_id");
+}
+
+#[tokio::test]
+async fn test_describe_table_snapshot_selectors_recreated_main_tag() {
+    use lance::dataset::ColumnAlteration;
+    use lance_namespace::models::DropTableRequest;
+
+    let (writer, temp) = create_test_namespace().await;
+    let registry =
+        build_failing_list_session(Arc::new(Mutex::new(Some(ListBehavior::WithoutEtags))))
+            .store_registry();
+    let reader = DirectoryNamespaceBuilder::new(file_object_store_uri(temp.to_str().unwrap()))
+        .session(Arc::new(Session::new(0, 1024 * 1024, registry)))
+        .manifest_enabled(false)
+        .build()
+        .await
+        .unwrap();
+    let request = DescribeTableRequest {
+        id: Some(vec!["users".into()]),
+        tag: Some("release".into()),
+        load_detailed_metadata: Some(true),
+        ..Default::default()
+    };
+    for field in ["old_id", "new_id"] {
+        create_scalar_table(&writer, "users").await;
+        let mut main = open_dataset(&writer, "users").await;
+        main.alter_columns(&[ColumnAlteration::new("id".into()).rename(field.into())])
+            .await
+            .unwrap();
+        main.migrate_manifest_paths_v2().await.unwrap();
+        main.tags().create("release", 2).await.unwrap();
+        let tagged = reader.describe_table(request.clone()).await.unwrap();
+        assert_eq!(tagged.version, Some(2));
+        assert_eq!(tagged.schema.unwrap().fields[0].name, field);
+        writer
+            .drop_table(DropTableRequest {
+                id: request.id.clone(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn test_describe_directory_branch_alias_replacing_an_ordinary_table() {
+    use lance::dataset::ColumnAlteration;
+    use lance_namespace::models::DropTableRequest;
+
+    let (writer, temp) = create_test_namespace().await;
+    create_scalar_table(&writer, "users").await;
+    let mut main = open_dataset(&writer, "users").await;
+    let root = temp.as_ref().join("users.lance/tree/feature");
+    std::fs::create_dir_all(&root).unwrap();
+    let root = root.to_str().unwrap();
+    let alias_writer = DirectoryNamespaceBuilder::new(root)
+        .manifest_enabled(false)
+        .build()
+        .await
+        .unwrap();
+    let registry =
+        build_failing_list_session(Arc::new(Mutex::new(Some(ListBehavior::WithoutEtags))))
+            .store_registry();
+    let reader = DirectoryNamespaceBuilder::new(file_object_store_uri(root))
+        .session(Arc::new(Session::new(0, 1024 * 1024, registry)))
+        .manifest_enabled(false)
+        .build()
+        .await
+        .unwrap();
+    let request = DescribeTableRequest {
+        id: Some(vec!["dev".into()]),
+        version: Some(2),
+        load_detailed_metadata: Some(true),
+        ..Default::default()
+    };
+    for (branch, field) in [
+        (false, "original"),
+        (true, "branched"),
+        (false, "replacement"),
+    ] {
+        let mut dataset = if branch {
+            main.create_branch("feature/dev.lance", 1, None)
+                .await
+                .unwrap()
+        } else {
+            create_scalar_table(&alias_writer, "dev").await;
+            open_dataset(&alias_writer, "dev").await
+        };
+        dataset
+            .alter_columns(&[ColumnAlteration::new("id".into()).rename(field.into())])
+            .await
+            .unwrap();
+        dataset.migrate_manifest_paths_v2().await.unwrap();
+        let described = reader.describe_table(request.clone()).await.unwrap();
+        assert_eq!(described.schema.unwrap().fields[0].name, field);
+        if branch {
+            main.delete_branch("feature/dev.lance").await.unwrap();
+        } else {
+            alias_writer
+                .drop_table(DropTableRequest {
+                    id: request.id.clone(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
+    }
 }
 
 /// Regression test for the throttling-induced TableNotFound bug: a storage

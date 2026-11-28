@@ -534,6 +534,29 @@ impl Session {
         self.table_session.metadata_cache()
     }
 
+    /// Clone this session with both caches scoped to a snapshot identity.
+    ///
+    /// Equal identities reuse entries. Distinct identities share capacity and
+    /// keep their entries separate. An unknown identity disables caching.
+    /// Scoped manifest reads require an ETag because a branch can republish a version.
+    /// All handles retain the original providers and runtime settings.
+    ///
+    /// ```
+    /// use lance::session::Session;
+    ///
+    /// let session = Session::default();
+    /// let scoped = session.with_cache_identity(Some("generation-1"));
+    /// assert!(std::sync::Arc::ptr_eq(&session.store_registry(), &scoped.store_registry()));
+    /// ```
+    pub fn with_cache_identity(&self, identity: Option<&str>) -> Self {
+        let table_session = self.table_session.with_cache_identity(identity);
+        Self {
+            index_cache: GlobalIndexCache(table_session.index_cache().clone()),
+            table_session: Arc::new(table_session),
+            ..self.clone()
+        }
+    }
+
     /// Get a reference to the raw metadata cache (for use in index reconstruction).
     pub fn file_metadata_cache(&self) -> &LanceCache {
         self.metadata_cache().cache()
@@ -670,14 +693,28 @@ mod tests {
     #[tokio::test]
     async fn test_cache_diagnostics_both_tiers_and_shared_namespaces() {
         let session = Session::new(4096, 0, Default::default());
-        let first = session.index_cache.0.with_key_prefix("first-dataset");
-        let second = session.index_cache.0.with_key_prefix("second-dataset");
+        let first = session.with_cache_identity(Some("first-dataset"));
+        let second = session.with_cache_identity(Some("second-dataset"));
         first
+            .table_session
+            .index_cache()
             .get_or_insert_with_key(TestKey("entry"), || async { Ok(vec![1, 2, 3]) })
             .await
             .unwrap();
-        assert!(second.get_with_key(&TestKey("entry")).await.is_none());
-        assert!(first.get_with_key(&TestKey("entry")).await.is_some());
+        assert!(
+            second
+                .index_cache
+                .get_with_key(&TestKey("entry"))
+                .await
+                .is_none()
+        );
+        let same = session.with_cache_identity(Some("first-dataset"));
+        assert!(
+            same.index_cache
+                .get_with_key(&TestKey("entry"))
+                .await
+                .is_some()
+        );
         let snapshot = session.cache_diagnostics();
         assert_eq!(
             (snapshot.index.activity.hits, snapshot.index.activity.misses),
@@ -700,6 +737,9 @@ mod tests {
         assert_eq!(index_by_type.occupancy.unwrap().types[0].num_entries, 1);
         let legacy = session.index_cache_stats().await;
         assert_eq!((legacy.hits, legacy.misses, legacy.num_entries), (1, 2, 1));
+        let unknown = session.with_cache_identity(None).cache_diagnostics();
+        assert_eq!(unknown.index.backend.enabled, Some(false));
+        assert_eq!(unknown.metadata.backend.enabled, Some(false));
     }
 
     #[cfg(feature = "metrics")]
@@ -729,21 +769,23 @@ mod tests {
                 .unwrap();
             let session = Session::new(4096, 4096, Default::default());
             runtime.block_on(async {
-                assert!(
-                    session
-                        .index_cache
-                        .0
-                        .get_with_key(&TestKey("metrics-index"))
-                        .await
-                        .is_none()
-                );
-                assert!(
-                    session
-                        .file_metadata_cache()
-                        .get_with_key(&TestKey("metrics-metadata"))
-                        .await
-                        .is_none()
-                );
+                for session in [&session, &session.with_cache_identity(None)] {
+                    assert!(
+                        session
+                            .index_cache
+                            .0
+                            .get_with_key(&TestKey("metrics-index"))
+                            .await
+                            .is_none()
+                    );
+                    assert!(
+                        session
+                            .file_metadata_cache()
+                            .get_with_key(&TestKey("metrics-metadata"))
+                            .await
+                            .is_none()
+                    );
+                }
             });
         });
 
@@ -762,7 +804,7 @@ mod tests {
                         && labels.contains(&("backend", "quick"))
                         && labels.contains(&("type", "Test"))
                         && labels.contains(&("outcome", "miss"))
-                        && matches!(value, DebugValue::Counter(1))
+                        && matches!(value, DebugValue::Counter(2))
                 }),
                 "missing exact activity labels for {cache}"
             );
