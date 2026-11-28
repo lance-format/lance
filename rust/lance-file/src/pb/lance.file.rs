@@ -142,6 +142,8 @@ pub struct Field {
     /// * "date32:day"
     /// * "date64:ms"
     /// * "decimal:128:{precision}:{scale}" / "decimal:256:{precision}:{scale}"
+    /// * "decimal:32:{precision}:{scale}" / "decimal:64:{precision}:{scale}", only in
+    ///    file version 2.3 or later, where 0 <= scale <= precision
     /// * "time:{unit}" / "timestamp:{unit}" / "duration:{unit}", where unit is
     /// "s", "ms", "us", "ns"
     /// * "dict:{value_type}:{index_type}:false"
