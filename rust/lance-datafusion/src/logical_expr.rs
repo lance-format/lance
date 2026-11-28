@@ -3,12 +3,16 @@
 
 //! Extends logical expression.
 
+use std::sync::Arc;
+
 use arrow_schema::DataType;
 
 use crate::expr::safe_coerce_scalar;
 use crate::numeric_coercion::rewrite as rewrite_numeric;
+use datafusion::common::DFSchema;
 use datafusion::logical_expr::{Between, ScalarUDFImpl};
 use datafusion::logical_expr::{BinaryExpr, Operator};
+use datafusion::optimizer::simplify_expressions::{ExprSimplifier, SimplifyContext};
 use datafusion::prelude::*;
 use datafusion::scalar::ScalarValue;
 use datafusion_functions::core::expr_ext::FieldAccessor;
@@ -90,6 +94,159 @@ fn is_literal_only_same_type_expr(expr: &Expr) -> bool {
     }
 }
 
+/// Whether `expr` is arithmetic on literals only, such as `100 + 100`.
+fn is_constant_expr(expr: &Expr) -> bool {
+    matches!(expr, Expr::BinaryExpr(_)) && is_literal_only_same_type_expr(expr)
+}
+
+/// Folds a constant expression to a literal, or returns `None` when it does not fold.
+fn simplify_constant(expr: Expr) -> Option<ScalarValue> {
+    let schema = Arc::new(DFSchema::empty());
+    let context = SimplifyContext::builder().with_schema(schema.clone());
+    let simplifier = ExprSimplifier::new(context.build());
+    let folded = simplifier
+        .coerce(expr, &schema)
+        .and_then(|expr| simplifier.simplify(expr))
+        .ok()?;
+    match folded {
+        Expr::Literal(value, _) => Some(value),
+        _ => None,
+    }
+}
+
+/// The exact value of `+`, `-`, `*`, `/`, `%`, `<<` and `>>` on integer
+/// literals, or `None` for any other operator or operand, a division by zero,
+/// or a value beyond `i128`. A shift count is masked to 0..=63, as the 64-bit
+/// literal types mask it, while the shifted value stays exact.
+fn exact_integer(expr: &Expr) -> Option<i128> {
+    let shift = |by: i128| i64::try_from(by).ok().map(|by| (by & 63) as u32);
+    match expr {
+        Expr::Literal(value, _) => match value {
+            ScalarValue::Int8(Some(v)) => Some((*v).into()),
+            ScalarValue::Int16(Some(v)) => Some((*v).into()),
+            ScalarValue::Int32(Some(v)) => Some((*v).into()),
+            ScalarValue::Int64(Some(v)) => Some((*v).into()),
+            ScalarValue::UInt8(Some(v)) => Some((*v).into()),
+            ScalarValue::UInt16(Some(v)) => Some((*v).into()),
+            ScalarValue::UInt32(Some(v)) => Some((*v).into()),
+            ScalarValue::UInt64(Some(v)) => Some((*v).into()),
+            _ => None,
+        },
+        Expr::BinaryExpr(BinaryExpr { left, op, right }) => {
+            let (left, right) = (exact_integer(left)?, exact_integer(right)?);
+            match op {
+                Operator::Plus => left.checked_add(right),
+                Operator::Minus => left.checked_sub(right),
+                Operator::Multiply => left.checked_mul(right),
+                Operator::Divide => left.checked_div(right),
+                Operator::Modulo => left.checked_rem(right),
+                Operator::BitwiseShiftLeft => left.checked_mul(1 << shift(right)?),
+                Operator::BitwiseShiftRight => Some(left >> shift(right)?),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// `value` as a scalar of the integer type `data_type`, when that type holds it.
+fn integer_scalar(value: i128, data_type: &DataType) -> Option<ScalarValue> {
+    Some(match data_type {
+        DataType::Int8 => ScalarValue::Int8(Some(value.try_into().ok()?)),
+        DataType::Int16 => ScalarValue::Int16(Some(value.try_into().ok()?)),
+        DataType::Int32 => ScalarValue::Int32(Some(value.try_into().ok()?)),
+        DataType::Int64 => ScalarValue::Int64(Some(value.try_into().ok()?)),
+        DataType::UInt8 => ScalarValue::UInt8(Some(value.try_into().ok()?)),
+        DataType::UInt16 => ScalarValue::UInt16(Some(value.try_into().ok()?)),
+        DataType::UInt32 => ScalarValue::UInt32(Some(value.try_into().ok()?)),
+        DataType::UInt64 => ScalarValue::UInt64(Some(value.try_into().ok()?)),
+        _ => return None,
+    })
+}
+
+/// Folds a constant expression compared with a column of type `data_type`.
+///
+/// The expression is evaluated as written, in its literals' own types, so it
+/// keeps its arithmetic, NULL and errors: `(1 << 7) > i` compares with 128 on
+/// an `Int8` column, and `7 / 0 = f` is left to fail as before. Only the result
+/// is then resolved like any literal compared with the column, which narrows it
+/// to the column type when it fits. Integer arithmetic whose exact result the
+/// column's integer type holds folds to that result, so `u = (1 << 63)` matches
+/// 2^63 on a `UInt64` column although `Int64` wraps it.
+fn fold_constant(expr: &Expr, data_type: Option<&DataType>) -> Option<Expr> {
+    if !is_constant_expr(expr) {
+        return None;
+    }
+    if let Some(value) =
+        data_type.and_then(|data_type| integer_scalar(exact_integer(expr)?, data_type))
+    {
+        return Some(lit(value));
+    }
+    let value = simplify_constant(expr.clone())?;
+    // A NULL result compares as NULL whatever its type.
+    let value = match data_type {
+        Some(data_type) if value.is_null() => ScalarValue::try_from(data_type).unwrap_or(value),
+        _ => value,
+    };
+    Some(lit(value))
+}
+
+/// Whether `op` is one of the comparisons `numeric_coercion::rewrite` resolves.
+/// Only these narrow a constant operand to the other side's column type;
+/// arithmetic keeps DataFusion's promotion, so a projection such as
+/// `(25 * 2) + i` is not narrowed.
+fn is_comparison(op: &Operator) -> bool {
+    matches!(
+        op,
+        Operator::Eq
+            | Operator::NotEq
+            | Operator::Lt
+            | Operator::LtEq
+            | Operator::Gt
+            | Operator::GtEq
+    )
+}
+
+/// Folds the constant operands of a comparison, `BETWEEN` or `IN` list, which
+/// are then resolved like any other literal. Returns `None` when no operand folds.
+fn fold_constant_operands(expr: &Expr, schema: &Schema) -> Option<Expr> {
+    let fold = |operand: &Expr, column: &Expr| {
+        fold_constant(operand, resolve_column_type(column, schema).as_ref())
+            .unwrap_or_else(|| operand.clone())
+    };
+    let folded = match expr {
+        Expr::BinaryExpr(BinaryExpr { left, op, right })
+            if is_comparison(op) && (is_constant_expr(left) || is_constant_expr(right)) =>
+        {
+            Expr::BinaryExpr(BinaryExpr::new(
+                Box::new(fold(left, right)),
+                *op,
+                Box::new(fold(right, left)),
+            ))
+        }
+        Expr::Between(between)
+            if is_constant_expr(&between.low) || is_constant_expr(&between.high) =>
+        {
+            Expr::Between(Between {
+                low: Box::new(fold(&between.low, &between.expr)),
+                high: Box::new(fold(&between.high, &between.expr)),
+                ..between.clone()
+            })
+        }
+        Expr::InList(in_list) if in_list.list.iter().any(is_constant_expr) => Expr::in_list(
+            in_list.expr.as_ref().clone(),
+            in_list
+                .list
+                .iter()
+                .map(|item| fold(item, &in_list.expr))
+                .collect(),
+            in_list.negated,
+        ),
+        _ => return None,
+    };
+    (folded != *expr).then_some(folded)
+}
+
 /// Resolve logical expression `expr`.
 ///
 /// Parameters
@@ -97,6 +254,9 @@ fn is_literal_only_same_type_expr(expr: &Expr) -> bool {
 /// - *expr*: a datafusion logical expression
 /// - *schema*: lance schema.
 pub fn resolve_expr(expr: &Expr, schema: &Schema) -> Result<Expr> {
+    if let Some(folded) = fold_constant_operands(expr, schema) {
+        return resolve_expr(&folded, schema);
+    }
     if let Some(rewritten) = rewrite_numeric(expr, schema) {
         return Ok(rewritten);
     }
@@ -139,14 +299,6 @@ pub fn resolve_expr(expr: &Expr, schema: &Schema) -> Result<Expr> {
                         op: *op,
                         right: Box::new(coerce_expr(right.as_ref(), &left_type)?),
                     })),
-                    // Constant expressions need the column type applied to all of their literals.
-                    Expr::BinaryExpr(_) if is_literal_only_same_type_expr(right) => {
-                        Ok(Expr::BinaryExpr(BinaryExpr {
-                            left: left.clone(),
-                            op: *op,
-                            right: Box::new(coerce_expr(right, &left_type)?),
-                        }))
-                    }
                     // Let DataFusion coerce other expressions. Recursively resolving them
                     // can narrow literals to an inner column's type before arithmetic promotes
                     // its operands, for example the 0.5 in `float_col = int_col + 0.5`.
@@ -399,22 +551,8 @@ mod tests {
         });
         let resolved = resolve_expr(&expr, &Schema::try_from(&arrow_schema).unwrap()).unwrap();
 
-        match resolved {
-            Expr::BinaryExpr(be) => match be.right.as_ref() {
-                Expr::BinaryExpr(r_be) => {
-                    assert_eq!(
-                        r_be.left.as_ref(),
-                        &Expr::Literal(ScalarValue::Float64(Some(2.0)), None)
-                    );
-                    assert_eq!(
-                        r_be.right.as_ref(),
-                        &Expr::Literal(ScalarValue::Float64(Some(-1.0)), None)
-                    );
-                }
-                _ => panic!("Expected BinaryExpr"),
-            },
-            _ => panic!("Expected BinaryExpr"),
-        }
+        // The constant is folded first, then the result is coerced to the column type.
+        assert_eq!(resolved, col("a").eq(lit(3.0_f64)));
     }
 
     #[test]
@@ -608,5 +746,208 @@ mod tests {
             false,
         );
         assert_eq!(resolve_expr(&expr, &schema).unwrap(), expected);
+    }
+
+    fn constant_expression_batch() -> arrow_array::RecordBatch {
+        use arrow_array::{Float64Array, Int8Array, UInt8Array};
+        arrow_array::RecordBatch::try_from_iter(vec![
+            (
+                "i",
+                Arc::new(Int8Array::from(vec![Some(-56), Some(50), Some(100), None]))
+                    as arrow_array::ArrayRef,
+            ),
+            (
+                "u",
+                Arc::new(UInt8Array::from(vec![Some(0), Some(10), Some(255), None])),
+            ),
+            (
+                "f",
+                Arc::new(Float64Array::from(vec![
+                    Some(3.0),
+                    Some(3.5),
+                    Some(1.0),
+                    None,
+                ])),
+            ),
+        ])
+        .unwrap()
+    }
+
+    /// Plans the filter `sql` on [`constant_expression_batch`] and evaluates it,
+    /// returning the first planning or evaluation error as text.
+    fn evaluate_filter(sql: &str) -> std::result::Result<arrow_array::ArrayRef, String> {
+        let batch = constant_expression_batch();
+        let planner = crate::planner::Planner::new(batch.schema());
+        let expr = planner.parse_filter(sql).map_err(|e| e.to_string())?;
+        let expr = planner.optimize_expr(expr).map_err(|e| e.to_string())?;
+        let expr = planner
+            .create_physical_expr(&expr)
+            .map_err(|e| e.to_string())?;
+        let value = expr.evaluate(&batch).map_err(|e| e.to_string())?;
+        value
+            .into_array(batch.num_rows())
+            .map_err(|e| e.to_string())
+    }
+
+    /// A constant expression keeps its own value whichever side of the
+    /// comparison it is on: `i < 100 + 100` matches the same rows as
+    /// `100 + 100 > i` and `i < 200`, rather than adding the literals as `Int8`.
+    /// It is evaluated as written, in its literals' own types, before only its
+    /// result is narrowed to the column type.
+    #[rstest::rstest]
+    #[case::sum_above_type("i < 100 + 100", [Some(true), Some(true), Some(true), None])]
+    #[case::sum_above_type_reversed("100 + 100 > i", [Some(true), Some(true), Some(true), None])]
+    #[case::gt_sum_above_type("i > 100 + 100", [Some(false), Some(false), Some(false), None])]
+    #[case::eq_sum_above_type("i = 100 + 100", [Some(false), Some(false), Some(false), None])]
+    #[case::in_sum_above_type("i IN (100 + 100)", [Some(false), Some(false), Some(false), None])]
+    #[case::between_sum_above_type(
+        "i BETWEEN 100 + 100 AND 127",
+        [Some(false), Some(false), Some(false), None]
+    )]
+    #[case::max_plus_one("i < 127 + 1", [Some(true), Some(true), Some(true), None])]
+    #[case::operand_above_type("i < 200 - 100", [Some(true), Some(true), Some(false), None])]
+    #[case::float_operand("i > 1.5 + 1", [Some(false), Some(true), Some(true), None])]
+    #[case::in_range("i = 25 * 2", [Some(false), Some(true), Some(false), None])]
+    #[case::shift_above_type("(1 << 7) > i", [Some(true), Some(true), Some(true), None])]
+    #[case::shift_above_type_column_first("i < (1 << 7)", [Some(true), Some(true), Some(true), None])]
+    #[case::unsigned_below_zero("u > 0 - 1", [Some(true), Some(true), Some(true), None])]
+    #[case::unsigned_difference_below_zero(
+        "u < 5 - 10",
+        [Some(false), Some(false), Some(false), None]
+    )]
+    #[case::integers_before_float(
+        "9007199254740993 - 9007199254740992 = f",
+        [Some(false), Some(false), Some(true), None]
+    )]
+    #[case::integers_before_float_column_first(
+        "f = 9007199254740993 - 9007199254740992",
+        [Some(false), Some(false), Some(true), None]
+    )]
+    #[case::integer_division("7 / 2 = f", [Some(true), Some(false), Some(false), None])]
+    #[case::integer_division_column_first("f = 7 / 2", [Some(true), Some(false), Some(false), None])]
+    #[case::float_division("f = 7.0 / 2.0", [Some(false), Some(true), Some(false), None])]
+    #[case::distinct_from_sum_above_type(
+        "i IS DISTINCT FROM 100 + 100",
+        [Some(true), Some(true), Some(true), Some(true)]
+    )]
+    #[case::null_operand("i = 1 + NULL", [None, None, None, None])]
+    #[case::null_operand_reversed("1 + NULL = i", [None, None, None, None])]
+    fn constant_expressions_keep_their_value(
+        #[case] sql: &str,
+        #[case] expected: [Option<bool>; 4],
+    ) {
+        use arrow_array::{BooleanArray, cast::AsArray};
+
+        let result = evaluate_filter(sql).unwrap_or_else(|error| panic!("{sql}: {error}"));
+        assert_eq!(
+            result.as_boolean(),
+            &BooleanArray::from(expected.to_vec()),
+            "{sql}"
+        );
+    }
+
+    /// A constant expression that fails, such as a division by zero, still
+    /// fails instead of being evaluated in the column type.
+    #[rstest::rstest]
+    #[case::constant_first("7 / 0 = f")]
+    #[case::column_first("f = 7 / 0")]
+    #[case::integer_column("i = 7 / 0")]
+    #[case::remainder("i = 7 % 0")]
+    fn constant_expressions_keep_their_errors(#[case] sql: &str) {
+        let error = evaluate_filter(sql).expect_err(sql);
+        assert!(error.contains("Divide by zero"), "{sql}: {error}");
+    }
+
+    /// A folded constant that fits the column type is still narrowed to it, so
+    /// the comparison stays on the bare column and a scalar index applies.
+    #[rstest::rstest]
+    #[case::sum("i = 25 * 2", col("i").eq(lit(50_i8)))]
+    #[case::reversed("25 * 2 = i", lit(50_i8).eq(col("i")))]
+    #[case::in_list("i IN (25 * 2)", col("i").in_list(vec![lit(50_i8)], false))]
+    fn constant_expressions_plan_on_column(#[case] sql: &str, #[case] expected: Expr) {
+        let batch = constant_expression_batch();
+        let planner = crate::planner::Planner::new(batch.schema());
+        assert_eq!(planner.parse_filter(sql).unwrap(), expected, "{sql}");
+    }
+
+    /// A shift whose exact result a `UInt64` column holds compares with that
+    /// result on the bare column, although it wraps as `Int64`.
+    #[rstest::rstest]
+    #[case::column_first("w = (1 << 63)", col("w").eq(lit(1_u64 << 63)))]
+    #[case::constant_first("(1 << 63) = w", lit(1_u64 << 63).eq(col("w")))]
+    fn exact_shift_plans_on_unsigned_column(#[case] sql: &str, #[case] expected: Expr) {
+        let batch = arrow_array::record_batch!(("w", UInt64, [1_u64 << 63, 3])).unwrap();
+        let planner = crate::planner::Planner::new(batch.schema());
+        assert_eq!(planner.parse_filter(sql).unwrap(), expected, "{sql}");
+    }
+
+    /// Every integer operator a constant expression may hold keeps its exact
+    /// value before the result is narrowed, so `(1 << 63) / 2` compares with
+    /// 2^62 on a `UInt64` column rather than with a negative `Int64`.
+    #[rstest::rstest]
+    #[case::divide("w >= (1 << 63) / 2", [Some(false), Some(false), Some(true), Some(true), None])]
+    #[case::divide_reversed("(1 << 63) / 2 <= w", [Some(false), Some(false), Some(true), Some(true), None])]
+    #[case::right_shift("w >= (1 << 63) >> 1", [Some(false), Some(false), Some(true), Some(true), None])]
+    #[case::masked_right_shift("w >= (1 << 63) >> 64", [Some(false), Some(false), Some(false), Some(true), None])]
+    #[case::masked_right_shift_by_65("w >= (1 << 63) >> 65", [Some(false), Some(false), Some(true), Some(true), None])]
+    #[case::masked_left_shift("w = 1 << 64", [Some(false), Some(true), Some(false), Some(false), None])]
+    #[case::remainder(
+        "w = (1 << 63) % 9223372036854775807",
+        [Some(false), Some(true), Some(false), Some(false), None]
+    )]
+    #[case::between(
+        "w BETWEEN (1 << 63) >> 1 AND (1 << 63) / 1",
+        [Some(false), Some(false), Some(true), Some(true), None]
+    )]
+    fn exact_integer_arithmetic_on_unsigned_column(
+        #[case] sql: &str,
+        #[case] expected: [Option<bool>; 5],
+    ) {
+        use arrow_array::{BooleanArray, cast::AsArray};
+
+        let batch = arrow_array::record_batch!((
+            "w",
+            UInt64,
+            [Some(0), Some(1), Some(1_u64 << 62), Some(1_u64 << 63), None]
+        ))
+        .unwrap();
+        let planner = crate::planner::Planner::new(batch.schema());
+        let expr = planner
+            .optimize_expr(planner.parse_filter(sql).unwrap())
+            .unwrap();
+        let result = planner
+            .create_physical_expr(&expr)
+            .unwrap()
+            .evaluate(&batch)
+            .unwrap()
+            .into_array(batch.num_rows())
+            .unwrap();
+        assert_eq!(
+            result.as_boolean(),
+            &BooleanArray::from(expected.to_vec()),
+            "{sql}"
+        );
+    }
+
+    /// Arithmetic with a constant operand is not narrowed to the column type,
+    /// so a projection keeps DataFusion's promotion instead of wrapping.
+    #[rstest::rstest]
+    #[case::sum("(25 * 2) + i", "150")]
+    #[case::product("(1 + 1) * u", "510")]
+    fn constant_operands_do_not_narrow_arithmetic(#[case] sql: &str, #[case] expected: &str) {
+        let batch = arrow_array::record_batch!(("i", Int8, [100]), ("u", UInt8, [255])).unwrap();
+        let planner = crate::planner::Planner::new(batch.schema());
+        let expr = planner
+            .optimize_expr(planner.parse_expr(sql).unwrap())
+            .unwrap();
+        let result = planner
+            .create_physical_expr(&expr)
+            .unwrap()
+            .evaluate(&batch)
+            .unwrap()
+            .into_array(1)
+            .unwrap();
+        let value = ScalarValue::try_from_array(result.as_ref(), 0).unwrap();
+        assert_eq!(value.to_string(), expected, "{sql}: {value:?}");
     }
 }
