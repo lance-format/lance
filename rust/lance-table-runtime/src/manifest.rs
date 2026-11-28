@@ -205,6 +205,14 @@ impl Table {
         uri: &str,
         session: &TableSession,
     ) -> Result<Arc<Manifest>> {
+        if session.require_manifest_etag && manifest_location.e_tag.is_none() {
+            // A live branch can reuse a deleted version number. Keep the manifest
+            // and its inline transaction and index metadata out of the shared caches.
+            let isolated = session.with_cache_identity(None);
+            return Self::load_manifest(object_store, manifest_location, uri, &isolated)
+                .await
+                .map(Arc::new);
+        }
         if manifest_location.size.is_none() {
             return Ok(Arc::new(
                 Self::load_manifest(object_store, manifest_location, uri, session).await?,

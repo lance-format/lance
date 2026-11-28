@@ -16,6 +16,7 @@ mod marker;
 mod namespace;
 mod query;
 mod resolve;
+mod snapshot;
 mod transactions;
 mod versions;
 

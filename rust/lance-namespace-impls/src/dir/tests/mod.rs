@@ -291,6 +291,25 @@ async fn create_vector_table(namespace: &DirectoryNamespace, table_name: &str) {
         .unwrap();
 }
 
+async fn append_unreadable_manifest(namespace: &DirectoryNamespace, dataset: &Dataset) -> i64 {
+    let (store, base, _) = namespace
+        .configured_builder(dataset.uri())
+        .build_object_store()
+        .await
+        .unwrap();
+    let mut future = dataset.manifest().clone();
+    future.version += 1;
+    future.reader_feature_flags |= lance_table::feature_flags::FLAG_UNKNOWN;
+    let path = dataset
+        .manifest_location()
+        .naming_scheme
+        .manifest_path(&base, future.version);
+    lance_table::io::commit::write_manifest_file_to_path(&store, &mut future, None, &path, None)
+        .await
+        .unwrap();
+    i64::try_from(future.version).unwrap()
+}
+
 async fn open_dataset(namespace: &DirectoryNamespace, table_name: &str) -> Dataset {
     let mut describe_request = DescribeTableRequest::new();
     describe_request.id = Some(vec![table_name.to_string()]);
