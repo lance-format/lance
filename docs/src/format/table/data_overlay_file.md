@@ -147,10 +147,13 @@ restricted to field `F`, of every overlay whose `committed_version >
 index.dataset_version`. The exclusion is **field-aware**: an overlay that touches
 only unrelated columns does not exclude anything from the index on `F`.
 
-`F` here ranges over the union of the index's `fields` and `covering_fields`
-(see [Serving carried columns](../index/index.md#serving-carried-columns)).
+`F` here ranges over the union of the index's `fields`, `covering_fields`
+(see [Serving carried columns](../index/index.md#serving-carried-columns)), and
+[predicate](../index/index.md#index-predicates) `fields`.
 An overlay updating a merely-carried column leaves the keyed value correct while
-making the carried value stale, so it must exclude those rows just the same.
+making the carried value stale, so it must exclude those rows just the same. An
+overlay updating a predicate column can move rows into or out of the predicate,
+so it excludes rows the same way.
 
 The query then proceeds as:
 

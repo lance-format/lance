@@ -901,6 +901,10 @@ pub struct Manifest {
     ///    derived snapshots, including clone and restore, because data files may
     ///    retain version 1 seeds. Legacy seeds may coexist and must be decoded
     ///    with their original semantics.
+    /// * 1 << 23: some index has a predicate (see IndexPredicate). Both feature
+    ///    words must carry the bit while any index in the manifest has one. A
+    ///    reader or writer that ignores it would treat a partial index as covering
+    ///    every row.
     #[prost(uint64, tag = "9")]
     pub reader_feature_flags: u64,
     /// Feature flags for writers.
@@ -1240,8 +1244,8 @@ pub struct IndexMetadata {
     /// When the manifest has feature flag 1 << 13, this declaration is independent
     /// of `fields` and has no positional relationship to it. A field may occur in
     /// both lists when the index carries a value it is also keyed on. Consumers
-    /// must use the union of `fields` and `covering_fields` as the index dependency
-    /// set.
+    /// must use the union of `fields`, `covering_fields`, and `predicate.fields` as
+    /// the index dependency set.
     ///
     /// Without feature flag 1 << 13, the legacy contract applies: the carried columns
     /// form the trailing suffix of `fields` in emission order. A column the
@@ -1291,6 +1295,12 @@ pub struct IndexMetadata {
     /// maintenance support aliases.
     #[prost(map = "uint32, uint32", tag = "14")]
     pub local_fragment_aliases: ::std::collections::HashMap<u32, u32>,
+    /// Restricts the index to rows where this predicate is TRUE. Absent means
+    /// the index covers every live row of the fragments in fragment_bitmap.
+    /// Requires feature flag 1 << 23 in both reader_feature_flags and
+    /// writer_feature_flags while any index in the manifest sets this field.
+    #[prost(message, optional, tag = "15")]
+    pub predicate: ::core::option::Option<IndexPredicate>,
 }
 impl ::prost::Name for IndexMetadata {
     const NAME: &'static str = "IndexMetadata";
@@ -1300,6 +1310,29 @@ impl ::prost::Name for IndexMetadata {
     }
     fn type_url() -> ::prost::alloc::string::String {
         "/lance.table.IndexMetadata".into()
+    }
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct IndexPredicate {
+    /// A Substrait ExtendedExpression holding one boolean expression. Its base
+    /// schema has one column per entry of fields, and column i is the field whose
+    /// id is fields\[i\]: readers bind the columns by position and ignore their
+    /// names. The expression references every column and nothing else.
+    #[prost(bytes = "vec", tag = "1")]
+    pub substrait: ::prost::alloc::vec::Vec<u8>,
+    /// Ids of the top-level fields the base schema columns bind to, in column
+    /// order. Not empty.
+    #[prost(int32, repeated, tag = "2")]
+    pub fields: ::prost::alloc::vec::Vec<i32>,
+}
+impl ::prost::Name for IndexPredicate {
+    const NAME: &'static str = "IndexPredicate";
+    const PACKAGE: &'static str = "lance.table";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lance.table.IndexPredicate".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lance.table.IndexPredicate".into()
     }
 }
 /// Metadata about a single file within an index segment.
