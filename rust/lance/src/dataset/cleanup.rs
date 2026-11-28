@@ -40,10 +40,12 @@
 //! (which should only be done if the caller can guarantee there are no updates
 //! happening at the same time)
 
+mod cache_reclamation;
 mod expiry;
 mod file_verdict;
 pub mod retention;
 
+use cache_reclamation::ExpiredManifest;
 // Two independent decisions share the name `Verdict`: expiry decides whether a
 // version is kept, file_verdict decides whether a listed file is kept.
 use expiry::Verdict as ExpiryVerdict;
@@ -446,15 +448,6 @@ struct ManagedScanKey {
     fields: Vec<arrow_schema::Field>,
     field_ids: Vec<i32>,
     retained: bool,
-}
-
-/// A manifest that has aged out and is queued for deletion.
-#[derive(Clone, Debug)]
-struct ExpiredManifest {
-    version: u64,
-    /// Size from the manifest listing. `None` means it must be fetched before it can
-    /// be counted in `RemovalStats::bytes_removed`.
-    size_bytes: Option<u64>,
 }
 
 /// Information about the dataset that we learn by inspecting all of the manifests
@@ -1038,11 +1031,14 @@ impl<'a> CleanupTask<'a> {
             ));
         }
 
+        let stale_versions = cache_reclamation::stale_versions(&inspection);
+
         final_result.merge(
             self.delete_unreferenced_files(inspection, verification_threshold)
                 .await?,
             candidate_file_limit,
         );
+        self.invalidate_stale_version_caches(&stale_versions).await;
         Ok(final_result)
     }
 
@@ -1316,6 +1312,7 @@ impl<'a> CleanupTask<'a> {
                 ExpiredManifest {
                     version: location.version,
                     size_bytes: location.size,
+                    e_tag: location.e_tag.clone(),
                 },
             );
             if let Some(identity) = location.identity {
@@ -1405,6 +1402,7 @@ impl<'a> CleanupTask<'a> {
                     // Carried from the listing so the delete phase need not HEAD
                     // every manifest just to report bytes removed.
                     size_bytes: location.size,
+                    e_tag: location.e_tag.clone(),
                 },
             );
             if let Some(identity) = location.identity.clone() {
@@ -3245,7 +3243,7 @@ mod tests {
         },
         index::vector::VectorIndexParams,
     };
-    use all_asserts::assert_gt;
+    use all_asserts::{assert_gt, assert_lt};
     use arrow::compute;
     use arrow_array::{
         Int32Array, RecordBatch, RecordBatchIterator, RecordBatchReader, UInt64Array,
@@ -3287,6 +3285,8 @@ mod tests {
     mod auto_cleanup;
 
     mod branch_lineage;
+
+    mod cache_reclamation;
 
     #[rstest]
     #[case::zero(0)]

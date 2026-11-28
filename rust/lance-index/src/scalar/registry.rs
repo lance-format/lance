@@ -972,6 +972,10 @@ mod tests {
             Ok(result)
         }
 
+        async fn invalidate(&self, key: &InternalCacheKey) {
+            self.inner.invalidate(key).await;
+        }
+
         async fn clear(&self) {
             self.inner.clear().await;
         }
