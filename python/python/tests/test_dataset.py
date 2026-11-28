@@ -1223,6 +1223,34 @@ def test_take(tmp_path: Path):
     assert table2 == table1
 
 
+@pytest.mark.parametrize("enable_stable_row_ids", [False, True])
+@pytest.mark.parametrize("as_array", [False, True])
+@pytest.mark.parametrize("columns", [None, ["b"], {"doubled": "a * 2"}])
+def test_take_row_ids(tmp_path: Path, enable_stable_row_ids, as_array, columns):
+    table = pa.table({"a": range(6), "b": ["a", "b", "c", "d", "e", "f"]})
+    ds = lance.write_dataset(
+        table,
+        tmp_path,
+        max_rows_per_file=2,
+        enable_stable_row_ids=enable_stable_row_ids,
+    )
+    indices = [4, 0, 4, 2]
+    row_ids = ds.to_table(columns=[], with_row_id=True)["_rowid"].combine_chunks()
+    row_ids = row_ids.take(indices)
+    if not as_array:
+        row_ids = row_ids.to_pylist()
+
+    expected = table.take(indices)
+    if columns == ["b"]:
+        expected = expected.select(["b"])
+    elif isinstance(columns, dict):
+        expected = pa.table({"doubled": [8, 0, 8, 4]})
+
+    assert ds.take_row_ids(row_ids, columns=columns) == expected
+    assert ds.take_row_ids(row_ids[:0], columns=columns) == expected.slice(0, 0)
+    assert ds._take_rows(row_ids, columns=columns) == expected
+
+
 def test_take_with_io_parallelism(tmp_path: Path):
     table = pa.table({"a": range(8), "b": [str(i) for i in range(8)]})
     dataset = lance.write_dataset(table, tmp_path, max_rows_per_file=1)
@@ -1249,7 +1277,7 @@ def test_take_unknown_column(tmp_path: Path, columns):
     with pytest.raises(ValueError, match="not found"):
         dataset.take([0], columns=columns)
     with pytest.raises(ValueError, match="not found"):
-        dataset._take_rows([0], columns=columns)
+        dataset.take_row_ids([0], columns=columns)
 
 
 @pytest.mark.parametrize("data_storage_version", ["legacy", "stable"])
@@ -1563,7 +1591,7 @@ def test_take_with_projection(tmp_path: Path):
 
     assert table2 == pa.Table.from_pylist([{"a2": 2, "bup": "X"}])
 
-    table3 = dataset._take_rows([0], columns={"a2": "a*2", "bup": "UPPER(b)"})
+    table3 = dataset.take_row_ids([0], columns={"a2": "a*2", "bup": "UPPER(b)"})
     assert table3 == table2
 
 
@@ -1598,8 +1626,8 @@ def test_take_with_json_column(tmp_path: Path):
     assert metas[1] == '{"val":5}'
     assert metas[2] == '{"val":8}'
 
-    # Dataset._take_rows should also return arrow.json type
-    result = dataset._take_rows([0, 3, 9])
+    # Dataset.take_row_ids should also return arrow.json type
+    result = dataset.take_row_ids([0, 3, 9])
     meta_field = result.schema.field("meta")
     assert meta_field.type == pa.utf8() or meta_field.type == pa.json_(), (
         f"Expected arrow.json (Utf8), got {meta_field.type}"
@@ -8433,18 +8461,20 @@ def test_scan_with_row_ids(tmp_path: Path):
     row_ids = tbl["_rowid"].to_pylist()
     assert row_ids == list(range(0, 250, 10)) + list(range(2**32, 2**32 + 250, 10))
 
-    tbl2 = ds._take_rows(row_ids)
+    tbl2 = ds.take_row_ids(row_ids)
     assert tbl2["a"] == tbl["a"]
 
 
-def test_take_rows_ignore_deletions(tmp_path: Path):
+@pytest.mark.parametrize("method", ["take_row_ids", "_take_rows"])
+def test_take_rows_ignore_deletions(tmp_path: Path, method):
     data = pa.table({"a": range(8)})
     ds = lance.write_dataset(data, tmp_path, enable_stable_row_ids=True)
     ds.delete("a in (1, 7)")
+    take_rows = getattr(ds, method)
 
-    assert ds._take_rows([0, 1, 7, 4])["a"].to_pylist() == [0, 4]
+    assert take_rows([0, 1, 7, 4])["a"].to_pylist() == [0, 4]
     # Deleted rows come back with their stored values; no deletion file is read.
-    assert ds._take_rows([0, 1, 7, 4], ignore_deletions=True)["a"].to_pylist() == [
+    assert take_rows([0, 1, 7, 4], ignore_deletions=True)["a"].to_pylist() == [
         0,
         1,
         7,

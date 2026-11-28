@@ -1796,22 +1796,28 @@ class LanceDataset(pa.dataset.Dataset):
             ]
         )
 
-    def _take_rows(
+    def take_row_ids(
         self,
         row_ids: Union[List[int], pa.Array],
         columns: Optional[Union[List[str], Dict[str, str]]] = None,
         *,
         ignore_deletions: bool = False,
-        **kargs,
     ) -> pa.Table:
-        """Select rows by row_ids.
+        """Select rows by their row IDs, in the requested order.
 
-        **Unstable API**. Internal use only
+        Get row IDs from the ``_rowid`` column of a scan with
+        ``with_row_id=True``. These are different from the row positions used
+        by :py:meth:`take`. When stable row IDs are enabled, they can also differ
+        from the ``_rowaddr`` column returned by ``with_row_address=True``.
+
+        Use IDs from the same dataset version. IDs from another version may
+        refer to different rows or no longer exist, for example after compaction
+        when stable row IDs are disabled.
 
         Parameters
         ----------
-        row_ids : List Array or array-like
-            row IDs to select in the dataset.
+        row_ids : list of int or pyarrow.Array
+            Row IDs to select. Duplicate IDs produce duplicate rows.
         columns: list of str, or dict of str to str default None
             List of column names to be fetched.
             Or a dictionary of column names to SQL expressions.
@@ -1825,12 +1831,25 @@ class LanceDataset(pa.dataset.Dataset):
             the result is only complete for live ids: use it only for ids known
             to be live, for example ids read from an index built after the
             last deletion.
-        **kwargs : dict, optional
-            See scanner() method for full parameter description.
 
         Returns
         -------
-        table : Table
+        table : pyarrow.Table
+            Selected rows in input order. By default, deleted rows are omitted.
+
+        Examples
+        --------
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> ds = lance.write_dataset(
+        ...     pa.table({"a": [1, 2, 3], "b": ["x", "y", "z"]}),
+        ...     "memory://take_row_ids",
+        ... )
+        >>> row_ids = ds.to_table(
+        ...     columns=[], filter="a > 1", with_row_id=True
+        ... )["_rowid"].to_pylist()
+        >>> ds.take_row_ids(row_ids, columns=["b"]).to_pydict()
+        {'b': ['y', 'z']}
         """
         columns_with_transform = None
         if isinstance(columns, dict):
@@ -1845,6 +1864,19 @@ class LanceDataset(pa.dataset.Dataset):
                     ignore_deletions=ignore_deletions,
                 )
             ]
+        )
+
+    def _take_rows(
+        self,
+        row_ids: Union[List[int], pa.Array],
+        columns: Optional[Union[List[str], Dict[str, str]]] = None,
+        *,
+        ignore_deletions: bool = False,
+        **kargs,
+    ) -> pa.Table:
+        """Compatibility alias for :py:meth:`take_row_ids`."""
+        return self.take_row_ids(
+            row_ids, columns=columns, ignore_deletions=ignore_deletions
         )
 
     def take_blobs(
