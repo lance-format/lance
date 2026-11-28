@@ -163,6 +163,31 @@ async fn lookup_inline_row_id(
     Ok(Some(live))
 }
 
+#[doc(hidden)]
+pub async fn try_resolve_point_take_row_id(
+    table: &Table,
+    row_id: u64,
+    with_deletions: bool,
+) -> Result<Option<Option<RowAddress>>> {
+    let cache = table
+        .state
+        .session
+        .index_cache()
+        .with_key_prefix(table.uri());
+    if let Some(e_tag) = table.state.manifest_location.e_tag.as_deref()
+        && let Some(index) = cache
+            .get_with_key(&RowIdIndexKey {
+                version: table.manifest.version,
+                with_deletions,
+                e_tag: Some(e_tag),
+            })
+            .await
+    {
+        return Ok(Some(index.get(row_id)?));
+    }
+    lookup_inline_row_id(table, row_id, with_deletions, &cache).await
+}
+
 pub async fn resolve_take_row_ids(
     table: &Table,
     row_ids: &[u64],
@@ -171,27 +196,16 @@ pub async fn resolve_take_row_ids(
     if !table.manifest.uses_stable_row_ids() {
         return Ok(None);
     }
+    if let [id] = row_ids
+        && let Some(address) = try_resolve_point_take_row_id(table, *id, with_deletions).await?
+    {
+        return Ok(Some(vec![address]));
+    }
     let cache = table
         .state
         .session
         .index_cache()
         .with_key_prefix(table.uri());
-    if let [id] = row_ids {
-        if let Some(e_tag) = table.state.manifest_location.e_tag.as_deref()
-            && let Some(index) = cache
-                .get_with_key(&RowIdIndexKey {
-                    version: table.manifest.version,
-                    with_deletions,
-                    e_tag: Some(e_tag),
-                })
-                .await
-        {
-            return Ok(Some(vec![index.get(*id)?]));
-        }
-        if let Some(address) = lookup_inline_row_id(table, *id, with_deletions, &cache).await? {
-            return Ok(Some(vec![address]));
-        }
-    }
     get_row_id_index_with_cache(table, with_deletions, &cache)
         .await?
         .map(|index| index.get_many(row_ids))

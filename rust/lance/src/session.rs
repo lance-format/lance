@@ -91,6 +91,8 @@ pub struct Session {
 
     pub(crate) table_session: Arc<TableSession>,
 
+    pub(crate) row_id_fragment_registry: Arc<crate::dataset::rowids::cache::RowIdFragmentRegistry>,
+
     pub(crate) index_extensions: HashMap<(IndexType, String), Arc<dyn IndexExtension>>,
 
     spill_store: Arc<dyn SpillStore>,
@@ -118,6 +120,7 @@ impl DeepSizeOf for Session {
         // Measure the actual cache contents through the wrapper types
         size += self.index_cache.deep_size_of_children(context);
         size += self.metadata_cache().deep_size_of_children(context);
+        size += self.row_id_fragment_registry.deep_size_of_children(context);
         for ext in self.index_extensions.values() {
             size += ext.deep_size_of_children(context);
         }
@@ -423,6 +426,7 @@ impl Session {
         Self {
             index_cache,
             table_session: Arc::new(table_session),
+            row_id_fragment_registry: Default::default(),
             index_extensions: HashMap::new(),
             spill_store: Arc::new(LocalSpillStore::default()),
             index_origin_latency: None,

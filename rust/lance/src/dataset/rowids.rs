@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+pub(crate) mod cache;
+pub(crate) mod group;
+pub(crate) mod resolve;
 mod spill;
 #[cfg(test)]
 mod validate;
@@ -13,8 +16,8 @@ use lance_select::{
     NullableRowAddrMask, NullableRowAddrSet, RowAddrMask, RowAddrSelection, RowAddrTreeMap,
 };
 use lance_table::{
-    format::{Fragment, RowDatasetVersionSequence},
-    rowids::{RowIdIndex, RowIdSequence, version::SpilledRowLineage},
+    format::{Fragment, RowDatasetVersionSequence, RowIdMeta},
+    rowids::{RowIdIndex, RowIdSequence, read_row_ids, version::SpilledRowLineage},
 };
 use std::sync::Arc;
 
@@ -35,6 +38,15 @@ pub async fn load_row_id_sequence(
 ) -> Result<Arc<RowIdSequence>> {
     lance_table_runtime::rowids::load_row_id_sequence(&dataset.table_view().to_table(), fragment)
         .await
+}
+
+/// Decode the row id sequence of `fragment`, bypassing every cache.
+async fn read_row_id_sequence(dataset: &Dataset, fragment: &Fragment) -> Result<RowIdSequence> {
+    match &fragment.row_id_meta {
+        None => Err(Error::internal("Missing row id meta")),
+        Some(RowIdMeta::Inline(data)) => read_row_ids(data),
+        Some(RowIdMeta::Column) => read_spilled_row_ids(dataset, fragment).await,
+    }
 }
 
 /// Load one of the fragment's per-row version sequences, wherever it is stored.
@@ -114,6 +126,14 @@ pub async fn get_row_id_index(dataset: &Dataset) -> Result<Option<Arc<RowIdIndex
     get_row_id_index_with(dataset, true).await
 }
 
+pub(crate) use resolve::resolve_row_ids;
+
+/// The row id index, built with or without the deletion vectors.
+///
+/// Without them the index maps a deleted row id to its address instead of
+/// `None`, but reads no deletion file: on a table with many fragments that is
+/// one request per fragment saved for a caller that already knows its ids are
+/// live.
 pub(crate) async fn get_row_id_index_with(
     dataset: &Dataset,
     with_deletions: bool,
@@ -126,6 +146,26 @@ pub(crate) async fn get_row_id_index_with(
     .await
 }
 
+pub(super) async fn resolve_take_row_ids(
+    dataset: &Dataset,
+    row_ids: &[u64],
+    with_deletions: bool,
+) -> Result<Option<Vec<Option<RowAddress>>>> {
+    if !dataset.manifest.uses_stable_row_ids() {
+        return Ok(None);
+    }
+    if let [id] = row_ids
+        && let Some(address) = lance_table_runtime::rowids::try_resolve_point_take_row_id(
+            &dataset.table_view().to_table(),
+            *id,
+            with_deletions,
+        )
+        .await?
+    {
+        return Ok(Some(vec![address]));
+    }
+    resolve_row_ids(dataset, row_ids, with_deletions).await
+}
 /// The [`RowIdIndex`] a row-id -> row-address translation needs, or `None` when
 /// the dataset has no stable row ids and an id already *is* an address, so there
 /// is nothing to translate.

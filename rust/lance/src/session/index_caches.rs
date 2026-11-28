@@ -374,6 +374,175 @@ pub(crate) fn write_index_identity(builder: &mut KeyBuilder, uuid: &Uuid, fri_uu
 
 // Cache key types for type-safe cache access
 
+/// Raw row-ID bounds, independent of deletion visibility and prepared graphs.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RowIdFragmentSpanKey {
+    pub source: InternalCacheKey,
+}
+
+impl CacheKey for RowIdFragmentSpanKey {
+    type ValueType = crate::dataset::rowids::resolve::FragmentSpan;
+
+    fn key(&self) -> Cow<'_, str> {
+        Cow::Borrowed("row_id_fragment_span")
+    }
+
+    fn type_name() -> &'static str {
+        "RowIdFragmentSpan"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.dataset.row-id-fragment-span", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_fixed_bytes(self.source.as_bytes());
+    }
+}
+
+/// A distinct fragment mapping, keyed by the deletions actually applied to it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PreparedRowIdFragmentKey {
+    pub source: InternalCacheKey,
+    pub deletion: Option<InternalCacheKey>,
+}
+
+impl CacheKey for PreparedRowIdFragmentKey {
+    type ValueType = crate::dataset::rowids::resolve::PreparedFragment;
+
+    fn key(&self) -> Cow<'_, str> {
+        Cow::Borrowed("row_id_fragment")
+    }
+
+    fn type_name() -> &'static str {
+        "PreparedRowIdFragment"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.dataset.prepared-row-id-fragment", 3)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_fixed_bytes(self.source.as_bytes());
+        if let Some(deletion) = self.deletion {
+            builder.write_some();
+            builder.write_fixed_bytes(deletion.as_bytes());
+        } else {
+            builder.write_none();
+        }
+    }
+}
+
+/// Weak latest-source or validated-snapshot view of a charged fragment mapping.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RowIdFragmentAliasKey(pub PreparedRowIdFragmentKey);
+
+impl CacheKey for RowIdFragmentAliasKey {
+    type ValueType = crate::dataset::rowids::resolve::FragmentAlias;
+
+    fn key(&self) -> Cow<'_, str> {
+        Cow::Borrowed("row_id_fragment_alias")
+    }
+
+    fn type_name() -> &'static str {
+        "RowIdFragmentAlias"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.dataset.row-id-fragment-alias", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        self.0.write_key(builder);
+    }
+}
+
+/// Snapshot deletion visibility, charged separately from shared row-ID lookups.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RowIdFragmentDeletionKey {
+    pub deletion: InternalCacheKey,
+}
+
+impl CacheKey for RowIdFragmentDeletionKey {
+    type ValueType = lance_core::utils::deletion::DeletionVector;
+
+    fn key(&self) -> Cow<'_, str> {
+        Cow::Borrowed("row_id_fragment_deletion")
+    }
+
+    fn type_name() -> &'static str {
+        "RowIdFragmentDeletion"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.dataset.row-id-fragment-deletion", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_fixed_bytes(self.deletion.as_bytes());
+    }
+}
+
+/// Shared deletion-free lookup merged across a high-overlap set of immutable
+/// fragment row-ID sources.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct MergedRowIdGroupKey {
+    pub group: InternalCacheKey,
+}
+
+impl CacheKey for MergedRowIdGroupKey {
+    type ValueType = crate::dataset::rowids::group::MergedSourceGroup;
+
+    fn key(&self) -> Cow<'_, str> {
+        Cow::Borrowed("row_id_merged_group")
+    }
+
+    fn type_name() -> &'static str {
+        "MergedRowIdGroup"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.dataset.merged-row-id-group", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_fixed_bytes(self.group.as_bytes());
+    }
+}
+
+/// Lightweight per-snapshot route pointing weakly to a cached
+/// [`crate::dataset::rowids::group::MergedSourceGroup`] plus snapshot deletion
+/// metadata and uncovered delta fragments.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SnapshotRowIdRouteKey<'a> {
+    pub version: u64,
+    pub e_tag: &'a str,
+}
+
+impl CacheKey for SnapshotRowIdRouteKey<'_> {
+    type ValueType = crate::dataset::rowids::group::SnapshotRowIdRoute;
+
+    fn key(&self) -> Cow<'_, str> {
+        Cow::Owned(format!(
+            "row_id_snapshot_route/{}/{}",
+            self.version, self.e_tag
+        ))
+    }
+
+    fn type_name() -> &'static str {
+        "SnapshotRowIdRoute"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.dataset.snapshot-row-id-route", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_u64(self.version);
+        builder.write_str(self.e_tag);
+    }
+}
+
 pub use lance_table_runtime::caches::{FragReuseDetailsKey, FragReuseIndexKey};
 
 /// Restricted deletion mask of a vector index segment at one dataset version

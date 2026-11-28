@@ -39,6 +39,8 @@ pub use spill::write::{
 };
 pub use spill::{read_spilled_row_ids, read_spilled_versions};
 pub(crate) use take::resolve_take_row_ids;
+#[doc(hidden)]
+pub use take::try_resolve_point_take_row_id;
 pub use validate::validate_stable_row_ids;
 
 /// Load a row id sequence from the fragment's metadata and table files.

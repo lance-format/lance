@@ -546,11 +546,26 @@ impl TakeBuilder {
             io_parallelism,
             ..Default::default()
         };
+        let table = self.dataset.table_view().to_table();
+        let resolved_addrs: Vec<u64>;
         let selection = match &self.rows {
-            TakeRows::Ids(ids) => TakeSelection::RowIds(ids),
+            TakeRows::Ids(ids) if ids.is_empty() => TakeSelection::RowAddresses(&[]),
+            TakeRows::Ids(ids) => {
+                if let Some(resolved) = crate::dataset::rowids::resolve_take_row_ids(
+                    &self.dataset,
+                    ids,
+                    !self.ignore_deletions,
+                )
+                .await?
+                {
+                    resolved_addrs = resolved.into_iter().flatten().map(u64::from).collect();
+                    TakeSelection::RowAddresses(&resolved_addrs)
+                } else {
+                    TakeSelection::RowAddresses(ids)
+                }
+            }
             TakeRows::Addresses(addrs) => TakeSelection::RowAddresses(addrs),
         };
-        let table = self.dataset.table_view().to_table();
         match self.output {
             TakeOutput::Schema(projection) => {
                 table
@@ -610,6 +625,7 @@ mod test {
 
     use crate::dataset::{
         MergeInsertBuilder, UpdateBuilder, WhenMatched, WhenNotMatched, WriteParams,
+        optimize::{CompactionOptions, compact_files},
         scanner::test_dataset::TestVectorDataset,
     };
     use crate::utils::test::ThrottledStoreWrapper;
@@ -2692,8 +2708,11 @@ mod test {
     /// An update keeps the old copy of a row under a deletion vector and writes
     /// its id again in a new fragment. Ignoring deletions must still resolve
     /// the id to the live copy, which takes that fragment's deletion vector.
+    #[rstest]
+    #[case::before_compaction(false)]
+    #[case::after_compaction(true)]
     #[tokio::test]
-    async fn test_take_rows_ignore_deletions_after_update() {
+    async fn test_take_rows_ignore_deletions_after_update(#[case] compacted: bool) {
         let data = test_batch(0..8);
         let write_params = WriteParams {
             enable_stable_row_ids: true,
@@ -2703,7 +2722,7 @@ mod test {
         let dataset = Dataset::write(batches, "memory://", Some(write_params))
             .await
             .unwrap();
-        let dataset = UpdateBuilder::new(Arc::new(dataset))
+        let mut dataset = UpdateBuilder::new(Arc::new(dataset))
             .update_where("i = 1")
             .unwrap()
             .set("s", "'updated'")
@@ -2713,7 +2732,15 @@ mod test {
             .execute()
             .await
             .unwrap()
-            .new_dataset;
+            .new_dataset
+            .as_ref()
+            .clone();
+        if compacted {
+            compact_files(&mut dataset, CompactionOptions::default(), None)
+                .await
+                .unwrap();
+        }
+        let dataset = Arc::new(dataset);
 
         for ignore_deletions in [false, true] {
             let point = dataset
