@@ -441,10 +441,10 @@ impl LsmScanner {
         self
     }
 
-    /// Set the over-fetch multiple block-listed sources use in search plans
-    /// so they still yield `k` live rows after cross-generation dedup.
-    /// Threaded into the LSM search planners; values below `1.0` are rejected
-    /// when the plan is created.
+    /// Bound candidate fetches from sources shadowed by newer generations.
+    /// A finite multiple may underfill the requested limit after stale hits are
+    /// removed. By default FTS limits live hits; vector search uses a multiple
+    /// of 1.0. Values below 1.0 are rejected when the plan is created.
     pub fn with_overfetch_factor(mut self, factor: f64) -> Self {
         self.overfetch_factor = Some(factor);
         self
@@ -742,7 +742,8 @@ impl LsmScanner {
         let mut planner =
             super::LsmFtsSearchPlanner::new(collector, self.pk_columns.clone(), base_schema)
                 .with_identity_schema(Arc::clone(&self.identity_schema))
-                .with_filter(self.filter.clone());
+                .with_filter(self.filter.clone())
+                .with_system_columns(self.with_row_address, self.with_memtable_gen);
         if let Some(session) = &self.session {
             planner = planner.with_session(session.clone());
         }
@@ -863,9 +864,8 @@ impl LsmScanner {
     /// merged by `_score` DESC. Mirrors
     /// [`crate::dataset::scanner::Scanner::full_text_search`]: the searched
     /// column(s) come from the query (set via `FullTextSearchQuery::with_column`);
-    /// the query limit, when present, controls the FTS source/merge top-k;
-    /// scanner limit/offset still apply to the final merged result. The LSM
-    /// path supports a single FTS-indexed column.
+    /// the query limit caps the merged hits, and scanner limit/offset page
+    /// through them. In-memory sources do not support combined-fields queries.
     pub fn full_text_search(mut self, query: FullTextSearchQuery) -> Result<Self> {
         self.search.set_full_text(query);
         Ok(self)

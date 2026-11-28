@@ -191,11 +191,11 @@ struct PkBlockFilterStream {
 
 /// Keep only the rows no newer-gen membership contains. Async because SSTables
 /// are probed against their on-disk PK BTree.
-async fn filter_batch(batch: RecordBatch, config: Arc<FilterConfig>) -> DFResult<RecordBatch> {
-    let FilterConfig {
-        pk_columns,
-        blocked,
-    } = config.as_ref();
+pub(in crate::dataset::mem_wal::scanner) async fn filter_batch(
+    batch: RecordBatch,
+    pk_columns: &[String],
+    blocked: &[GenMembership],
+) -> DFResult<RecordBatch> {
     if blocked.is_empty() || batch.num_rows() == 0 {
         return Ok(batch);
     }
@@ -265,7 +265,14 @@ impl Stream for PkBlockFilterStream {
             match this.input.poll_next_unpin(cx) {
                 Poll::Ready(Some(Ok(batch))) => {
                     this.input_seen += batch.num_rows();
-                    this.pending = Some(filter_batch(batch, this.config.clone()).boxed());
+                    let config = this.config.clone();
+                    this.pending =
+                        Some(
+                            async move {
+                                filter_batch(batch, &config.pk_columns, &config.blocked).await
+                            }
+                            .boxed(),
+                        );
                     // Loop to poll the just-created future.
                 }
                 Poll::Ready(Some(Err(e))) => return Poll::Ready(Some(Err(e))),

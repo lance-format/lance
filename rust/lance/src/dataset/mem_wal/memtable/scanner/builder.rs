@@ -532,6 +532,7 @@ fn to_local_expr(query: &IndexFtsQuery) -> Result<FtsQueryExpr> {
 ///
 /// let stream = scanner.try_into_stream().await?;
 /// ```
+#[derive(Clone)]
 pub struct MemTableScanner {
     batch_store: Arc<BatchStore>,
     indexes: Arc<IndexStore>,

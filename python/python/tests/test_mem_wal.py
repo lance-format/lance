@@ -9,6 +9,7 @@ import weakref
 import lance
 import numpy as np
 import pyarrow as pa
+import pyarrow.compute as pc
 import pytest
 from lance.mem_wal import (
     CompactedSsTable,
@@ -20,6 +21,7 @@ from lance.mem_wal import (
     ShardSnapshot,
     evaluate_sharding_spec,
 )
+from lance.query import DocumentGranularity, MatchQuery
 from lance.schema import LanceSchema
 
 _PK_META = {"lance-schema:unenforced-primary-key": "true"}
@@ -229,6 +231,293 @@ def test_lsm_scanner_with_memtables(tmp_path):
         LsmScanner.from_snapshots(base_ds, [snap]).limit(None, offset=1).to_table()
     )
     assert len(offset_table) == 2, "Offset-only LSM scan should not require a limit"
+
+
+def test_lsm_scanner_full_text_search_with_memtables(tmp_path):
+    schema = pa.schema(
+        [
+            pa.field("id", pa.int64(), nullable=False, metadata=_PK_META),
+            pa.field("c", pa.utf8()),
+        ]
+    )
+    ds = lance.write_dataset(
+        pa.table({"id": [0], "c": ["def getUserName(): pass"]}, schema=schema),
+        tmp_path / "base",
+        schema=schema,
+    )
+    ds.create_scalar_index(
+        "c",
+        "INVERTED",
+        analyzer="code",
+        split_identifiers=True,
+        with_position=True,
+        name="c_idx",
+    )
+    ds.initialize_mem_wal(maintained_indexes=["c_idx"], unsharded=True)
+    query = MatchQuery("user", "c")
+
+    assert ds.to_table(full_text_query=query)["id"].to_pylist() == [0]
+
+    shard_id = str(uuid.uuid4())
+    with ds.mem_wal_writer(shard_id) as writer:
+        writer.put(
+            pa.table(
+                {
+                    "id": [1, 2],
+                    "c": ["fn parseUserName(x: &str)", "fn unrelated()"],
+                },
+                schema=schema,
+            )
+        )
+        scanner = writer.lsm_scanner()
+        with pytest.raises(TypeError, match="FullTextQuery.*str"):
+            scanner.full_text_search("user")  # type: ignore[arg-type]
+        assert scanner.full_text_search(query) is scanner
+        hits = scanner.with_row_address().with_memtable_gen().project(["id"]).to_table()
+        columns = ["id", "_rowaddr", "_memtable_gen"]
+        active = hits.select(columns).sort_by("id")
+        expected = (
+            writer.lsm_scanner()
+            .filter("id < 2")
+            .with_row_address()
+            .with_memtable_gen()
+            .to_table()
+            .select(columns)
+            .sort_by("id")
+        )
+        assert active.equals(expected)
+        assert active["id"].to_pylist() == [0, 1]
+        assert active["_rowaddr"].to_pylist() == [0, None]
+        assert active["_memtable_gen"][0].as_py() == 0
+        assert active["_memtable_gen"][1].as_py() > 0
+        assert hits["_score"].null_count == 0
+        empty = scanner.limit(0).to_table()
+        assert empty.num_rows == 0
+        assert empty.schema == hits.schema
+
+    # The old generation has no physical value for this filter-only column.
+    ds.add_columns(pa.field("_memtable_gen", pa.int64()))
+    with ds.mem_wal_writer(shard_id) as writer:
+        flushed = (
+            writer.lsm_scanner()
+            .with_memtable_gen()
+            .filter("_memtable_gen IS NULL")
+            .project(["id", "_rowaddr"])
+            .full_text_search(query)
+            .to_table()
+        )
+        assert flushed.select(columns).sort_by("id").equals(active)
+
+
+def test_lsm_row_search_preserves_metadata_named_data_columns(tmp_path):
+    # Both names are legal data fields. Only list-element search produces
+    # coordinates, and a plain scan keeps an explicitly projected data field
+    # when it shares the generation tag's name.
+    schema = pa.schema(
+        [
+            pa.field("id", pa.int64(), nullable=False, metadata=_PK_META),
+            pa.field("text", pa.string()),
+            pa.field("_doc_index", pa.string()),
+            pa.field("_memtable_gen", pa.string()),
+        ]
+    )
+    rows = pa.table(
+        {"id": [0], "text": ["user"], "_doc_index": ["doc"], "_memtable_gen": ["gen"]},
+        schema=schema,
+    )
+    ds = lance.write_dataset(rows, tmp_path / "base")
+    ds.create_scalar_index("text", "INVERTED", name="text_idx")
+    ds.initialize_mem_wal(maintained_indexes=["text_idx"], unsharded=True)
+    with ds.mem_wal_writer(str(uuid.uuid4())) as writer:
+        query = MatchQuery("user", "text")
+        columns = ["_doc_index", "_memtable_gen"]
+        plain = writer.lsm_scanner().project(columns).with_memtable_gen().to_table()
+        hits = (
+            writer.lsm_scanner()
+            .project(columns)
+            .with_memtable_gen()
+            .full_text_search(query)
+            .to_table()
+        )
+        assert hits.select(columns).equals(plain.select(columns))
+        assert hits.select(columns).to_pylist() == [
+            {"_doc_index": "doc", "_memtable_gen": "gen"}
+        ]
+
+
+@pytest.mark.parametrize("key", ["_doc_index", "_score"])
+def test_lsm_element_search_rejects_computed_column_named_primary_key(tmp_path, key):
+    schema = pa.schema(
+        [
+            pa.field(key, pa.int64(), nullable=False, metadata=_PK_META),
+            pa.field("tags", pa.list_(pa.string())),
+        ]
+    )
+    rows = pa.table({key: [1], "tags": [["user"]]}, schema=schema)
+    ds = lance.write_dataset(rows, tmp_path / "base")
+    granularity = DocumentGranularity.LIST_ELEMENT
+    ds.create_scalar_index(
+        "tags", "INVERTED", name="tags_idx", document_granularity=granularity
+    )
+    ds.initialize_mem_wal(maintained_indexes=["tags_idx"], unsharded=True)
+    query = MatchQuery("user", "tags", document_granularity=granularity)
+    with ds.mem_wal_writer(str(uuid.uuid4())) as writer:
+        with pytest.raises(
+            OSError, match=f"primary key and a computed column named {key}"
+        ):
+            writer.lsm_scanner().full_text_search(query).to_table()
+
+
+def test_lsm_element_search_preserves_coordinates_after_flush(tmp_path):
+    # A stored field can even have the same name and type as the computed one.
+    coordinates = pa.list_(pa.field("item", pa.uint32(), nullable=False))
+    schema = pa.schema(
+        [
+            pa.field("id", pa.int64(), nullable=False, metadata=_PK_META),
+            pa.field("tags", pa.list_(pa.string())),
+            pa.field("_doc_index", coordinates, nullable=False),
+            pa.field("_score", pa.float32()),
+        ]
+    )
+    ds = lance.write_dataset(
+        pa.table(
+            {
+                "id": [0],
+                "tags": [["other", "user"]],
+                "_doc_index": [[42]],
+                "_score": [42.0],
+            },
+            schema=schema,
+        ),
+        tmp_path / "base",
+    )
+    granularity = DocumentGranularity.LIST_ELEMENT
+    ds.create_scalar_index(
+        "tags", "INVERTED", name="tags_idx", document_granularity=granularity
+    )
+    ds.initialize_mem_wal(maintained_indexes=["tags_idx"], unsharded=True)
+    shard_id = str(uuid.uuid4())
+    with ds.mem_wal_writer(shard_id) as writer:
+        writer.put(
+            pa.table(
+                {"id": [1], "tags": [["user"]], "_doc_index": [[43]], "_score": [43.0]},
+                schema=schema,
+            )
+        )
+    with ds.mem_wal_writer(shard_id) as writer:
+        hits = (
+            writer.lsm_scanner()
+            .full_text_search(
+                MatchQuery("user", "tags", document_granularity=granularity)
+            )
+            .project(["id", "`_doc_index`", "_doc_index", "_score"])
+            .to_table()
+            .sort_by("id")
+        )
+    assert hits["id"].to_pylist() == [0, 1]
+    assert hits.column_names.count("_doc_index") == 1
+    assert hits["_doc_index"].to_pylist() == [[1], [0]]
+    assert all(
+        score is not None and 0 < score < 42 for score in hits["_score"].to_pylist()
+    )
+
+
+@pytest.mark.parametrize("column", ["_score", "_doc_index"])
+def test_lsm_fts_filter_on_column_added_after_flush(tmp_path, column):
+    coordinates = pa.list_(pa.field("item", pa.uint32(), nullable=False))
+    field = pa.field(column, pa.float32() if column == "_score" else coordinates)
+    schema = pa.schema(
+        [
+            pa.field("id", pa.int64(), nullable=False, metadata=_PK_META),
+            pa.field("tags", pa.list_(pa.string())),
+        ]
+    )
+    ds = lance.write_dataset(
+        pa.table({"id": [1], "tags": [["user"]]}, schema=schema), tmp_path / "base"
+    )
+    granularity = DocumentGranularity.LIST_ELEMENT
+    ds.create_scalar_index(
+        "tags", "INVERTED", name="fts", document_granularity=granularity
+    )
+    ds.initialize_mem_wal(maintained_indexes=["fts"], unsharded=True)
+    shard_id = str(uuid.uuid4())
+    with ds.mem_wal_writer(shard_id) as writer:
+        writer.put(
+            pa.table(
+                {"id": [2, 3], "tags": [["other", "user user user"], ["other"] * 8]},
+                schema=schema,
+            )
+        )
+    ds.add_columns(field)
+
+    with ds.mem_wal_writer(shard_id) as writer:
+        writer.put(
+            pa.table(
+                {
+                    "id": [4],
+                    "tags": [["user"]],
+                    column: [42.0 if column == "_score" else [42]],
+                },
+                schema=schema.append(field),
+            )
+        )
+        query = MatchQuery("user", "tags", document_granularity=granularity)
+
+        def scan():
+            return writer.lsm_scanner().project(["id"]).full_text_search(query)
+
+        hits = scan().to_table()
+        assert sorted(hits["id"].to_pylist()) == [1, 2, 4]
+        assert hits["id"][0].as_py() == 2
+        assert hits["_doc_index"][0].as_py() == [1]
+        assert hits["_score"][0].as_py() > hits["_score"][1].as_py() > 0
+
+        # Both older sources predate the physical field. Their FTS outputs
+        # keep the scores and coordinates from the unfiltered query.
+        older = hits.filter(pc.not_equal(hits["id"], 4))
+        missing = scan().filter(f"{column} IS NULL")
+        assert missing.to_table().equals(older)
+        assert missing.limit(1).to_table().equals(older.slice(0, 1))
+        present = scan().filter(f"{column} IS NOT NULL").to_table()
+        assert present.equals(hits.filter(pc.equal(hits["id"], 4)))
+
+
+def test_lsm_fts_filter_on_stored_score_and_missing_label(tmp_path):
+    schema = pa.schema(
+        [
+            pa.field("id", pa.int64(), nullable=False, metadata=_PK_META),
+            pa.field("text", pa.string()),
+            pa.field("_score", pa.float32()),
+        ]
+    )
+    ds = lance.write_dataset(
+        pa.table({"id": [0], "text": ["other"], "_score": [0.0]}, schema=schema),
+        tmp_path / "base",
+    )
+    ds.create_scalar_index("text", "INVERTED", name="fts")
+    ds.initialize_mem_wal(maintained_indexes=["fts"], unsharded=True)
+    shard_id = str(uuid.uuid4())
+    with ds.mem_wal_writer(shard_id) as writer:
+        writer.put(
+            pa.table(
+                {"id": [1, 2], "text": ["user user", "user"], "_score": [None, -1.0]},
+                schema=schema,
+            )
+        )
+    ds.add_columns(pa.field("label", pa.string()))
+
+    with ds.mem_wal_writer(shard_id) as writer:
+        query = MatchQuery("user", "text")
+        hits = (
+            writer.lsm_scanner()
+            .full_text_search(query)
+            .filter("_score IS NOT NULL AND label IS NULL")
+            .project(["id"])
+            .limit(1)
+            .to_table()
+        )
+    assert hits["id"].to_pylist() == [2]
+    assert hits["_score"][0].as_py() > 0
 
 
 def test_lsm_scanner_json_column(tmp_path):
