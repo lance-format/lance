@@ -403,23 +403,20 @@ impl Scanner {
         filter_plan: &ExprFilterPlan,
         desired_projection: &Projection,
     ) -> Result<Projection> {
-        // Note: We use all_columns and not refine_columns here.  If a column is covered by an index but
-        // the user has requested it, then we do not use it for late materialization.
-        //
-        // Either that column is covered by an exact filter (e.g. string with bitmap/btree) and there is no
-        // need for late materialization or that column is covered by an inexact filter (e.g. ngram) in which
-        // case we are going to load the column anyways for the recheck.
-        let filter_columns = filter_plan
-            .full_expr
-            .as_ref()
-            .map(|expr| filter_read_columns(expr, desired_projection))
-            .unwrap_or_default();
-
-        let filter_schema = self
-            .dataset
-            .empty_projection()
-            .union_columns(filter_columns, OnMissing::Error)?
-            .into_schema();
+        // A recheck may already read a requested column. Keep it in the output
+        // so a later Take does not fetch it a second time. Unrequested columns
+        // covered by an index are read only on fragments that need a recheck.
+        let filter_projection = |expr: Option<&datafusion_expr::Expr>| {
+            let columns = expr
+                .map(|expr| filter_read_columns(expr, desired_projection))
+                .unwrap_or_default();
+            self.dataset
+                .empty_projection()
+                .union_columns(columns, OnMissing::Error)
+        };
+        let requested_filter =
+            filter_projection(filter_plan.full_expr.as_ref())?.intersect(desired_projection);
+        let refine = filter_projection(filter_plan.refine_expr.as_ref())?;
 
         let mut late_ids = HashSet::new();
         for field in self.dataset.schema().fields.iter() {
@@ -432,7 +429,8 @@ impl Scanner {
             // Subtract columns that are expensive
             .subtract_predicate(|f| late_ids.contains(&f.id))
             // Add back columns that we need for filtering
-            .union_schema(&filter_schema))
+            .union_projection(&requested_filter)
+            .union_projection(&refine))
     }
 
     // Collects the ids of the fields that should be materialized late (see calc_eager_projection).
