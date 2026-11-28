@@ -114,38 +114,93 @@ fn simplify_constant(expr: Expr) -> Option<ScalarValue> {
     }
 }
 
-/// Evaluates a constant expression with each of its literals converted to
-/// `data_type`, so `u = 1 << 63` shifts as `UInt64` for a `UInt64` column.
-/// Returns `None` when a literal does not convert or the sum, difference or
-/// product overflows `data_type`.
-fn fold_as(expr: &Expr, data_type: &DataType) -> Option<ScalarValue> {
+/// The exact value of `+`, `-`, `*` and `<<` on integer literals, or `None`
+/// for any other operator or operand, or a value beyond `i128`.
+fn exact_integer(expr: &Expr) -> Option<i128> {
     match expr {
-        Expr::Literal(value, _) => safe_coerce_scalar(value, data_type),
+        Expr::Literal(value, _) => match value {
+            ScalarValue::Int8(Some(v)) => Some((*v).into()),
+            ScalarValue::Int16(Some(v)) => Some((*v).into()),
+            ScalarValue::Int32(Some(v)) => Some((*v).into()),
+            ScalarValue::Int64(Some(v)) => Some((*v).into()),
+            ScalarValue::UInt8(Some(v)) => Some((*v).into()),
+            ScalarValue::UInt16(Some(v)) => Some((*v).into()),
+            ScalarValue::UInt32(Some(v)) => Some((*v).into()),
+            ScalarValue::UInt64(Some(v)) => Some((*v).into()),
+            _ => None,
+        },
         Expr::BinaryExpr(BinaryExpr { left, op, right }) => {
-            let left = fold_as(left, data_type)?;
-            let right = fold_as(right, data_type)?;
+            let (left, right) = (exact_integer(left)?, exact_integer(right)?);
             match op {
-                Operator::Plus => left.add_checked(&right).ok(),
-                Operator::Minus => left.sub_checked(&right).ok(),
-                Operator::Multiply => left.mul_checked(&right).ok(),
-                _ => simplify_constant(binary_expr(lit(left), *op, lit(right))),
+                Operator::Plus => left.checked_add(right),
+                Operator::Minus => left.checked_sub(right),
+                Operator::Multiply => left.checked_mul(right),
+                Operator::BitwiseShiftLeft => {
+                    left.checked_mul(2_i128.checked_pow(u32::try_from(right).ok()?)?)
+                }
+                _ => None,
             }
         }
         _ => None,
     }
 }
 
-/// Folds a constant expression compared with a column of type `data_type`:
-/// in that type when it holds the result, otherwise with the literals' own
-/// types, so `i8_col < 100 + 100` compares with 200 rather than a wrapped `-56`.
+/// `value` as a scalar of the integer type `data_type`, when that type holds it.
+fn integer_scalar(value: i128, data_type: &DataType) -> Option<ScalarValue> {
+    Some(match data_type {
+        DataType::Int8 => ScalarValue::Int8(Some(value.try_into().ok()?)),
+        DataType::Int16 => ScalarValue::Int16(Some(value.try_into().ok()?)),
+        DataType::Int32 => ScalarValue::Int32(Some(value.try_into().ok()?)),
+        DataType::Int64 => ScalarValue::Int64(Some(value.try_into().ok()?)),
+        DataType::UInt8 => ScalarValue::UInt8(Some(value.try_into().ok()?)),
+        DataType::UInt16 => ScalarValue::UInt16(Some(value.try_into().ok()?)),
+        DataType::UInt32 => ScalarValue::UInt32(Some(value.try_into().ok()?)),
+        DataType::UInt64 => ScalarValue::UInt64(Some(value.try_into().ok()?)),
+        _ => return None,
+    })
+}
+
+/// Folds a constant expression compared with a column of type `data_type`.
+///
+/// The expression is evaluated as written, in its literals' own types, so it
+/// keeps its arithmetic, NULL and errors: `(1 << 7) > i` compares with 128 on
+/// an `Int8` column, and `7 / 0 = f` is left to fail as before. Only the result
+/// is then resolved like any literal compared with the column, which narrows it
+/// to the column type when it fits. Integer arithmetic whose exact result the
+/// column's integer type holds folds to that result, so `u = (1 << 63)` matches
+/// 2^63 on a `UInt64` column although `Int64` wraps it.
 fn fold_constant(expr: &Expr, data_type: Option<&DataType>) -> Option<Expr> {
     if !is_constant_expr(expr) {
         return None;
     }
-    let value = data_type
-        .and_then(|data_type| fold_as(expr, data_type))
-        .or_else(|| simplify_constant(expr.clone()))?;
+    if let Some(value) =
+        data_type.and_then(|data_type| integer_scalar(exact_integer(expr)?, data_type))
+    {
+        return Some(lit(value));
+    }
+    let value = simplify_constant(expr.clone())?;
+    // A NULL result compares as NULL whatever its type.
+    let value = match data_type {
+        Some(data_type) if value.is_null() => ScalarValue::try_from(data_type).unwrap_or(value),
+        _ => value,
+    };
     Some(lit(value))
+}
+
+/// Whether `op` is one of the comparisons `numeric_coercion::rewrite` resolves.
+/// Only these narrow a constant operand to the other side's column type;
+/// arithmetic keeps DataFusion's promotion, so a projection such as
+/// `(25 * 2) + i` is not narrowed.
+fn is_comparison(op: &Operator) -> bool {
+    matches!(
+        op,
+        Operator::Eq
+            | Operator::NotEq
+            | Operator::Lt
+            | Operator::LtEq
+            | Operator::Gt
+            | Operator::GtEq
+    )
 }
 
 /// Folds the constant operands of a comparison, `BETWEEN` or `IN` list, which
@@ -157,8 +212,7 @@ fn fold_constant_operands(expr: &Expr, schema: &Schema) -> Option<Expr> {
     };
     let folded = match expr {
         Expr::BinaryExpr(BinaryExpr { left, op, right })
-            if !matches!(op, Operator::And | Operator::Or)
-                && (is_constant_expr(left) || is_constant_expr(right)) =>
+            if is_comparison(op) && (is_constant_expr(left) || is_constant_expr(right)) =>
         {
             Expr::BinaryExpr(BinaryExpr::new(
                 Box::new(fold(left, right)),
@@ -715,9 +769,27 @@ mod tests {
         .unwrap()
     }
 
+    /// Plans the filter `sql` on [`constant_expression_batch`] and evaluates it,
+    /// returning the first planning or evaluation error as text.
+    fn evaluate_filter(sql: &str) -> std::result::Result<arrow_array::ArrayRef, String> {
+        let batch = constant_expression_batch();
+        let planner = crate::planner::Planner::new(batch.schema());
+        let expr = planner.parse_filter(sql).map_err(|e| e.to_string())?;
+        let expr = planner.optimize_expr(expr).map_err(|e| e.to_string())?;
+        let expr = planner
+            .create_physical_expr(&expr)
+            .map_err(|e| e.to_string())?;
+        let value = expr.evaluate(&batch).map_err(|e| e.to_string())?;
+        value
+            .into_array(batch.num_rows())
+            .map_err(|e| e.to_string())
+    }
+
     /// A constant expression keeps its own value whichever side of the
     /// comparison it is on: `i < 100 + 100` matches the same rows as
     /// `100 + 100 > i` and `i < 200`, rather than adding the literals as `Int8`.
+    /// It is evaluated as written, in its literals' own types, before only its
+    /// result is narrowed to the column type.
     #[rstest::rstest]
     #[case::sum_above_type("i < 100 + 100", [Some(true), Some(true), Some(true), None])]
     #[case::sum_above_type_reversed("100 + 100 > i", [Some(true), Some(true), Some(true), None])]
@@ -732,35 +804,52 @@ mod tests {
     #[case::operand_above_type("i < 200 - 100", [Some(true), Some(true), Some(false), None])]
     #[case::float_operand("i > 1.5 + 1", [Some(false), Some(true), Some(true), None])]
     #[case::in_range("i = 25 * 2", [Some(false), Some(true), Some(false), None])]
+    #[case::shift_above_type("(1 << 7) > i", [Some(true), Some(true), Some(true), None])]
+    #[case::shift_above_type_column_first("i < (1 << 7)", [Some(true), Some(true), Some(true), None])]
     #[case::unsigned_below_zero("u > 0 - 1", [Some(true), Some(true), Some(true), None])]
     #[case::unsigned_difference_below_zero(
         "u < 5 - 10",
         [Some(false), Some(false), Some(false), None]
     )]
-    #[case::division_as_column_type("f = 7 / 2", [Some(false), Some(true), Some(false), None])]
-    #[case::division_as_column_type_reversed(
-        "7 / 2 = f",
-        [Some(false), Some(true), Some(false), None]
+    #[case::integers_before_float(
+        "9007199254740993 - 9007199254740992 = f",
+        [Some(false), Some(false), Some(true), None]
     )]
+    #[case::integers_before_float_column_first(
+        "f = 9007199254740993 - 9007199254740992",
+        [Some(false), Some(false), Some(true), None]
+    )]
+    #[case::integer_division("7 / 2 = f", [Some(true), Some(false), Some(false), None])]
+    #[case::integer_division_column_first("f = 7 / 2", [Some(true), Some(false), Some(false), None])]
+    #[case::float_division("f = 7.0 / 2.0", [Some(false), Some(true), Some(false), None])]
+    #[case::distinct_from_sum_above_type(
+        "i IS DISTINCT FROM 100 + 100",
+        [Some(true), Some(true), Some(true), Some(true)]
+    )]
+    #[case::null_operand("i = 1 + NULL", [None, None, None, None])]
+    #[case::null_operand_reversed("1 + NULL = i", [None, None, None, None])]
     fn constant_expressions_keep_their_value(
         #[case] sql: &str,
         #[case] expected: [Option<bool>; 4],
     ) {
         use arrow_array::{BooleanArray, cast::AsArray};
 
-        let batch = constant_expression_batch();
-        let planner = crate::planner::Planner::new(batch.schema());
-        let expr = planner
-            .parse_filter(sql)
-            .unwrap_or_else(|error| panic!("{sql}: {error}"));
-        let expr = planner.optimize_expr(expr).unwrap();
-        let result = planner.create_physical_expr(&expr).unwrap();
-        let result = result.evaluate(&batch).unwrap().into_array(4).unwrap();
+        let result = evaluate_filter(sql).unwrap_or_else(|error| panic!("{sql}: {error}"));
         assert_eq!(
             result.as_boolean(),
             &BooleanArray::from(expected.to_vec()),
             "{sql}"
         );
+    }
+
+    /// A constant expression that fails, such as a division by zero, still
+    /// fails instead of being evaluated in the column type.
+    #[rstest::rstest]
+    #[case::constant_first("7 / 0 = f")]
+    #[case::column_first("f = 7 / 0")]
+    fn constant_expressions_keep_their_errors(#[case] sql: &str) {
+        let error = evaluate_filter(sql).expect_err(sql);
+        assert!(error.contains("Divide by zero"), "{sql}: {error}");
     }
 
     /// A folded constant that fits the column type is still narrowed to it, so
@@ -773,5 +862,38 @@ mod tests {
         let batch = constant_expression_batch();
         let planner = crate::planner::Planner::new(batch.schema());
         assert_eq!(planner.parse_filter(sql).unwrap(), expected, "{sql}");
+    }
+
+    /// A shift whose exact result a `UInt64` column holds compares with that
+    /// result on the bare column, although it wraps as `Int64`.
+    #[rstest::rstest]
+    #[case::column_first("w = (1 << 63)", col("w").eq(lit(1_u64 << 63)))]
+    #[case::constant_first("(1 << 63) = w", lit(1_u64 << 63).eq(col("w")))]
+    fn exact_shift_plans_on_unsigned_column(#[case] sql: &str, #[case] expected: Expr) {
+        let batch = arrow_array::record_batch!(("w", UInt64, [1_u64 << 63, 3])).unwrap();
+        let planner = crate::planner::Planner::new(batch.schema());
+        assert_eq!(planner.parse_filter(sql).unwrap(), expected, "{sql}");
+    }
+
+    /// Arithmetic with a constant operand is not narrowed to the column type,
+    /// so a projection keeps DataFusion's promotion instead of wrapping.
+    #[rstest::rstest]
+    #[case::sum("(25 * 2) + i", "150")]
+    #[case::product("(1 + 1) * u", "510")]
+    fn constant_operands_do_not_narrow_arithmetic(#[case] sql: &str, #[case] expected: &str) {
+        let batch = arrow_array::record_batch!(("i", Int8, [100]), ("u", UInt8, [255])).unwrap();
+        let planner = crate::planner::Planner::new(batch.schema());
+        let expr = planner
+            .optimize_expr(planner.parse_expr(sql).unwrap())
+            .unwrap();
+        let result = planner
+            .create_physical_expr(&expr)
+            .unwrap()
+            .evaluate(&batch)
+            .unwrap()
+            .into_array(1)
+            .unwrap();
+        let value = ScalarValue::try_from_array(result.as_ref(), 0).unwrap();
+        assert_eq!(value.to_string(), expected, "{sql}: {value:?}");
     }
 }
