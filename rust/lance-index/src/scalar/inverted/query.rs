@@ -62,6 +62,11 @@ pub struct FtsSearchParams {
     /// DataFusion fallback passes `None` recursively so intermediate children
     /// remain complete.
     pub limit: Option<usize>,
+    /// Set when the caller scores every match with one constant, as a zero boost
+    /// does. Scores rank nothing: selection follows the tie order, and the walk
+    /// applies no score bound.
+    #[serde(default)]
+    pub constant_score: bool,
     pub wand_factor: f32,
     pub fuzziness: Option<u32>,
     /// Final fuzzy vocabulary budget for one Match leaf across all selected
@@ -78,6 +83,7 @@ impl FtsSearchParams {
     pub fn new() -> Self {
         Self {
             limit: None,
+            constant_score: false,
             wand_factor: 1.0,
             fuzziness: Some(0),
             max_expansions: 50,
@@ -88,6 +94,11 @@ impl FtsSearchParams {
 
     pub fn with_limit(mut self, limit: Option<usize>) -> Self {
         self.limit = limit;
+        self
+    }
+
+    pub fn with_constant_score(mut self, constant_score: bool) -> Self {
+        self.constant_score = constant_score;
         self
     }
 

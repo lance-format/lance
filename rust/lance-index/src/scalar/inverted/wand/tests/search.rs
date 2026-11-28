@@ -347,3 +347,123 @@ fn test_flat_search_finds_list_row_with_match_at_non_last_position(
         "expected exactly row 100, got {addrs:?}"
     );
 }
+
+#[test]
+fn test_ascending_row_addresses_prune_a_tied_walk_at_the_raw_kth_score() {
+    // Row addresses ascend with DocId, so a tie the walk has not reached yet
+    // loses against the k-th entry and the floor stays at the raw k-th score. A
+    // floor one ULP lower would let every block max through and score the whole
+    // posting list.
+    const NUM_BLOCKS: u32 = 64;
+    let total = NUM_BLOCKS * BLOCK_SIZE as u32;
+    let mut docs = DocSet::default();
+    for row_id in 0..total {
+        docs.append(u64::from(row_id), 1);
+    }
+    let scored = Arc::new(AtomicUsize::new(0));
+    let posting = PostingIterator::with_query_weight(
+        String::from("term"),
+        0,
+        0,
+        1.0,
+        generate_posting_list(
+            (0..total).collect(),
+            1.0,
+            Some(vec![1.0; NUM_BLOCKS as usize]),
+            true,
+        ),
+        docs.len(),
+    );
+    let params = FtsSearchParams::new().with_limit(Some(10));
+    let hits = Wand::new(
+        Operator::Or,
+        std::iter::once(posting),
+        &docs,
+        CountingScorer {
+            scored: scored.clone(),
+        },
+    )
+    .search(&params, &NoOpMetricsCollector)
+    .unwrap();
+    assert_eq!(hits.len(), 10, "the top-k must be complete");
+    let scored = scored.load(Ordering::Relaxed);
+    assert_eq!(
+        scored, BLOCK_SIZE,
+        "a tied address-ascending walk must stop after the first posting block of {BLOCK_SIZE} documents, scored {scored} of {total}"
+    );
+}
+
+/// A constant score ranks nothing: the walk selects on the tie order and stops
+/// early.
+#[rstest]
+#[case::small_top_k(4)]
+#[case::one_block_top_k(BLOCK_SIZE)]
+#[case::past_one_block(BLOCK_SIZE + 5)]
+fn test_a_constant_score_walk_selects_the_lowest_row_addresses(#[case] limit: usize) {
+    use crate::metrics::MetricsCollector;
+
+    #[derive(Default)]
+    struct CountWalkSteps(AtomicUsize);
+    impl MetricsCollector for CountWalkSteps {
+        fn record_parts_loaded(&self, _: usize) {}
+        fn record_index_loads(&self, _: usize) {}
+        fn record_comparisons(&self, n: usize) {
+            self.0.fetch_add(n, Ordering::Relaxed);
+        }
+    }
+
+    const NUM_DOCS: u32 = 4 * BLOCK_SIZE as u32;
+    let mut docs = DocSet::default();
+    for row_id in 0..NUM_DOCS {
+        docs.append(u64::from(row_id), 1);
+    }
+    // The higher frequencies sit in the last half of the posting list, so a
+    // collector that ranked on this score would answer with the highest row
+    // addresses, exactly the rows the caller's constant order keeps last.
+    let freqs = (0..NUM_DOCS)
+        .map(|doc_id| if doc_id < NUM_DOCS / 2 { 1 } else { 4 })
+        .collect::<Vec<_>>();
+    let posting = PostingIterator::with_query_weight(
+        String::from("term"),
+        0,
+        0,
+        1.0,
+        generate_posting_list_with_freqs(
+            (0..NUM_DOCS).collect(),
+            freqs,
+            4.0,
+            Some(vec![4.0; (NUM_DOCS / BLOCK_SIZE as u32) as usize]),
+            true,
+        ),
+        docs.len(),
+    );
+
+    let params = FtsSearchParams::new()
+        .with_limit(Some(limit))
+        .with_constant_score(true);
+    let steps = CountWalkSteps::default();
+    let hits = Wand::new(
+        Operator::Or,
+        std::iter::once(posting),
+        &docs,
+        CountingScorer {
+            scored: Arc::new(AtomicUsize::new(0)),
+        },
+    )
+    .search(&params, &steps)
+    .unwrap();
+
+    // `search` hands back its candidates unordered; the caller ranks them.
+    let mut addresses = hits.iter().map(|hit| hit.document).collect::<Vec<_>>();
+    addresses.sort_unstable();
+    assert_eq!(
+        addresses,
+        (0..limit as u64).collect::<Vec<_>>(),
+        "a constant-score walk must keep the lowest row addresses, not the best BM25 scores"
+    );
+    let steps = steps.0.load(Ordering::Relaxed);
+    assert!(
+        steps <= limit + 1,
+        "a constant-score walk must stop at the k-th row address, walked {steps} of {NUM_DOCS} documents"
+    );
+}

@@ -2302,8 +2302,15 @@ impl PartialOrd for ScoredDoc {
 }
 
 impl Ord for ScoredDoc {
+    /// The FTS result order: score descending, then `row_id` ascending, then
+    /// `doc_index` ascending, oriented so the best document compares greatest.
+    /// The order is total, so the top-k at limit k is an ordered prefix of the
+    /// top-k at any larger limit.
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.score.cmp(&other.score)
+        self.score
+            .cmp(&other.score)
+            .then_with(|| other.row_id.cmp(&self.row_id))
+            .then_with(|| other.doc_index.cmp(&self.doc_index))
     }
 }
 

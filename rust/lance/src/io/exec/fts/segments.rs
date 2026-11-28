@@ -17,7 +17,9 @@ use lance_index::metrics::MetricsCollector;
 use lance_index::prefilter::PreFilter;
 use lance_index::scalar::inverted::builder::ScoredDoc;
 use lance_index::scalar::inverted::query::{FtsSearchParams, Operator, Tokens};
-use lance_index::scalar::inverted::{CombinedFieldColumn, InvertedIndex, MemBM25Scorer};
+use lance_index::scalar::inverted::{
+    CombinedFieldColumn, InvertedIndex, MemBM25Scorer, push_top_k_document,
+};
 use lance_table::format::IndexMetadata;
 
 use super::matches::PreparedMatch;
@@ -245,12 +247,7 @@ pub(super) async fn search_prepared_segments(
 
     while let Some(documents) = searches.try_next().await? {
         for document in documents {
-            if candidates.len() < limit {
-                candidates.push(std::cmp::Reverse(document));
-            } else if candidates.peek().unwrap().0.score < document.score {
-                candidates.pop();
-                candidates.push(std::cmp::Reverse(document));
-            }
+            push_top_k_document(&mut candidates, limit, document);
         }
     }
 
@@ -316,12 +313,7 @@ pub(super) async fn search_segments(
 
     while let Some(documents) = searches.try_next().await? {
         for document in documents {
-            if candidates.len() < limit {
-                candidates.push(std::cmp::Reverse(document));
-            } else if candidates.peek().unwrap().0.score < document.score {
-                candidates.pop();
-                candidates.push(std::cmp::Reverse(document));
-            }
+            push_top_k_document(&mut candidates, limit, document);
         }
     }
 

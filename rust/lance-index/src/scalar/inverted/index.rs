@@ -62,7 +62,7 @@ use tracing::{debug, info, instrument, warn};
 
 use super::documents::{
     AddressKeyedDocuments, DocId, DocLengths, DocVisibility, PartitionDocumentStore,
-    PartitionDocuments,
+    PartitionDocuments, ResidentAddressProjection, ResidentDocCoordinates,
 };
 use super::encoding::{MAX_POSTING_BLOCK_SIZE, PositionBlockBuilder};
 use super::impact::{IMPACT_LEVEL1_BLOCKS, ImpactSkipData, ImpactSkipDataBuilder};
@@ -133,6 +133,7 @@ pub use posting_builder::*;
 pub use posting_list::*;
 pub use posting_reader::*;
 use prewarm::*;
+pub use search_candidates::push_top_k_document;
 pub(super) use search_candidates::*;
 pub use token_set::*;
 

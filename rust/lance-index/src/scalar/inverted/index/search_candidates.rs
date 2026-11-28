@@ -221,38 +221,340 @@ pub(super) fn address_read_concurrency(io_parallelism: usize, largest_read_bytes
     )
 }
 
-pub(super) fn push_scored_key(
+/// Merge a document into a bounded cross-source top-k heap.
+///
+/// [`ScoredDoc::cmp`] compares the full `(score DESC, row_id ASC, doc_index ASC)`
+/// key, so a lower row address wins a score tie regardless of source or arrival
+/// order.
+pub fn push_top_k_document(
     candidates: &mut BinaryHeap<Reverse<ScoredDoc>>,
     limit: usize,
-    key: u64,
-    score: f32,
+    document: ScoredDoc,
 ) {
+    // `OrderedFloat` compares with `total_cmp`, which ranks NaN above every real
+    // score, so a NaN candidate would take the top of the result.
+    if document.score.0.is_nan() {
+        return;
+    }
     if candidates.len() < limit {
-        candidates.push(Reverse(ScoredDoc::new(key, score)));
+        candidates.push(Reverse(document));
     } else if candidates
         .peek()
-        .is_some_and(|candidate| candidate.0.score.0 < score)
+        .is_some_and(|Reverse(worst)| *worst < document)
     {
         candidates.pop();
-        candidates.push(Reverse(ScoredDoc::new(key, score)));
+        candidates.push(Reverse(document));
     }
 }
 
-pub(super) fn push_scored_partition_doc(
-    candidates: &mut BinaryHeap<Reverse<ScoredPartitionDoc>>,
-    limit: usize,
-    document: PartitionDocId,
-    score: f32,
-) {
-    if candidates.len() < limit {
-        candidates.push(Reverse(ScoredPartitionDoc::new(document, score)));
-    } else if candidates
-        .peek()
-        .is_some_and(|candidate| candidate.0.score.0 < score)
-    {
-        candidates.pop();
-        candidates.push(Reverse(ScoredPartitionDoc::new(document, score)));
+/// The global top-k of a modern search, as the merge can express it before row
+/// addresses are known.
+#[derive(Default)]
+pub(super) struct ModernCandidates {
+    /// The best `limit` candidates by score.
+    heap: BinaryHeap<Reverse<ScoredPartitionDoc>>,
+    /// Candidates tied at the current k-th score that the heap has no room for.
+    /// The k-th score rising clears them, so a query without ties leaves the
+    /// band empty.
+    tie_band: Vec<ScoredPartitionDoc>,
+}
+
+impl ModernCandidates {
+    /// Merge a candidate. Row addresses resolve only after selection, so a
+    /// k-th-score tie cannot be ranked: every tied candidate joins the band and
+    /// [`rank_resolved_documents`] picks the exact top-k afterwards.
+    pub(super) fn push(&mut self, limit: usize, document: PartitionDocId, score: f32) {
+        if score.is_nan() {
+            return;
+        }
+        let candidate = ScoredPartitionDoc::new(document, score);
+        if self.heap.len() < limit {
+            self.heap.push(Reverse(candidate));
+            return;
+        }
+        let Some(Reverse(worst)) = self.heap.peek() else {
+            return;
+        };
+        let worst_score = worst.score;
+        match candidate.score.cmp(&worst_score) {
+            std::cmp::Ordering::Less => {}
+            // Tied at the k-th score: a potential winner once addresses resolve.
+            std::cmp::Ordering::Equal => self.tie_band.push(candidate),
+            std::cmp::Ordering::Greater => {
+                let Some(Reverse(displaced)) = self.heap.pop() else {
+                    return;
+                };
+                self.heap.push(Reverse(candidate));
+                let kth = self.heap.peek().map(|Reverse(entry)| entry.score);
+                if kth.is_some_and(|kth| kth > worst_score) {
+                    // The k-th score rose past the band: none of its members can win.
+                    self.tie_band.clear();
+                } else {
+                    self.tie_band.push(displaced);
+                }
+            }
+        }
     }
+
+    /// Candidates held for the final selection: the top-k plus the tie band.
+    pub(super) fn buffered(&self) -> usize {
+        self.heap.len() + self.tie_band.len()
+    }
+
+    /// The candidates whose addresses have to be resolved: the top-k plus the tie
+    /// band. More than `limit` come back, and the final ranking truncates.
+    pub(super) fn into_vec(self) -> Vec<ScoredPartitionDoc> {
+        let mut candidates = self
+            .heap
+            .into_vec()
+            .into_iter()
+            .map(|Reverse(candidate)| candidate)
+            .collect::<Vec<_>>();
+        candidates.extend(self.tie_band);
+        candidates
+    }
+
+    /// Rebuild from candidates already ordered best first, as the exact top-k with
+    /// an empty tie band.
+    pub(super) fn from_ranked(ordered: Vec<ScoredPartitionDoc>) -> Self {
+        Self {
+            heap: ordered.into_iter().map(Reverse).collect(),
+            tie_band: Vec::new(),
+        }
+    }
+}
+
+/// Order resolved FTS documents by `(score DESC, row_id ASC, doc_index ASC)` and
+/// keep the exact top-k. The input may exceed `limit`: it is the top-k plus its
+/// k-th-score tie group, and the resolved row addresses break those ties. `key`
+/// selects the [`ScoredDoc`] to rank each element by.
+pub(super) fn rank_resolved_documents<T>(
+    mut documents: Vec<T>,
+    limit: usize,
+    key: impl Fn(&T) -> &ScoredDoc,
+) -> Vec<T> {
+    documents.sort_unstable_by(|left, right| key(right).cmp(key(left)));
+    documents.truncate(limit);
+    documents
+}
+
+/// What a WAND search dropped from its retained tie band.
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct WandBandStatus {
+    /// True when the candidates are missing part of the partition's k-th-score
+    /// tie band, so they must not be merged: the partition is searched again with
+    /// row addresses attached. See [`Wand::score_floor_overflow`].
+    pub(super) score_floor_overflow: bool,
+    /// True when a band was truncated while addresses were already resident, so
+    /// a retry cannot recover it. See [`Wand::band_truncated`].
+    pub(super) band_truncated: bool,
+}
+
+impl WandBandStatus {
+    pub(super) fn of<S: Scorer, D: WandDocuments>(wand: &Wand<'_, S, D>) -> Self {
+        Self {
+            score_floor_overflow: wand.score_floor_overflow(),
+            band_truncated: wand.band_truncated(),
+        }
+    }
+}
+
+/// Everything the CPU scoring phase needs from a single modern partition.
+pub(super) struct LoadedModernPartition {
+    pub(super) partition_ordinal: usize,
+    pub(super) part: Arc<InvertedPartition>,
+    pub(super) lengths: Arc<DocLengths>,
+    pub(super) visibility: DocVisibility,
+    pub(super) postings: FetchedPostings,
+    /// Row addresses the walk orders k-th-score ties by: the resident ones, those
+    /// read for a tie retry, or those read for a constant-score walk. Without them
+    /// the walk defers ties to the global merge.
+    pub(super) addresses: Option<ResidentAddressProjection>,
+    /// Element coordinates the walk orders one row's ties by: read when the
+    /// partition holds list elements and the addresses are resident. Without them
+    /// the walk cannot rank those.
+    pub(super) coordinates: Option<ResidentDocCoordinates>,
+}
+
+/// Load everything the CPU scoring phase needs for one modern partition.
+///
+/// `Ok(None)` means the partition cannot contribute: nothing visible under the
+/// prefilter, or no matching postings.
+pub(super) async fn load_modern_partition(
+    partition_ordinal: usize,
+    part: Arc<InvertedPartition>,
+    context: &ModernScoringContext,
+    mask: &Arc<RowAddrMask>,
+    term_ids: Option<PartitionTermIds<'_>>,
+    load_addresses: bool,
+) -> Result<Option<LoadedModernPartition>> {
+    let documents = part
+        .docs
+        .modern()
+        .ok_or_else(|| Error::internal("modern index contains legacy partition documents"))?;
+    let materialize_selected = context.operator == Operator::Or
+        && mask.max_len().is_some_and(|selected| {
+            u128::from(selected).saturating_mul(100)
+                <= u128::from(*FLAT_SEARCH_PERCENT_THRESHOLD)
+                    .saturating_mul(documents.len() as u128)
+        });
+    let visibility = match documents.immediate_visibility(mask.clone(), materialize_selected) {
+        Some(visibility) => visibility,
+        None => {
+            documents
+                .visibility(mask.clone(), materialize_selected)
+                .await?
+        }
+    };
+    if !visibility.may_match().await? {
+        return Ok(None);
+    }
+    let Some(postings) = part
+        .fetch_posting_lists(
+            context.tokens.as_ref(),
+            context.params.as_ref(),
+            context.operator,
+            context.metrics.as_ref(),
+            PostingLoadOptions::cache_aware_exact(),
+            term_ids,
+        )
+        .await?
+    else {
+        return Ok(None);
+    };
+    let lengths = match documents.cached_lengths() {
+        Some(lengths) => lengths,
+        None => documents.lengths().await?,
+    };
+    let addresses = if load_addresses {
+        // A constant-score walk orders ties by address and needs the projection up front.
+        Some(documents.address_projection().await?)
+    } else {
+        documents.resident_address_projection()
+    };
+    // Element partitions supply coordinate columns at any depth: an element's
+    // `doc_index` ranks the ties an address cannot. The final ranking reads the
+    // same cached columns.
+    let coordinates = if addresses.is_some() && documents.coordinate_rank() > 0 {
+        Some(documents.resident_coordinates().await?)
+    } else {
+        None
+    };
+    Ok(Some(LoadedModernPartition {
+        partition_ordinal,
+        part,
+        lengths,
+        visibility,
+        postings,
+        addresses,
+        coordinates,
+    }))
+}
+
+/// Query-wide state every modern partition is scored with.
+#[derive(Clone)]
+pub(super) struct ModernScoringContext {
+    pub(super) tokens: Arc<Tokens>,
+    pub(super) params: Arc<FtsSearchParams>,
+    pub(super) operator: Operator,
+    pub(super) metrics: Arc<dyn MetricsCollector>,
+    pub(super) impact_scorer: Arc<MemBM25Scorer>,
+    pub(super) impact_shared_threshold: Arc<AtomicU32>,
+    pub(super) shared_norm_addends: SharedNormAddends,
+}
+
+/// What a modern partition contributes to the global merge.
+pub(super) enum ModernPartitionOutcome {
+    /// Rescored candidates: the partition's top-k plus its k-th-score tie band.
+    Scored {
+        partition_ordinal: usize,
+        scored: Vec<(DocId, f32)>,
+    },
+    /// The tie band passed `limit + SCORE_FLOOR_BUFFER`, so the candidates are
+    /// not the exact top-k: the partition is searched again with addresses.
+    Overflow {
+        partition_ordinal: usize,
+        part: Arc<InvertedPartition>,
+    },
+}
+
+/// Run a modern partition's WAND search and rescore its candidates. Pure CPU
+/// work, so the compute pool runs it and the thread that allocated the frequency
+/// lists frees them.
+pub(super) fn score_modern_partition(
+    loaded: LoadedModernPartition,
+    context: &ModernScoringContext,
+) -> Result<Option<ModernPartitionOutcome>> {
+    let LoadedModernPartition {
+        partition_ordinal,
+        part,
+        lengths,
+        visibility,
+        postings,
+        addresses,
+        coordinates,
+    } = loaded;
+    let LoadedPostings {
+        postings,
+        grouped_expansions,
+        impact_safe,
+        exact_scoring_required,
+        ..
+    } = postings.into_loaded(context.tokens.as_ref(), context.impact_scorer.as_ref())?;
+    if postings.is_empty() {
+        return Ok(None);
+    }
+    let use_global_scorer = impact_safe || exact_scoring_required;
+    let threshold = if use_global_scorer {
+        context.impact_shared_threshold.clone()
+    } else {
+        Arc::new(AtomicU32::new(f32::NEG_INFINITY.to_bits()))
+    };
+    let wand_scorer = use_global_scorer.then(|| context.impact_scorer.clone());
+    let idf_by_position = idf_by_position(&postings, context.impact_scorer.as_ref());
+    let (candidates, band) = part.bm25_search_modern(
+        lengths.as_ref(),
+        &visibility,
+        addresses.as_ref(),
+        coordinates,
+        context.params.as_ref(),
+        context.operator,
+        postings,
+        wand_scorer,
+        context.shared_norm_addends.clone(),
+        context.metrics.as_ref(),
+        threshold,
+    )?;
+    if band.score_floor_overflow {
+        return Ok(Some(ModernPartitionOutcome::Overflow {
+            partition_ordinal,
+            part,
+        }));
+    }
+    if band.band_truncated {
+        debug!(
+            partition_ordinal,
+            "FTS element tie band truncated; elements tied on the whole `doc_index` path past the cap order by DocId"
+        );
+    }
+    let mut scored = rescore_partition_candidates(
+        PartitionCandidates {
+            idf_by_position,
+            grouped_expansions,
+            candidates,
+        },
+        context.impact_scorer.as_ref(),
+    );
+    if context.params.constant_score {
+        // Zero the score: not a ranking key downstream.
+        scored.iter_mut().for_each(|(_, score)| *score = 0.0);
+    }
+    Ok(
+        (!scored.is_empty()).then_some(ModernPartitionOutcome::Scored {
+            partition_ordinal,
+            scored,
+        }),
+    )
 }
 
 pub(super) fn rescore_partition_candidates<C>(

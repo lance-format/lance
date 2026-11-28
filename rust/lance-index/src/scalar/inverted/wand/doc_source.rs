@@ -8,8 +8,12 @@ use std::fmt::Debug;
 use lance_core::utils::address::RowAddress;
 use lance_select::RowAddrMask;
 
-use crate::scalar::inverted::documents::{DocId, DocLengths, DocVisibility};
+use crate::scalar::inverted::documents::{
+    DocId, DocLengths, DocVisibility, ResidentAddressProjection, ResidentDocCoordinates,
+};
 use crate::scalar::inverted::{DocInfo, DocSet};
+
+use super::collector::TieOrder;
 
 #[derive(Debug)]
 pub struct DocCandidate<C> {
@@ -51,6 +55,40 @@ pub(in crate::scalar::inverted) trait WandDocuments {
     fn candidate_from_key(&self, key: u64) -> Self::Candidate;
     fn flat_documents(&self) -> Option<FlatDocuments<'_>>;
     fn flat_doc_length(&self, doc_id: u64, document_key: u64, compressed: bool) -> u32;
+
+    /// True when [`WandDocuments::tie_order`] returns row addresses, so the
+    /// walk ranks score ties between rows itself. Otherwise the address is a
+    /// constant and the collector keeps the whole k-th-score band for the caller.
+    fn orders_ties_by_address(&self) -> bool;
+
+    /// The partition's element coordinate columns for the ranks past the packed key
+    /// [`tie_order`](Self::tie_order) returns, which continue a tie that key leaves
+    /// equal. `None` when the walk ranks no element coordinates, or its key already
+    /// covers every rank of the partition.
+    fn deeper_element_coordinates(&self) -> Option<ResidentDocCoordinates> {
+        None
+    }
+
+    /// Rank below the score inside a partition's top-k. `address` is the row
+    /// address when [`WandDocuments::orders_ties_by_address`] is true, otherwise a
+    /// constant, so every tie compares equal and is retained. `coordinate` ranks
+    /// the documents sharing an address. The default returns `document_key` as the
+    /// address with no coordinate, which is what the legacy adapter and a
+    /// [`DocSet`] without row ids use.
+    fn tie_order(&self, document_key: u64) -> TieOrder {
+        TieOrder {
+            address: document_key,
+            coordinate: None,
+        }
+    }
+
+    /// True when this partition's row addresses are unique and strictly ascend
+    /// with the local DocId order every WAND walk follows, which makes DocId order
+    /// result order among equal scores. Requires
+    /// [`WandDocuments::orders_ties_by_address`]. Default false.
+    fn row_addresses_ascend_with_doc_id(&self) -> bool {
+        false
+    }
 }
 
 pub(in crate::scalar::inverted) trait ModernVisibility {
@@ -110,6 +148,11 @@ impl ModernVisibility for &DocVisibility {
 pub(in crate::scalar::inverted) struct ModernWandDocuments<'a, V> {
     lengths: &'a DocLengths,
     visibility: V,
+    /// Row addresses resident in memory, which rank k-th-score ties between rows.
+    addresses: Option<&'a ResidentAddressProjection>,
+    /// Element coordinates resident in memory, which rank the ties between one
+    /// row's elements. Only useful together with `addresses`.
+    coordinates: Option<ResidentDocCoordinates>,
 }
 
 impl<'a> ModernWandDocuments<'a, AllModernDocuments> {
@@ -117,6 +160,8 @@ impl<'a> ModernWandDocuments<'a, AllModernDocuments> {
         Self {
             lengths,
             visibility: AllModernDocuments,
+            addresses: None,
+            coordinates: None,
         }
     }
 }
@@ -126,7 +171,27 @@ impl<'a> ModernWandDocuments<'a, &'a DocVisibility> {
         Self {
             lengths,
             visibility,
+            addresses: None,
+            coordinates: None,
         }
+    }
+}
+
+impl<'a, V> ModernWandDocuments<'a, V> {
+    /// Order k-th-score ties by row address instead of deferring them.
+    pub(crate) fn with_addresses(
+        mut self,
+        addresses: Option<&'a ResidentAddressProjection>,
+    ) -> Self {
+        self.addresses = addresses;
+        self
+    }
+
+    /// Rank one row's element ties by `doc_index`. Attach coordinates only with
+    /// the addresses: a coordinate orders documents inside one address.
+    pub(crate) fn with_coordinates(mut self, coordinates: Option<ResidentDocCoordinates>) -> Self {
+        self.coordinates = coordinates;
+        self
     }
 }
 
@@ -193,6 +258,45 @@ impl<V: ModernVisibility> WandDocuments for ModernWandDocuments<'_, V> {
 
     fn flat_doc_length(&self, doc_id: u64, _document_key: u64, _compressed: bool) -> u32 {
         self.scoring_num_tokens(doc_id as u32)
+    }
+
+    fn orders_ties_by_address(&self) -> bool {
+        self.addresses.is_some()
+    }
+
+    fn deeper_element_coordinates(&self) -> Option<ResidentDocCoordinates> {
+        self.coordinates
+            .as_ref()
+            .filter(|coordinates| coordinates.has_deeper_ranks())
+            .cloned()
+    }
+
+    fn row_addresses_ascend_with_doc_id(&self) -> bool {
+        // `dense` matters as much as `ascending`: a dead slot has no current
+        // address, so ranking it last breaks the DocId-to-address order.
+        self.addresses
+            .is_some_and(ResidentAddressProjection::dense_and_strictly_ascending)
+    }
+
+    fn tie_order(&self, document_key: u64) -> TieOrder {
+        let doc_id = DocId::new(document_key as u32);
+        // The elements of a row share its address, so the coordinate ranks what
+        // the address cannot. `u64::MAX` ranks a dead slot the walk skips, and
+        // every document when no projection is attached: then every tie compares
+        // equal and the whole k-th-score band is retained.
+        // `load_modern_partition` attaches coordinates only with an address projection,
+        // and the collector finishes ranks past the packed key using
+        // [`Self::deeper_element_coordinates`].
+        TieOrder {
+            address: self
+                .addresses
+                .and_then(|addresses| addresses.address(doc_id))
+                .unwrap_or(u64::MAX),
+            coordinate: self
+                .coordinates
+                .as_ref()
+                .map(|coordinates| coordinates.coordinate_key(doc_id)),
+        }
     }
 }
 
@@ -265,6 +369,17 @@ impl WandDocuments for LegacyWandDocuments<'_> {
             self.docs.num_tokens_by_row_id(document_key)
         }
     }
+
+    // Legacy document keys are row addresses, so the walk orders ties exactly.
+    fn orders_ties_by_address(&self) -> bool {
+        true
+    }
+
+    // A loaded legacy `DocSet` keeps its row ids sorted, so only a row owning
+    // several documents breaks DocId-equals-address order. The verdict is memoized.
+    fn row_addresses_ascend_with_doc_id(&self) -> bool {
+        self.docs.row_ids_strictly_ascending()
+    }
 }
 
 // Most unit tests exercise WAND in isolation with an in-memory complete
@@ -323,5 +438,16 @@ impl WandDocuments for DocSet {
         } else {
             self.num_tokens_by_row_id(document_key)
         }
+    }
+
+    // `document_key` is a row address whenever the in-memory DocSet has row ids.
+    fn orders_ties_by_address(&self) -> bool {
+        self.has_row_ids()
+    }
+
+    // Unit tests build DocSets in DocId order, so this is the mode a partition
+    // written by the current writer reports and the pruned-walk path gets covered.
+    fn row_addresses_ascend_with_doc_id(&self) -> bool {
+        self.has_row_ids() && self.row_ids_strictly_ascending()
     }
 }

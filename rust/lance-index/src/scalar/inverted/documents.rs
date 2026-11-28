@@ -9,6 +9,7 @@
 
 use lance_index_core::remapping::{BatchRowIdRemapper, remap_row_ids_async};
 use std::borrow::Cow;
+use std::cmp::Ordering;
 use std::ops::Range;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, OnceLock, Weak};
@@ -98,6 +99,141 @@ impl CacheKey for DocRowIdsKey {
 
     fn type_name() -> &'static str {
         "DocRowIds"
+    }
+}
+
+/// Holds the element coordinate columns of a partition: one column per
+/// coordinate rank.
+///
+/// The cross-partition merge resolves the same documents again on each tie-band
+/// compaction and for the final ranking, so they are cached under
+/// [`DocCoordinatesKey`].
+#[derive(Debug)]
+pub(super) struct CachedDocCoordinates {
+    pub(crate) coordinates: Vec<Arc<UInt32Array>>,
+}
+
+impl DeepSizeOf for CachedDocCoordinates {
+    fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
+        self.coordinates
+            .iter()
+            .map(|column| column.len() * std::mem::size_of::<u32>())
+            .sum()
+    }
+}
+
+/// Cache key for one partition's [`CachedDocCoordinates`].
+#[derive(Debug, Clone)]
+pub(super) struct DocCoordinatesKey {
+    pub(crate) partition_id: u64,
+}
+
+impl CacheKey for DocCoordinatesKey {
+    type ValueType = CachedDocCoordinates;
+
+    fn key(&self) -> Cow<'_, str> {
+        format!("doc-coordinates-{}", self.partition_id).into()
+    }
+
+    fn type_name() -> &'static str {
+        "DocCoordinates"
+    }
+}
+
+/// The coordinate ranks one [`ElementCoordinateKey`] holds: ranks 0-1 in
+/// `ranks_0_1`, ranks 2-3 in `ranks_2_3`. Deeper ranks are compared against
+/// the resident columns, see
+/// [`ResidentDocCoordinates::compare_deeper_ranks`].
+pub(in crate::scalar::inverted) const PACKED_COORDINATE_RANKS: usize = 4;
+
+/// Two coordinate ranks in one u64: rank 0 in the high 32 bits, rank 1 in the
+/// low 32. Numeric order matches comparing the ranks in order.
+pub(super) fn pack_coordinate_ranks(rank_0: u32, rank_1: u32) -> u64 {
+    (u64::from(rank_0) << 32) | u64::from(rank_1)
+}
+
+/// The ranks of one document's element path that fit a packed key, in rank
+/// order. `ranks_2_3` is `None` at two rank columns or fewer. A prefix of the
+/// partition's full element path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(in crate::scalar::inverted) struct ElementCoordinateKey {
+    pub(in crate::scalar::inverted) ranks_0_1: u64,
+    pub(in crate::scalar::inverted) ranks_2_3: Option<u64>,
+}
+
+/// Element coordinates of every DocId in a partition, resident in memory.
+///
+/// A WAND walk reads a key per candidate, so the whole columns are held, from
+/// the same cache entry [`PartitionDocuments::resident_coordinates`] uses.
+#[derive(Debug, Clone)]
+pub(super) struct ResidentDocCoordinates {
+    columns: Arc<CachedDocCoordinates>,
+    coordinate_rank: usize,
+}
+
+impl ResidentDocCoordinates {
+    /// True when the partition has rank columns past the packed key.
+    #[inline]
+    pub(super) fn has_deeper_ranks(&self) -> bool {
+        self.coordinate_rank > PACKED_COORDINATE_RANKS
+    }
+
+    /// Continue a tie that [`Self::coordinate_key`] left equal, over the ranks past
+    /// the packed key. A rank the partition lacks and an out-of-range DocId rank
+    /// last, as in the key. `Ordering::Equal` means both documents hold the same
+    /// element path.
+    #[inline]
+    pub(super) fn compare_deeper_ranks(&self, lhs: DocId, rhs: DocId) -> Ordering {
+        for rank in PACKED_COORDINATE_RANKS..self.coordinate_rank {
+            let ordering = self
+                .rank_value(rank, lhs.as_usize())
+                .cmp(&self.rank_value(rank, rhs.as_usize()));
+            if ordering != Ordering::Equal {
+                return ordering;
+            }
+        }
+        Ordering::Equal
+    }
+
+    /// The coordinate key of `doc_id`. A rank column the partition lacks, and an
+    /// out-of-range DocId, give the largest value at that rank, so the document
+    /// loses every tie. A partition with one rank column gets a constant low half
+    /// of `ranks_0_1`.
+    #[inline]
+    pub(super) fn coordinate_key(&self, doc_id: DocId) -> ElementCoordinateKey {
+        let position = doc_id.as_usize();
+        ElementCoordinateKey {
+            ranks_0_1: pack_coordinate_ranks(
+                self.rank_value(0, position),
+                self.rank_value(1, position),
+            ),
+            ranks_2_3: (self.columns.coordinates.len() > 2).then(|| {
+                pack_coordinate_ranks(self.rank_value(2, position), self.rank_value(3, position))
+            }),
+        }
+    }
+
+    /// The `rank`th coordinate of the document at `position`, or `u32::MAX` when
+    /// that rank or position does not exist.
+    #[inline]
+    fn rank_value(&self, rank: usize, position: usize) -> u32 {
+        self.columns
+            .coordinates
+            .get(rank)
+            .filter(|column| position < column.len())
+            .map_or(u32::MAX, |column| column.value(position))
+    }
+}
+
+/// Resident element coordinates built from one column per rank, without a store,
+/// for the collector tests that rank a partition's element ties.
+#[cfg(test)]
+pub(super) fn resident_coordinates_for_test(columns: Vec<UInt32Array>) -> ResidentDocCoordinates {
+    let coordinates = columns.into_iter().map(Arc::new).collect::<Vec<_>>();
+    let coordinate_rank = coordinates.len();
+    ResidentDocCoordinates {
+        columns: Arc::new(CachedDocCoordinates { coordinates }),
+        coordinate_rank,
     }
 }
 
@@ -1019,7 +1155,9 @@ impl ResidentAddressProjection {
     /// so a contiguous DocId range spans a contiguous address interval. Row
     /// granularity relies on the second half: cross-field statistics count
     /// distinct rows, so an ascending partition can answer
-    /// [`AddressKeyedDocuments::num_distinct_rows`] without walking it.
+    /// [`AddressKeyedDocuments::num_distinct_rows`] without walking it. The FTS
+    /// top-k walk visits documents in DocId order, so it can prune a k-th-score
+    /// tie rather than retain it.
     ///
     /// The ordering half is [`OrderedRowAddressProjection`], whose verdict this
     /// projection already caches for the cross-column scorer. Density is the
@@ -1028,7 +1166,7 @@ impl ResidentAddressProjection {
     /// cannot tell from an exhausted cursor. A remapper is attached whenever the
     /// dataset carries a fragment reuse index, even when it retains every
     /// document, so liveness has to be decided on cardinality.
-    fn dense_and_strictly_ascending(&self) -> bool {
+    pub(super) fn dense_and_strictly_ascending(&self) -> bool {
         // A cached invalid verdict already decides the answer. Asking for the
         // ordered view would rebuild its diagnostics by rescanning the documents
         // up to the first violation, only to discard them.
@@ -2067,62 +2205,77 @@ impl PartitionDocuments {
                 .collect());
         }
 
-        let ranges = doc_ids
-            .iter()
-            .map(|doc_id| {
-                let index = doc_id.as_usize();
-                index..index + 1
-            })
-            .collect::<Vec<_>>();
-        let coordinate_names = (0..self.coordinate_rank)
-            .map(doc_index_storage_column)
-            .collect::<Vec<_>>();
-        let projection = coordinate_names
-            .iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>();
-        let batch = self
-            .reader()
-            .await?
-            .read_ranges(&ranges, Some(&projection))
-            .await?;
-        if batch.num_rows() != row_ids.len() {
-            return Err(corrupt_docs(
-                &self.path,
-                format!(
-                    "document coordinate projection returned {} rows for {} candidates",
-                    batch.num_rows(),
-                    row_ids.len()
-                ),
-            ));
-        }
-        let coordinate_columns = coordinate_names
-            .iter()
-            .map(|name| {
-                let column = required_u32_column(&batch, name, &self.path)?;
-                if column.null_count() != 0 {
-                    return Err(corrupt_docs(
-                        &self.path,
-                        format!("document coordinate column {name} contains null values"),
-                    ));
-                }
-                Ok(column)
-            })
-            .collect::<Result<Vec<_>>>()?;
-
+        let coordinates = self.coordinate_columns().await?;
         Ok(row_ids
             .into_iter()
-            .enumerate()
-            .map(|(index, row_id)| {
+            .zip(doc_ids)
+            .map(|(row_id, doc_id)| {
                 (
                     row_id,
-                    coordinate_columns
+                    coordinates
+                        .coordinates
                         .iter()
-                        .map(|column| column.value(index))
+                        .map(|column| column.value(doc_id.as_usize()))
                         .collect(),
                 )
             })
             .collect())
+    }
+
+    /// The partition's element coordinate columns, read whole and cached, so a
+    /// candidate costs no range read of its own.
+    async fn coordinate_columns(&self) -> Result<Arc<CachedDocCoordinates>> {
+        let store = self.store.clone();
+        let path = self.path.clone();
+        let num_docs = self.num_docs;
+        let coordinate_rank = self.coordinate_rank;
+        self.index_cache
+            .get_or_insert_with_key(
+                DocCoordinatesKey {
+                    partition_id: self.partition_id,
+                },
+                || async move {
+                    let names = (0..coordinate_rank)
+                        .map(doc_index_storage_column)
+                        .collect::<Vec<_>>();
+                    let projection = names.iter().map(String::as_str).collect::<Vec<_>>();
+                    let reader = store.open_index_file(&path).await?;
+                    let batch = reader.read_range(0..num_docs, Some(&projection)).await?;
+                    let coordinates = names
+                        .iter()
+                        .map(|name| {
+                            let column = required_u32_column(&batch, name, &path)?;
+                            if column.null_count() != 0 {
+                                return Err(corrupt_docs(
+                                    &path,
+                                    format!("document coordinate column {name} contains null values"),
+                                ));
+                            }
+                            if column.len() != num_docs {
+                                return Err(corrupt_docs(
+                                    &path,
+                                    format!(
+                                        "document coordinate column {name} has {} rows but the file footer reports {num_docs}",
+                                        column.len()
+                                    ),
+                                ));
+                            }
+                            Ok(Arc::new(column.clone()))
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    Ok(CachedDocCoordinates { coordinates })
+                },
+            )
+            .await
+    }
+
+    /// The partition's element coordinates, from the same cached columns
+    /// [`Self::resolve_document_keys`] reads for the final ranking.
+    pub(crate) async fn resident_coordinates(&self) -> Result<ResidentDocCoordinates> {
+        Ok(ResidentDocCoordinates {
+            columns: self.coordinate_columns().await?,
+            coordinate_rank: self.coordinate_rank,
+        })
     }
 
     fn validate_doc_ids(&self, doc_ids: &[DocId]) -> Result<()> {
@@ -4066,5 +4219,27 @@ mod tests {
         );
         assert!(!documents.lengths_loaded());
         assert!(!documents.projection_loaded());
+    }
+
+    #[test]
+    fn test_element_coordinate_key_orders_the_first_pair_before_the_second() {
+        // Derived `Ord` compares fields in declaration order, so ranks 2-3 decide
+        // only a tie in ranks 0-1, and rank 3 decides only a tie in rank 2.
+        let key = |rank_0, rank_1, rank_2, rank_3| ElementCoordinateKey {
+            ranks_0_1: pack_coordinate_ranks(rank_0, rank_1),
+            ranks_2_3: Some(pack_coordinate_ranks(rank_2, rank_3)),
+        };
+        assert!(
+            key(0, 0, 1, 0) > key(0, 0, 0, 5),
+            "equal ranks 0-1 must let ranks 2-3 decide"
+        );
+        assert!(
+            key(0, 0, 2, 0) > key(0, 0, 1, u32::MAX),
+            "a rank 2 difference must outrank any rank 3 difference"
+        );
+        assert!(
+            key(1, 0, 0, 0) > key(0, 1, u32::MAX, u32::MAX),
+            "ranks 0-1 must outrank any ranks 2-3 difference"
+        );
     }
 }

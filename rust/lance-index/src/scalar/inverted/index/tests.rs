@@ -33,7 +33,7 @@ use arrow_array::{ArrayRef, Float32Array, RecordBatch, StringArray, UInt32Array,
 use arrow_schema::{DataType, Field, Schema};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use crate::scalar::inverted::tokenizer::document_tokenizer::TextTokenizer;
 use lance_tokenizer::{Language, SimpleTokenizer, StopWordFilter, TextAnalyzer};
@@ -144,6 +144,95 @@ async fn write_test_metadata(
     writer.finish_with_metadata(metadata).await.unwrap();
 }
 
+/// Rewrites the reader a [`WrappingReaderStore`] opens for each index file.
+pub(super) trait ReaderWrapper: std::fmt::Debug + Send + Sync + 'static {
+    fn wrap(&self, name: &str, reader: Arc<dyn IndexReader>) -> Arc<dyn IndexReader>;
+}
+
+/// Index store that hands every opened file to a [`ReaderWrapper`].
+#[derive(Debug)]
+pub(super) struct WrappingReaderStore {
+    pub(super) inner: Arc<dyn IndexStore>,
+    pub(super) wrapper: Arc<dyn ReaderWrapper>,
+}
+
+#[cfg_attr(coverage, coverage(off))]
+impl DeepSizeOf for WrappingReaderStore {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
+        self.inner.deep_size_of_children(context)
+    }
+}
+
+#[cfg_attr(coverage, coverage(off))]
+#[async_trait]
+impl IndexStore for WrappingReaderStore {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn clone_arc(&self) -> Arc<dyn IndexStore> {
+        Arc::new(Self {
+            inner: self.inner.clone(),
+            wrapper: self.wrapper.clone(),
+        })
+    }
+    fn io_parallelism(&self) -> usize {
+        self.inner.io_parallelism()
+    }
+    fn with_io_priority(&self, io_priority: u64) -> Arc<dyn IndexStore> {
+        Arc::new(Self {
+            inner: self.inner.with_io_priority(io_priority),
+            wrapper: self.wrapper.clone(),
+        })
+    }
+    fn with_io_buffer_size(&self, bytes: u64) -> Arc<dyn IndexStore> {
+        Arc::new(Self {
+            inner: self.inner.with_io_buffer_size(bytes),
+            wrapper: self.wrapper.clone(),
+        })
+    }
+    async fn new_index_file(
+        &self,
+        name: &str,
+        schema: Arc<arrow_schema::Schema>,
+    ) -> Result<Box<dyn crate::scalar::IndexWriter>> {
+        self.inner.new_index_file(name, schema).await
+    }
+    async fn open_index_file(&self, name: &str) -> Result<Arc<dyn IndexReader>> {
+        let reader = self.inner.open_index_file(name).await?;
+        Ok(self.wrapper.wrap(name, reader))
+    }
+    async fn copy_index_file(
+        &self,
+        name: &str,
+        dest_store: &dyn IndexStore,
+    ) -> Result<crate::scalar::IndexFile> {
+        self.inner.copy_index_file(name, dest_store).await
+    }
+    async fn copy_index_file_to(
+        &self,
+        name: &str,
+        new_name: &str,
+        dest_store: &dyn IndexStore,
+    ) -> Result<crate::scalar::IndexFile> {
+        self.inner
+            .copy_index_file_to(name, new_name, dest_store)
+            .await
+    }
+    async fn rename_index_file(
+        &self,
+        name: &str,
+        new_name: &str,
+    ) -> Result<crate::scalar::IndexFile> {
+        self.inner.rename_index_file(name, new_name).await
+    }
+    async fn delete_index_file(&self, name: &str) -> Result<()> {
+        self.inner.delete_index_file(name).await
+    }
+    async fn list_files_with_sizes(&self) -> Result<Vec<crate::scalar::IndexFile>> {
+        self.inner.list_files_with_sizes().await
+    }
+}
+
 mod flat_search;
 mod format_and_builder;
 mod grouping;
@@ -153,3 +242,4 @@ mod prewarm_cache;
 mod query;
 mod scoring;
 mod stats;
+mod topk_tiebreak;

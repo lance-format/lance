@@ -1538,6 +1538,9 @@ impl InvertedPartition {
         }))
     }
 
+    /// Search a legacy partition. Its document keys are row addresses, so the
+    /// walk ranks every k-th-score tie and
+    /// [`Wand::score_floor_overflow`] cannot be set.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn bm25_search_legacy(
         &self,
@@ -1551,7 +1554,7 @@ impl InvertedPartition {
         shared_threshold: Arc<AtomicU32>,
     ) -> Result<Vec<DocCandidate<u64>>> {
         let documents = LegacyWandDocuments::new(docs, mask);
-        self.bm25_search_with_documents(
+        let (candidates, band) = self.bm25_search_with_documents(
             &documents,
             params,
             operator,
@@ -1560,9 +1563,19 @@ impl InvertedPartition {
             None,
             metrics,
             shared_threshold,
-        )
+        )?;
+        debug_assert!(
+            !band.score_floor_overflow,
+            "legacy postings carry row addresses, so their ties never defer"
+        );
+        Ok(candidates)
     }
 
+    /// Search a modern partition. When
+    /// [`WandBandStatus::score_floor_overflow`] is set the candidates are missing
+    /// part of the partition's k-th-score tie band, so the caller searches again
+    /// with resident `addresses`, plus the `coordinates` of an element partition at
+    /// any rank.
     /// `shared_norm_addends` is used only with `impact_scorer`, and must be
     /// shared only by searches that pass the same impact scorer.
     #[allow(clippy::too_many_arguments)]
@@ -1570,6 +1583,8 @@ impl InvertedPartition {
         &self,
         lengths: &DocLengths,
         visibility: &DocVisibility,
+        addresses: Option<&ResidentAddressProjection>,
+        coordinates: Option<ResidentDocCoordinates>,
         params: &FtsSearchParams,
         operator: Operator,
         postings: Vec<PostingIterator>,
@@ -1577,9 +1592,11 @@ impl InvertedPartition {
         shared_norm_addends: SharedNormAddends,
         metrics: &dyn MetricsCollector,
         shared_threshold: Arc<AtomicU32>,
-    ) -> Result<Vec<DocCandidate<DocId>>> {
+    ) -> Result<(Vec<DocCandidate<DocId>>, WandBandStatus)> {
         if visibility.is_all() {
-            let documents = ModernWandDocuments::all(lengths);
+            let documents = ModernWandDocuments::all(lengths)
+                .with_addresses(addresses)
+                .with_coordinates(coordinates);
             self.bm25_search_with_documents(
                 &documents,
                 params,
@@ -1591,7 +1608,9 @@ impl InvertedPartition {
                 shared_threshold,
             )
         } else {
-            let documents = ModernWandDocuments::filtered(lengths, visibility);
+            let documents = ModernWandDocuments::filtered(lengths, visibility)
+                .with_addresses(addresses)
+                .with_coordinates(coordinates);
             self.bm25_search_with_documents(
                 &documents,
                 params,
@@ -1617,25 +1636,26 @@ impl InvertedPartition {
         shared_norm_addends: Option<SharedNormAddends>,
         metrics: &dyn MetricsCollector,
         shared_threshold: Arc<AtomicU32>,
-    ) -> Result<Vec<DocCandidate<D::Candidate>>> {
+    ) -> Result<(Vec<DocCandidate<D::Candidate>>, WandBandStatus)> {
         if postings.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), WandBandStatus::default()));
         }
 
-        let hits = if let Some(scorer) = impact_scorer {
+        if let Some(scorer) = impact_scorer {
             let mut wand = Wand::new(operator, postings.into_iter(), documents, scorer)
                 .with_shared_threshold(shared_threshold);
             if let Some(shared_norm_addends) = shared_norm_addends {
                 wand = wand.with_shared_norm_addends(shared_norm_addends);
             }
-            wand.search(params, metrics)?
+            let hits = wand.search(params, metrics)?;
+            Ok((hits, WandBandStatus::of(&wand)))
         } else {
             let scorer = IndexBM25Scorer::new(std::iter::once(self));
             let mut wand = Wand::new(operator, postings.into_iter(), documents, scorer)
                 .with_shared_threshold(shared_threshold);
-            wand.search(params, metrics)?
-        };
-        Ok(hits)
+            let hits = wand.search(params, metrics)?;
+            Ok((hits, WandBandStatus::of(&wand)))
+        }
     }
 
     pub async fn into_builder(self) -> Result<InnerBuilder> {

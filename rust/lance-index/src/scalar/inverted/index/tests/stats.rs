@@ -124,96 +124,23 @@ impl IndexReader for CountingPostingReader {
     }
 }
 
+/// Wraps the posting file's readers so [`PostingMetadataCounter`] counts their reads.
 #[derive(Debug)]
-pub(super) struct CountingStore {
-    pub(super) inner: Arc<dyn IndexStore>,
+pub(super) struct PostingFileReader {
     pub(super) posting_file: String,
     pub(super) counter: Arc<PostingMetadataCounter>,
 }
 
-impl DeepSizeOf for CountingStore {
-    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
-        self.inner.deep_size_of_children(context)
-    }
-}
-
-#[async_trait]
-impl IndexStore for CountingStore {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-    fn clone_arc(&self) -> Arc<dyn IndexStore> {
-        Arc::new(Self {
-            inner: self.inner.clone(),
-            posting_file: self.posting_file.clone(),
-            counter: self.counter.clone(),
-        })
-    }
-    fn io_parallelism(&self) -> usize {
-        self.inner.io_parallelism()
-    }
-    fn with_io_priority(&self, io_priority: u64) -> Arc<dyn IndexStore> {
-        Arc::new(Self {
-            inner: self.inner.with_io_priority(io_priority),
-            posting_file: self.posting_file.clone(),
-            counter: self.counter.clone(),
-        })
-    }
-
-    fn with_io_buffer_size(&self, bytes: u64) -> Arc<dyn IndexStore> {
-        Arc::new(Self {
-            inner: self.inner.with_io_buffer_size(bytes),
-            posting_file: self.posting_file.clone(),
-            counter: self.counter.clone(),
-        })
-    }
-    async fn new_index_file(
-        &self,
-        name: &str,
-        schema: Arc<arrow_schema::Schema>,
-    ) -> Result<Box<dyn crate::scalar::IndexWriter>> {
-        self.inner.new_index_file(name, schema).await
-    }
-    async fn open_index_file(&self, name: &str) -> Result<Arc<dyn IndexReader>> {
-        let reader = self.inner.open_index_file(name).await?;
+impl ReaderWrapper for PostingFileReader {
+    fn wrap(&self, name: &str, reader: Arc<dyn IndexReader>) -> Arc<dyn IndexReader> {
         if name == self.posting_file {
-            Ok(Arc::new(CountingPostingReader {
+            Arc::new(CountingPostingReader {
                 inner: reader,
                 counter: self.counter.clone(),
-            }))
+            })
         } else {
-            Ok(reader)
+            reader
         }
-    }
-    async fn copy_index_file(
-        &self,
-        name: &str,
-        dest_store: &dyn IndexStore,
-    ) -> Result<crate::scalar::IndexFile> {
-        self.inner.copy_index_file(name, dest_store).await
-    }
-    async fn copy_index_file_to(
-        &self,
-        name: &str,
-        new_name: &str,
-        dest_store: &dyn IndexStore,
-    ) -> Result<crate::scalar::IndexFile> {
-        self.inner
-            .copy_index_file_to(name, new_name, dest_store)
-            .await
-    }
-    async fn rename_index_file(
-        &self,
-        name: &str,
-        new_name: &str,
-    ) -> Result<crate::scalar::IndexFile> {
-        self.inner.rename_index_file(name, new_name).await
-    }
-    async fn delete_index_file(&self, name: &str) -> Result<()> {
-        self.inner.delete_index_file(name).await
-    }
-    async fn list_files_with_sizes(&self) -> Result<Vec<crate::scalar::IndexFile>> {
-        self.inner.list_files_with_sizes().await
     }
 }
 
@@ -271,10 +198,12 @@ async fn load_counted_v2_index_with_counter(
         .unwrap();
     writer.finish_with_metadata(metadata).await.unwrap();
 
-    let counting_store: Arc<dyn IndexStore> = Arc::new(CountingStore {
+    let counting_store: Arc<dyn IndexStore> = Arc::new(WrappingReaderStore {
         inner: inner_store,
-        posting_file: posting_file_path(0),
-        counter: counter.clone(),
+        wrapper: Arc::new(PostingFileReader {
+            posting_file: posting_file_path(0),
+            counter: counter.clone(),
+        }),
     });
     let index = InvertedIndex::load(counting_store, None, &cache)
         .await
@@ -372,10 +301,12 @@ async fn load_counted_v3_index(
         serde_json::from_str(metadata.schema().metadata.get("partitions").unwrap()).unwrap();
     assert_eq!(partitions.len(), 1);
     let counter = Arc::new(PostingMetadataCounter::default());
-    let store: Arc<dyn IndexStore> = Arc::new(CountingStore {
+    let store: Arc<dyn IndexStore> = Arc::new(WrappingReaderStore {
         inner: store,
-        posting_file: posting_file_path(partitions[0]),
-        counter: counter.clone(),
+        wrapper: Arc::new(PostingFileReader {
+            posting_file: posting_file_path(partitions[0]),
+            counter: counter.clone(),
+        }),
     });
     let index = InvertedIndex::load(store, None, &cache).await.unwrap();
     assert_eq!(index.format_version(), InvertedListFormatVersion::V3);

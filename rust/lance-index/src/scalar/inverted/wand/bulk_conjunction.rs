@@ -16,7 +16,6 @@ use crate::scalar::inverted::scorer::{Scorer, bm25_doc_weight_with_norm};
 use crate::scalar::inverted::{DocInfo, PostingList, RawDocInfo};
 
 use super::bounds::{exclusive_partial_score_limit, score_sum_upper_bound_factor};
-use super::collector::TopKCollector;
 use super::doc_source::{DocCandidate, WandDocuments};
 #[cfg(target_arch = "x86_64")]
 use super::posting::find_next_geq_avx2;
@@ -489,7 +488,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
             }
         }
 
-        let mut candidates = TopKCollector::new(limit, std::cmp::min(limit, BLOCK_SIZE * 10));
+        let mut candidates = self.new_collector(limit, std::cmp::min(limit, BLOCK_SIZE * 10));
         let mut num_comparisons: usize = 0;
         let mut wins: Vec<WindowList> = Vec::with_capacity(num_lists);
         // Per-window candidate batch. The merge kernel only records matches;
@@ -547,6 +546,10 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         }
 
         'window: loop {
+            if candidates.aborted() {
+                // The rest of the conjunction cannot rank the tie that stopped it.
+                break;
+            }
             #[cfg(test)]
             {
                 self.and_window_stats.windows_sliced += 1;
@@ -927,6 +930,7 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
 
                     if candidates.insert(
                         ScoredDoc::new(document_key, score),
+                        self.documents.tie_order(document_key),
                         doc_length,
                         u64::from(doc),
                         wins.iter().zip(self.lead.iter()).zip(offs.iter()).map(
@@ -950,6 +954,10 @@ impl<'a, S: Scorer, D: WandDocuments> Wand<'a, S, D> {
         }
 
         metrics.record_comparisons(num_comparisons);
+
+        self.score_floor_overflow = candidates.aborted();
+
+        self.band_truncated = candidates.band_truncated();
 
         candidates.into_candidates(|key| self.documents.candidate_from_key(key))
     }

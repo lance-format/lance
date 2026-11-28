@@ -1200,6 +1200,10 @@ impl LsmFtsSearchPlanner {
 
     /// Order a merged FTS result by `_score` descending, capped at `limit`.
     ///
+    /// The element scan's merged schema carries `_doc_index`, which breaks score
+    /// ties. `_rowid` is not a sort key: `project_to_canonical` fills it with a
+    /// typed NULL, so it ties for every row.
+    ///
     /// Per-partition sort with `fetch=k` so each upstream partition can
     /// early-terminate at k; the preserving merge then does a K-way heap merge
     /// also capped at k. Same pattern as `LsmVectorSearchPlanner`.
@@ -1217,13 +1221,22 @@ impl LsmFtsSearchPlanner {
             ))
         })?;
 
-        let sort_expr = vec![PhysicalSortExpr {
+        let mut sort_expr = vec![PhysicalSortExpr {
             expr: Arc::new(Column::new(SCORE_COLUMN, score_idx)),
             options: SortOptions {
                 descending: true,
                 nulls_first: false,
             },
         }];
+        if let Some((idx, _)) = merged.schema().column_with_name(DOC_INDEX_COL) {
+            sort_expr.push(PhysicalSortExpr {
+                expr: Arc::new(Column::new(DOC_INDEX_COL, idx)),
+                options: SortOptions {
+                    descending: false,
+                    nulls_first: false,
+                },
+            });
+        }
         let lex_ordering = LexOrdering::new(sort_expr).ok_or_else(|| {
             Error::internal("Failed to build LexOrdering for FTS _score sort".to_string())
         })?;
@@ -2206,6 +2219,169 @@ mod tests {
         }
         hits.sort_unstable();
         assert_eq!(hits, vec![(1, 0), (2, 1)]);
+    }
+
+    /// Two memtable arms, one hit each, tied on `_score`. The earlier arm holds
+    /// the larger `_doc_index`, so a score-only merge orders the two hits wrong
+    /// and cuts at k on the wrong one.
+    #[tokio::test]
+    async fn element_document_score_ties_break_on_doc_index() {
+        use lance_index::scalar::inverted::InvertedIndexParams;
+
+        fn element_tags_batch(schema: &Arc<ArrowSchema>, id: i32, tags: &[&str]) -> RecordBatch {
+            let mut builder = ListBuilder::new(StringBuilder::new());
+            for tag in tags {
+                builder.values().append_value(*tag);
+            }
+            builder.append(true);
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from(vec![id])),
+                    Arc::new(builder.finish()),
+                ],
+            )
+            .unwrap()
+        }
+
+        fn element_memtable(
+            schema: &Arc<ArrowSchema>,
+            batch: RecordBatch,
+            generation: u64,
+        ) -> InMemoryMemTableRef {
+            let batch_store = Arc::new(BatchStore::with_capacity(16));
+            let mut indexes = IndexStore::new();
+            indexes.enable_pk_index(&[("id".to_string(), 0)]);
+            indexes
+                .add_fts_with_params(
+                    "tags_list_element_fts".to_string(),
+                    1,
+                    "tags".to_string(),
+                    InvertedIndexParams::default()
+                        .document_granularity(DocumentGranularity::ListElement),
+                )
+                .unwrap();
+            let (_, row_offset, batch_position) = batch_store.append(batch.clone()).unwrap();
+            indexes
+                .insert_with_batch_position(&batch, row_offset, Some(batch_position))
+                .unwrap();
+            InMemoryMemTableRef {
+                batch_store,
+                index_store: Arc::new(indexes),
+                schema: schema.clone(),
+                generation,
+            }
+        }
+
+        async fn hits(
+            planner: &LsmFtsSearchPlanner,
+            limit: Option<usize>,
+            projection: &[String],
+        ) -> Vec<(i32, u32, f32)> {
+            let plan = planner
+                .plan_search(
+                    FullTextSearchQuery::new_query(IndexFtsQuery::Match(MatchQuery::new(
+                        "beta".to_string(),
+                    )))
+                    .with_column("tags".to_string())
+                    .unwrap(),
+                    limit,
+                    Some(projection),
+                )
+                .await
+                .unwrap();
+            let ctx = datafusion::prelude::SessionContext::new();
+            let batches: Vec<RecordBatch> = plan
+                .execute(0, ctx.task_ctx())
+                .unwrap()
+                .try_collect()
+                .await
+                .unwrap();
+            let mut hits = Vec::new();
+            for batch in batches {
+                let ids = batch["id"].as_any().downcast_ref::<Int32Array>().unwrap();
+                let coordinates = batch[DOC_INDEX_COL]
+                    .as_any()
+                    .downcast_ref::<ListArray>()
+                    .unwrap();
+                let scores = batch[SCORE_COLUMN]
+                    .as_any()
+                    .downcast_ref::<Float32Array>()
+                    .unwrap();
+                for row in 0..batch.num_rows() {
+                    let coordinate = coordinates
+                        .value(row)
+                        .as_any()
+                        .downcast_ref::<UInt32Array>()
+                        .unwrap()
+                        .value(0);
+                    hits.push((ids.value(row), coordinate, scores.value(row)));
+                }
+            }
+            hits
+        }
+
+        let mut id_meta = HashMap::new();
+        id_meta.insert(
+            "lance-schema:unenforced-primary-key".to_string(),
+            "true".to_string(),
+        );
+        let id_field = Field::new("id", DataType::Int32, false).with_metadata(id_meta);
+        let list_type = DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)));
+        let schema = Arc::new(ArrowSchema::new(vec![
+            id_field,
+            Field::new("tags", list_type, true),
+        ]));
+        // Each document holds "beta" once in a two-element list, so both arms
+        // score their hit with the same corpus statistics.
+        let frozen = element_memtable(
+            &schema,
+            element_tags_batch(&schema, 1, &["other", "beta"]),
+            1,
+        );
+        let active = element_memtable(
+            &schema,
+            element_tags_batch(&schema, 2, &["beta", "other"]),
+            2,
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", tmp.path().to_str().unwrap());
+        let collector = LsmDataSourceCollector::without_base_table(base_uri, vec![])
+            .with_in_memory_memtables(
+                uuid::Uuid::new_v4(),
+                InMemoryMemTables {
+                    active,
+                    frozen: vec![frozen],
+                },
+            );
+        let planner = LsmFtsSearchPlanner::new(collector, vec!["id".to_string()], schema);
+        let projection = vec!["id".to_string()];
+
+        let merged = hits(&planner, Some(2), &projection).await;
+        assert_eq!(merged.len(), 2, "both arms answer the query");
+        let top_score = merged[0].2;
+        assert!(
+            merged.iter().all(|hit| (hit.2 - top_score).abs() < 1e-6),
+            "premise: both hits tie on score: {merged:?}"
+        );
+        assert_eq!(
+            merged
+                .iter()
+                .map(|(id, coordinate, _)| (*id, *coordinate))
+                .collect::<Vec<_>>(),
+            vec![(2, 0), (1, 1)],
+            "tied scores order by `_doc_index` ascending"
+        );
+
+        let kept = hits(&planner, Some(1), &projection).await;
+        assert_eq!(
+            kept.iter()
+                .map(|(id, coordinate, _)| (*id, *coordinate))
+                .collect::<Vec<_>>(),
+            vec![(2, 0)],
+            "the cut at k keeps the row the merge keeps"
+        );
     }
 
     #[tokio::test]

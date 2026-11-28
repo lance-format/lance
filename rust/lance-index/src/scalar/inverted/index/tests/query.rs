@@ -36,7 +36,7 @@ struct OffsetBatchRemapper {
     calls: AtomicU32,
 }
 
-struct MaskFilter(RowAddrMask);
+pub(super) struct MaskFilter(pub(super) RowAddrMask);
 
 #[async_trait]
 impl PreFilter for MaskFilter {
@@ -136,14 +136,16 @@ async fn test_prefilter_skips_excluded_partition_postings(
     assert_eq!(expected.len(), selected_rows as usize);
 
     let counter = Arc::new(super::stats::PostingMetadataCounter::default());
-    let store = Arc::new(super::stats::CountingStore {
+    let store = Arc::new(WrappingReaderStore {
         inner: Arc::new(LanceIndexStore::new(
             Arc::new(object_store),
             directory,
             Arc::new(LanceCache::no_cache()),
         )),
-        posting_file: posting_file_path(1),
-        counter: counter.clone(),
+        wrapper: Arc::new(super::stats::PostingFileReader {
+            posting_file: posting_file_path(1),
+            counter: counter.clone(),
+        }),
     });
     let index = InvertedIndex::load_with_remapping(store, remapper, &LanceCache::no_cache())
         .await

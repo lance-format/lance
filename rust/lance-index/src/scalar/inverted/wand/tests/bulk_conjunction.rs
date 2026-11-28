@@ -842,6 +842,8 @@ fn bulk_and_builds_frequency_prune_table_after_mid_window_floor() {
     assert_eq!(bulk, classic);
     assert_eq!(bulk.len(), 1);
     assert_eq!(bulk[0].0, 0);
+    // Row addresses ascend with DocId, so a k-th-score tie has already lost on
+    // row address: the floor stays at the raw k-th score instead of dropping a ULP.
     assert_eq!(bulk_floor, 20.0);
     assert_eq!(bulk_floor, classic_floor);
     assert_eq!(

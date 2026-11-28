@@ -1952,7 +1952,7 @@ MatchQuery: column=s, query=[hello]
   Take: columns="_rowid, _score, (s)"
 CoalesceBatchesExec: target_batch_size=8192
   MatchCorpus
-    SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
+    SortExec: expr=[_score@1 DESC NULLS LAST, _rowid@0 ASC NULLS LAST], preserve_partitioning=[false]
       CoalescePartitionsExec
         UnionExec
           MatchQuery: column=s, query=[hello]
@@ -1962,7 +1962,7 @@ CoalesceBatchesExec: target_batch_size=8192
         r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
   LanceRead: uri=..., projection=[s], source=stream(_rowid)
 MatchCorpus
-  SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
+  SortExec: expr=[_score@1 DESC NULLS LAST, _rowid@0 ASC NULLS LAST], preserve_partitioning=[false]
     CoalescePartitionsExec
       UnionExec
         MatchQuery: column=s, query=[hello]
@@ -2015,7 +2015,7 @@ MatchQuery: column=s, query=[hello]"#
   Take: columns="_rowid, _score, (s)"
 CoalesceBatchesExec: target_batch_size=8192
   MatchCorpus
-    SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
+    SortExec: expr=[_score@1 DESC NULLS LAST, _rowid@0 ASC NULLS LAST], preserve_partitioning=[false]
       CoalescePartitionsExec
         UnionExec
           MatchQuery: column=s, query=[hello]
@@ -2037,7 +2037,7 @@ CoalesceBatchesExec: target_batch_size=8192
         r#"ProjectionExec: expr=[s@2 as s, _score@1 as _score, _rowid@0 as _rowid]
   LanceRead: uri=..., projection=[s], source=stream(_rowid)
 MatchCorpus
-  SortExec: expr=[_score@1 DESC NULLS LAST], preserve_partitioning=[false]
+  SortExec: expr=[_score@1 DESC NULLS LAST, _rowid@0 ASC NULLS LAST], preserve_partitioning=[false]
     CoalescePartitionsExec
       UnionExec
         MatchQuery: column=s, query=[hello]

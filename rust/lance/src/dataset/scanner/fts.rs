@@ -42,7 +42,7 @@ use lance_index::scalar::inverted::query::{
     fill_fts_query_column, uses_fuzzy_expansion,
 };
 use lance_index::scalar::inverted::{
-    CombinedFieldsBM25Scorer, DocumentGranularity, INVERTED_INDEX_VERSION_V2,
+    CombinedFieldsBM25Scorer, DOC_INDEX_COL, DocumentGranularity, INVERTED_INDEX_VERSION_V2,
     INVERTED_INDEX_VERSION_V3, PreparedFtsQueryLeaf, SCORE_COL, SCORE_FIELD, fts_schema,
     prepare_fts_global_statistics,
 };
@@ -385,6 +385,23 @@ fn normalize_fts_zero_boosts(query: &mut FtsQuery) {
                 normalize_fts_zero_boosts(child);
             }
         }
+    }
+}
+
+/// Search parameters for a Match leaf: pushed limit kept, score ranking off at
+/// a zero boost.
+///
+/// The collector ranks hits by its own BM25 score and cuts top-k there, while
+/// `MatchQueryExec` multiplies emitted scores by `MatchQuery::boost`. A boost
+/// of 0.0 ranks nothing, so a collector-side cut would drop rows the final
+/// order keeps. `constant_score` tells the index to rank on the tie order and
+/// return that constant. `validate_fts_query_contract` admits no other
+/// non-positive boost.
+fn match_leaf_params(query: &MatchQuery, params: &FtsSearchParams) -> FtsSearchParams {
+    if query.boost > 0.0 {
+        params.clone()
+    } else {
+        params.clone().with_constant_score(true)
     }
 }
 
@@ -1185,14 +1202,47 @@ impl Scanner {
             .plan_corpus_query(query, &params, filter_plan, &prefilter_source)
             .await?
         {
-            return Ok(plan);
+            return self.fts_page_order(plan, &params);
         }
         // Data overlay masking blocks stale rows from indexed leaves and re-evaluates only those
         // rows from their current values on the flat-text path.
         let fts_exec = self
             .plan_fts(query, &params, filter_plan, &prefilter_source)
             .await?;
-        Ok(fts_exec)
+        self.fts_page_order(fts_exec, &params)
+    }
+
+    /// Sort an FTS source when the scan skips rows without a fetch.
+    ///
+    /// With an offset and no limit, `fts_page_params` pushes no candidate budget
+    /// into the leaves, so each leaf emits its own order and `GlobalLimitExec`
+    /// skips into a stream the scan did not order. Pages then repeat some rows
+    /// and drop others. Sorting before the skip fixes the stream; offset 0 sorts
+    /// too, so pages of one query share an order.
+    ///
+    /// A scan with no offset, or one with `order_by`, keeps the leaf order: the
+    /// first is not paged, and the second is re-sorted by the caller's ordering.
+    fn fts_page_order(
+        &self,
+        plan: Arc<dyn ExecutionPlan>,
+        params: &FtsSearchParams,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        if params.limit.is_some() || self.offset.is_none() || self.ordering.is_some() {
+            return Ok(plan);
+        }
+        let sort_exprs = Self::fts_score_sort_exprs(plan.schema().as_ref())?;
+        if plan
+            .properties()
+            .equivalence_properties()
+            .ordering_satisfy(sort_exprs.clone())?
+        {
+            return Ok(plan);
+        }
+        let plan = Arc::new(RepartitionExec::try_new(
+            plan,
+            Partitioning::RoundRobinBatch(1),
+        )?);
+        Ok(Arc::new(SortExec::new(sort_exprs, plan)))
     }
 
     async fn plan_compound_scorer(
@@ -1574,14 +1624,16 @@ impl Scanner {
                     fts_node,
                     schema,
                 )?);
+                // MultiMatch rejects `DocumentGranularity::ListElement`, so the
+                // plan has no `doc_index` column and the sort key ends at `row_id`.
                 let sort_exprs = Self::fts_score_sort_exprs(fts_node.schema().as_ref())?;
                 if params.limit == Some(0) {
-                    return zero_candidate_plan(fts_node, sort_exprs.into());
+                    return zero_candidate_plan(fts_node, sort_exprs);
                 }
 
                 // `params.limit` is the recursive planning contract. Compound
                 // parents pass `None` when they require every candidate.
-                Arc::new(SortExec::new(sort_exprs.into(), fts_node).with_fetch(params.limit))
+                Arc::new(SortExec::new(sort_exprs, fts_node).with_fetch(params.limit))
             }
             FtsQuery::CombinedFields(query) => {
                 self.plan_combined_fields_query(query, params, filter_plan, prefilter_source)
@@ -1871,7 +1923,7 @@ impl Scanner {
         // their positions, as `plan_phrase_query` does.
         let (phrase, match_query, match_params) = match query {
             FtsQuery::Match(query) if query.fuzziness == Some(0) => {
-                (None, query.clone(), params.clone())
+                (None, query.clone(), match_leaf_params(query, params))
             }
             FtsQuery::Phrase(query)
                 if query.document_granularity == Some(DocumentGranularity::Row) =>
@@ -2004,7 +2056,7 @@ impl Scanner {
                         MatchQueryExec::new_with_segments_and_document_granularity(
                             self.dataset.clone(),
                             match_query.clone(),
-                            params.clone(),
+                            match_params.clone(),
                             prefilter_source.clone(),
                             segments,
                             DocumentGranularity::Row,
@@ -2076,6 +2128,7 @@ impl Scanner {
         }
 
         let is_fuzzy = uses_fuzzy_expansion(query.fuzziness);
+        let search_params = match_leaf_params(query, params);
         let (match_plan, flat_match_plan, shared_scorer) = match &index {
             Some(index) => {
                 let all_unindexed = self.dataset.unindexed_fragments(&index.name).await?;
@@ -2183,7 +2236,7 @@ impl Scanner {
                     Some(segments) => MatchQueryExec::new_with_segments_and_document_granularity(
                         self.dataset.clone(),
                         query.clone(),
-                        params.clone(),
+                        search_params,
                         prefilter_source.clone(),
                         segments,
                         document_granularity,
@@ -2191,7 +2244,7 @@ impl Scanner {
                     None => MatchQueryExec::new_with_document_granularity(
                         self.dataset.clone(),
                         query.clone(),
-                        params.clone(),
+                        search_params,
                         prefilter_source.clone(),
                         document_granularity,
                     ),
@@ -2292,7 +2345,11 @@ impl Scanner {
             (Some(indexed_plan), Some(flat_plan)) => {
                 UnionExec::try_new(vec![indexed_plan, flat_plan])?
             }
-            (Some(indexed_plan), None) => return Ok(indexed_plan),
+            // The indexed leaf orders hits by the index's own score, so a bounded
+            // scan re-sorts into the final score space. Scans that skip rows
+            // without a fetch are sorted by `fts_page_order`.
+            (Some(indexed_plan), None) if params.limit.is_none() => return Ok(indexed_plan),
+            (Some(indexed_plan), None) => indexed_plan,
             (None, Some(flat_plan)) if params.limit.is_none() => return Ok(flat_plan),
             (None, Some(flat_plan)) => flat_plan,
             (None, None) => {
@@ -2301,23 +2358,19 @@ impl Scanner {
                 ));
             }
         };
+        let sort_exprs = Self::fts_score_sort_exprs(plan.schema().as_ref())?;
         if params.limit == Some(0) {
-            let sort_exprs = Self::fts_score_sort_exprs(plan.schema().as_ref())?;
-            return zero_candidate_plan(plan, sort_exprs.into());
+            return zero_candidate_plan(plan, sort_exprs);
         }
         let plan = Arc::new(RepartitionExec::try_new(
             plan,
             Partitioning::RoundRobinBatch(1),
         )?);
-        let sort_expr = PhysicalSortExpr {
-            expr: expressions::col(SCORE_COL, plan.schema().as_ref())?,
-            options: SortOptions {
-                descending: true,
-                nulls_first: false,
-            },
-        };
+        // A `SortExec` with a fetch is not a stable top-k: among equal scores it
+        // keeps rows in arrival order. The union's two plans and the flat scan's
+        // fragments are read concurrently, so their rows interleave.
         Ok(Arc::new(
-            SortExec::new([sort_expr].into(), plan).with_fetch(params.limit),
+            SortExec::new(sort_exprs, plan).with_fetch(params.limit),
         ))
     }
 
@@ -2401,19 +2454,21 @@ impl Scanner {
         Ok(flat_match_plan)
     }
 
-    /// Sort keys for an FTS plan whose scores come from more than one source, or
-    /// from a source that does not sort.
+    /// Sort keys for an FTS plan whose scores come from several sources, or from
+    /// a source that does not sort.
     ///
-    /// `row_id ASC` is a required second key, not a nicety: a score-only sort over
-    /// concurrently read sources breaks ties by arrival order, so equal-scoring
-    /// documents would come back in a different order run to run and
-    /// `limit`/`offset` pagination could skip and repeat rows. `combined_fields`
-    /// needs it for the same reason: `combined_fields_search` visits candidates in
-    /// ascending row-id order, so its top-k is reproducible, but it does not order
-    /// ties itself (`ScoredDoc` compares on score alone), so this sort is what
-    /// decides which of two equal-scoring rows comes first.
-    fn fts_score_sort_exprs(schema: &ArrowSchema) -> Result<[PhysicalSortExpr; 2]> {
-        Ok([
+    /// A score-only sort breaks ties by arrival order, so equal-scoring rows
+    /// change order between runs, and `limit`/`offset` pagination skips and
+    /// repeats rows.
+    ///
+    /// At list-element granularity a row's elements share its address, so
+    /// `row_id` leaves them tied and `doc_index` orders them.
+    fn fts_score_sort_exprs(schema: &ArrowSchema) -> Result<LexOrdering> {
+        let ascending = SortOptions {
+            descending: false,
+            nulls_first: false,
+        };
+        let mut sort_exprs = vec![
             PhysicalSortExpr {
                 expr: expressions::col(SCORE_COL, schema)?,
                 options: SortOptions {
@@ -2423,12 +2478,17 @@ impl Scanner {
             },
             PhysicalSortExpr {
                 expr: expressions::col(ROW_ID, schema)?,
-                options: SortOptions {
-                    descending: false,
-                    nulls_first: false,
-                },
+                options: ascending,
             },
-        ])
+        ];
+        if schema.field_with_name(DOC_INDEX_COL).is_ok() {
+            sort_exprs.push(PhysicalSortExpr {
+                expr: expressions::col(DOC_INDEX_COL, schema)?,
+                options: ascending,
+            });
+        }
+        LexOrdering::new(sort_exprs)
+            .ok_or_else(|| Error::internal("FTS result ordering is unexpectedly empty".to_string()))
     }
 
     /// Plan a cross-field (BM25F) `combined_fields` query.
@@ -2692,11 +2752,11 @@ impl Scanner {
         };
         let plan: Arc<dyn ExecutionPlan> = if params.limit == Some(0) {
             let sort_exprs = Self::fts_score_sort_exprs(scored_plan.schema().as_ref())?;
-            zero_candidate_plan(scored_plan, sort_exprs.into())?
+            zero_candidate_plan(scored_plan, sort_exprs)?
         } else {
             Arc::new(
                 SortExec::new(
-                    Self::fts_score_sort_exprs(scored_plan.schema().as_ref())?.into(),
+                    Self::fts_score_sort_exprs(scored_plan.schema().as_ref())?,
                     scored_plan,
                 )
                 .with_fetch(params.limit),
