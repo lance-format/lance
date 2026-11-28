@@ -1564,6 +1564,44 @@ impl ObjectStore {
         object_store.open(&os_path).await
     }
 
+    /// Open a direct local reader with accounted file state, metadata calls and
+    /// reads. Unsupported backends fail before I/O; small objects are not cached
+    /// in an independent reader. A known size skips the metadata request.
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use lance_core::{Result, utils::memory::MemoryReserver};
+    /// # use lance_io::object_store::ObjectStore;
+    /// # use object_store::path::Path;
+    /// async fn open(store: &ObjectStore, path: &Path, pool: Arc<dyn MemoryReserver>) -> Result<()> {
+    ///     let reader = store.open_with_memory_reserver(path, None, pool).await?;
+    ///     let _size = reader.size().await?;
+    ///     Ok(())
+    /// }
+    /// ```
+    #[doc(hidden)]
+    pub async fn open_with_memory_reserver(
+        &self,
+        path: &Path,
+        known_size: Option<usize>,
+        pool: Arc<dyn lance_core::utils::memory::MemoryReserver>,
+    ) -> Result<Box<dyn Reader>> {
+        if self.scheme != "file" || !self.has_direct_local_paths() {
+            return Err(Error::not_supported(format!(
+                "resource-aware reader opening is not implemented for storage scheme '{}'",
+                self.scheme
+            )));
+        }
+        LocalObjectReader::open_with_resources(
+            path,
+            self.block_size,
+            known_size,
+            Arc::new(self.io_tracker.clone()),
+            pool,
+        )
+        .await
+    }
+
     /// Create a new file.
     pub async fn create(&self, path: &Path) -> Result<Box<dyn Writer>> {
         self.create_with_diagnostics(path, &CopyDiagnostics::default())

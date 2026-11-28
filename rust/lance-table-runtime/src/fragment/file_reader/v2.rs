@@ -17,7 +17,7 @@ use lance_core::datatypes::{
     BLOB_DESC_LANCE_FIELD, BLOB_V2_DESC_FIELDS, BlobKind, Field as LanceField, Schema,
 };
 use lance_core::{Error, Result};
-use lance_encoding::decoder::{ColumnInfo, FilterExpression, PageEncoding};
+use lance_encoding::decoder::{ColumnInfo, DecodeResources, FilterExpression, PageEncoding};
 use lance_encoding::format::metadata::{PageLayout, page_layout::Layout};
 use lance_file::reader::ProjectedFileReader;
 use lance_file::version::ConcreteFileVersion;
@@ -243,6 +243,7 @@ impl Reader {
         params: ReadBatchParams,
         batch_size: u32,
         output_schema: Arc<Schema>,
+        resources: Option<DecodeResources>,
     ) -> Result<ReadBatchTaskStream> {
         let has_legacy_blobs = output_schema
             .fields_pre_order()
@@ -259,11 +260,12 @@ impl Reader {
         )?;
         let legacy_blobs = self.legacy_blobs.clone();
         Ok(reader
-            .read_tasks(
+            .read_tasks_with_resources(
                 params,
                 batch_size,
                 Some(projection),
                 FilterExpression::no_filter(),
+                resources,
             )
             .await?
             .map(move |task| {
@@ -286,7 +288,25 @@ impl Reader {
     }
 }
 
+use lance_file::reader::ReadEstimate;
+
 impl GenericFileReader for Reader {
+    fn estimate_read(
+        &self,
+        ranges: Arc<[Range<u64>]>,
+        projection: Arc<Schema>,
+    ) -> BoxFuture<'_, Result<ReadEstimate>> {
+        async move {
+            let projection = file_versions::reader_projection_from_field_ids(
+                self.reader.version(),
+                projection.as_ref(),
+                self.field_id_to_column_idx.as_ref(),
+            )?;
+            self.reader.estimate_read(&ranges, Some(projection)).await
+        }
+        .boxed()
+    }
+
     fn read_range_tasks(
         &self,
         range: Range<u64>,
@@ -298,6 +318,7 @@ impl GenericFileReader for Reader {
             ReadBatchParams::Range(range.start as usize..range.end as usize),
             batch_size,
             projection,
+            None,
         )
         .boxed()
     }
@@ -313,6 +334,24 @@ impl GenericFileReader for Reader {
             ReadBatchParams::Ranges(ranges),
             batch_size,
             projection,
+            None,
+        )
+        .boxed()
+    }
+
+    fn read_ranges_tasks_with_resources(
+        &self,
+        ranges: Arc<[Range<u64>]>,
+        batch_size: u32,
+        projection: Arc<Schema>,
+        resources: DecodeResources,
+    ) -> BoxFuture<'_, Result<ReadBatchTaskStream>> {
+        self.read_tasks(
+            &self.reader,
+            ReadBatchParams::Ranges(ranges),
+            batch_size,
+            projection,
+            Some(resources),
         )
         .boxed()
     }
@@ -327,6 +366,7 @@ impl GenericFileReader for Reader {
             ReadBatchParams::RangeFull,
             batch_size,
             projection,
+            None,
         )
         .boxed()
     }
@@ -355,6 +395,7 @@ impl GenericFileReader for Reader {
                 ReadBatchParams::Indices(indices),
                 batch_size,
                 projection,
+                None,
             )
             .await
         }

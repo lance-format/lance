@@ -978,11 +978,24 @@ pub fn execute_plan_with_context(
 pub struct StrictBatchSizeExec {
     input: Arc<dyn ExecutionPlan>,
     batch_size: usize,
+    account_memory: bool,
 }
 
 impl StrictBatchSizeExec {
     pub fn new(input: Arc<dyn ExecutionPlan>, batch_size: usize) -> Self {
-        Self { input, batch_size }
+        Self {
+            input,
+            batch_size,
+            account_memory: false,
+        }
+    }
+
+    /// Account for retained scan inputs and copied output in the execution pool.
+    /// The execution context must carry the scan's operation resource adapter.
+    #[doc(hidden)]
+    pub fn with_memory_accounting(mut self, account_memory: bool) -> Self {
+        self.account_memory = account_memory;
+        self
     }
 }
 
@@ -1019,6 +1032,7 @@ impl ExecutionPlan for StrictBatchSizeExec {
         Ok(Arc::new(Self {
             input: children[0].clone(),
             batch_size: self.batch_size,
+            account_memory: self.account_memory,
         }))
     }
 
@@ -1027,9 +1041,24 @@ impl ExecutionPlan for StrictBatchSizeExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> datafusion_common::Result<SendableRecordBatchStream> {
+        let pool =
+            if self.account_memory {
+                crate::resources::flat_batch_allowance(self.schema().as_ref(), 0)?;
+                Some(crate::resources::DataFusionMemoryReserver::from_context(&context)?
+                .ok_or_else(|| Error::invalid_input(
+                    "strict batch memory accounting requires an accounted scan TaskContext"
+                ))?)
+            } else {
+                None
+            };
         let stream = self.input.execute(partition, context)?;
         let schema = stream.schema();
         let stream = StrictBatchSizeStream::new(stream, self.batch_size);
+        let stream = if let Some(pool) = pool {
+            stream.with_memory_reserver(pool)?
+        } else {
+            stream
+        };
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
     }
 

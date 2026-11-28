@@ -37,7 +37,7 @@ use lance_core::datatypes::{Field, OnMissing, Projection};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{ROW_ADDR, ROW_ID, ROW_OFFSET};
 use lance_datafusion::exec::{
-    LanceExecutionOptions, StrictBatchSizeExec, analyze_plan, execute_plan,
+    LanceExecutionOptions, StrictBatchSizeExec, analyze_plan, execute_accounted_scan, execute_plan,
 };
 use lance_index::scalar::expression::create_filter_plan;
 use lance_index::scalar::inverted::{
@@ -275,14 +275,9 @@ impl Scanner {
         async move {
             let plan = self.create_plan().await?;
 
-            Ok(DatasetRecordBatchStream::new(execute_plan(
-                plan,
-                LanceExecutionOptions {
-                    batch_size: self.batch_size,
-                    execution_stats_callback: self.scan_stats_callback.clone(),
-                    ..Default::default()
-                },
-            )?))
+            Ok(DatasetRecordBatchStream::new(
+                self.execute_scan_plan(plan, self.execution_options())?,
+            ))
         }
         .boxed()
     }
@@ -298,7 +293,19 @@ impl Scanner {
             options.execution_stats_callback = self.scan_stats_callback.clone();
         }
 
-        execute_plan(plan, options)
+        self.execute_scan_plan(plan, options)
+    }
+
+    fn execute_scan_plan(
+        &self,
+        plan: Arc<dyn ExecutionPlan>,
+        options: LanceExecutionOptions,
+    ) -> Result<SendableRecordBatchStream> {
+        if self.strict_batch_memory_accounting {
+            execute_accounted_scan(plan, options)
+        } else {
+            execute_plan(plan, options)
+        }
     }
 
     pub(crate) fn execution_options(&self) -> LanceExecutionOptions {
@@ -451,6 +458,43 @@ impl Scanner {
     }
 
     fn validate_options(&self) -> Result<()> {
+        if self.strict_batch_memory_accounting {
+            if !self.strict_batch_size || self.dataset.session.read_budget().is_none() {
+                return Err(Error::invalid_input(
+                    "strict batch memory accounting requires strict_batch_size and a session read memory budget",
+                ));
+            }
+            let store = &self.dataset.table_state.object_store;
+            let fragments = self
+                .fragments
+                .as_deref()
+                .unwrap_or_else(|| self.dataset.fragments().as_slice());
+            if store.scheme() != "file"
+                || !store.has_direct_local_paths()
+                || self.filter.expr_filter.is_some()
+                || self.filter.query_filter.is_some()
+                || self.nearest.is_some()
+                || self.full_text_query.is_some()
+                || self.minhash_query.is_some()
+                || self.aggregate.is_some()
+                || self.ordering.is_some()
+                || self.external_row_mask.is_some()
+                || self.physical_row_addr_prefilter.is_some()
+                || self.include_deleted_rows
+                || fragments.iter().any(|fragment| {
+                    fragment.deletion_file.is_some()
+                        || !fragment.overlays.is_empty()
+                        || fragment.files.iter().any(|file| {
+                            file.base_id.is_some()
+                                || (file.file_major_version, file.file_minor_version) != (2, 2)
+                        })
+                })
+            {
+                return Err(Error::not_supported(
+                    "strict batch memory accounting requires a plain direct-local Lance 2.2 scan",
+                ));
+            }
+        }
         if let Some(query) = &self.nearest {
             query.validate_search_effort()?;
         }
@@ -1031,11 +1075,26 @@ impl Scanner {
             .as_ref()
             .and_then(|ordering| Self::ordering_in_output(ordering, &final_projection));
 
+        if self.strict_batch_memory_accounting {
+            lance_datafusion::resources::flat_batch_allowance(plan.schema().as_ref(), 0)?;
+            if final_projection
+                .iter()
+                .any(|(expr, _)| expr.downcast_ref::<Column>().is_none())
+                || plan.downcast_ref::<FilteredReadExec>().is_none()
+            {
+                return Err(Error::not_supported(
+                    "strict batch memory accounting requires a column projection over a local scan",
+                ));
+            }
+        }
         plan = Arc::new(DFProjectionExec::try_new(final_projection, plan)?);
 
         // If requested, apply a strict batch size to the final output
         if self.strict_batch_size {
-            plan = Arc::new(StrictBatchSizeExec::new(plan, self.get_batch_size()));
+            plan = Arc::new(
+                StrictBatchSizeExec::new(plan, self.get_batch_size())
+                    .with_memory_accounting(self.strict_batch_memory_accounting),
+            );
         }
 
         // Fold in measured widths before any rule reads statistics off the plan.

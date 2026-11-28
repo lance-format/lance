@@ -237,12 +237,19 @@ fn get_task_context(
     session_ctx: &SessionContext,
     options: &LanceExecutionOptions,
 ) -> Result<Arc<TaskContext>> {
+    Ok(Arc::new(build_task_context(session_ctx, options)?))
+}
+
+fn build_task_context(
+    session_ctx: &SessionContext,
+    options: &LanceExecutionOptions,
+) -> Result<TaskContext> {
     // Build from the session state in place. `SessionContext::state` would clone
     // the whole state (every function map, rule list and option) only to drop
     // it, which is a measurable share of CPU for short queries.
     let task_ctx = track_execution_memory(TaskContext::from(session_ctx), options);
     let Some(batch_size) = options.validated_batch_size()? else {
-        return Ok(Arc::new(task_ctx));
+        return Ok(task_ctx);
     };
     let batch_size = ConfigNonZeroUsize::try_new(batch_size).map_err(|_| {
         Error::invalid_input(format!(
@@ -251,7 +258,7 @@ fn get_task_context(
     })?;
     let mut session_config = task_ctx.session_config().clone();
     session_config.options_mut().execution.batch_size = batch_size;
-    Ok(Arc::new(task_ctx.with_session_config(session_config)))
+    Ok(task_ctx.with_session_config(session_config))
 }
 
 /// Executes a plan under a task context of the cached session for `options`,
@@ -264,6 +271,17 @@ pub fn execute_plan(
 ) -> Result<SendableRecordBatchStream> {
     let task_context = get_task_context(&get_session_context(&options), &options)?;
     execute_plan_with_context(plan, options, task_context)
+}
+
+/// Execute a strict scan with one adapter for its read and operator reservations.
+#[doc(hidden)]
+pub fn execute_accounted_scan(
+    plan: Arc<dyn ExecutionPlan>,
+    options: LanceExecutionOptions,
+) -> Result<SendableRecordBatchStream> {
+    let context = build_task_context(&get_session_context(&options), &options)?;
+    let context = crate::resources::DataFusionMemoryReserver::configure(context)?;
+    execute_plan_with_context(plan, options, Arc::new(context))
 }
 
 /// Executes a plan with an existing session context.

@@ -32,6 +32,7 @@
 //! deletion succeeds, including when a writer is aborted. Failed deletions are
 //! retried on the next spill allocation and on directory cleanup.
 
+use std::fmt;
 use std::fs::File;
 use std::future::Future;
 use std::io::{self, Write};
@@ -52,7 +53,10 @@ use lance_core::deepsize::{Context as DeepSizeContext, DeepSizeOf};
 use object_store::path::Path;
 use tokio::io::AsyncWrite;
 
-use lance_core::{Error, Result};
+use lance_core::{
+    Error, Result,
+    utils::{memory::MemoryReserver, tokio::io_task_with_resources},
+};
 
 use crate::object_writer::WriteResult;
 use crate::traits::{ByteStream, Reader, Writer};
@@ -434,6 +438,7 @@ pub struct LocalSpillStore {
     /// directory.
     parent_dir: Option<PathBuf>,
     metrics: Arc<SpillMetrics>,
+    memory_pool: Option<Arc<dyn MemoryReserver>>,
 }
 
 /// Create `path` without creating its parents. On Unix, request mode `0o700`,
@@ -516,6 +521,7 @@ impl LocalSpillStore {
             quota: self.quota.clone(),
             parent_dir: self.parent_dir.clone(),
             metrics: Arc::new(SpillMetrics::default()),
+            memory_pool: self.memory_pool.clone(),
         }
     }
 
@@ -567,6 +573,22 @@ impl LocalSpillStore {
         }
     }
 
+    /// Create a spill scope whose local creation and opening share the
+    /// operation's memory and task group. Writes use the existing disk quota.
+    /// See [`Self::scope`] for how the directory and quota are shared.
+    #[doc(hidden)]
+    pub fn with_memory_reserver(&self, pool: Arc<dyn MemoryReserver>) -> Result<Self> {
+        if self.memory_pool.is_some() {
+            return Err(Error::invalid_input(
+                "spill scope already has a memory reserver",
+            ));
+        }
+        Ok(Self {
+            memory_pool: Some(pool),
+            ..self.scope()
+        })
+    }
+
     fn ensure_temp_dir(&self) -> Result<Arc<SpillDirectory>> {
         // Serialize initialization and pending cleanup without holding the lock
         // across an `.await`.
@@ -593,6 +615,7 @@ impl Default for LocalSpillStore {
             file_counter: Arc::new(AtomicU64::new(0)),
             quota: None,
             parent_dir: None,
+            memory_pool: None,
             metrics: Arc::new(SpillMetrics::default()),
         }
     }
@@ -601,29 +624,60 @@ impl Default for LocalSpillStore {
 #[async_trait]
 impl SpillStore for LocalSpillStore {
     async fn new_spill(&self) -> Result<(Box<dyn Writer>, Box<dyn Spill>)> {
-        let temp_dir = self.ensure_temp_dir()?;
-        let idx = self
-            .file_counter
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-                value.checked_add(1)
+        let resources = self
+            .memory_pool
+            .as_ref()
+            .map(|pool| {
+                let path_bytes = self
+                    .parent_dir
+                    .as_ref()
+                    .map_or(0, |path| path.as_os_str().len());
+                let bytes = path_bytes
+                    .checked_mul(8)
+                    .and_then(|n| n.checked_add(4096))
+                    .ok_or_else(|| {
+                        Error::invalid_input("local spill backing allowance overflow")
+                    })?;
+                let control = pool.reserve("scratch spill backing", bytes)?;
+                Ok::<_, Error>(SpillResources {
+                    pool: pool.clone(),
+                    _control: control,
+                })
             })
-            .map_err(|_| Error::invalid_input("spill file counter overflow"))?;
-        let fs_path = temp_dir.path().join(format!("spill_{idx:06}.bin"));
-        let os_path = Path::from_absolute_path(&fs_path)?;
-        let backing = Arc::new(SpillBacking {
-            fs_path,
+            .transpose()?;
+        let state = Self {
+            temp_dir: self.temp_dir.clone(),
+            file_counter: self.file_counter.clone(),
             quota: self.quota.clone(),
-            accepted: AtomicU64::new(0),
-            finished: AtomicBool::new(false),
-            directory: temp_dir,
+            parent_dir: self.parent_dir.clone(),
             metrics: self.metrics.clone(),
-        });
-        self.metrics.allocated();
-        let write_backing = backing.clone();
-        let inner = tokio::task::spawn_blocking(move || {
+            memory_pool: None,
+        };
+        let create = move || {
+            let temp_dir = state.ensure_temp_dir()?;
+            let idx = state
+                .file_counter
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                    value.checked_add(1)
+                })
+                .map_err(|_| Error::invalid_input("spill file counter overflow"))?;
+            let fs_path = temp_dir.path().join(format!("spill_{idx:06}.bin"));
+            let os_path = Path::from_absolute_path(&fs_path)?;
+            let backing = Arc::new(SpillBacking {
+                fs_path,
+                quota: state.quota,
+                accepted: AtomicU64::new(0),
+                finished: AtomicBool::new(false),
+                directory: temp_dir,
+                metrics: state.metrics.clone(),
+                resources,
+            });
+            state.metrics.allocated();
+            #[cfg(test)]
+            tests::wait_for_native_job(&backing.fs_path);
             // Recreate the scratch directory and its immediate parent after
             // external cleanup, requiring higher ancestors to still exist.
-            let directory_path = write_backing.directory.path();
+            let directory_path = backing.directory.path();
             let create_directory = directory_path
                 .parent()
                 .into_iter()
@@ -635,29 +689,34 @@ impl SpillStore for LocalSpillStore {
                     format!(
                         "failed to create spill directory {} for spill {}: {err}",
                         directory_path.display(),
-                        write_backing.fs_path.display(),
+                        backing.fs_path.display(),
                     ),
                 )
             })?;
-            let file = File::create(&write_backing.fs_path).map_err(|err| {
+            let file = File::create(&backing.fs_path).map_err(|err| {
                 io::Error::new(
                     err.kind(),
                     format!(
                         "failed to create spill file {}: {err}",
-                        write_backing.fs_path.display(),
+                        backing.fs_path.display(),
                     ),
                 )
             })?;
-            Ok::<_, io::Error>(LocalSpillWriter {
+            let inner = LocalSpillWriter {
                 file: Arc::new(SpillWriteFile {
                     file,
-                    _backing: write_backing,
+                    _backing: backing.clone(),
                 }),
                 pending: None,
                 position: 0,
-            })
-        })
-        .await??;
+            };
+            Ok::<_, Error>((inner, backing, os_path))
+        };
+        let (inner, backing, os_path) = if let Some(pool) = &self.memory_pool {
+            io_task_with_resources(pool.clone(), "scratch file creation", create)?.await??
+        } else {
+            tokio::task::spawn_blocking(create).await??
+        };
         let writer = Box::new(SpillWriter {
             inner: Box::new(inner),
             backing: backing.clone(),
@@ -841,6 +900,18 @@ struct SpillBacking {
     finished: AtomicBool,
     directory: Arc<SpillDirectory>,
     metrics: Arc<SpillMetrics>,
+    resources: Option<SpillResources>,
+}
+
+struct SpillResources {
+    pool: Arc<dyn MemoryReserver>,
+    _control: Box<dyn Send + Sync>,
+}
+
+impl fmt::Debug for SpillResources {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SpillResources").finish_non_exhaustive()
+    }
 }
 
 impl Drop for SpillBacking {
@@ -877,7 +948,13 @@ impl Spill for LocalSpill {
         let backing = self.backing.clone();
         let path = self.os_path.clone();
         // The blocking task owns the backing even if opening is cancelled.
-        tokio::task::spawn_blocking(move || {
+        let pool = backing
+            .resources
+            .as_ref()
+            .map(|resources| resources.pool.clone());
+        let open = move || {
+            #[cfg(test)]
+            tests::wait_for_native_job(&backing.fs_path);
             let file = File::open(&backing.fs_path)?;
             let size = usize::try_from(file.metadata()?.len())
                 .map_err(|err| Error::invalid_input(format!("spill size exceeds usize: {err}")))?;
@@ -889,8 +966,12 @@ impl Spill for LocalSpill {
                 path,
                 size,
             }) as Box<dyn Reader>)
-        })
-        .await?
+        };
+        if let Some(pool) = pool {
+            io_task_with_resources(pool, "scratch file opening", open)?.await?
+        } else {
+            tokio::task::spawn_blocking(open).await?
+        }
     }
 }
 
@@ -1275,6 +1356,50 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_cancelled_first_spill_initializes_in_blocking_job() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("spill-parent");
+        let store = LocalSpillStore::with_cap(8)
+            .unwrap()
+            .with_parent_dir(&parent);
+        let scope = store.scope();
+        runtime.block_on(async {
+            let (release, wait) = std::sync::mpsc::channel();
+            let (started, ready) = tokio::sync::oneshot::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                started.send(()).unwrap();
+                let _ = wait.recv();
+            });
+            ready.await.unwrap();
+
+            let mut create = scope.new_spill();
+            assert!(futures::poll!(&mut create).is_pending());
+            drop(create);
+            assert!(!parent.exists(), "filesystem work ran on the async caller");
+            release.send(()).unwrap();
+            blocker.await.unwrap();
+
+            let (writer, spill) = store.new_spill().await.unwrap();
+            let directory = store.ensure_temp_dir().unwrap().path().to_owned();
+            assert_eq!(scope.ensure_temp_dir().unwrap().path(), directory);
+            assert_eq!(scope.metrics().snapshot().live_files, 0);
+            assert_eq!(scope.metrics().snapshot().files_created, 1);
+            assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
+            finish_writer(writer, b"retained").await.unwrap();
+            let reader = spill.reader().await.unwrap();
+            assert_eq!(reader.get_all().await.unwrap().as_ref(), b"retained");
+            drop((reader, spill, scope, store));
+            assert!(!directory.exists());
+            assert!(parent.is_dir());
+        });
+    }
+
     #[tokio::test]
     async fn test_raii_cleanup() {
         let store = LocalSpillStore::new().unwrap();
@@ -1613,8 +1738,10 @@ mod tests {
         finish_writer(writer, &[0; 100]).await.unwrap();
     }
 
-    #[test]
-    fn test_cancelled_running_read_keeps_quota_until_io_finishes() {
+    #[rstest]
+    #[case::range(false)]
+    #[case::stream(true)]
+    fn test_cancelled_queued_read_keeps_quota_until_io_finishes(#[case] is_stream: bool) {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .max_blocking_threads(1)
@@ -1632,11 +1759,17 @@ mod tests {
                 wait.recv().unwrap();
             });
             ready.await.unwrap();
-            let mut read = reader.get_range(0..100);
+            let mut stream = if is_stream {
+                reader.get_range_stream(0..100).await.unwrap()
+            } else {
+                futures::stream::once(reader.get_range(0..100)).boxed()
+            };
+            let mut read = stream.next();
             // Polling queues the read behind the blocker, so cancellation is
             // deterministic and cannot race an already completed disk read.
             assert!(futures::poll!(&mut read).is_pending());
             drop(read);
+            drop(stream);
             drop(reader);
             drop(spill);
             let quota = store.quota.as_ref().unwrap();
@@ -1723,6 +1856,7 @@ mod tests {
             finished: AtomicBool::new(false),
             directory: directory.clone(),
             metrics: store.metrics.clone(),
+            resources: None,
         });
         assert_eq!(quota.used.load(Ordering::Relaxed), 100);
         assert_eq!(store.metrics.snapshot().charged_bytes, 100);
@@ -1831,6 +1965,7 @@ mod tests {
             finished: AtomicBool::new(false),
             directory: store.ensure_temp_dir().unwrap(),
             metrics: store.metrics.clone(),
+            resources: None,
         });
         let mut writer = SpillWriter {
             inner: Box::new(ControlledWriter { outcome }),
@@ -1844,5 +1979,265 @@ mod tests {
         drop(writer);
         assert_eq!(quota.used.load(Ordering::Relaxed), 0);
         assert_eq!(store.metrics.snapshot().charged_bytes, 0);
+    }
+    #[derive(Debug)]
+    struct RefuseIoAdmission {
+        stage: &'static str,
+        refuse: AtomicBool,
+        tasks: Arc<lance_core::utils::tasks::ResourceTaskGroup>,
+    }
+
+    impl MemoryReserver for RefuseIoAdmission {
+        fn task_group(&self) -> Option<Arc<lance_core::utils::tasks::ResourceTaskGroup>> {
+            Some(self.tasks.clone())
+        }
+
+        fn reserve(&self, stage: &str, _bytes: usize) -> Result<Box<dyn Send + Sync>> {
+            if stage == self.stage && self.refuse.swap(false, Ordering::Relaxed) {
+                return Err(Error::execution(format!(
+                    "injected admission denial: stage={stage}"
+                )));
+            }
+            Ok(Box::new(()))
+        }
+    }
+
+    // Per-path gates keep concurrent tests independent and exist only in test
+    // builds. The real native closure announces entry before it waits.
+    type NativeJobGate = (
+        tokio::sync::oneshot::Sender<()>,
+        std::sync::mpsc::Receiver<()>,
+    );
+    static NATIVE_JOB_GATES: std::sync::LazyLock<
+        std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, NativeJobGate>>,
+    > = std::sync::LazyLock::new(Default::default);
+
+    pub(super) fn wait_for_native_job(path: &std::path::Path) {
+        let gate = NATIVE_JOB_GATES.lock().unwrap().remove(path);
+        if let Some((started, release)) = gate {
+            let _ = started.send(());
+            let _ = release.recv();
+        }
+    }
+
+    #[rstest]
+    #[case::create(false)]
+    #[case::open(true)]
+    #[tokio::test]
+    async fn resource_spill_started_job_remains_tracked(#[case] opening: bool) {
+        let pool = Arc::new(RefuseIoAdmission {
+            stage: "unused",
+            refuse: AtomicBool::new(false),
+            tasks: Arc::default(),
+        });
+        let store = LocalSpillStore::with_cap(4).unwrap();
+        let scoped = store.with_memory_reserver(pool.clone()).unwrap();
+        let spill = if opening {
+            let (writer, spill) = scoped.new_spill().await.unwrap();
+            finish_writer(writer, b"data").await.unwrap();
+            Some(spill)
+        } else {
+            None
+        };
+        let path = store
+            .ensure_temp_dir()
+            .unwrap()
+            .path()
+            .join("spill_000000.bin");
+        let (started, ready) = tokio::sync::oneshot::channel();
+        // Disconnecting this sender also unblocks the native closure on panic.
+        let (release, blocked) = std::sync::mpsc::channel();
+        NATIVE_JOB_GATES
+            .lock()
+            .unwrap()
+            .insert(path, (started, blocked));
+        if let Some(spill) = &spill {
+            let mut open = Box::pin(spill.reader());
+            assert!(futures::poll!(&mut open).is_pending());
+            ready.await.unwrap();
+            drop(open);
+        } else {
+            let mut create = Box::pin(scoped.new_spill());
+            assert!(futures::poll!(&mut create).is_pending());
+            ready.await.unwrap();
+            drop(create);
+        }
+        assert_eq!(pool.tasks.active(), 1);
+        assert!(futures::FutureExt::now_or_never(pool.tasks.wait()).is_none());
+        drop(spill);
+        release.send(()).unwrap();
+        pool.tasks.wait().await;
+        assert_eq!(pool.tasks.active(), 0);
+        assert_eq!(
+            store.quota.as_ref().unwrap().used.load(Ordering::Acquire),
+            0
+        );
+        assert_eq!(scoped.metrics().snapshot().live_files, 0);
+    }
+
+    #[rstest]
+    #[case::create(false)]
+    #[case::open(true)]
+    #[test]
+    fn resource_spill_cancelled_native_job_remains_tracked(#[case] opening: bool) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let pool = Arc::new(RefuseIoAdmission {
+                stage: "unused",
+                refuse: AtomicBool::new(false),
+                tasks: Arc::default(),
+            });
+            let store = LocalSpillStore::with_cap(4).unwrap();
+            let scoped = store.with_memory_reserver(pool.clone()).unwrap();
+            let spill = if opening {
+                let (writer, spill) = scoped.new_spill().await.unwrap();
+                finish_writer(writer, b"data").await.unwrap();
+                Some(spill)
+            } else {
+                None
+            };
+            let (release, blocked) = std::sync::mpsc::channel::<()>();
+            let (started, ready) = tokio::sync::oneshot::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                let _ = started.send(());
+                let _ = blocked.recv();
+            });
+            ready.await.unwrap();
+            if let Some(spill) = &spill {
+                let mut open = Box::pin(spill.reader());
+                assert!(futures::poll!(&mut open).is_pending());
+                drop(open);
+            } else {
+                let mut create = Box::pin(scoped.new_spill());
+                assert!(futures::poll!(&mut create).is_pending());
+                drop(create);
+            }
+            assert_eq!(pool.tasks.active(), 1);
+            assert!(futures::FutureExt::now_or_never(pool.tasks.wait()).is_none());
+            drop(spill);
+            release.send(()).unwrap();
+            blocker.await.unwrap();
+            pool.tasks.wait().await;
+            assert_eq!(pool.tasks.active(), 0);
+            assert_eq!(
+                store.quota.as_ref().unwrap().used.load(Ordering::Acquire),
+                0
+            );
+            assert_eq!(scoped.metrics().snapshot().live_files, 0);
+        });
+    }
+
+    #[rstest]
+    #[case::create(false)]
+    #[case::open(true)]
+    #[tokio::test]
+    async fn resource_spill_native_admission_refusal(
+        #[case] opening: bool,
+        #[values(false, true)] cancelled: bool,
+        #[values(
+            "I/O completion driver control",
+            "I/O completion future",
+            "I/O await future"
+        )]
+        stage: &'static str,
+    ) {
+        let pool = Arc::new(RefuseIoAdmission {
+            stage,
+            refuse: AtomicBool::new(false),
+            tasks: Arc::default(),
+        });
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("new-parent");
+        let store = LocalSpillStore::with_cap(4)
+            .unwrap()
+            .with_parent_dir(&parent);
+        let scoped = store.with_memory_reserver(pool.clone()).unwrap();
+        let spill = if opening {
+            let (writer, spill) = scoped.new_spill().await.unwrap();
+            finish_writer(writer, b"data").await.unwrap();
+            Some(spill)
+        } else {
+            None
+        };
+        if cancelled {
+            pool.tasks.cancel();
+        } else {
+            pool.refuse.store(true, Ordering::Relaxed);
+        }
+        let error = if let Some(spill) = &spill {
+            spill.reader().await.err().unwrap()
+        } else {
+            scoped.new_spill().await.err().unwrap()
+        };
+        assert!(matches!(error, Error::Execution { .. }));
+        assert!(error.to_string().contains(if cancelled {
+            "cancelled before dispatch"
+        } else {
+            stage
+        }));
+        assert_eq!(pool.tasks.active(), 0);
+        if !opening {
+            assert!(
+                !parent.exists(),
+                "refused creation must not initialize its parent"
+            );
+            assert!(store.temp_dir.lock().unwrap().is_none());
+            if !cancelled {
+                // Retry the same first spill after transient admission refusal.
+                let (writer, created) = scoped.new_spill().await.unwrap();
+                finish_writer(writer, b"data").await.unwrap();
+                assert!(parent.is_dir());
+                assert!(store.temp_dir.lock().unwrap().is_some());
+                drop(created);
+                pool.tasks.wait().await;
+            }
+        }
+        drop(spill);
+        assert_eq!(scoped.metrics().snapshot().live_files, 0);
+        assert_eq!(
+            store.quota.as_ref().unwrap().used.load(Ordering::Acquire),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn resource_spill_open_error_releases_task() {
+        let pool = Arc::new(RefuseIoAdmission {
+            stage: "unused",
+            refuse: AtomicBool::new(false),
+            tasks: Arc::default(),
+        });
+        let store = LocalSpillStore::with_cap(4).unwrap();
+        let scoped = store.with_memory_reserver(pool.clone()).unwrap();
+        let (writer, spill) = scoped.new_spill().await.unwrap();
+        finish_writer(writer, b"data").await.unwrap();
+        let path = store
+            .ensure_temp_dir()
+            .unwrap()
+            .path()
+            .join("spill_000000.bin");
+        std::fs::remove_file(&path).unwrap();
+        let error = spill.reader().await.err().unwrap();
+        assert!(matches!(error, Error::IO { .. }), "{error}");
+        let Error::IO { source, .. } = &error else {
+            unreachable!()
+        };
+        assert_eq!(
+            source.downcast_ref::<io::Error>().unwrap().kind(),
+            io::ErrorKind::NotFound
+        );
+        pool.tasks.wait().await;
+        assert_eq!(pool.tasks.active(), 0);
+        assert!(pool.tasks.peak() > 0);
+        drop(spill);
+        assert_eq!(
+            store.quota.as_ref().unwrap().used.load(Ordering::Acquire),
+            0
+        );
+        assert_eq!(scoped.metrics().snapshot().live_files, 0);
     }
 }

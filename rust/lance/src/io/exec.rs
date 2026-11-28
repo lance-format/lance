@@ -22,6 +22,7 @@ pub mod ordered_index_scan;
 mod prefilter_union;
 mod projection;
 mod pushdown_scan;
+pub(crate) mod read_budget;
 pub(crate) mod row_addr_mask;
 mod rowids;
 pub mod scalar_index;

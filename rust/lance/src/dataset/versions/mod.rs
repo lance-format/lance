@@ -18,6 +18,7 @@ use lance_core::{
     datatypes::{Field, Projection, Schema},
 };
 use lance_file::version::ConcreteFileVersion;
+use lance_io::read_budget::BudgetReader;
 use lance_table::format::Fragment;
 
 use super::Dataset;
@@ -44,6 +45,7 @@ pub fn create_scan_stream(
     offsets: Option<Range<u64>>,
     projection: Arc<Schema>,
     config: LanceScanConfig,
+    read_budget: Option<BudgetReader>,
     metrics: &ExecutionPlanMetricsSet,
     partition: usize,
 ) -> datafusion::error::Result<LanceStream> {
@@ -55,7 +57,14 @@ pub fn create_scan_stream(
         | ConcreteFileVersion::V2_1
         | ConcreteFileVersion::V2_2
         | ConcreteFileVersion::V2_3 => LanceStream::try_new_v2(
-            dataset, fragments, offsets, projection, config, metrics, partition,
+            dataset,
+            fragments,
+            offsets,
+            projection,
+            config,
+            read_budget,
+            metrics,
+            partition,
         ),
     }
 }

@@ -32,3 +32,6 @@ pub mod sql;
 pub mod substrait;
 pub mod udf;
 pub use lance_datafusion_exec::utils;
+
+#[doc(hidden)]
+pub use lance_datafusion_exec::resources;

@@ -198,7 +198,7 @@ pub struct MaterializedBlobBatch {
     /// Reservations are reference-counted so that splitting a batch into
     /// multiple chunks keeps the original memory reservation alive until the
     /// last chunk is dropped.
-    _reservations: Vec<Arc<BlobMaterializationReservation>>,
+    _reservations: Vec<Arc<dyn std::any::Any + Send + Sync>>,
 }
 
 impl MaterializedBlobBatch {
@@ -213,7 +213,7 @@ impl MaterializedBlobBatch {
     #[cfg(test)]
     fn with_reservations(
         batch: RecordBatch,
-        reservations: Vec<Arc<BlobMaterializationReservation>>,
+        reservations: Vec<Arc<dyn std::any::Any + Send + Sync>>,
     ) -> Self {
         Self {
             batch,
@@ -268,6 +268,19 @@ impl MaterializedBlobBatch {
                 _reservations: _reservations.clone(),
             })
             .collect())
+    }
+
+    /// Attach an existing read-admission owner while this output is queued.
+    #[doc(hidden)]
+    pub fn with_reservation(mut self, owner: Arc<dyn std::any::Any + Send + Sync>) -> Self {
+        self._reservations.push(owner);
+        self
+    }
+
+    /// Transfer a queued batch together with its original reservation owners.
+    #[doc(hidden)]
+    pub fn into_raw(self) -> (RecordBatch, Vec<Arc<dyn std::any::Any + Send + Sync>>) {
+        (self.batch, self._reservations)
     }
 
     #[doc(hidden)]
@@ -496,7 +509,10 @@ pub fn materialize_blob_v2_binary_batch_with_admission<'a>(
                 )),
                 columns,
             )?,
-            _reservations: reservation.into_iter().map(Arc::new).collect(),
+            _reservations: reservation
+                .into_iter()
+                .map(|owner| Arc::new(owner) as Arc<dyn std::any::Any + Send + Sync>)
+                .collect(),
         })
     }
     .boxed()
