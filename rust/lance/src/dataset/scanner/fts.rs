@@ -1477,17 +1477,20 @@ impl Scanner {
                 // the documents that are not in the top-k results of the positive query,
                 // but in the final top-k results.
                 let unlimited_params = params.clone().with_limit(None);
+                // Both children must read one shared prefilter materialization;
+                // see `PreFilterSource::shared_for_consumers`.
+                let prefilter_sources = prefilter_source.shared_for_consumers(2);
                 let positive_exec = Box::pin(self.plan_fts(
                     &query.positive,
                     &unlimited_params,
                     filter_plan,
-                    prefilter_source,
+                    &prefilter_sources[0],
                 ));
                 let negative_exec = Box::pin(self.plan_fts(
                     &query.negative,
                     &unlimited_params,
                     filter_plan,
-                    prefilter_source,
+                    &prefilter_sources[1],
                 ));
                 let (positive_exec, negative_exec) =
                     futures::future::try_join(positive_exec, negative_exec).await?;
@@ -1509,7 +1512,7 @@ impl Scanner {
                 let can_use_bounded_compound =
                     !document_granularity.is_list_element() && params.limit.is_some();
                 let field_prefilter_sources =
-                    prefilter_source.shared_for_multimatch_fields(query.match_queries.len());
+                    prefilter_source.shared_for_consumers(query.match_queries.len());
                 let children = futures::future::try_join_all(
                     query
                         .match_queries
@@ -1594,38 +1597,50 @@ impl Scanner {
                 // so that we won't miss possible matches
                 let unlimited_params = params.clone().with_limit(None);
 
+                // Every leaf must read one shared prefilter materialization;
+                // see `PreFilterSource::shared_for_consumers`.
+                let mut prefilter_sources = prefilter_source
+                    .shared_for_consumers(
+                        query.should.len() + query.must.len() + query.must_not.len(),
+                    )
+                    .into_iter();
+
                 let mut should = Vec::with_capacity(query.should.len());
-                for subquery in &query.should {
+                for (subquery, prefilter_source) in
+                    query.should.iter().zip(prefilter_sources.by_ref())
+                {
                     should.push(
                         Box::pin(self.plan_fts(
                             subquery,
                             &unlimited_params,
                             filter_plan,
-                            prefilter_source,
+                            &prefilter_source,
                         ))
                         .await?,
                     );
                 }
                 let mut must = Vec::with_capacity(query.must.len());
-                for subquery in &query.must {
+                for (subquery, prefilter_source) in
+                    query.must.iter().zip(prefilter_sources.by_ref())
+                {
                     must.push(
                         Box::pin(self.plan_fts(
                             subquery,
                             &unlimited_params,
                             filter_plan,
-                            prefilter_source,
+                            &prefilter_source,
                         ))
                         .await?,
                     );
                 }
                 let mut must_not = Vec::with_capacity(query.must_not.len());
-                for subquery in &query.must_not {
+                for (subquery, prefilter_source) in query.must_not.iter().zip(prefilter_sources) {
                     must_not.push(
                         Box::pin(self.plan_fts(
                             subquery,
                             &unlimited_params,
                             filter_plan,
-                            prefilter_source,
+                            &prefilter_source,
                         ))
                         .await?,
                     );

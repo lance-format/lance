@@ -2279,6 +2279,132 @@ async fn test_multimatch_shared_prefilter(
     assert_scored_rows_close("shared_multimatch_prefilter", &actual, &expected);
 }
 
+#[rstest]
+#[case::boolean(BooleanQuery::new([
+    (Occur::Must, compound_match_query("red", "t", 1.0)),
+    (Occur::MustNot, compound_match_query("blue", "t", 1.0)),
+]).into())]
+#[case::boost(BoostQuery::new(
+    compound_match_query("red", "t", 1.0),
+    compound_match_query("blue", "t", 1.0),
+    None,
+).into())]
+#[case::nested_boolean(BooleanQuery::new([
+    (Occur::Must, BooleanQuery::new([
+        (Occur::Should, compound_match_query("red", "t", 1.0)),
+        (Occur::Should, compound_match_query("green", "t", 1.0)),
+    ]).into()),
+    (Occur::MustNot, BoostQuery::new(
+        compound_match_query("blue", "t", 1.0),
+        compound_match_query("green", "t", 1.0),
+        None,
+    ).into()),
+]).into())]
+#[tokio::test]
+async fn test_compound_fts_leaves_share_prefilter(
+    #[case] query: FtsQuery,
+    // Only the mixed filter plans the prefilter as one `FilteredReadExec`
+    // with an index input, which splits its row IDs when executed twice.
+    #[values("g = 0 AND id < 100", "g = 0", "id < 100")] filter: &str,
+) {
+    let test_uri = TempStrDir::default();
+    let batch = arrow_array::record_batch!(
+        ("id", Int32, [0, 1, 2, 3]),
+        ("t", Utf8, ["red blue", "red", "red green", "blue"]),
+        ("g", Int32, [0, 0, 0, 0])
+    )
+    .unwrap();
+    let schema = batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch)], schema.clone()),
+        &test_uri,
+        None,
+    )
+    .await
+    .unwrap();
+    dataset
+        .create_index(
+            &["t"],
+            IndexType::Inverted,
+            None,
+            &InvertedIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+    dataset
+        .create_index(
+            &["g"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+    // An unindexed fragment keeps the boolean and boost leaves off the
+    // compound scorer, so each leaf consumes the prefilter on its own.
+    let appended = arrow_array::record_batch!(
+        ("id", Int32, [10, 11]),
+        ("t", Utf8, ["red blue", "red"]),
+        ("g", Int32, [0, 0])
+    )
+    .unwrap();
+    dataset
+        .append(RecordBatchIterator::new([Ok(appended)], schema), None)
+        .await
+        .unwrap();
+
+    async fn search(
+        dataset: &Dataset,
+        query: &FtsQuery,
+        filter: &str,
+        prefilter: bool,
+    ) -> Vec<(i32, f32)> {
+        let mut scanner = dataset.scan();
+        scanner
+            .prefilter(prefilter)
+            .project(&["id"])
+            .unwrap()
+            .full_text_search(FullTextSearchQuery::new_query(query.clone()))
+            .unwrap()
+            .filter(filter)
+            .unwrap();
+        let batch = scanner.try_into_batch().await.unwrap();
+        batch["id"]
+            .as_primitive::<Int32Type>()
+            .values()
+            .iter()
+            .copied()
+            .zip(
+                batch[SCORE_COL]
+                    .as_primitive::<Float32Type>()
+                    .values()
+                    .iter()
+                    .copied(),
+            )
+            .sorted_by_key(|(id, _)| *id)
+            .collect()
+    }
+
+    let expected = search(&dataset, &query, filter, false).await;
+    assert!(!expected.is_empty());
+    // The split depended on scheduling, so a single run could pass by chance.
+    for _ in 0..20 {
+        let actual = search(&dataset, &query, filter, true).await;
+        assert_eq!(
+            actual.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            expected.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+        );
+        for ((id, actual), (_, expected)) in actual.iter().zip(&expected) {
+            assert!(
+                (actual - expected).abs() <= 1e-5 * expected.abs().max(1.0),
+                "row {id}: score {actual} != {expected}"
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn test_multimatch_shared_prefilter_preserves_deletes() {
     let mut dataset = write_cross_column_compound_dataset().await;
@@ -2355,7 +2481,7 @@ async fn test_multimatch_shared_prefilter_when_first_field_is_flat_only() {
         .unwrap();
     let plan = scanner.explain_plan(false).await.unwrap();
     assert!(
-        plan.contains("FlatMatchQuery") && plan.contains("SharedMultiMatchPrefilter"),
+        plan.contains("FlatMatchQuery") && plan.contains("SharedPrefilter"),
         "the later indexed field must retain the declared shared source:\n{plan}"
     );
     scanner.try_into_batch().await.unwrap();

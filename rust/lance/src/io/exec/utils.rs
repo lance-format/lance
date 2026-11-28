@@ -95,7 +95,7 @@ struct SharedPreFilterEntry {
     generation: u64,
 }
 
-/// Query-plan-local materialization state for a MultiMatch base prefilter.
+/// Query-plan-local materialization state for a prefilter shared by FTS consumers.
 ///
 /// Entries are keyed by task-context identity and partition. This prevents a
 /// reused physical plan from carrying a mask into a later query and keeps an
@@ -158,7 +158,7 @@ impl SharedPreFilterExec {
 
 impl DisplayAs for SharedPreFilterExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "SharedMultiMatchPrefilter")
+        write!(f, "SharedPrefilter")
     }
 }
 
@@ -191,13 +191,11 @@ impl ExecutionPlan for SharedPreFilterExec {
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         let source = match children.len() {
             1 => children.pop().ok_or_else(|| {
-                DataFusionError::Internal(
-                    "shared MultiMatch prefilter lost its source child".to_string(),
-                )
+                DataFusionError::Internal("shared prefilter lost its source child".to_string())
             })?,
             count => {
                 return Err(DataFusionError::Internal(format!(
-                    "shared MultiMatch prefilter expected one child, got {count}"
+                    "shared prefilter expected one child, got {count}"
                 )));
             }
         };
@@ -210,7 +208,7 @@ impl ExecutionPlan for SharedPreFilterExec {
         _context: Arc<datafusion::execution::TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
         Err(DataFusionError::Internal(
-            "shared MultiMatch prefilter must be materialized by its FTS consumer".to_string(),
+            "shared prefilter must be materialized by its FTS consumer".to_string(),
         ))
     }
 
@@ -226,16 +224,26 @@ pub(crate) struct PreFilterMasks {
 }
 
 impl PreFilterSource {
-    /// Return a plan-local shared form for a MultiMatch with multiple fields.
+    /// Return one plan-local shared source per consumer, e.g. per MultiMatch
+    /// field or per boolean/boost leaf. The source then runs once per query
+    /// instead of once per consumer, which also matters for correctness: the
+    /// executions of one `FilteredReadExec` attach to a single running stream
+    /// and would split its row IDs between the consumers.
     /// No-filter and already-shared sources retain their existing identity.
-    pub(crate) fn shared_for_multimatch_fields(&self, field_count: usize) -> Vec<Self> {
-        if field_count <= 1 {
-            return vec![self.clone(); field_count];
+    pub(crate) fn shared_for_consumers(&self, consumer_count: usize) -> Vec<Self> {
+        if consumer_count <= 1 {
+            return vec![self.clone(); consumer_count];
         }
         match self {
+            // A compound nested in another compound inherits its parent's sharing.
+            Self::FilteredRowIds(source) | Self::ScalarIndexQuery(source)
+                if source.downcast_ref::<SharedPreFilterExec>().is_some() =>
+            {
+                vec![self.clone(); consumer_count]
+            }
             Self::FilteredRowIds(source) | Self::ScalarIndexQuery(source) => {
                 let materialization = Arc::new(SharedPreFilterMaterialization::new());
-                (0..field_count)
+                (0..consumer_count)
                     .map(|_| {
                         let shared = Arc::new(SharedPreFilterExec::new(
                             source.clone(),
@@ -249,7 +257,7 @@ impl PreFilterSource {
                     })
                     .collect()
             }
-            Self::None => vec![self.clone(); field_count],
+            Self::None => vec![self.clone(); consumer_count],
         }
     }
 
@@ -343,13 +351,14 @@ fn shared_prefilter_future(
         let key = (context_id, partition);
         let (future, generation) = {
             let mut queries = materialization.queries.lock().map_err(|_| {
-                Error::internal("MultiMatch prefilter materialization lock was poisoned")
+                Error::internal("shared prefilter materialization lock was poisoned")
             })?;
             queries.retain(|_, entry| entry.context.strong_count() > 0);
             if let Some(entry) = queries.get_mut(&key) {
-                entry.waiters = entry.waiters.checked_add(1).ok_or_else(|| {
-                    Error::internal("MultiMatch prefilter waiter count overflowed")
-                })?;
+                entry.waiters = entry
+                    .waiters
+                    .checked_add(1)
+                    .ok_or_else(|| Error::internal("shared prefilter waiter count overflowed"))?;
                 (entry.future.clone(), entry.generation)
             } else {
                 let generation = materialization
@@ -360,7 +369,7 @@ fn shared_prefilter_future(
                         |generation| generation.checked_add(1),
                     )
                     .map_err(|_| {
-                        Error::internal("MultiMatch prefilter generation counter overflowed")
+                        Error::internal("shared prefilter generation counter overflowed")
                     })?;
                 let entry = SharedPreFilterEntry {
                     context: Arc::downgrade(&context),
@@ -1784,8 +1793,8 @@ mod tests {
         #[values(false, true)] is_scalar_index_query: bool,
         #[values(false, true)] is_empty: bool,
     ) {
-        let shared_sources = prefilter_source(is_scalar_index_query, is_empty)
-            .shared_for_multimatch_fields(field_count);
+        let shared_sources =
+            prefilter_source(is_scalar_index_query, is_empty).shared_for_consumers(field_count);
         assert_eq!(
             shared_sources
                 .iter()
@@ -1815,18 +1824,31 @@ mod tests {
 
     #[test]
     fn no_filter_and_single_field_do_not_install_sharing() {
-        let no_filter = PreFilterSource::None.shared_for_multimatch_fields(8);
+        let no_filter = PreFilterSource::None.shared_for_consumers(8);
         assert!(
             no_filter
                 .iter()
                 .all(|source| matches!(source, PreFilterSource::None))
         );
 
-        let single = prefilter_source(false, false).shared_for_multimatch_fields(1);
+        let single = prefilter_source(false, false).shared_for_consumers(1);
         assert!(matches!(
             single.as_slice(),
             [PreFilterSource::FilteredRowIds(_)]
         ));
+    }
+
+    #[test]
+    fn nested_compound_keeps_parent_sharing() {
+        let parent = prefilter_source(false, false).shared_for_consumers(2);
+        let parent_source = parent[0].execution_plan().unwrap();
+        let nested = parent[0].shared_for_consumers(3);
+        assert_eq!(nested.len(), 3);
+        // Wrapping again would execute the parent's shared node as a source.
+        assert!(nested.iter().all(|source| {
+            matches!(source, PreFilterSource::FilteredRowIds(_))
+                && Arc::ptr_eq(source.execution_plan().unwrap(), parent_source)
+        }));
     }
 
     #[tokio::test]
@@ -1843,7 +1865,7 @@ mod tests {
             ))]),
         ));
         let source = PreFilterSource::FilteredRowIds(Arc::new(OneShotExec::new(stream)));
-        let shared_sources = source.shared_for_multimatch_fields(2);
+        let shared_sources = source.shared_for_consumers(2);
         let context = Arc::new(datafusion::execution::TaskContext::default());
         let dataset = test_dataset().await;
         let left = shared_prefilter_future(
@@ -1908,7 +1930,7 @@ mod tests {
             }),
         ));
         let source = PreFilterSource::FilteredRowIds(Arc::new(OneShotExec::new(stream)));
-        let shared_sources = source.shared_for_multimatch_fields(2);
+        let shared_sources = source.shared_for_consumers(2);
         let materialization = shared_materialization(&shared_sources[0]);
         let context = Arc::new(datafusion::execution::TaskContext::default());
         let dataset = test_dataset().await;
@@ -1975,7 +1997,7 @@ mod tests {
             }),
         ));
         let source = PreFilterSource::FilteredRowIds(Arc::new(OneShotExec::new(stream)));
-        let shared_sources = source.shared_for_multimatch_fields(2);
+        let shared_sources = source.shared_for_consumers(2);
         let materialization = shared_materialization(&shared_sources[0]);
         let waiter = tokio::spawn(shared_prefilter_future(
             materialization.clone(),
@@ -2095,7 +2117,7 @@ mod tests {
         )
         .unwrap();
         let field_sources =
-            PreFilterSource::FilteredRowIds(Arc::new(source_plan)).shared_for_multimatch_fields(2);
+            PreFilterSource::FilteredRowIds(Arc::new(source_plan)).shared_for_consumers(2);
         let output_schema = Arc::new(Schema::new(vec![Field::new(
             "allowed_rows",
             DataType::UInt64,
