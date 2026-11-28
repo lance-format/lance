@@ -3,6 +3,230 @@
 
 use super::*;
 use async_trait::async_trait;
+use datafusion::execution::memory_pool::PeakRecordingPool;
+use lance_datafusion::exec::{
+    ExecutionMetricValue, new_session_context, new_session_context_with_memory_tracking,
+};
+
+#[tokio::test]
+async fn test_indexed_merge_insert_spills_wide_source() {
+    const POOL_BYTES: u64 = 512 * 1024;
+    const ROWS_PER_BATCH: u64 = 64;
+    const BATCHES: u32 = 16;
+    const ROWS: u64 = ROWS_PER_BATCH * BATCHES as u64;
+    const UPDATES: u64 = 768;
+    const INSERTS: u64 = ROWS - UPDATES;
+
+    // The vector payload alone is twice the pool. Reverse source keys exercise
+    // merging sorted spill files, with inserts before updates in join order.
+    let data = |keys, value, updated| {
+        lance_datagen::gen_batch()
+            .col("id", keys)
+            .col(
+                "payload",
+                array::cycle_vec(array::fill::<UInt32Type>(value), Dimension::from(256)),
+            )
+            .col("updated", updated)
+    };
+    let target = data(
+        array::step_custom::<UInt64Type>(INSERTS, 1),
+        0,
+        array::fill::<UInt32Type>(0),
+    )
+    .col("untouched", array::fill::<UInt32Type>(7))
+    .into_reader_rows(RowCount::from(UPDATES), BatchCount::from(1));
+    let mut dataset = Dataset::write(
+        target,
+        "memory://",
+        Some(WriteParams {
+            enable_stable_row_ids: true,
+            max_rows_per_file: (UPDATES / 8) as usize,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    dataset
+        .create_index(
+            &["id"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+    let mut job = MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".into()])
+        .unwrap()
+        .when_matched(WhenMatched::UpdateAll)
+        .when_not_matched(WhenNotMatched::InsertAll)
+        // A one-shot source takes the indexed replay path before the probe.
+        .conflict_retries(0)
+        .try_build()
+        .unwrap();
+    job.spill_execution_options.mem_pool_size = Some(POOL_BYTES);
+    let session = new_session_context_with_memory_tracking(&job.spill_execution_options).unwrap();
+    let scope = analysis::AnalysisScope::observing_subplan_starts(job.dataset.uri());
+    job.spill_session_context = SessionContext::new_with_config_rt(
+        session
+            .copied_config()
+            // Keep fragment-sort output batches proportional to this small fixture.
+            .with_batch_size(ROWS_PER_BATCH as usize)
+            .with_extension(scope.clone()),
+        session.runtime_env(),
+    );
+    let source: Box<dyn RecordBatchReader + Send> = Box::new(
+        data(
+            array::cycle::<UInt64Type>((0..ROWS).rev().collect()),
+            1,
+            array::step_custom::<UInt32Type>(1, 1),
+        )
+        .into_reader_rows(RowCount::from(ROWS_PER_BATCH), BatchCount::from(BATCHES)),
+    );
+    let (dataset, stats) = job.execute_reader(source).await.unwrap();
+    assert_eq!(
+        (stats.num_updated_rows, stats.num_inserted_rows),
+        (UPDATES, INSERTS)
+    );
+
+    // Only the wide source and the small address-only probe have been replayed here.
+    {
+        let starts = scope.subplan_starts.as_ref().unwrap().lock().unwrap();
+        let source_sort = starts
+            .iter()
+            .find(|start| start.purpose == "indexed_source_sort")
+            .unwrap();
+        assert!(source_sort.replay_bytes_written > POOL_BYTES);
+    }
+    // The join and replay have their own spill counters. Check each SortExec directly.
+    let plans = scope.plans();
+    for (stage, minimum) in [
+        ("indexed_source_sort", 2),
+        ("indexed_join", 1),
+        ("fragment_update_sort", 1),
+    ] {
+        let plan = plans.iter().find(|plan| plan.purpose == stage).unwrap();
+        let sort = plan
+            .execution
+            .operators
+            .iter()
+            .find(|op| op.name == "SortExec")
+            .unwrap();
+        let spills: usize = sort
+            .metrics
+            .iter()
+            .filter_map(|metric| match (&*metric.name, &metric.value) {
+                ("spill_count", ExecutionMetricValue::Count(count)) => Some(*count),
+                _ => None,
+            })
+            .sum();
+        assert!(
+            spills >= minimum,
+            "{stage} spilled {spills} files, expected at least {minimum}"
+        );
+    }
+    let pool = session.runtime_env().memory_pool.clone();
+    let peak = PeakRecordingPool::from_pool(pool.as_ref())
+        .unwrap()
+        .max_reserved();
+    assert!(
+        (1..=POOL_BYTES as usize).contains(&peak),
+        "reserved {peak} bytes in a {POOL_BYTES}-byte pool; operator memory peaks: {:?}",
+        plans
+            .iter()
+            .flat_map(|plan| plan.execution.operators.iter().flat_map(|op| {
+                op.metrics
+                    .iter()
+                    .filter_map(move |metric| match metric.value {
+                        ExecutionMetricValue::PeakMemoryBytes(bytes) => Some((&op.name, bytes)),
+                        _ => None,
+                    })
+            }))
+            .collect::<Vec<_>>()
+    );
+
+    let batch = dataset
+        .scan()
+        .with_row_id()
+        .project(&["id", "updated", "untouched"])
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let ids = batch["id"].as_primitive::<UInt64Type>();
+    let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>();
+    let updated = batch["updated"].as_primitive::<UInt32Type>();
+    let untouched = batch["untouched"].as_primitive::<UInt32Type>();
+    assert_eq!(
+        (ids.null_count(), row_ids.null_count(), updated.null_count()),
+        (0, 0, 0)
+    );
+    let mut distinct_ids = row_ids.values().to_vec();
+    distinct_ids.sort_unstable();
+    distinct_ids.dedup();
+    assert_eq!(distinct_ids.len(), ROWS as usize);
+    let mut keys = ids.values().to_vec();
+    keys.sort_unstable();
+    assert_eq!(keys, (0..ROWS).collect::<Vec<_>>());
+    for (i, &id) in ids.values().iter().enumerate() {
+        assert_eq!(u64::from(updated.value(i)), ROWS - id);
+        if id >= INSERTS {
+            assert_eq!(row_ids.value(i), id - INSERTS);
+            assert!(!untouched.is_null(i));
+            assert_eq!(untouched.value(i), 7);
+        } else {
+            assert!(row_ids.value(i) >= UPDATES);
+            assert!(untouched.is_null(i));
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_indexed_merge_insert_updates_row_above_rechunk_target() {
+    // Omit "untouched" from the update so the payload goes through the fragment sort.
+    let target = record_batch!(
+        ("id", UInt32, [1]),
+        ("payload", Utf8, ["old"]),
+        ("untouched", UInt32, [7])
+    )
+    .unwrap();
+    let schema = target.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(target)], schema),
+        "memory://",
+        None,
+    )
+    .await
+    .unwrap();
+    dataset
+        .create_index(
+            &["id"],
+            IndexType::BTree,
+            None,
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await
+        .unwrap();
+    let mut job = MergeInsertBuilder::try_new(Arc::new(dataset), vec!["id".into()])
+        .unwrap()
+        .when_matched(WhenMatched::UpdateAll)
+        .when_not_matched(WhenNotMatched::DoNothing)
+        .try_build()
+        .unwrap();
+    job.spill_execution_options.mem_pool_size = Some(512 * 1024);
+    job.spill_session_context = new_session_context(&job.spill_execution_options);
+    let budget = MergeInsertBudget::new(&job.spill_execution_options);
+    let payload = "x".repeat(budget.batch_bytes + 1);
+    let source = record_batch!(("id", UInt32, [1]), ("payload", Utf8, [payload.as_str()])).unwrap();
+
+    let (dataset, stats) = job.execute_batches(vec![source]).await.unwrap();
+    assert_eq!(stats.num_updated_rows, 1);
+    let batch = dataset.scan().try_into_batch().await.unwrap();
+    assert_eq!(batch.num_rows(), 1);
+    assert_eq!(batch["payload"].as_string::<i32>().value(0), payload);
+    assert_eq!(batch["untouched"].as_primitive::<UInt32Type>().value(0), 7);
+}
 
 #[tokio::test]
 async fn test_indexed_merge_insert() {

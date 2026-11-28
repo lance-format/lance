@@ -495,6 +495,17 @@ impl LanceExecutionOptions {
         })
     }
 
+    /// Headroom for merging one external sort's runs within the execution pool.
+    ///
+    /// ```
+    /// use lance_datafusion_exec::exec::LanceExecutionOptions;
+    /// let options = LanceExecutionOptions { mem_pool_size: Some(9000), ..Default::default() };
+    /// assert_eq!(options.sort_spill_reservation_bytes(), 3000);
+    /// ```
+    pub fn sort_spill_reservation_bytes(&self) -> usize {
+        (self.mem_pool_size() / 3).min(MAX_SORT_SPILL_RESERVATION_BYTES) as usize
+    }
+
     pub fn max_temp_directory_size(&self) -> u64 {
         self.max_temp_directory_size.unwrap_or_else(|| {
             std::env::var("LANCE_MAX_TEMP_DIRECTORY_SIZE")
@@ -567,10 +578,8 @@ pub fn new_session_config(options: &LanceExecutionOptions) -> SessionConfig {
         // instead of DataFusion's 10 MiB default. Limit it to one third of the pool
         // to leave room for input batches in small pools. This reservation comes
         // out of the same pool; it does not guarantee that every batch will fit.
-        let sort_spill_reservation_bytes =
-            (options.mem_pool_size() / 3).min(MAX_SORT_SPILL_RESERVATION_BYTES) as usize;
-        session_config =
-            session_config.with_sort_spill_reservation_bytes(sort_spill_reservation_bytes);
+        session_config = session_config
+            .with_sort_spill_reservation_bytes(options.sort_spill_reservation_bytes());
     }
     session_config
 }

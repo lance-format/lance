@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use super::job::fragment_update_session_context;
-use super::{MAX_FRAGMENT_UPDATE_BATCH_BYTES, analysis};
+use super::{MergeInsertBudget, analysis};
 use super::{MergeInsertJob, PatchedFragments};
 use crate::dataset::rowids::load_spilled_row_lineage;
 use crate::dataset::utils::SchemaAdapter;
@@ -210,7 +210,7 @@ impl MergeInsertJob {
                         .map(|c| {
                             Arc::new(HardCapBatchSizeExec::new(
                                 c.clone(),
-                                MAX_FRAGMENT_UPDATE_BATCH_BYTES,
+                                MergeInsertBudget::MAX_BATCH_BYTES,
                             )) as Arc<dyn ExecutionPlan>
                         })
                         .collect();
