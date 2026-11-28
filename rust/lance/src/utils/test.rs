@@ -461,6 +461,55 @@ pub fn copy_test_data_to_tmp(table_path: &str) -> std::io::Result<TempDir> {
     Ok(test_dir)
 }
 
+/// Runs the calling test again in a child process with `env` applied: `Some`
+/// sets a variable and `None` removes it. Returns `true` in the parent once the
+/// child has passed, and `false` in the child, where the test body runs. Call it
+/// first thing in the test, on the test's own thread.
+///
+/// Tests use this instead of `std::env::set_var`, which is unsound while other
+/// threads may read the environment outside `std::env` (C code calling
+/// `getenv`, for example), as concurrent tests in the same binary can.
+#[must_use = "the test must return when this returns true"]
+#[track_caller]
+pub fn rerun_in_child_process(env: &[(&str, Option<&str>)]) -> bool {
+    const CHILD_MARKER: &str = "LANCE_TEST_CHILD_PROCESS";
+    // libtest names the thread it runs a test on after the test, so the filter
+    // cannot drift from the test that called this.
+    let test_name = std::thread::current()
+        .name()
+        .expect("libtest names test threads")
+        .to_owned();
+    // The marker holds the test name, so one left in the caller's environment
+    // cannot make a test skip its child.
+    if std::env::var_os(CHILD_MARKER).is_some_and(|marker| marker == test_name.as_str()) {
+        return false;
+    }
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    command.args(["--exact", &test_name, "--nocapture"]);
+    for (name, value) in env {
+        match value {
+            Some(value) => command.env(name, value),
+            None => command.env_remove(name),
+        };
+    }
+    // Set after `env`, so no entry can remove it and make the child recurse.
+    command.env(CHILD_MARKER, &test_name);
+    let output = command.output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "child run of {test_name} failed with {}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        output.status
+    );
+    // libtest also exits 0 when the filter matches no test.
+    assert!(
+        stdout.contains("test result: ok. 1 passed;"),
+        "child run did not run {test_name}:\n{stdout}"
+    );
+    true
+}
+
 /// Trims whitespace from the start and end of each line in the string.
 fn trim_whitespace(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
