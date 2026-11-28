@@ -35,6 +35,7 @@ pub use pk::{
     validate_pk_types,
 };
 pub use pk_block_filter::PkBlockFilterExec;
+pub(super) use pk_block_filter::filter_batch as filter_blocked_keys;
 pub(crate) use reconcile::ReconcileExec;
 pub use schema_relabel::SchemaRelabelExec;
 pub(super) use sstable_lookup::SsTablePointLookupExec;

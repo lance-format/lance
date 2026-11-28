@@ -482,6 +482,44 @@ def test_lsm_fts_filter_on_column_added_after_flush(tmp_path, column):
         assert present.equals(hits.filter(pc.equal(hits["id"], 4)))
 
 
+def test_lsm_fts_filter_on_stored_score_and_missing_label(tmp_path):
+    schema = pa.schema(
+        [
+            pa.field("id", pa.int64(), nullable=False, metadata=_PK_META),
+            pa.field("text", pa.string()),
+            pa.field("_score", pa.float32()),
+        ]
+    )
+    ds = lance.write_dataset(
+        pa.table({"id": [0], "text": ["other"], "_score": [0.0]}, schema=schema),
+        tmp_path / "base",
+    )
+    ds.create_scalar_index("text", "INVERTED", name="fts")
+    ds.initialize_mem_wal(maintained_indexes=["fts"], unsharded=True)
+    shard_id = str(uuid.uuid4())
+    with ds.mem_wal_writer(shard_id) as writer:
+        writer.put(
+            pa.table(
+                {"id": [1, 2], "text": ["user user", "user"], "_score": [None, -1.0]},
+                schema=schema,
+            )
+        )
+    ds.add_columns(pa.field("label", pa.string()))
+
+    with ds.mem_wal_writer(shard_id) as writer:
+        query = MatchQuery("user", "text")
+        hits = (
+            writer.lsm_scanner()
+            .full_text_search(query)
+            .filter("_score IS NOT NULL AND label IS NULL")
+            .project(["id"])
+            .limit(1)
+            .to_table()
+        )
+    assert hits["id"].to_pylist() == [2]
+    assert hits["_score"][0].as_py() > 0
+
+
 def test_lsm_scanner_json_column(tmp_path):
     """Every LsmScanner read method returns a JSON column as Arrow JSON, the
     same as Dataset.to_table, not as Lance's stored JSONB bytes."""

@@ -107,7 +107,13 @@ impl GenerationRead {
         projection: Vec<String>,
     ) -> Self {
         let (names, fts_names) = stored_names(&stored_schema, table_schema);
-        let stored_columns = names.keys().cloned().collect::<HashSet<_>>();
+        let stored_columns = stored_schema
+            .fields()
+            .iter()
+            .map(|field| field.name())
+            .filter(|name| names.contains_key(&format_field_path_minimal(&[name])))
+            .cloned()
+            .collect();
         // Invert once so a lookup is a map get, not a scan.
         let invert = |m: HashMap<String, String>| {
             m.into_iter()
@@ -198,18 +204,21 @@ impl GenerationRead {
     /// refers to `info`), and a child rename does not move the parent's name, so
     /// the parent's whole type is compared rather than its name.
     pub(super) fn to_stored(&self, expr: &Expr) -> Option<Expr> {
-        let pushable = expr
-            .column_refs()
+        let refs = expr.column_refs();
+        let names = refs
             .iter()
-            .all(|c| self.stored_as_declared(&c.name));
-        if !pushable {
-            return None;
-        }
+            .map(|c| {
+                let stored = self.stored_filter_field(&c.name)?;
+                let declared = self.table_schema.field_with_name(&c.name).ok()?;
+                // Comparing the full Arrow type also checks nested field ids and renames.
+                (stored.data_type() == declared.data_type())
+                    .then_some((c.name.as_str(), stored.name()))
+            })
+            .collect::<Option<HashMap<_, _>>>()?;
         expr.clone()
             .transform(|e| match e {
                 Expr::Column(mut c) => {
-                    // `stored_name` is total over the refs, checked above.
-                    c.name = self.stored_name(&c.name).expect("checked").to_string();
+                    c.name = names[c.name.as_str()].clone();
                     Ok(Transformed::yes(Expr::Column(c)))
                 }
                 other => Ok(Transformed::no(other)),
@@ -229,7 +238,7 @@ impl GenerationRead {
         let deferred = filter.filter(|_| pushed.is_none()).cloned();
         if let Some(expr) = &deferred {
             for column in expr.column_refs() {
-                self.also_produce(&column.name);
+                self.also_produce(&format_field_path_minimal(&[&column.name]));
             }
         }
         (pushed, deferred)
@@ -245,11 +254,12 @@ impl GenerationRead {
         let filter = filter
             .map(|expr| {
                 expr.clone().transform(|expr| {
-                    // A physical field added after this generation has a known value.
-                    // Projecting it to evaluate the filter would overwrite the FTS output.
+                    // A field added after this generation reads as a typed NULL.
+                    // Bind it here so the rest of the predicate can still read
+                    // stored fields, including one sharing a search output's name.
                     if let Expr::Column(column) = &expr
-                        && computed_columns.contains(&column.name.as_str())
-                        && self.stored_name(&column.name).is_none()
+                        && self.stored_filter_field(&column.name).is_none()
+                        && self.stored_system_column(&column.name).is_none()
                         && let Ok(field) = self.table_schema.field_with_name(&column.name)
                     {
                         return Ok(Transformed::yes(Expr::Literal(
@@ -279,31 +289,12 @@ impl GenerationRead {
         Ok(filters)
     }
 
-    /// Whether the generation stores `column` exactly as the table declares
-    /// it, so a predicate naming it means the same thing pushed down.
-    ///
-    /// A nested column is where the two can differ without the name moving: a
-    /// reference names the parent (`info.a` refers to `info`) and a parent's
-    /// name does not move when a child is renamed. Comparing the shapes rather
-    /// than assuming the worst is what keeps an ordinary predicate on an
-    /// ordinary struct pushed down — the common case, where nothing moved.
-    fn stored_as_declared(&self, column: &str) -> bool {
-        let Some(stored_column) = self.stored_name(column) else {
-            return false;
-        };
-        let (Ok(stored_field), Ok(declared)) = (
-            self.stored_schema.field_with_name(stored_column),
-            self.table_schema.field_with_name(column),
-        ) else {
-            return false;
-        };
-        // The top-level ids matched already: `stored_name` resolved through a
-        // map keyed by them. This compares the children, whose ids live inside
-        // the parent's own type -- so a child dropped and added back under the
-        // same name and type is caught as the different column it is, rather
-        // than filtering on the retired child's values while the reconciliation
-        // above synthesizes nulls for the new one.
-        stored_field.data_type() == declared.data_type()
+    /// An expression names one top-level Arrow field. The mapping uses paths,
+    /// which quote literal dots and backticks even in a single field name.
+    fn stored_filter_field(&self, column: &str) -> Option<&Field> {
+        let path = self.stored_name(&format_field_path_minimal(&[column]))?;
+        let name = top_level_of(path).ok()?;
+        self.stored_schema.field_with_name(&name).ok()
     }
 
     /// [`Self::reconcile`], then apply a filter that could only run once rows
@@ -392,8 +383,8 @@ impl GenerationRead {
             .map(|field| {
                 // Absent from the source means synthesized, so nullable.
                 let nullable = self
-                    .stored_name(field.name())
-                    .and_then(|stored_column| source.field_with_name(stored_column).ok())
+                    .stored_filter_field(field.name())
+                    .and_then(|stored| source.field_with_name(stored.name()).ok())
                     .is_none_or(|f| f.is_nullable());
                 field.as_ref().clone().with_nullable(nullable)
             })
@@ -783,6 +774,44 @@ mod tests {
             vec!["id", TOMBSTONE],
             "the tombstone is still asked for, under its own name"
         );
+    }
+
+    #[test]
+    fn fts_filter_preserves_a_quoted_stored_field_alongside_a_missing_field() {
+        let mut read = generation(
+            schema(vec![
+                with_id("id", DataType::Int64, 0),
+                with_id("old`score", DataType::Float32, 1),
+            ]),
+            schema(vec![
+                with_id("id", DataType::Int64, 0),
+                with_id("new`score", DataType::Float32, 1),
+                with_id("label", DataType::Utf8, 2),
+            ]),
+            &["id"],
+        );
+        let field = |name| Expr::Column(datafusion::common::Column::from_name(name));
+        let expr = field("new`score").is_not_null().and(col("label").is_null());
+        let (pushed, above) = read.split_fts_filter(Some(&expr), &["_score"]).unwrap();
+        assert_eq!(
+            pushed,
+            Some(
+                field("old`score")
+                    .is_not_null()
+                    .and(lit(ScalarValue::Utf8(None)).is_null())
+            )
+        );
+        assert_eq!(above, None);
+
+        // A deferred predicate also needs the physical id to survive the scan
+        // so reconciliation can pair the quoted names across the rename.
+        read.also_produce("`new``score`");
+        let source = read.with_only_table_field_ids(read.stored_schema.clone());
+        assert_eq!(
+            field_id_of(source.field_with_name("old`score").unwrap()),
+            Some(1)
+        );
+        assert_eq!(read.stored_projection(), vec!["id", "`old``score`"]);
     }
 
     #[test]
