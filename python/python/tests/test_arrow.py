@@ -379,6 +379,22 @@ def test_image_tensor_arrays(tmp_path: Path, png_uris):
     ) in repr_
 
 
+@pytest.mark.parametrize("storage_type", [pa.binary(), pa.large_binary()])
+@pytest.mark.parametrize(
+    ("selection", "preview"),
+    [
+        pytest.param(slice(1, 1), "\n[]", id="empty"),
+        pytest.param(slice(0, 1), "\n[None]", id="null-only"),
+        pytest.param(slice(0, 2), "\n[None, ..]", id="leading-null"),
+    ],
+)
+def test_encoded_image_repr_empty_or_null(png_uris, storage_type, selection, preview):
+    png = ImageURIArray.from_uris(png_uris[:1]).read_uris().storage[0].as_py()
+    images = ImageArray.from_array(pa.array([None, png], type=storage_type))
+
+    assert repr(images[selection]).endswith(preview)
+
+
 def test_roundtrip_image_tensor(tmp_path: Path):
     import os
 
