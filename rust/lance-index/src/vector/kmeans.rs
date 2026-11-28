@@ -38,7 +38,6 @@ use lance_linalg::kernels::{
     Normalizable, argmin_value_float, argmin_value_float_with_bias, normalize,
 };
 use log::{info, warn};
-use num_traits::One;
 use num_traits::{AsPrimitive, Float, FromPrimitive, Num, Zero};
 use rand::prelude::*;
 use rayon::prelude::*;
@@ -267,13 +266,23 @@ fn split_clusters<T: Float + MulAssign>(cnts: &mut [usize], centroids: &mut [T],
             cnts[i] = cnts[j] / 2;
             cnts[j] -= cnts[i];
             for k in 0..dim {
-                if k % 2 == 0 {
-                    centroids[i * dim + k] = centroids[j * dim + k] * (T::one() + eps);
-                    centroids[j * dim + k] *= T::one() - eps;
+                let original = centroids[j * dim + k];
+                let increased = original * (T::one() + eps);
+                let decreased = original * (T::one() - eps);
+                // A finite mean near the storage limit must stay finite after
+                // perturbation. The other half still moves toward zero.
+                let increased = if increased.is_finite() {
+                    increased
                 } else {
-                    centroids[i * dim + k] = centroids[j * dim + k] * (T::one() - eps);
-                    centroids[j * dim + k] *= T::one() + eps;
-                }
+                    original
+                };
+                let (new, donor) = if k % 2 == 0 {
+                    (increased, decreased)
+                } else {
+                    (decreased, increased)
+                };
+                centroids[i * dim + k] = new;
+                centroids[j * dim + k] = donor;
             }
         }
     }
@@ -467,22 +476,25 @@ const SINGLE_PASS_MAX_CHUNKS: usize = 64;
 /// Sums the members of each centroid with one partial table per chunk of
 /// `rows_per_chunk` rows, merged in chunk order. Memberships outside `0..k`
 /// are skipped, as the centroid-split update skips them.
-fn sum_members_single_pass<N: Float + AddAssign + Send + Sync>(
+/// Accumulate in f64 so f16/f32 cluster sums cannot overflow their storage type.
+fn sum_members_single_pass<N: Float + Send + Sync>(
     data: &[N],
     dimension: usize,
     k: usize,
     membership: &[Option<u32>],
     rows_per_chunk: usize,
-) -> Vec<N> {
+) -> Vec<f64> {
     let partial_sums = data
         .par_chunks(rows_per_chunk * dimension)
         .zip(membership.par_chunks(rows_per_chunk))
         .map(|(vectors, members)| {
-            let mut sums = vec![N::zero(); k * dimension];
+            let mut sums = vec![0.0; k * dimension];
             for (vector, cluster_id) in vectors.chunks(dimension).zip(members) {
                 if let Some(cluster_id) = cluster_id.filter(|&id| (id as usize) < k) {
                     let centroid = &mut sums[cluster_id as usize * dimension..][..dimension];
-                    centroid.iter_mut().zip(vector).for_each(|(c, v)| *c += *v);
+                    centroid.iter_mut().zip(vector).for_each(|(c, v)| {
+                        *c += v.to_f64().expect("Arrow floats can be represented as f64")
+                    });
                 }
             }
             sums
@@ -494,18 +506,18 @@ fn sum_members_single_pass<N: Float + AddAssign + Send + Sync>(
             total.iter_mut().zip(sums).for_each(|(t, s)| *t += s);
             total
         })
-        .unwrap_or_else(|| vec![N::zero(); k * dimension])
+        .unwrap_or_else(|| vec![0.0; k * dimension])
 }
 
 /// Sums the members of each centroid with the centroids split across workers,
 /// each scanning all of `data` for its own slice of the table.
-fn sum_members_centroid_split<N: Float + AddAssign + Send + Sync>(
+fn sum_members_centroid_split<N: Float + Send + Sync>(
     data: &[N],
     dimension: usize,
     k: usize,
     membership: &[Option<u32>],
-) -> Vec<N> {
-    let mut centroids = vec![N::zero(); k * dimension];
+) -> Vec<f64> {
+    let mut centroids = vec![0.0; k * dimension];
 
     let mut num_cpus = get_num_compute_intensive_cpus();
     if k < num_cpus || k < 16 {
@@ -530,7 +542,9 @@ fn sum_members_centroid_split<N: Float + AddAssign + Send + Sync>(
                         let local_id = cluster_id - start;
                         let centroid =
                             &mut centroids[local_id * dimension..(local_id + 1) * dimension];
-                        centroid.iter_mut().zip(vector).for_each(|(c, v)| *c += *v);
+                        centroid.iter_mut().zip(vector).for_each(|(c, v)| {
+                            *c += v.to_f64().expect("Arrow floats can be represented as f64")
+                        });
                     }
                 });
         });
@@ -756,8 +770,7 @@ where
         distance_type: DistanceType,
         loss: f64,
     ) -> KMeans {
-        let mut centroids = if k * dimension * size_of::<T::Native>() <= SINGLE_PASS_SUMS_MAX_BYTES
-        {
+        let mut centroids = if k * dimension * size_of::<f64>() <= SINGLE_PASS_SUMS_MAX_BYTES {
             let rows_per_chunk = membership.len().div_ceil(SINGLE_PASS_MAX_CHUNKS).max(1);
             sum_members_single_pass(data, dimension, k, membership, rows_per_chunk)
         } else {
@@ -769,10 +782,17 @@ where
             .zip(cluster_sizes.par_iter())
             .for_each(|(centroid, &cnt)| {
                 if cnt > 0 {
-                    let norm = T::Native::one() / T::Native::from_usize(cnt).unwrap();
+                    let norm = 1.0 / cnt as f64;
                     centroid.iter_mut().for_each(|v| *v *= norm);
                 }
             });
+
+        let mut centroids: Vec<T::Native> = centroids
+            .into_iter()
+            .map(|value| {
+                T::Native::from_f64(value).expect("f64 converts to all Arrow floating point types")
+            })
+            .collect();
 
         let empty_clusters = cluster_sizes.iter().filter(|&cnt| *cnt == 0).count();
         if empty_clusters as f32 / k as f32 > 0.1 {
@@ -1202,8 +1222,7 @@ impl KMeans {
         // the data is `num_partitions * sample_rate` vectors,
         // but here `k` may be not `num_partitions` in the case of hierarchical kmeans,
         // so we need to sample the sampled data again here.
-        // we have to limit the number of data to avoid division underflow,
-        // the threshold 512 is chosen because the minimal normal f16 value will be 0 if divided by 1024.
+        // Keep at most 512 vectors per centroid to bound training cost.
         let data = if data.len() >= k * 512 {
             data.slice(0, k * 512)
         } else {
@@ -1278,6 +1297,13 @@ impl KMeans {
 
                 adjusted_balance_factor =
                     compute_cluster_sizes(&membership, &radius, &losses, &mut cluster_sizes);
+                let assigned = cluster_sizes.iter().sum::<usize>();
+                if assigned < k {
+                    return Err(ArrowError::InvalidArgumentError(format!(
+                        "KMeans: only {assigned} of {n} training vectors could be assigned to {k} clusters \
+                         at iteration {i}; check for non-finite values or distances that overflow"
+                    )));
+                }
                 let balance_loss = compute_balance_loss(&cluster_sizes, n, balance_factor);
                 let last_loss = losses.iter().sum::<f64>() + balance_loss as f64;
 
@@ -2602,11 +2628,48 @@ mod tests {
         for (actual, name) in [(&single_pass, "single pass"), (&split, "centroid split")] {
             for (value, reference) in actual.iter().zip(&expected) {
                 assert!(
-                    (value - reference).abs() <= 1e-4,
+                    (value - f64::from(*reference)).abs() <= 1e-4,
                     "{name}: {value} vs {reference}"
                 );
             }
         }
+    }
+
+    #[rstest]
+    #[case::large_values(128, 1000.0)]
+    #[case::large_count(65536, 1.0)]
+    #[case::small_values(65536, f16::MIN_POSITIVE.to_f32())]
+    fn test_float16_centroid_mean(#[case] rows: usize, #[case] value: f32) {
+        let value = f16::from_f32(value);
+        let data = vec![value; rows * 2];
+        let membership = vec![Some(0); rows];
+        let expected_sum = value.to_f64() * rows as f64;
+        // Exercise both summation strategies without a large centroid table.
+        for sums in [
+            sum_members_single_pass(&data, 2, 1, &membership, rows.div_ceil(4)),
+            sum_members_centroid_split(&data, 2, 1, &membership),
+        ] {
+            for sum in sums {
+                assert_eq!(num_traits::ToPrimitive::to_f64(&sum).unwrap(), expected_sum);
+            }
+        }
+        let model = KMeansAlgoFloat::<Float16Type>::to_kmeans(
+            &data,
+            2,
+            1,
+            &membership,
+            &mut [rows],
+            DistanceType::L2,
+            0.0,
+        );
+        assert_eq!(
+            model
+                .centroids
+                .as_primitive::<Float16Type>()
+                .values()
+                .as_ref(),
+            &[value; 2]
+        );
     }
 
     /// Both update strategies must return the member means: a table under
@@ -2618,7 +2681,7 @@ mod tests {
     fn test_to_kmeans_centroids_are_member_means(#[case] k: usize, #[case] dim: usize) {
         assert_eq!(
             k == 3,
-            k * dim * size_of::<f32>() <= SINGLE_PASS_SUMS_MAX_BYTES,
+            k * dim * size_of::<f64>() <= SINGLE_PASS_SUMS_MAX_BYTES,
             "the case must exercise the update its name claims"
         );
         let rows = 2 * k;
@@ -2780,6 +2843,31 @@ mod tests {
         );
 
         membership.iter().for_each(|cd| assert!(cd.is_none()));
+    }
+
+    #[rstest]
+    #[case::nan(f32::NAN, 0)]
+    #[case::infinity(f32::INFINITY, 0)]
+    #[case::distance_overflow(f32::MAX, 0)]
+    #[case::too_few_valid_rows(f32::NAN, 1)]
+    fn test_kmeans_rejects_unassignable_training_data(
+        #[case] value: f32,
+        #[case] valid_rows: usize,
+    ) {
+        let mut values = vec![value; 8];
+        values[..valid_rows * 2].fill(0.0);
+        let data = FixedSizeListArray::try_new_from_values(Float32Array::from(values), 2).unwrap();
+        let initial =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(vec![0.0; 4]), 2).unwrap();
+        let params = KMeansParams::new(Some(Arc::new(initial)), 2, 1, DistanceType::L2);
+        let error = KMeans::new_with_params(&data, 2, &params).unwrap_err();
+        assert!(matches!(error, ArrowError::InvalidArgumentError(_)));
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("only {valid_rows} of 4 training vectors")),
+            "{error}"
+        );
     }
 
     #[tokio::test]
@@ -3324,6 +3412,18 @@ mod tests {
         // The empty cluster's centroid is a perturbed copy of the largest one.
         assert!((centroids[0] - 1.0).abs() < 0.01 && centroids[0] != centroids[2]);
         assert!((centroids[1] - 2.0).abs() < 0.01 && centroids[1] != centroids[3]);
+    }
+
+    #[rstest]
+    #[case::positive(f16::MAX)]
+    #[case::negative(f16::MIN)]
+    fn test_split_clusters_stays_finite(#[case] value: f16) {
+        let mut counts = [2, 0];
+        let mut centroids = [value, value, f16::ZERO, f16::ZERO];
+        split_clusters(&mut counts, &mut centroids, 2);
+        assert_eq!(counts, [1, 1]);
+        assert!(centroids.iter().all(|v| v.is_finite()));
+        assert_ne!(&centroids[..2], &centroids[2..]);
     }
 
     fn skewed_training_data(rows: usize, dim: usize) -> FixedSizeListArray {
