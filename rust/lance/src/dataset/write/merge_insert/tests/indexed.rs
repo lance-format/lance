@@ -1391,6 +1391,216 @@ async fn test_merge_insert_use_index() {
     assert_eq!(updated_count, 3);
 }
 
+/// A LABEL_LIST index answers list membership, not equality on the whole list,
+/// so a merge keyed on the list column must join without probing it.
+#[tokio::test]
+async fn test_merge_insert_on_label_list_indexed_key() {
+    let tags = |rows: &[&[&str]]| {
+        let mut builder = ListBuilder::new(StringBuilder::new());
+        for row in rows {
+            for tag in *row {
+                builder.values().append_value(tag);
+            }
+            builder.append(true);
+        }
+        Arc::new(builder.finish()) as ArrayRef
+    };
+    let schema = Arc::new(Schema::new(vec![
+        Field::new(
+            "tags",
+            DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+            true,
+        ),
+        Field::new("value", DataType::Int32, false),
+    ]));
+    let target = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            tags(&[&["a"], &["a", "b"], &["c"]]),
+            Arc::new(Int32Array::from(vec![1, 2, 3])),
+        ],
+    )
+    .unwrap();
+    let mut ds = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(target)], schema.clone()),
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 2,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    ds.create_index(
+        &["tags"],
+        IndexType::LabelList,
+        None,
+        &ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::LabelList),
+        false,
+    )
+    .await
+    .unwrap();
+
+    let source = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            tags(&[&["a", "b"], &["d"]]),
+            Arc::new(Int32Array::from(vec![20, 40])),
+        ],
+    )
+    .unwrap();
+    let (ds, stats) = MergeInsertBuilder::try_new(Arc::new(ds), vec!["tags".to_string()])
+        .unwrap()
+        .when_matched(WhenMatched::UpdateAll)
+        .when_not_matched(WhenNotMatched::InsertAll)
+        .try_build()
+        .unwrap()
+        .execute_reader(Box::new(RecordBatchIterator::new(
+            vec![Ok(source)],
+            schema.clone(),
+        )))
+        .await
+        .unwrap();
+    assert_eq!(stats.num_updated_rows, 1);
+    assert_eq!(stats.num_inserted_rows, 1);
+
+    let batch = ds
+        .scan()
+        .project(&["value"])
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let mut values = batch["value"].as_primitive::<Int32Type>().values().to_vec();
+    values.sort();
+    assert_eq!(values, vec![1, 3, 20, 40]);
+}
+
+/// Lance v0.19.2 wrote LABEL_LIST indices without index details. A merge keyed
+/// on the list column must still join on whole lists instead of probing such
+/// an index for membership.
+#[tokio::test]
+async fn test_merge_insert_on_label_list_key_index_without_details() {
+    use crate::dataset::transaction::Transaction;
+
+    let tags = |rows: &[&[&str]]| {
+        let mut builder = ListBuilder::new(StringBuilder::new());
+        for row in rows {
+            for tag in *row {
+                builder.values().append_value(tag);
+            }
+            builder.append(true);
+        }
+        Arc::new(builder.finish()) as ArrayRef
+    };
+    let schema = Arc::new(Schema::new(vec![
+        Field::new(
+            "tags",
+            DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+            true,
+        ),
+        Field::new("value", DataType::Int32, false),
+    ]));
+    let target = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            tags(&[&["a"], &["a", "b"], &["c"]]),
+            Arc::new(Int32Array::from(vec![1, 2, 3])),
+        ],
+    )
+    .unwrap();
+    let mut ds = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(target)], schema.clone()),
+        "memory://",
+        None,
+    )
+    .await
+    .unwrap();
+    ds.create_index(
+        &["tags"],
+        IndexType::LabelList,
+        None,
+        &ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::LabelList),
+        false,
+    )
+    .await
+    .unwrap();
+
+    // A v0.19.2 manifest has no index details and records index version 0.
+    let old_indices = ds.load_indices().await.unwrap().as_ref().clone();
+    assert_eq!(old_indices.len(), 1);
+    let index_name = old_indices[0].name.clone();
+    let mut new_indices = old_indices.clone();
+    for index in &mut new_indices {
+        index.index_details = None;
+        index.index_version = 0;
+    }
+    let transaction = Transaction::new(
+        ds.manifest.version,
+        Operation::CreateIndex {
+            new_indices,
+            removed_indices: old_indices,
+        },
+        None,
+    );
+    ds.apply_commit(transaction, &Default::default(), &Default::default())
+        .await
+        .unwrap();
+    let indices = ds.load_indices_by_name(&index_name).await.unwrap();
+    assert_eq!(indices.len(), 1);
+    assert!(indices[0].index_details.is_none());
+
+    // An equal list updates its row, and a distinct list that shares the label
+    // `a` is inserted.
+    let source = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            tags(&[&["a", "b"], &["a", "c"]]),
+            Arc::new(Int32Array::from(vec![20, 40])),
+        ],
+    )
+    .unwrap();
+    let (ds, stats) = MergeInsertBuilder::try_new(Arc::new(ds), vec!["tags".to_string()])
+        .unwrap()
+        .when_matched(WhenMatched::UpdateAll)
+        .when_not_matched(WhenNotMatched::InsertAll)
+        .try_build()
+        .unwrap()
+        .execute_reader(Box::new(RecordBatchIterator::new(
+            vec![Ok(source)],
+            schema.clone(),
+        )))
+        .await
+        .unwrap();
+    assert_eq!(stats.num_updated_rows, 1);
+    assert_eq!(stats.num_inserted_rows, 1);
+
+    let batch = ds.scan().try_into_batch().await.unwrap();
+    let mut rows = (0..batch.num_rows())
+        .map(|i| {
+            let tags = batch["tags"].as_list::<i32>().value(i);
+            let tags = tags
+                .as_string::<i32>()
+                .iter()
+                .map(|tag| tag.unwrap().to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            let value = batch["value"].as_primitive::<Int32Type>().value(i);
+            (tags, value)
+        })
+        .collect::<Vec<_>>();
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![
+            ("a".to_string(), 1),
+            ("a,b".to_string(), 20),
+            ("a,c".to_string(), 40),
+            ("c".to_string(), 3),
+        ]
+    );
+}
+
 #[tokio::test]
 async fn test_full_schema_upsert_fragment_bitmap() {
     let schema = Arc::new(Schema::new(vec![
