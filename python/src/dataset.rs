@@ -15,7 +15,7 @@ use arrow_data::ArrayData;
 use arrow_schema::{DataType, Schema as ArrowSchema};
 use async_trait::async_trait;
 use blob::LanceBlobFile;
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 use datafusion_common::ScalarValue;
 use futures::{StreamExt, TryFutureExt};
 use lance_index::scalar::minhash_lsh::MinHashQuery;
@@ -322,6 +322,7 @@ impl Dataset {
     async fn cleanup_operation(
         &self,
         older_than_micros: Option<i64>,
+        before_timestamp: Option<DateTime<Utc>>,
         retain_versions: Option<usize>,
         delete_unverified: Option<bool>,
         error_if_tagged_old_versions: Option<bool>,
@@ -330,15 +331,16 @@ impl Dataset {
         policy_json: Option<String>,
     ) -> lance_core::Result<lance::dataset::cleanup::CleanupOperation<'_>> {
         let mut builder = CleanupPolicyBuilder::default();
-        if let Some(v) = older_than_micros {
-            if v < 0 {
-                // A negative age moves the cutoff into the future.
-                return Err(lance::Error::invalid_input(format!(
-                    "older_than must be non-negative, got {v} microseconds"
-                )));
-            }
-            let older_than = Duration::microseconds(v);
-            builder = builder.before_timestamp(Utc::now() - older_than);
+        if let Some(v) = older_than_micros
+            && v < 0
+        {
+            // A negative age moves the cutoff into the future.
+            return Err(lance::Error::invalid_input(format!(
+                "older_than must be non-negative, got {v} microseconds"
+            )));
+        }
+        if let Some(timestamp) = before_timestamp {
+            builder = builder.before_timestamp(timestamp);
         }
         if let Some(v) = retain_versions {
             builder = builder.retain_n_versions(self.ds.as_ref(), v).await?;
@@ -378,6 +380,19 @@ impl Dataset {
     }
 }
 
+/// The time `age_micros` microseconds before now, for the cleanup and expire cutoffs.
+///
+/// An age that reaches past the earliest timestamp chrono can represent is rejected
+/// instead of panicking.
+fn cutoff_before_now(age_micros: i64, name: &str) -> lance_core::Result<DateTime<Utc>> {
+    let age = Duration::microseconds(age_micros);
+    Utc::now().checked_sub_signed(age).ok_or_else(|| {
+        lance::Error::invalid_input(format!(
+            "{name} {age} reaches past the earliest representable timestamp"
+        ))
+    })
+}
+
 fn cleanup_stats(stats: lance::dataset::cleanup::RemovalStats) -> CleanupStats {
     CleanupStats {
         bytes_removed: stats.bytes_removed,
@@ -412,7 +427,7 @@ fn expire_versions_policy(
         }
         // A duration, not an absolute time, matching `cleanup_policy`: the caller says
         // "older than this" and the cutoff is computed here against one clock.
-        builder = builder.before_timestamp(Utc::now() - Duration::microseconds(micros));
+        builder = builder.before_timestamp(cutoff_before_now(micros, "before").infer_error()?);
     }
     if let Some(version) = before_version {
         builder = builder.before_version(version);
@@ -2153,11 +2168,18 @@ impl Dataset {
         keep_one_micros: Option<(i64, i64)>,
         policy_json: Option<String>,
     ) -> PyResult<CleanupStats> {
+        // A negative age is rejected inside the cleanup operation.
+        let before_timestamp = older_than_micros
+            .filter(|micros| *micros >= 0)
+            .map(|micros| cutoff_before_now(micros, "older_than"))
+            .transpose()
+            .infer_error()?;
         let stats = rt()
             .block_on(None, async {
                 let mut operation = self
                     .cleanup_operation(
                         older_than_micros,
+                        before_timestamp,
                         retain_versions,
                         delete_unverified,
                         error_if_tagged_old_versions,
@@ -2248,11 +2270,18 @@ impl Dataset {
         policy_json: Option<String>,
     ) -> PyResult<CleanupExplanation> {
         let _ = delete_rate_limit; // Retained in the signature for existing callers.
+        // A negative age is rejected inside the cleanup operation.
+        let before_timestamp = older_than_micros
+            .filter(|micros| *micros >= 0)
+            .map(|micros| cutoff_before_now(micros, "older_than"))
+            .transpose()
+            .infer_error()?;
         let explanation = rt()
             .block_on(None, async {
                 let operation = self
                     .cleanup_operation(
                         older_than_micros,
+                        before_timestamp,
                         retain_versions,
                         delete_unverified,
                         error_if_tagged_old_versions,
