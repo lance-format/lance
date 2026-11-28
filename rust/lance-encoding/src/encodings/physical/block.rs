@@ -26,6 +26,7 @@ use futures::{FutureExt, future::BoxFuture, future::join_all};
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
 use lance_core::{Error, Result};
 
+use std::borrow::Cow;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -38,7 +39,7 @@ use crate::format::{
 };
 use crate::{
     buffer::LanceBuffer,
-    compression::VariablePerValueDecompressor,
+    compression::{VariablePerValueDecompressor, VariableWidthOffsets},
     data::{BlockInfo, DataBlock, VariableWidthBlock},
     encodings::logical::primitive::fullzip::{PerValueCompressor, PerValueDataBlock},
 };
@@ -152,11 +153,16 @@ pub trait BufferCompressor: std::fmt::Debug + Send + Sync {
         output_buf: &mut Vec<u8>,
         expected_bytes: usize,
     ) -> Result<()> {
-        self.decompress(input_buf, output_buf)?;
-        if output_buf.len() != expected_bytes {
+        let start = output_buf.len();
+        if let Err(err) = self.decompress(input_buf, output_buf) {
+            output_buf.truncate(start);
+            return Err(err);
+        }
+        let produced_bytes = output_buf.len() - start;
+        if produced_bytes != expected_bytes {
+            output_buf.truncate(start);
             return Err(Error::invalid_input(format!(
-                "General compression produced {} bytes, expected {expected_bytes}",
-                output_buf.len()
+                "General compression produced {produced_bytes} bytes, expected {expected_bytes}"
             )));
         }
         Ok(())
@@ -169,6 +175,15 @@ pub trait BufferCompressor: std::fmt::Debug + Send + Sync {
     ///
     /// Returns `None` if the format does not embed the decompressed size.
     fn decompressed_size_of_value(&self, _compressed: &[u8]) -> Option<u64> {
+        None
+    }
+
+    /// Returns the exact decompressed size of a single compressed value when
+    /// [`Self::decompress_exact`] returns an error for any other output length.
+    ///
+    /// Returns `None` when bounded exact decompression is unsupported for the
+    /// value's format.
+    fn exact_decompressed_size_of_value(&self, _compressed: &[u8]) -> Option<u64> {
         None
     }
 }
@@ -439,6 +454,14 @@ mod zstd {
                 Some(u64::from_le_bytes(prefix))
             }
         }
+
+        fn exact_decompressed_size_of_value(&self, compressed: &[u8]) -> Option<u64> {
+            if self.is_raw_stream_format(compressed) {
+                return None;
+            }
+            let prefix: [u8; 8] = compressed.get(..8)?.try_into().ok()?;
+            Some(u64::from_le_bytes(prefix))
+        }
     }
 }
 
@@ -581,7 +604,17 @@ mod lz4 {
         fn decompressed_size_of_value(&self, compressed: &[u8]) -> Option<u64> {
             // compress_to_buffer with prepend_size=true writes a 4-byte LE size header.
             let prefix: [u8; 4] = compressed.get(..4)?.try_into().ok()?;
-            Some(u32::from_le_bytes(prefix) as u64)
+            let uncompressed_size = usize::try_from(u32::from_le_bytes(prefix)).ok()?;
+            if uncompressed_size > compressed.len().saturating_mul(255)
+                || ::lz4::block::compress_bound(uncompressed_size).is_err()
+            {
+                return None;
+            }
+            Some(uncompressed_size as u64)
+        }
+
+        fn exact_decompressed_size_of_value(&self, compressed: &[u8]) -> Option<u64> {
+            self.decompressed_size_of_value(compressed)
         }
     }
 }
@@ -625,6 +658,10 @@ impl BufferCompressor for NoopBufferCompressor {
 
     fn decompressed_size_of_value(&self, compressed: &[u8]) -> Option<u64> {
         u64::try_from(compressed.len()).ok()
+    }
+
+    fn exact_decompressed_size_of_value(&self, compressed: &[u8]) -> Option<u64> {
+        self.decompressed_size_of_value(compressed)
     }
 }
 
@@ -847,13 +884,87 @@ impl CompressedBufferEncoder {
         offsets: &[T],
         decompressed: &mut Vec<u8>,
     ) -> Result<LanceBuffer> {
-        map_values(data, offsets, decompressed, &|value, out| {
-            if value.is_empty() {
-                Ok(())
-            } else {
-                self.compressor.decompress(value, out)
-            }
+        let mut new_offsets = Vec::with_capacity(offsets.len());
+        new_offsets.push(zero_offset::<T>()?);
+        self.push_decompressed_values(
+            data,
+            offsets,
+            decompressed,
+            &mut new_offsets,
+            |_, value, out| self.compressor.decompress(value, out),
+        )?;
+        Ok(LanceBuffer::reinterpret_vec(new_offsets))
+    }
+
+    fn per_value_decompress_into<T: ArrowNativeType>(
+        &self,
+        data: &[u8],
+        offsets: &[T],
+        out_data: &mut Vec<u8>,
+        out_offsets: &mut Vec<T>,
+    ) -> Result<()> {
+        self.push_decompressed_values(data, offsets, out_data, out_offsets, |idx, value, out| {
+            let declared = self
+                .compressor
+                .exact_decompressed_size_of_value(value)
+                .ok_or_else(|| {
+                    Error::not_supported(
+                        "Direct variable-width decompression requires a declared per-value output size"
+                            .to_string(),
+                    )
+                })?;
+            let expected_bytes = usize::try_from(declared).map_err(|_| {
+                Error::corrupt_file_named(
+                    "compressed_variable_width",
+                    format!("compressed value {idx} declared output size {declared} exceeds usize"),
+                )
+            })?;
+            self.compressor
+                .decompress_exact(value, out, expected_bytes)
+                .map_err(|err| {
+                    Error::corrupt_file_named(
+                        "compressed_variable_width",
+                        format!("compressed value {idx} failed exact decompression: {err}"),
+                    )
+                })
         })
+    }
+
+    fn push_decompressed_values<T: ArrowNativeType>(
+        &self,
+        data: &[u8],
+        offsets: &[T],
+        out_data: &mut Vec<u8>,
+        out_offsets: &mut Vec<T>,
+        mut decode_value: impl FnMut(usize, &[u8], &mut Vec<u8>) -> Result<()>,
+    ) -> Result<()> {
+        for (value_idx, pair) in offsets.windows(2).enumerate() {
+            let start = pair[0].as_usize();
+            let end = pair[1].as_usize();
+            let value = data.get(start..end).ok_or_else(|| {
+                Error::corrupt_file_named(
+                    "compressed_variable_width",
+                    format!(
+                        "compressed value {value_idx} range {start}..{end} exceeds {} bytes",
+                        data.len()
+                    ),
+                )
+            })?;
+            if !value.is_empty() {
+                decode_value(value_idx, value, out_data)?;
+            }
+            out_offsets.push(T::from_usize(out_data.len()).ok_or_else(|| {
+                Error::corrupt_file_named(
+                    "compressed_variable_width",
+                    format!(
+                        "decompressed size {} at value {value_idx} does not fit in a {}-bit offset",
+                        out_data.len(),
+                        std::mem::size_of::<T>() * 8
+                    ),
+                )
+            })?);
+        }
+        Ok(())
     }
 }
 
@@ -1120,15 +1231,20 @@ impl VariablePerValueDecompressor for CompressedBufferEncoder {
         let new_offsets = match data.bits_per_offset {
             32 => self.per_value_decompress(
                 data_bytes,
-                &data.offsets.borrow_to_typed_slice::<u32>(),
+                offsets_view::<u32>(&data.offsets)?.as_ref(),
                 &mut decompressed,
             )?,
             64 => self.per_value_decompress(
                 data_bytes,
-                &data.offsets.borrow_to_typed_slice::<u64>(),
+                offsets_view::<u64>(&data.offsets)?.as_ref(),
                 &mut decompressed,
             )?,
-            _ => unreachable!(),
+            bits => {
+                return Err(Error::corrupt_file_named(
+                    "compressed_variable_width",
+                    format!("Unsupported bits_per_offset: {bits}"),
+                ));
+            }
         };
         Ok(DataBlock::VariableWidth(VariableWidthBlock {
             bits_per_offset: data.bits_per_offset,
@@ -1139,46 +1255,102 @@ impl VariablePerValueDecompressor for CompressedBufferEncoder {
         }))
     }
 
+    fn appended_size(&self, data: &[u8], offsets_bytes: &[u8], bits_per_offset: u8) -> Option<u64> {
+        if read_offset(offsets_bytes, 0, bits_per_offset)? != 0 {
+            return None;
+        }
+        sum_decompressed_sizes(data, offsets_bytes, bits_per_offset, |value| {
+            self.compressor.exact_decompressed_size_of_value(value)
+        })
+    }
+
+    fn decompress_into(
+        &self,
+        data: VariableWidthBlock,
+        out_data: &mut Vec<u8>,
+        out_offsets: &mut VariableWidthOffsets,
+    ) -> Result<()> {
+        match (data.bits_per_offset, out_offsets) {
+            (32, VariableWidthOffsets::U32(offsets)) => {
+                let src_offsets = offsets_view::<u32>(&data.offsets)?;
+                self.per_value_decompress_into(&data.data, src_offsets.as_ref(), out_data, offsets)
+            }
+            (64, VariableWidthOffsets::U64(offsets)) => {
+                let src_offsets = offsets_view::<u64>(&data.offsets)?;
+                self.per_value_decompress_into(&data.data, src_offsets.as_ref(), out_data, offsets)
+            }
+            (bits, _) => Err(Error::invalid_input(format!(
+                "Destination offsets do not match the compressed block's {bits}-bit offsets"
+            ))),
+        }
+    }
+
     fn decompressed_size(
         &self,
         data: &[u8],
         offsets_bytes: &[u8],
         bits_per_offset: u8,
     ) -> Option<u64> {
-        // Iterate the per-value offset pairs and sum frame-header sizes.
-        // Each value was independently compressed so each has its own frame header.
-        if !matches!(bits_per_offset, 32 | 64)
-            || !offsets_bytes
-                .len()
-                .is_multiple_of(bits_per_offset as usize / 8)
-        {
-            return None;
-        }
-        let bytes_per_offset = bits_per_offset as usize / 8;
-        let num_offsets = offsets_bytes.len() / bytes_per_offset;
-        if num_offsets < 2 {
-            return Some(0);
-        }
-
-        let base = usize::try_from(read_offset(offsets_bytes, 0, bits_per_offset)?).ok()?;
-        let mut total = 0u64;
-        for i in 0..num_offsets - 1 {
-            let start = usize::try_from(read_offset(offsets_bytes, i, bits_per_offset)?).ok()?;
-            let end = usize::try_from(read_offset(offsets_bytes, i + 1, bits_per_offset)?).ok()?;
-            // Rebase: offsets stored in self.offsets are absolute into self.data, but
-            // offsets_bytes here is the raw slice starting at offset_starts[row_start],
-            // so the first offset value is the base we subtract.
-            let val_start = start.checked_sub(base)?;
-            let val_end = end.checked_sub(base)?;
-            if val_start == val_end {
-                // Null / zero-length value — contributes 0 decompressed bytes.
-                continue;
-            }
-            let value_bytes = data.get(val_start..val_end)?;
-            total = total.checked_add(self.compressor.decompressed_size_of_value(value_bytes)?)?;
-        }
-        Some(total)
+        sum_decompressed_sizes(data, offsets_bytes, bits_per_offset, |value| {
+            self.compressor.decompressed_size_of_value(value)
+        })
     }
+}
+
+fn offsets_view<T: ArrowNativeType + bytemuck::Pod>(offsets: &LanceBuffer) -> Result<Cow<'_, [T]>> {
+    let bytes_per_offset = std::mem::size_of::<T>();
+    if !offsets.len().is_multiple_of(bytes_per_offset) {
+        return Err(Error::corrupt_file_named(
+            "compressed_variable_width",
+            format!(
+                "{}-bit offsets buffer length {} is not a multiple of {bytes_per_offset}",
+                bytes_per_offset * 8,
+                offsets.len()
+            ),
+        ));
+    }
+    Ok(offsets.borrow_to_typed_view::<T>())
+}
+
+fn sum_decompressed_sizes(
+    data: &[u8],
+    offsets_bytes: &[u8],
+    bits_per_offset: u8,
+    size_of_value: impl Fn(&[u8]) -> Option<u64>,
+) -> Option<u64> {
+    // Iterate the per-value offset pairs and sum frame-header sizes.
+    // Each value was independently compressed so each has its own frame header.
+    if !matches!(bits_per_offset, 32 | 64)
+        || !offsets_bytes
+            .len()
+            .is_multiple_of(bits_per_offset as usize / 8)
+    {
+        return None;
+    }
+    let bytes_per_offset = bits_per_offset as usize / 8;
+    let num_offsets = offsets_bytes.len() / bytes_per_offset;
+    if num_offsets < 2 {
+        return Some(0);
+    }
+
+    let base = usize::try_from(read_offset(offsets_bytes, 0, bits_per_offset)?).ok()?;
+    let mut total = 0u64;
+    for i in 0..num_offsets - 1 {
+        let start = usize::try_from(read_offset(offsets_bytes, i, bits_per_offset)?).ok()?;
+        let end = usize::try_from(read_offset(offsets_bytes, i + 1, bits_per_offset)?).ok()?;
+        // Rebase: offsets stored in self.offsets are absolute into self.data, but
+        // offsets_bytes here is the raw slice starting at offset_starts[row_start],
+        // so the first offset value is the base we subtract.
+        let val_start = start.checked_sub(base)?;
+        let val_end = end.checked_sub(base)?;
+        if val_start == val_end {
+            // Null / zero-length value — contributes 0 decompressed bytes.
+            continue;
+        }
+        let value_bytes = data.get(val_start..val_end)?;
+        total = total.checked_add(size_of_value(value_bytes)?)?;
+    }
+    Some(total)
 }
 
 /// Read an offset value (u32 or u64) from a packed byte slice at position `idx`.
@@ -1354,6 +1526,63 @@ mod tests {
     #[test]
     fn test_compression_scheme_from_str_invalid() {
         assert!(CompressionScheme::from_str("invalid").is_err());
+    }
+
+    #[test]
+    fn test_decompress_into_rejects_unaligned_offsets_and_nonzero_appended_start() {
+        let encoder =
+            CompressedBufferEncoder::try_new(CompressionConfig::new(CompressionScheme::None, None))
+                .unwrap();
+
+        let bad_u32 = VariableWidthBlock {
+            bits_per_offset: 32,
+            data: LanceBuffer::from(b"abc".to_vec()),
+            offsets: LanceBuffer::from(vec![0_u8; 5]),
+            num_values: 1,
+            block_info: BlockInfo::new(),
+        };
+        let mut out_data = Vec::new();
+        let mut out_offsets = VariableWidthOffsets::U32(vec![0]);
+        let err = encoder
+            .decompress_into(bad_u32, &mut out_data, &mut out_offsets)
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::CorruptFile { .. }),
+            "unexpected: {err}"
+        );
+        assert!(
+            err.to_string()
+                .contains("32-bit offsets buffer length 5 is not a multiple of 4"),
+            "unexpected: {err}"
+        );
+
+        let bad_u64 = VariableWidthBlock {
+            bits_per_offset: 64,
+            data: LanceBuffer::from(b"abc".to_vec()),
+            offsets: LanceBuffer::from(vec![0_u8; 10]),
+            num_values: 1,
+            block_info: BlockInfo::new(),
+        };
+        let mut out_offsets_64 = VariableWidthOffsets::U64(vec![0]);
+        let err = encoder
+            .decompress_into(bad_u64, &mut out_data, &mut out_offsets_64)
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::CorruptFile { .. }),
+            "unexpected: {err}"
+        );
+        assert!(
+            err.to_string()
+                .contains("64-bit offsets buffer length 10 is not a multiple of 8"),
+            "unexpected: {err}"
+        );
+
+        let nonzero_start_offsets: Vec<u8> =
+            [4_u32, 8].into_iter().flat_map(u32::to_le_bytes).collect();
+        assert_eq!(
+            encoder.appended_size(b"abcdefgh", &nonzero_start_offsets, 32),
+            None
+        );
     }
 
     #[cfg(feature = "zstd")]
@@ -1780,6 +2009,21 @@ mod tests {
                 compressor.decompressed_size_of_value(&compressed_data),
                 Some(input_data.len() as u64)
             );
+
+            let encoder = CompressedBufferEncoder::try_new(CompressionConfig::new(
+                CompressionScheme::Zstd,
+                Some(0),
+            ))
+            .unwrap();
+            let offsets: Vec<u8> = [0_u32, compressed_data.len() as u32]
+                .into_iter()
+                .flat_map(u32::to_le_bytes)
+                .collect();
+            assert_eq!(
+                encoder.decompressed_size(&compressed_data, &offsets, 32),
+                Some(input_data.len() as u64)
+            );
+            assert_eq!(encoder.appended_size(&compressed_data, &offsets, 32), None);
         }
 
         #[test]
@@ -1856,6 +2100,33 @@ mod tests {
 
         /// A length prefix beyond what the payload can decode to is rejected before
         /// any output is allocated, while the most compressible input still decodes.
+        #[test]
+        fn test_lz4_decompressed_size_bounds_length_prefix() {
+            let compressor = Lz4BufferCompressor::default();
+            let mut compressed = Vec::new();
+            compressor.compress(b"bounded", &mut compressed).unwrap();
+            let mut max_prefix = compressed.clone();
+            max_prefix[..4].copy_from_slice(&u32::MAX.to_le_bytes());
+            assert_eq!(compressor.decompressed_size_of_value(&max_prefix), None);
+
+            let mut over_255x = compressed;
+            let over_limit = u32::try_from(over_255x.len() * 255 + 1).unwrap();
+            over_255x[..4].copy_from_slice(&over_limit.to_le_bytes());
+            assert_eq!(compressor.decompressed_size_of_value(&over_255x), None);
+
+            let encoder = CompressedBufferEncoder::try_new(CompressionConfig::new(
+                CompressionScheme::Lz4,
+                None,
+            ))
+            .unwrap();
+            let offsets: Vec<u8> = [0_u32, max_prefix.len() as u32]
+                .into_iter()
+                .flat_map(u32::to_le_bytes)
+                .collect();
+            assert_eq!(encoder.decompressed_size(&max_prefix, &offsets, 32), None);
+            assert_eq!(encoder.appended_size(&max_prefix, &offsets, 32), None);
+        }
+
         #[test]
         fn test_lz4_decompress_bounds_length_prefix() {
             let compressor = Lz4BufferCompressor::default();
