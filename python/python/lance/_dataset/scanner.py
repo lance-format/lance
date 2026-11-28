@@ -775,6 +775,17 @@ class ScannerBuilder:
                 setter(value)
         return self
 
+    def _has_search_query(self) -> bool:
+        return any(
+            query is not None
+            for query in (
+                self._nearest,
+                self._minhash_query,
+                self._full_text_query,
+                self._search_filter,
+            )
+        )
+
     def batch_size(self, batch_size: int) -> ScannerBuilder:
         """Set the maximum number of rows per batch.
 

@@ -1942,6 +1942,83 @@ def test_count_rows(tmp_path: Path):
 
 
 @pytest.mark.parametrize(
+    ("options", "scan_ids"),
+    [
+        pytest.param({"limit": 2}, [4, 1], id="limit"),
+        pytest.param({"offset": 2}, [2, 3, 0, 5], id="offset"),
+        pytest.param({"order_by": ["id"]}, list(range(6)), id="order-by"),
+        pytest.param(
+            {"limit": 2, "filter": {"filter": pc.field("id") >= 0}},
+            [4, 1],
+            id="wrapped-arrow-filter",
+        ),
+        pytest.param(
+            {"limit": 2, "filter": {"filter": {"expr_filter": pc.field("id") >= 0}}},
+            [4, 1],
+            id="wrapped-structured-filter",
+        ),
+    ],
+)
+def test_count_rows_with_pagination_or_ordering_defaults(tmp_path, options, scan_ids):
+    dataset = lance.write_dataset(
+        pa.table({"id": [4, 1, 2, 3, 0, 5]}), tmp_path, max_rows_per_file=3
+    )
+    reopened = lance.dataset(tmp_path, default_scan_options=options)
+    predicate = pc.field("id") >= 1
+
+    assert reopened.count_rows() == 6
+    assert reopened.count_rows(filter="id >= 1") == 5
+    assert dataset.count_rows(filter=predicate) == 5
+    assert reopened.count_rows(filter=predicate) == 5
+    assert reopened.to_table()["id"].to_pylist() == scan_ids
+
+
+def test_count_rows_pagination_with_fragment_scope(tmp_path):
+    dataset = lance.write_dataset(
+        pa.table({"id": range(6)}), tmp_path, max_rows_per_file=3
+    )
+    fragment_scope = {"fragments": dataset.get_fragments()[1:]}
+    scoped = lance.dataset(tmp_path, default_scan_options=fragment_scope)
+    paginated = lance.dataset(
+        tmp_path, default_scan_options={**fragment_scope, "limit": 1}
+    )
+    predicate = pc.field("id") >= 1
+    assert scoped.count_rows(filter=predicate) == 3
+    assert paginated.count_rows(filter=predicate) == 3
+    assert paginated.to_table()["id"].to_pylist() == [3]
+
+
+@pytest.mark.parametrize(
+    "defaults", [None, {"limit": 1}], ids=["plain", "default-limit"]
+)
+def test_count_rows_uses_overridden_scanner(tmp_path, defaults):
+    dataset = lance.write_dataset(
+        pa.table({"id": range(6)}), tmp_path, max_rows_per_file=3
+    )
+
+    class ScopedDataset(lance.LanceDataset):
+        def scanner(self, **kwargs):
+            return dataset.scanner(fragments=dataset.get_fragments()[:1], **kwargs)
+
+    scoped = ScopedDataset(tmp_path, default_scan_options=defaults)
+    assert scoped.count_rows(filter=pc.field("id") >= 0) == 3
+
+
+def test_count_rows_uses_class_scanner_override(tmp_path, monkeypatch):
+    dataset = lance.write_dataset(
+        pa.table({"id": range(6)}), tmp_path, max_rows_per_file=3
+    )
+    scoped = lance.dataset(tmp_path, default_scan_options={"limit": 1})
+    scanner = lance.LanceDataset.scanner
+
+    def scan_first_fragment(self, **kwargs):
+        return scanner(dataset, fragments=dataset.get_fragments()[:1], **kwargs)
+
+    monkeypatch.setattr(lance.LanceDataset, "scanner", scan_first_fragment)
+    assert scoped.count_rows(filter=pc.field("id") >= 0) == 3
+
+
+@pytest.mark.parametrize(
     ("predicate", "expected"),
     [(None, [3, 3]), ("a < 4", [3, 1]), (pc.field("a") < 4, [3, 1])],
     ids=["unfiltered", "sql", "arrow"],

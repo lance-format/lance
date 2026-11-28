@@ -954,6 +954,9 @@ class LanceDataset(pa.dataset.Dataset):
                 builder = builder.nearest(**nearest)
         return builder.to_scanner()
 
+    # Retain the original scanner identity for count_rows dispatch.
+    _original_scanner = scanner
+
     @property
     def schema(self) -> pa.Schema:
         """
@@ -2107,6 +2110,9 @@ class LanceDataset(pa.dataset.Dataset):
     ) -> int:
         """Count rows in the dataset matching the filter.
 
+        Arrow-filtered counts on ordinary scans ignore saved ``limit``,
+        ``offset``, and ``order_by``.
+
         Parameters
         ----------
         filter : str or pyarrow.compute.Expression, optional
@@ -2127,10 +2133,35 @@ class LanceDataset(pa.dataset.Dataset):
                 "Call LanceFragment.count_rows() on the selected fragments."
             )
         if isinstance(filter, pa.compute.Expression):
-            # TODO: consolidate all to use scanner
-            return self.scanner(
-                columns=[], with_row_id=True, filter=filter
-            ).count_rows()
+            scanner = self.scanner
+            defaults = self._default_scan_options or {}
+            output_options = ("limit", "offset", "order_by")
+            if getattr(
+                scanner, "__func__", None
+            ) is not LanceDataset._original_scanner or all(
+                defaults.get(key) is None for key in output_options
+            ):
+                return scanner(columns=[], with_row_id=True, filter=filter).count_rows()
+
+            builder = ScannerBuilder(self).apply_defaults(
+                {
+                    key: value
+                    for key, value in defaults.items()
+                    if key not in output_options
+                }
+            )
+            # Search queries can use limit to determine how many neighbors to rank.
+            if builder._has_search_query():
+                builder.apply_defaults(
+                    {key: defaults[key] for key in output_options if key in defaults}
+                )
+            return (
+                builder.columns([])
+                .with_row_id()
+                .filter(filter)
+                .to_scanner()
+                .count_rows()
+            )
 
         return self._ds.count_rows(filter)
 
