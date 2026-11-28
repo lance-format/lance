@@ -151,7 +151,9 @@ impl StatisticsAccumulator {
         }
 
         self.buffer_memory += array.get_buffer_memory_size() as u64;
-        self.null_count += array.null_count() as u64;
+        // Count logical nulls: a `NullArray` has no validity buffer, so its
+        // `null_count()` is 0 although every value is NULL.
+        self.null_count += array.logical_null_count() as u64;
 
         match array.data_type() {
             DataType::List(_) => {
@@ -209,7 +211,7 @@ impl StatisticsAccumulator {
             return Ok(());
         }
         if let Some(ref mut item_nulls) = self.item_nulls {
-            *item_nulls += item_array.null_count() as u64;
+            *item_nulls += item_array.logical_null_count() as u64;
         }
         match item_array.data_type() {
             DataType::List(_) => {
@@ -584,6 +586,31 @@ mod tests {
         assert!(stats.min.is_none());
         assert!(stats.max.is_none());
         assert_eq!(stats.null_count, 3);
+    }
+
+    #[test]
+    fn test_null_type_counts_logical_nulls() {
+        // A NullArray has no validity buffer, so `null_count()` is 0.
+        let mut acc = StatisticsAccumulator::new(&DataType::Null);
+        let array: ArrayRef = Arc::new(NullArray::new(3));
+        acc.update(&array).unwrap();
+        let stats = acc.finish();
+        assert!(stats.min.is_none());
+        assert!(stats.max.is_none());
+        assert_eq!(stats.null_count, 3);
+
+        let mut builder = builder::ListBuilder::new(builder::NullBuilder::new());
+        builder.values().append_nulls(2);
+        builder.append(true);
+        builder.append(true);
+        builder.values().append_null();
+        builder.append(true);
+        let list: ArrayRef = Arc::new(builder.finish());
+        let mut acc = StatisticsAccumulator::new(list.data_type());
+        acc.update(&list).unwrap();
+        let stats = acc.finish();
+        assert_eq!(stats.null_count, 0);
+        assert_eq!(stats.item_nulls, Some(3));
     }
 
     #[test]

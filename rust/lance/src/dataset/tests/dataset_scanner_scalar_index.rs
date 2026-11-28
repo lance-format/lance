@@ -2850,3 +2850,133 @@ async fn test_fast_search_ignored_scalar_indices(
         assert_eq!(values.values().as_ref(), &[97, 99]);
     }
 }
+
+/// Arrow's `NullArray` has no validity buffer, so its `null_count()` is 0 and
+/// `nulls()` is `None` although every value is NULL. A zone map over a
+/// Null-typed column must still record those rows as NULL, or `IS NULL`
+/// returns nothing and `IS NOT NULL` returns every row.
+#[rstest]
+#[tokio::test]
+async fn test_zonemap_on_null_type_column_matches_unindexed_scan(
+    #[values(false, true)] store_null_bitmap: bool,
+    #[values(false, true)] use_seeds: bool,
+    #[values(false, true)] use_stable_row_ids: bool,
+    #[values(LanceFileVersion::V2_0, LanceFileVersion::Stable)] version: LanceFileVersion,
+) {
+    use arrow_array::NullArray;
+
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, false),
+        ArrowField::new("v", DataType::Null, true),
+    ]));
+    let make_batch = |ids: std::ops::Range<i32>| {
+        let len = ids.len();
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(ids)),
+                Arc::new(NullArray::new(len)),
+            ],
+        )
+        .unwrap()
+    };
+    let write_params = |mode| WriteParams {
+        max_rows_per_file: 4,
+        mode,
+        enable_stable_row_ids: use_stable_row_ids,
+        data_storage_version: Some(version),
+        ..Default::default()
+    };
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(make_batch(0..10))], schema.clone()),
+        "memory://",
+        Some(write_params(crate::dataset::WriteMode::Create)),
+    )
+    .await
+    .unwrap();
+    let params =
+        ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap).with_params(&serde_json::json!({
+            "rows_per_zone": 3,
+            "use_seeds": use_seeds,
+            "store_null_bitmap": store_null_bitmap,
+        }));
+    dataset
+        .create_index(&["v"], IndexType::ZoneMap, None, &params, false)
+        .await
+        .unwrap();
+
+    // `expect_index` is false where the zone map covers no fragment. The
+    // negated forms are exact, and so planned on the index, only with the
+    // null bitmap.
+    async fn check(dataset: &Dataset, stage: &str, expect_index: bool, store_null_bitmap: bool) {
+        for filter in ["v IS NULL", "v IS NOT NULL", "NOT (v IS NULL)"] {
+            let mut full_scan = dataset.scan();
+            full_scan
+                .use_scalar_index(false)
+                .filter(filter)
+                .unwrap()
+                .project(&["id"])
+                .unwrap();
+            let full = full_scan.try_into_batch().await.unwrap();
+            let mut full_ids = full["id"].as_primitive::<Int32Type>().values().to_vec();
+            full_ids.sort_unstable();
+
+            let mut indexed_scan = dataset.scan();
+            indexed_scan
+                .filter(filter)
+                .unwrap()
+                .project(&["id"])
+                .unwrap();
+            let plan = indexed_scan.explain_plan(false).await.unwrap();
+            if expect_index && (store_null_bitmap || filter == "v IS NULL") {
+                assert!(
+                    plan.contains("ScalarIndexQuery") && plan.contains("ZoneMap"),
+                    "{stage}: filter {filter} must go through the zone map index: {plan}"
+                );
+            }
+            let indexed = indexed_scan.try_into_batch().await.unwrap();
+            let mut indexed_ids = indexed["id"].as_primitive::<Int32Type>().values().to_vec();
+            indexed_ids.sort_unstable();
+            assert_eq!(
+                indexed_ids, full_ids,
+                "{stage}: indexed and unindexed scans disagree for filter {filter}"
+            );
+            let count = dataset.count_rows(Some(filter.to_string())).await.unwrap();
+            assert_eq!(
+                count,
+                full_ids.len(),
+                "{stage}: count_rows disagrees for filter {filter}"
+            );
+        }
+    }
+
+    check(&dataset, "fresh", true, store_null_bitmap).await;
+
+    // New rows are added to the index by an incremental update.
+    dataset.delete("id = 1 OR id = 6").await.unwrap();
+    dataset
+        .append(
+            RecordBatchIterator::new(vec![Ok(make_batch(10..16))], schema.clone()),
+            Some(write_params(crate::dataset::WriteMode::Append)),
+        )
+        .await
+        .unwrap();
+    check(&dataset, "unindexed append", true, store_null_bitmap).await;
+    dataset
+        .optimize_indices(&OptimizeOptions::default())
+        .await
+        .unwrap();
+    check(&dataset, "optimized", true, store_null_bitmap).await;
+
+    // Compaction rewrites every fragment, which the zone map then no longer
+    // covers; the next optimize indexes the rewritten fragment.
+    compact_files(&mut dataset, CompactionOptions::default(), None)
+        .await
+        .unwrap();
+    check(&dataset, "compacted", false, store_null_bitmap).await;
+    dataset
+        .optimize_indices(&OptimizeOptions::default())
+        .await
+        .unwrap();
+    check(&dataset, "compacted and optimized", true, store_null_bitmap).await;
+}

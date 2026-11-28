@@ -2602,8 +2602,8 @@ fn test_zone_map_seed_writer_null_runs_match_positions() {
         assert_eq!(bitmap, Some(expected.clone()));
     }
 
-    // No validity buffer means no nulls: the run scan records nothing.
-    let valid: ArrayRef = Arc::new(Int32Array::from_iter_values(0..10));
+    // An all-valid buffer means no nulls: the run scan records nothing.
+    let valid = arrow::buffer::NullBuffer::new_valid(10);
     let mut writer = ZoneMapSeedWriter::new("c", 64, DataType::Int32).unwrap();
     writer.record_null_runs(&valid, 0);
     assert!(writer.null_offsets.is_empty());
@@ -2668,6 +2668,209 @@ async fn test_zone_map_seed_writer_round_trip() {
     // Full zones must have the full rows_per_zone length
     assert_eq!(zones[0].bound.length, rows_per_zone as usize);
     assert_eq!(zones[1].bound.length, rows_per_zone as usize);
+}
+
+/// The `null_count` column and the null bitmap as the file stores them,
+/// before the load-time correction for Null-typed columns.
+async fn stored_null_stats(store: &dyn IndexStore) -> (Vec<u32>, Option<RowAddrTreeMap>) {
+    let index_file = store.open_index_file(ZONEMAP_FILENAME).await.unwrap();
+    let batch = index_file
+        .read_record_batch(0, index_file.num_rows() as u64)
+        .await
+        .unwrap();
+    let null_counts = batch
+        .column_by_name("null_count")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<UInt32Array>()
+        .unwrap()
+        .values()
+        .to_vec();
+    let null_rows = match index_file
+        .schema()
+        .metadata
+        .get(super::NULL_BITMAP_META_KEY)
+    {
+        Some(idx) => {
+            let bytes = index_file
+                .read_global_buffer(idx.parse().unwrap())
+                .await
+                .unwrap();
+            Some(RowAddrTreeMap::deserialize_from(bytes.as_ref()).unwrap())
+        }
+        None => None,
+    };
+    (null_counts, null_rows)
+}
+
+/// A Null-typed batch covering `offsets` of fragment `fragment_id`.
+fn null_type_batch(fragment_id: u64, offsets: std::ops::Range<u64>) -> RecordBatch {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new(VALUE_COLUMN_NAME, DataType::Null, true),
+        Field::new(ROW_ADDR, DataType::UInt64, false),
+    ]));
+    let len = (offsets.end - offsets.start) as usize;
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(arrow_array::NullArray::new(len)),
+            Arc::new(UInt64Array::from_iter_values(
+                offsets.map(|offset| (fragment_id << 32) | offset),
+            )),
+        ],
+    )
+    .unwrap()
+}
+
+fn null_type_stream(batches: Vec<RecordBatch>) -> SendableRecordBatchStream {
+    let schema = batches[0].schema();
+    Box::pin(RecordBatchStreamAdapter::new(
+        schema,
+        stream::iter(batches.into_iter().map(Ok)),
+    ))
+}
+
+/// Training on a `NullArray`, which has no validity buffer, writes every row
+/// as NULL into the zone counts and the null bitmap of the file itself.
+#[tokio::test]
+async fn test_train_null_type_counts_logical_nulls() {
+    let tmpdir = TempObjDir::default();
+    let store = local_store(&tmpdir);
+    ZoneMapIndexPlugin::train_zonemap_index(
+        null_type_stream(vec![null_type_batch(0, 0..5), null_type_batch(1, 0..3)]),
+        store.as_ref(),
+        Some(ZoneMapIndexBuilderParams::new(2)),
+        &NoopIndexBuildProgress,
+    )
+    .await
+    .unwrap();
+
+    let mut all_rows = RowAddrTreeMap::new();
+    all_rows.insert_range(0..5);
+    all_rows.insert_range(1 << 32..(1 << 32) + 3);
+    assert_eq!(
+        stored_null_stats(store.as_ref()).await,
+        (vec![2, 2, 1, 2, 1], Some(all_rows.clone()))
+    );
+
+    let index = ZoneMapIndex::load(
+        store,
+        None,
+        &LanceCache::no_cache(),
+        false,
+        ZoneMapIndexVersion::V1,
+    )
+    .await
+    .unwrap();
+    let result = index
+        .search(&SargableQuery::IsNull(), &NoOpMetricsCollector)
+        .await
+        .unwrap();
+    assert_eq!(result, SearchResult::exact(all_rows));
+}
+
+/// An index an older writer built on a Null-typed column stored a null count
+/// of 0 and an empty null bitmap. Loading it must still answer `IS NULL` with
+/// every row, without a rebuild, and an update must write correct statistics
+/// for the old zones as well as the new ones.
+#[rstest::rstest]
+#[tokio::test]
+async fn test_load_null_type_index_with_stale_null_counts(
+    #[values(ZoneMapIndexVersion::V0, ZoneMapIndexVersion::V1)] version: ZoneMapIndexVersion,
+) {
+    let tmpdir = TempObjDir::default();
+    let store = local_store(&tmpdir);
+    let stale_zone = |fragment_id: u64, start: u64, length: usize| ZoneMapStatistics {
+        min: ScalarValue::Null,
+        max: ScalarValue::Null,
+        null_count: 0,
+        nan_count: 0,
+        negative_nan_count: Some(0),
+        bound: ZoneBound {
+            fragment_id,
+            start,
+            length,
+        },
+    };
+    let mut builder =
+        super::ZoneMapIndexBuilder::try_new(ZoneMapIndexBuilderParams::new(4), DataType::Null)
+            .unwrap()
+            .with_version(version);
+    builder.maps = vec![
+        stale_zone(0, 0, 4),
+        stale_zone(0, 4, 2),
+        stale_zone(3, 0, 3),
+    ];
+    builder.null_rows = Some(RowAddrTreeMap::new());
+    builder.write_index(store.as_ref()).await.unwrap();
+
+    let index = ZoneMapIndex::load(store, None, &LanceCache::no_cache(), false, version)
+        .await
+        .unwrap();
+    assert_eq!(
+        index
+            .zones
+            .iter()
+            .map(|zone| zone.null_count)
+            .collect::<Vec<_>>(),
+        vec![4, 2, 3]
+    );
+    let mut all_rows = RowAddrTreeMap::new();
+    all_rows.insert_range(0..6);
+    all_rows.insert_range(3 << 32..(3 << 32) + 3);
+    let result = index
+        .search(&SargableQuery::IsNull(), &NoOpMetricsCollector)
+        .await
+        .unwrap();
+    assert_eq!(result, SearchResult::exact(all_rows.clone()));
+
+    // An incremental update keeps the corrected old zones next to the new
+    // ones instead of rewriting the stale counts.
+    let updated_dir = TempObjDir::default();
+    let updated_store = local_store(&updated_dir);
+    index
+        .update(
+            null_type_stream(vec![null_type_batch(5, 0..5)]),
+            updated_store.as_ref(),
+            None,
+        )
+        .await
+        .unwrap();
+    all_rows.insert_range(5 << 32..(5 << 32) + 5);
+    assert_eq!(
+        stored_null_stats(updated_store.as_ref()).await,
+        (vec![4, 2, 3, 4, 1], Some(all_rows))
+    );
+}
+
+/// A `NullArray` has no validity buffer, so the seed must count its logical
+/// nulls; otherwise `validate_seed` rejects the seed (comparable rows without
+/// bounds) and the fragment is rescanned.
+#[test]
+fn test_zone_map_seed_writer_null_type() {
+    let seed = seed_of(7, 4, arrow_array::NullArray::new(10));
+    let (zones, null_bitmap) = ZoneMapSeedWriter::deserialize_seed(7, &seed.bytes).unwrap();
+    assert_eq!(
+        zones.iter().map(|zone| zone.null_count).collect::<Vec<_>>(),
+        vec![4, 4, 2]
+    );
+    assert_eq!(null_bitmap, Some(RoaringBitmap::from_iter(0..10)));
+
+    let validated = super::validate_seed(&seed, Some(10), &DataType::Null, true)
+        .unwrap()
+        .expect("a Null-typed seed must be reusable");
+    assert_eq!(
+        validated
+            .records
+            .iter()
+            .map(|zone| zone.null_count)
+            .collect::<Vec<_>>(),
+        vec![4, 4, 2]
+    );
+    assert_eq!(
+        validated.null_positions,
+        Some(RoaringBitmap::from_iter(0..10))
+    );
 }
 
 #[tokio::test]

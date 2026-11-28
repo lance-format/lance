@@ -951,6 +951,21 @@ impl ZoneMapIndex {
         version: ZoneMapIndexVersion,
     ) -> Result<Self> {
         let (data_type, zones) = parse_zones(&data, version)?;
+        // As in `parse_zones`: every row a Null-typed zone covers is NULL,
+        // whatever bitmap an older writer stored. The bitmap becomes the
+        // zones' offset spans, deleted offsets included; the deletion mask
+        // filters those out of query results.
+        let null_rows = match null_rows {
+            Some(_) if data_type == DataType::Null => {
+                let mut rows = RowAddrTreeMap::new();
+                for zone in &zones {
+                    let start = (zone.bound.fragment_id << 32).saturating_add(zone.bound.start);
+                    rows.insert_range(start..start.saturating_add(zone.bound.length as u64));
+                }
+                Some(rows)
+            }
+            null_rows => null_rows,
+        };
         Ok(Self {
             zones,
             data_type,
@@ -1063,9 +1078,20 @@ fn parse_zones(
                 ScalarValue::try_from_array(max_col, i)?,
             )
         };
-        let null_count = null_count_col.value(i);
-        let nan_count = nan_count_col.value(i);
         let length = zone_length.value(i);
+        // Every value of a Null-typed column is NULL. Writers that read the
+        // physical null count of a `NullArray` stored 0 here.
+        let null_count = if data_type == DataType::Null {
+            u32::try_from(length).map_err(|_| {
+                Error::corrupt_file_named(
+                    ZONEMAP_FILENAME,
+                    format!("ZoneMapIndex: zone {i} length {length} exceeds u32"),
+                )
+            })?
+        } else {
+            null_count_col.value(i)
+        };
+        let nan_count = nan_count_col.value(i);
         let negative_nan_count = match negative_nan_count_col {
             Some(col) => {
                 let negative = col.value(i);
@@ -1986,7 +2012,7 @@ impl ZoneProcessor for ZoneMapProcessor {
                         array.data_type()
                     )));
                 }
-                *null_count += array.null_count() as u64;
+                *null_count += array.logical_null_count() as u64;
             }
         }
         Ok(())
@@ -2766,12 +2792,9 @@ impl ZoneMapSeedWriter {
     /// contiguous null region instead of one per null row, so all-null and
     /// clustered-null data cost almost nothing to track. `base_offset` is the
     /// fragment-local offset of the chunk's first row.
-    fn record_null_runs(&mut self, chunk: &ArrayRef, base_offset: u32) {
-        let len = chunk.len() as u32;
-        let Some(nulls) = chunk.nulls() else {
-            return;
-        };
-        // The validity buffer marks valid rows; the gaps between its set runs
+    fn record_null_runs(&mut self, nulls: &arrow::buffer::NullBuffer, base_offset: u32) {
+        let len = nulls.len() as u32;
+        // The logical validity marks valid rows; the gaps between its set runs
         // are the null runs.
         let mut cursor = 0u32;
         for (start, end) in nulls.inner().set_slices() {
@@ -2796,6 +2819,10 @@ impl IndexSeedWriter for ZoneMapSeedWriter {
 
     fn observe_batch(&mut self, values: &ArrayRef) -> lance_core::Result<()> {
         let mut offset = 0usize;
+        // Logical nulls: a `NullArray` has no validity buffer at all.
+        let nulls = values
+            .logical_nulls()
+            .filter(|nulls| self.collect_null_positions && nulls.null_count() > 0);
 
         while offset < values.len() {
             let remaining_in_zone = self.rows_per_zone - self.rows_in_current_zone;
@@ -2803,9 +2830,12 @@ impl IndexSeedWriter for ZoneMapSeedWriter {
             let chunk = values.slice(offset, chunk_len);
             self.processor.process_chunk(&chunk)?;
 
-            if self.collect_null_positions && chunk.null_count() > 0 {
-                let base_offset = (self.next_zone_start + self.rows_in_current_zone) as u32;
-                self.record_null_runs(&chunk, base_offset);
+            if let Some(nulls) = &nulls {
+                let chunk_nulls = nulls.slice(offset, chunk_len);
+                if chunk_nulls.null_count() > 0 {
+                    let base_offset = (self.next_zone_start + self.rows_in_current_zone) as u32;
+                    self.record_null_runs(&chunk_nulls, base_offset);
+                }
             }
 
             self.rows_in_current_zone += chunk_len as u64;
