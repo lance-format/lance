@@ -388,6 +388,22 @@ def test_file_session_upload_download(s3_bucket: str, tmp_path):
 
 
 @pytest.mark.integration
+def test_opendal_session_lists_nested_unicode_path(s3_bucket: str, tmp_path):
+    session = LanceFileSession(
+        f"s3://{s3_bucket}/run~1",
+        storage_options={**CONFIG, "use_opendal": "true"},
+    )
+    local = tmp_path / "note.txt"
+    local.write_bytes(b"July report")
+    session.upload_file(str(local), "café/note.txt")
+
+    listed = session.list_with_delimiter("café").objects
+    assert listed == ["café/note.txt"]
+    assert session.contains(listed[0])
+    assert session.read_range(listed[0], 0, 11) == b"July report"
+
+
+@pytest.mark.integration
 def test_append_fragment(s3_bucket: str):
     storage_options = copy.deepcopy(CONFIG)
     table = pa.table({"a": [1, 2], "b": ["a", "b"]})

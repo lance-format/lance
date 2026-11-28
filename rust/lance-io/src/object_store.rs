@@ -82,6 +82,12 @@ use crate::{object_reader::CloudObjectReader, object_writer::ObjectWriter, trait
 use lance_core::{Error, Result};
 use local_staging::{LocalStagingPaths, remove_local_staging_file};
 
+/// The OpenDAL adapter decoded these filenames for directory display.
+#[derive(Clone)]
+struct DecodedFileNames {
+    encode_for_read: bool,
+}
+
 // Local disks tend to do fine with a few threads
 // Note: the number of threads here also impacts the number of files
 // we need to read in some situations.  So keeping this at 8 keeps the
@@ -2425,7 +2431,22 @@ impl ObjectStore {
     /// [`ListResult::common_prefixes`] and the direct child files as
     /// [`ListResult::objects`].
     pub async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> {
-        Ok(self.inner.list_with_delimiter(prefix).await?)
+        let mut result = self.inner.list_with_delimiter(prefix).await?;
+        if let Some(names) = result.extensions.remove::<DecodedFileNames>() {
+            // PrefixStore may have removed only part of the displayed parent.
+            // File reads use the directory that the caller passed to this store.
+            let dir = prefix.cloned().unwrap_or_default();
+            for file in &mut result.objects {
+                if let Some(name) = file.location.parts().next_back() {
+                    file.location = if names.encode_for_read {
+                        dir.clone().join(name.as_ref())
+                    } else {
+                        dir.clone().join(name)
+                    };
+                }
+            }
+        }
+        Ok(result)
     }
 
     /// List objects recursively. On unordered stores, a retryable failure after
