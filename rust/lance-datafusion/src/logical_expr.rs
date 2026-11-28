@@ -116,10 +116,10 @@ fn simplify_constant(expr: Expr) -> Option<ScalarValue> {
 
 /// The exact value of `+`, `-`, `*`, `/`, `%`, `<<` and `>>` on integer
 /// literals, or `None` for any other operator or operand, a division by zero,
-/// a shift by 64 or more, or a value beyond `i128`.
+/// or a value beyond `i128`. A shift count is masked to 0..=63, as the 64-bit
+/// literal types mask it, while the shifted value stays exact.
 fn exact_integer(expr: &Expr) -> Option<i128> {
-    // Beyond 63 the operand types mask the shift, so the exact value would differ.
-    let shift = |by: i128| u32::try_from(by).ok().filter(|by| *by < 64);
+    let shift = |by: i128| i64::try_from(by).ok().map(|by| (by & 63) as u32);
     match expr {
         Expr::Literal(value, _) => match value {
             ScalarValue::Int8(Some(v)) => Some((*v).into()),
@@ -888,6 +888,9 @@ mod tests {
     #[case::divide("w >= (1 << 63) / 2", [Some(false), Some(false), Some(true), Some(true), None])]
     #[case::divide_reversed("(1 << 63) / 2 <= w", [Some(false), Some(false), Some(true), Some(true), None])]
     #[case::right_shift("w >= (1 << 63) >> 1", [Some(false), Some(false), Some(true), Some(true), None])]
+    #[case::masked_right_shift("w >= (1 << 63) >> 64", [Some(false), Some(false), Some(false), Some(true), None])]
+    #[case::masked_right_shift_by_65("w >= (1 << 63) >> 65", [Some(false), Some(false), Some(true), Some(true), None])]
+    #[case::masked_left_shift("w = 1 << 64", [Some(false), Some(true), Some(false), Some(false), None])]
     #[case::remainder(
         "w = (1 << 63) % 9223372036854775807",
         [Some(false), Some(true), Some(false), Some(false), None]
