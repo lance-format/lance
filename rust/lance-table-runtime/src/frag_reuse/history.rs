@@ -10,6 +10,7 @@
 //! replaces the fragment reuse index, may remove versions: the oldest ones, and
 //! only those no index of the published manifest still needs.
 
+use std::collections::HashMap;
 use std::io::Cursor;
 use std::sync::Arc;
 
@@ -25,7 +26,7 @@ use super::{live_source_row_addrs, load_frag_reuse_index_details, normalize_sour
 use crate::Table;
 use crate::commit::load_all_indices;
 use lance_table::system_index::frag_reuse::retention::{
-    is_index_remap_caught_up, reuse_chain_frag_bitmap,
+    ReuseVersionReachIndex, compute_v0_retention, index_postdates_rewrite,
 };
 use lance_table::transaction::{Operation, RewriteGroup};
 
@@ -90,11 +91,20 @@ pub async fn validate_frag_reuse_history(
             return validate_restore(base, *version, proposed_manifest, proposed_indices).await;
         }
         Operation::Overwrite { .. } => return Ok(()),
-        // Non-stable-row-id tables can need the same history protection.
-        // Extending these checks must also allow existing operations such as
-        // migration to stable row ids, which drops unused history once no
-        // other index remains.
-        _ if !base.manifest.uses_stable_row_ids() => return Ok(()),
+        // Non-stable-row-id tables still protect v0 FRI cleanups against
+        // dropping versions needed by an index in the published manifest
+        // (including concurrent CreateIndex commits), while allowing other
+        // operations such as migration to stable row ids.
+        _ if !base.manifest.uses_stable_row_ids() => {
+            return validate_non_stable_v0_trim(
+                operation,
+                base,
+                read,
+                proposed_manifest,
+                proposed_indices,
+            )
+            .await;
+        }
         _ => {}
     }
     let base_indices = load_all_indices(base, None).await?;
@@ -297,18 +307,60 @@ fn trimmed_versions(
     Ok(Some(trimmed))
 }
 
-/// The first of `indices` that may still hold row addresses `version` moved:
-/// one cleanup's rule ([`is_index_remap_caught_up`]) finds behind it, or that
-/// the rule cannot decide for (a rewrite group split across its coverage).
-/// `chain` is every fragment the history holding `version` touches.
-fn index_needing<'a>(
+/// Whether `index` may still hold row addresses `version` moved: either
+/// behind it under [`index_postdates_rewrite`] or undecided (`InvalidInput`
+/// for a rewrite group split across its coverage). `overlaps_reach` must be
+/// `true` when `index.fragment_bitmap` is absent or intersects `version`'s
+/// per-version reach.
+fn index_needs_version(
     version: &FragReuseVersion,
+    index: &IndexMetadata,
+    overlaps_reach: bool,
+) -> bool {
+    !is_system_index(index)
+        && overlaps_reach
+        && !matches!(index_postdates_rewrite(version, index), Ok(true))
+}
+
+/// For each position in `0..prefix_len`, the first index in `indices` that
+/// may still need `versions[pos]`, evaluated via reverse-topological boolean
+/// reach propagation without materializing per-version reach bitmaps.
+fn first_needing_indices<'a>(
+    versions: &[FragReuseVersion],
+    prefix_len: usize,
     indices: &'a [IndexMetadata],
-    chain: &RoaringBitmap,
-) -> Option<&'a IndexMetadata> {
-    indices
-        .iter()
-        .find(|index| !matches!(is_index_remap_caught_up(version, index, chain), Ok(true)))
+) -> Vec<Option<&'a IndexMetadata>> {
+    let mut needing = vec![None; prefix_len];
+    if prefix_len == 0 || versions.is_empty() {
+        return needing;
+    }
+    let reach_index = ReuseVersionReachIndex::new(versions.iter());
+    let mut remaining = prefix_len;
+    for index in indices {
+        if is_system_index(index) {
+            continue;
+        }
+        let overlaps = index
+            .fragment_bitmap
+            .as_ref()
+            .map(|bitmap| reach_index.versions_overlapping_bitmap(bitmap));
+        for pos in 0..prefix_len {
+            if needing[pos].is_none()
+                && index_needs_version(
+                    &versions[pos],
+                    index,
+                    overlaps.as_ref().is_none_or(|hits| hits[pos]),
+                )
+            {
+                needing[pos] = Some(index);
+                remaining -= 1;
+            }
+        }
+        if remaining == 0 {
+            break;
+        }
+    }
+    needing
 }
 
 /// How many of the oldest versions a cleanup of a stable-row-id table removes:
@@ -316,20 +368,45 @@ fn index_needing<'a>(
 /// versions stay a complete suffix of the history, so an address they map
 /// translates through every later move.
 pub fn trimmable_versions(versions: &[FragReuseVersion], indices: &[IndexMetadata]) -> usize {
-    let chain = reuse_chain_frag_bitmap(versions);
-    versions
-        .iter()
-        .position(|version| index_needing(version, indices, &chain).is_some())
-        .unwrap_or(versions.len())
-}
-
-fn contains_version(versions: &[FragReuseVersion], version: &FragReuseVersion) -> Result<bool> {
-    for candidate in versions {
-        if same_version(candidate, version)? {
-            return Ok(true);
+    if versions.is_empty() {
+        return 0;
+    }
+    let reach_index = ReuseVersionReachIndex::new(versions.iter());
+    let mut first_needed = versions.len();
+    for index in indices {
+        if is_system_index(index) {
+            continue;
+        }
+        let overlaps = index
+            .fragment_bitmap
+            .as_ref()
+            .map(|bitmap| reach_index.versions_overlapping_bitmap(bitmap));
+        if let Some(pos) = (0..first_needed).find(|&pos| {
+            index_needs_version(
+                &versions[pos],
+                index,
+                overlaps.as_ref().is_none_or(|hits| hits[pos]),
+            )
+        }) {
+            first_needed = pos;
+            if first_needed == 0 {
+                break;
+            }
         }
     }
-    Ok(false)
+    first_needed
+}
+
+fn find_version(
+    versions: &[FragReuseVersion],
+    version: &FragReuseVersion,
+) -> Result<Option<usize>> {
+    for (pos, candidate) in versions.iter().enumerate() {
+        if same_version(candidate, version)? {
+            return Ok(Some(pos));
+        }
+    }
+    Ok(None)
 }
 
 /// A cleanup removes the oldest `trimmed` recorded versions. Each must be one
@@ -345,45 +422,91 @@ async fn validate_trim(
     read: &ReadSnapshot<'_>,
     base: &Table,
 ) -> Result<()> {
-    let retry = |message: String| {
+    let seen = read.load().await.map_err(|error| {
         Error::retryable_commit_conflict_source(
             base.manifest.version,
+            format!(
+                "This cleanup removes fragment reuse versions on a table with stable row ids, but \
+                 the version it read cannot be loaded to check them: {error}. Run the cleanup \
+                 again on the latest version."
+            )
+            .into(),
+        )
+    })?;
+    validate_trim_against_read_state(
+        recorded,
+        trimmed,
+        supplied_indices,
+        proposed_indices,
+        &seen,
+        base.manifest.version,
+    )
+}
+
+fn validate_trim_against_read_state(
+    recorded: &[FragReuseVersion],
+    trimmed: usize,
+    supplied_indices: &[IndexMetadata],
+    proposed_indices: &[IndexMetadata],
+    seen: &ReadState,
+    base_version: u64,
+) -> Result<()> {
+    let retry = |message: String| {
+        Error::retryable_commit_conflict_source(
+            base_version,
             format!("{message}. Run the cleanup again on the latest version.").into(),
         )
     };
-    let seen = read.load().await.map_err(|error| {
-        retry(format!(
-            "This cleanup removes fragment reuse versions on a table with stable row ids, but \
-             the version it read cannot be loaded to check them: {error}"
-        ))
-    })?;
+    if trimmed == 0 {
+        return Ok(());
+    }
     let read_versions = seen
         .history
         .as_ref()
         .map_or(&[][..], |history| history.versions.as_slice());
-    let chain = reuse_chain_frag_bitmap(recorded);
-    let read_chain = reuse_chain_frag_bitmap(read_versions);
-    for version in &recorded[..trimmed] {
+    let mut read_by_stamp: HashMap<u64, Vec<(usize, &FragReuseVersion)>> =
+        HashMap::with_capacity(read_versions.len());
+    for (read_pos, candidate) in read_versions.iter().enumerate() {
+        read_by_stamp
+            .entry(candidate.dataset_version)
+            .or_default()
+            .push((read_pos, candidate));
+    }
+    let needing = first_needing_indices(recorded, trimmed, proposed_indices);
+    for (pos, version) in recorded[..trimmed].iter().enumerate() {
         let stamp = version.dataset_version;
-        if !contains_version(read_versions, version)? {
+        let mut found_read_pos = None;
+        if let Some(candidates) = read_by_stamp.get(&stamp) {
+            for &(candidate_pos, candidate) in candidates {
+                if same_version(candidate, version)? {
+                    found_read_pos = Some(candidate_pos);
+                    break;
+                }
+            }
+        }
+        let Some(read_pos) = found_read_pos else {
             return Err(retry(format!(
                 "This cleanup would remove the fragment reuse version stamped {stamp}, which was \
                  recorded after version {}, the version it read",
                 seen.version
             )));
-        }
-        let Some(index) = index_needing(version, proposed_indices, &chain) else {
+        };
+        let Some(index) = needing[pos] else {
             continue;
         };
         // Judged as the writer saw it: against the history it read, through the
         // metadata it read or supplies.
+        let read_reaches = ReuseVersionReachIndex::new(read_versions.iter());
         let needed_when_read = seen
             .indices
             .iter()
             .chain(supplied_indices)
             .filter(|known| known.uuid == index.uuid)
             .any(|known| {
-                index_needing(version, std::slice::from_ref(known), &read_chain).is_some()
+                let overlaps_reach = known.fragment_bitmap.as_ref().is_none_or(|bitmap| {
+                    read_reaches.versions_overlapping_bitmap(bitmap)[read_pos]
+                });
+                index_needs_version(version, known, overlaps_reach)
             });
         if needed_when_read {
             return Err(Error::invalid_input(format!(
@@ -401,6 +524,152 @@ async fn validate_trim(
         )));
     }
     Ok(())
+}
+
+/// Protect a non-stable-row-id v0 FRI cleanup against dropping a version that
+/// an index in the published manifest still requires (directly or through a
+/// downstream mapping hop), such as when a concurrent `CreateIndex` commits
+/// after the cleanup read its snapshot.
+async fn validate_non_stable_v0_trim(
+    operation: &Operation,
+    base: &Table,
+    read: ReadSnapshot<'_>,
+    proposed_manifest: &Manifest,
+    proposed_indices: &[IndexMetadata],
+) -> Result<()> {
+    let Operation::CreateIndex {
+        new_indices,
+        removed_indices,
+    } = operation
+    else {
+        return Ok(());
+    };
+    if !replaces_frag_reuse_entry(new_indices, removed_indices) {
+        return Ok(());
+    }
+    let base_indices = load_all_indices(base, None).await?;
+    let (Ok(Some(replaced)), Ok(Some(proposed))) = (
+        sole_v0_entry(&base_indices),
+        sole_v0_entry(proposed_indices),
+    ) else {
+        return Ok(());
+    };
+    if replaced == proposed
+        && replaced.base_id.is_none_or(|id| {
+            base.manifest.base_paths.get(&id) == proposed_manifest.base_paths.get(&id)
+        })
+    {
+        return Ok(());
+    }
+    let recorded = load_frag_reuse_index_details(base, replaced).await?;
+    let published = load_proposed_history(base, proposed_manifest, proposed).await?;
+    let Some(dropped) =
+        first_dropped_required_version(&recorded.versions, &published.versions, proposed_indices)?
+    else {
+        return Ok(());
+    };
+    let seen = read.load().await.map_err(|error| {
+        Error::retryable_commit_conflict_source(
+            base.manifest.version,
+            format!(
+                "This cleanup removes fragment reuse versions, but the version it read cannot be \
+                 loaded to check them: {error}. Run the cleanup again on the latest version."
+            )
+            .into(),
+        )
+    })?;
+    classify_non_stable_v0_trim_drop(
+        dropped,
+        new_indices,
+        removed_indices,
+        &seen,
+        base.manifest.version,
+    )
+}
+
+fn first_dropped_required_version<'a>(
+    recorded: &'a [FragReuseVersion],
+    published: &[FragReuseVersion],
+    proposed_indices: &[IndexMetadata],
+) -> Result<Option<&'a FragReuseVersion>> {
+    Ok(first_dropped_required_version_with_comparisons(recorded, published, proposed_indices)?.0)
+}
+
+fn first_dropped_required_version_with_comparisons<'a>(
+    recorded: &'a [FragReuseVersion],
+    published: &[FragReuseVersion],
+    proposed_indices: &[IndexMetadata],
+) -> Result<(Option<&'a FragReuseVersion>, usize)> {
+    let required = compute_v0_retention(recorded, proposed_indices);
+    let mut published_by_stamp: HashMap<u64, Vec<&FragReuseVersion>> =
+        HashMap::with_capacity(published.len());
+    for candidate in published {
+        published_by_stamp
+            .entry(candidate.dataset_version)
+            .or_default()
+            .push(candidate);
+    }
+
+    let mut comparisons = 0usize;
+    for (version, needed) in recorded.iter().zip(required) {
+        if !needed {
+            continue;
+        }
+        let mut present = false;
+        if let Some(candidates) = published_by_stamp.get(&version.dataset_version) {
+            for candidate in candidates {
+                comparisons += 1;
+                if same_version(candidate, version)? {
+                    present = true;
+                    break;
+                }
+            }
+        }
+        if !present {
+            return Ok((Some(version), comparisons));
+        }
+    }
+    Ok((None, comparisons))
+}
+
+fn classify_non_stable_v0_trim_drop(
+    dropped: &FragReuseVersion,
+    supplied_indices: &[IndexMetadata],
+    removed_indices: &[IndexMetadata],
+    seen: &ReadState,
+    base_version: u64,
+) -> Result<()> {
+    let stamp = dropped.dataset_version;
+    let read_versions = seen
+        .history
+        .as_ref()
+        .map_or(&[][..], |history| history.versions.as_slice());
+    if let Some(read_pos) = find_version(read_versions, dropped)? {
+        let known_indices: Vec<IndexMetadata> = seen
+            .indices
+            .iter()
+            .filter(|known| !removed_indices.iter().any(|r| r.uuid == known.uuid))
+            .chain(supplied_indices.iter())
+            .cloned()
+            .collect();
+        let read_required = compute_v0_retention(read_versions, &known_indices);
+        if read_required[read_pos] {
+            return Err(Error::invalid_input(format!(
+                "Cannot remove the fragment reuse version stamped {stamp}: an index in the \
+                 manifest may still need its row-address mappings"
+            )));
+        }
+    }
+    Err(Error::retryable_commit_conflict_source(
+        base_version,
+        format!(
+            "This cleanup would remove the fragment reuse version stamped {stamp}, which is \
+             required by an index committed after version {}, the version the cleanup read. Run \
+             the cleanup again on the latest version.",
+            seen.version
+        )
+        .into(),
+    ))
 }
 
 enum Loss<'a> {
@@ -807,5 +1076,305 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn test_digest(id: u64) -> FragDigest {
+        FragDigest {
+            id,
+            physical_rows: 100,
+            num_deleted_rows: 0,
+        }
+    }
+
+    fn test_version(dataset_version: u64, old: &[u64], new: &[u64]) -> FragReuseVersion {
+        FragReuseVersion {
+            dataset_version,
+            groups: vec![FragReuseGroup {
+                changed_row_addrs: Vec::new(),
+                old_frags: old.iter().copied().map(test_digest).collect(),
+                new_frags: new.iter().copied().map(test_digest).collect(),
+            }],
+        }
+    }
+
+    fn test_index_meta(
+        uuid: uuid::Uuid,
+        name: &str,
+        dataset_version: u64,
+        frags: &[u32],
+    ) -> IndexMetadata {
+        IndexMetadata {
+            uuid,
+            name: name.to_string(),
+            fields: vec![0],
+            covering_fields: vec![],
+            dataset_version,
+            fragment_bitmap: Some(frags.iter().copied().collect()),
+            index_details: None,
+            index_version: 0,
+            created_at: None,
+            base_id: None,
+            files: None,
+            clustering_id: None,
+            metadata: Default::default(),
+        }
+    }
+
+    #[test]
+    fn test_trimmable_versions_uses_per_version_reach() {
+        let v1 = test_version(10, &[4, 5], &[6]);
+        let v2 = test_version(20, &[8, 9], &[10]);
+        let rebuilt_after_v1 = test_index_meta(uuid::Uuid::new_v4(), "idx_a", 15, &[6]);
+
+        // Rebuilt after v1 over [6], disjoint from v2: neither version is needed.
+        assert_eq!(trimmable_versions(&[v1, v2], &[rebuilt_after_v1]), 2);
+    }
+
+    #[test]
+    fn test_validate_trim_classifies_reach_change_between_read_and_commit() {
+        let v1 = test_version(10, &[1], &[2]);
+        let v2 = test_version(20, &[2, 3], &[4]);
+        let idx_uuid = uuid::Uuid::new_v4();
+        let idx_before_v2 = test_index_meta(idx_uuid, "idx", 5, &[3]);
+        let idx_after_v2 = test_index_meta(idx_uuid, "idx", 5, &[4]);
+
+        // Read snapshot only saw v1 (reach {1, 2}), disjoint from idx covering [3].
+        // By commit time, v2 merged [2, 3] -> [4], extending v1's reach to {1, 2, 4}
+        // and advancing idx onto [4]: refusal must be retryable.
+        let seen_before_v2 = ReadState {
+            version: 10,
+            indices: vec![idx_before_v2],
+            history: Some(Arc::new(FragReuseIndexDetails {
+                versions: vec![v1.clone()],
+            })),
+        };
+        let err = validate_trim_against_read_state(
+            &[v1.clone(), v2.clone()],
+            1,
+            &[],
+            std::slice::from_ref(&idx_after_v2),
+            &seen_before_v2,
+            20,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, Error::RetryableCommitConflict { .. }),
+            "{err}"
+        );
+
+        // When the writer's read snapshot already included v2 and idx over [4],
+        // the same trim is invalid input rather than a retryable conflict.
+        let seen_after_v2 = ReadState {
+            version: 20,
+            indices: vec![idx_after_v2.clone()],
+            history: Some(Arc::new(FragReuseIndexDetails {
+                versions: vec![v1.clone(), v2.clone()],
+            })),
+        };
+        let err = validate_trim_against_read_state(
+            &[v1, v2],
+            1,
+            &[],
+            std::slice::from_ref(&idx_after_v2),
+            &seen_after_v2,
+            20,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "{err}");
+
+        // Disjoint versions where the only index rebuilt after v1 over [6] are
+        // both trimmable without conflict.
+        let d1 = test_version(10, &[4, 5], &[6]);
+        let d2 = test_version(20, &[8, 9], &[10]);
+        let rebuilt = test_index_meta(uuid::Uuid::new_v4(), "idx_a", 15, &[6]);
+        let seen_disjoint = ReadState {
+            version: 20,
+            indices: vec![rebuilt.clone()],
+            history: Some(Arc::new(FragReuseIndexDetails {
+                versions: vec![d1.clone(), d2.clone()],
+            })),
+        };
+        validate_trim_against_read_state(&[d1, d2], 2, &[], &[rebuilt], &seen_disjoint, 20)
+            .unwrap();
+    }
+
+    #[test]
+    fn test_non_stable_v0_trim_rejects_dropping_required_version() {
+        let v1 = test_version(10, &[1], &[2]);
+        let v2 = test_version(20, &[2], &[3]);
+        let recorded = vec![v1.clone(), v2];
+        let published = vec![v1];
+
+        // Concurrent stale index committed after the cleanup read its snapshot:
+        // raw bitmap {1} needs v1 directly and v2 via forward closure -> retryable conflict.
+        let stale_concurrent = test_index_meta(uuid::Uuid::new_v4(), "idx_b", 5, &[1]);
+        let dropped = first_dropped_required_version(
+            &recorded,
+            &published,
+            std::slice::from_ref(&stale_concurrent),
+        )
+        .unwrap()
+        .expect("v2 must be required via forward closure");
+        assert_eq!(dropped.dataset_version, 20);
+
+        let seen_without_idx = ReadState {
+            version: 20,
+            indices: vec![],
+            history: Some(Arc::new(FragReuseIndexDetails {
+                versions: recorded.clone(),
+            })),
+        };
+        let err =
+            classify_non_stable_v0_trim_drop(dropped, &[], &[], &seen_without_idx, 21).unwrap_err();
+        assert!(
+            matches!(err, Error::RetryableCommitConflict { .. }),
+            "{err}"
+        );
+
+        // When the read snapshot already held the stale index, dropping v2 is InvalidInput.
+        let seen_with_idx = ReadState {
+            version: 21,
+            indices: vec![stale_concurrent],
+            history: Some(Arc::new(FragReuseIndexDetails {
+                versions: recorded.clone(),
+            })),
+        };
+        let err =
+            classify_non_stable_v0_trim_drop(dropped, &[], &[], &seen_with_idx, 21).unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "{err}");
+    }
+
+    #[test]
+    fn test_non_stable_v0_trim_check_scales_linearly_on_disjoint_history() {
+        // 2,000 disjoint required versions plus 1 droppable version: stamp-bucketed
+        // lookup checks each required version once rather than scanning published quadratically.
+        const REQUIRED: usize = 2_000;
+        let mut recorded: Vec<FragReuseVersion> = (0..REQUIRED)
+            .map(|i| {
+                let base = (i as u64) * 2;
+                test_version(i as u64 + 10, &[base], &[base + 1])
+            })
+            .collect();
+        let droppable = test_version(REQUIRED as u64 + 10, &[900_000], &[900_001]);
+        let published = recorded.clone();
+        recorded.push(droppable);
+
+        let stale_all_required = test_index_meta(
+            uuid::Uuid::new_v4(),
+            "stale",
+            1,
+            &(0..REQUIRED)
+                .map(|i| (i as u32) * 2 + 1)
+                .collect::<Vec<_>>(),
+        );
+        let (dropped, comparisons) = first_dropped_required_version_with_comparisons(
+            &recorded,
+            &published,
+            &[stale_all_required],
+        )
+        .unwrap();
+        assert!(dropped.is_none());
+        assert_eq!(comparisons, REQUIRED);
+    }
+
+    #[test]
+    fn test_stable_v0_trim_handles_long_chain_suffix_and_straddled_group() {
+        // Multi-container chain where a single index rebuilt after the last hop
+        // covers only the final live fragment: every hop is trimmable via boolean
+        // reach propagation without materializing per-version suffix bitmaps.
+        const HOPS: usize = 500;
+        let mut chain: Vec<FragReuseVersion> = (0..HOPS)
+            .map(|i| {
+                let src = ((i as u64) + 1) * 100_000;
+                let dst = ((i as u64) + 2) * 100_000;
+                test_version(i as u64 + 1, &[src], &[dst])
+            })
+            .collect();
+        let final_live = ((HOPS as u32) + 1) * 100_000;
+        let rebuilt_after_all =
+            test_index_meta(uuid::Uuid::new_v4(), "idx", HOPS as u64 + 1, &[final_live]);
+        assert_eq!(
+            trimmable_versions(&chain, std::slice::from_ref(&rebuilt_after_all)),
+            HOPS
+        );
+        let seen_all = ReadState {
+            version: HOPS as u64 + 1,
+            indices: vec![rebuilt_after_all.clone()],
+            history: Some(Arc::new(FragReuseIndexDetails {
+                versions: chain.clone(),
+            })),
+        };
+        validate_trim_against_read_state(
+            &chain,
+            HOPS,
+            &[],
+            &[rebuilt_after_all],
+            &seen_all,
+            HOPS as u64 + 1,
+        )
+        .unwrap();
+
+        // Adding a disjoint version at the tail while an index still needs hop 250
+        // (dataset_version 251) keeps the full suffix starting at hop 250.
+        chain.push(test_version(
+            HOPS as u64 + 10,
+            &[900_000_000],
+            &[900_000_001],
+        ));
+        let stale_mid = test_index_meta(uuid::Uuid::new_v4(), "stale_mid", 251, &[251 * 100_000]);
+        assert_eq!(trimmable_versions(&chain, &[stale_mid]), 250);
+
+        // A post-rewrite index straddling v2's old_frags [2, 3] causes
+        // `index_postdates_rewrite` to return InvalidInput, which stable-v0 trim
+        // treats as still needed: v1 is trimmable, while v2 and its trailing
+        // disjoint suffix v3 are retained.
+        let v1 = test_version(10, &[1], &[2]);
+        let v2 = test_version(20, &[2, 3], &[4]);
+        let v3 = test_version(30, &[8], &[9]);
+        let straddling = test_index_meta(uuid::Uuid::new_v4(), "straddling", 25, &[2]);
+        let straddle_history = vec![v1, v2, v3];
+        assert_eq!(
+            trimmable_versions(&straddle_history, std::slice::from_ref(&straddling)),
+            1
+        );
+
+        let seen_with_straddle = ReadState {
+            version: 30,
+            indices: vec![straddling.clone()],
+            history: Some(Arc::new(FragReuseIndexDetails {
+                versions: straddle_history.clone(),
+            })),
+        };
+        let err = validate_trim_against_read_state(
+            &straddle_history,
+            2,
+            &[],
+            std::slice::from_ref(&straddling),
+            &seen_with_straddle,
+            30,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "{err}");
+
+        let seen_without_straddle = ReadState {
+            version: 30,
+            indices: vec![],
+            history: Some(Arc::new(FragReuseIndexDetails {
+                versions: straddle_history.clone(),
+            })),
+        };
+        let err = validate_trim_against_read_state(
+            &straddle_history,
+            2,
+            &[],
+            &[straddling],
+            &seen_without_straddle,
+            30,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, Error::RetryableCommitConflict { .. }),
+            "{err}"
+        );
     }
 }
