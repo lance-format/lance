@@ -93,6 +93,9 @@ pub struct IndexMetadata {
     /// version they do not support. They may leave it unchanged, shrink its
     /// coverage, drop it, or refuse the operation. The active writer declares
     /// its capabilities in [`super::ManifestBuildConfig::with_index_is_supported`].
+    /// If indexed values change, coverage must also be withdrawn from retired
+    /// sources that resolve to the changed fragments. Without that mapping,
+    /// clear the affected segment's coverage rather than retaining stale claims.
     pub fragment_bitmap: Option<RoaringBitmap>,
 
     /// Metadata specific to the index type

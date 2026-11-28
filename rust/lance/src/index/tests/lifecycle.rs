@@ -3,6 +3,11 @@
 
 use super::support::*;
 use super::*;
+use crate::dataset::CommitBuilder;
+use lance_table::format::DataFile;
+use lance_table::transaction::action::{
+    Action, AddDataFile, CompositeOperation, FieldRef, Ref, TombstoneFieldData, UserStep,
+};
 
 #[tokio::test]
 async fn test_drop_index() {
@@ -3170,6 +3175,165 @@ async fn test_dataset_append_preserves_unsupported_coverage_after_deferred_compa
             .contains("ScalarIndex")
     );
     assert_eq!(indexed_scan.try_into_batch().await.unwrap(), expected);
+}
+
+#[rstest]
+#[case::future_version(UnreadableIndexKind::NewerVersion)]
+#[case::unknown_type(UnreadableIndexKind::UnknownType)]
+#[cfg_attr(
+    not(feature = "geo"),
+    case::disabled_feature(UnreadableIndexKind::DisabledFeature)
+)]
+#[tokio::test]
+async fn test_in_place_replacement_withdraws_unsupported_source_coverage(
+    #[case] kind: UnreadableIndexKind,
+    #[values(false, true)] composite: bool,
+) {
+    let directory = tempfile::tempdir().unwrap();
+    let uri = directory.path().to_str().unwrap();
+    let mut dataset = Dataset::write(
+        two_column_reader(),
+        uri,
+        Some(WriteParams {
+            max_rows_per_file: 5,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let params = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree);
+    for (column, name) in [("id", "id_idx"), ("payload", READABLE_INDEX)] {
+        dataset
+            .create_index_builder(&[column], IndexType::BTree, &params)
+            .name(name.to_string())
+            .await
+            .unwrap();
+    }
+    let readable = manifest_index(&dataset, "id_idx").await;
+    hide_index_as(&mut dataset, "id_idx", kind).await;
+    hide_index_as(&mut dataset, READABLE_INDEX, kind).await;
+    let before = manifest_index(&dataset, "id_idx").await;
+    let unrelated = manifest_index(&dataset, READABLE_INDEX).await;
+
+    let metrics = compact_files(
+        &mut dataset,
+        CompactionOptions {
+            defer_index_remap: true,
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(metrics.fragments_removed, 2);
+    assert_eq!(dataset.fragments().len(), 1);
+    assert_eq!(
+        manifest_index(&dataset, FRAG_REUSE_INDEX_NAME)
+            .await
+            .index_version,
+        0
+    );
+    assert_eq!(before.fragment_bitmap, Some(RoaringBitmap::from([0, 1])));
+    assert_eq!(manifest_index(&dataset, "id_idx").await, before);
+
+    let replacement = arrow_array::record_batch!(("id", Int32, vec![42; 10])).unwrap();
+    let replacements = dataset
+        .get_fragments()
+        .remove(0)
+        .write_columns(
+            futures::stream::iter([Ok(replacement)]),
+            &dataset.schema().project(&["id"]).unwrap(),
+        )
+        .await
+        .unwrap();
+    let operation = if composite {
+        Operation::CompositeOperation(CompositeOperation::new(vec![UserStep::new(
+            "replace id",
+            vec![
+                Action::TombstoneFieldData(TombstoneFieldData {
+                    fragment: Ref::Committed(replacements.0),
+                    field_ids: vec![FieldRef::Committed(0)],
+                    data_change: true,
+                }),
+                Action::AddDataFile(AddDataFile {
+                    fragment: Ref::Committed(replacements.0),
+                    file: DataFile {
+                        fields: Arc::from([]),
+                        ..replacements.1
+                    },
+                    field_ids: vec![FieldRef::Committed(0)],
+                    data_change: true,
+                    base: None,
+                }),
+            ],
+        )]))
+    } else {
+        Operation::DataReplacement {
+            replacements: vec![replacements],
+            data_change: true,
+        }
+    };
+    let transaction = Transaction::new(dataset.manifest.version, operation, None);
+    if composite {
+        CommitBuilder::new(Arc::new(dataset))
+            .with_experimental_composite_operations(true)
+            .execute(transaction)
+            .await
+            .unwrap();
+    } else {
+        dataset
+            .apply_commit(transaction, &Default::default(), &Default::default())
+            .await
+            .unwrap();
+    }
+    let mut reopened = Dataset::open(uri).await.unwrap();
+    let after = manifest_index(&reopened, "id_idx").await;
+    assert_eq!(
+        after,
+        IndexMetadata {
+            fragment_bitmap: Some(RoaringBitmap::new()),
+            ..before
+        },
+        "a value replacement must withdraw its retired source coverage"
+    );
+    assert_eq!(manifest_index(&reopened, READABLE_INDEX).await, unrelated);
+
+    // Model a later reader that understands the original BTree files. Their
+    // stale values must not hide the replacement values from its queries.
+    reopened
+        .apply_commit(
+            Transaction::new(
+                reopened.manifest.version,
+                Operation::CreateIndex {
+                    new_indices: vec![IndexMetadata {
+                        index_details: readable.index_details,
+                        index_version: readable.index_version,
+                        ..after.clone()
+                    }],
+                    removed_indices: vec![after],
+                },
+                None,
+            ),
+            &Default::default(),
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+    let reopened = Dataset::open(uri).await.unwrap();
+    let mut full_scan = reopened.scan();
+    full_scan.filter("id = 42").unwrap().use_scalar_index(false);
+    let expected = full_scan.try_into_batch().await.unwrap();
+    assert_eq!(expected.num_rows(), 10);
+    assert_eq!(
+        reopened
+            .scan()
+            .filter("id = 42")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap(),
+        expected
+    );
 }
 
 /// Without stable row ids a rewrite moves every row address, so each index

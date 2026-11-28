@@ -45,7 +45,7 @@ use crate::transaction::validate::schema_fragments_valid;
 use crate::transaction::{FragReuseUpdate, LogicalIndexSegments, ReadVersionState, Transaction};
 use lance_core::datatypes::{Field, Schema};
 use lance_core::{Error, Result, is_system_column};
-use roaring::RoaringTreemap;
+use roaring::{RoaringBitmap, RoaringTreemap};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use uuid::Uuid;
@@ -216,6 +216,9 @@ pub(super) struct ApplyState<'a> {
     /// Ids of the fragments this operation added, whether minted from the
     /// counter or claimed out of a reservation.
     new_fragments: HashSet<u64>,
+    /// Live fragment ids for withdrawing unmapped index coverage during a
+    /// value rewrite, without scanning the fragment list for each rebind.
+    live_fragment_ids: RoaringBitmap,
     /// The new fragments an [`AddFragment`](super::AddFragment) added with
     /// `data_change = false`: rows moved from elsewhere in the table, whose
     /// values no action in the operation may change.
@@ -301,6 +304,11 @@ impl<'a> ApplyState<'a> {
             build_config,
             schema: manifest.schema.clone(),
             fragments: manifest.fragments.as_ref().clone(),
+            live_fragment_ids: manifest
+                .fragments
+                .iter()
+                .map(|fragment| fragment.id as u32)
+                .collect(),
             indices,
             new_bases: Vec::new(),
             existing_base_paths: manifest.base_paths.clone(),
@@ -664,6 +672,7 @@ impl<'a> ApplyState<'a> {
     }
 
     pub(super) fn push_fragment(&mut self, fragment: Fragment) {
+        self.live_fragment_ids.insert(fragment.id as u32);
         self.fragments.push(fragment);
     }
 
@@ -678,6 +687,7 @@ impl<'a> ApplyState<'a> {
             return false;
         };
         let removed = self.fragments.remove(position);
+        self.live_fragment_ids.remove(fragment_id as u32);
         let modified = self
             .current_manifest
             .fragments
@@ -707,6 +717,7 @@ impl<'a> ApplyState<'a> {
         self.schema.fields.clear();
         self.schema.metadata.clear();
         self.fragments.clear();
+        self.live_fragment_ids.clear();
         self.indices.clear();
         self.new_fragments.clear();
         self.rearranged_fragments.clear();
@@ -996,12 +1007,18 @@ impl<'a> ApplyState<'a> {
                 .filter_map(|field| u32::try_from(*field).ok())
                 .collect(),
         ));
+        // Tagged histories withdraw source coverage along their lineage at
+        // assembly. Without that mapping, retired source coverage needs the
+        // same conservative withdrawal as a legacy in-place rewrite, now so
+        // a segment built by a later action is not invalidated too.
+        let unmapped_live = (!self.carries_tagged_history()).then_some(&self.live_fragment_ids);
         prune_rebound_fields_from_indices(
             &mut self.indices,
             fragment_id,
             &fields,
             &self.current_manifest.schema,
             &self.schema,
+            unmapped_live,
         )
     }
 
@@ -1361,6 +1378,7 @@ fn prune_rebound_fields_from_indices(
     fields: &[i32],
     base_schema: &Schema,
     working_schema: &Schema,
+    unmapped_live: Option<&RoaringBitmap>,
 ) -> Result<()> {
     let Ok(fragment_id) = u32::try_from(fragment_id) else {
         return Ok(());
@@ -1383,7 +1401,11 @@ fn prune_rebound_fields_from_indices(
             continue;
         };
         if affected_field.is_some() {
-            bitmap.remove(fragment_id);
+            if let Some(live) = unmapped_live {
+                Transaction::withdraw_unmapped_fragment_coverage(index, fragment_id, live);
+            } else {
+                bitmap.remove(fragment_id);
+            }
         }
     }
     Ok(())

@@ -3802,15 +3802,22 @@ mod tests {
         assert_eq!(indices, prepared.prepared());
     }
 
-    /// An ordinary table prepares the same way, pruning by fragment id.
+    /// Untagged coverage is pruned by live fragment id. Retired source coverage
+    /// cannot be attributed to a destination without a mapping, so it goes whole.
     #[rstest::rstest]
     #[case::update("update")]
     #[case::merge("merge")]
     #[case::data_replacement("data_replacement")]
-    fn prepare_indices_prunes_by_id_on_an_untagged_table(#[case] kind: &str) {
+    fn prepare_indices_withdraws_untagged_coverage(
+        #[case] kind: &str,
+        #[values(false, true)] has_retired_coverage: bool,
+    ) {
         let mut manifest = manifest_with_file("a.lance");
         manifest.reader_feature_flags &= !FLAG_FRAGMENT_REUSE_INDEX;
         manifest.writer_feature_flags &= !FLAG_FRAGMENT_REUSE_INDEX;
+        if !has_retired_coverage {
+            Arc::make_mut(&mut manifest.fragments).push(Fragment::new(3));
+        }
         let mut segment = sample_index_metadata("id_idx");
         segment.fragment_bitmap = Some([0u32, 3].into_iter().collect());
         let transaction = Transaction::new(
@@ -3830,7 +3837,11 @@ mod tests {
         assert_eq!(prepared.original(), &[segment]);
         assert_eq!(
             prepared.prepared()[0].fragment_bitmap,
-            Some(RoaringBitmap::from_iter([3u32]))
+            Some(if has_retired_coverage {
+                RoaringBitmap::new()
+            } else {
+                RoaringBitmap::from_iter([3u32])
+            })
         );
     }
 
