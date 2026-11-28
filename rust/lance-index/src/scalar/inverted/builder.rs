@@ -11,9 +11,9 @@ use crate::scalar::inverted::tokenizer::LEGACY_BLOCK_SIZE;
 use crate::scalar::inverted::tokenizer::document_tokenizer::LanceTokenizer;
 #[cfg(test)]
 use crate::scalar::lance_format::LanceIndexStore;
-use crate::scalar::{IndexFile, IndexStore, OldIndexDataFilter};
+use crate::scalar::{CreatedIndex, IndexFile, IndexStore, OldIndexDataFilter};
 use crate::vector::graph::OrderedFloat;
-use crate::{progress::IndexBuildProgress, progress::noop_progress};
+use crate::{pbold, progress::IndexBuildProgress, progress::noop_progress};
 use arrow::array::AsArray;
 use arrow::datatypes;
 use arrow_array::{Array, BinaryArray, RecordBatch};
@@ -294,6 +294,22 @@ impl InvertedIndexBuilder {
     pub fn with_progress(mut self, progress: Arc<dyn IndexBuildProgress>) -> Self {
         self.progress = progress;
         self
+    }
+
+    pub(super) fn into_created_index(
+        self,
+        files: Vec<IndexFile>,
+        index_version: u32,
+    ) -> Result<CreatedIndex> {
+        // The stored tokenizer parameters omit the posting format. Report the version
+        // this builder wrote, including when it preserved a non-default source format.
+        let params = self.params.format_version(self.format_version);
+        let details = pbold::InvertedIndexDetails::try_from(&params)?;
+        Ok(CreatedIndex {
+            index_details: prost_types::Any::from_msg(&details)?,
+            index_version,
+            files,
+        })
     }
 
     pub async fn update(

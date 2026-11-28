@@ -85,7 +85,6 @@ use super::{
     query::*,
     scorer::{B, IndexBM25Scorer, K1, Scorer, idf},
 };
-use crate::pbold;
 use crate::progress::IndexBuildProgress;
 use crate::scalar::inverted::scorer::MemBM25Scorer;
 use crate::scalar::inverted::tokenizer::document_tokenizer::LanceTokenizer;
