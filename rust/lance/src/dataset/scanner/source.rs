@@ -1182,7 +1182,7 @@ impl Scanner {
             file_reader_options: self.resolved_file_reader_options(),
             parallelism_cap: None,
         };
-        let fragment_id_column = if with_make_deletions_null {
+        let fragment_id_column = if options.with_make_deletions_null {
             self.fragment_id_column
                 .as_deref()
                 .map(FragmentIdColumn::new)
