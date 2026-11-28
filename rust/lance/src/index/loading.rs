@@ -14,6 +14,8 @@ use std::time::Instant;
 
 use arrow_schema::{DataType, Field as ArrowField, Fields};
 use async_trait::async_trait;
+use datafusion::common::tree_node::TreeNode;
+use datafusion::logical_expr::Expr;
 use lance_core::cache::{CacheKey, CacheKeySchema, KeyBuilder};
 use lance_core::datatypes::{Field, Schema as LanceSchema};
 use lance_core::utils::tracing::{
@@ -50,7 +52,9 @@ use lance_io::utils::{
     CachedFileSize, read_last_block, read_message, read_message_from_buf, read_metadata_offset,
     read_version,
 };
-use lance_table::format::{Fragment, IndexMetadata, Manifest, SelfDescribingFileReader};
+use lance_table::format::{
+    Fragment, IndexDetailsType, IndexMetadata, Manifest, SelfDescribingFileReader,
+};
 use roaring::RoaringBitmap;
 use tracing::{info, instrument};
 use uuid::Uuid;
@@ -584,6 +588,7 @@ async fn resolve_query_parsers(
     dataset: &Dataset,
     plugin_for: &impl Fn(&IndexDetails) -> Result<&dyn ScalarIndexPlugin>,
     mut pending: Vec<PendingQueryParser<'_>>,
+    filter: Option<&Expr>,
     indexed_fields: &mut Vec<IndexedFieldParser>,
     fragment_bitmaps: &mut HashMap<(String, String), Option<RoaringBitmap>>,
 ) -> Result<()> {
@@ -647,7 +652,31 @@ async fn resolve_query_parsers(
         let Some(parser) = pending.parser else {
             continue;
         };
-        union_fragment_bitmap(fragment_bitmaps, &pending.field_path, pending.index);
+        if dataset.manifest().uses_stable_row_ids()
+            && pending.index.legacy_json_coverage_requires_verification()
+        {
+            if let Some(filter) = filter
+                && !filter.exists(|expr| {
+                    Ok(parser
+                        .is_valid_reference(expr, &pending.column_type)
+                        .is_some())
+                })?
+            {
+                continue;
+            }
+            let coverage = dataset
+                .verified_legacy_json_query_fragments(pending.index)
+                .await
+                .unwrap_or_default();
+            if coverage.is_empty() {
+                continue;
+            }
+            let mut segment = pending.index.clone();
+            segment.fragment_bitmap = Some(coverage);
+            union_fragment_bitmap(fragment_bitmaps, &pending.field_path, &segment);
+        } else {
+            union_fragment_bitmap(fragment_bitmaps, &pending.field_path, pending.index);
+        }
         indexed_fields.push((pending.field_path, (pending.column_type, parser)));
     }
     Ok(())
@@ -665,7 +694,14 @@ async fn recover_missing_parsers(
         if pending[position].parser.is_some() {
             continue;
         }
-        let recovered = recover_one_query_parser(dataset, plugin_for, &pending[position]).await;
+        let segment = &pending[position];
+        let recovered = match plugin_for(&segment.index_details) {
+            Ok(plugin) => {
+                recover_scalar_query_domain(dataset, segment.index, &segment.index_details, plugin)
+                    .await
+            }
+            Err(error) => Err(error),
+        };
         match recovered {
             Ok(Some((parser, domain))) => {
                 let segment = &mut pending[position];
@@ -697,24 +733,91 @@ async fn recover_missing_parsers(
     }
 }
 
-async fn recover_one_query_parser(
+pub(super) async fn recover_scalar_query_domain(
     dataset: &Dataset,
-    plugin_for: &impl Fn(&IndexDetails) -> Result<&dyn ScalarIndexPlugin>,
-    segment: &PendingQueryParser<'_>,
+    index: &IndexMetadata,
+    details: &IndexDetails,
+    plugin: &dyn ScalarIndexPlugin,
 ) -> Result<Option<(Box<dyn ScalarQueryParser>, QueryDomain)>> {
-    let plugin = plugin_for(&segment.index_details)?;
-    let store = Arc::new(LanceIndexStore::from_dataset_for_existing(dataset, segment.index).await?);
+    if plugin.query_domain_recovery_support(&details.0) == Some(false) {
+        return Ok(None);
+    }
+    let store = Arc::new(LanceIndexStore::from_dataset_for_existing(dataset, index).await?);
     plugin
         .recover_query_domain(
-            segment.index.name.clone(),
-            &segment.index_details.0,
-            u32::try_from(segment.index.index_version).unwrap_or(0),
+            index.name.clone(),
+            &details.0,
+            u32::try_from(index.index_version).unwrap_or(0),
             store,
         )
         .await
 }
 
 impl Dataset {
+    pub(crate) async fn scalar_index_info_for_filter(
+        &self,
+        expr: &Expr,
+        selected_segments: Option<&[IndexMetadata]>,
+        ignored_names: &HashSet<String>,
+        use_scalar_index: bool,
+    ) -> Result<ScalarIndexInfo> {
+        if !use_scalar_index {
+            return self
+                .scalar_index_info_for_segments_ignoring(&[], ignored_names)
+                .await;
+        }
+        let listed;
+        let indices = match selected_segments {
+            Some(segments) => segments,
+            None => {
+                listed = self.load_indices().await?;
+                listed.as_ref()
+            }
+        };
+        let json_names: HashSet<_> = indices
+            .iter()
+            .filter(|index| {
+                index.index_details.as_ref().is_some_and(|details| {
+                    IndexDetailsType::from_url(&details.type_url) == Some(IndexDetailsType::Json)
+                })
+            })
+            .map(|index| &index.name)
+            .collect();
+        if json_names.is_empty() {
+            return self
+                .scalar_index_info_for_segments_ignoring(indices, ignored_names)
+                .await;
+        }
+
+        // A name can span segments on different fields. Keep all of its
+        // segments if a referenced field could route through any one of them.
+        let columns = expr.column_refs();
+        let referenced_names = indices
+            .iter()
+            .filter(|index| {
+                json_names.contains(&index.name)
+                    && index.keyed_fields().iter().any(|field| {
+                        let root = self.schema().field_ancestry_by_id(*field);
+                        let path = self.schema().field_path(*field).ok();
+                        columns.iter().any(|column| {
+                            root.as_ref()
+                                .is_some_and(|ancestry| column.name == ancestry[0].name)
+                                || path.as_ref() == Some(&column.name)
+                        })
+                    })
+            })
+            .map(|index| &index.name)
+            .collect();
+        let mut ignored = ignored_names.clone();
+        ignored.extend(
+            json_names
+                .difference(&referenced_names)
+                .map(|name| (*name).clone()),
+        );
+        self.build_scalar_index_info(indices, &ignored, IndexDetails::get_plugin, Some(expr))
+            .await
+    }
+
     #[instrument(level = "trace", skip_all)]
     pub(crate) async fn scalar_index_info_ignoring(
         &self,
@@ -755,6 +858,17 @@ impl Dataset {
         indices: &[IndexMetadata],
         ignored_index_names: &HashSet<String>,
         plugin_for: impl Fn(&IndexDetails) -> Result<&dyn ScalarIndexPlugin>,
+    ) -> Result<ScalarIndexInfo> {
+        self.build_scalar_index_info(indices, ignored_index_names, plugin_for, None)
+            .await
+    }
+
+    async fn build_scalar_index_info(
+        &self,
+        indices: &[IndexMetadata],
+        ignored_index_names: &HashSet<String>,
+        plugin_for: impl Fn(&IndexDetails) -> Result<&dyn ScalarIndexPlugin>,
+        filter: Option<&Expr>,
     ) -> Result<ScalarIndexInfo> {
         let schema = self.schema();
         // Legacy V1 scans materialize index results in `MaterializeIndexExec`,
@@ -907,6 +1021,7 @@ impl Dataset {
             self,
             &plugin_for,
             pending_parsers,
+            filter,
             &mut indexed_fields,
             &mut fragment_bitmaps,
         )
@@ -1019,13 +1134,8 @@ impl Dataset {
         } else if let Some(files) = &index_meta.files {
             files.iter().any(|f| f.path == INDEX_FILE_NAME)
         } else {
-            let index_dir = self.indice_files_dir(&index_meta)?;
-            let index_file = index_dir
-                .clone()
-                .join(uuid.to_string())
-                .join(INDEX_FILE_NAME);
-            let object_store = self.object_store_for_index(&index_meta).await?;
-            object_store.exists(&index_file).await?
+            self.legacy_index_has_file(&index_meta, &[INDEX_FILE_NAME])
+                .await?
         };
 
         if is_vector_index {
@@ -1039,6 +1149,24 @@ impl Dataset {
                 .await?;
             Ok(index.as_index())
         }
+    }
+
+    /// Probe a legacy segment without a file inventory in its own base store.
+    pub(super) async fn legacy_index_has_file(
+        &self,
+        segment: &IndexMetadata,
+        names: &[&str],
+    ) -> Result<bool> {
+        let directory = self
+            .indice_files_dir(segment)?
+            .join(segment.uuid.to_string());
+        let store = self.object_store_for_index(segment).await?;
+        for name in names {
+            if store.exists(&directory.clone().join(*name)).await? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     #[instrument(level = "debug", skip_all)]
@@ -1780,7 +1908,9 @@ impl DatasetIndexInternalExt for Dataset {
     }
 
     async fn unindexed_fragments(&self, name: &str) -> Result<Vec<Fragment>> {
-        let indices = self.load_indices_by_name(name).await?;
+        let indices = self
+            .load_indices_with_verified_legacy_json_coverage(name)
+            .await?;
         let mut total_fragment_bitmap = RoaringBitmap::new();
         for idx in indices.iter() {
             total_fragment_bitmap |= idx.fragment_bitmap.as_ref().ok_or(Error::index(
@@ -1796,7 +1926,9 @@ impl DatasetIndexInternalExt for Dataset {
     }
 
     async fn indexed_fragments(&self, name: &str) -> Result<Vec<Vec<Fragment>>> {
-        let indices = self.load_indices_by_name(name).await?;
+        let indices = self
+            .load_indices_with_verified_legacy_json_coverage(name)
+            .await?;
         indices
             .iter()
             .map(|index| {

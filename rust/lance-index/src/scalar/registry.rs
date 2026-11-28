@@ -299,6 +299,14 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
         None
     }
 
+    /// Whether the persisted format can supply a missing query domain.
+    /// `None` means the plugin does not declare a recovery capability, so
+    /// callers may attempt recovery but cannot infer coverage from metadata.
+    /// A positive declaration does not guarantee that the files are readable.
+    fn query_domain_recovery_support(&self, _index_details: &prost_types::Any) -> Option<bool> {
+        None
+    }
+
     /// [`Self::new_query_parser`] for a segment whose persisted details do not
     /// declare the [`QueryDomain`] its keys were built for.
     ///

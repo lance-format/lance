@@ -572,21 +572,17 @@ impl Scanner {
             let expr = planner.optimize_expr(
                 filter.to_datafusion(self.dataset.schema(), filter_schema.as_ref())?,
             )?;
-            let index_info = match self.scalar_index_selection.as_ref() {
-                Some(selection) => {
-                    self.dataset
-                        .scalar_index_info_for_segments_ignoring(
-                            selection.segments.as_ref(),
-                            &self.ignored_scalar_index_names,
-                        )
-                        .await?
-                }
-                None => {
-                    self.dataset
-                        .scalar_index_info_ignoring(&self.ignored_scalar_index_names)
-                        .await?
-                }
-            };
+            let index_info = self
+                .dataset
+                .scalar_index_info_for_filter(
+                    &expr,
+                    self.scalar_index_selection
+                        .as_ref()
+                        .map(|selection| selection.segments.as_slice()),
+                    &self.ignored_scalar_index_names,
+                    use_scalar_index,
+                )
+                .await?;
             let filter_plan = create_filter_plan(expr.clone(), &index_info, use_scalar_index)?;
 
             // This tests if any of the fragments are missing the physical_rows property (old style)

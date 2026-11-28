@@ -24,6 +24,7 @@ use lance_io::traits::Reader;
 use lance_io::utils::{CachedFileSize, read_last_block, read_version};
 use lance_linalg::distance::DistanceType;
 use lance_table::format::IndexMetadata;
+use prost::Message;
 use serde::Serialize;
 
 use lance_index::vector::bq::{RQBuildParams, RQRotationType};
@@ -245,7 +246,7 @@ pub fn apply_runtime_hints(hints: &HashMap<String, String>, params: &mut VectorI
 /// Returns `None` for legacy indices (empty details) or if the proto is malformed.
 /// The rows-per-partition target the index was created with, if it was recorded.
 pub fn target_partition_size_from_details(details: &prost_types::Any) -> Option<usize> {
-    let details = details.to_msg::<VectorIndexDetails>().ok()?;
+    let details = decode_vector_details(details).ok().flatten()?;
     (details.target_partition_size > 0).then_some(details.target_partition_size as usize)
 }
 
@@ -253,12 +254,9 @@ pub fn target_partition_size_from_details(details: &prost_types::Any) -> Option<
 // TODO: wire into a general `Dataset::rebuild_index` method so users can
 // regenerate an index from its stored details (e.g. after file corruption).
 pub fn vector_params_from_details(details: &prost_types::Any) -> Option<VectorIndexParams> {
-    if details.value.is_empty() {
-        return None;
-    }
-    let d = details.to_msg::<VectorIndexDetails>().ok()?;
+    let d = decode_vector_details(details).ok().flatten()?;
 
-    let metric = DistanceType::from(VectorMetricType::try_from(d.metric_type).ok()?);
+    let metric = recorded_vector_metric(&d)?;
 
     let mut ivf = IvfBuildParams::default();
     if d.target_partition_size > 0 {
@@ -341,25 +339,52 @@ pub fn vector_params_from_details(details: &prost_types::Any) -> Option<VectorIn
 /// * `Some(DistanceType)` if details are present and valid
 /// * `None` if details are absent or empty (legacy index without details)
 pub fn metric_type_from_index_metadata(index: &IndexMetadata) -> Option<DistanceType> {
-    let index_details = index.index_details.as_ref()?;
-
-    // Empty value bytes indicates legacy index that needs to be opened for details
-    if index_details.value.is_empty() {
-        return None;
-    }
-
-    let details = index_details.to_msg::<VectorIndexDetails>().ok()?;
-
-    // Try to convert the metric_type field. This works even if metric_type is 0 (L2),
-    // since L2 is a valid metric type.
-    let metric_enum = VectorMetricType::try_from(details.metric_type).ok()?;
-    Some(DistanceType::from(metric_enum))
+    let details = decode_vector_details(index.index_details.as_ref()?)
+        .ok()
+        .flatten()?;
+    recorded_vector_metric(&details)
 }
 
-/// Returns true if the proto value represents a "truly empty" VectorIndexDetails
-/// (i.e., a legacy index that was created before we populated this field).
-fn is_empty_vector_details(details: &prost_types::Any) -> bool {
-    details.value.is_empty()
+pub(in crate::index) fn recorded_vector_metric(
+    details: &VectorIndexDetails,
+) -> Option<DistanceType> {
+    // Zero is the recorded L2 metric in a populated payload.
+    VectorMetricType::try_from(details.metric_type)
+        .ok()
+        .map(DistanceType::from)
+}
+
+pub(in crate::index) fn is_vector_details_type(type_url: &str) -> bool {
+    type_url.rsplit_once('/').is_some_and(|(_, name)| {
+        name.eq_ignore_ascii_case("lance.index.pb.VectorIndexDetails")
+            // MemWAL flush briefly used this pre-pb package name.
+            || name.eq_ignore_ascii_case("lance.index.VectorIndexDetails")
+    }) || is_legacy_vector_details_marker(type_url)
+}
+
+fn is_legacy_vector_details_marker(type_url: &str) -> bool {
+    type_url
+        .rsplit_once('/')
+        .is_some_and(|(_, name)| name.eq_ignore_ascii_case("lance.table.VectorIndexDetails"))
+}
+
+pub(in crate::index) fn decode_vector_details(
+    details: &prost_types::Any,
+) -> Result<Option<VectorIndexDetails>> {
+    if !is_vector_details_type(&details.type_url) {
+        return Err(Error::index(format!(
+            "Unrecognized vector details type {}",
+            details.type_url
+        )));
+    }
+    // The released table message had no fields. Its URL identifies the
+    // family, while the index files supply the physical configuration.
+    if is_legacy_vector_details_marker(&details.type_url) || details.value.is_empty() {
+        return Ok(None);
+    }
+    VectorIndexDetails::decode(details.value.as_slice())
+        .map(Some)
+        .map_err(|error| Error::index(format!("Failed to deserialize VectorIndexDetails: {error}")))
 }
 
 /// Returns true if this is a vector index whose details need to be inferred from disk.
@@ -374,7 +399,10 @@ pub fn needs_vector_details_inference(
     schema: &lance_core::datatypes::Schema,
 ) -> bool {
     match &index.index_details {
-        Some(d) => d.type_url.ends_with("VectorIndexDetails") && d.value.is_empty(),
+        Some(d) => {
+            is_legacy_vector_details_marker(&d.type_url)
+                || (is_vector_details_type(&d.type_url) && d.value.is_empty())
+        }
         None => index.fields.first().is_some_and(|&field_id| {
             schema
                 .field_by_id(field_id)
@@ -387,7 +415,7 @@ pub fn needs_vector_details_inference(
 /// Infer missing vector index details for all indices that need it.
 ///
 /// Runs inference once per unique index name, concurrently across names.
-/// Applies the inferred details back to all matching indices in the slice.
+/// Applies the inferred details to matching segments with missing details.
 pub async fn infer_missing_vector_details(dataset: &Dataset, indices: &mut [IndexMetadata]) {
     let schema = dataset.schema();
     let needs_inference: HashMap<&str, &IndexMetadata> = indices
@@ -416,7 +444,9 @@ pub async fn infer_missing_vector_details(dataset: &Dataset, indices: &mut [Inde
         })
         .collect();
     for index in indices.iter_mut() {
-        if let Some(details) = inferred.get(&index.name) {
+        if needs_vector_details_inference(index, schema)
+            && let Some(details) = inferred.get(&index.name)
+        {
             index.index_details = Some(details.clone());
         }
     }
@@ -424,13 +454,13 @@ pub async fn infer_missing_vector_details(dataset: &Dataset, indices: &mut [Inde
 
 /// Derive a human-readable index type string from VectorIndexDetails.
 pub fn derive_vector_index_type(details: &prost_types::Any) -> String {
-    if is_empty_vector_details(details) {
-        return "Vector".to_string();
-    }
-
-    let Ok(d) = details.to_msg::<VectorIndexDetails>() else {
+    let Ok(Some(details)) = decode_vector_details(details) else {
         return "Vector".to_string();
     };
+    decoded_vector_index_type(&details)
+}
+
+pub(in crate::index) fn decoded_vector_index_type(d: &VectorIndexDetails) -> String {
     let mut index_type = "IVF_".to_string();
     if d.hnsw_index_config.is_some() {
         index_type.push_str("HNSW_");
@@ -446,14 +476,21 @@ pub fn derive_vector_index_type(details: &prost_types::Any) -> String {
 
 /// Serialize VectorIndexDetails as a JSON string.
 pub fn vector_details_as_json(details: &prost_types::Any) -> Result<String> {
-    if is_empty_vector_details(details) {
+    let Some(details) = decode_vector_details(details)? else {
         return Ok("{}".to_string());
-    }
+    };
+    serde_json::to_string(&vector_details_json(details))
+        .map_err(|error| Error::index(format!("Failed to serialize: {error}")))
+}
 
-    let d = details
-        .to_msg::<VectorIndexDetails>()
-        .map_err(|e| Error::index(format!("Failed to deserialize VectorIndexDetails: {}", e)))?;
+pub(in crate::index) fn vector_details_value(
+    details: VectorIndexDetails,
+) -> Result<serde_json::Value> {
+    serde_json::to_value(vector_details_json(details))
+        .map_err(|error| Error::index(format!("Failed to serialize: {error}")))
+}
 
+fn vector_details_json(d: VectorIndexDetails) -> VectorDetailsJson {
     let metric_type = match VectorMetricType::try_from(d.metric_type) {
         Ok(VectorMetricType::L2) => "L2",
         Ok(VectorMetricType::Cosine) => "COSINE",
@@ -489,7 +526,7 @@ pub fn vector_details_as_json(details: &prost_types::Any) -> Result<String> {
         }
     });
 
-    let json = VectorDetailsJson {
+    VectorDetailsJson {
         metric_type,
         target_partition_size: if d.target_partition_size > 0 {
             Some(d.target_partition_size)
@@ -499,9 +536,7 @@ pub fn vector_details_as_json(details: &prost_types::Any) -> Result<String> {
         hnsw,
         compression,
         runtime_hints: d.runtime_hints,
-    };
-
-    serde_json::to_string(&json).map_err(|e| Error::index(format!("Failed to serialize: {}", e)))
+    }
 }
 
 /// Infer VectorIndexDetails from index files on disk.

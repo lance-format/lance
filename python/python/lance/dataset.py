@@ -117,7 +117,7 @@ if TYPE_CHECKING:
     from . import mem_wal
     from ._dataset.index import Index, IndexInformation
     from .commit import CommitLock
-    from .lance.indices import IndexDescription
+    from .lance.indices import IndexDescription, IndexScanStatistics
     from .progress import FragmentWriteProgress, IndexProgress
     from .types import ReaderLike
 
@@ -513,6 +513,39 @@ class LanceDataset(pa.dataset.Dataset):
         index.
         """
         return self._ds.remap_row_addrs(addrs)
+
+    def index_scan_statistics(
+        self, index_name: str, *, include_segment_stats: bool = False
+    ) -> IndexScanStatistics:
+        """Inspect a named data index at this dataset version.
+
+        The default reads only the pinned manifest. Unknown measurements are
+        returned as ``None``. An empty ``covered_fragment_ids`` bitmap means
+        the segment covers zero fragments. Set ``include_segment_stats=True``
+        to resolve fragment-reuse coverage, verify legacy JSON and legacy
+        vector address coverage, and inspect IVF models. This may read index
+        files, including partitions when verifying legacy vector coverage.
+        For overlapping legacy vector segments that store stable row IDs,
+        coverage remains unknown even in detailed mode. Detailed statistics
+        return one entry count per partition of each eligible vector segment.
+        Each data byte total counts a file once by storage base and path.
+        JSON details report ``target_index_type`` and include
+        ``target_index_version`` when the wrapper recorded a version.
+
+        Raises
+        ------
+        KeyError
+            If the name is absent from the snapshot.
+
+        Examples
+        --------
+        >>> stats = dataset.index_scan_statistics("embedding_idx")  # doctest: +SKIP
+        >>> stats.dataset_version == dataset.version  # doctest: +SKIP
+        True
+        """
+        return self._ds.index_scan_statistics(
+            index_name, include_segment_stats=include_segment_stats
+        )
 
     def index_statistics(self, index_name: str) -> Dict[str, Any]:
         warnings.warn(

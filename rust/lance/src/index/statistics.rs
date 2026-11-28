@@ -134,7 +134,7 @@ fn is_externally_maintained_index(metadata: &IndexMetadata) -> bool {
     })
 }
 
-fn empty_fragment_bitmap_has_unknown_coverage(metadata: &IndexMetadata) -> bool {
+pub(super) fn empty_fragment_bitmap_has_unknown_coverage(metadata: &IndexMetadata) -> bool {
     let Some(details) = metadata.index_details.as_ref() else {
         // Preserve best-effort behavior for legacy descriptions without details.
         return false;

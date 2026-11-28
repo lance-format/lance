@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     sync::{Arc, LazyLock, Mutex, OnceLock},
 };
 
 use lance_core::{Error, Result};
+use lance_table::format::index_details_type_name;
 use prost::Name;
 
 use crate::{
@@ -115,7 +116,7 @@ impl PluginRegistrations {
             )));
         }
         if builtins.plugins.contains_key(&name)
-            || builtins.details_type_names.contains(&details_type_name)
+            || builtins.details_type_names.contains_key(&details_type_name)
             || self
                 .plugins
                 .iter()
@@ -160,11 +161,6 @@ fn frozen_registrations() -> &'static PluginRegistrations {
     })
 }
 
-fn details_type_name(type_url: &str) -> Option<&str> {
-    let (_, name) = type_url.rsplit_once('/')?;
-    (!name.is_empty() && !name.starts_with('.')).then_some(name)
-}
-
 fn builtin_scalar_details_are_known(details_type_name: &str) -> bool {
     let Some((package, name)) = details_type_name.rsplit_once('.') else {
         return false;
@@ -180,7 +176,7 @@ fn builtin_scalar_details_are_known(details_type_name: &str) -> bool {
 /// Check scalar reader availability without constructing a plugin registry.
 #[doc(hidden)]
 pub fn scalar_index_details_are_known(type_url: &str) -> bool {
-    let Some(type_name) = details_type_name(type_url) else {
+    let Some(type_name) = index_details_type_name(type_url) else {
         return false;
     };
     // Scalar index metadata used to construct the registry on first access.
@@ -323,7 +319,7 @@ pub fn display_type_from_url(type_url: &str) -> &str {
 /// A registry of index plugins
 pub struct IndexPluginRegistry {
     plugins: HashMap<String, Box<dyn ScalarIndexPlugin>>,
-    details_type_names: HashSet<String>,
+    details_type_names: HashMap<String, String>,
 }
 
 impl IndexPluginRegistry {
@@ -350,15 +346,18 @@ impl IndexPluginRegistry {
         &mut self,
     ) {
         let plugin_name = self.get_plugin_name_from_details_name(DetailsType::NAME);
+        let canonical = DetailsType::full_name();
         self.details_type_names
-            .insert(DetailsType::full_name().to_ascii_lowercase());
+            .insert(canonical.to_ascii_lowercase(), canonical);
         self.plugins
             .insert(plugin_name, Box::new(PluginType::default()));
     }
 
     fn add_details_type_alias<DetailsType: prost::Name>(&mut self, package: &str) {
-        self.details_type_names
-            .insert(format!("{}.{}", package, DetailsType::NAME).to_ascii_lowercase());
+        self.details_type_names.insert(
+            format!("{}.{}", package, DetailsType::NAME).to_ascii_lowercase(),
+            DetailsType::full_name(),
+        );
     }
 
     /// Create a registry with builtin and startup-registered plugins.
@@ -421,7 +420,7 @@ impl IndexPluginRegistry {
     fn with_builtin_plugins() -> Self {
         let mut registry = Self {
             plugins: HashMap::new(),
-            details_type_names: HashSet::new(),
+            details_type_names: HashMap::new(),
         };
         registry.add_plugin::<pbold::BTreeIndexDetails, BTreeIndexPlugin>();
         registry.add_plugin::<pbold::BitmapIndexDetails, BitmapIndexPlugin>();
@@ -456,8 +455,17 @@ impl IndexPluginRegistry {
     /// message name after the final slash. The table format requires index type
     /// URL comparisons to be case-insensitive.
     pub fn supports_details(&self, details: &prost_types::Any) -> bool {
-        details_type_name(&details.type_url)
-            .is_some_and(|name| self.details_type_names.contains(&name.to_ascii_lowercase()))
+        self.canonical_details_type_name(&details.type_url)
+            .is_some()
+    }
+
+    /// Return the canonical protobuf message name for a registered type URL.
+    /// An authority or an explicitly registered alias does not change this identity.
+    pub fn canonical_details_type_name(&self, type_url: &str) -> Option<&str> {
+        let name = index_details_type_name(type_url)?;
+        self.details_type_names
+            .get(&name.to_ascii_lowercase())
+            .map(String::as_str)
     }
 
     /// Get an index plugin suitable for training an index with the given parameters
@@ -492,6 +500,7 @@ impl IndexPluginRegistry {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::sync::Barrier;
 
     use arrow_schema::{DataType, Field};
@@ -543,7 +552,14 @@ mod tests {
                 }
             }
         }
-        assert_eq!(details_names, registry.details_type_names);
+        assert_eq!(
+            details_names,
+            registry
+                .details_type_names
+                .keys()
+                .cloned()
+                .collect::<HashSet<_>>()
+        );
     }
 
     #[test]

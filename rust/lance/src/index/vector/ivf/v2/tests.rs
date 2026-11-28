@@ -7927,6 +7927,19 @@ async fn test_pq_storage_backwards_compat() {
     // Just make sure we can query the index.
     let dataset = Dataset::open(test_uri).await.unwrap();
     let query_vec = Float32Array::from(vec![0_f32; 32]);
+    let indices = dataset.load_indices_by_name("vec_idx").await.unwrap();
+    assert_eq!(indices.len(), 1);
+    let mut fast_scan = dataset.scan();
+    fast_scan
+        .nearest("vec", &query_vec, 1)
+        .unwrap()
+        .fast_search();
+    let plan = fast_scan.explain_plan(false).await.unwrap();
+    assert!(
+        plan.contains("ANNSubIndex") || plan.contains("ANNIvfPartition"),
+        "{plan}"
+    );
+    assert_eq!(fast_scan.try_into_batch().await.unwrap().num_rows(), 1);
     let search_result = dataset
         .scan()
         .nearest("vec", &query_vec, 5)

@@ -13,6 +13,7 @@ use futures::StreamExt;
 use lance_core::deepsize::DeepSizeOf;
 use lance_io::object_store::ObjectStore;
 use object_store::path::Path;
+use prost::Message;
 use roaring::RoaringBitmap;
 use uuid::Uuid;
 
@@ -130,6 +131,145 @@ pub struct IndexMetadata {
     pub metadata: HashMap<String, String>,
 }
 
+/// Built-in index details identities used by readers and rewrite operations.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IndexDetailsType {
+    BTree,
+    Bitmap,
+    LabelList,
+    NGram,
+    RTree,
+    MinHashLsh,
+    Json,
+    ZoneMap,
+    BloomFilter,
+    Fm,
+    ListElement,
+    Inverted,
+    Vector,
+}
+
+impl IndexDetailsType {
+    /// Recognize the complete case-insensitive protobuf name, including
+    /// explicitly supported historical spellings.
+    pub fn from_url(type_url: &str) -> Option<Self> {
+        use IndexDetailsType::*;
+
+        Some(
+            match index_details_type_name(type_url)?
+                .to_ascii_lowercase()
+                .as_str()
+            {
+                "lance.table.btreeindexdetails" | "lance.index.pb.btreeindexdetails" => BTree,
+                "lance.table.bitmapindexdetails" | "lance.index.pb.bitmapindexdetails" => Bitmap,
+                "lance.table.labellistindexdetails" | "lance.index.pb.labellistindexdetails" => {
+                    LabelList
+                }
+                "lance.table.ngramindexdetails" | "lance.index.pb.ngramindexdetails" => NGram,
+                "lance.index.pb.rtreeindexdetails" => RTree,
+                "lance.index.pb.minhashlshindexdetails" => MinHashLsh,
+                "lance.index.pb.jsonindexdetails" => Json,
+                "lance.table.zonemapindexdetails" | "lance.index.pb.zonemapindexdetails" => ZoneMap,
+                "lance.index.pb.bloomfilterindexdetails" => BloomFilter,
+                "lance.index.pb.fmindexdetails" => Fm,
+                "lance.index.pb.listelementindexdetails" => ListElement,
+                "lance.table.invertedindexdetails" | "lance.index.pb.invertedindexdetails" => {
+                    Inverted
+                }
+                "lance.table.vectorindexdetails"
+                | "lance.index.vectorindexdetails"
+                | "lance.index.pb.vectorindexdetails" => Vector,
+                _ => return None,
+            },
+        )
+    }
+
+    /// The target version assumed by a legacy JSON wrapper for index types
+    /// that migrated from row IDs to physical addresses.
+    pub fn legacy_json_target_version(self) -> Option<u32> {
+        match self {
+            Self::BTree | Self::Bitmap | Self::NGram | Self::RTree => Some(0),
+            Self::LabelList => Some(1),
+            _ => None,
+        }
+    }
+
+    fn row_address_version(self) -> Option<i32> {
+        use IndexDetailsType::*;
+
+        // These are the persisted format versions at which each index began
+        // storing physical addresses. JSON's version reflects its target's domain.
+        match self {
+            ZoneMap | BloomFilter | Fm | ListElement => Some(0),
+            BTree | Bitmap | NGram | RTree | MinHashLsh | Json => Some(1),
+            LabelList => Some(2),
+            Inverted | Vector => None,
+        }
+    }
+}
+
+/// Extract the complete protobuf message name from an index details type URL.
+pub fn index_details_type_name(type_url: &str) -> Option<&str> {
+    let (_, name) = type_url.rsplit_once('/')?;
+    (!name.is_empty() && !name.starts_with('.')).then_some(name)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RowIdDomain {
+    StableIds,
+    Addresses,
+}
+
+// The fields needed from lance.index.pb.JsonIndexDetails in protos/index.proto.
+// lance-index depends on lance-table, so the transaction layer decodes only
+// this wire projection of the registered message.
+#[derive(prost::Message)]
+struct JsonTargetFormat {
+    #[prost(message, optional, tag = "2")]
+    target_details: Option<prost_types::Any>,
+    #[prost(uint32, optional, tag = "4")]
+    target_index_version: Option<u32>,
+}
+
+fn row_id_domain(details: &prost_types::Any, mut version: i32) -> Option<RowIdDomain> {
+    // Peel off v0 wrappers until the backing format supplies the domain.
+    // Newer wrappers stamp the address domain in their own version.
+    let mut target = None;
+    loop {
+        if version < 0 {
+            return None;
+        }
+        let current = target.as_ref().unwrap_or(details);
+        let kind = IndexDetailsType::from_url(&current.type_url)?;
+        if kind != IndexDetailsType::Json || version != 0 {
+            return Some(
+                if kind
+                    .row_address_version()
+                    .is_some_and(|start| version >= start)
+                {
+                    RowIdDomain::Addresses
+                } else {
+                    RowIdDomain::StableIds
+                },
+            );
+        }
+        let decoded = JsonTargetFormat::decode(current.value.as_slice()).ok()?;
+        let next = decoded.target_details?;
+        let next_kind = IndexDetailsType::from_url(&next.type_url)?;
+        if next_kind == IndexDetailsType::Vector {
+            return None;
+        }
+        version = i32::try_from(
+            decoded
+                .target_index_version
+                .or_else(|| next_kind.legacy_json_target_version())
+                .unwrap_or(0),
+        )
+        .ok()?;
+        target = Some(next);
+    }
+}
+
 /// True when an index segment with these details, persisted at `index_version`,
 /// reports matches as physical row addresses rather than row ids.
 ///
@@ -137,36 +277,9 @@ pub struct IndexMetadata {
 /// index (e.g. JSON) can classify the target index it holds, which has details and
 /// a version but no [`IndexMetadata`] of its own.
 pub fn index_details_are_row_addrs(details: &prost_types::Any, index_version: i32) -> bool {
-    let is_fm = details
-        .type_url
-        .rsplit_once('/')
-        .is_some_and(|(_, details_type_name)| {
-            details_type_name.eq_ignore_ascii_case("lance.index.pb.FMIndexDetails")
-        });
-    let is_btree_addr_domain = IndexMetadata::is_btree_addr_domain(details, index_version);
-    let is_bitmap_addr_domain = IndexMetadata::is_bitmap_addr_domain(details, index_version);
-    let is_label_list_addr_domain =
-        IndexMetadata::is_label_list_addr_domain(details, index_version);
-    let is_ngram_addr_domain = IndexMetadata::is_ngram_addr_domain(details, index_version);
-    let is_rtree_addr_domain = IndexMetadata::is_rtree_addr_domain(details, index_version);
-    let is_minhash_addr_domain = IndexMetadata::is_minhash_addr_domain(details, index_version);
-    // A JSON index takes its domain from the target index it wraps. It is
-    // stamped with format version 1
-    // (`lance_index::scalar::json::JSON_ROW_ADDR_DOMAIN_VERSION`) exactly
-    // when that target stores row addresses, so the wrapper's own version
-    // answers this without decoding the nested target details.
-    let is_json_addr_domain = details.type_url.ends_with("JsonIndexDetails") && index_version >= 1;
-    details.type_url.ends_with("ZoneMapIndexDetails")
-        || details.type_url.ends_with("BloomFilterIndexDetails")
-        || is_fm
-        || IndexMetadata::is_list_element(details)
-        || is_btree_addr_domain
-        || is_bitmap_addr_domain
-        || is_label_list_addr_domain
-        || is_ngram_addr_domain
-        || is_rtree_addr_domain
-        || is_minhash_addr_domain
-        || is_json_addr_domain
+    IndexDetailsType::from_url(&details.type_url)
+        .and_then(IndexDetailsType::row_address_version)
+        .is_some_and(|version| index_version >= version)
 }
 
 impl IndexMetadata {
@@ -247,80 +360,21 @@ impl IndexMetadata {
     /// of rewritten rows instead of being assumed to store stable row IDs.
     /// Missing details retain the historical native-index behavior.
     pub(crate) fn can_follow_stable_row_ids(&self) -> bool {
-        if self.results_are_row_addrs() {
-            return false;
-        }
         let Some(details) = &self.index_details else {
             return true;
         };
-        let type_url = details.type_url.to_ascii_lowercase();
-        let Some((package, name)) = type_url
-            .rsplit_once('/')
-            .and_then(|(_, name)| name.rsplit_once('.'))
-        else {
-            return false;
-        };
-        match (package, name) {
-            ("lance.table" | "lance.index.pb", "btreeindexdetails") => self.index_version < 1,
-            ("lance.table" | "lance.index.pb", "bitmapindexdetails") => self.index_version < 1,
-            ("lance.table" | "lance.index.pb", "labellistindexdetails") => self.index_version < 2,
-            ("lance.table" | "lance.index.pb", "ngramindexdetails") => self.index_version < 1,
-            ("lance.table" | "lance.index.pb", "invertedindexdetails") => true,
-            ("lance.index.pb", "rtreeindexdetails") => self.index_version < 1,
-            ("lance.index.pb", "minhashlshindexdetails") => self.index_version < 1,
-            ("lance.index.pb", "vectorindexdetails" | "jsonindexdetails") => true,
-            // MemWAL flush briefly emitted this native vector identity.
-            ("lance.index", "vectorindexdetails") => true,
-            _ => false,
-        }
+        row_id_domain(details, self.index_version) == Some(RowIdDomain::StableIds)
     }
 
-    // A BTree segment stores row addresses only from format version 1
-    // onward (`lance_index::scalar::btree::BTREE_ROW_ADDR_DOMAIN_VERSION`,
-    // kept in sync with this literal). A segment persisted before that
-    // by an older Lance version stores row ids directly and must not be
-    // reinterpreted as addresses.
-    fn is_btree_addr_domain(details: &prost_types::Any, index_version: i32) -> bool {
-        details.type_url.ends_with("BTreeIndexDetails") && index_version >= 1
-    }
-
-    // A bitmap segment stores row addresses only from format version 1 onward
-    fn is_bitmap_addr_domain(details: &prost_types::Any, index_version: i32) -> bool {
-        details.type_url.ends_with("BitmapIndexDetails") && index_version >= 1
-    }
-
-    // A label list segment stores row addresses only from format version 2 onward
-    fn is_label_list_addr_domain(details: &prost_types::Any, index_version: i32) -> bool {
-        details.type_url.ends_with("LabelListIndexDetails") && index_version >= 2
-    }
-
-    // A list-element segment wraps a B-tree that always stores row addresses
-    // (`lance_index::scalar::list_element`), at every format version.
-    fn is_list_element(details: &prost_types::Any) -> bool {
-        details
-            .type_url
-            .rsplit_once('/')
-            .is_some_and(|(_, details_type_name)| {
-                details_type_name.eq_ignore_ascii_case("lance.index.pb.ListElementIndexDetails")
+    /// Whether a stable-row-ID reader must verify this legacy JSON segment's
+    /// bitmap against its backing index. Older writers could transfer its
+    /// coverage as if the wrapper stored stable IDs.
+    pub fn legacy_json_coverage_requires_verification(&self) -> bool {
+        self.index_version == 0
+            && self.index_details.as_ref().is_some_and(|details| {
+                IndexDetailsType::from_url(&details.type_url) == Some(IndexDetailsType::Json)
+                    && !self.can_follow_stable_row_ids()
             })
-    }
-
-    // An NGram segment stores row addresses only from format version 1 onward
-    // (`lance_index::scalar::ngram::NGRAM_ROW_ADDR_DOMAIN_VERSION`).
-    fn is_ngram_addr_domain(details: &prost_types::Any, index_version: i32) -> bool {
-        details.type_url.ends_with("NGramIndexDetails") && index_version >= 1
-    }
-
-    // An RTree segment stores row addresses only from format version 1 onward
-    // (`lance_index::scalar::rtree::RTREE_ROW_ADDR_DOMAIN_VERSION`).
-    fn is_rtree_addr_domain(details: &prost_types::Any, index_version: i32) -> bool {
-        details.type_url.ends_with("RTreeIndexDetails") && index_version >= 1
-    }
-
-    // A MinHash LSH segment stores row addresses only from format version 1
-    // onward (`lance_index::scalar::minhash_lsh::MINHASH_LSH_ROW_ADDR_DOMAIN_VERSION`).
-    fn is_minhash_addr_domain(details: &prost_types::Any, index_version: i32) -> bool {
-        details.type_url.ends_with("MinHashLshIndexDetails") && index_version >= 1
     }
 
     /// True when this index both stores row addresses ([`Self::results_are_row_addrs`])
@@ -333,12 +387,20 @@ impl IndexMetadata {
     /// supported built-in address-domain formats without opening index files.
     pub fn supports_eager_remap(&self) -> bool {
         self.index_details.as_ref().is_some_and(|details| {
-            Self::is_btree_addr_domain(details, self.index_version)
-                || Self::is_bitmap_addr_domain(details, self.index_version)
-                || Self::is_label_list_addr_domain(details, self.index_version)
-                || Self::is_list_element(details)
-                || Self::is_ngram_addr_domain(details, self.index_version)
-                || Self::is_minhash_addr_domain(details, self.index_version)
+            let kind = IndexDetailsType::from_url(&details.type_url);
+            matches!(
+                kind,
+                Some(
+                    IndexDetailsType::BTree
+                        | IndexDetailsType::Bitmap
+                        | IndexDetailsType::LabelList
+                        | IndexDetailsType::ListElement
+                        | IndexDetailsType::NGram
+                        | IndexDetailsType::MinHashLsh
+                )
+            ) && kind
+                .and_then(IndexDetailsType::row_address_version)
+                .is_some_and(|version| self.index_version >= version)
         })
     }
 
@@ -1402,7 +1464,11 @@ mod tests {
     #[case::inverted("type.googleapis.com/lance.table.InvertedIndexDetails", false, true)]
     #[case::vector("type.googleapis.com/lance.index.pb.VectorIndexDetails", false, true)]
     #[case::vector_legacy("type.googleapis.com/lance.index.VectorIndexDetails", false, true)]
-    #[case::json("type.googleapis.com/lance.index.pb.JsonIndexDetails", false, true)]
+    #[case::json_without_target(
+        "type.googleapis.com/lance.index.pb.JsonIndexDetails",
+        false,
+        false
+    )]
     #[case::rtree("type.googleapis.com/lance.index.pb.RTreeIndexDetails", false, true)]
     #[case::minhash_lsh(
         "type.googleapis.com/lance.index.pb.MinHashLshIndexDetails",
@@ -1430,6 +1496,10 @@ mod tests {
 
     #[rstest]
     #[case::btree("type.googleapis.com/lance.table.BTreeIndexDetails", 1, true)]
+    #[case::btree_mixed_case("/LANCE.INDEX.PB.btreeindexdetails", 1, true)]
+    #[case::json("/lance.index.pb.JsonIndexDetails", 1, false)]
+    #[case::json_mixed_case("/LANCE.INDEX.PB.jsonindexdetails", 1, false)]
+    #[case::minhash_mixed_case("/LANCE.INDEX.PB.minhashlshindexdetails", 1, true)]
     #[case::ngram("type.googleapis.com/lance.table.NGramIndexDetails", 1, true)]
     // RTree cannot remap at all (`ScalarIndexPlugin::can_remap` is always
     // false), unlike every other address-domain type here.
@@ -1445,7 +1515,18 @@ mod tests {
         let mut metadata = index_metadata_with(vec![0], vec![]);
         metadata.index_details = Some(Arc::new(prost_types::Any {
             type_url: type_url.to_string(),
-            value: Vec::new(),
+            value: if IndexDetailsType::from_url(type_url) == Some(IndexDetailsType::Json) {
+                JsonTargetFormat {
+                    target_details: Some(prost_types::Any {
+                        type_url: "/lance.table.BTreeIndexDetails".into(),
+                        value: Vec::new(),
+                    }),
+                    target_index_version: None,
+                }
+                .encode_to_vec()
+            } else {
+                Vec::new()
+            },
         }));
 
         metadata.index_version = addr_domain_version - 1;
@@ -1481,25 +1562,72 @@ mod tests {
         assert!(metadata.supports_eager_remap());
     }
 
-    #[test]
-    fn test_results_are_row_addrs_json_is_version_gated() {
+    #[rstest]
+    #[case::zonemap("/lance.table.ZoneMapIndexDetails", None, Some(true))]
+    #[case::bloom("/lance.index.pb.BloomFilterIndexDetails", None, Some(true))]
+    #[case::fm("/lance.index.pb.FMIndexDetails", None, Some(true))]
+    #[case::legacy_btree("/LANCE.INDEX.PB.btreeindexdetails", None, Some(false))]
+    #[case::btree_with_addresses("/lance.table.BTreeIndexDetails", Some(1), Some(true))]
+    #[case::legacy_bitmap("/lance.table.BitmapIndexDetails", Some(0), Some(false))]
+    #[case::bitmap_with_addresses("/lance.table.BitmapIndexDetails", Some(1), Some(true))]
+    #[case::legacy_label_list("/lance.table.LabelListIndexDetails", None, Some(false))]
+    #[case::foreign("/foreign.ZoneMapIndexDetails", None, None)]
+    #[case::malformed_nested("/lance.index.pb.JsonIndexDetails", None, None)]
+    fn test_results_are_row_addrs_from_legacy_json_target(
+        #[case] target_url: &str,
+        #[case] target_version: Option<u32>,
+        #[case] address_domain: Option<bool>,
+    ) {
         let mut metadata = index_metadata_with(vec![0], vec![]);
         metadata.index_details = Some(Arc::new(prost_types::Any {
-            type_url: "type.googleapis.com/lance.index.pb.JsonIndexDetails".to_string(),
+            type_url: "/LANCE.INDEX.PB.jsonindexdetails".into(),
+            value: JsonTargetFormat {
+                target_details: Some(prost_types::Any {
+                    type_url: target_url.into(),
+                    value: Vec::new(),
+                }),
+                target_index_version: target_version,
+            }
+            .encode_to_vec(),
+        }));
+        assert_eq!(
+            metadata
+                .index_details
+                .as_deref()
+                .and_then(|details| row_id_domain(details, metadata.index_version)),
+            address_domain.map(|is_address| {
+                if is_address {
+                    RowIdDomain::Addresses
+                } else {
+                    RowIdDomain::StableIds
+                }
+            })
+        );
+        assert_eq!(
+            metadata.can_follow_stable_row_ids(),
+            address_domain == Some(false)
+        );
+        assert_eq!(
+            metadata.legacy_json_coverage_requires_verification(),
+            address_domain != Some(false)
+        );
+        assert!(!metadata.supports_eager_remap());
+    }
+
+    #[rstest]
+    #[case::btree("/foreign.BTreeIndexDetails")]
+    #[case::json("/foreign.JsonIndexDetails")]
+    #[case::minhash("/foreign.MinHashLshIndexDetails")]
+    fn test_results_are_row_addrs_foreign_details(#[case] type_url: &str) {
+        let mut metadata = index_metadata_with(vec![0], vec![]);
+        metadata.index_details = Some(Arc::new(prost_types::Any {
+            type_url: type_url.into(),
             value: Vec::new(),
         }));
-
-        metadata.index_version = 0;
-        assert!(
-            !metadata.results_are_row_addrs(),
-            "a version 0 JSON segment wraps a target that stores row ids"
-        );
-
         metadata.index_version = 1;
-        assert!(
-            metadata.results_are_row_addrs(),
-            "a version 1 JSON segment wraps a target that stores row addresses"
-        );
+        assert!(!metadata.results_are_row_addrs());
+        assert!(!metadata.can_follow_stable_row_ids());
+        assert!(!metadata.supports_eager_remap());
     }
 
     /// `validate_covering_fields` holds the rules of both layouts, which is

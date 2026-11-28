@@ -10,6 +10,7 @@ use lance_core::utils::address::RowAddress;
 use lance_core::{Error, Result};
 use lance_file::reader::FileReaderOptions;
 use lance_file::versions::data_file_columns;
+use lance_index::scalar::inverted::is_inverted_details_type;
 use lance_index::scalar::zonemap::{ZoneMapIndex, ZoneMapIndexBuilderParams};
 use lance_index::{
     INDEX_FILE_NAME, IndexType,
@@ -1621,7 +1622,7 @@ pub async fn index_field_path(
     })?;
     let raw_field_path = dataset.schema().field_path(field_id)?;
     let details = super::scalar::fetch_index_details(dataset, &raw_field_path, metadata).await?;
-    let resolved_fts = if details.type_url.ends_with("InvertedIndexDetails") {
+    let resolved_fts = if is_inverted_details_type(&details.type_url) {
         let details = lance_index::pbold::InvertedIndexDetails::decode(details.value.as_slice())
             .map_err(|error| {
                 Error::io(format!(

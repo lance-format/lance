@@ -7336,3 +7336,64 @@ def test_row_address_index_maintenance(tmp_path, index_type):
     # both rows remain available through physical-address coverage as well.
     dataset.optimize.optimize_indices()
     _assert_row_address_case(index_type, dataset, 16)
+
+
+@pytest.mark.parametrize("second_size", [64, 16_384], ids=["equal", "different"])
+def test_index_scan_statistics_zonemap_settings(tmp_path, second_size):
+    ds = generate_multi_fragment_dataset(
+        tmp_path, num_fragments=2, rows_per_fragment=32
+    )
+    name = "id_zonemap_settings"
+    sizes = (64, second_size)
+    staged = [
+        ds.create_index_uncommitted(
+            column="id",
+            index_type=IndexConfig(
+                index_type="ZONEMAP",
+                parameters={"rows_per_zone": size, "use_seeds": False},
+            ),
+            name=name,
+            fragment_ids=[fragment.fragment_id],
+        )
+        for fragment, size in zip(ds.get_fragments(), sizes)
+    ]
+    ds = ds.commit_existing_index_segments(name, "id", staged)
+    stats = ds.index_scan_statistics(name)
+    assert stats.index_type == "ZoneMap"
+    expected = dict(zip((segment.uuid for segment in staged), sizes))
+    for segment in stats.segments:
+        assert segment.details == {
+            "rows_per_zone": expected[segment.uuid],
+            "use_seeds": False,
+            "has_null_bitmap": True,
+        }
+    assert stats.details == (stats.segments[0].details if second_size == 64 else None)
+
+
+@pytest.mark.parametrize("include_segment_stats", [False, True])
+def test_index_scan_statistics_json_target_details(tmp_path, include_segment_stats):
+    values = pa.array(['{"x": 7}', '{"x": 9}', '{"x": 7}'], type=pa.json_())
+    ds = lance.write_dataset(pa.table({"data": values}), tmp_path, max_rows_per_file=1)
+    for target in ("BTree", "Bitmap"):
+        ds.create_scalar_index(
+            "data",
+            IndexConfig(
+                index_type="json",
+                parameters={"target_index_type": target, "path": "x"},
+            ),
+            name=f"json_{target}",
+        )
+    descriptions = {index.name: index for index in ds.describe_indices()}
+    for target in ("BTree", "Bitmap"):
+        name = f"json_{target}"
+        stats = ds.index_scan_statistics(
+            name, include_segment_stats=include_segment_stats
+        )
+        assert stats.index_type == "Json"
+        assert stats.details["target_index_type"] == target
+        assert isinstance(stats.details["target_index_version"], int)
+        assert len(stats.segments) == 1
+        assert stats.segments[0].uuid == descriptions[name].segments[0].uuid
+        assert stats.segments[0].details == stats.details
+        assert "target_index_type" not in descriptions[name].details
+        assert "target_index_version" not in descriptions[name].details

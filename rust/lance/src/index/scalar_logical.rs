@@ -27,9 +27,9 @@ use roaring::RoaringBitmap;
 use serde_json::json;
 
 use crate::dataset::Dataset;
-use crate::index::scalar::fetch_index_details;
+use crate::index::loading::DatasetIndexInternalExt;
+use crate::index::scalar::{fetch_index_details, index_details_type_matches};
 use crate::index::segment_coverage::{SegmentCoverage, SegmentRowDomain};
-use crate::index::{DatasetIndexExt, loading::DatasetIndexInternalExt};
 
 /// Query-time view that exposes several physical scalar index segments as a single [`ScalarIndex`].
 ///
@@ -344,7 +344,7 @@ pub async fn load_named_scalar_segments(
     index_name: &str,
 ) -> Result<Vec<IndexMetadata>> {
     let usable_indices = dataset
-        .load_indices_by_name(index_name)
+        .load_indices_with_verified_legacy_json_coverage(index_name)
         .await?
         .into_iter()
         .filter(|index| index_intersects_dataset(index, dataset))
@@ -363,7 +363,7 @@ pub async fn load_named_scalar_segments(
             }
         };
         match &index_type_url {
-            Some(expected) if expected != &segment_type_url => {
+            Some(expected) if !index_details_type_matches(expected, &segment_type_url) => {
                 return Err(Error::invalid_input(format!(
                     "Scalar index '{}' on column '{}' mixes incompatible segment types",
                     index_name, column
@@ -520,7 +520,7 @@ mod tests {
     use crate::dataset::optimize::{CompactionOptions, compact_files};
     use crate::dataset::write::WriteMode;
     use crate::dataset::{MergeInsertBuilder, MergeInsertWriteMode, WhenMatched, WhenNotMatched};
-    use crate::index::create::CreateIndexBuilder;
+    use crate::index::{DatasetIndexExt, create::CreateIndexBuilder};
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount, copy_test_data_to_tmp};
 
     use super::*;

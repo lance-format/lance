@@ -207,6 +207,21 @@ pub struct IVFIndex {
     partition_rows: Vec<OnceLock<Arc<RowAddrTreeMap>>>,
 }
 
+impl IVFIndex {
+    /// Legacy HNSW stores graph offsets in the main IVF model and vector
+    /// lengths in the auxiliary storage. Keep graph offsets for traversal.
+    fn auxiliary_vector_partition_lengths(&self) -> Option<&[u32]> {
+        let sub_index = self.sub_index.as_any();
+        if let Some(index) = sub_index.downcast_ref::<HNSWIndex<ScalarQuantizer>>() {
+            Some(index.vector_partition_lengths())
+        } else {
+            sub_index
+                .downcast_ref::<HNSWIndex<ProductQuantizer>>()
+                .map(HNSWIndex::vector_partition_lengths)
+        }
+    }
+}
+
 impl DeepSizeOf for IVFIndex {
     fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
         // `Uuid` is a fixed 16-byte struct with no heap children, so contributes 0.
@@ -1540,6 +1555,20 @@ impl VectorIndex for IVFIndex {
 
     fn partition_size(&self, part_id: usize) -> usize {
         self.ivf.partition_size(part_id)
+    }
+
+    fn ivf_partition_entry_counts(&self) -> Result<Option<Vec<u64>>> {
+        let lengths = self
+            .auxiliary_vector_partition_lengths()
+            .unwrap_or(&self.ivf.lengths);
+        let partitions = self.ivf.num_partitions();
+        if lengths.len() != partitions {
+            return Err(Error::index(format!(
+                "IVF model has {partitions} partitions but vector storage has {}",
+                lengths.len()
+            )));
+        }
+        Ok(Some(lengths.iter().copied().map(u64::from).collect()))
     }
 
     /// the index type of this vector index.

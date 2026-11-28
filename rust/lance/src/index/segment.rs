@@ -16,13 +16,13 @@ use lance_index::registry::{
     plugin_name_from_details_url, scalar_index_details_are_known, scalar_index_version,
 };
 use lance_index::scalar::btree::BTREE_LOOKUP_NAME;
-use lance_index::{INDEX_FILE_NAME, IndexType, pb::VectorIndexDetails};
-use lance_table::format::{IndexFile, IndexMetadata};
+use lance_index::scalar::inverted::is_inverted_details_type;
+use lance_index::{INDEX_FILE_NAME, IndexType};
+use lance_table::format::{IndexDetailsType, IndexFile, IndexMetadata};
 use lance_table::system_index::is_system_index;
-use prost::Name;
 use roaring::RoaringBitmap;
 
-use crate::index::scalar::IndexDetails;
+use crate::index::scalar::{IndexDetails, index_details_type_matches};
 use crate::{Error, Result};
 
 pub(crate) fn retain_committed_inverted_files(files: &mut Vec<IndexFile>) {
@@ -114,7 +114,7 @@ pub(crate) fn validate_segment_index_details(
             ))
         })?;
         match type_url {
-            Some(expected) if expected != segment_type_url.type_url => {
+            Some(expected) if !index_details_type_matches(expected, &segment_type_url.type_url) => {
                 return Err(Error::invalid_input(format!(
                     "CreateIndex: segment set for index '{}' mixes incompatible index detail types",
                     index_name
@@ -159,7 +159,7 @@ pub(crate) fn segment_has_vector_details(segment: &IndexMetadata) -> bool {
                 .as_ref()
                 .is_some_and(|files| files.iter().any(|file| file.path == INDEX_FILE_NAME))
         },
-        |details| details.type_url.ends_with("VectorIndexDetails"),
+        |details| super::vector::details::is_vector_details_type(&details.type_url),
     )
 }
 
@@ -177,20 +177,14 @@ pub(crate) fn index_type_is_known(index: &IndexMetadata) -> bool {
 
 /// Whether this build has a reader for the complete declared type name.
 pub(crate) fn index_details_have_reader(type_url: &str) -> bool {
-    let Some((_, details_type_name)) = type_url.rsplit_once('/') else {
-        return false;
-    };
-    if details_type_name.eq_ignore_ascii_case(&VectorIndexDetails::full_name())
-        // MemWAL flush used this exact pre-`pb` package name.
-        || details_type_name.eq_ignore_ascii_case("lance.index.VectorIndexDetails")
-    {
+    if super::vector::details::is_vector_details_type(type_url) {
         return true;
     }
     if scalar_index_details_are_known(type_url) {
         return true;
     }
     #[cfg(feature = "geo")]
-    if details_type_name.eq_ignore_ascii_case(&lance_index::pb::RTreeIndexDetails::full_name()) {
+    if IndexDetailsType::from_url(type_url) == Some(IndexDetailsType::RTree) {
         return true;
     }
     false
@@ -204,7 +198,7 @@ pub(crate) fn segment_has_inverted_details(segment: &IndexMetadata) -> bool {
     segment
         .index_details
         .as_ref()
-        .is_some_and(|details| details.type_url.ends_with("InvertedIndexDetails"))
+        .is_some_and(|details| is_inverted_details_type(&details.type_url))
 }
 
 pub(crate) fn segment_has_bitmap_details(segment: &IndexMetadata) -> bool {
@@ -230,7 +224,7 @@ pub(crate) fn segment_has_btree_details(segment: &IndexMetadata) -> bool {
                 .as_ref()
                 .is_some_and(|files| files.iter().any(|file| file.path == BTREE_LOOKUP_NAME))
         },
-        |details| details.type_url.ends_with("BTreeIndexDetails"),
+        |details| IndexDetailsType::from_url(&details.type_url) == Some(IndexDetailsType::BTree),
     )
 }
 
@@ -263,10 +257,9 @@ pub(crate) fn segment_has_rtree_details(segment: &IndexMetadata) -> bool {
 }
 
 pub(crate) fn segment_has_minhashlsh_details(segment: &IndexMetadata) -> bool {
-    segment
-        .index_details
-        .as_ref()
-        .is_some_and(|details| details.type_url.ends_with("MinHashLshIndexDetails"))
+    segment.index_details.as_ref().is_some_and(|details| {
+        lance_index::scalar::minhash_lsh::is_minhash_details_type(&details.type_url)
+    })
 }
 
 pub(crate) fn segment_has_ngram_details(segment: &IndexMetadata) -> bool {
@@ -294,7 +287,7 @@ pub(crate) fn unsupported_index_version(index: &IndexMetadata) -> Option<u32> {
 fn details_index_version(type_url: &str) -> Option<u32> {
     // The details do not include the vector subtype, so use the highest
     // supported version of any vector index.
-    if type_url.ends_with(VectorIndexDetails::NAME) {
+    if super::vector::details::is_vector_details_type(type_url) {
         return Some(IndexType::max_vector_version());
     }
     let plugin_name = plugin_name_from_details_url(type_url);

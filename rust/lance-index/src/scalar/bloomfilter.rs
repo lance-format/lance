@@ -1792,6 +1792,10 @@ impl ScalarIndexPlugin for BloomFilterIndexPlugin {
         "BloomFilter"
     }
 
+    fn query_domain_recovery_support(&self, _index_details: &prost_types::Any) -> Option<bool> {
+        Some(false)
+    }
+
     fn new_query_parser(
         &self,
         index_name: String,

@@ -30,6 +30,7 @@ use rstest::rstest;
 use tracing::instrument::WithSubscriber;
 use tracing_subscriber::fmt::format::FmtSpan;
 
+use crate::index::IndexScanStatisticsOptions;
 use crate::index::vector::IndexFileVersion;
 use crate::index::vector::VectorIndexParams;
 use crate::index::vector::ivf::v2::tests::{
@@ -184,9 +185,31 @@ async fn test_open_logical_vector_index_segmented_quality_apis() {
     );
 
     let row_count_by_segment = rows_per_segment.into_iter().collect::<HashMap<_, _>>();
+    let stats = dataset
+        .index_scan_statistics(
+            "vector_idx",
+            IndexScanStatisticsOptions::default().with_segment_stats(true),
+        )
+        .await
+        .unwrap();
+    let scan_layouts: HashMap<_, _> = stats
+        .segments
+        .iter()
+        .map(|segment| (segment.uuid, segment.ivf.as_ref().unwrap()))
+        .collect();
     let partition_sizes = ivf_view.partition_sizes();
     assert_eq!(partition_sizes.len(), logical_index.num_segments());
     for (segment_id, sizes) in partition_sizes {
+        let layout = scan_layouts[&segment_id];
+        assert_eq!(layout.num_partitions, sizes.len() as u64);
+        assert_eq!(
+            layout.indexed_vector_entries,
+            row_count_by_segment[&segment_id]
+        );
+        assert_eq!(
+            layout.partition_entry_counts,
+            sizes.iter().map(|size| *size as u64).collect::<Vec<_>>()
+        );
         assert_eq!(sizes.len(), 2);
         assert_eq!(
             sizes.iter().sum::<usize>(),
@@ -331,6 +354,17 @@ async fn test_list_element_dependency_fields_preserve_single_input() {
     assert_eq!(described.len(), 1);
     assert_eq!(described[0].field_ids(), [fields[0] as u32]);
     let metadata = dataset.load_indices_by_name("objects_idx").await.unwrap();
+    assert_eq!(metadata[0].fields, fields);
+    for detailed in [false, true] {
+        let stats = dataset
+            .index_scan_statistics(
+                "objects_idx",
+                IndexScanStatisticsOptions::default().with_segment_stats(detailed),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stats.keyed_field_ids, [fields[0]]);
+    }
     let recovered = crate::index::scalar::load_scalar_segment_params(&dataset, &metadata[0])
         .await
         .unwrap();

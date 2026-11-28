@@ -446,6 +446,11 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
         self.ivf.num_partitions()
     }
 
+    /// Stored vector counts in partition-ID order.
+    pub fn partition_lengths(&self) -> &[u32] {
+        &self.ivf.lengths
+    }
+
     /// Load one partition of vector storage.
     ///
     /// # Parameters

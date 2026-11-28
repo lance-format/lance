@@ -11,7 +11,10 @@ use chrono::{DateTime, Utc};
 use lance::dataset::Dataset as LanceDataset;
 use lance::index::vector::ivf::builder::write_vector_storage;
 use lance::index::vector::pq::build_pq_model_in_fragments;
-use lance::index::{DatasetIndexExt, IndexSegment, IntoIndexSegment};
+use lance::index::{
+    DatasetIndexExt, IndexScanCoverage, IndexScanIvfStatistics, IndexScanSegmentStatistics,
+    IndexScanStatistics, IndexSegment, IntoIndexSegment,
+};
 use lance::io::ObjectStore;
 use lance_index::progress::NoopIndexBuildProgress;
 use lance_index::vector::ivf::shuffler::{IvfShuffler, shuffle_vectors};
@@ -34,6 +37,7 @@ use pyo3::{
 
 use lance::index::DatasetIndexInternalExt;
 
+use crate::bitmap::PyBitmap;
 use crate::fragment::FileFragment;
 use crate::utils::{PyJson, PyLance, parse_distance_type};
 use crate::{
@@ -812,6 +816,156 @@ impl PyIndexDescription {
     }
 }
 
+/// Recorded facts for one named index at a pinned dataset version.
+#[pyclass(
+    name = "IndexScanStatistics",
+    module = "lance.indices",
+    frozen,
+    get_all
+)]
+pub struct PyIndexScanStatistics {
+    dataset_version: u64,
+    fragment_count: u64,
+    live_rows: Option<u64>,
+    deleted_rows: Option<u64>,
+    total_data_bytes: Option<u64>,
+    index_name: String,
+    keyed_field_ids: Vec<i32>,
+    covering_field_ids: Vec<i32>,
+    type_url: Option<String>,
+    index_type: Option<String>,
+    metric_type: Option<String>,
+    details: Option<PyJson>,
+    total_index_bytes: Option<u64>,
+    coverage: Option<PyIndexScanCoverage>,
+    segments: Vec<PyIndexScanSegmentStatistics>,
+}
+
+impl From<IndexScanStatistics> for PyIndexScanStatistics {
+    fn from(stats: IndexScanStatistics) -> Self {
+        Self {
+            dataset_version: stats.dataset_version,
+            fragment_count: stats.fragment_count,
+            live_rows: stats.live_rows,
+            deleted_rows: stats.deleted_rows,
+            total_data_bytes: stats.total_data_bytes,
+            index_name: stats.index_name,
+            keyed_field_ids: stats.keyed_field_ids,
+            covering_field_ids: stats.covering_field_ids,
+            type_url: stats.type_url,
+            index_type: stats.index_type,
+            metric_type: stats.metric_type.map(|metric| metric.to_string()),
+            details: stats.details.map(|details| PyJson(details.to_string())),
+            total_index_bytes: stats.total_index_bytes,
+            coverage: stats.coverage.map(Into::into),
+            segments: stats.segments.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+/// Whole-fragment coverage and distinct physical slots requiring overlay replay.
+#[pyclass(
+    name = "IndexScanCoverage",
+    module = "lance.indices",
+    frozen,
+    get_all,
+    skip_from_py_object
+)]
+#[derive(Clone)]
+struct PyIndexScanCoverage {
+    covered_fragment_count: u64,
+    uncovered_fragment_ids: PyBitmap,
+    covered_fragment_live_rows: Option<u64>,
+    uncovered_fragment_live_rows: Option<u64>,
+    uncovered_data_bytes: Option<u64>,
+    covered_live_row_ratio: Option<f64>,
+    overlay_stale_row_slots: u64,
+}
+
+impl From<IndexScanCoverage> for PyIndexScanCoverage {
+    fn from(coverage: IndexScanCoverage) -> Self {
+        Self {
+            covered_fragment_count: coverage.covered_fragment_count,
+            uncovered_fragment_ids: PyBitmap::new(coverage.uncovered_fragment_ids),
+            covered_fragment_live_rows: coverage.covered_fragment_live_rows,
+            uncovered_fragment_live_rows: coverage.uncovered_fragment_live_rows,
+            uncovered_data_bytes: coverage.uncovered_data_bytes,
+            covered_live_row_ratio: coverage.covered_live_row_ratio,
+            overlay_stale_row_slots: coverage.overlay_stale_row_slots,
+        }
+    }
+}
+
+/// Recorded facts for a single segment. Fragment coverage can overlap across segments.
+#[pyclass(
+    name = "IndexScanSegmentStatistics",
+    module = "lance.indices",
+    frozen,
+    get_all,
+    skip_from_py_object
+)]
+#[derive(Clone)]
+struct PyIndexScanSegmentStatistics {
+    uuid: String,
+    index_version: i32,
+    created_at: Option<DateTime<Utc>>,
+    base_id: Option<u32>,
+    dataset_version_at_last_update: u64,
+    size_bytes: Option<u64>,
+    index_type: Option<String>,
+    metric_type: Option<String>,
+    details: Option<PyJson>,
+    covered_fragment_ids: Option<PyBitmap>,
+    covered_fragment_live_rows: Option<u64>,
+    covered_fragment_deleted_rows: Option<u64>,
+    ivf: Option<PyIndexScanIvfStatistics>,
+}
+
+impl From<IndexScanSegmentStatistics> for PyIndexScanSegmentStatistics {
+    fn from(segment: IndexScanSegmentStatistics) -> Self {
+        Self {
+            uuid: segment.uuid.to_string(),
+            index_version: segment.index_version,
+            created_at: segment.created_at,
+            base_id: segment.base_id,
+            dataset_version_at_last_update: segment.dataset_version_at_last_update,
+            size_bytes: segment.size_bytes,
+            index_type: segment.index_type,
+            metric_type: segment.metric_type.map(|metric| metric.to_string()),
+            details: segment.details.map(|details| PyJson(details.to_string())),
+            covered_fragment_ids: segment.covered_fragment_ids.map(PyBitmap::new),
+            covered_fragment_live_rows: segment.covered_fragment_live_rows,
+            covered_fragment_deleted_rows: segment.covered_fragment_deleted_rows,
+            ivf: segment.ivf.map(Into::into),
+        }
+    }
+}
+
+/// Stored vector entry counts in partition-ID order.
+#[pyclass(
+    name = "IndexScanIvfStatistics",
+    module = "lance.indices",
+    frozen,
+    get_all,
+    skip_from_py_object
+)]
+#[derive(Clone)]
+struct PyIndexScanIvfStatistics {
+    indexed_vector_entries: u64,
+    num_partitions: u64,
+    partition_entry_counts: Vec<u64>,
+}
+
+impl From<IndexScanIvfStatistics> for PyIndexScanIvfStatistics {
+    fn from(layout: IndexScanIvfStatistics) -> Self {
+        Self {
+            indexed_vector_entries: layout.indexed_vector_entries,
+            num_partitions: layout.num_partitions,
+            partition_entry_counts: layout.partition_entry_counts,
+        }
+    }
+}
+
 pub fn register_indices(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     let indices = PyModule::new(py, "indices")?;
     indices.add_wrapped(wrap_pyfunction!(train_ivf_model))?;
@@ -824,6 +978,10 @@ pub fn register_indices(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     indices.add_class::<PyIndexConfig>()?;
     indices.add_class::<PyIndexSegment>()?;
     indices.add_class::<PyIndexDescription>()?;
+    indices.add_class::<PyIndexScanStatistics>()?;
+    indices.add_class::<PyIndexScanCoverage>()?;
+    indices.add_class::<PyIndexScanSegmentStatistics>()?;
+    indices.add_class::<PyIndexScanIvfStatistics>()?;
     indices.add_class::<PyIndexSegmentDescription>()?;
     indices.add_wrapped(wrap_pyfunction!(get_ivf_model))?;
     m.add_submodule(&indices)?;

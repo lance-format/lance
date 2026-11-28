@@ -115,7 +115,10 @@ mod tests {
     use crate::dataset::{UpdateBuilder, WriteMode, WriteParams};
     use crate::index::append::fragment_reuse_affects_segments;
     use crate::index::optimize::{commit_optimize_indices, plan_optimize_indices};
-    use crate::index::{CreateIndexBuilder, DatasetIndexExt, loading::DatasetIndexInternalExt};
+    use crate::index::{
+        CreateIndexBuilder, DatasetIndexExt, IndexScanStatisticsOptions,
+        loading::DatasetIndexInternalExt,
+    };
     use crate::{Dataset, Error};
 
     const INDEX_NAME: &str = "text_minhash";
@@ -954,6 +957,109 @@ mod tests {
         assert!(
             !neighbors.contains(&2),
             "deleted row must stay gone: {neighbors:?}"
+        );
+    }
+
+    #[rstest]
+    #[case::canonical(None)]
+    #[case::mixed_case(Some("/LANCE.INDEX.PB.minhashlshindexdetails"))]
+    #[tokio::test]
+    async fn test_stable_row_ids_preserve_minhash_through_merge_and_compaction(
+        #[case] alias: Option<&str>,
+    ) {
+        let dir = TempStrDir::default();
+        let uri = dir.as_str();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch(0..4))], schema()),
+            uri,
+            Some(WriteParams {
+                max_rows_per_file: 2,
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        create_index_segments(&mut dataset, 1).await;
+        let mut segments = dataset.load_indices_by_name(INDEX_NAME).await.unwrap();
+        assert_eq!(segments.len(), 2);
+        if let Some(alias) = alias {
+            for segment in &mut segments {
+                Arc::make_mut(segment.index_details.as_mut().unwrap()).type_url = alias.into();
+            }
+            dataset
+                .commit_existing_index_segments(INDEX_NAME, "text", segments)
+                .await
+                .unwrap();
+        }
+
+        let mut dataset = DatasetBuilder::from_uri(uri).load().await.unwrap();
+        assert_eq!(search_ids(&dataset, 2, 1).await, vec![2]);
+        let segments = dataset.load_indices_by_name(INDEX_NAME).await.unwrap();
+        let mut merged = dataset
+            .merge_existing_index_segments(segments)
+            .await
+            .unwrap();
+        assert_eq!(merged.index_version, MINHASH_LSH_INDEX_VERSION as i32);
+        if let Some(alias) = alias {
+            Arc::make_mut(merged.index_details.as_mut().unwrap()).type_url = alias.into();
+        }
+        let before_rewrite = merged.uuid;
+        dataset
+            .commit_existing_index_segments(INDEX_NAME, "text", vec![merged])
+            .await
+            .unwrap();
+        let mut dataset = DatasetBuilder::from_uri(uri).load().await.unwrap();
+        assert_eq!(search_ids(&dataset, 2, 1).await, vec![2]);
+        let metrics = compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 10,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(metrics.fragments_removed, 2);
+        assert_eq!(metrics.fragments_added, 1);
+
+        let dataset = DatasetBuilder::from_uri(uri).load().await.unwrap();
+        assert_eq!(
+            dataset.fragment_bitmap().iter().collect::<Vec<_>>(),
+            vec![2]
+        );
+        for detailed in [false, true] {
+            let stats = dataset
+                .index_scan_statistics(
+                    INDEX_NAME,
+                    IndexScanStatisticsOptions::default().with_segment_stats(detailed),
+                )
+                .await
+                .unwrap();
+            assert_eq!(stats.segments.len(), 1);
+            assert_ne!(stats.segments[0].uuid, before_rewrite);
+            assert_eq!(
+                stats.segments[0].covered_fragment_ids.as_ref(),
+                Some(dataset.fragment_bitmap().as_ref()),
+            );
+            let coverage = stats.coverage.unwrap();
+            assert_eq!(coverage.covered_fragment_live_rows, Some(4));
+            assert_eq!(coverage.uncovered_fragment_live_rows, Some(0));
+        }
+        let mut scan = dataset.scan();
+        let full_scan = scan
+            .filter("id = 2")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(
+            search_text_ids(dataset.scan().fast_search(), row_text(2), 1).await,
+            full_scan["id"]
+                .as_primitive::<Int32Type>()
+                .values()
+                .to_vec(),
         );
     }
 

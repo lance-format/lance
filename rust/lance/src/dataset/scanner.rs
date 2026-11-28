@@ -45,6 +45,7 @@ use lance_datafusion::projection::ProjectionPlan;
 use lance_file::reader::FileReaderOptions;
 use lance_index::scalar::FullTextSearchQuery;
 use lance_index::scalar::inverted::DocumentGranularity;
+use lance_index::scalar::inverted::is_inverted_details_type;
 use lance_index::scalar::inverted::query::{FtsQuery, FtsQueryNode, fill_fts_query_column};
 use lance_index::scalar::minhash_lsh::MinHashQuery;
 use lance_index::vector::{ProbeParams, Query};
@@ -659,8 +660,6 @@ impl Dataset {
                 )));
             }
 
-            let mut selected_segments = Vec::with_capacity(segment_uuids.len());
-            let mut selected_coverage = RoaringBitmap::new();
             for segment_uuid in segment_uuids {
                 let segment = all_indices
                     .iter()
@@ -676,6 +675,22 @@ impl Dataset {
                         segment.name
                     )));
                 }
+            }
+
+            let effective_segments = self
+                .load_indices_with_verified_legacy_json_coverage(index_name)
+                .await?;
+            let mut selected_segments = Vec::with_capacity(segment_uuids.len());
+            let mut selected_coverage = RoaringBitmap::new();
+            for segment_uuid in segment_uuids {
+                let segment = effective_segments
+                    .iter()
+                    .find(|segment| segment.uuid == *segment_uuid)
+                    .ok_or_else(|| {
+                        Error::invalid_input(format!(
+                            "Scalar index segment {segment_uuid} does not exist"
+                        ))
+                    })?;
                 let Some(&field_id) = segment.keyed_fields().first() else {
                     return Err(Error::invalid_input(format!(
                         "Scalar index '{index_name}' segment {segment_uuid} has no keyed field"
@@ -721,7 +736,7 @@ impl Dataset {
             // the requested UUIDs would publish that scope and then under-count.
             reject_incomplete_segment_contributors(
                 index_name,
-                all_indices.as_ref(),
+                &effective_segments,
                 &selected_uuid_set,
                 &selected_coverage,
             )?;
@@ -777,7 +792,7 @@ impl Dataset {
     }
 }
 
-/// Reject a UUID selection whose advertised fragments still depend on an unselected segment.
+/// Reject a UUID selection whose covered fragments still depend on an unselected segment.
 fn reject_incomplete_segment_contributors(
     index_name: &str,
     indices: &[IndexMetadata],
@@ -825,7 +840,7 @@ async fn fts_indexed_columns(dataset: Arc<Dataset>) -> Result<Vec<String>> {
         let details =
             crate::index::scalar::fetch_index_details(dataset.as_ref(), &preliminary_path, index)
                 .await?;
-        if !details.type_url.ends_with("InvertedIndexDetails") {
+        if !is_inverted_details_type(&details.type_url) {
             continue;
         }
         let details = lance_index::pbold::InvertedIndexDetails::decode(details.value.as_slice())

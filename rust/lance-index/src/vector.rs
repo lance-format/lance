@@ -794,6 +794,13 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
     fn quantizer(&self) -> Quantizer;
     fn partition_size(&self, part_id: usize) -> usize;
 
+    /// Return the stored vector entry counts in IVF partition order, including empty partitions.
+    ///
+    /// Return `None` if this handle does not expose an IVF layout.
+    fn ivf_partition_entry_counts(&self) -> Result<Option<Vec<u64>>> {
+        Ok(None)
+    }
+
     /// the index type of this vector index.
     fn sub_index_type(&self) -> (SubIndexType, QuantizationType);
 

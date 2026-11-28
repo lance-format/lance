@@ -95,6 +95,11 @@ impl<Q: Quantization> HNSWIndex<Q> {
         self.partition_storage.quantizer()
     }
 
+    /// Counts from the auxiliary vector storage, independent of graph levels.
+    pub fn vector_partition_lengths(&self) -> &[u32] {
+        self.partition_storage.partition_lengths()
+    }
+
     pub fn metadata(&self) -> HnswMetadata {
         self.partition_metadata.as_ref().unwrap()[0].clone()
     }
