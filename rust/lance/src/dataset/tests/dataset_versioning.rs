@@ -2,6 +2,8 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::collections::HashMap;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::os::fd::AsRawFd;
 use std::process::Command;
 use std::sync::{
     Arc, Mutex,
@@ -923,6 +925,206 @@ async fn test_tag(
         dataset = dataset.checkout_version("tag1").await.unwrap();
         assert_eq!(dataset.manifest.version, version);
     }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug)]
+struct PublishDuringTagResolution {
+    uri: String,
+    mutation: &'static str,
+    inner: Arc<dyn CommitHandler>,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[async_trait::async_trait]
+impl CommitHandler for PublishDuringTagResolution {
+    async fn resolve_version_location(
+        &self,
+        base: &Path,
+        version: u64,
+        store: &dyn OSObjectStore,
+    ) -> lance_core::Result<ManifestLocation> {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "dataset::tests::dataset_versioning::test_tag_mutation_child",
+                "--nocapture",
+            ])
+            .env("LANCE_TEST_TAG_URI", &self.uri)
+            .env("LANCE_TEST_TAG_MUTATION", self.mutation)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        self.inner
+            .resolve_version_location(base, version, store)
+            .await
+    }
+
+    async fn commit(
+        &self,
+        manifest: &mut lance_table::format::Manifest,
+        indices: Option<Vec<lance_table::format::IndexMetadata>>,
+        base: &Path,
+        store: &ObjectStore,
+        writer: ManifestWriter,
+        scheme: ManifestNamingScheme,
+        transaction: Option<lance_table::format::Transaction>,
+    ) -> std::result::Result<ManifestLocation, CommitError> {
+        self.inner
+            .commit(manifest, indices, base, store, writer, scheme, transaction)
+            .await
+    }
+}
+
+// Keep the fixture independent of the tag implementation so the same race
+// runs when replaying this test on older versions.
+#[cfg(target_os = "linux")]
+fn supports_tag_race_fixture(dir: &std::fs::File) -> bool {
+    let Ok(fdinfo) =
+        std::fs::read_to_string(format!("/proc/thread-self/fdinfo/{}", dir.as_raw_fd()))
+    else {
+        return false;
+    };
+    let Some(id) = fdinfo.lines().find_map(|line| line.strip_prefix("mnt_id:")) else {
+        return false;
+    };
+    let Ok(mounts) = std::fs::read("/proc/thread-self/mountinfo") else {
+        return false;
+    };
+    String::from_utf8_lossy(&mounts).lines().any(|line| {
+        let Some((mount_id, rest)) = line.split_once(' ') else {
+            return false;
+        };
+        mount_id == id.trim_ascii()
+            && rest.split_once(" - ").is_some_and(|(_, fs)| {
+                matches!(
+                    fs.split_ascii_whitespace().next(),
+                    Some("ext4" | "overlay" | "tmpfs")
+                )
+            })
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn supports_tag_race_fixture(dir: &std::fs::File) -> bool {
+    let mut attrs = libc::attrlist {
+        bitmapcount: libc::ATTR_BIT_MAP_COUNT,
+        reserved: 0,
+        commonattr: libc::ATTR_CMN_OBJTAG,
+        volattr: libc::ATTR_VOL_INFO,
+        dirattr: 0,
+        fileattr: 0,
+        forkattr: 0,
+    };
+    let mut reply = [0_u32; 2]; // byte length, then volume root vnode tag
+    // SAFETY: attrs and reply are live, aligned buffers of the declared sizes.
+    let status = unsafe {
+        libc::fgetattrlist(
+            dir.as_raw_fd(),
+            (&raw mut attrs).cast(),
+            reply.as_mut_ptr().cast(),
+            size_of_val(&reply),
+            0,
+        )
+    };
+    assert_eq!(status, 0, "{}", std::io::Error::last_os_error());
+    reply == [size_of_val(&reply) as u32, 25] // VT_APFS in <sys/vnode.h>
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[rstest]
+#[case::metadata("metadata")]
+#[case::delete("delete")]
+#[case::recreate("recreate")]
+#[tokio::test]
+async fn test_tag_retarget_observes_concurrent_writer(#[case] mutation: &'static str) {
+    let temp = TempStdDir::default();
+    if !supports_tag_race_fixture(&std::fs::File::open(&*temp).unwrap()) {
+        return;
+    }
+    let table = temp.join("space %2F");
+    let path = table.to_str().unwrap();
+    let mut first = Dataset::write(id_rows(0, 2), path, None).await.unwrap();
+    first.delete("id = 0").await.unwrap();
+    first.tags().create("发布", 1).await.unwrap();
+    let original_creation = first.tags().get("发布").await.unwrap().created_at.unwrap();
+
+    let peer = PublishDuringTagResolution {
+        uri: format!(
+            "file-object-store://{}",
+            Url::from_directory_path(&table).unwrap().path()
+        ),
+        mutation,
+        inner: first.commit_handler(),
+    };
+    first.refs = Refs::new(
+        first.table_state.object_store.clone(),
+        Arc::new(peer),
+        first.branch_location(),
+    );
+    let result = first.tags().update("发布", 2).await;
+    let fresh = Dataset::open(path).await.unwrap();
+    let observed = fresh.tags().get("发布").await;
+    if mutation == "delete" {
+        assert!(
+            matches!(observed, Err(Error::RefNotFound { .. })),
+            "retarget={result:?}, fresh={observed:?}"
+        );
+    } else {
+        let tag = observed.unwrap();
+        assert_eq!(
+            tag.metadata.get("owner").map(String::as_str),
+            Some(mutation),
+            "retarget={result:?}, fresh={tag:?}"
+        );
+        assert!(
+            tag.updated_at >= tag.created_at,
+            "retarget={result:?}, fresh={tag:?}"
+        );
+        if mutation == "recreate" {
+            assert_ne!(tag.created_at, Some(original_creation));
+        } else {
+            assert_eq!(tag.created_at, Some(original_creation));
+        }
+        if mutation == "recreate" && result.is_ok() {
+            // A serialized retarget can precede deletion or follow recreation.
+            assert!(matches!(tag.version, 1 | 2), "fresh={tag:?}");
+        } else {
+            assert_eq!(tag.version, if result.is_ok() { 2 } else { 1 });
+        }
+    }
+    assert!(
+        matches!(
+            result,
+            Ok(()) | Err(Error::RefConflict { .. } | Error::RefNotFound { .. })
+        ),
+        "{result:?}"
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn test_tag_mutation_child() {
+    let Ok(uri) = std::env::var("LANCE_TEST_TAG_URI") else {
+        return;
+    };
+    let mutation = std::env::var("LANCE_TEST_TAG_MUTATION").unwrap();
+    let dataset = Dataset::open(&uri).await.unwrap();
+    let tags = dataset.tags();
+    if mutation != "metadata" {
+        tags.delete("发布").await.unwrap();
+        if mutation == "delete" {
+            return;
+        }
+        tags.create("发布", 1).await.unwrap();
+    }
+    tags.replace_metadata("发布", HashMap::from([("owner".to_owned(), mutation)]))
+        .await
+        .unwrap();
 }
 
 #[tokio::test]

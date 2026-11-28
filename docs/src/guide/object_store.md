@@ -101,6 +101,10 @@ For example, a Lance Spark catalog named `lance` forwards settings below its
 spark-sql --conf "spark.sql.catalog.lance.storage.scheduler_error_mode=fail_fast"
 ```
 
+### Local tag coordination
+
+Local tag writers that use an external lock can set `local_tag_external_coordination` to `"true"` to bypass Lance's tag lock. All writers of the same tag must participate in that coordination. See [Tags and branches](tags_and_branches.md).
+
 ### Local filesystem durability
 
 Set `local_fsync` to `"true"` for local datasets when writes must be durable
@@ -297,6 +301,7 @@ The following keys can be used as both environment variables or keys in the
 | `aws_secret_access_key` / `secret_access_key`                       | The AWS secret access key to use.                                                                                                                |
 | `aws_session_token` / `session_token`                               | The AWS session token to use.                                                                                                                    |
 | `aws_endpoint` / `endpoint`                                         | The endpoint to use for S3-compatible stores.                                                                                                    |
+| `aws_conditional_put` / `conditional_put`                           | Set to `etag` (default) to require `If-Match` for tag retargets and metadata replacements, or `disabled` for unconditional updates. The native S3 client also applies this setting to conditional creates. |
 | `aws_virtual_hosted_style_request` / `virtual_hosted_style_request` | Whether to use virtual hosted-style requests, where bucket name is part of the endpoint. Meant to be used with `aws_endpoint`. Default, `False`. |
 | `aws_s3_express` / `s3_express`                                     | Whether to use S3 Express One Zone endpoints. Default, `False`. See more details below.                                                          |
 | `aws_server_side_encryption`                                        | The server-side encryption algorithm to use. Must be one of `"AES256"`, `"aws:kms"`, or `"aws:kms:dsse"`. Default, `None`.                       |

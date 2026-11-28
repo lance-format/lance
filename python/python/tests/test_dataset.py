@@ -30,6 +30,7 @@ import numpy as np
 import pandas as pd
 import pandas.testing as tm
 import polars as pl
+import psutil
 import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.dataset as pa_ds
@@ -1000,6 +1001,48 @@ def test_v2_manifest_paths_migration(tmp_path: Path):
     manifest_path = _list_manifests(tmp_path / "_versions")
     assert len(manifest_path) == 1
     assert re.match(r"\d{20}\.manifest", manifest_path[0])
+
+
+@pytest.mark.parametrize(
+    ("method", "args"),
+    [("update", (2,)), ("replace_metadata", ({"owner": "review"},)), ("delete", ())],
+)
+def test_contended_tag_mutation(tmp_path: Path, method: str, args: tuple):
+    fcntl = pytest.importorskip("fcntl")
+    # Use the same local CI filesystems as the native process-race fixture.
+    parents = tmp_path.resolve().parents
+    mounts = [
+        p for p in psutil.disk_partitions(all=True) if Path(p.mountpoint) in parents
+    ]
+    mount = max(mounts, key=lambda p: len(p.mountpoint), default=None)
+    if (
+        sys.platform not in {"linux", "darwin"}
+        or mount is None
+        or mount.fstype not in {"apfs", "ext4", "overlay", "tmpfs"}
+    ):
+        pytest.skip(
+            "the contention fixture requires a local APFS, ext4, overlay or tmpfs mount"
+        )
+    lance.write_dataset(pa.table({"id": [1]}), tmp_path)
+    ds = lance.write_dataset(pa.table({"id": [2]}), tmp_path, mode="append")
+    ds.tags.create("release", 1)
+    original = ds.tags.get("release")
+    with (tmp_path / "_refs" / "tags" / "release.json").open("rb") as tag:
+        fcntl.flock(tag, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with pytest.raises(ValueError, match="Ref conflict error"):
+            getattr(ds.tags, method)("release", *args)
+        assert lance.dataset(tmp_path).tags.get("release") == original
+        external = lance.dataset(
+            tmp_path, storage_options={"local_tag_external_coordination": "true"}
+        )
+        getattr(external.tags, method)("release", *args)
+    tags = lance.dataset(tmp_path).tags
+    if method == "delete":
+        assert "release" not in tags.list()
+    elif method == "replace_metadata":
+        assert tags.get("release")["metadata"] == args[0]
+    else:
+        assert tags.get("release")["version"] == args[0]
 
 
 def test_tag(tmp_path: Path):

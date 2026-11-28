@@ -514,6 +514,13 @@ fn tag_to_py(py: Python<'_>, tag: TagContents) -> PyResult<Py<PyAny>> {
     dict.into_py_any(py)
 }
 
+fn tag_update_result(result: lance::Result<()>) -> PyResult<()> {
+    match result {
+        Err(err @ Error::RefConflict { .. }) => Err(PyValueError::new_err(err.to_string())),
+        result => result.infer_error(),
+    }
+}
+
 fn file_reader_options_from_read_params(
     read_params: Option<&Bound<PyDict>>,
 ) -> Option<FileReaderOptions> {
@@ -2345,8 +2352,9 @@ impl Dataset {
         let new_self = self.ds.as_ref().clone();
         rt().block_on(None, new_self.tags().delete(tag.as_str()))?
             .map_err(|err| match err {
-                lance::Error::NotFound { .. } => PyValueError::new_err(err.to_string()),
-                lance::Error::RefNotFound { .. } => PyValueError::new_err(err.to_string()),
+                Error::NotFound { .. } | Error::RefNotFound { .. } | Error::RefConflict { .. } => {
+                    PyValueError::new_err(err.to_string())
+                }
                 _ => PyIOError::new_err(err.to_string()),
             })?;
         Ok(())
@@ -2354,21 +2362,17 @@ impl Dataset {
 
     fn update_tag(&self, tag: String, reference: Option<Bound<PyAny>>) -> PyResult<()> {
         let reference = self.transform_ref(reference)?;
-        rt().block_on(
+        tag_update_result(rt().block_on(
             None,
             self.ds.as_ref().tags().update(tag.as_str(), reference),
-        )?
-        .infer_error()?;
-        Ok(())
+        )?)
     }
 
     fn replace_tag_metadata(&self, tag: String, metadata: HashMap<String, String>) -> PyResult<()> {
-        rt().block_on(
+        tag_update_result(rt().block_on(
             None,
             self.ds.as_ref().tags().replace_metadata(&tag, metadata),
-        )?
-        .infer_error()?;
-        Ok(())
+        )?)
     }
 
     /// Check out the latest version of the current branch

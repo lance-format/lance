@@ -11,7 +11,7 @@ use lance_table::io::commit::{CommitHandler, VERSIONS_DIR};
 use lance_table::io::deletion::DELETIONS_DIR;
 use lance_table::system_index::mem_wal::is_mem_wal_dir_name;
 use object_store::{
-    Error as ObjectStoreError,
+    Error as ObjectStoreError, UpdateVersion,
     path::{Path, PathPart},
 };
 use serde::{Deserialize, Serialize};
@@ -222,26 +222,26 @@ impl Tags<'_> {
         self.get(tag).await.map(|tag| tag.version)
     }
 
-    pub async fn get(&self, tag: &str) -> Result<TagContents> {
+    fn tag_path(&self, tag: &str) -> Result<Path> {
         check_valid_tag(tag)?;
+        Ok(tag_path(&self.refs.root()?.path, tag))
+    }
 
-        let root_location = self.refs.root()?;
-        let tag_file = tag_path(&root_location.path, tag);
-
-        if !self.object_store().exists(&tag_file).await? {
-            return Err(Error::RefNotFound {
-                message: format!("tag {} does not exist", tag),
-            });
+    async fn require_existing(&self, tag: &str, path: &Path) -> Result<()> {
+        if !self.object_store().exists(path).await? {
+            return Err(tag_not_found(tag));
         }
+        Ok(())
+    }
 
-        let tag_contents = TagContents::from_path(&tag_file, self.object_store()).await?;
-        Ok(tag_contents)
+    pub async fn get(&self, tag: &str) -> Result<TagContents> {
+        let path = self.tag_path(tag)?;
+        self.require_existing(tag, &path).await?;
+        TagContents::from_path(&path, self.object_store()).await
     }
 
     pub async fn create(&self, tag: &str, reference: impl Into<Ref>) -> Result<()> {
-        check_valid_tag(tag)?;
-        let root_location = self.refs.root()?;
-        let tag_file = tag_path(&root_location.path, tag);
+        let tag_file = self.tag_path(tag)?;
 
         let now = Utc::now();
         let tag_contents = self
@@ -257,48 +257,63 @@ impl Tags<'_> {
         .await
     }
 
+    async fn read_for_update(&self, tag: &str) -> Result<(TagContents, TagUpdate)> {
+        let path = self.tag_path(tag)?;
+        let store = self.object_store();
+        #[cfg(unix)]
+        if let Some(local) = store
+            .open_local_mutation(&path)
+            .await
+            .map_err(|e| tag_io_error(e, tag))?
+        {
+            let current = parse_ref_json(&path, &local.read_all().await?)?;
+            return Ok((current, TagUpdate::Local(local)));
+        }
+        let snapshot = store
+            .read_for_update(&path)
+            .await
+            .map_err(|error| match error {
+                ObjectStoreError::NotFound { .. } => tag_not_found(tag),
+                ObjectStoreError::Precondition { .. } => tag_conflict(tag),
+                error => error.into(),
+            })?;
+        if let Some((bytes, version)) = snapshot {
+            let current = parse_ref_json(&path, &bytes)?;
+            return Ok((current, TagUpdate::Conditional { path, version }));
+        }
+        self.require_existing(tag, &path).await?;
+        let current = TagContents::from_path(&path, store).await?;
+        Ok((current, TagUpdate::Overwrite(path)))
+    }
+
     pub async fn delete(&self, tag: &str) -> Result<()> {
-        check_valid_tag(tag)?;
-
-        let root_location = self.refs.root()?;
-        let tag_file = tag_path(&root_location.path, tag);
-
-        if !self.object_store().exists(&tag_file).await? {
-            return Err(Error::RefNotFound {
-                message: format!("tag {} does not exist", tag),
+        let path = self.tag_path(tag)?;
+        let store = self.object_store();
+        #[cfg(unix)]
+        if let Some(local) = store
+            .open_local_mutation(&path)
+            .await
+            .map_err(|e| tag_io_error(e, tag))?
+        {
+            return local.publish(None).await.map_err(|e| match e.kind() {
+                ErrorKind::WouldBlock => tag_conflict(tag),
+                _ => e.into(),
             });
         }
-
-        self.object_store().delete(&tag_file).await
+        self.require_existing(tag, &path).await?;
+        store.delete(&path).await
     }
 
     pub async fn update(&self, tag: &str, reference: impl Into<Ref>) -> Result<()> {
-        check_valid_tag(tag)?;
-
-        let root_location = self.refs.root()?;
-        let tag_file = tag_path(&root_location.path, tag);
-        if !self.object_store().exists(&tag_file).await? {
-            return Err(Error::RefNotFound {
-                message: format!("tag {} does not exist", tag),
-            });
-        }
-        let mut tag_contents = TagContents::from_path(&tag_file, self.object_store()).await?;
-        let updated_reference = self
-            .build_tag_content_by_ref(reference, tag_contents.created_at, Some(Utc::now()))
+        let (mut current, update) = self.read_for_update(tag).await?;
+        let reference = self
+            .build_tag_content_by_ref(reference, current.created_at, Some(Utc::now()))
             .await?;
-        tag_contents.branch = updated_reference.branch;
-        tag_contents.version = updated_reference.version;
-        tag_contents.created_at = updated_reference.created_at;
-        tag_contents.updated_at = updated_reference.updated_at;
-        tag_contents.manifest_size = updated_reference.manifest_size;
-
-        self.object_store()
-            .put(
-                &tag_file,
-                serde_json::to_string_pretty(&tag_contents)?.as_bytes(),
-            )
-            .await
-            .map(|_| ())
+        current.branch = reference.branch;
+        current.version = reference.version;
+        current.updated_at = reference.updated_at;
+        current.manifest_size = reference.manifest_size;
+        update.write(self.object_store(), tag, &current).await
     }
 
     pub async fn replace_metadata(
@@ -306,26 +321,9 @@ impl Tags<'_> {
         tag: &str,
         metadata: HashMap<String, String>,
     ) -> Result<()> {
-        check_valid_tag(tag)?;
-
-        let root_location = self.refs.root()?;
-        let tag_file = tag_path(&root_location.path, tag);
-        if !self.object_store().exists(&tag_file).await? {
-            return Err(Error::RefNotFound {
-                message: format!("tag {} does not exist", tag),
-            });
-        }
-
-        let mut tag_contents = TagContents::from_path(&tag_file, self.object_store()).await?;
-        tag_contents.metadata = metadata;
-
-        self.object_store()
-            .put(
-                &tag_file,
-                serde_json::to_string_pretty(&tag_contents)?.as_bytes(),
-            )
-            .await
-            .map(|_| ())
+        let (mut current, update) = self.read_for_update(tag).await?;
+        current.metadata = metadata;
+        update.write(self.object_store(), tag, &current).await
     }
 
     async fn build_tag_content_by_ref(
@@ -387,6 +385,66 @@ impl Tags<'_> {
             metadata: HashMap::new(),
         };
         Ok(tag_contents)
+    }
+}
+
+enum TagUpdate {
+    #[cfg(unix)]
+    Local(lance_io::object_store::LocalFileMutation),
+    Conditional {
+        path: Path,
+        version: UpdateVersion,
+    },
+    Overwrite(Path),
+}
+
+impl TagUpdate {
+    async fn write(self, store: &ObjectStore, tag: &str, contents: &TagContents) -> Result<()> {
+        let bytes = serde_json::to_vec_pretty(contents)?;
+        match self {
+            #[cfg(unix)]
+            Self::Local(local) => {
+                local
+                    .publish(Some(bytes))
+                    .await
+                    .map_err(|error| match error.kind() {
+                        ErrorKind::WouldBlock => tag_conflict(tag),
+                        _ => error.into(),
+                    })
+            }
+            Self::Conditional { path, version } => store
+                .replace_if_current(&path, bytes.into(), version)
+                .await
+                .map(|_| ())
+                .map_err(|error| match error {
+                    ObjectStoreError::Precondition { .. } | ObjectStoreError::NotFound { .. } => {
+                        tag_conflict(tag)
+                    }
+                    error => error.into(),
+                }),
+            Self::Overwrite(path) => store.put(&path, &bytes).await.map(|_| ()),
+        }
+    }
+}
+
+fn tag_not_found(tag: &str) -> Error {
+    Error::RefNotFound {
+        message: format!("tag {tag} does not exist"),
+    }
+}
+
+fn tag_conflict(tag: &str) -> Error {
+    Error::RefConflict {
+        message: format!("tag {tag} changed during mutation"),
+    }
+}
+
+#[cfg(unix)]
+fn tag_io_error(error: std::io::Error, tag: &str) -> Error {
+    match error.kind() {
+        ErrorKind::NotFound => tag_not_found(tag),
+        ErrorKind::WouldBlock => tag_conflict(tag),
+        _ => error.into(),
     }
 }
 
@@ -1442,9 +1500,13 @@ where
             end: tag_reader.size().await?,
         })
         .await?;
-    let json_str = String::from_utf8(tag_bytes.to_vec())
-        .map_err(|e| Error::corrupt_file(path.clone(), e.to_string()))?;
-    Ok(serde_json::from_str(&json_str)?)
+    parse_ref_json(path, &tag_bytes)
+}
+
+fn parse_ref_json<T: DeserializeOwned>(path: &Path, bytes: &[u8]) -> Result<T> {
+    let json_str =
+        std::str::from_utf8(bytes).map_err(|e| Error::corrupt_file(path.clone(), e.to_string()))?;
+    Ok(serde_json::from_str(json_str)?)
 }
 
 impl TagContents {
@@ -1667,7 +1729,62 @@ pub fn check_valid_tag(s: &str) -> Result<()> {
 mod tests {
     use super::*;
 
+    use lance_table::io::commit::ConditionalPutCommitHandler;
     use rstest::rstest;
+
+    #[rstest]
+    #[case::replace_metadata(false)]
+    #[case::delete(true)]
+    #[tokio::test]
+    async fn test_stale_tag_update_on_conditional_store(
+        #[case] delete: bool,
+        #[values("memory", "shared-memory")] scheme: &str,
+    ) {
+        let uri = format!("{scheme}://stale-tag-{delete}/table");
+        let (store, base) = ObjectStore::from_uri(&uri).await.unwrap();
+        // Each from_uri call creates an independent registry. Only shared-memory
+        // resolves the same authority to the same backend across registries.
+        let peer = if scheme == "shared-memory" {
+            ObjectStore::from_uri(&uri).await.unwrap().0
+        } else {
+            store.clone()
+        };
+        let root = BranchLocation {
+            path: base,
+            uri,
+            branch: None,
+        };
+        let path = tag_path(&root.path, "release");
+        store
+            .put(&path, br#"{"version":1,"manifestSize":12}"#)
+            .await
+            .unwrap();
+        let peer_refs = Refs::new(peer, Arc::new(ConditionalPutCommitHandler), root.clone());
+        let refs = Refs::new(store.clone(), Arc::new(ConditionalPutCommitHandler), root);
+        let tags = refs.tags();
+        let (mut stale, update) = tags.read_for_update("release").await.unwrap();
+        stale.version = 2;
+        let metadata = HashMap::from([("owner".into(), "review".into())]);
+        if delete {
+            peer_refs.tags().delete("release").await.unwrap();
+        } else {
+            peer_refs
+                .tags()
+                .replace_metadata("release", metadata.clone())
+                .await
+                .unwrap();
+        }
+        let error = update.write(&store, "release", &stale).await.unwrap_err();
+        assert!(matches!(error, Error::RefConflict { .. }), "{error}");
+        assert!(error.to_string().contains("release"), "{error}");
+        if delete {
+            assert!(!store.exists(&path).await.unwrap());
+        } else {
+            let current = tags.get("release").await.unwrap();
+            assert_eq!(current.version, 1);
+            assert_eq!(current.metadata, metadata);
+        }
+    }
 
     #[rstest]
     fn test_ok_ref(

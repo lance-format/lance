@@ -429,7 +429,15 @@ impl OperationThrottle {
         F: Fn() -> Fut,
         Fut: std::future::Future<Output = OSResult<T>>,
     {
-        for attempt in 0..=self.max_retries {
+        self.throttled_with_retries(f, self.max_retries).await
+    }
+
+    async fn throttled_with_retries<T, F, Fut>(&self, f: F, max_retries: usize) -> OSResult<T>
+    where
+        F: Fn() -> Fut,
+        Fut: std::future::Future<Output = OSResult<T>>,
+    {
+        for attempt in 0..=max_retries {
             self.acquire_token().await;
             let result = f().await;
             let outcome = match &result {
@@ -452,7 +460,7 @@ impl OperationThrottle {
             self.update_bucket_rate(new_rate).await;
 
             match &result {
-                Err(err) if is_throttle_error(err) && attempt < self.max_retries => {
+                Err(err) if is_throttle_error(err) && attempt < max_retries => {
                     let backoff_ms =
                         rand::rng().random_range(self.min_backoff_ms..=self.max_backoff_ms);
                     debug!(
@@ -796,7 +804,7 @@ fn is_delete_request(request: &HttpRequest) -> bool {
 /// carry, so an object key echoed in `<Key>` or `<Location>` cannot be
 /// mistaken for an error code.
 #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
-fn error_document_code(body: &str) -> Option<String> {
+pub(super) fn error_document_code(body: &str) -> Option<String> {
     use quick_xml::events::Event;
 
     let mut reader = quick_xml::Reader::from_str(body);
@@ -976,7 +984,15 @@ impl HttpService for AimdHttpService {
         }
         let is_complete = is_multipart_complete_request(&request);
 
-        for attempt in 0..=write.max_retries {
+        // Retrying a completed conditional update can turn an unknown outcome
+        // into a mismatch against the client's own write.
+        let max_retries = if is_complete && request.headers().contains_key(::http::header::IF_MATCH)
+        {
+            0
+        } else {
+            write.max_retries
+        };
+        for attempt in 0..=max_retries {
             write.acquire_token().await;
             let (http_attempt, mut result) = self.execute(request.clone()).await;
             let mut is_retryable = result.as_ref().err().is_some_and(is_retryable_http_error);
@@ -1041,7 +1057,7 @@ impl HttpService for AimdHttpService {
             let new_rate = write.record_outcome(outcome, error);
             write.update_bucket_rate(new_rate).await;
 
-            if is_retryable && attempt < write.max_retries {
+            if is_retryable && attempt < max_retries {
                 let backoff_ms =
                     rand::rng().random_range(write.min_backoff_ms..=write.max_backoff_ms);
                 debug!(
@@ -1279,8 +1295,22 @@ impl ObjectStore for AimdThrottledStore {
         bytes: PutPayload,
         opts: PutOptions,
     ) -> OSResult<PutResult> {
+        let max_retries = self.write.max_retries;
+        #[cfg(feature = "aws")]
+        let max_retries = if opts
+            .extensions
+            .get::<super::providers::aws::ConditionalUpdate>()
+            .is_some()
+        {
+            0
+        } else {
+            max_retries
+        };
         self.write
-            .throttled(|| self.target.put_opts(location, bytes.clone(), opts.clone()))
+            .throttled_with_retries(
+                || self.target.put_opts(location, bytes.clone(), opts.clone()),
+                max_retries,
+            )
             .await
     }
 

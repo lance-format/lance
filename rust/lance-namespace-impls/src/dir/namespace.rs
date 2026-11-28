@@ -2505,7 +2505,12 @@ impl LanceNamespace for DirectoryNamespace {
             .tags()
             .create(&request.tag, request.version as u64)
             .await
-            .map_err(|e| Self::map_tag_error(e, &request.tag, &table_uri))?;
+            .map_err(|e| match e {
+                Error::RefConflict { .. } => Error::from(NamespaceError::TableTagAlreadyExists {
+                    message: format!("tag '{}' for table at '{}'", request.tag, table_uri),
+                }),
+                other => Self::map_tag_error(other, &request.tag, &table_uri),
+            })?;
 
         Ok(CreateTableTagResponse {
             transaction_id: None,

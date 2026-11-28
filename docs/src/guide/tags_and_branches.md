@@ -27,6 +27,18 @@ In reference contexts, `"main"` is an alias for the default branch and is equiva
     Creating or deleting tags does not generate new dataset versions.
     Tags exist as auxiliary metadata stored in a separate directory.
 
+A tag retarget or metadata replacement can report a conflict when another writer changes the same tag. Read the tag again before retrying.
+
+If an S3 update returns a storage error during publication, the outcome may be unknown. Another writer may already have changed the tag. Read the current tag and retry only if the intended change still makes sense for that state.
+
+The native and OpenDAL S3 clients send `If-Match` by default, including on multipart completion. S3-compatible endpoints must enforce this condition. The in-memory store also checks the tag's ETag.
+
+For local files, Lance writers lock the tag before replacing or deleting it on APFS and HFS on Apple platforms and on ext2/3/4, XFS, Btrfs, F2FS, OverlayFS and tmpfs on Linux and Android.
+
+Coordinate writers externally on other filesystems, on GCS or Azure, and whenever a client overwrites tags unconditionally. If one writer accesses an exported directory locally and another through NFS or SMB, both must use the same external coordination.
+
+On Linux, a restricted process may be unable to identify the filesystem of an opened tag. If Lance reports this, make the dataset mount visible in `/proc/self/mountinfo`, or coordinate every writer externally and set `local_tag_external_coordination` to `"true"` on local clients. This option bypasses Lance's tag locks.
+
 === "Python"
 
     ```python

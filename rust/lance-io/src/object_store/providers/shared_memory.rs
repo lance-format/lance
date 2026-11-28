@@ -50,8 +50,11 @@ pub struct SharedMemoryStoreProvider {
 #[async_trait::async_trait]
 impl ObjectStoreProvider for SharedMemoryStoreProvider {
     async fn new_store(&self, base_path: Url, params: &ObjectStoreParams) -> Result<ObjectStore> {
-        let mut store = self.inner.new_store(base_path.clone(), params).await?;
-        store.inner = shared_backend_for(&base_path);
+        let mut store = self.inner.new_store_with_backend(
+            &base_path,
+            params,
+            shared_backend_for(&base_path),
+        )?;
         store.scheme = String::from("shared-memory");
         store.store_prefix = self.calculate_object_store_prefix(&base_path, None)?;
         Ok(store)
@@ -99,6 +102,22 @@ mod tests {
         let (reader, _) = store_for("shared-memory://bucket-a/").await;
         let bytes = reader.inner.get(&Path::from("file")).await.unwrap();
         assert_eq!(bytes.bytes().await.unwrap(), Bytes::from_static(b"hello"));
+    }
+
+    #[tokio::test]
+    async fn custom_wrapper_does_not_inherit_shared_memory_etag_support() {
+        let uri = Url::parse("shared-memory://wrapped/").unwrap();
+        let mut store = SharedMemoryStoreProvider::default()
+            .new_store(uri, &ObjectStoreParams::default())
+            .await
+            .unwrap();
+        store.inner = Arc::new(object_store::prefix::PrefixStore::new(
+            store.inner,
+            "wrapped",
+        ));
+        let path = Path::from("tag");
+        store.put(&path, b"original").await.unwrap();
+        assert!(store.read_for_update(&path).await.unwrap().is_none());
     }
 
     #[tokio::test]

@@ -349,9 +349,10 @@ impl ObjectStoreProvider for GcsStoreProvider {
             with_throttling(throttle_state, !use_opendal, inner, paginated_lister);
 
         Ok(ObjectStore {
+            // GCS XML multipart completion cannot check a destination generation.
+            mutation_backend: None,
             inner,
             external_blob_inner: None,
-            direct_local_io: false,
             _external_blob_origin: None,
             local_dir_operations: None,
             local_fsync: false,
@@ -422,14 +423,83 @@ mod tests {
 
     use crate::object_store::test_utils::RecordingConnector;
     use crate::object_store::test_utils::StaticMockStorageOptionsProvider;
-    use crate::object_store::{ObjectStoreParams, StorageOptionsAccessor};
+    use crate::object_store::{ObjectStoreParams, ObjectStoreRegistry, StorageOptionsAccessor};
+    use crate::object_writer::initial_upload_size;
     use object_store::client::{HttpError, HttpErrorKind};
     use tempfile::TempDir;
     use tokio::io::{AsyncBufReadExt, BufReader};
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
-        matchers::{method, path},
+        matchers::{header, method, path, query_param},
     };
+
+    #[rstest::rstest]
+    #[case::native(false)]
+    #[case::opendal(true)]
+    #[tokio::test]
+    async fn test_gcs_tag_overwrite_preserves_multipart(#[case] use_opendal: bool) {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/bucket/tag"))
+            .and(query_param("uploads", ""))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "<InitiateMultipartUploadResult><UploadId>test</UploadId></InitiateMultipartUploadResult>",
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let part_size = initial_upload_size();
+        for (part_number, size) in [("1", part_size), ("2", 1)] {
+            Mock::given(method("PUT"))
+                .and(path("/bucket/tag"))
+                .and(query_param("uploadId", "test"))
+                .and(query_param("partNumber", part_number))
+                .and(header("content-length", size.to_string()))
+                .respond_with(ResponseTemplate::new(200).insert_header("etag", "\"part\""))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+        Mock::given(method("POST"))
+            .and(path("/bucket/tag"))
+            .and(query_param("uploadId", "test"))
+            .respond_with(ResponseTemplate::new(200).insert_header("etag", "\"v2\"").set_body_string(
+                "<CompleteMultipartUploadResult><ETag>\"v2\"</ETag></CompleteMultipartUploadResult>",
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let options = HashMap::from([
+            ("use_opendal".into(), use_opendal.to_string()),
+            ("google_base_url".into(), server.uri()),
+            ("google_storage_token".into(), "test-token".into()),
+            ("allow_http".into(), "true".into()),
+            ("endpoint".into(), server.uri()),
+            ("disable_config_load".into(), "true".into()),
+            ("disable_vm_metadata".into(), "true".into()),
+            ("skip_signature".into(), "true".into()),
+        ]);
+        let params = ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                options,
+            ))),
+            ..Default::default()
+        };
+        let (store, root) = ObjectStore::from_uri_and_params(
+            Arc::new(ObjectStoreRegistry::default()),
+            "gs://bucket",
+            &params,
+        )
+        .await
+        .unwrap();
+        let tag = root.join("tag");
+        assert!(store.read_for_update(&tag).await.unwrap().is_none());
+        let payload = vec![b'x'; part_size + 1];
+        let result = store.put(&tag, &payload).await.unwrap();
+        assert_eq!(result.size, payload.len());
+        assert_eq!(result.e_tag.as_deref(), Some("\"v2\""));
+    }
 
     #[rstest::rstest]
     #[case::canonical("google_service_account", "service_account")]
