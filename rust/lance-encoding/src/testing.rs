@@ -1026,6 +1026,7 @@ fn tag(e: &Compression) -> &'static str {
         AxisDelta(_) => "axis_delta",
         Alp(_) => "alp",
         Pcodec(_) => "pcodec",
+        IntegerBitpacking(_) => "integer bitpacking",
     }
 }
 

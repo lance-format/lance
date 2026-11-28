@@ -2601,6 +2601,7 @@ fn compression_name(compression: &Compression) -> &'static str {
         Compression::MonotonicDelta(_) => "monotonic delta",
         Compression::Alp(_) => "alp",
         Compression::Pcodec(_) => "pcodec",
+        Compression::IntegerBitpacking(_) => "integer bitpacking",
     }
 }
 

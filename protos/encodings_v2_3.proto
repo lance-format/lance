@@ -574,6 +574,18 @@ message Pcodec {
   CompressiveEncoding values = 1;
 }
 
+/* Unstable 2.3 frame-of-reference and delta bitpacking for integer and
+ * temporal mini-block values. Use only as the direct ChunkedValues compression
+ * with one value buffer per chunk and no dictionary. Each buffer begins with
+ * a little-endian word holding the mode in the low two bits and packed width
+ * above it, followed by the mode's reference words and residual bits.
+ * See Integer Bitpacking in the file encoding specification for the layout.
+ */
+message IntegerBitpacking {
+  // The physical width of the leaf values. Must be 8, 16, 32 or 64.
+  uint32 bits_per_value = 1;
+}
+
 // An encoding that compresses a data block into buffers
 message CompressiveEncoding {
     oneof compression {
@@ -595,5 +607,6 @@ message CompressiveEncoding {
         AxisDelta axis_delta = 16;
         Alp alp = 17;
         Pcodec pcodec = 18;
+        IntegerBitpacking integer_bitpacking = 19;
     }
 }
