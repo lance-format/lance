@@ -62,7 +62,10 @@ message ChunkedValues {
   uint64 num_dictionary_items = 4;
   // Number of value buffers per chunk, excluding repetition and definition.
   uint64 num_buffers = 5;
-  // Dense structural event count. Sparse counts are derived from its domains.
+  /* Number of dense value-plane slots, including visible nulls. A fixed-size
+   * list in the value plane occupies one slot. Must be zero for sparse
+   * structure, which supplies the terminal slot count including nulls.
+   */
   uint64 num_items = 6;
 }
 
@@ -79,12 +82,20 @@ message ZippedValues {
   // Present only with dense structure; sparse values contain no control words.
   DenseZipLevels levels = 2;
   oneof addressing {
+    /* Width in bits of one fixed-width value frame, excluding dense control
+     * words. Must be positive, byte-aligned, and match the compression
+     * descriptor, including any fixed-size list child validity bytes.
+     */
     uint32 bits_per_value = 3;
+    // Width in bits of the variable-width length prefixes.
     uint32 bits_per_offset = 4;
   }
-  // Dense event count or sparse materialized value count.
+  // Dense control event count, or sparse materialized value count.
   uint64 num_items = 5;
-  // Leaf slots for dense pages; equal to num_items for sparse pages.
+  /* Visible value-plane slots (including visible nulls) for dense structure.
+   * For sparse structure, both counts are the number of materialized slots.
+   * A value-plane fixed-size list occupies one slot regardless of its shape.
+   */
   uint64 num_visible_items = 6;
 }
 
@@ -422,21 +433,26 @@ message Rle {
   CompressiveEncoding run_lengths = 2;
 }
 
-/* Converts a fixed-size-list of values into a flattened list of values
- *
- * This encoding does not actually compress the data, it just flattens out the FSL layers.
- *
- * This is a transparent encoding.
- *
- * The input is a single block of fixed-width data (with a wide width and few items)
- * The output is a single block of fixed-width data (with a narrow width and many items)
+/* Preserves one fixed-size list layer in the unstable 2.3 value plane.
+ * These dimensions match the fixed-size list shape of the leaf column. A
+ * sparse terminal slot is a complete list value. The structure plane holds
+ * validity of that slot, and the descriptors below hold child validity.
+ * In ChunkedValues, chunks contain whole rows. Child validity buffers appear
+ * outermost first, followed by the leaf codec's buffers. The leaf is plain
+ * Flat, null Constant, OutOfLineBitpacking, InlineBitpacking, Rle,
+ * ByteStreamSplit, Alp, or General wrapping one of those payload codecs.
+ * InlineBitpacking holds consecutive 1024-item segments within each chunk.
+ * In fixed ZippedValues, OutOfLineBitpacking restarts at each row, with a
+ * raw tail when raw and padded sizes are equal. Child validity bytes precede
+ * the leaf frame in each row. Bitmaps are least-significant-bit first.
+ * Outer General compression of these rows requires bits_per_offset.
  */
 message FixedSizeList {
-  // The number of items in this layer of FSL
+  // The positive number of children per value at this layer.
   uint64 items_per_value = 1;
-  // Whether or not there is a validity buffer
+  // Whether this layer stores a validity bitmap for its children.
   bool has_validity = 3;
-  // The compression used to store the flattened values data block
+  // The next FixedSizeList layer or the flattened leaf codec.
   CompressiveEncoding values = 2;
 }
 

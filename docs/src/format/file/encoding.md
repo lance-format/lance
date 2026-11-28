@@ -434,6 +434,94 @@ packed structs can compose with sparse structure. Codec selection is a writer po
 %%% proto.message.NoValues %%%
 ```
 
+#### Fixed-Size List Values
+
+A `FixedSizeList` compression descriptor preserves one layer of a fixed-size list of fixed-width items
+in the value plane. Its nested dimensions must match the fixed-size list layers of the leaf column.
+Let `c_i` be the product of the dimensions from the outermost value layer through layer `i`, and let
+`D` be the product through the innermost layer. Dimensions are positive. A value-plane row is one
+complete fixed-size list value, with `D` leaf items. Counts and byte sizes derived from dimensions
+must fit without overflow.
+
+The structure plane represents enclosing lists and structs and the validity of the fixed-size list value
+itself. Each `has_validity` flag describes that layer's *children*, with `c_i` validity bits per value-plane
+row. Child validity beneath this boundary is stored in the value-plane bitmaps. In sparse structure the
+terminal domain contains complete fixed-size list values in leaf-column order. Each dimension belongs
+to its matching schema layer in exactly one plane. For a fixed-size list of structs with a fixed-size
+list field, the outer dimension belongs to a `SparseFixedSizeListLayer`, and the field's dimensions
+belong to `FixedSizeList` compression descriptors. Readers validate the structural layers and the
+value descriptor against their respective portions of the schema path.
+
+In `ChunkedValues`, each mini-block contains whole value-plane rows. The chunk count in Buffer 0
+counts those rows, so a chunk with `N` rows decodes `N * D` leaf items. With dense structure,
+`num_items` counts the value-plane rows across the page, excluding structural events with no value.
+With sparse structure, chunks cover all terminal slots including null placeholders. The terminal domain
+determines the count and `num_items` is zero. Each chunk stores the validity buffers in
+outermost-to-innermost order, followed by the leaf codec's buffers. Each validity buffer occupies
+`ceil(N * c_i / 8)` bytes, with the least significant bit of the first byte describing the first child.
+`ChunkedValues.num_buffers` is the number of present validity buffers plus the number of leaf buffers.
+
+The innermost descriptor uses one of these leaf codecs:
+
+- `Flat` with a positive bit width and absent `data` uses one buffer.
+- `Constant` with absent `value` represents all-null children of the last described layer and uses
+  zero leaf buffers. An all-null child can itself be a fixed-size list.
+- `OutOfLineBitpacking` uses one buffer of 1024-item FastLanes blocks over the flattened chunk.
+  Blocks run across fixed-size list rows within the chunk. Its `values` is a `Flat` width descriptor
+  with absent `data` and a width no greater than the original 8-, 16-, 32-, or 64-bit width. The final
+  partial block can be raw or padded to 1024 items and packed. Its byte length selects the
+  representation, with equal lengths interpreted as raw.
+- `InlineBitpacking` with absent `values` uses one buffer. It consists of `ceil(N * D / 1024)`
+  consecutive segments. Each segment starts with its packed bit width as an unsigned little-endian
+  word of the original 8-, 16-, 32-, or 64-bit width, followed by `128 * packed_width` bytes containing
+  1024 FastLanes-packed items. Its packed width is at most the original width. Only the last segment
+  may contain padding items. Readers consume exactly the number of segments and bytes implied by the
+  item count and segment widths. Each standalone scalar `InlineBitpacking` mini-block still has one
+  segment.
+- `Rle` uses the mini-block run values and run lengths buffers, in that order, with the existing
+  fixed-width child grammar.
+- `ByteStreamSplit` uses one buffer and wraps plain `Flat` of 32 or 64 bits.
+- `Alp` uses four buffers for 32- or 64-bit floating-point items. All chunks share the page's ALP
+  descriptor and buffer count. The codec decodes the flattened chunk count, and exception positions
+  are 16-bit indices into that flattened chunk.
+- `General` wraps one of the payload-bearing leaf codecs above and compresses its first buffer.
+  It appears inside the fixed-size list layers, after all validity buffers. The other leaf buffers
+  retain the inner codec's framing.
+
+In fixed-width `ZippedValues`, a fixed-size list can also use `OutOfLineBitpacking` with the same
+width descriptor. Each row starts a fresh sequence of 1024-item blocks. With original width `w` and
+packed width `b`, each complete block uses `128 * b` bytes. A tail of `r = D % 1024` items uses
+`min(r * w / 8, 128 * b)` bytes. Writers store it raw when `r * w / 8` is at most `128 * b`, and readers
+interpret equal lengths as raw. A row starts with one `ceil(c_i / 8)`-byte child validity bitmap for each
+layer with `has_validity`, in outermost-to-innermost order, followed by the packed leaf frame. Bits in
+each bitmap are stored least-significant bit first. `bits_per_value` must equal the width in bits derived
+from those bitmaps and the leaf frame, be positive, and be divisible by eight. Readers reject a mismatch.
+
+With dense structure, `num_items` counts control events, including events without a visible value (such
+as an empty enclosing list). `num_visible_items` counts the visible fixed-size list slots, including
+visible null slots. Each visible event in a fixed-width stream carries a row frame, including when the
+list itself is null. A control word precedes each event when repetition or definition levels are present.
+Its bytes are outside `bits_per_value`. The repetition index locates top-level rows when repetition
+levels are present. For an unindexed stream with zero repetition and definition bits, the shared dense
+full-zip reader also accepts one zero padding byte before each fixed-width frame when the total buffer
+length matches that stride.
+
+With sparse structure, `num_items` and `num_visible_items` both count materialized fixed-size list slots.
+Frames follow the materialized positions in order, without control words or frames for null slots.
+
+Outer `General` wraps each complete fixed-width row independently in variable-width `ZippedValues`.
+It requires `bits_per_offset` addressing, with the usual variable-width length prefixes and byte index.
+The child describes the uncompressed row width, including child validity and the leaf frame. In dense
+streams the control word remains outside the compressed frame. A valid visible event carries a length
+prefix and a frame. A visible null event stores its control word alone and contributes one slot to
+`num_visible_items`. The reader reconstructs an empty payload for that slot, represented by equal
+adjacent offsets in memory, and restores null validity from the control word.
+
+`Pcodec` and `AxisDelta` retain their own plain `Flat` leaf grammar when wrapping fixed-size list
+layers. The new leaf codecs and compositions apply only to unstable Lance 2.3 planar values. Stable
+Lance 2.1 and 2.2 fixed-size list descriptors retain nested `FixedSizeList` with a `Flat` or `Constant`
+leaf.
+
 #### Sparse Structural Domains
 
 A domain is a layer-local coordinate space `[0, size)`. Layers are ordered from outer-most to inner-most:
@@ -847,8 +935,8 @@ to `k - 1`) occupies bits `r * w` to `(r + 1) * w - 1`. Row `r` of lane `l` hold
 `O[r / 8] * 16 + (r % 8) * 128 + l`, where `O = [0, 4, 2, 6, 1, 5, 3, 7]`. When `w = k` the block is still this
 permutation of the values, not a plain copy. A block with `w = 0` is empty.
 
-An `InlineBitpacking` buffer is a mini-block chunk, or a block of at most 1024 values. It is one word of the
-uncompressed width holding `w`, little-endian, followed by one packed block; for 128-bit values the header is 16 bytes
+A standalone `InlineBitpacking` buffer holds at most 1024 values. It starts with one little-endian word of the
+uncompressed width holding `w`, followed by one packed block. For 128-bit values the header is 16 bytes
 and `w` is from 0 to 128. Each chunk has its own `w`. A buffer of fewer than 1024 values is zero-padded to 1024 before
 packing, and readers keep the leading values. A buffer that holds no values (`num_values = 0`) is 0 bytes, with no
 header, and readers return no values without reading it. `InlineBitpacking.values` must be absent. Readers reject a
@@ -864,9 +952,8 @@ values and packed, or stored as `t` raw little-endian values. Lance writers pack
 is smaller than the raw values; for 128-bit values that is `128 * w < 16 * t`. Readers pick the tail layout from the
 payload length, treat the tail as raw when both lengths are equal, and reject any other length.
 
-Bitpacking is, in theory, usable in a full zip context. However, values in this context are so large that shaving
-off a few bits is unlikely to have any meaningful impact. Also, the full-zip context keeps things byte-aligned and
-so we would have to remove at least 8 bits per value.
+Fixed-width Zipped values in unstable Lance 2.3 support out-of-line bitpacking for fixed-size list leaves,
+with one independently addressable frame per row. See [Fixed-Size List Values](#fixed-size-list-values).
 
 ### Fsst
 
@@ -909,12 +996,12 @@ own reconstruction parameters.
 
 #### ALP Chunk Framing
 
-An ALP chunk has four value buffers, so `ChunkedValues.num_buffers` is `4`. Their lengths use the `u32` mini-block
-framing of the [planar page layout](#planar-page-layout). The outer chunk header starts with a little-endian `u16`
-level count, followed by a little-endian `u16` byte length for each present repetition and definition stream in
-that order, then four little-endian `u32` value buffer lengths. The buffers follow in the same order. Sparse
-chunks write zero for the level count, then the four value lengths. The writer aligns the end of the outer
-header and of each buffer to 8 bytes using `0xFE`. The declared lengths exclude that alignment padding. Empty
+A standalone ALP chunk has four value buffers, so `ChunkedValues.num_buffers` is `4`. Their lengths use the
+`u32` mini-block framing of the [planar page layout](#planar-page-layout). The outer chunk header starts with a
+little-endian `u16` level count, followed by a little-endian `u16` byte length for each present repetition and
+definition stream in that order, then four little-endian `u32` value buffer lengths. The buffers follow in the
+same order. Sparse chunks write zero for the level count, then the four value lengths. The writer aligns the
+end of the outer header and of each buffer to 8 bytes using `0xFE`. The declared lengths exclude that alignment padding. Empty
 value buffers still have a length entry. When `General` wraps `Alp`, decompress value buffer 0 with the declared
 general codec before interpreting its ALP contents.
 
@@ -922,8 +1009,12 @@ Each little-endian `u32` in the mini-block metadata describes a chunk of `8 * ((
 alignment. For a non-final chunk of `n` values, the low four bits store `log2(n)` and must be nonzero. The final
 chunk gets its count from the page total minus the preceding chunk counts. If its low four bits are nonzero,
 they must agree with that count. The page total comes from `ChunkedValues.num_items` for dense pages and the
-terminal slot domain for sparse pages. The writer emits 1024 values per chunk, with a shorter final chunk
-if needed. It writes `10` for a full chunk and `0` for the shorter final chunk.
+terminal slot domain for sparse pages. The standalone ALP writer emits 1024 values per chunk, with a shorter final
+chunk if needed. It writes `10` for a full chunk and `0` for the shorter final chunk.
+
+For a [fixed-size list leaf](#fixed-size-list-values), the chunk metadata counts whole list values, and the four
+ALP buffers follow any child validity buffers. In the ALP reconstruction below, `n` counts the flattened leaf
+items in the chunk.
 
 The reader rejects a mismatched declared buffer count, truncated outer chunk headers, and buffers that extend
 past the chunk boundary. The chunk lengths must sum to the size of the page's chunk data buffer. A zero-value
