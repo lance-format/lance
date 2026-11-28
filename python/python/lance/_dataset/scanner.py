@@ -1565,7 +1565,8 @@ class LanceScanner(pa.dataset.Scanner):
         ------
         ValueError
             If an explicit fragment scope contains conflicting descriptors for
-            the same fragment ID.
+            the same fragment ID or the dataset's default scope contains
+            duplicate fragment IDs.
         NotImplementedError
             If the scan produces aggregate rows without a source fragment.
 
