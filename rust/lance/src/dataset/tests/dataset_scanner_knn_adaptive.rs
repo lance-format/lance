@@ -312,6 +312,80 @@ async fn test_batch_knn_adaptive_distance_range_matches_single(
     }
 }
 
+/// When the prefilter allows `k` rows or fewer, late search can return the
+/// allowed rows it has not reached at an infinite distance instead of probing
+/// further. Those rows are never scored, so a distance range cannot drop them,
+/// and a query with a range must probe for them instead.
+#[rstest]
+#[case::upper_bound(None, Some(0.01))]
+#[case::lower_bound(Some(0.5), None)]
+#[tokio::test]
+async fn test_knn_adaptive_fewer_than_k_match_keeps_distance_range(
+    #[case] lower: Option<f32>,
+    #[case] upper: Option<f32>,
+    #[values(false, true)] is_batch: bool,
+) {
+    let dataset = adaptive_batch_dataset("IVF_FLAT", false, MetricType::L2).await;
+    let query_values = adaptive_batch_queries(&dataset).await;
+    let queries = FixedSizeListArray::try_new_from_values(
+        Float32Array::from(query_values.clone()),
+        ADAPTIVE_DIM as i32,
+    )
+    .unwrap();
+    let k = 10;
+    // Only 5 rows match, fewer than k.
+    let filter = Some("i < 5");
+
+    let batch = if is_batch {
+        let mut scan = dataset.scan();
+        configure_adaptive_scan(&mut scan, &queries, k, filter, None, true);
+        scan.distance_range(lower, upper);
+        Some(scan.try_into_batch().await.unwrap())
+    } else {
+        None
+    };
+
+    for query_index in 0..ADAPTIVE_QUERIES {
+        let query = Float32Array::from(
+            query_values[query_index * ADAPTIVE_DIM..(query_index + 1) * ADAPTIVE_DIM].to_vec(),
+        );
+        let indexed = match &batch {
+            Some(batch) => rows_for_query(batch, query_index),
+            None => {
+                let mut scan = dataset.scan();
+                configure_adaptive_scan(&mut scan, &query, k, filter, None, true);
+                scan.distance_range(lower, upper);
+                scan.try_into_batch().await.unwrap()
+            }
+        };
+        let mut flat_scan = dataset.scan();
+        configure_adaptive_scan(&mut flat_scan, &query, k, filter, None, false);
+        flat_scan.distance_range(lower, upper);
+        let flat = flat_scan.try_into_batch().await.unwrap();
+
+        let rows = |batch: &RecordBatch| {
+            let mut rows = batch["i"].as_primitive::<Int32Type>().values().to_vec();
+            rows.sort_unstable();
+            rows
+        };
+        assert_eq!(
+            rows(&indexed),
+            rows(&flat),
+            "{lower:?}..{upper:?} batch={is_batch} query {query_index}: \
+             indexed rows must match a flat search, got distances {:?}",
+            indexed[DIST_COL].as_primitive::<Float32Type>().values()
+        );
+        for distance in indexed[DIST_COL].as_primitive::<Float32Type>().values() {
+            assert!(
+                lower.is_none_or(|lower| *distance >= lower)
+                    && upper.is_none_or(|upper| *distance < upper),
+                "{lower:?}..{upper:?} batch={is_batch} query {query_index}: \
+                 distance {distance} is outside the range"
+            );
+        }
+    }
+}
+
 /// `search_effort` scales each query's initial budget inside
 /// `AutoProbePolicy`, so the shared-scan batch node must return what
 /// single-query search returns at every effort level.

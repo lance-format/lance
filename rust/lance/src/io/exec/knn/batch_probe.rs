@@ -394,7 +394,8 @@ pub(super) async fn late_search(
     // makes the dependency explicit before reading the mask.
     pre_filter.wait_for_ready().await?;
     let prefilter_mask = pre_filter.mask();
-    let stop = LateSearchBudget::new(&prefilter_mask, k);
+    // Every delta holds the same batch query, so any one carries its range.
+    let stop = LateSearchBudget::new(&prefilter_mask, k).with_distance_range_of(&deltas[0].query);
     let budget = stop.stop_at();
 
     // Rows found so far, counted like the single-query `initial_ids` (capped at k).

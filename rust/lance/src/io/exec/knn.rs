@@ -1771,6 +1771,8 @@ struct LateSearchBudget {
     k: usize,
     /// Upper bound on the rows the prefilter allows, when the mask knows it.
     prefilter_rows: Option<usize>,
+    /// Whether the query bounds the distance of its rows.
+    has_distance_range: bool,
 }
 
 impl LateSearchBudget {
@@ -1778,7 +1780,15 @@ impl LateSearchBudget {
         Self {
             k,
             prefilter_rows: prefilter_mask.max_len().map(|len| len as usize),
+            has_distance_range: false,
         }
+    }
+
+    /// Record whether `query` has a distance range. The rows the shortcut
+    /// returns are never scored, so they cannot be checked against one.
+    fn with_distance_range_of(mut self, query: &Query) -> Self {
+        self.has_distance_range = query.lower_bound.is_some() || query.upper_bound.is_some();
+        self
     }
 
     /// Rows after which a query probes no further: `k`, or fewer when the
@@ -1789,10 +1799,13 @@ impl LateSearchBudget {
 
     /// Whether fewer than `k` rows match the prefilter and the query has not yet
     /// found them all, so the remaining allowed rows can be returned unscored
-    /// instead of probing further.
+    /// instead of probing further. A query with a distance range has to probe
+    /// for them instead, since an unscored row can lie outside the range.
     fn emits_unseen_rows(&self, found: usize) -> bool {
-        self.prefilter_rows
-            .is_some_and(|rows| found < rows && rows <= self.k)
+        !self.has_distance_range
+            && self
+                .prefilter_rows
+                .is_some_and(|rows| found < rows && rows <= self.k)
     }
 }
 
@@ -2371,7 +2384,8 @@ impl ANNIvfSubIndexExec {
             // We know the prefilter should be ready at this point so we shouldn't
             // need to call wait_for_ready
             let prefilter_mask = global_prefilter.mask();
-            let budget = LateSearchBudget::new(&prefilter_mask, query.k);
+            let budget =
+                LateSearchBudget::new(&prefilter_mask, query.k).with_distance_range_of(&query);
 
             if budget.emits_unseen_rows(found_so_far)
                 // Quantized refinement must score every returned row and apply its
