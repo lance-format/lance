@@ -465,8 +465,24 @@ lance_core::target_kernel! {
     /// Portable dot product for f32, relying on LLVM to auto-vectorize it.
     #[inline]
     fn dot_f32_scalar(x: &[f32], y: &[f32]) -> f32 {
-        dot_scalar::<f32, f32, 16>(x, y)
+        dot_f32_impl(x, y)
     }
+}
+
+/// f32 dot product written as a plain loop that LLVM auto-vectorizes.
+///
+/// `algebraic_add` and `algebraic_mul` let LLVM reassociate the sum and fuse
+/// the multiply-add, so it splits the reduction across vector lanes, unrolls
+/// with several accumulators, and emits FMA where the target has it. Plain `+`
+/// keeps strict left-to-right order, which forces a scalar dependency chain.
+/// Each f32 pair kernel, and the x86 `cosine_with_norms` kernels, inline this
+/// body under their own `target_feature`s, so one source serves AVX-512,
+/// AVX + FMA, AVX and the baseline.
+#[inline(always)]
+pub(super) fn dot_f32_impl(x: &[f32], y: &[f32]) -> f32 {
+    x.iter()
+        .zip(y)
+        .fold(0.0, |sum, (&x, &y)| sum.algebraic_add(x.algebraic_mul(y)))
 }
 
 lance_core::target_kernel! {
@@ -637,13 +653,10 @@ mod x86 {
     lance_core::target_kernel! {
         #[target_features("avx", "fma")]
         #[candidate(pub(super) DOT_F32_BATCH_AVX_FMA: BatchKernel)]
-        /// Up to 16 dimensions the scalar kernel's 16-lane chunking degenerates
-        /// to its remainder loop, so the explicit AVX kernel wins; above that
-        /// the auto-vectorized scalar kernel is as good or better.
-        ///
-        /// Unlike `l2_batch_f32_avx_fma` there is no dimension-16 fast path:
-        /// that one closed a Haswell regression in PQ L2 tables, while dot at
-        /// dimension 16 was already faster than before `Dispatch`.
+        /// The dimension-8 and dimension-16 fast paths cover the common PQ
+        /// sub-vector widths. They load the key once for the whole batch and
+        /// start each row with a multiply, where the pair kernel reloads the
+        /// key per row and starts from a zero accumulator.
         pub(super) fn dot_batch_f32_avx_fma(
             x: &[f32],
             batch: &[f32],
@@ -658,13 +671,35 @@ mod x86 {
                     let product = _mm256_mul_ps(key, unsafe { _mm256_loadu_ps(y.as_ptr()) });
                     *distance = unsafe { hsum256_ps(product) };
                 }
-            } else if dimension <= 16 {
-                for (distance, y) in output.iter_mut().zip(batch.chunks_exact(dimension)) {
-                    *distance = dot_f32_avx_fma(x, y);
+            } else if dimension == 16
+                && let Ok(key) = <&[f32; 16]>::try_from(x)
+            {
+                // Intrinsics on purpose. The plain-Rust form,
+                // `super::dot_f32_impl(key, y)` with `&[f32; 16]` inputs, is
+                // 2x slower here: LLVM fully unrolls the constant-length body
+                // into scalar code before its loop vectorizer runs, which then
+                // vectorizes across 8 output rows and assembles each register
+                // lane by lane (`vinsertps`). Stable Rust has no per-loop
+                // vectorize hint; wrapping each result in `std::hint::black_box`
+                // blocks this but is a best-effort benchmarking hint and was
+                // still 4-7% slower, because of a stack round trip per row.
+                //
+                // `_mm256_loadu_ps` and `_mm256_mul_ps` are AVX, available on
+                // CPUs since 2011 (Intel Sandy Bridge, AMD Bulldozer).
+                // `_mm256_fmadd_ps` is FMA3, available since 2013 on Intel
+                // (Haswell) and 2012 on AMD (Piledriver), which is why this
+                // kernel requires both `avx` and `fma`.
+                let key_lo = unsafe { _mm256_loadu_ps(key.as_ptr()) };
+                let key_hi = unsafe { _mm256_loadu_ps(key.as_ptr().add(8)) };
+                for (distance, y) in output.iter_mut().zip(batch.as_chunks::<16>().0) {
+                    let lo = _mm256_mul_ps(key_lo, unsafe { _mm256_loadu_ps(y.as_ptr()) });
+                    let acc =
+                        _mm256_fmadd_ps(key_hi, unsafe { _mm256_loadu_ps(y.as_ptr().add(8)) }, lo);
+                    *distance = unsafe { hsum256_ps(acc) };
                 }
             } else {
                 for (distance, y) in output.iter_mut().zip(batch.chunks_exact(dimension)) {
-                    *distance = super::dot_f32_scalar(x, y);
+                    *distance = dot_f32_avx_fma(x, y);
                 }
             }
         }
@@ -865,96 +900,48 @@ mod x86 {
     lance_core::target_kernel! {
         #[target_features("avx512f")]
         #[candidate(pub(super) DOT_F32_AVX512: PairKernel)]
-        /// AVX-512 path for f32: 16-wide `__m512` with `vfmadd231ps` per iteration.
         #[inline]
         pub(super) fn dot_f32_avx512(x: &[f32], y: &[f32]) -> f32 {
-            // Callers pass equal lengths; `min` keeps the unchecked loads in
-            // bounds for any input, as a safe function must.
-            let dim = x.len().min(y.len());
-            let unrolled_len = dim / 16 * 16;
-
-            let mut acc = _mm512_setzero_ps();
-            for i in (0..unrolled_len).step_by(16) {
-                let (a, b) = unsafe {
-                    (
-                        _mm512_loadu_ps(x.as_ptr().add(i)),
-                        _mm512_loadu_ps(y.as_ptr().add(i)),
-                    )
-                };
-                acc = _mm512_fmadd_ps(a, b, acc);
-            }
-
-            let tail: f32 = x[unrolled_len..]
-                .iter()
-                .zip(y[unrolled_len..].iter())
-                .map(|(&a, &b)| a * b)
-                .sum();
-
-            _mm512_reduce_add_ps(acc) + tail
+            super::dot_f32_impl(x, y)
         }
     }
 
     lance_core::target_kernel! {
         #[target_features("avx", "fma")]
         #[candidate(pub(super) DOT_F32_AVX_FMA: PairKernel)]
-        /// AVX + FMA path for f32. Covers both AvxFma and AVX2 hosts (body uses no AVX2-specific intrinsics).
         #[inline]
         pub(super) fn dot_f32_avx_fma(x: &[f32], y: &[f32]) -> f32 {
-            // See `dot_f32_avx512` for `min`.
-            let dim = x.len().min(y.len());
-            let unrolled_len = dim / 8 * 8;
-
-            let mut acc = _mm256_setzero_ps();
-            for i in (0..unrolled_len).step_by(8) {
-                let (a, b) = unsafe {
-                    (
-                        _mm256_loadu_ps(x.as_ptr().add(i)),
-                        _mm256_loadu_ps(y.as_ptr().add(i)),
-                    )
-                };
-                acc = _mm256_fmadd_ps(a, b, acc);
+            // LLVM's loop for `dot_f32_impl` runs 4 ymm accumulators, so it
+            // needs 32 floats for one pass of its main loop and handles
+            // shorter vectors with a 4-wide xmm epilogue. Below 32 floats, one
+            // 8-wide FMA chain is faster on AVX2 hosts: 35% at dimension 16
+            // and 29% at 24. Single-pair calls use this kernel on AVX2 hosts;
+            // the batch kernel uses it for the other widths on every x86 host.
+            //
+            // A single length test on purpose: also checking `len >= 8` added
+            // a cycle to every call and cost 10% at dimensions 32-64.
+            if x.len() >= 32 {
+                return super::dot_f32_impl(x, y);
             }
-
-            let tail: f32 = x[unrolled_len..]
-                .iter()
-                .zip(y[unrolled_len..].iter())
-                .map(|(&a, &b)| a * b)
-                .sum();
-
-            let sum = unsafe { hsum256_ps(acc) };
-            sum + tail
+            let (x_chunks, x_tail) = x.as_chunks::<8>();
+            let (y_chunks, y_tail) = y.as_chunks::<8>();
+            let mut acc = _mm256_setzero_ps();
+            for (x, y) in x_chunks.iter().zip(y_chunks) {
+                let x = unsafe { _mm256_loadu_ps(x.as_ptr()) };
+                let y = unsafe { _mm256_loadu_ps(y.as_ptr()) };
+                acc = _mm256_fmadd_ps(x, y, acc);
+            }
+            let head = unsafe { hsum256_ps(acc) };
+            head + super::dot_f32_impl(x_tail, y_tail)
         }
     }
 
     lance_core::target_kernel! {
         #[target_features("avx")]
         #[candidate(pub(super) DOT_F32_AVX: PairKernel)]
-        /// AVX-only path for f32 (no FMA): `_mm256_mul_ps` + `_mm256_add_ps` per iteration for Sandy/Ivy Bridge.
         #[inline]
         pub(super) fn dot_f32_avx(x: &[f32], y: &[f32]) -> f32 {
-            // See `dot_f32_avx512` for `min`.
-            let dim = x.len().min(y.len());
-            let unrolled_len = dim / 8 * 8;
-
-            let mut acc = _mm256_setzero_ps();
-            for i in (0..unrolled_len).step_by(8) {
-                let (a, b) = unsafe {
-                    (
-                        _mm256_loadu_ps(x.as_ptr().add(i)),
-                        _mm256_loadu_ps(y.as_ptr().add(i)),
-                    )
-                };
-                acc = _mm256_add_ps(acc, _mm256_mul_ps(a, b));
-            }
-
-            let tail: f32 = x[unrolled_len..]
-                .iter()
-                .zip(y[unrolled_len..].iter())
-                .map(|(&a, &b)| a * b)
-                .sum();
-
-            let sum = unsafe { hsum256_ps(acc) };
-            sum + tail
+            super::dot_f32_impl(x, y)
         }
     }
 }
@@ -1224,8 +1211,9 @@ mod tests {
     }
 
     /// Every host-supported f32 kernel, single-pair and batch, must agree with
-    /// an f64 reference. Prefixes of length 8 and 16 pin the batch kernels'
-    /// PQ-width fast paths regardless of the generated dimension.
+    /// an f64 reference. Prefixes of length 8 and 16 pin the common PQ
+    /// sub-vector widths, including the batch kernels' fast paths, regardless
+    /// of the generated dimension.
     #[rstest::rstest]
     fn test_dot_f32_kernels_match_reference(
         #[values(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)] shard: usize,
@@ -1250,20 +1238,21 @@ mod tests {
                     );
                 }
 
-                // Where an x86 batch kernel reuses its tier's pair kernel or a
-                // fast path for it, the two must agree bit for bit: up to 16
-                // dimensions for AVX+FMA (above that it uses the scalar
-                // kernel), and at every dimension for AVX. The one allowed
-                // difference is the sign of a zero result: the pair kernels
-                // add products to a +0.0 accumulator, which turns -0.0 into
-                // +0.0, while the dimension-8 fast paths sum the products
-                // directly.
+                // Each x86 batch kernel reuses its tier's pair kernel, so the
+                // two must agree bit for bit. The exceptions are the fast
+                // paths, which sum the products in `hsum256_ps` order rather
+                // than the pair kernel's auto-vectorized order, so they are
+                // held to the reference tolerance below instead.
                 #[cfg(target_arch = "x86_64")]
-                for (pair, batch, max_dimension) in [
-                    (x86::DOT_F32_AVX_FMA, x86::DOT_F32_BATCH_AVX_FMA, 16),
-                    (x86::DOT_F32_AVX, x86::DOT_F32_BATCH_AVX, usize::MAX),
+                for (pair, batch, fast_path_dimensions) in [
+                    (
+                        x86::DOT_F32_AVX_FMA,
+                        x86::DOT_F32_BATCH_AVX_FMA,
+                        &[8, 16][..],
+                    ),
+                    (x86::DOT_F32_AVX, x86::DOT_F32_BATCH_AVX, &[8][..]),
                 ] {
-                    if dimension > max_dimension {
+                    if fast_path_dimensions.contains(&dimension) {
                         continue;
                     }
                     let (Some(pair_kernel), Some(batch_kernel)) = (pair.kernel(), batch.kernel())
@@ -1274,7 +1263,7 @@ mod tests {
                     batch_kernel.call(x, y, dimension, &mut got);
                     let want = pair_kernel.call(x, y);
                     prop_assert!(
-                        got[0].to_bits() == want.to_bits() || (got[0] == 0.0 && want == 0.0),
+                        got[0].to_bits() == want.to_bits(),
                         "{} at dim {dimension}: {} != {want}",
                         batch.name(),
                         got[0]

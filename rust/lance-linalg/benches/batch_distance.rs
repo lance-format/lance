@@ -33,6 +33,22 @@ fn bench_batch_distance(c: &mut Criterion) {
             black_box(&mut output);
         })
     });
+    const DIMENSION_16: usize = 16;
+    let key_16 = (0..DIMENSION_16)
+        .map(|index| index as f32 * 0.125 + 0.25)
+        .collect::<Vec<_>>();
+    let mut output_16 = vec![0.0; TOTAL_VALUES / DIMENSION_16];
+    c.bench_function("Batch distance dot f32 dim 16", |b| {
+        b.iter(|| {
+            <f32 as Dot>::dot_batch_into(
+                black_box(&key_16),
+                black_box(&batch),
+                black_box(DIMENSION_16),
+                &mut output_16,
+            );
+            black_box(&mut output_16);
+        })
+    });
     c.bench_function("Batch distance l2 f32 dim 8", |b| {
         b.iter(|| {
             <f32 as L2>::l2_batch_into(

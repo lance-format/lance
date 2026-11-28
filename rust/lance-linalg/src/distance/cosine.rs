@@ -465,6 +465,7 @@ mod x86 {
 
     use super::{CosineKernel, CosineWithNormsKernel, dot, norm_l2, norm_l2_impl};
     use crate::distance::BatchKernel;
+    use crate::distance::dot::dot_f32_impl;
     use crate::simd::f32::{f32x8, f32x16};
     use crate::simd::f64::{f64x4, f64x8};
     use crate::simd::x86::{hsum256_pd, hsum256_ps};
@@ -734,7 +735,6 @@ mod x86 {
     lance_core::target_kernel! {
         #[target_features("avx512f")]
         #[candidate(pub(super) COSINE_WITH_NORMS_F32_AVX512: CosineWithNormsKernel)]
-        /// 16-wide `__m512` with `vfmadd231ps` per iteration.
         #[inline]
         pub(super) fn cosine_with_norms_f32_avx512(
             x: &[f32],
@@ -742,35 +742,16 @@ mod x86 {
             y_norm: f32,
             y: &[f32],
         ) -> f32 {
-            // See `cosine_f32_avx512` for `min`.
-            let dim = x.len().min(y.len());
-            let unrolled_len = dim / 16 * 16;
-
-            let mut acc = _mm512_setzero_ps();
-            for i in (0..unrolled_len).step_by(16) {
-                // SAFETY: `i + 16 <= dim`, which is in bounds for both slices.
-                let (xv, yv) = unsafe {
-                    (
-                        _mm512_loadu_ps(x.as_ptr().add(i)),
-                        _mm512_loadu_ps(y.as_ptr().add(i)),
-                    )
-                };
-                acc = _mm512_fmadd_ps(xv, yv, acc);
-            }
-
-            let mut xy = _mm512_reduce_add_ps(acc);
-            for i in unrolled_len..dim {
-                xy += x[i] * y[i];
-            }
-
-            1.0 - xy / x_norm / y_norm
+            // Same auto-vectorized loop as the f32 dot kernels, inlined
+            // under this kernel's target features.
+            1.0 - dot_f32_impl(x, y) / x_norm / y_norm
         }
     }
 
     lance_core::target_kernel! {
         #[target_features("avx", "fma")]
         #[candidate(pub(super) COSINE_WITH_NORMS_F32_AVX_FMA: CosineWithNormsKernel)]
-        /// Covers both AVX+FMA and AVX2 hosts (body uses no AVX2-specific intrinsics).
+        /// Covers both AVX+FMA and AVX2 hosts.
         #[inline]
         pub(super) fn cosine_with_norms_f32_avx_fma(
             x: &[f32],
@@ -778,35 +759,9 @@ mod x86 {
             y_norm: f32,
             y: &[f32],
         ) -> f32 {
-            // See `cosine_f32_avx512` for `min`.
-            let dim = x.len().min(y.len());
-            let unrolled_len = dim / 16 * 16;
-            let mut xy16 = f32x16::zeros();
-            for i in (0..unrolled_len).step_by(16) {
-                // SAFETY: `i + 16 <= dim`, which is in bounds for both slices.
-                let (xv, yv) = unsafe {
-                    (
-                        f32x16::load_unaligned(x.as_ptr().add(i)),
-                        f32x16::load_unaligned(y.as_ptr().add(i)),
-                    )
-                };
-                xy16.multiply_add(xv, yv);
-            }
-            let aligned_len = dim / 8 * 8;
-            let mut xy8 = f32x8::zeros();
-            for i in (unrolled_len..aligned_len).step_by(8) {
-                // SAFETY: `i + 8 <= dim`, which is in bounds for both slices.
-                let (xv, yv) = unsafe {
-                    (
-                        f32x8::load_unaligned(x.as_ptr().add(i)),
-                        f32x8::load_unaligned(y.as_ptr().add(i)),
-                    )
-                };
-                xy8.multiply_add(xv, yv);
-            }
-            let xy =
-                xy16.reduce_sum() + xy8.reduce_sum() + dot(&x[aligned_len..], &y[aligned_len..]);
-            1.0 - xy / x_norm / y_norm
+            // Same auto-vectorized loop as the f32 dot kernels, inlined
+            // under this kernel's target features.
+            1.0 - dot_f32_impl(x, y) / x_norm / y_norm
         }
     }
 
@@ -821,26 +776,9 @@ mod x86 {
             y_norm: f32,
             y: &[f32],
         ) -> f32 {
-            // See `cosine_f32_avx512` for `min`.
-            let dim = x.len().min(y.len());
-            let aligned_len = dim / 8 * 8;
-
-            let mut acc = _mm256_setzero_ps();
-            for i in (0..aligned_len).step_by(8) {
-                // SAFETY: `i + 8 <= dim`, which is in bounds for both slices.
-                let (xv, yv) = unsafe {
-                    (
-                        _mm256_loadu_ps(x.as_ptr().add(i)),
-                        _mm256_loadu_ps(y.as_ptr().add(i)),
-                    )
-                };
-                acc = _mm256_add_ps(acc, _mm256_mul_ps(xv, yv));
-            }
-
-            // SAFETY: AVX is enabled for this function.
-            let xy_main = unsafe { hsum256_ps(acc) };
-            let xy = xy_main + dot(&x[aligned_len..], &y[aligned_len..]);
-            1.0 - xy / x_norm / y_norm
+            // Same auto-vectorized loop as the f32 dot kernels, inlined
+            // under this kernel's target features.
+            1.0 - dot_f32_impl(x, y) / x_norm / y_norm
         }
     }
 
@@ -1236,15 +1174,25 @@ mod tests {
     use num_traits::AsPrimitive;
     use proptest::prelude::*;
 
-    fn cosine_dist_brute_force(x: &[f32], y: &[f32]) -> f32 {
+    /// Cosine distance accumulated in f64, as a reference independent of the
+    /// f32 summation order.
+    fn cosine_dist_f64(x: &[f32], y: &[f32]) -> f32 {
         let xy = x
             .iter()
             .zip(y.iter())
-            .map(|(&xi, &yi)| xi * yi)
-            .sum::<f32>();
-        let x_sq = x.iter().map(|&xi| xi * xi).sum::<f32>().sqrt();
-        let y_sq = y.iter().map(|&yi| yi * yi).sum::<f32>().sqrt();
-        1.0 - xy / x_sq / y_sq
+            .map(|(&xi, &yi)| xi as f64 * yi as f64)
+            .sum::<f64>();
+        let x_sq = x
+            .iter()
+            .map(|&xi| xi as f64 * xi as f64)
+            .sum::<f64>()
+            .sqrt();
+        let y_sq = y
+            .iter()
+            .map(|&yi| yi as f64 * yi as f64)
+            .sum::<f64>()
+            .sqrt();
+        (1.0 - xy / x_sq / y_sq) as f32
     }
 
     #[test]
@@ -1305,7 +1253,10 @@ mod tests {
         let x = (0..total).map(|v| v as f32).collect::<Vec<_>>();
         let y = (1024..1024 + total).map(|v| v as f32).collect::<Vec<_>>();
         let d = cosine_distance_batch_vec(&x, &y, total);
-        assert_relative_eq!(d[0], cosine_dist_brute_force(&x, &y));
+        // The similarity is ~0.945, so `1 - similarity` magnifies its rounding
+        // about 18x: a few ulps in the f32 dot product move the distance by
+        // several 1e-6. The SSE fallback lands 7e-6 from the f64 value.
+        assert_relative_eq!(d[0], cosine_dist_f64(&x, &y), max_relative = 2e-5);
     }
 
     #[test]

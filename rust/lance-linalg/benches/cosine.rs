@@ -137,17 +137,47 @@ fn bench_distance(c: &mut Criterion) {
     }
 }
 
+/// `cosine_with_norms` with precomputed norms, as used by flat storage. Keeps
+/// ~256 KiB of 64-byte-aligned targets in cache so it measures the kernel.
+fn bench_cosine_with_norms(c: &mut Criterion) {
+    for dim in [8, 16, 32, 64, 128, 256, 768, 1024, 1536] {
+        let num_vectors = 64 * 1024 / dim;
+        let aligned = |len: usize, seed: [u8; 32]| {
+            let values = generate_random_array_with_seed::<Float32Type>(len + 15, seed);
+            let values = values.values().to_vec();
+            let offset = values.as_ptr().align_offset(64);
+            (values, offset)
+        };
+        let (key_buf, key_offset) = aligned(dim, [0; 32]);
+        let (target_buf, target_offset) = aligned(num_vectors * dim, [42; 32]);
+        let x = &key_buf[key_offset..][..dim];
+        let target = &target_buf[target_offset..][..num_vectors * dim];
+        let x_norm = x.iter().map(|v| v * v).sum::<f32>().sqrt();
+        let y_norms = target
+            .chunks_exact(dim)
+            .map(|y| y.iter().map(|v| v * v).sum::<f32>().sqrt())
+            .collect::<Vec<_>>();
+        c.bench_function(&format!("Cosine(f32, with norms, dim={dim})"), |b| {
+            b.iter(|| {
+                for (y, &y_norm) in target.chunks_exact(black_box(dim)).zip(&y_norms) {
+                    black_box(f32::cosine_with_norms(x, x_norm, y_norm, y));
+                }
+            });
+        });
+    }
+}
+
 #[cfg(target_os = "linux")]
 criterion_group!(
     name=benches;
     config = Criterion::default().significance_level(0.1).sample_size(10)
         .with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
-    targets = bench_distance);
+    targets = bench_cosine_with_norms, bench_distance);
 
 // Non-linux version does not support pprof.
 #[cfg(not(target_os = "linux"))]
 criterion_group!(
     name=benches;
     config = Criterion::default().significance_level(0.1).sample_size(10);
-    targets = bench_distance);
+    targets = bench_cosine_with_norms, bench_distance);
 criterion_main!(benches);

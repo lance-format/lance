@@ -270,10 +270,11 @@ impl<T: FlatFloat> FloatKernel<'_, T> {
     }
 }
 
-/// f32 squared L2 and dot product over rows wider than one lane block,
-/// bit-identical to lance-linalg's `l2_scalar::<f32, f32, 16>` and
-/// `dot_scalar::<f32, f32, 16>` (what its batch kernels run above 16
-/// dimensions on the x86 AVX2 baseline and on aarch64).
+/// f32 squared L2 and dot product over rows wider than one lane block. L2 is
+/// bit-identical to lance-linalg's `l2_scalar::<f32, f32, 16>` (what its batch
+/// kernel runs above 16 dimensions on the x86 AVX2 baseline and on aarch64).
+/// Dot uses the same fixed 16-lane order; lance-linalg's dot kernels let LLVM
+/// pick the order, so the two agree only within rounding.
 ///
 /// Each row keeps the same 16 independent lane sums, updated with a separate
 /// multiply and add (never FMA), then folds the remainder and the lanes in
@@ -715,7 +716,7 @@ mod tests {
         }
     }
 
-    /// lance-linalg's `dot_scalar::<f32, f32, 16>`, which is private there.
+    /// The fixed 16-lane dot product order the blocked kernels reproduce.
     fn dot_reference(x: &[f32], y: &[f32]) -> f32 {
         let (x_chunks, x_remainder) = y.as_chunks::<16>();
         let (y_chunks, y_remainder) = x.as_chunks::<16>();
@@ -747,8 +748,8 @@ mod tests {
         }
     }
 
-    /// The blocked f32 kernels reproduce lance-linalg's 16-lane kernels bit
-    /// for bit on every backend and for every block split of the rows.
+    /// The blocked f32 kernels reproduce the 16-lane reference bit for bit on
+    /// every backend and for every block split of the rows.
     #[rstest]
     fn test_f32_rows_bit_identical(
         #[values(17, 32, 35, 64, 100, 1536)] dim: usize,
@@ -777,19 +778,15 @@ mod tests {
         if l2 {
             assert_eq!(expected[3], 0.0);
         }
-        // lance-linalg's batch kernels are these 16-lane kernels on the
-        // default builds; sub-AVX2 x86 builds dispatch per host instead.
+        // lance-linalg's L2 batch kernel is this 16-lane kernel on the default
+        // builds; sub-AVX2 x86 builds dispatch per host instead.
         #[cfg(any(
             not(target_arch = "x86_64"),
             all(target_feature = "avx2", target_feature = "fma")
         ))]
-        {
+        if l2 {
             let mut batch = vec![0.0; num_rows];
-            batch_rows_kernel::<f32>(if l2 {
-                DistanceType::L2
-            } else {
-                DistanceType::Dot
-            })(&anchor, &rows, &mut batch);
+            batch_rows_kernel::<f32>(DistanceType::L2)(&anchor, &rows, &mut batch);
             assert_same_bits(&batch, &expected, "lance-linalg batch");
         }
 

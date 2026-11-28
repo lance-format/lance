@@ -148,6 +148,31 @@ fn bench_distance(c: &mut Criterion) {
         }
     }
 
+    // The 1M x 1024 benches above stream 4 GiB and measure memory bandwidth;
+    // these keep ~256 KiB of targets in cache so they measure the kernel.
+    // Both inputs are 64-byte-aligned views, as for u8 above, so that results
+    // do not depend on heap placement.
+    for dim in [8, 16, 24, 32, 64, 128, 768, 1024, 1536] {
+        let num_vectors = 64 * 1024 / dim;
+        let aligned = |len: usize, seed: [u8; 32]| {
+            let values = generate_random_array_with_seed::<Float32Type>(len + 15, seed);
+            let values = values.values().to_vec();
+            let offset = values.as_ptr().align_offset(64);
+            (values, offset)
+        };
+        let (key_buf, key_offset) = aligned(dim, [0; 32]);
+        let (target_buf, target_offset) = aligned(num_vectors * dim, [42; 32]);
+        let x = &key_buf[key_offset..][..dim];
+        let target = &target_buf[target_offset..][..num_vectors * dim];
+        c.bench_function(&format!("Dot(f32, in-cache, dim={dim})"), |b| {
+            b.iter(|| {
+                for y in target.chunks_exact(black_box(dim)) {
+                    black_box(f32::dot(x, y));
+                }
+            });
+        });
+    }
+
     run_bench::<Float32Type>(c);
     c.bench_function("Dot(f32, SIMD)", |b| {
         let key = generate_random_array_with_seed::<Float32Type>(DIMENSION, [0; 32]);
