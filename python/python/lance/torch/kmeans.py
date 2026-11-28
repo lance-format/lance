@@ -16,7 +16,7 @@ from lance.dependencies import numpy as np
 from lance.log import LOGGER
 from lance.util import MetricType, _normalize_metric_type
 
-from . import preferred_device
+from . import _to_device, preferred_device
 from .data import TensorDataset
 from .distance import dot_distance, l2_distance
 
@@ -108,8 +108,7 @@ class KMeans:
                 + f"np.ndarray or torch.Tensor, got: {type(data)}"
             )
 
-        data = data.to(self.device)
-        return data
+        return _to_device(data, self.device)
 
     def _random_init(self, data: Union[torch.Tensor, np.ndarray]):
         """Random centroid initialization."""
@@ -155,7 +154,7 @@ class KMeans:
             data = TensorDataset(data, batch_size=10240)
 
         assert self.centroids is not None
-        self.centroids = self.centroids.to(self.device)
+        self.centroids = _to_device(self.centroids, self.device)
 
         LOGGER.info(
             "Start kmean training, metric: %s, iters: %s", self.metric, self.max_iters
@@ -241,8 +240,8 @@ class KMeans:
             if column is not None:
                 chunk = chunk[column]
             chunk: torch.Tensor = chunk
+            chunk = _to_device(chunk, self.device)
             dtype = chunk.dtype
-            chunk = chunk.to(self.device)
             ids, dists = self._transform(chunk, y2=self.y2)
 
             # Training is significantly faster w/o these checks

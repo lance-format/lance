@@ -11,7 +11,7 @@ from lance.dependencies import _check_for_numpy, torch
 from lance.dependencies import numpy as np
 
 from .. import LanceDataset
-from . import preferred_device
+from . import _to_device, preferred_device
 from .data import LanceDataset as PytorchLanceDataset
 from .distance import pairwise_cosine, pairwise_l2
 
@@ -81,7 +81,7 @@ def ground_truth(
 
     if _check_for_numpy(query) and isinstance(query, np.ndarray):
         query = torch.from_numpy(query)
-    query = query.to(device)
+    query = _to_device(query, device)
     metric_type = metric_type.lower()
 
     all_ids = None
@@ -95,7 +95,7 @@ def ground_truth(
     total = ds.count_rows()
     with tqdm(total=total) as progress_bar:
         for batch in tds:
-            vectors = batch[column].to(device)
+            vectors = _to_device(batch[column], device)
             row_ids = batch["_rowid"].to(device).broadcast_to((query.shape[0], -1))
             if metric_type == "l2":
                 dists = pairwise_l2(query, vectors)
