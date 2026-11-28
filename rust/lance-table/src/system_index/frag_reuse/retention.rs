@@ -3,9 +3,9 @@
 
 //! Which records of a fragment reuse history some index still needs.
 //!
-//! Computed from the history's digests and the stored index metadata alone,
-//! with no payload IO, so both the maintenance trim and an action-based
-//! commit's `TrimFragReuse` reach the same verdict.
+//! Computed from the history's digests, the stored index metadata and the
+//! live fragment set alone, with no payload IO, so both the maintenance trim
+//! and an action-based commit's `TrimFragReuse` reach the same verdict.
 
 use std::collections::{HashMap, VecDeque};
 
@@ -162,6 +162,14 @@ pub fn split_trim_elements(content: &[u8]) -> Result<Vec<TrimElement>> {
     Ok(elements)
 }
 
+/// One record's lineage edge as the trim walks it: a transition, or one group
+/// of a lifted legacy version.
+struct Node {
+    element: usize,
+    sources: Vec<u64>,
+    destinations: Vec<u64>,
+}
+
 /// One logical index's coverage as the trim sees it: provenance is the union
 /// of every stored segment bitmap (any segment, usable by this build or not,
 /// pins the records its addresses need), while direct coverage counts only
@@ -174,47 +182,201 @@ struct IndexGroupCoverage {
     direct: RoaringBitmap,
 }
 
-/// Whether some index still needs this transition to translate its rows.
+/// Bitmaps hold u32 ids, so an id outside that range is in none of them.
+fn bitmap_contains(bitmap: &RoaringBitmap, fragment: u64) -> bool {
+    u32::try_from(fragment).is_ok_and(|id| bitmap.contains(id))
+}
+
+/// Every record naming each fragment as a destination. A valid history has
+/// one producer per fragment, but only tagged transitions are checked for a
+/// duplicate producer (`order_lineage`); lifted legacy groups are not, so
+/// every producer is kept and walked.
+fn producers_of(nodes: &[Node]) -> HashMap<u64, Vec<usize>> {
+    let mut producer_of: HashMap<u64, Vec<usize>> = HashMap::new();
+    for (node_index, node) in nodes.iter().enumerate() {
+        for destination in &node.destinations {
+            producer_of
+                .entry(*destination)
+                .or_default()
+                .push(node_index);
+        }
+    }
+    producer_of
+}
+
+/// The producers the walk follows out of `fragment`: none once it is directly
+/// covered.
+fn upstream_producers<'a>(
+    fragment: u64,
+    direct: &RoaringBitmap,
+    producer_of: &'a HashMap<u64, Vec<usize>>,
+) -> &'a [usize] {
+    if bitmap_contains(direct, fragment) {
+        return &[];
+    }
+    producer_of
+        .get(&fragment)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+}
+
+/// One node's verdict in the walk of one logical index.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Verdict {
+    InProgress,
+    Pinned,
+    NotPinned,
+}
+
+struct IndexWalk {
+    /// `None` for a node the walk did not reach.
+    verdicts: Vec<Option<Verdict>>,
+    /// Node resolutions performed, so tests can check the memoisation.
+    #[cfg(test)]
+    resolutions: usize,
+}
+
+/// Which records lie on a translation path one logical index still needs,
+/// and whether that index pins them.
 ///
-/// RETAIN iff there is a logical index I (its stored segments grouped by
-/// name, system indices exempt) such that:
-/// * some segment's stored provenance bitmap intersects the transition's
-///   sources (I holds addresses the transition moves), AND
-/// * some destination is not directly covered by any USABLE segment of I
-///   (I has not fully re-derived onto the transition's output in a form this
-///   build can serve).
+/// The walk starts at every live fragment that some record produces and the
+/// index does not cover directly, visits its producers, and from each visited
+/// record continues to the producers of its sources outside direct coverage;
+/// it never crosses a directly covered fragment. A visited record is pinned
+/// when one of its sources is in the index's provenance, or a source outside
+/// direct coverage has a pinned producer. Every such producer is visited even
+/// once the record is known pinned, since upstream records need their own
+/// verdict.
 ///
-/// A segment without a stored bitmap imposes no constraint, mirroring the v0
-/// leniency for missing bitmaps.
-fn is_transition_needed(
-    transition: &pb_fri::Transition,
-    index_groups: &HashMap<&str, IndexGroupCoverage>,
-) -> bool {
-    index_groups.values().any(|group| {
-        let sources_hit = transition
+/// This mirrors the reader's `FragmentReuseIndex::segment_plans` (per index,
+/// direct coverage first, otherwise back through producers) with two
+/// differences: every stored bitmap pins, while only usable segments stop the
+/// walk.
+///
+/// Post-order with an explicit stack so long chains cannot overflow, and
+/// memoised so each node is resolved at most once per index. A node reached
+/// again while in progress (a cycle, which a valid history cannot hold) counts
+/// as pinned, so every node on the cycle resolves pinned and the trim retains.
+fn walk_index(
+    nodes: &[Node],
+    producer_of: &HashMap<u64, Vec<usize>>,
+    coverage: &IndexGroupCoverage,
+    live_fragments: &RoaringBitmap,
+) -> IndexWalk {
+    struct Frame {
+        node: usize,
+        next_source: usize,
+        next_producer: usize,
+        pinned: bool,
+    }
+    let open = |node: usize| Frame {
+        node,
+        next_source: 0,
+        next_producer: 0,
+        pinned: nodes[node]
             .sources
             .iter()
-            .any(|source| group.provenance.contains(source.id as u32));
-        sources_hit
-            && transition
-                .destinations
-                .iter()
-                .any(|destination| !group.direct.contains(destination.id as u32))
-    })
+            .any(|&source| bitmap_contains(&coverage.provenance, source)),
+    };
+
+    let mut verdicts: Vec<Option<Verdict>> = vec![None; nodes.len()];
+    #[cfg(test)]
+    let mut resolutions = 0usize;
+    let mut stack: Vec<Frame> = Vec::new();
+    for (&fragment, producers) in producer_of {
+        if bitmap_contains(&coverage.direct, fragment) || !bitmap_contains(live_fragments, fragment)
+        {
+            continue;
+        }
+        for &root in producers {
+            if verdicts[root].is_some() {
+                continue;
+            }
+            verdicts[root] = Some(Verdict::InProgress);
+            stack.push(open(root));
+            while let Some(frame) = stack.last_mut() {
+                let sources = &nodes[frame.node].sources;
+                let mut descend = None;
+                while let Some(&source) = sources.get(frame.next_source) {
+                    let producers = upstream_producers(source, &coverage.direct, producer_of);
+                    let Some(&producer) = producers.get(frame.next_producer) else {
+                        frame.next_source += 1;
+                        frame.next_producer = 0;
+                        continue;
+                    };
+                    frame.next_producer += 1;
+                    match verdicts[producer] {
+                        None => {
+                            descend = Some(producer);
+                            break;
+                        }
+                        Some(Verdict::Pinned | Verdict::InProgress) => frame.pinned = true,
+                        Some(Verdict::NotPinned) => {}
+                    }
+                }
+                if let Some(child) = descend {
+                    verdicts[child] = Some(Verdict::InProgress);
+                    stack.push(open(child));
+                    continue;
+                }
+                let (node, pinned) = (frame.node, frame.pinned);
+                stack.pop();
+                verdicts[node] = Some(if pinned {
+                    Verdict::Pinned
+                } else {
+                    Verdict::NotPinned
+                });
+                #[cfg(test)]
+                {
+                    resolutions += 1;
+                }
+                if pinned && let Some(parent) = stack.last_mut() {
+                    parent.pinned = true;
+                }
+            }
+        }
+    }
+    IndexWalk {
+        verdicts,
+        #[cfg(test)]
+        resolutions,
+    }
 }
 
 /// Which elements of a tagged history are still needed, from the entry's
-/// digests and the stored index metadata alone (zero payload IO).
+/// digests, the stored index metadata and the live fragment set alone (zero
+/// payload IO). `live_fragments` must be the fragments of the same manifest
+/// `indices` was read from.
 ///
-/// Legacy versions keep the exact v0 caught-up predicate; transitions use
-/// `is_transition_needed`; then transitive chain retention closes the set
-/// forward: a retained record's translation path walks through every
-/// downstream consumer of its destinations, so those records must survive
-/// too. Legacy versions retain at whole-version granularity (their groups
-/// stand or fall together, as in v0).
+/// Seeds. Legacy versions keep the exact v0 caught-up predicate. A tagged
+/// transition is a seed when, for some logical index (its stored segments
+/// grouped by name, system indices exempt), the producer walk of
+/// `walk_index` visits it and finds it pinned: every stored segment bitmap
+/// of the index pins (a segment without a bitmap imposes nothing, mirroring
+/// the v0 leniency), and only the bitmaps of usable segments stop the walk.
+/// Only an index's own direct coverage stops its walk: the reader gives direct
+/// coverage precedence per logical index, so another index's segments never
+/// stand in for its translation. Lifted legacy groups pass pins through the
+/// walk but their verdict does not decide a legacy version.
+///
+/// A transition none of whose destinations leads to a live fragment outside
+/// direct coverage is released: a retired destination that no record
+/// consumes had its rows deleted, since the trim does not run on a history
+/// with unsupported transitions, and the forward closure never releases a
+/// consumer before the record producing its sources. A fan-in whose sources
+/// are only partly in provenance stays retained, since a later segment over
+/// the other sources may complete it.
+///
+/// Final retention is the forward closure of all seeds: a retained record's
+/// translation path walks through every downstream consumer of its
+/// destinations, so those records survive too, and legacy versions retain at
+/// whole-version granularity (their groups stand or fall together, as in
+/// v0). A record can therefore be retained although no walk visited or pinned
+/// it. Each index's walk resolves every node at most once.
 pub fn compute_tagged_retention(
     elements: &[TrimElement],
     indices: &[IndexMetadata],
+    live_fragments: &RoaringBitmap,
     is_usable: impl Fn(&IndexMetadata) -> bool,
 ) -> Vec<bool> {
     // The v0 predicate's disjointness rule is scoped to the legacy chain, as
@@ -252,39 +414,7 @@ pub fn compute_tagged_retention(
         }
     }
 
-    let mut retained = vec![false; elements.len()];
-    for (position, element) in elements.iter().enumerate() {
-        match &element.record {
-            TrimRecord::LegacyVersion(version) => {
-                let check_results = indices
-                    .iter()
-                    .map(|idx| is_index_remap_caught_up(version, idx, &chain_frag_bitmap))
-                    .collect::<Vec<_>>();
-                if check_results
-                    .iter()
-                    .any(|r| matches!(r, Err(Error::InvalidInput { .. })))
-                {
-                    // If the check fails, the reuse version is likely corrupted,
-                    // do not retain it (v0 behavior).
-                    continue;
-                }
-                if !check_results.into_iter().all(|r| r.unwrap()) {
-                    retained[position] = true;
-                }
-            }
-            TrimRecord::Transition(transition) => {
-                retained[position] = is_transition_needed(transition, &index_groups);
-            }
-        }
-    }
-
-    // Transitive chain retention (forward closure over producer->consumer
-    // edges).
-    struct Node {
-        element: usize,
-        sources: Vec<u64>,
-        destinations: Vec<u64>,
-    }
+    // Lineage edges, shared by the producer walk and the forward closure.
     let mut nodes = Vec::new();
     for (position, element) in elements.iter().enumerate() {
         match &element.record {
@@ -304,6 +434,10 @@ pub fn compute_tagged_retention(
             }),
         }
     }
+    // Relies on each fragment being consumed by at most one record; a repeated
+    // source would be last-wins. The ledger rejects duplicate consumers among
+    // tagged transitions (`order_lineage`); lifted legacy groups are not
+    // checked there.
     let mut consumer_of: HashMap<u64, usize> = HashMap::new();
     let mut element_nodes: HashMap<usize, Vec<usize>> = HashMap::new();
     for (node_index, node) in nodes.iter().enumerate() {
@@ -315,6 +449,42 @@ pub fn compute_tagged_retention(
             .or_default()
             .push(node_index);
     }
+
+    let producer_of = producers_of(&nodes);
+
+    let mut retained = vec![false; elements.len()];
+    for (position, element) in elements.iter().enumerate() {
+        if let TrimRecord::LegacyVersion(version) = &element.record {
+            let check_results = indices
+                .iter()
+                .map(|idx| is_index_remap_caught_up(version, idx, &chain_frag_bitmap))
+                .collect::<Vec<_>>();
+            if check_results
+                .iter()
+                .any(|r| matches!(r, Err(Error::InvalidInput { .. })))
+            {
+                // If the check fails, the reuse version is likely corrupted,
+                // do not retain it (v0 behavior).
+                continue;
+            }
+            if !check_results.into_iter().all(|r| r.unwrap()) {
+                retained[position] = true;
+            }
+        }
+    }
+    for coverage in index_groups.values() {
+        let walk = walk_index(&nodes, &producer_of, coverage, live_fragments);
+        for (node, verdict) in nodes.iter().zip(walk.verdicts) {
+            if verdict == Some(Verdict::Pinned)
+                && matches!(elements[node.element].record, TrimRecord::Transition(_))
+            {
+                retained[node.element] = true;
+            }
+        }
+    }
+
+    // Transitive chain retention (forward closure over producer->consumer
+    // edges).
     let mut node_retained = vec![false; nodes.len()];
     let mut queue: VecDeque<usize> = VecDeque::new();
     for (node_index, node) in nodes.iter().enumerate() {
@@ -347,4 +517,79 @@ pub fn compute_tagged_retention(
     }
 
     retained
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn node(
+        sources: impl IntoIterator<Item = u64>,
+        destinations: impl IntoIterator<Item = u64>,
+    ) -> Node {
+        Node {
+            element: 0,
+            sources: sources.into_iter().collect(),
+            destinations: destinations.into_iter().collect(),
+        }
+    }
+
+    fn pinning(fragments: &[u32]) -> IndexGroupCoverage {
+        IndexGroupCoverage {
+            provenance: fragments.iter().copied().collect(),
+            direct: RoaringBitmap::new(),
+        }
+    }
+
+    /// Every destination of a wide transition is a root, yet the transition
+    /// is resolved once.
+    #[test]
+    fn wide_transition_is_resolved_once() {
+        const SOURCES: u64 = 4_096;
+        const DESTINATIONS: u64 = 2_048;
+        let nodes = vec![node(1..=SOURCES, SOURCES + 1..=SOURCES + DESTINATIONS)];
+        let live: RoaringBitmap = (SOURCES as u32 + 1..=(SOURCES + DESTINATIONS) as u32).collect();
+        let walk = walk_index(&nodes, &producers_of(&nodes), &pinning(&[1]), &live);
+        assert_eq!(walk.resolutions, 1);
+        assert_eq!(walk.verdicts, vec![Some(Verdict::Pinned)]);
+    }
+
+    /// Many roots behind one shared upstream chain: each reachable node is
+    /// resolved once, not once per root.
+    #[test]
+    fn shared_upstream_chain_is_resolved_once_per_node() {
+        const HOPS: u64 = 1_000;
+        const ROOTS: u64 = 500;
+        // Chain `k -> k + 1` for k in 1..=HOPS, a split of HOPS + 1 into
+        // ROOTS fragments, and one hop from each of them onto a live root.
+        let mut nodes: Vec<Node> = (1..=HOPS).map(|hop| node([hop], [hop + 1])).collect();
+        let split_base = HOPS + 2;
+        nodes.push(node([HOPS + 1], split_base..split_base + ROOTS));
+        let root_base = split_base + ROOTS;
+        nodes.extend((0..ROOTS).map(|i| node([split_base + i], [root_base + i])));
+        let live: RoaringBitmap = (root_base as u32..(root_base + ROOTS) as u32).collect();
+
+        let walk = walk_index(&nodes, &producers_of(&nodes), &pinning(&[1]), &live);
+        assert_eq!(walk.resolutions, nodes.len());
+        assert!(
+            walk.verdicts
+                .iter()
+                .all(|verdict| *verdict == Some(Verdict::Pinned))
+        );
+    }
+
+    /// A cycle (which a valid history cannot hold) resolves every node on it
+    /// pinned, even without any provenance.
+    #[test]
+    fn cycle_resolves_pinned() {
+        let nodes = vec![node([2], [1]), node([1], [2]), node([1], [3])];
+        let live: RoaringBitmap = [3u32].into_iter().collect();
+        let walk = walk_index(&nodes, &producers_of(&nodes), &pinning(&[]), &live);
+        assert_eq!(walk.resolutions, 3);
+        assert!(
+            walk.verdicts
+                .iter()
+                .all(|verdict| *verdict == Some(Verdict::Pinned))
+        );
+    }
 }

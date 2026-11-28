@@ -12,7 +12,7 @@ use crate::{RT, block_on};
 use arrow::ffi::FFI_ArrowSchema;
 use jni::JNIEnv;
 use jni::objects::JObject;
-use jni::sys::{jboolean, jint, jlong};
+use jni::sys::{jboolean, jlong};
 use lance::dataset::scanner::Scanner;
 use lance_io::ffi::to_ffi_arrow_array_stream;
 
@@ -192,7 +192,7 @@ pub extern "system" fn Java_org_lance_ipc_AsyncScanner_createAsyncScanner<'local
     prefilter: jboolean,
     with_row_id: jboolean,
     with_row_address: jboolean,
-    batch_readahead: jint,
+    batch_readahead_obj: JObject<'local>,
     fragment_readahead_obj: JObject<'local>,
     scan_in_order: jboolean,
     late_materialization_obj: JObject<'local>,
@@ -226,7 +226,7 @@ pub extern "system" fn Java_org_lance_ipc_AsyncScanner_createAsyncScanner<'local
             prefilter,
             with_row_id,
             with_row_address,
-            batch_readahead,
+            batch_readahead_obj,
             fragment_readahead_obj,
             scan_in_order,
             late_materialization_obj,
@@ -262,7 +262,7 @@ fn inner_create_async_scanner<'local>(
     prefilter: jboolean,
     with_row_id: jboolean,
     with_row_address: jboolean,
-    batch_readahead: jint,
+    batch_readahead_obj: JObject<'local>,
     fragment_readahead_obj: JObject<'local>,
     scan_in_order: jboolean,
     late_materialization_obj: JObject<'local>,
@@ -297,7 +297,7 @@ fn inner_create_async_scanner<'local>(
         prefilter,
         with_row_id,
         with_row_address,
-        batch_readahead,
+        batch_readahead_obj,
         fragment_readahead_obj,
         scan_in_order,
         late_materialization_obj,

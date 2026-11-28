@@ -51,6 +51,12 @@ async fn write(uri: &str, version: LanceFileVersion) -> Dataset {
 /// files, `[a, b, c]`, `[d]` and `[e]`.
 async fn write_backfilled() -> Dataset {
     let mut dataset = write("memory://", LanceFileVersion::V2_0).await;
+    backfill(&mut dataset).await;
+    dataset
+}
+
+/// Add `d` and `e`, each in a new file of every fragment.
+async fn backfill(dataset: &mut Dataset) {
     for (name, expr) in [("d", "a + 1"), ("e", "a + 2")] {
         dataset
             .add_columns(
@@ -61,7 +67,6 @@ async fn write_backfilled() -> Dataset {
             .await
             .unwrap();
     }
-    dataset
 }
 
 fn repack_options(max_files: Option<usize>) -> CompactionOptions {
@@ -956,12 +961,7 @@ fn repack_skips_a_fragment_holding_a_legacy_file() {
         v2_0_file("c.lance", vec![2]),
     ];
     let plan = |fragment: &Fragment| {
-        crate::dataset::optimize::repack::plan_fragment_repack(
-            &schema,
-            fragment,
-            fragment.files.len(),
-            1,
-        )
+        runtime::repack::plan_fragment_repack(&schema, fragment, fragment.files.len(), 1)
     };
     assert_eq!(plan(&fragment), None);
     // The same layout with a V2 file in its place is repacked.
@@ -1045,13 +1045,13 @@ fn repack_keeps_the_spilled_lineage_file() {
 
     // Above the limit, the lineage file's column stays and the others move.
     assert_eq!(
-        crate::dataset::optimize::repack::plan_fragment_repack(&schema, &fragment, 3, 2),
+        runtime::repack::plan_fragment_repack(&schema, &fragment, 3, 2),
         Some(vec![vec![1, 2]])
     );
     // With a limit of 1 as well: a file a move cannot empty stays anyway, so
     // the lineage file keeps its column.
     assert_eq!(
-        crate::dataset::optimize::repack::plan_fragment_repack(&schema, &fragment, 3, 1),
+        runtime::repack::plan_fragment_repack(&schema, &fragment, 3, 1),
         Some(vec![vec![1, 2]])
     );
 }
@@ -1094,7 +1094,7 @@ fn repack_merges_around_a_blob_column() {
         v2_0_file("e.lance", vec![3]),
     ];
     assert_eq!(
-        crate::dataset::optimize::repack::plan_fragment_repack(&schema, &fragment, 3, 1),
+        runtime::repack::plan_fragment_repack(&schema, &fragment, 3, 1),
         Some(vec![vec![2, 3]])
     );
 }
@@ -1124,7 +1124,7 @@ fn repack_merges_every_movable_file_next_to_one_that_stays() {
         v2_0_file("f.lance", vec![4]),
     ];
     assert_eq!(
-        crate::dataset::optimize::repack::plan_fragment_repack(&schema, &fragment, 4, 2),
+        runtime::repack::plan_fragment_repack(&schema, &fragment, 4, 2),
         Some(vec![vec![2, 3, 4]])
     );
 }
@@ -1173,16 +1173,7 @@ async fn repack_applies_data_cache_bytes(#[case] version: LanceFileVersion) {
         data_cache_bytes: Option<u64>,
     ) -> usize {
         let mut dataset = write("memory://", version).await;
-        for (name, expr) in [("d", "a + 1"), ("e", "a + 2")] {
-            dataset
-                .add_columns(
-                    NewColumnTransform::SqlExpressions(vec![(name.into(), expr.into())]),
-                    None,
-                    None,
-                )
-                .await
-                .unwrap();
-        }
+        backfill(&mut dataset).await;
         let options = CompactionOptions {
             batch_size: Some(1),
             data_cache_bytes,
@@ -1198,7 +1189,7 @@ async fn repack_applies_data_cache_bytes(#[case] version: LanceFileVersion) {
             .unwrap()
             .join(file.path.as_str());
         let scheduler = ScanScheduler::new(
-            dataset.object_store.clone(),
+            dataset.table_state.object_store.clone(),
             SchedulerConfig::default_for_testing(),
         );
         let file_scheduler = scheduler
@@ -1214,6 +1205,142 @@ async fn repack_applies_data_cache_bytes(#[case] version: LanceFileVersion) {
     assert!(
         bounded_pages > default_pages,
         "default={default_pages}, bounded={bounded_pages}"
+    );
+}
+
+/// The budget and bytes read of every I/O scheduler state event fired while
+/// it is the default subscriber.
+#[derive(Clone, Default)]
+struct SchedulerStates(Arc<std::sync::Mutex<Vec<SchedulerState>>>);
+
+#[derive(Debug, Default)]
+struct SchedulerState {
+    io_buffer_size_bytes: u64,
+    bytes_read: u64,
+}
+
+impl tracing::field::Visit for SchedulerState {
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+        match field.name() {
+            "io_buffer_size_bytes" => self.io_buffer_size_bytes = value,
+            "scheduler_bytes_read" => self.bytes_read = value,
+            _ => {}
+        }
+    }
+    fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for SchedulerStates {
+    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+        if event.metadata().target() != "lance_io::scheduler::state" {
+            return;
+        }
+        let mut state = SchedulerState::default();
+        event.record(&mut state);
+        self.0.lock().unwrap().push(state);
+    }
+}
+
+/// Sets an environment variable until dropped, then restores its old value,
+/// so a failing assertion does not leave it set for later tests.
+struct EnvVar {
+    key: &'static str,
+    old: Option<std::ffi::OsString>,
+}
+
+impl EnvVar {
+    fn set(key: &'static str, value: &str) -> Self {
+        let old = std::env::var_os(key);
+        unsafe { std::env::set_var(key, value) };
+        Self { key, old }
+    }
+}
+
+impl Drop for EnvVar {
+    fn drop(&mut self) {
+        unsafe {
+            match &self.old {
+                Some(old) => std::env::set_var(self.key, old),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+}
+
+/// A repack reads with `io_buffer_size`, or `LANCE_DEFAULT_IO_BUFFER_SIZE`
+/// when that is unset, as a rewrite does, both the files of the dataset and,
+/// in a shallow clone, the source files it references.
+#[rstest]
+#[case::own_files(false, false)]
+#[case::shallow_clone(true, false)]
+#[case::env_var(false, true)]
+#[case::env_var_shallow_clone(true, true)]
+// The events are recorded on this thread only, so the scheduler's I/O loop
+// has to run on it too.
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial(LANCE_DEFAULT_IO_BUFFER_SIZE)]
+async fn repack_reads_with_io_buffer_size(#[case] shallow_clone: bool, #[case] from_env: bool) {
+    use tracing_subscriber::layer::SubscriberExt;
+
+    let source_dir = TempStrDir::default();
+    let clone_dir = TempStrDir::default();
+    let dataset = if shallow_clone {
+        let mut source = write(&source_dir, LanceFileVersion::V2_0).await;
+        backfill(&mut source).await;
+        source
+            .tags()
+            .create("to_clone", source.version().version)
+            .await
+            .unwrap();
+        let clone = source
+            .shallow_clone(&clone_dir, "to_clone", None)
+            .await
+            .unwrap();
+        let files = &clone.manifest.fragments[0].files;
+        assert!(files.iter().all(|file| file.base_id.is_some()), "{files:?}");
+        clone
+    } else {
+        write_backfilled().await
+    };
+
+    let io_buffer_size = 3 * 1024 * 1024 + 1;
+    let options = CompactionOptions {
+        io_buffer_size: (!from_env).then_some(io_buffer_size),
+        ..repack_options(Some(1))
+    };
+    let plan = plan_compaction(&dataset, &options).await.unwrap();
+    let task = plan.compaction_tasks().next().unwrap();
+    // `DEFAULT_IO_BUFFER_SIZE` reads the variable once and caches it, so read
+    // it before setting the variable, or a scan elsewhere could cache this value.
+    let _ = *crate::dataset::scanner::DEFAULT_IO_BUFFER_SIZE;
+    let _env =
+        from_env.then(|| EnvVar::set("LANCE_DEFAULT_IO_BUFFER_SIZE", &io_buffer_size.to_string()));
+
+    // tracing caches each callsite's interest from the firing thread's default
+    // dispatcher while exactly one dispatcher is registered; a second live
+    // dispatcher makes it consult every registered dispatcher, including this
+    // thread-local one.
+    let states = SchedulerStates::default();
+    let _second_dispatcher = tracing::Dispatch::new(tracing_subscriber::registry());
+    {
+        let subscriber = tracing_subscriber::registry().with(states.clone());
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let result = task.execute(&dataset).await.unwrap();
+        assert!(result.repacked_files.is_some(), "{result:?}");
+    }
+
+    // A scheduler reports its budget when it closes even if it read nothing,
+    // so look for one that read.
+    let states = states.0.lock().unwrap();
+    assert!(
+        states.iter().any(|state| state.bytes_read > 0),
+        "{states:?}"
+    );
+    assert!(
+        states
+            .iter()
+            .all(|state| state.io_buffer_size_bytes == io_buffer_size),
+        "{states:?}"
     );
 }
 
@@ -1266,9 +1393,7 @@ fn repack_merges_around_a_blob_outside_the_kept_file() {
     fragment.row_id_meta = Some(RowIdMeta::Column);
     for max_files in [1, 2] {
         assert_eq!(
-            crate::dataset::optimize::repack::plan_fragment_repack(
-                &schema, &fragment, 4, max_files
-            ),
+            runtime::repack::plan_fragment_repack(&schema, &fragment, 4, max_files),
             Some(vec![vec![2, 3]]),
             "max_files={max_files}"
         );
@@ -1289,12 +1414,7 @@ fn repack_never_adds_a_file() {
         field
     };
     let plan = |schema: &lance_core::datatypes::Schema, fragment: &Fragment, max| {
-        crate::dataset::optimize::repack::plan_fragment_repack(
-            schema,
-            fragment,
-            fragment.files.len(),
-            max,
-        )
+        runtime::repack::plan_fragment_repack(schema, fragment, fragment.files.len(), max)
     };
 
     // Lineage in one file, a blob next to a movable column in the other.
@@ -1349,12 +1469,7 @@ fn repack_never_adds_a_file() {
 fn repack_moves_a_struct_with_its_header() {
     use arrow_schema::Fields;
     let plan = |schema: &lance_core::datatypes::Schema, fragment: &Fragment| {
-        crate::dataset::optimize::repack::plan_fragment_repack(
-            schema,
-            fragment,
-            fragment.files.len(),
-            2,
-        )
+        runtime::repack::plan_fragment_repack(schema, fragment, fragment.files.len(), 2)
     };
     let child = |name: &str| Field::new(name, DataType::Int32, true);
 
@@ -1532,12 +1647,7 @@ fn repack_merges_only_files_it_empties() {
     use lance_table::format::{ROW_ID_FIELD_ID, RowIdMeta};
     let child = |name: &str| Field::new(name, DataType::Int32, true);
     let plan = |schema: &lance_core::datatypes::Schema, fragment: &Fragment, max| {
-        crate::dataset::optimize::repack::plan_fragment_repack(
-            schema,
-            fragment,
-            fragment.files.len(),
-            max,
-        )
+        runtime::repack::plan_fragment_repack(schema, fragment, fragment.files.len(), max)
     };
 
     // s=0 {y=1, z=2}, b=3, c=4. s is split between the lineage file and
@@ -1604,12 +1714,7 @@ fn repack_keeps_the_largest_file_that_shares_a_struct() {
         file
     };
     let plan = |schema: &lance_core::datatypes::Schema, fragment: &Fragment| {
-        crate::dataset::optimize::repack::plan_fragment_repack(
-            schema,
-            fragment,
-            fragment.files.len(),
-            2,
-        )
+        runtime::repack::plan_fragment_repack(schema, fragment, fragment.files.len(), 2)
     };
     // a=0, s=1 {x=2, y=3, z=4}, b=5.
     let schema = lance_schema(Schema::new(vec![
@@ -1646,12 +1751,7 @@ fn repack_merges_all_files_when_none_can_stay() {
     use arrow_schema::Fields;
     let child = |name: &str| Field::new(name, DataType::Int32, true);
     let plan = |schema: &lance_core::datatypes::Schema, fragment: &Fragment, limit| {
-        crate::dataset::optimize::repack::plan_fragment_repack(
-            schema,
-            fragment,
-            fragment.files.len(),
-            limit,
-        )
+        runtime::repack::plan_fragment_repack(schema, fragment, fragment.files.len(), limit)
     };
 
     // s=0 {x=1, y=2, z=3}, one child per file.
@@ -1743,7 +1843,7 @@ fn repack_keeps_the_largest_file_next_to_a_header_only_file() {
         sized("bf.lance", vec![4], 10),
     ];
     assert_eq!(
-        crate::dataset::optimize::repack::plan_fragment_repack(&schema, &fragment, 4, 2),
+        runtime::repack::plan_fragment_repack(&schema, &fragment, 4, 2),
         Some(vec![vec![1, 4]])
     );
 }
@@ -1782,7 +1882,7 @@ fn repack_prefers_leaving_the_largest_file_in_place() {
     ];
     // Keeping m3 merges m1 and m2 (s and c) and leaves k holding t.
     assert_eq!(
-        crate::dataset::optimize::repack::plan_fragment_repack(&schema, &fragment, 4, 3),
+        runtime::repack::plan_fragment_repack(&schema, &fragment, 4, 3),
         Some(vec![vec![0, 7]])
     );
 }
@@ -1812,7 +1912,7 @@ fn repack_plans_nothing_for_header_only_files() {
         v2_0_file("c.lance", vec![0, 3]),
     ];
     assert_eq!(
-        crate::dataset::optimize::repack::plan_fragment_repack(&schema, &fragment, 3, 2),
+        runtime::repack::plan_fragment_repack(&schema, &fragment, 3, 2),
         None
     );
 }
@@ -1848,7 +1948,7 @@ fn repack_prefers_the_proposal_leaving_the_fewest_files() {
         sized("m3.lance", vec![5], 10),
     ];
     assert_eq!(
-        crate::dataset::optimize::repack::plan_fragment_repack(&schema, &fragment, 4, 2),
+        runtime::repack::plan_fragment_repack(&schema, &fragment, 4, 2),
         Some(vec![vec![1, 4, 5]])
     );
 }

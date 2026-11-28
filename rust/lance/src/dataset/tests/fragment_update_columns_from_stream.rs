@@ -179,6 +179,7 @@ async fn commit_rewrite(dataset: &Dataset, result: FragmentUpdateColumnsResult) 
 
 async fn count_files(dataset: &Dataset) -> usize {
     dataset
+        .table_state
         .object_store
         .read_dir_all(&dataset.data_dir(), None)
         .try_fold(0usize, |count, _| async move { Ok(count + 1) })

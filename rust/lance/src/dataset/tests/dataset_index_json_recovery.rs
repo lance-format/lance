@@ -237,7 +237,12 @@ async fn test_legacy_btree_index_reports_key_type_from_metadata() {
     let plugin = index_details.get_plugin().unwrap();
     assert_eq!(plugin.name(), "BTree");
 
-    let io = dataset.object_store.as_ref().io_tracker().clone();
+    let io = dataset
+        .table_state
+        .object_store
+        .as_ref()
+        .io_tracker()
+        .clone();
     let store = Arc::new(
         LanceIndexStore::from_dataset_for_existing(&dataset, &index)
             .await
@@ -410,6 +415,7 @@ async fn test_json_unreadable_target_type_falls_back_to_scan(
         .join(index.uuid.to_string())
         .join("page_lookup.lance");
     dataset
+        .table_state
         .object_store
         .inner
         .delete(&lookup_path)
@@ -1002,6 +1008,7 @@ async fn test_json_unrecorded_ngram_target_type_recovers(
         .join(index.uuid.to_string())
         .join(lance_index::scalar::ngram::POSTINGS_FILENAME);
     dataset
+        .table_state
         .object_store
         .inner
         .delete(&postings_path)
@@ -1168,6 +1175,7 @@ async fn test_json_missing_segment_with_recorded_sibling_declines_name(
         .join(unrecoverable.uuid.to_string())
         .join("page_lookup.lance");
     dataset
+        .table_state
         .object_store
         .inner
         .delete(&lookup_path)
@@ -1263,7 +1271,12 @@ async fn test_json_type_recovery_planning_reads_only_index_metadata(
     // The baseline: the same index with its type recorded reads nothing at
     // planning time.
     let recorded = Dataset::open(test_uri.as_str()).await.unwrap();
-    let io = recorded.object_store.as_ref().io_tracker().clone();
+    let io = recorded
+        .table_state
+        .object_store
+        .as_ref()
+        .io_tracker()
+        .clone();
     io.incremental_stats();
     recorded.scalar_index_info().await.unwrap();
     let recorded_planning = io.incremental_stats();
@@ -1289,6 +1302,7 @@ async fn test_json_type_recovery_planning_reads_only_index_metadata(
         .join(index.uuid.to_string())
         .join("page_lookup.lance");
     let lookup_size = dataset
+        .table_state
         .object_store
         .inner
         .head(&lookup_path)
@@ -1304,7 +1318,12 @@ async fn test_json_type_recovery_planning_reads_only_index_metadata(
 
     // A fresh session, so planning starts with no cached index metadata.
     let dataset = Dataset::open(test_uri.as_str()).await.unwrap();
-    let io = dataset.object_store.as_ref().io_tracker().clone();
+    let io = dataset
+        .table_state
+        .object_store
+        .as_ref()
+        .io_tracker()
+        .clone();
     io.incremental_stats();
     dataset.scalar_index_info().await.unwrap();
     let cold = io.incremental_stats();
@@ -1399,7 +1418,12 @@ async fn test_json_type_recovery_planning_reads_only_index_metadata(
     );
 
     let dataset = Dataset::open(multi_uri.as_str()).await.unwrap();
-    let io = dataset.object_store.as_ref().io_tracker().clone();
+    let io = dataset
+        .table_state
+        .object_store
+        .as_ref()
+        .io_tracker()
+        .clone();
     io.incremental_stats();
     dataset.scalar_index_info().await.unwrap();
     let multi_cold = io.incremental_stats();
@@ -1481,7 +1505,12 @@ async fn test_json_zonemap_type_recovery_planning_reads_only_metadata(
         .unwrap();
 
     let recorded = Dataset::open(test_uri.as_str()).await.unwrap();
-    let io = recorded.object_store.as_ref().io_tracker().clone();
+    let io = recorded
+        .table_state
+        .object_store
+        .as_ref()
+        .io_tracker()
+        .clone();
     io.incremental_stats();
     recorded.scalar_index_info().await.unwrap();
     let recorded_planning = io.incremental_stats();
@@ -1505,6 +1534,7 @@ async fn test_json_zonemap_type_recovery_planning_reads_only_metadata(
         .join(index.uuid.to_string())
         .join("zonemap.lance");
     let zonemap_size = dataset
+        .table_state
         .object_store
         .inner
         .head(&zonemap_path)
@@ -1518,7 +1548,12 @@ async fn test_json_zonemap_type_recovery_planning_reads_only_metadata(
     );
 
     let dataset = Dataset::open(test_uri.as_str()).await.unwrap();
-    let io = dataset.object_store.as_ref().io_tracker().clone();
+    let io = dataset
+        .table_state
+        .object_store
+        .as_ref()
+        .io_tracker()
+        .clone();
     io.incremental_stats();
     dataset.scalar_index_info().await.unwrap();
     let cold = io.incremental_stats();

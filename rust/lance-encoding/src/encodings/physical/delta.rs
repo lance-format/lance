@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Delta encoding for non-decreasing unsigned block sequences.
+//! MonotonicDelta encoding for non-decreasing unsigned block sequences.
 
 use super::{checked_fixed_values, try_vec_with_capacity};
 use crate::{
@@ -13,7 +13,7 @@ use crate::{
 use lance_core::{Error, Result};
 
 #[derive(Debug)]
-/// Encodes adjacent differences with a concrete child block codec.
+/// Encodes a Lance 2.3 `MonotonicDelta` block with a child codec for adjacent differences.
 pub struct DeltaEncoder {
     bits_per_value: u64,
     base: u64,
@@ -21,7 +21,7 @@ pub struct DeltaEncoder {
 }
 
 impl DeltaEncoder {
-    /// Creates a delta codec with the first value and child difference codec.
+    /// Creates an encoder with the first value and the child codec for adjacent differences.
     pub fn new(bits_per_value: u64, base: u64, child: Box<dyn BlockCompressor>) -> Self {
         Self {
             bits_per_value,
@@ -35,12 +35,12 @@ impl BlockCompressor for DeltaEncoder {
     fn compress(&self, data: DataBlock) -> Result<(Option<LanceBuffer>, CompressiveEncoding)> {
         let DataBlock::FixedWidth(data) = data else {
             return Err(Error::invalid_input(
-                "Delta encoding requires a fixed-width data block",
+                "MonotonicDelta encoding requires a fixed-width data block",
             ));
         };
         if data.bits_per_value != self.bits_per_value {
             return Err(Error::invalid_input(format!(
-                "Delta codec expects {}-bit values, got {}",
+                "MonotonicDelta codec expects {}-bit values, got {}",
                 self.bits_per_value, data.bits_per_value
             )));
         }
@@ -57,31 +57,32 @@ impl BlockCompressor for DeltaEncoder {
 fn encode_deltas(data: FixedWidthDataBlock, expected_base: u64) -> Result<FixedWidthDataBlock> {
     if !matches!(data.bits_per_value, 32 | 64) {
         return Err(Error::invalid_input(format!(
-            "Delta only supports 32 or 64-bit values, got {}",
+            "MonotonicDelta only supports 32 or 64-bit values, got {}",
             data.bits_per_value
         )));
     }
     if data.num_values < 2 {
         return Err(Error::invalid_input(format!(
-            "Delta requires at least 2 values, got {}",
+            "MonotonicDelta requires at least 2 values, got {}",
             data.num_values
         )));
     }
 
     let deltas = match data.bits_per_value {
         32 => {
-            let values = checked_fixed_values::<u32>(&data, "Delta input")?;
+            let values = checked_fixed_values::<u32>(&data, "MonotonicDelta input")?;
             if u64::from(values[0]) != expected_base {
                 return Err(Error::invalid_input(format!(
-                    "Delta base mismatch: codec expects {expected_base}, input starts with {}",
+                    "MonotonicDelta base mismatch: codec expects {expected_base}, input starts with {}",
                     values[0]
                 )));
             }
-            let mut deltas = try_vec_with_capacity::<u32>(data.num_values - 1, "Delta output")?;
+            let mut deltas =
+                try_vec_with_capacity::<u32>(data.num_values - 1, "MonotonicDelta output")?;
             for (index, pair) in values.windows(2).enumerate() {
                 deltas.push(pair[1].checked_sub(pair[0]).ok_or_else(|| {
                     Error::invalid_input(format!(
-                        "Delta input decreases at index {}: {} -> {}",
+                        "MonotonicDelta input decreases at index {}: {} -> {}",
                         index + 1,
                         pair[0],
                         pair[1]
@@ -91,18 +92,19 @@ fn encode_deltas(data: FixedWidthDataBlock, expected_base: u64) -> Result<FixedW
             LanceBuffer::reinterpret_vec(deltas)
         }
         64 => {
-            let values = checked_fixed_values::<u64>(&data, "Delta input")?;
+            let values = checked_fixed_values::<u64>(&data, "MonotonicDelta input")?;
             if values[0] != expected_base {
                 return Err(Error::invalid_input(format!(
-                    "Delta base mismatch: codec expects {expected_base}, input starts with {}",
+                    "MonotonicDelta base mismatch: codec expects {expected_base}, input starts with {}",
                     values[0]
                 )));
             }
-            let mut deltas = try_vec_with_capacity::<u64>(data.num_values - 1, "Delta output")?;
+            let mut deltas =
+                try_vec_with_capacity::<u64>(data.num_values - 1, "MonotonicDelta output")?;
             for (index, pair) in values.windows(2).enumerate() {
                 deltas.push(pair[1].checked_sub(pair[0]).ok_or_else(|| {
                     Error::invalid_input(format!(
-                        "Delta input decreases at index {}: {} -> {}",
+                        "MonotonicDelta input decreases at index {}: {} -> {}",
                         index + 1,
                         pair[0],
                         pair[1]
@@ -153,17 +155,17 @@ impl BlockDecompressor for DeltaDecompressor {
 pub(crate) fn validate_delta_header(bits_per_value: u64, base: u64, num_values: u64) -> Result<()> {
     if !matches!(bits_per_value, 32 | 64) {
         return Err(Error::invalid_input(format!(
-            "Delta only supports 32 or 64-bit values, got {bits_per_value}"
+            "MonotonicDelta only supports 32 or 64-bit values, got {bits_per_value}"
         )));
     }
     if bits_per_value == 32 && base > u32::MAX as u64 {
         return Err(Error::invalid_input(format!(
-            "Delta base {base} exceeds u32::MAX"
+            "MonotonicDelta base {base} exceeds u32::MAX"
         )));
     }
     if num_values < 2 {
         return Err(Error::invalid_input(format!(
-            "Delta requires at least 2 values, got {num_values}"
+            "MonotonicDelta requires at least 2 values, got {num_values}"
         )));
     }
     Ok(())
@@ -177,12 +179,12 @@ fn reconstruct_deltas(
 ) -> Result<DataBlock> {
     let DataBlock::FixedWidth(child) = child else {
         return Err(Error::invalid_input(
-            "Delta child decoded to a non fixed-width block",
+            "MonotonicDelta child decoded to a non fixed-width block",
         ));
     };
     if child.bits_per_value != bits_per_value || child.num_values != num_values - 1 {
         return Err(Error::invalid_input(format!(
-            "Delta child decoded {} {}-bit values, expected {} {}-bit values",
+            "MonotonicDelta child decoded {} {}-bit values, expected {} {}-bit values",
             child.num_values,
             child.bits_per_value,
             num_values - 1,
@@ -192,15 +194,16 @@ fn reconstruct_deltas(
 
     let data = match bits_per_value {
         32 => {
-            let deltas = checked_fixed_values::<u32>(&child, "Delta child")?;
-            let mut values = try_vec_with_capacity::<u32>(num_values, "Delta output")?;
-            let mut current = u32::try_from(base)
-                .map_err(|_| Error::invalid_input(format!("Delta base {base} exceeds u32::MAX")))?;
+            let deltas = checked_fixed_values::<u32>(&child, "MonotonicDelta child")?;
+            let mut values = try_vec_with_capacity::<u32>(num_values, "MonotonicDelta output")?;
+            let mut current = u32::try_from(base).map_err(|_| {
+                Error::invalid_input(format!("MonotonicDelta base {base} exceeds u32::MAX"))
+            })?;
             values.push(current);
             for (index, delta) in deltas.iter().enumerate() {
                 current = current.checked_add(*delta).ok_or_else(|| {
                     Error::invalid_input(format!(
-                        "Delta prefix sum overflows u32 at index {}",
+                        "MonotonicDelta prefix sum overflows u32 at index {}",
                         index + 1
                     ))
                 })?;
@@ -209,14 +212,14 @@ fn reconstruct_deltas(
             LanceBuffer::reinterpret_vec(values)
         }
         64 => {
-            let deltas = checked_fixed_values::<u64>(&child, "Delta child")?;
-            let mut values = try_vec_with_capacity::<u64>(num_values, "Delta output")?;
+            let deltas = checked_fixed_values::<u64>(&child, "MonotonicDelta child")?;
+            let mut values = try_vec_with_capacity::<u64>(num_values, "MonotonicDelta output")?;
             let mut current = base;
             values.push(current);
             for (index, delta) in deltas.iter().enumerate() {
                 current = current.checked_add(*delta).ok_or_else(|| {
                     Error::invalid_input(format!(
-                        "Delta prefix sum overflows u64 at index {}",
+                        "MonotonicDelta prefix sum overflows u64 at index {}",
                         index + 1
                     ))
                 })?;
@@ -254,10 +257,10 @@ mod tests {
         });
         let encoder = DeltaEncoder::new(64, 5, Box::new(ValueEncoder::default()));
         let (payload, encoding) = encoder.compress(input).unwrap();
-        let crate::format::metadata::compressive_encoding::Compression::Delta(delta) =
+        let crate::format::metadata::compressive_encoding::Compression::MonotonicDelta(delta) =
             encoding.compression.as_ref().unwrap()
         else {
-            panic!("expected Delta encoding");
+            panic!("expected MonotonicDelta encoding");
         };
         let child = crate::compression::DefaultDecompressionStrategy::default()
             .create_block_decompressor(delta.deltas.as_deref().unwrap())

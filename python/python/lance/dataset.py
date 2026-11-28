@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import copy
 import json
+import operator
 import os
 import random
 import re
@@ -142,6 +143,24 @@ def _resolve_blob_selection(
     raise ValueError("Either ids, addresses, or indices must be specified")
 
 
+def _snapshot_scan_scope_defaults(
+    options: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    if options is None:
+        return None
+    # Schema access and subsequent scans must not exhaust a scope iterator.
+    for key in ("fragments", "index_segments"):
+        scope = options.get(key)
+        if scope is not None:
+            selection = (
+                _normalize_index_segment_ids(scope)
+                if key == "index_segments"
+                else tuple(item for item in scope)
+            )
+            options = {**options, key: selection}
+    return options
+
+
 class LanceDataset(pa.dataset.Dataset):
     """A Lance Dataset in Lance format where the data is stored at the given uri."""
 
@@ -205,7 +224,7 @@ class LanceDataset(pa.dataset.Dataset):
             namespace_client_managed_versioning=namespace_client_managed_versioning,
             base_store_params=base_store_params,
         )
-        self._default_scan_options = default_scan_options
+        self._default_scan_options = _snapshot_scan_scope_defaults(default_scan_options)
         self._read_params = read_params
 
     @classmethod
@@ -507,9 +526,20 @@ class LanceDataset(pa.dataset.Dataset):
     def has_index(self):
         return len(self.describe_indices()) > 0
 
-    def _apply_default_scan_options(self, builder: ScannerBuilder):
-        if self._default_scan_options:
-            builder.apply_defaults(self._default_scan_options)
+    def _apply_default_scan_options(
+        self, builder: ScannerBuilder, *, override_nearest: bool = False
+    ):
+        default_options = self._default_scan_options
+        if default_options:
+            # Vector and MinHash queries use separate builder fields, so an
+            # explicit nearest drops every default key that sets either one.
+            if override_nearest:
+                default_options = {
+                    key: value
+                    for key, value in default_options.items()
+                    if key not in ("nearest", "minhash_search")
+                }
+            builder.apply_defaults(default_options)
         return builder
 
     def scanner(
@@ -856,12 +886,9 @@ class LanceDataset(pa.dataset.Dataset):
 
         """
         builder = ScannerBuilder(self)
-        builder = self._apply_default_scan_options(builder)
-
-        if order_by is not None:
-            order_by = [
-                ColumnOrdering(o) if isinstance(o, str) else o for o in order_by
-            ]
+        builder = self._apply_default_scan_options(
+            builder, override_nearest=nearest is not None
+        )
 
         # Calls the setter if the user provided a non-None value
         # We need to avoid calling the setter with a None value so
@@ -1718,6 +1745,8 @@ class LanceDataset(pa.dataset.Dataset):
         self,
         indices: Union[List[int], pa.Array],
         columns: Optional[Union[List[str], Dict[str, str]]] = None,
+        *,
+        io_parallelism: Optional[int] = None,
     ) -> pa.Table:
         """Select rows of data by index.
 
@@ -1729,17 +1758,42 @@ class LanceDataset(pa.dataset.Dataset):
             List of column names to be fetched.
             Or a dictionary of column names to SQL expressions.
             All columns are fetched if None or unspecified.
+        io_parallelism: int, optional
+            Maximum active fragment-reader data and overlay reads in the
+            primary base for this take. This overrides the store's
+            per-scheduler default and caps fragment-reader fanout at
+            ``min(store_parallelism, io_parallelism)``, without increasing
+            fanout above the store default, so actual concurrency may be lower.
+            Legacy v1 files, additional-base per-file schedulers, and auxiliary
+            metadata or lineage reads (such as deletion vectors and spilled
+            row-ID or row-version sequences) keep their existing schedulers.
 
         Returns
         -------
         table : pyarrow.Table
         """
+        if io_parallelism is not None:
+            if isinstance(io_parallelism, bool):
+                raise TypeError("io_parallelism must be an integer, not bool")
+            try:
+                io_parallelism = operator.index(io_parallelism)
+            except TypeError as err:
+                raise TypeError("io_parallelism must be an integer") from err
+            if io_parallelism <= 0:
+                raise ValueError("io_parallelism must be greater than 0")
         columns_with_transform = None
         if isinstance(columns, dict):
             columns_with_transform = list(columns.items())
             columns = None
         return pa.Table.from_batches(
-            [self._ds.take(indices, columns, columns_with_transform)]
+            [
+                self._ds.take(
+                    indices,
+                    columns,
+                    columns_with_transform,
+                    io_parallelism=io_parallelism,
+                )
+            ]
         )
 
     def _take_rows(
@@ -2051,19 +2105,27 @@ class LanceDataset(pa.dataset.Dataset):
     def count_rows(
         self, filter: Optional[Union[str, Expression]] = None, **kwargs: Any
     ) -> int:
-        """Count rows matching the scanner filter.
+        """Count rows in the dataset matching the filter.
 
         Parameters
         ----------
+        filter : str or pyarrow.compute.Expression, optional
+            Count only rows matching this predicate.
         **kwargs : dict, optional
-            See py:method:`scanner` method for full parameter description.
+            PyArrow scan tuning arguments are accepted for compatibility.
+            To count rows in a selected fragment, use :meth:`LanceFragment.count_rows`.
 
         Returns
         -------
         count : int
-            The total number of rows in the dataset.
+            The number of matching rows.
 
         """
+        if kwargs.get("fragments") is not None:
+            raise TypeError(
+                "LanceDataset.count_rows() does not support fragments. "
+                "Call LanceFragment.count_rows() on the selected fragments."
+            )
         if isinstance(filter, pa.compute.Expression):
             # TODO: consolidate all to use scanner
             return self.scanner(
@@ -5038,7 +5100,9 @@ class LanceDataset(pa.dataset.Dataset):
         else:
             target_uri = target_path
 
-        default_scan_options = kwargs.pop("default_scan_options", None)
+        default_scan_options = _snapshot_scan_scope_defaults(
+            kwargs.pop("default_scan_options", None)
+        )
         read_params = kwargs.pop("read_params", None)
 
         if storage_options is None:
@@ -5804,6 +5868,7 @@ def write_dataset(
     enable_v2_manifest_paths: bool = True,
     enable_stable_row_ids: bool = False,
     auto_cleanup_options: Optional[AutoCleanupConfig] = None,
+    disable_transaction_file: bool = False,
     commit_message: Optional[str] = None,
     transaction_properties: Optional[Dict[str, str]] = None,
     initial_bases: Optional[List[DatasetBasePath]] = None,
@@ -5907,6 +5972,17 @@ def write_dataset(
         then no autocleaning will be performed.
         Note: this option only takes effect when creating a new dataset,
         it has no effect on existing datasets.
+    disable_transaction_file: bool, default False
+        If True, this write's commit stores its transaction only inline in the
+        manifest and skips the separate file under ``_transactions/``, saving one
+        object write. The transaction is inlined regardless of its size (up to
+        4 GiB), so very large transactions grow the manifest. The new version
+        gets a writer feature flag, so Lance releases older than 1.0.0 refuse to
+        write to it. Later commits that leave this unset write the transaction
+        file again and drop the flag. Readers older than Lance 14.0 return no
+        transaction for such a version and cannot rebase a concurrent commit
+        across it, so keep the transaction file when clients older than 14.0
+        read transaction history or commit concurrently.
     commit_message: str, optional
         A message to associate with this commit. This message will be stored in the
         dataset's metadata and can be retrieved using read_transaction().
@@ -6083,6 +6159,7 @@ def write_dataset(
         "enable_v2_manifest_paths": enable_v2_manifest_paths,
         "enable_stable_row_ids": enable_stable_row_ids,
         "auto_cleanup_options": auto_cleanup_options,
+        "disable_transaction_file": disable_transaction_file,
         "transaction_properties": merged_properties,
         "initial_bases": initial_bases,
         "target_bases": target_bases,

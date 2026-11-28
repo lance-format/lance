@@ -7,6 +7,7 @@ use super::apply::ApplyState;
 use super::footprint::UnenforcedKey;
 use super::proto::required;
 use super::{ConfigMap, Coordinate, FieldRef, Footprint};
+use crate::feature_flags::ZONE_WRITE_SEEDS_VERSION_KEY;
 use crate::format::pb_actions;
 use crate::transaction::UpdateMap;
 use crate::transaction::update_map::apply_update_map;
@@ -48,6 +49,14 @@ pub struct FieldMetadataUpdate {
 impl ConfigUpdate {
     pub(super) fn apply(&self, state: &mut ApplyState) -> Result<()> {
         if let Some(updates) = &self.config {
+            if updates.replace
+                || updates
+                    .update_entries
+                    .iter()
+                    .any(|entry| entry.key == ZONE_WRITE_SEEDS_VERSION_KEY)
+            {
+                state.mark_zone_write_seeds_version_written();
+            }
             apply_update_map(state.config_mut(), updates);
         }
         if let Some(updates) = &self.table_metadata {
@@ -268,6 +277,7 @@ impl TryFrom<pb_actions::ConfigUpdate> for ConfigUpdate {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::feature_flags::{FLAG_ZONE_WRITE_SEEDS, ZONE_WRITE_SEEDS_VERSION_KEY};
     use crate::format::Manifest;
     use crate::transaction::action::test_support::{
         added_field, apply, backed_manifest, footprint, unbacked_manifest,
@@ -606,6 +616,76 @@ mod tests {
         assert!(crate::feature_flags::validate_auto_cleanup_config(&manifest).is_err());
 
         apply(&manifest, vec![set_config(&[("unrelated", Some("1"))])]).unwrap();
+    }
+
+    #[test]
+    fn test_config_update_validates_and_activates_zone_write_seeds_version() {
+        let error = apply(
+            &backed_manifest(),
+            vec![set_config(&[(ZONE_WRITE_SEEDS_VERSION_KEY, Some("2"))])],
+        )
+        .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(
+            error.to_string().contains(ZONE_WRITE_SEEDS_VERSION_KEY),
+            "{error}"
+        );
+
+        let v0 = apply(
+            &backed_manifest(),
+            vec![set_config(&[(ZONE_WRITE_SEEDS_VERSION_KEY, Some("0"))])],
+        )
+        .unwrap();
+        assert!(!v0.has_zone_write_seeds());
+
+        let v1 = apply(
+            &backed_manifest(),
+            vec![
+                set_config(&[(ZONE_WRITE_SEEDS_VERSION_KEY, Some("bad"))]),
+                set_config(&[(ZONE_WRITE_SEEDS_VERSION_KEY, Some("1"))]),
+            ],
+        )
+        .unwrap();
+        assert_ne!(v1.reader_feature_flags & FLAG_ZONE_WRITE_SEEDS, 0);
+        assert_ne!(v1.writer_feature_flags & FLAG_ZONE_WRITE_SEEDS, 0);
+
+        let mut inherited_invalid = backed_manifest();
+        inherited_invalid
+            .config
+            .insert(ZONE_WRITE_SEEDS_VERSION_KEY.into(), "future".into());
+        apply(
+            &inherited_invalid,
+            vec![set_config(&[("unrelated", Some("1"))])],
+        )
+        .unwrap();
+
+        // An inherited "1" is not an opt-in for an unrelated ConfigUpdate.
+        let mut inherited_v1 = backed_manifest();
+        inherited_v1
+            .config
+            .insert(ZONE_WRITE_SEEDS_VERSION_KEY.into(), "1".into());
+        let ordinary = apply(&inherited_v1, vec![set_config(&[("unrelated", Some("1"))])]).unwrap();
+        assert!(!ordinary.has_zone_write_seeds());
+
+        // Writing the same "1" again is an explicit opt-in.
+        let same_value = apply(
+            &inherited_v1,
+            vec![set_config(&[(ZONE_WRITE_SEEDS_VERSION_KEY, Some("1"))])],
+        )
+        .unwrap();
+        assert_ne!(same_value.reader_feature_flags & FLAG_ZONE_WRITE_SEEDS, 0);
+        assert_ne!(same_value.writer_feature_flags & FLAG_ZONE_WRITE_SEEDS, 0);
+
+        // Explicitly rewriting an inherited invalid value is rejected.
+        let error = apply(
+            &inherited_invalid,
+            vec![set_config(&[(
+                ZONE_WRITE_SEEDS_VERSION_KEY,
+                Some("future"),
+            )])],
+        )
+        .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
     }
 
     #[test]
