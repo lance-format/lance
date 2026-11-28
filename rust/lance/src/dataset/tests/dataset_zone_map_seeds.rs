@@ -12,6 +12,8 @@
 use std::sync::Arc;
 
 use arrow::compute::concat_batches;
+use arrow_array::cast::AsArray;
+use arrow_array::types::Int32Type;
 use arrow_array::{
     Array, ArrayRef, BinaryArray, BinaryViewArray, Int32Array, RecordBatch, RecordBatchIterator,
     StringArray, StringViewArray, StructArray,
@@ -859,6 +861,46 @@ async fn test_merge_insert_partial_fragment_rewrite_seeds_new_file() {
         assert_eq!(serving_file(fragment, val).path, fragment.files[1].path);
     }
     assert_seed_matches_data(&dataset, &[1, 2], "val").await;
+}
+
+#[tokio::test]
+async fn test_zone_map_refresh_after_rewrite_and_deferred_compaction() {
+    let dataset = dataset_with_val_index("memory://", true).await;
+    // Row 17 was null in indexed fragment 1. Rewrite it before compacting
+    // that fragment together with the unindexed append.
+    let mut dataset = merge_insert_val(dataset, 17..18).await;
+    let metrics = compact_files(
+        &mut dataset,
+        CompactionOptions {
+            defer_index_remap: true,
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(metrics.fragments_removed, 2);
+    assert!(dataset.get_fragment(1).is_none());
+
+    dataset
+        .optimize_indices(&OptimizeOptions::default())
+        .await
+        .unwrap();
+
+    for use_index in [false, true] {
+        let mut scan = dataset.scan();
+        scan.use_scalar_index(use_index)
+            .project(&["id"])
+            .unwrap()
+            .filter("val IS NULL")
+            .unwrap();
+        let plan = scan.explain_plan(false).await.unwrap();
+        assert_eq!(plan.contains("ScalarIndexQuery"), use_index, "{plan}");
+        let batch = scan.try_into_batch().await.unwrap();
+        let mut ids = batch["id"].as_primitive::<Int32Type>().values().to_vec();
+        ids.sort_unstable();
+        assert_eq!(ids, [3, 10, 24], "use_scalar_index={use_index}");
+    }
 }
 
 /// `FileFragment::write_columns`, used by computed and function column
