@@ -11,7 +11,7 @@ import random
 import re
 import time
 import warnings
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
@@ -5395,13 +5395,15 @@ class LanceDataset(pa.dataset.Dataset):
         *,
         begin_version: Optional[int] = None,
         end_version: Optional[int] = None,
+        begin_date: Optional[datetime] = None,
+        end_date: Optional[datetime] = None,
     ) -> "DatasetDelta":
         """
         Compare changes between two versions of this dataset.
 
         You must specify either ``compared_against`` (shorthand for comparing the
-        current version against a specific older version) or both ``begin_version``
-        and ``end_version`` for an explicit range.
+        current version against a specific older version), both ``begin_version``
+        and ``end_version``, or a ``begin_date`` window.
 
         Reading row changes requires stable row IDs at both nonzero endpoints.
         Enable them when creating the dataset with ``enable_stable_row_ids=True``.
@@ -5419,6 +5421,25 @@ class LanceDataset(pa.dataset.Dataset):
         end_version : int, optional
             The end version (inclusive) for the comparison range.
             Must be used together with ``begin_version``.
+        begin_date : datetime, optional
+            Exclusive start of a time window. A naive datetime, or one whose
+            ``utcoffset()`` is ``None``, is a local wall time, matching
+            :meth:`versions` and ``asof``. An aware datetime converts as an
+            instant. Must not be combined with a version range.
+
+            Bounds use the microsecond precision :meth:`versions` and
+            :meth:`get_version` expose. Those methods floor manifest
+            nanoseconds; passing a reported timestamp back selects that same
+            commit. The latest commit at or before this microsecond is
+            excluded. Commits that share a microsecond are one boundary, the
+            later commit, so this start skips every commit in that microsecond.
+        end_date : datetime, optional
+            Inclusive end of a time window, interpreted the same way as
+            ``begin_date``. The latest commit at or before this microsecond is
+            included, which keeps every commit that shares it. Requires
+            ``begin_date``. When omitted, the latest committed version is the
+            end, including commits from another writer, and row reads use that
+            same snapshot.
 
         Returns
         -------
@@ -5467,6 +5488,10 @@ class LanceDataset(pa.dataset.Dataset):
             builder = builder.with_begin_version(begin_version)
         if end_version is not None:
             builder = builder.with_end_version(end_version)
+        if begin_date is not None:
+            builder = builder.with_begin_date(begin_date)
+        if end_date is not None:
+            builder = builder.with_end_date(end_date)
 
         return builder.build()
 

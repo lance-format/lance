@@ -1,6 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
+import os
+import time
+from datetime import datetime, timedelta, timezone, tzinfo
+
+import lance
 import pyarrow as pa
 import pytest
 from lance import write_dataset
@@ -213,3 +218,272 @@ def test_delta_get_deleted_row_ids():
         deleted.extend(batch.column("_rowid").to_pylist())
 
     assert sorted(deleted) == sorted([row_ids[1], row_ids[2]])
+
+
+def test_delta_get_upserted_rows():
+    table = pa.table(
+        {
+            "id": pa.array([1, 2, 3], type=pa.int32()),
+            "val": pa.array(["a", "b", "c"], type=pa.string()),
+        }
+    )
+    ds = write_dataset(
+        table, "memory://delta_api_test_upsert", enable_stable_row_ids=True
+    )
+    ds.update({"val": "'b_updated'"}, where="id = 2")
+    ds.insert(
+        pa.table(
+            {
+                "id": pa.array([4], type=pa.int32()),
+                "val": pa.array(["d"], type=pa.string()),
+            }
+        )
+    )
+
+    rows = ds.delta(begin_version=1, end_version=3).get_upserted_rows().read_all()
+    assert sorted(rows.column("id").to_pylist()) == [2, 4]
+
+
+def test_delta_with_dates():
+    table = pa.table({"id": pa.array([1, 2], type=pa.int32())})
+    ds = write_dataset(
+        table, "memory://delta_api_test_dates", enable_stable_row_ids=True
+    )
+    # versions() returns a naive local datetime. Attach the local zone before
+    # converting to UTC; labeling that wall time as UTC shifts the window.
+    created = ds.versions()[0]["timestamp"]
+    local_tz = datetime.now().astimezone().tzinfo
+    created_utc = created.replace(tzinfo=local_tz).astimezone(timezone.utc)
+    begin = created_utc + timedelta(microseconds=1)
+    ds.insert(pa.table({"id": pa.array([3], type=pa.int32())}))
+
+    end = datetime.now(timezone.utc) + timedelta(hours=1)
+    inserted = ds.delta(begin_date=begin, end_date=end).get_inserted_rows().read_all()
+    assert inserted.column("id").to_pylist() == [3]
+
+    # Aware values name instants. The same window in another zone still
+    # selects the write that happened inside it.
+    shifted_begin = begin.astimezone(timezone(timedelta(hours=8)))
+    shifted_end = end.astimezone(timezone(timedelta(hours=-5)))
+    inserted = (
+        ds.delta(begin_date=shifted_begin, end_date=shifted_end)
+        .get_inserted_rows()
+        .read_all()
+    )
+    assert inserted.column("id").to_pylist() == [3]
+
+    # Naive datetimes are local wall times, matching versions() and asof.
+    # Dropping the zone from a UTC value would name a different instant
+    # wherever the machine is not on UTC.
+    naive_begin = begin.astimezone().replace(tzinfo=None)
+    naive_end = end.astimezone().replace(tzinfo=None)
+    inserted = (
+        ds.delta(begin_date=naive_begin, end_date=naive_end)
+        .get_inserted_rows()
+        .read_all()
+    )
+    assert inserted.column("id").to_pylist() == [3]
+
+
+def test_date_delta_after_external_append(tmp_path):
+    uri = tmp_path / "data.lance"
+    original = write_dataset(pa.table({"id": [1]}), uri, enable_stable_row_ids=True)
+    begin = datetime.now(timezone.utc)
+    writer = lance.dataset(uri)
+    writer.insert(pa.table({"id": [2]}))
+    assert original.version == 1
+    assert writer.version == 2
+
+    delta = original.delta(begin_date=begin)
+    assert len(delta.list_transactions()) == 1
+    observed = delta.get_upserted_rows().read_all()["id"].to_pylist()
+    assert observed == [2]
+
+
+class _NoOffsetTzInfo(tzinfo):
+    """A tzinfo without a UTC offset; Python treats such datetimes as naive."""
+
+    def utcoffset(self, dt):
+        return None
+
+    def dst(self, dt):
+        return None
+
+    def tzname(self, dt):
+        return None
+
+
+@pytest.fixture
+def asia_shanghai_tz():
+    # time.tzset is Unix-only, matching the guard in test_dataset.py.
+    if not hasattr(time, "tzset"):
+        pytest.skip("time.tzset is Unix-only")
+    previous = os.environ.get("TZ")
+    os.environ["TZ"] = "Asia/Shanghai"
+    time.tzset()
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = previous
+        time.tzset()
+
+
+@pytest.mark.skipif(not hasattr(time, "tzset"), reason="time.tzset is Unix-only")
+@pytest.mark.usefixtures("asia_shanghai_tz")
+def test_delta_naive_version_timestamp_is_local_wall_time(tmp_path):
+    """A naive version timestamp passed back as begin_date stays local.
+
+    versions() and get_version() return naive local wall times. In
+    Asia/Shanghai, 12:00 is 04:00Z. Labeling that naive value as UTC would
+    move an exclusive begin to 12:00Z and skip commits over the next eight
+    hours.
+    """
+    noon = datetime(2026, 6, 1, 12, 0)
+    assert noon.utcoffset() is None
+    assert noon.astimezone(timezone.utc) == datetime(
+        2026, 6, 1, 4, 0, tzinfo=timezone.utc
+    )
+
+    ds = write_dataset(
+        pa.table({"id": pa.array([1], type=pa.int32())}),
+        tmp_path / "delta.lance",
+        enable_stable_row_ids=True,
+    )
+    created = ds.get_version()["timestamp"]
+    assert created.tzinfo is None
+    assert created == ds.versions()[0]["timestamp"]
+    # The same eight-hour shift as 12:00 local versus 12:00Z.
+    assert created.astimezone(timezone.utc) == created.replace(
+        tzinfo=timezone.utc
+    ) - timedelta(hours=8)
+
+    ds.insert(pa.table({"id": pa.array([2], type=pa.int32())}))
+
+    # The commit timestamp, unchanged, is an exclusive begin. The following
+    # write stays inside the window.
+    inserted = ds.delta(begin_date=created).get_inserted_rows().read_all()
+    assert inserted.column("id").to_pylist() == [2]
+
+    # Aware UTC names the same instant.
+    inserted = (
+        ds.delta(begin_date=created.astimezone(timezone.utc))
+        .get_inserted_rows()
+        .read_all()
+    )
+    assert inserted.column("id").to_pylist() == [2]
+
+    # A tzinfo with no offset is naive too, matching asof.
+    unmarked = created.replace(tzinfo=_NoOffsetTzInfo())
+    assert unmarked.tzinfo is not None
+    assert unmarked.utcoffset() is None
+    inserted = ds.delta(begin_date=unmarked).get_inserted_rows().read_all()
+    assert inserted.column("id").to_pylist() == [2]
+
+
+def _wait_until_after(stamp: datetime) -> None:
+    """Block until the local clock moves past ``stamp``.
+
+    An inclusive end keeps every commit in that microsecond. The commit that
+    exercises the upper bound has to land in a later one.
+    """
+    deadline = time.monotonic() + 2.0
+    while datetime.now() <= stamp:
+        if time.monotonic() > deadline:
+            break
+        time.sleep(0.0002)
+
+
+def test_delta_exposed_version_timestamps_round_trip(tmp_path):
+    """get_version() timestamps are the exclusive begin and inclusive end.
+
+    Create ids 1 and 9, append 2, delete 9, then a later append. (1, 3] is
+    inserted id 2 and deleted row id 1. A membership check on 2 would still
+    pass if version 1 leaked, and a begin that resolved to version 0 would
+    report no deletions.
+    """
+    uri = tmp_path / "delta.lance"
+    ds = write_dataset(pa.table({"id": [1, 9]}), uri, enable_stable_row_ids=True)
+    ds.insert(pa.table({"id": [2]}))
+    live = ds.to_table(columns=["id"], with_row_id=True)
+    row_id_of_9 = dict(zip(live["id"].to_pylist(), live["_rowid"].to_pylist()))[9]
+    assert row_id_of_9 == 1
+    ds.delete("id = 9")
+    end_commit = ds.get_version()["timestamp"]
+    _wait_until_after(end_commit)
+    ds.insert(pa.table({"id": [3]}))
+    assert ds.version == 4
+
+    begin = lance.dataset(uri, version=1).get_version()["timestamp"]
+    end = lance.dataset(uri, version=3).get_version()["timestamp"]
+    reported = {v["version"]: v["timestamp"] for v in ds.versions()}
+    assert begin == reported[1]
+    assert end == reported[3]
+    assert begin.tzinfo is None
+    assert end.tzinfo is None
+
+    delta = ds.delta(begin_date=begin, end_date=end)
+    assert len(delta.list_transactions()) == 2
+    inserted = delta.get_inserted_rows().read_all()["id"].to_pylist()
+    deleted = delta.get_deleted_row_ids().read_all()["_rowid"].to_pylist()
+    assert inserted == [2]
+    assert deleted == [1]
+
+    by_version = ds.delta(begin_version=1, end_version=3)
+    assert by_version.get_inserted_rows().read_all()["id"].to_pylist() == inserted
+    assert by_version.get_deleted_row_ids().read_all()["_rowid"].to_pylist() == deleted
+
+
+def test_delta_groups_commits_that_share_a_microsecond(tmp_path):
+    """Commits versions() reports at one timestamp are a single boundary.
+
+    An exclusive begin skips every commit in that microsecond. An inclusive
+    end keeps every one of them. Expected ids are that group, so a second
+    commit sharing the microsecond cannot leak past the end or survive the
+    begin.
+    """
+    uri = tmp_path / "delta.lance"
+    ds = write_dataset(pa.table({"id": [1]}), uri, enable_stable_row_ids=True)
+    ds.insert(pa.table({"id": [2]}))
+    _wait_until_after(ds.get_version()["timestamp"])
+    ds.insert(pa.table({"id": [3]}))
+    assert ds.version == 3
+
+    written = {1: 1, 2: 2, 3: 3}
+    order = []
+    groups = {}
+    for entry in ds.versions():
+        stamp = entry["timestamp"]
+        assert stamp.tzinfo is None
+        if stamp not in groups:
+            order.append(stamp)
+            groups[stamp] = []
+        groups[stamp].append(entry["version"])
+    assert order[-1] > order[0]
+
+    def ids_of(versions):
+        return [written[version] for version in versions]
+
+    shared = order[0]
+    after = order[-1]
+    before = shared - timedelta(seconds=1)
+    first = groups[shared]
+    later = [version for stamp in order[1:] for version in groups[stamp]]
+
+    skipped = (
+        ds.delta(begin_date=shared, end_date=after)
+        .get_inserted_rows()
+        .read_all()["id"]
+        .to_pylist()
+    )
+    assert skipped == ids_of(later)
+
+    kept = (
+        ds.delta(begin_date=before, end_date=shared)
+        .get_inserted_rows()
+        .read_all()["id"]
+        .to_pylist()
+    )
+    assert kept == ids_of(first)

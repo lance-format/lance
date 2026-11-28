@@ -12,7 +12,7 @@ use crate::dataset::scanner::{
 use arrow_array::{ArrayRef, RecordBatch, UInt64Array};
 use arrow_schema::Schema as ArrowSchema;
 use arrow_schema::SortOptions;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use datafusion::common::NullEquality;
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::JoinType;
@@ -141,6 +141,10 @@ impl DatasetDeltaBuilder {
 
     /// Set the beginning timestamp for the delta (exclusive).
     ///
+    /// The boundary is the latest version whose commit time is strictly before
+    /// `timestamp`. Comparison uses the full [`DateTime<Utc>`], including
+    /// sub-microsecond digits stored on the manifest.
+    ///
     /// Must be used together with `with_end_date`.
     /// Cannot be used together with `compared_against_version` or explicit version range.
     pub fn with_begin_date(mut self, timestamp: DateTime<Utc>) -> Self {
@@ -149,6 +153,9 @@ impl DatasetDeltaBuilder {
     }
 
     /// Set the ending timestamp for the delta (inclusive).
+    ///
+    /// The boundary is the latest version whose commit time is at or before
+    /// `timestamp`, compared at full [`DateTime<Utc>`] precision.
     ///
     /// Must be used together with `with_begin_date`.
     /// Cannot be used together with `compared_against_version` or explicit version range.
@@ -231,6 +238,39 @@ impl DatasetDeltaBuilder {
     }
 }
 
+/// Floor to the microsecond a Python `datetime` can store.
+fn floor_to_microsecond(ts: DateTime<Utc>) -> DateTime<Utc> {
+    let remainder_ns = i64::from(ts.timestamp_subsec_nanos() % 1_000);
+    ts - TimeDelta::nanoseconds(remainder_ns)
+}
+
+/// Exclusive-begin bound for a microsecond-precision caller.
+///
+/// [`DatasetDelta`] compares full nanosecond timestamps and does not call this.
+/// Python `datetime` only has microseconds, and `versions()` / `get_version()`
+/// floor the manifest time to that. One microsecond past the floored value is
+/// strictly after every commit in the bucket, so the resolver's strictly-before
+/// comparison selects the later of those commits and the exclusive start drops
+/// the whole bucket.
+#[doc(hidden)]
+pub fn exclusive_begin_for_microsecond(timestamp: DateTime<Utc>) -> DateTime<Utc> {
+    floor_to_microsecond(timestamp)
+        .checked_add_signed(TimeDelta::microseconds(1))
+        .expect("microsecond bucket stays inside DateTime<Utc>")
+}
+
+/// Inclusive-end bound for a microsecond-precision caller.
+///
+/// [`DatasetDelta`] compares full nanosecond timestamps and does not call this.
+/// One nanosecond before the next microsecond includes every commit in this
+/// one and excludes a commit that lands on the following microsecond.
+#[doc(hidden)]
+pub fn inclusive_end_for_microsecond(timestamp: DateTime<Utc>) -> DateTime<Utc> {
+    exclusive_begin_for_microsecond(timestamp)
+        .checked_sub_signed(TimeDelta::nanoseconds(1))
+        .expect("one nanosecond before the next microsecond stays in range")
+}
+
 /// APIs for exploring changes between two versions of a dataset.
 pub struct DatasetDelta {
     /// The base version number for comparison.
@@ -254,7 +294,9 @@ impl DatasetDelta {
     /// Resolve the effective version range for this delta.
     ///
     /// If a date window is set (`begin_timestamp` and `end_timestamp` provided), this lazily
-    /// maps timestamps to version ids by scanning dataset versions:
+    /// maps timestamps to version ids by scanning dataset versions. Both comparisons use the
+    /// full timestamp, including sub-microsecond digits. Commit times and the caller's bound
+    /// are not floored here:
     /// - Begin is exclusive: pick the greatest version with `timestamp < begin_timestamp`.
     /// - End is inclusive:  pick the greatest version with `timestamp <= end_timestamp`.
     ///
@@ -2856,6 +2898,165 @@ mod tests {
         );
     }
 
+    /// Full-precision bounds follow the manifest timestamp, nanoseconds
+    /// included. An exclusive begin at v2's own timestamp selects v1, and an
+    /// inclusive end at v3's own timestamp keeps the delete. Version 4 stays
+    /// past that end. 187ns and 297ns are remainders a floored comparison
+    /// would have discarded.
+    #[tokio::test]
+    async fn test_full_precision_timestamp_bounds_select_the_version_range() {
+        let dir = lance_core::utils::tempfile::TempStrDir::default();
+        MockClock::set_system_time(std::time::Duration::new(1_700_000_000, 187));
+        let data = lance_datagen::gen_batch()
+            .col("key", array::cycle::<Int32Type>(vec![1, 9]))
+            .col("value", array::fill_utf8("v1".to_string()))
+            .into_reader_rows(RowCount::from(2), BatchCount::from(1));
+        let ds = Dataset::write(
+            data,
+            &dir,
+            Some(WriteParams {
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(ds.version().version, 1);
+
+        MockClock::set_system_time(std::time::Duration::new(1_700_000_001, 297));
+        let mut ds = write_dataset_temp(&dir, 2, 1, 1, "v2", true, true).await;
+        assert_eq!(ds.version().version, 2);
+        let live = ds.scan().with_row_id().try_into_batch().await.unwrap();
+        let keys = live["key"].as_primitive::<Int32Type>().values();
+        let row_ids = live[ROW_ID].as_primitive::<UInt64Type>().values();
+        let row_of_9 = keys
+            .iter()
+            .zip(row_ids)
+            .find(|(key, _)| **key == 9)
+            .map(|(_, row_id)| *row_id);
+        // Rows are written as key 1 then key 9, so the deleted key is row id 1.
+        assert_eq!(row_of_9, Some(1));
+
+        MockClock::set_system_time(std::time::Duration::new(1_700_000_002, 50));
+        ds.delete("key = 9").await.unwrap();
+        assert_eq!(ds.version().version, 3);
+
+        // A commit after the inclusive end. Its key must not leak through.
+        MockClock::set_system_time(std::time::Duration::new(1_700_000_003, 10));
+        let ds = write_dataset_temp(&dir, 3, 1, 1, "v4", true, true).await;
+        assert_eq!(ds.version().version, 4);
+
+        let versions = ds.versions().await.unwrap();
+        assert_eq!(versions[0].timestamp.timestamp_subsec_nanos(), 187);
+        assert_eq!(versions[1].timestamp.timestamp_subsec_nanos(), 297);
+        assert_eq!(versions[2].timestamp.timestamp_subsec_nanos(), 50);
+        // v2's own timestamp is strictly after v1, so the exclusive start is v1.
+        let begin = versions[1].timestamp;
+        let end = versions[2].timestamp;
+
+        let delta = ds
+            .delta()
+            .with_begin_date(begin)
+            .with_end_date(end)
+            .build()
+            .unwrap();
+        assert_eq!(delta.list_transactions().await.unwrap().len(), 2);
+        let inserted = collect_stream(delta.get_inserted_rows().await.unwrap()).await;
+        assert_eq!(
+            inserted["key"].as_primitive::<Int32Type>().values(),
+            &[2],
+            "version 1 must not leak, and version 4 must stay past the end"
+        );
+        assert_eq!(
+            collect_deleted(&delta).await,
+            vec![1],
+            "version 1 is the exclusive start, so its deleted row is reported"
+        );
+    }
+
+    /// v1 at 10s+100ns and v2 at 10s+900ns share a microsecond. A full
+    /// `DateTime<Utc>` bound between them splits the commits. The microsecond
+    /// bucket Python passes still groups them.
+    #[tokio::test]
+    async fn test_submicrosecond_midpoint_splits_commits_python_groups() {
+        let dir = lance_core::utils::tempfile::TempStrDir::default();
+        MockClock::set_system_time(std::time::Duration::new(10, 100));
+        let _v1 = write_dataset_temp(&dir, 1, 1, 1, "v1", true, false).await;
+        MockClock::set_system_time(std::time::Duration::new(10, 900));
+        let _v2 = write_dataset_temp(&dir, 2, 1, 1, "v2", true, true).await;
+        MockClock::set_system_time(std::time::Duration::new(11, 0));
+        let ds = write_dataset_temp(&dir, 3, 1, 1, "v3", true, true).await;
+        assert_eq!(ds.version().version, 3);
+
+        let versions = ds.versions().await.unwrap();
+        assert_eq!(versions[0].timestamp.timestamp_subsec_nanos(), 100);
+        assert_eq!(versions[1].timestamp.timestamp_subsec_nanos(), 900);
+        assert_eq!(versions[2].timestamp.timestamp_subsec_nanos(), 0);
+
+        let keys_of = |delta: super::DatasetDelta| async move {
+            let batch = collect_stream(delta.get_inserted_rows().await.unwrap()).await;
+            let mut keys = batch["key"].as_primitive::<Int32Type>().values().to_vec();
+            keys.sort_unstable();
+            keys
+        };
+
+        let before = chrono::DateTime::<chrono::Utc>::from_timestamp(9, 0).unwrap();
+        let midpoint = chrono::DateTime::<chrono::Utc>::from_timestamp(10, 500).unwrap();
+        let v2_at = versions[1].timestamp;
+
+        // Inclusive end at 10s+500ns is after v1 and before v2.
+        let ended = ds
+            .delta()
+            .with_begin_date(before)
+            .with_end_date(midpoint)
+            .build()
+            .unwrap();
+        assert_eq!(
+            keys_of(ended).await,
+            vec![1],
+            "inclusive end at 10s+500ns returns only v1"
+        );
+
+        // Exclusive start at 10s+500ns is after v1, so v2 stays in the window.
+        let started = ds
+            .delta()
+            .with_begin_date(midpoint)
+            .with_end_date(v2_at)
+            .build()
+            .unwrap();
+        assert_eq!(
+            keys_of(started).await,
+            vec![2],
+            "exclusive start at 10s+500ns includes v2"
+        );
+
+        // The datetime Python would pass for this shared microsecond.
+        let shared = chrono::DateTime::<chrono::Utc>::from_timestamp(10, 0).unwrap();
+        let after = chrono::DateTime::<chrono::Utc>::from_timestamp(11, 0).unwrap();
+        let skipped = ds
+            .delta()
+            .with_begin_date(super::exclusive_begin_for_microsecond(shared))
+            .with_end_date(super::inclusive_end_for_microsecond(after))
+            .build()
+            .unwrap();
+        assert_eq!(
+            keys_of(skipped).await,
+            vec![3],
+            "a microsecond begin skips both commits in that microsecond"
+        );
+        let kept = ds
+            .delta()
+            .with_begin_date(super::exclusive_begin_for_microsecond(before))
+            .with_end_date(super::inclusive_end_for_microsecond(shared))
+            .build()
+            .unwrap();
+        assert_eq!(
+            keys_of(kept).await,
+            vec![1, 2],
+            "a microsecond end keeps both commits in that microsecond"
+        );
+    }
+
     /// Unchanged shared fragments appear nowhere; changed ones on both
     /// sides; vanished as candidates; added as probed.
     #[test]
@@ -3275,5 +3476,25 @@ mod tests {
         let mut keys = batch["key"].as_primitive::<Int32Type>().values().to_vec();
         keys.sort_unstable();
         assert_eq!(keys, (0..10).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn test_open_ended_date_delta_reads_other_writers_rows() {
+        MockClock::set_system_time(std::time::Duration::from_secs(10));
+        let dir = lance_core::utils::tempfile::TempStrDir::default();
+        let original = write_dataset_temp(&dir, 0, 1, 1, "v1", true, false).await;
+        assert_eq!(original.version().version, 1);
+
+        MockClock::set_system_time(std::time::Duration::from_secs(20));
+        let begin_ts = chrono::DateTime::<chrono::Utc>::from_timestamp(15, 0).unwrap();
+        let writer = write_dataset_temp(&dir, 100, 1, 1, "v2", true, true).await;
+        assert_eq!(writer.version().version, 2);
+        assert_eq!(original.version().version, 1);
+
+        let delta = original.delta().with_begin_date(begin_ts).build().unwrap();
+        assert_eq!(delta.list_transactions().await.unwrap().len(), 1);
+        let batch = collect_stream(delta.get_upserted_rows().await.unwrap()).await;
+        let keys = batch["key"].as_primitive::<Int32Type>().values().to_vec();
+        assert_eq!(keys, vec![100]);
     }
 }
