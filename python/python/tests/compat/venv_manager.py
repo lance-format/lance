@@ -185,7 +185,6 @@ class VenvExecutor:
         self._created = False
         self._subprocess: Optional[subprocess.Popen] = None
         self._stderr_path: Optional[Path] = None
-        self._stderr_file = None
 
     @property
     def python_path(self) -> Path:
@@ -340,14 +339,17 @@ class VenvExecutor:
         # Capture stderr to a file so a Rust panic (which crashes the runner) can be
         # surfaced in the error instead of an opaque "broken pipe".
         self._stderr_path = self.venv_path / ".runner_stderr.log"
-        self._stderr_file = open(self._stderr_path, "w")
-        self._subprocess = subprocess.Popen(
-            [str(self.python_path), "-u", str(runner_script)],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=self._stderr_file,
-            env=env,
-        )
+        # The child inherits its own copy of the handle, and the log is read
+        # back by path, so the parent closes its handle as soon as `Popen`
+        # returns or raises.
+        with open(self._stderr_path, "w") as stderr_file:
+            self._subprocess = subprocess.Popen(
+                [str(self.python_path), "-u", str(runner_script)],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=stderr_file,
+                env=env,
+            )
 
     def _recent_stderr(self, max_lines: int = 200) -> str:
         """Return the tail of the runner's captured stderr, if any.
@@ -499,8 +501,10 @@ class VenvExecutor:
                 self._subprocess.terminate()
                 self._subprocess.wait(timeout=5)
             except Exception:
-                # Force kill if graceful termination fails
+                # Force kill if graceful termination fails, and reap the runner
+                # so it no longer holds its stderr log when the venv is removed.
                 self._subprocess.kill()
+                self._subprocess.wait()
             finally:
                 self._subprocess = None
 
