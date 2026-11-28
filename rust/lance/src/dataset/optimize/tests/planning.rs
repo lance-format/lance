@@ -6,7 +6,7 @@
 use super::*;
 use std::collections::BTreeSet;
 
-use crate::dataset::optimize::planning::{
+use lance_table_runtime::optimize::planning::{
     CandidateBin, CompactionCandidacy, FragmentMetrics, HELD_BACK_SAMPLE_LIMIT, describe_held,
     fragment_file_bytes, limit_tasks_to_source_budget,
 };
@@ -66,7 +66,7 @@ fn merge_candidate_byte_threshold(
     #[case] min_bytes: Option<usize>,
     #[case] expected: bool,
 ) {
-    let planner = DefaultCompactionPlanner::new(CompactionOptions {
+    let planner = runtime::DefaultCompactionPlanner::new(CompactionOptions {
         target_rows_per_fragment: 1000,
         max_bytes_per_file: cap,
         min_bytes_per_file: min_bytes,
@@ -2898,7 +2898,7 @@ async fn test_max_source_bytes() {
 
     let first_task_base_bytes: u64 = dataset.get_fragments()[..3]
         .iter()
-        .flat_map(|f| f.metadata.files.iter())
+        .flat_map(|f| f.metadata().files.iter())
         .map(|df| df.file_size_bytes.get().unwrap().get())
         .sum();
     let overlay_bytes = dataset.get_fragment(0).unwrap().metadata().overlays[0]

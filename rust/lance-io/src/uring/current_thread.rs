@@ -32,7 +32,7 @@ use std::sync::{Arc, Mutex};
 use tracing::instrument;
 
 // Re-use file handle types from reader.rs
-use super::reader::{CacheKey, CachedReaderData, HANDLE_CACHE, UringFileHandle};
+use super::reader::UringFileHandle;
 
 /// Global counter for generating unique user_data values
 static USER_DATA_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -301,8 +301,6 @@ impl DeepSizeOf for UringCurrentThreadReader {
 
 impl UringCurrentThreadReader {
     /// Open a file with thread-local io_uring
-    ///
-    /// This reuses the file handle caching infrastructure from UringReader
     #[instrument(level = "debug")]
     pub(crate) async fn open(
         path: &Path,
@@ -313,25 +311,10 @@ impl UringCurrentThreadReader {
         // Determine block size with environment variable override
         let block_size = URING_BLOCK_SIZE.unwrap_or(block_size.max(DEFAULT_URING_BLOCK_SIZE));
 
-        let cache_key = CacheKey::new(path, block_size);
-
-        // Try to get from cache first
-        if let Some(data) = HANDLE_CACHE.get(&cache_key).await {
-            // Use known_size if provided, otherwise use cached size
-            let size = known_size.unwrap_or(data.size);
-            return Ok(Box::new(Self {
-                handle: data.handle,
-                block_size,
-                size,
-                io_tracker,
-            }) as Box<dyn Reader>);
-        }
-
-        // Cache miss - open file and get size
         let path_clone = path.clone();
         let local_path = to_local_path(path);
 
-        let data = tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             let file = File::open(&local_path).map_err(|e| match e.kind() {
                 ErrorKind::NotFound => Error::not_found(path_clone.to_string()),
                 _ => e.into(),
@@ -343,23 +326,14 @@ impl UringCurrentThreadReader {
                 None => file.metadata()?.len() as usize,
             };
 
-            Ok::<_, Error>(CachedReaderData {
+            Ok(Box::new(Self {
                 handle: Arc::new(UringFileHandle::new(file, path_clone)),
+                block_size,
                 size,
-            })
+                io_tracker,
+            }) as Box<dyn Reader>)
         })
-        .await??;
-
-        // Insert into cache
-        HANDLE_CACHE.insert(cache_key, data.clone()).await;
-
-        // Return new reader instance
-        Ok(Box::new(Self {
-            handle: data.handle.clone(),
-            block_size,
-            size: data.size,
-            io_tracker,
-        }) as Box<dyn Reader>)
+        .await?
     }
 
     /// Submit a read request and return a future

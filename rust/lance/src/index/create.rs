@@ -9,6 +9,7 @@ use crate::{
     },
     index::{
         DatasetIndexExt, IntoIndexSegment,
+        field_dependencies::{fields_with_dependencies, input_field_ids},
         frag_reuse::OpenPurpose,
         frag_reuse_with_stable_row_ids::{
             ensure_index_allowed_with_frag_reuse, ensure_index_kind_allowed_with_frag_reuse,
@@ -409,11 +410,10 @@ impl<'a> CreateIndexBuilder<'a> {
             let mut candidate = base_name.clone();
             let mut counter = 2; // Start with no suffix, then use _2, _3, ...
             while indices.iter().any(|idx| {
-                // A covered index still names the same column by its keyed
-                // prefix; only that prefix decides whether this is "the same
-                // field", not the full `fields` vector including carried
-                // columns.
-                let different_field = idx.keyed_field() != Some(field.id);
+                // Only the query inputs decide whether this is "the same
+                // field", not the full `fields` vector including dependencies
+                // and carried columns.
+                let different_field = !indexes_field(idx, field.id);
                 idx.name == candidate
                     && (different_field || !index_matches_type(idx, self.index_type, self.params))
             }) {
@@ -427,9 +427,9 @@ impl<'a> CreateIndexBuilder<'a> {
             .filter(|idx| idx.name == index_name)
             .collect::<Vec<_>>();
         if existing_named_indices.iter().any(|idx| {
-            // Same rule as above: the keyed prefix decides identity, not the
+            // Same rule as above: the query inputs decide identity, not the
             // full `fields` vector.
-            idx.keyed_field() != Some(field.id)
+            !indexes_field(idx, field.id)
         }) {
             return Err(Error::index(format!(
                 "Index name '{index_name}' already exists with different fields, \
@@ -720,7 +720,11 @@ impl<'a> CreateIndexBuilder<'a> {
         let index_metadata = IndexMetadata {
             uuid: output_index_uuid,
             name: index_name,
-            fields: vec![field.id],
+            fields: fields_with_dependencies(
+                self.dataset.schema(),
+                &[field.id],
+                &created_index.index_details,
+            )?,
             covering_fields: vec![],
             dataset_version: self.dataset.manifest.version,
             fragment_bitmap: if train {
@@ -856,7 +860,7 @@ impl<'a> CreateIndexBuilder<'a> {
             while indices.iter().any(|idx| {
                 // Same name-collision rule as `execute_uncommitted_impl`'s
                 // default-name loop above in this file.
-                let different_field = idx.keyed_field() != Some(field.id);
+                let different_field = !indexes_field(idx, field.id);
                 idx.name == candidate
                     && (different_field || !index_matches_type(idx, self.index_type, self.params))
             }) {
@@ -870,9 +874,9 @@ impl<'a> CreateIndexBuilder<'a> {
             .filter(|idx| idx.name == index_name)
             .collect::<Vec<_>>();
         if existing_named_indices.iter().any(|idx| {
-            // Same rule as above: the keyed prefix decides identity, not the
+            // Same rule as above: the query inputs decide identity, not the
             // full `fields` vector.
-            idx.keyed_field() != Some(field.id)
+            !indexes_field(idx, field.id)
         }) {
             return Err(Error::index(format!(
                 "Index name '{index_name}' already exists with different fields, \
@@ -1055,6 +1059,13 @@ impl<'a> CreateIndexBuilder<'a> {
         observed.finish();
         Ok(committed)
     }
+}
+
+/// Whether `index` answers queries on `field_id` alone. An index whose
+/// declaration this build cannot resolve answers for no field, but it still
+/// holds its name.
+fn indexes_field(index: &IndexMetadata, field_id: i32) -> bool {
+    input_field_ids(index).is_ok_and(|inputs| inputs.as_ref() == [field_id])
 }
 
 /// Returns true if an existing `IndexMetadata` matches the given type

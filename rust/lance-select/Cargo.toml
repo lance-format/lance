@@ -38,5 +38,9 @@ harness = false
 name = "nullable_equality"
 harness = false
 
+[[bench]]
+name = "combined_filter"
+harness = false
+
 [lints]
 workspace = true

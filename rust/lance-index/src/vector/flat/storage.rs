@@ -214,6 +214,10 @@ impl VectorStore for FlatFloatStorage {
         self.row_ids.values().iter()
     }
 
+    fn row_ids_slice(&self) -> Option<&[u64]> {
+        Some(self.row_ids.values().as_ref())
+    }
+
     fn dist_calculator(&self, query: ArrayRef, _dist_q_c: f32) -> Self::DistanceCalculator<'_> {
         let norms = self.norms.as_ref().map(|n| n.values().as_ref());
         Self::DistanceCalculator::new(self.vectors.as_ref(), query, self.distance_type, norms)
@@ -387,6 +391,10 @@ impl VectorStore for FlatBinStorage {
 
     fn row_ids(&self) -> impl Iterator<Item = &u64> {
         self.row_ids.values().iter()
+    }
+
+    fn row_ids_slice(&self) -> Option<&[u64]> {
+        Some(self.row_ids.values().as_ref())
     }
 
     fn dist_calculator(&self, query: ArrayRef, _dist_q_c: f32) -> Self::DistanceCalculator<'_> {

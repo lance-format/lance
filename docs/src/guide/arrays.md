@@ -205,3 +205,20 @@ The default requires no AxisDelta configuration. To override it, set field metad
 Axes are zero-based and exclude the dataset row dimension. For HWC images,
 `auto:1` tests horizontal differences within each channel. Floating-point vectors
 and stable 2.1/2.2 writers keep their existing behavior.
+
+## Compressing floating-point arrays with Pcodec (Lance 2.3)
+
+With the unstable Lance 2.3 writer, set `lance-encoding:compression=pcodec` in
+the field metadata to request [Pcodec compression](../format/file/encoding.md#pcodec)
+for floating-point values or fixed-size lists of them.
+
+`lance-encoding` enables its optional `pcodec` Cargo feature by default. A
+consumer that depends directly on `lance-encoding` can omit Pcodec by setting
+`default-features = false` and leaving `pcodec` disabled throughout the dependency
+graph. Cargo combines features across dependencies. `lance-file`, the Lance Rust
+SDK, and the Lance bindings enable the encoding crate's default features.
+
+With `pcodec` disabled, the encoding library returns `NotSupported` when asked
+to create a Pcodec decoder or when it selects Pcodec for an eligible page. Use a
+build with `lance-encoding/pcodec` enabled to read or write Pcodec data. For new
+writes, you can also choose another compression scheme.

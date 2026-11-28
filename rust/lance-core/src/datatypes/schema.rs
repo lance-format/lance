@@ -1478,6 +1478,57 @@ impl Projection {
         }
     }
 
+    /// Resolve a requested schema against the base schema by name and type.
+    ///
+    /// Fields can select a subset of the children of a nested column. System
+    /// columns are represented by projection flags. In particular, a request
+    /// for `_rowoffset` selects the row address needed to compute it.
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use lance_core::{ROW_ADDR, datatypes::{Projection, Schema}};
+    ///
+    /// let base = Arc::new(Schema::default());
+    /// let requested = base.project_preserve_system_columns(&[ROW_ADDR])?;
+    /// let projection = Projection::from_schema(base, &requested)?;
+    /// assert!(projection.with_row_addr);
+    /// # Ok::<(), lance_core::Error>(())
+    /// ```
+    pub fn from_schema(base: Arc<dyn Projectable>, requested: &Schema) -> Result<Self> {
+        let mut projection = Self::empty(base);
+        let mut data_fields = Vec::with_capacity(requested.fields.len());
+        for field in &requested.fields {
+            match field.name.as_str() {
+                ROW_ID => projection.with_row_id = true,
+                ROW_ADDR | ROW_OFFSET => projection.with_row_addr = true,
+                ROW_LAST_UPDATED_AT_VERSION => {
+                    projection.with_row_last_updated_at_version = true;
+                }
+                ROW_CREATED_AT_VERSION => projection.with_row_created_at_version = true,
+                name => {
+                    if projection.base_schema().field(name).is_none() {
+                        return Err(Error::invalid_input(format!(
+                            "Column '{name}' not found in schema"
+                        )));
+                    }
+                    data_fields.push(field.clone());
+                }
+            }
+        }
+        // Resolve names and types first. A schema assembled independently can
+        // contain field IDs that designate different columns in this table.
+        let data_schema = Schema {
+            fields: data_fields,
+            metadata: requested.metadata.clone(),
+        };
+        let data_schema = projection.base_schema().project_by_schema(
+            &data_schema,
+            OnMissing::Error,
+            OnTypeMismatch::Error,
+        )?;
+        Ok(projection.union_schema(&data_schema))
+    }
+
     pub fn full(base: Arc<dyn Projectable>) -> Self {
         let schema = base.schema().clone();
         Self::empty(base).union_schema(&schema)

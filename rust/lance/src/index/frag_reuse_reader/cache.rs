@@ -4,7 +4,6 @@
 //! Immutable ledgers and store-bound mappings shared across dataset snapshots.
 
 use std::borrow::Cow;
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -12,11 +11,12 @@ use lance_core::Result;
 use lance_core::cache::{CacheKey, CacheKeySchema, KeyBuilder, WeakLanceCache};
 use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_core::utils::fragment_reuse::{MappingReader, OrderedCompactionMapping};
-use lance_index::frag_reuse::row_map::{ROW_MAP_CACHE_CHUNK_BYTES, RowMapBlockCache};
-use lance_index::frag_reuse::stable_partition::{MAPPING_FILE, StablePartitionMapping};
-use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_table::format::IndexMetadata;
 use lance_table::system_index::frag_reuse::ledger::{FragReuseLedger, Mapping, Transition};
+use lance_table::system_index::frag_reuse::row_map::{ROW_MAP_CACHE_CHUNK_BYTES, RowMapBlockCache};
+use lance_table::system_index::frag_reuse::stable_partition::{
+    MAPPING_FILE, StablePartitionMapping,
+};
 use uuid::Uuid;
 
 use crate::Dataset;
@@ -200,11 +200,6 @@ pub async fn open_mapping(
                         .table_state
                         .metadata_cache
                         .file_metadata_cache(&directory);
-                    let store = LanceIndexStore::new(store, directory, Arc::new(metadata_cache))
-                        .with_file_sizes(HashMap::from([(
-                            MAPPING_FILE.to_string(),
-                            reference.map_size_bytes,
-                        )]));
                     // Row-map label chunks live in the index cache (following the
                     // v0 placement choice: FRI file content is index-cached, not
                     // file-cached). Keyed by the transition fingerprint so the
@@ -227,8 +222,11 @@ pub async fn open_mapping(
                             *transition.fingerprint(),
                         )),
                     };
-                    Arc::new(StablePartitionMapping::try_new_with_cache(
-                        Arc::new(store),
+                    Arc::new(StablePartitionMapping::try_from_file(
+                        store,
+                        directory.join(MAPPING_FILE),
+                        reference.map_size_bytes,
+                        metadata_cache,
                         transition.sources().to_vec(),
                         transition.destinations().to_vec(),
                         block_cache,

@@ -18,11 +18,12 @@ use byteorder::{ByteOrder, LittleEndian, ReadBytesExt};
 use bytes::{Bytes, BytesMut};
 use futures::{Stream, StreamExt, stream::BoxStream};
 use lance_core::deepsize::{Context, DeepSizeOf};
+pub use lance_encoding::decoder::FilterExpression;
 use lance_encoding::{
     EncodingsIo,
     decoder::{
-        ColumnInfo, DecoderConfig, DecoderPlugins, FilterExpression, PageEncoding, ReadBatchTask,
-        RequestedRows, SchedulerDecoderConfig, schedule_and_decode, schedule_and_decode_blocking,
+        ColumnInfo, DecoderConfig, DecoderPlugins, PageEncoding, ReadBatchTask, RequestedRows,
+        SchedulerDecoderConfig, schedule_and_decode, schedule_and_decode_blocking,
     },
     encoder::EncodedBatch,
 };
@@ -3583,7 +3584,9 @@ mod tests {
                 } else {
                     assert!(matches!(
                         offsets,
-                        Some(metadata::compressive_encoding::Compression::Delta(_))
+                        Some(metadata::compressive_encoding::Compression::MonotonicDelta(
+                            _
+                        ))
                     ));
                 }
             }

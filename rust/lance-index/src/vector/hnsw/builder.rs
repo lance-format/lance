@@ -534,15 +534,8 @@ impl HNSW {
             .visited_generator_queue
             .pop()
             .unwrap_or_else(|| VisitedGenerator::new(storage.len()));
-        let result = self.search_inner(
-            query,
-            k,
-            params,
-            bitset,
-            &mut visited_generator,
-            storage,
-            self.inner.params.prefetch_distance,
-        );
+        let result =
+            self.search_basic_with(query, k, params, bitset, &mut visited_generator, storage);
 
         match self.inner.visited_generator_queue.push(visited_generator) {
             Ok(_) => {}
@@ -552,6 +545,29 @@ impl HNSW {
         }
 
         result
+    }
+
+    /// [`Self::search_basic`] with a visited set the caller owns, for a caller
+    /// that runs many searches in a row on one thread: taking a set from the
+    /// shared pool and returning it on every search contends across threads.
+    pub fn search_basic_with(
+        &self,
+        query: ArrayRef,
+        k: usize,
+        params: &HnswQueryParams,
+        bitset: Option<Visited>,
+        visited_generator: &mut VisitedGenerator,
+        storage: &impl VectorStore,
+    ) -> Result<(Vec<OrderedNode>, usize)> {
+        self.search_inner(
+            query,
+            k,
+            params,
+            bitset,
+            visited_generator,
+            storage,
+            self.inner.params.prefetch_distance,
+        )
     }
 
     /// Like [Self::search_basic] but the bottom level runs

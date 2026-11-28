@@ -391,7 +391,7 @@ async fn test_compaction_does_not_strand_small_remainders(
     let mut fragment_sizes = dataset
         .get_fragments()
         .iter()
-        .map(|fragment| fragment.metadata.physical_rows.unwrap())
+        .map(|fragment| fragment.metadata().physical_rows.unwrap())
         .collect::<Vec<_>>();
     fragment_sizes.sort_unstable();
     assert_eq!(fragment_sizes, vec![600, 600, 800]);
@@ -440,7 +440,7 @@ async fn test_compaction_rebalances_oversized_task(#[case] data_storage_version:
         dataset
             .get_fragments()
             .iter()
-            .map(|fragment| fragment.metadata.physical_rows.unwrap())
+            .map(|fragment| fragment.metadata().physical_rows.unwrap())
             .collect::<Vec<_>>(),
         vec![1_025; 4]
     );
@@ -701,5 +701,5 @@ async fn test_compact_deletions(
 
     let fragments = dataset.get_fragments();
     assert_eq!(fragments.len(), 1);
-    assert!(fragments[0].metadata.deletion_file.is_none());
+    assert!(fragments[0].metadata().deletion_file.is_none());
 }
