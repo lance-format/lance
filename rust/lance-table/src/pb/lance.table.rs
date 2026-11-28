@@ -2340,8 +2340,16 @@ pub mod transaction {
         /// The mode of update
         #[prost(enumeration = "UpdateMode", tag = "7")]
         pub update_mode: i32,
-        /// Filter for checking existence of keys in newly inserted rows, used for conflict detection.
-        /// Only tracks keys from INSERT operations during merge insert, not updates.
+        /// Filter over the keys of rows this update inserted, used to detect a
+        /// concurrent writer that inserted a matching key. Only inserted rows
+        /// contribute, not updated rows. The filter's `field_ids` are the key
+        /// columns in encoding order.
+        ///
+        /// A writer that tracks inserted keys sets this field. Enabling it for
+        /// ordinary merge-insert ON columns requires explicit caller opt-in; the
+        /// existing primary-key path is unchanged. Absence and a present empty
+        /// filter are distinct states. See the transaction specification for the
+        /// conflict rules.
         #[prost(message, optional, tag = "8")]
         pub inserted_rows: ::core::option::Option<crate::format::pb_actions::KeyExistenceFilter>,
         /// Per-fragment physical row offsets that matched an update_columns hash join (RewriteColumns).
