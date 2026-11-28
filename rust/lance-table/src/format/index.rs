@@ -49,10 +49,12 @@ pub struct IndexMetadata {
     /// Unique ID across all dataset versions.
     pub uuid: Uuid,
 
-    /// Fields to build the index.
+    /// Fields used to build the index, including plugin-declared dependencies.
     ///
     /// `fields[0]` is always a column the index is keyed on. Trailing entries
-    /// may instead be merely carried, not keyed on -- see [`Self::covering_fields`].
+    /// may be additional plugin dependencies or merely carried columns -- see
+    /// [`Self::covering_fields`]. Query input routing must also consult the
+    /// plugin's additional field declaration.
     pub fields: Vec<i32>,
 
     /// Fields whose values this index carries.
@@ -344,9 +346,10 @@ impl IndexMetadata {
     /// columns of [`Self::covering_fields`] removed when they use the suffix
     /// layout. Under the independent layout this is all of `fields`.
     ///
-    /// Only this prefix decides which column an index answers for;
-    /// [`Self::dependency_fields`] answers what invalidates it. Empty for a system index
-    /// that declares no fields.
+    /// This is a metadata declaration and can still contain additional plugin
+    /// dependencies. Query input routing resolves those through the plugin;
+    /// [`Self::dependency_fields`] answers what invalidates the index without
+    /// loading a plugin. Empty for a system index that declares no fields.
     pub fn keyed_fields(&self) -> &[i32] {
         Self::keyed_fields_of(&self.fields, &self.covering_fields)
     }
@@ -374,7 +377,8 @@ impl IndexMetadata {
     }
 
     /// The single column this index is keyed on, or `None` when it is keyed on
-    /// several -- a genuinely composite index -- or on none at all.
+    /// several fields or on none at all. A plugin may declare additional
+    /// dependencies, so `None` alone does not establish composite query inputs.
     ///
     /// Most selection paths are only defined for one keyed column, so they can
     /// compare this against the column they are resolving.
@@ -743,6 +747,13 @@ impl IndexMetadata {
             })
             .transpose()?;
 
+        // An empty map means the segment uses its stored fragment IDs.
+        if !proto.local_fragment_aliases.is_empty() {
+            return Err(Error::not_supported(
+                "index segment has local fragment aliases, which this build does not support yet",
+            ));
+        }
+
         Ok(Self {
             uuid: proto.uuid.as_ref().map(Uuid::try_from).ok_or_else(|| {
                 Error::invalid_input("uuid field does not exist in Index metadata".to_string())
@@ -816,6 +827,7 @@ impl From<&IndexMetadata> for pb::IndexMetadata {
             created_at: idx.created_at.map(|dt| dt.timestamp_millis() as u64),
             base_id: idx.base_id,
             files,
+            local_fragment_aliases: Default::default(),
         }
     }
 }
@@ -897,6 +909,7 @@ pub async fn list_index_files_with_sizes(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use prost::Message;
     use rstest::rstest;
     use std::collections::HashMap;
 
@@ -971,6 +984,32 @@ mod tests {
         let err = IndexMetadata::try_from(proto).unwrap_err();
         assert!(matches!(err, Error::CorruptFile { .. }), "got: {err:?}");
         assert!(err.to_string().contains("created_at"), "got: {err}");
+    }
+
+    #[test]
+    fn test_index_metadata_empty_local_fragment_aliases_round_trip() {
+        let metadata = index_metadata_with(vec![0], vec![]);
+        let proto = pb::IndexMetadata::from(&metadata);
+        assert!(proto.local_fragment_aliases.is_empty());
+
+        let decoded = pb::IndexMetadata::decode(proto.encode_to_vec().as_slice()).unwrap();
+        assert!(decoded.local_fragment_aliases.is_empty());
+        assert_eq!(IndexMetadata::try_from(decoded).unwrap(), metadata);
+    }
+
+    #[test]
+    fn test_index_metadata_rejects_local_fragment_aliases() {
+        let mut proto = pb::IndexMetadata::from(&index_metadata_with(vec![0], vec![]));
+        proto.local_fragment_aliases.insert(17, 42);
+        let decoded = pb::IndexMetadata::decode(proto.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(decoded.local_fragment_aliases.get(&17), Some(&42));
+
+        let err = IndexMetadata::try_from(decoded).unwrap_err();
+        assert!(matches!(err, Error::NotSupported { .. }), "got: {err:?}");
+        assert!(
+            err.to_string().contains("local fragment aliases"),
+            "got: {err}"
+        );
     }
 
     #[test]

@@ -37,7 +37,7 @@ use roaring::RoaringBitmap;
 use uuid::Uuid;
 
 use super::vector::ivf::{
-    SteadyStateRebalance, VectorSegmentCompatibility, index_type_for_segmented_optimize,
+    IVFIndex, SteadyStateRebalance, VectorSegmentCompatibility, index_type_for_segmented_optimize,
     optimize_vector_indices, select_steady_state_rebalance, vector_segment_compatibility,
 };
 use super::vector::{LogicalVectorIndex, VectorIndexParams, details, fresh_vector_segment_params};
@@ -193,7 +193,7 @@ pub async fn build_old_data_filter(
                         Ok::<_, Error>((fragment_id, deleted))
                     }
                 })
-                .buffer_unordered(dataset.object_store.io_parallelism());
+                .buffer_unordered(dataset.table_state.object_store.io_parallelism());
             let mut deleted_rows = RowAddrTreeMap::new();
             while let Some((fragment_id, deleted)) = deletions.try_next().await? {
                 if let Some(deleted) = deleted
@@ -276,7 +276,7 @@ pub async fn tagged_segment_coverage(
                 SegmentRemappingPlan::Identity => segment
                     .fragment_bitmap
                     .as_ref()
-                    .map(|bitmap| bitmap & dataset.fragment_bitmap.as_ref())
+                    .map(|bitmap| bitmap & dataset.table_state.fragment_bitmap.as_ref())
                     .unwrap_or_default(),
                 SegmentRemappingPlan::Translate { coverage, .. } => coverage.clone(),
                 SegmentRemappingPlan::MissingCoverage(_) => {
@@ -319,10 +319,10 @@ pub fn split_segment_coverage<'a>(
     let mut effective = RoaringBitmap::new();
     let mut deleted = RoaringBitmap::new();
     for segment in segments {
-        if let Some(eff) = segment.effective_fragment_bitmap(&dataset.fragment_bitmap) {
+        if let Some(eff) = segment.effective_fragment_bitmap(&dataset.table_state.fragment_bitmap) {
             effective |= eff;
         }
-        if let Some(del) = segment.deleted_fragment_bitmap(&dataset.fragment_bitmap) {
+        if let Some(del) = segment.deleted_fragment_bitmap(&dataset.table_state.fragment_bitmap) {
             deleted |= del;
         }
     }
@@ -403,7 +403,7 @@ pub async fn build_per_segment_filters(
         let mut filters = Vec::with_capacity(segments.len());
         for segment in segments {
             let effective = segment
-                .effective_fragment_bitmap(&dataset.fragment_bitmap)
+                .effective_fragment_bitmap(&dataset.table_state.fragment_bitmap)
                 .ok_or_else(|| {
                     Error::invalid_input(format!(
                         "CreateIndex: segment {} is missing fragment coverage",
@@ -429,10 +429,10 @@ pub async fn build_per_segment_filters(
             )));
         }
         let effective = segment
-            .effective_fragment_bitmap(&dataset.fragment_bitmap)
+            .effective_fragment_bitmap(&dataset.table_state.fragment_bitmap)
             .unwrap_or_default();
         let deleted = segment
-            .deleted_fragment_bitmap(&dataset.fragment_bitmap)
+            .deleted_fragment_bitmap(&dataset.table_state.fragment_bitmap)
             .unwrap_or_default();
         effective_union |= &effective;
         filters.push(build_old_data_filter(dataset, &effective, &deleted, address_domain).await?);
@@ -682,7 +682,10 @@ impl<'a> SeedHarvester<'a> {
             file_scheduler,
             None,
             Default::default(),
-            &dataset.metadata_cache.file_metadata_cache(&path),
+            &dataset
+                .table_state
+                .metadata_cache
+                .file_metadata_cache(&path),
             FileReaderOptions::default(),
         )
         .await
@@ -900,7 +903,7 @@ pub fn select_segments_to_merge<'a>(
     let mut selected = Vec::new();
     for (i, idx) in old_indices.iter().enumerate() {
         let covers_deleted = idx
-            .effective_fragment_bitmap(&dataset.fragment_bitmap)
+            .effective_fragment_bitmap(&dataset.table_state.fragment_bitmap)
             .is_some_and(|eff| !eff.is_disjoint(&deleted_frags));
         if i >= tail_start || covers_deleted {
             selected.push(*idx);
@@ -912,7 +915,7 @@ pub fn select_segments_to_merge<'a>(
 /// Whether a scalar index can merge multiple segments without rescanning their data.
 fn has_segment_merge_primitive(index_type: IndexType) -> bool {
     match index_type {
-        IndexType::BTree | IndexType::Bitmap | IndexType::NGram => true,
+        IndexType::BTree | IndexType::Bitmap | IndexType::NGram | IndexType::MinHashLsh => true,
         #[cfg(feature = "geo")]
         IndexType::RTree => true,
         _ => false,
@@ -1251,11 +1254,29 @@ async fn merge_scalar_indices<'a>(
                 scan_selection,
             )
             .await?;
-            let per_segment_filters = |filters: Vec<Option<OldIndexDataFilter>>| {
-                filters
-                    .into_iter()
-                    .map(|filter| block_stale_rows(dataset.as_ref(), filter, &stale_rows))
-                    .collect::<Vec<_>>()
+            // The scalar merge primitives below read old rows by address. Only
+            // those types need per-segment filters, so skip the deletion-vector
+            // reads for a BloomFilter zone merge. `old_data_address_domain`
+            // returns true for every type in this group.
+            let merge_filters = if matches!(
+                index_type,
+                IndexType::BTree
+                    | IndexType::Bitmap
+                    | IndexType::NGram
+                    | IndexType::RTree
+                    | IndexType::MinHashLsh
+            ) {
+                let (_, filters) =
+                    build_per_segment_filters(dataset.as_ref(), &selected_old_indices, None, true)
+                        .await?;
+                Some(
+                    filters
+                        .into_iter()
+                        .map(|filter| block_stale_rows(dataset.as_ref(), filter, &stale_rows))
+                        .collect::<Vec<_>>(),
+                )
+            } else {
+                None
             };
 
             match index_type {
@@ -1276,81 +1297,61 @@ async fn merge_scalar_indices<'a>(
                     .await?
                 }
                 IndexType::BTree => {
-                    let (_, old_data_filters) = build_per_segment_filters(
-                        dataset.as_ref(),
-                        &selected_old_indices,
-                        None,
-                        true,
-                    )
-                    .await?;
-                    let old_data_filters = per_segment_filters(old_data_filters);
                     crate::index::scalar::btree::open_and_merge_segments(
                         dataset.as_ref(),
                         field_path,
                         &selected_old_indices,
                         new_data_stream,
                         &new_store,
-                        &old_data_filters,
+                        merge_filters.as_deref().unwrap_or_default(),
                         None,
                     )
                     .await?
                 }
                 IndexType::Bitmap => {
-                    let (_, old_data_filters) = build_per_segment_filters(
-                        dataset.as_ref(),
-                        &selected_old_indices,
-                        None,
-                        true,
-                    )
-                    .await?;
-                    let old_data_filters = per_segment_filters(old_data_filters);
                     crate::index::scalar::bitmap::open_and_merge_segments(
                         dataset.as_ref(),
                         field_path,
                         &selected_old_indices,
                         new_data_stream,
                         &new_store,
-                        &old_data_filters,
+                        merge_filters.as_deref().unwrap_or_default(),
                         None,
                     )
                     .await?
                 }
                 IndexType::NGram => {
-                    let (_, old_data_filters) = build_per_segment_filters(
-                        dataset.as_ref(),
-                        &selected_old_indices,
-                        None,
-                        true,
-                    )
-                    .await?;
-                    let old_data_filters = per_segment_filters(old_data_filters);
                     crate::index::scalar::ngram::open_and_merge_segments(
                         dataset.as_ref(),
                         &selected_old_indices,
                         Some(new_data_stream),
                         &new_store,
-                        &old_data_filters,
+                        merge_filters.as_deref().unwrap_or_default(),
                         None,
                     )
                     .await?
                 }
                 #[cfg(feature = "geo")]
                 IndexType::RTree => {
-                    let (_, old_data_filters) = build_per_segment_filters(
-                        dataset.as_ref(),
-                        &selected_old_indices,
-                        None,
-                        address_domain,
-                    )
-                    .await?;
-                    let old_data_filters = per_segment_filters(old_data_filters);
                     crate::index::scalar::rtree::open_and_merge_segments(
                         dataset.as_ref(),
                         field_path,
                         &selected_old_indices,
                         Some(new_data_stream),
                         &new_store,
-                        &old_data_filters,
+                        merge_filters.as_deref().unwrap_or_default(),
+                        None,
+                    )
+                    .await?
+                }
+                IndexType::MinHashLsh => {
+                    super::scalar::minhash_lsh::open_and_merge_segments(
+                        dataset.as_ref(),
+                        field_path,
+                        &selected_old_indices,
+                        Some(new_data_stream),
+                        &new_store,
+                        merge_filters.as_deref().unwrap_or_default(),
                         None,
                     )
                     .await?
@@ -1520,7 +1521,7 @@ async fn train_from_definition<'a>(
                 old_indices[0].name
             ))
         })?;
-    let fragment_bitmap = dataset.fragment_bitmap.as_ref().clone();
+    let fragment_bitmap = dataset.table_state.fragment_bitmap.as_ref().clone();
     let segment = rebuild_vector_segment(
         dataset.as_ref(),
         &old_indices[0].name,
@@ -1738,7 +1739,7 @@ pub fn partition_dormant_vector_segments<'a>(
                 .get(&idx.uuid)
                 .is_some_and(|bitmap| !bitmap.is_empty()),
             None => idx
-                .effective_fragment_bitmap(&dataset.fragment_bitmap)
+                .effective_fragment_bitmap(&dataset.table_state.fragment_bitmap)
                 .is_none_or(|bitmap| !bitmap.is_empty()),
         };
         !has_stored_rows || has_live_coverage
@@ -1871,7 +1872,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                     })?;
                 let params =
                     fresh_vector_segment_params(reference_metadata, reference_index.as_ref())?;
-                let fragment_bitmap = dataset.fragment_bitmap.as_ref().clone();
+                let fragment_bitmap = dataset.table_state.fragment_bitmap.as_ref().clone();
                 let segment = rebuild_vector_segment(
                     dataset.as_ref(),
                     logical_index.name(),
@@ -1900,8 +1901,18 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
             let explicit_append = options.num_indices_to_merge == Some(0);
             let default_append_for_heterogeneous_models = options.num_indices_to_merge.is_none()
                 && compatibility == VectorSegmentCompatibility::QueryCompatibleModelsDiffer;
+            // A legacy merge cannot drop the postings of rows an update moved
+            // under their stable row ids (see `optimize_vector_indices`).
+            let default_append_for_legacy_stable_row_ids = options.num_indices_to_merge.is_none()
+                && dataset.manifest.uses_stable_row_ids()
+                && logical_index
+                    .iter()
+                    .any(|(_, index)| index.as_any().is::<IVFIndex>());
 
-            if !unindexed.is_empty() && (explicit_append || default_append_for_heterogeneous_models)
+            if !unindexed.is_empty()
+                && (explicit_append
+                    || default_append_for_heterogeneous_models
+                    || default_append_for_legacy_stable_row_ids)
             {
                 // CreateIndex commits append new segments at the end of the manifest's
                 // stable index order. Reusing the current suffix model keeps consecutive
@@ -1997,7 +2008,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                     removed_segment.fragment_bitmap.clone().unwrap_or_default()
                 } else {
                     removed_segment
-                        .effective_fragment_bitmap(&dataset.fragment_bitmap)
+                        .effective_fragment_bitmap(&dataset.table_state.fragment_bitmap)
                         .or_else(|| removed_segment.fragment_bitmap.clone())
                         .unwrap_or_default()
                 };
@@ -2072,7 +2083,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                 });
                 for removed in removed_indices.iter() {
                     if let Some(effective) =
-                        removed.effective_fragment_bitmap(&dataset.fragment_bitmap)
+                        removed.effective_fragment_bitmap(&dataset.table_state.fragment_bitmap)
                     {
                         frag_bitmap |= &effective;
                     }
@@ -2206,7 +2217,11 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                         return Ok(Some(IndexMergeResults {
                             new_uuid,
                             removed_indices: old_indices.to_vec(),
-                            new_fragment_bitmap: dataset.fragment_bitmap.as_ref().clone(),
+                            new_fragment_bitmap: dataset
+                                .table_state
+                                .fragment_bitmap
+                                .as_ref()
+                                .clone(),
                             new_dataset_version: dataset.manifest.version,
                             new_index_version: created_index.index_version as i32,
                             new_index_details: created_index.index_details,
@@ -2257,7 +2272,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                             }
                             None => {
                                 let effective = idx
-                                    .effective_fragment_bitmap(&dataset.fragment_bitmap)
+                                    .effective_fragment_bitmap(&dataset.table_state.fragment_bitmap)
                                     .unwrap_or_default();
                                 frag_bitmap |= &effective;
                                 effective
@@ -2723,7 +2738,7 @@ mod tests {
             );
             assert_eq!(
                 segments[0].fragment_bitmap.as_ref().unwrap(),
-                dataset.fragment_bitmap.as_ref()
+                dataset.table_state.fragment_bitmap.as_ref()
             );
             let index = dataset
                 .open_vector_index("vector", &segments[0].uuid, &NoOpMetricsCollector)
@@ -3130,7 +3145,7 @@ mod tests {
         }
         assert_eq!(
             covered,
-            dataset.fragment_bitmap.as_ref().clone(),
+            dataset.table_state.fragment_bitmap.as_ref().clone(),
             "physical vector segments must exactly cover indexed fragments"
         );
 
@@ -3202,7 +3217,7 @@ mod tests {
         assert_eq!(retrained.len(), 1);
         assert_eq!(
             retrained[0].fragment_bitmap.as_ref().unwrap(),
-            dataset.fragment_bitmap.as_ref(),
+            dataset.table_state.fragment_bitmap.as_ref(),
             "explicit retrain must source-rebuild one segment over all current fragments"
         );
         assert_eq!(
@@ -3346,7 +3361,7 @@ mod tests {
 
         let version_before = dataset.version().version;
         let segments_before = dataset.load_indices_by_name(INDEX_NAME).await.unwrap();
-        let object_store = dataset.object_store.clone();
+        let object_store = dataset.table_state.object_store.clone();
         let directories_before = object_store
             .read_dir(dataset.indices_dir())
             .await
@@ -3565,7 +3580,7 @@ mod tests {
         );
 
         // There should be two indices directories existed.
-        let object_store = dataset.object_store.as_ref();
+        let object_store = dataset.table_state.object_store.as_ref();
         let index_dirs = object_store.read_dir(dataset.indices_dir()).await.unwrap();
         assert_eq!(index_dirs.len(), 2);
 
@@ -3774,7 +3789,7 @@ mod tests {
             .unwrap();
         let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
         let version_before = dataset.version().version;
-        let object_store = dataset.object_store.as_ref();
+        let object_store = dataset.table_state.object_store.as_ref();
         let dirs_before = object_store
             .read_dir(dataset.indices_dir())
             .await
@@ -4029,7 +4044,7 @@ mod tests {
         );
         assert_eq!(
             merged[0].fragment_bitmap.as_ref().unwrap(),
-            dataset.fragment_bitmap.as_ref(),
+            dataset.table_state.fragment_bitmap.as_ref(),
             "the compatible merge must preserve exact fragment coverage"
         );
     }
@@ -6610,9 +6625,17 @@ mod tests {
         let mut removed = 0;
         for fragment in dataset.get_fragments() {
             if let Some(deletion_file) = fragment.metadata().deletion_file.clone() {
-                let path =
-                    deletion_file_path(&dataset.base, fragment.metadata().id, &deletion_file);
-                dataset.object_store.delete(&path).await.unwrap();
+                let path = deletion_file_path(
+                    &dataset.table_state.base,
+                    fragment.metadata().id,
+                    &deletion_file,
+                );
+                dataset
+                    .table_state
+                    .object_store
+                    .delete(&path)
+                    .await
+                    .unwrap();
                 removed += 1;
             }
         }
@@ -7201,7 +7224,11 @@ mod tests {
             !files.is_empty(),
             "the index must cover at least one fragment with data"
         );
-        dataset.object_store.as_ref().io_stats_incremental(); // Reset
+        dataset
+            .table_state
+            .object_store
+            .as_ref()
+            .io_stats_incremental(); // Reset
         files
     }
 
@@ -7215,6 +7242,7 @@ mod tests {
         indexed_files: &[String],
     ) {
         let rescanned = dataset
+            .table_state
             .object_store
             .as_ref()
             .io_stats_incremental()

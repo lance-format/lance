@@ -799,30 +799,37 @@ impl<'a> PageBufferReader<'a> {
         let prefetched = if ranges.is_empty() {
             VecDeque::new()
         } else {
-            let expected = ranges.len();
-            // Columns may have interleaved pages on disk. The scheduler needs
-            // physical order; copying still needs column/page/buffer order.
-            let mut order = (0..expected).collect::<Vec<_>>();
-            order.sort_unstable_by_key(|&index| (ranges[index].start, index));
-            let requests = order.iter().map(|&index| ranges[index].clone()).collect();
-            let buffers = scheduler.submit_request(requests, 0).await?;
-            if buffers.len() != expected {
-                return Err(Error::io(format!(
-                    "prefetched input at '{}' returned {} page buffers, expected {expected}",
-                    scheduler.reader().path(),
-                    buffers.len()
-                )));
-            }
-            let mut restored = vec![Bytes::new(); expected];
-            for (index, buffer) in order.into_iter().zip(buffers) {
-                restored[index] = buffer;
-            }
-            restored.into()
+            Self::read_in_page_order(scheduler, ranges).await?.into()
         };
         Ok(Self {
             scheduler,
             prefetched: Some(prefetched),
         })
+    }
+
+    async fn read_in_page_order(
+        scheduler: &FileScheduler,
+        ranges: Vec<Range<u64>>,
+    ) -> Result<Vec<Bytes>> {
+        // The scheduler requires physical offset order and returns bytes in
+        // request order. Concat consumes buffers in column, page, and buffer order.
+        let expected = ranges.len();
+        let mut order = (0..expected).collect::<Vec<_>>();
+        order.sort_unstable_by_key(|&index| (ranges[index].start, index));
+        let requests = order.iter().map(|&index| ranges[index].clone()).collect();
+        let buffers = scheduler.submit_request(requests, 0).await?;
+        if buffers.len() != expected {
+            return Err(Error::io(format!(
+                "input at '{}' returned {} page buffers, expected {expected}",
+                scheduler.reader().path(),
+                buffers.len()
+            )));
+        }
+        let mut restored = vec![Bytes::new(); expected];
+        for (index, buffer) in order.into_iter().zip(buffers) {
+            restored[index] = buffer;
+        }
+        Ok(restored)
     }
 
     async fn read(&mut self, ranges: Vec<Range<u64>>) -> Result<Vec<Bytes>> {
@@ -840,8 +847,10 @@ impl<'a> PageBufferReader<'a> {
                 .collect()
         } else if ranges.is_empty() {
             Ok(Vec::new())
+        } else if ranges.is_sorted_by_key(|range| range.start) {
+            scheduler.submit_request(ranges, 0).await
         } else {
-            self.scheduler.submit_request(ranges, 0).await
+            Self::read_in_page_order(scheduler, ranges).await
         }
     }
 }
@@ -1237,7 +1246,9 @@ where
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use arrow_array::RecordBatch;
     use lance_core::utils::tempfile::TempObjFile;
+    use lance_encoding::encoder::{EncodingOptions, encode_batch};
     use lance_io::{
         object_store::{ObjectStore, ObjectStoreParams},
         scheduler::{ScanScheduler, SchedulerConfig},
@@ -1279,6 +1290,146 @@ mod tests {
             .await
             .unwrap();
         EncodedFileInput::new(file).with_expected_num_rows(expected_num_rows)
+    }
+
+    async fn assert_v2_3_scan_and_take(
+        input: &EncodedFileInput,
+        expected: &RecordBatch,
+        take_indices: Vec<u32>,
+    ) -> FileReader {
+        let reader = FileReader::try_open(
+            input.scheduler(),
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &LanceCache::no_cache(),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(reader.metadata().version(), ConcreteFileVersion::V2_3);
+        let take_indices = take_indices.into();
+        let expected_take = arrow_select::take::take_record_batch(expected, &take_indices).unwrap();
+        for (selection, expected) in [
+            (ReadBatchParams::RangeFull, expected),
+            (ReadBatchParams::Indices(take_indices), &expected_take),
+        ] {
+            let batches = reader
+                .read_stream(selection, 32, 1, FilterExpression::no_filter())
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            let actual =
+                arrow_select::concat::concat_batches(&expected.schema(), &batches).unwrap();
+            assert_eq!(&actual, expected);
+        }
+        reader
+    }
+
+    #[tokio::test]
+    async fn concat_streams_non_monotonic_page_buffers() {
+        let store = Arc::new(ObjectStore::local());
+        let first_path = TempObjFile::default();
+        let reordered_path = TempObjFile::default();
+        let output_path = TempObjFile::default();
+        let version = ConcreteFileVersion::V2_3;
+        let prefix = [-101, -23];
+        let values = (0..64).map(|value| value * value).collect::<Vec<i32>>();
+        let schema = write_file(&store, &first_path, version, &prefix).await;
+        let batch = arrow_array::record_batch!(("value", Int32, values.clone())).unwrap();
+        let strategy = versions::v2_3::encoding_strategy(Default::default());
+        let encoded = encode_batch(
+            &batch,
+            schema.clone(),
+            strategy.as_ref(),
+            &EncodingOptions::default(),
+        )
+        .await
+        .unwrap();
+        let [column] = encoded.page_table.as_slice() else {
+            panic!("fixture must have one physical column");
+        };
+        let [page] = column.page_infos.as_ref() else {
+            panic!("fixture must have one page");
+        };
+        let [chunk_metadata, chunk_data] = page.buffer_offsets_and_sizes.as_ref() else {
+            panic!("fixture must have a MiniBlock metadata buffer and data buffer");
+        };
+        assert!(chunk_metadata.1 > 0 && chunk_metadata.1 < chunk_data.1);
+
+        // Place the initialization buffer after the data with a gap while
+        // keeping MiniBlock's semantic buffer order in the page descriptor.
+        let mut writer = versions::create_lazy_writer(
+            version,
+            store.create(&reordered_path).await.unwrap(),
+            FileWriterOptions::default(),
+        )
+        .unwrap();
+        let data_range = chunk_data.0 as usize..(chunk_data.0 + chunk_data.1) as usize;
+        let data_buffer = writer
+            .write_external_buffer(&encoded.data[data_range])
+            .await
+            .unwrap();
+        writer
+            .write_external_buffer(&[0; crate::writer::PAGE_BUFFER_ALIGNMENT])
+            .await
+            .unwrap();
+        let metadata_range =
+            chunk_metadata.0 as usize..(chunk_metadata.0 + chunk_metadata.1) as usize;
+        let metadata_buffer = writer
+            .write_external_buffer(&encoded.data[metadata_range])
+            .await
+            .unwrap();
+        writer.write_external_buffer(&[]).await.unwrap();
+        let relocated_page = PageInfo {
+            num_rows: page.num_rows,
+            priority: page.priority,
+            encoding: page.encoding.clone(),
+            buffer_offsets_and_sizes: Arc::from([metadata_buffer, data_buffer]),
+        };
+        let relocated_column = Arc::new(ColumnInfo {
+            page_infos: Arc::from([relocated_page]),
+            ..column.as_ref().clone()
+        });
+        writer
+            .initialize_with_external_columns(
+                schema.as_ref().clone(),
+                &[relocated_column],
+                encoded.num_rows,
+            )
+            .unwrap();
+        writer.finish().await.unwrap();
+
+        let reordered_input = input(store.clone(), &reordered_path, encoded.num_rows).await;
+        let reader = assert_v2_3_scan_and_take(&reordered_input, &batch, vec![1, 17, 63]).await;
+        assert_eq!(
+            reader.metadata().column_infos[0].page_infos[0]
+                .buffer_offsets_and_sizes
+                .as_ref(),
+            &[metadata_buffer, data_buffer],
+        );
+        assert!(metadata_buffer.0 > data_buffer.0 + data_buffer.1);
+
+        let first_input = input(store.clone(), &first_path, prefix.len() as u64).await;
+        let result = concat_files(
+            &FileConcatTarget::new(version, schema),
+            &[first_input, reordered_input],
+            || store.create(&output_path),
+            FileConcatOptions {
+                // Rule out whole-part prefetch and force the streaming path.
+                read_batch_bytes: 1,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(result, FileConcatResult::Written(_)));
+
+        let values = prefix.into_iter().chain(values).collect::<Vec<_>>();
+        let output = input(store, &output_path, values.len() as u64).await;
+        let expected = arrow_array::record_batch!(("value", Int32, values)).unwrap();
+        assert_v2_3_scan_and_take(&output, &expected, vec![0, 1, 2, 19, 65]).await;
     }
 
     #[tokio::test]

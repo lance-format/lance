@@ -25,8 +25,8 @@
 
 use super::{CompositeOperation, FieldId, FieldRef, Ref};
 use crate::feature_flags::{
-    FLAG_MANAGED_BLOBS, apply_index_object_metadata_flag, inherit_sticky_feature_flags,
-    managed_blobs_enabled, validate_auto_cleanup_config,
+    FLAG_MANAGED_BLOBS, apply_index_object_metadata_flag, apply_zone_write_seeds_version_config,
+    inherit_sticky_feature_flags, managed_blobs_enabled, validate_auto_cleanup_config,
 };
 use crate::format::overlay::staleness::field_affects_index;
 use crate::format::{
@@ -82,7 +82,7 @@ impl Transaction {
         // `build_manifest_with_read_version`: `migrate_to_stable_row_ids`
         // activates the flag with an `Operation::Merge`, so an action set
         // never carries that watermark.
-        if config.use_stable_row_ids && !current_manifest.uses_stable_row_ids() {
+        if config.use_stable_row_ids() && !current_manifest.uses_stable_row_ids() {
             return Err(Error::not_supported_source(
                 "This dataset was not created with the stable row ids feature.  Please run \
                  `migrate_to_stable_row_ids` before attempting to use stable row ids"
@@ -194,6 +194,10 @@ pub(super) struct ApplyState<'a> {
     /// to be written back over the assembled manifest.
     config: HashMap<String, String>,
     table_metadata: HashMap<String, String>,
+    /// Whether an action in this operation wrote or deleted
+    /// [`ZONE_WRITE_SEEDS_VERSION_KEY`](crate::feature_flags::ZONE_WRITE_SEEDS_VERSION_KEY).
+    /// An inherited value, even `"1"`, is not an opt-in.
+    zone_write_seeds_version_written: bool,
 
     /// The highest id handed out so far in each space, by the version being
     /// committed on top of or by this operation. Kept as marks rather than
@@ -302,6 +306,7 @@ impl<'a> ApplyState<'a> {
             existing_base_paths: manifest.base_paths.clone(),
             config: manifest.config.clone(),
             table_metadata: manifest.table_metadata.clone(),
+            zone_write_seeds_version_written: false,
             fragment_high_water: manifest.max_fragment_id(),
             field_high_water: manifest.max_field_id(),
             base_high_water: max_base_id(manifest),
@@ -357,6 +362,7 @@ impl<'a> ApplyState<'a> {
             field_high_water,
             config: dataset_config,
             table_metadata,
+            zone_write_seeds_version_written,
             ..
         } = self;
 
@@ -432,6 +438,7 @@ impl<'a> ApplyState<'a> {
             manifest.reader_feature_flags |= FLAG_MANAGED_BLOBS;
             manifest.writer_feature_flags |= FLAG_MANAGED_BLOBS;
         }
+        apply_zone_write_seeds_version_config(&mut manifest, zone_write_seeds_version_written)?;
 
         // The assembly derives the marks from what the manifest still holds,
         // which misses ids this operation reserved or minted and then
@@ -454,7 +461,8 @@ impl<'a> ApplyState<'a> {
             *current = (*current).max(field_high_water);
         }
 
-        manifest.transaction_file = Some(transaction_file_path.to_string());
+        manifest.transaction_file =
+            (!transaction_file_path.is_empty()).then(|| transaction_file_path.to_string());
         if let Some(next_row_id) = next_row_id {
             manifest.next_row_id = next_row_id;
         }
@@ -571,7 +579,7 @@ impl<'a> ApplyState<'a> {
     /// Row lineage the caller read ahead of time for fragments whose lineage
     /// lives in a data file, which applying cannot read itself.
     pub(super) fn spilled_row_lineage(&self) -> &'a SpilledRowLineage {
-        &self.build_config.spilled_row_lineage
+        self.build_config.spilled_row_lineage()
     }
 
     pub(super) fn schema(&self) -> &Schema {
@@ -628,6 +636,12 @@ impl<'a> ApplyState<'a> {
 
     pub(super) fn config_mut(&mut self) -> &mut HashMap<String, String> {
         &mut self.config
+    }
+
+    /// Record that this operation itself writes or deletes the zone write seed
+    /// version key, as opposed to inheriting it from the current manifest.
+    pub(super) fn mark_zone_write_seeds_version_written(&mut self) {
+        self.zone_write_seeds_version_written = true;
     }
 
     pub(super) fn table_metadata_mut(&mut self) -> &mut HashMap<String, String> {
@@ -2007,7 +2021,7 @@ mod tests {
         vec![vec![
             remove_fragment_zero(),
             Action::SetDeletionFile(SetDeletionFile {
-                fragment: 0,
+                fragment: Ref::Committed(0),
                 deletion_file: any_deletion_file(),
                 data_change: true,
                 base: None,
@@ -2377,7 +2391,7 @@ mod tests {
         vec![
             mint_fragment(0),
             Action::SetDeletionFile(SetDeletionFile {
-                fragment: 5,
+                fragment: Ref::Committed(5),
                 deletion_file: any_deletion_file(),
                 data_change: true,
                 base: None,
@@ -2418,7 +2432,7 @@ mod tests {
     #[rstest]
     #[case::deletion_file(
         Action::SetDeletionFile(SetDeletionFile {
-            fragment: 1,
+            fragment: Ref::Committed(1),
             deletion_file: any_deletion_file(),
             data_change: true,
             base: None,
@@ -2901,7 +2915,7 @@ mod tests {
         write_data(Ref::Local(0), FieldRef::Committed(0)),
     ])]
     #[case::deletion_in_a_committed_fragment(vec![Action::SetDeletionFile(SetDeletionFile {
-        fragment: 0,
+        fragment: Ref::Committed(0),
         deletion_file: any_deletion_file(),
         data_change: true,
         base: None,

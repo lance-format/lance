@@ -558,3 +558,250 @@ async fn test_all_valid_combinations() {
         check_round_trip_encoding_of_data(vec![test_data], &test_cases, HashMap::new()).await;
     }
 }
+
+#[cfg(any(feature = "bitpacking", feature = "pcodec"))]
+mod float_miniblocks {
+    use super::*;
+    use arrow_array::types::Float16Type;
+    use arrow_buffer::NullBuffer;
+
+    #[cfg(feature = "pcodec")]
+    use crate::constants::{COMPRESSION_META_KEY, PCODEC_COMPRESSION};
+    use crate::{
+        constants::{STRUCTURAL_ENCODING_META_KEY, STRUCTURAL_ENCODING_SPARSE},
+        decoder::PageEncoding,
+        format::{metadata::compressive_encoding::Compression, pb23::value_plane::Codec},
+    };
+
+    type Float16 = <Float16Type as ArrowPrimitiveType>::Native;
+    type FloatToBits = fn(f32) -> u64;
+    const NUM_EDGE_VALUES: usize = 6;
+
+    fn float_array(
+        data_type: &DataType,
+        dimension: usize,
+        first_edge_row: usize,
+        ordinary_values: impl Iterator<Item = f32>,
+        [nan_payload, subnormal]: [u64; 2],
+        validity: Option<NullBuffer>,
+    ) -> ArrayRef {
+        let (exponent_bits, fraction_bits, to_bits): (_, _, FloatToBits) = match data_type {
+            DataType::Float16 => (5, 10, |v| u64::from(Float16::from_f32(v).to_bits())),
+            DataType::Float32 => (8, 23, |v| u64::from(v.to_bits())),
+            DataType::Float64 => (11, 52, |v| f64::from(v).to_bits()),
+            _ => unreachable!(),
+        };
+        let sign_bit = 1 << (exponent_bits + fraction_bits);
+        let exponent_mask = ((1 << exponent_bits) - 1) << fraction_bits;
+        let quiet_bit = 1 << (fraction_bits - 1);
+        let nan_payload = (nan_payload & (quiet_bit - 1)).max(1);
+        let subnormal = (subnormal & ((1 << fraction_bits) - 1)).max(1);
+        let edge_values: [u64; NUM_EDGE_VALUES] = [
+            exponent_mask | quiet_bit | nan_payload,
+            sign_bit | exponent_mask | nan_payload,
+            0,
+            sign_bit,
+            subnormal,
+            sign_bit | subnormal,
+        ];
+
+        let mut bits: Vec<_> = ordinary_values.map(to_bits).collect();
+        for (i, value) in edge_values.into_iter().enumerate() {
+            bits[(first_edge_row + i) * dimension + i % dimension] = value;
+        }
+        match data_type {
+            DataType::Float16 => Arc::new(Float16Array::new(
+                bits.into_iter()
+                    .map(|v| Float16::from_bits(v as u16))
+                    .collect::<Vec<_>>()
+                    .into(),
+                validity,
+            )),
+            DataType::Float32 => Arc::new(Float32Array::new(
+                bits.into_iter()
+                    .map(|v| f32::from_bits(v as u32))
+                    .collect::<Vec<_>>()
+                    .into(),
+                validity,
+            )),
+            DataType::Float64 => Arc::new(Float64Array::new(
+                bits.into_iter()
+                    .map(f64::from_bits)
+                    .collect::<Vec<_>>()
+                    .into(),
+                validity,
+            )),
+            _ => unreachable!(),
+        }
+    }
+
+    fn check_float_miniblocks(
+        data_type: DataType,
+        dimension: usize,
+        has_null_items: bool,
+        is_sparse: bool,
+        value_step: f32,
+        mut metadata: HashMap<String, String>,
+        verify_compression: impl Fn(&Compression) -> bool + 'static,
+    ) {
+        if is_sparse {
+            metadata.insert(
+                STRUCTURAL_ENCODING_META_KEY.to_string(),
+                STRUCTURAL_ENCODING_SPARSE.to_string(),
+            );
+        }
+        let test_cases = TestCases::default()
+            .with_encoding(TestEncoding::StructuralSparse)
+            .with_page_sizes(vec![1 << 20])
+            .with_batch_size(257)
+            .with_exact_array_equality()
+            .with_verify_column_pages(Arc::new(move |columns| {
+                assert_eq!(columns.len(), 1);
+                let [page] = columns[0].page_infos.as_ref() else {
+                    panic!("Expected one page, got {}", columns[0].page_infos.len());
+                };
+                let PageEncoding::Planar(layout) = &page.encoding else {
+                    panic!("Expected planar encoding, got {:?}", page.encoding);
+                };
+                assert_eq!(layout.sparse().is_some(), is_sparse);
+                let Some(Codec::Chunked(values)) =
+                    layout.values.as_ref().and_then(|v| v.codec.as_ref())
+                else {
+                    panic!("Expected chunked values, got {:?}", layout.values);
+                };
+                let compression = values
+                    .compression
+                    .as_ref()
+                    .and_then(|c| c.compression.as_ref())
+                    .expect("Missing value compression");
+                assert!(
+                    verify_compression(compression),
+                    "Unexpected value compression: {compression:?}"
+                );
+            }));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        // Row 1024 is a chunk boundary for ALP and for Pcodec with eight
+        // Float32 items per row. Scalar Pcodec uses one chunk at these row counts.
+        let strategy = (
+            1280..=1536usize,
+            1020..=1024usize,
+            1..=7usize,
+            0..256usize,
+            any::<[u64; 2]>(),
+        );
+        let mut runner = TestRunner::new(Config {
+            cases: 8,
+            ..Config::default()
+        });
+        runner
+            .run(
+                &strategy,
+                |(num_rows, first_edge_row, nulls_per_eight, offset, seeds)| {
+                    let edge_rows = first_edge_row..first_edge_row + NUM_EDGE_VALUES;
+                    // Place a null right after the edge values so the range
+                    // and take both read it at every generated null density.
+                    let row_validity = NullBuffer::from_iter((0..num_rows).map(|row| {
+                        edge_rows.contains(&row)
+                            || (row != edge_rows.end && row % 8 >= nulls_per_eight)
+                    }));
+                    let (item_validity, list_validity) = if dimension == 1 {
+                        (Some(row_validity), None)
+                    } else {
+                        // A null item in a valid row triggers the Pcodec fallback.
+                        let item_validity = has_null_items.then(|| {
+                            let null_item = first_edge_row * dimension + 1;
+                            NullBuffer::from_iter((0..num_rows * dimension).map(|i| i != null_item))
+                        });
+                        (item_validity, Some(row_validity))
+                    };
+                    let ordinary_values =
+                        (0..num_rows * dimension).map(|i| (offset + i % 2048) as f32 * value_step);
+                    let values = float_array(
+                        &data_type,
+                        dimension,
+                        first_edge_row,
+                        ordinary_values,
+                        seeds,
+                        item_validity,
+                    );
+                    let array: ArrayRef = if let Some(list_validity) = list_validity {
+                        Arc::new(FixedSizeListArray::new(
+                            Arc::new(Field::new("item", data_type.clone(), true)),
+                            dimension as i32,
+                            values,
+                            Some(list_validity),
+                        ))
+                    } else {
+                        values
+                    };
+                    let indices = std::iter::once(0)
+                        .chain(edge_rows.start as u64..=edge_rows.end as u64)
+                        .chain(std::iter::once((num_rows - 1) as u64))
+                        .collect();
+                    let test_cases = test_cases
+                        .clone()
+                        .with_range((edge_rows.start - 2) as u64..(edge_rows.end + 2) as u64)
+                        .with_indices(indices);
+                    rt.block_on(check_round_trip_encoding_of_data(
+                        vec![array],
+                        &test_cases,
+                        metadata.clone(),
+                    ));
+                    Ok(())
+                },
+            )
+            .unwrap();
+    }
+
+    #[cfg(feature = "bitpacking")]
+    #[rstest::rstest]
+    #[case::dense_f32(DataType::Float32, false)]
+    #[case::sparse_f32(DataType::Float32, true)]
+    #[case::dense_f64(DataType::Float64, false)]
+    #[case::sparse_f64(DataType::Float64, true)]
+    fn alp(#[case] data_type: DataType, #[case] is_sparse: bool) {
+        // Half steps fit the smallest decimal scale ALP tries, even when the
+        // strided sample contains only integers.
+        check_float_miniblocks(
+            data_type,
+            1,
+            false,
+            is_sparse,
+            0.5,
+            HashMap::new(),
+            |codec| matches!(codec, Compression::Alp(_)),
+        );
+    }
+
+    #[cfg(feature = "pcodec")]
+    #[rstest::rstest]
+    #[case::f16(DataType::Float16, 1, false)]
+    #[case::f32(DataType::Float32, 1, false)]
+    #[case::f64(DataType::Float64, 1, false)]
+    #[case::vectors(DataType::Float32, 8, false)]
+    #[case::vectors_with_null_items(DataType::Float32, 8, true)]
+    fn pcodec(#[case] data_type: DataType, #[case] dimension: usize, #[case] has_null_items: bool) {
+        let metadata = HashMap::from([(
+            COMPRESSION_META_KEY.to_string(),
+            PCODEC_COMPRESSION.to_string(),
+        )]);
+        check_float_miniblocks(
+            data_type,
+            dimension,
+            has_null_items,
+            true,
+            0.25,
+            metadata,
+            move |codec| {
+                if has_null_items {
+                    matches!(codec, Compression::FixedSizeList(_))
+                } else {
+                    matches!(codec, Compression::Pcodec(_))
+                }
+            },
+        );
+    }
+}

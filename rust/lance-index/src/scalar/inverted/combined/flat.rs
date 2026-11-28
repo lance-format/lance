@@ -16,7 +16,10 @@ use lance_core::error::DataFusionResult;
 use lance_core::utils::tokio::spawn_cpu;
 use lance_select::RowAddrMask;
 
-use super::super::index::{BlendedRows, FTS_SCHEMA, slice_into_batches, tokenize_and_blend_multi};
+use super::super::index::{
+    BlendedRows, FTS_SCHEMA, collect_flat_stats_multi, slice_into_batches,
+    tokenize_and_blend_multi, tokenize_blend_and_score_multi,
+};
 use super::super::query::{Operator, Tokens};
 use super::super::scorer::CombinedFieldsBM25Scorer;
 use super::super::tokenizer::document_tokenizer::LanceTokenizer;
@@ -144,6 +147,97 @@ pub async fn flat_combined_fields_search_stream(
         )),
         scorer,
     ))
+}
+
+/// Collect per-column flat corpus statistics (`doc_counts`, `total_tokens`,
+/// `doc_freqs`) for a `combined_fields` stream without retaining candidate rows.
+///
+/// Intended for distributed Phase-1 statistics collection over unindexed or
+/// partially indexed fragments before blending a global [`CombinedFieldsBM25Scorer`].
+#[allow(clippy::too_many_arguments)]
+pub async fn collect_flat_combined_field_stats(
+    input: SendableRecordBatchStream,
+    doc_col_indices: Vec<usize>,
+    stats_masks: &[Arc<RowAddrMask>],
+    tokens: &Tokens,
+    tokenizer: Box<dyn LanceTokenizer>,
+    elapsed_compute: Option<Time>,
+) -> DataFusionResult<FlatFieldStats> {
+    let terms = unique_terms(tokens);
+    debug_assert_eq!(doc_col_indices.len(), stats_masks.len());
+    if doc_col_indices.is_empty() {
+        return Ok(FlatFieldStats::zeros(0, terms.len()));
+    }
+    let input_schema = input.schema();
+    let unique_tokens = Arc::new(Tokens::new(terms, tokens.token_type().clone()));
+    const ACCUMULATE_BYTES: usize = 256 * 1024;
+    const SLICE_BYTES: usize = 512 * 1024;
+    let chunked = lance_arrow::stream::rechunk_stream_by_size(
+        input,
+        input_schema,
+        ACCUMULATE_BYTES,
+        SLICE_BYTES,
+    );
+    collect_flat_stats_multi(
+        chunked,
+        tokenizer,
+        unique_tokens,
+        Arc::new(doc_col_indices),
+        Arc::new(stats_masks.to_vec()),
+        elapsed_compute,
+    )
+    .await
+}
+
+/// Stream-score a flat `combined_fields` scan against a precomputed
+/// [`CombinedFieldsBM25Scorer`], avoiding whole-corpus buffering.
+///
+/// Produces bit-identical `(ROW_ID, SCORE)` results to
+/// [`flat_combined_fields_search_stream`] when given the same blended scorer.
+#[allow(clippy::too_many_arguments)]
+pub fn flat_combined_fields_search_with_scorer_stream(
+    input: SendableRecordBatchStream,
+    weights: Vec<f32>,
+    doc_col_indices: Vec<usize>,
+    emit_mask: Option<Arc<RowAddrMask>>,
+    tokens: &Tokens,
+    tokenizer: Box<dyn LanceTokenizer>,
+    operator: Operator,
+    scorer: Arc<CombinedFieldsBM25Scorer>,
+    target_batch_size: usize,
+    elapsed_compute: Option<Time>,
+) -> SendableRecordBatchStream {
+    let terms = unique_terms(tokens);
+    debug_assert_eq!(doc_col_indices.len(), weights.len());
+    if terms.is_empty() || weights.is_empty() || scorer.doc_count() == 0 {
+        return Box::pin(RecordBatchStreamAdapter::new(
+            FTS_SCHEMA.clone(),
+            stream::empty::<DataFusionResult<RecordBatch>>(),
+        ));
+    }
+    let input_schema = input.schema();
+    let unique_tokens = Arc::new(Tokens::new(terms.clone(), tokens.token_type().clone()));
+    const ACCUMULATE_BYTES: usize = 256 * 1024;
+    const SLICE_BYTES: usize = 512 * 1024;
+    let chunked = lance_arrow::stream::rechunk_stream_by_size(
+        input,
+        input_schema,
+        ACCUMULATE_BYTES,
+        SLICE_BYTES,
+    );
+    tokenize_blend_and_score_multi(
+        chunked,
+        tokenizer,
+        unique_tokens,
+        Arc::new(terms),
+        Arc::new(doc_col_indices),
+        Arc::new(weights),
+        emit_mask,
+        operator == Operator::And,
+        scorer,
+        target_batch_size,
+        elapsed_compute,
+    )
 }
 
 /// Score every retained flat row from its blended `dl'`/`tf'`, emitting
@@ -274,6 +368,43 @@ mod tests {
                 (6, 0x3f32_7287),
             ]
         );
+
+        // Phase-1 stats + build_combined_bm25_scorer_from_totals + streaming
+        // pre-scored flat search must produce bit-identical scores.
+        let collected = collect_flat_combined_field_stats(
+            flat_input(&row_ids, &docs, 2),
+            vec![1, 2],
+            &stats_masks,
+            &tokens,
+            InvertedIndexParams::default().build().unwrap(),
+            None,
+        )
+        .await
+        .unwrap();
+        let scorer = Arc::new(
+            super::super::stats::build_combined_bm25_scorer_from_totals(
+                &weights,
+                &collected.doc_counts,
+                &collected.total_tokens,
+                &["cat".to_string(), "dog".to_string()],
+                &collected.doc_freqs,
+            )
+            .unwrap(),
+        );
+        let streamed = flat_combined_fields_search_with_scorer_stream(
+            flat_input(&row_ids, &docs, 2),
+            weights.to_vec(),
+            vec![1, 2],
+            None,
+            &tokens,
+            InvertedIndexParams::default().build().unwrap(),
+            Operator::Or,
+            scorer,
+            3,
+            None,
+        );
+        let (_, streamed_scored) = flat_scores(streamed).await;
+        assert_eq!(streamed_scored, scored);
     }
 
     /// The retained per-row payload must not grow with the number of target

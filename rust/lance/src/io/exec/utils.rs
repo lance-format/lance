@@ -34,7 +34,7 @@ use datafusion::physical_plan::metrics::{
 };
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, RecordBatchStream,
-    SendableRecordBatchStream,
+    SendableRecordBatchStream, coalesce_partitions::CoalescePartitionsExec,
 };
 use datafusion_physical_expr::{Distribution, EquivalenceProperties, Partitioning};
 use datafusion_physical_plan::execution_plan::{Boundedness, EmissionType};
@@ -322,13 +322,30 @@ impl Drop for SharedPreFilterWaiter {
     }
 }
 
+// Whether `node` is a `PrefilterUnionExec`, seeing through a single
+// `CoalescePartitionsExec` wrapper (the generic single-partition normalization
+// a caller may apply before handing the node off as a prefilter source).
+// `PrefilterUnionExec`'s own output stays row-id domain regardless of this
+// wrapping; this is the one place that distinction is still recovered by node
+// identity rather than an explicit tag (see `SelectionVectorToPrefilter`).
+pub(crate) fn is_prefilter_union(node: &Arc<dyn ExecutionPlan>) -> bool {
+    let node = match node.downcast_ref::<CoalescePartitionsExec>() {
+        Some(coalesce) => coalesce.input(),
+        None => node,
+    };
+    node.downcast_ref::<super::prefilter_union::PrefilterUnionExec>()
+        .is_some()
+}
+
 fn shared_prefilter_future(
     materialization: Arc<SharedPreFilterMaterialization>,
     source: Arc<dyn ExecutionPlan>,
     is_scalar_index_query: bool,
     context: Arc<datafusion::execution::TaskContext>,
     partition: usize,
+    dataset: Arc<Dataset>,
 ) -> BoxFuture<'static, Result<Arc<RowAddrMask>>> {
+    let is_prefilter_union = is_prefilter_union(&source);
     async move {
         let context_id = Arc::as_ptr(&context) as usize;
         let key = (context_id, partition);
@@ -361,7 +378,12 @@ fn shared_prefilter_future(
                             let result = async move {
                                 let stream = source.execute(partition, context)?;
                                 if is_scalar_index_query {
-                                    Box::new(SelectionVectorToPrefilter(stream)).load().await
+                                    Box::new(
+                                        SelectionVectorToPrefilter::new(stream, dataset)
+                                            .with_already_row_id_domain(is_prefilter_union),
+                                    )
+                                    .load()
+                                    .await
                                 } else {
                                     Box::new(FilteredRowIdsToPrefilter::new(stream))
                                         .load()
@@ -407,6 +429,7 @@ fn prefilter_mask_future(
     prefilter_source: &PreFilterSource,
     external_mask: Option<Arc<RowAddrMask>>,
     metrics: &ExecutionPlanMetricsSet,
+    dataset: Arc<Dataset>,
 ) -> Result<Option<BoxFuture<'static, Result<Arc<RowAddrMask>>>>> {
     let mut shared_filter = None;
     let prefilter_loader = match &prefilter_source {
@@ -418,6 +441,7 @@ fn prefilter_mask_future(
                     false,
                     context,
                     partition,
+                    dataset,
                 ));
                 None
             } else {
@@ -437,11 +461,16 @@ fn prefilter_mask_future(
                     true,
                     context,
                     partition,
+                    dataset,
                 ));
                 None
             } else {
+                let is_prefilter_union = is_prefilter_union(src_node);
                 let stream = src_node.execute(partition, context)?;
-                Some(Box::new(SelectionVectorToPrefilter(stream)) as Box<dyn FilterLoader>)
+                Some(Box::new(
+                    SelectionVectorToPrefilter::new(stream, dataset)
+                        .with_already_row_id_domain(is_prefilter_union),
+                ) as Box<dyn FilterLoader>)
             }
         }
         PreFilterSource::None => None,
@@ -479,6 +508,7 @@ pub(crate) fn build_prefilter(
         prefilter_source,
         masks.external_mask,
         metrics,
+        ds.clone(),
     )?;
     let mut prefilter = DatasetPreFilter::new_with_filter_future(ds, index_meta, filter);
     if let Some(overlay_block) = masks.overlay_block {
@@ -505,6 +535,7 @@ pub(crate) fn build_prefilter_restricted_to_fragments(
         prefilter_source,
         masks.external_mask,
         metrics,
+        ds.clone(),
     )?;
     let mut prefilter = DatasetPreFilter::new_restricted_to_fragments(ds, fragments, filter);
     if let Some(overlay_block) = masks.overlay_block {
@@ -600,12 +631,74 @@ impl FilterLoader for FilteredRowIdsToPrefilter {
 }
 
 // Utility to convert a serialized selection vector into a prefilter
-pub(crate) struct SelectionVectorToPrefilter(pub SendableRecordBatchStream);
+pub(crate) struct SelectionVectorToPrefilter {
+    stream: SendableRecordBatchStream,
+    dataset: Arc<Dataset>,
+    // The wire format carries no domain bit, so the producer's identity decides
+    // how to interpret it: `ScalarIndexExec` always emits row-address domain
+    // (needs converting, see below), but `PrefilterUnionExec` already finalizes
+    // its own combined result to row-id domain before serializing (to match its
+    // `missing` branch) — converting its output again would corrupt it, treating
+    // genuine row ids as if they were addresses.
+    already_row_id_domain: bool,
+}
+
+impl SelectionVectorToPrefilter {
+    pub(crate) fn new(stream: SendableRecordBatchStream, dataset: Arc<Dataset>) -> Self {
+        Self {
+            stream,
+            dataset,
+            already_row_id_domain: false,
+        }
+    }
+
+    /// Mark the source as already row-id domain (a `PrefilterUnionExec`), so
+    /// `load` does not re-finalize it.
+    pub(crate) fn with_already_row_id_domain(mut self, already_row_id_domain: bool) -> Self {
+        self.already_row_id_domain = already_row_id_domain;
+        self
+    }
+}
+
+/// Drop the listed matches the producer did not claim to cover, before the
+/// address -> row-id conversion below.
+///
+/// `fragments_covered` is the producer's index coverage already narrowed by its
+/// fragment scope, and it is the extent over which this result is authoritative
+/// (`FilteredReadExec` full-scans everything outside it). A listed address beyond
+/// it is one a shared index segment matched from past the scan's fragments:
+/// nothing downstream uses it, but resolving it to an id costs a row-id-sequence
+/// and deletion-vector load for that fragment. Narrowing first keeps a small
+/// scoped search's metadata I/O proportional to its scope.
+///
+/// Only an allow-list narrows. A block list names the rows that do *not* match,
+/// so dropping an entry unblocks that row, and this mask is the only thing
+/// bounding what the vector search considers — unlike
+/// [`super::prefilter_union::PrefilterUnionExec`], which can narrow either shape
+/// because it intersects the scope's own allow-list right after.
+fn restrict_to_covered_fragments(
+    result: IndexExprResult,
+    fragments_covered: &RoaringBitmap,
+) -> IndexExprResult {
+    let retain = |mask: RowAddrMask| match mask {
+        RowAddrMask::AllowList(mut set) => {
+            set.retain_fragments(fragments_covered.iter());
+            RowAddrMask::AllowList(set)
+        }
+        block_list @ RowAddrMask::BlockList(_) => block_list,
+    };
+    let domain = result.domain;
+    if result.is_exact() {
+        IndexExprResult::exact(retain(result.upper)).with_domain(domain)
+    } else {
+        IndexExprResult::new(retain(result.lower), retain(result.upper)).with_domain(domain)
+    }
+}
 
 #[async_trait]
 impl FilterLoader for SelectionVectorToPrefilter {
     async fn load(mut self: Box<Self>) -> Result<Arc<RowAddrMask>> {
-        let batch = self.0.try_next().await?.ok_or_else(|| {
+        let batch = self.stream.try_next().await?.ok_or_else(|| {
             Error::internal("Selection vector source for prefilter did not yield any batches")
         })?;
         // The vector-search prefilter wants the set of rows the search is
@@ -616,7 +709,17 @@ impl FilterLoader for SelectionVectorToPrefilter {
         // Use deserialize() here (rather than indexing "upper" directly) to
         // support both the TwoMask and the legacy ThreeVariant wire formats
         // that ScalarIndexExec may emit.
-        let (result, _) = IndexExprResult::deserialize(&batch)?;
+        let (result, fragments_covered) = IndexExprResult::deserialize(&batch)?;
+        // Vector/PQ indices are keyed by stable row id (trained with
+        // `.with_row_id()`), so convert here before this mask is matched
+        // against those ids — unless the source already did so (see
+        // `already_row_id_domain`).
+        let result = if self.already_row_id_domain {
+            result
+        } else {
+            let result = restrict_to_covered_fragments(result, &fragments_covered);
+            super::scalar_index::finalize_to_row_ids(&self.dataset, result).await?
+        };
         Ok(Arc::new(result.upper))
     }
 }
@@ -1387,7 +1490,7 @@ mod tests {
     use futures::{StreamExt, TryStreamExt, stream};
     use lance_core::{ROW_ID, utils::futures::Capacity};
     use lance_datafusion::exec::{LanceExecutionOptions, OneShotExec, execute_plan};
-    use lance_datagen::{BatchCount, RowCount, array};
+    use lance_datagen::{BatchCount, RowCount, array, gen_batch};
     use lance_index::prefilter::FilterLoader;
     use lance_select::result::IndexExprResultWireFormat;
     use lance_select::{RowAddrMask, RowAddrTreeMap, RowSetOps, result::IndexExprResult};
@@ -1399,6 +1502,162 @@ mod tests {
         SharedPreFilterExec, SharedPreFilterMaterialization, prefilter_mask_future,
         shared_prefilter_future,
     };
+    use crate::Dataset;
+    use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+
+    // A minimal non-stable-row-id dataset, purely to satisfy
+    // `shared_prefilter_future`/`SelectionVectorToPrefilter`'s dataset
+    // parameter in tests that don't otherwise need a real one — the
+    // row-id -> row-address finalization it does is then a guaranteed no-op.
+    async fn test_dataset() -> Arc<Dataset> {
+        Arc::new(
+            gen_batch()
+                .col("i", array::step::<arrow_array::types::Int32Type>())
+                .into_ram_dataset(FragmentCount::from(1), FragmentRowCount::from(1))
+                .await
+                .unwrap(),
+        )
+    }
+
+    // A `PrefilterUnionExec`'s row-id-domain output is recovered by node
+    // identity (no domain bit survives the wire format — see
+    // `SelectionVectorToPrefilter`), so a caller that wraps it in a generic
+    // single-partition `CoalescePartitionsExec` before handing it off as a
+    // prefilter source must not defeat that recognition.
+    #[tokio::test]
+    async fn test_is_prefilter_union_sees_through_coalesce_wrapper() {
+        use super::super::prefilter_union::PrefilterUnionExec;
+        use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
+
+        let dataset = test_dataset().await;
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                ROW_ID,
+                DataType::UInt64,
+                false,
+            )])),
+            vec![Arc::new(UInt64Array::from_iter_values(0_u64..1))],
+        )
+        .unwrap();
+        let scalar = Arc::new(OneShotExec::from_batch(batch.clone())) as Arc<dyn ExecutionPlan>;
+        let union = Arc::new(PrefilterUnionExec::new(
+            dataset,
+            scalar,
+            None,
+            RoaringBitmap::new(),
+            RoaringBitmap::new(),
+            IndexExprResultWireFormat::default(),
+        )) as Arc<dyn ExecutionPlan>;
+
+        assert!(super::is_prefilter_union(&union));
+        let wrapped =
+            Arc::new(CoalescePartitionsExec::new(union.clone())) as Arc<dyn ExecutionPlan>;
+        assert!(
+            super::is_prefilter_union(&wrapped),
+            "must see through a CoalescePartitionsExec wrapper"
+        );
+
+        let unrelated = Arc::new(OneShotExec::from_batch(batch)) as Arc<dyn ExecutionPlan>;
+        assert!(!super::is_prefilter_union(&unrelated));
+        let unrelated_wrapped =
+            Arc::new(CoalescePartitionsExec::new(unrelated)) as Arc<dyn ExecutionPlan>;
+        assert!(!super::is_prefilter_union(&unrelated_wrapped));
+    }
+
+    /// A shared index segment can list matches from fragments outside the
+    /// scan's scope. `SelectionVectorToPrefilter` must drop those before the
+    /// reverse (address -> id) conversion, which loads a row-id sequence and
+    /// deletion vector per fragment it touches.
+    #[tokio::test]
+    async fn scoped_selection_vector_reads_only_scoped_deletions() {
+        use crate::dataset::ReadParams;
+        use crate::dataset::builder::DatasetBuilder;
+        use arrow_array::record_batch;
+        use datafusion::datasource::memory::MemorySourceConfig;
+        use lance_core::utils::address::RowAddress;
+        use lance_core::utils::tempfile::TempStrDir;
+        use lance_io::object_store::ObjectStoreParams;
+        use lance_io::utils::tracking_store::IOTracker;
+        use lance_table::io::deletion::relative_deletion_file_path;
+
+        let tmp = TempStrDir::default();
+        let path = tmp.as_str();
+        let prefix = if path.starts_with('/') { "" } else { "/" };
+        let uri = format!("file-object-store://{prefix}{path}");
+        let batch = record_batch!(("id", Int64, (0..12).collect::<Vec<_>>())).unwrap();
+        let mut dataset = Dataset::write(
+            arrow_array::RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+            &uri,
+            Some(crate::dataset::WriteParams {
+                max_rows_per_file: 4,
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset.delete("id IN (0, 5, 9)").await.unwrap();
+
+        let io = Arc::new(IOTracker::default());
+        let dataset = Arc::new(
+            DatasetBuilder::from_uri(&uri)
+                .with_read_params(ReadParams {
+                    store_options: Some(ObjectStoreParams {
+                        object_store_wrapper: Some(io.clone()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })
+                .load()
+                .await
+                .unwrap(),
+        );
+        let fragment = &dataset.fragments()[1];
+        let allowed_deletion =
+            relative_deletion_file_path(fragment.id, fragment.deletion_file.as_ref().unwrap());
+
+        // The mask lists matches across every fragment, but the producer's
+        // coverage says only fragment 1 is in scope.
+        let addresses = (0..3u32).flat_map(|fragment_id| {
+            (0..4u32).map(move |offset| u64::from(RowAddress::new_from_parts(fragment_id, offset)))
+        });
+        let format = IndexExprResultWireFormat::TwoMask;
+        let coverage: RoaringBitmap = [1].into_iter().collect();
+        let mask = IndexExprResult::exact(RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(
+            addresses,
+        )))
+        .serialize(&coverage, format)
+        .unwrap();
+        let scalar =
+            MemorySourceConfig::try_new_exec(&[vec![mask]], format.schema().clone(), None).unwrap();
+        let stream = scalar.execute(0, Arc::new(TaskContext::default())).unwrap();
+
+        io.incremental_stats();
+        let prefilter = Box::new(super::SelectionVectorToPrefilter::new(stream, dataset))
+            .load()
+            .await
+            .unwrap();
+        // Fragment 1 holds rows 4..8 with id=5 deleted, so only its live
+        // stable ids survive the conversion.
+        assert_eq!(
+            *prefilter,
+            RowAddrMask::from_allowed(RowAddrTreeMap::from_iter([4, 6, 7]))
+        );
+
+        let reads = io.incremental_stats();
+        let deletion_reads = reads
+            .requests
+            .iter()
+            .filter(|request| request.path.as_ref().contains("/_deletions/"))
+            .collect::<Vec<_>>();
+        assert!(!deletion_reads.is_empty());
+        assert!(
+            deletion_reads
+                .iter()
+                .all(|request| request.path.as_ref().ends_with(allowed_deletion.as_str())),
+            "scoped prefilter read another fragment's deletion file: {deletion_reads:?}"
+        );
+    }
 
     #[test]
     fn test_index_stage_timings() {
@@ -1545,6 +1804,7 @@ mod tests {
             "every field must declare its shared source dependency"
         );
         let context = Arc::new(datafusion::execution::TaskContext::default());
+        let dataset = test_dataset().await;
         let masks = futures::future::try_join_all(shared_sources.iter().map(|source| {
             shared_prefilter_future(
                 shared_materialization(source),
@@ -1552,6 +1812,7 @@ mod tests {
                 is_scalar_index_query,
                 context.clone(),
                 0,
+                dataset.clone(),
             )
         }))
         .await
@@ -1606,12 +1867,14 @@ mod tests {
         let source = PreFilterSource::FilteredRowIds(Arc::new(OneShotExec::new(stream)));
         let shared_sources = source.shared_for_consumers(2);
         let context = Arc::new(datafusion::execution::TaskContext::default());
+        let dataset = test_dataset().await;
         let left = shared_prefilter_future(
             shared_materialization(&shared_sources[0]),
             shared_source(&shared_sources[0]),
             false,
             context.clone(),
             0,
+            dataset.clone(),
         );
         let right = shared_prefilter_future(
             shared_materialization(&shared_sources[1]),
@@ -1619,6 +1882,7 @@ mod tests {
             false,
             context,
             0,
+            dataset,
         );
         let (left, right) = tokio::join!(left, right);
 
@@ -1669,12 +1933,14 @@ mod tests {
         let shared_sources = source.shared_for_consumers(2);
         let materialization = shared_materialization(&shared_sources[0]);
         let context = Arc::new(datafusion::execution::TaskContext::default());
+        let dataset = test_dataset().await;
         let first = tokio::spawn(shared_prefilter_future(
             materialization.clone(),
             shared_source(&shared_sources[0]),
             false,
             context.clone(),
             0,
+            dataset.clone(),
         ));
         tokio::time::timeout(std::time::Duration::from_secs(5), has_started)
             .await
@@ -1686,6 +1952,7 @@ mod tests {
             false,
             context,
             0,
+            dataset,
         ));
         loop {
             let waiters = materialization
@@ -1738,6 +2005,7 @@ mod tests {
             false,
             Arc::new(datafusion::execution::TaskContext::default()),
             0,
+            test_dataset().await,
         ));
         tokio::time::timeout(std::time::Duration::from_secs(5), has_started)
             .await
@@ -1787,6 +2055,7 @@ mod tests {
     struct MultiMatchPrefilterConsumer {
         field_sources: Vec<PreFilterSource>,
         schema: SchemaRef,
+        dataset: Arc<Dataset>,
     }
 
     impl PartitionStream for MultiMatchPrefilterConsumer {
@@ -1805,6 +2074,7 @@ mod tests {
                         source,
                         None,
                         &ExecutionPlanMetricsSet::new(),
+                        self.dataset.clone(),
                     )
                     .map(|mask| mask.expect("a filtered MultiMatch field loads a prefilter"))
                 })
@@ -1853,9 +2123,17 @@ mod tests {
             DataType::UInt64,
             true,
         )]));
+        let dataset = Arc::new(
+            gen_batch()
+                .col("i", array::step::<arrow_array::types::Int32Type>())
+                .into_ram_dataset(FragmentCount::from(1), FragmentRowCount::from(1))
+                .await
+                .unwrap(),
+        );
         let consumer = Arc::new(MultiMatchPrefilterConsumer {
             field_sources,
             schema: output_schema.clone(),
+            dataset,
         });
         let plan: Arc<dyn ExecutionPlan> = Arc::new(
             StreamingTableExec::try_new(

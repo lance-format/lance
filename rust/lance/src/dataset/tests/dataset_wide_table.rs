@@ -81,6 +81,7 @@ async fn test_add_column_rewrites_full_manifest() {
     // This is the whole manifest: the flat format has no way to express "one
     // column changed".
     let base_manifest = dataset
+        .table_state
         .manifest_location
         .size
         .expect("the writer should report the size of the manifest it wrote");
@@ -109,6 +110,7 @@ async fn test_add_column_rewrites_full_manifest() {
     // manifest object itself collapses to a small delta in that case and fails
     // here - the signal this test exists to provide.
     let after_manifest = dataset
+        .table_state
         .manifest_location
         .size
         .expect("the writer should report the size of the manifest it wrote");
@@ -116,7 +118,7 @@ async fn test_add_column_rewrites_full_manifest() {
         after_manifest >= base_manifest,
         "expected a one-column add to rewrite the whole {base_manifest} byte manifest, \
          but v{}'s manifest is only {after_manifest} bytes",
-        dataset.manifest_location.version
+        dataset.table_state.manifest_location.version
     );
 
     let grown = dataset.manifest().serialized().len();
@@ -137,7 +139,7 @@ async fn test_cold_open_reads_full_manifest() {
     // Cold open with a fresh session: opening the dataset reads the full
     // manifest before any query can run.
     let ds = Dataset::open(uri).await.unwrap();
-    let io = ds.object_store.as_ref().io_stats_snapshot();
+    let io = ds.table_state.object_store.as_ref().io_stats_snapshot();
     assert!(
         io.read_bytes >= manifest,
         "expected a cold open to read at least the manifest size \
@@ -173,10 +175,18 @@ async fn test_version_refresh_rereads_manifest() {
 
     // The reader's next version refresh reads the full manifest for the new
     // version.
-    reader.object_store.as_ref().io_stats_incremental();
+    reader
+        .table_state
+        .object_store
+        .as_ref()
+        .io_stats_incremental();
     reader.checkout_latest().await.unwrap();
     assert_eq!(reader.version().version, 2);
-    let io = reader.object_store.as_ref().io_stats_incremental();
+    let io = reader
+        .table_state
+        .object_store
+        .as_ref()
+        .io_stats_incremental();
     assert!(
         io.read_bytes >= manifest_v2,
         "expected version refresh to re-read the full manifest \
@@ -235,11 +245,19 @@ async fn test_compaction_rewrites_every_column() {
         .max()
         .expect("the backfilled file should report its size");
 
-    dataset.object_store.as_ref().io_stats_incremental();
+    dataset
+        .table_state
+        .object_store
+        .as_ref()
+        .io_stats_incremental();
     let metrics = compact_files(&mut dataset, CompactionOptions::default(), None)
         .await
         .unwrap();
-    let io = dataset.object_store.as_ref().io_stats_incremental();
+    let io = dataset
+        .table_state
+        .object_store
+        .as_ref()
+        .io_stats_incremental();
 
     assert_eq!(metrics.fragments_removed, NUM_FRAGMENTS);
     assert_eq!(metrics.fragments_added, 1);
@@ -293,6 +311,7 @@ async fn test_compaction_rewrites_every_column() {
     // of eight - but it still carries the whole schema and every fragment, so
     // it is at least as large as the manifest it serializes.
     let after_manifest = dataset
+        .table_state
         .manifest_location
         .size
         .expect("the writer should report the size of the manifest it wrote");

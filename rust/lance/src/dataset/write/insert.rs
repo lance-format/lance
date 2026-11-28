@@ -1,41 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow_array::{RecordBatch, RecordBatchIterator};
-use datafusion::execution::SendableRecordBatchStream;
-use humantime::format_duration;
-use lance_core::datatypes::{NullabilityComparison, Schema};
-use lance_core::is_system_column;
-use lance_core::utils::tracing::{DATASET_WRITING_EVENT, TRACE_DATASET_EVENTS};
+use arrow_array::RecordBatch;
 use lance_datafusion::utils::StreamingWriteSource;
-use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
+use lance_table_runtime::InsertBuilder as RuntimeInsertBuilder;
 
-use lance_io::object_store::ObjectStore;
-use lance_table::feature_flags::can_write_dataset;
-use lance_table::format::Fragment;
-use lance_table::io::commit::CommitHandler;
-use object_store::path::Path;
+use crate::dataset::transaction::Transaction;
+use crate::io::commit::LanceCommitHook;
+use crate::session::Session;
+use crate::{Dataset, Result};
 
-use crate::Dataset;
-use crate::blob::prepared_to_logical_blob_schema;
-use crate::dataset::ReadParams;
-use crate::dataset::builder::DatasetBuilder;
-use crate::dataset::transaction::{Operation, Transaction, TransactionBuilder};
-use crate::dataset::write::{
-    validate_and_resolve_target_bases_with_primary, write_fragments_internal_impl,
-};
-use crate::{Error, Result};
-use tracing::info;
-
-use super::WriteDestination;
-use super::WriteMode;
-use super::WriteParams;
-use super::commit::CommitBuilder;
-use super::resolve_commit_handler;
-use crate::dataset::progress::{WriteProgressFn, WriteStats};
+#[allow(unused_imports)]
+use super::CommitBuilder;
+use super::seeds::LanceWriteSeedHook;
+use super::{DataFusionWriteSource, WriteDestination, WriteParams, WriteProgressFn, WriteStats};
 
 /// Insert or create a new dataset.
 ///
@@ -110,29 +90,22 @@ impl<'a> InsertBuilder<'a> {
         self
     }
 
-    /// Execute the insert operation with the given data.
-    ///
-    /// This writes the data fragments and commits them into the dataset.
+    /// Write the data fragments and commit them into the dataset.
     pub async fn execute(&self, data: Vec<RecordBatch>) -> Result<Dataset> {
-        let (transaction, context) = self.write_uncommitted_impl(data).await?;
-        self.do_commit(&context, transaction).await
+        let (params, session) = self.runtime_params();
+        let table = Box::pin(self.runtime_builder(&params, &session).execute(data)).await?;
+        Ok(Dataset::from_committed_table(table, session))
     }
 
-    /// Execute the insert operation with the given stream.
-    ///
-    /// This writes the data fragments and commits them into the dataset.
+    /// Write the data fragments from a stream and commit them into the dataset.
     pub async fn execute_stream(&self, source: impl StreamingWriteSource) -> Result<Dataset> {
-        let (stream, schema) = source.into_stream_and_schema().await?;
-        self.execute_stream_impl(stream, schema).await
-    }
-
-    async fn execute_stream_impl(
-        &self,
-        stream: SendableRecordBatchStream,
-        schema: Schema,
-    ) -> Result<Dataset> {
-        let (transaction, context) = self.write_uncommitted_stream_impl(stream, schema).await?;
-        self.do_commit(&context, transaction).await
+        let (params, session) = self.runtime_params();
+        let table = Box::pin(
+            self.runtime_builder(&params, &session)
+                .execute_stream(DataFusionWriteSource(source)),
+        )
+        .await?;
+        Ok(Dataset::from_committed_table(table, session))
     }
 
     /// Write data files, but don't commit the transaction yet.
@@ -160,348 +133,71 @@ impl<'a> InsertBuilder<'a> {
     /// # }
     /// ```
     pub async fn execute_uncommitted(&self, data: Vec<RecordBatch>) -> Result<Transaction> {
-        self.write_uncommitted_impl(data).await.map(|(t, _)| t)
+        let (params, session) = self.runtime_params();
+        Box::pin(
+            self.runtime_builder(&params, &session)
+                .execute_uncommitted(data),
+        )
+        .await
     }
 
-    async fn do_commit(
-        &self,
-        context: &WriteContext<'_>,
-        transaction: Transaction,
-    ) -> Result<Dataset> {
-        let mut commit_builder = CommitBuilder::new(context.dest.clone())
-            .use_stable_row_ids(context.params.enable_stable_row_ids)
-            .with_exact_storage_format(context.storage_version)
-            .enable_v2_manifest_paths(context.params.enable_v2_manifest_paths)
-            .with_commit_handler(context.commit_handler.clone())
-            .with_object_store(context.object_store.clone())
-            .with_skip_auto_cleanup(context.params.skip_auto_cleanup);
-
-        if let Some(params) = context.params.store_params.as_ref() {
-            commit_builder = commit_builder.with_store_params(params.clone());
-        }
-
-        if let Some(session) = context.params.session.as_ref() {
-            commit_builder = commit_builder.with_session(session.clone());
-        }
-        if self.inherited_field_ids {
-            commit_builder = commit_builder.with_inherited_field_ids();
-        }
-
-        commit_builder.execute(transaction).await
-    }
-
-    async fn write_uncommitted_impl(
-        &self,
-        data: Vec<RecordBatch>,
-    ) -> Result<(Transaction, WriteContext<'_>)> {
-        // TODO: This should be able to split the data up based on max_rows_per_file
-        // and write in parallel. https://github.com/lance-format/lance/issues/1980
-        if data.is_empty() {
-            return Err(Error::invalid_input_source("No data to write".into()));
-        }
-        let schema = data[0].schema();
-        for batch in data.iter().skip(1) {
-            if batch.schema() != schema {
-                return Err(Error::invalid_input_source(
-                    "All record batches must have the same schema".into(),
-                ));
-            }
-        }
-        let reader = RecordBatchIterator::new(data.into_iter().map(Ok), schema);
-        let (stream, schema) = reader.into_stream_and_schema().await?;
-        self.write_uncommitted_stream_impl(stream, schema).await
-    }
-
-    /// Write data files, but don't commit the transaction yet.
+    /// Write data files from a stream without committing the transaction.
     ///
     /// Use [`CommitBuilder`] to commit the transaction.
     pub async fn execute_uncommitted_stream(
         &self,
         source: impl StreamingWriteSource,
     ) -> Result<Transaction> {
-        let (stream, schema) = source.into_stream_and_schema().await?;
-        let (transaction, _) = self.write_uncommitted_stream_impl(stream, schema).await?;
-        Ok(transaction)
-    }
-
-    async fn write_uncommitted_stream_impl(
-        &self,
-        stream: SendableRecordBatchStream,
-        schema: Schema,
-    ) -> Result<(Transaction, WriteContext<'_>)> {
-        let mut context = self.resolve_context().await?;
-
-        info!(
-            target: TRACE_DATASET_EVENTS,
-            event=DATASET_WRITING_EVENT,
-            uri=context.dest.uri(),
-            mode=?context.params.mode
-        );
-
-        self.validate_write(&mut context, &schema)?;
-
-        let existing_base_paths = context.dest.dataset().map(|ds| &ds.manifest.base_paths);
-        let target_base_info = validate_and_resolve_target_bases_with_primary(
-            &mut context.params,
-            existing_base_paths,
-            &context.object_store,
-            &context.base_path,
-            &context.dest.uri(),
+        let (params, session) = self.runtime_params();
+        Box::pin(
+            self.runtime_builder(&params, &session)
+                .execute_uncommitted_stream(DataFusionWriteSource(source)),
         )
-        .await?;
-
-        if self.preassigned_data_file_name.is_some() && target_base_info.is_some() {
-            return Err(Error::invalid_input(
-                "a fixed data file name cannot be combined with target bases",
-            ));
-        }
-        let (written_fragments, written_schema) = Box::pin(write_fragments_internal_impl(
-            context.storage_version,
-            context.dest.dataset(),
-            context.object_store.clone(),
-            &context.base_path,
-            schema.clone(),
-            stream,
-            context.params.clone(),
-            target_base_info,
-            None,
-            self.preassigned_data_file_name.clone(),
-            self.inherited_field_ids,
-            self.disable_dictionary_split,
-            None,
-            None,
-        ))
-        .await?;
-
-        let transaction = Self::build_transaction(written_schema, written_fragments, &context)?;
-
-        Ok((transaction, context))
+        .await
     }
 
-    fn build_transaction(
-        schema: Schema,
-        fragments: Vec<Fragment>,
-        context: &WriteContext<'_>,
-    ) -> Result<Transaction> {
-        let operation = match context.params.mode {
-            WriteMode::Create => {
-                let mut upsert_values = HashMap::new();
-                if let Some(auto_cleanup_params) = context.params.auto_cleanup.as_ref() {
-                    upsert_values.insert(
-                        String::from("lance.auto_cleanup.interval"),
-                        auto_cleanup_params.interval.to_string(),
-                    );
-
-                    let duration = auto_cleanup_params
-                        .older_than
-                        .to_std()
-                        .map_err(|e| Error::invalid_input_source(e.into()))?;
-                    upsert_values.insert(
-                        String::from("lance.auto_cleanup.older_than"),
-                        format_duration(duration).to_string(),
-                    );
-                }
-                let config_upsert_values = if upsert_values.is_empty() {
-                    None
-                } else {
-                    Some(upsert_values)
-                };
-                Operation::Overwrite {
-                    // Use the full schema, not the written schema
-                    schema,
-                    fragments,
-                    config_upsert_values,
-                    initial_bases: context.params.initial_bases.clone(),
-                }
-            }
-            WriteMode::Overwrite => Operation::Overwrite {
-                schema,
-                fragments,
-                config_upsert_values: None,
-                initial_bases: context.params.initial_bases.clone(),
-            },
-            WriteMode::Append => Operation::Append { fragments },
-        };
-
-        let transaction = TransactionBuilder::new(
-            context
-                .dest
-                .dataset()
-                .map(|ds| ds.manifest.version)
-                .unwrap_or(0),
-            operation,
-        )
-        .transaction_properties(context.params.transaction_properties.clone())
-        .build();
-
-        Ok(transaction)
-    }
-
-    fn validate_write(&self, context: &mut WriteContext, data_schema: &Schema) -> Result<()> {
-        // Write mode
-        match (&context.params.mode, &context.dest) {
-            (WriteMode::Create, WriteDestination::Dataset(ds)) => {
-                return Err(Error::dataset_already_exists(ds.uri.clone()));
-            }
-            (WriteMode::Append | WriteMode::Overwrite, WriteDestination::Uri(uri)) => {
-                log::warn!("No existing dataset at {uri}, it will be created");
-                context.params.mode = WriteMode::Create;
-            }
-            _ => {}
-        }
-
-        // Validate schema
-        if matches!(context.params.mode, WriteMode::Append)
-            && let WriteDestination::Dataset(dataset) = &context.dest
-        {
-            // If the dataset is already using (or not using) stable row ids, we need to match
-            // and ignore whatever the user provided as input
-            if context.params.enable_stable_row_ids != dataset.manifest.uses_stable_row_ids() {
-                log::info!(
-                    "Ignoring user provided stable row ids setting of {}, dataset already has it set to {}",
-                    context.params.enable_stable_row_ids,
-                    dataset.manifest.uses_stable_row_ids()
-                );
-                context.params.enable_stable_row_ids = dataset.manifest.uses_stable_row_ids();
-            }
-
-            let version = dataset.manifest.data_storage_format.lance_file_format();
-            if (version == ConcreteFileVersion::V1)
-                != (context.storage_version == ConcreteFileVersion::V1)
-            {
-                return Err(Error::invalid_input(format!(
-                    "Cannot append data files in version {} to a dataset with default version {version}: V1 and V2 storage versions cannot be mixed",
-                    context.storage_version
-                )));
-            }
-            let mut schema_cmp_opts = crate::dataset::versions::schema_compare_options(version);
-            schema_cmp_opts.compare_nullability = NullabilityComparison::Ignore;
-            schema_cmp_opts.allow_missing_if_nullable = true;
-            schema_cmp_opts.ignore_field_order = true;
-
-            let normalized_data_schema = prepared_to_logical_blob_schema(data_schema)?;
-            if normalized_data_schema
-                .check_compatible(dataset.schema(), &schema_cmp_opts)
-                .is_err()
-            {
-                let normalized_data_schema =
-                    super::promote_legacy_blob_schema(&normalized_data_schema)?;
-                let dataset_schema = super::promote_legacy_blob_schema(dataset.schema())?;
-                normalized_data_schema.check_compatible(&dataset_schema, &schema_cmp_opts)?;
-            }
-        }
-
-        for field in data_schema.fields.iter() {
-            if is_system_column(&field.name) {
-                return Err(Error::invalid_input_source(
-                    format!(
-                        "The column {} is a reserved name and cannot be used in a Lance dataset",
-                        field.name
-                    )
-                    .into(),
-                ));
-            }
-        }
-
-        // Feature flags
-        if let WriteDestination::Dataset(dataset) = &context.dest
-            && !can_write_dataset(dataset.manifest.writer_feature_flags)
-        {
-            let message = format!(
-                "This dataset cannot be written by this version of Lance. \
-                Please upgrade Lance to write to this dataset.\n Flags: {}",
-                dataset.manifest.writer_feature_flags
-            );
-            return Err(Error::not_supported_source(message.into()));
-        }
-
-        Ok(())
-    }
-
-    async fn resolve_context(&self) -> Result<WriteContext<'a>> {
+    fn runtime_params(&self) -> (lance_table_runtime::WriteParams, Arc<Session>) {
         let mut params = self.params.cloned().unwrap_or_default();
-        if let Some(cb) = self.write_progress.clone() {
-            params.write_progress = Some(cb);
+        if let Some(progress) = &self.write_progress {
+            params.write_progress = Some(progress.clone());
         }
-        let (object_store, base_path, commit_handler) = match &self.dest {
-            WriteDestination::Dataset(dataset) => (
-                dataset.object_store.clone(),
-                dataset.base.clone(),
-                params
-                    .commit_handler
-                    .clone()
-                    .unwrap_or_else(|| dataset.commit_handler.clone()),
-            ),
-            WriteDestination::Uri(uri) => {
-                let registry = params
-                    .session
-                    .as_ref()
-                    .map(|s| s.store_registry())
-                    .unwrap_or_else(|| Arc::new(Default::default()));
-                let (object_store, base_path) = ObjectStore::from_uri_and_params(
-                    registry,
-                    uri,
-                    &params.store_params.clone().unwrap_or_default(),
-                )
-                .await?;
-                let commit_handler = resolve_commit_handler(
-                    uri,
-                    params.commit_handler.clone(),
-                    &params.store_params,
-                )
-                .await?;
-                (object_store, base_path, commit_handler)
-            }
-        };
-        let dest = match &self.dest {
-            WriteDestination::Dataset(dataset) => WriteDestination::Dataset(dataset.clone()),
-            WriteDestination::Uri(uri) => {
-                // Check if it already exists.
-                let builder = DatasetBuilder::from_uri(uri).with_read_params(ReadParams {
-                    store_options: params.store_params.clone(),
-                    commit_handler: params.commit_handler.clone(),
-                    session: params.session.clone(),
-                    ..Default::default()
-                });
-
-                match builder.load().await {
-                    Ok(dataset) => WriteDestination::Dataset(Arc::new(dataset)),
-                    Err(Error::DatasetNotFound { .. } | Error::NotFound { .. }) => {
-                        WriteDestination::Uri(uri)
-                    }
-                    Err(e) => return Err(e),
-                }
-            }
-        };
-
-        let storage_version = match &dest {
-            WriteDestination::Dataset(dataset) => params
-                .data_storage_version
-                .map(LanceFileVersion::resolve)
-                .unwrap_or_else(|| dataset.manifest.data_storage_format.lance_file_format()),
-            // Otherwise (no existing dataset) fallback to the default if the user didn't specify
-            WriteDestination::Uri(_) => params.storage_version_or_default(),
-        };
-
-        Ok(WriteContext {
-            params,
-            dest,
-            object_store,
-            base_path,
-            commit_handler,
-            storage_version,
-        })
+        let session = params
+            .session
+            .clone()
+            .or_else(|| self.dest.dataset().map(|dataset| dataset.session.clone()))
+            .unwrap_or_default();
+        (super::into_runtime_write_params(params), session)
     }
-}
 
-#[derive(Debug)]
-struct WriteContext<'a> {
-    params: WriteParams,
-    dest: WriteDestination<'a>,
-    object_store: Arc<ObjectStore>,
-    base_path: Path,
-    commit_handler: Arc<dyn CommitHandler>,
-    storage_version: ConcreteFileVersion,
+    fn runtime_builder<'b>(
+        &'b self,
+        params: &'b lance_table_runtime::WriteParams,
+        session: &Arc<Session>,
+    ) -> RuntimeInsertBuilder<'b> {
+        let hook_session = self
+            .dest
+            .dataset()
+            .map(|dataset| dataset.session.clone())
+            .unwrap_or_else(|| session.clone());
+        let seed_hook = Arc::new(LanceWriteSeedHook::new(hook_session.clone()));
+        let commit_hook = Arc::new(LanceCommitHook::new(hook_session));
+        let mut builder = RuntimeInsertBuilder::new(self.dest.to_runtime())
+            .with_params(params)
+            .with_default_session(session.table_session.clone())
+            .with_seed_hook(seed_hook)
+            .with_index_hook(commit_hook.clone())
+            .with_lifecycle_hook(commit_hook);
+        if let Some(name) = &self.preassigned_data_file_name {
+            builder = builder.with_preassigned_data_file_name(name.as_str());
+        }
+        if self.inherited_field_ids {
+            builder = builder.with_inherited_field_ids();
+        }
+        if self.disable_dictionary_split {
+            builder = builder.with_dictionary_split_disabled();
+        }
+        builder
+    }
 }
 
 #[cfg(test)]
@@ -509,18 +205,65 @@ mod test {
     use std::collections::HashMap;
 
     use arrow_array::{
-        ArrayRef, BinaryArray, Int32Array, RecordBatchReader, StructArray, record_batch,
+        ArrayRef, BinaryArray, Int32Array, RecordBatchIterator, RecordBatchReader, StructArray,
+        record_batch,
     };
-    use arrow_schema::{ArrowError, DataType, Field, Schema};
+    use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef};
+    use datafusion::physical_plan::{
+        SendableRecordBatchStream as DataFusionRecordBatchStream, stream::RecordBatchStreamAdapter,
+    };
     use lance_arrow::BLOB_META_KEY;
-    use lance_core::utils::tempfile::TempStrDir;
+    use lance_core::{Error, utils::tempfile::TempStrDir};
+    use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
     use lance_table::feature_flags::FLAG_MIXED_DATA_FILE_VERSIONS;
     use lance_table::io::commit::{RenameCommitHandler, commit_handler_from_url};
+    use lance_table::transaction::Operation;
     use rstest::rstest;
 
+    use crate::dataset::WriteMode;
     use crate::session::Session;
 
     use super::*;
+
+    #[tokio::test]
+    async fn insert_uses_custom_streaming_write_source_schema() {
+        struct CustomWriteSource(DataFusionRecordBatchStream);
+
+        #[async_trait::async_trait]
+        impl StreamingWriteSource for CustomWriteSource {
+            fn arrow_schema(&self) -> SchemaRef {
+                self.0.schema()
+            }
+
+            fn into_stream(self) -> DataFusionRecordBatchStream {
+                self.0
+            }
+
+            async fn into_stream_and_schema(
+                self,
+            ) -> Result<(DataFusionRecordBatchStream, lance_core::datatypes::Schema)> {
+                let mut schema =
+                    lance_core::datatypes::Schema::try_from(self.arrow_schema().as_ref())?;
+                schema
+                    .metadata
+                    .insert("write_source".into(), "custom".into());
+                Ok((self.0, schema))
+            }
+        }
+
+        let batch = record_batch!(("id", Int32, [1, 2, 3])).unwrap();
+        let stream = Box::pin(RecordBatchStreamAdapter::new(
+            batch.schema(),
+            futures::stream::iter([Ok(batch)]),
+        ));
+        let dataset = InsertBuilder::new("memory://")
+            .execute_stream(CustomWriteSource(stream))
+            .await
+            .unwrap();
+
+        assert_eq!(dataset.schema().metadata["write_source"], "custom");
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 3);
+    }
 
     #[rstest]
     #[tokio::test]
@@ -866,7 +609,7 @@ mod test {
             ))
             .await
             .unwrap();
-        dataset.commit_handler = commit_handler_from_url("cos://bucket/dataset", &None)
+        dataset.table_state.commit_handler = commit_handler_from_url("cos://bucket/dataset", &None)
             .await
             .unwrap();
 

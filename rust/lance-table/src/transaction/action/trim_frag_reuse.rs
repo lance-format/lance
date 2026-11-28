@@ -62,10 +62,11 @@ mod tests {
         apply_with_indices, footprint, one_column_file,
     };
     use crate::transaction::action::{
-        Action, AddDataFile, AddOverlays, FieldRef, Ref, TombstoneFieldData,
+        Action, AddDataFile, AddOverlays, FieldRef, Ref, RemoveFragment, TombstoneFieldData,
     };
     use crate::transaction::test_support::sample_index_metadata;
     use rstest::rstest;
+    use std::sync::Arc;
 
     fn trim() -> Action {
         Action::TrimFragReuse(TrimFragReuse {})
@@ -145,6 +146,69 @@ mod tests {
         assert_eq!(sources(&transitions), vec![vec![0]]);
         assert!(!footprint(vec![trim()]).conflicts_with(&footprint(appended.clone())));
         assert!(!footprint(appended).conflicts_with(&footprint(vec![trim()])));
+    }
+
+    /// The trim judges liveness on the fragments this operation publishes, not
+    /// on those of the manifest it started from. The history moves 1 and 2
+    /// into 10, then 10 into 30; index `a` holds addresses in 1 and covers 30
+    /// directly. While 10 is live it is an uncovered destination, so both
+    /// transitions stay; once the same operation removes 10, it is retired
+    /// and settled through 30, so both go.
+    #[test]
+    fn test_a_trim_judges_the_fragments_the_operation_publishes() {
+        let mut start = table(31, false);
+        start.fragments = Arc::new(
+            start
+                .fragments
+                .iter()
+                .filter(|fragment| matches!(fragment.id, 10 | 30))
+                .cloned()
+                .collect(),
+        );
+        let merged = recorded(&[1, 2], &[10]);
+        // 10 carries the rows of both 1 and 2, so the onward move must agree.
+        let rows = merged.destinations[0].physical_rows;
+        let mut onward = recorded(&[10], &[30]);
+        onward.sources[0].physical_rows = rows;
+        onward.destinations[0].physical_rows = rows;
+        let mut moved = roaring::RoaringTreemap::new();
+        for offset in 0..rows as u32 {
+            moved.insert(u64::from(
+                lance_core::utils::address::RowAddress::new_from_parts(10, offset),
+            ));
+        }
+        let mut changed_row_addrs = Vec::new();
+        moved.serialize_into(&mut changed_row_addrs).unwrap();
+        onward.mapping = Some(
+            crate::format::pb::fragment_reuse_index_details::transition::Mapping::OrderedCompaction(
+                crate::format::pb::fragment_reuse_index_details::OrderedCompaction {
+                    changed_row_addrs,
+                },
+            ),
+        );
+        let indices = vec![
+            segment("a", &[1]),
+            segment("a", &[30]),
+            history(1, Vec::new(), vec![merged, onward]),
+        ];
+
+        let (_, kept) = apply_with_indices(&start, vec![trim()], indices.clone()).unwrap();
+        let (_, _, transitions) = read_history(&kept).unwrap();
+        assert_eq!(sources(&transitions), vec![vec![1, 2], vec![10]]);
+
+        let (_, trimmed) = apply_with_indices(
+            &start,
+            vec![
+                Action::RemoveFragment(RemoveFragment {
+                    fragment: Ref::Committed(10),
+                    data_change: true,
+                }),
+                trim(),
+            ],
+            indices,
+        )
+        .unwrap();
+        assert!(read_history(&trimmed).is_none());
     }
 
     /// An in-place rewrite of a fragment that a segment reaches through the
