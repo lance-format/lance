@@ -816,6 +816,28 @@ public class Dataset implements Closeable {
   private native void nativeMigrateManifestPathsV2();
 
   /**
+   * Stop reusing field IDs in this dataset.
+   *
+   * <p>By default, dropping the column with the highest field ID lets the next added column take
+   * that ID again. After this migration, new fields always get an ID above every ID the dataset has
+   * used, so a field ID keeps naming one column for the life of the dataset.
+   *
+   * <p>The migration commits a new version. It is one-way and idempotent.
+   *
+   * <p>WARNING: before running this, make sure every client that writes to the dataset enforces
+   * writer feature flags. A client that ignores them may discard the high-water mark and reuse
+   * field IDs.
+   */
+  public void migrateToNonReusableFieldIds() {
+    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      nativeMigrateToNonReusableFieldIds();
+    }
+  }
+
+  private native void nativeMigrateToNonReusableFieldIds();
+
+  /**
    * Add columns to the dataset.
    *
    * @param sqlExpressions The SQL expressions to add columns

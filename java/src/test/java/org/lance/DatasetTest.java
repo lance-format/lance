@@ -890,6 +890,35 @@ public class DatasetTest {
   }
 
   @Test
+  void testMigrateToNonReusableFieldIds(@TempDir Path tempDir) {
+    String datasetPath = tempDir.resolve("testMigrateToNonReusableFieldIds").toString();
+    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      dataset = testDataset.createEmptyDataset();
+      dataset.addColumns(
+          new SqlExpressions.Builder().withExpression("double_id", "id * 2").build(),
+          Optional.empty());
+
+      dataset.migrateToNonReusableFieldIds();
+      // Running it again is a no-op.
+      dataset.migrateToNonReusableFieldIds();
+
+      dataset.dropColumns(Collections.singletonList("double_id"));
+      dataset.addColumns(
+          new SqlExpressions.Builder().withExpression("triple_id", "id * 3").build(),
+          Optional.empty());
+      // Without the migration, triple_id would take double_id's dropped ID (2).
+      LanceField tripleId =
+          dataset.getLanceSchema().fields().stream()
+              .filter(f -> f.getName().equals("triple_id"))
+              .findFirst()
+              .orElseThrow(AssertionError::new);
+      assertEquals(3, tripleId.getId());
+    }
+  }
+
+  @Test
   void testAddColumnBySqlExpressions(@TempDir Path tempDir) {
     String testMethodName = new Object() {}.getClass().getEnclosingMethod().getName();
     String datasetPath = tempDir.resolve(testMethodName).toString();
