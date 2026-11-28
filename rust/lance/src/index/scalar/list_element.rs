@@ -21,13 +21,29 @@ use lance_index::scalar::{CreatedIndex, ScalarIndex};
 use lance_table::format::IndexMetadata;
 use prost::Message;
 
-use crate::{Error, Result};
+use super::segment_merge::{SegmentMerge, downcast_sources, open_dyn_sources};
+use crate::index::frag_reuse::StagedRemappingPlans;
+use crate::{Dataset, Error, Result};
 
 /// Whether `details` belong to a list-element index segment.
 pub fn is_list_element(details: &prost_types::Any) -> bool {
     details.type_url.rsplit_once('/').is_some_and(|(_, name)| {
         name.eq_ignore_ascii_case("lance.index.pb.ListElementIndexDetails")
     })
+}
+
+pub(in crate::index) async fn merge_segments(
+    dataset: &Dataset,
+    segments: &[IndexMetadata],
+    staged: Option<&StagedRemappingPlans>,
+) -> Result<IndexMetadata> {
+    let merge = SegmentMerge::new(dataset, "ListElement", segments)?;
+    let (coverage, filters) = merge.per_segment_filters(dataset, staged, true).await?;
+    let opened = open_dyn_sources(dataset, merge.field_path(), merge.segments(), staged).await?;
+    let sources = downcast_sources::<ListElementIndex>(&opened, merge.segments(), "ListElement")?;
+    let (uuid, store) = merge.new_store(dataset)?;
+    let created = ListElementIndex::merge_segments(&sources, &store, &filters).await?;
+    Ok(merge.build_metadata(uuid, merge.dataset_version(), coverage, created))
 }
 
 fn decode(details: &prost_types::Any) -> Result<ListElementIndexDetails> {

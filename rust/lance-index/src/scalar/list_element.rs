@@ -92,7 +92,7 @@ use crate::{
     scalar::{
         AnyQuery, CreatedIndex, IndexStore, OldIndexDataFilter, RowIdRemapper, SargableQuery,
         ScalarIndex, ScalarIndexParams, SearchOptions, SearchResult, UpdateCriteria,
-        btree::{BTREE_ROW_ADDR_DOMAIN_VERSION, BTreeIndexPlugin},
+        btree::{BTREE_ROW_ADDR_DOMAIN_VERSION, BTreeIndex, BTreeIndexPlugin},
         expression::{IndexedExpression, ScalarQueryParser},
         registry::{
             BasicTrainer, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
@@ -272,11 +272,14 @@ impl KeyCodec {
         self.fields.iter().map(|f| f.name().clone()).collect()
     }
 
+    fn key_types(&self) -> impl Iterator<Item = &DataType> {
+        self.fields.iter().map(|field| field.data_type())
+    }
+
     /// The Lance logical type of each key, as recorded in the details.
     fn logical_types(&self) -> Result<Vec<String>> {
-        self.fields
-            .iter()
-            .map(|f| Ok(LogicalType::try_from(f.data_type())?.to_string()))
+        self.key_types()
+            .map(|data_type| Ok(LogicalType::try_from(data_type)?.to_string()))
             .collect()
     }
 
@@ -932,6 +935,56 @@ impl ListElementIndex {
         wrap_target(&self.codec, target)
     }
 
+    /// Merge the encoded B-trees of segments with the same recorded key field
+    /// IDs and types, in order. Key names may differ after a field rename.
+    pub async fn merge_segments(
+        segments: &[&Self],
+        dest_store: &dyn IndexStore,
+        filters: &[Option<OldIndexDataFilter>],
+    ) -> Result<CreatedIndex> {
+        let first = segments.first().ok_or_else(|| {
+            Error::invalid_input("cannot merge a list-element index without source segments")
+        })?;
+        let targets = segments
+            .iter()
+            .enumerate()
+            .map(|(i, segment)| {
+                let codec = &segment.codec;
+                if !codec.has_field_ids() {
+                    return Err(Error::invalid_input(format!(
+                        "cannot merge list-element segment {i} without recorded key field IDs"
+                    )));
+                }
+                if codec.field_ids != first.codec.field_ids
+                    || codec.key_types().ne(first.codec.key_types())
+                {
+                    return Err(Error::invalid_input(format!(
+                        "list-element segment {i} has incompatible key field IDs and types: \
+                         {:?} {:?}, expected {:?} {:?}",
+                        codec.field_ids,
+                        codec.key_types().collect::<Vec<_>>(),
+                        first.codec.field_ids,
+                        first.codec.key_types().collect::<Vec<_>>()
+                    )));
+                }
+                let target = segment
+                    .target
+                    .as_any()
+                    .downcast_ref::<BTreeIndex>()
+                    .ok_or_else(|| {
+                        Error::internal("expected a B-tree target for list-element merge")
+                    })?;
+                Ok(Arc::new(target.clone()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let new_data = Box::pin(RecordBatchStreamAdapter::new(
+            training_schema(),
+            futures::stream::empty(),
+        ));
+        let merged = BTreeIndex::merge_segments(&targets, new_data, dest_store, filters).await?;
+        first.wrap_target(merged)
+    }
+
     /// TRUE rows of a B-tree search, ignoring the B-tree's own NULL tracking.
     async fn search_target(
         &self,
@@ -1578,6 +1631,13 @@ mod tests {
     async fn train(
         rows: Vec<Option<Vec<Option<Det>>>>,
     ) -> (Arc<dyn IndexStore>, CreatedIndex, TempObjDir) {
+        train_with_keys(rows, ["label", "confidence"]).await
+    }
+
+    async fn train_with_keys(
+        rows: Vec<Option<Vec<Option<Det>>>>,
+        keys: [&str; 2],
+    ) -> (Arc<dyn IndexStore>, CreatedIndex, TempObjDir) {
         let tmp = TempObjDir::default();
         let store: Arc<dyn IndexStore> = Arc::new(LanceIndexStore::new(
             Arc::new(ObjectStore::local()),
@@ -1587,7 +1647,7 @@ mod tests {
         let plugin = ListElementIndexPlugin;
         let request = plugin
             .new_training_request(
-                r#"{"keys": ["label", "confidence"], "zone_size": 4}"#,
+                &serde_json::json!({"keys": keys, "zone_size": 4}).to_string(),
                 &Field::new(VALUE_COLUMN_NAME, list_type(), true),
             )
             .unwrap();
@@ -1612,6 +1672,67 @@ mod tests {
             .await
             .unwrap();
         (store, created, tmp)
+    }
+
+    #[rstest]
+    #[case::reversed(["area", "confidence"], &[3, 2], Some("incompatible key field IDs and types"))]
+    #[case::different_type(["label", "area"], &[2, 3], Some("incompatible key field IDs and types"))]
+    #[case::missing_ids(["confidence", "area"], &[], Some("without recorded key field IDs"))]
+    #[case::renamed(["confidence", "area"], &[2, 3], None)]
+    #[tokio::test]
+    #[serial_test::serial(LANCE_DF_SPILL_POOL)]
+    async fn test_merge_segment_keys(
+        #[case] keys: [&str; 2],
+        #[case] ids: &[i32],
+        #[case] expected_error: Option<&str>,
+    ) {
+        async fn open_segment(
+            keys: [&str; 2],
+            ids: &[i32],
+            rename: bool,
+        ) -> (Arc<dyn ScalarIndex>, TempObjDir) {
+            let (store, created, tmp) = train_with_keys(vec![Some(vec![car(0.95)])], keys).await;
+            let mut details = decode_details(&created.index_details).unwrap();
+            details.key_field_ids = ids.to_vec();
+            if rename {
+                details.keys[0] = "score".into();
+            }
+            let index = ListElementIndexPlugin
+                .load_index(
+                    store,
+                    &prost_types::Any::from_msg(&details).unwrap(),
+                    created.index_version,
+                    None,
+                    &LanceCache::no_cache(),
+                )
+                .await
+                .unwrap();
+            (index, tmp)
+        }
+
+        let (first, _first_dir) = open_segment(["confidence", "area"], &[2, 3], false).await;
+        let (second, _second_dir) = open_segment(keys, ids, expected_error.is_none()).await;
+        let dest_dir = TempObjDir::default();
+        let dest = LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            dest_dir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        );
+        let segments = [first, second];
+        let segments = segments
+            .each_ref()
+            .map(|s| s.as_any().downcast_ref::<ListElementIndex>().unwrap());
+        let merged = ListElementIndex::merge_segments(&segments, &dest, &[None, None]).await;
+        if let Some(expected_error) = expected_error {
+            let err = merged.err().expect("incompatible key definitions merged");
+            assert!(matches!(err, Error::InvalidInput { .. }), "{err}");
+            assert!(err.to_string().contains(expected_error), "{err}");
+            assert!(dest.list_files_with_sizes().await.unwrap().is_empty());
+        } else {
+            let details = decode_details(&merged.unwrap().index_details).unwrap();
+            assert_eq!(details.key_field_ids, [2, 3]);
+            assert_eq!(details.keys, ["confidence", "area"]);
+        }
     }
 
     fn parse(filter: &str) -> Option<ListElementQuery> {
