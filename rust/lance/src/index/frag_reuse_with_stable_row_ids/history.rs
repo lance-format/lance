@@ -2073,7 +2073,9 @@ pub mod tests {
 
         catch_up_i_idx(&mut dataset).await;
         let before = rows_by_addr(&dataset).await;
-        let options = compaction_of(&dataset, &[6, 7]);
+        // Compact the fragments `i_idx` actually covers ([4, 5]) so `i_idx`
+        // needs this second version while having caught up with the first.
+        let options = compaction_of(&dataset, &[4, 5]);
         compact_files(&mut dataset, options, None).await.unwrap();
         let both = history(&dataset).await;
         assert_eq!(both.len(), 2);

@@ -312,29 +312,21 @@ impl<'a> TransactionRebase<'a> {
                     }
                     // if index remapping is deferred, there is no conflict with
                     // concurrent CreateIndex of column indices: the index keeps covering
-                    // the rewritten rows under their old fragments. On an untagged table
-                    // the remap was deferred if the rewrite carries a reuse update
-                    // (visible only in the process that committed it) or the latest
-                    // reuse index records it. On a stable-row-id table only the latest
-                    // reuse index counts: a cleanup there may have trimmed the record
-                    // since, leaving an index built before the rewrite nothing to
-                    // translate through.
-                    // A frag_reuse_index cleanup is checked against the latest entry in
-                    // `finish_create_index`. A tagged entry (an in-process rewrite on a
-                    // tagged history) takes the durable-evidence path below instead.
-                    let is_recorded = self
-                        .untagged_reuse
-                        .as_ref()
-                        .is_some_and(|reuse| reuse.records(groups));
-                    let has_stable_row_ids = self
-                        .untagged_reuse
-                        .as_ref()
-                        .is_some_and(|reuse| reuse.manifest.uses_stable_row_ids());
-                    let deferred = is_recorded
-                        || (!has_stable_row_ids
-                            && frag_reuse_index
-                                .as_ref()
-                                .is_some_and(|entry| !is_tagged(entry)));
+                    // the rewritten rows under their old fragments. Once the latest
+                    // untagged reuse index has been loaded, only its durable records
+                    // count: a cached in-memory `frag_reuse_index` on an older `Rewrite`
+                    // transaction does not prove the mapping survived a subsequent
+                    // `cleanup_frag_reuse_index`, whether or not stable row ids are on.
+                    // A frag_reuse_index cleanup skips loading `untagged_reuse` and is
+                    // checked against the latest entry in `finish_create_index`. A
+                    // tagged entry (an in-process rewrite on a tagged history) takes
+                    // the durable-evidence path below instead.
+                    let deferred = match &self.untagged_reuse {
+                        Some(reuse) => reuse.records(groups),
+                        None => frag_reuse_index
+                            .as_ref()
+                            .is_some_and(|entry| !is_tagged(entry)),
+                    };
                     if deferred {
                         if let Some(reuse) = &self.untagged_reuse
                             && !reuse.withdraw_folded_overlays(groups, new_indices)

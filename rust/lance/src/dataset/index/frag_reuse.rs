@@ -19,8 +19,10 @@ use lance_index::is_system_index;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_table::format::IndexMetadata;
 use lance_table::io::manifest::read_manifest_indexes;
+use lance_table::system_index::frag_reuse::retention::compute_v0_retention;
+#[cfg(test)]
 use lance_table::system_index::frag_reuse::retention::{
-    is_index_remap_caught_up, reuse_chain_frag_bitmap,
+    is_index_remap_caught_up, reuse_version_reaches,
 };
 use lance_table_runtime::frag_reuse::history::trimmable_versions;
 use lance_table_runtime::frag_reuse::{
@@ -86,20 +88,20 @@ impl Dataset {
 }
 
 /// Cleanup a fragment reuse index based on the current condition of the indices.
-/// If all the indices currently available are already caught up to as a specific reuse version,
-/// all older reuse versions (inclusive) can be cleaned up.
 ///
 /// An index is considered caught up against a specific reuse version if either:
-/// 1. its coverage is disjoint from the fragments the reuse chain touches, so it
-///    holds nothing the FRI would remap (the common multi-index case: a
+/// 1. its coverage is disjoint from that version's reach (its old fragments plus
+///    the forward closure of its new fragments through later rewrites), so it
+///    holds nothing the version remaps (the common multi-index case: a
 ///    compaction rewrote a sibling index's fragments, not this one); or
 /// 2. it is past the reuse version's dataset version and no old fragment in the
 ///    version is still in its bitmap. A missing bitmap counts as caught up, else
 ///    the version could never be cleaned up.
 ///
-/// Note that there could be a race condition that an index is being added during the cleanup,
-/// This will make that specific index not efficient until the next reindex,
-/// but it will not cause any correctness problem.
+/// On a table without stable row ids, any retained v0 version also retains its
+/// downstream producer-to-consumer hops so an index still holding raw
+/// pre-compaction fragment IDs can translate all the way to live fragments,
+/// while disjoint versions are removed.
 ///
 /// Typically run after [`compact_files`] with deferred remap and per-index
 /// [`remap_column_index`] have caught the indexes up.
@@ -115,9 +117,8 @@ impl Dataset {
 /// # Errors
 ///
 /// Returns [`Error::RetryableCommitConflict`] if the fragment reuse index changed
-/// after `dataset`'s version or, on a table with stable row ids, if an index
-/// committed since then still needs a version it removes; reload the latest
-/// version and run it again.
+/// after `dataset`'s version or if an index committed since then still needs a
+/// version it removes; reload the latest version and run it again.
 ///
 /// # Example
 ///
@@ -157,25 +158,12 @@ pub async fn cleanup_frag_reuse_index(dataset: &mut Dataset) -> lance_core::Resu
 
     let frag_reuse_details = load_frag_reuse_index_details(dataset, frag_reuse_index_meta).await?;
 
-    let chain_frag_bitmap = reuse_chain_frag_bitmap(&frag_reuse_details.versions);
+    let retained = compute_v0_retention(&frag_reuse_details.versions, &indices);
 
     let mut retained_versions = Vec::new();
     let mut fragment_bitmaps = RoaringBitmap::new();
-    for version in frag_reuse_details.versions.iter() {
-        let check_results = indices
-            .iter()
-            .map(|idx| is_index_remap_caught_up(version, idx, &chain_frag_bitmap))
-            .collect::<Vec<_>>();
-
-        if check_results
-            .iter()
-            .any(|r| matches!(r, Err(Error::InvalidInput { .. })))
-        {
-            // If the check fails, the reuse version is likely corrupted, do not retain it.
-            continue;
-        }
-
-        if !check_results.into_iter().all(|r| r.unwrap()) {
+    for (version, keep) in frag_reuse_details.versions.iter().zip(retained) {
+        if keep {
             fragment_bitmaps.extend(version.new_frag_bitmap());
             retained_versions.push(version.clone());
         }
@@ -490,6 +478,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::dataset::builder::DatasetBuilder;
     use crate::dataset::optimize::{CompactionOptions, compact_files, remapping};
+    use crate::dataset::{WriteMode, WriteParams};
     use crate::index::DatasetIndexExt;
     use crate::index::vector::details::vector_index_details_default;
     use crate::session::Session;
@@ -500,13 +489,26 @@ pub(crate) mod tests {
     use all_asserts::{assert_false, assert_true};
     use arrow_array::cast::AsArray;
     use arrow_array::types::{Float32Type, Int32Type};
+    use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator};
+    use arrow_schema::{DataType, Field, Schema};
+    use async_trait::async_trait;
+    use futures::future::BoxFuture;
     use lance_core::ROW_ADDR;
     use lance_core::utils::address::RowAddress;
     use lance_datagen::Dimension;
     use lance_index::IndexType;
     use lance_index::frag_reuse::FragReuseVersion;
     use lance_index::scalar::ScalarIndexParams;
+    use lance_io::object_store::ObjectStore;
+    use lance_table::format::Manifest;
+    use lance_table::format::pb::transaction::Operation as PbOperation;
+    use lance_table::io::commit::{
+        CommitError, CommitHandler, ConditionalPutCommitHandler, ManifestLocation,
+        ManifestNamingScheme, ManifestWriter,
+    };
     use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn frag_digest(id: u64) -> lance_index::frag_reuse::FragDigest {
         lance_index::frag_reuse::FragDigest {
@@ -552,48 +554,63 @@ pub(crate) mod tests {
     fn test_caught_up_uses_fragment_coverage_not_only_version() {
         // A reuse version at dataset_version 10 rewrote fragments [4, 5] -> [6].
         let version = reuse_version(10, &[4, 5], &[6]);
-        let chain = reuse_chain_frag_bitmap(std::slice::from_ref(&version));
+        let reach = &reuse_version_reaches(std::slice::from_ref(&version))[0];
 
         // Non-covering, stale version: touches none of the rewritten frags, so
         // caught up despite version 5 < 10 (the case the old gate got wrong).
         assert_true!(
-            is_index_remap_caught_up(&version, &index_covering(5, &[1, 2, 3]), &chain).unwrap()
+            is_index_remap_caught_up(&version, &index_covering(5, &[1, 2, 3]), reach).unwrap()
         );
 
         // Still holds an old fragment: not caught up.
         assert_false!(
-            is_index_remap_caught_up(&version, &index_covering(5, &[1, 4, 5]), &chain).unwrap()
+            is_index_remap_caught_up(&version, &index_covering(5, &[1, 4, 5]), reach).unwrap()
         );
 
         // Bitmap advanced onto the new fragment but data not yet remapped: not
-        // caught up (why the chain must include new frags).
+        // caught up (why the reach must include new frags).
         assert_false!(
-            is_index_remap_caught_up(&version, &index_covering(5, &[1, 6]), &chain).unwrap()
+            is_index_remap_caught_up(&version, &index_covering(5, &[1, 6]), reach).unwrap()
         );
 
         // Built at version 10 itself: still pre-rewrite data, not caught up.
         assert_false!(
-            is_index_remap_caught_up(&version, &index_covering(10, &[1, 6]), &chain).unwrap()
+            is_index_remap_caught_up(&version, &index_covering(10, &[1, 6]), reach).unwrap()
         );
 
         // Built or remapped after version 10: caught up.
         assert_true!(
-            is_index_remap_caught_up(&version, &index_covering(11, &[1, 6]), &chain).unwrap()
+            is_index_remap_caught_up(&version, &index_covering(11, &[1, 6]), reach).unwrap()
         );
     }
 
-    /// The chain spans every reuse version, not just the one being checked: a
-    /// stale index touching only a *later* version's fragment must still fall to
-    /// the version gate (a per-version chain would wrongly clear it).
+    /// A version's reach follows chained later rewrites: a stale index touching
+    /// only a *later* version's chained output must still fall to the version
+    /// gate.
     #[test]
     fn test_caught_up_uses_whole_reuse_chain() {
         let v1 = reuse_version(10, &[4, 5], &[6]); // 4,5 -> 6
         let v2 = reuse_version(11, &[6], &[7]); // 6 -> 7
-        let chain = reuse_chain_frag_bitmap(&[v1.clone(), v2]);
+        let reaches = reuse_version_reaches(&[v1.clone(), v2]);
 
-        // Stale index (version 5) covering only v2's new fragment [7]: not
-        // disjoint from the chain, so not caught up on v1.
-        assert_false!(is_index_remap_caught_up(&v1, &index_covering(5, &[1, 7]), &chain).unwrap());
+        // Stale index (version 5) covering only v2's new fragment [7]: reachable
+        // from v1 through v2, so not caught up on v1.
+        assert_false!(
+            is_index_remap_caught_up(&v1, &index_covering(5, &[1, 7]), &reaches[0]).unwrap()
+        );
+    }
+
+    /// Disjoint versions are judged independently: an index rebuilt after v1
+    /// over v1's output must not falsely pin an unrelated later version v2.
+    #[test]
+    fn test_caught_up_is_judged_per_version() {
+        let v1 = reuse_version(10, &[4, 5], &[6]); // 4,5 -> 6
+        let v2 = reuse_version(20, &[8, 9], &[10]); // 8,9 -> 10 (disjoint)
+        let reaches = reuse_version_reaches(&[v1.clone(), v2.clone()]);
+
+        let rebuilt_after_v1 = index_covering(15, &[6]);
+        assert_true!(is_index_remap_caught_up(&v1, &rebuilt_after_v1, &reaches[0]).unwrap());
+        assert_true!(is_index_remap_caught_up(&v2, &rebuilt_after_v1, &reaches[1]).unwrap());
     }
 
     /// Whole-fragment removal (every row deleted, no replacement): an index
@@ -604,15 +621,13 @@ pub(crate) mod tests {
     fn test_caught_up_handles_fragment_removal() {
         // Reuse version 20 removed fragment [7] outright (no replacement).
         let version = reuse_version(20, &[7], &[]);
-        let chain = reuse_chain_frag_bitmap(std::slice::from_ref(&version));
+        let reach = &reuse_version_reaches(std::slice::from_ref(&version))[0];
 
         // Index emptied by the deletion (empty bitmap): caught up.
-        assert_true!(is_index_remap_caught_up(&version, &index_covering(5, &[]), &chain).unwrap());
+        assert_true!(is_index_remap_caught_up(&version, &index_covering(5, &[]), reach).unwrap());
 
         // Bitmap still lists the removed fragment (not yet updated): retained.
-        assert_false!(
-            is_index_remap_caught_up(&version, &index_covering(5, &[7]), &chain).unwrap()
-        );
+        assert_false!(is_index_remap_caught_up(&version, &index_covering(5, &[7]), reach).unwrap());
     }
 
     #[tokio::test]
@@ -670,7 +685,7 @@ pub(crate) mod tests {
             is_index_remap_caught_up(
                 &frag_reuse_details.versions[0],
                 scalar_index,
-                &reuse_chain_frag_bitmap(&frag_reuse_details.versions),
+                &reuse_version_reaches(&frag_reuse_details.versions)[0],
             )
             .unwrap()
         );
@@ -685,7 +700,7 @@ pub(crate) mod tests {
             is_index_remap_caught_up(
                 &frag_reuse_details.versions[0],
                 scalar_index,
-                &reuse_chain_frag_bitmap(&frag_reuse_details.versions),
+                &reuse_version_reaches(&frag_reuse_details.versions)[0],
             )
             .unwrap()
         );
@@ -710,6 +725,792 @@ pub(crate) mod tests {
             cleanup_frag_reuse_index(&mut dataset_clone).await,
             Err(Error::RetryableCommitConflict { .. })
         ));
+    }
+
+    async fn collect_i32_column(
+        dataset: &Dataset,
+        col: &str,
+        filter: &str,
+        use_scalar_index: bool,
+        expected_index_name: Option<&str>,
+    ) -> Vec<i32> {
+        let mut scanner = dataset.scan();
+        scanner
+            .project(&[col])
+            .unwrap()
+            .filter(filter)
+            .unwrap()
+            .use_scalar_index(use_scalar_index);
+        if let Some(index_name) = expected_index_name {
+            let plan = scanner.explain_plan(true).await.unwrap();
+            let expected_target = format!("@{index_name}(");
+            assert!(
+                plan.lines().any(
+                    |line| line.contains("ScalarIndexQuery") && line.contains(&expected_target)
+                ),
+                "expected query plan to have a ScalarIndexQuery hitting '{index_name}', got:\n{plan}"
+            );
+        }
+        let batch = scanner.try_into_batch().await.unwrap();
+        let mut values: Vec<i32> = batch
+            .column_by_name(col)
+            .unwrap()
+            .as_primitive::<Int32Type>()
+            .values()
+            .iter()
+            .copied()
+            .collect();
+        values.sort_unstable();
+        values
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_v0_retains_chained_rewrites_for_stale_snapshot_index() {
+        let test_dir = lance_core::utils::tempfile::TempStrDir::default();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("i", DataType::Int32, false),
+            Field::new("j", DataType::Int32, false),
+        ]));
+        let make_batch = |range: std::ops::Range<i32>| {
+            let vals: Vec<i32> = range.collect();
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from(vals.clone())),
+                    Arc::new(Int32Array::from(vals)),
+                ],
+            )
+            .unwrap()
+        };
+
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(make_batch(0..600))], schema.clone()),
+            test_dir.as_str(),
+            Some(WriteParams {
+                max_rows_per_file: 100,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        dataset
+            .create_index(
+                &["j"],
+                IndexType::Scalar,
+                Some("existing".into()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+
+        // Snapshot taken before both chained compactions v1 and v2.
+        let mut stale_ds = dataset.clone();
+        let pre_v1_frags: RoaringBitmap = dataset.fragments().iter().map(|f| f.id as u32).collect();
+
+        // v1: 6 fragments of 100 -> 3 fragments of 200.
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 200,
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        // v2: 3 fragments of 200 -> 1 fragment of 600 (chains directly onto v1's output).
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 600,
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Append 2 disjoint fragments of 100 rows and compact only them into v3.
+        Dataset::write(
+            RecordBatchIterator::new(vec![Ok(make_batch(600..800))], schema.clone()),
+            test_dir.as_str(),
+            Some(WriteParams {
+                max_rows_per_file: 100,
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset.checkout_latest().await.unwrap();
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 200,
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Rebuild `existing` so it is caught up with v1, v2, and v3.
+        dataset
+            .create_index(
+                &["j"],
+                IndexType::Scalar,
+                Some("existing".into()),
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+
+        // Publish an index built on the pre-v1 snapshot; its raw manifest bitmap
+        // still lists the pre-v1 source fragments.
+        stale_ds
+            .create_index(
+                &["i"],
+                IndexType::Scalar,
+                Some("stale_scalar".into()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        dataset.checkout_latest().await.unwrap();
+
+        let raw_indices = read_manifest_indexes(
+            &dataset.table_state.object_store,
+            &dataset.table_state.manifest_location,
+            &dataset.manifest,
+        )
+        .await
+        .unwrap();
+        let raw_stale = raw_indices
+            .iter()
+            .find(|idx| idx.name == "stale_scalar")
+            .unwrap();
+        assert_eq!(raw_stale.fragment_bitmap.as_ref(), Some(&pre_v1_frags));
+
+        let fri_before = dataset
+            .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+            .await
+            .unwrap()
+            .unwrap();
+        let details_before = load_frag_reuse_index_details(&dataset, &fri_before)
+            .await
+            .unwrap();
+        assert_eq!(details_before.versions.len(), 3);
+        let expected_kept_stamps = [
+            details_before.versions[0].dataset_version,
+            details_before.versions[1].dataset_version,
+        ];
+
+        cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+
+        let fri_after = dataset
+            .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+            .await
+            .unwrap()
+            .unwrap();
+        let details_after = load_frag_reuse_index_details(&dataset, &fri_after)
+            .await
+            .unwrap();
+        let kept_stamps: Vec<u64> = details_after
+            .versions
+            .iter()
+            .map(|v| v.dataset_version)
+            .collect();
+        assert_eq!(
+            kept_stamps, expected_kept_stamps,
+            "v1 and chained v2 must stay while disjoint v3 is dropped"
+        );
+
+        // Cold reopen: indexed query must hit `stale_scalar` and match full scan.
+        let reopened = DatasetBuilder::from_uri(test_dir.as_str())
+            .with_session(Arc::new(Session::default()))
+            .load()
+            .await
+            .unwrap();
+        let indexed = collect_i32_column(
+            &reopened,
+            "i",
+            "i >= 50 AND i < 350",
+            true,
+            Some("stale_scalar"),
+        )
+        .await;
+        let full_scan =
+            collect_i32_column(&reopened, "i", "i >= 50 AND i < 350", false, None).await;
+        assert_eq!(indexed.len(), 300);
+        assert_eq!(indexed, full_scan);
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_v0_conflicts_with_concurrent_create_index() {
+        let test_dir = lance_core::utils::tempfile::TempStrDir::default();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("i", DataType::Int32, false),
+            Field::new("j", DataType::Int32, false),
+            Field::new("k", DataType::Int32, false),
+        ]));
+        let make_batch = |range: std::ops::Range<i32>| {
+            let vals: Vec<i32> = range.collect();
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from(vals.clone())),
+                    Arc::new(Int32Array::from(vals.clone())),
+                    Arc::new(Int32Array::from(vals)),
+                ],
+            )
+            .unwrap()
+        };
+
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(make_batch(0..400))], schema.clone()),
+            test_dir.as_str(),
+            Some(WriteParams {
+                max_rows_per_file: 100,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        dataset
+            .create_index(
+                &["i"],
+                IndexType::Scalar,
+                Some("idx_a".into()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        dataset
+            .create_index(
+                &["j"],
+                IndexType::Scalar,
+                Some("idx_f".into()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+
+        // v1 compacts the first 4 fragments into 2 fragments of 200 rows.
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 200,
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Rebuild idx_a so only idx_f pins v1.
+        dataset
+            .create_index(
+                &["i"],
+                IndexType::Scalar,
+                Some("idx_a".into()),
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+
+        // Append 2 disjoint fragments of 100 rows.
+        Dataset::write(
+            RecordBatchIterator::new(vec![Ok(make_batch(400..600))], schema.clone()),
+            test_dir.as_str(),
+            Some(WriteParams {
+                max_rows_per_file: 100,
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset.checkout_latest().await.unwrap();
+
+        // Independent session B reads before v2.
+        let mut session_b = DatasetBuilder::from_uri(test_dir.as_str())
+            .with_session(Arc::new(Session::default()))
+            .load()
+            .await
+            .unwrap();
+
+        // v2 compacts only the 2 appended fragments into 1 fragment of 200 rows.
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 200,
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Independent session A reads after v2 (neither idx_a nor idx_f covers v2,
+        // so session A plans to keep v1 and drop v2).
+        let mut session_a = DatasetBuilder::from_uri(test_dir.as_str())
+            .with_session(Arc::new(Session::default()))
+            .load()
+            .await
+            .unwrap();
+
+        // Session B wins first: commits idx_b (built before v2) without touching FRI.
+        session_b
+            .create_index(
+                &["k"],
+                IndexType::Scalar,
+                Some("idx_b".into()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+
+        // Session A's stale cleanup must be refused with a retryable conflict instead
+        // of dropping v2 out from under idx_b.
+        let err = cleanup_frag_reuse_index(&mut session_a).await.unwrap_err();
+        assert!(
+            matches!(err, Error::RetryableCommitConflict { .. }),
+            "expected RetryableCommitConflict, got {err}"
+        );
+
+        let mut reopened = DatasetBuilder::from_uri(test_dir.as_str())
+            .with_session(Arc::new(Session::default()))
+            .load()
+            .await
+            .unwrap();
+        let fri = reopened
+            .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+            .await
+            .unwrap()
+            .unwrap();
+        let details = load_frag_reuse_index_details(&reopened, &fri)
+            .await
+            .unwrap();
+        assert_eq!(details.versions.len(), 2, "v2 must still be present");
+
+        // Re-running cleanup on the latest version succeeds as a no-op and keeps both versions.
+        cleanup_frag_reuse_index(&mut reopened).await.unwrap();
+        let fri_after = reopened
+            .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+            .await
+            .unwrap()
+            .unwrap();
+        let details_after = load_frag_reuse_index_details(&reopened, &fri_after)
+            .await
+            .unwrap();
+        assert_eq!(details_after.versions.len(), 2);
+
+        let indexed =
+            collect_i32_column(&reopened, "k", "k >= 420 AND k < 520", true, Some("idx_b")).await;
+        let full_scan =
+            collect_i32_column(&reopened, "k", "k >= 420 AND k < 520", false, None).await;
+        assert_eq!(indexed.len(), 100);
+        assert_eq!(indexed, full_scan);
+    }
+
+    #[rstest::rstest]
+    #[case::shared_session(true)]
+    #[case::independent_session(false)]
+    #[tokio::test]
+    async fn test_cleanup_v0_wins_first_conflicts_stale_create_index(#[case] shared_session: bool) {
+        let test_dir = lance_core::utils::tempfile::TempStrDir::default();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("i", DataType::Int32, false),
+            Field::new("j", DataType::Int32, false),
+            Field::new("k", DataType::Int32, false),
+        ]));
+        let make_batch = |range: std::ops::Range<i32>| {
+            let vals: Vec<i32> = range.collect();
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from(vals.clone())),
+                    Arc::new(Int32Array::from(vals.clone())),
+                    Arc::new(Int32Array::from(vals)),
+                ],
+            )
+            .unwrap()
+        };
+
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(make_batch(0..400))], schema.clone()),
+            test_dir.as_str(),
+            Some(WriteParams {
+                max_rows_per_file: 100,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        dataset
+            .create_index(
+                &["i"],
+                IndexType::Scalar,
+                Some("idx_a".into()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        dataset
+            .create_index(
+                &["j"],
+                IndexType::Scalar,
+                Some("idx_f".into()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+
+        // v1 compacts the first 4 fragments into 2 fragments of 200 rows.
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 200,
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Rebuild idx_a so only idx_f pins v1.
+        dataset
+            .create_index(
+                &["i"],
+                IndexType::Scalar,
+                Some("idx_a".into()),
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+
+        // Append 2 disjoint fragments of 100 rows.
+        Dataset::write(
+            RecordBatchIterator::new(vec![Ok(make_batch(400..600))], schema.clone()),
+            test_dir.as_str(),
+            Some(WriteParams {
+                max_rows_per_file: 100,
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset.checkout_latest().await.unwrap();
+
+        // Stale builder reads BEFORE v2, using either the SAME session (so the
+        // Rewrite transaction with in-memory `frag_reuse_index: Some(...)` is
+        // in its session cache) or an independent session.
+        let mut stale_builder = if shared_session {
+            dataset.clone()
+        } else {
+            DatasetBuilder::from_uri(test_dir.as_str())
+                .with_session(Arc::new(Session::default()))
+                .load()
+                .await
+                .unwrap()
+        };
+
+        // v2 compacts only the 2 appended fragments into 1 fragment of 200 rows.
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 200,
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Cleanup wins first and drops v2 (retaining only v1, which idx_f pins).
+        cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+        let fri = dataset
+            .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+            .await
+            .unwrap()
+            .unwrap();
+        let details = load_frag_reuse_index_details(&dataset, &fri).await.unwrap();
+        assert_eq!(details.versions.len(), 1, "cleanup should drop disjoint v2");
+
+        // Now stale_builder tries to commit an index covering the retired v2
+        // sources whose mapping was already dropped: must fail with a retryable
+        // conflict rather than publishing dangling fragment addresses.
+        let err = stale_builder
+            .create_index(
+                &["k"],
+                IndexType::Scalar,
+                Some("idx_b".into()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::RetryableCommitConflict { .. }),
+            "shared_session={shared_session}: expected RetryableCommitConflict, got {err}"
+        );
+
+        let reopened = DatasetBuilder::from_uri(test_dir.as_str())
+            .with_session(Arc::new(Session::default()))
+            .load()
+            .await
+            .unwrap();
+        assert!(
+            reopened
+                .load_index_by_name("idx_b")
+                .await
+                .unwrap()
+                .is_none(),
+            "conflicting stale index must not be committed"
+        );
+    }
+
+    #[derive(Default)]
+    struct BeforeFirstIndexCommit {
+        hook: Mutex<Option<BoxFuture<'static, ()>>>,
+        attempts: AtomicUsize,
+    }
+
+    impl std::fmt::Debug for BeforeFirstIndexCommit {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("BeforeFirstIndexCommit")
+                .finish_non_exhaustive()
+        }
+    }
+
+    #[async_trait]
+    impl CommitHandler for BeforeFirstIndexCommit {
+        async fn commit(
+            &self,
+            manifest: &mut Manifest,
+            indices: Option<Vec<IndexMetadata>>,
+            base_path: &object_store::path::Path,
+            object_store: &ObjectStore,
+            manifest_writer: ManifestWriter,
+            naming_scheme: ManifestNamingScheme,
+            transaction: Option<lance_table::format::Transaction>,
+        ) -> std::result::Result<ManifestLocation, CommitError> {
+            let is_index = transaction
+                .as_ref()
+                .and_then(|transaction| transaction.as_pb().operation.as_ref())
+                .is_some_and(|operation| matches!(operation, PbOperation::CreateIndex(_)));
+            if is_index {
+                self.attempts.fetch_add(1, Ordering::SeqCst);
+                let hook = self.hook.lock().unwrap().take();
+                if let Some(hook) = hook {
+                    hook.await;
+                }
+            }
+            ConditionalPutCommitHandler
+                .commit(
+                    manifest,
+                    indices,
+                    base_path,
+                    object_store,
+                    manifest_writer,
+                    naming_scheme,
+                    transaction,
+                )
+                .await
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_v0_slipping_between_index_check_and_write_preserves_query_correctness() {
+        let test_dir = lance_core::utils::tempfile::TempStrDir::default();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("i", DataType::Int32, false),
+            Field::new("j", DataType::Int32, false),
+            Field::new("k", DataType::Int32, false),
+        ]));
+        let make_batch = |range: std::ops::Range<i32>| {
+            let vals: Vec<i32> = range.collect();
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from(vals.clone())),
+                    Arc::new(Int32Array::from(vals.clone())),
+                    Arc::new(Int32Array::from(vals)),
+                ],
+            )
+            .unwrap()
+        };
+
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(make_batch(0..400))], schema.clone()),
+            test_dir.as_str(),
+            Some(WriteParams {
+                max_rows_per_file: 100,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        dataset
+            .create_index(
+                &["i"],
+                IndexType::Scalar,
+                Some("idx_a".into()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        dataset
+            .create_index(
+                &["j"],
+                IndexType::Scalar,
+                Some("idx_f".into()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 200,
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        dataset
+            .create_index(
+                &["i"],
+                IndexType::Scalar,
+                Some("idx_a".into()),
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+
+        Dataset::write(
+            RecordBatchIterator::new(vec![Ok(make_batch(400..600))], schema.clone()),
+            test_dir.as_str(),
+            Some(WriteParams {
+                max_rows_per_file: 100,
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset.checkout_latest().await.unwrap();
+
+        let uri = test_dir.as_str().to_string();
+        let race = Arc::new(BeforeFirstIndexCommit {
+            hook: Mutex::new(Some(Box::pin(async move {
+                let mut cleaner = DatasetBuilder::from_uri(&uri)
+                    .with_session(Arc::new(Session::default()))
+                    .load()
+                    .await
+                    .unwrap();
+                cleanup_frag_reuse_index(&mut cleaner).await.unwrap();
+            }))),
+            ..Default::default()
+        });
+        let mut stale_builder = DatasetBuilder::from_uri(test_dir.as_str())
+            .with_session(Arc::new(Session::default()))
+            .with_commit_handler(race.clone())
+            .load()
+            .await
+            .unwrap();
+
+        // v2 compacts only the 2 appended fragments into a new live output fragment;
+        // attempt 1 of stale_builder checks v2 while it is still in the FRI, then
+        // our commit hook runs cleanup (dropping v2) before attempt 1's write.
+        // Per Lance's untagged-v0 concurrent-reindex contract, attempt 2 commits
+        // with coverage disjoint from v2's live output (those rows fall back to
+        // scan until reindex) and queries remain 100% accurate.
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 200,
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        let v2_output_frag = dataset.manifest.max_fragment_id.unwrap();
+
+        stale_builder
+            .create_index(
+                &["k"],
+                IndexType::Scalar,
+                Some("idx_b".into()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(race.attempts.load(Ordering::SeqCst), 2);
+
+        let reopened = DatasetBuilder::from_uri(test_dir.as_str())
+            .with_session(Arc::new(Session::default()))
+            .load()
+            .await
+            .unwrap();
+        let idx_b = reopened.load_index_by_name("idx_b").await.unwrap().unwrap();
+        assert!(
+            !idx_b
+                .fragment_bitmap
+                .as_ref()
+                .unwrap()
+                .contains(v2_output_frag),
+            "trimmed v2 must not translate idx_b onto live fragment {v2_output_frag}"
+        );
+        let fri = reopened
+            .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+            .await
+            .unwrap()
+            .unwrap();
+        let details = load_frag_reuse_index_details(&reopened, &fri)
+            .await
+            .unwrap();
+        assert_eq!(details.versions.len(), 1);
+
+        // Queries covering rows moved by trimmed v2 must match full scan exactly.
+        let queried = collect_i32_column(&reopened, "k", "k >= 420 AND k < 520", true, None).await;
+        let full_scan =
+            collect_i32_column(&reopened, "k", "k >= 420 AND k < 520", false, None).await;
+        assert_eq!(queried.len(), 100);
+        assert_eq!(queried, full_scan);
     }
 
     #[tokio::test]
@@ -900,7 +1701,7 @@ pub(crate) mod tests {
                 is_index_remap_caught_up(
                     &frag_reuse_details.versions[0],
                     index,
-                    &reuse_chain_frag_bitmap(&frag_reuse_details.versions),
+                    &reuse_version_reaches(&frag_reuse_details.versions)[0],
                 )
                 .unwrap(),
                 "index {col}_idx was not caught up after remap"
@@ -1724,16 +2525,65 @@ pub(crate) mod tests {
             };
 
             let mut retained = vec![false; elements.len()];
-            let versions: Vec<lance_index::frag_reuse::FragReuseVersion> =
-                legacy_versions.iter().map(|(_, v)| v.clone()).collect();
-            let chain = reuse_chain_frag_bitmap(&versions);
-            for (element, version) in &legacy_versions {
-                let caught_up = indices
-                    .iter()
-                    .map(|index| is_index_remap_caught_up(version, index, &chain))
-                    .collect::<lance_core::Result<Vec<bool>>>();
-                if let Ok(caught_up) = caught_up {
-                    retained[*element] = !caught_up.into_iter().all(|ok| ok);
+            // Independent oracle for legacy seeds: sort legacy versions stably by
+            // dataset_version, compute each version's reach via direct set closure,
+            // and evaluate the caught-up rule without calling production helpers.
+            let mut legacy_order: Vec<usize> = (0..legacy_versions.len()).collect();
+            legacy_order.sort_by_key(|&i| legacy_versions[i].1.dataset_version);
+            for (pos, &i) in legacy_order.iter().enumerate() {
+                let (element, version) = &legacy_versions[i];
+                let mut frontier: std::collections::HashSet<u64> =
+                    version.new_frag_ids().into_iter().collect();
+                let mut reach: std::collections::HashSet<u64> =
+                    version.old_frag_ids().into_iter().collect();
+                reach.extend(frontier.iter().copied());
+                for &later_i in &legacy_order[pos + 1..] {
+                    for group in &legacy_versions[later_i].1.groups {
+                        if group.old_frags.iter().any(|f| frontier.contains(&f.id)) {
+                            for f in &group.new_frags {
+                                frontier.insert(f.id);
+                                reach.insert(f.id);
+                            }
+                        }
+                    }
+                }
+
+                let mut saw_corrupt = false;
+                let mut needs_version = false;
+                for index in indices {
+                    if is_system_index(index) {
+                        continue;
+                    }
+                    if let Some(bitmap) = &index.fragment_bitmap
+                        && reach.iter().all(|&id| !contains(bitmap, id))
+                    {
+                        continue;
+                    }
+                    if index.dataset_version <= version.dataset_version {
+                        needs_version = true;
+                        continue;
+                    }
+                    let Some(bitmap) = &index.fragment_bitmap else {
+                        continue;
+                    };
+                    for group in &version.groups {
+                        let hits = group
+                            .old_frags
+                            .iter()
+                            .filter(|f| contains(bitmap, f.id))
+                            .count();
+                        if hits > 0 {
+                            if hits != group.old_frags.len() {
+                                saw_corrupt = true;
+                            } else {
+                                needs_version = true;
+                            }
+                            break;
+                        }
+                    }
+                }
+                if !saw_corrupt && needs_version {
+                    retained[*element] = true;
                 }
             }
 

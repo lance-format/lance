@@ -966,9 +966,8 @@ async fn test_defer_index_remap_records_and_trims_unindexed_data() {
     );
 }
 /// Recording unindexed groups must not pin the history behind an index that
-/// lags it (#7774): uncovered versions trim without a remap, and in a mixed
-/// history they trim with the covered versions once the lagging index is
-/// remapped.
+/// lags it (#7774): uncovered versions trim without a remap, even alongside a
+/// covered version still pinned by the lagging index.
 #[tokio::test]
 async fn test_unindexed_records_trim_behind_a_lagging_index() {
     let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
@@ -1044,7 +1043,8 @@ async fn test_unindexed_records_trim_behind_a_lagging_index() {
     assert_eq!(versions(&dataset).await, 0);
 
     // A covered version (the indexed base folds pairwise), then an uncovered
-    // one: both stay while the index lags, and both go once it is remapped.
+    // one: the uncovered version trims while the lagging index keeps the
+    // covered one, and the covered one goes once it is remapped.
     compact_files(&mut dataset, deferred(200), None)
         .await
         .unwrap();
@@ -1060,8 +1060,25 @@ async fn test_unindexed_records_trim_behind_a_lagging_index() {
         .await
         .unwrap();
     assert_eq!(versions(&dataset).await, 2);
+    let covered_version = dataset
+        .frag_reuse_index()
+        .await
+        .unwrap()
+        .unwrap()
+        .details
+        .versions[0]
+        .dataset_version;
     cleanup_frag_reuse_index(&mut dataset).await.unwrap();
-    assert_eq!(versions(&dataset).await, 2);
+    let kept_versions = dataset
+        .frag_reuse_index()
+        .await
+        .unwrap()
+        .unwrap()
+        .details
+        .versions
+        .clone();
+    assert_eq!(kept_versions.len(), 1);
+    assert_eq!(kept_versions[0].dataset_version, covered_version);
     remapping::remap_column_index(&mut dataset, &["i"], Some("i_idx".into()))
         .await
         .unwrap();
