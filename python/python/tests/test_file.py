@@ -258,6 +258,11 @@ def test_take(tmp_path):
     # Can't read out of range
     with pytest.raises(ValueError):
         reader.take_rows([0, 100]).to_table()
+    # Indices beyond u32 must be rejected, not wrapped around to another row.
+    with pytest.raises(ValueError, match="up to 4294967295, got 4294967299"):
+        reader.take_rows([0, 2**32 + 3]).to_table()
+    with pytest.raises(ValueError, match="up to 4294967295, got 4294967373"):
+        reader.take_rows([2**32 + 77]).to_table()
 
     table = reader.take_rows([0, 77, 83]).to_table()
     assert table == pa.table({"a": [0, 77, 83]})

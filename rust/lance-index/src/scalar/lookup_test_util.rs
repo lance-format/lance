@@ -9,8 +9,10 @@ use std::sync::Arc;
 use arrow_array::cast::AsArray;
 use arrow_array::types::{UInt32Type, UInt64Type};
 use arrow_array::{ArrayRef, RecordBatch, UInt64Array};
+use async_trait::async_trait;
 use futures::TryStreamExt;
 use lance_core::Result;
+use lance_index_core::remapping::BatchRowIdRemapper;
 use lance_select::RowAddrTreeMap;
 use roaring::RoaringTreemap;
 
@@ -110,5 +112,14 @@ impl RowIdRemapper for CompactedToFragmentOne {
             .collect::<std::result::Result<Vec<_>, _>>()?;
         columns[row_id_idx] = Arc::new(UInt64Array::from(row_ids));
         Ok(RecordBatch::try_new(batch.schema(), columns)?)
+    }
+}
+
+/// Also usable as a batch translator: the same move-and-drop mapping is applied to a whole
+/// slice of row addresses at once.
+#[async_trait]
+impl BatchRowIdRemapper for CompactedToFragmentOne {
+    async fn remap_row_ids(&self, row_ids: &[u64]) -> Result<Vec<Option<u64>>> {
+        Ok(row_ids.iter().map(|&row| self.remap_row_id(row)).collect())
     }
 }

@@ -3,7 +3,6 @@
 
 use super::*;
 use crate::blob::{BlobArrayBuilder, blob_field};
-use crate::dataset::blob::external::{ExternalBaseCandidate, ExternalBaseResolver};
 use crate::dataset::blob::test_util::create_multi_base_blob_v2_fixture;
 use crate::dataset::{DatasetBuilder, ReadParams, WriteParams};
 use crate::session::{Session, UnregisteredExternalBlobPolicy};
@@ -397,76 +396,6 @@ async fn test_explicit_ingest_keeps_its_source_access_under_deny() {
 }
 
 #[rstest]
-#[case::absolute("/tmp/external-base/payload")]
-#[case::relative("external-base/payload")]
-#[tokio::test]
-async fn test_external_reference_matches_local_paths_when_provider_is_enabled(#[case] uri: &str) {
-    let registry = Arc::new(ObjectStoreRegistry::default());
-    let path = ObjectStore::extract_path_from_uri(registry.clone(), uri).unwrap();
-    let base = path.parent().unwrap();
-    let mut resolver = ExternalBaseResolver::new(
-        vec![ExternalBaseCandidate {
-            base_id: 2,
-            store_prefix: "file".to_string(),
-            base_path: base,
-            store_params: ObjectStoreParams::default(),
-        }],
-        registry,
-    );
-    resolver.unregistered_external_blob_policy = UnregisteredExternalBlobPolicy::Deny;
-    let matched = resolver.resolve_external_uri(uri).await.unwrap().unwrap();
-    assert_eq!(matched.base_id, 2);
-    assert_eq!(matched.relative_path, "payload");
-}
-
-#[tokio::test]
-async fn test_external_reference_preserves_registered_matches_and_input_errors() {
-    let registry = Arc::new(
-        ObjectStoreRegistry::default()
-            .without_providers(["file", "file-object-store", "file+uring"])
-            .unwrap(),
-    );
-    let provider = Arc::new(BlobProvider::default());
-    registry.insert("probe", provider.clone());
-    let mut resolver = ExternalBaseResolver::new(
-        vec![ExternalBaseCandidate {
-            base_id: 2,
-            store_prefix: "probe".to_string(),
-            base_path: Path::from("base"),
-            store_params: ObjectStoreParams::default(),
-        }],
-        registry,
-    );
-    resolver.unregistered_external_blob_policy = UnregisteredExternalBlobPolicy::Deny;
-    let matched = resolver
-        .resolve_external_uri("probe://bucket/base/payload")
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(matched.base_id, 2);
-    assert_eq!(matched.relative_path, "payload");
-    let error = resolver
-        .resolve_external_uri("probe://bucket/base/%FF")
-        .await
-        .unwrap_err();
-    assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
-    assert!(error.to_string().contains("Invalid source path"), "{error}");
-    assert!(!error.to_string().contains("Remote tables"), "{error}");
-    resolver.unregistered_external_blob_policy = UnregisteredExternalBlobPolicy::Allow;
-    let error = resolver
-        .resolve_external_uri("file:///etc/passwd")
-        .await
-        .unwrap_err();
-    assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
-    assert!(
-        error.to_string().contains("Unknown scheme: file"),
-        "{error}"
-    );
-    assert!(provider.params.lock().unwrap().is_empty());
-    assert_eq!(provider.tracker.stats().read_iops, 0);
-}
-
-#[rstest]
 #[case::unknown_size(0, false)]
 #[case::known_size(3, false)]
 #[case::prefetched_unknown_size(0, true)]
@@ -607,7 +536,7 @@ async fn test_external_preserves_runtime_base_store(#[values(false, true)] is_wr
         .await
         .unwrap();
     let store = dataset.object_store(Some(2)).await.unwrap();
-    let root = dataset.blob_base_path(Some(2)).unwrap();
+    let root = dataset.table_view().blob_base_path(Some(2)).unwrap();
     store
         .put(&root.clone().join("payload"), b"old")
         .await

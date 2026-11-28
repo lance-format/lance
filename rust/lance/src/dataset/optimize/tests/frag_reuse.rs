@@ -4,8 +4,8 @@
 //! Compaction tests for the frag reuse contract area.
 
 use super::*;
-use crate::dataset::optimize::commit::reserve_fragment_ids;
-use crate::dataset::optimize::execution::{can_use_binary_copy, live_row_addrs};
+use lance_table_runtime::optimize::commit::reserve_fragment_ids;
+use lance_table_runtime::optimize::execution::live_row_addrs;
 
 // Regression test for https://github.com/lancedb/lance/issues/6161
 // When FragReuseIndexDetails exceeds 204800 bytes it is written to an external
@@ -662,7 +662,7 @@ async fn test_recording_refuses_moves_it_cannot_pair() {
     fragments.reverse();
     let mut rewritten = fragments.clone();
     rewritten[0].physical_rows = Some(9);
-    let error = live_row_addrs(&dataset, &fragments, &rewritten)
+    let error = live_row_addrs(&dataset.table_view().to_table(), &fragments, &rewritten)
         .await
         .unwrap_err();
     assert!(
@@ -780,9 +780,13 @@ async fn test_defer_index_remap() {
             .iter_mut()
             .flat_map(|r| r.new_fragments.iter_mut())
             .collect();
-        reserve_fragment_ids(&dataset2, frags.into_iter())
-            .await
-            .unwrap();
+        reserve_fragment_ids(
+            &dataset2.table_view().to_table(),
+            frags.into_iter(),
+            &LanceCompactionHooks::new(&dataset2, None).runtime(),
+        )
+        .await
+        .unwrap();
     }
 
     // Build expected values by transposing using the immediate results

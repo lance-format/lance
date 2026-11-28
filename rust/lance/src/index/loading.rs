@@ -6,8 +6,11 @@
 // These helpers stay crate-visible so callers do not depend on private parameter types.
 #![allow(clippy::redundant_pub_crate)]
 
+use super::field_dependencies::input_field_ids;
+
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Instant;
 
 use arrow_schema::{DataType, Field as ArrowField, Fields};
 use async_trait::async_trait;
@@ -770,16 +773,23 @@ impl Dataset {
         // other segments registered under the same name, because a search opens
         // every segment of the name a parser reports and asks all of them.
         let mut pending_parsers = Vec::new();
-        for index in indices.iter().filter(|idx| {
-            if ignored_index_names.contains(&idx.name) {
-                return false;
+        for index in indices {
+            if ignored_index_names.contains(&index.name) {
+                continue;
             }
-            if idx.keyed_fields().len() > 1 && !registers_planners {
-                return false;
+            let input_fields = match input_field_ids(index) {
+                Ok(fields) => fields,
+                Err(error) => {
+                    log::warn!("Skipping index '{}': {error}", index.name);
+                    continue;
+                }
+            };
+            if input_fields.len() > 1 && !registers_planners {
+                continue;
             }
 
             // Check if this is an FTS index by looking at index details
-            let is_fts_index = if let Some(details) = &idx.index_details {
+            let is_fts_index = if let Some(details) = &index.index_details {
                 IndexDetails(details.clone()).supports_fts()
             } else {
                 false
@@ -787,18 +797,16 @@ impl Dataset {
 
             // Only include indices with non-empty fragment bitmaps, except for FTS indices
             // which need to be discoverable even when empty
-            let has_non_empty_bitmap = idx.fragment_bitmap.as_ref().is_some_and(|bitmap| {
+            let has_non_empty_bitmap = index.fragment_bitmap.as_ref().is_some_and(|bitmap| {
                 !bitmap.is_empty()
                     && !(bitmap & self.table_state.fragment_bitmap.as_ref()).is_empty()
             });
 
-            // Same name-collision rationale as `CreateIndexBuilder`'s
-            // default-name loop in create.rs: only the keyed prefix decides
-            // which column this index answers for.
-            !idx.keyed_fields().is_empty() && (has_non_empty_bitmap || is_fts_index)
-        }) {
-            let keyed_columns = index
-                .keyed_fields()
+            // Dependencies and carried columns do not add query inputs.
+            if input_fields.is_empty() || !(has_non_empty_bitmap || is_fts_index) {
+                continue;
+            }
+            let keyed_columns = input_fields
                 .iter()
                 .map(|&field_id| {
                     schema.field_by_id(field_id).ok_or_else(|| {
@@ -1151,6 +1159,7 @@ impl Dataset {
             return Ok(cached.0.clone());
         }
 
+        let prepare_start = Instant::now();
         // Only legacy vector file readers consume the V1 handle. A tagged
         // history is handled by the shared remapper above, including identity.
         let has_tagged_history = load_all_indices(self)
@@ -1207,7 +1216,7 @@ impl Dataset {
             minor_version,
         ) {
             (0, 1) | (0, 0) => {
-                info!(target: TRACE_IO_EVENTS, index_uuid=%uuid, r#type=IO_TYPE_OPEN_VECTOR, version="0.1", index_type="IVF_PQ");
+                info!(target: TRACE_IO_EVENTS, index_uuid=%uuid, r#type=IO_TYPE_OPEN_VECTOR, prepare_us=i64::try_from(prepare_start.elapsed().as_micros()).unwrap_or(i64::MAX), version="0.1", index_type="IVF_PQ");
                 let proto = open_index_proto(reader.as_ref()).await?;
                 match &proto.implementation {
                     Some(Implementation::VectorIndex(vector_index)) => {
@@ -1229,7 +1238,7 @@ impl Dataset {
             }
 
             (0, 2) => {
-                info!(target: TRACE_IO_EVENTS, index_uuid=%uuid, r#type=IO_TYPE_OPEN_VECTOR, version="0.2", index_type="IVF_PQ");
+                info!(target: TRACE_IO_EVENTS, index_uuid=%uuid, r#type=IO_TYPE_OPEN_VECTOR, prepare_us=i64::try_from(prepare_start.elapsed().as_micros()).unwrap_or(i64::MAX), version="0.2", index_type="IVF_PQ");
                 let reader = V1FileReader::try_new_self_described_from_reader(
                     lazy_reader,
                     Some(
@@ -1261,7 +1270,7 @@ impl Dataset {
 
                 let (_, element_type) = get_vector_type(self.schema(), &field_path)?;
 
-                info!(target: TRACE_IO_EVENTS, index_uuid=%uuid, r#type=IO_TYPE_OPEN_VECTOR, version="0.3", index_type=index_metadata.index_type);
+                info!(target: TRACE_IO_EVENTS, index_uuid=%uuid, r#type=IO_TYPE_OPEN_VECTOR, prepare_us=i64::try_from(prepare_start.elapsed().as_micros()).unwrap_or(i64::MAX), version="0.3", index_type=index_metadata.index_type);
 
                 match index_metadata.index_type.as_str() {
                     "IVF_FLAT" => match element_type {
@@ -1825,11 +1834,9 @@ impl DatasetIndexInternalExt for Dataset {
                 ))
             })?;
 
-        // Only the keyed prefix matters here. The rebuild below writes fresh,
-        // non-covered metadata and never reads the carried columns, so requiring
-        // them to exist and type-match would reject a target that can hold this
-        // index perfectly well.
-        let keyed_fields = source_index.keyed_fields();
+        // Rebuild from the query inputs. The target build records its own field
+        // IDs for additional dependencies and does not read carried columns.
+        let keyed_fields = input_field_ids(source_index)?;
         let mut field_paths = Vec::with_capacity(keyed_fields.len());
         for field_id in keyed_fields.iter() {
             let source_field = source_dataset

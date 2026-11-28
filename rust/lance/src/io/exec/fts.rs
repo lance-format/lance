@@ -879,6 +879,73 @@ mod tests {
         assert!(error.to_string().contains("requires one input"));
     }
 
+    /// Re-cutting both legs of a corpus owner widens its output and keeps the
+    /// scorer binding the owner checks at execution.
+    #[tokio::test]
+    async fn test_corpus_legs_with_limit_keep_shared_scorer() {
+        use datafusion::common::tree_node::{Transformed, TreeNode};
+        use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
+
+        let dataset = indexed_match_dataset().await;
+        let query = MatchQuery::new("alpha beta".to_string())
+            .with_column(Some("text".to_string()))
+            .with_document_granularity(DocumentGranularity::Row);
+        let params = FtsSearchParams::default().with_limit(Some(1));
+        let residual = memory_input(
+            record_batch!(
+                ("text", Utf8, vec!["alpha"; 4]),
+                (ROW_ID, UInt64, (100..104).collect::<Vec<u64>>())
+            )
+            .unwrap(),
+        );
+        let shared = Arc::new(SharedFtsScorer::new());
+        let indexed = Arc::new(
+            MatchQueryExec::new(
+                dataset.clone(),
+                query.clone(),
+                params.clone(),
+                PreFilterSource::None,
+            )
+            .unwrap()
+            .with_shared_scorer(shared.clone()),
+        );
+        let flat = Arc::new(
+            FlatMatchQueryExec::new(dataset, query, params, residual)
+                .unwrap()
+                .with_shared_scorer(shared.clone()),
+        );
+        let union = UnionExec::try_new(vec![indexed, flat]).unwrap();
+        let owner: Arc<dyn ExecutionPlan> = Arc::new(SharedFtsScorerExec::new(
+            Arc::new(CoalescePartitionsExec::new(union)),
+            shared,
+        ));
+        // The flat leg emits every match and leaves the cut to the consumer, so
+        // only the indexed leg's limit shows: one indexed row plus four residual.
+        assert_eq!(execute_results(owner.as_ref()).await.unwrap().len(), 5);
+
+        let widened = owner
+            .transform_up(|plan| {
+                if let Some(m) = plan.downcast_ref::<MatchQueryExec>() {
+                    return Ok(Transformed::yes(
+                        Arc::new(m.with_limit(10)) as Arc<dyn ExecutionPlan>
+                    ));
+                }
+                if let Some(m) = plan.downcast_ref::<FlatMatchQueryExec>() {
+                    let widened_flat = m.with_limit(10);
+                    assert!(widened_flat.has_shared_scorer());
+                    assert_eq!(widened_flat.params().limit, Some(10));
+                    return Ok(Transformed::yes(
+                        Arc::new(widened_flat) as Arc<dyn ExecutionPlan>
+                    ));
+                }
+                Ok(Transformed::no(plan))
+            })
+            .unwrap()
+            .data;
+        // Both indexed rows match `alpha beta` once the indexed leg widens.
+        assert_eq!(execute_results(widened.as_ref()).await.unwrap().len(), 6);
+    }
+
     #[derive(Debug, Clone, Copy)]
     pub(super) enum ResidualFailure {
         Execute,

@@ -4,7 +4,11 @@
 use std::num::NonZeroU32;
 use std::ops::Range;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
+use std::time::{Duration, Instant};
 
 use arrow_array::{RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field as ArrowField};
@@ -17,13 +21,228 @@ use lance_arrow::RecordBatchExt;
 use lance_arrow::json::convert_lance_json_to_arrow;
 use lance_core::ROW_ADDR;
 use lance_core::datatypes::Schema;
+use lance_core::utils::io_stats::IoStatsRecorder;
 use lance_datafusion::projection::{OutputColumn, ProjectionPlan};
 use lance_table_runtime::{Table, TakeOptions, TakeProjection, TakeSelection};
+use tracing::Span;
 
 use super::{
     Dataset, ProjectionRequest, fragment::FileFragment, scanner::DatasetRecordBatchStream,
 };
 use crate::{Error, Result};
+
+#[derive(Debug, Default)]
+struct TakeIoStats {
+    fragments_selected: AtomicU64,
+    logical_ranges: AtomicU64,
+    logical_requested_bytes: AtomicU64,
+    logical_union_bytes: AtomicU64,
+    physical_iops: AtomicU64,
+    scheduler_requests: AtomicU64,
+    physical_bytes: AtomicU64,
+    cloud_reader_attempts: AtomicU64,
+    cloud_reader_failed_attempts: AtomicU64,
+    cloud_reader_body_bytes: AtomicU64,
+    active_reads: AtomicU64,
+    peak_active_reads: AtomicU64,
+    max_queue_time_ns: AtomicU64,
+    max_read_time_ns: AtomicU64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TakeIoSnapshot {
+    fragments_selected: u64,
+    logical_ranges: u64,
+    logical_requested_bytes: u64,
+    logical_union_bytes: u64,
+    physical_iops: u64,
+    scheduler_requests: u64,
+    physical_bytes: u64,
+    cloud_reader_attempts: u64,
+    cloud_reader_failed_attempts: u64,
+    cloud_reader_body_bytes: u64,
+    peak_active_reads: u64,
+    max_queue_time_ns: u64,
+    max_read_time_ns: u64,
+}
+
+struct TakeTraceGuard {
+    span: Span,
+    stats: Arc<TakeIoStats>,
+    started_at: Instant,
+    outcome: &'static str,
+    is_recorded: bool,
+}
+
+fn duration_ns(duration: Duration) -> u64 {
+    duration.as_nanos().min(u64::MAX as u128) as u64
+}
+
+impl TakeIoStats {
+    fn snapshot(&self) -> TakeIoSnapshot {
+        TakeIoSnapshot {
+            fragments_selected: self.fragments_selected.load(Ordering::Relaxed),
+            logical_ranges: self.logical_ranges.load(Ordering::Relaxed),
+            logical_requested_bytes: self.logical_requested_bytes.load(Ordering::Relaxed),
+            logical_union_bytes: self.logical_union_bytes.load(Ordering::Relaxed),
+            physical_iops: self.physical_iops.load(Ordering::Relaxed),
+            scheduler_requests: self.scheduler_requests.load(Ordering::Relaxed),
+            physical_bytes: self.physical_bytes.load(Ordering::Relaxed),
+            cloud_reader_attempts: self.cloud_reader_attempts.load(Ordering::Relaxed),
+            cloud_reader_failed_attempts: self.cloud_reader_failed_attempts.load(Ordering::Relaxed),
+            cloud_reader_body_bytes: self.cloud_reader_body_bytes.load(Ordering::Relaxed),
+            peak_active_reads: self.peak_active_reads.load(Ordering::Relaxed),
+            max_queue_time_ns: self.max_queue_time_ns.load(Ordering::Relaxed),
+            max_read_time_ns: self.max_read_time_ns.load(Ordering::Relaxed),
+        }
+    }
+}
+
+impl IoStatsRecorder for TakeIoStats {
+    fn record_fragments_selected(&self, count: usize) {
+        self.fragments_selected
+            .store(count as u64, Ordering::Relaxed);
+    }
+
+    fn record_request(&self, ranges: &[Range<u64>]) {
+        self.record_request_transform(ranges, ranges);
+    }
+
+    fn record_request_transform(
+        &self,
+        logical_ranges: &[Range<u64>],
+        physical_ranges: &[Range<u64>],
+    ) {
+        self.scheduler_requests.fetch_add(1, Ordering::Relaxed);
+        self.logical_ranges
+            .fetch_add(logical_ranges.len() as u64, Ordering::Relaxed);
+        self.logical_requested_bytes
+            .fetch_add(ranges_bytes(logical_ranges), Ordering::Relaxed);
+        self.logical_union_bytes
+            .fetch_add(union_bytes(logical_ranges), Ordering::Relaxed);
+        self.physical_iops
+            .fetch_add(physical_ranges.len() as u64, Ordering::Relaxed);
+        self.physical_bytes
+            .fetch_add(ranges_bytes(physical_ranges), Ordering::Relaxed);
+    }
+
+    fn record_cloud_reader_attempt(&self, body_bytes: u64, failed: bool) {
+        self.cloud_reader_attempts.fetch_add(1, Ordering::Relaxed);
+        self.cloud_reader_body_bytes
+            .fetch_add(body_bytes, Ordering::Relaxed);
+        if failed {
+            self.cloud_reader_failed_attempts
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn records_cloud_reader_attempts(&self) -> bool {
+        true
+    }
+
+    fn records_read_lifecycle(&self) -> bool {
+        true
+    }
+
+    fn record_read_started(&self, queue_time: Duration) {
+        let active = self.active_reads.fetch_add(1, Ordering::Relaxed) + 1;
+        self.peak_active_reads.fetch_max(active, Ordering::Relaxed);
+        self.max_queue_time_ns
+            .fetch_max(duration_ns(queue_time), Ordering::Relaxed);
+    }
+
+    fn record_read_completed(&self, read_time: Duration) {
+        self.active_reads.fetch_sub(1, Ordering::Relaxed);
+        self.max_read_time_ns
+            .fetch_max(duration_ns(read_time), Ordering::Relaxed);
+    }
+}
+
+fn ranges_bytes(ranges: &[Range<u64>]) -> u64 {
+    ranges.iter().fold(0_u64, |total, range| {
+        total.saturating_add(range.end.saturating_sub(range.start))
+    })
+}
+
+fn union_bytes(ranges: &[Range<u64>]) -> u64 {
+    let Some(first) = ranges.first() else {
+        return 0;
+    };
+    let mut total = 0_u64;
+    let mut current = first.clone();
+    for range in &ranges[1..] {
+        if range.start <= current.end {
+            current.end = current.end.max(range.end);
+        } else {
+            total = total.saturating_add(current.end.saturating_sub(current.start));
+            current = range.clone();
+        }
+    }
+    total.saturating_add(current.end.saturating_sub(current.start))
+}
+
+impl TakeTraceGuard {
+    fn new(span: Span) -> Self {
+        Self {
+            span,
+            stats: Arc::new(TakeIoStats::default()),
+            started_at: Instant::now(),
+            outcome: "cancelled",
+            is_recorded: false,
+        }
+    }
+
+    fn stats(&self) -> Arc<TakeIoStats> {
+        self.stats.clone()
+    }
+
+    fn finish<T>(&mut self, result: &Result<T>) {
+        self.outcome = if result.is_ok() { "ok" } else { "error" };
+        self.record();
+    }
+
+    fn record(&mut self) {
+        if self.is_recorded {
+            return;
+        }
+        let stats = self.stats.snapshot();
+        self.span
+            .record("fragments_selected", stats.fragments_selected);
+        self.span.record("logical_ranges", stats.logical_ranges);
+        self.span
+            .record("logical_requested_bytes", stats.logical_requested_bytes);
+        self.span
+            .record("logical_union_bytes", stats.logical_union_bytes);
+        self.span.record("physical_iops", stats.physical_iops);
+        self.span
+            .record("scheduler_requests", stats.scheduler_requests);
+        self.span.record("physical_bytes", stats.physical_bytes);
+        self.span
+            .record("cloud_reader_attempts", stats.cloud_reader_attempts);
+        self.span.record(
+            "cloud_reader_failed_attempts",
+            stats.cloud_reader_failed_attempts,
+        );
+        self.span
+            .record("cloud_reader_body_bytes", stats.cloud_reader_body_bytes);
+        self.span
+            .record("peak_active_reads", stats.peak_active_reads);
+        self.span
+            .record("max_scheduler_queue_time_ns", stats.max_queue_time_ns);
+        self.span
+            .record("max_child_read_time_ns", stats.max_read_time_ns);
+        self.span
+            .record("elapsed_ns", duration_ns(self.started_at.elapsed()));
+        self.span.record("outcome", self.outcome);
+        self.is_recorded = true;
+    }
+}
+
+impl Drop for TakeTraceGuard {
+    fn drop(&mut self) {
+        self.record();
+    }
+}
 
 pub async fn row_offsets_to_row_addresses(
     fragments: &[FileFragment],
@@ -40,8 +259,9 @@ pub async fn take(
     dataset: &Dataset,
     offsets: &[u64],
     projection: ProjectionRequest,
+    span: Option<Span>,
 ) -> Result<RecordBatch> {
-    take_with_io_parallelism(dataset, offsets, projection, None).await
+    take_with_io_parallelism(dataset, offsets, projection, None, span).await
 }
 
 pub async fn take_with_io_parallelism(
@@ -49,6 +269,23 @@ pub async fn take_with_io_parallelism(
     offsets: &[u64],
     projection: ProjectionRequest,
     io_parallelism: Option<u32>,
+    span: Option<Span>,
+) -> Result<RecordBatch> {
+    let mut trace = span.map(TakeTraceGuard::new);
+    let io_stats = trace.as_ref().map(TakeTraceGuard::stats);
+    let result = execute_take(dataset, offsets, projection, io_parallelism, io_stats).await;
+    if let Some(trace) = trace.as_mut() {
+        trace.finish(&result);
+    }
+    result
+}
+
+async fn execute_take(
+    dataset: &Dataset,
+    offsets: &[u64],
+    projection: ProjectionRequest,
+    io_parallelism: Option<u32>,
+    io_stats: Option<Arc<TakeIoStats>>,
 ) -> Result<RecordBatch> {
     let io_parallelism = io_parallelism
         .map(|limit| {
@@ -60,8 +297,17 @@ pub async fn take_with_io_parallelism(
     let table = dataset.table_view().to_table();
     match projection {
         ProjectionRequest::Schema(schema) => {
+            let projection = TakeProjection::try_new(Arc::new(table.clone()), &schema)?;
             table
-                .take_with_io_parallelism(offsets, &schema, io_parallelism)
+                .take_with_options_with_io_stats(
+                    TakeSelection::Indices(offsets),
+                    &projection,
+                    TakeOptions {
+                        io_parallelism,
+                        ..Default::default()
+                    },
+                    io_stats.map(|stats| stats as Arc<dyn IoStatsRecorder>),
+                )
                 .await
         }
         projection @ ProjectionRequest::Sql(_) => {
@@ -74,6 +320,7 @@ pub async fn take_with_io_parallelism(
                     io_parallelism,
                     ..Default::default()
                 },
+                io_stats,
             )
             .await
         }
@@ -85,13 +332,15 @@ async fn take_expressions(
     selection: TakeSelection<'_>,
     mut projection: Arc<ProjectionPlan>,
     options: TakeOptions,
+    io_stats: Option<Arc<TakeIoStats>>,
 ) -> Result<RecordBatch> {
     let batch = table
-        .take_physical(
+        .take_physical_with_io_stats(
             selection,
             &projection.physical_projection,
             projection.must_add_row_offset,
             options,
+            io_stats.map(|stats| stats as Arc<dyn IoStatsRecorder>),
         )
         .await?;
     let Some(batch) = batch else {
@@ -309,7 +558,7 @@ impl TakeBuilder {
                     .await
             }
             TakeOutput::Expressions(projection) => {
-                take_expressions(&table, selection, projection, options).await
+                take_expressions(&table, selection, projection, options, None).await
             }
         }
     }
@@ -339,21 +588,193 @@ mod test {
     use lance_core::utils::testing::{ProxyObjectStore, ProxyObjectStorePolicy};
     use lance_core::{ROW_ADDR_FIELD, ROW_ID_FIELD};
     use lance_file::version::LanceFileVersion;
+    use lance_io::object_store::{ObjectStore as LanceObjectStore, WrappingObjectStore};
     use lance_io::stream::RecordBatchStream;
     use object_store::throttle::{ThrottleConfig, ThrottledStore};
     use pretty_assertions::assert_eq;
     use rstest::rstest;
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
+    use tracing::{
+        Id, Subscriber,
+        field::{Field, Visit},
+        span::{Attributes, Record},
+    };
+    use tracing_subscriber::{
+        Layer,
+        filter::LevelFilter,
+        layer::{Context, SubscriberExt},
+    };
 
     use crate::dataset::{
         MergeInsertBuilder, UpdateBuilder, WhenMatched, WhenNotMatched, WriteParams,
         scanner::test_dataset::TestVectorDataset,
     };
+    use crate::utils::test::ThrottledStoreWrapper;
 
     use super::*;
+
+    const TAKE_SUMMARY_FIELDS: [&str; 16] = [
+        "num_rows",
+        "fragments_selected",
+        "logical_ranges",
+        "logical_requested_bytes",
+        "logical_union_bytes",
+        "physical_iops",
+        "scheduler_requests",
+        "physical_bytes",
+        "cloud_reader_attempts",
+        "cloud_reader_failed_attempts",
+        "cloud_reader_body_bytes",
+        "peak_active_reads",
+        "max_scheduler_queue_time_ns",
+        "max_child_read_time_ns",
+        "elapsed_ns",
+        "outcome",
+    ];
+
+    #[derive(Debug, Default)]
+    struct CapturedTakeSpan {
+        field_names: Vec<String>,
+        values: BTreeMap<String, String>,
+        record_counts: BTreeMap<String, usize>,
+    }
+
+    #[derive(Debug, Default)]
+    struct TakeSpanState {
+        open: HashMap<Id, CapturedTakeSpan>,
+        closed: Vec<CapturedTakeSpan>,
+    }
+
+    #[derive(Clone, Debug, Default)]
+    struct TakeSpanCapture(Arc<Mutex<TakeSpanState>>);
+
+    type LightweightTakeSpan = (String, Vec<String>, BTreeMap<String, String>);
+
+    #[derive(Clone, Debug, Default)]
+    struct LightweightTakeSpanCapture(Arc<Mutex<Vec<LightweightTakeSpan>>>);
+
+    struct FieldCapture<'a> {
+        values: &'a mut BTreeMap<String, String>,
+        record_counts: &'a mut BTreeMap<String, usize>,
+    }
+
+    impl Visit for FieldCapture<'_> {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            self.values.insert(
+                field.name().to_string(),
+                format!("{value:?}").trim_matches('"').to_string(),
+            );
+            *self
+                .record_counts
+                .entry(field.name().to_string())
+                .or_default() += 1;
+        }
+
+        fn record_u64(&mut self, field: &Field, value: u64) {
+            self.values
+                .insert(field.name().to_string(), value.to_string());
+            *self
+                .record_counts
+                .entry(field.name().to_string())
+                .or_default() += 1;
+        }
+
+        fn record_str(&mut self, field: &Field, value: &str) {
+            self.values
+                .insert(field.name().to_string(), value.to_string());
+            *self
+                .record_counts
+                .entry(field.name().to_string())
+                .or_default() += 1;
+        }
+    }
+
+    impl<S> Layer<S> for TakeSpanCapture
+    where
+        S: Subscriber,
+    {
+        fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, _ctx: Context<'_, S>) {
+            if attrs.metadata().name() != "take_io" {
+                return;
+            }
+            let mut span = CapturedTakeSpan {
+                field_names: attrs
+                    .metadata()
+                    .fields()
+                    .iter()
+                    .map(|field| field.name().to_string())
+                    .collect(),
+                ..Default::default()
+            };
+            attrs.record(&mut FieldCapture {
+                values: &mut span.values,
+                record_counts: &mut span.record_counts,
+            });
+            self.0.lock().unwrap().open.insert(id.clone(), span);
+        }
+
+        fn on_record(&self, id: &Id, values: &Record<'_>, _ctx: Context<'_, S>) {
+            let mut state = self.0.lock().unwrap();
+            let Some(span) = state.open.get_mut(id) else {
+                return;
+            };
+            values.record(&mut FieldCapture {
+                values: &mut span.values,
+                record_counts: &mut span.record_counts,
+            });
+        }
+
+        fn on_close(&self, id: Id, _ctx: Context<'_, S>) {
+            let mut state = self.0.lock().unwrap();
+            if let Some(span) = state.open.remove(&id) {
+                state.closed.push(span);
+            }
+        }
+    }
+
+    impl TakeSpanCapture {
+        fn take_spans(&self) -> Vec<CapturedTakeSpan> {
+            let mut state = self.0.lock().unwrap();
+            std::mem::take(&mut state.closed)
+        }
+    }
+
+    impl<S> Layer<S> for LightweightTakeSpanCapture
+    where
+        S: Subscriber,
+    {
+        fn on_new_span(&self, attrs: &Attributes<'_>, _id: &Id, _ctx: Context<'_, S>) {
+            let name = attrs.metadata().name();
+            if name != "take" && name != "take_with_io_parallelism" {
+                return;
+            }
+            let mut values = BTreeMap::new();
+            let mut record_counts = BTreeMap::new();
+            attrs.record(&mut FieldCapture {
+                values: &mut values,
+                record_counts: &mut record_counts,
+            });
+            self.0.lock().unwrap().push((
+                name.to_string(),
+                attrs
+                    .metadata()
+                    .fields()
+                    .iter()
+                    .map(|field| field.name().to_string())
+                    .collect(),
+                values,
+            ));
+        }
+    }
+
+    impl LightweightTakeSpanCapture {
+        fn take_spans(&self) -> Vec<LightweightTakeSpan> {
+            std::mem::take(&mut *self.0.lock().unwrap())
+        }
+    }
 
     #[rstest]
     #[case::empty(&[])]
@@ -597,6 +1018,237 @@ mod test {
             ],
         )
         .unwrap()
+    }
+
+    #[test]
+    fn take_io_stats_track_peaks_and_maxima() {
+        let stats = TakeIoStats::default();
+        stats.record_request_transform(&[0..10, 5..15, 20..25, 20..25], &[0..25]);
+        stats.record_cloud_reader_attempt(8, true);
+        stats.record_cloud_reader_attempt(25, false);
+        stats.record_read_started(Duration::from_millis(7));
+        stats.record_read_started(Duration::from_millis(3));
+        stats.record_read_completed(Duration::from_millis(5));
+        stats.record_read_completed(Duration::from_millis(11));
+
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.logical_ranges, 4);
+        assert_eq!(snapshot.logical_requested_bytes, 30);
+        assert_eq!(snapshot.logical_union_bytes, 20);
+        assert_eq!(snapshot.physical_iops, 1);
+        assert_eq!(snapshot.scheduler_requests, 1);
+        assert_eq!(snapshot.physical_bytes, 25);
+        assert_eq!(snapshot.cloud_reader_attempts, 2);
+        assert_eq!(snapshot.cloud_reader_failed_attempts, 1);
+        assert_eq!(snapshot.cloud_reader_body_bytes, 33);
+        assert_eq!(snapshot.peak_active_reads, 2);
+        assert_eq!(snapshot.max_queue_time_ns, 7_000_000);
+        assert_eq!(snapshot.max_read_time_ns, 11_000_000);
+        assert_eq!(stats.active_reads.load(Ordering::Relaxed), 0);
+    }
+
+    async fn take_trace_dataset() -> Dataset {
+        let data = test_batch(0..9);
+        Dataset::write(
+            RecordBatchIterator::new([Ok(data.clone())], data.schema()),
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 3,
+                data_storage_version: Some(LanceFileVersion::Stable),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+    }
+
+    fn assert_take_span(
+        span: &CapturedTakeSpan,
+        outcome: &str,
+        num_rows: usize,
+        fragments_selected: usize,
+        io_parallelism: Option<u32>,
+    ) {
+        let mut expected_fields = TAKE_SUMMARY_FIELDS.map(str::to_string).to_vec();
+        if io_parallelism.is_some() {
+            expected_fields.insert(1, "io_parallelism".to_string());
+        }
+        assert_eq!(span.field_names, expected_fields);
+        for field in TAKE_SUMMARY_FIELDS {
+            assert_eq!(span.record_counts.get(field), Some(&1), "field {field}");
+        }
+        assert_eq!(span.values["outcome"], outcome);
+        assert_eq!(span.values["num_rows"], num_rows.to_string());
+        if let Some(io_parallelism) = io_parallelism {
+            assert_eq!(span.record_counts.get("io_parallelism"), Some(&1));
+            assert_eq!(span.values["io_parallelism"], io_parallelism.to_string());
+        }
+        assert_eq!(
+            span.values["fragments_selected"],
+            fragments_selected.to_string()
+        );
+        assert!(span.values["elapsed_ns"].parse::<u64>().is_ok());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dataset_take_records_public_paths() {
+        let dataset = take_trace_dataset().await;
+        let capture = TakeSpanCapture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        dataset
+            .take(&[0, 1], dataset.schema().clone())
+            .await
+            .unwrap();
+        dataset
+            .take(&[0, 3, 6], dataset.schema().clone())
+            .await
+            .unwrap();
+        dataset
+            .take_with_io_parallelism(&[6, 0, 3], dataset.schema().clone(), 2)
+            .await
+            .unwrap();
+        let empty = dataset.take(&[], dataset.schema().clone()).await.unwrap();
+        assert_eq!(empty.num_rows(), 0);
+        let error = dataset
+            .take(&[9], dataset.schema().clone())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        let error = dataset
+            .take_with_io_parallelism(&[0], dataset.schema().clone(), 0)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+
+        let spans = capture.take_spans();
+        assert_eq!(spans.len(), 6);
+        assert_take_span(&spans[0], "ok", 2, 1, None);
+        assert_take_span(&spans[1], "ok", 3, 3, None);
+        assert_take_span(&spans[2], "ok", 3, 3, Some(2));
+        assert_take_span(&spans[3], "ok", 0, 0, None);
+        assert_take_span(&spans[4], "error", 1, 0, None);
+        assert_take_span(&spans[5], "error", 1, 0, Some(0));
+        for span in &spans[..3] {
+            assert!(span.values["logical_ranges"].parse::<u64>().unwrap() > 0);
+            assert!(span.values["physical_iops"].parse::<u64>().unwrap() > 0);
+            assert!(span.values["scheduler_requests"].parse::<u64>().unwrap() > 0);
+            assert!(span.values["physical_bytes"].parse::<u64>().unwrap() > 0);
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dataset_take_records_cloud_transport() {
+        let mut dataset = take_trace_dataset().await;
+        let inner = dataset.table_state.object_store.inner.clone();
+        dataset.table_state.object_store = Arc::new(LanceObjectStore::new(
+            inner,
+            url::Url::parse("s3://take-observability-test").unwrap(),
+            Some(64 * 1024),
+            None,
+            false,
+            true,
+            8,
+            3,
+            None,
+        ));
+        let capture = TakeSpanCapture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        dataset.take(&[0], dataset.schema().clone()).await.unwrap();
+
+        let spans = capture.take_spans();
+        assert_eq!(spans.len(), 1);
+        assert_take_span(&spans[0], "ok", 1, 1, None);
+        assert!(
+            spans[0].values["cloud_reader_attempts"]
+                .parse::<u64>()
+                .unwrap()
+                > 0
+        );
+        assert!(
+            spans[0].values["cloud_reader_body_bytes"]
+                .parse::<u64>()
+                .unwrap()
+                > 0
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dataset_take_records_cancellation() {
+        let dataset = take_trace_dataset()
+            .await
+            .with_object_store_wrappers([Arc::new(ThrottledStoreWrapper {
+                config: ThrottleConfig {
+                    wait_get_per_call: Duration::from_millis(200),
+                    ..Default::default()
+                },
+            }) as Arc<dyn WrappingObjectStore>]);
+        let capture = TakeSpanCapture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let timed_out = tokio::time::timeout(
+            Duration::from_millis(20),
+            dataset.take(&[0], dataset.schema().clone()),
+        )
+        .await;
+        assert!(timed_out.is_err());
+
+        let spans = capture.take_spans();
+        assert_eq!(spans.len(), 1);
+        assert_take_span(&spans[0], "cancelled", 1, 1, None);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dataset_take_preserves_info_spans_without_io_summary() {
+        let dataset = take_trace_dataset().await;
+        let summary_capture = TakeSpanCapture::default();
+        let lightweight_capture = LightweightTakeSpanCapture::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(summary_capture.clone().with_filter(LevelFilter::INFO))
+            .with(lightweight_capture.clone().with_filter(LevelFilter::INFO));
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        dataset.take(&[0], dataset.schema().clone()).await.unwrap();
+        dataset
+            .take_with_io_parallelism(&[0], dataset.schema().clone(), 2)
+            .await
+            .unwrap();
+
+        assert!(summary_capture.take_spans().is_empty());
+        let lightweight_spans = lightweight_capture.take_spans();
+        assert_eq!(lightweight_spans.len(), 2);
+        assert_eq!(lightweight_spans[0].0, "take");
+        assert_eq!(lightweight_spans[0].1, vec!["num_rows"]);
+        assert_eq!(lightweight_spans[0].2["num_rows"], "1");
+        assert_eq!(lightweight_spans[1].0, "take_with_io_parallelism");
+        assert_eq!(lightweight_spans[1].1, vec!["num_rows", "io_parallelism"]);
+        assert_eq!(lightweight_spans[1].2["num_rows"], "1");
+        assert_eq!(lightweight_spans[1].2["io_parallelism"], "2");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn concurrent_public_take_summaries_do_not_mix() {
+        let dataset = take_trace_dataset().await;
+        let capture = TakeSpanCapture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let (one_fragment, two_fragments) = tokio::join!(
+            dataset.take(&[0], dataset.schema().clone()),
+            dataset.take(&[3, 6], dataset.schema().clone()),
+        );
+        assert_eq!(one_fragment.unwrap().num_rows(), 1);
+        assert_eq!(two_fragments.unwrap().num_rows(), 2);
+
+        let mut spans = capture.take_spans();
+        spans.sort_by_key(|span| span.values["num_rows"].parse::<usize>().unwrap());
+        assert_eq!(spans.len(), 2);
+        assert_take_span(&spans[0], "ok", 1, 1, None);
+        assert_take_span(&spans[1], "ok", 2, 2, None);
     }
 
     #[rstest]
