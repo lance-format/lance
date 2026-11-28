@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
+import asyncio
 import math
 import os
 import time
@@ -1030,3 +1031,80 @@ def test_evaluate_sharding_spec_python_binding_column_parameter():
 def test_mem_wal_index_details_none_before_init(tmp_path):
     ds = _mem_wal_dataset(tmp_path)
     assert ds.mem_wal_index_details() is None
+
+
+def _fenced_writer(tmp_path):
+    """Return a writer whose close() fails because a successor fenced it."""
+    ds = lance.write_dataset(_lookup_table([0], "base"), tmp_path / "ds")
+    ds.initialize_mem_wal()
+    shard_id = str(uuid.uuid4())
+    fenced = ds.mem_wal_writer(shard_id, durable_write=False)
+    fenced.put(_lookup_table([1], "input"))
+    # A second writer on the same shard fences the first one.
+    return fenced, ds.mem_wal_writer(shard_id)
+
+
+@pytest.mark.parametrize(
+    ("in_flight", "raised", "match"),
+    [
+        (None, OSError, "Writer fenced"),
+        (KeyboardInterrupt, KeyboardInterrupt, "in flight"),
+        (ValueError, ValueError, "in flight"),
+    ],
+)
+def test_shard_writer_close_failure_is_reported_again(
+    tmp_path, in_flight, raised, match
+):
+    # A close() that fails gives the writer up. A later close() must report the same
+    # failure instead of returning as if the rows had been flushed.
+    fenced, successor = _fenced_writer(tmp_path)
+
+    # Leaving the block reports the failure again when the body caught it and exits
+    # normally, and does not replace an exception that is propagating.
+    with pytest.raises(raised, match=match):
+        with fenced:
+            with pytest.raises(OSError, match="Writer fenced"):
+                fenced.close()
+            if in_flight is not None:
+                raise in_flight("in flight")
+    # Later, an empty `with` block and close() both report it again.
+    with pytest.raises(OSError, match="Writer fenced"):
+        with fenced:
+            pass
+    with pytest.raises(OSError, match="Writer fenced"):
+        fenced.close()
+    successor.close()
+
+
+@pytest.mark.parametrize(
+    ("in_flight", "raised", "match"),
+    [
+        (None, OSError, "Writer fenced"),
+        (ValueError, OSError, "Writer fenced"),
+        (SystemExit, OSError, "Writer fenced"),
+        (GeneratorExit, OSError, "Writer fenced"),
+        (KeyboardInterrupt, KeyboardInterrupt, "in flight"),
+        (asyncio.CancelledError, asyncio.CancelledError, "in flight"),
+    ],
+)
+def test_shard_writer_exit_flush_failure(tmp_path, in_flight, raised, match):
+    # A flush that fails on exit is raised when the block exits normally and replaces
+    # an Exception, SystemExit or GeneratorExit, but must not turn KeyboardInterrupt or
+    # a cancellation into an OSError that `except Exception` would swallow.
+    fenced, successor = _fenced_writer(tmp_path)
+    with pytest.raises(raised, match=match):
+        with fenced:
+            if in_flight is not None:
+                raise in_flight("in flight")
+    with pytest.raises(OSError, match="Writer fenced"):
+        fenced.close()
+    successor.close()
+
+
+def test_shard_writer_close_after_clean_close_returns(tmp_path):
+    ds = lance.write_dataset(_lookup_table([0], "base"), tmp_path / "ds")
+    ds.initialize_mem_wal()
+    with ds.mem_wal_writer(str(uuid.uuid4())) as writer:
+        writer.put(_lookup_table([1], "input"))
+        writer.close()
+    writer.close()
