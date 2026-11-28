@@ -3333,6 +3333,14 @@ impl Dataset {
         Ok(())
     }
 
+    fn migrate_to_stable_row_ids(&mut self) -> PyResult<()> {
+        let mut new_self = self.ds.as_ref().clone();
+        rt().block_on(None, new_self.migrate_to_stable_row_ids())?
+            .infer_error()?;
+        self.ds = Arc::new(new_self);
+        Ok(())
+    }
+
     fn drop_columns(&mut self, columns: Vec<String>) -> PyResult<()> {
         let mut new_self = self.ds.as_ref().clone();
         let columns: Vec<_> = columns.iter().map(|s| s.as_str()).collect();
