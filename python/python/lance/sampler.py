@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import gc
 import math
+import operator
 import random
 import warnings
 from abc import ABC, abstractmethod
@@ -14,6 +15,7 @@ from heapq import heappush, heappushpop
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
+    Any,
     Dict,
     Generic,
     Iterable,
@@ -28,6 +30,7 @@ import pyarrow.compute as pc
 
 import lance
 from lance.dependencies import numpy as np
+from lance.dependencies import torch
 from lance.log import LOGGER
 
 if TYPE_CHECKING:
@@ -304,6 +307,88 @@ class Sampler(ABC):
         pass
 
 
+class _SharedEpoch:
+    """Epoch storage that can reach persistent DataLoader workers.
+
+    The epoch is a plain int until :class:`lance.torch.data.LanceDataset` calls
+    :meth:`_share_epoch_with_workers`. A persistent worker keeps the sampler copy
+    it received at startup, so an int set by ``set_epoch`` in the main process
+    never reaches it. Torch's multiprocessing pickler sends a shared-memory tensor
+    as a handle to the same storage, so once shared, DataLoader workers and
+    shallow copies of the sampler read the epoch the main process last set.
+    """
+
+    _epoch_value: Union[int, torch.Tensor] = 0
+
+    @property
+    def _epoch(self) -> int:
+        return int(self._epoch_value)
+
+    @_epoch.setter
+    def _epoch(self, epoch: int) -> None:
+        try:
+            epoch = operator.index(epoch)
+        except TypeError:
+            # Earlier releases accepted float epochs, so keep accepting integral
+            # ones and reject the rest rather than truncating them.
+            if isinstance(epoch, float) and epoch.is_integer():
+                epoch = int(epoch)
+            else:
+                raise TypeError(f"epoch must be an integer, got {epoch!r}") from None
+        if isinstance(self._epoch_value, int):
+            self._epoch_value = epoch
+        else:
+            # The tensor is an inference tensor when it was created or copied
+            # inside inference mode, and those only accept in-place updates
+            # there. A normal tensor updated there stays normal and shared.
+            with torch.inference_mode():
+                self._epoch_value.fill_(epoch)
+
+    def set_epoch(self, epoch: int):
+        """Set the epoch that is combined with ``seed`` to shuffle.
+
+        Call it before each epoch. Once the sampler is passed to
+        :class:`lance.torch.data.LanceDataset`, DataLoader workers and shallow
+        copies of the sampler share one epoch, so per-worker epochs set in
+        ``worker_init_fn`` overwrite each other. Copies made with :mod:`pickle` or
+        :func:`copy.deepcopy` keep an independent epoch.
+        """
+        self._epoch = epoch
+
+    def __setstate__(self, state: Any) -> None:
+        # A subclass with __slots__ pickles as (__dict__, slots).
+        state, slots = state if isinstance(state, tuple) else (state, None)
+        state = dict(state or {})
+        # Samplers pickled by earlier releases stored the epoch as ``_epoch``,
+        # which the property now shadows.
+        legacy_epoch = state.pop("_epoch", None)
+        self.__dict__.update(state)
+        for name, value in (slots or {}).items():
+            setattr(self, name, value)
+        if legacy_epoch is not None and "_epoch_value" not in state:
+            self._epoch = legacy_epoch
+
+    def _share_epoch_with_workers(self) -> None:
+        value = self._epoch_value
+        if not isinstance(value, int) and value.device.type == "meta":
+            raise ValueError(
+                "the sampler's epoch is a tensor on the meta device and has no "
+                "value; load the sampler onto the CPU"
+            )
+        # Shared memory is CPU only, so pin the tensor there: a default device
+        # (e.g. CUDA) or torch.load(map_location=...) must not redirect it.
+        if isinstance(value, int) or value.device.type != "cpu":
+            self._epoch_value = torch.tensor(
+                int(value), dtype=torch.int64, device="cpu"
+            )
+        # A deep copy of a shared sampler holds an unshared tensor. A tensor
+        # received from another process is already shared, and sharing it again
+        # under a strategy other than the sender's would move it to new storage
+        # the sender never writes.
+        if not self._epoch_value.is_shared():
+            self._epoch_value.share_memory_()
+
+
 class FragmentSampler(Sampler):
     """Sampling over Fragments.
 
@@ -351,7 +436,7 @@ class FullScanSampler(FragmentSampler):
             yield fragment
 
 
-class ShardedFragmentSampler(FragmentSampler):
+class ShardedFragmentSampler(FragmentSampler, _SharedEpoch):
     """Sharded fragments by rank and world_size.
 
     Each rank / process will process a subset of the fragments.
@@ -382,9 +467,6 @@ class ShardedFragmentSampler(FragmentSampler):
         self._seed = seed
         self._epoch = 0
 
-    def set_epoch(self, epoch: int):
-        self._epoch = epoch
-
     @staticmethod
     def from_torch(randomize: bool = False, seed: int = 0) -> ShardedFragmentSampler:
         """Use from a PyTorch distributed environment.
@@ -408,7 +490,7 @@ class ShardedFragmentSampler(FragmentSampler):
             yield fragments[idx]
 
 
-class ShardedBatchSampler(Sampler):
+class ShardedBatchSampler(Sampler, _SharedEpoch):
     """Sharded batch sampler.
 
     Each rank / process will process a subset of the batches.
@@ -441,9 +523,6 @@ class ShardedBatchSampler(Sampler):
 
     def __len__(self):
         return self._len
-
-    def set_epoch(self, epoch: int):
-        self._epoch = epoch
 
     @staticmethod
     def from_torch(randomize: bool = False, seed: int = 0) -> ShardedBatchSampler:

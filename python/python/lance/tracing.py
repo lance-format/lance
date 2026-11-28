@@ -5,11 +5,13 @@ import atexit
 from typing import Callable, Optional
 
 from .lance import (
-    TraceEvent,
-    shutdown_tracing,
+    TraceEvent as TraceEvent,
 )
 from .lance import (
     capture_trace_events as lance_capture_trace_events,
+)
+from .lance import (
+    shutdown_tracing as shutdown_tracing,
 )
 from .lance import (
     trace_to_chrome as lance_trace_to_chrome,
@@ -50,6 +52,12 @@ def capture_trace_events(callback: Callable[[TraceEvent], None]):
     ----------
     callback: Callable[[TraceEvent], None]
         The callback to call with each trace event.
+
+    Raises
+    ------
+    RuntimeError
+        If a callback is already registered. Call ``shutdown_tracing()`` before
+        registering another one.
     """
     lance_capture_trace_events(callback)
     atexit.register(lambda: shutdown_tracing())

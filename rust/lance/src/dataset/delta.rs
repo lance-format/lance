@@ -1330,6 +1330,7 @@ mod tests {
         };
         let take_read_data_files = |dataset: &Dataset| -> BTreeSet<String> {
             dataset
+                .table_state
                 .object_store
                 .io_stats_incremental()
                 .requests
@@ -1340,7 +1341,7 @@ mod tests {
                 .collect()
         };
         dataset.session().file_metadata_cache().clear().await;
-        dataset.object_store.io_stats_incremental();
+        dataset.table_state.object_store.io_stats_incremental();
         let expected = scan_project_filter(&dataset, columns, Some(filter)).await;
         let full_scan_files = take_read_data_files(&dataset);
         assert_eq!(full_scan_files.len(), dataset.get_fragments().len());
@@ -1413,7 +1414,7 @@ mod tests {
         for _ in 0..2 {
             dataset.delete("false").await.unwrap();
         }
-        dataset.object_store.io_stats_incremental();
+        dataset.table_state.object_store.io_stats_incremental();
         let delta = dataset
             .delta()
             .with_begin_version(begin)
@@ -1440,6 +1441,7 @@ mod tests {
         // Endpoint validation can read manifests, but pruning must avoid data files.
         assert!(
             dataset
+                .table_state
                 .object_store
                 .io_stats_incremental()
                 .requests
@@ -2554,10 +2556,10 @@ mod tests {
             let manifest = Arc::make_mut(&mut dataset.manifest);
             manifest.reader_feature_flags &= !FLAG_STABLE_ROW_IDS;
             write_manifest_file_to_path(
-                dataset.object_store.as_ref(),
+                dataset.table_state.object_store.as_ref(),
                 manifest,
                 None,
-                &dataset.manifest_location.path,
+                &dataset.table_state.manifest_location.path,
                 None,
             )
             .await

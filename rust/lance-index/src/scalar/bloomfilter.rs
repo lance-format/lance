@@ -18,7 +18,7 @@ use crate::scalar::{
 use arrow_array::{Array, BooleanArray, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use futures::TryStreamExt;
-use lance_arrow_stats::StatisticsAccumulator;
+use lance_arrow::stats::StatisticsAccumulator;
 use lance_core::utils::bloomfilter::as_bytes;
 use lance_core::utils::bloomfilter::sbbf::{Sbbf, SbbfBuilder};
 use lance_core::utils::row_addr_remap::RowAddrRemap;

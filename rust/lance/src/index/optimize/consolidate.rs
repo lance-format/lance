@@ -94,7 +94,7 @@ pub(super) async fn plan_index(
     let mut fragment_rows = BTreeMap::new();
     for segment in candidates.iter().rev() {
         let effective = segment
-            .effective_fragment_bitmap(&dataset.fragment_bitmap)
+            .effective_fragment_bitmap(&dataset.table_state.fragment_bitmap)
             .ok_or_else(|| {
                 Error::not_supported("consolidation requires known fragment coverage")
             })?;
@@ -331,7 +331,7 @@ pub(super) async fn validate_commit(
                 ));
             }
             let live = source
-                .effective_fragment_bitmap(&dataset.fragment_bitmap)
+                .effective_fragment_bitmap(&dataset.table_state.fragment_bitmap)
                 .ok_or_else(|| {
                     Error::not_supported("consolidation requires known source coverage")
                 })?;
@@ -354,7 +354,8 @@ pub(super) async fn validate_commit(
             expected_metadata.created_at = now.created_at;
             if !same_created_at
                 || &expected_metadata != now
-                || now.effective_fragment_bitmap(&dataset.fragment_bitmap) != Some(live.clone())
+                || now.effective_fragment_bitmap(&dataset.table_state.fragment_bitmap)
+                    != Some(live.clone())
             {
                 return Err(Error::invalid_input(format!(
                     "consolidation source {uuid} changed; replan before committing"
@@ -416,7 +417,7 @@ pub(super) async fn validate_commit(
     for result in results.iter_mut() {
         let coverage = result
             .segment
-            .effective_fragment_bitmap(&dataset.fragment_bitmap)
+            .effective_fragment_bitmap(&dataset.table_state.fragment_bitmap)
             .ok_or_else(|| Error::invalid_input("consolidation result has unknown coverage"))?;
         let covered = actual.entry(result.segment.name.clone()).or_default();
         if !covered.is_disjoint(&coverage) {

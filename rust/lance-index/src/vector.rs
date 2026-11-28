@@ -385,6 +385,31 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
     /// Get the total number of partitions in the index.
     fn total_partitions(&self) -> usize;
 
+    /// Prewarm the selected physical partition IDs using the query cache keys.
+    ///
+    /// An empty selection does nothing. Duplicate IDs are warmed once. Supported
+    /// implementations reject out-of-range IDs before loading partition data.
+    /// Opening the index may still load shared metadata or resident columns.
+    /// Implementations without selective warming return [`Error::NotSupported`]
+    /// for a nonempty selection rather than warming the whole index.
+    ///
+    /// ```
+    /// # use lance_index::vector::VectorIndex;
+    /// # async fn example(index: &dyn VectorIndex) -> lance_core::Result<()> {
+    /// index.prewarm_partitions(&[0, 2]).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    async fn prewarm_partitions(&self, partition_ids: &[usize]) -> Result<()> {
+        if partition_ids.is_empty() {
+            return Ok(());
+        }
+        Err(Error::not_supported(format!(
+            "selective partition prewarm is not supported for {:?}",
+            self.index_type()
+        )))
+    }
+
     /// Search a single partition for nearest neighbors.
     ///
     /// This method should return the same results as [`VectorIndex::search`] method except
