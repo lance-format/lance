@@ -1531,7 +1531,7 @@ async fn merge_vector_segments(
     let last = inputs.last().expect("at least two inputs");
     // A task result passed twice (a retried task, say) would index its rows
     // twice; the scalar merge refuses overlapping inputs the same way.
-    validate_segment_metadata(&last.name, &inputs)?;
+    let covered_fragments = validate_segment_metadata(&last.name, &inputs)?;
     let field_path = dataset.schema().field_path(field_id)?;
     let mut pairs = Vec::with_capacity(inputs.len());
     for metadata in &inputs {
@@ -1576,12 +1576,9 @@ async fn merge_vector_segments(
             .map(|metadata| metadata.dataset_version)
             .min()
             .unwrap_or(dataset.manifest.version),
-        fragment_bitmap: Some(
-            inputs
-                .iter()
-                .filter_map(|metadata| metadata.fragment_bitmap.clone())
-                .fold(RoaringBitmap::new(), |acc, bitmap| acc | bitmap),
-        ),
+        // Split plans exclude legacy writers and tagged histories. The writer
+        // drops postings from fragments retired at the plan's read version.
+        fragment_bitmap: Some(covered_fragments & dataset.table_state.fragment_bitmap.as_ref()),
         index_details: last.index_details.clone().or_else(|| {
             Some(Arc::new(
                 super::vector::details::vector_index_details_default(),
@@ -1687,11 +1684,7 @@ pub async fn commit_optimize_indices(
 
     let mut new_indices = Vec::new();
     for (name, mut segments) in by_name {
-        validate_segment_metadata(&name, &segments)?;
-        let incoming = segments
-            .iter()
-            .filter_map(|segment| segment.fragment_bitmap.clone())
-            .fold(RoaringBitmap::new(), |acc, bitmap| acc | bitmap);
+        let incoming = validate_segment_metadata(&name, &segments)?;
         // A retained segment and a new one must not both answer for a fragment.
         for old in committed_segments
             .iter()
@@ -2146,12 +2139,13 @@ mod tests {
         commit_optimize_indices(&mut dataset, merged, &options)
             .await
             .unwrap();
-        let segments = segments(&dataset, VECTOR_INDEX).await;
+        let dataset = Dataset::open(&test_dir).await.unwrap();
+        let segments = load_all_indices(&dataset).await.unwrap();
         assert_eq!(segments.len(), 1);
         assert!(!old_uuids.contains(&segments[0].uuid));
         assert_eq!(
-            coverage(&segments) & dataset.table_state.fragment_bitmap.as_ref(),
-            *dataset.table_state.fragment_bitmap.as_ref()
+            segments[0].fragment_bitmap.as_ref(),
+            Some(&RoaringBitmap::from_iter([0, 2, 3, 4]))
         );
         // The rows of the retired fragment were filtered out of the merge.
         assert_eq!(indexed_rows(&dataset, &segments).await, 1250);
