@@ -146,8 +146,9 @@ public class IndexOptions {
     }
 
     /**
-     * A UUID to use for fragment-level distributed indexing multiple fragment-level indices need to
-     * share UUID for later merging. If not provided, a new UUID will be generated.
+     * An output UUID, for index types that support specifying one. If omitted, a new UUID is
+     * generated. Bitmap fragment builds reject this option: build independent segments and merge
+     * the returned Index objects instead of sharing a UUID between workers.
      *
      * @param indexUUID indexUUID option
      */

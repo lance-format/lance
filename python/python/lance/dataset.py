@@ -3260,6 +3260,15 @@ class LanceDataset(pa.dataset.Dataset):
         """Validate and normalize a scalar-index request for the native
         ``create_index`` call.
         """
+        if (
+            kwargs.get("shard_id") is not None
+            and self._scalar_segment_type(index_type) == "BITMAP"
+        ):
+            raise ValueError(
+                "Bitmap shard_id is no longer supported. Omit it and build "
+                "independent segments with create_index_uncommitted."
+            )
+
         if isinstance(column, str):
             column = [column]
 
@@ -3365,15 +3374,21 @@ class LanceDataset(pa.dataset.Dataset):
                 parameters["document_granularity"] = kwargs["document_granularity"]
             config = json.dumps(parameters)
             kwargs["config"] = indices.IndexConfig(index_type.index_type, config)
-            return column, "scalar", logical_index_type
+            return column, "scalar", self._scalar_segment_type(index_type)
         else:
             raise Exception("index_type must be str or IndexConfig")
 
     @staticmethod
-    def _normalized_index_type(
+    def _scalar_segment_type(
         index_type: Union[str, IndexConfig],
     ) -> str:
         if isinstance(index_type, IndexConfig):
+            if (
+                index_type.index_type.upper() == "JSON"
+                and str(index_type.parameters.get("target_index_type")).upper()
+                == "BITMAP"
+            ):
+                return "BITMAP"
             index_type = index_type.index_type
         return index_type.upper()
 
@@ -3382,7 +3397,7 @@ class LanceDataset(pa.dataset.Dataset):
         cls,
         index_type: Union[str, IndexConfig],
     ) -> bool:
-        return cls._normalized_index_type(index_type) in {
+        return cls._scalar_segment_type(index_type) in {
             "BTREE",
             "BITMAP",
             "INVERTED",
@@ -3401,7 +3416,7 @@ class LanceDataset(pa.dataset.Dataset):
         cls,
         index_type: Union[str, IndexConfig],
     ) -> bool:
-        return cls._normalized_index_type(index_type) in {
+        return cls._scalar_segment_type(index_type) in {
             "BTREE",
             "BITMAP",
             "NGRAM",
@@ -3556,6 +3571,8 @@ class LanceDataset(pa.dataset.Dataset):
             A UUID to use for the segment written by this call.
             If not provided, a new UUID will be generated. This parameter is
             passed via kwargs internally.
+            Bitmap fragment builds reject this option and generate independent
+            segment UUIDs.
         progress_callback : callable, optional
             A callback that receives :class:`lance.progress.IndexProgress` events while
             the index is being built.
@@ -3721,8 +3738,7 @@ class LanceDataset(pa.dataset.Dataset):
         ):
             raise ValueError(
                 f"{logical_index_type} distributed indexing uses "
-                "create_index_uncommitted(..., "
-                f'index_type="{logical_index_type}", fragment_ids=...)'
+                "create_index_uncommitted(..., fragment_ids=...) with the same type"
             )
         # Add fragment_ids and index_uuid to kwargs if provided
         if fragment_ids is not None:
@@ -4493,6 +4509,8 @@ class LanceDataset(pa.dataset.Dataset):
         requirement:
 
         - ``fragment_ids`` must be provided
+        - Bitmap builds, including JSON paths targeting Bitmap, generate a UUID
+          for each segment. Omit ``shard_id`` and ``index_uuid``.
         - Vector segments support both shared and independent model scopes. Pass
           the same IVF centroids, and for IVF_PQ the same PQ codebook, to each
           worker when segments need shared model semantics or physical merge
@@ -4662,7 +4680,7 @@ class LanceDataset(pa.dataset.Dataset):
         t = index_type.upper()
 
         valid = {member.name for member in SupportedDistributedIndices}
-        if t not in valid:
+        if t not in valid and t != "BITMAP":
             raise NotImplementedError(
                 f"Only {', '.join(sorted(valid))} are supported, received {index_type}"
             )

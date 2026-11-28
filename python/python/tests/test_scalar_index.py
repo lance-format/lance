@@ -5713,7 +5713,8 @@ def test_distribute_btree_index_build(tmp_path):
     )
 
 
-def test_bitmap_uncommitted_segments_can_be_committed_from_python(tmp_path):
+@pytest.mark.parametrize("index_type", ["BITMAP", IndexConfig("bitmap", {})])
+def test_bitmap_uncommitted_segments_can_be_committed_from_python(tmp_path, index_type):
     dataset_path = tmp_path / "bitmap_segments.lance"
     ds = generate_multi_fragment_bitmap_dataset(
         dataset_path, num_fragments=4, rows_per_fragment=40
@@ -5729,7 +5730,7 @@ def test_bitmap_uncommitted_segments_can_be_committed_from_python(tmp_path):
     staged_segments = [
         ds.create_index_uncommitted(
             column="category",
-            index_type="BITMAP",
+            index_type=index_type,
             name=index_name,
             fragment_ids=fragment_group,
         )
@@ -5771,6 +5772,47 @@ def test_bitmap_uncommitted_segments_can_be_committed_from_python(tmp_path):
         "ScalarIndexQuery"
         in ds.scanner(filter=filter_expr, use_scalar_index=True).explain_plan()
     )
+
+
+def test_json_bitmap_distributed_build_uses_segments(tmp_path):
+    ds = lance.write_dataset(
+        pa.table({"doc": pa.array(['{"x":1}', '{"x":2}', '{"x":null}'], pa.json_())}),
+        tmp_path,
+        max_rows_per_file=1,
+    )
+    config = IndexConfig("json", {"target_index_type": "bitmap", "path": "x"})
+    with pytest.raises(ValueError, match="create_index_uncommitted"):
+        ds.create_scalar_index("doc", config, fragment_ids=[0])
+    with pytest.raises(ValueError, match="shard_id"):
+        ds.create_index_uncommitted("doc", config, fragment_ids=[0], shard_id=0)
+    with pytest.raises(ValueError, match="index_uuid"):
+        ds.create_index_uncommitted(
+            "doc", config, fragment_ids=[], index_uuid=str(uuid.uuid4())
+        )
+    with pytest.raises(ValueError, match="create_index_uncommitted"):
+        ds.merge_index_metadata(str(uuid.uuid4()), "BITMAP")
+
+    segments = [
+        ds.create_index_uncommitted("doc", config, fragment_ids=group)
+        for group in ([0], [1, 2])
+    ]
+    assert segments[0].uuid != segments[1].uuid
+    for segment in segments:
+        assert [f.path for f in segment.files] == ["bitmap_page_lookup.lance"]
+    ds.commit_existing_index_segments("json_bitmap", "doc", segments)
+    ds = lance.dataset(tmp_path)
+    scan = ds.scanner(filter="json_get_int(doc, 'x') = 2")
+    assert "ScalarIndex" in scan.explain_plan()
+    assert scan.count_rows() == 1
+
+
+def test_bitmap_segment_rejects_shard_parameters(tmp_path):
+    ds = lance.write_dataset(pa.table({"value": [1]}), tmp_path)
+    with pytest.raises(ValueError, match="shard_id.*create_index_uncommitted"):
+        ds.create_index_uncommitted(
+            "value", IndexConfig("bitmap", {"shard_id": 0}), fragment_ids=[0]
+        )
+    assert not list((tmp_path / "_indices").rglob("*.lance"))
 
 
 def test_ngram_segment_merge_and_commit_from_python(tmp_path):
