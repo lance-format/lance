@@ -1355,10 +1355,9 @@ fn required_field_ids(schema: &Schema) -> HashSet<i32> {
 
 /// Drop the fragments whose data no longer matches what an index recorded.
 ///
-/// An index built over a field describes the values that were in that field
-/// when it was built. Rebinding the field's data in a fragment invalidates the
-/// index for that fragment only, so the fragment leaves the bitmap rather than
-/// the whole index being discarded.
+/// An index records both keyed and covering values. Rebinding either kind of
+/// field invalidates its coverage for that fragment. Retired source claims
+/// without a known mapping require clearing the coverage conservatively.
 ///
 /// Rebinding a field also invalidates an index on any field it contains or is
 /// nested in: a packed struct is stored under the parent's id while an index may
@@ -1384,9 +1383,10 @@ fn prune_rebound_fields_from_indices(
         return Ok(());
     };
     for index in indices.iter_mut() {
+        let dependency_fields = index.dependency_fields();
         let affected_field = fields.iter().copied().find(|field| {
-            field_affects_index(*field, &index.fields, base_schema)
-                || field_affects_index(*field, &index.fields, working_schema)
+            field_affects_index(*field, &dependency_fields, base_schema)
+                || field_affects_index(*field, &dependency_fields, working_schema)
         });
         let Some(bitmap) = index.fragment_bitmap.as_mut() else {
             if !is_system_index(index)
@@ -1805,16 +1805,20 @@ mod tests {
     fn test_rewriting_a_field_prunes_indices_on_its_ancestor_or_descendant(
         #[case] rewritten: i32,
         #[case] indexed: i32,
+        #[values(false, true)] covering_field: bool,
     ) {
-        let arrow = ArrowSchema::new(vec![ArrowField::new(
-            "s",
-            DataType::Struct(Fields::from(vec![ArrowField::new(
-                "x",
-                DataType::Int32,
+        let arrow = ArrowSchema::new(vec![
+            ArrowField::new(
+                "s",
+                DataType::Struct(Fields::from(vec![ArrowField::new(
+                    "x",
+                    DataType::Int32,
+                    true,
+                )])),
                 true,
-            )])),
-            true,
-        )]);
+            ),
+            ArrowField::new("key", DataType::Int32, true),
+        ]);
         let mut manifest = backed_manifest();
         manifest.schema = lance_core::datatypes::Schema::try_from(&arrow).unwrap();
         let mut fragment = manifest.fragments[0].clone();
@@ -1845,7 +1849,12 @@ mod tests {
                 }),
             ],
             vec![IndexMetadata {
-                fields: vec![indexed],
+                fields: vec![if covering_field { 2 } else { indexed }],
+                covering_fields: if covering_field {
+                    vec![indexed]
+                } else {
+                    Vec::new()
+                },
                 ..sample_index_metadata("idx")
             }],
         )
@@ -1857,18 +1866,23 @@ mod tests {
     /// A child the operation itself adds is not in the schema it builds on, so
     /// its ancestry has to come from the schema being built for a rewrite of
     /// its parent to reach an index on it.
-    #[test]
-    fn test_rewriting_a_struct_prunes_an_index_on_a_child_added_in_the_same_operation() {
+    #[rstest]
+    fn test_rewriting_a_struct_prunes_an_index_on_a_child_added_in_the_same_operation(
+        #[values(false, true)] covering_field: bool,
+    ) {
         let mut manifest = backed_manifest();
-        manifest.schema = Schema::try_from(&ArrowSchema::new(vec![ArrowField::new(
-            "s",
-            DataType::Struct(Fields::from(vec![ArrowField::new(
-                "x",
-                DataType::Int32,
+        manifest.schema = Schema::try_from(&ArrowSchema::new(vec![
+            ArrowField::new(
+                "s",
+                DataType::Struct(Fields::from(vec![ArrowField::new(
+                    "x",
+                    DataType::Int32,
+                    true,
+                )])),
                 true,
-            )])),
-            true,
-        )]))
+            ),
+            ArrowField::new("key", DataType::Int32, true),
+        ]))
         .unwrap();
 
         let mut actions = vec![
@@ -1880,8 +1894,16 @@ mod tests {
             Action::AddIndexSegment(AddIndexSegment {
                 uuid: Uuid::from_u128(1),
                 name: "idx".into(),
-                fields: vec![FieldRef::Local(0)],
-                covering_fields: Vec::new(),
+                fields: vec![if covering_field {
+                    FieldRef::Committed(2)
+                } else {
+                    FieldRef::Local(0)
+                }],
+                covering_fields: if covering_field {
+                    vec![FieldRef::Local(0)]
+                } else {
+                    Vec::new()
+                },
                 index_details: None,
                 index_version: 1,
                 covered_fragments: Some(vec![Ref::Committed(0)]),
@@ -1909,14 +1931,17 @@ mod tests {
     /// rewritten. Keeping it would serve stale results, and dropping it
     /// silently would lose an index the user built, so the rewrite is refused.
     #[rstest]
-    #[case::indexed_field(0, true)]
-    #[case::other_field(1, false)]
+    #[case::indexed_field(0, Vec::new(), true)]
+    #[case::covering_field(1, vec![0], true)]
+    #[case::other_field(1, Vec::new(), false)]
     fn test_rewriting_under_an_index_of_unknown_coverage_is_refused(
         #[case] indexed: i32,
+        #[case] covering_fields: Vec<i32>,
         #[case] rejected: bool,
     ) {
         let index = IndexMetadata {
             fields: vec![indexed],
+            covering_fields,
             fragment_bitmap: None,
             ..sample_index_metadata("idx")
         };

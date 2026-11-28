@@ -3188,11 +3188,16 @@ async fn test_dataset_append_preserves_unsupported_coverage_after_deferred_compa
 async fn test_in_place_replacement_withdraws_unsupported_source_coverage(
     #[case] kind: UnreadableIndexKind,
     #[values(false, true)] composite: bool,
+    #[values(false, true)] covering_field: bool,
 ) {
     let directory = tempfile::tempdir().unwrap();
     let uri = directory.path().to_str().unwrap();
     let mut dataset = Dataset::write(
-        two_column_reader(),
+        lance_datagen::gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .col("payload", array::step::<Int32Type>())
+            .col("covered", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(10), BatchCount::from(1)),
         uri,
         Some(WriteParams {
             max_rows_per_file: 5,
@@ -3210,6 +3215,26 @@ async fn test_in_place_replacement_withdraws_unsupported_source_coverage(
             .unwrap();
     }
     let readable = manifest_index(&dataset, "id_idx").await;
+    if covering_field {
+        dataset
+            .apply_commit(
+                Transaction::new(
+                    dataset.manifest.version,
+                    Operation::CreateIndex {
+                        new_indices: vec![IndexMetadata {
+                            covering_fields: vec![2],
+                            ..readable.clone()
+                        }],
+                        removed_indices: vec![readable.clone()],
+                    },
+                    None,
+                ),
+                &Default::default(),
+                &Default::default(),
+            )
+            .await
+            .unwrap();
+    }
     hide_index_as(&mut dataset, "id_idx", kind).await;
     hide_index_as(&mut dataset, READABLE_INDEX, kind).await;
     let before = manifest_index(&dataset, "id_idx").await;
@@ -3236,23 +3261,28 @@ async fn test_in_place_replacement_withdraws_unsupported_source_coverage(
     assert_eq!(before.fragment_bitmap, Some(RoaringBitmap::from([0, 1])));
     assert_eq!(manifest_index(&dataset, "id_idx").await, before);
 
-    let replacement = arrow_array::record_batch!(("id", Int32, vec![42; 10])).unwrap();
+    let (column, field_id) = if covering_field {
+        ("covered", 2)
+    } else {
+        ("id", 0)
+    };
+    let replacement = arrow_array::record_batch!((column, Int32, vec![42; 10])).unwrap();
     let replacements = dataset
         .get_fragments()
         .remove(0)
         .write_columns(
             futures::stream::iter([Ok(replacement)]),
-            &dataset.schema().project(&["id"]).unwrap(),
+            &dataset.schema().project(&[column]).unwrap(),
         )
         .await
         .unwrap();
     let operation = if composite {
         Operation::CompositeOperation(CompositeOperation::new(vec![UserStep::new(
-            "replace id",
+            "replace indexed values",
             vec![
                 Action::TombstoneFieldData(TombstoneFieldData {
                     fragment: Ref::Committed(replacements.0),
-                    field_ids: vec![FieldRef::Committed(0)],
+                    field_ids: vec![FieldRef::Committed(field_id)],
                     data_change: true,
                 }),
                 Action::AddDataFile(AddDataFile {
@@ -3261,7 +3291,7 @@ async fn test_in_place_replacement_withdraws_unsupported_source_coverage(
                         fields: Arc::from([]),
                         ..replacements.1
                     },
-                    field_ids: vec![FieldRef::Committed(0)],
+                    field_ids: vec![FieldRef::Committed(field_id)],
                     data_change: true,
                     base: None,
                 }),
@@ -3320,14 +3350,15 @@ async fn test_in_place_replacement_withdraws_unsupported_source_coverage(
         .await
         .unwrap();
     let reopened = Dataset::open(uri).await.unwrap();
+    let filter = format!("{column} = 42");
     let mut full_scan = reopened.scan();
-    full_scan.filter("id = 42").unwrap().use_scalar_index(false);
+    full_scan.filter(&filter).unwrap().use_scalar_index(false);
     let expected = full_scan.try_into_batch().await.unwrap();
     assert_eq!(expected.num_rows(), 10);
     assert_eq!(
         reopened
             .scan()
-            .filter("id = 42")
+            .filter(&filter)
             .unwrap()
             .try_into_batch()
             .await
