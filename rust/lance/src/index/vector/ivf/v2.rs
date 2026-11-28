@@ -1501,6 +1501,29 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> CacheKey for IVFPartit
     }
 }
 
+#[derive(Debug)]
+struct IVFPartitionRowsKey(usize);
+
+impl CacheKey for IVFPartitionRowsKey {
+    type ValueType = RowAddrTreeMap;
+
+    fn key(&self) -> Cow<'_, str> {
+        format!("ivf-rows-{}", self.0).into()
+    }
+
+    fn type_name() -> &'static str {
+        "IVFPartitionRows"
+    }
+
+    fn schema() -> CacheKeySchema {
+        CacheKeySchema::new("lance.index.ivf-partition-rows", 1)
+    }
+
+    fn write_key(&self, builder: &mut KeyBuilder) {
+        builder.write_u64(self.0 as u64);
+    }
+}
+
 /// What the session opening an IVF index declares about it, passed to
 /// [`IVFIndex::try_new`] and to the reconstruction from a cached
 /// [`IvfIndexState`]. The default declares nothing and charges no cache.
@@ -1647,6 +1670,14 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         partition_id: usize,
         partition: &Arc<PartitionEntry<S, Q>>,
     ) -> Result<Arc<RowAddrTreeMap>> {
+        if !partition.cache_whole_partition {
+            let partition = partition.clone();
+            return index_cache
+                .get_or_insert_with_key(IVFPartitionRowsKey(partition_id), || async move {
+                    spawn_cpu(move || Ok(partition.storage.row_ids().collect())).await
+                })
+                .await;
+        }
         let rows = partition.partition_rows();
         if partition.cache_whole_partition
             && !partition.partition_rows_accounted.load(Ordering::Acquire)
@@ -2912,7 +2943,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
     /// [`Index::prewarm`] of an index that is not native: its partitions,
     /// in byte windows ([`IVF_PREWARM_WINDOW_SIZE_ENV`]) read with bounded
     /// parallelism.
-    async fn prewarm_partitions(&self) -> Result<()> {
+    async fn prewarm_all_partitions(&self) -> Result<()> {
         prewarm_partitions(
             &|partitions| self.prewarm_partition_window(partitions).boxed(),
             &self.uuid,
@@ -2999,7 +3030,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> Index for IVFIndex<S, 
             let index_cache = self.raw_cache.with_load_origin(CacheLoadOrigin::Warm);
             self.storage.prewarm_planes(&index_cache).await?;
         } else {
-            self.prewarm_partitions().await?;
+            self.prewarm_all_partitions().await?;
         }
         Ok(())
     }
@@ -3093,6 +3124,36 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> Index for IVFIndex<S, 
 
 #[async_trait]
 impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFIndex<S, Q> {
+    async fn prewarm_partitions(&self, partition_ids: &[usize]) -> Result<()> {
+        if let Some(partition_id) = partition_ids
+            .iter()
+            .find(|&&id| id >= self.ivf.num_partitions())
+        {
+            return Err(Error::invalid_input(format!(
+                "partition_id={partition_id} out of range 0..{}",
+                self.ivf.num_partitions()
+            )));
+        }
+        let mut selected = partition_ids.to_vec();
+        selected.sort_unstable();
+        selected.dedup();
+        if self.uses_rabit_plane_cache() {
+            let cache = self.raw_cache.with_load_origin(CacheLoadOrigin::Warm);
+            return self
+                .storage
+                .prewarm_partition_planes(&cache, &selected)
+                .await;
+        }
+        let parallelism =
+            prewarm_parallelism(self.io_parallelism, get_num_compute_intensive_cpus());
+        stream::iter(selected)
+            .map(|partition_id| self.prewarm_partition_window(partition_id..partition_id + 1))
+            .buffer_unordered(parallelism)
+            .try_collect::<Vec<_>>()
+            .await?;
+        Ok(())
+    }
+
     async fn search(
         &self,
         _query: &Query,

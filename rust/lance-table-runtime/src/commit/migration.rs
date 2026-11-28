@@ -378,11 +378,11 @@ pub(super) async fn migrate_indices(
         if needs_recalculating.contains(&index.name)
             || bitmap_missing_or_legacy && !is_system_index(index)
         {
-            // A covered index still has exactly one keyed field; the trailing
-            // `covering_fields` are carried, not keyed, so counting them
-            // against `fields.len()` would fail this on a legal covered index.
+            // `fields[0]` is the one query input used to recover the bitmap.
+            // Plugin-declared dependencies and carried columns may follow it;
+            // the index hook resolves which entries are query inputs.
             debug_assert!(
-                index.keyed_field().is_some(),
+                !index.keyed_fields().is_empty(),
                 "migrate_indices expects a single keyed field, got fields {:?} carrying {:?}",
                 index.fields,
                 index.covering_fields,

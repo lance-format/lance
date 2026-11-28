@@ -337,6 +337,33 @@ impl<'a> CommitBuilder<'a> {
         self
     }
 
+    /// Whether to store the transaction only inline in the manifest, skipping the
+    /// separate file under `_transactions/` and saving one object write. The
+    /// transaction is inlined regardless of its size, up to `u32::MAX` bytes.
+    ///
+    /// The new manifest gets a writer feature flag, so Lance releases older than
+    /// v1.0.0 refuse to write to that version. Later commits that do not set this
+    /// write the transaction file again and drop the flag.
+    ///
+    /// Readers older than Lance 14.0 return no transaction for such a version
+    /// and cannot rebase a concurrent commit across it. Keep the transaction
+    /// file when clients older than 14.0 read transaction history or commit
+    /// concurrently.
+    ///
+    /// **Default is false.**
+    ///
+    /// ```
+    /// use lance_table_runtime::CommitBuilder;
+    ///
+    /// let _builder = CommitBuilder::new("memory://dataset").with_disable_transaction_file(true);
+    /// ```
+    pub fn with_disable_transaction_file(mut self, disable_transaction_file: bool) -> Self {
+        self.manifest_config = self
+            .manifest_config
+            .with_disable_transaction_file(disable_transaction_file);
+        self
+    }
+
     /// Provide the set of row addresses that were deleted or updated. This is
     /// used to perform fast conflict resolution.
     pub fn with_affected_rows(mut self, affected_rows: RowAddrTreeMap) -> Self {

@@ -49,6 +49,7 @@ use arrow_schema::Fields;
 use arrow_select::interleave::interleave;
 use futures::StreamExt;
 use lance_core::datatypes::{Field, Schema};
+use lance_core::utils::io_stats::IoStatsRecorder;
 use lance_core::{Error, Result};
 use roaring::RoaringBitmap;
 
@@ -837,6 +838,7 @@ pub async fn resolve_overlays(
     selection: &OverlayReadSelection,
     fragment: &FileFragment,
     read_config: &FragReadConfig,
+    io_stats: Option<Arc<dyn IoStatsRecorder>>,
 ) -> Result<Vec<LoadedAtomicField>> {
     // A file is opened only if some atomic field it covers has cells among the requested rows.
     // This is the row-selection pruning: overlays outside the read are skipped.
@@ -861,12 +863,18 @@ pub async fn resolve_overlays(
     let opened: Vec<Option<Arc<dyn GenericFileReader>>> =
         futures::future::try_join_all(planner.files.iter().enumerate().map(|(i, file)| {
             let needed = file_needed[i];
+            let io_stats = io_stats.clone();
             async move {
                 if !needed {
                     return Ok::<_, Error>(None);
                 }
                 Ok(fragment
-                    .open_reader(&file.data_file, Some(&file.open_projection), read_config)
+                    .open_reader(
+                        &file.data_file,
+                        Some(&file.open_projection),
+                        read_config,
+                        io_stats,
+                    )
                     .await?
                     .map(Arc::from))
             }

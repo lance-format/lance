@@ -21,6 +21,7 @@ use futures::{FutureExt, StreamExt, TryStreamExt, future::BoxFuture};
 use lance_arrow::RecordBatchExt;
 use lance_core::datatypes::{Projection, Schema};
 use lance_core::utils::address::RowAddress;
+use lance_core::utils::io_stats::IoStatsRecorder;
 use lance_core::{Error, ROW_ADDR, ROW_OFFSET, Result};
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_table::rowids::compute_row_offset_array;
@@ -181,7 +182,20 @@ impl Table {
         projection: &TakeProjection,
         options: TakeOptions,
     ) -> Result<RecordBatch> {
-        projection.take(self, selection, options).await
+        self.take_with_options_with_io_stats(selection, projection, options, None)
+            .await
+    }
+
+    /// Take rows while attributing current-format data-file I/O to `io_stats`.
+    #[doc(hidden)]
+    pub async fn take_with_options_with_io_stats(
+        &self,
+        selection: TakeSelection<'_>,
+        projection: &TakeProjection,
+        options: TakeOptions,
+        io_stats: Option<Arc<dyn IoStatsRecorder>>,
+    ) -> Result<RecordBatch> {
+        projection.take(self, selection, options, io_stats).await
     }
 
     /// Read the physical inputs for a caller's output expressions. An empty
@@ -194,9 +208,22 @@ impl Table {
         with_row_offset: bool,
         options: TakeOptions,
     ) -> BoxFuture<'a, Result<Option<RecordBatch>>> {
+        self.take_physical_with_io_stats(selection, projection, with_row_offset, options, None)
+    }
+
+    /// Read physical inputs while attributing current-format data-file I/O to `io_stats`.
+    #[doc(hidden)]
+    pub fn take_physical_with_io_stats<'a>(
+        &'a self,
+        selection: TakeSelection<'a>,
+        projection: &'a Projection,
+        with_row_offset: bool,
+        options: TakeOptions,
+        io_stats: Option<Arc<dyn IoStatsRecorder>>,
+    ) -> BoxFuture<'a, Result<Option<RecordBatch>>> {
         // Keep fragment reader futures out of the layout of callers that
         // compose takes with deeply nested scan and index operations.
-        self.take_physical_impl(selection, projection, with_row_offset, options)
+        self.take_physical_impl(selection, projection, with_row_offset, options, io_stats)
             .boxed()
     }
 
@@ -206,6 +233,7 @@ impl Table {
         projection: &Projection,
         with_row_offset: bool,
         options: TakeOptions,
+        io_stats: Option<Arc<dyn IoStatsRecorder>>,
     ) -> Result<Option<RecordBatch>> {
         if selection.is_empty() {
             return Ok(None);
@@ -249,6 +277,7 @@ impl Table {
                 physical_schema,
                 read_config,
                 fragment_concurrency,
+                io_stats,
             )
             .await?;
 
@@ -312,6 +341,7 @@ impl Table {
         schema: Arc<Schema>,
         config: FragReadConfig,
         concurrency: usize,
+        io_stats: Option<Arc<dyn IoStatsRecorder>>,
     ) -> Result<RecordBatch> {
         let first = RowAddress::from(row_addrs[0]);
         let last = RowAddress::from(row_addrs[row_addrs.len() - 1]);
@@ -329,7 +359,12 @@ impl Table {
                     row_addrs[0]
                 ))
             })?;
-            let reader = fragment.open(&schema, config).await?;
+            if let Some(io_stats) = io_stats.as_ref() {
+                io_stats.record_fragments_selected(1);
+            }
+            let reader = fragment
+                .open_with_io_stats(&schema, config, io_stats)
+                .await?;
             return reader
                 .read_range_as_batch(first.row_offset() as usize..last.row_offset() as usize + 1)
                 .await;
@@ -337,7 +372,7 @@ impl Table {
 
         if sorted {
             return self
-                .take_fragment_groups(row_addrs, schema, config, concurrency, false)
+                .take_fragment_groups(row_addrs, schema, config, concurrency, false, io_stats)
                 .await;
         }
 
@@ -351,6 +386,7 @@ impl Table {
                 config.with_row_address(true),
                 concurrency,
                 true,
+                io_stats,
             )
             .await?;
 
@@ -384,6 +420,7 @@ impl Table {
         config: FragReadConfig,
         concurrency: usize,
         reorder: bool,
+        io_stats: Option<Arc<dyn IoStatsRecorder>>,
     ) -> Result<RecordBatch> {
         // Own each fragment for the lifetime of its buffered read.
         let table = Arc::new(self.clone());
@@ -410,10 +447,19 @@ impl Table {
                 .collect();
             groups.push((fragment, offsets));
         }
+        if let Some(io_stats) = io_stats.as_ref() {
+            io_stats.record_fragments_selected(groups.len());
+        }
 
         let batches: Vec<RecordBatch> = futures::stream::iter(groups)
             .map(|(fragment, offsets)| {
-                read_fragment(fragment, offsets, schema.clone(), config.clone())
+                read_fragment(
+                    fragment,
+                    offsets,
+                    schema.clone(),
+                    config.clone(),
+                    io_stats.clone(),
+                )
             })
             .buffered(concurrency)
             .try_collect()
@@ -435,8 +481,13 @@ fn read_fragment(
     offsets: Vec<u32>,
     schema: Arc<Schema>,
     config: FragReadConfig,
+    io_stats: Option<Arc<dyn IoStatsRecorder>>,
 ) -> impl Future<Output = Result<RecordBatch>> + Send {
-    async move { fragment.take_rows(&offsets, &schema, config).await }
+    async move {
+        fragment
+            .take_rows_with_io_stats(&offsets, &schema, config, io_stats)
+            .await
+    }
 }
 
 fn take_struct_array(array: &StructArray, indices: &UInt64Array) -> Result<StructArray> {
