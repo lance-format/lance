@@ -29,6 +29,7 @@ use lance_index::scalar::{BuiltinIndexType, SargableQuery, ScalarIndexParams};
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_io::utils::CachedFileSize;
 use lance_io::utils::tracking_store::IoStats;
+use lance_table::feature_flags::ZONE_WRITE_SEEDS_VERSION_KEY;
 use lance_table::format::{DataFile, IndexMetadata};
 use roaring::RoaringBitmap;
 
@@ -240,7 +241,7 @@ async fn assert_index_matches_scan_with(
 }
 
 fn io(dataset: &Dataset) -> IoStats {
-    dataset.object_store.io_stats_incremental()
+    dataset.table_state.object_store.io_stats_incremental()
 }
 
 async fn open_data_file(dataset: &Dataset, file: &DataFile) -> FileReader {
@@ -249,8 +250,8 @@ async fn open_data_file(dataset: &Dataset, file: &DataFile) -> FileReader {
         .unwrap()
         .join(file.path.as_str());
     let scheduler = ScanScheduler::new(
-        dataset.object_store.clone(),
-        SchedulerConfig::max_bandwidth(&dataset.object_store),
+        dataset.table_state.object_store.clone(),
+        SchedulerConfig::max_bandwidth(&dataset.table_state.object_store),
     );
     let file_scheduler = scheduler
         .open_file(&path, &CachedFileSize::unknown())
@@ -260,7 +261,10 @@ async fn open_data_file(dataset: &Dataset, file: &DataFile) -> FileReader {
         file_scheduler,
         None,
         Default::default(),
-        &dataset.metadata_cache.file_metadata_cache(&path),
+        &dataset
+            .table_state
+            .metadata_cache
+            .file_metadata_cache(&path),
         FileReaderOptions::default(),
     )
     .await
@@ -1244,11 +1248,23 @@ async fn test_rebuild_keeps_boundaries_past_a_deleted_tail() {
 async fn test_float_nan_queries_match_scan_after_seed_reuse() {
     let dir = TempStrDir::default();
     let mut dataset = write(dir.as_str(), 0..N).await;
+    dataset
+        .update_config([(ZONE_WRITE_SEEDS_VERSION_KEY, "1")])
+        .await
+        .unwrap();
     create_index(&mut dataset, "x", &zone_map_params(8, true, true), None).await;
     append(&mut dataset, N..2 * N).await;
     append(&mut dataset, 2 * N..3 * N).await;
     dataset.drop_index(&index_name("x")).await.unwrap();
-    create_index(&mut dataset, "x", &zone_map_params(20000, true, true), None).await;
+    let (_, reports) = with_reports(create_index(
+        &mut dataset,
+        "x",
+        &zone_map_params(20000, true, true),
+        None,
+    ))
+    .await;
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].reused_fragments, vec![1, 2]);
     assert_index_matches_scan(
         &dataset,
         &[
@@ -1481,7 +1497,7 @@ async fn test_historical_index_without_bitmap_still_collects_seed_positions() {
 async fn test_seed_collector_policy_lookup_cost() {
     use lance_file::version::ConcreteFileVersion;
 
-    use crate::dataset::write::seeds::SeedCollector;
+    use crate::dataset::write::seeds::collect_write_seeds;
 
     async fn index_requests(dataset: &Dataset) -> usize {
         io(dataset)
@@ -1492,14 +1508,9 @@ async fn test_seed_collector_policy_lookup_cost() {
     }
     async fn writers_and_requests(dataset: &Dataset) -> (usize, usize) {
         io(dataset);
-        let collector = SeedCollector::for_write(
-            ConcreteFileVersion::V2_0,
-            Some(dataset),
-            dataset.schema(),
-            true,
-        )
-        .await
-        .unwrap();
+        let collector = collect_write_seeds(ConcreteFileVersion::V2_0, dataset, dataset.schema())
+            .await
+            .unwrap();
         (collector.len(), index_requests(dataset).await)
     }
 
@@ -1866,6 +1877,10 @@ async fn test_binary_copy_bitmap_provenance(
 ) {
     let dir = TempStrDir::default();
     let mut dataset = write(dir.as_str(), 0..N).await;
+    dataset
+        .update_config([(ZONE_WRITE_SEEDS_VERSION_KEY, "1")])
+        .await
+        .unwrap();
     create_index(
         &mut dataset,
         "val",

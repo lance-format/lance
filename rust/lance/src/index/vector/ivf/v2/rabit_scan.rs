@@ -37,6 +37,9 @@ use lance_index::vector::storage::{
 use lance_index::vector::{
     ApproxMode, PartitionSearchControl, Query, VECTOR_RESULT_SCHEMA, VectorIndex,
 };
+use tokio::sync::OnceCell;
+
+use crate::index::prefilter::lookup::PreparedRowAddrMask;
 
 use super::{
     IVFIndex, PartitionEntry, PreparedPartitionGuard, PreparedPartitionSearch,
@@ -216,6 +219,7 @@ pub(super) fn controlled_partition_stream(
 pub struct RabitScanContext {
     index: Arc<RabitIndex>,
     raw_query: Option<Arc<RabitRawQueryContext>>,
+    lookup_mask: Arc<OnceCell<Arc<PreparedRowAddrMask>>>,
     /// Original query, before setting each partition's centroid distance.
     pub query: Query,
     /// Ordered partition identifiers, paired with `centroid_distances`.
@@ -286,6 +290,7 @@ impl RabitScanContext {
         Self {
             index,
             raw_query,
+            lookup_mask: Arc::new(OnceCell::new()),
             query,
             partitions,
             centroid_distances,
@@ -413,6 +418,9 @@ impl RabitScanContext {
         dist_q_c: f32,
         scope: RabitScanScope,
     ) -> Result<Option<RabitSignPartition>> {
+        if self.query.approx_mode == ApproxMode::Fast {
+            return Ok(None);
+        }
         let loading = Instant::now();
         let io_stats = self.metrics.io_stats();
         let (index, sign) = tokio::try_join!(
@@ -431,6 +439,20 @@ impl RabitScanContext {
             self.pre_filter.clone(),
         )
         .await?;
+        let probe_rows = entry.storage.len();
+        let mask = self
+            .lookup_mask
+            .get_or_try_init(|| async {
+                let mask = self.pre_filter.mask();
+                lance_core::utils::tokio::spawn_cpu(move || {
+                    Ok::<_, Error>(Arc::new(PreparedRowAddrMask::for_probe_rows(
+                        mask, probe_rows,
+                    )))
+                })
+                .await
+            })
+            .await?
+            .clone();
         let context = self.clone();
         let in_flight = self.index.prepared_partitions.track();
         lance_core::utils::tokio::spawn_cpu(move || {
@@ -448,6 +470,11 @@ impl RabitScanContext {
                 context.raw_query.as_deref(),
             )?;
             let mut stage = SignStage::default();
+            let needs_mask = !pre_filter.is_empty()
+                || storage
+                    .row_ids()
+                    .any(|&row_id| row_id == RowAddress::TOMBSTONE_ROW);
+            let accept = needs_mask.then(|| mask.acceptance(storage.row_ids()));
             let gated = context.index.scratch_pool.with_scratch(|scratch| {
                 let calc = storage.dist_calculator_with_scratch(
                     context.query.key.clone(),
@@ -459,11 +486,11 @@ impl RabitScanContext {
                     },
                 );
                 if scope == RabitScanScope::Partition && !pre_filter.is_empty() {
-                    calc.filtered_partition_sign_stage_with_scratch(
+                    calc.filtered_partition_sign_stage_for_mask(
                         &mut stage,
-                        &mut scratch.u16,
-                        &mut scratch.u8,
-                        &mut scratch.u32,
+                        accept
+                            .as_deref()
+                            .expect("a non-empty prefilter prepares acceptance"),
                     )
                 } else {
                     calc.full_sign_stage_with_scratch(
@@ -479,19 +506,6 @@ impl RabitScanContext {
                 scan_stats::counters().stage1_cpu_ns.add_elapsed(computing);
                 return Ok(None);
             }
-            // FRI deletions must be excluded even when there is no query
-            // filter: their slots remain so ex gathers keep file offsets.
-            let needs_mask = !pre_filter.is_empty()
-                || storage
-                    .row_ids()
-                    .any(|&row_id| row_id == RowAddress::TOMBSTONE_ROW);
-            let accept = needs_mask.then(|| {
-                let mask = pre_filter.mask();
-                storage
-                    .row_ids()
-                    .map(|&row_id| row_id != RowAddress::TOMBSTONE_ROW && mask.selected(row_id))
-                    .collect()
-            });
             scan_stats::counters().stage1_cpu_ns.add_elapsed(computing);
             if scope == RabitScanScope::Partition {
                 // The query heap's approximate pruning can skip intermediate

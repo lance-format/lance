@@ -663,14 +663,15 @@ impl EncodingUtils {
         }
     }
 
+    /// Creates a Lance 2.3 `MonotonicDelta` descriptor for an unsigned block.
     pub fn delta(
         uncompressed_bits_per_value: u64,
         base: u64,
         deltas: metadata::CompressiveEncoding,
     ) -> metadata::CompressiveEncoding {
         metadata::CompressiveEncoding {
-            compression: Some(metadata::compressive_encoding::Compression::Delta(
-                Box::new(metadata::Delta {
+            compression: Some(metadata::compressive_encoding::Compression::MonotonicDelta(
+                Box::new(metadata::MonotonicDelta {
                     uncompressed_bits_per_value,
                     base,
                     deltas: Some(Box::new(deltas)),

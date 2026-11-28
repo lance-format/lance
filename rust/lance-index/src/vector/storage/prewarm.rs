@@ -31,6 +31,54 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
     /// backends warm both planes of every partition concurrently, including
     /// entries that can only be retained by a persistent tier.
     pub async fn prewarm_planes(&self, cache: &WeakLanceCache) -> Result<()> {
+        self.prewarm_planes_selected(cache, 0..self.num_partitions())
+            .await
+    }
+
+    /// Warm sign and ex planes only for the selected physical partitions.
+    ///
+    /// Uses the same cache keys, admission rules and staging budget as
+    /// [`Self::prewarm_planes`]. Empty selections do nothing; duplicates are
+    /// coalesced and out-of-range IDs fail before loading any plane.
+    ///
+    /// ```
+    /// # use lance_index::vector::{quantizer::Quantization, storage::IvfQuantizationStorage};
+    /// # use lance_core::cache::WeakLanceCache;
+    /// # async fn example<Q: Quantization>(storage: &IvfQuantizationStorage<Q>, cache: &WeakLanceCache) -> lance_core::Result<()> {
+    /// storage.prewarm_partition_planes(cache, &[0, 2]).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn prewarm_partition_planes(
+        &self,
+        cache: &WeakLanceCache,
+        partition_ids: &[usize],
+    ) -> Result<()> {
+        if let Some(partition_id) = partition_ids
+            .iter()
+            .find(|&&id| id >= self.num_partitions())
+        {
+            return Err(Error::invalid_input(format!(
+                "partition_id={partition_id} out of range 0..{}",
+                self.num_partitions()
+            )));
+        }
+        let mut selected = partition_ids.to_vec();
+        selected.sort_unstable();
+        selected.dedup();
+        self.prewarm_planes_selected(cache, selected.iter().copied())
+            .await
+    }
+
+    async fn prewarm_planes_selected<I>(
+        &self,
+        cache: &WeakLanceCache,
+        partition_ids: I,
+    ) -> Result<()>
+    where
+        I: Clone + IntoIterator<Item = usize> + Send + Sync,
+        I::IntoIter: Send,
+    {
         let row_bytes = self
             .schema()
             .fields()
@@ -39,7 +87,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
                 sum.checked_add(field.data_type().byte_width_opt()?)
             });
         let partitions = || {
-            (0..self.num_partitions()).map(|part_id| {
+            partition_ids.clone().into_iter().map(|part_id| {
                 // Unknown or overflowing sizes conservatively run alone.
                 let bytes = row_bytes
                     .and_then(|width| width.checked_mul(self.partition_size(part_id)))

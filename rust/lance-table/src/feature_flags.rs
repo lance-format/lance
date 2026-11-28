@@ -120,6 +120,19 @@ pub const FLAG_NON_REUSABLE_FIELD_IDS: u64 = 1 << 15;
 /// Their min/max exclude NaNs, which are counted separately by sign. Set in
 /// both reader and writer feature flags and preserve across commits.
 pub const FLAG_ZONE_WRITE_SEEDS: u64 = 1 << 16;
+
+/// Dataset config key that opts a table into version 1 zone write seeds
+/// ([`FLAG_ZONE_WRITE_SEEDS`]).
+///
+/// Valid values are `"0"` and `"1"`. When absent or `"0"`, writers continue to
+/// emit version 0 zone write seeds without setting [`FLAG_ZONE_WRITE_SEEDS`],
+/// keeping the table readable and writable by Lance `< 15`. A commit that
+/// itself writes this key as `"1"` atomically activates
+/// [`FLAG_ZONE_WRITE_SEEDS`] in both feature flag words; an inherited `"1"`
+/// alone does not, because a writer that did not know the flag could have
+/// stored it. Once activated, the capability is sticky and later writes emit
+/// version 1 seeds unless this key explicitly pins the table back to `"0"`.
+pub const ZONE_WRITE_SEEDS_VERSION_KEY: &str = "lance.zone_write_seeds.version";
 /// Writer-only protection for clustering definitions, ID allocation, references,
 /// and generic fragment/index segment metadata maintenance.
 /// Set whenever a manifest carries any of them; a writer that does not preserve
@@ -145,8 +158,19 @@ pub const FLAG_LOCAL_FRAGMENT_ALIASES: u64 = 1 << 20;
 /// The reader bit is set while any fragment sets `path`, and the writer bit remains set
 /// on subsequent versions so cleanup preserves files referenced by retained versions.
 pub const FLAG_DELETION_FILE_PATHS: u64 = 1 << 21;
+/// Keeps released writers away from BTree segments whose `BTreeIndexDetails`
+/// sets `key_layout`.
+///
+/// Writer-only. The
+/// [key layout writer rules](https://lance.org/format/index/scalar/btree/#key-layout-writer-rules)
+/// say when a writer sets this bit and how it treats a `key_layout` segment
+/// from a manifest that lacks it.
+///
+/// Reserved ahead of its implementation. This build masks the bit out in
+/// `supported_flags_when`, so it refuses to write a table that sets it.
+pub const FLAG_BTREE_KEY_LAYOUT: u64 = 1 << 22;
 /// The first bit that is unknown as a feature flag
-pub const FLAG_UNKNOWN: u64 = 1 << 22;
+pub const FLAG_UNKNOWN: u64 = 1 << 23;
 
 const _: () = assert!(FLAG_COVERED_INDEX_METADATA < FLAG_UNKNOWN);
 // The fence needs a bit the current released build already refuses, which means
@@ -171,6 +195,9 @@ const _: () = assert!(FLAG_LOCAL_FRAGMENT_ALIASES < FLAG_DELETION_FILE_PATHS);
 // Released builds refuse bit 20 and above, so they cannot read this format.
 const _: () = assert!(FLAG_DELETION_FILE_PATHS >= 1 << 20);
 const _: () = assert!(FLAG_DELETION_FILE_PATHS < FLAG_UNKNOWN);
+// Same fence for this bit: v15.0.0-beta.7 refuses bit 19 and up.
+const _: () = assert!(FLAG_BTREE_KEY_LAYOUT >= 1 << 19);
+const _: () = assert!(FLAG_BTREE_KEY_LAYOUT < FLAG_UNKNOWN);
 
 pub(crate) const STICKY_PAIRED_FLAGS: u64 = FLAG_MIXED_DATA_FILE_VERSIONS
     | FLAG_FRAGMENT_REUSE_INDEX
@@ -292,6 +319,83 @@ pub fn validate_auto_cleanup_config(manifest: &Manifest) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// Validate a change to [`ZONE_WRITE_SEEDS_VERSION_KEY`].
+///
+/// Accepts absent, `"0"`, or `"1"`. Call before publishing a commit that
+/// writes or deletes this key, not when carrying inherited configuration
+/// across an unrelated commit.
+///
+/// ```
+/// # use lance_table::{feature_flags::validate_zone_write_seeds_version_config, format::Manifest};
+/// # fn check(manifest: &Manifest) -> lance_core::Result<()> {
+/// validate_zone_write_seeds_version_config(manifest)?;
+/// # Ok(())
+/// # }
+/// ```
+pub fn validate_zone_write_seeds_version_config(manifest: &Manifest) -> Result<()> {
+    if let Some(value) = manifest.config.get(ZONE_WRITE_SEEDS_VERSION_KEY) {
+        match value.as_str() {
+            "0" | "1" => {}
+            _ => {
+                return Err(Error::invalid_input(format!(
+                    "{ZONE_WRITE_SEEDS_VERSION_KEY} must be \"0\" or \"1\", got {value:?}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether the manifest's config asks for version 1 zone write seeds
+/// (`lance.zone_write_seeds.version = "1"`).
+///
+/// This only reads the resulting config. It does not activate
+/// [`FLAG_ZONE_WRITE_SEEDS`]: a table can inherit `"1"` from a build that did
+/// not know the flag (for example, a v14 `update_config`), and that inherited
+/// value must not turn an ordinary commit into an opt-in.
+pub fn zone_write_seeds_v1_enabled(manifest: &Manifest) -> bool {
+    manifest
+        .config
+        .get(ZONE_WRITE_SEEDS_VERSION_KEY)
+        .is_some_and(|value| value == "1")
+}
+
+/// Validate and apply an explicit commit write of
+/// [`ZONE_WRITE_SEEDS_VERSION_KEY`].
+///
+/// `written` must be true only when this commit itself sets or deletes the key,
+/// even if the resulting value equals the inherited one. An explicit `"1"`
+/// activates [`FLAG_ZONE_WRITE_SEEDS`] in both feature words; explicit `"0"` or
+/// deletion leaves the flag alone, so an activated table stays sticky while
+/// future writes use version 0. When `written` is false, inherited config is
+/// left untouched and never activates the flag.
+pub fn apply_zone_write_seeds_version_config(manifest: &mut Manifest, written: bool) -> Result<()> {
+    if !written {
+        return Ok(());
+    }
+    validate_zone_write_seeds_version_config(manifest)?;
+    if zone_write_seeds_v1_enabled(manifest) {
+        manifest.reader_feature_flags |= FLAG_ZONE_WRITE_SEEDS;
+        manifest.writer_feature_flags |= FLAG_ZONE_WRITE_SEEDS;
+    }
+    Ok(())
+}
+
+/// Whether writers targeting `manifest` should emit version 1 zone write seeds
+/// rather than version 0.
+///
+/// Version 1 seeds require [`FLAG_ZONE_WRITE_SEEDS`] to already be active on
+/// the snapshot. Once activated, writers emit version 1 unless
+/// [`ZONE_WRITE_SEEDS_VERSION_KEY`] explicitly pins the table back to `"0"`.
+pub fn write_v1_zone_write_seeds(manifest: &Manifest) -> bool {
+    manifest.has_zone_write_seeds()
+        && manifest
+            .config
+            .get(ZONE_WRITE_SEEDS_VERSION_KEY)
+            .map(String::as_str)
+            != Some("0")
 }
 
 /// Set the reader and writer feature flags in the manifest based on the contents of the manifest.
@@ -594,6 +698,7 @@ fn supported_flags_when(
     mark_supported(&mut supported, FLAG_LOCAL_FRAGMENT_ALIASES, false);
     mark_supported(&mut supported, FLAG_ZONE_WRITE_SEEDS, true);
     mark_supported(&mut supported, FLAG_OBJECT_METADATA, true);
+    mark_supported(&mut supported, FLAG_BTREE_KEY_LAYOUT, false);
     supported
 }
 
@@ -895,6 +1000,19 @@ mod tests {
     }
 
     #[test]
+    fn test_btree_key_layout_flag_fences_writes_without_blocking_reads() {
+        let mut manifest = empty_manifest();
+        manifest.writer_feature_flags = FLAG_BTREE_KEY_LAYOUT;
+        ensure_can_read_manifest(&manifest).unwrap();
+        let error = ensure_can_write_manifest(&manifest).unwrap_err();
+        assert!(matches!(error, Error::NotSupported { .. }));
+        assert!(error.to_string().contains("cannot be written"));
+        assert!(!can_read_dataset(FLAG_BTREE_KEY_LAYOUT));
+        assert!(!can_write_dataset(FLAG_BTREE_KEY_LAYOUT));
+        assert_eq!(FLAG_BTREE_KEY_LAYOUT, 1 << 22);
+    }
+
+    #[test]
     fn test_object_metadata_flag_is_supported_and_derived() {
         assert_eq!(FLAG_OBJECT_METADATA, 1 << 17);
         assert!(can_read_dataset(FLAG_OBJECT_METADATA));
@@ -902,7 +1020,7 @@ mod tests {
         assert_eq!(FLAG_INLINE_DELETIONS, 1 << 19);
         assert!(can_read_dataset(FLAG_INLINE_DELETIONS));
         assert!(can_write_dataset(FLAG_INLINE_DELETIONS));
-        assert_eq!(FLAG_UNKNOWN, 1 << 22);
+        assert_eq!(FLAG_UNKNOWN, 1 << 23);
         assert!(!can_read_dataset(FLAG_UNKNOWN));
         assert!(!can_write_dataset(FLAG_UNKNOWN));
 
@@ -998,6 +1116,64 @@ mod tests {
             assert!(matches!(error, Error::CorruptFile { .. }));
             assert!(error.to_string().contains("zone write seed"));
         }
+    }
+
+    #[rstest::rstest]
+    #[case::absent(None, true)]
+    #[case::v0(Some("0"), true)]
+    #[case::v1(Some("1"), true)]
+    #[case::v2(Some("2"), false)]
+    #[case::bool_true(Some("true"), false)]
+    #[case::empty(Some(""), false)]
+    fn test_validate_zone_write_seeds_version_config(
+        #[case] value: Option<&str>,
+        #[case] valid: bool,
+    ) {
+        let mut manifest = empty_manifest();
+        if let Some(value) = value {
+            manifest
+                .config
+                .insert(ZONE_WRITE_SEEDS_VERSION_KEY.to_string(), value.to_string());
+        }
+        let result = validate_zone_write_seeds_version_config(&manifest);
+        assert_eq!(result.is_ok(), valid, "{value:?}: {result:?}");
+        if !valid {
+            let error = result.unwrap_err();
+            assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+            assert!(
+                error.to_string().contains(ZONE_WRITE_SEEDS_VERSION_KEY),
+                "{error}"
+            );
+        }
+    }
+
+    #[rstest::rstest]
+    #[case::unflagged_absent(false, None, false)]
+    #[case::unflagged_v0(false, Some("0"), false)]
+    #[case::unflagged_v1_without_flag(false, Some("1"), false)]
+    #[case::flagged_absent(true, None, true)]
+    #[case::flagged_v1(true, Some("1"), true)]
+    #[case::flagged_pinned_v0(true, Some("0"), false)]
+    fn test_write_v1_zone_write_seeds_policy(
+        #[case] flagged: bool,
+        #[case] config_value: Option<&str>,
+        #[case] expected_v1: bool,
+    ) {
+        let mut manifest = empty_manifest();
+        if flagged {
+            manifest.reader_feature_flags = FLAG_ZONE_WRITE_SEEDS;
+            manifest.writer_feature_flags = FLAG_ZONE_WRITE_SEEDS;
+        }
+        if let Some(value) = config_value {
+            manifest
+                .config
+                .insert(ZONE_WRITE_SEEDS_VERSION_KEY.to_string(), value.to_string());
+        }
+        assert_eq!(write_v1_zone_write_seeds(&manifest), expected_v1);
+        assert_eq!(
+            zone_write_seeds_v1_enabled(&manifest),
+            config_value == Some("1")
+        );
     }
 
     #[test]
@@ -1651,7 +1827,7 @@ mod tests {
         assert_eq!(FLAG_DELETION_FILE_PATHS, 1 << 21);
         assert!(can_read_dataset(FLAG_DELETION_FILE_PATHS));
         assert!(can_write_dataset(FLAG_DELETION_FILE_PATHS));
-        assert_eq!(FLAG_UNKNOWN, 1 << 22);
+        assert_eq!(FLAG_UNKNOWN, 1 << 23);
         assert!(!can_read_dataset(FLAG_UNKNOWN));
         assert!(!can_write_dataset(FLAG_UNKNOWN));
     }

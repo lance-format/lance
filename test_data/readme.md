@@ -54,6 +54,14 @@ folder contains a `datagen.py` script that generates one or more lance datasets.
   64-dimensional vectors were divided into 14 sub-vectors. Writers at this
   version silently omitted the final eight dimensions from the PQ codebook.
   Readers should preserve that prefix-only search behavior.
+* `v0.16.1/legacy_ivf_hnsw_pq`, `v0.18.2/ivf_hnsw_pq` and
+  `v0.24.1/ivf_hnsw_pq`: IVF_HNSW_PQ indices from releases before 0.25, whose
+  PQ storage metadata names the bit width `num_bits` instead of `nbits` and has
+  no `transposed` key before 0.19.2. 0.16.1 wrote the legacy v1 file (0, 2),
+  with an L2 and a Dot index; readers refuse it and ask for a rebuild. 0.18.2
+  and 0.24.1 wrote the v3 index layout in a Lance 2.0 file (0, 3), in two
+  fragments. 0.24.1 also recorded empty index details, which readers fill in
+  from that metadata.
 * `v0.27.1/pq_in_schema`: This dataset uses the old method of storing the PQ
   metadata in the schema metadata in the index file. We switched to storing them
   in a global buffer in https://github.com/lancedb/lance/pull/3829, but still
@@ -73,3 +81,10 @@ folder contains a `datagen.py` script that generates one or more lance datasets.
   dictionary columns whose pages store 32-bit indices. Lance 10.0.0 widened
   them for the null slot it appended past the last Int8 key, and for two
   chunks whose dictionaries did not fit Int8 together.
+* `v4.0.1/merge_insert_padded_control_words.lance` and
+  `v11.0.0/fullzip_padded_control_words.lance`: full-zip pages whose layout
+  records no control-word bits but which hold a zero byte before each value.
+  Lance 4.0.1 wrote them for a binary column updated by a merge_insert of some
+  columns (#6338); Lance 11.0.0 still wrote them for `FixedSizeList<Struct>`
+  columns, binary and fixed-width, in a file whose slice of the list validity
+  bitmap had no nulls.

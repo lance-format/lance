@@ -3,10 +3,44 @@
 
 use std::time::Duration;
 
-use http::header::{ACCEPT_ENCODING, HeaderValue};
-use http::{Request, Response};
+use http::header::{ACCEPT_ENCODING, HeaderValue, RETRY_AFTER};
+use http::{Request, Response, StatusCode};
 use opendal::layers::RetryLayer;
-use opendal::{Buffer, HttpBody, HttpTransport, HttpTransporter, Operator};
+use opendal::raw::{SystemTime, Timestamp, with_error_response_context};
+use opendal::{Buffer, Error, ErrorKind, HttpBody, HttpTransport, HttpTransporter, Operator};
+
+/// Largest server-provided `Retry-After` delay this transport waits for.
+///
+/// A larger delay is surfaced as a permanent error instead of retrying before
+/// the server allowed it.
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(300);
+
+/// Parse the delay-seconds or HTTP-date form of `Retry-After`.
+fn parse_retry_after(headers: &http::HeaderMap) -> Option<Duration> {
+    let value = headers.get(RETRY_AFTER)?.to_str().ok()?.trim();
+    if let Ok(seconds) = value.parse::<u64>() {
+        return Some(Duration::from_secs(seconds));
+    }
+
+    let deadline = Timestamp::parse_rfc2822(value).ok()?;
+    let deadline = SystemTime::from(deadline);
+    Some(
+        deadline
+            .duration_since(SystemTime::now())
+            .unwrap_or_default(),
+    )
+}
+
+fn retry_after_exceeded(delay: Duration) -> Error {
+    Error::new(
+        ErrorKind::RateLimited,
+        format!(
+            "Hugging Face asked to retry after {}s, which exceeds the {}s retry bound",
+            delay.as_secs(),
+            MAX_RETRY_AFTER.as_secs()
+        ),
+    )
+}
 
 /// Sends `Accept-Encoding: identity` unless the request already sets an encoding.
 ///
@@ -15,9 +49,21 @@ use opendal::{Buffer, HttpBody, HttpTransport, HttpTransporter, Operator};
 /// compress the body and drop `Content-Length`: Alibaba Cloud OSS does this for
 /// `text/plain` objects on a full GET, and the read fails with "HTTP response does
 /// not contain file content length".
+///
+/// When `honor_retry_after` is set, a `429` carrying an in-bound `Retry-After`
+/// is held until the server-directed delay has elapsed before the response is
+/// returned to the retry layer. A delay above `MAX_RETRY_AFTER` returns a
+/// permanent error immediately instead. This is the only boundary where the
+/// header is available as a typed response header; OpenDAL's retry layer only
+/// sees the error. The retry
+/// layer keeps ownership of every attempt, so mixed responses share its
+/// `client_max_retries` budget. The transport cannot tell whether the retry layer
+/// will spend its last retry, so the final positive-header 429 is also held; the
+/// error may be delayed by up to `MAX_RETRY_AFTER`, but no extra request is sent.
 #[derive(Debug)]
 struct IdentityEncodingTransport {
     inner: HttpTransporter,
+    honor_retry_after: bool,
 }
 
 impl HttpTransport for IdentityEncodingTransport {
@@ -25,13 +71,62 @@ impl HttpTransport for IdentityEncodingTransport {
         req.headers_mut()
             .entry(ACCEPT_ENCODING)
             .or_insert(HeaderValue::from_static("identity"));
-        self.inner.fetch(req).await
+
+        let response = self.inner.fetch(req).await?;
+        if !self.honor_retry_after || response.status() != StatusCode::TOO_MANY_REQUESTS {
+            return Ok(response);
+        }
+        let Some(delay) = parse_retry_after(response.headers()) else {
+            return Ok(response);
+        };
+        if delay > MAX_RETRY_AFTER {
+            let (parts, _) = response.into_parts();
+            return Err(with_error_response_context(
+                retry_after_exceeded(delay),
+                parts,
+            ));
+        }
+        if delay.is_zero() {
+            return Ok(response);
+        }
+
+        // Release the response body and its connection before waiting. The HF
+        // service only reads error headers, so an empty body preserves the
+        // error classification while avoiding a connection held across the delay.
+        let (parts, _) = response.into_parts();
+        tokio::time::sleep(delay).await;
+        Ok(Response::from_parts(
+            parts,
+            HttpBody::new(futures::stream::empty::<opendal::Result<Buffer>>(), Some(0)),
+        ))
     }
 }
 
 pub(in crate::object_store) fn finish_opendal_operator(
     operator: Operator,
     max_retries: usize,
+) -> Operator {
+    finish_opendal_operator_inner(operator, max_retries, false)
+}
+
+/// Finish a Hugging Face operator.
+///
+/// The transport waits out an in-bound `Retry-After` on a `429` before the
+/// response reaches OpenDAL's retry layer, so the first retry already honors the
+/// server-directed delay and every attempt shares one `client_max_retries` budget.
+/// A delay above the transport bound is surfaced immediately without retrying.
+#[cfg(feature = "huggingface")]
+pub(in crate::object_store) fn finish_huggingface_operator(
+    operator: Operator,
+    max_retries: usize,
+) -> Operator {
+    finish_opendal_operator_inner(operator, max_retries, true)
+}
+
+fn finish_opendal_operator_inner(
+    operator: Operator,
+    max_retries: usize,
+    honor_retry_after: bool,
 ) -> Operator {
     // OpenDAL's auto-registration process constructor can emit an ARM64 branch
     // outside the +/-128 MiB range in large dynamic libraries. Initialize the
@@ -42,6 +137,7 @@ pub(in crate::object_store) fn finish_opendal_operator(
     let context =
         base_context.with_http_transport(HttpTransporter::new(IdentityEncodingTransport {
             inner: base_context.http_transport().clone(),
+            honor_retry_after: honor_retry_after && max_retries > 0,
         }));
     let operator = operator.with_context(context);
 
@@ -94,6 +190,40 @@ mod tests {
         let operator =
             Operator::via_iter("memory", []).expect("memory service should be registered");
         assert_eq!(operator.info().scheme(), "memory");
+    }
+
+    #[rstest]
+    #[case::seconds("3", Some(Duration::from_secs(3)))]
+    #[case::zero("0", Some(Duration::ZERO))]
+    #[case::invalid("soon", None)]
+    fn test_parse_retry_after_delay_seconds(
+        #[case] value: &str,
+        #[case] expected: Option<Duration>,
+    ) {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(RETRY_AFTER, HeaderValue::from_str(value).unwrap());
+        assert_eq!(parse_retry_after(&headers), expected);
+    }
+
+    #[test]
+    fn test_parse_retry_after_http_date() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            RETRY_AFTER,
+            HeaderValue::from_static("Wed, 21 Oct 2015 07:28:00 GMT"),
+        );
+        assert_eq!(parse_retry_after(&headers), Some(Duration::ZERO));
+
+        let deadline = Timestamp::now() + Duration::from_secs(10);
+        headers.insert(
+            RETRY_AFTER,
+            HeaderValue::from_str(&deadline.format_http_date()).unwrap(),
+        );
+        let delay = parse_retry_after(&headers).expect("future HTTP date must parse");
+        assert!(
+            delay > Duration::from_secs(5),
+            "unexpected delay: {delay:?}"
+        );
     }
 
     #[derive(Debug, Clone)]

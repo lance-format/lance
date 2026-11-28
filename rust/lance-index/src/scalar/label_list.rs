@@ -8,17 +8,17 @@ use lance_index_core::remapping::{BatchRowIdRemapper, remap_row_addrs_tree_map_a
 use std::{
     any::Any,
     fmt::Debug,
-    pin::Pin,
     sync::{Arc, Mutex},
 };
 
 use arrow::array::AsArray;
-use arrow_array::{Array, RecordBatch, UInt64Array};
-use arrow_schema::{DataType, Field, Fields, Schema, SchemaRef, SortOptions};
+use arrow_array::{
+    Array, ArrayRef, GenericListArray, OffsetSizeTrait, RecordBatch, UInt64Array, types::UInt64Type,
+};
+use arrow_schema::{DataType, Field, Schema, SortOptions};
 use async_trait::async_trait;
 use bytes::Bytes;
 use datafusion_common::{DataFusionError, ScalarValue};
-use datafusion_execution::RecordBatchStream;
 use datafusion_physical_expr::{PhysicalSortExpr, expressions::Column};
 use datafusion_physical_plan::{
     ExecutionPlan, SendableRecordBatchStream, sorts::sort::SortExec,
@@ -26,6 +26,7 @@ use datafusion_physical_plan::{
 };
 use futures::{StreamExt, TryStream, TryStreamExt, future::Either, stream::BoxStream};
 use lance_arrow::deepcopy::deep_copy_batch_sliced;
+use lance_arrow::list::ListArrayExt;
 use lance_core::cache::{
     CacheCodec, CacheCodecImpl, CacheEntryReader, CacheEntryWriter, CacheKey, CacheKeySchema,
     KeyBuilder, LanceCache,
@@ -42,7 +43,7 @@ use tracing::instrument;
 
 use super::{
     AnyQuery, IndexFile, IndexStore, LabelListQuery, OldIndexDataFilter, ScalarIndex,
-    bitmap::BitmapIndex,
+    SearchOptions, bitmap::BitmapIndex,
 };
 use super::{BuiltinIndexType, SargableQuery, ScalarIndexParams};
 use super::{MetricsCollector, SearchResult};
@@ -95,7 +96,13 @@ trait LabelListSubIndex: ScalarIndex + DeepSizeOf {
         query: &dyn AnyQuery,
         metrics: &dyn MetricsCollector,
     ) -> Result<NullableRowAddrSet> {
-        let result = self.search(query, metrics).await?;
+        let result = self
+            .search_with_options(
+                query,
+                SearchOptions::default().with_track_nulls(false),
+                metrics,
+            )
+            .await?;
         match result {
             SearchResult::Exact(row_ids) => {
                 // Label list semantics treat NULL elements as non-matches, so only TRUE/FALSE
@@ -304,6 +311,16 @@ impl ScalarIndex for LabelListIndex {
         query: &dyn AnyQuery,
         metrics: &dyn MetricsCollector,
     ) -> Result<SearchResult> {
+        self.search_with_options(query, SearchOptions::default(), metrics)
+            .await
+    }
+
+    async fn search_with_options(
+        &self,
+        query: &dyn AnyQuery,
+        options: SearchOptions,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<SearchResult> {
         let query = query.as_any().downcast_ref::<LabelListQuery>().unwrap();
 
         let row_ids = match query {
@@ -317,7 +334,7 @@ impl ScalarIndex for LabelListIndex {
                 self.set_union(values_results, labels.len() == 1).await
             }
         }?;
-        let row_ids = if self.list_nulls.as_ref().is_empty() {
+        let row_ids = if !options.track_nulls() || self.list_nulls.as_ref().is_empty() {
             row_ids
         } else {
             let mut nulls = row_ids.null_rows().clone();
@@ -383,163 +400,84 @@ impl ScalarIndex for LabelListIndex {
     }
 }
 
-fn extract_flatten_indices(list_arr: &dyn Array) -> UInt64Array {
-    if let Some(list_arr) = list_arr.as_list_opt::<i32>() {
-        let mut indices = Vec::with_capacity(list_arr.values().len());
-        let offsets = list_arr.value_offsets();
-        for (offset_idx, w) in offsets.windows(2).enumerate() {
-            let size = (w[1] - w[0]) as u64;
-            indices.extend((0..size).map(|_| offset_idx as u64));
+fn expand_labels<O: OffsetSizeTrait>(
+    lists: &GenericListArray<O>,
+    rows: &UInt64Array,
+    list_nulls: &Mutex<RowAddrTreeMap>,
+) -> Vec<ArrayRef> {
+    let mut labels = lists.trimmed_values();
+    let mut identifiers = Vec::with_capacity(labels.len());
+    let mut nulls = RowAddrTreeMap::new();
+    for (i, len) in lists.offsets().lengths().enumerate() {
+        if lists.is_null(i) {
+            nulls.insert(rows.value(i));
+        } else {
+            identifiers.extend(std::iter::repeat_n(rows.value(i), len));
         }
-        UInt64Array::from(indices)
-    } else if let Some(list_arr) = list_arr.as_list_opt::<i64>() {
-        let mut indices = Vec::with_capacity(list_arr.values().len());
-        let offsets = list_arr.value_offsets();
-        for (offset_idx, w) in offsets.windows(2).enumerate() {
-            let size = (w[1] - w[0]) as u64;
-            indices.extend((0..size).map(|_| offset_idx as u64));
-        }
-        UInt64Array::from(indices)
-    } else {
-        unreachable!(
-            "Should verify that the first column is a list earlier. Got array of type: {}",
-            list_arr.data_type()
-        )
     }
+    if !nulls.is_empty() {
+        *list_nulls.lock().unwrap() |= &nulls;
+        // Arrow permits null lists to contain child slots; those labels have no owner.
+        if identifiers.len() != labels.len() {
+            labels = lists.filter_garbage_nulls().trimmed_values();
+        }
+    }
+    vec![labels, Arc::new(UInt64Array::from(identifiers))]
 }
 
-/// Collect row_ids for list-level NULLs before unnest; unnest drops NULL lists entirely.
-fn track_list_nulls(
+/// Expand each list into (label, identifier) pairs. A null list emits no labels,
+/// so record its identifier separately before expanding the batch.
+fn unnest_labels(
     source: SendableRecordBatchStream,
     list_nulls: Arc<Mutex<RowAddrTreeMap>>,
-) -> SendableRecordBatchStream {
-    let schema = source.schema();
-    let stream = source.try_filter_map(move |batch| {
-        let list_nulls = list_nulls.clone();
-        async move {
-            record_list_nulls(&batch, &list_nulls)?;
-            Ok(Some(batch))
-        }
-    });
-
-    Box::pin(RecordBatchStreamAdapter::new(schema, stream))
-}
-
-fn record_list_nulls(
-    batch: &RecordBatch,
-    list_nulls: &Arc<Mutex<RowAddrTreeMap>>,
-) -> datafusion_common::Result<()> {
-    let values = batch.column_by_name(VALUE_COLUMN_NAME).expect_ok()?;
-    let row_addrs = batch.column_by_name(ROW_ADDR).expect_ok()?;
-    let row_addrs = row_addrs.as_any().downcast_ref::<UInt64Array>().unwrap();
-
-    let mut local_nulls = RowAddrTreeMap::new();
-    for i in 0..values.len() {
-        if values.is_null(i) {
-            local_nulls.insert(row_addrs.value(i));
-        }
-    }
-    if !local_nulls.is_empty() {
-        let mut guard = list_nulls.lock().unwrap();
-        *guard |= &local_nulls;
-    }
-    Ok(())
-}
-
-fn unnest_schema(schema: &Schema) -> SchemaRef {
-    let mut fields_iter = schema.fields.iter().cloned();
-    let key_field = fields_iter.next().unwrap();
-    let remaining_fields = fields_iter.collect::<Vec<_>>();
-
-    let new_key_field = match key_field.data_type() {
-        DataType::List(item_field) | DataType::LargeList(item_field) => Field::new(
-            key_field.name(),
-            item_field.data_type().clone(),
-            item_field.is_nullable() || key_field.is_nullable(),
-        ),
-        other_type => {
-            unreachable!(
-                "The first field in the schema must be a List or LargeList type. \
-                Found: {}. This should have been verified earlier in the code.",
-                other_type
-            )
-        }
-    };
-
-    let all_fields = vec![Arc::new(new_key_field)]
-        .into_iter()
-        .chain(remaining_fields)
-        .collect::<Vec<_>>();
-
-    Arc::new(Schema::new(Fields::from(all_fields)))
-}
-
-fn unnest_batch(
-    batch: arrow::record_batch::RecordBatch,
-    unnest_schema: SchemaRef,
-) -> datafusion_common::Result<RecordBatch> {
-    let mut columns_iter = batch.columns().iter().cloned();
-    let key_col = columns_iter.next().unwrap();
-    let remaining_cols = columns_iter.collect::<Vec<_>>();
-
-    let remaining_fields = unnest_schema
-        .fields
-        .iter()
-        .skip(1)
-        .cloned()
-        .collect::<Vec<_>>();
-
-    let remaining_batch = RecordBatch::try_new(
-        Arc::new(Schema::new(Fields::from(remaining_fields))),
-        remaining_cols,
-    )?;
-
-    let flatten_indices = extract_flatten_indices(key_col.as_ref());
-
-    let flattened_remaining =
-        arrow_select::take::take_record_batch(&remaining_batch, &flatten_indices)?;
-
-    let new_key_values = if let Some(key_list) = key_col.as_list_opt::<i32>() {
-        let value_start = key_list.value_offsets()[key_list.offset()] as usize;
-        let value_stop = key_list.value_offsets()[key_list.len()] as usize;
-        key_list
-            .values()
-            .slice(value_start, value_stop - value_start)
-            .clone()
-    } else if let Some(key_list) = key_col.as_list_opt::<i64>() {
-        let value_start = key_list.value_offsets()[key_list.offset()] as usize;
-        let value_stop = key_list.value_offsets()[key_list.len()] as usize;
-        key_list
-            .values()
-            .slice(value_start, value_stop - value_start)
-            .clone()
-    } else {
-        unreachable!("Should verify that the first column is a list earlier")
-    };
-
-    let all_columns = vec![new_key_values]
-        .into_iter()
-        .chain(flattened_remaining.columns().iter().cloned())
-        .collect::<Vec<_>>();
-
-    datafusion_common::Result::Ok(arrow::record_batch::RecordBatch::try_new(
-        unnest_schema,
-        all_columns,
-    )?)
-}
-
-fn unnest_chunks(
-    source: Pin<Box<dyn RecordBatchStream + Send>>,
+    row_column: &'static str,
 ) -> Result<SendableRecordBatchStream> {
-    let unnest_schema = unnest_schema(source.schema().as_ref());
-    let unnest_schema_copy = unnest_schema.clone();
-    let source = source.try_filter_map(move |batch| {
-        std::future::ready(Some(unnest_batch(batch, unnest_schema.clone())).transpose())
+    let schema = source.schema();
+    let values = schema.field_with_name(VALUE_COLUMN_NAME)?;
+    let (DataType::List(item) | DataType::LargeList(item)) = values.data_type() else {
+        return Err(Error::invalid_input(format!(
+            "LabelList requires a List or LargeList {VALUE_COLUMN_NAME} column, got {}",
+            values.data_type()
+        )));
+    };
+    let id = schema
+        .field_with_name(row_column)
+        .ok()
+        .filter(|f| f.data_type() == &DataType::UInt64)
+        .ok_or_else(|| {
+            Error::invalid_input(format!("LabelList requires a UInt64 {row_column} column"))
+        })?;
+    let output = Arc::new(Schema::new(vec![
+        Field::new(
+            VALUE_COLUMN_NAME,
+            item.data_type().clone(),
+            item.is_nullable() || values.is_nullable(),
+        ),
+        id.clone(),
+    ]));
+    let output_schema = output.clone();
+    let batches = source.map(move |batch| {
+        let batch = batch?;
+        let values = batch.column_by_name(VALUE_COLUMN_NAME).expect_ok()?;
+        let rows = batch
+            .column_by_name(row_column)
+            .expect_ok()?
+            .as_primitive::<UInt64Type>();
+        if rows.null_count() != 0 {
+            return Err(DataFusionError::Execution(format!(
+                "LabelList {row_column} contains null identifiers"
+            )));
+        }
+        let columns = if let Some(lists) = values.as_list_opt::<i32>() {
+            expand_labels(lists, rows, &list_nulls)
+        } else {
+            expand_labels(values.as_list::<i64>(), rows, &list_nulls)
+        };
+        Ok(RecordBatch::try_new(output.clone(), columns)?)
     });
-
     Ok(Box::pin(RecordBatchStreamAdapter::new(
-        unnest_schema_copy,
-        source,
+        output_schema,
+        batches,
     )))
 }
 
@@ -689,7 +627,7 @@ fn sort_labels_by_value(
 /// `list_nulls` set as a global buffer in the same file.
 ///
 /// `list_nulls` is a closure, not a value, because it is only correct to read
-/// after `sorted_labels` is drained -- `track_list_nulls` fills its set as rows
+/// after `sorted_labels` is drained -- `unnest_labels` fills its set as rows
 /// flow through it, and the sort upstream means no row reaches here until every
 /// input row has passed it. The buffer is attached after the data pages for the
 /// same reason; `add_global_buffer` records its index in the file metadata, so
@@ -741,8 +679,7 @@ async fn train_label_list_index_with_plan(
     progress: &dyn crate::progress::IndexBuildProgress,
 ) -> Result<(IndexFile, Arc<dyn ExecutionPlan>)> {
     let list_nulls = Arc::new(Mutex::new(RowAddrTreeMap::new()));
-    let data = track_list_nulls(data, list_nulls.clone());
-    let data = unnest_chunks(data)?;
+    let data = unnest_labels(data, list_nulls.clone(), ROW_ADDR)?;
     let value_type = data.schema().field(0).data_type().clone();
     let (sorted, sort_plan) = sort_labels_by_value(data, mem_pool_size)?;
     let sorted = crate::progress::stage_until_first_batch(progress, "sort_values", sorted).await?;
@@ -784,8 +721,7 @@ async fn update_label_list_index(
     old_data_filter: Option<&OldIndexDataFilter>,
 ) -> Result<IndexFile> {
     let list_nulls = Arc::new(Mutex::new(RowAddrTreeMap::new()));
-    let new_data = track_list_nulls(new_data, list_nulls.clone());
-    let new_data = unnest_chunks(new_data)?;
+    let new_data = unnest_labels(new_data, list_nulls.clone(), ROW_ADDR)?;
 
     // The destination file's schema is declared from the existing index while
     // every new key comes from the stream. If the two disagree the written
@@ -1253,6 +1189,8 @@ mod tests {
 
     use std::sync::atomic::Ordering;
 
+    use arrow_array::builder::{GenericListBuilder, LargeListBuilder, ListBuilder, StringBuilder};
+    use arrow_schema::SchemaRef;
     use datafusion_common::ScalarValue;
     use lance_core::cache::CacheCodec;
     use lance_core::utils::address::RowAddress;
@@ -1261,7 +1199,7 @@ mod tests {
     use super::super::bitmap::BitmapIndexState;
     use super::super::btree::OrderableScalarValue;
     use super::*;
-    use crate::metrics::LocalMetricsCollector;
+    use crate::metrics::{LocalMetricsCollector, NoOpMetricsCollector};
     use crate::progress::NoopIndexBuildProgress;
     use crate::scalar::bitmap::test_util::{self, row_addrs};
     use lance_core::utils::tempfile::TempObjDir;
@@ -1722,6 +1660,45 @@ mod tests {
             .await
             .unwrap();
         (tmpdir, index)
+    }
+
+    #[rstest]
+    #[case::any(LabelListQuery::HasAnyLabel(vec![ScalarValue::Utf8(Some("a".into()))]))]
+    #[case::all(LabelListQuery::HasAllLabels(vec![ScalarValue::Utf8(Some("a".into()))]))]
+    #[tokio::test]
+    #[serial_test::serial(LANCE_DF_SPILL_POOL)]
+    async fn test_search_options_preserve_true_rows_without_tracking_list_nulls(
+        #[case] query: LabelListQuery,
+    ) {
+        let other_fragment = 1u64 << 32;
+        let rows: Vec<SampleRow> = vec![
+            (0, Some(vec![Some("a".into())])),
+            (1, None),
+            (other_fragment, Some(vec![Some("a".into()), None])),
+            (other_fragment + 1, Some(vec![])),
+            (other_fragment + 2, Some(vec![None])),
+        ];
+        let (_dir, index) = build_label_list_segment(&rows).await;
+        let SearchResult::Exact(tracked) =
+            index.search(&query, &NoOpMetricsCollector).await.unwrap()
+        else {
+            panic!("label-list search must be exact");
+        };
+        let SearchResult::Exact(untracked) = index
+            .search_with_options(
+                &query,
+                SearchOptions::default().with_track_nulls(false),
+                &NoOpMetricsCollector,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("label-list search must be exact");
+        };
+        assert_eq!(row_addrs(tracked.null_rows()), vec![1]);
+        assert!(untracked.null_rows().is_empty());
+        assert_eq!(row_addrs(&tracked.true_rows()), vec![0, other_fragment]);
+        assert_eq!(untracked.true_rows(), tracked.true_rows());
     }
 
     /// `calculate_included_frags` reports that coverage cannot be rebuilt from
@@ -2285,15 +2262,47 @@ mod tests {
         );
     }
 
-    /// A null *element* inside a list, a null *list*, and an empty list are three
-    /// different things and must land in three different places. `track_list_nulls`
-    /// runs ahead of the unnest, where the list column's validity is still present,
-    /// which is the only reason they are separable -- after unnesting, a null list
-    /// and an empty list are both zero rows.
-    ///
-    /// Asserted through every path that writes an index, so moving the unnest
-    /// upstream of the null tracking fails here rather than silently misfiling
-    /// rows and breaking NOT filters on nullable list columns.
+    #[rstest]
+    #[case::list(ListBuilder::new(StringBuilder::new()))]
+    #[case::large_list(LargeListBuilder::new(StringBuilder::new()))]
+    #[tokio::test]
+    async fn test_build_ignores_children_of_null_lists<O: OffsetSizeTrait>(
+        #[case] mut lists: GenericListBuilder<O, StringBuilder>,
+    ) {
+        lists.values().append_value("outside slice");
+        lists.append(true);
+        lists.values().append_value("hidden");
+        lists.append(false);
+        lists.append(true);
+        lists.values().append_null();
+        lists.values().append_value("visible");
+        lists.append(true);
+
+        let lists = lists.finish().slice(1, 3);
+        let batch = RecordBatch::try_from_iter([
+            (VALUE_COLUMN_NAME, Arc::new(lists) as ArrayRef),
+            (ROW_ADDR, Arc::new(UInt64Array::from(vec![10, 11, 12]))),
+        ])
+        .unwrap();
+        let stream = Box::pin(RecordBatchStreamAdapter::new(
+            batch.schema(),
+            futures::stream::iter([Ok(batch)]),
+        ));
+        let (_dir, store) = test_util::index_store();
+        train_label_list_index(stream, store.as_ref(), &NoopIndexBuildProgress)
+            .await
+            .unwrap();
+        assert_eq!(
+            read_index_contents(store.as_ref()).await,
+            IndexContents {
+                labels: vec![(None, vec![12]), (Some("visible".into()), vec![12])],
+                list_nulls: vec![10],
+            }
+        );
+    }
+
+    /// A null element has a posting, a null list is recorded in the list-null
+    /// bitmap, and an empty list contributes to neither.
     #[rstest]
     #[case::build("build")]
     #[case::update("update")]

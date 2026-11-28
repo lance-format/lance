@@ -58,15 +58,18 @@ impl LinderaTokenizer {
 
 pub struct LinderaTokenStream<'a> {
     tokens: Vec<LinderaToken<'a>>,
+    // Index of the next token to return. Tokens are read in place: removing them
+    // from the front instead made draining the stream quadratic in its length.
+    cursor: usize,
     token: &'a mut Token,
 }
 
 impl<'a> TokenStream for LinderaTokenStream<'a> {
     fn advance(&mut self) -> bool {
-        if self.tokens.is_empty() {
+        let Some(token) = self.tokens.get(self.cursor) else {
             return false;
-        }
-        let token = self.tokens.remove(0);
+        };
+        self.cursor += 1;
         self.token.text = token.surface.to_string();
         self.token.offset_from = token.byte_start;
         self.token.offset_to = token.byte_end;
@@ -91,6 +94,7 @@ impl Tokenizer for LinderaTokenizer {
         self.token.reset();
         LinderaTokenStream {
             tokens: self.tokenizer.tokenize(text).unwrap_or_default(),
+            cursor: 0,
             token: &mut self.token,
         }
     }
@@ -145,6 +149,29 @@ mod tests {
         let dictionary = load_fs_dictionary(&dst).unwrap();
         std::fs::remove_dir_all(&root).unwrap();
         LinderaTokenizer::from_segmenter(Segmenter::new(Mode::Normal, dictionary, None))
+    }
+
+    #[test]
+    fn token_stream_drains_in_linear_time() {
+        // Only the drain is timed. Removing tokens from the front of the buffer made it
+        // quadratic, far past the bound below.
+        let text = "東京 ".repeat(100_000);
+        let mut tokenizer = tiny_tokenizer();
+        let mut stream = tokenizer.token_stream(&text);
+        let start = std::time::Instant::now();
+        let mut count = 0;
+        while stream.advance() {
+            let token = stream.token();
+            assert_eq!(token.text, "東京");
+            assert_eq!(token.offset_from, count * "東京 ".len());
+            count += 1;
+        }
+        let elapsed = start.elapsed();
+        assert_eq!(count, 100_000);
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "draining 100k tokens took {elapsed:?}"
+        );
     }
 
     #[test]

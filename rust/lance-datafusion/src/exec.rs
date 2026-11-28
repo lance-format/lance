@@ -33,10 +33,11 @@ use lance_core::{Error, Result, utils::tracing::StreamTracingExt};
 use tracing::Span;
 
 pub use lance_datafusion_exec::exec::{
-    ExecutionDiagnostics, ExecutionDiagnosticsCallback, ExecutionMetric, ExecutionMetricValue,
-    ExecutionOutcome, ExecutionStatsCallback, ExecutionSummaryCounts, HardCapBatchSizeExec,
-    LanceExecutionOptions, OneShotExec, OperatorMetrics, RecordBatchExec, StrictBatchSizeExec,
-    collect_execution_metrics, collect_operator_metrics, execute_plan_with_diagnostics,
+    DefaultTargetPartitions, ExecutionDiagnostics, ExecutionDiagnosticsCallback, ExecutionMetric,
+    ExecutionMetricValue, ExecutionOutcome, ExecutionStatsCallback, ExecutionSummaryCounts,
+    HardCapBatchSizeExec, LanceExecutionOptions, OneShotExec, OperatorMetrics, RecordBatchExec,
+    StrictBatchSizeExec, collect_execution_metrics, collect_operator_metrics,
+    execute_plan_with_diagnostics,
 };
 use lance_datafusion_exec::exec::{
     execute_plan_with_context, new_runtime_env, new_session_config, track_execution_memory,

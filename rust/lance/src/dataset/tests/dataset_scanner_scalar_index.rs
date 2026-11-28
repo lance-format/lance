@@ -1113,10 +1113,7 @@ async fn test_ngram_regex_index_scan() {
     // A non-accelerable pattern (no trigram derivable) still returns correct
     // results via a full recheck.
     assert_eq!(matched(&dataset, "regexp_like(s, 'o.m')").await, ["dogma"]);
-    // A case-insensitive flag is not accelerated (the index normalization
-    // disagrees with Unicode case folding) but must still return correct
-    // results via a full recheck -- here matching despite the upper-case
-    // pattern. This exercises the three-argument `regexp_like` flags path.
+    // The three-argument `regexp_like` flags path.
     assert_eq!(
         matched(&dataset, "regexp_like(s, 'RHINO', 'i')").await,
         ["rhino", "rhino horn", "rhinos nose"]
@@ -1153,6 +1150,16 @@ async fn test_ngram_regex_index_scan() {
             "expected ngram index usage for `{filter}`, got plan:\n{plan_str}"
         );
     }
+
+    // The plan names the trigrams the index is asked for.
+    let mut scan = dataset.scan();
+    scan.filter("regexp_match(s, 'rhino.*(horn|nose)')")
+        .unwrap();
+    let plan = scan.explain_plan(true).await.unwrap();
+    assert!(
+        plan.contains("trigrams=(hin AND ino AND rhi AND ((hor AND orn) OR (nos AND ose)))"),
+        "{plan}"
+    );
 
     // contains with >= 3 characters (uses index)
     assert_eq!(
@@ -1202,6 +1209,69 @@ async fn test_ngram_regex_index_scan() {
             !plan_str.contains("ScalarIndexQuery"),
             "expected NO ngram index usage for `{filter}`, got plan:\n{plan_str}"
         );
+    }
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_regex_operators(#[values(false, true)] indexed: bool) {
+    let batch = arrow_array::record_batch!((
+        "s",
+        Utf8,
+        [
+            Some("rhino"),
+            Some("Rhinos nose"),
+            Some("rhino horn"),
+            Some("catalog"),
+            None
+        ]
+    ))
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+    let mut dataset = Dataset::write(reader, "memory://", None).await.unwrap();
+    if indexed {
+        dataset
+            .create_index(
+                &["s"],
+                IndexType::NGram,
+                None,
+                &ScalarIndexParams::default(),
+                true,
+            )
+            .await
+            .unwrap();
+    }
+
+    for (filter, expected, accelerated) in [
+        ("s ~ 'rhino.*(horn|nose)'", vec!["rhino horn"], true),
+        // `regexp_like` is simplified to `~` before it reaches the index.
+        (
+            "regexp_like(s, 'rhino.*(horn|nose)')",
+            vec!["rhino horn"],
+            true,
+        ),
+        (
+            "s ~* 'RHINO.*(horn|nose)'",
+            vec!["Rhinos nose", "rhino horn"],
+            false,
+        ),
+        ("s !~ 'rhino'", vec!["Rhinos nose", "catalog"], false),
+        ("s !~* 'rhino'", vec!["catalog"], false),
+    ] {
+        let mut scan = dataset.scan();
+        scan.filter(filter).unwrap();
+        let plan = scan.explain_plan(true).await.unwrap();
+        if accelerated || !indexed {
+            assert_eq!(plan.contains("ScalarIndexQuery"), indexed, "{plan}");
+        }
+        let batch = scan.try_into_batch().await.unwrap();
+        let mut matched = batch["s"]
+            .as_string::<i32>()
+            .iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        matched.sort();
+        assert_eq!(matched, expected, "{filter}");
     }
 }
 
@@ -1255,6 +1325,60 @@ async fn test_ngram_regex_non_accelerable_recheck() {
     // "acb" and "axb" each appear 10 times in the 60 rows -> 20 matches.
     assert_eq!(count(&dataset, "regexp_match(text, 'a.b')").await, 20);
     assert_eq!(count(&dataset, "regexp_like(text, 'a.b')").await, 20);
+}
+
+/// Classes and case folds go through the index without losing a match.
+#[rstest]
+#[case::long_s("regexp_match(s, '(?i)strasse')", "Stra\u{17f}se")]
+#[case::kelvin_sign("regexp_match(s, 'kelvin', 'i')", "\u{212a}ELVIN")]
+#[case::accent("regexp_match(s, '[e\u{e9}]cole')", "\u{e9}cole")]
+#[case::either_case("regexp_match(s, '[Cc]ataract')", "cataract")]
+#[case::digit("regexp_match(s, 'ab[0-3]cd')", "ab2cd")]
+#[case::repeated_group("regexp_match(s, '(ab|cd){2,}e')", "cdabcde")]
+#[case::ilike("s ILIKE '%CATALOG%'", "Catalog")]
+#[tokio::test]
+async fn test_ngram_regex_classes(#[case] filter: &str, #[case] expected: &str) {
+    let batch = arrow_array::record_batch!((
+        "s",
+        Utf8,
+        [
+            "Stra\u{17f}se",
+            "\u{212a}ELVIN",
+            "\u{e9}cole",
+            "Catalog",
+            "ab2cd",
+            "cdabcde",
+            "strap",
+            "kelp",
+            "colon",
+            "cataract",
+            "ab7cd",
+            "abe"
+        ]
+    ))
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+    let mut dataset = Dataset::write(reader, "memory://", None).await.unwrap();
+    dataset
+        .create_index(
+            &["s"],
+            IndexType::NGram,
+            None,
+            &ScalarIndexParams::default(),
+            true,
+        )
+        .await
+        .unwrap();
+
+    let mut scan = dataset.scan();
+    scan.filter(filter).unwrap();
+    let plan = scan.explain_plan(true).await.unwrap();
+    assert!(plan.contains("ScalarIndexQuery"), "{plan}");
+    let batch = scan.try_into_batch().await.unwrap();
+    assert_eq!(
+        batch["s"].as_string::<i32>().iter().collect::<Vec<_>>(),
+        [Some(expected)]
+    );
 }
 
 #[rstest]

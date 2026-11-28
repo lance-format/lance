@@ -21,7 +21,8 @@ use arrow::datatypes::{
     ArrowPrimitiveType, Decimal128Type, Float32Type, Float64Type, Int32Type, Int64Type,
 };
 use arrow_array::{
-    Array, Float64Array, PrimitiveArray, RecordBatch, UInt32Array, UInt64Array, record_batch,
+    Array, Float64Array, PrimitiveArray, RecordBatch, StringArray, UInt32Array, UInt64Array,
+    record_batch,
 };
 use arrow_schema::{DataType, Field, Schema};
 use datafusion_common::ScalarValue;
@@ -50,9 +51,9 @@ use crate::scalar::{
     zonemap::{
         HarvestedZoneSeed, ReusedZones, SEED_NULL_BITMAP_META_KEY, SEED_VERSION_META_KEY,
         SeedOutcome, ZONEMAP_FILENAME, ZONEMAP_SIZE_META_KEY, ZoneMapIndex,
-        ZoneMapIndexBuilderParams, ZoneMapProcessor, ZoneMapSeedWriter, ZoneMapSegmentBase,
-        build_zonemap_segment, merge_seeds_for_binary_copy, merge_zonemap_indices,
-        parse_seed_for_binary_copy, place_records, remap_zone,
+        ZoneMapIndexBuilderParams, ZoneMapProcessor, ZoneMapSeedVersion, ZoneMapSeedWriter,
+        ZoneMapSegmentBase, build_zonemap_segment, merge_seeds_for_binary_copy,
+        merge_zonemap_indices, parse_seed_for_binary_copy, place_records, remap_zone,
     },
 };
 use arrow_array::Int32Array;
@@ -2916,6 +2917,85 @@ async fn test_zone_map_seed_writer_empty() {
     assert!(result.is_none(), "empty fragment should return None");
 }
 
+#[test]
+fn test_zone_map_seed_writer_v0_format_and_nan_marker() {
+    let mut writer = ZoneMapSeedWriter::new("f", 4, DataType::Float64)
+        .unwrap()
+        .with_version(ZoneMapSeedVersion::V0);
+    assert_eq!(writer.required_feature_flags(), 0);
+
+    // Zone 0: finite + negative NaN + null -> V0 keeps ordinary min, writes max = +NaN.
+    // Zone 1: all positive NaNs -> V0 has null min, max = +NaN.
+    // Zone 2: finite only -> V0 keeps ordinary min and max.
+    let values: ArrayRef = Arc::new(Float64Array::from(vec![
+        Some(1.0),
+        Some(5.0),
+        Some(-f64::NAN),
+        None,
+        Some(f64::NAN),
+        Some(f64::NAN),
+        Some(f64::NAN),
+        Some(f64::NAN),
+        Some(10.0),
+        Some(20.0),
+    ]));
+    writer.observe_batch(&values).unwrap();
+    let bytes = writer.finish().unwrap().expect("should produce bytes");
+
+    let reader =
+        arrow_ipc::reader::FileReader::try_new(std::io::Cursor::new(bytes.as_ref()), None).unwrap();
+    let schema = reader.schema();
+    assert!(
+        !schema.metadata.contains_key(SEED_VERSION_META_KEY),
+        "V0 seed must omit version metadata"
+    );
+    assert!(
+        schema.field_with_name("negative_nan_count").is_err(),
+        "V0 seed must omit negative_nan_count"
+    );
+    assert_eq!(schema.fields().len(), 5);
+    assert!(schema.metadata.contains_key(SEED_NULL_BITMAP_META_KEY));
+
+    let (zones, null_bitmap) = ZoneMapSeedWriter::deserialize_seed(3, &bytes).unwrap();
+    assert_eq!(zones.len(), 3);
+    assert_eq!(zones[0].min, ScalarValue::Float64(Some(1.0)));
+    assert!(ZoneMapIndex::scalar_is_nan(&zones[0].max));
+    assert!(!ZoneMapIndex::scalar_is_negative_nan(&zones[0].max));
+    assert_eq!(zones[0].null_count, 1);
+    assert_eq!(zones[0].nan_count, 1);
+    assert_eq!(zones[0].negative_nan_count, None);
+
+    assert_eq!(zones[1].min, ScalarValue::Float64(None));
+    assert!(ZoneMapIndex::scalar_is_nan(&zones[1].max));
+    assert_eq!(zones[1].nan_count, 4);
+    assert_eq!(zones[1].negative_nan_count, None);
+
+    assert_eq!(zones[2].min, ScalarValue::Float64(Some(10.0)));
+    assert_eq!(zones[2].max, ScalarValue::Float64(Some(20.0)));
+    assert_eq!(zones[2].nan_count, 0);
+    assert_eq!(zones[2].negative_nan_count, None);
+
+    let bitmap = null_bitmap.expect("null bitmap should be recorded by default");
+    assert_eq!(bitmap.len(), 1);
+    assert!(bitmap.contains(3));
+
+    // Disabling null positions omits SEED_NULL_BITMAP_META_KEY in V0 as well.
+    let mut no_pos = ZoneMapSeedWriter::new("s", 4, DataType::Utf8)
+        .unwrap()
+        .with_version(ZoneMapSeedVersion::V0)
+        .with_null_positions(false);
+    let strings: ArrayRef = Arc::new(StringArray::from(vec![Some("a"), None, Some("z")]));
+    no_pos.observe_batch(&strings).unwrap();
+    let no_pos_bytes = no_pos.finish().unwrap().expect("should produce bytes");
+    let (s_zones, s_bitmap) = ZoneMapSeedWriter::deserialize_seed(4, &no_pos_bytes).unwrap();
+    assert_eq!(s_zones.len(), 1);
+    assert_eq!(s_zones[0].min, ScalarValue::Utf8(Some("a".into())));
+    assert_eq!(s_zones[0].max, ScalarValue::Utf8(Some("z".into())));
+    assert_eq!(s_zones[0].null_count, 1);
+    assert_eq!(s_zones[0].negative_nan_count, None);
+    assert_eq!(s_bitmap, None);
+}
+
 /// Seeds produced for fragments that contain null values must carry a null
 /// bitmap so that `try_update_with_seeds` can reconstruct `null_rows` without
 /// rescanning data.
@@ -5317,7 +5397,12 @@ fn test_reuse_rejects_missing_bounds_but_accepts_all_null_records() {
 
     fn seed_from_records(records: &[ZoneMapStatistics]) -> FragmentSeed {
         use arrow_ipc::writer::FileWriter;
-        let batch = ZoneMapSeedWriter::seed_batch_from_zones(records, &DataType::Int32).unwrap();
+        let batch = ZoneMapSeedWriter::seed_batch_from_zones(
+            records,
+            &DataType::Int32,
+            ZoneMapSeedVersion::V1,
+        )
+        .unwrap();
         let mut buf = std::io::Cursor::new(Vec::new());
         {
             let mut writer = FileWriter::try_new(&mut buf, batch.schema_ref()).unwrap();
