@@ -127,6 +127,15 @@ async fn can_use_binary_copy(
         .await
 }
 
+struct SavedCompactionPlan(CompactionPlan);
+
+#[async_trait]
+impl CompactionPlanner for SavedCompactionPlan {
+    async fn plan(&self, _dataset: &Dataset) -> Result<CompactionPlan> {
+        Ok(self.0.clone())
+    }
+}
+
 fn sample_data() -> RecordBatch {
     let schema = Schema::new(vec![Field::new("a", DataType::Int64, false)]);
 

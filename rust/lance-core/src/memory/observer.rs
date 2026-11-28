@@ -18,8 +18,9 @@ use crate::{Error, Result};
 ///
 /// It takes a boolean such as `1`/`0`, `true`/`false`, `on`/`off` or
 /// `yes`/`no`, in any case; unset or empty means off. Any other value makes
-/// index builds fail with an invalid-input error, and no memory metric is
-/// reported. The variable is read once per process, when Lance first needs it.
+/// the observed operations fail with an invalid-input error, keeps a MemWAL
+/// shard writer with a memtable from opening, and reports no memory metric.
+/// The variable is read once per process, when Lance first needs it.
 pub const OBSERVE_ENV_VAR: &str = "LANCE_MEMORY_OBSERVE";
 
 /// How often the process-wide sampler reads memory while a window is open.
@@ -110,9 +111,9 @@ pub(super) fn warn_unsupported() {
     UNSUPPORTED.call_once(|| {
         if cfg!(feature = "metrics") {
             tracing::warn!(
-                "Memory observation is switched on, but the process gauges and the index \
-                 build peaks need Linux and stay off; lance_memory_component_bytes is still \
-                 reported"
+                "Memory observation is switched on, but the process gauges, the operation peaks and \
+                 the memory events need Linux and stay off; lance_memory_component_bytes is \
+                 still reported"
             );
         } else {
             tracing::warn!(
@@ -220,11 +221,11 @@ impl Shared {
 }
 
 /// Tracks the peak resident set size (RSS) of the process over windows of
-/// time, such as the stages of an index build.
+/// time, such as an operation and its stages.
 ///
 /// One background thread samples memory while at least one window is open and
 /// sleeps otherwise. It reads `/proc`, so windows report a peak on Linux only.
-/// Public for the `lance` crate, which observes its index builds with it.
+/// Public for the `lance` crate, which observes its operations with it.
 #[doc(hidden)]
 #[derive(Debug)]
 pub struct MemoryObserver {

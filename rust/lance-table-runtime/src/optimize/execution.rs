@@ -36,6 +36,7 @@ use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
 use futures::{StreamExt, TryStreamExt};
 use lance_core::datatypes::Field as LanceField;
+use lance_core::memory::{ObservedOperation, OperationScope};
 use lance_core::{Error, Result};
 use lance_file::reader::FileReader as LFReader;
 use lance_file::version::ConcreteFileVersion;
@@ -284,6 +285,25 @@ impl CompactionTask {
 
 #[doc(hidden)]
 pub async fn execute_task(
+    dataset: &Table,
+    read_version: u64,
+    task: &TaskData,
+    options: &CompactionOptions,
+    hooks: &CompactionHooks<'_>,
+) -> Result<RewriteResult> {
+    let scope = OperationScope::start(ObservedOperation::Compaction, || None)?;
+    let stage_name = match &task.kind {
+        CompactionTaskKind::RewriteFragments => "rewrite_files",
+        CompactionTaskKind::RepackColumns { .. } => "repack_files",
+    };
+    let stage = scope.stages().start(stage_name);
+    let result = execute_task_inner(dataset, read_version, task, options, hooks).await?;
+    stage.complete();
+    scope.finish();
+    Ok(result)
+}
+
+pub(super) async fn execute_task_inner(
     dataset: &Table,
     read_version: u64,
     task: &TaskData,

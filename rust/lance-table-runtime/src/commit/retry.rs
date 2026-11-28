@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures::{FutureExt, TryFutureExt, future::Either};
+use lance_core::memory::{OperationScope, StageReporter};
 use lance_core::utils::backoff::SlotBackoff;
 use lance_core::{Error, Result};
 
@@ -127,6 +128,23 @@ pub async fn execute_with_retry<S: RetrySnapshot, E: RetryExecutor<S>>(
     dataset: Arc<S>,
     config: RetryConfig,
 ) -> Result<E::Result> {
+    execute_with_retry_and_stages(
+        executor,
+        dataset,
+        config,
+        &OperationScope::unobserved().stages(),
+    )
+    .await
+}
+
+/// Execute an operation and report each attempt's execution and commit to its caller.
+#[doc(hidden)]
+pub async fn execute_with_retry_and_stages<S: RetrySnapshot, E: RetryExecutor<S>>(
+    executor: E,
+    dataset: Arc<S>,
+    config: RetryConfig,
+    stages: &StageReporter,
+) -> Result<E::Result> {
     let start = Instant::now();
     let mut dataset_ref = dataset;
     let mut backoff = SlotBackoff::default();
@@ -135,10 +153,12 @@ pub async fn execute_with_retry<S: RetrySnapshot, E: RetryExecutor<S>>(
         let mut executor_clone = executor.clone();
         executor_clone.update_dataset(dataset_ref.clone());
 
+        let execute_stage = stages.start("execute");
         let execute_fut = executor_clone.execute_impl();
         let execute_fut =
             maybe_timeout(backoff.attempt(), start, config.retry_timeout, execute_fut);
         let data = execute_fut.await??;
+        execute_stage.complete();
 
         // The deadline is checked before the commit starts, never around it.
         // Cancelling a commit after its manifest is written would report a
@@ -149,8 +169,12 @@ pub async fn execute_with_retry<S: RetrySnapshot, E: RetryExecutor<S>>(
             return Err(timeout_error(config.retry_timeout, backoff.attempt() + 1));
         }
 
+        let commit_stage = stages.start("commit");
         match executor.commit(dataset_ref.clone(), data).await {
-            Ok(result) => return Ok(result),
+            Ok(result) => {
+                commit_stage.complete();
+                return Ok(result);
+            }
             Err(Error::RetryableCommitConflict { .. }) => {
                 // Check whether we have exhausted our retries *before* we sleep.
                 if backoff.attempt() >= config.max_retries {

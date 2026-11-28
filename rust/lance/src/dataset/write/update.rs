@@ -32,6 +32,7 @@ use lance_arrow::json::{JsonArray, is_json_field};
 use lance_core::datatypes::{BLOB_V2_LOGICAL_FIELDS, BLOB_V2_LOGICAL_TYPE, BlobHandling};
 use lance_core::datatypes::{Field as LanceField, Schema as LanceSchema};
 use lance_core::error::{InvalidInputSnafu, box_error};
+use lance_core::memory::{ObservedOperation, OperationScope};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{ROW_ADDR_FIELD, ROW_CREATED_AT_VERSION_FIELD, ROW_ID_FIELD, ROW_OFFSET_FIELD};
 use lance_datafusion::utils::from_datafusion_stream;
@@ -398,13 +399,16 @@ impl UpdatePlan {
 
 impl UpdateJob {
     pub async fn execute(self) -> Result<UpdateResult> {
+        let scope = OperationScope::start(ObservedOperation::Update, || None)?;
         let dataset = self.dataset.clone();
         let config = RetryConfig {
             max_retries: self.conflict_retries,
             retry_timeout: self.retry_timeout,
         };
 
-        Box::pin(execute_with_retry(self, dataset, config)).await
+        let result = Box::pin(execute_with_retry(self, dataset, config, &scope.stages())).await?;
+        scope.finish();
+        Ok(result)
     }
 
     async fn execute_impl(self) -> Result<UpdateData> {

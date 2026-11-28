@@ -17,6 +17,7 @@ use crate::session::index_caches::DSIndexCache;
 use itertools::Itertools;
 use lance_core::ROW_ADDR;
 use lance_core::datatypes::{OnMissing, OnTypeMismatch, Projectable, Projection};
+use lance_core::memory::ObservedOperation;
 use lance_core::traits::DatasetTakeRows;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::tracing::{
@@ -137,7 +138,7 @@ use crate::dataset::cleanup::{CleanupOperation, CleanupPolicy, CleanupPolicyBuil
 use crate::dataset::refs::{BranchContents, BranchIdentifier, BranchReservation, Branches, Tags};
 use crate::dataset::sql::SqlQueryBuilder;
 use crate::datatypes::Schema;
-use crate::index::memory_progress::{ObservedBuild, ObservedOperation};
+use crate::index::memory_progress::ObservedBuild;
 use crate::io::commit::{
     CommitTransactionOptions, commit_transaction, detect_overlapping_fragments, fix_schema,
 };

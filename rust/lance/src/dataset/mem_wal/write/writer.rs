@@ -11,7 +11,7 @@ use arc_swap::ArcSwap;
 use arrow_array::RecordBatch;
 use arrow_schema::Schema as ArrowSchema;
 use lance_core::datatypes::Schema;
-use lance_core::memory::{Component, register_component};
+use lance_core::memory::{Component, MemoryObserver, register_component};
 use lance_core::{Error, Result};
 use lance_index::mem_wal::ShardManifest;
 use lance_io::object_store::ObjectStore;
@@ -905,6 +905,10 @@ impl ShardWriter {
     /// `schema` should carry each field's id under `lance:field_id` in its
     /// field metadata; without them a replayed entry is matched by name, which
     /// a rename loses.
+    ///
+    /// A writer with a memtable is refused with an invalid-input error while
+    /// `LANCE_MEMORY_OBSERVE` holds a value other than a boolean, since none of
+    /// its flushes could run.
     #[instrument(name = "sw_open", level = "info", skip_all, fields(shard_id = %config.shard_id, index_count = index_specs.len()))]
     pub async fn open(
         object_store: Arc<ObjectStore>,
@@ -934,6 +938,13 @@ impl ShardWriter {
         schema: Arc<ArrowSchema>,
         index_specs: Vec<MemIndexSpec>,
     ) -> Result<Self> {
+        // Every memtable flush checks LANCE_MEMORY_OBSERVE, and the flush
+        // handler gives up on an invalid value for good; refuse the writer
+        // before it claims the shard or accepts a single put instead. A
+        // WAL-only writer flushes no memtable.
+        if config.enable_memtable {
+            MemoryObserver::global()?;
+        }
         if !config.enable_memtable && !index_specs.is_empty() {
             return Err(Error::invalid_input(
                 "indexes require enable_memtable = true; \

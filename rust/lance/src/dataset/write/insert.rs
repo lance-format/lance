@@ -36,6 +36,7 @@ pub struct InsertBuilder<'a> {
     preassigned_data_file_name: Option<Arc<String>>,
     inherited_field_ids: bool,
     disable_dictionary_split: bool,
+    observed: bool,
 }
 
 impl<'a> InsertBuilder<'a> {
@@ -47,6 +48,7 @@ impl<'a> InsertBuilder<'a> {
             preassigned_data_file_name: None,
             inherited_field_ids: false,
             disable_dictionary_split: false,
+            observed: true,
         }
     }
 
@@ -75,6 +77,13 @@ impl<'a> InsertBuilder<'a> {
     /// whose deletion vector and indexes address a single fragment.
     pub(crate) fn with_dictionary_split_disabled(mut self) -> Self {
         self.disable_dictionary_split = true;
+        self
+    }
+
+    /// Observes no write of its own, for a write that is only one step of
+    /// another operation, which reports it in a stage of its own.
+    pub(crate) fn without_memory_observation(mut self) -> Self {
+        self.observed = false;
         self
     }
 
@@ -189,6 +198,9 @@ impl<'a> InsertBuilder<'a> {
             .with_lifecycle_hook(commit_hook);
         if let Some(name) = &self.preassigned_data_file_name {
             builder = builder.with_preassigned_data_file_name(name.as_str());
+        }
+        if !self.observed {
+            builder = builder.without_memory_observation();
         }
         if self.inherited_field_ids {
             builder = builder.with_inherited_field_ids();

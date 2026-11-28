@@ -11,6 +11,7 @@ use crate::{
 use datafusion::logical_expr::Expr;
 use datafusion::scalar::ScalarValue;
 use futures::{StreamExt, TryStreamExt};
+use lance_core::memory::{ObservedOperation, OperationScope};
 use lance_core::{Error, ROW_ID, Result};
 use lance_select::RowAddrTreeMap;
 use lance_table::format::Fragment;
@@ -162,6 +163,7 @@ impl DeleteBuilder {
 
     /// Execute the delete operation
     pub async fn execute(self) -> Result<DeleteResult> {
+        let scope = OperationScope::start(ObservedOperation::Delete, || None)?;
         let job = DeleteJob {
             dataset: self.dataset.clone(),
             filter: self.filter,
@@ -172,7 +174,9 @@ impl DeleteBuilder {
             retry_timeout: self.retry_timeout,
         };
 
-        execute_with_retry(job, self.dataset, config).await
+        let result = execute_with_retry(job, self.dataset, config, &scope.stages()).await?;
+        scope.finish();
+        Ok(result)
     }
 
     /// Execute the delete operation without committing the transaction.
@@ -202,11 +206,14 @@ impl DeleteBuilder {
     /// # }
     /// ```
     pub async fn execute_uncommitted(self) -> Result<UncommittedDelete> {
+        let scope = OperationScope::start(ObservedOperation::Delete, || None)?;
         let job = DeleteJob {
             dataset: self.dataset,
             filter: self.filter,
         };
+        let stage = scope.stages().start("execute");
         let data = job.execute_impl().await?;
+        stage.complete();
         let DeleteData {
             updated_fragments,
             deleted_fragment_ids,
@@ -218,6 +225,7 @@ impl DeleteBuilder {
             updated_fragments,
             deleted_fragment_ids,
         );
+        scope.finish();
         Ok(UncommittedDelete {
             transaction,
             affected_rows,

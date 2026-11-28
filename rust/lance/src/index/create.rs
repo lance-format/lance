@@ -16,7 +16,7 @@ use crate::{
         },
         lifecycle::build_index_metadata_from_segments,
         loading::{DatasetIndexInternalExt, load_all_indices, load_all_indices_by_name},
-        memory_progress::{ObservedBuild, ObservedOperation, index_type_label},
+        memory_progress::{ObservedBuild, index_type_label},
         scalar::{build_bitmap_index_segment, build_scalar_index},
         vector::details::{vector_index_details, vector_index_details_default},
         vector::{
@@ -27,6 +27,7 @@ use crate::{
 };
 use futures::{FutureExt, future::BoxFuture};
 use lance_core::datatypes::format_field_path;
+use lance_core::memory::ObservedOperation;
 use lance_index::progress::{IndexBuildProgress, NoopIndexBuildProgress};
 use lance_index::{
     IndexParams, IndexType, registry::plugin_name_from_details_url, scalar::CreatedIndex,
@@ -180,8 +181,9 @@ impl<'a> CreateIndexBuilder<'a> {
         self
     }
 
-    /// Leaves the build out of memory observation, for a build that is only one
-    /// step of another operation.
+    /// Observes no build of its own, for a build that is only one step of
+    /// another operation: that operation reports the build's stages through the
+    /// progress it hands in (see `memory_progress::observing_progress`).
     pub(crate) fn without_memory_observation(mut self) -> Self {
         self.memory_operation = None;
         self

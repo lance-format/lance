@@ -9,6 +9,7 @@
 //! table and pass the results to [commit_compaction].
 
 use futures::{StreamExt, TryStreamExt};
+use lance_core::memory::{ObservedOperation, OperationScope, StageReporter};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::utils::tracing::{DATASET_COMPACTING_EVENT, TRACE_DATASET_EVENTS};
 use lance_core::{Error, Result};
@@ -64,8 +65,17 @@ pub async fn compact_files_with_planner(
     table: &mut Table,
     planner: &dyn CompactionPlanner,
 ) -> Result<CompactionMetrics> {
+    let scope = OperationScope::start(ObservedOperation::Compaction, || None)?;
     let plan = planner.plan(table).await?;
-    execute_compaction_plan(table, plan, &CompactionHooks::default()).await
+    let metrics = execute_compaction_plan_with_stages(
+        table,
+        plan,
+        &CompactionHooks::default(),
+        &scope.stages(),
+    )
+    .await?;
+    scope.finish();
+    Ok(metrics)
 }
 
 /// Execute and publish an already computed plan using locally bound hooks.
@@ -73,6 +83,20 @@ pub async fn execute_compaction_plan(
     table: &mut Table,
     plan: CompactionPlan,
     hooks: &CompactionHooks<'_>,
+) -> Result<CompactionMetrics> {
+    let scope = OperationScope::start(ObservedOperation::Compaction, || None)?;
+    let metrics = execute_compaction_plan_with_stages(table, plan, hooks, &scope.stages()).await?;
+    scope.finish();
+    Ok(metrics)
+}
+
+/// Execute a plan within the caller's compaction operation.
+#[doc(hidden)]
+pub async fn execute_compaction_plan_with_stages(
+    table: &mut Table,
+    plan: CompactionPlan,
+    hooks: &CompactionHooks<'_>,
+    stages: &StageReporter,
 ) -> Result<CompactionMetrics> {
     let options = &plan.options;
     if !hooks
@@ -98,12 +122,11 @@ pub async fn execute_compaction_plan(
     if plan.tasks.is_empty() {
         return Ok(CompactionMetrics::default());
     }
-    if !options.defer_index_remap
-        && plan
-            .tasks
-            .iter()
-            .any(|task| task.kind == CompactionTaskKind::RewriteFragments)
-    {
+    let has_rewrites = plan
+        .tasks
+        .iter()
+        .any(|task| task.kind == CompactionTaskKind::RewriteFragments);
+    if has_rewrites && !options.defer_index_remap {
         commit::reject_eager_remap_on_tagged_fri(table).await?;
     }
     for task in &plan.tasks {
@@ -115,12 +138,19 @@ pub async fn execute_compaction_plan(
         .unwrap_or_else(get_num_compute_intensive_cpus);
     let snapshot = &*table;
     let read_version = plan.read_version;
+    // Concurrent tasks share a stage and still execute on the planned snapshot.
+    let execution_stage = stages.start(if has_rewrites {
+        "rewrite_files"
+    } else {
+        "repack_files"
+    });
     let results = futures::stream::iter(plan.tasks)
         .map(move |task| async move {
-            execution::execute_task(snapshot, read_version, &task, options, hooks).await
+            execution::execute_task_inner(snapshot, read_version, &task, options, hooks).await
         })
         .buffer_unordered(concurrency)
         .try_collect()
         .await?;
-    commit_compaction_with_hooks(table, results, options, hooks).await
+    execution_stage.complete();
+    commit::commit_compaction_inner(table, results, options, hooks, stages).await
 }

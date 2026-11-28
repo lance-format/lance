@@ -853,18 +853,43 @@ async fn write_new_value_of_d(dataset: &mut Dataset, how: NewValueOfD) {
 #[case::in_place_update(NewValueOfD::InPlaceUpdate)]
 #[case::data_changing_replacement(NewValueOfD::Replacement)]
 #[tokio::test]
-async fn repack_against_concurrent_new_value_of_moved_column(#[case] how: NewValueOfD) {
+async fn repack_against_concurrent_new_value_of_moved_column(
+    #[case] how: NewValueOfD,
+    #[values(false, true)] is_saved_plan: bool,
+) {
     let mut dataset = write_backfilled().await;
     // Moves every column of each fragment, d included, into one file.
-    let stale = stale_repack_results(&dataset, &repack_options(Some(1))).await;
+    let options = repack_options(Some(1));
+    let plan = plan_compaction(&dataset, &options).await.unwrap();
+    assert_eq!(plan.num_tasks(), 2);
+    assert!(
+        plan.tasks()
+            .iter()
+            .all(|task| matches!(task.kind, CompactionTaskKind::RepackColumns { .. }))
+    );
+    let stale = if is_saved_plan {
+        Vec::new()
+    } else {
+        stale_repack_results(&dataset, &options).await
+    };
 
     write_new_value_of_d(&mut dataset, how).await;
     let expected = dataset.scan().try_into_batch().await.unwrap();
     assert_eq!(dataset.count_rows(Some("d = 100".into())).await.unwrap(), 1);
 
-    let err = commit_results(&mut dataset, stale).await.unwrap_err();
+    let result = if is_saved_plan {
+        compact_files_with_planner(&mut dataset, None, &SavedCompactionPlan(plan)).await
+    } else {
+        commit_results(&mut dataset, stale).await
+    };
+    let err = result.unwrap_err();
     assert!(
         matches!(err, Error::RetryableCommitConflict { .. }),
+        "{err}"
+    );
+    assert!(
+        err.to_string()
+            .contains("preempted by concurrent transaction"),
         "{err}"
     );
     dataset.checkout_latest().await.unwrap();

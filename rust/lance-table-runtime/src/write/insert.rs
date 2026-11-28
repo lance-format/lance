@@ -7,6 +7,7 @@ use std::sync::Arc;
 use arrow_array::{RecordBatch, RecordBatchIterator};
 use humantime::format_duration;
 use lance_core::datatypes::{NullabilityComparison, Schema};
+use lance_core::memory::{ObservedOperation, OperationScope, StageReporter};
 use lance_core::utils::tracing::{DATASET_WRITING_EVENT, TRACE_DATASET_EVENTS};
 use lance_core::{Error, Result, is_system_column};
 use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
@@ -50,6 +51,7 @@ pub struct InsertBuilder<'a> {
     preassigned_data_file_name: Option<Arc<String>>,
     inherited_field_ids: bool,
     disable_dictionary_split: bool,
+    observed: bool,
     default_session: Option<Arc<TableSession>>,
     seed_hook: Option<Arc<dyn WriteSeedHook>>,
     index_hook: Option<Arc<dyn CommitIndexHook>>,
@@ -66,6 +68,7 @@ impl<'a> InsertBuilder<'a> {
             preassigned_data_file_name: None,
             inherited_field_ids: false,
             disable_dictionary_split: false,
+            observed: true,
             default_session: None,
             seed_hook: None,
             index_hook: None,
@@ -130,6 +133,23 @@ impl<'a> InsertBuilder<'a> {
         self
     }
 
+    /// Observes no write of its own, for a write that is only one step of
+    /// another operation, which reports it in a stage of its own.
+    #[doc(hidden)]
+    pub fn without_memory_observation(mut self) -> Self {
+        self.observed = false;
+        self
+    }
+
+    /// Observes the memory of the write, unless the caller opted out.
+    fn observe(&self) -> Result<OperationScope> {
+        if self.observed {
+            OperationScope::start(ObservedOperation::Write, || None)
+        } else {
+            Ok(OperationScope::unobserved())
+        }
+    }
+
     /// Register a callback that is invoked after each batch of rows is written.
     ///
     /// The callback receives cumulative [`WriteStats`] and can be used to drive
@@ -146,25 +166,31 @@ impl<'a> InsertBuilder<'a> {
     ///
     /// This writes the data fragments and commits them into the dataset.
     pub async fn execute(&self, data: Vec<RecordBatch>) -> Result<Table> {
+        let scope = self.observe()?;
+        let stages = scope.stages();
+        let write_stage = stages.start("write_fragments");
         let (transaction, context) = self.write_uncommitted_impl(data).await?;
-        self.do_commit(&context, transaction).await
+        write_stage.complete();
+        let table = self.do_commit(&context, transaction, &stages).await?;
+        scope.finish();
+        Ok(table)
     }
 
     /// Execute the insert operation with the given stream.
     ///
     /// This writes the data fragments and commits them into the dataset.
     pub async fn execute_stream(&self, source: impl StreamingWriteSource) -> Result<Table> {
+        let scope = self.observe()?;
+        let stages = scope.stages();
+        // Started before the source is read: reading its schema reads its
+        // first batch.
+        let write_stage = stages.start("write_fragments");
         let (stream, schema) = source.into_stream_and_schema().await?;
-        self.execute_stream_impl(stream, schema).await
-    }
-
-    async fn execute_stream_impl(
-        &self,
-        stream: SendableRecordBatchStream,
-        schema: Schema,
-    ) -> Result<Table> {
         let (transaction, context) = self.write_uncommitted_stream_impl(stream, schema).await?;
-        self.do_commit(&context, transaction).await
+        write_stage.complete();
+        let table = self.do_commit(&context, transaction, &stages).await?;
+        scope.finish();
+        Ok(table)
     }
 
     /// Write data files, but don't commit the transaction yet.
@@ -192,13 +218,19 @@ impl<'a> InsertBuilder<'a> {
     /// # }
     /// ```
     pub async fn execute_uncommitted(&self, data: Vec<RecordBatch>) -> Result<Transaction> {
-        self.write_uncommitted_impl(data).await.map(|(t, _)| t)
+        let scope = self.observe()?;
+        let write_stage = scope.stages().start("write_fragments");
+        let (transaction, _) = self.write_uncommitted_impl(data).await?;
+        write_stage.complete();
+        scope.finish();
+        Ok(transaction)
     }
 
     async fn do_commit(
         &self,
         context: &WriteContext<'_>,
         transaction: Transaction,
+        stages: &StageReporter,
     ) -> Result<Table> {
         let mut commit_builder = CommitBuilder::new(context.dest.clone())
             .use_stable_row_ids(context.params.enable_stable_row_ids)
@@ -228,8 +260,13 @@ impl<'a> InsertBuilder<'a> {
             commit_builder = commit_builder.with_index_hook(hook.clone());
         }
 
-        Box::pin(commit_builder.execute_with_lifecycle(transaction, self.lifecycle_hook.as_deref()))
-            .await
+        let stage = stages.start("commit");
+        let table = Box::pin(
+            commit_builder.execute_with_lifecycle(transaction, self.lifecycle_hook.as_deref()),
+        )
+        .await?;
+        stage.complete();
+        Ok(table)
     }
 
     async fn write_uncommitted_impl(
@@ -261,8 +298,12 @@ impl<'a> InsertBuilder<'a> {
         &self,
         source: impl StreamingWriteSource,
     ) -> Result<Transaction> {
+        let scope = self.observe()?;
+        let write_stage = scope.stages().start("write_fragments");
         let (stream, schema) = source.into_stream_and_schema().await?;
         let (transaction, _) = self.write_uncommitted_stream_impl(stream, schema).await?;
+        write_stage.complete();
+        scope.finish();
         Ok(transaction)
     }
 

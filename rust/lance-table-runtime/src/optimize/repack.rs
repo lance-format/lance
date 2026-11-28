@@ -17,6 +17,7 @@ use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 
 use lance_core::datatypes::{Field as LanceField, Schema};
+use lance_core::memory::StageReporter;
 use lance_file::version::ConcreteFileVersion;
 use lance_file::writer::FileWriterOptions;
 use lance_table::format::{DataFile, Fragment};
@@ -409,6 +410,7 @@ pub(super) async fn commit_repacked_files(
     results: Vec<RewriteResult>,
     options: &CompactionOptions,
     hooks: &CompactionHooks<'_>,
+    stages: &StageReporter,
 ) -> Result<CompactionMetrics> {
     let mut metrics = CompactionMetrics::default();
     let mut read_version = u64::MAX;
@@ -442,6 +444,8 @@ pub(super) async fn commit_repacked_files(
     .build();
     // Like a rewrite's, a repack result can be retried after an ambiguous
     // success, so its files are left for cleanup rather than deleted here.
+    let commit_stage = stages.start("commit");
     *dataset = publish_compaction(&base, transaction, hooks).await?;
+    commit_stage.complete();
     Ok(metrics)
 }

@@ -9,29 +9,13 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use async_trait::async_trait;
-use lance_core::memory::{MemoryObserver, OperationReport, StageWindow};
+use lance_core::memory::{ObservedOperation, OperationScope, Stage, StageReporter};
 use lance_index::progress::IndexBuildProgress;
 use lance_index::scalar::{BuiltinIndexType, LANCE_SCALAR_INDEX, ScalarIndexParams};
 use lance_index::{IndexParams, IndexType};
 
 use super::vector::{LANCE_VECTOR_INDEX, VectorIndexParams};
 use crate::Result;
-
-/// The operation an observed build belongs to, reported as its `operation` label.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ObservedOperation {
-    CreateIndex,
-    MergeIndexMetadata,
-}
-
-impl ObservedOperation {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::CreateIndex => "create_index",
-            Self::MergeIndexMetadata => "merge_index_metadata",
-        }
-    }
-}
 
 /// An index build whose memory is observed while memory observation is on.
 ///
@@ -40,7 +24,7 @@ impl ObservedOperation {
 /// of the whole build.
 pub struct ObservedBuild {
     progress: Arc<dyn IndexBuildProgress>,
-    build: Option<(StageWindow, Arc<OperationReport>)>,
+    scope: OperationScope,
 }
 
 impl ObservedBuild {
@@ -48,7 +32,7 @@ impl ObservedBuild {
     pub fn unobserved(progress: Arc<dyn IndexBuildProgress>) -> Self {
         Self {
             progress,
-            build: None,
+            scope: OperationScope::unobserved(),
         }
     }
 
@@ -59,30 +43,14 @@ impl ObservedBuild {
         operation: ObservedOperation,
         index_type: impl FnOnce() -> String,
     ) -> Result<Self> {
-        Ok(match MemoryObserver::global()? {
-            Some(observer) => Self::with_observer(progress, observer, operation, index_type()),
-            None => Self::unobserved(progress),
-        })
+        let scope = OperationScope::start(operation, || Some(index_type()))?;
+        Ok(Self::observing(progress, scope))
     }
 
-    pub fn with_observer(
-        progress: Arc<dyn IndexBuildProgress>,
-        observer: Arc<MemoryObserver>,
-        operation: ObservedOperation,
-        index_type: String,
-    ) -> Self {
-        let build = observer.open_window();
-        let report = Arc::new(OperationReport::new(operation.as_str(), index_type));
-        report.start();
-        let progress = Arc::new(MemoryObservingProgress {
-            inner: progress,
-            observer,
-            report: Arc::clone(&report),
-            stages: Mutex::default(),
-        });
+    fn observing(progress: Arc<dyn IndexBuildProgress>, scope: OperationScope) -> Self {
         Self {
-            progress,
-            build: Some((build, report)),
+            progress: observing_progress(&scope.stages(), progress),
+            scope,
         }
     }
 
@@ -96,10 +64,27 @@ impl ObservedBuild {
     /// build dropped without this reports no completion and records no
     /// operation peak; stages that completed before the drop keep theirs.
     pub fn finish(self) {
-        if let Some((window, report)) = self.build {
-            report.complete(window.close());
-        }
+        self.scope.finish();
     }
+}
+
+/// `inner`, reporting every stage it is told about as a stage of the operation
+/// that `stages` reports into, or `inner` itself when that operation is not
+/// observed. Builders that run inside a larger operation, such as the segment
+/// rebuilds of `optimize_indices`, report their stages this way instead of
+/// observing a build of their own.
+pub fn observing_progress(
+    stages: &StageReporter,
+    inner: Arc<dyn IndexBuildProgress>,
+) -> Arc<dyn IndexBuildProgress> {
+    if !stages.is_observed() {
+        return inner;
+    }
+    Arc::new(MemoryObservingProgress {
+        inner,
+        stages: stages.clone(),
+        open: Mutex::default(),
+    })
 }
 
 /// The `index_type` label of a build, resolved the way the build resolves the
@@ -131,21 +116,20 @@ pub fn index_type_label(index_type: IndexType, params: &dyn IndexParams) -> Stri
     index_type.to_string().to_lowercase()
 }
 
-/// Forwards every progress call to `inner` and reports the start of each stage
-/// and its peak memory between its start and its completion.
+/// Forwards every progress call to `inner` and reports each stage, from its
+/// start to its completion, as a stage of the observed operation.
 #[derive(Debug)]
 struct MemoryObservingProgress {
     inner: Arc<dyn IndexBuildProgress>,
-    observer: Arc<MemoryObserver>,
-    report: Arc<OperationReport>,
-    /// Open windows by stage name. A stage may run nested in, or again after,
-    /// another stage of the same name, so each name keeps a stack.
-    stages: Mutex<HashMap<String, Vec<StageWindow>>>,
+    stages: StageReporter,
+    /// Open stages by name. A stage may run nested in, or again after, another
+    /// stage of the same name, so each name keeps a stack.
+    open: Mutex<HashMap<String, Vec<Stage>>>,
 }
 
 impl MemoryObservingProgress {
-    fn stages(&self) -> MutexGuard<'_, HashMap<String, Vec<StageWindow>>> {
-        self.stages.lock().unwrap_or_else(PoisonError::into_inner)
+    fn open(&self) -> MutexGuard<'_, HashMap<String, Vec<Stage>>> {
+        self.open.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
@@ -156,12 +140,11 @@ impl IndexBuildProgress for MemoryObservingProgress {
     }
 
     async fn stage_start(&self, stage: &str, total: Option<u64>, unit: &str) -> Result<()> {
-        let window = self.observer.open_window();
-        self.report.stage_start(stage);
-        self.stages()
+        let started = self.stages.start(stage);
+        self.open()
             .entry(stage.to_string())
             .or_default()
-            .push(window);
+            .push(started);
         self.inner.stage_start(stage, total, unit).await
     }
 
@@ -170,9 +153,9 @@ impl IndexBuildProgress for MemoryObservingProgress {
     }
 
     async fn stage_complete(&self, stage: &str) -> Result<()> {
-        let window = self.stages().get_mut(stage).and_then(Vec::pop);
-        if let Some(window) = window {
-            self.report.stage_complete(stage, window.close());
+        let started = self.open().get_mut(stage).and_then(Vec::pop);
+        if let Some(started) = started {
+            started.complete();
         }
         self.inner.stage_complete(stage).await
     }
@@ -182,6 +165,7 @@ impl IndexBuildProgress for MemoryObservingProgress {
 mod tests {
     use super::*;
     use crate::Error;
+    use lance_core::memory::MemoryObserver;
     use lance_linalg::distance::MetricType;
     use rstest::rstest;
     use std::any::Any;
@@ -223,12 +207,12 @@ mod tests {
     // the thread that hits it: a test emitting without a subscriber could then
     // turn the callsite off for the mock of a test running in parallel.
     fn observed(inner: Arc<dyn IndexBuildProgress>) -> ObservedBuild {
-        ObservedBuild::with_observer(
-            inner,
+        let scope = OperationScope::with_observer(
             Arc::new(MemoryObserver::new(Duration::from_millis(1))),
             ObservedOperation::CreateIndex,
-            "ivf_pq".to_string(),
-        )
+            Some("ivf_pq".to_string()),
+        );
+        ObservedBuild::observing(inner, scope)
     }
 
     #[tokio::test]
@@ -283,10 +267,12 @@ mod tests {
     }
 
     #[test]
-    fn test_unobserved_build_hands_the_progress_through() {
+    fn test_unobserved_work_hands_the_progress_through() {
         let inner: Arc<dyn IndexBuildProgress> = Arc::new(RecordingProgress::default());
         let build = ObservedBuild::unobserved(inner.clone());
         assert!(Arc::ptr_eq(&build.progress(), &inner));
+        let nested = observing_progress(&OperationScope::unobserved().stages(), inner.clone());
+        assert!(Arc::ptr_eq(&nested, &inner));
     }
 
     #[rstest]
@@ -322,14 +308,26 @@ mod tests {
         use tracing_mock::event::ExpectedEvent;
         use tracing_mock::{expect, subscriber};
 
-        /// A memory event of the build that [`observed`] starts. A completion
-        /// carries a peak wherever the platform reports memory.
+        /// A memory event of the build that [`observed`] starts.
         fn memory_event(event: &str, stage: Option<&str>) -> ExpectedEvent {
+            operation_event("create_index", Some("ivf_pq"), event, stage)
+        }
+
+        /// A memory event of an operation. A completion carries a peak
+        /// wherever the platform reports memory.
+        fn operation_event(
+            operation: &str,
+            index_type: Option<&str>,
+            event: &str,
+            stage: Option<&str>,
+        ) -> ExpectedEvent {
             let mut fields = expect::field("event")
                 .with_value(&event)
                 .and(expect::field("operation_id"))
-                .and(expect::field("operation").with_value(&"create_index"))
-                .and(expect::field("index_type").with_value(&"ivf_pq"));
+                .and(expect::field("operation").with_value(&operation));
+            if let Some(index_type) = index_type {
+                fields = fields.and(expect::field("index_type").with_value(&index_type));
+            }
             if let Some(stage) = stage {
                 fields = fields.and(expect::field("stage").with_value(&stage));
             }
@@ -396,6 +394,38 @@ mod tests {
             drop(build);
             drop(guard);
             handle.assert_finished();
+        }
+
+        #[tokio::test]
+        #[serial_test::serial(memory_events)]
+        async fn test_a_nested_builder_reports_its_stages_into_the_operation() {
+            let mut mock = subscriber::mock();
+            for (event, stage) in [
+                ("operation_start", None),
+                ("stage_start", Some("train_ivf")),
+                ("stage_complete", Some("train_ivf")),
+                ("operation_complete", None),
+            ] {
+                mock = mock.event(operation_event("optimize_indices", None, event, stage));
+            }
+            let (subscriber, handle) = mock.only().run_with_handle();
+            let guard = tracing::subscriber::set_default(subscriber);
+            let scope = OperationScope::with_observer(
+                Arc::new(MemoryObserver::new(Duration::from_millis(1))),
+                ObservedOperation::OptimizeIndices,
+                None,
+            );
+            let inner = Arc::new(RecordingProgress::default());
+            let progress = observing_progress(&scope.stages(), inner.clone());
+            progress
+                .stage_start("train_ivf", Some(3), "iterations")
+                .await
+                .unwrap();
+            progress.stage_complete("train_ivf").await.unwrap();
+            scope.finish();
+            drop(guard);
+            handle.assert_finished();
+            assert_eq!(inner.recorded_events().len(), 2);
         }
 
         #[tokio::test]

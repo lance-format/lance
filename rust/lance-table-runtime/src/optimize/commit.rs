@@ -23,6 +23,7 @@ use crate::frag_reuse::{
     build_new_frag_reuse_index, frag_reuse_entry_appending, normalize_source_fragments,
 };
 use crate::{CommitBuilder, Table};
+use lance_core::memory::{ObservedOperation, OperationScope, StageReporter};
 use lance_core::utils::row_addr_remap::{GroupInput, RowAddrRemap};
 use lance_core::{Error, Result};
 use lance_table::format::{Fragment, pb::fragment_reuse_index_details as pb_fri};
@@ -160,6 +161,20 @@ pub async fn commit_compaction_with_hooks(
     options: &CompactionOptions,
     hooks: &CompactionHooks<'_>,
 ) -> Result<CompactionMetrics> {
+    let scope = OperationScope::start(ObservedOperation::Compaction, || None)?;
+    let metrics =
+        commit_compaction_inner(dataset, completed_tasks, options, hooks, &scope.stages()).await?;
+    scope.finish();
+    Ok(metrics)
+}
+
+pub(super) async fn commit_compaction_inner(
+    dataset: &mut Table,
+    completed_tasks: Vec<RewriteResult>,
+    options: &CompactionOptions,
+    hooks: &CompactionHooks<'_>,
+    stages: &StageReporter,
+) -> Result<CompactionMetrics> {
     let (repacks, rewrites): (Vec<_>, Vec<_>) = completed_tasks
         .into_iter()
         .partition(|task| task.repacked_files.is_some());
@@ -184,9 +199,10 @@ pub async fn commit_compaction_with_hooks(
     // committing from it would load that version's manifest back, and it may
     // have been expired since.
     let repack_base = dataset.clone();
-    let mut metrics = Box::pin(commit_rewrites(dataset, rewrites, options, hooks)).await?;
+    let mut metrics = Box::pin(commit_rewrites(dataset, rewrites, options, hooks, stages)).await?;
     metrics +=
-        super::repack::commit_repacked_files(dataset, repack_base, repacks, options, hooks).await?;
+        super::repack::commit_repacked_files(dataset, repack_base, repacks, options, hooks, stages)
+            .await?;
     Ok(metrics)
 }
 
@@ -195,6 +211,7 @@ async fn commit_rewrites(
     completed_tasks: Vec<RewriteResult>,
     options: &CompactionOptions,
     hooks: &CompactionHooks<'_>,
+    stages: &StageReporter,
 ) -> Result<CompactionMetrics> {
     if completed_tasks.is_empty() {
         return Ok(CompactionMetrics::default());
@@ -295,7 +312,9 @@ async fn commit_rewrites(
             .collect();
         // A replayed result shares file paths with its earlier commit, so a failed
         // reservation cannot prove the files are unreferenced. Leave them for GC.
+        let reserve_stage = stages.start("reserve_fragments");
         reserved_version = Some(reserve_fragment_ids(dataset, frags.into_iter(), hooks).await?);
+        reserve_stage.complete();
     }
 
     let mut rewrite_groups = Vec::with_capacity(completed_tasks.len());
@@ -313,6 +332,10 @@ async fn commit_rewrites(
     // Trim reclaims such records once every index is disjoint from the chain
     // or postdates the rewrite.
 
+    // Building the row map is part of the memory needed for an eager remap.
+    let remap_stage = index_remapper
+        .as_ref()
+        .map(|_| stages.start("remap_indices"));
     for task in completed_tasks {
         metrics += task.metrics;
         // One source of truth: the deferred branch normalizes the source
@@ -475,12 +498,19 @@ async fn commit_rewrites(
             .flat_map(|group| group.new_fragments.iter_mut())
             .collect::<Vec<_>>();
         // As above, reservation failure does not make replayed files safe to delete.
+        let reserve_stage = stages.start("reserve_fragments");
         reserve_fragment_ids(dataset, new_fragments.into_iter(), hooks).await?;
+        reserve_stage.complete();
         Vec::new()
     } else {
         Vec::new()
     };
 
+    if let Some(stage) = remap_stage {
+        stage.complete();
+    }
+
+    let commit_stage = stages.start("commit");
     // A stable-row-id table always keeps a v0 record: recording is refused
     // before any rewrite where the table requires a tagged history.
     //
@@ -630,6 +660,7 @@ async fn commit_rewrites(
         }
     }
 
+    commit_stage.complete();
     Ok(metrics)
 }
 

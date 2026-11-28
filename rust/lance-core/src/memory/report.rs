@@ -16,18 +16,26 @@ static NEXT_OPERATION_ID: LazyLock<AtomicU64> = LazyLock::new(|| AtomicU64::new(
 /// Reports an observed operation and its stages to the metrics and as memory
 /// events. Every event of the operation carries its id, which tells apart
 /// operations that run at the same time.
-#[doc(hidden)]
 #[derive(Debug)]
 pub struct OperationReport {
     id: u64,
     operation: &'static str,
-    index_type: String,
+    index_type: Option<String>,
 }
 
 impl OperationReport {
-    /// A report with an id that no other operation of the process has. It
-    /// reports nothing until [`Self::start`].
+    /// A report for an index operation. It reports nothing until [`Self::start`].
+    /// Use [`super::OperationScope`] to observe an operation and its stages.
+    #[deprecated(note = "Use OperationScope to observe an operation and its stages")]
     pub fn new(operation: &'static str, index_type: String) -> Self {
+        Self::for_operation(operation, Some(index_type))
+    }
+
+    /// A report with an id that no other operation of the process has. It
+    /// reports nothing until [`Self::start`]. `index_type` names the type of
+    /// the index the operation builds; without one, events leave the field out
+    /// and peaks are recorded without the label.
+    pub(super) fn for_operation(operation: &'static str, index_type: Option<String>) -> Self {
         Self {
             id: NEXT_OPERATION_ID.fetch_add(1, Ordering::Relaxed),
             operation,
@@ -41,7 +49,7 @@ impl OperationReport {
             "operation_start",
             self.id,
             self.operation,
-            &self.index_type,
+            self.index_type.as_deref(),
             None,
             None,
         );
@@ -53,7 +61,7 @@ impl OperationReport {
             "stage_start",
             self.id,
             self.operation,
-            &self.index_type,
+            self.index_type.as_deref(),
             Some(stage),
             None,
         );
@@ -63,13 +71,18 @@ impl OperationReport {
     /// bytes where the platform reports memory.
     pub fn stage_complete(&self, stage: &str, peak_bytes: Option<u64>) {
         if let Some(peak_bytes) = peak_bytes {
-            telemetry::record_stage_peak(self.operation, &self.index_type, stage, peak_bytes);
+            telemetry::record_stage_peak(
+                self.operation,
+                self.index_type.as_deref(),
+                stage,
+                peak_bytes,
+            );
         }
         events::emit(
             "stage_complete",
             self.id,
             self.operation,
-            &self.index_type,
+            self.index_type.as_deref(),
             Some(stage),
             peak_bytes,
         );
@@ -79,13 +92,17 @@ impl OperationReport {
     /// the platform reports memory.
     pub fn complete(&self, peak_bytes: Option<u64>) {
         if let Some(peak_bytes) = peak_bytes {
-            telemetry::record_operation_peak(self.operation, &self.index_type, peak_bytes);
+            telemetry::record_operation_peak(
+                self.operation,
+                self.index_type.as_deref(),
+                peak_bytes,
+            );
         }
         events::emit(
             "operation_complete",
             self.id,
             self.operation,
-            &self.index_type,
+            self.index_type.as_deref(),
             None,
             peak_bytes,
         );
@@ -94,9 +111,10 @@ impl OperationReport {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Mutex, PoisonError};
+    use std::sync::PoisonError;
 
     use super::*;
+    use crate::memory::EMITTING;
     #[cfg(feature = "metrics")]
     use crate::memory::{METRIC_OPERATION_PEAK, METRIC_STAGE_PEAK};
     use crate::utils::tracing::TRACE_MEMORY;
@@ -104,13 +122,6 @@ mod tests {
     use metrics_util::debugging::{DebugValue, DebuggingRecorder};
     use tracing_mock::field::ExpectedFields;
     use tracing_mock::{expect, subscriber};
-
-    /// Taken by every test that emits memory events. Tracing caches a
-    /// callsite's interest when it is first hit, and while only one scoped
-    /// subscriber exists it asks just the thread that hits it: a test emitting
-    /// without a subscriber could then turn the callsite off for the mock of a
-    /// test running in parallel.
-    static EMITTING: Mutex<()> = Mutex::new(());
 
     /// Exactly the fields of a memory event of `report`. The memory readings
     /// are expected where the platform reports them, and by value only for the
@@ -125,8 +136,10 @@ mod tests {
             .with_value(&event)
             .and(expect::field("pid").with_value(&std::process::id()))
             .and(expect::field("operation_id").with_value(&report.id))
-            .and(expect::field("operation").with_value(&report.operation))
-            .and(expect::field("index_type").with_value(&report.index_type.as_str()));
+            .and(expect::field("operation").with_value(&report.operation));
+        if let Some(index_type) = report.index_type.as_deref() {
+            fields = fields.and(expect::field("index_type").with_value(&index_type));
+        }
         if let Some(stage) = stage {
             fields = fields.and(expect::field("stage").with_value(&stage));
         }
@@ -150,11 +163,14 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_every_report_logs_one_event_with_its_operation_id() {
         let _emitting = EMITTING.lock().unwrap_or_else(PoisonError::into_inner);
-        let build = OperationReport::new("create_index", "ivf_pq".to_string());
+        let build = crate::memory::OperationReport::new("create_index", "ivf_pq".to_string());
         let merge = OperationReport::new("merge_index_metadata", "inverted".to_string());
+        let compaction = OperationReport::for_operation("compaction", None);
         assert_ne!(build.id, merge.id);
+        assert_ne!(merge.id, compaction.id);
         let mut mock = subscriber::mock();
         for fields in [
             event_fields(&build, "operation_start", None, None),
@@ -170,6 +186,9 @@ mod tests {
             ),
             event_fields(&merge, "operation_complete", None, None),
             event_fields(&build, "operation_complete", None, Some(4096)),
+            event_fields(&compaction, "operation_start", None, None),
+            event_fields(&compaction, "stage_complete", Some("commit"), Some(512)),
+            event_fields(&compaction, "operation_complete", None, Some(1024)),
         ] {
             mock = mock.event(
                 expect::event()
@@ -188,6 +207,9 @@ mod tests {
             merge.stage_complete("remap_partition_files", None);
             merge.complete(None);
             build.complete(Some(4096));
+            compaction.start();
+            compaction.stage_complete("commit", Some(512));
+            compaction.complete(Some(1024));
         });
         handle.assert_finished();
     }
@@ -199,32 +221,69 @@ mod tests {
         let recorder = DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
         metrics::with_local_recorder(&recorder, || {
-            let report = OperationReport::new("create_index", "btree".to_string());
+            let report = OperationReport::for_operation("create_index", Some("btree".to_string()));
             report.start();
             report.stage_start("load_data");
             report.stage_complete("load_data", None);
             report.stage_complete("load_data", Some(1 << 20));
             report.complete(None);
             report.complete(Some(2 << 20));
+            let compaction = OperationReport::for_operation("compaction", None);
+            compaction.stage_complete("commit", Some(3 << 20));
+            compaction.complete(Some(4 << 20));
         });
-        let mut recorded: Vec<(String, Vec<f64>)> = snapshotter
+        type RecordedMetric = (String, Vec<(String, String)>, Vec<f64>);
+        let mut recorded: Vec<RecordedMetric> = snapshotter
             .snapshot()
             .into_vec()
             .into_iter()
             .map(|(key, _unit, _description, value)| {
+                let labels = key
+                    .key()
+                    .labels()
+                    .map(|label| (label.key().to_string(), label.value().to_string()))
+                    .collect();
                 let samples = match value {
                     DebugValue::Histogram(values) => values.iter().map(|value| value.0).collect(),
                     _ => Vec::new(),
                 };
-                (key.key().name().to_string(), samples)
+                (key.key().name().to_string(), labels, samples)
             })
             .collect();
-        recorded.sort_by(|a, b| a.0.cmp(&b.0));
+        recorded.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+        let labels = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+            pairs
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect()
+        };
         assert_eq!(
             recorded,
             [
-                (METRIC_OPERATION_PEAK.to_string(), vec![f64::from(2 << 20)]),
-                (METRIC_STAGE_PEAK.to_string(), vec![f64::from(1 << 20)]),
+                (
+                    METRIC_OPERATION_PEAK.to_string(),
+                    labels(&[("operation", "compaction")]),
+                    vec![f64::from(4 << 20)],
+                ),
+                (
+                    METRIC_OPERATION_PEAK.to_string(),
+                    labels(&[("operation", "create_index"), ("index_type", "btree")]),
+                    vec![f64::from(2 << 20)],
+                ),
+                (
+                    METRIC_STAGE_PEAK.to_string(),
+                    labels(&[("operation", "compaction"), ("stage", "commit")]),
+                    vec![f64::from(3 << 20)],
+                ),
+                (
+                    METRIC_STAGE_PEAK.to_string(),
+                    labels(&[
+                        ("operation", "create_index"),
+                        ("index_type", "btree"),
+                        ("stage", "load_data"),
+                    ]),
+                    vec![f64::from(1 << 20)],
+                ),
             ]
         );
     }

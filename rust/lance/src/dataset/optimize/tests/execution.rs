@@ -6,6 +6,66 @@
 use super::*;
 use lance_core::datatypes::Field as LanceField;
 
+#[rstest]
+#[case::custom_planner(true)]
+#[case::standalone_tasks(false)]
+#[tokio::test]
+async fn saved_plan_preserves_concurrent_delete(#[case] is_custom_planner: bool) {
+    let data = lance_datagen::gen_batch()
+        .col("id", lance_datagen::array::step::<Int64Type>())
+        .into_reader_rows(RowCount::from(2), BatchCount::from(2));
+    let mut dataset = Dataset::write(
+        data,
+        "memory://",
+        Some(WriteParams {
+            max_rows_per_file: 2,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 2);
+    let options = CompactionOptions::default();
+    let plan = plan_compaction(&dataset, &options).await.unwrap();
+    assert_eq!(plan.num_tasks(), 1);
+    let read_version = plan.read_version();
+    dataset.delete("id = 0").await.unwrap();
+    let expected = dataset.scan().try_into_batch().await.unwrap();
+    assert_eq!(expected.num_rows(), 3);
+
+    let result = if is_custom_planner {
+        compact_files_with_planner(&mut dataset, None, &SavedCompactionPlan(plan)).await
+    } else {
+        let mut results = Vec::with_capacity(plan.num_tasks());
+        for task in plan.compaction_tasks() {
+            let result = task.execute(&dataset).await.unwrap();
+            assert_eq!(result.read_version, read_version);
+            results.push(result);
+        }
+        commit_compaction(
+            &mut dataset,
+            results,
+            Arc::new(DatasetIndexRemapperOptions::default()),
+            &options,
+        )
+        .await
+    };
+    let error = result.unwrap_err();
+    assert!(
+        matches!(error, Error::RetryableCommitConflict { .. }),
+        "{error}"
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("preempted by concurrent transaction"),
+        "{error}"
+    );
+    dataset.checkout_latest().await.unwrap();
+    assert_eq!(dataset.scan().try_into_batch().await.unwrap(), expected);
+    assert_eq!(dataset.count_rows(Some("id = 0".into())).await.unwrap(), 0);
+}
+
 #[tokio::test]
 async fn test_compact_v2_0_file_missing_evolved_struct_child() {
     let old_child = Arc::new(Field::new("old", DataType::Int32, true));
