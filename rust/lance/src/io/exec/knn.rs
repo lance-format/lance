@@ -58,6 +58,7 @@ use lance_index::metrics::{IndexTimer, IndexTiming, MetricsCollector};
 use lance_index::prefilter::PreFilter;
 use lance_index::vector::DIST_Q_C_COLUMN;
 use lance_index::vector::graph::OrderedFloat;
+use lance_index::vector::quantizer::Quantizer;
 use lance_index::vector::{
     ApproxMode, DIST_COL, INDEX_UUID_COLUMN, PART_ID_COLUMN, PartitionSearchControl, Query,
     VectorIndex, flat::compute_distance,
@@ -2150,7 +2151,7 @@ impl ANNIvfSubIndexExec {
     #[allow(clippy::too_many_arguments)]
     async fn search_partition(
         index: Arc<dyn VectorIndex>,
-        query: Query,
+        mut query: Query,
         part_id: usize,
         pre_filter: Arc<dyn PreFilter>,
         metrics: Arc<AnnIndexMetrics>,
@@ -2158,7 +2159,54 @@ impl ANNIvfSubIndexExec {
         quantized_refine_factor: Option<u32>,
         result_cache: Option<Arc<QuantizedRefinementCache>>,
     ) -> DataFusionResult<RecordBatch> {
-        let batch = if let (Some(cache), Some(_)) = (&result_cache, quantized_refine_factor) {
+        let candidate_limit = if let Some(factor) = quantized_refine_factor {
+            if !matches!(
+                index.index_type(),
+                IndexType::IvfRq | IndexType::IvfSq | IndexType::IvfHnswSq
+            ) {
+                return Err(DataFusionError::NotImplemented(format!(
+                    "quantized refinement requires an IVF_RQ flat, IVF_SQ, or IVF_HNSW_SQ index, got {}",
+                    index.index_type()
+                )));
+            }
+            if matches!(index.index_type(), IndexType::IvfSq | IndexType::IvfHnswSq)
+                && let Quantizer::Scalar(sq) = index.quantizer()
+                && sq.num_bits() != 8
+            {
+                return Err(DataFusionError::NotImplemented(format!(
+                    "quantized refinement requires SQ8, got SQ num_bits={}",
+                    sq.num_bits()
+                )));
+            }
+            let candidate_count = query.k.checked_mul(factor as usize).ok_or_else(|| {
+                DataFusionError::Execution(format!(
+                    "quantized refinement candidate count overflows: k={} factor={factor}",
+                    query.k
+                ))
+            })?;
+            if index.index_type() == IndexType::IvfHnswSq {
+                match query.ef {
+                    Some(ef) if ef < candidate_count => {
+                        return Err(DataFusionError::Execution(format!(
+                            "ef must be greater than or equal to the quantized refinement candidate count: ef={ef}, candidate_count={candidate_count}"
+                        )));
+                    }
+                    None => {
+                        let ef = candidate_count.checked_add(candidate_count / 2).ok_or_else(|| {
+                            DataFusionError::Execution(format!(
+                                "default HNSW ef overflows for quantized refinement candidate_count={candidate_count}"
+                            ))
+                        })?;
+                        query.ef = Some(ef.max(lance_index::vector::hnsw::builder::DEFAULT_MIN_EF));
+                    }
+                    Some(_) => {}
+                }
+            }
+            Some(candidate_count)
+        } else {
+            None
+        };
+        let batch = if let (Some(cache), Some(_)) = (&result_cache, candidate_limit) {
             let key = QuantizedRefinementKey {
                 identity: cache.identity,
                 partition_id: part_id,
@@ -2174,7 +2222,7 @@ impl ANNIvfSubIndexExec {
                         pre_filter,
                         metrics.clone(),
                         seg_mask,
-                        quantized_refine_factor,
+                        candidate_limit,
                     )
                     .await?;
                     QuantizedRefinementResult::copy_from(&batch)
@@ -2189,7 +2237,7 @@ impl ANNIvfSubIndexExec {
                 pre_filter,
                 metrics.clone(),
                 seg_mask,
-                quantized_refine_factor,
+                candidate_limit,
             )
             .await?
         };
@@ -2204,15 +2252,10 @@ impl ANNIvfSubIndexExec {
         pre_filter: Arc<dyn PreFilter>,
         metrics: Arc<AnnIndexMetrics>,
         seg_mask: Option<Arc<RowAddrMask>>,
-        quantized_refine_factor: Option<u32>,
+        candidate_limit: Option<usize>,
     ) -> DataFusionResult<RecordBatch> {
-        let batch = if let Some(factor) = quantized_refine_factor {
-            if index.index_type() != IndexType::IvfRq {
-                return Err(DataFusionError::NotImplemented(format!(
-                    "quantized refinement requires an IVF_RQ flat index, got {}",
-                    index.index_type()
-                )));
-            }
+        let batch = if let Some(candidate_limit) = candidate_limit {
+            let index_type = index.index_type();
             let candidate_prefilter: Arc<dyn PreFilter> = match &seg_mask {
                 Some(restriction) => Arc::new(RestrictedPreFilter {
                     inner: pre_filter,
@@ -2220,7 +2263,23 @@ impl ANNIvfSubIndexExec {
                 }),
                 None => pre_filter,
             };
-            if query.lower_bound.is_some() || query.upper_bound.is_some() {
+            if index_type == IndexType::IvfSq {
+                // SQ8 already scores every selected row at its full precision.
+                // Native flat search applies bounds before truncating the heap.
+                let mut sq_query = query.clone();
+                sq_query.refine_factor = None;
+                let batch = index
+                    .search_in_partition(
+                        part_id,
+                        &sq_query,
+                        candidate_prefilter,
+                        &metrics.index_metrics,
+                    )
+                    .await?;
+                restrict_to_segment(batch, seg_mask.as_deref())?
+            } else if index_type == IndexType::IvfRq
+                && (query.lower_bound.is_some() || query.upper_bound.is_some())
+            {
                 // Fast and Accurate scores use different scales. Let the
                 // existing Accurate range search choose candidates so bounds
                 // apply before top-k truncation.
@@ -2241,17 +2300,13 @@ impl ANNIvfSubIndexExec {
                     })?;
                 restrict_to_segment(batch, seg_mask.as_deref())?
             } else {
-                let candidate_limit = query.k.checked_mul(factor as usize).ok_or_else(|| {
-                    DataFusionError::Execution(format!(
-                        "quantized refinement candidate count overflows: k={} factor={factor}",
-                        query.k
-                    ))
-                })?;
                 let mut coarse_query = query.clone();
-                coarse_query.approx_mode = ApproxMode::Fast;
                 coarse_query.refine_factor = None;
-                coarse_query.lower_bound = None;
-                coarse_query.upper_bound = None;
+                if index_type == IndexType::IvfRq {
+                    coarse_query.approx_mode = ApproxMode::Fast;
+                    coarse_query.lower_bound = None;
+                    coarse_query.upper_bound = None;
+                }
                 let candidates = index
                     .search_in_partition_with_candidates(
                         part_id,
@@ -2265,18 +2320,29 @@ impl ANNIvfSubIndexExec {
                         DataFusionError::from(e)
                             .context("failed to discover quantized refinement candidates")
                     })?;
-                let offsets = candidates
-                    .candidates
-                    .iter()
-                    .map(|candidate| candidate.offset_in_partition)
-                    .collect::<Vec<_>>();
-                let scored = index
-                    .score_partition_candidates(part_id, &query, &offsets, &metrics.index_metrics)
-                    .await
-                    .map_err(|e| {
-                        DataFusionError::from(e)
-                            .context("failed to score quantized refinement candidates")
-                    })?;
+                let scored = if index_type == IndexType::IvfRq {
+                    // Fast RQ discovery scores need to be recomputed at Accurate precision.
+                    let offsets = candidates
+                        .candidates
+                        .iter()
+                        .map(|candidate| candidate.offset_in_partition)
+                        .collect::<Vec<_>>();
+                    index
+                        .score_partition_candidates(
+                            part_id,
+                            &query,
+                            &offsets,
+                            &metrics.index_metrics,
+                        )
+                        .await
+                        .map_err(|e| {
+                            DataFusionError::from(e)
+                                .context("failed to score quantized refinement candidates")
+                        })?
+                } else {
+                    // HNSW already computed distances at the stored SQ8 precision.
+                    candidates.batch
+                };
                 let scored = restrict_to_segment(scored, seg_mask.as_deref())?;
                 quantized_top_k(&scored, &query).map_err(|e| {
                     DataFusionError::from(e)
@@ -2794,7 +2860,7 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                             let _open_timer = IndexTimer::new(&metrics.index_metrics, IndexTiming::IndexOpen);
                             ds.open_vector_index(&column, &index_uuid, &metrics.index_metrics).await?
                         };
-                        let result_cache = if let Some(options) = cache_options.filter(|_| cache_eligible && raw_index.index_type() == IndexType::IvfRq) {
+                        let result_cache = if let Some(options) = cache_options.filter(|_| cache_eligible && matches!(raw_index.index_type(), IndexType::IvfRq | IndexType::IvfSq | IndexType::IvfHnswSq)) {
                             QuantizedRefinementCache::for_segment(&ds, index_metadata, &query, options).await?
                         } else { None };
                         query = normalize_query_for_index(raw_index.as_ref(), query)?;

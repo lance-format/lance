@@ -1080,6 +1080,8 @@ impl Scanner {
     ///
     /// Defaults to `1.5 * k * refine_factor`, floored at
     /// [`lance_index::vector::hnsw::builder::DEFAULT_MIN_EF`].
+    /// IVF_HNSW_SQ quantized refinement includes the quantized factor in the
+    /// candidate budget before applying that floor.
     pub fn ef(&mut self, ef: usize) -> &mut Self {
         if let Some(q) = self.nearest.as_mut() {
             q.ef = Some(ef);
@@ -1255,23 +1257,28 @@ impl Scanner {
         Ok(self)
     }
 
-    /// Re-rank an over-fetched IVF_RQ candidate set with its multi-bit index data.
+    /// Score IVF_RQ or SQ8 candidates using only stored index data.
     ///
-    /// Unlike [`Self::refine`], indexed candidates are re-ranked without reading
-    /// their original vectors. It first discovers `factor * k` candidates with
+    /// IVF_RQ discovers `factor * k` candidates with
     /// one-bit RQ scores and then re-ranks them with the index's most accurate
     /// stored RQ representation. Unindexed fragments and stale overlay rows still
     /// use flat fallback and may read original vectors. If exact refinement is also
     /// configured, the quantized stage emits enough candidates for that exact stage.
-    /// When a distance range is set, the selected partitions use Accurate RQ search
+    /// IVF_SQ uses its native eight-bit scan directly. IVF_HNSW_SQ expands
+    /// the graph candidate pool by `factor` and reuses distances computed
+    /// during graph search at the native eight-bit precision. Explicit `ef` must be at least
+    /// `k * factor * exact_refine_factor`, where the exact factor defaults
+    /// to 1. The default `ef` grows with that budget. The factor must be positive.
+    /// Unsupported quantizers, legacy indices and multivectors are rejected.
+    /// When IVF_RQ has a distance range, selected partitions use Accurate RQ search
     /// directly so the range applies before top-k truncation.
     ///
     /// Completed partition results may be reused for identical queries in the
     /// same snapshot, within the session index-cache budget. This memory-only
     /// cache accepts fully indexed single-vector queries without filters,
     /// fragment subsets, external masks, or stale vector overlays, and requires
-    /// a proven manifest identity. It stores row IDs and quantized distances;
-    /// exact refinement and projections still run independently. Immutable RQ
+    /// a proven manifest identity. It stores row IDs and quantized distances.
+    /// Exact refinement and projections still run independently. Immutable quantized
     /// index data is cached separately and can remain reusable across queries
     /// and snapshots even when completed results cannot be reused.
     ///

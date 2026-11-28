@@ -132,8 +132,9 @@ pub trait IvfSubIndex: Send + Sync + Debug + DeepSizeOf {
     }
 
     /// Search the sub-index while preserving each result's partition-local
-    /// storage offset. Implementations that cannot expose stable offsets return
-    /// [`Error::NotSupported`].
+    /// offset in the supplied storage, after any graph realignment. Use the
+    /// same partition view when scoring the offsets. Implementations without
+    /// candidate identities return [`Error::NotSupported`].
     #[allow(clippy::too_many_arguments)]
     fn search_with_candidates_with_scratch(
         &self,
