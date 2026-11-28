@@ -609,30 +609,32 @@ impl StorageOptionsAccessor {
 
     async fn fresh_options(&self, scope: StorageOptionsScope) -> Option<super::StorageOptions> {
         let cache = self.cache.read().await.clone();
-        let refresh_offset = match &cache.absence {
-            Some(absence) if Instant::now() >= absence.retry_after => return None,
-            // After absence, retry at the shared deadline or when this view actually expires.
-            Some(_) => 0,
-            None => self.refresh_offset.as_millis() as u64,
-        };
-        let (options, expiry) = if let Some(snapshot) = &cache.vended {
-            let (options, expiry) = snapshot.view(scope);
-            if cache.absence.as_ref().is_some_and(|absence| {
-                absence.fallback_scopes.contains(&scope)
-                    || expiry.is_some_and(|expiry| expiry <= absence.recorded_at_millis)
-            }) {
-                self.fallback_view(scope)
-            } else {
-                (options, expiry)
-            }
-        } else if cache.absence.is_some() || self.initial_options.is_some() {
-            self.fallback_view(scope)
+        let vended = cache
+            .vended
+            .as_ref()
+            .map(|snapshot| snapshot.view(scope))
+            .filter(|(_, expiry)| {
+                !cache.absence.as_ref().is_some_and(|absence| {
+                    absence.fallback_scopes.contains(&scope)
+                        || expiry.is_some_and(|expiry| expiry <= absence.recorded_at_millis)
+                })
+            });
+
+        let ((options, expiry), refresh_offset) = if let Some(view) = vended {
+            (view, self.refresh_offset)
         } else {
-            return None;
+            let refresh_offset = match &cache.absence {
+                // A fallback retries at the shared deadline or its actual expiry.
+                Some(absence) if Instant::now() < absence.retry_after => Duration::ZERO,
+                None if self.initial_options.is_some() => self.refresh_offset,
+                _ => return None,
+            };
+            (self.fallback_view(scope), refresh_offset)
         };
 
-        if expiry.is_some_and(|expiry| Self::now_millis().saturating_add(refresh_offset) >= expiry)
-        {
+        if expiry.is_some_and(|expiry| {
+            Self::now_millis().saturating_add(refresh_offset.as_millis() as u64) >= expiry
+        }) {
             return None;
         }
         Some(super::StorageOptions(options.into_owned()))
@@ -1567,17 +1569,18 @@ mod tests {
     async fn scoped_absence_preserves_vended_siblings(
         #[case] force: bool,
         #[case] vended_base_expiry: u64,
+        #[values(false, true)] provider_fails_at_deadline: bool,
     ) {
         MockClock::set_system_time(Duration::from_secs(100_055));
         let mut initial = scoped_block_sizes("2048", "4096", "8192", 300_000);
         initial.insert(EXPIRES_AT_MILLIS_KEY.into(), "100110000".into());
         let provider = Arc::new(TransitionProvider::default());
-        *provider.options.write().await = Some(scoped_block_sizes(
-            "16384",
-            "32768",
-            "65536",
-            vended_base_expiry,
-        ));
+        let mut vended = scoped_block_sizes("16384", "32768", "65536", vended_base_expiry);
+        vended.insert(
+            format!("base_8.{EXPIRES_AT_MILLIS_KEY}"),
+            "100250000".into(),
+        );
+        *provider.options.write().await = Some(vended);
         let parent = Arc::new(StorageOptionsAccessor::with_initial_and_provider(
             initial,
             provider.clone(),
@@ -1615,24 +1618,58 @@ mod tests {
             "4096"
         );
 
-        *provider.options.write().await =
-            Some(scoped_block_sizes("2048", "8192", "32768", 600_000));
         MockClock::advance(Duration::from_millis(59_999));
+        MockClock::advance_system_time(Duration::from_millis(59_999));
         assert_eq!(
-            base8.get_storage_options().await.unwrap().0["block_size"],
-            "65536"
+            base7.get_storage_options().await.unwrap().0["block_size"],
+            "4096"
         );
         assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+
         MockClock::advance(Duration::from_millis(1));
-        assert_eq!(
-            base8.get_storage_options().await.unwrap().0["block_size"],
-            "32768"
-        );
+        MockClock::advance_system_time(Duration::from_millis(1));
+        provider
+            .fail
+            .store(provider_fails_at_deadline, Ordering::SeqCst);
+        let primary_read = primary.get_storage_options().await;
+        let base8_read = base8.get_storage_options().await;
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(primary_read.unwrap().0["block_size"], "16384");
+        assert_eq!(base8_read.unwrap().0["block_size"], "65536");
+
+        let base7_read = base7.get_storage_options().await;
+        if provider_fails_at_deadline {
+            let error = base7_read.unwrap_err();
+            assert!(matches!(error, Error::IO { .. }));
+            assert!(error.to_string().contains("injected provider failure"));
+        } else {
+            assert_eq!(base7_read.unwrap().0["block_size"], "4096");
+        }
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 3);
+
+        // Base 8 refreshes at its own offset, even during a renewed absence window.
+        MockClock::advance(Duration::from_secs(9));
+        MockClock::advance_system_time(Duration::from_secs(9));
+        provider.fail.store(true, Ordering::SeqCst);
+        let error = base8.get_storage_options().await.unwrap_err();
+        assert!(matches!(error, Error::IO { .. }));
+        assert!(error.to_string().contains("injected provider failure"));
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 4);
+
+        provider.fail.store(false, Ordering::SeqCst);
+        *provider.options.write().await =
+            Some(scoped_block_sizes("2048", "8192", "32768", 600_000));
+        MockClock::advance(Duration::from_secs(60));
+        MockClock::advance_system_time(Duration::from_secs(60));
         assert_eq!(
             base7.get_storage_options().await.unwrap().0["block_size"],
             "8192"
         );
-        assert_eq!(provider.calls.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            base8.get_storage_options().await.unwrap().0["block_size"],
+            "32768"
+        );
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 5);
     }
 
     #[rstest::rstest]
