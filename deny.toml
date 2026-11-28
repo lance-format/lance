@@ -85,7 +85,7 @@ ignore = [
     #{ id = "RUSTSEC-0000-0000", reason = "expires 2026-01-31: fixed `some-crate` 1.2.4 is under 48 hours old" },
     #{ id = "RUSTSEC-0000-0000", reason = "no fix: `some-crate` is unmaintained with no patched release; `other-crate` depends on it" },
     #{ crate = "a-crate-that-is-yanked@0.1.1", reason = "expires 2026-01-31: 0.1.2 replaces the yanked release and is under 48 hours old" },
-    { id = "RUSTSEC-2024-0436", reason = "no fix: `paste` is unmaintained with no patched release; lance-bitpacking and foyer-memory (latest 0.22.6) depend on it" },
+    { id = "RUSTSEC-2024-0436", reason = "no fix: `paste` is unmaintained with no patched release; foyer-memory (latest 0.22.6) depends on it" },
     { id = "RUSTSEC-2023-0071", reason = "no fix: no `rsa` release fixes the Marvin timing side channel; opendal's reqsign crates depend on it" },
     { id = "RUSTSEC-2026-0194", reason = "expires 2027-01-20: fixed in `quick-xml` 0.41; lance-namespace-impls still asks for 0.40, and pprof 0.15 (tests only) pulls in 0.26 via inferno 0.11, so recheck for a pprof release on inferno 0.12.7+" },
     { id = "RUSTSEC-2026-0195", reason = "expires 2027-01-20: fixed in `quick-xml` 0.41; lance-namespace-impls still asks for 0.40, and pprof 0.15 (tests only) pulls in 0.26 via inferno 0.11, so recheck for a pprof release on inferno 0.12.7+" },

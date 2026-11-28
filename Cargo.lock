@@ -4686,7 +4686,6 @@ dependencies = [
  "arrayref",
  "bitpacking",
  "crunchy",
- "paste",
  "rstest",
  "seq-macro",
 ]

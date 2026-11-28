@@ -38,11 +38,9 @@ impl FastLanes for u32 {}
 impl FastLanes for u64 {}
 
 macro_rules! pack {
-    ($T:ty, $W:expr, $packed:expr, $lane:expr, | $_1:tt $idx:ident | $($body:tt)*) => {
+    ($T:tt, $W:expr, $packed:expr, $lane:expr, | $_1:tt $idx:ident | $($body:tt)*) => {
         macro_rules! __kernel__ {( $_1 $idx:ident ) => ( $($body)* )}
         {
-            use paste::paste;
-
             // The number of bits of T.
             const T: usize = <$T>::T;
 
@@ -57,10 +55,10 @@ macro_rules! pack {
                 // Nothing to do if W is 0, since the packed array is zero bytes.
             } else if $W == T {
                 // Special case for W=T, we can just copy the input value directly to the packed value.
-                paste!(seq_t!(row in $T {
+                seq_t!(row in $T {
                     let idx = index(row, $lane);
                     $packed[<$T>::LANES * row + $lane].write(__kernel__!(idx));
-                }));
+                });
             } else {
                 // A mask of W bits.
                 let mask: $T = (1 << $W) - 1;
@@ -71,7 +69,7 @@ macro_rules! pack {
                 // Loop over each of the rows of the lane.
                 // Inlining this loop means all branches are known at compile time and
                 // the code is auto-vectorized for SIMD execution.
-                paste!(seq_t!(row in $T {
+                seq_t!(row in $T {
                     let idx = index(row, $lane);
                     let src = __kernel__!(idx);
                     let src = src & mask;
@@ -95,18 +93,16 @@ macro_rules! pack {
                         // Keep the remaining bits for the next packed value.
                         tmp = src >> $W - remaining_bits;
                     }
-                }));
+                });
             }
         }
     };
 }
 
 macro_rules! unpack {
-    ($T:ty, $W:expr, $packed:expr, $lane:expr, | $_1:tt $idx:ident, $_2:tt $elem:ident | $($body:tt)*) => {
+    ($T:tt, $W:expr, $packed:expr, $lane:expr, | $_1:tt $idx:ident, $_2:tt $elem:ident | $($body:tt)*) => {
         macro_rules! __kernel__ {( $_1 $idx:ident, $_2 $elem:ident ) => ( $($body)* )}
         {
-            use paste::paste;
-
             // The number of bits of T.
             const T: usize = <$T>::T;
 
@@ -120,18 +116,18 @@ macro_rules! unpack {
             if $W == 0 {
                 // Special case for W=0, we just need to zero the output.
                 // We'll still respect the iteration order in case the kernel has side effects.
-                paste!(seq_t!(row in $T {
+                seq_t!(row in $T {
                     let idx = index(row, $lane);
                     let zero: $T = 0;
                     __kernel__!(idx, zero);
-                }));
+                });
             } else if $W == T {
                 // Special case for W=T, we can just copy the packed value directly to the output.
-                paste!(seq_t!(row in $T {
+                seq_t!(row in $T {
                     let idx = index(row, $lane);
                     let src = $packed[<$T>::LANES * row + $lane];
                     __kernel__!(idx, src);
-                }));
+                });
             } else {
                 #[inline]
                 fn mask(width: usize) -> $T {
@@ -141,7 +137,7 @@ macro_rules! unpack {
                 let mut src: $T = $packed[$lane];
                 let mut tmp: $T;
 
-                paste!(seq_t!(row in $T {
+                seq_t!(row in $T {
                     // Figure out the packed positions
                     let curr_word: usize = (row * $W) / T;
                     let next_word = ((row + 1) * $W) / T;
@@ -169,7 +165,7 @@ macro_rules! unpack {
                     // Write out the unpacked value
                     let idx = index(row, $lane);
                     __kernel__!(idx, tmp);
-                }));
+                });
             }
         }
     };
