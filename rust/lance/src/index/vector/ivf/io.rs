@@ -23,7 +23,7 @@ use lance_core::datatypes::Schema;
 use lance_core::traits::DatasetTakeRows;
 use lance_core::utils::tempfile::TempStdDir;
 use lance_core::utils::tokio::JoinHandle;
-use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
+use lance_core::utils::tokio::{get_global_num_compute_intensive_cpus, spawn_cpu};
 use lance_file::versions::v1::reader::FileReader as V1FileReader;
 use lance_file::versions::v1::writer::FileWriter as V1FileWriter;
 use lance_index::metrics::NoOpMetricsCollector;
@@ -50,7 +50,7 @@ use crate::Result;
 
 // TODO: make it configurable, limit by the number of CPU cores & memory
 static HNSW_PARTITIONS_BUILD_PARALLEL: LazyLock<usize> =
-    LazyLock::new(get_num_compute_intensive_cpus);
+    LazyLock::new(get_global_num_compute_intensive_cpus);
 
 async fn write_primitive_values<T: ArrowPrimitiveType>(
     writer: &mut dyn Writer,

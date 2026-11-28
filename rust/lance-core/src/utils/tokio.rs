@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::cell::UnsafeCell;
+use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, LazyLock, atomic};
@@ -19,8 +20,98 @@ use tracing::Span;
 static NUM_COMPUTE_INTENSIVE_CPUS: LazyLock<usize> =
     LazyLock::new(calculate_num_compute_intensive_cpus);
 
-pub fn get_num_compute_intensive_cpus() -> usize {
+tokio::task_local! {
+    static COMPUTE_CONCURRENCY: Option<NonZeroUsize>;
+}
+
+/// Process-wide compute parallelism, unaffected by operation-specific limits.
+///
+/// Use this when initializing shared runtimes or cached defaults, so the first
+/// operation to initialize them cannot change other operations' parallelism.
+///
+/// ```
+/// use lance_core::utils::tokio::get_global_num_compute_intensive_cpus;
+/// let process_default = get_global_num_compute_intensive_cpus();
+/// assert!(process_default > 0);
+/// ```
+pub fn get_global_num_compute_intensive_cpus() -> usize {
     *NUM_COMPUTE_INTENSIVE_CPUS
+}
+
+/// Compute parallelism for the current operation, or the process-wide default.
+pub fn get_num_compute_intensive_cpus() -> usize {
+    limit_compute_concurrency(get_global_num_compute_intensive_cpus())
+}
+
+/// Apply the current operation's limit to a stage's configured parallelism.
+/// Without an operation-specific limit, the configured value is unchanged.
+///
+/// ```
+/// # use std::num::NonZeroUsize;
+/// # use lance_core::utils::tokio::{with_compute_concurrency, limit_compute_concurrency};
+/// # async fn example() {
+/// with_compute_concurrency(NonZeroUsize::new(2).unwrap(), async {
+///     assert_eq!(limit_compute_concurrency(8), 2);
+///     assert_eq!(limit_compute_concurrency(1), 1);
+/// }).await;
+/// # }
+/// ```
+pub fn limit_compute_concurrency(parallelism: usize) -> usize {
+    COMPUTE_CONCURRENCY
+        .try_with(|limit| limit.map_or(parallelism, |limit| parallelism.min(limit.get())))
+        .unwrap_or(parallelism)
+}
+
+/// Limit compute-stage parallelism while polling a future.
+///
+/// The limit is inherited by [`spawn`] and [`spawn_cpu`]. Nested scopes can
+/// reduce it further. This controls stages that consult
+/// [`get_num_compute_intensive_cpus`] or [`limit_compute_concurrency`]; it does
+/// not resize shared runtimes or limit Rayon, I/O, or unrelated operations.
+///
+/// ```
+/// # use std::num::NonZeroUsize;
+/// # use lance_core::utils::tokio::{with_compute_concurrency, get_num_compute_intensive_cpus};
+/// # async fn example() {
+/// with_compute_concurrency(NonZeroUsize::new(1).unwrap(), async {
+///     assert_eq!(get_num_compute_intensive_cpus(), 1);
+/// }).await;
+/// # }
+/// ```
+pub async fn with_compute_concurrency<T>(
+    limit: NonZeroUsize,
+    future: impl Future<Output = T>,
+) -> T {
+    let limit = COMPUTE_CONCURRENCY
+        .try_with(|outer| outer.map_or(limit, |outer| outer.min(limit)))
+        .unwrap_or(limit);
+    COMPUTE_CONCURRENCY.scope(Some(limit), future).await
+}
+
+/// Capture the current compute limit for a future spawned outside [`spawn`],
+/// for example with [`tokio::task::JoinSet::spawn`]. The limit is captured when
+/// this function is called, rather than when the returned future is polled.
+///
+/// ```
+/// # use std::num::NonZeroUsize;
+/// # use lance_core::utils::tokio::{capture_compute_concurrency, with_compute_concurrency,
+/// #     limit_compute_concurrency};
+/// # async fn example() -> Result<(), tokio::task::JoinError> {
+/// let mut tasks = tokio::task::JoinSet::new();
+/// with_compute_concurrency(NonZeroUsize::new(1).unwrap(), async {
+///     tasks.spawn(capture_compute_concurrency(async {
+///         limit_compute_concurrency(8)
+///     }));
+/// }).await;
+/// assert_eq!(tasks.join_next().await.unwrap()?, 1);
+/// # Ok(())
+/// # }
+/// ```
+pub fn capture_compute_concurrency<T>(future: impl Future<Output = T>) -> impl Future<Output = T> {
+    COMPUTE_CONCURRENCY.scope(
+        COMPUTE_CONCURRENCY.try_with(|limit| *limit).ok().flatten(),
+        future,
+    )
 }
 
 fn calculate_num_compute_intensive_cpus() -> usize {
@@ -89,7 +180,7 @@ fn default_io_core_reservation(cpus: usize) -> usize {
 fn create_runtime() -> Runtime {
     Builder::new_multi_thread()
         .thread_name("lance-cpu")
-        .max_blocking_threads(get_num_compute_intensive_cpus())
+        .max_blocking_threads(get_global_num_compute_intensive_cpus())
         .worker_threads(1)
         // keep the thread alive "forever"
         .thread_keep_alive(Duration::from_secs(u64::MAX))
@@ -173,7 +264,10 @@ pub fn spawn<T: Send + 'static>(future: impl Future<Output = T> + Send + 'static
         stage: UnsafeCell::new(Stage::Running(future)),
     });
     JoinHandle {
-        handle: spawn_erased_task(ErasedTask(task.clone())),
+        handle: spawn_erased_task(ErasedTask {
+            task: task.clone(),
+            compute_concurrency: COMPUTE_CONCURRENCY.try_with(|limit| *limit).ok().flatten(),
+        }),
         task,
     }
 }
@@ -321,7 +415,10 @@ where
 }
 
 /// The single future type handed to `tokio::spawn`.
-struct ErasedTask(Arc<dyn PollErased>);
+struct ErasedTask {
+    task: Arc<dyn PollErased>,
+    compute_concurrency: Option<NonZeroUsize>,
+}
 
 impl Future for ErasedTask {
     type Output = ();
@@ -329,7 +426,9 @@ impl Future for ErasedTask {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         // SAFETY: `ErasedTask` is the task side's only access to the stage, and
         // tokio polls a task from one thread at a time.
-        unsafe { self.0.poll_erased(cx) }
+        COMPUTE_CONCURRENCY.sync_scope(self.compute_concurrency, || unsafe {
+            self.task.poll_erased(cx)
+        })
     }
 }
 
@@ -337,7 +436,9 @@ impl Drop for ErasedTask {
     fn drop(&mut self) {
         // SAFETY: as in `poll`; the handle does not read the stage until this
         // drop has happened.
-        unsafe { self.0.drop_future() }
+        COMPUTE_CONCURRENCY.sync_scope(self.compute_concurrency, || unsafe {
+            self.task.drop_future()
+        });
     }
 }
 
@@ -359,7 +460,7 @@ impl Drop for ErasedTask {
 ///
 /// # The task must never wait on anything
 ///
-/// The CPU pool is sized to [`get_num_compute_intensive_cpus`], which is
+/// The CPU pool is sized to [`get_global_num_compute_intensive_cpus`], which is
 /// `max(1, num_cpus - LANCE_IO_CORE_RESERVATION)`. On a big host that is plenty of
 /// workers (e.g. 62 on a 64-core box), but in resource-constrained environments it can
 /// collapse to a **single blocking thread** — on a 1-vCPU VM, with `LANCE_CPU_THREADS=1`,
@@ -454,17 +555,104 @@ impl<F: FnOnce() -> T + Send, T: Send> RunOnce for CpuTask<F, T> {
 fn spawn_erased(task: Arc<dyn RunOnce>) -> tokio::task::JoinHandle<()> {
     // Propagate the current span into the task
     let span = Span::current();
+    let compute_concurrency = COMPUTE_CONCURRENCY.try_with(|limit| *limit).ok().flatten();
     global_cpu_runtime().spawn_blocking(move || {
         let _span_guard = span.enter();
         // SAFETY: tokio runs a blocking task exactly once, and the caller in
         // `spawn_cpu` reads `output` only after this task's join handle resolves.
-        unsafe { task.run() };
+        COMPUTE_CONCURRENCY.sync_scope(compute_concurrency, || unsafe { task.run() });
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn compute_concurrency_scopes_are_isolated_and_restored() {
+        let global = get_global_num_compute_intensive_cpus();
+        let check = |limit| async move {
+            with_compute_concurrency(NonZeroUsize::new(limit).unwrap(), async move {
+                tokio::task::yield_now().await;
+                assert_eq!(limit_compute_concurrency(usize::MAX), limit);
+                assert_eq!(get_num_compute_intensive_cpus(), global.min(limit));
+                assert_eq!(get_global_num_compute_intensive_cpus(), global);
+                with_compute_concurrency(NonZeroUsize::new(limit + 1).unwrap(), async {
+                    assert_eq!(limit_compute_concurrency(usize::MAX), limit);
+                })
+                .await;
+            })
+            .await;
+        };
+        tokio::join!(check(1), check(3));
+        assert_eq!(get_num_compute_intensive_cpus(), global);
+        assert_eq!(limit_compute_concurrency(usize::MAX), usize::MAX);
+    }
+
+    #[tokio::test]
+    async fn compute_concurrency_is_inherited_by_async_and_cpu_tasks() {
+        let (task, cpu, captured) =
+            with_compute_concurrency(NonZeroUsize::new(1).unwrap(), async {
+                let task = spawn(async {
+                    tokio::task::yield_now().await;
+                    limit_compute_concurrency(usize::MAX)
+                });
+                let cpu =
+                    spawn_cpu(|| Ok::<_, std::io::Error>(limit_compute_concurrency(usize::MAX)));
+                let captured = capture_compute_concurrency(async {
+                    tokio::task::yield_now().await;
+                    limit_compute_concurrency(usize::MAX)
+                });
+                (task, cpu, captured)
+            })
+            .await;
+        // The originating scope has ended before these futures are polled here.
+        assert_eq!(task.await.unwrap(), 1);
+        assert_eq!(cpu.await.unwrap(), 1);
+        assert_eq!(tokio::spawn(captured).await.unwrap(), 1);
+        assert_eq!(limit_compute_concurrency(usize::MAX), usize::MAX);
+    }
+
+    #[tokio::test]
+    async fn compute_concurrency_preconstructed_scope_cannot_raise_outer_limit() {
+        let inner = with_compute_concurrency(NonZeroUsize::new(3).unwrap(), async {
+            assert_eq!(limit_compute_concurrency(usize::MAX), 1);
+        });
+        with_compute_concurrency(NonZeroUsize::new(1).unwrap(), inner).await;
+    }
+
+    #[tokio::test]
+    async fn compute_concurrency_scope_is_restored_after_panic() {
+        let limited = with_compute_concurrency(NonZeroUsize::new(1).unwrap(), async {
+            assert_eq!(limit_compute_concurrency(usize::MAX), 1);
+            panic!("scoped operation failed");
+        });
+        assert!(
+            std::panic::AssertUnwindSafe(limited)
+                .catch_unwind()
+                .await
+                .is_err()
+        );
+        assert_eq!(limit_compute_concurrency(usize::MAX), usize::MAX);
+    }
+
+    #[tokio::test]
+    async fn compute_concurrency_scope_is_restored_after_cancellation() {
+        let mut limited = Box::pin(with_compute_concurrency(
+            NonZeroUsize::new(1).unwrap(),
+            async {
+                assert_eq!(get_num_compute_intensive_cpus(), 1);
+                std::future::pending::<()>().await;
+            },
+        ));
+        assert!(futures::poll!(limited.as_mut()).is_pending());
+        assert_eq!(limit_compute_concurrency(usize::MAX), usize::MAX);
+        drop(limited);
+        assert_eq!(
+            get_num_compute_intensive_cpus(),
+            get_global_num_compute_intensive_cpus()
+        );
+    }
 
     /// The successful path must hand back the closure's own output.
     ///

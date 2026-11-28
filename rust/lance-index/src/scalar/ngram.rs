@@ -37,7 +37,7 @@ use arrow_array::{BinaryArray, RecordBatch, UInt32Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion_execution::SendableRecordBatchStream;
-use futures::{FutureExt, Stream, StreamExt, TryStreamExt, stream};
+use futures::{Future, FutureExt, Stream, StreamExt, TryStreamExt, stream};
 use lance_arrow::iter_str_array;
 use lance_core::cache::{
     CacheCodec, CacheCodecImpl, CacheEntryReader, CacheEntryWriter, CacheKey, CacheKeySchema,
@@ -47,7 +47,7 @@ use lance_core::deepsize::DeepSizeOf;
 use lance_core::error::LanceOptionExt;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::tempfile::TempDir;
-use lance_core::utils::tokio::get_num_compute_intensive_cpus;
+use lance_core::utils::tokio::{get_global_num_compute_intensive_cpus, limit_compute_concurrency};
 use lance_core::utils::tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS};
 use lance_core::{Error, ROW_ADDR, Result};
 use lance_io::object_store::ObjectStore;
@@ -909,7 +909,7 @@ static DEFAULT_TOKENS_PER_SPILL: LazyLock<usize> = LazyLock::new(|| {
 static DEFAULT_NUM_PARTITIONS: LazyLock<usize> = LazyLock::new(|| {
     std::env::var("LANCE_NGRAM_NUM_PARTITIONS")
         .map(|s| s.parse().expect("failed to parse LANCE_NGRAM_PARALLELISM"))
-        .unwrap_or((get_num_compute_intensive_cpus() * 4).max(128))
+        .unwrap_or((get_global_num_compute_intensive_cpus() * 4).max(128))
 });
 // Just enough so that tokenizing is faster than I/O
 static DEFAULT_TOKENIZE_PARALLELISM: LazyLock<usize> = LazyLock::new(|| {
@@ -1430,7 +1430,7 @@ impl NGramIndexBuilder {
         let schema = data.schema();
         Self::validate_schema(schema.as_ref())?;
 
-        let num_workers = self.options.num_workers;
+        let num_workers = limit_compute_concurrency(self.options.num_workers);
         let mut senders = Vec::with_capacity(num_workers);
         let mut builders = Vec::with_capacity(num_workers);
         for worker_idx in 0..num_workers {
@@ -1459,7 +1459,7 @@ impl NGramIndexBuilder {
                 })
                 .map(|res| res.unwrap())))
             })
-            .try_buffer_unordered(*DEFAULT_TOKENIZE_PARALLELISM);
+            .try_buffer_unordered(limit_compute_concurrency(*DEFAULT_TOKENIZE_PARALLELISM));
 
         while let Some(partitions) = partitions_stream.try_next().await? {
             for (part_idx, partition) in partitions.into_iter().enumerate() {
@@ -1754,6 +1754,31 @@ impl NGramIndexBuilder {
         Ok(())
     }
 
+    #[expect(
+        clippy::manual_async_fn,
+        reason = "the explicit Send return bound is required by downstream async-trait callers"
+    )]
+    fn run_merge_tasks<F>(
+        tasks: impl ExactSizeIterator<Item = F> + Send,
+    ) -> impl Future<Output = Result<()>> + Send
+    where
+        F: Future<Output = Result<()>> + Send + 'static,
+    {
+        async move {
+            let concurrency = limit_compute_concurrency(tasks.len().max(1));
+            let results = stream::iter(tasks)
+                // Spawn only after admission: buffering already-spawned handles would
+                // leave the inline bitmap unions in every task running concurrently.
+                .map(|task| async move { lance_core::utils::tokio::spawn(task).await })
+                .buffer_unordered(concurrency)
+                .try_collect::<Vec<Result<()>>>()
+                .await?;
+            // Finish every admitted write before surfacing an operational error,
+            // otherwise dropping the builder can remove files still being written.
+            results.into_iter().collect()
+        }
+    }
+
     // Can potentially parallelize in the future if this step becomes a bottleneck
     //
     // We can also merge in a more balanced fashion (e.g. binary tree) to reduce the size of
@@ -1772,20 +1797,18 @@ impl NGramIndexBuilder {
             while spill_files.len() >= 2 {
                 let left = spill_files.pop().expect_ok()?;
                 let right = spill_files.pop().expect_ok()?;
-                new_spills.push(lance_core::utils::tokio::spawn(Self::merge_spill_files(
+                new_spills.push(Self::merge_spill_files(
                     self.spill_store.clone(),
                     left,
                     right,
                     spill_counter + new_spills.len(),
-                )));
+                ));
             }
             for i in 0..new_spills.len() {
                 spill_files.push(spill_counter + i);
             }
             spill_counter += new_spills.len();
-            for result in futures::future::try_join_all(new_spills).await? {
-                result?;
-            }
+            Self::run_merge_tasks(new_spills.into_iter()).await?;
         }
 
         spill_files.pop().expect_ok()
@@ -1935,7 +1958,7 @@ impl NGramIndexBuilder {
             let s0 = stores[0].clone();
             let f0 = filters[0].clone();
             let second = (stores.len() == 2).then(|| (stores[1].clone(), filters[1].clone()));
-            tasks.push(lance_core::utils::tokio::spawn(async move {
+            tasks.push(async move {
                 let mut writer = spill_store
                     .new_index_file(&Self::spill_filename(out), POSTINGS_SCHEMA.clone())
                     .await?;
@@ -1955,11 +1978,9 @@ impl NGramIndexBuilder {
                     }
                 }
                 Result::Ok(())
-            }));
+            });
         }
-        for result in futures::future::try_join_all(tasks).await? {
-            result?;
-        }
+        Self::run_merge_tasks(tasks.into_iter()).await?;
 
         // Balanced parallel union of every spill (new data + paired segments).
         let final_spill = self.merge_spills(spills).await?;
@@ -2244,10 +2265,12 @@ impl ScalarIndexPlugin for NGramIndexPlugin {
 #[cfg(test)]
 mod tests {
     use lance_core::utils::row_addr_remap::RowAddrRemap;
+    use lance_core::utils::tokio::{limit_compute_concurrency, with_compute_concurrency};
     use lance_index_core::remapping::RowAddrTranslator;
     use rstest::rstest;
     use std::{
         collections::{HashMap, HashSet},
+        num::NonZeroUsize,
         sync::{
             Arc,
             atomic::{AtomicUsize, Ordering},
@@ -2276,6 +2299,7 @@ mod tests {
     use lance_tokenizer::TextAnalyzer;
     use roaring::RoaringTreemap;
     use std::pin::Pin;
+    use tokio::sync::{Notify, Semaphore};
 
     use crate::scalar::{
         IndexReader, IndexStore, ScalarIndex, SearchResult, TextQuery,
@@ -2914,6 +2938,41 @@ mod tests {
         ))
     }
 
+    #[tokio::test]
+    async fn test_ngram_compute_concurrency_limits_workers() {
+        let mut builder = NGramIndexBuilder::try_new(NGramIndexBuilderOptions {
+            num_workers: 8,
+            ..Default::default()
+        })
+        .unwrap();
+        let spill_files = with_compute_concurrency(
+            NonZeroUsize::new(1).unwrap(),
+            builder.train(simple_data_with_nulls()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(spill_files, vec![1]);
+
+        let tmpdir = TempDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.obj_path(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        builder
+            .write_index(store.as_ref(), spill_files, None)
+            .await
+            .unwrap();
+        let index = NGramIndex::from_store(store, None, &LanceCache::no_cache(), true)
+            .await
+            .unwrap();
+        assert_eq!(
+            get_posting_list_for_trigram(&index, "cat").await,
+            vec![0, 4]
+        );
+        assert_eq!(get_null_posting_list(&index).await, vec![2, 3]);
+    }
+
     #[test_log::test(tokio::test)]
     async fn test_ngram_nulls() {
         let data = simple_data_with_nulls();
@@ -3147,11 +3206,122 @@ mod tests {
         assert_eq!(null_posting_list, vec![addr(2), addr(3)]);
     }
 
+    #[rstest]
+    #[case::default(None, 3)]
+    #[case::single_worker(Some(NonZeroUsize::new(1).unwrap()), 1)]
+    #[tokio::test]
+    async fn test_ngram_merge_compute_concurrency_admission(
+        #[case] concurrency: Option<NonZeroUsize>,
+        #[case] expected_admitted: usize,
+    ) {
+        let check = async {
+            let admitted = Arc::new(AtomicUsize::new(0));
+            let finished = Arc::new(AtomicUsize::new(0));
+            let gate = Arc::new(Semaphore::new(0));
+            let tasks = (0..3)
+                .map(|_| {
+                    let finished = finished.clone();
+                    let gate = gate.clone();
+                    async move {
+                        let _permit = gate.acquire().await.unwrap();
+                        assert_eq!(
+                            limit_compute_concurrency(usize::MAX),
+                            concurrency.map_or(usize::MAX, NonZeroUsize::get)
+                        );
+                        finished.fetch_add(1, Ordering::Relaxed);
+                        Ok(())
+                    }
+                })
+                .collect::<Vec<_>>();
+            let tasks = tasks.into_iter().inspect(|_| {
+                admitted.fetch_add(1, Ordering::Relaxed);
+            });
+            let mut merge = Box::pin(NGramIndexBuilder::run_merge_tasks(tasks));
+            assert!(futures::poll!(merge.as_mut()).is_pending());
+            assert_eq!(admitted.load(Ordering::Relaxed), expected_admitted);
+            assert_eq!(finished.load(Ordering::Relaxed), 0);
+            gate.add_permits(3);
+            merge.await.unwrap();
+            assert_eq!(admitted.load(Ordering::Relaxed), 3);
+            assert_eq!(finished.load(Ordering::Relaxed), 3);
+        };
+        match concurrency {
+            Some(concurrency) => with_compute_concurrency(concurrency, check).await,
+            None => check.await,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_ngram_merge_compute_concurrency_waits_after_error() {
+        let gate = Arc::new(Semaphore::new(0));
+        let started = Arc::new(Notify::new());
+        let finished = Arc::new(AtomicUsize::new(0));
+        let tasks = (0..2).map(|id| {
+            let gate = gate.clone();
+            let started = started.clone();
+            let finished = finished.clone();
+            async move {
+                if id == 0 {
+                    return Err(Error::io("injected merge failure"));
+                }
+                started.notify_one();
+                let _permit = gate.acquire().await.unwrap();
+                finished.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+        });
+        with_compute_concurrency(NonZeroUsize::new(1).unwrap(), async {
+            let mut merge = Box::pin(NGramIndexBuilder::run_merge_tasks(tasks));
+            tokio::select! {
+                result = &mut merge => panic!("merge returned before pending writes finished: {result:?}"),
+                () = started.notified() => {},
+            }
+            assert!(futures::poll!(merge.as_mut()).is_pending());
+            gate.add_permits(1);
+            let error = merge.await.unwrap_err();
+            assert!(matches!(error, Error::IO { .. }));
+            assert!(error.to_string().contains("injected merge failure"));
+            assert_eq!(finished.load(Ordering::Relaxed), 1);
+        })
+        .await;
+    }
+
+    #[rstest]
+    #[case::single_segment(None, 1)]
+    #[case::four_segments(None, 4)]
+    #[case::four_segments_single_worker(Some(NonZeroUsize::new(1).unwrap()), 4)]
     #[test_log::test(tokio::test)]
-    async fn test_ngram_index_merge() {
+    async fn test_ngram_index_merge_compute_concurrency(
+        #[case] concurrency: Option<NonZeroUsize>,
+        #[case] num_segments: u64,
+    ) {
         let data = simple_data_with_nulls();
         let builder = NGramIndexBuilder::try_new(NGramIndexBuilderOptions::default()).unwrap();
         let (index, _merges, _tmpdir) = do_train(builder, data).await;
+
+        let mut segment_stores = vec![index.store.clone()];
+        let mut segment_dirs = Vec::new();
+        for segment in 1..num_segments {
+            let batch = simple_data_with_nulls().try_next().await.unwrap().unwrap();
+            let batch = RecordBatch::try_new(
+                batch.schema(),
+                vec![
+                    batch.column(0).clone(),
+                    Arc::new(UInt64Array::from_iter_values(
+                        (0..5).map(|id| segment * 10 + id),
+                    )),
+                ],
+            )
+            .unwrap();
+            let data = Box::pin(RecordBatchStreamAdapter::new(
+                batch.schema(),
+                stream::iter(vec![Ok(batch)]),
+            ));
+            let builder = NGramIndexBuilder::try_new(NGramIndexBuilderOptions::default()).unwrap();
+            let (segment, _, dir) = do_train(builder, data).await;
+            segment_stores.push(segment.store.clone());
+            segment_dirs.push(dir);
+        }
 
         let data = StringArray::from_iter(&[Some("giraffe"), Some("cat"), None]);
         let row_ids = UInt64Array::from_iter_values((0..data.len()).map(|i| i as u64 + 100));
@@ -3176,22 +3346,54 @@ mod tests {
             Arc::new(LanceCache::no_cache()),
         ));
 
-        index.update(data, test_store.as_ref(), None).await.unwrap();
+        let merge = async {
+            if num_segments == 1 {
+                index.update(data, test_store.as_ref(), None).await?;
+            } else {
+                NGramIndex::merge_segments(
+                    &segment_stores,
+                    Some(data),
+                    test_store.as_ref(),
+                    &vec![None; num_segments as usize],
+                    None,
+                    true,
+                )
+                .await?;
+            }
+            Result::Ok(())
+        };
+        match concurrency {
+            Some(concurrency) => with_compute_concurrency(concurrency, merge).await,
+            None => merge.await,
+        }
+        .unwrap();
 
         let index = NGramIndex::from_store(test_store, None, &LanceCache::no_cache(), true)
             .await
             .unwrap();
         let row_ids = row_ids_in_index(&index).await;
-        assert_eq!(row_ids, vec![0, 1, 2, 3, 4, 100, 101, 102]);
+        let expected_rows = (0..num_segments)
+            .flat_map(|segment| (0..5).map(move |id| segment * 10 + id))
+            .chain([100, 101, 102])
+            .collect::<Vec<_>>();
+        assert_eq!(row_ids, expected_rows);
 
         let posting_list = get_posting_list_for_trigram(&index, "cat").await;
-        assert_eq!(posting_list, vec![0, 4, 101]);
+        let expected_cats = (0..num_segments)
+            .flat_map(|segment| [segment * 10, segment * 10 + 4])
+            .chain([101])
+            .collect::<Vec<_>>();
+        assert_eq!(posting_list, expected_cats);
 
         let posting_list = get_posting_list_for_trigram(&index, "ffe").await;
         assert_eq!(posting_list, vec![100]);
 
         let posting_list = get_null_posting_list(&index).await;
-        assert_eq!(posting_list, vec![2, 3, 102]);
+        let expected_nulls = (0..num_segments)
+            .flat_map(|segment| [segment * 10 + 2, segment * 10 + 3])
+            .chain([102])
+            .collect::<Vec<_>>();
+        assert_eq!(posting_list, expected_nulls);
     }
 
     #[test]

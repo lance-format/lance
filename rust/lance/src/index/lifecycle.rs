@@ -11,12 +11,14 @@
 use super::field_dependencies::{described_field_ids, input_field_ids, input_field_ids_for};
 
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use futures::{FutureExt, StreamExt, TryStreamExt};
 use itertools::Itertools;
+use lance_core::utils::tokio::with_compute_concurrency;
 use lance_index::{
     FtsPrewarmResult, IndexCriteria, IndexDescription, IndexParams, IndexType, PrewarmOptions,
     frag_reuse::FRAG_REUSE_INDEX_NAME, is_system_index, mem_wal::MEM_WAL_INDEX_NAME,
@@ -1304,42 +1306,59 @@ impl DatasetIndexExt for Dataset {
     #[instrument(skip_all)]
 
     async fn optimize_indices(&mut self, options: &OptimizeOptions) -> Result<()> {
-        // Grouped from the complete list so a name's segments are all accounted
-        // for. A segment this build cannot read is still coverage, and merging
-        // against a group whose coverage is only partly visible would commit a
-        // new segment claiming fragments an existing one already holds.
-        let indices = load_all_indices(self).await?;
+        let num_threads = options
+            .num_threads
+            .map(|num_threads| {
+                NonZeroUsize::new(num_threads).ok_or_else(|| {
+                    Error::invalid_input(
+                        "OptimizeOptions::num_threads must be greater than 0 (use None for the default)",
+                    )
+                })
+            })
+            .transpose()?;
+        // Planning may train an index too, so keep every stage in the scope.
+        let optimize = async {
+            // Grouped from the complete list so a name's segments are all accounted
+            // for. A segment this build cannot read is still coverage, and merging
+            // against a group whose coverage is only partly visible would commit a
+            // new segment claiming fragments an existing one already holds.
+            let indices = load_all_indices(self).await?;
 
-        // The stages a distributed optimize runs across workers, run here in
-        // turn: without row bounds every index is one task that does the
-        // whole single-process optimize, and every merge passes it through.
-        let Some(plan) = optimize::plan_optimize_indices_or_skip(
-            self,
-            &indices,
-            options,
-            optimize::OptimizeExecution::Local,
-        )
-        .await?
-        else {
-            return Ok(());
+            // The stages a distributed optimize runs across workers, run here in
+            // turn: without row bounds every index is one task that does the
+            // whole single-process optimize, and every merge passes it through.
+            let Some(plan) = optimize::plan_optimize_indices_or_skip(
+                self,
+                &indices,
+                options,
+                optimize::OptimizeExecution::Local,
+            )
+            .await?
+            else {
+                return Ok(());
+            };
+            let mut built = Vec::with_capacity(plan.tasks.len());
+            for task in &plan.tasks {
+                built.extend(
+                    task.execute_with_progress(self, options.progress.clone())
+                        .await?,
+                );
+            }
+            let mut merged = Vec::with_capacity(plan.merges.len());
+            for merge in &plan.merges {
+                merged.extend(
+                    merge
+                        .execute_with_progress(self, &built, options.progress.clone())
+                        .await?,
+                );
+            }
+
+            // Without results this still commits when MemWAL catch-up needs it.
+            optimize::commit_optimize_indices(self, merged, options).await
         };
-        let mut built = Vec::with_capacity(plan.tasks.len());
-        for task in &plan.tasks {
-            built.extend(
-                task.execute_with_progress(self, options.progress.clone())
-                    .await?,
-            );
+        match num_threads {
+            Some(num_threads) => Box::pin(with_compute_concurrency(num_threads, optimize)).await,
+            None => optimize.await,
         }
-        let mut merged = Vec::with_capacity(plan.merges.len());
-        for merge in &plan.merges {
-            merged.extend(
-                merge
-                    .execute_with_progress(self, &built, options.progress.clone())
-                    .await?,
-            );
-        }
-
-        // Without results this still commits when MemWAL catch-up needs it.
-        optimize::commit_optimize_indices(self, merged, options).await
     }
 }

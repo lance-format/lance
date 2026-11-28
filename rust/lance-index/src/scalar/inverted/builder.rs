@@ -28,7 +28,10 @@ use lance_core::deepsize::DeepSizeOf;
 use lance_core::error::LanceOptionExt;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::row_addr_remap::RowAddrRemap;
-use lance_core::utils::tokio::{IO_CORE_RESERVATION, get_num_compute_intensive_cpus, spawn_cpu};
+use lance_core::utils::tokio::{
+    IO_CORE_RESERVATION, capture_compute_concurrency, get_global_num_compute_intensive_cpus,
+    get_num_compute_intensive_cpus, limit_compute_concurrency, spawn_cpu,
+};
 use lance_core::{Error, ROW_ID, Result};
 use lance_index_core::remapping::RowAddrTranslator;
 use lance_io::object_store::ObjectStore;
@@ -84,7 +87,7 @@ const MAX_RETAINED_TOKEN_IDS: usize = 8 * 1024;
 const POSTING_BATCH_BYTES: usize = 8 * 1024 * 1024;
 
 fn default_num_workers() -> usize {
-    let total_cpus = get_num_compute_intensive_cpus() + *IO_CORE_RESERVATION;
+    let total_cpus = get_global_num_compute_intensive_cpus() + *IO_CORE_RESERVATION;
     std::cmp::max(1, total_cpus / 2)
 }
 
@@ -563,7 +566,7 @@ impl InvertedIndexBuilder {
             let id_alloc = id_alloc.clone();
             let progress = self.progress.clone();
             let tokenized_count = tokenized_count.clone();
-            index_tasks.spawn(async move {
+            index_tasks.spawn(capture_compute_concurrency(async move {
                 let mut worker =
                     IndexWorker::new(tokenizer, dest_store, id_alloc, worker_config).await?;
                 while let Ok(batch) = receiver.recv().await {
@@ -579,7 +582,7 @@ impl InvertedIndexBuilder {
                     tokio::task::yield_now().await;
                 }
                 worker.finish().await
-            });
+            }));
         }
 
         let index_build = async {
@@ -3201,7 +3204,7 @@ async fn finalize_staged_partitions(
         let dest = dest.clone();
         let budget = budget.clone();
         let file_progress = file_progress.clone();
-        tasks.spawn(async move {
+        tasks.spawn(capture_compute_concurrency(async move {
             let _slot = budget.copy_slot().await?;
             let _lease = budget.reserve(budget.per_copy_bytes).await?;
             let mut files = Vec::with_capacity(PARTITION_FILE_SUFFIXES.len());
@@ -3221,15 +3224,24 @@ async fn finalize_staged_partitions(
                 file_progress.advance(1).await?;
             }
             Result::Ok((vec![new_id], files))
-        });
+        }));
     }
+    // Decoding each merge group consumes CPU inline. Limit that stage without
+    // reducing the independent file-copy concurrency controlled by the I/O budget.
+    let merge_slots = Arc::new(tokio::sync::Semaphore::new(limit_compute_concurrency(
+        plan.groups.len().max(1),
+    )));
     for group in plan.groups {
         let source = source.clone();
         let dest = dest.clone();
         let budget = budget.clone();
         let file_progress = file_progress.clone();
         let token_set_format = staged.token_set_format;
-        tasks.spawn(async move {
+        let merge_slots = merge_slots.clone();
+        tasks.spawn(capture_compute_concurrency(async move {
+            let _slot = merge_slots.acquire().await.map_err(|error| {
+                Error::internal(format!("Failed to acquire FTS merge group slot: {error}"))
+            })?;
             consolidate_group(
                 dest,
                 group,
@@ -3240,7 +3252,7 @@ async fn finalize_staged_partitions(
                 ConsolidationSource::Stored(&source, PartitionWriteTarget::Staged),
             )
             .await
-        });
+        }));
     }
 
     let mut final_ids = Vec::new();
@@ -3477,6 +3489,7 @@ mod tests {
     use lance_core::ROW_ID;
     use lance_core::cache::LanceCache;
     use lance_core::utils::tempfile::TempDir;
+    use lance_core::utils::tokio::with_compute_concurrency;
     use object_store::memory::InMemory;
     use object_store::{
         CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
@@ -3485,6 +3498,7 @@ mod tests {
     };
     use std::any::Any;
     use std::fmt::{Display, Formatter};
+    use std::num::NonZeroUsize;
     use std::ops::Range;
     use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use std::time::Duration;
@@ -5269,6 +5283,59 @@ mod tests {
     }
 
     lance_testing::define_stage_event_progress!(RecordingProgress, IndexBuildProgress, Result<()>);
+
+    #[derive(Debug, Default)]
+    struct ComputeConcurrencyProgress {
+        tokenized_batches: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl IndexBuildProgress for ComputeConcurrencyProgress {
+        async fn stage_start(&self, _stage: &str, _total: Option<u64>, _unit: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn stage_progress(&self, stage: &str, _completed: u64) -> Result<()> {
+            if stage == "tokenize_docs" {
+                // This callback runs inside a JoinSet worker, not the caller's task.
+                assert_eq!(limit_compute_concurrency(usize::MAX), 1);
+                self.tokenized_batches.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(())
+        }
+
+        async fn stage_complete(&self, _stage: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_builder_workers_inherit_compute_concurrency() -> Result<()> {
+        let index_dir = TempDir::default();
+        let store = LanceIndexStore::new(
+            ObjectStore::local().into(),
+            index_dir.obj_path(),
+            Arc::new(LanceCache::no_cache()),
+        );
+        let batch = make_doc_batch_from_docs(vec![Some("hello world"), None]);
+        let stream = Box::pin(RecordBatchStreamAdapter::new(
+            batch.schema(),
+            stream::iter(vec![Ok(batch)]),
+        ));
+        let params = InvertedIndexParams::default().num_workers(8);
+        let progress = Arc::new(ComputeConcurrencyProgress::default());
+        let mut builder = InvertedIndexBuilder::new(params.clone()).with_progress(progress.clone());
+        let default_workers = default_num_workers();
+        with_compute_concurrency(NonZeroUsize::new(1).unwrap(), async {
+            assert_eq!(resolve_num_workers(&params), 1);
+            assert_eq!(default_num_workers(), default_workers);
+            builder.update(stream, &store, None).await
+        })
+        .await?;
+        assert_eq!(progress.tokenized_batches.load(Ordering::Relaxed), 1);
+        assert_eq!(limit_compute_concurrency(usize::MAX), usize::MAX);
+        Ok(())
+    }
 
     #[derive(Debug, Default)]
     struct FailingProgress;
