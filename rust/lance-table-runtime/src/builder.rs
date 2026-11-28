@@ -912,6 +912,7 @@ mod tests {
             files: None,
             clustering_id: None,
             metadata: HashMap::new(),
+            local_fragment_aliases: Default::default(),
         };
         write_manifest_file_to_path(
             &store,

@@ -45,6 +45,7 @@ pub async fn write_vector_segment_metadata(
         }]),
         clustering_id: None,
         metadata: Default::default(),
+        local_fragment_aliases: Default::default(),
     }
 }
 

@@ -82,6 +82,7 @@ impl IndexMergeResults<'_> {
             files: Some(self.files),
             clustering_id: None,
             metadata: Default::default(),
+            local_fragment_aliases: Default::default(),
         }
     }
 }
@@ -1104,18 +1105,29 @@ async fn merge_scalar_indices<'a>(
             .any(|segment| migrated_to_row_addrs(segment) && !segment.results_are_row_addrs());
 
     // An older ZoneMap file version lacks statistics the current version
-    // stores (the NaN sign split, the maximum hidden by the NaN marker);
-    // only a scan recovers them, so such a segment is rebuilt, not merged.
+    // stores (the NaN sign split, the maximum hidden by the NaN marker), and
+    // aliased segments store zones/nulls in provisional fragment coordinates;
+    // rebuild from committed dataset rows rather than copying raw zones.
     let zonemap_requires_rebuild = index_type == IndexType::ZoneMap
+        && selected_old_indices.iter().any(|segment| {
+            segment.index_version < ZoneMapIndexVersion::CURRENT as i32
+                || !segment.local_fragment_aliases.is_empty()
+        });
+
+    // Aliased BloomFilter segments retain old zone bounds and null positions
+    // in stored coordinates during `update`/`merge_segments`, so rebuild them
+    // from committed dataset rows before clearing aliases.
+    let bloomfilter_requires_rebuild = index_type == IndexType::BloomFilter
         && selected_old_indices
             .iter()
-            .any(|segment| segment.index_version < ZoneMapIndexVersion::CURRENT as i32);
+            .any(|segment| !segment.local_fragment_aliases.is_empty());
 
     // Two or more bloom filter segments merge by their zones unless only a
     // rebuild catches the index up (a pending compaction remap, since the
     // merge keeps the oldest source version, or a segment without null rows)
     // or the merge would refuse them (a tagged history, other parameters).
     let is_bloomfilter_mergeable = if index_type == IndexType::BloomFilter
+        && !bloomfilter_requires_rebuild
         && selected_old_indices.len() >= 2
         && !is_remappable
         && tagged_coverage.is_none()
@@ -1161,6 +1173,7 @@ async fn merge_scalar_indices<'a>(
         && !ngram_requires_rebuild
         && !legacy_domain_mismatch
         && !zonemap_requires_rebuild
+        && !bloomfilter_requires_rebuild
         && (has_segment_merge_primitive(index_type)
             || is_bloomfilter_mergeable
             || selected_old_indices.len() == 1);
@@ -2451,6 +2464,7 @@ mod tests {
             files: None,
             clustering_id: None,
             metadata: Default::default(),
+            local_fragment_aliases: Default::default(),
         };
         let frag_reuse_index = CompactFragReuseIndex::from_row_id_maps(
             Uuid::new_v4(),

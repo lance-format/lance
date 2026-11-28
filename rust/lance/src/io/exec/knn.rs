@@ -3859,6 +3859,7 @@ mod tests {
             files: None,
             clustering_id: None,
             metadata: Default::default(),
+            local_fragment_aliases: Default::default(),
         };
         let mut prefilter = DatasetPreFilter::new(dataset, &[index], None);
         if let Some(mask) = mask {
@@ -4033,6 +4034,7 @@ mod tests {
             files: None,
             clustering_id: None,
             metadata: Default::default(),
+            local_fragment_aliases: Default::default(),
         };
         let new_segment = IndexMetadata {
             uuid: Uuid::new_v4(),
@@ -4048,6 +4050,7 @@ mod tests {
             files: None,
             clustering_id: None,
             metadata: Default::default(),
+            local_fragment_aliases: Default::default(),
         };
         assert!(
             !appended_fragments.is_empty(),
@@ -4292,6 +4295,7 @@ mod tests {
             files: None,
             clustering_id: None,
             metadata: Default::default(),
+            local_fragment_aliases: Default::default(),
         };
         fn key<'a>(
             segment: &'a IndexMetadata,

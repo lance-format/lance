@@ -23,6 +23,7 @@ fn test_mem_wal_install_conflicts_with_merge() {
         files: None,
         clustering_id: None,
         metadata: Default::default(),
+        local_fragment_aliases: Default::default(),
     };
     let column_index = IndexMetadata {
         uuid: uuid::Uuid::new_v4(),
@@ -120,6 +121,7 @@ fn test_create_index_conflicts_only_on_same_name() {
         files: None,
         clustering_id: None,
         metadata: Default::default(),
+        local_fragment_aliases: Default::default(),
     };
     let index1 = IndexMetadata {
         uuid: uuid::Uuid::new_v4(),
@@ -199,6 +201,7 @@ fn test_create_index_conflicts_only_on_same_name() {
                     files: None,
                     clustering_id: None,
                     metadata: Default::default(),
+                    local_fragment_aliases: Default::default(),
                 }],
                 removed_indices: vec![],
             },
@@ -249,6 +252,7 @@ fn test_create_index_conflicts_with_concurrent_drop(
         files: None,
         clustering_id: None,
         metadata: Default::default(),
+        local_fragment_aliases: Default::default(),
     };
     let drop_operation = Operation::CreateIndex {
         new_indices: vec![],
@@ -316,6 +320,7 @@ fn test_concurrent_index_drops_are_compatible() {
         files: None,
         clustering_id: None,
         metadata: Default::default(),
+        local_fragment_aliases: Default::default(),
     };
     let drop_operation = Operation::CreateIndex {
         new_indices: vec![],
@@ -363,6 +368,7 @@ fn test_index_replacement_compatible_with_removing_disjoint_segment() {
         files: None,
         clustering_id: None,
         metadata: Default::default(),
+        local_fragment_aliases: Default::default(),
     };
     let replaced = index(Uuid::new_v4());
     let concurrently_removed = index(Uuid::new_v4());
@@ -419,6 +425,7 @@ fn test_create_ngram_index_conflicts_with_overlapping_deferred_rewrite() {
         files: None,
         clustering_id: None,
         metadata: Default::default(),
+        local_fragment_aliases: Default::default(),
     };
     let frag_reuse_index = IndexMetadata {
         uuid: Uuid::new_v4(),
@@ -434,6 +441,7 @@ fn test_create_ngram_index_conflicts_with_overlapping_deferred_rewrite() {
         files: None,
         clustering_id: None,
         metadata: Default::default(),
+        local_fragment_aliases: Default::default(),
     };
     let rewrite = Transaction::new(
         1,
@@ -507,6 +515,7 @@ fn test_create_index_conflicts_with_deferred_rewrite_under_stable_row_ids() {
         files: None,
         clustering_id: None,
         metadata: Default::default(),
+        local_fragment_aliases: Default::default(),
     };
     let frag_reuse_index = IndexMetadata {
         uuid: Uuid::new_v4(),
@@ -522,6 +531,7 @@ fn test_create_index_conflicts_with_deferred_rewrite_under_stable_row_ids() {
         files: None,
         clustering_id: None,
         metadata: Default::default(),
+        local_fragment_aliases: Default::default(),
     };
 
     // The rewrite's own `old_fragments` are what the SRID inference reads:

@@ -603,6 +603,7 @@ async fn do_load_shuffled_vectors(
         files: Some(files),
         clustering_id: None,
         metadata: Default::default(),
+        local_fragment_aliases: Default::default(),
     };
     ds.commit_existing_index_segments(index_name, column, vec![metadata])
         .await

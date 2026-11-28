@@ -307,11 +307,30 @@ pub(crate) fn index_metadata_to_java<'a>(
         None => JObject::null(),
     };
     let metadata = to_java_map(env, &index_meta.metadata)?;
+    let local_fragment_aliases = env.new_object("java/util/HashMap", "()V", &[])?;
+    for (&local_id, &committed_id) in &index_meta.local_fragment_aliases {
+        let key = env.new_object(
+            "java/lang/Long",
+            "(J)V",
+            &[JValue::Long(i64::from(local_id))],
+        )?;
+        let val = env.new_object(
+            "java/lang/Long",
+            "(J)V",
+            &[JValue::Long(i64::from(committed_id))],
+        )?;
+        env.call_method(
+            &local_fragment_aliases,
+            "put",
+            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            &[JValue::Object(&key), JValue::Object(&val)],
+        )?;
+    }
 
     // Create Index object
     Ok(env.new_object(
         "org/lance/index/Index",
-        "(Ljava/util/UUID;Ljava/util/List;Ljava/util/List;Ljava/lang/String;JLjava/util/List;[BILjava/time/Instant;Ljava/lang/Integer;Ljava/lang/Long;Ljava/util/List;Lorg/lance/index/IndexType;Ljava/lang/Long;Ljava/util/Map;)V",
+        "(Ljava/util/UUID;Ljava/util/List;Ljava/util/List;Ljava/lang/String;JLjava/util/List;[BILjava/time/Instant;Ljava/lang/Integer;Ljava/lang/Long;Ljava/util/List;Lorg/lance/index/IndexType;Ljava/lang/Long;Ljava/util/Map;Ljava/util/Map;)V",
         &[
             JValue::Object(&uuid),
             JValue::Object(&fields),
@@ -328,6 +347,7 @@ pub(crate) fn index_metadata_to_java<'a>(
             JValue::Object(&index_type),
             JValue::Object(&clustering_id),
             JValue::Object(&metadata),
+            JValue::Object(&local_fragment_aliases),
         ],
     )?)
 }
@@ -488,6 +508,7 @@ mod tests {
             files: None,
             clustering_id: None,
             metadata: HashMap::new(),
+            local_fragment_aliases: Default::default(),
         }
     }
 

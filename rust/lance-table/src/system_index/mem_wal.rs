@@ -696,6 +696,7 @@ pub fn new_mem_wal_index_meta(
         files: None,
         clustering_id: None,
         metadata: Default::default(),
+        local_fragment_aliases: Default::default(),
     })
 }
 

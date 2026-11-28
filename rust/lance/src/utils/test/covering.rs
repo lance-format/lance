@@ -190,6 +190,7 @@ pub async fn commit_synthetic_covered_index(
         files: None,
         clustering_id: None,
         metadata: Default::default(),
+        local_fragment_aliases: Default::default(),
     };
 
     dataset

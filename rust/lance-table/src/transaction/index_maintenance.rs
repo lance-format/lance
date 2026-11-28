@@ -991,6 +991,7 @@ impl Transaction {
                 .any(|replacement| replacement.old_id != replacement.new_id)
             {
                 replacement.base_id = None;
+                replacement.local_fragment_aliases.clear();
             }
             // Independent remaps preserve the source's historical metadata. Only
             // a physical merge publishes a new segment's details and version,
@@ -1993,6 +1994,7 @@ mod tests {
         index.index_details = details.map(Arc::new);
         index.index_version = 0;
         index.base_id = Some(7);
+        index.local_fragment_aliases.insert(17, 1);
         let source_details = index.index_details.clone();
         let new_id = Uuid::new_v4();
         let replacement = RewrittenIndex {
@@ -2019,6 +2021,7 @@ mod tests {
         assert_eq!(indices[0].index_version, 0);
         assert_eq!(indices[0].uuid, new_id);
         assert_eq!(indices[0].base_id, None);
+        assert!(indices[0].local_fragment_aliases.is_empty());
         assert_eq!(indices[0].files, Some(vec![]));
         assert_eq!(
             indices[0].fragment_bitmap,
@@ -2036,6 +2039,7 @@ mod tests {
             true,
         );
         index.base_id = Some(7);
+        index.local_fragment_aliases.insert(17, 1);
         let replacement = RewrittenIndex {
             old_id: index.uuid,
             new_id: index.uuid,
@@ -2046,6 +2050,7 @@ mod tests {
         let mut indices = vec![index];
         Transaction::handle_rewrite_indices(&mut indices, &[replacement], &[]).unwrap();
         assert_eq!(indices[0].base_id, Some(7));
+        assert_eq!(indices[0].local_fragment_aliases.get(&17), Some(&1));
     }
 
     #[test]
@@ -2284,6 +2289,7 @@ mod tests {
             files: None,
             clustering_id: None,
             metadata: Default::default(),
+            local_fragment_aliases: Default::default(),
         }
     }
 
@@ -2350,6 +2356,7 @@ mod tests {
             files: None,
             clustering_id: None,
             metadata: Default::default(),
+            local_fragment_aliases: Default::default(),
         }
     }
 

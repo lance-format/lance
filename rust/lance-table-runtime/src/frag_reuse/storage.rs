@@ -213,6 +213,7 @@ pub async fn build_frag_reuse_index_metadata(
         files: None,
         clustering_id: None,
         metadata: Default::default(),
+        local_fragment_aliases: Default::default(),
     };
     // Spares the commit's history check from reading the file back.
     if let Some(Content::External(file)) = &proto.content {
@@ -461,6 +462,7 @@ pub async fn frag_reuse_entry_appending(
         files: None,
         clustering_id: None,
         metadata: Default::default(),
+        local_fragment_aliases: Default::default(),
     })
 }
 
@@ -519,6 +521,7 @@ pub async fn build_tagged_frag_reuse_entry(
         files: None,
         clustering_id: None,
         metadata: Default::default(),
+        local_fragment_aliases: Default::default(),
     })
 }
 

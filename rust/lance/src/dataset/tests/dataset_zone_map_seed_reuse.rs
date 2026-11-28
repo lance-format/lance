@@ -1449,6 +1449,7 @@ async fn test_historical_index_without_bitmap_still_collects_seed_positions() {
         files: Some(index_files_to_table(vec![index_file])),
         clustering_id: None,
         metadata: Default::default(),
+        local_fragment_aliases: Default::default(),
     };
     dataset
         .commit_existing_index_segments(&index_name("val"), "val", vec![segment])

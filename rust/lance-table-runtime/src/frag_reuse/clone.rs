@@ -362,6 +362,7 @@ pub async fn relocate_tagged_entry_for_clone(
             files: entry.files.clone(),
             clustering_id: None,
             metadata: Default::default(),
+            local_fragment_aliases: Default::default(),
         },
         spilled,
     ))

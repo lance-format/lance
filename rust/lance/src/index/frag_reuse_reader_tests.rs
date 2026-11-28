@@ -2131,6 +2131,7 @@ async fn tagged_coverage_filtering_bypasses_system_indexes() {
         files: None,
         clustering_id: None,
         metadata: Default::default(),
+        local_fragment_aliases: Default::default(),
     });
     persist_fixture(&mut dataset, indices).await;
 
@@ -3616,6 +3617,7 @@ async fn install_history(
         files: None,
         clustering_id: None,
         metadata: Default::default(),
+        local_fragment_aliases: Default::default(),
     };
     indices.push(fri.clone());
     Arc::make_mut(&mut dataset.manifest).fragments = live.into();

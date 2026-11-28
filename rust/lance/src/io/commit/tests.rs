@@ -2495,6 +2495,7 @@ fn index_segment(name: &str, fragment_bitmap: Option<RoaringBitmap>) -> IndexMet
         files: None,
         clustering_id: None,
         metadata: Default::default(),
+        local_fragment_aliases: Default::default(),
     }
 }
 
@@ -2543,6 +2544,7 @@ fn test_frag_reuse_rewrite_own_commit_comparison_uses_durable_form() {
         files: None,
         clustering_id: None,
         metadata: Default::default(),
+        local_fragment_aliases: Default::default(),
     };
     let transaction = Transaction::new(
         42,

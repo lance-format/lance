@@ -236,6 +236,7 @@ impl IndexSegment {
             files: None,
             clustering_id: self.clustering_id,
             metadata: self.metadata,
+            local_fragment_aliases: Default::default(),
         }
     }
 }
@@ -248,6 +249,12 @@ impl IntoIndexSegment for IndexSegment {
 
 impl IntoIndexSegment for IndexMetadata {
     fn into_index_segment(self) -> Result<IndexSegment> {
+        if !self.local_fragment_aliases.is_empty() {
+            return Err(Error::not_supported(format!(
+                "Index segment {} stores provisional fragment ids. Rewrite the index files before replacing the segment",
+                self.uuid
+            )));
+        }
         let fragment_bitmap = self.fragment_bitmap.ok_or_else(|| {
             Error::invalid_input(format!(
                 "CreateIndex: segment {} is missing fragment coverage",
@@ -568,6 +575,7 @@ mod tests {
             files: None,
             clustering_id: None,
             metadata: Default::default(),
+            local_fragment_aliases: Default::default(),
         };
 
         let segment = metadata.into_index_segment().unwrap();
@@ -626,6 +634,7 @@ mod tests {
             files: None,
             clustering_id: None,
             metadata: Default::default(),
+            local_fragment_aliases: Default::default(),
         };
 
         let segment = metadata.into_index_segment().unwrap();

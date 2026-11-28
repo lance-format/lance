@@ -2366,10 +2366,6 @@ impl BTreeIndex {
 
     /// Turn a page's serialized batch into a searchable page, applying
     /// whichever row id remap is configured.
-    ///
-    /// Tagged async remap must run in this async context; the legacy
-    /// synchronous remap is handled by `decode_page` (also used off the CPU
-    /// pool in `prewarm`).
     async fn build_page(
         &self,
         page_number: u32,
@@ -2378,6 +2374,12 @@ impl BTreeIndex {
     ) -> Result<FlatIndex> {
         metrics.record_part_load();
         info!(target: TRACE_IO_EVENTS, r#type=IO_TYPE_LOAD_SCALAR_PART, index_type="btree", part_id=page_number);
+        self.remapped_page(serialized_page).await
+    }
+
+    /// Runs tagged async remap here. Legacy sync remap goes through
+    /// `decode_page`, which `prewarm` also uses off the CPU pool.
+    async fn remapped_page(&self, serialized_page: RecordBatch) -> Result<FlatIndex> {
         if let Some(remapper) = self.batch_remapper.as_ref() {
             let serialized_page =
                 remap_record_batch_async(remapper.as_ref(), serialized_page, 1).await?;
@@ -3069,7 +3071,7 @@ impl Index for BTreeIndex {
         )
         .await?;
         while let Some((_, serialized)) = pages.try_next().await? {
-            let page = FlatIndex::try_new(serialized)?;
+            let page = self.remapped_page(serialized).await?;
             frag_ids |= page.calculate_included_frags()?;
         }
 

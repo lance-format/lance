@@ -424,6 +424,7 @@ async fn eager_compaction_without_bindings_preserves_opaque_index(#[case] stable
         files: None,
         clustering_id: None,
         metadata: Default::default(),
+        local_fragment_aliases: Default::default(),
     };
     let mut table = commit(
         &table,

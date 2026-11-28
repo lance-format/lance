@@ -25,6 +25,7 @@ use crate::dataset::optimize::RemappedIndex;
 use crate::dataset::optimize::remapping::RemapResult;
 use crate::index::frag_reuse;
 use crate::index::loading::DatasetIndexInternalExt;
+use crate::index::local_fragment_aliases::prepend_fragment_aliases;
 use crate::index::scalar::{
     IndexDetails, TrainingScanOptions, fetch_index_details, load_training_data,
 };
@@ -226,10 +227,25 @@ pub(crate) async fn remap_index(
                         )
                         .await?
                     } else {
-                        scalar_index.remap_streaming(row_id_map, &new_store).await?
+                        let row_id_map = prepend_fragment_aliases(dataset, matched, row_id_map);
+                        scalar_index
+                            .remap_streaming(row_id_map.as_ref(), &new_store)
+                            .await?
                     }
                 }
-                _ => scalar_index.remap_streaming(row_id_map, &new_store).await?,
+                // BitmapIndex::remap_index_map (also used by LabelList) reads
+                // postings via `load_bitmap` / `null_map`, which already apply
+                // the remapper installed at open (including local_fragment_aliases).
+                // Wrapping `row_id_map` again would apply aliases twice.
+                IndexType::Bitmap | IndexType::LabelList => {
+                    scalar_index.remap_streaming(row_id_map, &new_store).await?
+                }
+                _ => {
+                    let row_id_map = prepend_fragment_aliases(dataset, matched, row_id_map);
+                    scalar_index
+                        .remap_streaming(row_id_map.as_ref(), &new_store)
+                        .await?
+                }
             }
         }
         it if it.is_vector() => {

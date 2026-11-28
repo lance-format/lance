@@ -2786,6 +2786,15 @@ async fn merge_segments_inner(
     if segments.is_empty() {
         return Err(Error::index("No segment metadata was provided".to_string()));
     }
+    if let Some(aliased) = segments
+        .iter()
+        .find(|segment| !segment.local_fragment_aliases.is_empty())
+    {
+        return Err(Error::not_supported(format!(
+            "Vector index segment '{}' carries local_fragment_aliases, which IVF merge does not support yet",
+            aliased.uuid
+        )));
+    }
     if segments.len() == 1 {
         return Ok(segments.into_iter().next().unwrap());
     }
@@ -6711,6 +6720,7 @@ mod tests {
             files: None,
             clustering_id: None,
             metadata: Default::default(),
+            local_fragment_aliases: Default::default(),
         };
 
         // We need to commit this index to the dataset so that it can be found
@@ -6753,6 +6763,7 @@ mod tests {
             files: None,
             clustering_id: None,
             metadata: Default::default(),
+            local_fragment_aliases: Default::default(),
         };
 
         let prefilter = Arc::new(DatasetPreFilter::new(dataset.clone(), &[index_meta], None));
@@ -6815,6 +6826,7 @@ mod tests {
             files: None,
             clustering_id: None,
             metadata: Default::default(),
+            local_fragment_aliases: Default::default(),
         };
 
         // We need to commit this new index to the dataset so it can be found

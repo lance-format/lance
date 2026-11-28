@@ -4,13 +4,14 @@
 //! Metadata for index
 
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::num::NonZero;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use lance_core::deepsize::DeepSizeOf;
+use lance_core::utils::address::RowAddress;
 use lance_io::object_store::ObjectStore;
 use object_store::path::Path;
 use roaring::RoaringBitmap;
@@ -128,6 +129,14 @@ pub struct IndexMetadata {
     /// entry, including keys this build does not understand; new segments
     /// carry only what their creator sets.
     pub metadata: HashMap<String, String>,
+
+    /// Fragment ids stored in this segment's files, mapped to committed
+    /// fragment ids. Empty when the files already store committed ids.
+    ///
+    /// A reader translates each stored id once, before fragment-reuse
+    /// translation. A missing id keeps its stored value. A row address keeps
+    /// its row offset.
+    pub local_fragment_aliases: BTreeMap<u32, u32>,
 }
 
 /// True when an index segment with these details, persisted at `index_version`,
@@ -409,6 +418,7 @@ impl IndexMetadata {
     ///     files: None,
     ///     clustering_id: None,
     ///     metadata: Default::default(),
+    ///     local_fragment_aliases: Default::default(),
     /// };
     /// assert!(entry(vec![7, 11], vec![11]).declares_same_fields(&entry(vec![7], vec![11])));
     /// assert!(!entry(vec![7], vec![11]).declares_same_fields(&entry(vec![7], vec![13])));
@@ -443,6 +453,7 @@ impl IndexMetadata {
     ///     files: None,
     ///     clustering_id: None,
     ///     metadata: Default::default(),
+    ///     local_fragment_aliases: Default::default(),
     /// };
     /// assert_eq!(index.dependency_fields().as_ref(), &[0, 1]);
     ///
@@ -687,6 +698,7 @@ impl DeepSizeOf for IndexMetadata {
                 })
                 .unwrap_or(0)
             + self.metadata.deep_size_of_children(context)
+            + self.local_fragment_aliases.deep_size_of_children(context)
     }
 }
 
@@ -746,13 +758,8 @@ impl IndexMetadata {
                     .ok_or_else(|| out_of_range(ts))
             })
             .transpose()?;
-
-        // An empty map means the segment uses its stored fragment IDs.
-        if !proto.local_fragment_aliases.is_empty() {
-            return Err(Error::not_supported(
-                "index segment has local fragment aliases, which this build does not support yet",
-            ));
-        }
+        let local_fragment_aliases =
+            decode_local_fragment_aliases(&proto.name, proto.local_fragment_aliases)?;
 
         Ok(Self {
             uuid: proto.uuid.as_ref().map(Uuid::try_from).ok_or_else(|| {
@@ -770,8 +777,63 @@ impl IndexMetadata {
             files,
             clustering_id: proto.clustering_id,
             metadata: proto.metadata,
+            local_fragment_aliases,
         })
     }
+}
+
+impl IndexMetadata {
+    /// Validate stage-independent invariants of `local_fragment_aliases`.
+    ///
+    /// Does not cross-check against `fragment_bitmap` because V0 fragment reuse
+    /// updates `fragment_bitmap` to post-compaction fragment ids while
+    /// preserving `local_fragment_aliases`. Ensuring no unmapped stored
+    /// fragment id collides with a mapped destination is a writer invariant.
+    pub fn validate_local_fragment_aliases(&self) -> Result<()> {
+        validate_local_fragment_aliases_entries(
+            &self.name,
+            self.local_fragment_aliases.iter().map(|(&s, &c)| (s, c)),
+        )
+    }
+}
+
+fn validate_local_fragment_aliases_entries(
+    name: &str,
+    entries: impl IntoIterator<Item = (u32, u32)>,
+) -> Result<()> {
+    let mut committed_ids = BTreeSet::new();
+    for (stored, committed) in entries {
+        if stored == RowAddress::TOMBSTONE_FRAG || committed == RowAddress::TOMBSTONE_FRAG {
+            return Err(Error::corrupt_file_named(
+                "index metadata",
+                format!(
+                    "index {name} maps fragment {stored} to {committed}, and {} is reserved",
+                    RowAddress::TOMBSTONE_FRAG
+                ),
+            ));
+        }
+        if !committed_ids.insert(committed) {
+            return Err(Error::corrupt_file_named(
+                "index metadata",
+                format!(
+                    "index {name} maps more than one stored fragment id to committed fragment {committed}"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Decode and validate stage-independent alias invariants.
+fn decode_local_fragment_aliases(
+    name: &str,
+    aliases: HashMap<u32, u32>,
+) -> Result<BTreeMap<u32, u32>> {
+    if aliases.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    validate_local_fragment_aliases_entries(name, aliases.iter().map(|(&s, &c)| (s, c)))?;
+    Ok(aliases.into_iter().collect())
 }
 
 impl From<&IndexMetadata> for pb::IndexMetadata {
@@ -827,7 +889,7 @@ impl From<&IndexMetadata> for pb::IndexMetadata {
             created_at: idx.created_at.map(|dt| dt.timestamp_millis() as u64),
             base_id: idx.base_id,
             files,
-            local_fragment_aliases: Default::default(),
+            local_fragment_aliases: idx.local_fragment_aliases.clone().into_iter().collect(),
         }
     }
 }
@@ -909,9 +971,29 @@ pub async fn list_index_files_with_sizes(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use prost::Message;
     use rstest::rstest;
     use std::collections::HashMap;
+
+    #[test]
+    fn test_local_fragment_aliases_allow_non_transitive_maps_and_reject_collisions() {
+        let non_transitive =
+            decode_local_fragment_aliases("idx", HashMap::from([(17, 42), (42, 43)])).unwrap();
+        assert_eq!(non_transitive, BTreeMap::from([(17, 42), (42, 43)]));
+
+        let error =
+            decode_local_fragment_aliases("idx", HashMap::from([(1, 2), (3, 2)])).unwrap_err();
+        assert!(error.to_string().contains("more than one"), "{error}");
+
+        let error =
+            decode_local_fragment_aliases("idx", HashMap::from([(1, RowAddress::TOMBSTONE_FRAG)]))
+                .unwrap_err();
+        assert!(error.to_string().contains("reserved"), "{error}");
+
+        let error =
+            decode_local_fragment_aliases("idx", HashMap::from([(RowAddress::TOMBSTONE_FRAG, 1)]))
+                .unwrap_err();
+        assert!(error.to_string().contains("reserved"), "{error}");
+    }
 
     /// Provider metadata is heap-allocated and feeds bounded caches, so it has
     /// to be in the deep size. Compares two entries rather than asserting
@@ -954,6 +1036,7 @@ mod tests {
             files: None,
             clustering_id: None,
             metadata: Default::default(),
+            local_fragment_aliases: Default::default(),
         };
 
         let proto = pb::IndexMetadata::from(&metadata);
@@ -984,32 +1067,6 @@ mod tests {
         let err = IndexMetadata::try_from(proto).unwrap_err();
         assert!(matches!(err, Error::CorruptFile { .. }), "got: {err:?}");
         assert!(err.to_string().contains("created_at"), "got: {err}");
-    }
-
-    #[test]
-    fn test_index_metadata_empty_local_fragment_aliases_round_trip() {
-        let metadata = index_metadata_with(vec![0], vec![]);
-        let proto = pb::IndexMetadata::from(&metadata);
-        assert!(proto.local_fragment_aliases.is_empty());
-
-        let decoded = pb::IndexMetadata::decode(proto.encode_to_vec().as_slice()).unwrap();
-        assert!(decoded.local_fragment_aliases.is_empty());
-        assert_eq!(IndexMetadata::try_from(decoded).unwrap(), metadata);
-    }
-
-    #[test]
-    fn test_index_metadata_rejects_local_fragment_aliases() {
-        let mut proto = pb::IndexMetadata::from(&index_metadata_with(vec![0], vec![]));
-        proto.local_fragment_aliases.insert(17, 42);
-        let decoded = pb::IndexMetadata::decode(proto.encode_to_vec().as_slice()).unwrap();
-        assert_eq!(decoded.local_fragment_aliases.get(&17), Some(&42));
-
-        let err = IndexMetadata::try_from(decoded).unwrap_err();
-        assert!(matches!(err, Error::NotSupported { .. }), "got: {err:?}");
-        assert!(
-            err.to_string().contains("local fragment aliases"),
-            "got: {err}"
-        );
     }
 
     #[test]
@@ -1049,6 +1106,7 @@ mod tests {
             files: None,
             clustering_id: None,
             metadata: Default::default(),
+            local_fragment_aliases: Default::default(),
         };
         let with = |details: Arc<prost_types::Any>| IndexMetadata {
             index_details: Some(details),
@@ -1098,6 +1156,7 @@ mod tests {
                 }]),
                 clustering_id: None,
                 metadata: Default::default(),
+                local_fragment_aliases: Default::default(),
             },
             IndexMetadata {
                 uuid: Uuid::new_v4(),
@@ -1113,6 +1172,7 @@ mod tests {
                 files: None,
                 clustering_id: None,
                 metadata: Default::default(),
+                local_fragment_aliases: Default::default(),
             },
             index_metadata_with(vec![3], vec![3, 4]),
         ];
@@ -1369,6 +1429,7 @@ mod tests {
             files: None,
             clustering_id: None,
             metadata: Default::default(),
+            local_fragment_aliases: Default::default(),
         }
     }
 

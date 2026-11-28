@@ -23,6 +23,7 @@ mod frag_reuse_v0_cache;
 pub(crate) mod frag_reuse_with_stable_row_ids;
 mod lifecycle;
 pub(crate) mod loading;
+pub(crate) mod local_fragment_aliases;
 pub mod mem_wal;
 pub(crate) mod memory_progress;
 pub mod optimize;

@@ -372,6 +372,7 @@ mod tests {
             files: None,
             clustering_id: None,
             metadata: Default::default(),
+            local_fragment_aliases: Default::default(),
         };
         let plan = IndexVisibility::from_segments(dataset, &[segment], &fragments).unwrap();
         assert_eq!(plan.has_stale_unknown_coverage(), is_unknown);

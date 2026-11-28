@@ -6891,3 +6891,115 @@ fn test_seed_writer_without_positions_writes_counts_only() {
     let nulls: Vec<u32> = records.iter().map(|r| r.null_count).collect();
     assert_eq!(nulls, vec![2, 1, 1]);
 }
+
+#[tokio::test]
+async fn test_zonemap_calculate_included_frags_uses_bounded_batch_remapping() {
+    use lance_core::Result;
+    use lance_core::utils::address::RowAddress;
+    use lance_index_core::remapping::BatchRowIdRemapper;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Debug)]
+    struct BoundedSpyRemapper {
+        calls: AtomicUsize,
+        max_batch_len: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl BatchRowIdRemapper for BoundedSpyRemapper {
+        async fn remap_row_ids(&self, row_ids: &[u64]) -> Result<Vec<Option<u64>>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.max_batch_len
+                .fetch_max(row_ids.len(), Ordering::SeqCst);
+            Ok(row_ids
+                .iter()
+                .map(|&addr| {
+                    let row = RowAddress::from(addr);
+                    let target_frag = if row.fragment_id() == 7 {
+                        42
+                    } else {
+                        row.fragment_id()
+                    };
+                    Some(u64::from(RowAddress::new_from_parts(
+                        target_frag,
+                        row.row_offset(),
+                    )))
+                })
+                .collect())
+        }
+    }
+
+    let tmpdir = TempObjDir::default();
+    let store = Arc::new(LanceIndexStore::new(
+        Arc::new(ObjectStore::local()),
+        tmpdir.clone(),
+        Arc::new(LanceCache::no_cache()),
+    ));
+    let spy = Arc::new(BoundedSpyRemapper {
+        calls: AtomicUsize::new(0),
+        max_batch_len: AtomicUsize::new(0),
+    });
+
+    let index = ZoneMapIndex {
+        zones: vec![ZoneMapStatistics {
+            min: ScalarValue::Int32(Some(0)),
+            max: ScalarValue::Int32(Some(99_999)),
+            null_count: 0,
+            nan_count: 0,
+            negative_nan_count: Some(0),
+            bound: ZoneBound {
+                fragment_id: 7,
+                start: 0,
+                length: 100_000,
+            },
+        }],
+        data_type: DataType::Int32,
+        rows_per_zone: 100_000,
+        store: store.clone(),
+        fri: None,
+        batch_remapper: Some(spy.clone()),
+        store_null_bitmap: false,
+        index_cache: WeakLanceCache::from(&LanceCache::no_cache()),
+        null_rows: None,
+        use_seeds: false,
+        version: ZoneMapIndexVersion::V1,
+    };
+
+    let frags = index.calculate_included_frags().await.unwrap();
+    assert_eq!(frags, RoaringBitmap::from_iter([42u32]));
+    assert_eq!(spy.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(spy.max_batch_len.load(Ordering::SeqCst), 65_536);
+
+    // Overflowing zone range and reserved TOMBSTONE_FRAG must return explicit errors.
+    for (fragment_id, start, length, expected) in [
+        (7u64, u32::MAX as u64, 2usize, "overflows"),
+        (RowAddress::TOMBSTONE_FRAG as u64, 0u64, 1usize, "reserved"),
+    ] {
+        let bad_index = ZoneMapIndex {
+            zones: vec![ZoneMapStatistics {
+                min: ScalarValue::Int32(Some(0)),
+                max: ScalarValue::Int32(Some(1)),
+                null_count: 0,
+                nan_count: 0,
+                negative_nan_count: Some(0),
+                bound: ZoneBound {
+                    fragment_id,
+                    start,
+                    length,
+                },
+            }],
+            data_type: DataType::Int32,
+            rows_per_zone: 10,
+            store: store.clone(),
+            fri: None,
+            batch_remapper: Some(spy.clone()),
+            store_null_bitmap: false,
+            index_cache: WeakLanceCache::from(&LanceCache::no_cache()),
+            null_rows: None,
+            use_seeds: false,
+            version: ZoneMapIndexVersion::V1,
+        };
+        let err = bad_index.calculate_included_frags().await.unwrap_err();
+        assert!(err.to_string().contains(expected), "{err:?}");
+    }
+}

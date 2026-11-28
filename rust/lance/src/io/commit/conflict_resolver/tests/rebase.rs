@@ -20,6 +20,7 @@ async fn tagged_fri_rebase_returns_error_instead_of_panicking() {
         files: None,
         clustering_id: None,
         metadata: Default::default(),
+        local_fragment_aliases: Default::default(),
     };
     let operation = Operation::Rewrite {
         groups: vec![],
