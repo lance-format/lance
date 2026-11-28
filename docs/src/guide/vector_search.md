@@ -346,6 +346,83 @@ recall = len(set(exact["id"].to_pylist()) & set(approx["id"].to_pylist())) / 10
 
 Use a representative set of query vectors and report average recall, not just a single query. A recall target alone is not sufficient: compare latency under the same data, filter, cache, and storage conditions.
 
+## Batch Queries
+
+Pass several query vectors in one call to search them together. Lance returns up
+to `k` rows per query vector and prepends a non-null `query_index` column holding
+the zero-based position of the query that produced each row.
+
+=== "Python"
+
+    ```python
+    import numpy as np
+
+    queries = np.stack([query_vector_a, query_vector_b])  # shape (num_queries, dim)
+    result = dataset.to_table(
+        columns=["id", "_distance"],
+        nearest={"column": "vector", "q": queries, "k": 10, "nprobes": 20},
+    )
+    ```
+
+=== "Rust"
+
+    ```rust
+    use std::sync::Arc;
+    use arrow_array::{FixedSizeListArray, Float32Array};
+    use arrow_schema::{DataType, Field};
+
+    // `flat_queries` holds num_queries * dim values, one query after another.
+    let queries = FixedSizeListArray::try_new(
+        Arc::new(Field::new("item", DataType::Float32, true)),
+        dim,
+        Arc::new(Float32Array::from(flat_queries)),
+        None,
+    )?;
+    let batches: Vec<RecordBatch> = dataset
+        .scan()
+        .project(&["id", "_distance"])?
+        .nearest("vector", &queries, 10)?
+        .nprobes(20)
+        .try_into_stream()
+        .await?
+        .try_collect()
+        .await?;
+    ```
+
+=== "Java"
+
+    ```java
+    float[][] queries = {queryVectorA, queryVectorB};
+    ScanOptions options =
+        new ScanOptions.Builder()
+            .columns(Arrays.asList("id", "_distance"))
+            .nearest(
+                new Query.Builder()
+                    .setColumn("vector")
+                    .setKeys(queries)
+                    .setK(10)
+                    .setNprobes(20)
+                    .build())
+            .build();
+    ```
+
+A scan-level `limit` or `offset` applies to the combined result, not to each
+query. Batch queries need a fixed-size vector column (not a multivector column),
+and the dataset must not already have a `query_index` column.
+
+On IVF indexes without HNSW, Lance reads each probed partition once for all the
+queries in the batch that probe it, with fixed or adaptive `nprobes`, and each
+query still ranks only its own candidates. Lance searches each query separately
+instead when:
+
+- the index uses HNSW;
+- some target fragments are not covered by the index (unless `fast_search` is
+  set), indexed rows have newer vector overlays, or an external row mask is set;
+- `minimum_nprobes` is 0;
+- `nprobes` is adaptive and `query_parallelism` is -1 or greater than 1, a
+  `refine_factor` is set, or the index is `IVF_RQ`;
+- a `quantized_refine_factor` is set.
+
 ## Filter Vector Search
 
 The `prefilter` scanner option controls when SQL filtering happens relative to top-k selection:

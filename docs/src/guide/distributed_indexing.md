@@ -139,7 +139,11 @@ Distributed vector builds support two model scopes.
 
 **Shared model artifacts**: the caller trains or provides IVF centroids once and
 passes the same artifacts to every worker. For IVF-PQ segments that should be
-physically mergeable, workers should also use the same PQ codebook. This makes
+physically mergeable, workers should also use the same PQ codebook. For IVF-RQ,
+they should use the same rotation model: pass one `rabitq_model` from
+`lance.lance.indices.build_rq_model` to every `create_index_uncommitted(...)`
+call (`RQBuildParams.Builder.setModel` in Java). Otherwise each IVF-RQ build
+draws its own random rotation, and merging the segments fails. This makes
 partition ids and quantizer state have the same meaning across segments.
 
 **Independent segment models**: each worker trains the IVF/PQ model for its own
@@ -158,6 +162,12 @@ query path, independently trained committed segments can return valid results.
 For L2 and cosine IVF-PQ, each segment computes residuals against its own IVF
 centroid during both build and query, so distances remain estimates of the
 original query-to-vector metric.
+
+Each physical segment adds its own search work to every query, so many small
+segments are slower to query than one segment over the same rows. In a benchmark
+with 1M 128-dimensional vectors in 10 fragments (IVF-RQ, batched queries), 10
+unmerged segments took 2.2-2.7× as long to search as one index, and merging them
+brought search time back to within 2-11% of one index.
 
 Physical merge is a separate operation. It rewrites several segment artifacts
 into one artifact with one model metadata scope. Use shared compatible model
