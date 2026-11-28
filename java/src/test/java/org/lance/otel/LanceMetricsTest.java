@@ -57,13 +57,17 @@ public class LanceMetricsTest {
   private static final String DURATION = "lance_object_store_request_duration_seconds";
   private static final String RETRYABLE = "lance_object_store_retryable_responses_total";
   private static final String IN_FLIGHT = "lance_object_store_in_flight_requests";
+  private static final String MEMORY_HEAP_IN_USE = "lance_memory_heap_in_use_bytes";
+  private static final String MEMORY_HEAP_FREE = "lance_memory_heap_free_bytes";
   private static final List<String> MEMORY_GAUGES =
       List.of(
           "lance_memory_rss_bytes",
           "lance_memory_rss_peak_bytes",
           "lance_memory_cgroup_bytes",
           "lance_memory_cgroup_limit_bytes",
-          "lance_memory_component_bytes");
+          "lance_memory_component_bytes",
+          MEMORY_HEAP_IN_USE,
+          MEMORY_HEAP_FREE);
   private static final String MEMORY_STAGE_PEAK = "lance_memory_stage_peak_bytes";
   private static final String MEMORY_OPERATION_PEAK = "lance_memory_operation_peak_bytes";
 
@@ -171,7 +175,7 @@ public class LanceMetricsTest {
 
   @Test
   @EnabledOnOs(OS.LINUX)
-  void testSetMemoryObservationSwitchesAtRuntime(@TempDir Path tempDir) {
+  void testSetMemoryObservationSwitchesAtRuntime(@TempDir Path tempDir) throws Exception {
     InMemoryMetricReader reader = InMemoryMetricReader.create();
     SdkMeterProvider provider = SdkMeterProvider.builder().registerMetricReader(reader).build();
 
@@ -187,6 +191,30 @@ public class LanceMetricsTest {
 
         LanceMetrics.setMemoryObservation(true);
         assertTrue(memoryGauge("lance_memory_rss_bytes") > 0);
+        Map<String, MetricData> exported =
+            reader.collectAllMetrics().stream()
+                .collect(Collectors.toMap(MetricData::getName, Function.identity()));
+        if (hasMallinfo2()) {
+          Collection<DoublePointData> inUsePoints =
+              exported.get(MEMORY_HEAP_IN_USE).getDoubleGaugeData().getPoints();
+          Collection<DoublePointData> freePoints =
+              exported.get(MEMORY_HEAP_FREE).getDoubleGaugeData().getPoints();
+          assertEquals(1, inUsePoints.size());
+          assertTrue(inUsePoints.iterator().next().getValue() > 0);
+          assertEquals(1, freePoints.size());
+          assertTrue(freePoints.iterator().next().getValue() >= 0);
+          assertTrue(memoryGauge(MEMORY_HEAP_IN_USE) > 0);
+          assertTrue(memoryGauge(MEMORY_HEAP_FREE) >= 0);
+        } else {
+          assertFalse(exported.containsKey(MEMORY_HEAP_IN_USE));
+          assertFalse(exported.containsKey(MEMORY_HEAP_FREE));
+          assertTrue(
+              LanceMetrics.snapshot().stream()
+                  .noneMatch(
+                      point ->
+                          MEMORY_HEAP_IN_USE.equals(point.getName())
+                              || MEMORY_HEAP_FREE.equals(point.getName())));
+        }
 
         // The build checks the switch before its first stage, so it reports in
         // full although observation is switched off while it runs.
@@ -275,6 +303,26 @@ public class LanceMetricsTest {
         .map(MetricPoint::getValue)
         .findFirst()
         .orElseThrow(() -> new AssertionError("expected the gauge " + name));
+  }
+
+  private static boolean hasMallinfo2() throws Exception {
+    Process process =
+        new ProcessBuilder("getconf", "GNU_LIBC_VERSION").redirectErrorStream(true).start();
+    String output = new String(process.getInputStream().readAllBytes()).trim();
+    if (process.waitFor() != 0) {
+      return false;
+    }
+    String[] fields = output.split("\\s+");
+    if (fields.length != 2 || !"glibc".equals(fields[0])) {
+      return false;
+    }
+    String[] version = fields[1].split("\\.");
+    if (version.length < 2) {
+      return false;
+    }
+    int major = Integer.parseInt(version[0]);
+    int minor = Integer.parseInt(version[1]);
+    return major > 2 || (major == 2 && minor >= 33);
   }
 
   private static Set<String> metricNames(InMemoryMetricReader reader) {

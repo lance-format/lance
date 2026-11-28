@@ -422,15 +422,21 @@ pub fn lance_metrics_catalog() -> Vec<PyMetricDescription> {
 
 /// A point-in-time snapshot of every recorded metric. Empty until the recorder
 /// is installed. The read is lock-free but walks every series and allocates, so
-/// it runs with the GIL released.
+/// it runs with the GIL released. `refresh_heap` controls whether the allocator
+/// statistics are refreshed or only previously recorded points are collected.
 #[pyfunction]
-pub fn snapshot_lance_metrics(py: Python<'_>) -> Vec<PyMetricPoint> {
+#[pyo3(signature = (refresh_heap = true))]
+pub fn snapshot_lance_metrics(py: Python<'_>, refresh_heap: bool) -> Vec<PyMetricPoint> {
     let Some(registry) = REGISTRY.get() else {
         return Vec::new();
     };
     let points = py.detach(|| {
         lance_core::cache::refresh_metrics();
-        lance_core::memory::refresh_metrics();
+        if refresh_heap {
+            lance_core::memory::refresh_metrics_with_heap(lance_core::memory::read_glibc_heap);
+        } else {
+            lance_core::memory::refresh_metrics();
+        }
         collect_points(registry)
     });
     points.into_iter().map(PyMetricPoint::from).collect()
@@ -761,6 +767,8 @@ mod tests {
             memory::METRIC_RSS_PEAK,
             memory::METRIC_CGROUP,
             memory::METRIC_CGROUP_LIMIT,
+            memory::METRIC_HEAP_IN_USE,
+            memory::METRIC_HEAP_FREE,
         ] {
             assert!(matches!(kind(gauge), MetricKind::Gauge), "{gauge}");
         }
