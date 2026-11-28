@@ -458,9 +458,9 @@ impl CompactFragReuseIndex {
     }
 
     /// Remap a record batch that contains a row_id column at index `row_id_idx`
-    /// Currently this assumes there are only 2 columns in the schema,
-    /// which is the case for all indexes.
-    /// For example, for btree, the schema is (value, row_id).
+    /// Rows whose row id was deleted are dropped from every column, and the
+    /// schema and column order are kept.
+    /// For example, for btree, the schema is (value, row_id) plus any carried columns.
     /// For vector index storage, the schema is (row_id, vector).
     pub fn remap_row_ids_record_batch(
         &self,
@@ -486,9 +486,20 @@ fn remap_row_ids_record_batch(
     row_id_idx: usize,
     remap: impl FnOnce(&mut [Option<u64>]),
 ) -> Result<RecordBatch> {
-    assert_eq!(batch.schema().fields().len(), 2);
-    let other_column_idx = 1 - row_id_idx;
-    let row_ids = batch.column(row_id_idx).as_primitive::<UInt64Type>();
+    let num_columns = batch.num_columns();
+    let row_id_column = batch.columns().get(row_id_idx).ok_or_else(|| {
+        Error::invalid_input(format!(
+            "cannot remap row ids: row id column index {row_id_idx} is out of range for a batch with {num_columns} columns"
+        ))
+    })?;
+    let row_ids = row_id_column
+        .as_primitive_opt::<UInt64Type>()
+        .ok_or_else(|| {
+            Error::invalid_input(format!(
+                "cannot remap row ids: row id column {row_id_idx} of {num_columns} has type {}, expected UInt64",
+                row_id_column.data_type()
+            ))
+        })?;
     let mut remapped_row_ids = row_ids
         .values()
         .iter()
@@ -502,20 +513,20 @@ fn remap_row_ids_record_batch(
         .filter_map(|(idx, new_id)| new_id.map(|new_id| (idx as u64, new_id)))
         .unzip();
     let new_val_indices = UInt64Array::from_iter_values(val_indices);
-    let new_vals = arrow::compute::take(batch.column(other_column_idx), &new_val_indices, None)?;
-
-    let mut batch_data: Vec<(usize, ArrayRef)> = vec![
-        (
-            row_id_idx,
-            Arc::new(UInt64Array::from_iter_values(new_row_ids)) as ArrayRef,
-        ),
-        (other_column_idx, Arc::new(new_vals)),
-    ];
-    batch_data.sort_by_key(|(i, _)| *i);
-    Ok(RecordBatch::try_new(
-        batch.schema(),
-        batch_data.into_iter().map(|(_, item)| item).collect(),
-    )?)
+    let new_row_ids: ArrayRef = Arc::new(UInt64Array::from_iter_values(new_row_ids));
+    let columns = batch
+        .columns()
+        .iter()
+        .enumerate()
+        .map(|(idx, column)| {
+            if idx == row_id_idx {
+                Ok(new_row_ids.clone())
+            } else {
+                arrow::compute::take(column, &new_val_indices, None)
+            }
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(RecordBatch::try_new(batch.schema(), columns)?)
 }
 
 fn remap_row_ids_array(
@@ -608,6 +619,7 @@ fn fragment_layout(
 mod tests {
 
     use super::*;
+    use arrow_array::record_batch;
     use rstest::rstest;
 
     fn addr(fragment_id: u32, offset: u32) -> u64 {
@@ -1129,5 +1141,105 @@ mod tests {
             error.to_string().contains("old rows"),
             "expected the row-count validation, got: {error}"
         );
+    }
+
+    /// Fragment 0 is rewritten into fragment 10 with its offset 1 deleted.
+    /// Fragment 9 is not part of the compaction.
+    fn page_remap() -> CompactFragReuseIndex {
+        open(details(vec![vec![group(
+            [(0, 0), (0, 2), (0, 3)],
+            vec![digest(0, 4)],
+            vec![digest(10, 3)],
+        )]]))
+    }
+
+    /// A B-tree page with carried columns after `values` and `ids`.
+    fn carried_btree_page() -> RecordBatch {
+        record_batch!(
+            ("values", Int32, [0, 1, 2, 3, 4]),
+            (
+                "ids",
+                UInt64,
+                [addr(0, 0), addr(0, 1), addr(0, 2), addr(9, 0), addr(0, 3)]
+            ),
+            ("x", Int64, [Some(0), Some(10), None, Some(30), Some(40)]),
+            (
+                "s",
+                Utf8,
+                [Some("s0"), Some("s1"), Some("s2"), None, Some("s4")]
+            )
+        )
+        .unwrap()
+    }
+
+    #[rstest]
+    #[case::row_id_first(
+        record_batch!(
+            ("ids", UInt64, [addr(0, 0), addr(0, 1), addr(0, 2), addr(9, 0), addr(0, 3)]),
+            ("vector", Float32, [0.0, 1.0, 2.0, 3.0, 4.0])
+        )
+        .unwrap(),
+        0,
+        record_batch!(
+            ("ids", UInt64, [addr(10, 0), addr(10, 1), addr(9, 0), addr(10, 2)]),
+            ("vector", Float32, [0.0, 2.0, 3.0, 4.0])
+        )
+        .unwrap()
+    )]
+    #[case::row_id_second(
+        record_batch!(
+            ("values", Int32, [0, 1, 2, 3, 4]),
+            ("ids", UInt64, [addr(0, 0), addr(0, 1), addr(0, 2), addr(9, 0), addr(0, 3)])
+        )
+        .unwrap(),
+        1,
+        record_batch!(
+            ("values", Int32, [0, 2, 3, 4]),
+            ("ids", UInt64, [addr(10, 0), addr(10, 1), addr(9, 0), addr(10, 2)])
+        )
+        .unwrap()
+    )]
+    #[case::carried_btree_page(
+        carried_btree_page(),
+        1,
+        record_batch!(
+            ("values", Int32, [0, 2, 3, 4]),
+            ("ids", UInt64, [addr(10, 0), addr(10, 1), addr(9, 0), addr(10, 2)]),
+            ("x", Int64, [Some(0), None, Some(30), Some(40)]),
+            ("s", Utf8, [Some("s0"), Some("s2"), None, Some("s4")])
+        )
+        .unwrap()
+    )]
+    #[case::empty_carried_btree_page(
+        carried_btree_page().slice(0, 0),
+        1,
+        carried_btree_page().slice(0, 0)
+    )]
+    fn test_remap_row_ids_record_batch_keeps_columns_aligned(
+        #[case] page: RecordBatch,
+        #[case] row_id_idx: usize,
+        #[case] expected: RecordBatch,
+    ) {
+        let remapped = page_remap()
+            .remap_row_ids_record_batch(page, row_id_idx)
+            .unwrap();
+        assert_eq!(remapped, expected);
+    }
+
+    #[rstest]
+    #[case::row_id_index_out_of_range(
+        4,
+        "row id column index 4 is out of range for a batch with 4 columns"
+    )]
+    #[case::row_id_column_not_uint64(0, "row id column 0 of 4 has type Int32, expected UInt64")]
+    fn test_remap_row_ids_record_batch_rejects_bad_row_id_column(
+        #[case] row_id_idx: usize,
+        #[case] expected_message: &str,
+    ) {
+        let error = page_remap()
+            .remap_row_ids_record_batch(carried_btree_page(), row_id_idx)
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(error.to_string().contains(expected_message), "{error}");
     }
 }

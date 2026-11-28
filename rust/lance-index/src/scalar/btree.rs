@@ -4552,8 +4552,8 @@ mod tests {
 
     use arrow::datatypes::{Float32Type, Float64Type, Int32Type, UInt64Type};
     use arrow_array::{
-        Array, ArrayRef, FixedSizeListArray, Float64Array, Int64Array, UInt64Array,
-        new_empty_array, new_null_array, record_batch,
+        Array, ArrayRef, FixedSizeListArray, Float64Array, Int64Array, StringArray, UInt64Array,
+        cast::AsArray, new_empty_array, new_null_array, record_batch,
     };
     use arrow_schema::{DataType, Field, Schema};
     use datafusion_common::{DataFusionError, ScalarValue};
@@ -4573,16 +4573,22 @@ mod tests {
     use lance_io::object_store::ObjectStore;
     use lance_select::{RowAddrTreeMap, RowSetOps};
     use object_store::path::Path;
+    use roaring::RoaringTreemap;
+    use uuid::Uuid;
 
     use crate::Index;
+    use crate::frag_reuse::{
+        CompactFragReuseIndex, CompactFragReuseIndexHandle, FragDigest, FragReuseGroup,
+        FragReuseIndexDetails, FragReuseVersion,
+    };
     use crate::metrics::LocalMetricsCollector;
     use crate::progress::{IndexBuildProgress, noop_progress};
     use crate::{
         metrics::NoOpMetricsCollector,
         pbold,
         scalar::{
-            IndexStore, LOOKUP_BATCH_SIZE, OldIndexDataFilter, SargableQuery, ScalarIndex,
-            SearchOptions, SearchResult,
+            IndexStore, LOOKUP_BATCH_SIZE, OldIndexDataFilter, RowIdRemapper, SargableQuery,
+            ScalarIndex, SearchOptions, SearchResult,
             btree::{
                 BTREE_INDEX_VERSION, BTREE_PAGES_NAME, BTREE_ROW_ADDR_DOMAIN_VERSION, BTreeIndex,
             },
@@ -8940,6 +8946,174 @@ mod tests {
             vec![5000],
             "frag_reuse_index remap was not applied"
         );
+    }
+
+    /// A deferred compaction leaves B-tree pages as they were and remaps them
+    /// through the fragment reuse index at query time. A page with carried
+    /// columns after `values` and `ids` must answer like a scan of the
+    /// compacted table.
+    #[tokio::test]
+    async fn test_btree_search_remaps_page_with_carried_columns() {
+        const FRAGMENTS: u32 = 4;
+        const ROWS_PER_FRAGMENT: u32 = 10;
+        const PAGE_SIZE: u64 = 10;
+        const COMPACTED_FRAGMENT: u32 = 10;
+        let row_addr =
+            |fragment: u32, offset: u32| u64::from(RowAddress::new_from_parts(fragment, offset));
+        // Value `v` sits at offset `v / 4` of fragment `v % 4`, so every page
+        // holds rows of all four fragments.
+        let location = |value: u32| (value % FRAGMENTS, value / FRAGMENTS);
+        let num_rows = FRAGMENTS * ROWS_PER_FRAGMENT;
+
+        // Fragments 0 and 1, each with one deleted row, compact into one new
+        // fragment in read order. Fragments 2 and 3 are not compacted.
+        let deleted = [(0, 3), (1, 5)];
+        let compacted: Vec<(u32, u32)> = (0..2)
+            .flat_map(|fragment| (0..ROWS_PER_FRAGMENT).map(move |offset| (fragment, offset)))
+            .filter(|row| !deleted.contains(row))
+            .collect();
+        // The row address a scan of the compacted table reads for each value.
+        let scanned_addr = |value: u32| {
+            let (fragment, offset) = location(value);
+            if fragment >= 2 {
+                return Some(row_addr(fragment, offset));
+            }
+            compacted
+                .iter()
+                .position(|&row| row == (fragment, offset))
+                .map(|rank| row_addr(COMPACTED_FRAGMENT, rank as u32))
+        };
+
+        let mut changed_row_addrs = Vec::new();
+        RoaringTreemap::from_iter(
+            compacted
+                .iter()
+                .map(|&(fragment, offset)| row_addr(fragment, offset)),
+        )
+        .serialize_into(&mut changed_row_addrs)
+        .unwrap();
+        let digest = |id: u32, physical_rows: usize, num_deleted_rows: usize| FragDigest {
+            id: id.into(),
+            physical_rows,
+            num_deleted_rows,
+        };
+        let frag_reuse_index = CompactFragReuseIndex::try_new(
+            Uuid::new_v4(),
+            FragReuseIndexDetails {
+                versions: vec![FragReuseVersion {
+                    dataset_version: 2,
+                    groups: vec![FragReuseGroup {
+                        changed_row_addrs,
+                        old_frags: vec![
+                            digest(0, ROWS_PER_FRAGMENT as usize, 1),
+                            digest(1, ROWS_PER_FRAGMENT as usize, 1),
+                        ],
+                        new_frags: vec![digest(COMPACTED_FRAGMENT, compacted.len(), 0)],
+                    }],
+                }],
+            },
+        )
+        .unwrap();
+
+        let train_dir = TempObjDir::default();
+        let train_store = LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            train_dir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        );
+        let stream = gen_batch()
+            .col("value", array::step::<Int32Type>())
+            .col(
+                "_rowaddr",
+                array::cycle::<UInt64Type>(
+                    (0..num_rows)
+                        .map(|value| {
+                            let (fragment, offset) = location(value);
+                            row_addr(fragment, offset)
+                        })
+                        .collect(),
+                ),
+            )
+            .into_df_stream(RowCount::from(num_rows as u64), BatchCount::from(1));
+        train_btree_index(stream, &train_store, PAGE_SIZE, None, None)
+            .await
+            .unwrap();
+
+        // Rewrite the page file with a nullable Int64 and a Utf8 column after
+        // `values` and `ids`, keeping the lookup file as trained.
+        let page_dir = TempObjDir::default();
+        let page_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            page_dir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        train_store
+            .copy_index_file(BTREE_LOOKUP_NAME, page_store.as_ref())
+            .await
+            .unwrap();
+        let pages = train_store.open_index_file(BTREE_PAGES_NAME).await.unwrap();
+        let page = pages.read_range(0..pages.num_rows(), None).await.unwrap();
+        let keys = page["values"].as_primitive::<Int32Type>();
+        let carried_int: Int64Array = keys
+            .iter()
+            .map(|key| key.filter(|key| key % 3 != 0).map(i64::from))
+            .collect();
+        let carried_str: StringArray = keys
+            .iter()
+            .map(|key| key.filter(|key| key % 5 != 0).map(|key| format!("s{key}")))
+            .collect();
+        let mut fields: Vec<Field> = page
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| field.as_ref().clone())
+            .collect();
+        fields.push(Field::new("x", DataType::Int64, true));
+        fields.push(Field::new("s", DataType::Utf8, true));
+        let mut columns = page.columns().to_vec();
+        columns.push(Arc::new(carried_int));
+        columns.push(Arc::new(carried_str));
+        let carried_page = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap();
+        let mut writer = page_store
+            .new_index_file(BTREE_PAGES_NAME, carried_page.schema())
+            .await
+            .unwrap();
+        writer.write_record_batch(carried_page).await.unwrap();
+        writer
+            .finish_with_metadata(pages.schema().metadata.clone())
+            .await
+            .unwrap();
+
+        let frag_reuse_index: Arc<dyn RowIdRemapper> =
+            Arc::new(CompactFragReuseIndexHandle(Arc::new(frag_reuse_index)));
+        let index = BTreeIndex::load(
+            page_store,
+            Some(frag_reuse_index),
+            &LanceCache::no_cache(),
+            true,
+        )
+        .await
+        .unwrap();
+
+        // Values 5 to 29 span three pages, both deleted rows, and all four fragments.
+        let query = SargableQuery::Range(
+            Bound::Included(ScalarValue::Int32(Some(5))),
+            Bound::Excluded(ScalarValue::Int32(Some(30))),
+        );
+        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+        let mut row_addrs: Vec<u64> = match &result {
+            SearchResult::Exact(rows) => rows
+                .true_rows()
+                .row_addrs()
+                .unwrap()
+                .map(u64::from)
+                .collect(),
+            other => panic!("expected an exact result, got {other:?}"),
+        };
+        row_addrs.sort_unstable();
+        let mut expected: Vec<u64> = (5..30).filter_map(scanned_addr).collect();
+        expected.sort_unstable();
+        assert_eq!(row_addrs, expected);
     }
 
     #[tokio::test]
