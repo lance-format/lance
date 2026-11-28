@@ -116,6 +116,7 @@ impl_call!(<A: ?Sized, B: ?Sized> fn(a: &A, b: &B));
 impl_call!(<A: ?Sized, B: ?Sized> fn(a: &mut A, b: &B));
 impl_call!(<A: ?Sized> fn(a: &A, b: usize, c: u32));
 impl_call!(<A: ?Sized, C: ?Sized> fn(a: &A, b: f32, c: &C));
+impl_call!(<A: ?Sized, C: ?Sized> fn(a: &A, b: u16, c: &mut C));
 impl_call!(<A: ?Sized, B: ?Sized, C: ?Sized> fn(a: &A, b: &B, c: &mut C));
 impl_call!(<A: ?Sized, B: ?Sized, C: ?Sized> fn(a: &A, b: &mut B, c: &mut C));
 impl_call!(<A: ?Sized, B: ?Sized, D: ?Sized> fn(a: &A, b: &B, c: usize, d: &mut D));
