@@ -156,14 +156,14 @@ async fn test_fix_v0_8_0_broken_migration() {
     let physical_rows: Vec<_> = dataset
         .get_fragments()
         .iter()
-        .map(|f| f.metadata.physical_rows)
+        .map(|f| f.metadata().physical_rows)
         .collect();
     assert_eq!(physical_rows, vec![Some(100), Some(2), Some(5)]);
     let num_deletions: Vec<_> = dataset
         .get_fragments()
         .iter()
         .map(|f| {
-            f.metadata
+            f.metadata()
                 .deletion_file
                 .as_ref()
                 .and_then(|df| df.num_deleted_rows)
@@ -1741,7 +1741,7 @@ async fn test_migrate_to_stable_row_ids_with_deletions() {
 
     // physical_rows counts the pre-deletion slots; row IDs must cover all of
     // them so that the deleted rows' IDs are never reused.
-    let physical_rows = dataset.get_fragments()[0].metadata.physical_rows.unwrap();
+    let physical_rows = dataset.get_fragments()[0].metadata().physical_rows.unwrap();
     assert_eq!(physical_rows, 10);
 
     dataset.migrate_to_stable_row_ids().await.unwrap();

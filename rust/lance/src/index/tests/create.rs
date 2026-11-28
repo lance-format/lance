@@ -989,7 +989,7 @@ async fn test_scalar_index_retained_after_delete_all(
     // Critical test: Verify the fragment bitmap is empty after delete
     let index_after_delete = &indices_after_delete[0];
     let effective_bitmap = index_after_delete
-        .effective_fragment_bitmap(&dataset.fragment_bitmap)
+        .effective_fragment_bitmap(&dataset.table_state.fragment_bitmap)
         .unwrap();
     assert!(
         effective_bitmap.is_empty(),
@@ -1196,7 +1196,7 @@ async fn test_scalar_index_retained_after_update(
     let indices = dataset.load_indices().await.unwrap();
     let index = &indices[0];
     let effective_bitmap = index
-        .effective_fragment_bitmap(&dataset.fragment_bitmap)
+        .effective_fragment_bitmap(&dataset.table_state.fragment_bitmap)
         .unwrap();
     assert!(
         effective_bitmap.is_empty(),

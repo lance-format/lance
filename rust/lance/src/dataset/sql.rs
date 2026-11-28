@@ -4,7 +4,7 @@
 use crate::Dataset;
 use crate::datafusion::LanceTableProvider;
 use crate::dataset::scanner::validate_batch_size;
-use crate::dataset::utils::SchemaAdapter;
+use crate::dataset::utils::to_logical_stream;
 use arrow_array::RecordBatch;
 use datafusion::common::{DataFusionError, ParamValues, ResolvedTableReference, TableReference};
 use datafusion::dataframe::DataFrame;
@@ -541,13 +541,7 @@ impl SqlQuery {
             .await
             .map_err(planning_error)?;
         let exec_node = execute_stream(plan, task_ctx).map_err(lance_core::Error::from)?;
-        let schema = exec_node.schema();
-        if SchemaAdapter::requires_logical_conversion(&schema) {
-            let adapter = SchemaAdapter::new(schema);
-            Ok(adapter.to_logical_stream(exec_node))
-        } else {
-            Ok(exec_node)
-        }
+        Ok(to_logical_stream(exec_node))
     }
 
     pub async fn into_batch_records(self) -> lance_core::Result<Vec<RecordBatch>> {

@@ -448,6 +448,123 @@ impl PositionBlockBuilder {
         self.encoded_bytes.capacity() + self.pending_deltas.capacity() * std::mem::size_of::<u32>()
     }
 
+    pub(super) fn is_empty(&self) -> bool {
+        self.encoded_bytes.is_empty() && self.pending_deltas.is_empty()
+    }
+
+    pub(super) fn append_deltas(&mut self, deltas: &[u32]) -> Result<()> {
+        match self.codec {
+            PositionStreamCodec::VarintDocDelta => {
+                for &delta in deltas {
+                    encode_varint_u32(&mut self.encoded_bytes, delta);
+                }
+            }
+            PositionStreamCodec::PackedDelta => {
+                let mut rest = deltas;
+                let mut packed_buffer = [0u8; BLOCK_SIZE * 4 + 1];
+                if !self.pending_deltas.is_empty() {
+                    let need = BLOCK_SIZE - self.pending_deltas.len();
+                    if rest.len() < need {
+                        self.pending_deltas.extend_from_slice(rest);
+                        return Ok(());
+                    }
+                    self.pending_deltas.extend_from_slice(&rest[..need]);
+                    compress_block(
+                        self.pending_deltas.as_slice(),
+                        &mut packed_buffer,
+                        &mut self.encoded_bytes,
+                    )?;
+                    self.pending_deltas.clear();
+                    rest = &rest[need..];
+                }
+                while rest.len() >= BLOCK_SIZE {
+                    compress_block(
+                        &rest[..BLOCK_SIZE],
+                        &mut packed_buffer,
+                        &mut self.encoded_bytes,
+                    )?;
+                    rest = &rest[BLOCK_SIZE..];
+                }
+                if !rest.is_empty() {
+                    self.pending_deltas.extend_from_slice(rest);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn append_from_builder(&mut self, other: Self) -> Result<()> {
+        if self.codec != other.codec {
+            return Err(Error::index(format!(
+                "cannot merge position streams with mismatched codecs: {:?} vs {:?}",
+                self.codec, other.codec
+            )));
+        }
+        if other.is_empty() {
+            return Ok(());
+        }
+        if self.is_empty() {
+            *self = other;
+            return Ok(());
+        }
+        match self.codec {
+            PositionStreamCodec::VarintDocDelta => {
+                self.encoded_bytes.extend_from_slice(&other.encoded_bytes);
+            }
+            PositionStreamCodec::PackedDelta => {
+                if self.pending_deltas.is_empty() {
+                    self.encoded_bytes.extend_from_slice(&other.encoded_bytes);
+                    self.pending_deltas = other.pending_deltas;
+                } else {
+                    if !other.encoded_bytes.is_empty() {
+                        let compressor = BitPacker4x::new();
+                        let mut offset = 0usize;
+                        let mut packed_values = [0u32; BLOCK_SIZE];
+                        while offset < other.encoded_bytes.len() {
+                            let (num_bits, payload, next_offset) =
+                                packed_position_group(&other.encoded_bytes, offset)?;
+                            let consumed =
+                                compressor.decompress(payload, &mut packed_values, num_bits);
+                            debug_assert_eq!(consumed, payload.len());
+                            offset = next_offset;
+                            self.append_deltas(&packed_values)?;
+                        }
+                    }
+                    self.append_deltas(&other.pending_deltas)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn decode_deltas_into(&self, dst: &mut Vec<u32>) -> Result<()> {
+        match self.codec {
+            PositionStreamCodec::VarintDocDelta => {
+                let mut offset = 0usize;
+                while offset < self.encoded_bytes.len() {
+                    dst.push(decode_varint_u32(&self.encoded_bytes, &mut offset)?);
+                }
+            }
+            PositionStreamCodec::PackedDelta => {
+                if !self.encoded_bytes.is_empty() {
+                    let compressor = BitPacker4x::new();
+                    let mut offset = 0usize;
+                    let mut packed_values = [0u32; BLOCK_SIZE];
+                    while offset < self.encoded_bytes.len() {
+                        let (num_bits, payload, next_offset) =
+                            packed_position_group(&self.encoded_bytes, offset)?;
+                        let consumed = compressor.decompress(payload, &mut packed_values, num_bits);
+                        debug_assert_eq!(consumed, payload.len());
+                        offset = next_offset;
+                        dst.extend_from_slice(&packed_values);
+                    }
+                }
+                dst.extend_from_slice(&self.pending_deltas);
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn append_doc_positions(&mut self, positions: &[u32]) -> Result<()> {
         let mut previous = 0u32;
         for (index, &position) in positions.iter().enumerate() {
@@ -738,6 +855,54 @@ fn decode_position_stream_packed_block(
         }
     }
     debug_assert_eq!(delta_offset, deltas.len());
+    Ok(())
+}
+
+pub(super) fn decode_position_stream_deltas_into(
+    src: &[u8],
+    total_positions: usize,
+    codec: PositionStreamCodec,
+    dst: &mut Vec<u32>,
+) -> Result<()> {
+    match codec {
+        PositionStreamCodec::VarintDocDelta => {
+            let mut offset = 0usize;
+            dst.reserve(total_positions);
+            for _ in 0..total_positions {
+                dst.push(decode_varint_u32(src, &mut offset)?);
+            }
+            if offset != src.len() {
+                return Err(Error::index(format!(
+                    "position stream has {} trailing bytes after decoding block",
+                    src.len() - offset
+                )));
+            }
+        }
+        PositionStreamCodec::PackedDelta => {
+            let full_delta_blocks = total_positions / BLOCK_SIZE;
+            let tail_len = total_positions % BLOCK_SIZE;
+            let compressor = BitPacker4x::new();
+            let mut packed_offset = 0usize;
+            let mut packed_values = [0u32; BLOCK_SIZE];
+            dst.reserve(total_positions);
+            for _ in 0..full_delta_blocks {
+                let (num_bits, payload, next_offset) = packed_position_group(src, packed_offset)?;
+                let consumed = compressor.decompress(payload, &mut packed_values, num_bits);
+                debug_assert_eq!(consumed, payload.len());
+                packed_offset = next_offset;
+                dst.extend_from_slice(&packed_values);
+            }
+            for _ in 0..tail_len {
+                dst.push(decode_varint_u32(src, &mut packed_offset)?);
+            }
+            if packed_offset != src.len() {
+                return Err(Error::index(format!(
+                    "position stream has {} trailing bytes after decoding block",
+                    src.len() - packed_offset
+                )));
+            }
+        }
+    }
     Ok(())
 }
 

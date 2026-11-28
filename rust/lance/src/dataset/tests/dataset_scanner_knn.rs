@@ -3225,8 +3225,8 @@ async fn assert_refinement_cache(dataset: &Dataset, expect_hit: bool) -> RecordB
 #[case::branch(|ds: &mut Dataset| Arc::make_mut(&mut ds.manifest).branch = Some("other".to_string()))]
 #[case::incarnation(|ds: &mut Dataset| Arc::make_mut(&mut ds.manifest).transaction_file = Some("new-transaction.txn".to_string()))]
 #[case::version(|ds: &mut Dataset| Arc::make_mut(&mut ds.manifest).version += 1)]
-#[case::manifest_generation(|ds: &mut Dataset| ds.manifest_location.e_tag = Some("new-etag".to_string()))]
-#[case::manifest_path(|ds: &mut Dataset| ds.manifest_location.path = ds.manifest_location.path.clone().join("other"))]
+#[case::manifest_generation(|ds: &mut Dataset| ds.table_state.manifest_location.e_tag = Some("new-etag".to_string()))]
+#[case::manifest_path(|ds: &mut Dataset| ds.table_state.manifest_location.path = ds.table_state.manifest_location.path.clone().join("other"))]
 #[tokio::test]
 async fn test_quantized_refinement_cache_snapshot_identity(#[case] change: fn(&mut Dataset)) {
     let mut fixture = TestVectorDataset::new(LanceFileVersion::Stable, false)
@@ -3444,7 +3444,7 @@ async fn test_quantized_refinement_cache_bypass(#[case] restriction: u8) {
     assert_refinement_cache(&fixture.dataset, false).await;
     if restriction == 3 {
         Arc::make_mut(&mut fixture.dataset.manifest).transaction_file = None;
-        fixture.dataset.manifest_location.e_tag = None;
+        fixture.dataset.table_state.manifest_location.e_tag = None;
     }
     let dataset = &fixture.dataset;
     let before = refinement_cache_activity(dataset).await;
@@ -3638,6 +3638,7 @@ async fn test_quantized_refinement_cache_saves_scoring_without_vector_reads(#[ca
         for file in &fragment.files {
             fixture
                 .dataset
+                .table_state
                 .object_store
                 .delete(&fixture.dataset.data_dir().join(file.path.as_str()))
                 .await
@@ -3696,6 +3697,7 @@ async fn test_quantized_refinement_cache_saves_scoring_without_vector_reads(#[ca
     for file in &fixture.dataset.fragments().last().unwrap().files {
         fixture
             .dataset
+            .table_state
             .object_store
             .delete(&fixture.dataset.data_dir().join(file.path.as_str()))
             .await

@@ -3,25 +3,38 @@
 
 //! Vector segment query contracts and validation before transaction publication.
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    borrow::Cow,
+    collections::{BTreeMap, HashMap},
+    sync::Arc,
+};
 
 use futures::{FutureExt, StreamExt, TryStreamExt, stream};
-use lance_core::{Error, Result};
+use lance_core::{Error, Result, cache::CacheKey};
 use lance_index::{
-    INDEX_FILE_NAME, IndexMetadata, IndexType, metrics::NoOpMetricsCollector, vector::VectorIndex,
+    INDEX_FILE_NAME, INDEX_METADATA_SCHEMA_KEY, IndexMetadata, IndexType,
+    metrics::NoOpMetricsCollector, vector::VectorIndex,
 };
-use lance_io::utils::{read_last_block, read_version};
+use lance_io::{
+    scheduler::{ScanScheduler, SchedulerConfig},
+    utils::{CachedFileSize, read_last_block, read_version},
+};
 use lance_linalg::distance::DistanceType;
 use lance_table::{
     format::{IndexMetadata as TableIndexMetadata, Manifest},
     transaction::action::Action,
 };
+use uuid::Uuid;
 
 use crate::{
     dataset::{Dataset, transaction::Operation},
     index::{
+        DatasetIndexExt,
         frag_reuse::{OpenPurpose, SegmentRemappingPlan},
-        vector::{open_index_file, utils::infer_vector_dim},
+        vector::{
+            open_index_file,
+            utils::{get_vector_type, infer_vector_dim},
+        },
     },
 };
 
@@ -49,7 +62,7 @@ impl VectorQueryContract {
     /// The contract an index file of the current format records in its
     /// schema: the type the opener dispatches on, and the metric the opened
     /// index ranks by.
-    fn from_file_metadata(metadata: &IndexMetadata) -> Result<Self> {
+    pub(super) fn from_file_metadata(metadata: &IndexMetadata) -> Result<Self> {
         let index_type = IndexType::try_from(metadata.index_type.as_str())?;
         // The opener opens these files only as one of the IVF types.
         if !index_type.is_vector() || index_type == IndexType::Vector {
@@ -190,7 +203,8 @@ pub async fn validate_committed_vector_segments(
                 .boxed()
             })
             .collect::<Vec<_>>();
-        let mut contracts = stream::iter(contracts).buffered(dataset.object_store.io_parallelism());
+        let mut contracts =
+            stream::iter(contracts).buffered(dataset.table_state.object_store.io_parallelism());
         let mut reference: Option<(&TableIndexMetadata, VectorQueryContract)> = None;
         let mut without_index_file = None;
         while let Some((segment, contract)) = contracts.try_next().await? {
@@ -223,6 +237,128 @@ pub async fn validate_committed_vector_segments(
         }
     }
     Ok(())
+}
+
+// The enclosing cache namespace identifies the physical index file. A legacy
+// marker routes the lookup through the active session's extension registry and
+// snapshot-specific remapping plan.
+struct VectorFileTypeKey;
+
+impl CacheKey for VectorFileTypeKey {
+    type ValueType = Option<IndexType>;
+
+    fn key(&self) -> Cow<'_, str> {
+        "type".into()
+    }
+
+    fn type_name() -> &'static str {
+        "VectorIndexFileType"
+    }
+}
+
+impl Dataset {
+    /// Returns the physical index types of the query-visible segments on `column`,
+    /// in the order of the supplied UUIDs. A UUID outside this snapshot's query
+    /// listing or belonging to another column is an error.
+    ///
+    /// For current formats the type is read from the index file schema and cached
+    /// without loading IVF centroids, partitions, or quantizers. Older formats and
+    /// index extensions report their type through the ordinary query opener.
+    pub async fn vector_index_types(&self, column: &str, uuids: &[Uuid]) -> Result<Vec<IndexType>> {
+        if uuids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let field_id = self.schema().field_id(column)?;
+        get_vector_type(self.schema(), column)?;
+        // The listing enforces version and fragment reuse visibility before any
+        // physical type cache hit. Row address translation cannot change a type.
+        let indices = self.load_indices().await?;
+        let mut by_uuid = HashMap::with_capacity(indices.len());
+        for index in indices.iter() {
+            by_uuid.entry(index.uuid).or_insert(index);
+        }
+        let read = |uuid: Uuid| {
+            let segment = by_uuid.get(&uuid).copied();
+            async move {
+                let segment =
+                    segment.ok_or_else(|| Error::index_not_found(format!("uuid={uuid}")))?;
+                if segment.fields.first() != Some(&field_id) {
+                    return Err(Error::invalid_input(format!(
+                        "Vector index segment {uuid} does not belong to column '{column}'"
+                    )));
+                }
+                self.query_vector_segment_type(column, segment).await
+            }
+        };
+        // A legacy segment can require a full open. Limit the number of these a
+        // single query can construct concurrently even on a high-parallelism store.
+        stream::iter(uuids.iter().copied())
+            .map(read)
+            .buffered(self.table_state.object_store.io_parallelism().min(8))
+            .try_collect()
+            .await
+    }
+
+    async fn query_vector_segment_type(
+        &self,
+        column: &str,
+        segment: &TableIndexMetadata,
+    ) -> Result<IndexType> {
+        let store = self.object_store_for_index(segment).await?;
+        let path = self
+            .indice_files_dir(segment)?
+            .join(segment.uuid.to_string())
+            .join(INDEX_FILE_NAME);
+        let cache = self
+            .table_state
+            .metadata_cache
+            .file_metadata_cache(&path)
+            .with_key_prefix(&store.store_prefix);
+        let file_type = cache
+            .get_or_insert_with_key(VectorFileTypeKey, || async {
+                let scheduler =
+                    ScanScheduler::new(store.clone(), SchedulerConfig::max_bandwidth(&store));
+                let size = segment
+                    .files
+                    .iter()
+                    .flatten()
+                    .find(|file| file.path == INDEX_FILE_NAME)
+                    .map(|file| CachedFileSize::new(file.size_bytes))
+                    .unwrap_or_else(CachedFileSize::unknown);
+                let file = scheduler.open_file(&path, &size).await?;
+                let schema = match lance_file::reader::FileReader::read_schema(&file).await {
+                    Ok(schema) => schema,
+                    Err(Error::VersionConflict {
+                        major_version: 0,
+                        minor_version: 0..=2,
+                        ..
+                    }) => return Ok(None),
+                    Err(err) => return Err(err),
+                };
+                let raw = schema
+                    .metadata
+                    .get(INDEX_METADATA_SCHEMA_KEY)
+                    .ok_or_else(|| Error::index("Index Metadata not found".to_owned()))?;
+                let metadata = serde_json::from_str(raw)?;
+                Ok(Some(
+                    VectorQueryContract::from_file_metadata(&metadata)?.index_type,
+                ))
+            })
+            .await?;
+        match *file_type {
+            Some(index_type) => Ok(index_type),
+            None => Ok(self
+                .open_vector_index_from_metadata_with_plan(
+                    column,
+                    segment,
+                    None,
+                    OpenPurpose::Query,
+                    &NoOpMetricsCollector,
+                )
+                .await?
+                .index_type()),
+        }
+    }
 }
 
 /// A vector segment's contract, read from its own index file. A file of the

@@ -85,19 +85,11 @@ jobs:
       # Wait until https://github.com/rust-lang/crates-io-auth-action/issues/51 fixed
       # - uses: rust-lang/crates-io-auth-action@v1
       #   id: auth
-      # lance-arrow-stats and lance-arrow-scalar are versioned with Arrow
-      # (currently 58.0.0) and released on Arrow's cadence, not Lance's, so
-      # they are excluded from the per-release publish. Bump and publish them
-      # explicitly when their source changes.
       - name: Publish crates
         if: steps.check_version.outputs.skip != 'true'
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: |
-          cargo publish --workspace \
-            --exclude lance-arrow-stats \
-            --exclude lance-arrow-scalar \
-            --all-features
+        run: cargo publish --workspace --all-features
   report-failure:
     name: Report Workflow Failure
     runs-on: ubuntu-latest

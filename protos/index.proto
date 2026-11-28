@@ -68,7 +68,7 @@ message IVF {
   // Number of records in the partition.
   repeated uint32 lengths = 3;
 
-  // Tensor of centroids. `num_partitions * dimension` of float32s.
+  // Centroid tensor of shape `[num_partitions, dimension]` with type `Tensor.data_type`.
   Tensor centroids_tensor = 4;
 
   // KMeans loss.
@@ -234,8 +234,7 @@ message VectorIndexDetails {
 
 // Hierarchical Navigable Small World (HNSW) parameters, used as an optional configuration for IVF indexes.
 message HnswParameters {
-  /* The maximum number of outgoing edges per node in the HNSW graph. Higher values
-   * means more connections, better recall, but more memory and slower builds.
+  /* The maximum number of neighbors selected for a new node at each level.
    * Referred to as "M" in the HNSW literature.
    */
   uint32 max_connections = 1;
