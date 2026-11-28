@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use super::assign_action::{bind_struct_columns, struct_target_columns};
 use super::inserted_rows::{KeyExistenceFilterBuilder, extract_key_value_from_batch};
 use super::{
     InsertedKeyTracker, MergeInsertParams, MergeStats, SourceDedupeBehavior, WhenMatched,
@@ -14,6 +15,7 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Fields, Schema};
 use arrow_select::take::take_record_batch;
 use datafusion::error::DataFusionError;
+use datafusion::logical_expr::Expr;
 use datafusion::{
     physical_plan::{ColumnarValue, PhysicalExpr},
     scalar::ScalarValue,
@@ -24,7 +26,8 @@ use futures::{
 };
 use lance_arrow::SchemaExt;
 use lance_core::datatypes::{LANCE_UNENFORCED_PRIMARY_KEY, LANCE_UNENFORCED_PRIMARY_KEY_POSITION};
-use lance_core::{Error, ROW_ADDR_FIELD, ROW_ID_FIELD, Result};
+use lance_core::{Error, ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, ROW_ID_FIELD, Result};
+use lance_datafusion::logical_expr::{coerce_filter_type_to_boolean, resolve_expr};
 use roaring::RoaringTreemap;
 use std::sync::{Arc, Mutex};
 
@@ -54,6 +57,29 @@ fn combined_schema(source: &Schema, target: &Schema) -> Schema {
         Field::new("source", DataType::Struct(nullable(source)), false),
         Field::new("target", DataType::Struct(nullable(target)), false),
     ])
+}
+
+/// `schema` without primary-key markers on any field, including struct children.
+fn without_primary_key_markers(schema: &Schema) -> Schema {
+    fn strip(field: &Field) -> Field {
+        let mut metadata = field.metadata().clone();
+        metadata.remove(LANCE_UNENFORCED_PRIMARY_KEY);
+        metadata.remove(LANCE_UNENFORCED_PRIMARY_KEY_POSITION);
+        let data_type = match field.data_type() {
+            DataType::Struct(children) => {
+                DataType::Struct(children.iter().map(|c| strip(c)).collect())
+            }
+            other => other.clone(),
+        };
+        field
+            .clone()
+            .with_data_type(data_type)
+            .with_metadata(metadata)
+    }
+    Schema::new_with_metadata(
+        schema.fields.iter().map(|f| strip(f)).collect::<Fields>(),
+        schema.metadata.clone(),
+    )
 }
 
 // This takes a double-wide table (e.g. the result of the outer join below) and takes the left
@@ -119,10 +145,14 @@ pub(super) struct Merger {
     match_filter: Option<MatchFilter>,
     // The parameters controlling the merge
     params: MergeInsertParams,
-    /// Whether the output schema should include a row address column
-    with_row_addr: bool,
     /// Carry row IDs until full-schema upsert output is ordered for writing.
     pub(super) with_row_id: bool,
+    /// Number of source columns leading each joined batch.
+    num_source_columns: usize,
+    /// Column of the target row id in each joined batch.
+    row_id_col: usize,
+    /// Column of the target row address in each joined batch, if carried.
+    row_addr_col: Option<usize>,
     /// The output schema of the stream.
     output_schema: Arc<Schema>,
     /// Whether to enable stable row ids
@@ -139,6 +169,7 @@ impl Merger {
     // Creates a new merger with an empty set of deleted rows, compiles expressions, if present
     pub(super) fn try_new(
         params: MergeInsertParams,
+        update_condition: Option<MergerCondition>,
         schema: Arc<Schema>,
         joined_schema: &Schema,
         with_row_addr: bool,
@@ -162,16 +193,15 @@ impl Merger {
         } else {
             None
         };
-        let match_filter = match &params.when_matched {
-            WhenMatched::UpdateIf(_) | WhenMatched::UpdateIfExpr(_) => {
-                let target_schema = target_schema_for(&schema, joined_schema)?;
+        let match_filter = match update_condition {
+            Some(MergerCondition {
+                expr,
+                target_columns,
+                ..
+            }) => {
+                let target_schema = target_schema_for(&schema, &target_columns, joined_schema)?;
                 let combined_schema = Arc::new(combined_schema(&schema, &target_schema));
                 let planner = Planner::new(combined_schema.clone());
-                let expr = match &params.when_matched {
-                    WhenMatched::UpdateIf(expr_str) => planner.parse_filter(expr_str)?,
-                    WhenMatched::UpdateIfExpr(expr) => expr.clone(),
-                    _ => unreachable!(),
-                };
                 let expr = planner.optimize_expr(expr)?;
                 let match_expr = planner.create_physical_expr(&expr)?;
                 let data_type = match_expr.data_type(combined_schema.as_ref())?;
@@ -186,8 +216,30 @@ impl Merger {
                     expr: match_expr,
                 })
             }
-            _ => None,
+            None => None,
         };
+        let num_source_columns = schema.fields.len();
+        // The joined batches hold the source columns, then the target columns
+        // (the source's, then those the condition reads), then the target's
+        // row id and, for a partial-schema source, its row address.
+        let column_index = |name: &str| {
+            target_column_index(joined_schema, name, num_source_columns).ok_or_else(|| {
+                Error::internal(format!(
+                    "merge insert join is missing column 'target_{name}'"
+                ))
+            })
+        };
+        let row_id_col = column_index(ROW_ID)?;
+        let row_addr_col = with_row_addr.then(|| column_index(ROW_ADDR)).transpose()?;
+        let expected_row_id_col = joined_schema.fields().len() - 1 - usize::from(with_row_addr);
+        if row_id_col != expected_row_id_col
+            || row_addr_col.is_some_and(|col| col != row_id_col + 1)
+            || row_id_col < 2 * num_source_columns
+        {
+            return Err(Error::internal(format!(
+                "merge insert join schema does not match the merger layout: {joined_schema:?}"
+            )));
+        }
         let with_row_id = enable_stable_row_ids
             && !with_row_addr
             && params.insert_not_matched
@@ -210,8 +262,10 @@ impl Merger {
             merge_stats: Arc::new(Mutex::new(MergeStats::default())),
             match_filter,
             params,
-            with_row_addr,
             with_row_id,
+            num_source_columns,
+            row_id_col,
+            row_addr_col,
             output_schema,
             enable_stable_row_ids,
             processed_row_ids: Arc::new(Mutex::new(RoaringTreemap::new())),
@@ -285,18 +339,15 @@ impl Merger {
     {
         let mut merge_statistics = self.merge_stats.lock().unwrap();
         let num_fields = batch.schema().fields.len();
-        // The schema of the combined batches will be:
-        // source_keys, source_payload, target_keys, target_payload, row_id, row_addr?
-        // The keys and non_keys on both sides will be equal
-        let (row_id_col, row_addr_col, right_offset) = if num_fields % 2 == 1 {
-            // No rowaddr
-            assert!(!self.with_row_addr);
-            (num_fields - 1, None, num_fields / 2)
-        } else {
-            // Has rowaddr
-            assert!(self.with_row_addr);
-            (num_fields - 2, Some(num_fields - 1), (num_fields - 2) / 2)
-        };
+        // See `try_new` for the layout of the joined batches.
+        let right_offset = self.num_source_columns;
+        let (row_id_col, row_addr_col) = (self.row_id_col, self.row_addr_col);
+        if num_fields != row_addr_col.unwrap_or(row_id_col) + 1 {
+            return Err(DataFusionError::Internal(format!(
+                "merge insert joined batch has {num_fields} columns, expected {}",
+                row_addr_col.unwrap_or(row_id_col) + 1
+            )));
+        }
 
         let output_row_col = row_addr_col.or(self.with_row_id.then_some(row_id_col));
         let output_cols = (0..right_offset).chain(output_row_col).collect::<Vec<_>>();
@@ -541,10 +592,16 @@ fn target_column_index(joined: &Schema, name: &str, num_source_columns: usize) -
 
 /// The target side of an "update if" condition: each source column's `target_<name>`
 /// field as the join emits it (the indexed take projects nested children to the source's
-/// subset), renamed and in source order.
-fn target_schema_for(source: &Schema, joined: &Schema) -> Result<Schema> {
+/// subset), renamed and in source order, followed by the other target columns the
+/// condition reads. A name the join does not emit is left out, so planning the condition
+/// reports it as unknown.
+fn target_schema_for(
+    source: &Schema,
+    condition_columns: &[String],
+    joined: &Schema,
+) -> Result<Schema> {
     let width = source.fields.len();
-    let fields = source
+    let mut fields = source
         .fields
         .iter()
         .map(|f| {
@@ -558,7 +615,84 @@ fn target_schema_for(source: &Schema, joined: &Schema) -> Result<Schema> {
                 })
         })
         .collect::<Result<Vec<_>>>()?;
+    for name in condition_columns {
+        if source.column_with_name(name).is_none()
+            && let Some(i) = target_column_index(joined, name, width)
+        {
+            fields.push(joined.field(i).as_ref().clone().with_name(name));
+        }
+    }
     Ok(Schema::new(fields))
+}
+
+/// A "when matched update if" condition in the form the merger evaluates it:
+/// over a `source` struct of the source columns and a `target` struct of the
+/// target columns the join carries (see [`combined_schema`]).
+#[derive(Debug, Clone)]
+pub(super) struct MergerCondition {
+    /// The condition with each column reference bound to a struct field.
+    expr: Expr,
+    /// Top-level `target` fields the condition reads, in order of first reference.
+    target_columns: Vec<String>,
+    /// Dataset columns among `target_columns` that the source does not carry,
+    /// which the join must take from the target as well.
+    pub(super) target_only_columns: Vec<String>,
+}
+
+impl MergerCondition {
+    /// Plan the "update if" condition of `params`, if any, for a merge of
+    /// `source` into a dataset of `dataset_schema`.
+    ///
+    /// A SQL condition is parsed as before, against `source` and `target`
+    /// structs (the `target` struct holds every dataset column), so nested
+    /// fields, functions and lambdas over them resolve as fields of the
+    /// structs. Column references, and the qualified columns of a DataFusion
+    /// expression, are then bound to those structs by [`bind_struct_columns`].
+    pub(super) fn try_new(
+        params: &MergeInsertParams,
+        dataset_schema: &lance_core::datatypes::Schema,
+        source: &Schema,
+    ) -> Result<Option<Self>> {
+        let expr = match &params.when_matched {
+            WhenMatched::UpdateIf(condition) => {
+                // The full dataset schema is only used to parse the condition, and a
+                // primary key nested in a struct the source omits must not make the
+                // conversion below reject the schema.
+                let combined = combined_schema(
+                    &without_primary_key_markers(source),
+                    &without_primary_key_markers(&Schema::from(dataset_schema)),
+                );
+                let combined_lance = lance_core::datatypes::Schema::try_from(&combined)?;
+                let expr = Planner::new(Arc::new(combined))
+                    .parse_filter_with_schema(condition, &combined_lance)?;
+                // Parsing resolves literal types against the struct fields, which
+                // an unqualified column only becomes once bound; resolve again.
+                let expr = bind_struct_columns(expr, dataset_schema, source)?;
+                coerce_filter_type_to_boolean(resolve_expr(&expr, &combined_lance)?)
+            }
+            WhenMatched::UpdateIfExpr(condition) => {
+                bind_struct_columns(condition.clone(), dataset_schema, source)?
+            }
+            _ => return Ok(None),
+        };
+        let target_columns = struct_target_columns(&expr)?;
+        let target_only_columns = target_columns
+            .iter()
+            .filter(|name| {
+                source.column_with_name(name).is_none()
+                    && dataset_schema
+                        .fields
+                        .iter()
+                        .any(|f| f.name.as_str() == name.as_str())
+            })
+            .cloned()
+            .collect();
+        Ok(Some(Self {
+            expr,
+            target_columns,
+            target_only_columns,
+        }))
+    }
 }
 
 /// Physical "when matched update if" condition with the schema it evaluates against.

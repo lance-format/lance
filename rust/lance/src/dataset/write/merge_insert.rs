@@ -370,9 +370,15 @@ pub enum WhenMatched {
     DoNothing,
     /// The row is updated (similar to UpdateAll) only for rows where the expression evaluates to
     /// true
+    ///
+    /// Columns are qualified with `source.` or `target.`. An unqualified column refers to the
+    /// target when the source does not carry it, and is rejected as ambiguous when it does.
     UpdateIf(String),
     /// The row is updated (similar to UpdateAll) only for rows where the expression evaluates to
     /// true
+    ///
+    /// Columns are qualified with the `source` or `target` relation. An unqualified column refers
+    /// to the target when the source does not carry it, and is rejected as ambiguous when it does.
     UpdateIfExpr(Expr),
     /// Fail the operation if a match is found
     ///
