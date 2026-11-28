@@ -399,6 +399,9 @@ pub fn reordered_sources(
         .collect()
 }
 
+/// A physical index remap already completed by the writer, including an
+/// installed scalar plugin. The manifest builder publishes this result rather
+/// than inferring support from its built-in metadata hints.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RewrittenIndex {
     pub old_id: Uuid,

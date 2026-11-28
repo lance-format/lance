@@ -426,7 +426,13 @@ pub(crate) async fn load_all_indices(dataset: &Dataset) -> Result<Arc<Vec<IndexM
             store_identity: metadata_key.store_identity,
             e_tag: metadata_key.e_tag,
         };
-        if let Some(remapped) = dataset.index_cache.get_with_key(&remapped_key).await {
+        // A shared cache may also be used by a writer with different plugins
+        // or optional features. Only reuse projections when every segment is
+        // supported here; otherwise this writer must retain its raw coverage.
+        let all_indices_supported = indices.iter().all(index_is_usable);
+        if all_indices_supported
+            && let Some(remapped) = dataset.index_cache.get_with_key(&remapped_key).await
+        {
             return Ok(remapped);
         }
         let identity = frag_reuse::v0_cache_identity(dataset, frag_reuse_index_meta);
@@ -441,15 +447,21 @@ pub(crate) async fn load_all_indices(dataset: &Dataset) -> Result<Arc<Vec<IndexM
             .await?;
         let mut remapped = indices.as_ref().clone();
         for idx in remapped.iter_mut() {
+            // This listing also seeds commits. Never persist a projection of
+            // an unsupported segment's coverage through version-zero history.
+            if !index_is_usable(idx) {
+                continue;
+            }
             if let Some(bitmap) = idx.fragment_bitmap.as_mut() {
                 frag_reuse_index.remap_fragment_bitmap(bitmap)?;
             }
         }
         let remapped = Arc::new(remapped);
         // A later call may still infer the missing details; don't pin this list.
-        if !indices
-            .iter()
-            .any(|idx| needs_vector_details_inference(idx, dataset.schema()))
+        if all_indices_supported
+            && !indices
+                .iter()
+                .any(|idx| needs_vector_details_inference(idx, dataset.schema()))
         {
             dataset
                 .index_cache

@@ -65,6 +65,7 @@ impl Transaction {
         fields_for_preserving_frag_bitmap: &[u32],
         original_overlaid_frags: &HashMap<u32, &Fragment>,
         schema: &Schema,
+        index_is_supported: fn(&IndexMetadata) -> bool,
     ) -> Result<()> {
         if pure_update_frag_ids.is_empty() {
             return Ok(());
@@ -73,7 +74,7 @@ impl Transaction {
         for index in indices.iter_mut() {
             // Only known stable row IDs can follow moved rows into a new
             // fragment. Unknown plugin domains must leave it for the scanner.
-            if !index.can_follow_stable_row_ids() {
+            if !index_is_supported(index) || !index.can_follow_stable_row_ids() {
                 continue;
             }
             let index_covers_modified_field =
@@ -972,18 +973,9 @@ impl Transaction {
 
             let mut old_fragment_bitmap = RoaringBitmap::new();
             for (_, source) in &source_indices {
-                if !source.supports_fragment_bitmap_rewrite() {
-                    return Err(Error::not_supported(format!(
-                        "Cannot remap index '{}' (segment {}): unsupported index type {:?} or version {}",
-                        source.name,
-                        source.uuid,
-                        source
-                            .index_details
-                            .as_ref()
-                            .map(|details| &details.type_url),
-                        source.index_version
-                    )));
-                }
+                // The caller has already physically remapped this segment.
+                // Its plugin may be absent from the table layer's built-in
+                // metadata hints; do not reject the completed work here.
                 old_fragment_bitmap |= source.fragment_bitmap.as_ref().ok_or_else(|| {
                     Error::invalid_input(format!(
                         "Cannot rewrite index {} which did not store fragment bitmap",
@@ -2037,7 +2029,7 @@ mod tests {
     #[rstest]
     #[case::future_version("lance.table.BTreeIndexDetails", 2)]
     #[case::unknown_type("example.BTreeIndexDetails", 0)]
-    fn test_handle_rewrite_indices_rejects_unsupported_segments(
+    fn test_handle_rewrite_indices_accepts_completed_remaps(
         #[case] details_type: &str,
         #[case] index_version: i32,
     ) {
@@ -2055,7 +2047,7 @@ mod tests {
             new_index_files: None,
         };
         let mut indices = vec![index.clone()];
-        let error = Transaction::handle_rewrite_indices(
+        Transaction::handle_rewrite_indices(
             &mut indices,
             &[replacement],
             &[RewriteGroup {
@@ -2063,10 +2055,11 @@ mod tests {
                 new_fragments: vec![Fragment::new(3)],
             }],
         )
-        .unwrap_err();
-        assert!(matches!(error, Error::NotSupported { .. }));
-        assert!(error.to_string().contains("Cannot remap index 'idx'"));
-        assert_eq!(indices, vec![index]);
+        .unwrap();
+        assert_ne!(indices[0].uuid, index.uuid);
+        assert_eq!(indices[0].fragment_bitmap, Some(RoaringBitmap::from([3])));
+        assert_eq!(indices[0].index_details, index.index_details);
+        assert_eq!(indices[0].index_version, index.index_version);
     }
 
     #[test]
@@ -2223,6 +2216,7 @@ mod tests {
             &[changed],
             &HashMap::new(),
             &schema,
+            IndexMetadata::supports_fragment_bitmap_rewrite,
         )
         .unwrap();
         assert_eq!(
@@ -2256,6 +2250,7 @@ mod tests {
             &[2],
             &HashMap::new(),
             &create_test_schema(&[1, 2]),
+            IndexMetadata::supports_fragment_bitmap_rewrite,
         )
         .unwrap();
         assert_eq!(
@@ -2500,6 +2495,7 @@ mod tests {
                         &[changed as u32],
                         &HashMap::new(),
                         schema,
+                        IndexMetadata::supports_fragment_bitmap_rewrite,
                     )
                     .unwrap();
                     !covers(&indices, pure_update_frag_id)

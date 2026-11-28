@@ -1227,6 +1227,7 @@ impl Transaction {
                         fields_for_preserving_frag_bitmap,
                         &original_overlaid_frags,
                         &schema,
+                        config.index_is_supported,
                     )?;
                 }
 
@@ -1354,9 +1355,10 @@ impl Transaction {
                         {
                             continue;
                         }
-                        let results_are_row_addrs = index.supports_fragment_bitmap_rewrite()
-                            && index.results_are_row_addrs();
-                        let can_follow_stable_row_ids = index.can_follow_stable_row_ids();
+                        let is_supported = (config.index_is_supported)(index);
+                        let results_are_row_addrs = is_supported && index.results_are_row_addrs();
+                        let can_follow_stable_row_ids =
+                            is_supported && index.can_follow_stable_row_ids();
                         if let Some(fragment_bitmap) = &mut index.fragment_bitmap {
                             *fragment_bitmap = if !(can_follow_stable_row_ids
                                 || (results_are_row_addrs && deferred_remap))

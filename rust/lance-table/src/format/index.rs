@@ -89,8 +89,8 @@ pub struct IndexMetadata {
     ///
     /// Writers must not extend or remap coverage of an index whose type or
     /// version they do not support. They may leave it unchanged, shrink its
-    /// coverage, drop it, or refuse the operation. See
-    /// [`Self::supports_fragment_bitmap_rewrite`].
+    /// coverage, drop it, or refuse the operation. The active writer declares
+    /// its capabilities in [`super::ManifestBuildConfig::index_is_supported`].
     pub fragment_bitmap: Option<RoaringBitmap>,
 
     /// Metadata specific to the index type
@@ -245,10 +245,11 @@ impl IndexMetadata {
             .is_some_and(|details| index_details_are_row_addrs(details, self.index_version))
     }
 
-    /// Whether this build knows the index type and version well enough to
-    /// extend or remap its fragment coverage. This does not establish that a
-    /// particular rewrite is safe: the identifier domain and the operation's
-    /// remapping capabilities must also allow it.
+    /// Conservative support bounds for the built-in metadata hints in this
+    /// crate. This does not reflect installed scalar plugins or optional
+    /// features. Manifest builders must supply the active writer's capabilities
+    /// through [`super::ManifestBuildConfig::index_is_supported`] before inferring
+    /// coverage; a completed physical remap does not use this hint.
     ///
     /// Unknown types and versions may only retain or lose coverage. Legacy
     /// segments without details use version 0; newer versions require details.

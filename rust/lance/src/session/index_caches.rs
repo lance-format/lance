@@ -644,7 +644,7 @@ impl CacheKey for DerivedIndexListingKey<'_> {
     }
 
     fn schema() -> CacheKeySchema {
-        CacheKeySchema::new("lance.index.derived-listing-key", 1)
+        CacheKeySchema::new("lance.index.derived-listing-key", 2)
     }
 
     fn write_key(&self, builder: &mut KeyBuilder) {

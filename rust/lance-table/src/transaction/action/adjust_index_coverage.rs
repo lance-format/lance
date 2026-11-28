@@ -88,6 +88,7 @@ impl AdjustIndexCoverage {
             resolve(&self.covering_fields)?,
         )?;
 
+        let index_is_supported = state.build_config.index_is_supported;
         let segment = state.index_segment_mut(self.uuid, &self.name)?;
         if segment.fields != fields || segment.covering_fields != covering_fields {
             return Err(Error::invalid_input(format!(
@@ -98,7 +99,7 @@ impl AdjustIndexCoverage {
                 self.uuid, self.name, segment.fields, segment.covering_fields
             )));
         }
-        let is_supported = segment.supports_fragment_bitmap_rewrite();
+        let is_supported = index_is_supported(segment);
         let Some(bitmap) = segment.fragment_bitmap.as_mut() else {
             return Err(Error::invalid_input(format!(
                 "index segment {} records no fragment coverage, so there is nothing to adjust; \

@@ -2900,6 +2900,10 @@ async fn test_a_detached_commit_does_not_erase_an_unsupported_index() {
 #[case::supported(None)]
 #[case::future_version(Some(UnreadableIndexKind::NewerVersion))]
 #[case::unknown_type(Some(UnreadableIndexKind::UnknownType))]
+#[cfg_attr(
+    not(feature = "geo"),
+    case::disabled_feature(Some(UnreadableIndexKind::DisabledFeature))
+)]
 #[tokio::test]
 async fn test_compaction_only_expands_supported_index_coverage(
     #[case] unreadable_kind: Option<UnreadableIndexKind>,
@@ -3026,6 +3030,146 @@ async fn test_compaction_only_expands_supported_index_coverage(
             .num_rows(),
         20
     );
+}
+
+/// Dataset append carries the index hook, unlike a standalone write. It must
+/// not publish version-zero history's inferred coverage for an unreadable segment.
+#[rstest]
+#[case::future_version(UnreadableIndexKind::NewerVersion)]
+#[case::unknown_type(UnreadableIndexKind::UnknownType)]
+#[cfg_attr(
+    not(feature = "geo"),
+    case::disabled_feature(UnreadableIndexKind::DisabledFeature)
+)]
+#[tokio::test]
+async fn test_dataset_append_preserves_unsupported_coverage_after_deferred_compaction(
+    #[case] kind: UnreadableIndexKind,
+) {
+    let directory = tempfile::tempdir().unwrap();
+    let uri = directory.path().to_str().unwrap();
+    let mut dataset = Dataset::write(
+        two_column_reader(),
+        uri,
+        Some(WriteParams {
+            max_rows_per_file: 5,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    dataset
+        .create_index_builder(
+            &["id"],
+            IndexType::BTree,
+            &ScalarIndexParams::for_builtin(BuiltinIndexType::BTree),
+        )
+        .name("id_idx".to_string())
+        .await
+        .unwrap();
+    let readable = manifest_index(&dataset, "id_idx").await;
+    hide_index_as(&mut dataset, "id_idx", kind).await;
+    let before = manifest_index(&dataset, "id_idx").await;
+    assert_eq!(before.fragment_bitmap, Some(RoaringBitmap::from([0, 1])));
+
+    let metrics = compact_files(
+        &mut dataset,
+        CompactionOptions {
+            defer_index_remap: true,
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(metrics.fragments_removed, 2);
+    assert_eq!(dataset.fragments().len(), 1);
+    assert_eq!(
+        manifest_index(&dataset, FRAG_REUSE_INDEX_NAME)
+            .await
+            .index_version,
+        0
+    );
+    assert_eq!(manifest_index(&dataset, "id_idx").await, before);
+
+    // A shared cache may contain a projection made by a build that could
+    // read this type. This writer must not persist that projection either.
+    let mut projected = raw_manifest_indices(&dataset).await;
+    projected
+        .iter_mut()
+        .find(|index| index.name == "id_idx")
+        .unwrap()
+        .fragment_bitmap = Some(dataset.fragment_bitmap.as_ref().clone());
+    dataset
+        .index_cache
+        .insert_with_key(
+            &crate::session::index_caches::DerivedIndexListingKey {
+                version: dataset.manifest.version,
+                store_identity: &dataset.object_store.store_prefix,
+                e_tag: dataset.manifest_location.e_tag.as_deref(),
+            },
+            Arc::new(projected),
+        )
+        .await;
+
+    dataset.append(two_column_reader(), None).await.unwrap();
+    let mut reopened = Dataset::open(uri).await.unwrap();
+    let after = manifest_index(&reopened, "id_idx").await;
+    assert_eq!(
+        after, before,
+        "append must preserve the stored segment coverage"
+    );
+
+    // Restore the real identity to model a reader that understands the segment.
+    // Its deferred coverage excludes the appended fragment, which must be scanned.
+    reopened
+        .apply_commit(
+            Transaction::new(
+                reopened.manifest.version,
+                Operation::CreateIndex {
+                    new_indices: vec![IndexMetadata {
+                        index_details: readable.index_details,
+                        index_version: readable.index_version,
+                        ..after.clone()
+                    }],
+                    removed_indices: vec![after],
+                },
+                None,
+            ),
+            &Default::default(),
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+    let reopened = Dataset::open(uri).await.unwrap();
+    let coverage = reopened.load_indices_by_name("id_idx").await.unwrap()[0]
+        .fragment_bitmap
+        .clone()
+        .unwrap();
+    assert_eq!(coverage.len(), 1);
+    assert!(!coverage.contains(reopened.fragments().last().unwrap().id as u32));
+    let mut full_scan = reopened.scan();
+    full_scan
+        .project(&["id"])
+        .unwrap()
+        .filter("id = 3")
+        .unwrap()
+        .use_scalar_index(false);
+    let expected = full_scan.try_into_batch().await.unwrap();
+    assert_eq!(expected.num_rows(), 2);
+    let mut indexed_scan = reopened.scan();
+    indexed_scan
+        .project(&["id"])
+        .unwrap()
+        .filter("id = 3")
+        .unwrap();
+    assert!(
+        indexed_scan
+            .explain_plan(false)
+            .await
+            .unwrap()
+            .contains("ScalarIndex")
+    );
+    assert_eq!(indexed_scan.try_into_batch().await.unwrap(), expected);
 }
 
 /// Without stable row ids a rewrite moves every row address, so each index

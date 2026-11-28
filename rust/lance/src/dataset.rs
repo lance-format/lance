@@ -5175,6 +5175,7 @@ impl ManifestWriteConfig {
             activate_non_reusable_field_ids: self.activate_non_reusable_field_ids,
             clustering_definitions: self.clustering_definitions.clone(),
             spilled_row_lineage: Default::default(),
+            index_is_supported: crate::index::segment::index_is_usable,
         }
     }
 }

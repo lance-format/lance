@@ -19,7 +19,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use super::encoded_fragments::{EncodedFragmentCache, carry_encoded_fragments};
-use super::{ClusteringDefinition, Fragment, InlineRowIds, RowIdMeta};
+use super::{ClusteringDefinition, Fragment, IndexMetadata, InlineRowIds, RowIdMeta};
 use crate::feature_flags::{COVERING_FLAGS, STICKY_READER_FLAGS, STICKY_WRITER_FLAGS};
 use crate::feature_flags::{FLAG_STABLE_ROW_IDS, has_deprecated_v2_feature_flag};
 use crate::format::fragment::DataFileFieldInterner;
@@ -905,6 +905,11 @@ pub struct ManifestBuildConfig {
     /// last-updated-at versions; the build cannot read a data file itself. Only
     /// consulted for fragments whose sequences are spilled.
     pub spilled_row_lineage: std::sync::Arc<crate::rowids::version::SpilledRowLineage>,
+    /// Whether the active writer supports a segment's exact type and version.
+    /// Automatic coverage inference and coverage-only expansion consult this
+    /// before trusting the segment's identifier domain. A completed physical
+    /// remap supplies its own replacement metadata instead.
+    pub index_is_supported: fn(&IndexMetadata) -> bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

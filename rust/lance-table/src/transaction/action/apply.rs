@@ -177,7 +177,7 @@ pub(super) struct ApplyState<'a> {
     current_manifest: &'a Manifest,
     read_marks: ReadMarks,
     /// How the manifest this delta produces is to be assembled.
-    build_config: &'a ManifestBuildConfig,
+    pub(super) build_config: &'a ManifestBuildConfig,
     schema: Schema,
     fragments: Vec<Fragment>,
     /// Base paths minted by this operation. Kept apart from the manifest's own

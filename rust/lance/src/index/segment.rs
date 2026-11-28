@@ -275,7 +275,8 @@ pub(crate) fn unsupported_index_version(index: &IndexMetadata) -> Option<u32> {
 /// format version. Their field dependencies must belong to the user schema:
 /// reserved negative IDs require dedicated support, not schema lookups.
 pub(crate) fn index_is_usable(index: &IndexMetadata) -> bool {
-    index_type_is_known(index)
+    index.index_version >= 0
+        && index_type_is_known(index)
         && unsupported_index_version(index).is_none()
         && (is_system_index(index)
             || index

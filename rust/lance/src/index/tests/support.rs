@@ -701,6 +701,8 @@ pub enum UnreadableIndexKind {
     NewerVersion,
     UnknownType,
     ReservedField,
+    #[cfg(not(feature = "geo"))]
+    DisabledFeature,
 }
 
 /// Make `index_name` unreadable to this build, and give it the full fragment
@@ -729,6 +731,14 @@ pub async fn hide_index_as(dataset: &mut Dataset, index_name: &str, kind: Unread
                 type_url: "type.googleapis.com/example.ForeignIndexDetails".to_string(),
                 value: Vec::new(),
             }));
+        }
+        #[cfg(not(feature = "geo"))]
+        UnreadableIndexKind::DisabledFeature => {
+            unreadable[0].index_details = Some(Arc::new(prost_types::Any {
+                type_url: "type.googleapis.com/lance.index.pb.RTreeIndexDetails".to_string(),
+                value: Vec::new(),
+            }));
+            unreadable[0].index_version = 0;
         }
         UnreadableIndexKind::ReservedField => {
             unreadable[0].fields = vec![lance_table::format::ROW_ID_FIELD_ID];

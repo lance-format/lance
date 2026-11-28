@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use uuid::Uuid;
 
-/// The build config that `lance`'s `ManifestWriteConfig::default()` resolves to.
+/// A build config using the table layer's conservative built-in support bounds.
 pub fn default_build_config() -> ManifestBuildConfig {
     ManifestBuildConfig {
         auto_set_feature_flags: true,
@@ -33,6 +33,7 @@ pub fn default_build_config() -> ManifestBuildConfig {
         activate_non_reusable_field_ids: false,
         clustering_definitions: None,
         spilled_row_lineage: Default::default(),
+        index_is_supported: IndexMetadata::supports_fragment_bitmap_rewrite,
     }
 }
 
