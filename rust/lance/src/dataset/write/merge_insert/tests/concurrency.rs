@@ -4,6 +4,280 @@
 use super::*;
 use lance_datagen::ArrayGeneratorExt;
 
+#[rstest::rstest]
+#[case::more_output_rows(WhenMatched::UpdateAll, true, false)]
+#[case::delete_and_insert(WhenMatched::Delete, true, false)]
+#[case::known_inserts(WhenMatched::UpdateAll, true, true)]
+#[case::known_zero(WhenMatched::UpdateAll, false, true)]
+#[case::unknown_count(WhenMatched::UpdateAll, false, false)]
+#[tokio::test]
+async fn test_staged_merge_row_conflicts_unfiltered_write_set(
+    #[case] matched: WhenMatched,
+    #[case] insert: bool,
+    #[case] supply_count: bool,
+    #[values(false, true)] standalone: bool,
+    #[values(false, true)] missing_mode: bool,
+) {
+    use crate::io::commit::conflict_resolver::TransactionRebase;
+
+    let batch = |ids: Vec<u32>, value: u32| {
+        let values = vec![value; ids.len()];
+        record_batch!(("id", UInt32, ids), ("value", UInt32, values)).unwrap()
+    };
+    let read = Arc::new(
+        InsertBuilder::new("memory://")
+            .execute(vec![batch(vec![0, 1, 2], 0)])
+            .await
+            .unwrap(),
+    );
+    let stage = |id, value| {
+        let ids = if insert { vec![id, 3] } else { vec![id] };
+        MergeInsertBuilder::try_new(read.clone(), vec!["id".into()])
+            .unwrap()
+            .when_matched(matched.clone())
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .try_build()
+            .unwrap()
+            .execute_uncommitted_batches(vec![batch(ids, value)])
+    };
+    let first = stage(0, 10).await.unwrap();
+    let mut second = stage(1, 20).await.unwrap();
+    assert_eq!(second.stats.num_inserted_rows, u64::from(insert));
+    assert!(second.inserted_rows_filter.is_none());
+    let Operation::Update { update_mode, .. } = &mut second.transaction.operation else {
+        panic!("expected a row rewrite");
+    };
+    assert_eq!(
+        *update_mode,
+        Some(crate::dataset::transaction::UpdateMode::RewriteRows)
+    );
+    if missing_mode {
+        *update_mode = None;
+    }
+    let mut latest = CommitBuilder::new(read.clone())
+        .execute(first.transaction)
+        .await
+        .unwrap();
+    let rows = second.affected_rows.unwrap();
+    let result = if standalone {
+        async {
+            let mut rebase = if supply_count {
+                TransactionRebase::try_new_with_inserted_row_count(
+                    &latest,
+                    second.transaction,
+                    Some(&rows),
+                    Some(second.stats.num_inserted_rows),
+                )
+                .await?
+            } else {
+                TransactionRebase::try_new(&latest, second.transaction, Some(&rows)).await?
+            };
+            rebase.check_txn(
+                &latest.read_transaction().await?.unwrap(),
+                latest.version_id(),
+            )?;
+            let transaction = rebase.finish(&latest).await?;
+            CommitBuilder::new(read).execute(transaction).await
+        }
+        .await
+    } else {
+        let mut builder = CommitBuilder::new(read).with_affected_rows(rows);
+        if supply_count {
+            builder = builder.with_inserted_row_count(second.stats.num_inserted_rows);
+        }
+        builder.execute(second.transaction).await
+    };
+    let should_commit = supply_count && !insert;
+    if should_commit {
+        result.unwrap();
+    } else {
+        assert!(
+            matches!(result, Err(Error::RetryableCommitConflict { .. })),
+            "{result:?}"
+        );
+    }
+    latest.checkout_latest().await.unwrap();
+    assert_eq!(latest.version_id(), if should_commit { 3 } else { 2 });
+    let output = latest.scan().try_into_batch().await.unwrap();
+    let ids = output["id"].as_primitive::<UInt32Type>();
+    let values = output["value"].as_primitive::<UInt32Type>();
+    let mut actual: Vec<_> = ids
+        .values()
+        .iter()
+        .copied()
+        .zip(values.values().iter().copied())
+        .collect();
+    actual.sort_unstable();
+    let mut expected = vec![(1, if should_commit { 20 } else { 0 }), (2, 0)];
+    if !matches!(matched, WhenMatched::Delete) {
+        expected.insert(0, (0, 10));
+    }
+    if insert {
+        expected.push((3, 10));
+    }
+    assert_eq!(actual, expected);
+}
+
+#[tokio::test]
+async fn test_staged_merge_row_conflicts_standalone_json_key() {
+    use crate::io::commit::conflict_resolver::TransactionRebase;
+    use lance_arrow::ARROW_EXT_NAME_KEY;
+    use lance_arrow::json::{ARROW_JSON_EXT_NAME, convert_json_columns};
+    use lance_core::datatypes::LANCE_UNENFORCED_PRIMARY_KEY;
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false).with_metadata(HashMap::from([
+            (ARROW_EXT_NAME_KEY.into(), ARROW_JSON_EXT_NAME.into()),
+            (LANCE_UNENFORCED_PRIMARY_KEY.into(), "true".into()),
+        ])),
+        Field::new("value", DataType::Int32, false),
+    ]));
+    let batch = |keys: Vec<&str>, value| {
+        let values = Int32Array::from(vec![value; keys.len()]);
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from(keys)), Arc::new(values)],
+        )
+        .unwrap()
+    };
+    let read = Arc::new(
+        InsertBuilder::new("memory://")
+            .execute(vec![batch(vec!["2"], 0)])
+            .await
+            .unwrap(),
+    );
+    let stage = |rows| {
+        MergeInsertBuilder::try_new(read.clone(), vec!["id".into()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .when_not_matched(WhenNotMatched::InsertAll)
+            .try_build()
+            .unwrap()
+            .execute_uncommitted_batches(vec![rows])
+    };
+    let text = stage(batch(vec![" 90 "], 10)).await.unwrap();
+    let binary = stage(convert_json_columns(&batch(vec!["2", "90"], 20)).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(text.stats.num_inserted_rows, 1);
+    assert_eq!(
+        (
+            binary.stats.num_inserted_rows,
+            binary.stats.num_updated_rows
+        ),
+        (1, 1)
+    );
+    let latest = CommitBuilder::new(read.clone())
+        .execute(text.transaction)
+        .await
+        .unwrap();
+    let mut rebase =
+        TransactionRebase::try_new(&latest, binary.transaction, binary.affected_rows.as_ref())
+            .await
+            .unwrap();
+    rebase
+        .check_txn(
+            &latest.read_transaction().await.unwrap().unwrap(),
+            latest.version_id(),
+        )
+        .unwrap();
+    assert!(matches!(
+        rebase.finish(&latest).await,
+        Err(Error::RetryableCommitConflict { .. })
+    ));
+    assert_eq!(latest.count_rows(None).await.unwrap(), 2);
+}
+
+#[rstest::rstest]
+#[case::disjoint_update(1, false)]
+#[case::disjoint_delete(1, true)]
+#[case::same_row_update(2, false)]
+#[case::same_row_delete(2, true)]
+#[tokio::test]
+async fn test_staged_merge_row_conflicts(
+    #[case] other_id: u32,
+    #[case] delete: bool,
+    #[values(false, true)] stable_ids: bool,
+) {
+    let batch = |ids: Vec<u32>, value: u32| {
+        let values = vec![value; ids.len()];
+        record_batch!(("id", UInt32, ids), ("value", UInt32, values)).unwrap()
+    };
+    let mut dataset = InsertBuilder::new("memory://")
+        .with_params(&WriteParams {
+            max_rows_per_file: 5,
+            enable_stable_row_ids: stable_ids,
+            ..Default::default()
+        })
+        .execute(vec![batch((0..10).collect(), 0)])
+        .await
+        .unwrap();
+    dataset.delete("id = 0").await.unwrap();
+    assert_eq!(dataset.fragments().len(), 2);
+    let read = Arc::new(dataset.clone());
+    let stage = |id, value| {
+        MergeInsertBuilder::try_new(read.clone(), vec!["id".into()])
+            .unwrap()
+            .when_matched(WhenMatched::UpdateAll)
+            .try_build()
+            .unwrap()
+            .execute_uncommitted_batches(vec![batch(vec![id], value)])
+    };
+    let staged = stage(2, 20).await.unwrap();
+    if delete {
+        dataset.delete(&format!("id = {other_id}")).await.unwrap();
+    } else {
+        dataset = CommitBuilder::new(read.clone())
+            .execute(stage(other_id, 10).await.unwrap().transaction)
+            .await
+            .unwrap();
+    }
+    dataset.delete("id = 3").await.unwrap();
+    let version = dataset.manifest().version;
+    let result = CommitBuilder::new(read)
+        .with_affected_rows(staged.affected_rows.unwrap())
+        .with_inserted_row_count(staged.stats.num_inserted_rows)
+        .execute(staged.transaction)
+        .await;
+    if other_id == 2 {
+        assert!(
+            matches!(result, Err(Error::RetryableCommitConflict { .. })),
+            "{result:?}"
+        );
+        dataset.checkout_latest().await.unwrap();
+        assert_eq!(dataset.manifest().version, version);
+    } else {
+        dataset = result.expect("expected staged disjoint rows to commit");
+        assert_eq!(dataset.manifest().version, version + 1);
+    }
+    let rows = dataset.scan().try_into_batch().await.unwrap();
+    let ids = rows["id"].as_primitive::<UInt32Type>();
+    let values = rows["value"].as_primitive::<UInt32Type>();
+    let mut actual: Vec<_> = ids
+        .values()
+        .iter()
+        .copied()
+        .zip(values.values().iter().copied())
+        .collect();
+    actual.sort_unstable();
+    let expected: Vec<_> = (1..10)
+        .filter(|&id| id != 3 && !(delete && id == other_id))
+        .map(|id| {
+            (
+                id,
+                if id == other_id {
+                    10
+                } else if id == 2 {
+                    20
+                } else {
+                    0
+                },
+            )
+        })
+        .collect();
+    assert_eq!(actual, expected);
+}
+
 // For some reason, Windows isn't able to handle the timeout test. Possibly
 // a performance bug in their timer implementation?
 #[cfg(not(windows))]
@@ -1428,6 +1702,77 @@ fn make_nested_array(inner_lists: &[&[&str]]) -> ListArray {
         Arc::new(inner_list_array),
         None,
     )
+}
+
+#[rstest::rstest]
+#[tokio::test]
+async fn test_staged_merge_row_conflicts_delete_missing_key(
+    #[values(false, true)] delete_first: bool,
+) {
+    let key = Field::new("id", DataType::UInt32, false).with_metadata(HashMap::from([(
+        lance_core::datatypes::LANCE_UNENFORCED_PRIMARY_KEY.to_owned(),
+        "true".to_owned(),
+    )]));
+    let schema = Arc::new(Schema::new(vec![key]));
+    let batch = |id: u32| {
+        RecordBatch::try_new(schema.clone(), vec![Arc::new(UInt32Array::from(vec![id]))]).unwrap()
+    };
+    let read = Arc::new(
+        InsertBuilder::new("memory://")
+            .execute(vec![batch(1)])
+            .await
+            .unwrap(),
+    );
+    let stage = |matched, unmatched| {
+        MergeInsertBuilder::try_new(read.clone(), vec!["id".into()])
+            .unwrap()
+            .when_matched(matched)
+            .when_not_matched(unmatched)
+            .try_build()
+            .unwrap()
+            .execute_uncommitted_batches(vec![batch(100)])
+    };
+    let delete = stage(WhenMatched::Delete, WhenNotMatched::DoNothing)
+        .await
+        .unwrap();
+    let insert = stage(WhenMatched::UpdateAll, WhenNotMatched::InsertAll)
+        .await
+        .unwrap();
+    assert_eq!(delete.stats.num_deleted_rows, 0);
+    assert!(delete.inserted_rows_filter.is_none());
+    assert!(insert.inserted_rows_filter.is_some());
+    let (first, second) = if delete_first {
+        (delete, insert)
+    } else {
+        (insert, delete)
+    };
+    let latest = CommitBuilder::new(read.clone())
+        .execute(first.transaction)
+        .await
+        .unwrap();
+    let mut commit =
+        CommitBuilder::new(read).with_inserted_row_count(second.stats.num_inserted_rows);
+    if let Some(rows) = second.affected_rows {
+        commit = commit.with_affected_rows(rows);
+    }
+    let result = commit.execute(second.transaction).await;
+    assert!(
+        matches!(result, Err(Error::RetryableCommitConflict { .. })),
+        "{result:?}"
+    );
+    let mut reopened = latest;
+    reopened.checkout_latest().await.unwrap();
+    assert_eq!(reopened.version_id(), 2);
+    let rows = reopened.scan().try_into_batch().await.unwrap();
+    let ids = rows["id"].as_primitive::<UInt32Type>();
+    assert_eq!(
+        ids.values().as_ref(),
+        if delete_first {
+            &[1][..]
+        } else {
+            &[1, 100][..]
+        }
+    );
 }
 
 /// Test that merge_insert with bloom filter fails when committing against

@@ -64,6 +64,11 @@ class DatasetOptimizer:
         not be compacted because the fragments it is adjacent to do not need
         compaction.
 
+        The dataset moves to the new version once the compaction commits. If
+        another thread is using the dataset at that moment, it stays at its
+        previous version and a warning is logged; call ``checkout_latest()``
+        after that thread finishes to see the compacted fragments.
+
         Default values for these options can be stored in the dataset manifest
         config using keys prefixed with ``lance.compaction.``. For example,
         setting the config key ``lance.compaction.target_rows_per_fragment`` to
@@ -195,7 +200,9 @@ class DatasetOptimizer:
             ``max_data_files_per_fragment``, as an argument or from the table
             config, and refuses the ``"force_binary_copy"`` mode. A run that
             does both commits the rewrites and the repacks separately; if the
-            repack commit fails, the dataset is left at the rewrite's version.
+            repack commit fails, the rewrites stay committed and the dataset is
+            left at their version, or at its previous version if another thread
+            is using it then.
         data_cache_bytes: int, optional
             Total budget in bytes for buffering column data in each output
             file writer during re-encoding. Divided evenly among cache-owning
