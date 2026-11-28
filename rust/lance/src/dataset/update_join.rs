@@ -9,14 +9,17 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use arrow_array::{
-    Array, ArrayRef, LargeListArray, ListArray, RecordBatch, RecordBatchIterator,
+    Array, ArrayRef, BooleanArray, LargeListArray, ListArray, RecordBatch, RecordBatchIterator,
     RecordBatchReader, StructArray, UInt32Array, UInt64Array, new_null_array,
 };
+use arrow_buffer::BooleanBuffer;
 use arrow_row::{OwnedRow, RowConverter, SortField};
 use arrow_schema::{
     ArrowError, DataType, Field as ArrowField, FieldRef, Schema as ArrowSchema, SchemaRef,
     SortOptions,
 };
+use arrow_select::filter::filter_record_batch;
+use arrow_select::interleave::interleave;
 use datafusion::common::{JoinType, NullEquality, config::ConfigNonZeroUsize};
 use datafusion::error::DataFusionError;
 use datafusion::execution::context::SessionContext;
@@ -46,7 +49,7 @@ use lance_table::format::Fragment;
 use roaring::RoaringBitmap;
 
 use super::fragment::{FileFragment, FragmentUpdateColumnsResult};
-use super::hash_joiner::HashJoiner;
+use super::hash_joiner::{HashJoiner, null_mask, skip_null_indices};
 use super::utils::SchemaAdapter;
 use super::{UpdateJoinOptions, UpdateJoinStrategy, WriteParams, blob};
 use late_materialize::{
@@ -81,6 +84,7 @@ pub(super) struct UpdateColumnsOptions {
     pub(super) max_hash_bytes: usize,
     pub(super) execution_batch_size: usize,
     pub(super) sort_spill_reservation_bytes: Option<usize>,
+    pub(super) skip_null: bool,
     #[cfg(test)]
     pub(super) session_context: Option<SessionContext>,
 }
@@ -111,6 +115,7 @@ impl UpdateColumnsOptions {
             max_hash_bytes: options.max_hash_bytes(),
             execution_batch_size: EXECUTION_BATCH_SIZE,
             sort_spill_reservation_bytes: None,
+            skip_null: options.skip_null(),
             #[cfg(test)]
             session_context: None,
         }
@@ -167,6 +172,7 @@ struct ExternalUpdateOptions {
     execution_options: LanceExecutionOptions,
     execution_batch_size: usize,
     sort_spill_reservation_bytes: Option<usize>,
+    skip_null: bool,
     session_context: Option<SessionContext>,
     preparation_stats: RhsPreparationStats,
 }
@@ -447,6 +453,42 @@ impl BlobUpdateContext {
     }
 }
 
+/// Drops update rows whose columns other than `right_on` are all null.
+///
+/// With `skip_null`, such a row would keep every existing value, so dropping it up front makes
+/// the row unmatched (its version metadata is left alone) for every join strategy.
+fn drop_all_null_rows(
+    reader: Box<dyn RecordBatchReader + Send>,
+    right_on: &str,
+) -> Result<Box<dyn RecordBatchReader + Send>> {
+    let schema = reader.schema();
+    let key_index = schema.index_of(right_on)?;
+    let batches = reader.map(move |batch| {
+        let batch = batch?;
+        let mut has_value: Option<BooleanBuffer> = None;
+        for (column_i, column) in batch.columns().iter().enumerate() {
+            if column_i == key_index {
+                continue;
+            }
+            let Some(nulls) = null_mask(column.as_ref()) else {
+                // A column without nulls gives every row a value.
+                return Ok(batch);
+            };
+            has_value = Some(match has_value {
+                Some(has_value) => &has_value | nulls.inner(),
+                None => nulls.inner().clone(),
+            });
+        }
+        match has_value {
+            Some(has_value) if has_value.count_set_bits() < batch.num_rows() => {
+                filter_record_batch(&batch, &BooleanArray::new(has_value, None))
+            }
+            _ => Ok(batch),
+        }
+    });
+    Ok(Box::new(RecordBatchIterator::new(batches, schema)))
+}
+
 async fn prepare_rhs(
     reader: Box<dyn RecordBatchReader + Send>,
     right_on: &str,
@@ -614,6 +656,11 @@ pub(super) async fn update_columns_with_options(
     let right_reader = canonicalize_blob_reader(right_reader)?;
     let right_schema = right_reader.schema();
     validate_key_types(fragment, left_on, &right_schema, right_on)?;
+    let right_reader = if options.skip_null {
+        drop_all_null_rows(right_reader, right_on)?
+    } else {
+        right_reader
+    };
 
     match prepare_rhs(right_reader, right_on, &options).await? {
         PreparedRhs::Empty(stats) => {
@@ -636,6 +683,7 @@ pub(super) async fn update_columns_with_options(
                 left_on,
                 right_on,
                 write_schema,
+                options.skip_null,
             )
             .await;
             if result.is_ok() {
@@ -668,6 +716,7 @@ pub(super) async fn update_columns_with_options(
                     execution_options: options.execution_options,
                     execution_batch_size: options.execution_batch_size,
                     sort_spill_reservation_bytes: options.sort_spill_reservation_bytes,
+                    skip_null: options.skip_null,
                     session_context,
                     preparation_stats: stats,
                 },
@@ -708,12 +757,17 @@ async fn run_hash_update(
     left_on: &str,
     right_on: &str,
     write_schema: Schema,
+    skip_null: bool,
 ) -> Result<FragmentUpdateColumnsResult> {
     let reader: Box<dyn RecordBatchReader + Send> = Box::new(RecordBatchIterator::new(
         batches.into_iter().map(Ok),
         right_schema,
     ));
-    let joiner = Arc::new(HashJoiner::try_new_allow_duplicates(reader, right_on).await?);
+    let joiner = Arc::new(
+        HashJoiner::try_new_allow_duplicates(reader, right_on)
+            .await?
+            .with_skip_null(skip_null),
+    );
 
     let mut read_columns = write_schema
         .fields
@@ -787,6 +841,7 @@ async fn run_external_update(
         mut execution_options,
         execution_batch_size,
         sort_spill_reservation_bytes,
+        skip_null,
         session_context,
         preparation_stats,
     } = options;
@@ -953,7 +1008,7 @@ async fn run_external_update(
     let patch_stream = sorted_patches.execute(0, task_context)?;
 
     let fragment_id = fragment_id(fragment)?;
-    let mut patch_cursor = SortedPatchCursor::try_new(patch_stream, fragment_id).await?;
+    let mut patch_cursor = SortedPatchCursor::try_new(patch_stream, fragment_id, skip_null).await?;
     let mut update_projection = write_schema
         .fields
         .iter()
@@ -1206,6 +1261,8 @@ struct SortedPatchCursor {
     input: SendableRecordBatchStream,
     payload_schema: SchemaRef,
     fragment_id: u32,
+    /// Keep the original value wherever a matched patch value is null.
+    skip_null: bool,
     current_batch: Option<RecordBatch>,
     current_position: usize,
     current_batch_id: u64,
@@ -1214,7 +1271,11 @@ struct SortedPatchCursor {
 }
 
 impl SortedPatchCursor {
-    async fn try_new(input: SendableRecordBatchStream, fragment_id: u32) -> Result<Self> {
+    async fn try_new(
+        input: SendableRecordBatchStream,
+        fragment_id: u32,
+        skip_null: bool,
+    ) -> Result<Self> {
         let input_schema = input.schema();
         let address_index = input_schema.index_of(ROW_ADDR)?;
         if address_index != 0 {
@@ -1231,6 +1292,7 @@ impl SortedPatchCursor {
             input,
             payload_schema,
             fragment_id,
+            skip_null,
             current_batch: None,
             current_position: 0,
             current_batch_id: 0,
@@ -1406,7 +1468,12 @@ impl SortedPatchCursor {
             }
         }
 
-        Ok((interleave_batches(&source_batches, &indices)?, matched_rows))
+        let merged = if self.skip_null {
+            interleave_skipping_nulls(&source_batches, &indices)?
+        } else {
+            interleave_batches(&source_batches, &indices)?
+        };
+        Ok((merged, matched_rows))
     }
 
     fn ensure_exhausted(&self) -> Result<()> {
@@ -1427,6 +1494,43 @@ impl SortedPatchCursor {
         }
         Ok(())
     }
+}
+
+/// Interleaves `batches` like [`interleave_batches`], but takes a row of `batches[0]` (the
+/// original values) wherever the selected value of another batch is null.
+fn interleave_skipping_nulls(
+    batches: &[RecordBatch],
+    indices: &[(usize, usize)],
+) -> Result<RecordBatch> {
+    const ORIGINAL_INDEX: usize = 0;
+    let columns = (0..batches[ORIGINAL_INDEX].num_columns())
+        .map(|column_i| {
+            let arrays = batches
+                .iter()
+                .map(|batch| batch.column(column_i).as_ref())
+                .collect::<Vec<_>>();
+            let null_masks = arrays
+                .iter()
+                .enumerate()
+                .map(|(batch_i, array)| {
+                    (batch_i != ORIGINAL_INDEX)
+                        .then(|| null_mask(*array))
+                        .flatten()
+                })
+                .collect::<Vec<_>>();
+            let column = if null_masks.iter().any(Option::is_some) {
+                let column_indices = skip_null_indices(indices, ORIGINAL_INDEX, &null_masks);
+                interleave(&arrays, &column_indices)?
+            } else {
+                interleave(&arrays, indices)?
+            };
+            Ok(column)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(RecordBatch::try_new(
+        batches[ORIGINAL_INDEX].schema(),
+        columns,
+    )?)
 }
 
 fn fragment_id(fragment: &FileFragment) -> Result<u32> {
@@ -1486,15 +1590,17 @@ mod tests {
     use std::io;
     use std::sync::Mutex;
 
-    use arrow_array::types::Int32Type;
+    use arrow_array::cast::AsArray;
+    use arrow_array::types::{Int32Type, UInt64Type};
     use arrow_array::{
         ArrayRef, Int32Array, Int64Array, LargeBinaryArray, ListArray, StringArray, record_batch,
     };
-    use arrow_schema::{ArrowError, Field};
+    use arrow_schema::{ArrowError, Field, Fields};
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use futures::TryStreamExt;
     use lance_arrow::ARROW_EXT_NAME_KEY;
     use lance_arrow::json::ARROW_JSON_EXT_NAME;
+    use lance_core::ROW_LAST_UPDATED_AT_VERSION;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_file::version::LanceFileVersion;
     use lance_table::format::RowIdMeta;
@@ -1527,6 +1633,20 @@ mod tests {
             max_hash_bytes,
             ..Default::default()
         }
+    }
+
+    fn update_batch<const N: usize>(keys: [i32; N], values: [Option<i32>; N]) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![
+                Field::new("key", DataType::Int32, true),
+                Field::new("value", DataType::Int32, true),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(keys.to_vec())),
+                Arc::new(Int32Array::from(values.to_vec())),
+            ],
+        )
+        .unwrap()
     }
 
     fn list_batch(keys: Vec<i32>, is_update: bool) -> RecordBatch {
@@ -1705,10 +1825,14 @@ mod tests {
     }
 
     #[rstest]
-    #[case::no_batches(false)]
-    #[case::zero_row_batches(true)]
+    #[case::no_batches(Vec::new(), false)]
+    #[case::zero_row_batches(vec![RecordBatch::new_empty(update_batch([], []).schema())], false)]
+    #[case::all_null_rows_with_skip_null(vec![update_batch([1, 2], [None, None])], true)]
     #[tokio::test]
-    async fn test_empty_rhs_is_noop(#[case] include_zero_row_batches: bool) {
+    async fn test_empty_rhs_is_noop(
+        #[case] update_batches: Vec<RecordBatch>,
+        #[case] skip_null: bool,
+    ) {
         let test_dir = TempStrDir::default();
         let input = record_batch!(("key", Int32, [1, 2]), ("value", Int32, [10, 20])).unwrap();
         let dataset = Dataset::write(
@@ -1719,20 +1843,18 @@ mod tests {
         .await
         .unwrap();
         let update_schema = input.schema();
-        let update_batches = if include_zero_row_batches {
-            vec![Ok(RecordBatch::new_empty(update_schema.clone()))]
-        } else {
-            Vec::new()
-        };
         let mut fragment = dataset.get_fragment(0).unwrap();
         let original_fragment = fragment.metadata().clone();
 
         let result = update_columns_with_options(
             &mut fragment,
-            reader(update_schema, update_batches),
+            reader(update_schema, update_batches.into_iter().map(Ok).collect()),
             "key",
             "key",
-            UpdateColumnsOptions::default(),
+            UpdateColumnsOptions {
+                skip_null,
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -1808,6 +1930,7 @@ mod tests {
         let mut cursor = SortedPatchCursor::try_new(
             stream_from_batches(patch_schema, vec![first_patch, second_patch]),
             7,
+            false,
         )
         .await
         .unwrap();
@@ -1853,9 +1976,12 @@ mod tests {
             ("value", Int32, [10, 11])
         )
         .unwrap();
-        let Err(error) =
-            SortedPatchCursor::try_new(stream_from_batches(duplicate.schema(), vec![duplicate]), 7)
-                .await
+        let Err(error) = SortedPatchCursor::try_new(
+            stream_from_batches(duplicate.schema(), vec![duplicate]),
+            7,
+            false,
+        )
+        .await
         else {
             panic!("duplicate patch addresses should fail");
         };
@@ -1866,6 +1992,7 @@ mod tests {
         let Err(error) = SortedPatchCursor::try_new(
             stream_from_batches(wrong_fragment.schema(), vec![wrong_fragment]),
             7,
+            false,
         )
         .await
         else {
@@ -1885,9 +2012,12 @@ mod tests {
             ],
         )
         .unwrap();
-        let Err(error) =
-            SortedPatchCursor::try_new(stream_from_batches(nullable_schema, vec![null_address]), 7)
-                .await
+        let Err(error) = SortedPatchCursor::try_new(
+            stream_from_batches(nullable_schema, vec![null_address]),
+            7,
+            false,
+        )
+        .await
         else {
             panic!("null patch addresses should fail");
         };
@@ -1901,6 +2031,7 @@ mod tests {
         let Err(error) = SortedPatchCursor::try_new(
             stream_from_batches(out_of_order.schema(), vec![out_of_order]),
             7,
+            false,
         )
         .await
         else {
@@ -1918,7 +2049,7 @@ mod tests {
         )
         .unwrap();
         let mut cursor =
-            SortedPatchCursor::try_new(stream_from_batches(patch.schema(), vec![patch]), 7)
+            SortedPatchCursor::try_new(stream_from_batches(patch.schema(), vec![patch]), 7, false)
                 .await
                 .unwrap();
         let original =
@@ -1932,7 +2063,7 @@ mod tests {
         let patch =
             record_batch!((ROW_ADDR, UInt64, [address(2)]), ("value", Int32, [102])).unwrap();
         let cursor =
-            SortedPatchCursor::try_new(stream_from_batches(patch.schema(), vec![patch]), 7)
+            SortedPatchCursor::try_new(stream_from_batches(patch.schema(), vec![patch]), 7, false)
                 .await
                 .unwrap();
         let error = cursor.ensure_exhausted().unwrap_err();
@@ -2218,6 +2349,199 @@ mod tests {
             batch.column_by_name("value").unwrap().as_ref(),
             &Int32Array::from(vec![100, 200])
         );
+    }
+
+    fn point_fields() -> Fields {
+        Fields::from(vec![
+            Field::new("x", DataType::Int32, true),
+            Field::new("y", DataType::Int32, true),
+        ])
+    }
+
+    fn points(xs: Vec<Option<i32>>, ys: Vec<Option<i32>>, validity: Vec<bool>) -> ArrayRef {
+        Arc::new(StructArray::new(
+            point_fields(),
+            vec![
+                Arc::new(Int32Array::from(xs)),
+                Arc::new(Int32Array::from(ys)),
+            ],
+            Some(validity.into()),
+        ))
+    }
+
+    async fn row_last_updated_versions(dataset: &Dataset) -> Vec<u64> {
+        let mut scanner = dataset.scan();
+        scanner.project(&[ROW_LAST_UPDATED_AT_VERSION]).unwrap();
+        let batch = scanner.try_into_batch().await.unwrap();
+        batch[ROW_LAST_UPDATED_AT_VERSION]
+            .as_primitive::<UInt64Type>()
+            .values()
+            .to_vec()
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_update_skip_null(
+        #[values(false, true)] is_external: bool,
+        #[values(false, true)] skip_null: bool,
+    ) {
+        let test_dir = TempStrDir::default();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("key", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("point", DataType::Struct(point_fields()), true),
+        ]));
+        // Fragment 0 holds keys 0..4 and fragment 1 keys 4..8; only fragment 0 is updated.
+        let input = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..8)),
+                Arc::new(StringArray::from_iter_values(
+                    (0..8).map(|i| format!("old{i}")),
+                )),
+                points(
+                    (0..8).map(Some).collect(),
+                    (0..8).map(Some).collect(),
+                    vec![true; 8],
+                ),
+            ],
+        )
+        .unwrap();
+        let dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(input)], schema.clone()),
+            test_dir.as_ref(),
+            Some(WriteParams {
+                max_rows_per_file: 4,
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let original_versions = row_last_updated_versions(&dataset).await;
+
+        // Key 0: null name, non-null point with a null child. Key 1: new name, top-level null
+        // point. Key 2 (second batch): every updated column is null. Key 3 is not in the stream.
+        let first_update = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 0])),
+                Arc::new(StringArray::from(vec![Some("new1"), None])),
+                points(vec![None, Some(10)], vec![None, None], vec![false, true]),
+            ],
+        )
+        .unwrap();
+        let second_update = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![2])),
+                Arc::new(StringArray::from(vec![None::<&str>])),
+                points(vec![None], vec![None], vec![false]),
+            ],
+        )
+        .unwrap();
+        let mut fragment = dataset.get_fragment(0).unwrap();
+        let result = update_columns_with_options(
+            &mut fragment,
+            reader(schema, vec![Ok(first_update), Ok(second_update)]),
+            "key",
+            "key",
+            UpdateColumnsOptions {
+                skip_null,
+                ..if is_external {
+                    options(0, usize::MAX)
+                } else {
+                    options(usize::MAX, usize::MAX)
+                }
+            },
+        )
+        .await
+        .unwrap();
+        let expected_matched: &[u32] = if skip_null { &[0, 1] } else { &[0, 1, 2] };
+        assert_eq!(
+            result.matched_offsets.iter().collect::<Vec<_>>(),
+            expected_matched
+        );
+
+        let fragment_id = result.fragment.id;
+        let dataset = Dataset::commit(
+            test_dir.as_ref(),
+            crate::dataset::transaction::Operation::Update {
+                removed_fragment_ids: vec![],
+                updated_fragments: vec![result.fragment],
+                new_fragments: vec![],
+                fields_modified: result.fields_modified,
+                compacted_sstables: vec![],
+                fields_for_preserving_frag_bitmap: vec![],
+                update_mode: Some(crate::dataset::transaction::UpdateMode::RewriteColumns),
+                inserted_rows_filter: None,
+                mem_wal_dir_id: None,
+                updated_fragment_offsets: Some(
+                    crate::dataset::transaction::UpdatedFragmentOffsets(HashMap::from([(
+                        fragment_id,
+                        result.matched_offsets,
+                    )])),
+                ),
+            },
+            Some(dataset.version().version),
+            None,
+            None,
+            Default::default(),
+            true,
+        )
+        .await
+        .unwrap();
+
+        let mut expected_versions = original_versions;
+        for &offset in expected_matched {
+            expected_versions[offset as usize] = dataset.version().version;
+        }
+        assert_eq!(row_last_updated_versions(&dataset).await, expected_versions);
+
+        let batch = dataset.scan().try_into_batch().await.unwrap();
+        let (name_0, name_2) = if skip_null {
+            (Some("old0"), Some("old2"))
+        } else {
+            (None, None)
+        };
+        assert_eq!(
+            batch["name"].as_ref(),
+            &StringArray::from(vec![
+                name_0,
+                Some("new1"),
+                name_2,
+                Some("old3"),
+                Some("old4"),
+                Some("old5"),
+                Some("old6"),
+                Some("old7"),
+            ])
+        );
+        // A non-null struct replaces the old one as a whole, null children included.
+        let tail = (3..8).map(Some);
+        let expected_point = if skip_null {
+            points(
+                [Some(10), Some(1), Some(2)]
+                    .into_iter()
+                    .chain(tail.clone())
+                    .collect(),
+                [None, Some(1), Some(2)].into_iter().chain(tail).collect(),
+                vec![true; 8],
+            )
+        } else {
+            let mut validity = vec![true; 8];
+            validity[1] = false;
+            validity[2] = false;
+            points(
+                [Some(10), None, None]
+                    .into_iter()
+                    .chain(tail.clone())
+                    .collect(),
+                [None, None, None].into_iter().chain(tail).collect(),
+                validity,
+            )
+        };
+        assert_eq!(batch["point"].as_ref(), expected_point.as_ref());
     }
 
     #[tokio::test]

@@ -932,6 +932,7 @@ class LanceFragment(pa.dataset.Fragment):
         max_hash_bytes: Optional[int] = None,
         external_memory_pool_bytes: Optional[int] = None,
         max_temp_directory_bytes: Optional[int] = None,
+        skip_null: bool = False,
     ) -> Tuple[FragmentMetadata, List[int]]: ...
 
     @overload
@@ -948,6 +949,7 @@ class LanceFragment(pa.dataset.Fragment):
         max_hash_bytes: Optional[int] = None,
         external_memory_pool_bytes: Optional[int] = None,
         max_temp_directory_bytes: Optional[int] = None,
+        skip_null: bool = False,
     ) -> Tuple[FragmentMetadata, List[int], bytes]: ...
 
     def update_columns(
@@ -963,6 +965,7 @@ class LanceFragment(pa.dataset.Fragment):
         max_hash_bytes: Optional[int] = None,
         external_memory_pool_bytes: Optional[int] = None,
         max_temp_directory_bytes: Optional[int] = None,
+        skip_null: bool = False,
     ) -> Union[
         Tuple[FragmentMetadata, List[int]],
         Tuple[FragmentMetadata, List[int], bytes],
@@ -1017,6 +1020,14 @@ class LanceFragment(pa.dataset.Fragment):
             ``LANCE_MEM_POOL_SIZE`` environment variable or defaults to 256 MiB.
         max_temp_directory_bytes: int, optional
             The maximum temporary spill-directory usage for the sort-merge path.
+        skip_null: bool, default False
+            If True, a null value in data_obj keeps the existing value of the
+            matched row instead of overwriting it with null. Only top-level nulls
+            are skipped: a non-null struct replaces the old struct as a whole,
+            including its null children. A row of data_obj whose columns other
+            than right_on are all null changes nothing and is treated as
+            unmatched, so it is excluded from the offsets returned with
+            ``with_offsets``.
 
         Returns
         -------
@@ -1099,6 +1110,7 @@ class LanceFragment(pa.dataset.Fragment):
             max_hash_bytes,
             external_memory_pool_bytes,
             max_temp_directory_bytes,
+            skip_null,
         )
         if matched_offsets is not None:
             return metadata, fields_modified, matched_offsets

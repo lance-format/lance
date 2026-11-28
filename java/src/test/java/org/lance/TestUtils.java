@@ -573,6 +573,11 @@ public class TestUtils {
      * @return update result
      */
     public FragmentUpdateResult updateColumn(Fragment fragment, int updateNum) {
+      return updateColumn(fragment, updateNum, false);
+    }
+
+    /** Same as {@link #updateColumn(Fragment, int)}, optionally skipping nulls in the new data. */
+    public FragmentUpdateResult updateColumn(Fragment fragment, int updateNum, boolean skipNull) {
       assertEquals(actualUpdateRowCount, updateNum);
       try (VectorSchemaRoot root = VectorSchemaRoot.create(updateSchema, allocator)) {
         root.allocateNew();
@@ -615,7 +620,8 @@ public class TestUtils {
                     new ByteArrayReadableSeekableByteChannel(arrowData), allocator);
             ArrowArrayStream stream = ArrowArrayStream.allocateNew(allocator)) {
           Data.exportArrayStream(allocator, reader, stream);
-          return fragment.updateColumns(stream);
+          return fragment.updateColumns(
+              stream, MetadataColumns.ROWID, MetadataColumns.ROWID, skipNull);
         } catch (Exception e) {
           throw new RuntimeException("Cannot read arrow stream.", e);
         }
