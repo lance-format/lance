@@ -371,6 +371,20 @@ def test_sharded_batch_sampler_filter_no_match(tmp_path: Path, randomize):
     assert list(sampler(ds, columns=["id"], filter="id > 100")) == []
 
 
+def test_sharded_batch_sampler_filter_keeps_global_rng_without_randomize(
+    tmp_path: Path, preserve_random_state
+):
+    ds = lance.write_dataset(pa.table({"id": range(10)}), tmp_path / "data.lance")
+    sampler = ShardedBatchSampler(rank=0, world_size=1, randomize=False, seed=7)
+
+    random.seed(123)
+    expected = random.Random(123).random()
+    batches = list(sampler(ds, columns=["id"], filter="id >= 0", batch_size=4))
+
+    assert [v for b in batches for v in b["id"].to_pylist()] == list(range(10))
+    assert random.random() == expected
+
+
 @pytest.mark.parametrize("randomize", [False, True])
 def test_sharded_batch_sampler_filter_sparse_shard(tmp_path: Path, randomize):
     # Three matches spread over six rows: with a world size of four, rank 3 owns
