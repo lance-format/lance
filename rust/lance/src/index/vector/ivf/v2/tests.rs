@@ -9774,3 +9774,4 @@ mod native_resident_tests;
 mod native_scan_tests;
 mod native_share_tests;
 mod native_storage_tests;
+mod prepare_budget_tests;
