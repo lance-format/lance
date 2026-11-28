@@ -140,4 +140,19 @@ pub mod deps {
     pub use arrow_array;
     pub use arrow_schema;
     pub use datafusion;
+    pub use object_store;
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    #[test]
+    fn deps_reexports_lance_object_store() {
+        let store = lance_io::object_store::ObjectStore::memory();
+        let inner: Arc<dyn crate::deps::object_store::ObjectStore> = store.inner;
+        let path = crate::deps::object_store::path::Path::from("test.bin");
+        assert_eq!(path.as_ref(), "test.bin");
+        assert!(!inner.to_string().is_empty());
+    }
 }
