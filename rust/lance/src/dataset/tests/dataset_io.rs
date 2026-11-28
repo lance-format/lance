@@ -36,6 +36,7 @@ use arrow::array::as_struct_array;
 use arrow::compute::concat_batches;
 use arrow_array::RecordBatch;
 use arrow_array::RecordBatchReader;
+use arrow_array::cast::AsArray;
 use arrow_array::{Array, FixedSizeListArray, Int16Array, Int16DictionaryArray, StructArray};
 use arrow_array::{
     ArrayRef, BooleanArray, Decimal128Array, Int8Array, Int8DictionaryArray, Int32Array,
@@ -5980,4 +5981,626 @@ async fn a_legacy_nullable_primary_key_can_be_repaired_under_mem_wal() {
         .await
         .expect("removing the offending rows must not be blocked under MemWAL");
     assert_eq!(dataset.count_rows(None).await.unwrap(), 1);
+}
+
+fn dictionary_type(key_type: DataType, value_type: DataType) -> DataType {
+    DataType::Dictionary(Box::new(key_type), Box::new(value_type))
+}
+
+/// `values` with nulls, in `data_type`, a string or binary representation.
+fn representation_array(data_type: &DataType, values: &[Option<&str>]) -> ArrayRef {
+    let is_binary = matches!(
+        data_type,
+        DataType::Binary | DataType::LargeBinary | DataType::BinaryView
+    ) || matches!(
+        data_type,
+        DataType::Dictionary(_, value_type)
+            if matches!(value_type.as_ref(), DataType::Binary | DataType::LargeBinary | DataType::BinaryView)
+    );
+    let strings: ArrayRef = Arc::new(StringArray::from(values.to_vec()));
+    let source = if is_binary {
+        arrow::compute::cast(&strings, &DataType::Binary).unwrap()
+    } else {
+        strings
+    };
+    arrow::compute::cast(&source, data_type).unwrap()
+}
+
+/// The values of a string or binary array, whatever its representation.
+fn representation_values(array: &dyn Array) -> ArrayRef {
+    let flat = match array.data_type() {
+        DataType::Dictionary(_, value_type) => value_type.as_ref().clone(),
+        other => other.clone(),
+    };
+    let canonical = match flat {
+        DataType::Binary | DataType::LargeBinary | DataType::BinaryView => DataType::LargeBinary,
+        _ => DataType::LargeUtf8,
+    };
+    arrow::compute::cast(array, &canonical).unwrap()
+}
+
+async fn table_with_representation(table_type: &DataType) -> Dataset {
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, false),
+        ArrowField::new("value", table_type.clone(), true)
+            .with_metadata(HashMap::from([("note".to_string(), "kept".to_string())])),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![0, 1])),
+            representation_array(table_type, &[Some("first"), None]),
+        ],
+    )
+    .unwrap();
+    Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        "memory://",
+        None,
+    )
+    .await
+    .unwrap()
+}
+
+async fn append_representation(
+    dataset: Dataset,
+    value: ArrowField,
+    values: ArrayRef,
+) -> Result<Dataset> {
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, false),
+        value,
+    ]));
+    let ids = Arc::new(Int32Array::from_iter_values(2..2 + values.len() as i32));
+    let batch = RecordBatch::try_new(schema.clone(), vec![ids, values]).unwrap();
+    Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch)], schema),
+        Arc::new(dataset),
+        Some(WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        }),
+    )
+    .await
+}
+
+/// An append converts string and binary columns to the representation of the
+/// table's column; the table, its existing files and what reads return stay
+/// as they were.
+#[rstest::rstest]
+#[case::large_utf8_into_utf8(DataType::Utf8, DataType::LargeUtf8)]
+#[case::utf8_view_into_utf8(DataType::Utf8, DataType::Utf8View)]
+#[case::dictionary_into_utf8(DataType::Utf8, dictionary_type(DataType::Int8, DataType::LargeUtf8))]
+#[case::utf8_into_large_utf8(DataType::LargeUtf8, DataType::Utf8)]
+#[case::view_dictionary_into_large_utf8(
+    DataType::LargeUtf8,
+    dictionary_type(DataType::UInt16, DataType::Utf8View)
+)]
+#[case::utf8_into_dictionary(dictionary_type(DataType::Int32, DataType::Utf8), DataType::Utf8View)]
+#[case::dictionary_keys_into_dictionary(
+    dictionary_type(DataType::Int32, DataType::Utf8),
+    dictionary_type(DataType::Int8, DataType::LargeUtf8)
+)]
+#[case::large_binary_into_binary(DataType::Binary, DataType::LargeBinary)]
+#[case::binary_view_into_large_binary(DataType::LargeBinary, DataType::BinaryView)]
+#[case::binary_into_dictionary(
+    dictionary_type(DataType::Int16, DataType::Binary),
+    DataType::LargeBinary
+)]
+#[tokio::test]
+async fn test_append_converts_string_and_binary_representations(
+    #[case] table_type: DataType,
+    #[case] input_type: DataType,
+) {
+    let dataset = table_with_representation(&table_type).await;
+    let schema_before = dataset.schema().clone();
+    let files_before = dataset.get_fragments()[0].metadata().files.clone();
+
+    let values = [
+        Some("alpha"),
+        None,
+        Some("a value longer than twelve bytes"),
+        Some("alpha"),
+    ];
+    let input = representation_array(&input_type, &values);
+    let dataset = append_representation(
+        dataset,
+        ArrowField::new("value", input_type, true),
+        input.clone(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(dataset.schema(), &schema_before);
+    assert_eq!(dataset.get_fragments().len(), 2);
+    assert_eq!(dataset.get_fragments()[0].metadata().files, files_before);
+    let result = dataset.scan().try_into_batch().await.unwrap();
+    assert_eq!(result["value"].data_type(), &table_type);
+    assert_eq!(
+        result.schema().field_with_name("value").unwrap().metadata(),
+        &HashMap::from([("note".to_string(), "kept".to_string())])
+    );
+    assert_eq!(
+        representation_values(result["value"].slice(2, 4).as_ref()).as_ref(),
+        representation_values(input.as_ref()).as_ref()
+    );
+    assert_eq!(result["value"].slice(2, 4).null_count(), 1);
+}
+
+/// Struct members and list items convert like top-level columns.
+#[tokio::test]
+async fn test_append_converts_nested_string_and_binary_representations() {
+    let table_schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, false),
+        ArrowField::new(
+            "value",
+            DataType::Struct(
+                vec![
+                    ArrowField::new("name", DataType::Utf8, true),
+                    ArrowField::new(
+                        "payloads",
+                        DataType::List(Arc::new(ArrowField::new("item", DataType::Binary, true))),
+                        true,
+                    ),
+                ]
+                .into(),
+            ),
+            true,
+        ),
+    ]));
+    let empty = RecordBatch::new_empty(table_schema.clone());
+    let dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(empty)], table_schema.clone()),
+        "memory://",
+        None,
+    )
+    .await
+    .unwrap();
+
+    let names = representation_array(&DataType::LargeUtf8, &[Some("a"), None, Some("c")]);
+    let payload_type = DataType::BinaryView;
+    let payloads = Arc::new(arrow_array::ListArray::new(
+        Arc::new(ArrowField::new("item", payload_type.clone(), true)),
+        arrow_buffer::OffsetBuffer::from_lengths([2, 0, 1]),
+        representation_array(
+            &payload_type,
+            &[Some("x"), None, Some("a payload past the inline size")],
+        ),
+        Some(arrow_buffer::NullBuffer::from(vec![true, false, true])),
+    )) as ArrayRef;
+    let value_fields: arrow_schema::Fields = vec![
+        ArrowField::new("name", DataType::LargeUtf8, true),
+        ArrowField::new("payloads", payloads.data_type().clone(), true),
+    ]
+    .into();
+    let value = Arc::new(StructArray::new(
+        value_fields.clone(),
+        vec![names, payloads],
+        Some(arrow_buffer::NullBuffer::from(vec![true, false, true])),
+    )) as ArrayRef;
+    let dataset = append_representation(
+        dataset,
+        ArrowField::new("value", DataType::Struct(value_fields), true),
+        value,
+    )
+    .await
+    .unwrap();
+
+    let result = dataset.scan().try_into_batch().await.unwrap();
+    assert_eq!(
+        result
+            .schema()
+            .field_with_name("value")
+            .unwrap()
+            .data_type(),
+        table_schema.field(1).data_type()
+    );
+    let value = result["value"].as_struct();
+    assert_eq!(
+        value.nulls().unwrap().iter().collect::<Vec<_>>(),
+        [true, false, true]
+    );
+    assert_eq!(
+        value
+            .column(0)
+            .as_string::<i32>()
+            .iter()
+            .collect::<Vec<_>>(),
+        [Some("a"), None, Some("c")]
+    );
+    let payloads = value.column(1).as_list::<i32>();
+    assert_eq!(payloads.value_offsets(), &[0, 2, 2, 3]);
+    assert_eq!(
+        payloads.nulls().unwrap().iter().collect::<Vec<_>>(),
+        [true, false, true]
+    );
+    assert_eq!(
+        payloads
+            .values()
+            .as_binary::<i32>()
+            .iter()
+            .collect::<Vec<_>>(),
+        [
+            Some(&b"x"[..]),
+            None,
+            Some(&b"a payload past the inline size"[..])
+        ]
+    );
+}
+
+/// Conversions across families or to another extension type fail naming the
+/// field, and commit nothing.
+#[rstest::rstest]
+#[case::string_into_binary(DataType::Binary, ArrowField::new("value", DataType::LargeUtf8, true))]
+#[case::binary_into_string(DataType::Utf8, ArrowField::new("value", DataType::LargeBinary, true))]
+#[case::other_extension(
+    DataType::Utf8,
+    ArrowField::new("value", DataType::LargeUtf8, true).with_metadata(HashMap::from([(
+        ARROW_EXT_NAME_KEY.to_string(),
+        "example.label".to_string(),
+    )]))
+)]
+#[tokio::test]
+async fn test_append_rejects_unsupported_representation_conversions(
+    #[case] table_type: DataType,
+    #[case] input_field: ArrowField,
+) {
+    let dataset = table_with_representation(&table_type).await;
+    let values = representation_array(input_field.data_type(), &[Some("a"), None]);
+    let error = append_representation(dataset.clone(), input_field, values)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::SchemaMismatch { .. }), "{error:?}");
+    assert!(error.to_string().contains("`value`"), "{error}");
+    assert_eq!(dataset.latest_version_id().await.unwrap(), 1);
+}
+
+/// A batch with more distinct values than the table's dictionary keys address
+/// fails naming the field instead of losing values.
+#[tokio::test]
+async fn test_append_rejects_dictionary_key_overflow() {
+    let dataset = table_with_representation(&dictionary_type(DataType::Int8, DataType::Utf8)).await;
+    let values = Arc::new(StringArray::from_iter_values(
+        (0..200).map(|i| format!("value {i}")),
+    )) as ArrayRef;
+    let error = append_representation(
+        dataset.clone(),
+        ArrowField::new("value", DataType::Utf8, true),
+        values,
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+    assert!(error.to_string().contains("field `value`"), "{error}");
+    assert_eq!(dataset.latest_version_id().await.unwrap(), 1);
+}
+
+/// Narrowing dictionary keys re-encodes the values the rows reference, so a
+/// slice of a large dictionary fits a small key type when its values do.
+#[rstest::rstest]
+#[case::string(DataType::Utf8)]
+#[case::binary(DataType::Binary)]
+#[tokio::test]
+async fn test_append_reencodes_dictionary_for_narrower_keys(#[case] value_type: DataType) {
+    let table_type = dictionary_type(DataType::Int8, value_type.clone());
+    let dataset = table_with_representation(&table_type).await;
+    let strings: ArrayRef = Arc::new(StringArray::from_iter_values(
+        (0..256).map(|i| format!("value {i}")),
+    ));
+    let dictionary = arrow_array::DictionaryArray::<arrow_array::types::Int16Type>::try_new(
+        arrow_array::Int16Array::from(vec![Some(0), Some(200), None]),
+        arrow::compute::cast(&strings, &value_type).unwrap(),
+    )
+    .unwrap();
+    let values = Arc::new(dictionary.slice(1, 2)) as ArrayRef;
+    let dataset = append_representation(
+        dataset,
+        ArrowField::new("value", values.data_type().clone(), true),
+        values,
+    )
+    .await
+    .unwrap();
+
+    let result = dataset.scan().try_into_batch().await.unwrap();
+    assert_eq!(result["value"].data_type(), &table_type);
+    assert_eq!(
+        representation_values(result["value"].as_ref()).as_ref(),
+        representation_values(
+            representation_array(&table_type, &[Some("first"), None, Some("value 200"), None])
+                .as_ref()
+        )
+        .as_ref()
+    );
+}
+
+/// Narrowing dictionary keys counts distinct values, not referenced entries:
+/// entries holding equal values share one key, and an entry holding null
+/// becomes a null key.
+#[rstest::rstest]
+#[case::string(DataType::Utf8, DataType::Utf8)]
+#[case::string_view(DataType::Utf8View, DataType::Utf8)]
+#[case::binary(DataType::Binary, DataType::Binary)]
+#[case::large_binary(DataType::LargeBinary, DataType::Binary)]
+#[tokio::test]
+async fn test_append_reencodes_dictionary_by_value_for_narrower_keys(
+    #[case] input_type: DataType,
+    #[case] value_type: DataType,
+) {
+    let table_type = dictionary_type(DataType::Int8, value_type);
+    // 129 entries holding the same value, all referenced; then 128 distinct
+    // values and an entry holding null, all referenced. Each ends with a null
+    // key.
+    let same = vec![Some("same".to_string()); 129];
+    let distinct = (0..128)
+        .map(|i| Some(format!("value {i}")))
+        .chain([None])
+        .collect::<Vec<_>>();
+    for entries in [same, distinct] {
+        let dataset = table_with_representation(&table_type).await;
+        let strings: ArrayRef = Arc::new(StringArray::from(entries.clone()));
+        let dictionary = arrow_array::DictionaryArray::<arrow_array::types::Int16Type>::try_new(
+            arrow_array::Int16Array::from_iter((0..entries.len() as i16).map(Some).chain([None])),
+            arrow::compute::cast(&strings, &input_type).unwrap(),
+        )
+        .unwrap();
+        let values = Arc::new(dictionary) as ArrayRef;
+        let dataset = append_representation(
+            dataset,
+            ArrowField::new("value", values.data_type().clone(), true),
+            values,
+        )
+        .await
+        .unwrap();
+
+        // Read the appended fragment alone: a scan of the whole table merges
+        // both fragments' dictionaries into one, which 128 entries plus the
+        // first fragment's would overflow on their own.
+        let fragment = dataset.get_fragment(1).unwrap();
+        let result = fragment.scan().try_into_batch().await.unwrap();
+        assert_eq!(result["value"].data_type(), &table_type);
+        let expected = entries
+            .iter()
+            .map(|entry| entry.as_deref())
+            .chain([None])
+            .collect::<Vec<_>>();
+        assert_eq!(
+            representation_values(result["value"].as_ref()).as_ref(),
+            representation_values(representation_array(&table_type, &expected).as_ref()).as_ref()
+        );
+    }
+}
+
+/// A dictionary with more entries than the target key type addresses keeps
+/// only the entries its rows reference, even when those keys fit: the writer
+/// numbers every non-null entry, and unused ones would be stored as well.
+#[rstest::rstest]
+#[case::int8_v2_0(DataType::Int8, 128, LanceFileVersion::V2_0)]
+#[case::int8_v2_2(DataType::Int8, 128, LanceFileVersion::V2_2)]
+#[case::uint8_v2_0(DataType::UInt8, 256, LanceFileVersion::V2_0)]
+#[case::uint8_v2_2(DataType::UInt8, 256, LanceFileVersion::V2_2)]
+#[tokio::test]
+async fn test_append_compacts_oversized_dictionary_with_fitting_keys(
+    #[case] key_type: DataType,
+    #[case] key_space: usize,
+    #[case] version: LanceFileVersion,
+) {
+    let table_type = dictionary_type(key_type, DataType::Utf8);
+    let others = |count: usize| (1..=count).map(|i| Some(format!("value {i}")));
+    // One entry more than the key space either way: an unused null last, or
+    // all non-null.
+    let with_null = std::iter::once(Some("keep".to_string()))
+        .chain(others(key_space - 1))
+        .chain([None])
+        .collect::<Vec<_>>();
+    let non_null = std::iter::once(Some("keep".to_string()))
+        .chain(others(key_space))
+        .collect::<Vec<_>>();
+    for entries in [with_null, non_null] {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("value", table_type.clone(), true),
+        ]));
+        let seed = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![0, 1])),
+                representation_array(&table_type, &[Some("first"), None]),
+            ],
+        )
+        .unwrap();
+        let dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(seed)], schema),
+            "memory://",
+            Some(WriteParams {
+                data_storage_version: Some(version),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let dictionary = arrow_array::DictionaryArray::<arrow_array::types::Int16Type>::try_new(
+            arrow_array::Int16Array::from(vec![Some(0), None]),
+            Arc::new(StringArray::from(entries)),
+        )
+        .unwrap();
+        let values = Arc::new(dictionary) as ArrayRef;
+        let dataset = append_representation(
+            dataset,
+            ArrowField::new("value", values.data_type().clone(), true),
+            values,
+        )
+        .await
+        .unwrap();
+
+        let fragment = dataset.get_fragments().pop().unwrap();
+        let result = fragment.scan().try_into_batch().await.unwrap();
+        assert_eq!(result["value"].data_type(), &table_type);
+        // V2.0 reads null rows back through a null dictionary entry, so count
+        // the non-null entries.
+        let stored = result["value"].as_any_dictionary().values();
+        assert_eq!(stored.len() - stored.null_count(), 1);
+        assert_eq!(
+            representation_values(result["value"].as_ref()).as_ref(),
+            representation_values(
+                representation_array(&table_type, &[Some("keep"), None]).as_ref()
+            )
+            .as_ref()
+        );
+    }
+}
+
+/// Values that need more bytes than 32-bit offsets address fail naming the
+/// field before anything is allocated for them.
+#[tokio::test]
+async fn test_append_rejects_offset_overflow() {
+    let dataset = table_with_representation(&DataType::Binary).await;
+    // 2049 views of the same 1 MiB value reference more than 2 GiB of values
+    // while holding only 1 MiB.
+    let value = vec![b'x'; 1024 * 1024];
+    // A view of a value over 12 bytes: its length, its first 4 bytes, then
+    // buffer 0 at offset 0.
+    let prefix = u32::from_le_bytes(value[..4].try_into().unwrap());
+    let view = value.len() as u128 | (u128::from(prefix) << 32);
+    let values = Arc::new(
+        arrow_array::BinaryViewArray::try_new(
+            arrow_buffer::ScalarBuffer::from(vec![view; 2049]),
+            vec![arrow_buffer::Buffer::from_vec(value)],
+            None,
+        )
+        .unwrap(),
+    ) as ArrayRef;
+    let error = append_representation(
+        dataset.clone(),
+        ArrowField::new("value", DataType::BinaryView, true),
+        values,
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+    let message = error.to_string();
+    assert!(message.contains("field `value`"), "{message}");
+    assert!(message.contains("32-bit offsets"), "{message}");
+    assert_eq!(dataset.latest_version_id().await.unwrap(), 1);
+}
+
+fn map_of(key_type: DataType, value_type: DataType) -> DataType {
+    let entries = ArrowField::new(
+        "entries",
+        DataType::Struct(
+            vec![
+                ArrowField::new("keys", key_type, false),
+                ArrowField::new("values", value_type, true),
+            ]
+            .into(),
+        ),
+        false,
+    );
+    DataType::Map(Arc::new(entries), false)
+}
+
+/// Map keys and values convert like top-level columns; null maps stay null.
+#[tokio::test]
+async fn test_append_converts_map_string_representations() {
+    let table_type = map_of(DataType::Utf8, DataType::Utf8);
+    let table_schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, false),
+        ArrowField::new("value", table_type.clone(), true),
+    ]));
+    let dataset = Dataset::write(
+        RecordBatchIterator::new(
+            vec![Ok(RecordBatch::new_empty(table_schema.clone()))],
+            table_schema.clone(),
+        ),
+        "memory://",
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    let input_type = map_of(DataType::LargeUtf8, DataType::Utf8View);
+    let DataType::Map(entries_field, _) = &input_type else {
+        unreachable!()
+    };
+    let DataType::Struct(entry_fields) = entries_field.data_type() else {
+        unreachable!()
+    };
+    let entries = StructArray::new(
+        entry_fields.clone(),
+        vec![
+            representation_array(&DataType::LargeUtf8, &[Some("k1"), Some("k2"), Some("k3")]),
+            representation_array(
+                &DataType::Utf8View,
+                &[Some("v1"), None, Some("a value past the inline size")],
+            ),
+        ],
+        None,
+    );
+    let maps = Arc::new(
+        arrow_array::MapArray::try_new(
+            entries_field.clone(),
+            arrow_buffer::OffsetBuffer::from_lengths([2, 0, 1]),
+            entries,
+            Some(arrow_buffer::NullBuffer::from(vec![true, false, true])),
+            false,
+        )
+        .unwrap(),
+    ) as ArrayRef;
+    let dataset = append_representation(dataset, ArrowField::new("value", input_type, true), maps)
+        .await
+        .unwrap();
+
+    let result = dataset.scan().try_into_batch().await.unwrap();
+    assert_eq!(result["value"].data_type(), &table_type);
+    let maps = result["value"].as_map();
+    assert_eq!(
+        maps.nulls().unwrap().iter().collect::<Vec<_>>(),
+        [true, false, true]
+    );
+    assert_eq!(maps.value_offsets(), &[0, 2, 2, 3]);
+    assert_eq!(
+        maps.keys().as_string::<i32>().iter().collect::<Vec<_>>(),
+        [Some("k1"), Some("k2"), Some("k3")]
+    );
+    assert_eq!(
+        maps.values().as_string::<i32>().iter().collect::<Vec<_>>(),
+        [Some("v1"), None, Some("a value past the inline size")]
+    );
+}
+
+/// An all-null dictionary has no values; it appends as nulls in every
+/// representation.
+#[rstest::rstest]
+#[case::into_utf8(DataType::Utf8)]
+#[case::into_large_utf8(DataType::LargeUtf8)]
+#[case::into_dictionary(dictionary_type(DataType::Int32, DataType::Utf8))]
+#[case::into_binary(DataType::Binary)]
+#[tokio::test]
+async fn test_append_converts_all_null_dictionary(#[case] table_type: DataType) {
+    let dataset = table_with_representation(&table_type).await;
+    let value_type = match &table_type {
+        DataType::Binary => DataType::LargeBinary,
+        _ => DataType::LargeUtf8,
+    };
+    let values = Arc::new(
+        arrow_array::DictionaryArray::<arrow_array::types::Int8Type>::try_new(
+            Int8Array::from(vec![None, None]),
+            arrow_array::new_empty_array(&value_type),
+        )
+        .unwrap(),
+    ) as ArrayRef;
+    let dataset = append_representation(
+        dataset,
+        ArrowField::new("value", values.data_type().clone(), true),
+        values,
+    )
+    .await
+    .unwrap();
+
+    let result = dataset.scan().try_into_batch().await.unwrap();
+    assert_eq!(result["value"].data_type(), &table_type);
+    assert_eq!(result.num_rows(), 4);
+    assert_eq!(result["value"].slice(2, 2).null_count(), 2);
 }
