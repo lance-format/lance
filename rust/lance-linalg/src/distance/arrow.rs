@@ -11,8 +11,8 @@ use lance_arrow::FixedSizeListArrayExt;
 use num_traits::AsPrimitive;
 
 use super::{
-    Cosine, DistanceFunc, DistanceType, Dot, L2, Normalize, cosine_distance_batch_into,
-    dot_distance_batch_into, hamming, l2_distance_batch_into, norm_l2,
+    Cosine, DistanceType, Dot, L2, Normalize, cosine_distance_batch_into, dot_distance_batch_into,
+    hamming, l2_distance_batch_into, norm_l2,
 };
 use crate::Result;
 
@@ -92,9 +92,22 @@ impl Operation<'_> {
                 }
                 Ok(distances)
             }
-            Self::Multivec(metric, rows) => {
-                Ok(multivec(query, values, dim, rows, metric.try_func()?))
-            }
+            Self::Multivec(metric, rows) => match metric {
+                DistanceType::Cosine => {
+                    // The float types use the default `Cosine::cosine`, which is
+                    // `cosine_fast(x, norm_l2(x), y)`, so computing each query
+                    // sub-vector's norm once gives the same distances without a
+                    // query pass per (row, stored sub-vector) pair.
+                    let query_norms: Vec<f32> = query.chunks_exact(dim).map(norm_l2).collect();
+                    Ok(multivec(query, values, dim, rows, |query_index, q, v| {
+                        T::cosine_fast(q, query_norms[query_index], v)
+                    }))
+                }
+                _ => {
+                    let distance = metric.try_func()?;
+                    Ok(multivec(query, values, dim, rows, |_, q, v| distance(q, v)))
+                }
+            },
             Self::Norm(Norm::L2) => Ok(values.chunks_exact(dim).map(norm_l2).collect()),
             Self::Norm(Norm::Squared) => Ok(values
                 .chunks_exact(dim)
@@ -129,7 +142,9 @@ impl Operation<'_> {
                 Ok(distances)
             }
             Self::Multivec(DistanceType::Hamming, rows) => {
-                Ok(multivec(query, values, dim, rows, hamming::hamming))
+                Ok(multivec(query, values, dim, rows, |_, q, v| {
+                    hamming::hamming(q, v)
+                }))
             }
             _ => Err(self.error("UInt8 values require Hamming distance")),
         }
@@ -232,13 +247,10 @@ where
     )
 }
 
-fn multivec<T>(
-    query: &[T],
-    values: &[T],
-    dim: usize,
-    rows: &ListArray,
-    distance: DistanceFunc<T>,
-) -> Vec<f32> {
+fn multivec<T, F>(query: &[T], values: &[T], dim: usize, rows: &ListArray, distance: F) -> Vec<f32>
+where
+    F: Fn(usize, &[T], &[T]) -> f32,
+{
     rows.value_offsets()
         .windows(2)
         .enumerate()
@@ -249,10 +261,11 @@ fn multivec<T>(
             let values = &values[offsets[0] as usize * dim..offsets[1] as usize * dim];
             query
                 .chunks_exact(dim)
-                .map(|q| {
+                .enumerate()
+                .map(|(query_index, q)| {
                     values
                         .chunks_exact(dim)
-                        .map(|v| distance(q, v))
+                        .map(|v| distance(query_index, q, v))
                         .min_by(f32::total_cmp)
                         .unwrap_or(f32::NAN)
                 })
