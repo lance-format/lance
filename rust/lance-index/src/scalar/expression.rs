@@ -33,13 +33,13 @@
 
 use std::{
     cmp::{Ordering, Reverse},
-    collections::{HashMap, HashSet, hash_map::Entry},
+    collections::{HashMap, HashSet, VecDeque, hash_map::DefaultHasher, hash_map::Entry},
+    hash::{Hash, Hasher},
     ops::Bound,
     sync::Arc,
 };
 
 use arrow_schema::{DataType, Field};
-use async_recursion::async_recursion;
 use async_trait::async_trait;
 use datafusion_common::ScalarValue;
 use datafusion_expr::{
@@ -47,17 +47,16 @@ use datafusion_expr::{
     expr::{InList, Like, ScalarFunction},
     utils::{conjunction, split_conjunction},
 };
-use tokio::try_join;
 
 use super::{
     AnyQuery, BloomFilterQuery, LabelListQuery, MetricsCollector, SargableQuery, ScalarIndex,
-    SearchOptions, SearchResult, TextQuery, TokenQuery, label_list::validate_label_list_data_type,
+    TextQuery, TokenQuery, label_list::validate_label_list_data_type,
 };
 use crate::scalar::inverted::InvertedIndexParams;
 use crate::scalar::inverted::query::try_collect_query_tokens;
 use lance_core::{Error, Result};
 use lance_datafusion_exec::expr::{column_names_in_expr, safe_coerce_scalar};
-use lance_select::{IndexExprResult, MaskDomain, NullableIndexExprResult, NullableRowAddrMask};
+use lance_select::{IndexExprResult, MaskDomain, NullableIndexExprResult};
 use roaring::RoaringBitmap;
 use tracing::instrument;
 
@@ -208,6 +207,9 @@ pub struct ScalarIndexPlan<'a> {
     /// `needs_recheck` when the index can return [`SearchResult::AtMost`] or
     /// [`SearchResult::AtLeast`], because some scans decide whether to recheck
     /// rows before the search runs.
+    ///
+    /// [`SearchResult::AtMost`]: crate::scalar::SearchResult::AtMost
+    /// [`SearchResult::AtLeast`]: crate::scalar::SearchResult::AtLeast
     pub search: ScalarIndexSearch,
     /// The conjuncts that `search` answers, borrowed from the slice passed to
     /// [`ScalarIndexPlanner::plan`]. Every other conjunct goes on to the
@@ -226,6 +228,7 @@ pub struct ScalarIndexPlan<'a> {
 /// consumes the key residual too, and the search returns
 /// [`SearchResult::Exact`]. The row residual stays unconsumed.
 ///
+/// [`SearchResult::Exact`]: crate::scalar::SearchResult::Exact
 /// [`plan_tuple_predicate`]: crate::scalar::tuple::planner::plan_tuple_predicate
 ///
 /// ```
@@ -1843,13 +1846,74 @@ impl ScalarIndexExpr {
     fn optimize_with_context(self, is_not_null_elidable: bool) -> Self {
         match self {
             Self::And(_, _) => self.optimize_and_tree(is_not_null_elidable),
-            Self::Or(lhs, rhs) => Self::Or(
-                Box::new(lhs.optimize_with_context(is_not_null_elidable)),
-                Box::new(rhs.optimize_with_context(is_not_null_elidable)),
-            ),
+            Self::Or(lhs, rhs) => Self::optimize_or_tree(*lhs, *rhs, is_not_null_elidable),
             Self::Not(inner) => Self::Not(Box::new(inner.optimize_with_context(false))),
             other => other,
         }
+    }
+
+    /// Flatten one contiguous OR region iteratively, optimize each branch,
+    /// deduplicate identical disjuncts preserving first-seen order, and rebuild
+    /// a balanced OR tree.
+    fn optimize_or_tree(lhs: Self, rhs: Self, is_not_null_elidable: bool) -> Self {
+        let mut stack = vec![rhs];
+        let mut current = lhs;
+        let first = loop {
+            current = match current {
+                Self::Or(l, r) => {
+                    stack.push(*r);
+                    *l
+                }
+                other => match other.optimize_with_context(is_not_null_elidable) {
+                    Self::Or(l, r) => {
+                        stack.push(*r);
+                        *l
+                    }
+                    branch => break branch,
+                },
+            };
+        };
+
+        let mut rest = VecDeque::new();
+        let mut seen: HashMap<u64, Vec<usize>> = HashMap::new();
+        seen.entry(hash_expr(&first)).or_default().push(0);
+
+        while let Some(node) = stack.pop() {
+            match node {
+                Self::Or(l, r) => {
+                    stack.push(*r);
+                    stack.push(*l);
+                }
+                other => match other.optimize_with_context(is_not_null_elidable) {
+                    Self::Or(l, r) => {
+                        stack.push(*r);
+                        stack.push(*l);
+                    }
+                    branch => {
+                        let hash = hash_expr(&branch);
+                        let is_dup = seen.get(&hash).is_some_and(|indices| {
+                            indices.iter().any(|&idx| {
+                                let existing = if idx == 0 {
+                                    &first
+                                } else if let Some(node) = rest.get(idx - 1) {
+                                    node
+                                } else {
+                                    return false;
+                                };
+                                exact_expr_eq(existing, &branch)
+                            })
+                        });
+                        if !is_dup {
+                            let idx = rest.len() + 1;
+                            rest.push_back(branch);
+                            seen.entry(hash).or_default().push(idx);
+                        }
+                    }
+                },
+            }
+        }
+
+        Self::rebuild_or_tree(first, rest)
     }
 
     /// Flatten one contiguous AND region, apply local optimizer rules, and
@@ -1860,6 +1924,26 @@ impl ScalarIndexExpr {
         let leaves = Self::optimize_and_leaves(leaves, is_not_null_elidable);
 
         Self::rebuild_and_tree(leaves).expect("AND tree optimization should keep at least one leaf")
+    }
+
+    fn push_unique_expr(
+        optimized: &mut Vec<Self>,
+        seen: &mut HashMap<u64, Vec<usize>>,
+        expr: Self,
+    ) {
+        let hash = hash_expr(&expr);
+        let is_dup = seen.get(&hash).is_some_and(|indices| {
+            indices.iter().any(|&idx| {
+                optimized
+                    .get(idx)
+                    .is_some_and(|existing| exact_expr_eq(existing, &expr))
+            })
+        });
+        if !is_dup {
+            let idx = optimized.len();
+            optimized.push(expr);
+            seen.entry(hash).or_default().push(idx);
+        }
     }
 
     /// Apply optimizer rules within one AND region only. OR branches have already
@@ -1886,6 +1970,7 @@ impl ScalarIndexExpr {
 
         let mut optimized = Vec::with_capacity(leaves.len());
         let mut range_positions = HashMap::new();
+        let mut seen: HashMap<u64, Vec<usize>> = HashMap::new();
 
         for leaf in leaves {
             if let Some(key) = leaf.is_not_null_query_key()
@@ -1897,68 +1982,92 @@ impl ScalarIndexExpr {
             if let Some(key) = leaf.range_query_key() {
                 match range_positions.entry(key) {
                     Entry::Vacant(entry) => {
-                        entry.insert(optimized.len());
+                        let idx = optimized.len();
+                        entry.insert(idx);
+                        seen.entry(hash_expr(&leaf)).or_default().push(idx);
                         optimized.push(leaf);
                     }
                     Entry::Occupied(entry) => {
-                        if !optimized[*entry.get()].try_merge_range(&leaf) {
-                            optimized.push(leaf);
+                        let target_idx = *entry.get();
+                        let merged = optimized
+                            .get_mut(target_idx)
+                            .is_some_and(|existing| existing.try_merge_range(&leaf));
+                        if !merged {
+                            Self::push_unique_expr(&mut optimized, &mut seen, leaf);
                         }
                     }
                 }
             } else {
-                optimized.push(leaf);
+                Self::push_unique_expr(&mut optimized, &mut seen, leaf);
             }
         }
 
         optimized
     }
 
-    /// Recursively collect all leaf nodes from an AND tree. OR branches are
-    /// optimized independently with the current null-elision context. NOT
-    /// branches remain leaves while their children are optimized with null
-    /// elimination disabled.
+    /// Iteratively collect all leaf nodes from a contiguous AND tree. OR
+    /// branches are optimized independently with the current null-elision
+    /// context. NOT branches remain leaves while their children are optimized
+    /// with null elimination disabled.
     fn collect_and_leaves(self, leaves: &mut Vec<Self>, is_not_null_elidable: bool) {
-        match self {
-            Self::And(lhs, rhs) => {
-                lhs.collect_and_leaves(leaves, is_not_null_elidable);
-                rhs.collect_and_leaves(leaves, is_not_null_elidable);
+        let mut stack = vec![self];
+        while let Some(node) = stack.pop() {
+            match node {
+                Self::And(lhs, rhs) => {
+                    stack.push(*rhs);
+                    stack.push(*lhs);
+                }
+                or_node @ Self::Or(_, _) => {
+                    match or_node.optimize_with_context(is_not_null_elidable) {
+                        Self::And(lhs, rhs) => {
+                            stack.push(*rhs);
+                            stack.push(*lhs);
+                        }
+                        other => leaves.push(other),
+                    }
+                }
+                Self::Not(inner) => {
+                    leaves.push(Self::Not(Box::new(inner.optimize_with_context(false))));
+                }
+                other => leaves.push(other),
             }
-            Self::Or(lhs, rhs) => {
-                leaves.push(Self::Or(
-                    Box::new(lhs.optimize_with_context(is_not_null_elidable)),
-                    Box::new(rhs.optimize_with_context(is_not_null_elidable)),
-                ));
-            }
-            Self::Not(inner) => {
-                leaves.push(Self::Not(Box::new(inner.optimize_with_context(false))))
-            }
-            other => leaves.push(other),
         }
+    }
+
+    /// Rebuild a non-empty list of nodes into a balanced binary tree so large
+    /// conjunctions and disjunctions have O(log2 N) depth.
+    fn rebuild_non_empty_binary_tree(
+        mut first: Self,
+        mut rest: VecDeque<Self>,
+        combine: fn(Box<Self>, Box<Self>) -> Self,
+    ) -> Self {
+        while !rest.is_empty() {
+            let mut next_rest = VecDeque::with_capacity(rest.len() / 2);
+            if let Some(second) = rest.pop_front() {
+                first = combine(Box::new(first), Box::new(second));
+            }
+            while let Some(lhs) = rest.pop_front() {
+                if let Some(rhs) = rest.pop_front() {
+                    next_rest.push_back(combine(Box::new(lhs), Box::new(rhs)));
+                } else {
+                    next_rest.push_back(lhs);
+                }
+            }
+            rest = next_rest;
+        }
+        first
+    }
+
+    fn rebuild_or_tree(first: Self, rest: VecDeque<Self>) -> Self {
+        Self::rebuild_non_empty_binary_tree(first, rest, Self::Or)
     }
 
     /// Rebuild as a balanced tree so large planner-generated conjunctions do not
     /// become deep left-leaning trees after optimization.
     fn rebuild_and_tree(leaves: Vec<Self>) -> Option<Self> {
-        let mut leaves = leaves;
-        if leaves.is_empty() {
-            return None;
-        }
-
-        while leaves.len() > 1 {
-            let mut next = Vec::with_capacity(leaves.len().div_ceil(2));
-            let mut iter = leaves.into_iter();
-            while let Some(lhs) = iter.next() {
-                if let Some(rhs) = iter.next() {
-                    next.push(Self::And(Box::new(lhs), Box::new(rhs)));
-                } else {
-                    next.push(lhs);
-                }
-            }
-            leaves = next;
-        }
-
-        leaves.pop()
+        let mut rest = VecDeque::from(leaves);
+        let first = rest.pop_front()?;
+        Some(Self::rebuild_non_empty_binary_tree(first, rest, Self::And))
     }
 
     /// Detect the scalar-index representation of `col IS NOT NULL`, which is
@@ -2044,6 +2153,73 @@ impl ScalarIndexExpr {
     }
 }
 
+/// Hash an entire [`ScalarIndexExpr`] iteratively for O(N) structural deduplication.
+fn hash_expr(expr: &ScalarIndexExpr) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    let mut stack = vec![expr];
+    while let Some(node) = stack.pop() {
+        match node {
+            ScalarIndexExpr::Not(inner) => {
+                0u8.hash(&mut hasher);
+                stack.push(inner.as_ref());
+            }
+            ScalarIndexExpr::And(lhs, rhs) => {
+                1u8.hash(&mut hasher);
+                stack.push(rhs.as_ref());
+                stack.push(lhs.as_ref());
+            }
+            ScalarIndexExpr::Or(lhs, rhs) => {
+                2u8.hash(&mut hasher);
+                stack.push(rhs.as_ref());
+                stack.push(lhs.as_ref());
+            }
+            ScalarIndexExpr::Query(search) => {
+                3u8.hash(&mut hasher);
+                search.column.hash(&mut hasher);
+                search.index_name.hash(&mut hasher);
+                super::eval::hash_search_key(search).hash(&mut hasher);
+                match &search.fragment_bitmap {
+                    None => 0u8.hash(&mut hasher),
+                    Some(bm) => {
+                        1u8.hash(&mut hasher);
+                        bm.len().hash(&mut hasher);
+                        bm.min().hash(&mut hasher);
+                        bm.max().hash(&mut hasher);
+                    }
+                }
+            }
+        }
+    }
+    hasher.finish()
+}
+
+/// Exact structural equality for optimizer deduplication, respecting all
+/// [`ScalarIndexSearch`] metadata (`index_type`, `needs_recheck`, `fragment_bitmap`).
+fn exact_expr_eq(a: &ScalarIndexExpr, b: &ScalarIndexExpr) -> bool {
+    let mut stack = vec![(a, b)];
+    while let Some((lhs, rhs)) = stack.pop() {
+        match (lhs, rhs) {
+            (ScalarIndexExpr::Not(l), ScalarIndexExpr::Not(r)) => {
+                stack.push((l.as_ref(), r.as_ref()));
+            }
+            (ScalarIndexExpr::And(l0, l1), ScalarIndexExpr::And(r0, r1))
+            | (ScalarIndexExpr::Or(l0, l1), ScalarIndexExpr::Or(r0, r1)) => {
+                stack.push((l1.as_ref(), r1.as_ref()));
+                stack.push((l0.as_ref(), r0.as_ref()));
+            }
+            (ScalarIndexExpr::Query(ls), ScalarIndexExpr::Query(rs)) => {
+                if !super::eval::canonical_search_eq(ls, rs)
+                    || ls.fragment_bitmap != rs.fragment_bitmap
+                {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
 impl std::fmt::Display for ScalarIndexExpr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -2058,43 +2234,6 @@ impl std::fmt::Display for ScalarIndexExpr {
                 search.index_type
             ),
         }
-    }
-}
-
-fn search_result_to_nullable(result: SearchResult, domain: MaskDomain) -> NullableIndexExprResult {
-    let result = match result {
-        SearchResult::Exact(mask) => {
-            NullableIndexExprResult::exact(NullableRowAddrMask::AllowList(mask))
-        }
-        SearchResult::AtMost(mask) => {
-            NullableIndexExprResult::at_most(NullableRowAddrMask::AllowList(mask))
-        }
-        SearchResult::AtLeast(mask) => {
-            NullableIndexExprResult::at_least(NullableRowAddrMask::AllowList(mask))
-        }
-    };
-    result.with_domain(domain)
-}
-
-/// Reconcile mismatched mask domains before combining two results with
-/// `And`/`Or`.
-///
-/// Converts whichever side is row-id-domain into row-address domain (via
-/// [`ScalarIndexLoader::row_id_result_to_row_addrs`]). Same-domain pairs
-/// (the common case) pass through untouched.
-async fn reconcile_domains(
-    index_loader: &dyn ScalarIndexLoader,
-    lhs: NullableIndexExprResult,
-    rhs: NullableIndexExprResult,
-) -> Result<(NullableIndexExprResult, NullableIndexExprResult)> {
-    match (lhs.domain, rhs.domain) {
-        (MaskDomain::RowId, MaskDomain::RowAddress) => {
-            Ok((index_loader.row_id_result_to_row_addrs(lhs).await?, rhs))
-        }
-        (MaskDomain::RowAddress, MaskDomain::RowId) => {
-            Ok((lhs, index_loader.row_id_result_to_row_addrs(rhs).await?))
-        }
-        _ => Ok((lhs, rhs)),
     }
 }
 
@@ -2114,61 +2253,13 @@ impl ScalarIndexExpr {
             .await
     }
 
-    #[async_recursion]
     async fn evaluate_with_options(
         &self,
         index_loader: &dyn ScalarIndexLoader,
         metrics: &dyn MetricsCollector,
         track_nulls: bool,
     ) -> Result<NullableIndexExprResult> {
-        match self {
-            Self::Not(inner) => {
-                // NOT needs the child's NULL rows to preserve SQL three-valued
-                // logic. Once enabled, keep tracking through the whole subtree.
-                let result = inner
-                    .evaluate_with_options(index_loader, metrics, true)
-                    .await?;
-                Ok(!result)
-            }
-            Self::And(lhs, rhs) => {
-                let lhs_result = lhs.evaluate_with_options(index_loader, metrics, track_nulls);
-                let rhs_result = rhs.evaluate_with_options(index_loader, metrics, track_nulls);
-                let (lhs_result, rhs_result) = try_join!(lhs_result, rhs_result)?;
-                let (lhs_result, rhs_result) =
-                    reconcile_domains(index_loader, lhs_result, rhs_result).await?;
-                Ok(lhs_result & rhs_result)
-            }
-            Self::Or(lhs, rhs) => {
-                let lhs_result = lhs.evaluate_with_options(index_loader, metrics, track_nulls);
-                let rhs_result = rhs.evaluate_with_options(index_loader, metrics, track_nulls);
-                let (lhs_result, rhs_result) = try_join!(lhs_result, rhs_result)?;
-                let (lhs_result, rhs_result) =
-                    reconcile_domains(index_loader, lhs_result, rhs_result).await?;
-                Ok(lhs_result | rhs_result)
-            }
-            Self::Query(search) => {
-                let index = index_loader
-                    .load_index(&search.column, &search.index_name, metrics)
-                    .await?;
-                let search_result = index
-                    .search_with_options(
-                        search.query.as_ref(),
-                        SearchOptions::default().with_track_nulls(track_nulls),
-                        metrics,
-                    )
-                    .await?;
-                // Leave address-domain results as-is and tag row-id-domain
-                // results accordingly; domain reconciliation (if this leaf
-                // ends up combined with a mismatched-domain sibling) happens
-                // in the `And`/`Or` arms above, not here.
-                let domain = if index.results_are_row_addresses() {
-                    MaskDomain::RowAddress
-                } else {
-                    MaskDomain::RowId
-                };
-                Ok(search_result_to_nullable(search_result, domain))
-            }
-        }
+        super::eval::evaluate_expr(self, index_loader, metrics, track_nulls).await
     }
 
     #[instrument(level = "debug", skip_all)]
@@ -2201,11 +2292,22 @@ impl ScalarIndexExpr {
     }
 
     pub fn needs_recheck(&self) -> bool {
-        match self {
-            Self::Not(inner) => inner.needs_recheck(),
-            Self::And(lhs, rhs) | Self::Or(lhs, rhs) => lhs.needs_recheck() || rhs.needs_recheck(),
-            Self::Query(search) => search.needs_recheck,
+        let mut stack = vec![self];
+        while let Some(node) = stack.pop() {
+            match node {
+                Self::Not(inner) => stack.push(inner.as_ref()),
+                Self::And(lhs, rhs) | Self::Or(lhs, rhs) => {
+                    stack.push(rhs.as_ref());
+                    stack.push(lhs.as_ref());
+                }
+                Self::Query(search) => {
+                    if search.needs_recheck {
+                        return true;
+                    }
+                }
+            }
         }
+        false
     }
 
     /// Whether every search in the expression reports rows where its predicate
@@ -3185,6 +3287,7 @@ mod tests {
     use lance_core::deepsize::DeepSizeOf;
     use lance_datafusion::exec::{LanceExecutionOptions, get_session_context};
     use lance_datafusion::planner::Planner;
+    use lance_select::NullableRowAddrMask;
     use lance_select::result::IndexExprResultWireFormat;
     use lance_select::{NullableRowAddrSet, RowAddrTreeMap};
     use roaring::RoaringBitmap;
@@ -3192,6 +3295,7 @@ mod tests {
 
     use crate::{Index, IndexType};
 
+    use crate::scalar::SearchResult;
     use crate::scalar::json::{JsonQuery, JsonQueryParser};
     use crate::scalar::registry::ScalarIndexPlugin;
     use datafusion_expr::{col, lit};
@@ -7330,6 +7434,184 @@ mod tests {
             }
         }
     }
+
+    fn collect_test_or_branches(expr: &ScalarIndexExpr, out: &mut Vec<ScalarIndexExpr>) {
+        let mut stack = vec![expr];
+        while let Some(node) = stack.pop() {
+            match node {
+                ScalarIndexExpr::Or(lhs, rhs) => {
+                    stack.push(rhs.as_ref());
+                    stack.push(lhs.as_ref());
+                }
+                other => out.push(other.clone()),
+            }
+        }
+    }
+
+    fn test_or_depth(expr: &ScalarIndexExpr) -> usize {
+        let mut max_depth = 0;
+        let mut stack = vec![(expr, 0usize)];
+        while let Some((node, depth)) = stack.pop() {
+            max_depth = max_depth.max(depth);
+            match node {
+                ScalarIndexExpr::Or(lhs, rhs) => {
+                    stack.push((rhs.as_ref(), depth + 1));
+                    stack.push((lhs.as_ref(), depth + 1));
+                }
+                ScalarIndexExpr::And(lhs, rhs) => {
+                    stack.push((rhs.as_ref(), depth));
+                    stack.push((lhs.as_ref(), depth));
+                }
+                ScalarIndexExpr::Not(inner) => {
+                    stack.push((inner.as_ref(), depth));
+                }
+                ScalarIndexExpr::Query(_) => {}
+            }
+        }
+        max_depth
+    }
+
+    #[test]
+    fn test_optimize_flattens_balances_and_deduplicates_deep_or_and_trees() {
+        // 1. Deep 2,000-branch left-deep OR flattens without stack overflow and becomes balanced.
+        let mut deep_or = test_scalar_query("x", "idx_x", SargableQuery::Equals(0_i64.into()));
+        for i in 1..2000_i64 {
+            deep_or = ScalarIndexExpr::Or(
+                Box::new(deep_or),
+                Box::new(test_scalar_query(
+                    "x",
+                    "idx_x",
+                    SargableQuery::Equals(i.into()),
+                )),
+            );
+        }
+        let optimized_or = deep_or.optimize();
+        let mut branches = Vec::new();
+        collect_test_or_branches(&optimized_or, &mut branches);
+        assert_eq!(branches.len(), 2000);
+        assert!(
+            test_or_depth(&optimized_or) <= balanced_depth_bound(2000),
+            "OR depth should be balanced (<= {}), got {}",
+            balanced_depth_bound(2000),
+            test_or_depth(&optimized_or)
+        );
+
+        // 2. Deep 2,000-branch left-deep AND flattens iteratively without stack overflow.
+        let mut deep_and = test_scalar_query("x", "idx_x", SargableQuery::Equals(0_i64.into()));
+        for i in 1..2000_i64 {
+            deep_and = ScalarIndexExpr::And(
+                Box::new(deep_and),
+                Box::new(test_scalar_query(
+                    "x",
+                    "idx_x",
+                    SargableQuery::Equals(i.into()),
+                )),
+            );
+        }
+        let optimized_and = deep_and.optimize();
+        let leaves = collect_test_and_leaves(optimized_and.clone());
+        assert_eq!(leaves.len(), 2000);
+        assert!(test_and_depth(&optimized_and) <= balanced_depth_bound(2000));
+
+        // 3. OR deduplicates identical branches preserving first-seen order, including branches
+        // that become identical only after inner AND optimization (`A OR B OR A -> OR(A, B)`).
+        let a_branch = ScalarIndexExpr::And(
+            Box::new(test_scalar_range(
+                "x",
+                "idx_x",
+                Bound::Included(10_i64.into()),
+                Bound::Unbounded,
+            )),
+            Box::new(test_scalar_range(
+                "x",
+                "idx_x",
+                Bound::Unbounded,
+                Bound::Included(20_i64.into()),
+            )),
+        );
+        let a_swapped = ScalarIndexExpr::And(
+            Box::new(test_scalar_range(
+                "x",
+                "idx_x",
+                Bound::Unbounded,
+                Bound::Included(20_i64.into()),
+            )),
+            Box::new(test_scalar_range(
+                "x",
+                "idx_x",
+                Bound::Included(10_i64.into()),
+                Bound::Unbounded,
+            )),
+        );
+        let b_branch = test_scalar_query("y", "idx_y", SargableQuery::Equals(1_i64.into()));
+        let or_with_dups = ScalarIndexExpr::Or(
+            Box::new(ScalarIndexExpr::Or(
+                Box::new(a_branch),
+                Box::new(b_branch.clone()),
+            )),
+            Box::new(a_swapped),
+        );
+        let opt_or_dups = or_with_dups.optimize();
+        let mut dedup_branches = Vec::new();
+        collect_test_or_branches(&opt_or_dups, &mut dedup_branches);
+        assert_eq!(dedup_branches.len(), 2);
+        assert!(matches!(opt_or_dups, ScalarIndexExpr::Or(_, _)));
+        assert_eq!(dedup_branches[1], b_branch);
+
+        // `A OR A` collapses to `A`.
+        let collapsed =
+            ScalarIndexExpr::Or(Box::new(b_branch.clone()), Box::new(b_branch.clone())).optimize();
+        assert_eq!(collapsed, b_branch);
+
+        // 4. AND deduplicates exact duplicate conjuncts (`A AND A -> A`), while preserving
+        // distinct `needs_recheck`, `index_type`, or `fragment_bitmap` metadata.
+        let eq_exact = test_scalar_query("y", "idx_y", SargableQuery::Equals(7_i64.into()));
+        let and_dups = ScalarIndexExpr::And(
+            Box::new(ScalarIndexExpr::And(
+                Box::new(eq_exact.clone()),
+                Box::new(b_branch.clone()),
+            )),
+            Box::new(eq_exact.clone()),
+        )
+        .optimize();
+        let and_dup_leaves = collect_test_and_leaves(and_dups);
+        assert_eq!(and_dup_leaves, vec![eq_exact.clone(), b_branch]);
+
+        let mut eq_recheck = eq_exact.clone();
+        if let ScalarIndexExpr::Query(search) = &mut eq_recheck {
+            search.needs_recheck = true;
+        }
+        let preserved = ScalarIndexExpr::And(Box::new(eq_exact), Box::new(eq_recheck)).optimize();
+        assert_eq!(collect_test_and_leaves(preserved).len(), 2);
+
+        // 5. `is_not_null` is elided inside top-level OR branches, and preserved under NOT(OR(...)).
+        let is_not_null_x = ScalarIndexExpr::Not(Box::new(test_scalar_query(
+            "x",
+            "idx_x",
+            SargableQuery::IsNull(),
+        )));
+        let eq_x = test_scalar_query("x", "idx_x", SargableQuery::Equals(5_i64.into()));
+        let eq_y = test_scalar_query("y", "idx_y", SargableQuery::Equals(9_i64.into()));
+        let guarded_or = ScalarIndexExpr::Or(
+            Box::new(ScalarIndexExpr::And(
+                Box::new(is_not_null_x),
+                Box::new(eq_x.clone()),
+            )),
+            Box::new(eq_y),
+        );
+        let opt_top_or = guarded_or.clone().optimize();
+        let mut top_branches = Vec::new();
+        collect_test_or_branches(&opt_top_or, &mut top_branches);
+        assert_eq!(top_branches[0], eq_x);
+
+        let opt_not_or = ScalarIndexExpr::Not(Box::new(guarded_or)).optimize();
+        let ScalarIndexExpr::Not(inner_or) = opt_not_or else {
+            panic!("expected Not");
+        };
+        let mut not_branches = Vec::new();
+        collect_test_or_branches(&inner_or, &mut not_branches);
+        assert_eq!(collect_test_and_leaves(not_branches[0].clone()).len(), 2);
+    }
 }
 
 #[cfg(test)]
@@ -7346,7 +7628,9 @@ mod planner_tests {
 
     use super::*;
     use crate::metrics::NoOpMetricsCollector;
-    use crate::scalar::{CreatedIndex, IndexStore, ScalarIndexParams, UpdateCriteria};
+    use crate::scalar::{
+        CreatedIndex, IndexStore, ScalarIndexParams, SearchResult, UpdateCriteria,
+    };
     use crate::{Index, IndexType};
 
     /// Consumes every conjunct that reads only its key columns.
