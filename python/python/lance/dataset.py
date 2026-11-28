@@ -394,7 +394,7 @@ class LanceDataset(pa.dataset.Dataset):
         .. code-block:: python
 
             ds = lance.open("dataset.lance")
-            ds.tags.create("v2-prod-20250203", 10)
+            ds.tags.create("v2-prod-20250203", 10, metadata={"owner": "analytics"})
 
             tags = ds.tags.list()
 
@@ -412,7 +412,7 @@ class LanceDataset(pa.dataset.Dataset):
         .. code-block:: python
 
             ds = lance.open("dataset.lance")
-            ds.create_branch("v2-prod-20250203")
+            ds.create_branch("v2-prod-20250203", metadata={"owner": "analytics"})
 
             branches = ds.branches.list()
 
@@ -424,6 +424,8 @@ class LanceDataset(pa.dataset.Dataset):
         branch: str,
         reference: Optional[int | str | Tuple[Optional[str], Optional[int]]] = None,
         storage_options: Optional[Dict[str, str]] = None,
+        *,
+        metadata: Optional[Dict[str, str]] = None,
     ) -> "LanceDataset":
         """Create a new branch from a version or tag.
 
@@ -445,6 +447,8 @@ class LanceDataset(pa.dataset.Dataset):
         storage_options: Optional[Dict[str, str]]
             Storage options for the underlying object store. If not provided,
             the storage options from the current dataset will be used.
+        metadata: dict[str, str], optional
+            Metadata stored with the branch when its name is reserved.
         Returns
         -------
         LanceDataset
@@ -452,7 +456,9 @@ class LanceDataset(pa.dataset.Dataset):
         """
         if storage_options is None:
             storage_options = self._storage_options
-        new_ds = self._ds.create_branch(branch, reference, storage_options)
+        new_ds = self._ds.create_branch(
+            branch, reference, storage_options, metadata=metadata
+        )
         ds = LanceDataset.__new__(LanceDataset)
         ds._ds = new_ds
         ds._uri = new_ds.uri

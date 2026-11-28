@@ -681,7 +681,9 @@ class _Dataset:
         self,
         tag: str,
         reference: Optional[int | str | Tuple[Optional[str], Optional[int]]] = None,
-    ) -> Tag: ...
+        *,
+        metadata: Optional[Dict[str, str]] = None,
+    ) -> None: ...
     def delete_tag(self, tag: str): ...
     def update_tag(
         self,
@@ -701,7 +703,8 @@ class _Dataset:
         branch: str,
         reference: Optional[int | str | Tuple[Optional[str], Optional[int]]] = None,
         storage_options: Optional[Dict[str, str]] = None,
-        **kwargs,
+        *,
+        metadata: Optional[Dict[str, str]] = None,
     ) -> _Dataset: ...
     def delete_branch(self, branch: str) -> None: ...
     def replace_branch_metadata(

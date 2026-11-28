@@ -1022,8 +1022,7 @@ def test_tag(tmp_path: Path):
     with pytest.raises(ValueError):
         ds.tags.delete("tag1")
 
-    ds.tags.create("tag1", 1)
-    ds.tags.replace_metadata("tag1", {"description": "first tag"})
+    ds.tags.create("tag1", 1, metadata={"description": "first tag"})
     tag1_meta = ds.tags.get("tag1")
     assert tag1_meta == ds.tags.list()["tag1"]
     assert tag1_meta["version"] == 1
@@ -1037,8 +1036,9 @@ def test_tag(tmp_path: Path):
     assert len(ds.tags.list()) == 1
     assert ds.tags.list()["tag1"]["metadata"] == {"description": "first tag"}
 
-    with pytest.raises(ValueError):
-        ds.tags.create("tag1", 1)
+    with pytest.raises(ValueError, match="already exists"):
+        ds.tags.create("tag1", metadata={"description": "duplicate"})
+    assert ds.tags.get("tag1") == tag1_meta
 
     ds.tags.delete("tag1")
 
@@ -11826,7 +11826,10 @@ def test_branches(tmp_path: Path):
     main_table = pa.Table.from_pydict({"a": [1, 2, 3], "b": [4, 5, 6]})
     ds_main = lance.write_dataset(main_table, base_dir)
 
-    branch1 = ds_main.create_branch("branch1")
+    branch1 = ds_main.create_branch("branch1", metadata={"owner": "analytics"})
+    with pytest.raises(OSError, match="already exists"):
+        ds_main.create_branch("branch1", metadata={"owner": "duplicate"})
+    assert branch1.branches.list()["branch1"]["metadata"] == {"owner": "analytics"}
     ds_main.branches.replace_metadata("branch1", {"description": "branch one"})
     assert branch1.version == 1
     # The dataset returned by create_branch must be fully constructed

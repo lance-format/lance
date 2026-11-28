@@ -637,7 +637,23 @@ impl Dataset {
         version: impl Into<refs::Ref>,
         store_params: Option<ObjectStoreParams>,
     ) -> Result<Self> {
-        let reservation = self.reserve_branch(branch, version).await?;
+        self.create_branch_with_metadata(branch, version, store_params, HashMap::new())
+            .await
+    }
+
+    /// Create a branch as in [`Self::create_branch`], storing user metadata when
+    /// the branch name is reserved.
+    pub async fn create_branch_with_metadata(
+        &mut self,
+        branch: &str,
+        version: impl Into<refs::Ref>,
+        store_params: Option<ObjectStoreParams>,
+        metadata: HashMap<String, String>,
+    ) -> Result<Self> {
+        let reservation = self
+            .table_view()
+            .reserve_branch_with_metadata(branch, version, metadata)
+            .await?;
         // The reservation was just written, so skip complete_branch's ref reread.
         self.clone_reserved_branch(reservation, store_params).await
     }

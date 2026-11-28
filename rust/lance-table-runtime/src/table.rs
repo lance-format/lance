@@ -438,6 +438,17 @@ impl<'a> TableView<'a> {
         branch: &str,
         version: impl Into<refs::Ref>,
     ) -> Result<BranchReservation> {
+        self.reserve_branch_with_metadata(branch, version, HashMap::new())
+            .await
+    }
+
+    /// Atomically reserve a branch name with user metadata in the branch ref.
+    pub async fn reserve_branch_with_metadata(
+        &self,
+        branch: &str,
+        version: impl Into<refs::Ref>,
+        metadata: HashMap<String, String>,
+    ) -> Result<BranchReservation> {
         refs::check_new_branch(branch)?;
 
         let (source_branch, version_number) = self.resolve_reference(version.into()).await?;
@@ -461,7 +472,7 @@ impl<'a> TableView<'a> {
         // Claim the name before the clone can write into another creator's branch.
         let contents = self
             .branches()
-            .create(branch, version_number, source_branch.as_deref())
+            .create_with_metadata(branch, version_number, source_branch.as_deref(), metadata)
             .await?;
         Ok(BranchReservation {
             branch: branch.to_string(),

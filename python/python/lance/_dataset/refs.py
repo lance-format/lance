@@ -156,6 +156,8 @@ class Tags:
         self,
         tag: str,
         reference: Optional[int | str | Tuple[Optional[str], Optional[int]]] = None,
+        *,
+        metadata: Optional[Dict[str, str]] = None,
     ) -> None:
         """
         Create a tag for a given dataset version.
@@ -171,8 +173,16 @@ class Tags:
             a version number in a specified branch. (None, None) means the latest
             version_number on the default branch. ``("main", version)`` is an
             explicit alias for the default branch in this reference context.
+        metadata : dict[str, str], optional
+            Metadata stored with the tag when it is created.
+
+        Examples
+        --------
+        .. code-block:: python
+
+            ds.tags.create("release", metadata={"owner": "analytics"})
         """
-        self._ds.create_tag(tag, reference)
+        self._ds.create_tag(tag, reference, metadata=metadata)
 
     def delete(self, tag: str) -> None:
         """
