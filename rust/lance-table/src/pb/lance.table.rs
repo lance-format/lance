@@ -917,6 +917,15 @@ pub struct Manifest {
     /// * 1 << 16: paired with the reader bit for version 1 zone-level statistics
     ///    seeds. Writers must preserve the seed contract and the required bits
     ///    during data writes, index maintenance, cleanup, clone, and restore.
+    /// * 1 << 23: the complete index section contains a segment identified by
+    ///    lance.table.InvertedIndexDetails with index_version >= 3. This is the
+    ///    declared IndexMetadata version, not the posting payload version. Every
+    ///    manifest publication, including clone and restore, must set the bit
+    ///    atomically with those segments. Writers must preserve unsupported
+    ///    segments or refuse the operation, not omit them during index loading.
+    ///    The bit may be cleared only when the complete resulting index section
+    ///    contains no affected segment. It must not be set in reader_feature_flags.
+    ///    Reserved and unsupported until the writer contract is implemented.
     #[prost(uint64, tag = "10")]
     pub writer_feature_flags: u64,
     /// Highest fragment id ever allocated or reserved in this lineage.
@@ -1216,6 +1225,11 @@ pub struct IndexMetadata {
     #[prost(message, optional, tag = "6")]
     pub index_details: ::core::option::Option<::prost_types::Any>,
     /// Index format version for this segment. If unset, use version 0.
+    /// For lance.table.InvertedIndexDetails with a declared version >= 3,
+    /// writers implementing FLAG_VERSIONED_INVERTED_INDEX must set writer
+    /// feature flag 1 << 23 when publishing a new manifest; historical
+    /// unflagged manifests remain valid on read. This version is
+    /// independent of InvertedIndexDetails.posting_format_version.
     #[prost(int32, optional, tag = "7")]
     pub index_version: ::core::option::Option<i32>,
     /// Timestamp when the index was created (UTC timestamp in milliseconds since epoch)

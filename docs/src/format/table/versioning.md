@@ -46,9 +46,41 @@ they should return an "unsupported" error on any read or write operation.
 | `2^20`   | `FLAG_LOCAL_FRAGMENT_ALIASES`   | Yes             | Yes             | An index segment may set `IndexMetadata.local_fragment_aliases` to translate fragment IDs stored in its files. `fragment_bitmap` stores the committed fragment IDs. Both bits are set while any retained segment has a nonempty map, including when `fragment_bitmap` is empty, and both are cleared when none do. Unsupported until readers and index maintenance implement aliases. See [Local fragment aliases](../index/index.md#local-fragment-aliases). |
 | `2^21`   | `FLAG_DELETION_FILE_PATHS`     | Yes             | Yes             | Some fragment sets `DeletionFile.path` instead of deriving the deletion file path from `fragment_id`. The reader bit is set while any fragment sets `path`, and the writer bit remains set on later versions (see [Deletion Files](index.md#deletion-files)). |
 | `2^22`   | `FLAG_BTREE_KEY_LAYOUT`        | No              | Yes             | Some BTree index segment has a [key layout](../index/scalar/btree.md#key-layout) (`BTreeIndexDetails.key_layout`). Older writers could extend its coverage without indexing rewritten rows. See [Compatibility With Released Versions](../index/scalar/btree.md#compatibility-with-released-versions) for the reader and writer rules. Reserved, unsupported until key layouts are implemented. |
+| `2^23`   | `FLAG_VERSIONED_INVERTED_INDEX` | No              | Yes             | The index section contains an inverted index with declared index version 3 or later. Writers must preserve unsupported index segments or refuse the operation. See [Versioned inverted indices](#versioned-inverted-indices). Reserved and unsupported until implemented. |
 
 </div>
 
-Bits 12, 20, and 22 are reserved and remain unsupported. Bits 13, 16, and 17 are supported. Bits at positions 23 and above are unknown. Unknown or unsupported flags cause implementations to reject the corresponding read or write operation with an "unsupported" error. The paired mixed-version, Managed Blob, zone write-seed, and local fragment alias reader and writer bits must each either both be set or both be clear. A half-set manifest is invalid. `FLAG_DELETION_FILE_PATHS` requires the writer bit whenever the reader bit is set.
+Bits 12, 20, 22, and 23 are reserved and remain unsupported. Bits 13, 16, and 17 are supported. Bits at positions 24 and above are unknown. Unknown or unsupported flags cause implementations to reject the corresponding read or write operation with an "unsupported" error. The paired mixed-version, Managed Blob, zone write-seed, and local fragment alias reader and writer bits must each either both be set or both be clear. A half-set manifest is invalid. `FLAG_DELETION_FILE_PATHS` requires the writer bit whenever the reader bit is set.
 
 Committing schema metadata `lance.blob.managed = "true"` activates the Managed Blob capability, even without new blob files. Ordinary Blob v2 writes without this opt-in do not activate it. Once activated, removing the opt-in, removing Blob fields, or restoring an older snapshot does not clear it. Before activation, all maintenance clients must support Managed Blobs: the flag cannot revoke old handles or prevent older clients from running cleanup through an unflagged historical snapshot. See [client compatibility](../../guide/blob.md#managed-objects-and-client-compatibility).
+
+## Versioned Inverted Indices
+
+A writer implementing this capability must set `FLAG_VERSIONED_INVERTED_INDEX` in `writer_feature_flags`
+whenever the index section contains a segment whose `index_details` identifies
+`lance.table.InvertedIndexDetails` and whose `IndexMetadata.index_version` is at
+least 3. The index type is identified using the existing case-insensitive type
+URL convention. This condition uses the declared index version, not
+`InvertedIndexDetails.posting_format_version`, and does not apply to other index
+types with the same version number.
+
+The bit must be published atomically with the affected index metadata. Every
+operation that publishes a manifest, including append, index maintenance,
+clone, and restore, must derive the requirement from the complete index
+section being committed, including segments it cannot use for queries.
+Unsupported segments must not be omitted merely because the writer cannot
+decode them. A writer that cannot preserve them correctly must refuse the
+operation. An explicit index drop, replacement, or restore may remove segments;
+the bit may be cleared only when the complete resulting index section contains
+no affected segment.
+
+This is a writer-only capability. It must not be set in `reader_feature_flags`;
+it does not change index encodings or grant a reader support for an otherwise
+unsupported index version. Ordinary reads remain subject to the existing
+reader flags and index-version checks. Even a client that can read index
+version 3 must refuse writes if it does not recognize this writer flag.
+
+The flag does not retroactively protect existing unflagged snapshots or revoke
+old client handles. Before publishing protected snapshots, deployments must
+upgrade or stop all writers that do not enforce this capability, including
+long-lived writers opened before activation. Readers may be upgraded separately.
