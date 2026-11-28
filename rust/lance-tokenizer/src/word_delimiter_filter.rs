@@ -85,9 +85,7 @@ pub struct WordDelimiterTokenStream<T> {
     preserve_original: bool,
     split_on_numerics: bool,
     position_offset: usize,
-    // Reused across tokens to avoid allocating per identifier.
     parts: Vec<(usize, usize)>,
-    // Text buffers of emitted parts, reused for the parts of later tokens.
     spare_texts: Vec<String>,
 }
 
@@ -157,8 +155,6 @@ fn load_token(target: &mut Token, source: &Token, position: usize, position_leng
 }
 
 impl<T: TokenStream> WordDelimiterTokenStream<T> {
-    // Writes tokens that are not split straight into `current`, reusing its
-    // text buffer, and queues the parts of split identifiers.
     fn load_current_tail_token(&mut self) {
         let token = self.tail.token();
         let adjusted_position = token.position.saturating_add(self.position_offset);
