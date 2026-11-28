@@ -13,6 +13,7 @@ use lance_core::{
     Error, Result,
     datatypes::{
         Field, NullabilityComparison, OnMissing, OnTypeMismatch, Schema, SchemaCompareOptions,
+        first_decimal32_or_decimal64_field,
     },
 };
 use lance_file::version::ConcreteFileVersion;
@@ -240,23 +241,13 @@ pub fn validate_decimal32_and_decimal64(
     schema: &Schema,
     version: ConcreteFileVersion,
 ) -> Result<()> {
-    fn is_decimal32_or_decimal64(data_type: &DataType) -> bool {
-        match data_type {
-            DataType::FixedSizeList(item, _) => is_decimal32_or_decimal64(item.data_type()),
-            _ => matches!(data_type, DataType::Decimal32(..) | DataType::Decimal64(..)),
-        }
-    }
-
     match version {
         ConcreteFileVersion::V2_3 => Ok(()),
         ConcreteFileVersion::V1
         | ConcreteFileVersion::V2_0
         | ConcreteFileVersion::V2_1
         | ConcreteFileVersion::V2_2 => {
-            let Some(field) = schema
-                .fields_pre_order()
-                .find(|field| is_decimal32_or_decimal64(&field.data_type()))
-            else {
+            let Some(field) = first_decimal32_or_decimal64_field(schema) else {
                 return Ok(());
             };
             let path = schema

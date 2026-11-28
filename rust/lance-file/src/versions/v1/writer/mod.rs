@@ -16,7 +16,10 @@ use arrow_schema::DataType;
 use async_recursion::async_recursion;
 use async_trait::async_trait;
 use lance_arrow::*;
-use lance_core::datatypes::{Encoding, Field, NullabilityComparison, Schema, SchemaCompareOptions};
+use lance_core::datatypes::{
+    Encoding, Field, NullabilityComparison, Schema, SchemaCompareOptions,
+    first_decimal32_or_decimal64_field,
+};
 use lance_core::{Error, Result};
 use lance_io::object_store::ObjectStore;
 use lance_io::traits::{WriteExt, Writer};
@@ -111,6 +114,14 @@ impl<M: ManifestProvider + Send + Sync> FileWriter<M> {
         schema: Schema,
         options: &FileWriterOptions,
     ) -> Result<Self> {
+        if let Some(field) = first_decimal32_or_decimal64_field(&schema) {
+            return Err(Error::invalid_input(format!(
+                "field '{}' has data type {}, which the legacy file format cannot store; \
+                 write Decimal32 and Decimal64 columns with file version 2.3 or later",
+                field.name,
+                field.data_type()
+            )));
+        }
         let collect_stats_for_fields = if let Some(stats_fields) = &options.collect_stats_for_fields
         {
             stats_fields.clone()
@@ -1384,5 +1395,37 @@ mod tests {
         let page_table = file_writer.page_table;
         assert!(page_table.get(0, 0).is_some());
         assert!(page_table.get(2, 0).is_some());
+    }
+
+    /// The legacy writer takes any fixed-stride type, so it must reject the two
+    /// decimal widths that only file version 2.3 may record.
+    #[rstest::rstest]
+    #[case::decimal32(DataType::Decimal32(9, 2))]
+    #[case::decimal64(DataType::Decimal64(18, 2))]
+    #[case::fixed_size_list(DataType::FixedSizeList(
+        Arc::new(ArrowField::new("item", DataType::Decimal32(9, 2), true)),
+        2
+    ))]
+    #[tokio::test]
+    async fn test_rejects_decimal32_and_decimal64(#[case] data_type: DataType) {
+        let schema = Schema::try_from(&ArrowSchema::new(vec![ArrowField::new(
+            "d", data_type, true,
+        )]))
+        .unwrap();
+        let store = ObjectStore::memory();
+        let error = FileWriter::<NotSelfDescribing>::try_new(
+            &store,
+            &Path::from("/decimal"),
+            schema,
+            &Default::default(),
+        )
+        .await
+        .err()
+        .expect("the legacy format cannot store Decimal32 or Decimal64");
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(
+            error.to_string().contains("file version 2.3 or later"),
+            "{error}"
+        );
     }
 }

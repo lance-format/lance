@@ -328,6 +328,21 @@ fn parse_timeunit(unit: &str) -> Result<TimeUnit> {
     }
 }
 
+/// The first field, in pre-order, whose type is `Decimal32` or `Decimal64`, or a
+/// fixed-size list of them. These logical types need format version 2.3 or later.
+pub fn first_decimal32_or_decimal64_field(schema: &Schema) -> Option<&Field> {
+    fn holds(data_type: &DataType) -> bool {
+        match data_type {
+            DataType::Decimal32(..) | DataType::Decimal64(..) => true,
+            DataType::FixedSizeList(item, _) => holds(item.data_type()),
+            _ => false,
+        }
+    }
+    schema
+        .fields_pre_order()
+        .find(|field| holds(&field.data_type()))
+}
+
 /// Rejects a `Decimal32` or `Decimal64` type outside the schema spec's
 /// `1 <= P <= max` and `0 <= S <= P`. Arrow's own check accepts a negative
 /// scale, on which DataFusion's cast unwrapping overflows.

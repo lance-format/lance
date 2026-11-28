@@ -4222,4 +4222,86 @@ mod tests {
         let actual = arrow_select::concat::concat_batches(&batch.schema(), &batches).unwrap();
         assert_eq!(actual, batch);
     }
+
+    /// Eight rows with nulls, both signs and each precision's largest magnitude.
+    fn decimal32_and_decimal64_batch() -> RecordBatch {
+        let units = [
+            Some(-999_999_999),
+            None,
+            Some(5),
+            Some(-1),
+            Some(999_999_999),
+            None,
+            Some(0),
+            Some(42),
+        ];
+        let d32 = arrow_array::Decimal32Array::from(units.to_vec())
+            .with_precision_and_scale(9, 2)
+            .unwrap();
+        let d64 = arrow_array::Decimal64Array::from_iter(
+            units
+                .iter()
+                .map(|v| v.map(|v| i64::from(v) * 1_000_000_000 - 1)),
+        )
+        .with_precision_and_scale(18, 2)
+        .unwrap();
+        RecordBatch::try_from_iter([
+            ("d32", Arc::new(d32) as arrow_array::ArrayRef),
+            ("d64", Arc::new(d64) as arrow_array::ArrayRef),
+        ])
+        .unwrap()
+    }
+
+    /// A standalone file records `decimal:32` and `decimal:64` in its own schema,
+    /// so only file version 2.3 may write them.
+    #[rstest]
+    #[case::v2_0(ConcreteFileVersion::V2_0)]
+    #[case::v2_1(ConcreteFileVersion::V2_1)]
+    #[case::v2_2(ConcreteFileVersion::V2_2)]
+    #[tokio::test]
+    async fn test_decimal32_and_decimal64_files_require_v2_3(#[case] version: ConcreteFileVersion) {
+        let batch = decimal32_and_decimal64_batch();
+        let fs = FsFixture::default();
+        let object_writer = fs.object_store.create(&fs.tmp_path).await.unwrap();
+        let schema = LanceSchema::try_from(batch.schema_ref().as_ref()).unwrap();
+        let error = create_writer(object_writer, schema, version, FileWriterOptions::default())
+            .err()
+            .expect("only 2.3 files store Decimal32 and Decimal64");
+        assert!(
+            error.to_string().contains("Decimal32(9, 2)"),
+            "{version}: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_decimal32_and_decimal64_files_round_trip_on_v2_3() {
+        let batch = decimal32_and_decimal64_batch();
+        let fs = FsFixture::default();
+        let object_writer = fs.object_store.create(&fs.tmp_path).await.unwrap();
+        let schema = LanceSchema::try_from(batch.schema_ref().as_ref()).unwrap();
+        let mut writer = create_writer(
+            object_writer,
+            schema,
+            ConcreteFileVersion::V2_3,
+            FileWriterOptions::default(),
+        )
+        .unwrap();
+        writer.write_batch(&batch).await.unwrap();
+        let summary = writer.finish().await.unwrap();
+        let file = fs
+            .scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::new(summary.size_bytes))
+            .await
+            .unwrap();
+        let reader = FileReader::try_open(
+            file,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &LanceCache::no_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert_minichunk_scan_and_take(&reader, &batch).await;
+    }
 }

@@ -1316,3 +1316,56 @@ async fn add_decimal32_and_decimal64_columns_requires_2_3(
         assert_eq!(scanned, added);
     }
 }
+
+/// Released clients refuse feature bit 23, so the bit is what keeps them from
+/// reading or appending to a table whose schema they cannot parse. It stays set
+/// after the column is dropped and after restoring a version from before it.
+#[tokio::test]
+async fn decimal32_and_decimal64_set_a_sticky_feature_flag() {
+    use lance_table::feature_flags::FLAG_DECIMAL32_AND_DECIMAL64;
+
+    let has_flag = |dataset: &Dataset| {
+        let manifest = dataset.manifest();
+        (
+            manifest.reader_feature_flags & FLAG_DECIMAL32_AND_DECIMAL64 != 0,
+            manifest.writer_feature_flags & FLAG_DECIMAL32_AND_DECIMAL64 != 0,
+        )
+    };
+    let ids =
+        RecordBatch::try_from_iter([("id", Arc::new(Int32Array::from(vec![0, 1])) as ArrayRef)])
+            .unwrap();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(ids.clone())], ids.schema()),
+        "memory://",
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_3),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(has_flag(&dataset), (false, false));
+
+    let added = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "price",
+        DataType::Struct(Fields::from(vec![ArrowField::new(
+            "amount",
+            DataType::Decimal64(18, 2),
+            true,
+        )])),
+        true,
+    )]));
+    dataset
+        .add_columns(NewColumnTransform::AllNulls(added), None, None)
+        .await
+        .unwrap();
+    assert_eq!(has_flag(&dataset), (true, true));
+
+    dataset.drop_columns(&["price"]).await.unwrap();
+    assert_eq!(has_flag(&dataset), (true, true));
+
+    let mut first = dataset.checkout_version(1).await.unwrap();
+    assert_eq!(has_flag(&first), (false, false));
+    first.restore().await.unwrap();
+    assert_eq!(has_flag(&first), (true, true));
+}
