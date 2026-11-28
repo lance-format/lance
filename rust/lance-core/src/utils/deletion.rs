@@ -100,9 +100,13 @@ impl DeletionVector {
     pub fn to_sorted_iter<'a>(&'a self) -> Box<dyn Iterator<Item = u32> + Send + 'a> {
         match self {
             Self::NoDeletions => Box::new(std::iter::empty()),
-            // We have to make a clone when we're using a set
-            // but sets should be relatively small.
-            Self::Set(_) => self.clone().into_sorted_iter(),
+            Self::Set(set) => {
+                // Only the offsets need copying, not the hash table. They are
+                // unique integers, so stable sorting adds no ordering guarantee.
+                let mut values = Vec::from_iter(set.iter().copied());
+                values.sort_unstable();
+                Box::new(values.into_iter())
+            }
             Self::Bitmap(bitmap) => Box::new(bitmap.iter()),
         }
     }
@@ -496,7 +500,17 @@ mod test {
 
     #[rstest]
     #[case::no_deletions(DeletionVector::NoDeletions, vec![])]
+    #[case::empty_set(set_dv([]), vec![])]
+    #[case::singleton_set(set_dv([u32::MAX]), vec![u32::MAX])]
     #[case::set(set_dv([3, 1, 2]), vec![1, 2, 3])]
+    #[case::set_duplicates_and_boundaries(
+        set_dv([u32::MAX, 0, 65536, u32::MAX, 0]),
+        vec![0, 65536, u32::MAX]
+    )]
+    #[case::set_near_bitmap_threshold(
+        set_dv((0..4999).rev()),
+        (0..4999).collect()
+    )]
     #[case::bitmap(bitmap_dv([30, 10, 20]), vec![10, 20, 30])]
     fn test_iterators(#[case] dv: DeletionVector, #[case] expected: Vec<u32>) {
         // Test iter()
