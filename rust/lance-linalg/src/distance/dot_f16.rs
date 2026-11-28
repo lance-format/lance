@@ -33,6 +33,35 @@ use half::f16;
 
 use crate::distance::dot::dot;
 
+/// Signature of the [`dot_f16_batch_16`] kernels.
+pub(crate) type Batch16Kernel = unsafe fn(&[f16], &[&[f16]; 16], usize) -> [f32; 16];
+
+lance_core::dispatch! {
+    static DOT_F16_BATCH_16: Dispatch<Batch16Kernel> = &[
+        #[cfg(all(
+            kernel_support = "amx_fp16",
+            target_arch = "x86_64",
+            target_os = "linux"
+        ))]
+        crate::simd::amx_fp16::DOT_F16_BATCH_16_AMX,
+        DOT_F16_BATCH_16_FALLBACK,
+    ];
+}
+
+// `dot_f16_batch_16_fallback` as a dispatch candidate. The plain function stays
+// so the `dim < 32` path and the tests can call it directly and inline it.
+lance_core::target_kernel! {
+    #[target_features()]
+    #[candidate(DOT_F16_BATCH_16_FALLBACK: Batch16Kernel)]
+    fn dot_f16_batch_16_fallback_kernel(
+        query: &[f16],
+        candidates: &[&[f16]; 16],
+        len: usize,
+    ) -> [f32; 16] {
+        dot_f16_batch_16_fallback(query, candidates, len)
+    }
+}
+
 /// Batched f16 dot product: the raw dot products of one `query` against the
 /// first `len` of 16 `candidates`, in order. Every candidate slice must have the
 /// same length as `query`, and `len` must be in `1..=16`.
@@ -61,19 +90,16 @@ pub fn dot_f16_batch_16(query: &[f16], candidates: &[&[f16]; 16], len: usize) ->
         (1..=16).contains(&len),
         "batch length must be in 1..=16, got {len}"
     );
-    #[cfg(all(
-        kernel_support = "amx_fp16",
-        target_arch = "x86_64",
-        target_os = "linux"
-    ))]
-    {
-        // AMX only earns its tile-config overhead once there is at least one
-        // full 32-wide pass; for tiny dims the fallback is cheaper anyway.
-        if query.len() >= 32 && crate::simd::amx_fp16::amx_supported() {
-            return unsafe { crate::simd::amx_fp16::dot_f16_batch_16_amx(query, candidates, len) };
-        }
+    // AMX only earns its tile-config overhead once there is at least one full
+    // 32-wide pass; for tiny dims the fallback is cheaper anyway.
+    if query.len() < 32 {
+        return dot_f16_batch_16_fallback(query, candidates, len);
     }
-    dot_f16_batch_16_fallback(query, candidates, len)
+    let kernel = DOT_F16_BATCH_16.get().as_fn();
+    // SAFETY: `get` checked the host features, and every kernel checks its own
+    // arguments. The asserts above still run first so both paths panic the
+    // same way.
+    unsafe { kernel(query, candidates, len) }
 }
 
 /// Fallback for [`dot_f16_batch_16`]: `len` independent [`crate::distance::dot()`]
@@ -336,10 +362,11 @@ impl PackedCentroidsF16 {
 /// - the kernel was compiled in, i.e. `build.rs` found a C compiler accepting
 ///   `-mamx-fp16` (clang >= 16 or gcc >= 13) and set `kernel_support`;
 /// - the target is Linux/x86_64;
-/// - the CPU reports both the amx-tile and the amx-fp16 CPUID bits;
-/// - the one-time XTILEDATA `arch_prctl` grant succeeded.
+/// - [`CpuFeatures::host`](lance_core::utils::cpu::CpuFeatures::host) has
+///   amx-fp16 and the AVX-512 features the kernel object is compiled for.
+///   It reports AMX only after Linux grants the XTILEDATA state.
 ///
-/// This is the safety question — without the `arch_prctl` grant the first tile
+/// This is the safety question — without the XTILEDATA grant the first tile
 /// instruction would SIGILL — so no tile instruction in this module runs until
 /// it holds. It deliberately ignores [`LANCE_DISABLE_AMX`][amx_fp16_available],
 /// so kernel-level tests can exercise the kernels on any host that can run them
@@ -348,8 +375,8 @@ impl PackedCentroidsF16 {
 /// Callers choosing between the AMX path and their fallback want
 /// [`amx_fp16_available`] instead.
 ///
-/// Evaluated once and cached by the hardware probe underneath; nothing is
-/// recomputed per call.
+/// The host features are detected once per process; nothing is recomputed per
+/// call.
 pub fn amx_fp16_supported() -> bool {
     #[cfg(all(
         kernel_support = "amx_fp16",
@@ -357,7 +384,8 @@ pub fn amx_fp16_supported() -> bool {
         target_os = "linux"
     ))]
     {
-        return crate::simd::amx_fp16::amx_supported();
+        return lance_core::utils::cpu::CpuFeatures::host()
+            .contains(crate::simd::amx_fp16::FEATURES);
     }
     #[allow(unreachable_code)]
     false
@@ -595,6 +623,17 @@ mod tests {
         assert_eq!(amx_fp16_available(), amx_fp16_supported());
     }
 
+    /// The batch-16 dispatch and the GEMM gate must agree on whether AMX runs.
+    #[test]
+    fn batch_16_dispatch_selects_amx_exactly_when_supported() {
+        let selected = DOT_F16_BATCH_16.selected().name();
+        assert_eq!(
+            selected == "dot_f16_batch_16_amx",
+            amx_fp16_supported(),
+            "selected {selected}"
+        );
+    }
+
     /// The length arithmetic guarding the GEMM's FFI boundary must reject a
     /// shape it cannot represent, not wrap it into a small number.
     ///
@@ -664,7 +703,7 @@ mod tests {
     ))]
     #[test]
     fn amx_path_is_active_and_close() {
-        if !crate::simd::amx_fp16::amx_supported() {
+        if !amx_fp16_supported() {
             return;
         }
         let mut rng = StdRng::seed_from_u64(0xA11);
@@ -707,11 +746,10 @@ mod tests {
     #[test]
     fn kernel_reconfigures_after_foreign_tile_release() {
         use crate::simd::amx_fp16::{
-            amx_supported, clobber_tile_state_for_test, dot_f16_batch_16_amx,
-            tile_config_is_live_for_test,
+            clobber_tile_state_for_test, dot_f16_batch_16_amx, tile_config_is_live_for_test,
         };
 
-        if !amx_supported() {
+        if !amx_fp16_supported() {
             return;
         }
         let mut rng = StdRng::seed_from_u64(0xC10B);
@@ -719,7 +757,7 @@ mod tests {
         let candidates: [&[f16]; 16] = std::array::from_fn(|i| cands[i].as_slice());
 
         let before = unsafe { dot_f16_batch_16_amx(&query, &candidates, 16) };
-        // SAFETY: the `amx_supported()` check above granted XTILEDATA, so
+        // SAFETY: the `amx_fp16_supported()` check above means XTILEDATA is granted, so
         // TILERELEASE is legal here.
         unsafe { clobber_tile_state_for_test() };
         // Reaching the end of this call at all is the assertion that matters:
@@ -752,7 +790,7 @@ mod tests {
     /// configuration image back is a way to check it without executing a single
     /// tile instruction.
     ///
-    /// It still needs the `amx_supported()` guard, which is easy to mistake for
+    /// It still needs the `amx_fp16_supported()` guard, which is easy to mistake for
     /// redundant: `lance_amx_tilecfg_image` only fills a 64-byte struct. But
     /// `amx_fp16.c` is compiled as one translation unit with
     /// `-march=sapphirerapids`, so the compiler may use instructions from that
@@ -766,9 +804,9 @@ mod tests {
     ))]
     #[test]
     fn search_tile_config_image_is_pinned() {
-        use crate::simd::amx_fp16::{AMX_CFG_SEARCH, amx_supported, tilecfg_image};
+        use crate::simd::amx_fp16::{AMX_CFG_SEARCH, tilecfg_image};
 
-        if !amx_supported() {
+        if !amx_fp16_supported() {
             return;
         }
 
@@ -811,7 +849,7 @@ mod tests {
     ))]
     #[test]
     fn unknown_tile_config_kind_is_rejected() {
-        if !crate::simd::amx_fp16::amx_supported() {
+        if !amx_fp16_supported() {
             return;
         }
         assert!(crate::simd::amx_fp16::tilecfg_image(-1).is_none());
@@ -979,7 +1017,7 @@ mod tests {
     ))]
     #[test]
     fn gemm_matches_reference() {
-        if !crate::simd::amx_fp16::amx_supported() {
+        if !amx_fp16_supported() {
             return;
         }
         let mut rng = StdRng::seed_from_u64(0x6E33);
@@ -1052,9 +1090,9 @@ mod tests {
     ))]
     #[test]
     fn gemm_tile_config_image_is_pinned() {
-        use crate::simd::amx_fp16::{AMX_CFG_GEMM, amx_supported, tilecfg_image};
+        use crate::simd::amx_fp16::{AMX_CFG_GEMM, tilecfg_image};
 
-        if !amx_supported() {
+        if !amx_fp16_supported() {
             return;
         }
 
@@ -1090,7 +1128,7 @@ mod tests {
     ))]
     #[test]
     fn interleaved_search_and_gemm_stay_correct() {
-        if !crate::simd::amx_fp16::amx_supported() {
+        if !amx_fp16_supported() {
             return;
         }
         let mut rng = StdRng::seed_from_u64(0x11E12EA5);
@@ -1135,7 +1173,7 @@ mod tests {
     ))]
     #[test]
     fn concurrent_search_and_gemm_stay_correct() {
-        if !crate::simd::amx_fp16::amx_supported() {
+        if !amx_fp16_supported() {
             return;
         }
         const THREADS: u64 = 8;
