@@ -25,6 +25,8 @@ pub const MAX_CACHE_TYPE_SERIES: usize = 64;
 pub struct CacheOperationContext {
     type_name: Option<&'static str>,
     origin: CacheLoadOrigin,
+    pub(super) owner: Option<super::CacheEntryOwner>,
+    pub(super) index_file: Option<super::InternalCacheKey>,
 }
 
 impl CacheOperationContext {
@@ -32,6 +34,8 @@ impl CacheOperationContext {
         Self {
             type_name: Some(type_name),
             origin,
+            owner: None,
+            index_file: None,
         }
     }
 

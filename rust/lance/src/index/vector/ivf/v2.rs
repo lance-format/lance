@@ -36,8 +36,8 @@ use futures::prelude::stream::{self, TryStreamExt};
 use futures::stream::FuturesUnordered;
 use lance_arrow::{FixedSizeListArrayExt, RecordBatchExt};
 use lance_core::cache::{
-    CacheCodec, CacheCodecImpl, CacheEntryReader, CacheEntryWriter, CacheKey, CacheKeySchema,
-    CacheLoadOrigin, KeyBuilder, LanceCache, WeakLanceCache,
+    CacheCodec, CacheCodecImpl, CacheEntryOwner, CacheEntryReader, CacheEntryWriter, CacheKey,
+    CacheKeySchema, CacheLoadOrigin, KeyBuilder, LanceCache, WeakLanceCache,
 };
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
@@ -1546,6 +1546,8 @@ pub(crate) struct IvfOpenContext {
     /// and shallow clones can share them. `None` keeps the
     /// store charged nowhere, shared with the file's other live indexes.
     pub(crate) file_cache: Option<LanceCache>,
+    /// An index from an external base is a shared consumer of its physical file.
+    pub(crate) file_owner: Option<CacheEntryOwner>,
     /// A strong reference acquired before opening the index can evict the
     /// cached store. Dropped if the index does not use resident columns.
     pub(crate) resident_columns_handle: Option<ResidentColumns>,
@@ -1555,6 +1557,32 @@ pub(crate) struct IvfOpenContext {
     /// scheduler records the load with the rest of the open's I/O
     /// ([`VectorIndex::open_io_stats`]).
     pub(crate) io_stats: Option<IoStats>,
+}
+
+impl IvfOpenContext {
+    fn bind_file_cache<Q: Quantization>(
+        &mut self,
+        index_cache: &LanceCache,
+        store_prefix: &str,
+        aux_path: &Path,
+    ) -> WeakLanceCache {
+        // Both the resident columns and the raw entries must share one
+        // registration. Their cache keys stay in their original namespaces.
+        if Q::quantization_type() == QuantizationType::Rabit
+            && let Some(cache) = self.file_cache.take()
+        {
+            self.file_cache =
+                Some(cache.with_index_file_owner(store_prefix, aux_path.as_ref(), self.file_owner));
+        }
+        WeakLanceCache::from(
+            &self
+                .file_cache
+                .as_ref()
+                .unwrap_or(index_cache)
+                .with_key_prefix(store_prefix)
+                .with_key_prefix(aux_path.as_ref()),
+        )
+    }
 }
 
 /// The key of the auxiliary (storage) file of index `uuid` in `index_dir`
@@ -2020,7 +2048,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         file_metadata_cache: &LanceCache,
         index_cache: LanceCache,
         file_sizes: HashMap<String, u64>,
-        context: IvfOpenContext,
+        mut context: IvfOpenContext,
     ) -> Result<Self> {
         // Consecutive wall intervals include time awaiting their futures. Keep counters
         // on the initialization span so segment fanout does not multiply phase spans.
@@ -2050,14 +2078,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             .join(uuid_str.as_str())
             .join(INDEX_AUXILIARY_FILE_NAME);
         let index_file = aux_file_key(&object_store, &index_dir, &uuid);
-        let raw_cache = WeakLanceCache::from(
-            &context
-                .file_cache
-                .as_ref()
-                .unwrap_or(&index_cache)
-                .with_key_prefix(&object_store.store_prefix)
-                .with_key_prefix(aux_path.as_ref()),
-        );
+        let raw_cache =
+            context.bind_file_cache::<Q>(&index_cache, &object_store.store_prefix, &aux_path);
         let row_address_cache = WeakLanceCache::from(
             &index_cache
                 .with_key_prefix(&object_store.store_prefix)
@@ -3031,6 +3053,40 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> Index for IVFIndex<S, 
             self.storage.prewarm_planes(&index_cache).await?;
         } else {
             self.prewarm_all_partitions().await?;
+        }
+        Ok(())
+    }
+
+    fn supports_scoped_prewarm(&self) -> bool {
+        true
+    }
+
+    async fn verify_prewarm_residency(&self) -> Result<()> {
+        for partition in 0..self.ivf.num_partitions() {
+            let resident = if self.uses_rabit_plane_cache() {
+                self.raw_cache
+                    .peek_resident_with_key(&self.storage.plane_key(partition, 0))
+                    .await
+                    && self
+                        .raw_cache
+                        .peek_resident_with_key(&self.storage.plane_key(partition, 1))
+                        .await
+            } else if self.caches_partition_codes() {
+                self.raw_cache
+                    .peek_resident_with_key(&PartitionCodesKey { partition })
+                    .await
+            } else {
+                self.index_cache
+                    .peek_resident_with_key(&IVFPartitionKey::<S, Q>::new(partition))
+                    .await
+            };
+            if !resident {
+                let capacity = self.raw_cache.capacity_bytes().unwrap_or_default();
+                return Err(Error::invalid_input(format!(
+                    "IVF segment {} partition {partition} is no longer resident after prewarm (cache capacity {capacity} bytes)",
+                    self.uuid
+                )));
+            }
         }
         Ok(())
     }
@@ -4045,7 +4101,7 @@ async fn reconstruct_typed<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
     file_metadata_cache: &LanceCache,
     index_cache: LanceCache,
     frag_reuse_index: Option<ResolvedRemapping>,
-    context: IvfOpenContext,
+    mut context: IvfOpenContext,
 ) -> Result<Arc<dyn VectorIndex>> {
     let io_parallelism = object_store.io_parallelism();
     let origin_latency =
@@ -4060,14 +4116,8 @@ async fn reconstruct_typed<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
     let dir: Path = parts.into_iter().collect();
     let aux_path = dir.clone().join(INDEX_AUXILIARY_FILE_NAME);
     let index_file = IndexFileKey::new(&state.uuid, &object_store.store_prefix, aux_path.as_ref());
-    let raw_cache = WeakLanceCache::from(
-        &context
-            .file_cache
-            .as_ref()
-            .unwrap_or(&index_cache)
-            .with_key_prefix(&object_store.store_prefix)
-            .with_key_prefix(aux_path.as_ref()),
-    );
+    let raw_cache =
+        context.bind_file_cache::<Q>(&index_cache, &object_store.store_prefix, &aux_path);
 
     let row_address_cache = WeakLanceCache::from(
         &index_cache

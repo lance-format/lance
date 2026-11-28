@@ -1117,30 +1117,45 @@ impl Dataset {
         // What the session declares about the index, for whichever IVF open
         // or reconstruction below runs, and where a reconstruction adds the
         // I/O of a resident store load.
+        let owner = lance_core::cache::CacheEntryOwner {
+            collection: self.index_cache.index_collection(&index_meta.name),
+            segment: lance_core::cache::InternalCacheKey::from_bytes(*uuid.as_bytes()),
+            version: self.version_id(),
+        };
         let open_context = IvfOpenContext {
             rabit_scan_factory: self.session.rabit_scan_factory.clone(),
             origin_latency_hint: self.session.index_origin_latency(),
             resident_columns: self.session.index_resident_columns(),
             file_cache: Some(file_cache),
+            file_owner: index_meta.base_id.is_none().then_some(owner),
             resident_columns_handle,
             io_stats: metrics.io_stats(),
         };
-        let resolved =
-            frag_reuse::open_row_id_remapping_with_plan(self, index_meta, staged, purpose, metrics)
-                .await?;
+        // Snapshot listings and remapping metadata can be read when warming a
+        // segment, but charging each new snapshot would accumulate entries that
+        // cannot be reclaimed with the retired segment.
+        let resolved = self
+            .index_cache
+            .without_admission_during_prewarm(frag_reuse::open_row_id_remapping_with_plan(
+                self, index_meta, staged, purpose, metrics,
+            ))
+            .await?;
         // Portable file state is independent of this mapping. Legacy live
         // indices and decoded partitions still use the resolved translation
         // identity, including the current v0 history or tagged fingerprint.
         let frag_reuse_uuid = frag_reuse::fri_cache_id(&resolved).copied();
         let query_cache = frag_reuse::scoped_index_cache(self, &resolved);
+        let state_cache = self.index_cache.with_index_owner(owner);
         let remapping = resolved.map(|(_, remapping)| remapping);
 
         // Check sized cache first (v2+ indices with serializable state).
         let state_key =
             IvfIndexStateCacheKey::new(uuid, &object_store.store_prefix, index_file.as_ref());
-        if let Some(entry) = self.index_cache.get_with_key(&state_key).await {
+        if let Some(entry) = state_cache.get_with_key(&state_key).await {
             log::debug!("Found IvfIndexState in cache uuid: {}", uuid);
-            let partition_cache = query_cache.for_index(uuid, frag_reuse_uuid.as_ref());
+            let partition_cache = query_cache
+                .for_index(uuid, frag_reuse_uuid.as_ref())
+                .with_index_owner(owner);
             return entry
                 .0
                 .reconstruct(
@@ -1162,15 +1177,19 @@ impl Dataset {
         let prepare_start = Instant::now();
         // Only legacy vector file readers consume the V1 handle. A tagged
         // history is handled by the shared remapper above, including identity.
-        let has_tagged_history = load_all_indices(self)
-            .await?
-            .iter()
-            .any(|index| index.name == FRAG_REUSE_INDEX_NAME && index.index_version != 0);
-        let frag_reuse_index = if has_tagged_history {
-            None
-        } else {
-            self.open_frag_reuse_index(metrics).await?
-        };
+        let frag_reuse_index =
+            self.index_cache
+                .without_admission_during_prewarm(async {
+                    let has_tagged_history = load_all_indices(self).await?.iter().any(|index| {
+                        index.name == FRAG_REUSE_INDEX_NAME && index.index_version != 0
+                    });
+                    if has_tagged_history {
+                        Ok(None)
+                    } else {
+                        self.open_frag_reuse_index(metrics).await
+                    }
+                })
+                .await?;
         let file_sizes = index_meta.file_size_map();
         let reader: Arc<dyn Reader> = vector::open_index_file(
             object_store.as_ref(),
@@ -1199,7 +1218,9 @@ impl Dataset {
         // Namespace the index cache by the UUID of the index. v2+ partition
         // entries are store-free and remain reusable across object-store
         // generations alongside their serializable state.
-        let index_cache = query_cache.for_index(uuid, frag_reuse_uuid.as_ref());
+        let index_cache = query_cache
+            .for_index(uuid, frag_reuse_uuid.as_ref())
+            .with_index_owner(owner);
 
         // Extract the cacheable state before type-erasing to Arc<dyn VectorIndex>.
         fn wrap_ivf<S: IvfSubIndex + 'static, Q: Quantization + 'static>(
@@ -1452,7 +1473,7 @@ impl Dataset {
             io_stats.add_scan_stats(&open_stats);
         }
         if let Some(ivf_entry) = ivf_entry {
-            self.index_cache
+            state_cache
                 .insert_with_key(&state_key, Arc::new(ivf_entry))
                 .await;
         } else {

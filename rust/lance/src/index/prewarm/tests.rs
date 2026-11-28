@@ -9,10 +9,12 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use arrow::array::AsArray;
-use arrow::datatypes::Int32Type;
+use arrow::datatypes::{Float32Type, Int32Type};
 use arrow_array::RecordBatchIterator;
 use futures::future::try_join_all;
 use lance_core::utils::tempfile::TempStrDir;
+use lance_datagen::{array, gen_batch};
+use lance_index::INDEX_FILE_NAME;
 use lance_index::IndexType;
 use lance_index::metrics::LocalMetricsCollector;
 use lance_index::scalar::registry::ScalarIndexCacheKey;
@@ -20,13 +22,19 @@ use lance_index::scalar::{FullTextSearchQuery, InvertedIndexParams, inverted::In
 use lance_io::object_store::{
     ObjectStore, ObjectStoreParams, StorageOptionsAccessor, WrappingObjectStore,
 };
+use lance_linalg::distance::DistanceType;
+use lance_table::format::pb::fragment_reuse_index_details::InlineContent;
+use prost::Message;
 use rstest::rstest;
 
 use crate::dataset::WriteParams;
 use crate::dataset::builder::DatasetBuilder;
 use crate::index::DatasetIndexExt;
+use crate::index::create::CreateIndexBuilder;
+use crate::index::frag_reuse_reader::tests::{install, prepare_partition};
+use crate::index::vector::VectorIndexParams;
 use crate::session::Session;
-use crate::utils::test::copy_test_data_to_tmp;
+use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount, copy_test_data_to_tmp};
 
 #[rstest]
 #[case::credential_stores(false)]
@@ -332,4 +340,98 @@ async fn test_request_wrappers_reload_legacy_fts_fixture() {
         assert!(!wrapper.requests.lock().unwrap().is_empty());
         wrapper.revoked.store(true, Ordering::Relaxed);
     }
+}
+
+#[tokio::test]
+async fn prewarm_head_rejects_same_version_of_recreated_table() {
+    let dir = TempStrDir::default();
+    let path = std::path::Path::new(dir.as_str()).join("table");
+    let uri = path.to_str().unwrap();
+    let batch = arrow_array::record_batch!(("id", Int32, [1, 2, 3])).unwrap();
+    let write = || RecordBatchIterator::new([Ok(batch.clone())], batch.schema());
+
+    Dataset::write(write(), uri, None).await.unwrap();
+    let original = DatasetBuilder::from_uri(uri).load().await.unwrap();
+    assert!(original.prewarm_at_verified_head().await.unwrap());
+    std::fs::rename(&path, path.with_file_name("original")).unwrap();
+    Dataset::write(write(), uri, None).await.unwrap();
+    let replacement = DatasetBuilder::from_uri(uri).load().await.unwrap();
+
+    assert_eq!(original.version_id(), replacement.version_id());
+    assert_eq!(
+        original.manifest_location().path,
+        replacement.manifest_location().path
+    );
+    assert!(replacement.prewarm_at_verified_head().await.unwrap());
+    assert!(!original.prewarm_at_verified_head().await.unwrap());
+}
+
+#[tokio::test]
+async fn scoped_prewarm_retries_when_a_manifest_segment_format_cannot_be_read() {
+    let mut dataset = gen_batch()
+        .col("id", array::step::<Int32Type>())
+        .col("vector", array::rand_vec::<Float32Type>(4.into()))
+        .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(8))
+        .await
+        .unwrap();
+    assert!(dataset.index_cache.supports_scoped_prewarm());
+    let fragments = dataset.fragments().as_ref().clone();
+    let params = VectorIndexParams::ivf_flat(1, DistanceType::L2);
+    let mut segments = Vec::new();
+    for fragment in &fragments {
+        segments.push(
+            CreateIndexBuilder::new(&mut dataset, &["vector"], IndexType::Vector, &params)
+                .name("vector_idx".into())
+                .fragments(vec![fragment.id as u32])
+                .execute_uncommitted()
+                .await
+                .unwrap(),
+        );
+    }
+    let translating = segments[0].clone();
+    let direct_uuid = segments[1].uuid;
+    dataset
+        .commit_existing_index_segments("vector_idx", "vector", segments)
+        .await
+        .unwrap();
+    let (transition, mut live) = prepare_partition(&dataset, &[fragments[0].id], 10).await;
+    live.push(fragments[1].clone());
+    let history = InlineContent {
+        legacy_versions: vec![],
+        transitions: vec![transition],
+    };
+    install(&mut dataset, history.encode_to_vec(), live, false).await;
+
+    let marker = dataset
+        .indice_files_dir(&translating)
+        .unwrap()
+        .join(translating.uuid.to_string())
+        .join(INDEX_FILE_NAME);
+    let backup = dataset
+        .indice_files_dir(&translating)
+        .unwrap()
+        .join(translating.uuid.to_string())
+        .join("marker-backup");
+    let store = dataset.object_store_for_index(&translating).await.unwrap();
+    store.rename(&marker, &backup).await.unwrap();
+    let listing = dataset.derived_index_listing().await.unwrap();
+    assert!(listing.unverifiable.contains("vector_idx"));
+    assert!(
+        listing
+            .indices
+            .iter()
+            .any(|index| index.uuid == direct_uuid)
+    );
+    let error = dataset
+        .prewarm_index_with_cache_budget("vector_idx")
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::IO { .. }), "{error}");
+    assert!(error.to_string().contains("retry prewarm"), "{error}");
+
+    store.rename(&backup, &marker).await.unwrap();
+    dataset
+        .prewarm_index_with_cache_budget("vector_idx")
+        .await
+        .unwrap();
 }

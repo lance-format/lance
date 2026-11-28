@@ -53,6 +53,7 @@ mod diagnostics;
 mod entry_io;
 mod key;
 mod moka;
+mod prewarm;
 mod priority;
 mod quick;
 pub use priority::PriorityEntries;
@@ -74,6 +75,8 @@ pub use diagnostics::{
 pub use entry_io::{CacheEntryReader, CacheEntryWriter};
 pub use key::{CACHE_KEY_FORMAT, CacheKeySchema, CacheNamespace, InternalCacheKey, KeyBuilder};
 pub use moka::{MokaCacheBackend, MokaCacheBackendBuilder};
+pub use prewarm::{CacheEntryOwner, CachePrewarmPolicy, IndexFileRegistration};
+use prewarm::{PREWARM, ScopedPrewarm};
 pub use quick::{QuickCacheBackend, QuickCacheShardPolicy, recommended_cache_shards};
 pub use registry::{BackendBuildFn, BackendConfig, build_from_config, register_backend};
 #[cfg(feature = "metrics")]
@@ -504,6 +507,8 @@ pub struct LanceCache {
     state: Arc<CacheState>,
     namespace: key::CacheNamespace,
     origin: CacheLoadOrigin,
+    owner: Option<CacheEntryOwner>,
+    index_file: Option<Arc<IndexFileRegistration>>,
 }
 
 impl std::fmt::Debug for LanceCache {
@@ -538,7 +543,39 @@ impl DeepSizeOf for LanceCache {
     }
 }
 
+tokio::task_local! {
+    static NON_ADMITTING_CACHE: Arc<dyn CacheBackend>;
+}
+
 impl LanceCache {
+    /// Reuse existing hits and load misses without admitting new entries to this backend.
+    /// The operation must await its cache work in the current task.
+    pub async fn without_admission<T>(&self, operation: impl Future<Output = T>) -> T {
+        NON_ADMITTING_CACHE
+            .scope(self.state.backend.clone(), operation)
+            .await
+    }
+
+    /// During scoped prewarm, read dependencies without admitting them to the
+    /// index cache. Ordinary readers retain their normal admission behavior.
+    #[doc(hidden)]
+    pub async fn without_admission_during_prewarm<T>(
+        &self,
+        operation: impl Future<Output = T>,
+    ) -> T {
+        if ScopedPrewarm::current(&self.state.backend).is_some() {
+            self.without_admission(operation).await
+        } else {
+            operation.await
+        }
+    }
+
+    fn admission_disabled(&self) -> bool {
+        NON_ADMITTING_CACHE
+            .try_with(|backend| Arc::ptr_eq(backend, &self.state.backend))
+            .unwrap_or(false)
+    }
+
     /// Prepare a typed key for repeated operations in this cache namespace.
     ///
     /// This avoids recomputing its digest on each read without retaining the
@@ -586,6 +623,8 @@ impl LanceCache {
             state: Arc::new(CacheState::new(backend, cache_kind)),
             namespace: key::CacheNamespace::root(),
             origin: CacheLoadOrigin::Demand,
+            owner: None,
+            index_file: None,
         }
     }
 
@@ -603,6 +642,8 @@ impl LanceCache {
             state: self.state.clone(),
             namespace: self.namespace.child(prefix),
             origin: self.origin,
+            owner: self.owner,
+            index_file: self.index_file.clone(),
         }
     }
 
@@ -623,6 +664,162 @@ impl LanceCache {
             state: self.state.clone(),
             namespace: self.namespace,
             origin,
+            owner: self.owner,
+            index_file: self.index_file.clone(),
+        }
+    }
+
+    /// Tag future admissions in this namespace with the index segment owner.
+    pub fn with_index_owner(&self, owner: CacheEntryOwner) -> Self {
+        Self {
+            owner: Some(owner),
+            ..self.clone()
+        }
+    }
+
+    /// Tag admissions for one physical index file without changing the cache
+    /// namespace. A shallow-clone reference passes no owner, protecting its
+    /// file's resident entries when the clone opens it in the same cache.
+    #[doc(hidden)]
+    pub fn with_index_file_owner(
+        mut self,
+        store_prefix: &str,
+        file_path: &str,
+        owner: Option<CacheEntryOwner>,
+    ) -> Self {
+        let key = self
+            .with_key_prefix(store_prefix)
+            .with_key_prefix(file_path)
+            .index_collection("physical-index-file");
+        self.index_file = self
+            .state
+            .backend
+            .register_index_file(key, owner.map(|owner| owner.collection));
+        self.owner = owner.filter(|_| self.index_file.is_some());
+        self
+    }
+
+    /// Derive an opaque identity for a logical index in this namespace.
+    pub fn index_collection(&self, index_name: &str) -> InternalCacheKey {
+        KeyBuilder::new(
+            self.namespace.child(index_name),
+            "IndexCacheCollection",
+            CacheKeySchema::new("lance.index.cache-collection", 1),
+        )
+        .finish()
+    }
+
+    /// Whether this cache supports limiting eviction during explicit prewarm.
+    pub fn supports_scoped_prewarm(&self) -> bool {
+        self.state.backend.supports_scoped_prewarm()
+    }
+
+    /// Apply a scoped admission policy to a prewarm future and verify its
+    /// observed entries before returning. The prewarm must await its loaders
+    /// within this future so they run under the same admission policy.
+    pub async fn with_scoped_prewarm<T>(
+        &self,
+        policy: CachePrewarmPolicy,
+        warm: impl Future<Output = Result<T>>,
+    ) -> Result<T> {
+        let scope = Arc::new(ScopedPrewarm::new(self.state.backend.clone(), policy));
+        let result = PREWARM.scope(scope.clone(), warm).await;
+        scope.check_error()?;
+        let result = result?;
+        scope.verify().await?;
+        Ok(result)
+    }
+
+    fn operation_context(&self, type_name: &'static str) -> CacheOperationContext {
+        let mut context = CacheOperationContext::new(type_name, self.origin);
+        context.owner = self.owner;
+        context.index_file = self.index_file.as_ref().map(|file| file.key);
+        context
+    }
+
+    async fn insert_entry(
+        &self,
+        key: &InternalCacheKey,
+        value: CacheEntry,
+        size: usize,
+        codec: Option<CacheCodec>,
+        type_name: &'static str,
+    ) -> bool {
+        if self.admission_disabled() {
+            return false;
+        }
+        let context = self.operation_context(type_name);
+        if let Some(scope) = ScopedPrewarm::current(&self.state.backend) {
+            if scope.check_error().is_err() {
+                return false;
+            }
+            match self
+                .state
+                .backend
+                .admit_prewarm(key, value, size, codec, context, &scope.policy)
+                .await
+            {
+                Ok(_) => scope.record_resident(*key),
+                Err(error) => {
+                    scope.record_error(error);
+                    return false;
+                }
+            }
+        } else {
+            self.state
+                .backend
+                .insert_with_context(key, value, size, codec, context)
+                .await;
+        }
+        true
+    }
+
+    async fn load_entry(
+        &self,
+        key: &InternalCacheKey,
+        typed_loader: CacheLoader<'_>,
+        codec: Option<CacheCodec>,
+        type_name: &'static str,
+    ) -> Result<(CacheEntry, CacheLoadOutcome)> {
+        if self.admission_disabled() {
+            return match self.state.backend.get_resident(key).await {
+                Some(value) => Ok((value, CacheLoadOutcome::ResidentHit)),
+                None => typed_loader
+                    .await
+                    .map(|(value, _)| (value, CacheLoadOutcome::Loaded)),
+            };
+        }
+        let context = self.operation_context(type_name);
+        if let Some(scope) = ScopedPrewarm::current(&self.state.backend) {
+            scope.check_error()?;
+            let result = if let Some(value) = self.state.backend.get_resident(key).await {
+                Ok((value, CacheLoadOutcome::ResidentHit))
+            } else {
+                let (value, size) = typed_loader.await?;
+                self.state
+                    .backend
+                    .admit_prewarm(key, value, size, codec, context, &scope.policy)
+                    .await
+                    .map(|value| (value, CacheLoadOutcome::Loaded))
+            };
+            if result.is_ok() {
+                scope.record_resident(*key);
+            }
+            result
+        } else {
+            self.state
+                .backend
+                .get_or_insert_with_context_outcome(key, typed_loader, codec, context)
+                .await
+        }
+    }
+
+    fn record_prewarm_hit(&self, key: InternalCacheKey, resident: bool) {
+        if resident
+            && let Some(scope) = ScopedPrewarm::current(&self.state.backend)
+            && !self.admission_disabled()
+        {
+            scope.record_resident(key);
         }
     }
 
@@ -768,16 +965,18 @@ impl LanceCache {
         };
         let size = self.state.entry_size(metadata.as_ref());
         let key = self.sized_key(cache_key);
-        self.state
-            .backend
-            .insert_with_context(
+        if !self
+            .insert_entry(
                 &key,
                 metadata,
                 size,
                 cache_key.codec_for_key(),
-                CacheOperationContext::new(K::stable_type_id(), self.origin),
+                K::stable_type_id(),
             )
-            .await;
+            .await
+        {
+            return;
+        }
         if let Some(by_type) = by_type {
             self.state.record_warm_insert(by_type, self.origin, size);
         }
@@ -793,13 +992,16 @@ impl LanceCache {
         self.state.record_warm_attempt(by_type, self.origin);
         let key = self.sized_key(cache_key);
         let entry = self.state.backend.get_resident(&key).await;
+        self.record_prewarm_hit(key, entry.is_some());
         self.lookup_result(entry, by_type, K::stable_type_id(), false)
     }
 
     /// Report whether an entry is resident without counting as an access.
     pub async fn peek_resident_with_key<K: CacheKey>(&self, cache_key: &K) -> bool {
         let key = self.sized_key(cache_key);
-        self.state.backend.peek_resident(&key).await
+        let resident = self.state.backend.peek_resident(&key).await;
+        self.record_prewarm_hit(key, resident);
+        resident
     }
 
     /// Predict which tier would serve a read of the entry, without reading it
@@ -873,6 +1075,7 @@ impl LanceCache {
                     .await
             }
         };
+        self.record_prewarm_hit(key, entry.is_some());
         self.lookup_result(entry, by_type, K::stable_type_id(), true)
     }
 
@@ -983,19 +1186,17 @@ impl LanceCache {
             Ok((value as CacheEntry, size))
         });
 
-        let (entry, outcome) = self
-            .state
-            .backend
-            .get_or_insert_with_context_outcome(
+        let loaded = self
+            .load_entry(
                 &key,
                 typed_loader,
                 cache_key.codec_for_key(),
-                CacheOperationContext::new(K::stable_type_id(), self.origin),
+                K::stable_type_id(),
             )
-            .await
-            .inspect_err(|_| {
-                self.state.record_lookup_error(by_type, "load", self.origin);
-            })?;
+            .await;
+        let (entry, outcome) = loaded.inspect_err(|_| {
+            self.state.record_lookup_error(by_type, "load", self.origin);
+        })?;
         let entry = entry.downcast::<K::ValueType>().map_err(|_| {
             self.state.record_miss(by_type);
             self.state.record_type_mismatch(by_type, self.origin);
@@ -1058,16 +1259,12 @@ impl LanceCache {
         let metadata = Arc::new(metadata);
         let size = self.state.entry_size(metadata.as_ref());
         let key = self.unsized_key(cache_key);
-        self.state
-            .backend
-            .insert_with_context(
-                &key,
-                metadata,
-                size,
-                None,
-                CacheOperationContext::new(K::stable_type_id(), self.origin),
-            )
-            .await;
+        if !self
+            .insert_entry(&key, metadata, size, None, K::stable_type_id())
+            .await
+        {
+            return;
+        }
         if let Some(by_type) = by_type {
             self.state.record_warm_insert(by_type, self.origin, size);
         }
@@ -1131,14 +1328,7 @@ impl LanceCache {
         });
 
         let (entry, outcome) = self
-            .state
-            .backend
-            .get_or_insert_with_context_outcome(
-                &key,
-                typed_loader,
-                None,
-                CacheOperationContext::new(K::stable_type_id(), self.origin),
-            )
+            .load_entry(&key, typed_loader, None, K::stable_type_id())
             .await
             .inspect_err(|_| {
                 self.state.record_lookup_error(by_type, "load", self.origin);
@@ -1181,6 +1371,7 @@ impl LanceCache {
             self.state.record_miss(by_type);
             return None;
         };
+        self.record_prewarm_hit(key, true);
         match entry.downcast::<Arc<K::ValueType>>() {
             Ok(value) => {
                 self.state.record_hit(by_type);
@@ -1229,6 +1420,8 @@ pub struct WeakLanceCache {
     state: Weak<CacheState>,
     namespace: key::CacheNamespace,
     origin: CacheLoadOrigin,
+    owner: Option<CacheEntryOwner>,
+    index_file: Option<Arc<IndexFileRegistration>>,
 }
 
 impl WeakLanceCache {
@@ -1245,6 +1438,8 @@ impl WeakLanceCache {
             state: Arc::downgrade(&cache.state),
             namespace: cache.namespace,
             origin: cache.origin,
+            owner: cache.owner,
+            index_file: cache.index_file.clone(),
         }
     }
 
@@ -1253,6 +1448,8 @@ impl WeakLanceCache {
             state: self.state.clone(),
             namespace: self.namespace.child(prefix),
             origin: self.origin,
+            owner: self.owner,
+            index_file: self.index_file.clone(),
         }
     }
 
@@ -1269,6 +1466,8 @@ impl WeakLanceCache {
             state: self.state.clone(),
             namespace: self.namespace,
             origin,
+            owner: self.owner,
+            index_file: self.index_file.clone(),
         }
     }
 
@@ -1445,6 +1644,8 @@ impl WeakLanceCache {
             state: self.state.upgrade()?,
             namespace: self.namespace,
             origin: self.origin,
+            owner: self.owner,
+            index_file: self.index_file.clone(),
         })
     }
 }
