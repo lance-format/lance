@@ -327,9 +327,9 @@ impl IndexMetadata {
     /// and its type actively supports being remapped in place onto a rewrite's new
     /// fragments, rather than just losing coverage of them until rebuilt.
     ///
-    /// Of the address-domain types, BTree, Bitmap, LabelList, ListElement, NGram and
-    /// MinHash LSH's indexes support this today (`ScalarIndexPlugin::can_remap`);
-    /// ZoneMap, BloomFilter, FM and RTree cannot remap. This gate recognizes the
+    /// Of the address-domain types, BTree, Bitmap, LabelList, ListElement, NGram,
+    /// RTree and MinHash LSH's indexes support this today
+    /// (`ScalarIndexPlugin::can_remap`); ZoneMap, BloomFilter and FM cannot remap. This gate recognizes the
     /// supported built-in address-domain formats without opening index files.
     pub fn supports_eager_remap(&self) -> bool {
         self.index_details.as_ref().is_some_and(|details| {
@@ -338,6 +338,7 @@ impl IndexMetadata {
                 || Self::is_label_list_addr_domain(details, self.index_version)
                 || Self::is_list_element(details)
                 || Self::is_ngram_addr_domain(details, self.index_version)
+                || Self::is_rtree_addr_domain(details, self.index_version)
                 || Self::is_minhash_addr_domain(details, self.index_version)
         })
     }
@@ -1431,9 +1432,7 @@ mod tests {
     #[rstest]
     #[case::btree("type.googleapis.com/lance.table.BTreeIndexDetails", 1, true)]
     #[case::ngram("type.googleapis.com/lance.table.NGramIndexDetails", 1, true)]
-    // RTree cannot remap at all (`ScalarIndexPlugin::can_remap` is always
-    // false), unlike every other address-domain type here.
-    #[case::rtree("type.googleapis.com/lance.index.pb.RTreeIndexDetails", 1, false)]
+    #[case::rtree("type.googleapis.com/lance.index.pb.RTreeIndexDetails", 1, true)]
     #[case::minhash_lsh("type.googleapis.com/lance.index.pb.MinHashLshIndexDetails", 1, true)]
     #[case::bitmap("type.googleapis.com/lance.table.BitmapIndexDetails", 1, true)]
     #[case::label_list("type.googleapis.com/lance.table.LabelListIndexDetails", 2, true)]
