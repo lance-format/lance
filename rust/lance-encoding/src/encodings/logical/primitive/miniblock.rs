@@ -14,24 +14,27 @@
 //! entire chunks.
 use crate::{buffer::LanceBuffer, data::DataBlock, format::metadata::CompressiveEncoding};
 
-use lance_core::Result;
+use std::sync::LazyLock;
+
+use lance_core::{Error, Result};
 
 pub const MAX_MINIBLOCK_BYTES: u64 = 8 * 1024 - 6;
+/// Maximum framed chunk size in a u32 metadata word.
+pub(crate) const MAX_LARGE_MINIBLOCK_BYTES: u64 = 1 << 31;
 
 const DEFAULT_MAX_MINIBLOCK_VALUES: u64 = 4096;
-/// Maximum number of values that any mini-block decoder accepts from page metadata.
+/// Largest count expressible by the four bits of `log_num_values`.
 pub(crate) const MAX_CONFIGURABLE_MINIBLOCK_VALUES: u64 = 32768;
 
-fn parse_max_miniblock_values() -> u64 {
-    let val = std::env::var("LANCE_MINIBLOCK_MAX_VALUES")
+static CONFIGURED_MAX_MINIBLOCK_VALUES: LazyLock<Option<u64>> = LazyLock::new(|| {
+    std::env::var("LANCE_MINIBLOCK_MAX_VALUES")
         .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(DEFAULT_MAX_MINIBLOCK_VALUES);
-    val.clamp(1, MAX_CONFIGURABLE_MINIBLOCK_VALUES)
-}
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(|values| values.clamp(1, MAX_CONFIGURABLE_MINIBLOCK_VALUES))
+});
 
-pub static MAX_MINIBLOCK_VALUES: std::sync::LazyLock<u64> =
-    std::sync::LazyLock::new(parse_max_miniblock_values);
+pub static MAX_MINIBLOCK_VALUES: LazyLock<u64> =
+    LazyLock::new(|| CONFIGURED_MAX_MINIBLOCK_VALUES.unwrap_or(DEFAULT_MAX_MINIBLOCK_VALUES));
 
 /// Maximum number of rep/def levels the structural planner should place into
 /// a single mini-block chunk.
@@ -60,6 +63,13 @@ pub struct MiniBlockCompressionContext {
     common_chunk_buffers: u64,
     support_large_chunk: bool,
     allow_generic_offsets: bool,
+    fixed_width_chunk_target: Option<FixedWidthChunkTarget>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FixedWidthChunkTarget {
+    bytes: u64,
+    max_values: u64,
 }
 
 impl MiniBlockCompressionContext {
@@ -73,7 +83,69 @@ impl MiniBlockCompressionContext {
             common_chunk_buffers,
             support_large_chunk,
             allow_generic_offsets,
+            fixed_width_chunk_target: None,
         }
+    }
+
+    pub(crate) fn with_fixed_width_chunk_target(mut self, bytes: u64) -> Self {
+        self.fixed_width_chunk_target = Some(FixedWidthChunkTarget {
+            bytes,
+            max_values: CONFIGURED_MAX_MINIBLOCK_VALUES
+                .unwrap_or(MAX_CONFIGURABLE_MINIBLOCK_VALUES),
+        });
+        self
+    }
+
+    /// Reduce the chunk cardinality when the actual dense level buffers do not fit.
+    pub(crate) fn reduce_fixed_width_chunk_limit(&mut self, current_values: u64) -> bool {
+        let Some(target) = self.fixed_width_chunk_target.as_mut() else {
+            return false;
+        };
+        // Zero is reserved for the final chunk, so a full chunk needs at least two values.
+        if current_values <= 2 || current_values > target.max_values {
+            return false;
+        }
+        target.max_values = 1 << (current_values - 1).ilog2();
+        true
+    }
+
+    pub(crate) fn fixed_width_values_per_chunk(
+        self,
+        num_values: u64,
+        values_per_word: u64,
+        num_value_buffers: u64,
+        bytes_for_values: impl Fn(u64) -> u64,
+    ) -> Result<Option<u64>> {
+        let Some(target) = self
+            .fixed_width_chunk_target
+            .filter(|_| self.supports_large_chunk())
+        else {
+            return Ok(None);
+        };
+        // The wire limit includes headers, level buffers and per-buffer alignment.
+        let reserved = self.chunk_header_bytes(num_value_buffers)
+            + self.common_chunk_buffers * (u16::MAX as u64).next_multiple_of(8)
+            + 7 * num_value_buffers;
+        let byte_budget = target
+            .bytes
+            .min(MAX_LARGE_MINIBLOCK_BYTES.saturating_sub(reserved));
+        let min_full_chunk = values_per_word.max(2);
+        for log in (min_full_chunk.ilog2()..=target.max_values.ilog2()).rev() {
+            let values = 1 << log;
+            if bytes_for_values(values) <= byte_budget {
+                return Ok(Some(values));
+            }
+        }
+        // A page with just one chunk uses the final-chunk count, and can end mid-byte.
+        if num_values <= target.max_values && bytes_for_values(num_values) <= byte_budget {
+            return Ok(Some(num_values.max(1)));
+        }
+        Err(Error::invalid_input(format!(
+            "Fixed-width mini-block with {num_values} values needs at least {min_full_chunk} \
+             values and {} bytes per non-final chunk, but its limits are {} values and {byte_budget} bytes",
+            bytes_for_values(min_full_chunk),
+            target.max_values
+        )))
     }
 
     pub(crate) fn chunk_header_bytes(self, value_buffers: u64) -> u64 {
@@ -98,15 +170,10 @@ impl MiniBlockCompressionContext {
 /// Mini-block chunks are designed to be small (just a few disk sectors)
 /// and contain a power-of-two number of values (except for the last chunk)
 ///
-/// By default we limit a chunk to 4Ki values and slightly less than
-/// 8KiB of compressed value data.  The byte budget remains the primary
-/// constraint, so only encodings that compress many values into that
-/// budget can use larger value counts when explicitly configured.
-///
-/// The maximum number of values per chunk can be configured via the
-/// `LANCE_MINIBLOCK_MAX_VALUES` environment variable.  This is only
-/// useful in extremely bandwidth-limited environments; the default is
-/// appropriate for local disks and same-region cloud object storage.
+/// The default chunking budget is 4Ki values and slightly less than 8KiB of
+/// value data. With an explicit byte target, 2.2 and later fixed-width writers
+/// can reach the wire limit of 32Ki values. `LANCE_MINIBLOCK_MAX_VALUES` can
+/// set a process-wide count limit for these chunks.
 #[derive(Debug)]
 pub struct MiniBlockChunk {
     // The size in bytes of each buffer in the chunk.
@@ -121,11 +188,19 @@ pub struct MiniBlockChunk {
     // For example, 1 would mean there are 2 values in the chunk and 15 would mean there
     // are 32Ki values in the chunk.
     //
-    // This must be <= log2(MAX_MINIBLOCK_VALUES) (i.e. <= 12 at the default of 4096)
+    // This must be <= 15 to fit the four-bit metadata field.
     pub log_num_values: u8,
 }
 
 impl MiniBlockChunk {
+    pub(crate) fn log_for_fixed_width_chunk(values: u64) -> u8 {
+        if values.is_power_of_two() {
+            values.ilog2() as u8
+        } else {
+            0
+        }
+    }
+
     /// Gets the number of values in this block
     ///
     /// This requires `vals_in_prev_blocks` and `total_num_values` because the
@@ -166,13 +241,17 @@ mod tests {
     use super::*;
 
     #[rstest]
-    #[case::unset(None, 4096)]
-    #[case::custom_value(Some("256"), 256)]
-    #[case::can_raise_to_32k(Some("32768"), 32768)]
-    #[case::clamps_zero_to_one(Some("0"), 1)]
-    #[case::clamps_above_max(Some("99999"), MAX_CONFIGURABLE_MINIBLOCK_VALUES)]
-    #[case::invalid_falls_back_to_default(Some("not_a_number"), DEFAULT_MAX_MINIBLOCK_VALUES)]
-    fn test_parse_max_miniblock_values(#[case] env_value: Option<&str>, #[case] expected: u64) {
+    #[case::unset(None, None)]
+    #[case::custom_value(Some("256"), Some(256))]
+    #[case::non_power_of_two(Some("9000"), Some(9000))]
+    #[case::can_raise_to_32k(Some("32768"), Some(32768))]
+    #[case::clamps_zero_to_one(Some("0"), Some(1))]
+    #[case::clamps_above_max(Some("99999"), Some(MAX_CONFIGURABLE_MINIBLOCK_VALUES))]
+    #[case::invalid_falls_back_to_default(Some("not_a_number"), None)]
+    fn test_parse_max_miniblock_values(
+        #[case] env_value: Option<&str>,
+        #[case] expected: Option<u64>,
+    ) {
         // Other tests initialize `MAX_MINIBLOCK_VALUES` from the process-wide environment, so
         // instead of changing `LANCE_MINIBLOCK_MAX_VALUES` here the test re-runs itself in a child
         // process that starts with it. libtest names the thread after the running test, so the
@@ -202,7 +281,15 @@ mod tests {
             return;
         }
 
-        assert_eq!(parse_max_miniblock_values(), expected);
-        assert_eq!(*MAX_MINIBLOCK_VALUES, expected);
+        assert_eq!(*MAX_MINIBLOCK_VALUES, expected.unwrap_or(4096));
+        let context = MiniBlockCompressionContext::new(0, true, true)
+            .with_fixed_width_chunk_target(256 * 1024);
+        let num_values = if expected == Some(1) { 1 } else { 32769 };
+        assert_eq!(
+            context
+                .fixed_width_values_per_chunk(num_values, 1, 1, |values| values * 8)
+                .unwrap(),
+            Some(1 << expected.unwrap_or(32768).ilog2())
+        );
     }
 }

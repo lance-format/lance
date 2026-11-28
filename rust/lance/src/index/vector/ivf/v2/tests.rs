@@ -41,9 +41,11 @@ use crate::index::vector::details::{
     target_partition_size_from_details, vector_index_details_default,
 };
 use crate::index::vector::ivf::compatibility::{VectorQueryContract, vector_segment_contract};
+use crate::index::vector::ivf::v2::rabit_scan::RabitCacheLayout;
 use crate::index::vector::ivf::v2::{
     IVFPartitionKey, IvfFlatIndex, IvfHnswSqIndex, IvfPq, IvfStateEntryBox, PartitionEntry,
 };
+use crate::session::Session;
 use crate::session::index_caches::{DerivedIndexListingKey, QueryIndexListingKey};
 use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount, copy_test_data_to_tmp};
 use crate::{
@@ -58,7 +60,7 @@ use lance_core::cache::{CacheBackend, CacheCodecImpl, LanceCache, WeakLanceCache
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::utils::tempfile::TempStrDir;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
-use lance_core::{ROW_ID, Result};
+use lance_core::{Error, ROW_ID, Result};
 use lance_datagen::{Dimension, RowCount, Seed, array, gen_batch};
 use lance_encoding::decoder::DecoderPlugins;
 use lance_file::reader::{FileReader, FileReaderOptions};
@@ -381,6 +383,54 @@ async fn test_partition_coverage_is_only_built_for_capable_filters() {
     assert!(cache_weight_with_coverage > cache_weight_without_coverage);
     assert!(cache_weight_with_coverage >= entry.deep_size_of());
     assert!(entry.partition_rows_accounted.load(Ordering::Acquire));
+}
+
+#[tokio::test]
+async fn test_partition_coverage_cache_does_not_retain_transient_storage() {
+    let entry = |num_rows: usize| {
+        let vectors = FixedSizeListArray::try_new_from_values(
+            Float32Array::from(vec![0.0_f32; num_rows * 4]),
+            4,
+        )
+        .unwrap();
+        let mut entry = PartitionEntry::<FlatIndex, FlatQuantizer>::new(
+            FlatIndex::default(),
+            FlatFloatStorage::new(vectors, DistanceType::L2),
+        );
+        entry.cache_whole_partition = false;
+        Arc::new(entry)
+    };
+    let cache = LanceCache::with_capacity(1 << 20);
+    let weak_cache = WeakLanceCache::from(&cache.with_key_prefix("translation-a"));
+    let first = entry(4);
+    let weak_entry = Arc::downgrade(&first);
+    let rows =
+        super::IVFIndex::<FlatIndex, FlatQuantizer>::cache_partition_rows(&weak_cache, 0, &first)
+            .await
+            .unwrap();
+    assert_eq!(rows.as_ref(), &(0..4_u64).collect::<RowAddrTreeMap>());
+    drop(first);
+    assert!(weak_entry.upgrade().is_none());
+    let second = entry(4);
+    let cached_rows =
+        super::IVFIndex::<FlatIndex, FlatQuantizer>::cache_partition_rows(&weak_cache, 0, &second)
+            .await
+            .unwrap();
+    assert!(Arc::ptr_eq(&rows, &cached_rows));
+    assert!(second.partition_rows.get().is_none());
+    let changed_cache = WeakLanceCache::from(&cache.with_key_prefix("translation-b"));
+    let changed_rows = super::IVFIndex::<FlatIndex, FlatQuantizer>::cache_partition_rows(
+        &changed_cache,
+        0,
+        &entry(2),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        changed_rows.as_ref(),
+        &(0..2_u64).collect::<RowAddrTreeMap>()
+    );
+    assert!(!Arc::ptr_eq(&rows, &changed_rows));
 }
 
 #[rstest]
@@ -9079,6 +9129,185 @@ async fn test_prewarm_vector_index(#[case] params: VectorIndexParams) {
         .as_ref()
         .io_stats_incremental();
     assert_io_eq!(stats, read_iops, 0, "second prewarm should not perform IO");
+}
+
+#[rstest]
+#[case::ivf_pq(VectorIndexParams::with_ivf_pq_params(
+    DistanceType::L2,
+    IvfBuildParams { max_iters: 4, sample_rate: LIGHTWEIGHT_IVF_SAMPLE_RATE, ..IvfBuildParams::new(4) },
+    PQBuildParams { max_iters: 4, ..PQBuildParams::new(16, 4) },
+))]
+#[case::ivf_rq(VectorIndexParams::with_ivf_rq_params(
+    DistanceType::L2,
+    IvfBuildParams { max_iters: 4, sample_rate: LIGHTWEIGHT_IVF_SAMPLE_RATE, ..IvfBuildParams::new(4) },
+    RQBuildParams::with_rotation_type(5, RQRotationType::Fast),
+))]
+#[tokio::test]
+async fn test_prewarm_selected_vector_partitions(#[case] params: VectorIndexParams) {
+    const INDEX_NAME: &str = "selected_partitions";
+    let dir = TempStrDir::default();
+    let (schema, batches) = make_two_fragment_batches();
+    let vectors = batches[0]["vector"].as_fixed_size_list().clone();
+    let mut dataset = write_dataset_from_batches(dir.as_str(), schema, batches).await;
+    dataset
+        .create_index(
+            &["vector"],
+            IndexType::Vector,
+            Some(INDEX_NAME.to_owned()),
+            &params,
+            false,
+        )
+        .await
+        .unwrap();
+    let dataset = native_resident_tests::open_with_session(
+        dir.as_str(),
+        Session::default().with_rabit_scan_factory(Arc::new(
+            native_scan_tests::NativeScanFactory::Whole(RabitCacheLayout::Planes),
+        )),
+    )
+    .await;
+    let metadata = dataset.load_indices_by_name(INDEX_NAME).await.unwrap();
+    let index = dataset
+        .open_vector_index("vector", &metadata[0].uuid, &NoOpMetricsCollector)
+        .await
+        .unwrap();
+    assert_eq!(index.total_partitions(), 4);
+    let store = dataset.object_store(None).await.unwrap();
+    store.io_stats_incremental();
+    let before = dataset.session().cache_diagnostics();
+
+    index.prewarm_partitions(&[]).await.unwrap();
+    let error = index.prewarm_partitions(&[0, 4]).await.unwrap_err();
+    assert!(matches!(error, Error::InvalidInput { .. }));
+    assert!(error.to_string().contains("partition_id=4"));
+    assert_eq!(store.io_stats_incremental().read_iops, 0);
+    assert_eq!(
+        dataset
+            .session()
+            .cache_diagnostics()
+            .index
+            .activity
+            .warm
+            .loads_succeeded,
+        before.index.activity.warm.loads_succeeded
+    );
+
+    index.prewarm_partitions(&[2, 0, 2]).await.unwrap();
+    assert!(store.io_stats_incremental().read_iops > 0);
+    let after = dataset.session().cache_diagnostics();
+    assert!(after.index.activity.warm.loads_succeeded > before.index.activity.warm.loads_succeeded);
+    for partition_id in 0..4 {
+        let selected = matches!(partition_id, 0 | 2);
+        if let Some(native) = index
+            .as_any()
+            .downcast_ref::<super::IVFIndex<FlatIndex, RabitQuantizer>>()
+        {
+            assert!(native.uses_rabit_plane_cache());
+            for plane in [0, 1] {
+                let cached = native
+                    .raw_cache
+                    .get_with_key(&native.storage.plane_key(partition_id, plane))
+                    .await
+                    .is_some();
+                assert_eq!(cached, selected, "partition {partition_id} plane {plane}");
+            }
+        } else {
+            let pq = index
+                .as_any()
+                .downcast_ref::<super::IVFIndex<FlatIndex, ProductQuantizer>>()
+                .unwrap();
+            let cached = pq
+                .index_cache
+                .get_with_key(&IVFPartitionKey::<FlatIndex, ProductQuantizer>::new(
+                    partition_id,
+                ))
+                .await
+                .is_some();
+            assert_eq!(cached, selected, "partition {partition_id}");
+        }
+    }
+    index.prewarm_partitions(&[0, 2]).await.unwrap();
+    assert_eq!(store.io_stats_incremental().read_iops, 0);
+    assert_eq!(
+        dataset
+            .session()
+            .cache_diagnostics()
+            .index
+            .activity
+            .warm
+            .loads_succeeded,
+        after.index.activity.warm.loads_succeeded
+    );
+
+    let mut query = Query {
+        column: "vector".to_owned(),
+        key: vectors.value(0),
+        k: 10,
+        lower_bound: None,
+        upper_bound: None,
+        minimum_nprobes: 4,
+        maximum_nprobes: Some(4),
+        search_effort: 0.5,
+        ef: None,
+        refine_factor: None,
+        metric_type: Some(DistanceType::L2),
+        use_index: true,
+        query_parallelism: DEFAULT_QUERY_PARALLELISM,
+        dist_q_c: f32::NAN,
+        approx_mode: ApproxMode::Accurate,
+        rq_graph_scoring: Default::default(),
+    };
+    let (partitions, centroid_distances) = index.find_partitions(&query).unwrap();
+    let before_query = dataset.session().cache_diagnostics();
+    for partition_id in [0, 2] {
+        let position = partitions
+            .values()
+            .iter()
+            .position(|&id| id as usize == partition_id)
+            .unwrap();
+        query.dist_q_c = centroid_distances.value(position);
+        let results = index
+            .search_in_partition(
+                partition_id,
+                &query,
+                Arc::new(NoFilter),
+                &NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+        assert!(results.num_rows() > 0);
+    }
+    assert_eq!(store.io_stats_incremental().read_iops, 0);
+    let after_query = dataset.session().cache_diagnostics();
+    assert!(after_query.index.activity.hits > before_query.index.activity.hits);
+    assert_eq!(
+        after_query.index.activity.warm.loads_succeeded,
+        before_query.index.activity.warm.loads_succeeded
+    );
+
+    let mut hits = 0;
+    for row in 0..8 {
+        let query = vectors.value(row);
+        let truth = ground_truth(&dataset, "vector", query.as_ref(), 10, DistanceType::L2).await;
+        let results = dataset
+            .scan()
+            .nearest("vector", query.as_primitive::<Float32Type>(), 10)
+            .unwrap()
+            .nprobes(4)
+            .project(&["_rowid"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        hits += results["_rowid"]
+            .as_primitive::<UInt64Type>()
+            .values()
+            .iter()
+            .filter(|id| truth.contains(id))
+            .count();
+    }
+    let recall_at_10 = hits as f64 / 80.0;
+    assert!(recall_at_10 >= 0.5, "recall@10={recall_at_10}");
 }
 
 /// Index-cache backend that can drop partition entries on demand.

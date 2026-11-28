@@ -17,6 +17,7 @@ on:
       - ci/format_vote_gate.py
       - ci/test_format_vote_gate.py
       - ci/test_labeler_area.py
+      - ci/test_java_publish.py
       - ci/check_proto_comments.py
       - ci/test_check_proto_comments.py
       - ci/check_dependency_age.py
@@ -38,6 +39,8 @@ on:
       - .github/release.yml
       - .github/labeler-area.yml
       - .github/workflows/format-vote-gate.yml
+      - .github/workflows/java.yml
+      - .github/workflows/java-publish.yml
       - .github/workflows/recover-beta-win-arm64-wheel.yml
       - .github/workflows/ci-scripts.yml
 
@@ -60,4 +63,4 @@ jobs:
       - name: Check bumpversion crate coverage
         run: python ci/check_bumpversion_coverage.py
       - name: Run tests
-        run: pytest ci/test_format_vote_gate.py ci/test_labeler_area.py ci/test_check_proto_comments.py ci/test_check_dependency_age.py ci/test_check_advisory_ignores.py ci/test_arrow_upgrade.py ci/test_check_module_size.py ci/test_check_beta_wheel_recovery.py ci/test_generate_release_notes.py ci/test_check_bumpversion_coverage.py
+        run: pytest ci/test_format_vote_gate.py ci/test_labeler_area.py ci/test_java_publish.py ci/test_check_proto_comments.py ci/test_check_dependency_age.py ci/test_check_advisory_ignores.py ci/test_arrow_upgrade.py ci/test_check_module_size.py ci/test_check_beta_wheel_recovery.py ci/test_generate_release_notes.py ci/test_check_bumpversion_coverage.py

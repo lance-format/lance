@@ -674,6 +674,7 @@ impl FileFragment {
             blob_handling,
             write_version,
             || super::scanner::get_default_batch_size().unwrap_or(1024),
+            FragReadConfig::default(),
         ))
         .await?;
         let hook = Arc::new(LanceWriteSeedHook::new(self.dataset.session.clone()));
