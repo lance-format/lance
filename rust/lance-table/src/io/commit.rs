@@ -1242,7 +1242,13 @@ async fn build_dynamodb_external_store(
     }
     let client = Client::from_conf(dynamodb_config.build());
 
-    DynamoDBExternalManifestStore::new_external_store(client.into(), table_name, app_name).await
+    // Boxed so the AWS SDK's future is not inlined into every caller's future type.
+    Box::pin(DynamoDBExternalManifestStore::new_external_store(
+        client.into(),
+        table_name,
+        app_name,
+    ))
+    .await
 }
 
 pub async fn commit_handler_from_url(

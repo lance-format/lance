@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
+import inspect
 import json
 import multiprocessing
 import pickle
@@ -84,6 +85,9 @@ def test_scan_fragment(tmp_path: Path):
     tab = pa.table({"a": range(100), "b": range(100, 200)})
     ds = write_dataset(tab, tmp_path)
     frag = ds.get_fragments()[0]
+
+    for scan in (frag.scanner, frag.to_batches):
+        assert inspect.signature(scan).parameters["batch_readahead"].default is None
 
     actual = frag.to_table(
         columns=["b"],

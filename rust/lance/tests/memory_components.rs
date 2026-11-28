@@ -14,10 +14,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arrow_array::{Int32Array, RecordBatch};
+use arrow_buffer::MutableBuffer;
 use arrow_schema::{DataType, Field, Schema};
 use datafusion::execution::memory_pool::MemoryConsumer;
 use lance::dataset::mem_wal::{ShardWriter, ShardWriterConfig};
-use lance::memory::{METRIC_COMPONENT, describe_metrics, refresh_metrics};
+use lance::memory::{
+    IvfPartitionCopies, METRIC_COMPONENT, METRIC_IVF_PARTITION_BACKING, describe_metrics,
+    refresh_metrics, set_observation,
+};
 use lance_datafusion::exec::{LanceExecutionOptions, get_session_context, new_session_context};
 use lance_io::object_store::ObjectStore;
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
@@ -75,6 +79,7 @@ fn test_components_report_the_memory_they_hold() {
     let snapshotter = recorder.snapshotter();
     recorder.install().unwrap();
     describe_metrics();
+    check_ivf_partition_copies(&snapshotter);
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -91,6 +96,46 @@ fn test_components_report_the_memory_they_hold() {
         .unwrap();
     assert_eq!(unit, Some(Unit::Bytes));
     assert!(description.is_some());
+}
+
+/// An evicted buffer can remain live through a one-byte query slice.
+fn check_ivf_partition_copies(snapshotter: &Snapshotter) {
+    let live_bytes = || {
+        snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .find_map(|(key, _, _, value)| match value {
+                DebugValue::Gauge(value) if key.key().name() == METRIC_IVF_PARTITION_BACKING => {
+                    Some(value.0)
+                }
+                _ => None,
+            })
+    };
+    set_observation(false);
+    assert!(IvfPartitionCopies::start().is_none());
+    assert_eq!(live_bytes(), None);
+    set_observation(true);
+    let mut read = IvfPartitionCopies::start().unwrap();
+    let mut original = MutableBuffer::from_len_zeroed(8192);
+    original.as_slice_mut()[4096] = 17;
+    let ptr = original.as_ptr();
+    let cached = read.finish(original);
+    assert_eq!(cached.as_ptr(), ptr);
+    assert_eq!(cached.capacity(), 8192);
+    let query = cached.slice_with_length(4096, 1);
+    drop(cached);
+    assert_eq!(query.as_slice(), &[17]);
+    assert_eq!(live_bytes(), Some(8192.0));
+    let copy = read.finish(MutableBuffer::from_len_zeroed(4096));
+    assert_eq!(read.copied_bytes(), 12288);
+    assert_eq!(live_bytes(), Some(12288.0));
+    set_observation(false);
+    drop(query);
+    assert_eq!(live_bytes(), Some(4096.0));
+    drop(copy);
+    assert_eq!(live_bytes(), Some(0.0));
+    set_observation(true);
 }
 
 async fn check_components(snapshotter: &Snapshotter) {

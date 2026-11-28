@@ -2202,7 +2202,7 @@ async fn definitions_on_an_append_are_refused_and_change_nothing() {
             fragments: dataset
                 .get_fragments()
                 .iter()
-                .map(|f| f.metadata.clone())
+                .map(|f| f.metadata().clone())
                 .collect(),
         },
         None,
@@ -2241,7 +2241,7 @@ async fn an_empty_definitions_list_is_still_refused_on_an_append() {
             fragments: dataset
                 .get_fragments()
                 .iter()
-                .map(|f| f.metadata.clone())
+                .map(|f| f.metadata().clone())
                 .collect(),
         },
         None,

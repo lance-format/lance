@@ -744,7 +744,7 @@ async fn test_restore(
     let fragments = dataset.get_fragments();
     assert_eq!(fragments.len(), 1);
     assert_eq!(dataset.count_fragments(), 1);
-    assert_eq!(fragments[0].metadata.deletion_file, None);
+    assert_eq!(fragments[0].metadata().deletion_file, None);
     assert_eq!(dataset.manifest, original_manifest);
 
     // Checkout latest and then go back.
@@ -764,7 +764,7 @@ async fn test_restore(
     let fragments = dataset.get_fragments();
     assert_eq!(fragments.len(), 1);
     assert_eq!(dataset.count_fragments(), 1);
-    assert!(fragments[0].metadata.deletion_file.is_some());
+    assert!(fragments[0].metadata().deletion_file.is_some());
 }
 
 #[rstest]

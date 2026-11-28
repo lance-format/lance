@@ -529,6 +529,30 @@ impl RleEncoder {
         self
     }
 
+    /// Whether single-value runs produce the same chunk boundaries as a fixed stride.
+    pub(crate) fn singleton_chunks_match(
+        &self,
+        data: &FixedWidthDataBlock,
+        values_per_chunk: u64,
+    ) -> bool {
+        let entry_bytes = data.bits_per_value / 8 + self.run_length_width.bytes_per_value() as u64;
+        let final_limit = (self.max_miniblock_values as u64).min(MAX_MINIBLOCK_BYTES / entry_bytes);
+        let num_values = data.num_values;
+        if num_values <= values_per_chunk {
+            return num_values <= final_limit;
+        }
+        if final_limit < 2
+            || num_values <= final_limit
+            || (1 << final_limit.ilog2()) != values_per_chunk
+        {
+            return false;
+        }
+        // The rolling encoder uses the full byte/count budget for the tail
+        // and rolls back to a power of two only for non-final chunks.
+        (num_values - final_limit).div_ceil(values_per_chunk)
+            == num_values.div_ceil(values_per_chunk) - 1
+    }
+
     fn encode_data(
         &self,
         data: &LanceBuffer,

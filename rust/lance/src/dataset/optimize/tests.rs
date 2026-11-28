@@ -51,6 +51,7 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Field as ArrowField, Schema, Schema as ArrowSchema};
 use arrow_select::concat::concat_batches;
 use async_trait::async_trait;
+use futures::{StreamExt, TryStreamExt};
 use lance_arrow::{BLOB_META_KEY, FixedSizeListArrayExt};
 use lance_core::Error;
 use lance_core::ROW_ID;
@@ -102,6 +103,29 @@ use std::io::Cursor;
 use std::ops::Range;
 use std::sync::Arc;
 use uuid::Uuid;
+
+pub(super) async fn rewrite_files(
+    dataset: Cow<'_, Dataset>,
+    task: TaskData,
+    options: &CompactionOptions,
+) -> Result<RewriteResult> {
+    CompactionTask {
+        task,
+        read_version: dataset.manifest.version,
+        options: options.clone(),
+    }
+    .execute(&dataset)
+    .await
+}
+
+async fn can_use_binary_copy(
+    dataset: &Dataset,
+    options: &CompactionOptions,
+    fragments: &[Fragment],
+) -> bool {
+    runtime::execution::can_use_binary_copy(&dataset.table_view().to_table(), options, fragments)
+        .await
+}
 
 fn sample_data() -> RecordBatch {
     let schema = Schema::new(vec![Field::new("a", DataType::Int64, false)]);

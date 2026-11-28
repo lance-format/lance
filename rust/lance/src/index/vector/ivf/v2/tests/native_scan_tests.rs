@@ -671,6 +671,13 @@ async fn test_rabit_raw_cache_survives_fragment_reuse(
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum FragmentReuseFilter {
+    Unfiltered,
+    AllowList,
+    BlockList,
+}
+
 #[rstest]
 #[case::compaction(false)]
 #[case::stable_partition(true)]
@@ -683,7 +690,12 @@ async fn test_native_strategy_scoring_through_fragment_reuse(
         NativeScanFactory::Survivors(ExIndex::Compact, RabitScanScope::Query)
     )]
     factory: NativeScanFactory,
-    #[values(false, true)] filtered: bool,
+    #[values(
+        FragmentReuseFilter::Unfiltered,
+        FragmentReuseFilter::AllowList,
+        FragmentReuseFilter::BlockList
+    )]
+    filter_kind: FragmentReuseFilter,
     #[values(ApproxMode::Normal, ApproxMode::Accurate)] mode: ApproxMode,
 ) {
     let dir = TempStrDir::default();
@@ -750,7 +762,10 @@ async fn test_native_strategy_scoring_through_fragment_reuse(
     .await
     .unwrap();
     assert_eq!(dataset.fragments().len(), 1);
-    let predicate = if filtered { "i % 3 = 0" } else { "true" };
+    let predicate = match filter_kind {
+        FragmentReuseFilter::Unfiltered => "true",
+        FragmentReuseFilter::AllowList | FragmentReuseFilter::BlockList => "i % 3 = 0",
+    };
     let live = dataset
         .scan()
         .filter(predicate)
@@ -760,10 +775,32 @@ async fn test_native_strategy_scoring_through_fragment_reuse(
         .await
         .unwrap();
     let live_ids = live[ROW_ID].as_primitive::<UInt64Type>();
-    let filter: Arc<dyn PreFilter> = if filtered {
-        let mask = Arc::new(RowAddrMask::AllowList(
+    let mask = match filter_kind {
+        FragmentReuseFilter::Unfiltered => None,
+        FragmentReuseFilter::AllowList => Some(RowAddrMask::AllowList(
             live_ids.values().iter().copied().collect(),
-        ));
+        )),
+        FragmentReuseFilter::BlockList => {
+            let excluded = dataset
+                .scan()
+                .filter("i % 3 != 0")
+                .unwrap()
+                .with_row_id()
+                .try_into_batch()
+                .await
+                .unwrap();
+            Some(RowAddrMask::BlockList(
+                excluded[ROW_ID]
+                    .as_primitive::<UInt64Type>()
+                    .values()
+                    .iter()
+                    .copied()
+                    .collect(),
+            ))
+        }
+    };
+    let filter: Arc<dyn PreFilter> = if let Some(mask) = mask {
+        let mask = Arc::new(mask);
         Arc::new(DatasetPreFilter::new_with_filter_future(
             Arc::new(dataset.clone()),
             &dataset.load_indices().await.unwrap(),
@@ -830,7 +867,7 @@ async fn test_native_strategy_scoring_through_fragment_reuse(
 }
 
 #[derive(Debug, Clone, Copy)]
-enum NativeScanFactory {
+pub(super) enum NativeScanFactory {
     Whole(RabitCacheLayout),
     Survivors(ExIndex, RabitScanScope),
 }

@@ -1497,7 +1497,7 @@ async fn test_historical_index_without_bitmap_still_collects_seed_positions() {
 async fn test_seed_collector_policy_lookup_cost() {
     use lance_file::version::ConcreteFileVersion;
 
-    use crate::dataset::write::seeds::SeedCollector;
+    use crate::dataset::write::seeds::collect_write_seeds;
 
     async fn index_requests(dataset: &Dataset) -> usize {
         io(dataset)
@@ -1508,14 +1508,9 @@ async fn test_seed_collector_policy_lookup_cost() {
     }
     async fn writers_and_requests(dataset: &Dataset) -> (usize, usize) {
         io(dataset);
-        let collector = SeedCollector::for_write(
-            ConcreteFileVersion::V2_0,
-            Some(dataset),
-            dataset.schema(),
-            true,
-        )
-        .await
-        .unwrap();
+        let collector = collect_write_seeds(ConcreteFileVersion::V2_0, dataset, dataset.schema())
+            .await
+            .unwrap();
         (collector.len(), index_requests(dataset).await)
     }
 

@@ -18,6 +18,7 @@ use std::ops::{Range, RangeInclusive};
 mod bitmap;
 mod encoded_array;
 mod index;
+mod offsets;
 mod runs;
 pub mod segment;
 mod serde;
@@ -30,6 +31,7 @@ pub use index::RowIdIndex;
 use lance_core::{Error, Result};
 use lance_io::ReadBatchParams;
 use lance_select::{RowAddrMask, RowAddrTreeMap, RowSetOps};
+pub use offsets::{FragmentRowOffset, compute_row_offset_array};
 pub use serde::{read_row_ids, write_row_ids};
 
 use crate::utils::LanceIteratorExtension;

@@ -443,8 +443,50 @@ async fn managed_append_preserves_primary_base_root_semantics(
         dataset
             .get_fragments()
             .iter()
-            .all(|fragment| fragment.metadata.files[0].base_id.is_none())
+            .all(|fragment| fragment.metadata().files[0].base_id.is_none())
     );
+}
+
+#[rstest]
+#[case::primary(None)]
+#[case::registered(Some(7))]
+#[tokio::test]
+async fn take_blobs_reports_resolved_managed_base(#[case] file_base: Option<u32>) {
+    let dir = TempStrDir::default();
+    let mut values = BlobDescriptorArrayBuilder::new("blob");
+    // Both descriptors name the same object, one via the data file's base and
+    // the other via a registered base pointing at the same directory.
+    for base_id in [None, Some(7)] {
+        values
+            .push(BlobDescriptor::Managed {
+                base_id,
+                uri: "_blobs/shared.blob".to_string(),
+                offset: 0,
+                size: 1,
+            })
+            .unwrap();
+    }
+    let (field, values) = values.finish().unwrap().into_parts();
+    let schema = Arc::new(managed_blob_schema(vec![field]));
+    let batch = RecordBatch::try_new(schema.clone(), vec![values]).unwrap();
+    let dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch)], schema),
+        &dir,
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            initial_bases: Some(vec![BasePath::new(7, dir.to_string(), None, true)]),
+            target_bases: file_base.map(|id| vec![id]),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let files = Arc::new(dataset).take_blobs(&[0, 1], "blob").await.unwrap();
+    let inherited = files[0].as_ref().unwrap();
+    let explicit = files[1].as_ref().unwrap();
+    assert_eq!(inherited.data_path(), explicit.data_path());
+    assert_eq!(inherited.base_id(), file_base);
+    assert_eq!(explicit.base_id(), Some(7));
 }
 
 #[rstest]
@@ -1015,7 +1057,7 @@ async fn managed_clone_preserves_existing_retention_contract(
     if deep && !registered {
         assert_eq!(source.manifest.fragments, cloned.manifest.fragments);
         for fragment in source.get_fragments() {
-            for file in &fragment.metadata.files {
+            for file in &fragment.metadata().files {
                 let relative = format!("data/{}", file.path);
                 assert_eq!(
                     std::fs::read(std::path::Path::new(source_dir.as_ref()).join(&relative))
@@ -1840,6 +1882,7 @@ async fn test_released_legacy_blob_reads_from_shallow_clone(
         for (file, &index) in files.iter().zip(&indices) {
             match (file, expected[index as usize]) {
                 (Some(file), Some(payload)) => {
+                    assert_eq!(file.base_id(), base_id);
                     assert_eq!(file.read().await.unwrap().as_ref(), payload);
                 }
                 (None, None) => {}
@@ -3452,6 +3495,7 @@ async fn test_take_blob_v2_from_non_default_base_inline_reuses_store() {
         for blob in blobs {
             let blob = blob.as_ref().unwrap();
             assert_eq!(blob.kind(), BlobKind::Inline);
+            assert_eq!(blob.base_id(), Some(1));
             assert_eq!(
                 blob.read().await.unwrap().as_ref(),
                 fixture.expected.as_slice()
@@ -3480,6 +3524,7 @@ async fn test_take_blob_v2_from_non_default_base_dedicated() {
     assert_eq!(blobs.len(), 1);
     let blob = blobs[0].as_ref().unwrap();
     assert_eq!(blob.kind(), BlobKind::Dedicated);
+    assert_eq!(blob.base_id(), Some(1));
     assert_eq!(
         blob.read().await.unwrap().as_ref(),
         fixture.expected.as_slice()
@@ -3950,6 +3995,7 @@ async fn test_external_blob_unknown_sizes_are_resolved_once_and_concurrently() {
     for (row, file) in files.iter().enumerate() {
         let payload = &payloads[row / ROWS_PER_OBJECT];
         let file = file.as_ref().unwrap();
+        assert_eq!(file.base_id(), None);
         assert_eq!(file.size(), payload.len() as u64);
         assert_eq!(file.read().await.unwrap().as_ref(), payload.as_slice());
     }
@@ -4070,6 +4116,7 @@ async fn test_blob_v2_external_mapped_to_registered_base(
     let _ = external_store.io_stats_incremental();
     let blobs = dataset.take_blobs_by_indices(&[0], "blob").await.unwrap();
     assert_eq!(blobs.len(), 1);
+    assert_eq!(blobs[0].as_ref().unwrap().base_id(), Some(1));
     assert_eq!(
         blobs[0].as_ref().unwrap().read().await.unwrap().as_ref(),
         expected

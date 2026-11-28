@@ -891,7 +891,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     .ivf_params
                     .as_ref()
                     .ok_or(Error::invalid_input("IVF build params not set"))?;
-                super::build_ivf_model(
+                // The merge replaces the model's loss with the shuffle's.
+                super::ivf::build_ivf_model_with_sample_loss(
                     dataset,
                     &self.column,
                     dim,
@@ -899,6 +900,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     ivf_params,
                     self.fragment_filter.as_deref(),
                     self.progress.clone(),
+                    super::ivf::SampleLoss::Skip,
                 )
                 .await
             }

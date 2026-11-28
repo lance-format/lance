@@ -2,219 +2,110 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 mod spill;
+#[cfg(test)]
 mod validate;
 
 use super::Dataset;
-use crate::io::deletion::read_dataset_deletion_file;
-use crate::session::caches::{RowIdSequenceKey, RowVersionSequenceKey};
-use crate::session::index_caches::RowIdIndexKey;
 use crate::{Error, Result};
 use futures::{Stream, StreamExt, TryFutureExt, TryStreamExt};
-use lance_core::cache::{CacheKey, CacheKeySchema, KeyBuilder};
-use lance_core::deepsize::DeepSizeOf;
-use lance_core::utils::{address::RowAddress, deletion::DeletionVector};
+use lance_core::utils::address::RowAddress;
 use lance_select::{
     NullableRowAddrMask, NullableRowAddrSet, RowAddrMask, RowAddrSelection, RowAddrTreeMap,
 };
 use lance_table::{
-    format::{
-        Fragment, ROW_CREATED_AT_VERSION_FIELD_ID, ROW_ID_FIELD_ID,
-        ROW_LAST_UPDATED_AT_VERSION_FIELD_ID, RowDatasetVersionMeta, RowDatasetVersionSequence,
-        RowIdMeta,
-    },
-    rowids::{
-        FragmentRowIdIndex, RowIdIndex, RowIdSequence, read_row_ids,
-        segment::U64Segment,
-        version::{LoadedRowLineage, SpilledRowLineage},
-    },
+    format::{Fragment, RowDatasetVersionSequence},
+    rowids::{RowIdIndex, RowIdSequence, version::SpilledRowLineage},
 };
-use std::borrow::Cow;
 use std::sync::Arc;
 
+pub use lance_table_runtime::rowids::RowVersionKind;
 pub(crate) use spill::place_carried_row_lineage;
 pub use spill::{
     DEFAULT_INLINE_ROW_LINEAGE_MAX_BYTES, INLINE_ROW_LINEAGE_MAX_BYTES_CONFIG_KEY,
     PlacedRowLineage, RowLineage, SPILL_ROW_LINEAGE_CONFIG_KEY, inline_row_lineage_max_bytes,
-    place_row_lineage, read_spilled_row_ids, read_spilled_versions,
+    place_row_lineage,
 };
+#[cfg(test)]
 pub(crate) use spill::{RowLineagePlan, RowLineageSpill, plan_row_lineage_spill};
-pub(super) use validate::validate_stable_row_ids;
 
 /// Load a row id sequence from the given dataset and fragment.
 pub async fn load_row_id_sequence(
     dataset: &Dataset,
     fragment: &Fragment,
 ) -> Result<Arc<RowIdSequence>> {
-    let Some(row_id_meta) = &fragment.row_id_meta else {
-        return Err(Error::internal("Missing row id meta"));
-    };
-    let key = RowIdSequenceKey {
-        fragment_id: fragment.id,
-        row_id_meta,
-        lineage_file: fragment.row_lineage_file(ROW_ID_FIELD_ID)?,
-    };
-    dataset
-        .table_state
-        .metadata_cache
-        .get_or_insert_with_key(key, || read_row_id_sequence(dataset, fragment))
+    lance_table_runtime::rowids::load_row_id_sequence(&dataset.table_view().to_table(), fragment)
         .await
 }
 
-/// Decode the row id sequence of `fragment`, bypassing every cache.
-async fn read_row_id_sequence(dataset: &Dataset, fragment: &Fragment) -> Result<RowIdSequence> {
-    match &fragment.row_id_meta {
-        None => Err(Error::internal("Missing row id meta")),
-        Some(RowIdMeta::Inline(data)) => read_row_ids(data),
-        Some(RowIdMeta::Column) => spill::read_spilled_row_ids(dataset, fragment).await,
-    }
-}
-
-/// Which of a fragment's two per-row version sequences is meant.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RowVersionKind {
-    /// The dataset version each row first appeared at.
-    CreatedAt,
-    /// The dataset version each row was last written at.
-    LastUpdatedAt,
-}
-
-impl RowVersionKind {
-    fn meta(self, fragment: &Fragment) -> Option<&RowDatasetVersionMeta> {
-        match self {
-            Self::CreatedAt => fragment.created_at_version_meta.as_ref(),
-            Self::LastUpdatedAt => fragment.last_updated_at_version_meta.as_ref(),
-        }
-    }
-
-    /// The reserved field id of the hidden column a spilled sequence lives in.
-    pub fn field_id(self) -> i32 {
-        match self {
-            Self::CreatedAt => ROW_CREATED_AT_VERSION_FIELD_ID,
-            Self::LastUpdatedAt => ROW_LAST_UPDATED_AT_VERSION_FIELD_ID,
-        }
-    }
-}
-
-/// Load one of `fragment`'s per-row version sequences, wherever it is stored.
+/// Load one of the fragment's per-row version sequences, wherever it is stored.
 ///
-/// Requires stable row ids on the dataset.
-///
-/// `None` when the fragment carries no such metadata, which readers treat as
-/// every row being at version 1. A sequence spilled to a data file is cached
-/// per fragment and file; an inline one is decoded from the manifest bytes.
+/// Requires stable row ids. When version metadata is absent, readers use version 1.
 pub async fn load_row_version_sequence(
     dataset: &Dataset,
     fragment: &Fragment,
     kind: RowVersionKind,
 ) -> Result<Option<Arc<RowDatasetVersionSequence>>> {
-    if !dataset.manifest.uses_stable_row_ids() {
-        return Err(Error::invalid_input(format!(
-            "row version tracking requires stable row ids, version {} does not use them",
-            dataset.manifest.version
-        )));
-    }
-    let Some(meta) = kind.meta(fragment) else {
-        return Ok(None);
-    };
-    match meta {
-        RowDatasetVersionMeta::Column => {
-            let data_file = fragment.row_lineage_file(kind.field_id())?.ok_or_else(|| {
-                Error::corrupt_file(
-                    dataset.table_state.base.clone(),
-                    format!(
-                        "fragment {} marks its {kind:?} versions as spilled but none of its \
-                         data files carries field {}",
-                        fragment.id,
-                        kind.field_id()
-                    ),
-                )
-            })?;
-            let key = RowVersionSequenceKey {
-                fragment_id: fragment.id,
-                field_id: kind.field_id(),
-                data_file,
-            };
-            dataset
-                .table_state
-                .metadata_cache
-                .get_or_insert_with_key(key, || {
-                    spill::read_spilled_versions(dataset, fragment, kind.field_id())
-                })
-                .await
-                .map(Some)
-        }
-        RowDatasetVersionMeta::Inline(_) => meta
-            .load_sequence()
-            .map(|sequence| Some(Arc::new(sequence))),
-    }
+    lance_table_runtime::rowids::load_row_version_sequence(
+        &dataset.table_view().to_table(),
+        fragment,
+        kind,
+    )
+    .await
 }
 
-/// Read ahead every lineage sequence of `fragments` that lives outside the
-/// manifest, for a commit that will need to consult them.
-///
-/// Building a manifest is synchronous and cannot read a data file, so the
-/// commit path calls this first, over the whole manifest, and hands the result
-/// over in `ManifestBuildConfig::spilled_row_lineage`. Only spilled sequences
-/// are loaded; when none is, this returns an empty map without IO.
+/// Read spilled row lineage before building a manifest that needs it.
 pub async fn load_spilled_row_lineage<'a>(
     dataset: &Dataset,
     fragments: impl IntoIterator<Item = &'a Fragment>,
 ) -> Result<Arc<SpilledRowLineage>> {
-    // A `for` loop rather than `map`: a closure returning a future that borrows
-    // its argument trips the higher-ranked lifetime check on the outer future.
-    let mut loads = Vec::new();
-    for fragment in fragments {
-        if fragment.has_spilled_row_lineage() {
-            loads.push(load_fragment_spilled_lineage(dataset, fragment));
-        }
-    }
-    let loaded: SpilledRowLineage = futures::stream::iter(loads)
-        .buffer_unordered(dataset.table_state.object_store.io_parallelism())
-        .try_collect()
-        .await?;
-    Ok(Arc::new(loaded))
+    lance_table_runtime::rowids::load_spilled_row_lineage(
+        &dataset.table_view().to_table(),
+        fragments,
+    )
+    .await
 }
 
-/// The spilled sequences of one fragment, for [`load_spilled_row_lineage`].
-async fn load_fragment_spilled_lineage(
+/// Read the fragment's row ID sequence from its carrier data file.
+pub async fn read_spilled_row_ids(dataset: &Dataset, fragment: &Fragment) -> Result<RowIdSequence> {
+    lance_table_runtime::rowids::read_spilled_row_ids(&dataset.table_view().to_table(), fragment)
+        .await
+}
+
+/// Read the version sequence stored under the given reserved field id.
+pub async fn read_spilled_versions(
     dataset: &Dataset,
     fragment: &Fragment,
-) -> Result<(u64, LoadedRowLineage)> {
-    let row_ids = match &fragment.row_id_meta {
-        Some(RowIdMeta::Column) => Some(load_row_id_sequence(dataset, fragment).await?),
-        _ => None,
-    };
-    let mut versions = [None, None];
-    for (slot, kind) in versions
-        .iter_mut()
-        .zip([RowVersionKind::CreatedAt, RowVersionKind::LastUpdatedAt])
-    {
-        if let Some(RowDatasetVersionMeta::Column) = kind.meta(fragment) {
-            *slot = load_row_version_sequence(dataset, fragment, kind).await?;
-        }
-    }
-    let [created_at, last_updated_at] = versions;
-    Ok((
-        fragment.id,
-        LoadedRowLineage {
-            row_ids,
-            created_at,
-            last_updated_at,
-        },
-    ))
+    field_id: i32,
+) -> Result<RowDatasetVersionSequence> {
+    lance_table_runtime::rowids::read_spilled_versions(
+        &dataset.table_view().to_table(),
+        fragment,
+        field_id,
+    )
+    .await
+}
+
+pub(super) async fn validate_stable_row_ids(dataset: &Dataset) -> Result<()> {
+    lance_table_runtime::rowids::validate_stable_row_ids(&dataset.table_view().to_table()).await
 }
 
 /// Load row id sequences from the given dataset and fragments.
 ///
-/// Returned as a vector of (fragment_id, sequence) pairs. These are not
+/// Returned as a stream of (fragment_id, sequence) pairs. These are not
 /// guaranteed to be in the same order as the input fragments.
 pub fn load_row_id_sequences<'a>(
     dataset: &'a Dataset,
     fragments: &'a [Fragment],
 ) -> impl Stream<Item = Result<(u32, Arc<RowIdSequence>)>> + 'a {
+    let table = Arc::new(dataset.table_view().to_table());
     futures::stream::iter(fragments)
-        .map(|fragment| {
-            load_row_id_sequence(dataset, fragment).map_ok(move |seq| (fragment.id as u32, seq))
+        .map(move |fragment| {
+            let table = table.clone();
+            async move {
+                lance_table_runtime::rowids::load_row_id_sequence(&table, fragment)
+                    .map_ok(move |seq| (fragment.id as u32, seq))
+                    .await
+            }
         })
         .buffer_unordered(dataset.table_state.object_store.io_parallelism())
 }
@@ -223,215 +114,16 @@ pub async fn get_row_id_index(dataset: &Dataset) -> Result<Option<Arc<RowIdIndex
     get_row_id_index_with(dataset, true).await
 }
 
-/// The row id index, built with or without the deletion vectors.
-///
-/// Without them the index maps a deleted row id to its address instead of
-/// `None`, but reads no deletion file: on a table with many fragments that is
-/// one request per fragment saved for a caller that already knows its ids are
-/// live.
 pub(crate) async fn get_row_id_index_with(
     dataset: &Dataset,
     with_deletions: bool,
 ) -> Result<Option<Arc<RowIdIndex>>> {
-    if !dataset.manifest.uses_stable_row_ids() {
-        return Ok(None);
-    }
-    // The cache is shared by every dataset opened at this URI, and one dropped
-    // and recreated there restarts at version 1. Without a token for this
-    // manifest generation a cached index could be the old generation's, so
-    // build a private one instead of sharing.
-    let Some(e_tag) = dataset.table_state.manifest_location.e_tag.as_deref() else {
-        return Ok(Some(Arc::new(
-            load_row_id_index(dataset, with_deletions).await?,
-        )));
-    };
-    let key = RowIdIndexKey {
-        version: dataset.manifest.version,
+    lance_table_runtime::rowids::get_row_id_index_with_cache(
+        &dataset.table_view().to_table(),
         with_deletions,
-        e_tag: Some(e_tag),
-    };
-    let index = dataset
-        .index_cache
-        .get_or_insert_with_key(key, || load_row_id_index(dataset, with_deletions))
-        .await?;
-    Ok(Some(index))
-}
-
-/// A dense fragment maps an ID to a physical offset by subtraction. Cache only
-/// its endpoints and manifest slot. Prefix maxima let a point lookup skip
-/// disjoint ranges and still find old and new copies after an update.
-#[derive(DeepSizeOf)]
-struct InlineRowIdRange {
-    start: u64,
-    end: u64,
-    prefix_end: u64,
-    slot: usize,
-}
-
-struct InlineRowIdRangesKey<'a> {
-    version: u64,
-    e_tag: &'a str,
-}
-
-impl CacheKey for InlineRowIdRangesKey<'_> {
-    type ValueType = Option<Vec<InlineRowIdRange>>;
-
-    fn key(&self) -> Cow<'_, str> {
-        format!("inline_row_id_ranges/{}/{}", self.version, self.e_tag).into()
-    }
-
-    fn type_name() -> &'static str {
-        "InlineRowIdRanges"
-    }
-
-    fn schema() -> CacheKeySchema {
-        CacheKeySchema::new("lance.dataset.inline-row-id-ranges", 1)
-    }
-
-    fn write_key(&self, builder: &mut KeyBuilder) {
-        builder.write_u64(self.version);
-        builder.write_str(self.e_tag);
-    }
-}
-
-fn inline_row_id_ranges(dataset: &Dataset) -> Result<Option<Vec<InlineRowIdRange>>> {
-    let mut ranges = Vec::new();
-    for (slot, fragment) in dataset.iter_fragments().enumerate() {
-        let Some(RowIdMeta::Inline(data)) = &fragment.row_id_meta else {
-            return Ok(None);
-        };
-        // A protobuf sequence with one Range (two u64 varints) fits in 32
-        // bytes. Avoid decoding an arbitrarily large inline array to reject it.
-        if data.len() > 32 {
-            return Ok(None);
-        }
-        let sequence = read_row_ids(data)?;
-        let [U64Segment::Range(range)] = sequence.segments() else {
-            return Ok(None);
-        };
-        // Leave legacy or unrepresentable physical addresses to the existing index.
-        if u32::try_from(fragment.id).is_err()
-            || range.end.saturating_sub(range.start) > u64::from(u32::MAX) + 1
-            || slot > 0 && dataset.manifest.fragments[slot - 1].id >= fragment.id
-        {
-            return Ok(None);
-        }
-        if range.is_empty() {
-            continue;
-        }
-        ranges.push(InlineRowIdRange {
-            start: range.start,
-            end: range.end,
-            prefix_end: 0,
-            slot,
-        });
-    }
-    ranges.sort_unstable_by_key(|range| range.start);
-    let mut prefix_end = 0;
-    for range in &mut ranges {
-        prefix_end = prefix_end.max(range.end);
-        range.prefix_end = prefix_end;
-    }
-    Ok(Some(ranges))
-}
-
-/// Resolve one stable ID using only a dense inline snapshot and its candidate
-/// deletion files. The outer None means the snapshot needs the general index;
-/// the inner None means the ID is missing or deleted.
-async fn lookup_inline_row_id(
-    dataset: &Dataset,
-    row_id: u64,
-    with_deletions: bool,
-) -> Result<Option<Option<RowAddress>>> {
-    let ranges = if let Some(e_tag) = dataset.table_state.manifest_location.e_tag.as_deref() {
-        let key = InlineRowIdRangesKey {
-            version: dataset.manifest.version,
-            e_tag,
-        };
-        dataset
-            .index_cache
-            .get_or_insert_with_key(key, || async { inline_row_id_ranges(dataset) })
-            .await?
-    } else {
-        // As with RowIdIndex, an unversioned cache identity cannot be shared
-        // across a drop and recreate at the same URI.
-        Arc::new(inline_row_id_ranges(dataset)?)
-    };
-    let Some(ranges) = ranges.as_ref() else {
-        return Ok(None);
-    };
-    let lower = ranges.partition_point(|range| range.prefix_end <= row_id);
-    let upper = ranges.partition_point(|range| range.start <= row_id);
-    let mut lookups = Vec::new();
-    for idx in lower..upper {
-        let range = &ranges[idx];
-        if range.end <= row_id {
-            continue;
-        }
-        let fragment = &dataset.manifest.fragments[range.slot];
-        let address = RowAddress::new_from_parts(fragment.id as u32, (row_id - range.start) as u32);
-        // The general ignore-deletions index also applies tombstones to a
-        // fragment whose span overlaps another, even for its unique IDs.
-        let overlaps = idx > 0 && ranges[idx - 1].prefix_end > range.start
-            || ranges
-                .get(idx + 1)
-                .is_some_and(|next| next.start < range.end);
-        lookups.push(async move {
-            if (with_deletions || overlaps)
-                && let Some(file) = &fragment.deletion_file
-                && read_dataset_deletion_file(dataset, fragment.id, file)
-                    .await?
-                    .contains(address.row_offset())
-            {
-                return Ok(None);
-            }
-            Ok::<_, Error>(Some(address))
-        });
-    }
-    let mut live = None;
-    let mut candidates = futures::stream::iter(lookups)
-        .buffer_unordered(dataset.table_state.object_store.io_parallelism());
-    while let Some(candidate) = candidates.try_next().await? {
-        if let Some(address) = candidate
-            && live.replace(address).is_some()
-        {
-            return Err(Error::internal(format!(
-                "row id index corrupt: stable row id {row_id} is live in multiple fragments"
-            )));
-        }
-    }
-    Ok(Some(live))
-}
-
-pub(super) async fn resolve_take_row_ids(
-    dataset: &Dataset,
-    row_ids: &[u64],
-    with_deletions: bool,
-) -> Result<Option<Vec<Option<RowAddress>>>> {
-    if !dataset.manifest.uses_stable_row_ids() {
-        return Ok(None);
-    }
-    if let [id] = row_ids {
-        if let Some(e_tag) = dataset.table_state.manifest_location.e_tag.as_deref()
-            && let Some(index) = dataset
-                .index_cache
-                .get_with_key(&RowIdIndexKey {
-                    version: dataset.manifest.version,
-                    with_deletions,
-                    e_tag: Some(e_tag),
-                })
-                .await
-        {
-            return Ok(Some(vec![index.get(*id)?]));
-        }
-        if let Some(address) = lookup_inline_row_id(dataset, *id, with_deletions).await? {
-            return Ok(Some(vec![address]));
-        }
-    }
-    get_row_id_index_with(dataset, with_deletions)
-        .await?
-        .map(|index| index.get_many(row_ids))
-        .transpose()
+        &dataset.index_cache,
+    )
+    .await
 }
 
 /// The [`RowIdIndex`] a row-id -> row-address translation needs, or `None` when
@@ -719,131 +411,13 @@ pub(crate) async fn live_row_addr_to_row_id_lookup(
     })
 }
 
-/// Build the index from freshly decoded sequences. The index then owns their
-/// memory alone, so its cache charge is exact and it stays cached whenever it
-/// fits; reading them through the sequence cache instead would charge each
-/// sequence twice and leave a large table's index too heavy to keep. A scan
-/// that needs a sequence still caches its own copy under `RowIdSequenceKey`,
-/// keyed by the fragment's content; the index is keyed by manifest generation
-/// and cannot stand in for it.
-async fn load_row_id_index(dataset: &Dataset, with_deletions: bool) -> Result<RowIdIndex> {
-    load_row_id_index_for_fragments(dataset, &dataset.manifest.fragments, with_deletions).await
-}
-
-/// Build a row id index covering only `fragments`, not the whole dataset.
-///
-/// A caller that already knows the row ids it will look up were all read from
-/// a known, small set of fragments -- compaction rewriting a handful of
-/// fragments out of a much larger table, for instance -- gets no benefit from
-/// [`get_row_id_index`]'s whole-dataset index and pays for reading every other
-/// fragment's row id sequence and deletion vector for nothing. This builds an
-/// index scoped to just those fragments instead.
-pub(crate) async fn load_row_id_index_for_fragments(
-    dataset: &Dataset,
-    fragments: &[Fragment],
-    with_deletions: bool,
-) -> Result<RowIdIndex> {
-    // A `for` loop rather than `map`: a closure returning a future that borrows
-    // its argument trips the higher-ranked lifetime check on the outer future.
-    let mut loads = Vec::with_capacity(fragments.len());
-    for fragment in fragments.iter() {
-        loads.push(read_row_id_sequence(dataset, fragment).map_ok(Arc::new));
-    }
-    let sequences: Vec<Arc<RowIdSequence>> = futures::stream::iter(loads)
-        .buffered(dataset.table_state.object_store.io_parallelism())
-        .try_collect()
-        .await?;
-
-    // Without deletions the index must still tell the copies of a row apart:
-    // an update keeps the old copy under a deletion vector and writes the id
-    // again elsewhere. Only fragments whose id spans overlap can hold such
-    // copies, so only they need their deletion vector.
-    let needs_deletions = if with_deletions {
-        vec![true; fragments.len()]
-    } else {
-        overlapping_id_spans(&sequences)
-    };
-
-    let mut loads = Vec::with_capacity(fragments.len());
-    for ((fragment, row_id_sequence), needs_deletions) in
-        fragments.iter().zip(sequences).zip(needs_deletions)
-    {
-        loads.push(async move {
-            let deletion_vector = match &fragment.deletion_file {
-                Some(deletion_file) if needs_deletions => {
-                    read_dataset_deletion_file(dataset, fragment.id, deletion_file).await?
-                }
-                _ => Arc::new(DeletionVector::default()),
-            };
-            Ok::<_, Error>(FragmentRowIdIndex {
-                fragment_id: fragment.id as u32,
-                row_id_sequence,
-                deletion_vector,
-            })
-        });
-    }
-    let fragment_indices: Vec<FragmentRowIdIndex> = futures::stream::iter(loads)
-        .buffer_unordered(dataset.table_state.object_store.io_parallelism())
-        .try_collect()
-        .await?;
-    RowIdIndex::new(&fragment_indices)
-}
-
-/// For each sequence, whether its span of ids (lowest to highest) intersects
-/// another sequence's span. An empty sequence overlaps nothing.
-fn overlapping_id_spans(sequences: &[Arc<RowIdSequence>]) -> Vec<bool> {
-    let mut spans: Vec<(u64, u64, usize)> = sequences
-        .iter()
-        .enumerate()
-        .filter_map(|(index, sequence)| {
-            let span = sequence.row_id_range()?;
-            Some((*span.start(), *span.end(), index))
-        })
-        .collect();
-    spans.sort_unstable();
-    let mut overlapping = vec![false; sequences.len()];
-    let mut reach: Option<(u64, usize)> = None;
-    for &(start, end, index) in &spans {
-        if let Some((reach_end, reach_index)) = reach
-            && start <= reach_end
-        {
-            overlapping[index] = true;
-            overlapping[reach_index] = true;
-        }
-        if reach.is_none_or(|(reach_end, _)| end > reach_end) {
-            reach = Some((end, index));
-        }
-    }
-    overlapping
-}
-
 #[cfg(test)]
 mod test {
-    use std::ops::Range;
+    use crate::session::index_caches::RowIdIndexKey;
+    use lance_table::format::RowIdMeta;
+    use lance_table::rowids::{read_row_ids, segment::U64Segment};
 
-    /// Containment, a chain of pairwise overlaps, a disjoint span and an empty
-    /// sequence; the sweep must mark exactly the spans that touch another.
-    #[test]
-    fn test_overlapping_id_spans() {
-        let seq = |ids: Vec<u64>| Arc::new(RowIdSequence::try_from_iter(ids).unwrap());
-        let contained = vec![
-            seq((0..=100).collect()),
-            seq(vec![1, 2]),
-            seq(vec![50, 60]),
-            seq(vec![200, 201]),
-            seq(vec![]),
-        ];
-        assert_eq!(
-            overlapping_id_spans(&contained),
-            vec![true, true, true, false, false]
-        );
-        // The last span overlaps only the middle one, not the one that set the
-        // reach first.
-        let chain = vec![seq(vec![0, 10]), seq(vec![20, 30]), seq(vec![5, 25])];
-        assert_eq!(overlapping_id_spans(&chain), vec![true, true, true]);
-        let disjoint = vec![seq(vec![0, 10]), seq(vec![11, 20]), seq(vec![21])];
-        assert_eq!(overlapping_id_spans(&disjoint), vec![false, false, false]);
-    }
+    use std::ops::Range;
 
     use crate::dataset::{
         ProjectionRequest, ReadParams, UpdateBuilder, WriteMode, WriteParams,
@@ -1088,7 +662,14 @@ mod test {
 
         // QuickCache resists scans of small cold entries. Compete with other
         // loaded indices of the same size, without touching this one's recency.
+        let table = dataset.table_view().to_table();
+        let no_cache = lance_core::cache::LanceCache::no_cache();
         for version in 100..132 {
+            let competing_index =
+                lance_table_runtime::rowids::get_row_id_index_with_cache(&table, true, &no_cache)
+                    .await
+                    .unwrap()
+                    .unwrap();
             let key = RowIdIndexKey {
                 version,
                 with_deletions: true,
@@ -1096,10 +677,7 @@ mod test {
             };
             dataset
                 .index_cache
-                .insert_with_key(
-                    &key,
-                    Arc::new(load_row_id_index(&dataset, true).await.unwrap()),
-                )
+                .insert_with_key(&key, competing_index)
                 .await;
             assert!(dataset.index_cache.get_with_key(&key).await.is_some());
         }

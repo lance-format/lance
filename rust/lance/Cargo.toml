@@ -120,6 +120,7 @@ all_asserts.workspace = true
 mock_instant.workspace = true
 lance-testing = { workspace = true }
 lance-io = { workspace = true, features = ["test-util"] }
+lance-table-runtime = { workspace = true, features = ["test-util"] }
 lance-index = { workspace = true, features = ["test-oracle"] }
 tracing-subscriber = { version = "0.3.17", features = ["env-filter"] }
 tracing-mock.workspace = true
@@ -283,6 +284,10 @@ harness = false
 
 [[bench]]
 name = "scalar_prefilter"
+harness = false
+
+[[bench]]
+name = "combined_filter"
 harness = false
 
 [[bench]]

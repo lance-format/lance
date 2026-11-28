@@ -501,26 +501,19 @@ fn indexed_overlays<'a>(
         .collect()
 }
 
-/// Whether a row deleted in `before` is live again in `after` (only a restore
-/// does this; an index built in between never saw the row).
-pub(crate) async fn revives_rows<T: TableVersion>(
+async fn revives_rows<T: TableVersion>(
     before: &T,
     after: &T,
     then: &Fragment,
     now: &Fragment,
 ) -> Result<bool> {
-    let Some(deleted_then) = &then.deletion_file else {
-        return Ok(false);
-    };
-    let Some(deleted_now) = &now.deletion_file else {
-        return Ok(true);
-    };
-    if deleted_now.id == deleted_then.id && deleted_now.read_version == deleted_then.read_version {
-        return Ok(false);
-    }
-    let rows_then = before.deleted_rows(then, deleted_then).await?;
-    let rows_now = after.deleted_rows(now, deleted_now).await?;
-    Ok(rows_then.iter().any(|row| !rows_now.contains(row)))
+    lance_table_runtime::io::deletion::revives_rows(
+        then,
+        now,
+        |deletion| before.deleted_rows(then, deletion),
+        |deletion| after.deleted_rows(now, deletion),
+    )
+    .await
 }
 
 /// Whether `fragment`'s indexed data differs between `before` and `after`: a
@@ -996,7 +989,7 @@ async fn replay_staged_segments_from(
     rebase.load_current_lineage(dataset).await?;
     let (_, transactions) = crate::io::commit::load_and_sort_new_transactions(
         &read_dataset,
-        crate::dataset::TransactionReadSource::SessionCache,
+        crate::io::commit::TransactionReadSource::SessionCache,
     )
     .await
     .map_err(|error| rebuild(read_version, &error))?;
