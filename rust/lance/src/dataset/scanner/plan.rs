@@ -410,7 +410,7 @@ impl Scanner {
                 }
 
                 let byte_width = field.data_type().byte_width_opt();
-                let is_cloud = self.dataset.object_store.as_ref().is_cloud();
+                let is_cloud = self.dataset.table_state.object_store.as_ref().is_cloud();
                 if is_cloud {
                     byte_width.is_some_and(|bw| bw < 1000)
                 } else {
@@ -1137,9 +1137,9 @@ impl Scanner {
         })
         .ok();
         let measured = column_width::resolve(
-            &self.dataset.metadata_cache,
+            &self.dataset.table_state.metadata_cache,
             self.dataset.manifest().version,
-            self.dataset.manifest_location.e_tag.as_deref(),
+            self.dataset.table_state.manifest_location.e_tag.as_deref(),
             fields.iter().map(|field| field.as_ref()),
         )
         .await;
@@ -1794,9 +1794,9 @@ mod tests {
             .await
             .unwrap();
         let narrow_width = column_width::resolve(
-            &narrow.metadata_cache,
+            &narrow.table_state.metadata_cache,
             narrow.version().version,
-            narrow.manifest_location.e_tag.as_deref(),
+            narrow.table_state.manifest_location.e_tag.as_deref(),
             [&name].into_iter(),
         )
         .await
@@ -1835,12 +1835,15 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(wide.version().version, narrow.version().version);
-        assert_ne!(wide.manifest_location.e_tag, narrow.manifest_location.e_tag);
+        assert_ne!(
+            wide.table_state.manifest_location.e_tag,
+            narrow.table_state.manifest_location.e_tag
+        );
         assert_eq!(
             column_width::resolve(
-                &wide.metadata_cache,
+                &wide.table_state.metadata_cache,
                 wide.version().version,
-                wide.manifest_location.e_tag.as_deref(),
+                wide.table_state.manifest_location.e_tag.as_deref(),
                 [&name].into_iter(),
             )
             .await
@@ -1857,9 +1860,9 @@ mod tests {
             .await
             .unwrap();
         let wide_width = column_width::resolve(
-            &wide.metadata_cache,
+            &wide.table_state.metadata_cache,
             wide.version().version,
-            wide.manifest_location.e_tag.as_deref(),
+            wide.table_state.manifest_location.e_tag.as_deref(),
             [&name].into_iter(),
         )
         .await

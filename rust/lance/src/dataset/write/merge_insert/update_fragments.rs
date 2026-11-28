@@ -7,7 +7,7 @@ use super::{MergeInsertJob, PatchedFragments};
 use crate::dataset::rowids::load_spilled_row_lineage;
 use crate::dataset::utils::SchemaAdapter;
 use crate::dataset::write::cleanup_data_fragments;
-use crate::dataset::write::seeds::SeedCollector;
+use crate::dataset::write::seeds::collect_write_seeds;
 use crate::dataset::write::{
     TargetBaseInfo, WriteParams, write_fragments_internal, write_fragments_internal_impl,
 };
@@ -236,7 +236,7 @@ impl MergeInsertJob {
         let diagnostics = analysis::scope(spill_session_context);
         let new_fragments = Arc::new(Mutex::new(Vec::new()));
         let mut tasks = JoinSet::new();
-        let task_limit = dataset.object_store.as_ref().io_parallelism();
+        let task_limit = dataset.table_state.object_store.as_ref().io_parallelism();
         let reservation =
             MemoryConsumer::new("MergeInsert").register(session_ctx.task_ctx().memory_pool());
 
@@ -254,8 +254,8 @@ impl MergeInsertJob {
             tasks.shutdown().await;
             let written = new_fragments.lock().unwrap().clone();
             cleanup_data_fragments(
-                &dataset.object_store,
-                &dataset.base,
+                &dataset.table_state.object_store,
+                &dataset.table_state.base,
                 target_bases_info.as_deref(),
                 &written,
             )
@@ -281,7 +281,7 @@ impl MergeInsertJob {
                 versions: (u64, ConcreteFileVersion),
                 diagnostics: Option<Arc<analysis::AnalysisScope>>,
             ) -> Result<usize> {
-                let mut metadata = fragment.metadata.clone();
+                let mut metadata = fragment.metadata().clone();
                 let (current_version, write_version) = versions;
                 // batches still have _rowaddr
                 let write_schema = batches[0]
@@ -374,13 +374,8 @@ impl MergeInsertJob {
                     // Exact, deletion-free coverage can be written directly because the
                     // batches are sorted by row address.
 
-                    let mut seeds = SeedCollector::for_write(
-                        write_version,
-                        Some(&dataset),
-                        &write_schema,
-                        true,
-                    )
-                    .await?;
+                    let mut seeds =
+                        collect_write_seeds(write_version, &dataset, &write_schema).await?;
                     let mut writer =
                         versions::open_update_writer(write_version, &dataset, &write_schema, false)
                             .await?;
@@ -588,8 +583,8 @@ impl MergeInsertJob {
                     write_fragments_internal_impl(
                         write_version,
                         Some(dataset.as_ref()),
-                        dataset.object_store.clone(),
-                        &dataset.base,
+                        dataset.table_state.object_store.clone(),
+                        &dataset.table_state.base,
                         write_schema,
                         from_datafusion_stream(stream),
                         write_params.as_ref().clone(),
@@ -606,8 +601,8 @@ impl MergeInsertJob {
                     write_fragments_internal(
                         write_version,
                         Some(dataset.as_ref()),
-                        dataset.object_store.clone(),
-                        &dataset.base,
+                        dataset.table_state.object_store.clone(),
+                        &dataset.table_state.base,
                         write_schema,
                         stream,
                         write_params.as_ref().clone(),

@@ -69,7 +69,7 @@ pub(super) async fn remap_merged_segment_coverage(
                 Some(SegmentRemappingPlan::Identity) => segment
                     .fragment_bitmap
                     .as_ref()
-                    .map(|bitmap| bitmap & dataset.fragment_bitmap.as_ref())
+                    .map(|bitmap| bitmap & dataset.table_state.fragment_bitmap.as_ref())
                     .unwrap_or_default(),
                 Some(SegmentRemappingPlan::MissingCoverage(_)) | None => {
                     return Err(Error::not_supported(format!(
@@ -109,7 +109,7 @@ pub(super) async fn remap_merged_segment_coverage(
     let has_fragment_reuse_index = frag_reuse_index.is_some();
     // Partly retired counts as stale: the retired half is about to be
     // intersected away, which drops its rows from the merged index.
-    let coverage_is_stale = !staged_coverage.is_subset(&dataset.fragment_bitmap);
+    let coverage_is_stale = !staged_coverage.is_subset(&dataset.table_state.fragment_bitmap);
     let Some(frag_reuse_index) = frag_reuse_index
         .filter(|index| append::fragment_reuse_affects_segments(index, segments.iter()))
     else {
@@ -501,26 +501,19 @@ fn indexed_overlays<'a>(
         .collect()
 }
 
-/// Whether a row deleted in `before` is live again in `after` (only a restore
-/// does this; an index built in between never saw the row).
-pub(crate) async fn revives_rows<T: TableVersion>(
+async fn revives_rows<T: TableVersion>(
     before: &T,
     after: &T,
     then: &Fragment,
     now: &Fragment,
 ) -> Result<bool> {
-    let Some(deleted_then) = &then.deletion_file else {
-        return Ok(false);
-    };
-    let Some(deleted_now) = &now.deletion_file else {
-        return Ok(true);
-    };
-    if deleted_now.id == deleted_then.id && deleted_now.read_version == deleted_then.read_version {
-        return Ok(false);
-    }
-    let rows_then = before.deleted_rows(then, deleted_then).await?;
-    let rows_now = after.deleted_rows(now, deleted_now).await?;
-    Ok(rows_then.iter().any(|row| !rows_now.contains(row)))
+    lance_table_runtime::io::deletion::revives_rows(
+        then,
+        now,
+        |deletion| before.deleted_rows(then, deletion),
+        |deletion| after.deleted_rows(now, deletion),
+    )
+    .await
 }
 
 /// Whether `fragment`'s indexed data differs between `before` and `after`: a
@@ -996,7 +989,7 @@ async fn replay_staged_segments_from(
     rebase.load_current_lineage(dataset).await?;
     let (_, transactions) = crate::io::commit::load_and_sort_new_transactions(
         &read_dataset,
-        crate::dataset::TransactionReadSource::SessionCache,
+        crate::io::commit::TransactionReadSource::SessionCache,
     )
     .await
     .map_err(|error| rebuild(read_version, &error))?;

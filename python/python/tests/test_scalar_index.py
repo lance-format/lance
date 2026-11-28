@@ -3646,6 +3646,69 @@ def test_minhash_lsh_index():
         ScannerBuilder(ds).minhash_search("not a query")  # type: ignore[arg-type]
 
 
+@pytest.mark.parametrize(
+    ("default_key", "default_kind", "explicit_kind"),
+    [
+        pytest.param("nearest", "vector", None, id="vector-default"),
+        pytest.param("nearest", "minhash", None, id="minhash-default"),
+        pytest.param("nearest", "vector", "minhash", id="minhash-overrides-vector"),
+        pytest.param("nearest", "minhash", "vector", id="vector-overrides-minhash"),
+        pytest.param(
+            "minhash_search", "minhash", "vector", id="vector-overrides-minhash-search"
+        ),
+    ],
+)
+def test_default_scan_options_nearest_modes(
+    tmp_path, default_key, default_kind, explicit_kind
+):
+    text = "the quick brown fox jumps over the lazy dog and runs away very fast"
+    table = pa.table(
+        {
+            "id": [0, 1, 2, 3],
+            "text": [text, "unrelated terms about ledger storage", None, text],
+            "vector": pa.array(
+                [[float(i), 0.0] for i in range(4)], type=pa.list_(pa.float32(), 2)
+            ),
+        }
+    )
+    dataset = lance.write_dataset(table, tmp_path, max_rows_per_file=2)
+    dataset.create_scalar_index(
+        "text",
+        IndexConfig(
+            index_type="minhashlsh",
+            parameters={"num_hashes": 64, "num_bands": 16, "shingle_size": 2},
+        ),
+    )
+    queries = {
+        "vector": {"column": "vector", "q": [1.2, 0.0], "k": 2, "use_index": False},
+        "minhash": MinHashQuery(text, "text"),
+    }
+    columns = ["id", "_distance"]
+
+    def control(kind):
+        table = (
+            dataset.scanner(nearest=queries[kind], limit=2, columns=columns)
+            .to_table()
+            .sort_by("id")
+        )
+        assert table["id"].to_pylist() == ([0, 3] if kind == "minhash" else [1, 2])
+        return table
+
+    reopened = lance.dataset(
+        tmp_path,
+        default_scan_options={
+            default_key: queries[default_kind],
+            "limit": 2,
+            "columns": columns,
+        },
+    )
+    if explicit_kind is not None:
+        actual = reopened.scanner(nearest=queries[explicit_kind]).to_table()
+        assert actual.sort_by("id") == control(explicit_kind)
+    # The saved default still applies once nearest is omitted again.
+    assert reopened.scanner().to_table().sort_by("id") == control(default_kind)
+
+
 def test_json_index():
     vals = ['{"x": 7, "y": 10}', '{"x": 11, "y": 22}', '{"y": 0}', '{"x": 10}']
     tbl = pa.table({"jsons": pa.array(vals, pa.json_())})

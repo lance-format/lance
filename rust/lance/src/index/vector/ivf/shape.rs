@@ -63,6 +63,7 @@ impl Dataset {
             .join(uuid.to_string())
             .join(INDEX_FILE_NAME);
         let cache = self
+            .table_state
             .metadata_cache
             .file_metadata_cache(&path)
             .with_key_prefix(&store.store_prefix);

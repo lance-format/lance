@@ -8,85 +8,42 @@ use std::time::Duration;
 use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
 use lance_io::object_store::{ObjectStore, ObjectStoreParams};
 use lance_select::RowAddrTreeMap;
-use lance_table::format::{ClusteringDefinition, ManifestBuildConfig};
-use lance_table::{
-    format::{DataStorageFormat, is_detached_version},
-    io::commit::{CommitConfig, CommitHandler, ManifestNamingScheme},
-};
+use lance_table::format::ClusteringDefinition;
+use lance_table::io::commit::CommitHandler;
+use lance_table::transaction::Transaction;
+use lance_table_runtime::CommitBuilder as RuntimeCommitBuilder;
 
-use crate::io::commit::{
-    CommitTransactionOptions, conflict_resolver::AppendIdempotencyKey, default_commit_retry_timeout,
-};
-use crate::{
-    Dataset, Error, Result,
-    dataset::{
-        ReadParams,
-        builder::DatasetBuilder,
-        commit_detached_transaction, commit_new_dataset, commit_transaction,
-        refs::Refs,
-        transaction::{Operation, Transaction},
-    },
-    session::Session,
-};
+use crate::io::commit::LanceCommitHook;
+use crate::session::Session;
+use crate::{Dataset, Result};
 
-use super::{WriteDestination, resolve_commit_handler};
-use crate::dataset::branch_location::BranchLocation;
-use lance_core::utils::tracing::{DATASET_COMMITTED_EVENT, TRACE_DATASET_EVENTS};
-use tracing::info;
+use super::WriteDestination;
 
 /// Create a new commit from a [`Transaction`].
 ///
 /// Transactions can be created using a write method like [`super::InsertBuilder::execute_uncommitted`].
 #[derive(Debug, Clone)]
 pub struct CommitBuilder<'a> {
-    dest: WriteDestination<'a>,
-    use_stable_row_ids: Option<bool>,
-    enable_v2_manifest_paths: bool,
-    manifest_config: ManifestBuildConfig,
-    commit_handler: Option<Arc<dyn CommitHandler>>,
-    store_params: Option<ObjectStoreParams>,
-    object_store: Option<Arc<ObjectStore>>,
-    source_store: Option<Arc<ObjectStore>>,
+    inner: RuntimeCommitBuilder<'a>,
+    dataset: Option<Arc<Dataset>>,
     session: Option<Arc<Session>>,
-    detached: bool,
-    commit_config: CommitConfig,
-    retry_timeout: Duration,
-    affected_rows: Option<RowAddrTreeMap>,
-    transaction_properties: Option<Arc<HashMap<String, String>>>,
-    append_idempotency_property: Option<String>,
-    timeout: Option<Duration>,
-    /// Set only by `Dataset::deep_clone`, after it has copied the source files.
-    deep_clone_files_copied: bool,
-    inherited_field_ids: bool,
-    /// Whether the caller has opted in to committing a [`CompositeOperation`].
-    allow_composite_operations: bool,
 }
 
-/// Default timeout applied to [`CommitBuilder::execute`] when none is set.
-pub const DEFAULT_COMMIT_TIMEOUT: Duration = Duration::from_secs(1800);
+pub use lance_table_runtime::commit::DEFAULT_COMMIT_TIMEOUT;
 
 impl<'a> CommitBuilder<'a> {
     pub fn new(dest: impl Into<WriteDestination<'a>>) -> Self {
-        Self {
-            dest: dest.into(),
-            use_stable_row_ids: None,
-            enable_v2_manifest_paths: true,
-            manifest_config: ManifestBuildConfig::default(),
-            commit_handler: None,
-            store_params: None,
-            object_store: None,
-            source_store: None,
-            session: None,
-            detached: false,
-            commit_config: Default::default(),
-            retry_timeout: default_commit_retry_timeout(),
-            affected_rows: None,
-            transaction_properties: None,
-            append_idempotency_property: None,
-            timeout: Some(DEFAULT_COMMIT_TIMEOUT),
-            deep_clone_files_copied: false,
-            inherited_field_ids: false,
-            allow_composite_operations: false,
+        match dest.into() {
+            WriteDestination::Dataset(dataset) => Self {
+                inner: RuntimeCommitBuilder::new(Arc::new(dataset.table_view().to_table())),
+                dataset: Some(dataset),
+                session: None,
+            },
+            WriteDestination::Uri(uri) => Self {
+                inner: RuntimeCommitBuilder::new(uri),
+                dataset: None,
+                session: None,
+            },
         }
     }
 
@@ -99,7 +56,7 @@ impl<'a> CommitBuilder<'a> {
     ///
     /// **Default is false.**
     pub fn use_stable_row_ids(mut self, use_stable_row_ids: bool) -> Self {
-        self.use_stable_row_ids = Some(use_stable_row_ids);
+        self.inner = self.inner.use_stable_row_ids(use_stable_row_ids);
         self
     }
 
@@ -114,23 +71,18 @@ impl<'a> CommitBuilder<'a> {
     /// prewritten fragments introduce another exact V2 version, the commit
     /// derives the required mixed-version capability from the final manifest.
     pub fn with_storage_format(mut self, storage_format: LanceFileVersion) -> Self {
-        self.manifest_config = self
-            .manifest_config
-            .with_storage_format(DataStorageFormat::new(storage_format.resolve()));
-
+        self.inner = self.inner.with_storage_format(storage_format);
         self
     }
 
     pub(crate) fn with_exact_storage_format(mut self, storage_format: ConcreteFileVersion) -> Self {
-        self.manifest_config = self
-            .manifest_config
-            .with_storage_format(DataStorageFormat::new(storage_format));
+        self.inner = self.inner.with_exact_storage_format(storage_format);
         self
     }
 
     /// Pass an object store to use.
     pub fn with_object_store(mut self, object_store: Arc<ObjectStore>) -> Self {
-        self.object_store = Some(object_store);
+        self.inner = self.inner.with_object_store(object_store);
         self
     }
 
@@ -142,7 +94,7 @@ impl<'a> CommitBuilder<'a> {
     /// is not reachable with the destination's credentials. Defaults to the destination
     /// store when not set, preserving same-store behavior.
     pub fn with_source_store(mut self, source_store: Arc<ObjectStore>) -> Self {
-        self.source_store = Some(source_store);
+        self.inner = self.inner.with_source_store(source_store);
         self
     }
 
@@ -151,7 +103,7 @@ impl<'a> CommitBuilder<'a> {
     /// The source dataset's commit handler is not used.
     #[deprecated(since = "12.0.0-beta.12", note = "use with_source_store instead")]
     pub fn with_source_dataset(self, source: &Dataset) -> Self {
-        self.with_source_store(source.object_store.clone())
+        self.with_source_store(source.table_state.object_store.clone())
     }
 
     /// Pass a commit handler to use for the dataset.
@@ -160,7 +112,7 @@ impl<'a> CommitBuilder<'a> {
     /// set, a `Dataset` destination commits through its own handler and a
     /// `Uri` destination resolves one from the uri.
     pub fn with_commit_handler(mut self, commit_handler: Arc<dyn CommitHandler>) -> Self {
-        self.commit_handler = Some(commit_handler);
+        self.inner = self.inner.with_commit_handler(commit_handler);
         self
     }
 
@@ -196,9 +148,7 @@ impl<'a> CommitBuilder<'a> {
     /// be restored (they stay readable). A table already under the contract is
     /// unaffected.
     pub fn with_clustering_definitions(mut self, definitions: Vec<ClusteringDefinition>) -> Self {
-        self.manifest_config = self
-            .manifest_config
-            .with_clustering_definitions(definitions);
+        self.inner = self.inner.with_clustering_definitions(definitions);
         self
     }
 
@@ -206,7 +156,7 @@ impl<'a> CommitBuilder<'a> {
     ///
     /// If an object store is passed, these parameters will be ignored.
     pub fn with_store_params(mut self, store_params: ObjectStoreParams) -> Self {
-        self.store_params = Some(store_params);
+        self.inner = self.inner.with_store_params(store_params);
         self
     }
 
@@ -233,7 +183,7 @@ impl<'a> CommitBuilder<'a> {
     ///  versions of Lance (prior to 0.17.0).
     /// </div>
     pub fn enable_v2_manifest_paths(mut self, enable: bool) -> Self {
-        self.enable_v2_manifest_paths = enable;
+        self.inner = self.inner.enable_v2_manifest_paths(enable);
         self
     }
 
@@ -244,7 +194,7 @@ impl<'a> CommitBuilder<'a> {
     /// This can be used to stage changes or to handle "secondary" datasets
     /// whose lineage is tracked elsewhere.
     pub fn with_detached(mut self, detached: bool) -> Self {
-        self.detached = detached;
+        self.inner = self.inner.with_detached(detached);
         self
     }
 
@@ -252,7 +202,7 @@ impl<'a> CommitBuilder<'a> {
     ///
     /// If a commit operation fails, it will be retried up to `max_retries` times.
     pub fn with_max_retries(mut self, max_retries: u32) -> Self {
-        self.commit_config.num_retries = max_retries;
+        self.inner = self.inner.with_max_retries(max_retries);
         self
     }
 
@@ -272,19 +222,46 @@ impl<'a> CommitBuilder<'a> {
     ///     .with_retry_timeout(Duration::from_secs(10));
     /// ```
     pub fn with_retry_timeout(mut self, retry_timeout: Duration) -> Self {
-        self.retry_timeout = retry_timeout;
+        self.inner = self.inner.with_retry_timeout(retry_timeout);
         self
     }
 
     pub fn with_skip_auto_cleanup(mut self, skip_auto_cleanup: bool) -> Self {
-        self.commit_config.skip_auto_cleanup = skip_auto_cleanup;
+        self.inner = self.inner.with_skip_auto_cleanup(skip_auto_cleanup);
+        self
+    }
+
+    /// Whether to store the transaction only inline in the manifest, skipping the
+    /// separate file under `_transactions/` and saving one object write. The
+    /// transaction is inlined regardless of its size, up to `u32::MAX` bytes.
+    ///
+    /// The new manifest gets a writer feature flag, so Lance releases older than
+    /// v1.0.0 refuse to write to that version. Later commits that do not set this
+    /// write the transaction file again and drop the flag.
+    ///
+    /// Readers older than Lance 14.0 return no transaction for such a version
+    /// and cannot rebase a concurrent commit across it. Keep the transaction
+    /// file when clients older than 14.0 read transaction history or commit
+    /// concurrently.
+    ///
+    /// **Default is false.**
+    ///
+    /// ```
+    /// use lance::dataset::CommitBuilder;
+    ///
+    /// let _builder = CommitBuilder::new("memory://dataset").with_disable_transaction_file(true);
+    /// ```
+    pub fn with_disable_transaction_file(mut self, disable_transaction_file: bool) -> Self {
+        self.inner = self
+            .inner
+            .with_disable_transaction_file(disable_transaction_file);
         self
     }
 
     /// Provide the set of row addresses that were deleted or updated. This is
     /// used to perform fast conflict resolution.
     pub fn with_affected_rows(mut self, affected_rows: RowAddrTreeMap) -> Self {
-        self.affected_rows = Some(affected_rows);
+        self.inner = self.inner.with_affected_rows(affected_rows);
         self
     }
 
@@ -298,12 +275,12 @@ impl<'a> CommitBuilder<'a> {
     ///
     /// # Errors
     ///
-    /// - [`Error::InvalidInput`] if `timeout` is `Some(Duration::ZERO)` (raised
+    /// - [`crate::Error::InvalidInput`] if `timeout` is `Some(Duration::ZERO)` (raised
     ///   when [`Self::execute`] is called, not here).
-    /// - [`Error::Timeout`] if the operation does not complete within the
+    /// - [`crate::Error::Timeout`] if the operation does not complete within the
     ///   timeout.
     pub fn with_timeout(mut self, timeout: Option<Duration>) -> Self {
-        self.timeout = timeout;
+        self.inner = self.inner.with_timeout(timeout);
         self
     }
 
@@ -314,17 +291,19 @@ impl<'a> CommitBuilder<'a> {
         mut self,
         transaction_properties: HashMap<String, String>,
     ) -> Self {
-        self.transaction_properties = Some(Arc::new(transaction_properties));
+        self.inner = self
+            .inner
+            .with_transaction_properties(transaction_properties);
         self
     }
 
-    /// Deduplicate an [`Operation::Append`] by a property in
+    /// Deduplicate an [`Operation::Append`](lance_table::transaction::Operation::Append) by a property in
     /// [`Transaction::transaction_properties`]. The property value must be nonempty.
     ///
     /// Use the same property name, value and original `read_version` on every
     /// submission of a logical append. If an append with the same property value
     /// has already committed on this branch after `read_version`, the call returns
-    /// an error with [`Error::append_already_committed_version`] and publishes no
+    /// an error with [`crate::Error::append_already_committed_version`] and publishes no
     /// version. The first append wins even when the staged fragments differ. It
     /// may also reference the same staged files. Use distinct values for distinct
     /// appends, and retain the base version and intervening history for as long
@@ -341,7 +320,7 @@ impl<'a> CommitBuilder<'a> {
     /// let builder = CommitBuilder::new("memory://").with_append_idempotency_property("job_id");
     /// ```
     pub fn with_append_idempotency_property(mut self, property: impl Into<String>) -> Self {
-        self.append_idempotency_property = Some(property.into());
+        self.inner = self.inner.with_append_idempotency_property(property);
         self
     }
 
@@ -352,14 +331,14 @@ impl<'a> CommitBuilder<'a> {
     /// "cannot enable stable row IDs on an existing dataset" check so that the
     /// flag can be activated without creating the dataset from scratch.
     pub(crate) fn with_stable_row_id_migration_activation(mut self, next_row_id: u64) -> Self {
-        self.manifest_config = self.manifest_config.with_migration_next_row_id(next_row_id);
+        self.inner = self
+            .inner
+            .with_stable_row_id_migration_activation(next_row_id);
         self
     }
 
     pub(crate) fn with_non_reusable_field_id_migration_activation(mut self) -> Self {
-        self.manifest_config = self
-            .manifest_config
-            .with_activate_non_reusable_field_ids(true);
+        self.inner = self.inner.with_non_reusable_field_id_migration_activation();
         self
     }
 
@@ -370,14 +349,7 @@ impl<'a> CommitBuilder<'a> {
     /// A deep `Operation::Clone` points every file at the destination but the
     /// commit itself copies nothing, so it is rejected unless this is set.
     pub(crate) fn with_deep_clone_files_copied(mut self) -> Self {
-        self.deep_clone_files_copied = true;
-        self
-    }
-
-    /// Create the dataset keeping an existing table's field IDs; see
-    /// [`InsertBuilder::with_inherited_field_ids`](super::InsertBuilder::with_inherited_field_ids).
-    pub(crate) fn with_inherited_field_ids(mut self) -> Self {
-        self.inherited_field_ids = true;
+        self.inner = self.inner.with_deep_clone_files_copied();
         self
     }
 
@@ -390,7 +362,7 @@ impl<'a> CommitBuilder<'a> {
     /// The format it writes is not experimental.
     ///
     /// Without this opt-in, [`Self::execute`] rejects such a transaction with
-    /// [`Error::NotSupported`]. The opt-in has no effect on any other operation.
+    /// [`crate::Error::NotSupported`]. The opt-in has no effect on any other operation.
     ///
     /// # Compatibility
     ///
@@ -416,342 +388,31 @@ impl<'a> CommitBuilder<'a> {
     /// # }
     /// ```
     pub fn with_experimental_composite_operations(mut self, allow: bool) -> Self {
-        self.allow_composite_operations = allow;
+        self.inner = self.inner.with_experimental_composite_operations(allow);
         self
     }
 
     pub async fn execute(self, transaction: Transaction) -> Result<Dataset> {
-        if matches!(transaction.operation, Operation::CompositeOperation(_))
-            && !self.allow_composite_operations
-        {
-            return Err(Error::not_supported_source(
-                "Transaction V2 is experimental; a CompositeOperation can only be \
-                 committed after opting in with \
-                 CommitBuilder::with_experimental_composite_operations"
-                    .into(),
-            ));
-        }
-        let timeout = self.timeout;
-        if let Some(t) = timeout
-            && t.is_zero()
-        {
-            return Err(Error::invalid_input(
-                "CommitBuilder timeout must be non-zero; pass `None` to disable",
-            ));
-        }
-        // Box the inner future so wrapping it in `tokio::time::Timeout` does
-        // not deepen the future type — downstream `async fn`s that await
-        // `execute` otherwise hit the compiler's layout-query depth limit.
-        let fut = Box::pin(self.execute_inner(transaction));
-        match timeout {
-            Some(t) => match tokio::time::timeout(t, fut).await {
-                Ok(res) => res,
-                Err(_) => Err(Error::timeout(format!(
-                    "Commit timed out after {:?}. Increase the timeout via \
-                     CommitBuilder::with_timeout or pass `None` to disable.",
-                    t
-                ))),
-            },
-            None => fut.await,
-        }
+        let (inner, hook, session) = self.into_runtime();
+        let table =
+            Box::pin(inner.execute_with_lifecycle(transaction, Some(hook.as_ref()))).await?;
+        Ok(Dataset::from_committed_table(table, session))
     }
 
-    async fn execute_inner(self, transaction: Transaction) -> Result<Dataset> {
-        let append_idempotency_key = if let Some(property) =
-            self.append_idempotency_property.as_deref()
-        {
-            if self.detached
-                || transaction.read_version == 0
-                || is_detached_version(transaction.read_version)
-                || !matches!(transaction.operation, Operation::Append { .. })
-            {
-                return Err(Error::invalid_input(
-                    "append idempotency requires a non-detached Append based on an existing version",
-                ));
-            }
-            let value = transaction
-                .transaction_properties
-                .as_deref()
-                .and_then(|properties| properties.get(property))
-                .filter(|value| !value.is_empty())
-                .ok_or_else(|| {
-                    Error::invalid_input(format!(
-                        "append idempotency requires a nonempty transaction property {property:?}"
-                    ))
-                })?;
-            Some(AppendIdempotencyKey { property, value })
-        } else {
-            None
-        };
-
-        // A definitions list is a commit-time input for UpdateConfig alone. Every
-        // other operation is refused here, before any path is chosen: the
-        // new-dataset paths never reach the manifest builder's own check.
-        if self.manifest_config.clustering_definitions().is_some()
-            && !matches!(transaction.operation, Operation::UpdateConfig { .. })
-        {
-            return Err(Error::invalid_input(
-                "a complete clustering definitions list can only be committed with UpdateConfig",
-            ));
-        }
-        if matches!(
-            transaction.operation,
-            Operation::Clone {
-                is_shallow: false,
-                ..
-            }
-        ) && !self.deep_clone_files_copied
-        {
-            return Err(Error::invalid_input(
-                "A deep Clone cannot be committed directly: the commit does not copy the \
-                 source files, so the new dataset would reference files that do not exist. \
-                 Use deep_clone instead.",
-            ));
-        }
-
+    fn into_runtime(self) -> (RuntimeCommitBuilder<'a>, Arc<LanceCommitHook>, Arc<Session>) {
+        let destination_session = self.dataset.map(|dataset| dataset.session.clone());
         let session = self
             .session
-            .or_else(|| self.dest.dataset().map(|ds| ds.session.clone()))
+            .or_else(|| destination_session.clone())
             .unwrap_or_default();
-
-        // Store used to read the source manifest for a clone (see with_source_store).
-        let source_store = self.source_store.clone();
-
-        let (object_store, base_path, commit_handler) = match &self.dest {
-            WriteDestination::Dataset(dataset) => (
-                dataset.object_store.clone(),
-                dataset.base.clone(),
-                self.commit_handler
-                    .clone()
-                    .unwrap_or_else(|| dataset.commit_handler.clone()),
-            ),
-            WriteDestination::Uri(uri) => {
-                let commit_handler = if let (Some(_), Some(commit_handler)) =
-                    (&self.object_store, &self.commit_handler)
-                {
-                    commit_handler.clone()
-                } else {
-                    resolve_commit_handler(uri, self.commit_handler.clone(), &self.store_params)
-                        .await?
-                };
-                let (object_store, base_path) = if let Some(passed_store) = self.object_store {
-                    (
-                        passed_store,
-                        ObjectStore::extract_path_from_uri(session.store_registry(), uri)?,
-                    )
-                } else {
-                    ObjectStore::from_uri_and_params(
-                        session.store_registry(),
-                        uri,
-                        &self.store_params.clone().unwrap_or_default(),
-                    )
-                    .await?
-                };
-                (object_store, base_path, commit_handler)
-            }
-        };
-
-        let dest = match &self.dest {
-            WriteDestination::Dataset(dataset) => WriteDestination::Dataset(dataset.clone()),
-            WriteDestination::Uri(uri) => {
-                // Check if it already exists.
-                let mut builder = DatasetBuilder::from_uri(uri)
-                    .with_read_params(ReadParams {
-                        store_options: self.store_params.clone(),
-                        commit_handler: self.commit_handler.clone(),
-                        ..Default::default()
-                    })
-                    .with_session(session.clone());
-
-                // If we are using a detached version, we need to load the dataset.
-                // Otherwise, we are writing to the main history, and need to check
-                // out the latest version.
-                if is_detached_version(transaction.read_version) {
-                    builder = builder.with_version(transaction.read_version)
-                }
-
-                match builder.load().await {
-                    Ok(dataset) => WriteDestination::Dataset(Arc::new(dataset)),
-                    Err(Error::DatasetNotFound { .. } | Error::NotFound { .. }) => {
-                        WriteDestination::Uri(uri)
-                    }
-                    Err(e) => return Err(e),
-                }
-            }
-        };
-
-        // A clone creates a new dataset. The destination may have appeared
-        // after the caller's preflight; never rebase a clone onto its winner.
-        if dest.dataset().is_some() && matches!(transaction.operation, Operation::Clone { .. }) {
-            return Err(Error::dataset_already_exists(dest.uri()));
-        }
-
-        if dest.dataset().is_none()
-            && !matches!(
-                transaction.operation,
-                Operation::Overwrite { .. } | Operation::Clone { .. }
-            )
-        {
-            return Err(Error::dataset_not_found(
-                base_path.to_string(),
-                "The dataset must already exist unless the operation is Overwrite".into(),
-            ));
-        }
-
-        let (metadata_cache, index_cache) = match &dest {
-            WriteDestination::Dataset(ds) => (ds.metadata_cache.clone(), ds.index_cache.clone()),
-            WriteDestination::Uri(uri) => (
-                Arc::new(session.metadata_cache.for_dataset(uri)),
-                Arc::new(session.index_cache.for_dataset(uri)),
-            ),
-        };
-
-        let manifest_naming_scheme = if let Some(ds) = dest.dataset() {
-            ds.manifest_location.naming_scheme
-        } else if self.enable_v2_manifest_paths {
-            ManifestNamingScheme::V2
-        } else {
-            ManifestNamingScheme::V1
-        };
-
-        let manifest_config = if self.manifest_config.migration_next_row_id().is_some() {
-            // Migration activation always enables stable row IDs regardless of
-            // the current dataset state (already implied by `with_migration_next_row_id`).
-            self.manifest_config
-        } else {
-            let use_stable_row_ids = match dest.dataset() {
-                Some(ds) => ds.manifest.uses_stable_row_ids(),
-                None => self.use_stable_row_ids.unwrap_or(false),
-            };
-            self.manifest_config
-                .with_use_stable_row_ids(use_stable_row_ids)
-        };
-
-        let (manifest, manifest_location) = if let Some(dataset) = dest.dataset() {
-            if self.detached {
-                if matches!(manifest_naming_scheme, ManifestNamingScheme::V1) {
-                    return Err(Error::not_supported_source(
-                        "detached commits cannot be used with v1 manifest paths".into(),
-                    ));
-                }
-                commit_detached_transaction(
-                    dataset,
-                    object_store.as_ref(),
-                    commit_handler.as_ref(),
-                    &transaction,
-                    &manifest_config,
-                    &self.commit_config,
-                    self.retry_timeout,
-                )
-                .await?
-            } else {
-                commit_transaction(
-                    dataset,
-                    object_store.as_ref(),
-                    commit_handler.as_ref(),
-                    &transaction,
-                    CommitTransactionOptions::new(
-                        &manifest_config,
-                        &self.commit_config,
-                        manifest_naming_scheme,
-                    )
-                    .with_retry_timeout(self.retry_timeout)
-                    .with_affected_rows(self.affected_rows.as_ref())
-                    .with_append_idempotency_key(append_idempotency_key),
-                )
-                .await?
-            }
-        } else if self.detached {
-            // I think we may eventually want this, and we can probably handle it, but leaving a TODO for now
-            return Err(Error::not_supported_source(
-                "detached commits cannot currently be used to create new datasets".into(),
-            ));
-        } else {
-            commit_new_dataset(
-                object_store.as_ref(),
-                source_store.as_deref(),
-                &commit_handler,
-                &base_path,
-                &dest.uri(),
-                &transaction,
-                &manifest_config,
-                manifest_naming_scheme,
-                metadata_cache.as_ref(),
-                session.clone(),
-                self.inherited_field_ids,
-            )
-            .await?
-        };
-
-        info!(
-            target: TRACE_DATASET_EVENTS,
-            event=DATASET_COMMITTED_EVENT,
-            uri=dest.uri(),
-            read_version=transaction.read_version,
-            committed_version=manifest.version,
-            detached=self.detached,
-            operation=&transaction.operation.name()
-        );
-
-        let fragment_bitmap = Arc::new(manifest.fragments.iter().map(|f| f.id as u32).collect());
-
-        match &self.dest {
-            WriteDestination::Dataset(dataset) => {
-                let base_object_stores = if manifest.base_paths == dataset.manifest.base_paths {
-                    dataset.base_object_stores.clone()
-                } else {
-                    Default::default()
-                };
-                Ok(Dataset {
-                    manifest: Arc::new(manifest),
-                    manifest_location,
-                    session,
-                    fragment_bitmap,
-                    base_object_stores,
-                    ..dataset.as_ref().clone()
-                })
-            }
-            WriteDestination::Uri(uri) => {
-                let refs = Refs::new(
-                    object_store.clone(),
-                    commit_handler.clone(),
-                    BranchLocation {
-                        path: base_path.clone(),
-                        uri: uri.to_string(),
-                        branch: manifest.branch.clone(),
-                    },
-                );
-                let branch_identifier = if let Some(dataset) = dest.dataset() {
-                    dataset.ensure_branch_exists().await?;
-                    dataset.branch_identifier.clone()
-                } else {
-                    Arc::new(
-                        refs.branches()
-                            .get_identifier(manifest.branch.as_deref())
-                            .await?,
-                    )
-                };
-
-                Ok(Dataset {
-                    object_store,
-                    base: base_path,
-                    uri: uri.to_string(),
-                    manifest: Arc::new(manifest),
-                    manifest_location,
-                    session,
-                    commit_handler,
-                    refs,
-                    branch_identifier,
-                    index_cache,
-                    fragment_bitmap,
-                    metadata_cache,
-                    file_reader_options: None,
-                    store_params: self.store_params.clone().map(Box::new),
-                    base_store_params: None,
-                    base_object_stores: Default::default(),
-                })
-            }
-        }
+        let hook = Arc::new(LanceCommitHook::new(
+            destination_session.unwrap_or_else(|| session.clone()),
+        ));
+        let inner = self
+            .inner
+            .with_session(session.table_session.clone())
+            .with_index_hook(hook.clone());
+        (inner, hook, session)
     }
 
     /// Commit a set of transactions as a single new version.
@@ -761,44 +422,14 @@ impl<'a> CommitBuilder<'a> {
     ///   will be supported in the future.
     /// </div>
     pub async fn execute_batch(self, transactions: Vec<Transaction>) -> Result<BatchCommitResult> {
-        if self.append_idempotency_property.is_some() {
-            return Err(Error::invalid_input(
-                "append idempotency requires an individual Append transaction",
-            ));
-        }
-        if transactions.is_empty() {
-            return Err(Error::invalid_input_source(
-                "No transactions to commit".into(),
-            ));
-        }
-        if transactions
-            .iter()
-            .any(|t| !matches!(t.operation, Operation::Append { .. }))
-        {
-            return Err(Error::not_supported_source(
-                "Only append transactions are supported in batch commits".into(),
-            ));
-        }
-
-        let read_version = transactions.iter().map(|t| t.read_version).min().unwrap();
-
-        let merged = Transaction {
-            uuid: uuid::Uuid::new_v4().hyphenated().to_string(),
-            operation: Operation::Append {
-                fragments: transactions
-                    .iter()
-                    .flat_map(|t| match &t.operation {
-                        Operation::Append { fragments } => fragments.clone(),
-                        _ => unreachable!(),
-                    })
-                    .collect(),
-            },
-            read_version,
-            tag: None,
-            transaction_properties: None,
-        };
-        let dataset = self.execute(merged.clone()).await?;
-        Ok(BatchCommitResult { dataset, merged })
+        let (inner, hook, session) = self.into_runtime();
+        let result =
+            Box::pin(inner.execute_batch_with_lifecycle(transactions, Some(hook.as_ref()))).await?;
+        let dataset = Dataset::from_committed_table(result.table, session);
+        Ok(BatchCommitResult {
+            dataset,
+            merged: result.merged,
+        })
     }
 }
 
@@ -817,13 +448,18 @@ mod tests {
     use arrow_array::record_batch;
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 
+    use crate::Error;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_io::utils::CachedFileSize;
     use lance_io::{assert_io_eq, assert_io_gt};
+    use lance_table::format::is_detached_version;
     use lance_table::format::{
         DataFile, Fragment, IndexMetadata, Manifest, Transaction as TableTransaction,
     };
-    use lance_table::io::commit::{CommitError, ManifestLocation, ManifestWriter};
+    use lance_table::io::commit::{
+        CommitError, ManifestLocation, ManifestNamingScheme, ManifestWriter,
+    };
+    use lance_table::transaction::Operation;
     use lance_table::transaction::resolve_arrow_field_ids;
     use std::time::Duration;
 
@@ -1004,7 +640,11 @@ mod tests {
             .unwrap();
         let dataset = Arc::new(dataset);
 
-        let io_stats = dataset.object_store.as_ref().io_stats_incremental();
+        let io_stats = dataset
+            .table_state
+            .object_store
+            .as_ref()
+            .io_stats_incremental();
         assert_io_gt!(io_stats, read_iops, 0);
         assert_io_gt!(io_stats, write_iops, 0);
 
@@ -1020,7 +660,11 @@ mod tests {
             // we shouldn't need to read anything from disk. Except we do need
             // to check for the latest version to see if we need to do conflict
             // resolution.
-            let io_stats = dataset.object_store.as_ref().io_stats_incremental();
+            let io_stats = dataset
+                .table_state
+                .object_store
+                .as_ref()
+                .io_stats_incremental();
             assert_io_eq!(io_stats, read_iops, 1, "check latest version, i = {} ", i);
             // Should see 2 IOPs:
             // 1. Write the transaction files
@@ -1041,7 +685,11 @@ mod tests {
         // The read version's manifest body is served from the session cache (it
         // was cached when v1 was first created), so the checkout only pays the
         // version-resolution head, not a manifest read.
-        let io_stats = dataset.object_store.as_ref().io_stats_incremental();
+        let io_stats = dataset
+            .table_state
+            .object_store
+            .as_ref()
+            .io_stats_incremental();
         assert_io_eq!(io_stats, read_iops, 3, "load dataset + check version");
         assert_io_eq!(io_stats, write_iops, 2, "write txn + manifest");
 
@@ -1056,7 +704,11 @@ mod tests {
         assert_eq!(new_ds.manifest().version, 8);
         // Now we have to load all previous transactions.
 
-        let io_stats = dataset.object_store.as_ref().io_stats_incremental();
+        let io_stats = dataset
+            .table_state
+            .object_store
+            .as_ref()
+            .io_stats_incremental();
         assert_io_gt!(io_stats, read_iops, 10);
         assert_io_eq!(io_stats, write_iops, 2, "write txn + manifest");
     }
@@ -1086,7 +738,11 @@ mod tests {
             .await
             .unwrap();
 
-        dataset.object_store.as_ref().io_stats_incremental(); // Reset the stats
+        dataset
+            .table_state
+            .object_store
+            .as_ref()
+            .io_stats_incremental(); // Reset the stats
         let read_version = dataset.manifest().version;
         let new_ds = CommitBuilder::new(Arc::new(dataset))
             .execute(sample_transaction(read_version))
@@ -1094,7 +750,11 @@ mod tests {
             .unwrap();
 
         // Assert io requests
-        let io_stats = new_ds.object_store.as_ref().io_stats_incremental();
+        let io_stats = new_ds
+            .table_state
+            .object_store
+            .as_ref()
+            .io_stats_incremental();
         // This could be zero, if we decided to be optimistic. However, that
         // would mean wasted write requests (txn + manifest) if there was
         // a conflict. We choose to be pessimistic for more consistent performance.
@@ -1152,14 +812,22 @@ mod tests {
                 .await
                 .unwrap();
         }
-        dataset.object_store.as_ref().io_stats_incremental();
+        dataset
+            .table_state
+            .object_store
+            .as_ref()
+            .io_stats_incremental();
 
         let new_ds = CommitBuilder::new(original_dataset.clone())
             .execute(sample_transaction(original_dataset.manifest().version))
             .await
             .unwrap();
 
-        let io_stats = new_ds.object_store.as_ref().io_stats_incremental();
+        let io_stats = new_ds
+            .table_state
+            .object_store
+            .as_ref()
+            .io_stats_incremental();
 
         // If there is a conflict with two transaction, the retry should require io requests:
         // * 1 list version
@@ -1183,23 +851,6 @@ mod tests {
             assert_io_lt!(io_stats, num_stages, 6);
         }
         assert_io_eq!(io_stats, write_iops, 2); // txn + manifest
-    }
-
-    #[test]
-    fn test_commit_timeout_default_is_thirty_minutes() {
-        let builder = CommitBuilder::new("memory://default-timeout");
-        assert_eq!(builder.timeout, Some(DEFAULT_COMMIT_TIMEOUT));
-        assert_eq!(DEFAULT_COMMIT_TIMEOUT, Duration::from_secs(1800));
-    }
-
-    #[test]
-    fn test_commit_retry_timeout_default_is_thirty_seconds() {
-        let builder = CommitBuilder::new("memory://default-retry-timeout");
-        assert_eq!(builder.retry_timeout, default_commit_retry_timeout());
-        assert_eq!(
-            crate::io::commit::DEFAULT_COMMIT_RETRY_TIMEOUT,
-            Duration::from_secs(30)
-        );
     }
 
     #[tokio::test]
@@ -1541,7 +1192,7 @@ mod tests {
 
         let committed = CommitBuilder::new(stale.clone())
             .with_commit_handler(Arc::new(ConflictOnceCommitHandler {
-                inner: stale.commit_handler.clone(),
+                inner: stale.table_state.commit_handler.clone(),
                 conflicted: std::sync::atomic::AtomicBool::new(false),
             }))
             .with_retry_timeout(retry_timeout)
@@ -1677,7 +1328,11 @@ mod tests {
         }
         assert_eq!(dataset.manifest().version, 51);
 
-        dataset.object_store.as_ref().io_stats_incremental();
+        dataset
+            .table_state
+            .object_store
+            .as_ref()
+            .io_stats_incremental();
 
         let start = std::time::Instant::now();
         let new_ds = CommitBuilder::new(dataset.clone())
@@ -1692,7 +1347,11 @@ mod tests {
             "commit took {elapsed:?}; the version hint path was likely not used"
         );
 
-        let io_stats = new_ds.object_store.as_ref().io_stats_incremental();
+        let io_stats = new_ds
+            .table_state
+            .object_store
+            .as_ref()
+            .io_stats_incremental();
         assert!(
             io_stats.read_iops < 10,
             "read_iops = {}; a full listing was likely used",

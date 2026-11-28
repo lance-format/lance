@@ -753,6 +753,20 @@ class ScannerBuilder:
 
     def apply_defaults(self, default_opts: Dict[str, Any]) -> ScannerBuilder:
         for key, value in default_opts.items():
+            if key == "fragments":
+                self.with_fragments(value)
+                continue
+            if key == "index_segments":
+                self.with_index_segments(value)
+                continue
+            if key == "full_text_query":
+                # Match scanner(): None does not set a full-text query.
+                if value is None:
+                    continue
+                key = "full_text_search"
+            if key == "nearest" and isinstance(value, MinHashQuery):
+                self.minhash_search(value)
+                continue
             setter = getattr(self, key, None)
             if setter is None:
                 raise ValueError(f"Unknown option {key}")

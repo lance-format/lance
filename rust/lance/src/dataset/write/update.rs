@@ -234,6 +234,8 @@ impl UpdateBuilder {
 
     /// Set the total timeout for all retries.
     ///
+    /// A commit that has already started finishes even if this timeout expires.
+    ///
     /// Default is 30 seconds.
     pub fn retry_timeout(mut self, timeout: Duration) -> Self {
         self.retry_timeout = timeout;
@@ -578,8 +580,8 @@ impl UpdateJob {
         let (mut new_fragments, _) = write_fragments_internal_with_file_row_counts(
             self.write_version,
             Some(&self.dataset),
-            self.dataset.object_store.clone(),
-            &self.dataset.base,
+            self.dataset.table_state.object_store.clone(),
+            &self.dataset.table_state.base,
             self.dataset.schema().clone(),
             Box::pin(stream),
             write_params,
@@ -603,8 +605,8 @@ impl UpdateJob {
                 .await;
             if let Err(e) = placed {
                 cleanup_data_fragments(
-                    &self.dataset.object_store,
-                    &self.dataset.base,
+                    &self.dataset.table_state.object_store,
+                    &self.dataset.table_state.base,
                     None,
                     &new_fragments,
                 )
@@ -621,8 +623,8 @@ impl UpdateJob {
             Ok(v) => v,
             Err(e) => {
                 cleanup_data_fragments(
-                    &self.dataset.object_store,
-                    &self.dataset.base,
+                    &self.dataset.table_state.object_store,
+                    &self.dataset.table_state.base,
                     None,
                     &new_fragments,
                 )
@@ -842,7 +844,7 @@ impl UpdateJob {
                     if let Some(bitmap) = bitmaps_ref.get(&(fragment_id as u32)) {
                         match fragment.extend_deletions(*bitmap).await {
                             Ok(Some(new_fragment)) => {
-                                Ok(FragmentChange::Modified(Box::new(new_fragment.metadata)))
+                                Ok(FragmentChange::Modified(Box::new(new_fragment.into())))
                             }
                             Ok(None) => Ok(FragmentChange::Removed(fragment_id as u64)),
                             Err(e) => Err(e),
@@ -852,7 +854,7 @@ impl UpdateJob {
                     }
                 }
             })
-            .buffer_unordered(self.dataset.object_store.io_parallelism());
+            .buffer_unordered(self.dataset.table_state.object_store.io_parallelism());
 
         while let Some(res) = stream.next().await.transpose()? {
             match res {
@@ -866,7 +868,7 @@ impl UpdateJob {
     }
 }
 
-impl RetryExecutor for UpdateJob {
+impl RetryExecutor<Dataset> for UpdateJob {
     type Data = UpdateData;
     type Result = UpdateResult;
 
@@ -1399,34 +1401,37 @@ mod tests {
         assert_eq!(fragments.len(), 3);
 
         // One fragment not touched (id = 0..10)
-        assert_eq!(fragments[0].metadata.id, original_fragments[0].metadata.id);
         assert_eq!(
-            fragments[0].metadata.files,
-            original_fragments[0].metadata.files
+            fragments[0].metadata().id,
+            original_fragments[0].metadata().id
         );
         assert_eq!(
-            fragments[0].metadata.physical_rows,
-            original_fragments[0].metadata.physical_rows
+            fragments[0].metadata().files,
+            original_fragments[0].metadata().files
         );
         assert_eq!(
-            fragments[0].metadata.row_id_meta,
-            original_fragments[0].metadata.row_id_meta
+            fragments[0].metadata().physical_rows,
+            original_fragments[0].metadata().physical_rows
+        );
+        assert_eq!(
+            fragments[0].metadata().row_id_meta,
+            original_fragments[0].metadata().row_id_meta
         );
         // One fragment partially modified (id = 10..15)
         assert_eq!(
-            fragments[1].metadata.files,
-            original_fragments[1].metadata.files,
+            fragments[1].metadata().files,
+            original_fragments[1].metadata().files,
         );
         assert_eq!(
             fragments[1]
-                .metadata
+                .metadata()
                 .deletion_file
                 .as_ref()
                 .and_then(|f| f.num_deleted_rows),
             Some(5)
         );
         // One fragment fully modified
-        assert_eq!(fragments[2].metadata.physical_rows, Some(15));
+        assert_eq!(fragments[2].metadata().physical_rows, Some(15));
     }
 
     #[rstest]
@@ -3330,7 +3335,7 @@ mod tests {
         )
         .await
         .unwrap();
-        ds.object_store.io_stats_incremental();
+        ds.table_state.object_store.io_stats_incremental();
         Arc::new(ds)
     }
 
@@ -3356,7 +3361,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.rows_updated, 32);
-        let read_bytes = ds.object_store.io_stats_incremental().read_bytes;
+        let read_bytes = ds
+            .table_state
+            .object_store
+            .io_stats_incremental()
+            .read_bytes;
         assert_eq!(
             read_bytes >= MATCHED_PAYLOAD_BYTES,
             reads_payload,

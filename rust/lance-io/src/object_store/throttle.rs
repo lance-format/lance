@@ -53,6 +53,7 @@ use object_store::list::{PaginatedListOptions, PaginatedListResult, PaginatedLis
 
 #[cfg(any(test, feature = "aws", feature = "azure", feature = "gcp"))]
 use crate::object_store::ObjectStoreParams;
+use crate::object_store::copy_diagnostics::{CopyOperationEvent, record_current};
 
 /// Match ObjectStore's documented delete concurrency to bound in-flight operations
 /// and token reservations for stores without HTTP-level admission.
@@ -334,6 +335,7 @@ impl OperationThrottle {
     /// negative) so that concurrent waiters queue behind each other instead
     /// of all waking at the same instant (thundering herd).
     async fn acquire_token(&self) {
+        record_current(|| CopyOperationEvent::PermitWaiting);
         let sleep_duration = {
             let mut bucket = self.bucket.lock().await;
             let now = tokio::time::Instant::now();
@@ -345,7 +347,8 @@ impl OperationThrottle {
             bucket.tokens -= 1.0;
 
             if bucket.tokens >= 0.0 {
-                // Had a token available, no need to sleep
+                drop(bucket);
+                record_current(|| CopyOperationEvent::PermitAcquired);
                 return;
             }
 
@@ -354,6 +357,7 @@ impl OperationThrottle {
         };
 
         tokio::time::sleep(sleep_duration).await;
+        record_current(|| CopyOperationEvent::PermitAcquired);
     }
 
     /// Update the bucket's fill rate from the controller.
@@ -459,7 +463,9 @@ impl OperationThrottle {
                         error = %err,
                         "Retrying after throttle error"
                     );
-                    tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                    let duration = std::time::Duration::from_millis(backoff_ms);
+                    record_current(|| CopyOperationEvent::Backoff { duration });
+                    tokio::time::sleep(duration).await;
                     continue;
                 }
                 _ => return result,
@@ -908,6 +914,31 @@ fn is_retryable_http_error(error: &HttpError) -> bool {
 }
 
 #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
+impl AimdHttpService {
+    async fn execute(
+        &self,
+        request: HttpRequest,
+    ) -> (Option<u64>, Result<HttpResponse, HttpError>) {
+        let attempt = super::copy_diagnostics::start_http_attempt();
+        let result = self.inner.execute(request).await;
+        if let Some(attempt) = attempt {
+            record_current(|| match &result {
+                Ok(response) => CopyOperationEvent::HttpResponse {
+                    attempt,
+                    status: response.status().as_u16(),
+                    request_id: ["x-amz-request-id", "x-ms-request-id", "x-goog-request-id"]
+                        .iter()
+                        .find_map(|name| response.headers().get(*name)?.to_str().ok())
+                        .map(str::to_owned),
+                },
+                Err(_) => CopyOperationEvent::HttpError { attempt },
+            });
+        }
+        (attempt, result)
+    }
+}
+
+#[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
 #[async_trait]
 impl HttpService for AimdHttpService {
     async fn call(&self, request: HttpRequest) -> Result<HttpResponse, HttpError> {
@@ -915,7 +946,7 @@ impl HttpService for AimdHttpService {
             // The cloud client owns retry and bulk response handling. Each HTTP
             // attempt draws one token, including retries of a bulk request.
             delete.acquire_token().await;
-            let result = self.inner.execute(request).await;
+            let (_, result) = self.execute(request).await;
             let is_throttle = match &result {
                 Ok(response) => matches!(
                     response.status(),
@@ -938,16 +969,16 @@ impl HttpService for AimdHttpService {
             return result;
         }
         let Some(write) = self.write.as_ref() else {
-            return self.inner.execute(request).await;
+            return self.execute(request).await.1;
         };
         if !is_multipart_upload_request(&request) {
-            return self.inner.execute(request).await;
+            return self.execute(request).await.1;
         }
         let is_complete = is_multipart_complete_request(&request);
 
         for attempt in 0..=write.max_retries {
             write.acquire_token().await;
-            let mut result = self.inner.execute(request.clone()).await;
+            let (http_attempt, mut result) = self.execute(request.clone()).await;
             let mut is_retryable = result.as_ref().err().is_some_and(is_retryable_http_error);
             let mut is_throttle = false;
             let mut response_status = None;
@@ -962,7 +993,14 @@ impl HttpService for AimdHttpService {
                     || status == ::http::StatusCode::SERVICE_UNAVAILABLE;
 
                 let (parts, body) = response.into_parts();
-                result = match body.bytes().await {
+                let body = body.bytes().await;
+                if let Some(attempt) = http_attempt {
+                    record_current(|| CopyOperationEvent::HttpBodyReturned {
+                        attempt,
+                        success: body.is_ok(),
+                    });
+                }
+                result = match body {
                     Ok(bytes) => {
                         let verdict = classify_multipart_response_body(
                             status,
@@ -1013,7 +1051,9 @@ impl HttpService for AimdHttpService {
                     backoff_ms,
                     "Retrying multipart upload request after retryable HTTP response"
                 );
-                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                let duration = std::time::Duration::from_millis(backoff_ms);
+                record_current(|| CopyOperationEvent::Backoff { duration });
+                tokio::time::sleep(duration).await;
                 continue;
             }
             return result;
@@ -3326,6 +3366,7 @@ mod tests {
                     None,
                 )
             } else if method == ::http::Method::PUT && query.contains("partNumber=") {
+                tokio::task::yield_now().await;
                 self.state
                     .part_uris
                     .lock()
@@ -3348,7 +3389,7 @@ mod tests {
                 };
                 if should_fail {
                     (
-                        ::http::StatusCode::SERVICE_UNAVAILABLE,
+                        ::http::StatusCode::TOO_MANY_REQUESTS,
                         "<Error><Code>SlowDown</Code><Message>Please reduce your request rate.</Message></Error>",
                         None,
                     )
@@ -3402,7 +3443,9 @@ mod tests {
                 (::http::StatusCode::BAD_REQUEST, "unexpected request", None)
             };
 
-            let mut response = ::http::Response::builder().status(status);
+            let mut response = ::http::Response::builder()
+                .status(status)
+                .header("x-amz-request-id", "provider-request");
             if let Some(e_tag) = e_tag {
                 response = response.header(::http::header::ETAG, e_tag);
             }
@@ -3448,12 +3491,68 @@ mod tests {
             .unwrap();
 
         let mut upload = store.put_multipart(&Path::from("object")).await.unwrap();
-        upload
-            .put_part(PutPayload::from_static(b"payload"))
-            .await
-            .unwrap();
+        use crate::object_store::copy_diagnostics::{
+            CopyDiagnostics, CopyOperation, CopyOperationEvent as Event,
+        };
+        let (diagnostics, events) = CopyDiagnostics::recording();
+        let part = diagnostics.run(
+            CopyOperation::UploadPart { index: 0, bytes: 7 },
+            upload.put_part(PutPayload::from_static(b"payload")),
+        );
+        tokio::pin!(part);
+        assert!(futures::poll!(&mut part).is_pending());
+        {
+            let events = events.lock().unwrap();
+            assert!(events.iter().any(|op| op.event == Event::PermitAcquired));
+            assert!(
+                events
+                    .iter()
+                    .any(|op| matches!(op.event, Event::HttpDispatch { .. }))
+            );
+            assert!(!events.iter().any(|op| matches!(
+                op.event,
+                Event::HttpResponse { .. } | Event::HttpError { .. }
+            )));
+        }
+        part.await.unwrap();
         upload.complete().await.unwrap();
 
+        let events = events.lock().unwrap();
+        let observed: Vec<_> = events.iter().map(|op| &op.event).collect();
+        let attempts: Vec<_> = observed
+            .iter()
+            .filter_map(|event| match event {
+                Event::HttpDispatch { attempt } => Some(*attempt),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(attempts.len(), 4);
+        assert!(attempts.windows(2).all(|ids| ids[0] < ids[1]));
+        for (attempt, status) in attempts.into_iter().zip([429, 429, 429, 200]) {
+            assert!(observed.contains(&&Event::HttpResponse {
+                attempt,
+                status,
+                request_id: Some("provider-request".into())
+            }));
+            assert!(observed.contains(&&Event::HttpBodyReturned {
+                attempt,
+                success: true
+            }));
+        }
+        assert_eq!(
+            observed
+                .iter()
+                .filter(|e| matches!(e, Event::PermitAcquired))
+                .count(),
+            4
+        );
+        assert_eq!(
+            observed
+                .iter()
+                .filter(|e| matches!(e, Event::Backoff { .. }))
+                .count(),
+            3
+        );
         let part_uris = retry_state.part_uris.lock().unwrap();
         assert_eq!(part_uris.len(), 4);
         assert!(part_uris.iter().all(|uri| uri == &part_uris[0]));

@@ -730,8 +730,8 @@ impl FullSchemaMergeInsertExec {
                     let (fragments, _) = write_fragments_internal_impl(
                         params.write_version(dataset),
                         Some(dataset),
-                        dataset.object_store.clone(),
-                        &dataset.base,
+                        dataset.table_state.object_store.clone(),
+                        &dataset.table_state.base,
                         dataset.schema().clone(),
                         from_datafusion_stream(stream),
                         write_params.clone(),
@@ -775,8 +775,8 @@ impl FullSchemaMergeInsertExec {
         }
         if let Some(error) = write_error {
             cleanup_data_fragments(
-                &dataset.object_store,
-                &dataset.base,
+                &dataset.table_state.object_store,
+                &dataset.table_state.base,
                 target_bases.as_deref(),
                 &fragments,
             )
@@ -1366,8 +1366,8 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
             .await;
             if let Err(error) = lineage_result {
                 cleanup_data_fragments(
-                    &dataset.object_store,
-                    &dataset.base,
+                    &dataset.table_state.object_store,
+                    &dataset.table_state.base,
                     cleanup_bases.as_deref(),
                     &new_fragments,
                 )
@@ -1400,8 +1400,8 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
                         // The new data files are not committed; remove them (including
                         // ones routed to target bases) before surfacing the error.
                         cleanup_data_fragments(
-                            &dataset.object_store,
-                            &dataset.base,
+                            &dataset.table_state.object_store,
+                            &dataset.table_state.base,
                             cleanup_bases.as_deref(),
                             &new_fragments,
                         )
@@ -1629,6 +1629,7 @@ mod tests {
         let (exec, state) = splitter_fixture().await;
         let mut before = exec
             .dataset
+            .table_state
             .object_store
             .read_dir(exec.dataset.data_dir())
             .await
@@ -1695,6 +1696,7 @@ mod tests {
             .unwrap();
         let mut after = exec
             .dataset
+            .table_state
             .object_store
             .read_dir(exec.dataset.data_dir())
             .await

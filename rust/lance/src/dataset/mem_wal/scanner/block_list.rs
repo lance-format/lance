@@ -412,9 +412,9 @@ pub(super) async fn load_pk_index(dataset: &crate::Dataset) -> Result<Arc<dyn Sc
     let index_cache = dataset
         .index_cache
         .for_index(&path_cache_uuid(dataset.uri()), None);
-    let index_dir = dataset.base.clone().join(PK_INDEX_DIR);
+    let index_dir = dataset.table_state.base.clone().join(PK_INDEX_DIR);
     let store: Arc<dyn ScalarIndexStore> = Arc::new(LanceIndexStore::new(
-        dataset.object_store.clone(),
+        dataset.table_state.object_store.clone(),
         index_dir,
         Arc::new(index_cache.clone()),
     ));

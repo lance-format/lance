@@ -321,7 +321,7 @@ async fn test_count_star_subset_fragments() {
     let subset: Vec<Fragment> = all_fragments
         .into_iter()
         .take(2)
-        .map(|f| f.metadata)
+        .map(Fragment::from)
         .collect();
 
     let agg_bytes = create_aggregate_rel(
@@ -620,7 +620,7 @@ async fn test_aggregate_specific_fragments() {
         .into_iter()
         .enumerate()
         .filter(|(i, _)| *i == 3 || *i == 5 || *i == 7)
-        .map(|(_, f)| f.metadata)
+        .map(|(_, fragment)| Fragment::from(fragment))
         .collect();
 
     let agg_bytes = create_aggregate_rel(
@@ -659,7 +659,7 @@ async fn test_sum_specific_fragments() {
         .into_iter()
         .enumerate()
         .filter(|(i, _)| *i == 1 || *i == 2)
-        .map(|(_, f)| f.metadata)
+        .map(|(_, fragment)| Fragment::from(fragment))
         .collect();
 
     let agg_bytes = create_aggregate_rel(

@@ -1585,7 +1585,17 @@ impl<'a> RabitDistCalculator<'a> {
             hacc_quantized_dists,
         );
 
-        Some(RawQueryTopkContext {
+        Some(self.raw_query_topk_parameters(k, lower_bound, upper_bound, n))
+    }
+
+    fn raw_query_topk_parameters(
+        &self,
+        k: usize,
+        lower_bound: Option<f32>,
+        upper_bound: Option<f32>,
+        n: usize,
+    ) -> RawQueryTopkContext<'_> {
+        RawQueryTopkContext {
             n,
             k,
             ex_bits: self.num_bits - 1,
@@ -1600,7 +1610,7 @@ impl<'a> RabitDistCalculator<'a> {
                 .expect("raw-query multi-bit RQ requires ex scale factors"),
             query_lower_bound: lower_bound.unwrap_or(f32::MIN),
             query_upper_bound: upper_bound.unwrap_or(f32::MAX),
-        })
+        }
     }
 
     /// Process one candidate row given its lower bound: the bound checks,
@@ -1673,23 +1683,63 @@ impl<'a> RabitDistCalculator<'a> {
         quantized_dists_table: &mut Vec<u8>,
         hacc_quantized_dists: &mut Vec<u32>,
     ) {
-        let Some(ctx) = self.raw_query_multi_bit_topk_context(
-            k,
-            lower_bound,
-            upper_bound,
-            dists,
-            quantized_dists,
-            quantized_dists_table,
-            hacc_quantized_dists,
-        ) else {
-            return;
+        let code_len = rabit_binary_code_bytes(self.dim);
+        let n = self.codes.len() / code_len;
+        let sparse = (n > 0
+            && self.approx_mode == ApproxMode::Normal
+            && self.sign_row_ids.is_none()
+            && row_ids.size_hint().1.is_some_and(|count| count <= n / 16))
+        .then(|| self.raw_query.map(|query| query.normal_lut()))
+        .flatten()
+        .and_then(|lut| match lut.dequant {
+            DistTableDequant::Affine { qmin, qmax } => Some((
+                lut.table.as_slice(),
+                (qmax - qmin) / 255.0,
+                lut.num_tables as f32 * qmin,
+            )),
+            DistTableDequant::Exact => None,
+        });
+        let ctx = if sparse.is_some() {
+            dists.clear();
+            quantized_dists.clear();
+            hacc_quantized_dists.clear();
+            self.raw_query_topk_parameters(k, lower_bound, upper_bound, n)
+        } else {
+            let Some(ctx) = self.raw_query_multi_bit_topk_context(
+                k,
+                lower_bound,
+                upper_bound,
+                dists,
+                quantized_dists,
+                quantized_dists_table,
+                hacc_quantized_dists,
+            ) else {
+                return;
+            };
+            ctx
         };
         let mut max_dist = res.peek().map(|node| node.dist);
         let mut counters = RabitPruneCounters::default();
 
         for (id, row_id) in row_ids {
-            let Some(binary_ip) = dists.get(id).copied() else {
+            if id >= ctx.n {
                 continue;
+            }
+            let binary_ip = if let Some((table, range, sum_min)) = sparse {
+                if id < n - n % BATCH_SIZE {
+                    let sum: u32 = get_rq_code(self.codes, id, n, code_len)
+                        .enumerate()
+                        .map(|(byte, code)| {
+                            u32::from(table[byte * 32 + usize::from(code & 15)])
+                                + u32::from(table[byte * 32 + 16 + usize::from(code >> 4)])
+                        })
+                        .sum();
+                    sum as f32 * range + sum_min
+                } else {
+                    compute_single_rq_distance(self.codes, id, n, code_len, &self.dist_table)
+                }
+            } else {
+                dists[id]
             };
             counters.candidates += 1;
             let Some(raw_lower_bound) = self.raw_query_lower_bound(id, binary_ip) else {
@@ -2464,6 +2514,10 @@ impl VectorStore for RabitQuantizationStorage {
 
     fn row_ids(&self) -> impl Iterator<Item = &u64> {
         self.row_ids.values().iter()
+    }
+
+    fn row_ids_slice(&self) -> Option<&[u64]> {
+        Some(self.row_ids.values().as_ref())
     }
 
     fn distance_type(&self) -> DistanceType {
@@ -3610,6 +3664,55 @@ mod tests {
                 &mut Vec::new(),
             )
             .unwrap();
+            let mut scalar = SignStage::default();
+            calc.filtered_partition_sign_stage_with_scratch(
+                &mut scalar,
+                &mut Vec::new(),
+                &mut Vec::new(),
+                &mut Vec::new(),
+            )
+            .unwrap();
+            for pattern in 0..4 {
+                let accept = (0..storage.len())
+                    .map(|row| match pattern {
+                        0 => false,
+                        1 => true,
+                        2 => {
+                            row % 3 == 1 && storage.row_id(row as u32) != RowAddress::TOMBSTONE_ROW
+                        }
+                        _ => row + 1 == storage.len(),
+                    })
+                    .collect::<Vec<_>>();
+                let mut masked = SignStage::default();
+                calc.filtered_partition_sign_stage_for_mask(&mut masked, &accept)
+                    .unwrap();
+                for (row, &accepted) in accept.iter().enumerate() {
+                    if accepted {
+                        assert_eq!(
+                            masked.binary_ips[row].to_bits(),
+                            scalar.binary_ips[row].to_bits()
+                        );
+                        assert_eq!(
+                            masked.lower_bounds[row].to_bits(),
+                            scalar.lower_bounds[row].to_bits()
+                        );
+                    } else {
+                        assert_eq!(masked.binary_ips[row], 0.0);
+                        assert_eq!(masked.lower_bounds[row], f32::INFINITY);
+                    }
+                }
+                let before_ips = masked.binary_ips.clone();
+                let before_bounds = masked.lower_bounds.clone();
+                assert_eq!(
+                    calc.filtered_partition_sign_stage_for_mask(
+                        &mut masked,
+                        &vec![true; storage.len() + 1]
+                    ),
+                    Err("mask_length")
+                );
+                assert_eq!(masked.binary_ips, before_ips);
+                assert_eq!(masked.lower_bounds, before_bounds);
+            }
             stage
         };
         let actual = prepare(&sign);
@@ -4176,6 +4279,16 @@ mod tests {
             calc.raw_query_lower_bound_gating_disabled_reason(),
             Some("approx_mode_fast")
         );
+        let mut stage = SignStage {
+            binary_ips: vec![7.0],
+            lower_bounds: vec![8.0],
+        };
+        assert_eq!(
+            calc.filtered_partition_sign_stage_for_mask(&mut stage, &[true, false]),
+            Err("approx_mode_fast")
+        );
+        assert_eq!(stage.binary_ips, vec![7.0]);
+        assert_eq!(stage.lower_bounds, vec![8.0]);
     }
 
     #[test]
@@ -4775,6 +4888,106 @@ mod tests {
             .collect::<Vec<_>>();
         rows.sort_unstable();
         rows
+    }
+
+    #[rstest]
+    fn test_filtered_sparse_binary_ips_match_bulk(
+        #[values(ApproxMode::Normal, ApproxMode::Accurate)] approx_mode: ApproxMode,
+        #[values(false, true)] sign_planes: bool,
+    ) {
+        for n in [0usize, 17, 33, 65, 129] {
+            let mut rng = SmallRng::seed_from_u64(771 + n as u64);
+            let exact = (0..n)
+                .map(|_| rng.random_range(0.0..20.0))
+                .collect::<Vec<_>>();
+            let mut data = CraftedTopkData::new(&exact, &vec![1.0; n], vec![0.7; n], &mut rng);
+            data.scale_factors.fill(0.3);
+            data.ex_scale_factors.fill(0.2);
+            let raw = RabitRawQueryContext::new(
+                CRAFTED_TOPK_DIM,
+                CRAFTED_TOPK_NUM_BITS - 1,
+                data.ex_query.clone(),
+                data.dist_table.clone(),
+                Vec::new(),
+                0.7,
+            );
+            let row_ids = (0..n as u64).collect::<Vec<_>>();
+            let mut calc = data.calculator(approx_mode);
+            calc.raw_query = Some(&raw);
+            calc.sign_row_ids = sign_planes.then_some(row_ids.as_slice());
+            let selections = if n == 0 {
+                vec![Vec::new()]
+            } else {
+                vec![
+                    vec![],
+                    vec![0],
+                    vec![n - 1],
+                    vec![0, n / 2, n - 1],
+                    vec![0, 0, n - 1],
+                    vec![n + 1, 0],
+                    (0..n).step_by(3).collect(),
+                ]
+            };
+            for selected in selections {
+                for k in [1, 3] {
+                    for (lower, upper) in [(None, None), (Some(-1.0), Some(100.0))] {
+                        let mut sparse_heap = BinaryHeap::new();
+                        let mut bulk_heap = BinaryHeap::new();
+                        let mut dists = vec![123.0];
+                        let mut u16_scratch = Vec::new();
+                        let mut u8_scratch = Vec::new();
+                        let mut u32_scratch = Vec::new();
+                        for pass in 0..2u64 {
+                            calc.accumulate_filtered_topk_with_scratch(
+                                k,
+                                lower,
+                                upper,
+                                selected
+                                    .iter()
+                                    .map(|&id| (id as u32, id as u64 + pass * 1000)),
+                                |_| true,
+                                &mut sparse_heap,
+                                &mut dists,
+                                &mut u16_scratch,
+                                &mut u8_scratch,
+                                &mut u32_scratch,
+                            );
+                            if n > 0
+                                && approx_mode == ApproxMode::Normal
+                                && !sign_planes
+                                && selected.len() <= n / 16
+                            {
+                                assert!(dists.is_empty());
+                            } else {
+                                assert_eq!(dists.len(), n);
+                            }
+                            let mut iter = selected.iter();
+                            let unknown_length = std::iter::from_fn(|| {
+                                iter.next().map(|&id| (id as u32, id as u64 + pass * 1000))
+                            });
+                            calc.accumulate_filtered_topk_with_scratch(
+                                k,
+                                lower,
+                                upper,
+                                unknown_length,
+                                |_| true,
+                                &mut bulk_heap,
+                                &mut dists,
+                                &mut u16_scratch,
+                                &mut u8_scratch,
+                                &mut u32_scratch,
+                            );
+                            assert_eq!(dists.len(), n);
+                        }
+                        assert_eq!(
+                            canonical_heap_rows(sparse_heap),
+                            canonical_heap_rows(bulk_heap),
+                            "n={n} selected={selected:?} k={k} mode={approx_mode:?} planes={sign_planes}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// The dense (SIMD-pruned) scan must reproduce the sparse scalar scan

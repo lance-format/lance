@@ -339,7 +339,7 @@ mod tests {
     }
 
     async fn create_index_segments(dataset: &mut Dataset, fragments_per_segment: usize) {
-        let fragments: Vec<_> = dataset.fragment_bitmap.iter().collect();
+        let fragments: Vec<_> = dataset.table_state.fragment_bitmap.iter().collect();
         let groups = fragments.chunks(fragments_per_segment);
         let mut staged = Vec::with_capacity(groups.len());
         for group in groups {
@@ -454,7 +454,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             merged.fragment_bitmap.as_ref().unwrap(),
-            dataset.fragment_bitmap.as_ref()
+            dataset.table_state.fragment_bitmap.as_ref()
         );
         assert!(
             merged
@@ -593,7 +593,7 @@ mod tests {
         let options = OptimizeOptions::merge(2)
             .max_rows_per_task(Some(task_limit))
             .max_rows_per_segment(segment_limit);
-        dataset.object_store.io_stats_incremental();
+        dataset.table_state.object_store.io_stats_incremental();
         let plan = plan_optimize_indices(&dataset, &options).await.unwrap();
         assert_eq!(plan.tasks.len(), task_count);
         assert_eq!(plan.merges.len(), segment_count);
@@ -625,6 +625,7 @@ mod tests {
             .await
             .unwrap();
         let rescan = dataset
+            .table_state
             .object_store
             .io_stats_incremental()
             .requests
@@ -643,7 +644,7 @@ mod tests {
                 .iter()
                 .flat_map(|segment| segment.fragment_bitmap.as_ref().unwrap().iter())
                 .collect::<RoaringBitmap>(),
-            *dataset.fragment_bitmap
+            *dataset.table_state.fragment_bitmap
         );
         for id in (0..8 + added).filter(|&id| id != 1) {
             assert_eq!(
@@ -810,7 +811,7 @@ mod tests {
                 .iter()
                 .flat_map(|segment| segment.fragment_bitmap.as_ref().unwrap().iter())
                 .collect::<RoaringBitmap>(),
-            *dataset.fragment_bitmap
+            *dataset.table_state.fragment_bitmap
         );
         for id in 0..append_end {
             let mut scan = dataset.scan();
@@ -897,7 +898,7 @@ mod tests {
         assert!(segments[0].base_id.is_none());
         assert_eq!(
             segments[0].fragment_bitmap.as_ref(),
-            Some(dataset.fragment_bitmap.as_ref())
+            Some(dataset.table_state.fragment_bitmap.as_ref())
         );
         for id in (0..8).filter(|&id| id != 1) {
             assert_eq!(
@@ -944,7 +945,7 @@ mod tests {
         assert_eq!(segments.len(), 1);
         assert_eq!(
             segments[0].fragment_bitmap.as_ref().unwrap(),
-            dataset.fragment_bitmap.as_ref()
+            dataset.table_state.fragment_bitmap.as_ref()
         );
         for id in [0, 3, 5] {
             assert_eq!(search_ids(&dataset, id, 1).await, vec![id]);

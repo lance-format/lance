@@ -109,6 +109,7 @@ const ZONEMAP_HARVEST_CONCURRENCY_CAP: usize = 16;
 
 pub fn harvest_concurrency(dataset: &Dataset) -> usize {
     dataset
+        .table_state
         .object_store
         .io_parallelism()
         .clamp(1, ZONEMAP_HARVEST_CONCURRENCY_CAP)
@@ -159,7 +160,7 @@ const ZONEMAP_SCAN_BATCH_FRAGMENTS: usize = 16;
 const ZONEMAP_SCAN_CONCURRENCY_CAP: usize = 2;
 
 fn scan_concurrency(dataset: &Dataset) -> usize {
-    (dataset.object_store.io_parallelism() / 16).clamp(1, ZONEMAP_SCAN_CONCURRENCY_CAP)
+    (dataset.table_state.object_store.io_parallelism() / 16).clamp(1, ZONEMAP_SCAN_CONCURRENCY_CAP)
 }
 
 /// How a fragment's rows are read once its seed is decided.

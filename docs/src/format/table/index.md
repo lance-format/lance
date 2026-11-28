@@ -230,7 +230,7 @@ When `DeletionFile.inline` is set, the deletion vector is stored directly in the
 Roaring bitmap with no external file (requires `FLAG_INLINE_DELETIONS`).
 
 Deletion files support two storage formats.
-The Arrow IPC format (`.arrow` extension) stores a flat Int32Array of deleted row offsets and is efficient for sparse deletions.
+The Arrow IPC format (`.arrow` extension) stores a flat UInt32Array of deleted row offsets and is efficient for sparse deletions.
 The Roaring Bitmap format (`.bin` extension) stores a compressed roaring bitmap and is efficient for dense deletions.
 Readers must filter rows whose offsets appear in the deletion file for the fragment.
 

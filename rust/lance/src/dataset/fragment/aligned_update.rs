@@ -189,7 +189,7 @@ impl FileFragment {
 
         // The updater writes one file holding every replaced field, appended
         // after the fragment's existing files.
-        if fragment.files.len() != self.metadata.files.len() + 1 {
+        if fragment.files.len() != self.metadata().files.len() + 1 {
             return Err(Error::internal(format!(
                 "update_columns_from_stream wrote no data file for fragment {}",
                 self.id()

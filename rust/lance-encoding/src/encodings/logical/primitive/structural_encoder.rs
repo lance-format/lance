@@ -31,14 +31,17 @@ use crate::constants::{
     DICT_VALUES_COMPRESSION_META_KEY, PCODEC_COMPRESSION, STRUCTURAL_ENCODING_FULLZIP,
     STRUCTURAL_ENCODING_META_KEY, STRUCTURAL_ENCODING_MINIBLOCK, STRUCTURAL_ENCODING_SPARSE,
 };
-use crate::data::{BlockInfo, DataBlock, FixedWidthDataBlock, VariableWidthBlock};
+use crate::data::{
+    BlockInfo, DataBlock, FixedSizeListBlock, FixedWidthDataBlock, NullableDataBlock,
+    VariableWidthBlock,
+};
 use crate::decoder::PageEncoding;
 use crate::encoder::{
     EncodeTask, EncodedColumn, EncodedPage, EncodingOptions, FieldEncoder, OutOfLineBuffers,
 };
 use crate::encodings::logical::primitive::fullzip::{PerValueCompressor, PerValueDataBlock};
 use crate::encodings::logical::primitive::miniblock::{
-    MiniBlockChunk, MiniBlockCompressed, MiniBlockCompressionContext,
+    MAX_LARGE_MINIBLOCK_BYTES, MiniBlockChunk, MiniBlockCompressed, MiniBlockCompressionContext,
 };
 use crate::encodings::physical::value::{ValueDecompressor, ValueEncoder};
 use crate::format::metadata::CompressiveEncoding;
@@ -219,13 +222,34 @@ pub struct PrimitiveStructuralEncoder {
 
 struct CompressedLevelsChunk {
     data: LanceBuffer,
-    num_levels: u16,
+    num_levels: u64,
+}
+
+impl CompressedLevelsChunk {
+    fn fits_chunk_header(&self) -> bool {
+        self.num_levels <= u16::MAX as u64 && self.data.len() <= u16::MAX as usize
+    }
 }
 
 struct CompressedLevels {
     data: Vec<CompressedLevelsChunk>,
     compression: CompressiveEncoding,
     rep_index: Option<LanceBuffer>,
+}
+
+// General compression wraps the selected value chunks without changing their boundaries.
+fn fixed_width_chunk_size_is_configurable(encoding: &metadata::CompressiveEncoding) -> bool {
+    use metadata::compressive_encoding::Compression;
+    match encoding.compression.as_ref() {
+        Some(
+            Compression::Flat(_) | Compression::FixedSizeList(_) | Compression::ByteStreamSplit(_),
+        ) => true,
+        Some(Compression::General(general)) => general
+            .values
+            .as_deref()
+            .is_some_and(fixed_width_chunk_size_is_configurable),
+        _ => false,
+    }
 }
 
 struct SerializedMiniBlockPage {
@@ -394,6 +418,15 @@ impl PrimitiveStructuralEncoder {
     pub(super) fn is_narrow(data_block: &DataBlock) -> bool {
         const MINIBLOCK_MAX_BYTE_LENGTH_PER_VALUE: u64 = 256;
 
+        // `MaxLength` counts whole bytes, so a fixed-size list of bit-packed booleans
+        // reports zero however wide it is. Such a list is narrow only while mini-block
+        // chunks can hold its rows.
+        if let DataBlock::FixedSizeList(fsl) = data_block
+            && !ValueEncoder::fsl_fits_miniblock(fsl)
+        {
+            return false;
+        }
+
         if let Some(max_len_array) = data_block.get_stat(Stat::MaxLength) {
             let max_len_array = max_len_array
                 .as_any()
@@ -520,8 +553,15 @@ impl PrimitiveStructuralEncoder {
             // Write the number of levels, or 0 if there is no rep/def
             let num_levels = rep
                 .as_ref()
-                .map(|r| r.num_levels)
-                .unwrap_or(def.as_ref().map(|d| d.num_levels).unwrap_or(0));
+                .or(def.as_ref())
+                .map_or(0, |chunk| chunk.num_levels);
+            let num_levels = u16::try_from(num_levels).map_err(|_| {
+                Error::invalid_input(format!(
+                    "Mini-block cannot encode {num_levels} rep/def levels in one chunk. \
+                     This usually means a top-level row contains too much nested structure \
+                     for the current layout."
+                ))
+            })?;
             data_buffer.extend_from_slice(&num_levels.to_le_bytes());
 
             // Write the buffer lengths
@@ -591,7 +631,7 @@ impl PrimitiveStructuralEncoder {
             let chunk_bytes = data_buffer.len() - start_pos;
             let max_chunk_size = match miniblock_chunk_size {
                 MiniblockChunkSize::U16 => 32 * 1024,
-                MiniblockChunkSize::U32 => 1_u64 << 31,
+                MiniblockChunkSize::U32 => MAX_LARGE_MINIBLOCK_BYTES,
             };
             if chunk_bytes == 0 || chunk_bytes as u64 > max_chunk_size {
                 return Err(Error::internal(format!(
@@ -756,20 +796,9 @@ impl PrimitiveStructuralEncoder {
                     "Rep/def block compressor selected a metadata-only codec".to_string(),
                 )
             })?;
-            let num_levels = u16::try_from(num_chunk_levels).map_err(|_| {
-                Error::invalid_input_source(
-                    format!(
-                        "Mini-block cannot encode {} rep/def levels in one chunk. \
-                         This usually means a top-level row contains too much nested structure \
-                         for the current layout.",
-                        num_chunk_levels
-                    )
-                    .into(),
-                )
-            })?;
             level_chunks.push(CompressedLevelsChunk {
                 data: compressed_levels,
-                num_levels,
+                num_levels: num_chunk_levels,
             });
         }
         debug_assert_eq!(levels.num_levels_remaining(), 0);
@@ -1143,46 +1172,79 @@ impl PrimitiveStructuralEncoder {
         } else {
             compression_strategy.create_miniblock_compressor(field, &data)?
         };
-        let common_chunk_buffers =
-            u64::from(repdef.rep_slicer().is_some()) + u64::from(repdef.def_slicer().is_some());
+        let common_chunk_buffers = u64::from(repdef.repetition_levels.is_some())
+            + u64::from(repdef.definition_levels.is_some());
         let support_large_chunk = miniblock_chunk_size == MiniblockChunkSize::U32;
-        let compression_context =
+        let mut compression_context =
             MiniBlockCompressionContext::new(common_chunk_buffers, support_large_chunk, true);
-        let (compressed_data, value_encoding) = compressor.compress(compression_context, data)?;
-
+        let minichunk_size = if support_large_chunk
+            && dictionary_data.is_none()
+            && matches!(
+                &data,
+                DataBlock::FixedWidth(_) | DataBlock::FixedSizeList(_)
+            ) {
+            compression_strategy.minichunk_size(field)?
+        } else {
+            None
+        };
+        if let Some(target) = minichunk_size {
+            compression_context = compression_context.with_fixed_width_chunk_target(target);
+        }
+        // Keep a reference to the raw values only for this opt-in path. Dense
+        // level counts can exceed the number of visible values, and each
+        // compressed level buffer has its own u16 length in the chunk header.
+        let retry_data =
+            (minichunk_size.is_some() && common_chunk_buffers > 0).then(|| data.clone());
         let max_rep = repdef.def_meaning.iter().filter(|l| l.is_list()).count() as u16;
-
-        let mut compressed_rep = repdef
-            .rep_slicer()
-            .map(|rep_slicer| {
+        let mut data = data;
+        let (compressed_data, value_encoding, mut compressed_rep, mut compressed_def) = loop {
+            let (compressed_data, value_encoding) =
+                compressor.compress(compression_context, data)?;
+            let compress = |slicer, max_rep| {
                 Self::compress_levels(
-                    rep_slicer,
+                    slicer,
                     num_items,
                     compression_strategy,
                     &compressed_data.chunks,
                     max_rep,
                 )
-            })
-            .transpose()?;
-
-        let (rep_index, rep_index_depth) =
-            match compressed_rep.as_mut().and_then(|cr| cr.rep_index.as_mut()) {
-                Some(rep_index) => (Some(rep_index.clone()), 1),
-                None => (None, 0),
             };
+            let compressed_rep = repdef
+                .rep_slicer()
+                .map(|slicer| compress(slicer, max_rep))
+                .transpose()?;
+            let compressed_def = repdef
+                .def_slicer()
+                .map(|slicer| compress(slicer, 0))
+                .transpose()?;
+            // Only codecs using the variable fixed-width target can retry
+            // with smaller chunks. The selection is encoded in the page.
+            if let Some(raw) = &retry_data
+                && fixed_width_chunk_size_is_configurable(&value_encoding)
+                && [&compressed_rep, &compressed_def]
+                    .into_iter()
+                    .flatten()
+                    .flat_map(|levels| &levels.data)
+                    .any(|chunk| !chunk.fits_chunk_header())
+                && let Some(first_chunk) = compressed_data.chunks.first()
+                && compression_context
+                    .reduce_fixed_width_chunk_limit(first_chunk.num_values(0, num_items))
+            {
+                data = raw.clone();
+                continue;
+            }
+            break (
+                compressed_data,
+                value_encoding,
+                compressed_rep,
+                compressed_def,
+            );
+        };
 
-        let mut compressed_def = repdef
-            .def_slicer()
-            .map(|def_slicer| {
-                Self::compress_levels(
-                    def_slicer,
-                    num_items,
-                    compression_strategy,
-                    &compressed_data.chunks,
-                    /*max_rep=*/ 0,
-                )
-            })
-            .transpose()?;
+        let rep_index = compressed_rep
+            .as_mut()
+            .and_then(|levels| levels.rep_index.take());
+        let rep_index_depth = u32::from(rep_index.is_some());
 
         // TODO: Parquet sparsely encodes values here.  We could do the same but
         // then we won't have log2 values per chunk.  This means more metadata
@@ -1471,6 +1533,67 @@ impl PrimitiveStructuralEncoder {
         }
     }
 
+    /// Whether a fixed-size list of booleans must store a byte per item in full-zip.
+    ///
+    /// Full-zip copies whole bytes per row, so a row of bit-packed items must be a whole
+    /// number of bytes, and the per-value decoder only splits byte-wide items away from
+    /// item validity. A null-free list whose rows fill whole bytes stays bit-packed, the
+    /// layout earlier writers produce for it.
+    fn fsl_booleans_need_bytes(fsl: &FixedSizeListBlock) -> bool {
+        let mut items_per_row = fsl.dimension;
+        let mut has_item_validity = false;
+        let mut child = fsl.child.as_ref();
+        loop {
+            match child {
+                DataBlock::Nullable(nullable) => {
+                    has_item_validity = true;
+                    child = nullable.data.as_ref();
+                }
+                DataBlock::FixedSizeList(inner) => {
+                    items_per_row = items_per_row.saturating_mul(inner.dimension);
+                    child = inner.child.as_ref();
+                }
+                DataBlock::FixedWidth(fixed) => {
+                    return fixed.bits_per_value == 1
+                        && (has_item_validity || !items_per_row.is_multiple_of(8));
+                }
+                _ => return false,
+            }
+        }
+    }
+
+    /// Why a fixed-size list of booleans that needs byte-wide items cannot be
+    /// written with a strategy that does not allow them.
+    fn byte_wide_fsl_booleans_error(field: &Field) -> String {
+        format!(
+            "field '{}': this FixedSizeList<Boolean> column needs one byte per item in the \
+             full-zip layout because its rows do not fill whole bytes or its items can be null. \
+             Released 2.1 and 2.2 readers cannot read that layout, so write it with file \
+             version 2.3",
+            field.name
+        )
+    }
+
+    /// Expands the bit-packed boolean items of a fixed-size list to one byte each,
+    /// keeping every layer's validity.
+    fn expand_fsl_booleans_to_bytes(data: DataBlock) -> DataBlock {
+        match data {
+            DataBlock::FixedWidth(fixed) if fixed.bits_per_value == 1 => {
+                DataBlock::FixedWidth(Self::expand_boolean_to_bytes(fixed))
+            }
+            DataBlock::Nullable(nullable) => DataBlock::Nullable(NullableDataBlock {
+                data: Box::new(Self::expand_fsl_booleans_to_bytes(*nullable.data)),
+                nulls: nullable.nulls,
+                block_info: nullable.block_info,
+            }),
+            DataBlock::FixedSizeList(fsl) => DataBlock::FixedSizeList(FixedSizeListBlock {
+                child: Box::new(Self::expand_fsl_booleans_to_bytes(*fsl.child)),
+                dimension: fsl.dimension,
+            }),
+            other => other,
+        }
+    }
+
     pub(super) fn encode_full_zip(
         column_idx: u32,
         field: &Field,
@@ -1542,6 +1665,14 @@ impl PrimitiveStructuralEncoder {
         let data = match data {
             DataBlock::FixedWidth(fixed) if fixed.bits_per_value == 1 => {
                 DataBlock::FixedWidth(Self::expand_boolean_to_bytes(fixed))
+            }
+            DataBlock::FixedSizeList(fsl) if Self::fsl_booleans_need_bytes(&fsl) => {
+                if !compression_strategy.allows_byte_wide_fsl_booleans() {
+                    return Err(Error::not_supported_source(
+                        Self::byte_wide_fsl_booleans_error(field).into(),
+                    ));
+                }
+                Self::expand_fsl_booleans_to_bytes(DataBlock::FixedSizeList(fsl))
             }
             other => other,
         };
@@ -2331,6 +2462,11 @@ impl PrimitiveStructuralEncoder {
             let requested_encoding = encoding_metadata
                 .get(STRUCTURAL_ENCODING_META_KEY)
                 .map(|requested| requested.to_lowercase());
+            let needs_byte_wide_booleans = matches!(
+                &data_block,
+                DataBlock::FixedSizeList(fsl) if Self::fsl_booleans_need_bytes(fsl)
+            ) && !compression_strategy
+                .allows_byte_wide_fsl_booleans();
             let fullzip_error = match &data_block {
                 // 1-bit booleans are widened to bytes inside `encode_full_zip`.
                 DataBlock::FixedWidth(fixed)
@@ -2359,6 +2495,11 @@ impl PrimitiveStructuralEncoder {
                 }
                 DataBlock::Dictionary(_) => {
                     Some("Full-zip does not encode dictionary data blocks directly".to_string())
+                }
+                // Full-zip widens these booleans to a byte each when the strategy
+                // allows it, so the same check decides here.
+                DataBlock::FixedSizeList(fsl) if Self::fsl_booleans_need_bytes(fsl) => {
+                    needs_byte_wide_booleans.then(|| Self::byte_wide_fsl_booleans_error(&field))
                 }
                 DataBlock::FixedSizeList(fsl) => match fsl.clone().try_into_flat() {
                     Some(flat) if flat.bits_per_value.is_multiple_of(8) => None,
@@ -2398,6 +2539,11 @@ impl PrimitiveStructuralEncoder {
                         return Ok(DensePageEncoding::FullZip(full_zip_request(
                             data_block, repdef,
                         )?));
+                    }
+                    if requested_encoding.is_none() && needs_byte_wide_booleans {
+                        return Err(Error::not_supported_source(
+                            Self::byte_wide_fsl_booleans_error(&field).into(),
+                        ));
                     }
                     return Err(Error::invalid_input_source(
                         format!(
@@ -2767,6 +2913,10 @@ fn plan_dense_primitive_pages(
 }
 
 impl PrimitivePageEncodingBehavior for DenseU16PrimitiveEncoding {
+    fn validate_field(&self, field: &Field, _metadata: &HashMap<String, String>) -> Result<()> {
+        self.compression.minichunk_size(field).map(|_| ())
+    }
+
     fn try_plan_pages(
         &self,
         _ctx: &PrimitivePlanContext<'_>,
@@ -2802,6 +2952,10 @@ impl PrimitivePageEncodingBehavior for DenseU16PrimitiveEncoding {
 }
 
 impl PrimitivePageEncodingBehavior for DenseU32PrimitiveEncoding {
+    fn validate_field(&self, field: &Field, _metadata: &HashMap<String, String>) -> Result<()> {
+        self.compression.minichunk_size(field).map(|_| ())
+    }
+
     fn try_plan_pages(
         &self,
         _ctx: &PrimitivePlanContext<'_>,
