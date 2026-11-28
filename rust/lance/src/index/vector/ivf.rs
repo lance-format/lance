@@ -819,6 +819,11 @@ pub(crate) async fn optimize_vector_indices(
             index_type_string(sub_index_type, quantization_type)
         )));
     }
+    // Refuse to merge a segment search cannot read, before any output file.
+    let num_to_merge = options.num_indices_to_merge.unwrap_or(1);
+    for index in existing_indices.iter().rev().take(num_to_merge) {
+        check_legacy_segment_readable(index.as_ref())?;
+    }
     // The legacy writers keep every posting of the segments they merge. With
     // stable row ids an updated row keeps its id in its new fragment, so its
     // old entry would stay in the index next to the new one.
@@ -1151,6 +1156,24 @@ pub(crate) async fn optimize_vector_indices_v2(
     };
 
     Ok((new_uuid, summary.indices_merged, summary.files))
+}
+
+/// Fails for a legacy IVF_PQ segment whose 4-bit codes search cannot read,
+/// see [`PQIndex::check_codes_readable`].
+pub(crate) fn check_legacy_segment_readable(index: &dyn VectorIndex) -> Result<()> {
+    let Some(segment) = index.as_any().downcast_ref::<IVFIndex>() else {
+        return Ok(());
+    };
+    let Some(pq) = segment.sub_index.as_any().downcast_ref::<PQIndex>() else {
+        return Ok(());
+    };
+    pq.check_codes_readable().map_err(|err| match err {
+        Error::NotSupported { source, .. } => Error::not_supported(format!(
+            "optimizing vector index segment {}: {source}",
+            segment.uuid
+        )),
+        other => other,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2199,7 +2222,7 @@ impl RemapPageTask {
             .push(page.row_ids.as_ref().unwrap().len() as u32);
         let original_pq = transpose(
             page.code.as_ref().unwrap(),
-            page.pq.code_dim(),
+            page.code_bytes_per_vector(),
             page.row_ids.as_ref().unwrap().len(),
         );
         write_pq_partition_payload(

@@ -75,9 +75,10 @@
 //! ```
 //!
 //! A split build skips, with a warning, what its merge cannot handle: a table
-//! with a tagged fragment reuse history, a legacy (v1) vector index and a
-//! scalar index that must be rebuilt from the whole column. Naming such an
-//! index in `OptimizeOptions::index_names` refuses instead.
+//! with a tagged fragment reuse history, a legacy (v1) vector index, new rows
+//! for a vector index with a segment search cannot read, and a scalar index
+//! that must be rebuilt from the whole column. Naming such an index in
+//! `OptimizeOptions::index_names` refuses instead.
 //!
 //! An unfiltered pass also skips an entire index when a segment cannot be
 //! translated through tagged fragment reuse. A single-process pass additionally
@@ -128,8 +129,8 @@ use super::segment::{
 };
 use super::vector::details::{vector_index_details, vector_params_from_details};
 use super::vector::ivf::{
-    IVFIndex as LegacyIvfIndex, VectorSegmentCompatibility, optimize_vector_indices,
-    select_steady_state_rebalance, vector_segment_compatibility,
+    IVFIndex as LegacyIvfIndex, VectorSegmentCompatibility, check_legacy_segment_readable,
+    optimize_vector_indices, select_steady_state_rebalance, vector_segment_compatibility,
 };
 use super::vector::{
     LogicalVectorIndex, VectorIndexParams, build_vector_model_segment, fresh_vector_segment_params,
@@ -985,6 +986,21 @@ async fn plan_split_vector_index(
             "the index uses the legacy v1 file format, which the split merge cannot read; \
              set retrain to rebuild it in the current format",
         );
+    }
+    // New rows would be indexed next to every live segment, and the index
+    // cannot be searched while one of them is unreadable.
+    if !fragments.is_empty() {
+        for (metadata, index) in logical_index.iter() {
+            if !live.iter().any(|segment| segment.uuid == metadata.uuid) {
+                continue;
+            }
+            match check_legacy_segment_readable(index.as_ref()) {
+                Err(Error::NotSupported { source, .. }) => {
+                    return skip_unless_named(name, named, &source.to_string());
+                }
+                other => other?,
+            }
+        }
     }
 
     // Unset, `num_indices_to_merge` appends a delta, as the single-process

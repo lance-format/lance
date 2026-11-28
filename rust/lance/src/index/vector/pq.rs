@@ -75,6 +75,41 @@ pub struct PQIndex {
     metric_type: MetricType,
 
     frag_reuse_index: Option<Arc<CompactFragReuseIndex>>,
+
+    /// Bytes of PQ code each row holds, in the file and in memory. Equal to
+    /// [`packed_code_bytes`] unless [`stores_packed_codes`] says the file holds
+    /// another layout; such an index is read and remapped at one byte per
+    /// sub-vector, as earlier releases did, and refuses search and merging.
+    code_bytes_per_vector: usize,
+}
+
+/// Bytes of PQ code per row in the layout writers since 0.20 use: two 4-bit
+/// codes per byte, since they reject an odd sub-vector count at 4 bits, and
+/// one byte per sub-vector otherwise.
+fn packed_code_bytes(pq: &ProductQuantizer) -> usize {
+    if pq.num_bits == 4 && pq.num_sub_vectors.is_multiple_of(2) {
+        pq.num_sub_vectors / 2
+    } else {
+        pq.num_sub_vectors
+    }
+}
+
+/// Whether a legacy IVF_PQ file stores [`packed_code_bytes`] per row, which
+/// only 4-bit files with an even sub-vector count can fail.
+///
+/// A legacy file holds its partitions back to back from offset 0, each one's
+/// codes followed by its `u64` row ids, with the index protobuf right after
+/// them at `metadata_offset`. A 4-bit file fails this when a release before
+/// 0.20 wrote it at one byte per sub-vector, or when a release before this fix
+/// remapped or merged a packed file: those read pages at that width.
+pub(crate) fn stores_packed_codes(
+    pq: &ProductQuantizer,
+    num_rows: usize,
+    metadata_offset: usize,
+) -> bool {
+    let row_bytes = packed_code_bytes(pq) + std::mem::size_of::<u64>();
+    pq.num_sub_vectors == packed_code_bytes(pq)
+        || num_rows.checked_mul(row_bytes) == Some(metadata_offset)
 }
 
 async fn read_legacy_index_values(
@@ -154,13 +189,22 @@ impl PQIndex {
         metric_type: MetricType,
         frag_reuse_index: Option<Arc<CompactFragReuseIndex>>,
     ) -> Self {
+        let code_bytes_per_vector = packed_code_bytes(&pq);
         Self {
             code: None,
             row_ids: None,
             pq,
             metric_type,
             frag_reuse_index,
+            code_bytes_per_vector,
         }
+    }
+
+    /// Reads the index file at one byte per sub-vector, for a file that does
+    /// not store the packed layout, see [`stores_packed_codes`].
+    pub(crate) fn with_unpacked_codes(mut self) -> Self {
+        self.code_bytes_per_vector = self.pq.num_sub_vectors;
+        self
     }
 
     /// Filter the row id and PQ code arrays based on the pre-filter.
@@ -194,6 +238,29 @@ impl PQIndex {
             .collect();
 
         Ok((Arc::new(code), row_ids))
+    }
+
+    /// Bytes of PQ code each row of `code` holds, and the width remapping
+    /// writes back, see [`stores_packed_codes`].
+    pub(crate) fn code_bytes_per_vector(&self) -> usize {
+        self.code_bytes_per_vector
+    }
+
+    /// Fails for a 4-bit index that does not store two codes per byte, which
+    /// search and merging cannot read, see [`stores_packed_codes`].
+    pub(crate) fn check_codes_readable(&self) -> Result<()> {
+        if self.pq.num_bits != 4 || self.code_bytes_per_vector * 2 == self.pq.num_sub_vectors {
+            return Ok(());
+        }
+        Err(Error::not_supported(format!(
+            "legacy IVF_PQ index stores {} bytes per row for {} 4-bit sub-vectors, not \
+             the packed layout Lance 0.20 and later write: a release before 0.20 wrote \
+             it, or an earlier release's compaction or index merge rewrote it from \
+             misread codes. Rebuild the index: optimize it with retrain set, or drop and \
+             recreate it. 4-bit PQ needs an even number of sub-vectors, so an index with \
+             an odd count must be recreated with other parameters.",
+            self.code_bytes_per_vector, self.pq.num_sub_vectors
+        )))
     }
 
     fn get_pq_codes(transposed_codes: &UInt8Array, vec_idx: usize, num_vectors: usize) -> Vec<u8> {
@@ -289,7 +356,7 @@ impl PQIndex {
         let transposed_codes = transpose(
             &pq_codes,
             self.row_ids.as_ref().unwrap().len(),
-            self.pq.num_sub_vectors,
+            self.code_bytes_per_vector(),
         );
         self.code = Some(Arc::new(transposed_codes));
         Ok(())
@@ -312,6 +379,7 @@ impl VectorIndex for PQIndex {
                 "PQIndex::search: PQ is not initialized".to_string(),
             ));
         }
+        self.check_codes_readable()?;
         pre_filter.wait_for_ready().await?;
 
         let code = self.code.as_ref().unwrap().clone();
@@ -408,7 +476,8 @@ impl VectorIndex for PQIndex {
         offset: usize,
         length: usize,
     ) -> Result<Box<dyn VectorIndex>> {
-        let pq_code_length = self.pq.code_dim() * length;
+        let code_bytes_per_vector = self.code_bytes_per_vector;
+        let pq_code_length = code_bytes_per_vector * length;
         let pq_codes =
             read_legacy_index_values(reader.as_ref(), &DataType::UInt8, offset, pq_code_length)
                 .await?;
@@ -421,7 +490,7 @@ impl VectorIndex for PQIndex {
         let pq_codes = transpose(
             pq_codes.as_primitive(),
             row_ids.len(),
-            self.pq.num_sub_vectors,
+            code_bytes_per_vector,
         );
 
         let (primitive_row_ids, transposed_pq_codes) =
@@ -443,7 +512,7 @@ impl VectorIndex for PQIndex {
                 let transposed_codes = transpose(
                     &UInt8Array::from_iter_values(remapped_pq_codes.into_iter().flatten()),
                     remapped_row_ids.len(),
-                    self.pq.num_sub_vectors,
+                    code_bytes_per_vector,
                 );
                 (
                     Arc::new(UInt64Array::from_iter_values(remapped_row_ids)),
@@ -459,6 +528,7 @@ impl VectorIndex for PQIndex {
             pq: self.pq.clone(),
             metric_type: self.metric_type,
             frag_reuse_index: self.frag_reuse_index.clone(),
+            code_bytes_per_vector,
         }))
     }
 
@@ -474,18 +544,19 @@ impl VectorIndex for PQIndex {
             let transposed_codes = self.code.clone().ok_or(Error::index(
                 "PQIndex::to_batch_stream: PQ codes not loaded for PQ".to_string(),
             ))?;
-            let original_codes = transpose(&transposed_codes, self.pq.num_sub_vectors, num_rows);
+            let code_bytes_per_vector = self.code_bytes_per_vector;
+            let original_codes = transpose(&transposed_codes, code_bytes_per_vector, num_rows);
             fields.push(Field::new(
                 self.pq.column(),
                 DataType::FixedSizeList(
                     Arc::new(Field::new("item", DataType::UInt8, true)),
-                    self.pq.code_dim() as i32,
+                    code_bytes_per_vector as i32,
                 ),
                 true,
             ));
             columns.push(Arc::new(FixedSizeListArray::try_new_from_values(
                 original_codes,
-                self.pq.code_dim() as i32,
+                code_bytes_per_vector as i32,
             )?));
         }
 
@@ -717,17 +788,29 @@ mod tests {
 
     use arrow::datatypes::Float32Type;
     use arrow_array::RecordBatchIterator;
+    use arrow_array::types::{Int64Type, UInt8Type};
     use arrow_schema::{Field, Schema};
-    use lance_core::utils::tempfile::{TempObjFile, TempStrDir};
+    use futures::TryStreamExt;
+    use lance_core::utils::tempfile::{TempDir, TempObjFile, TempStrDir};
     use lance_io::object_store::ObjectStore;
     use lance_io::traits::Writer;
+    use lance_io::utils::{read_last_block, read_metadata_offset, read_version};
     use lance_linalg::kernels::normalize_fsl;
+    use lance_table::format::IndexMetadata;
     use object_store::path::Path;
     use tokio::io::AsyncWriteExt;
+    use uuid::Uuid;
 
+    use crate::dataset::optimize::{CompactionOptions, compact_files};
+    use crate::index::DatasetIndexExt;
+    use crate::index::DatasetIndexInternalExt;
     use crate::index::vector::ivf::build_ivf_model;
+    use crate::utils::test::copy_test_data_to_tmp;
+    use lance_index::INDEX_FILE_NAME;
     use lance_index::metrics::NoOpMetricsCollector;
+    use lance_index::optimize::OptimizeOptions;
     use lance_index::vector::DEFAULT_QUERY_PARALLELISM;
+    use lance_index::vector::PQ_CODE_COLUMN;
     use lance_index::vector::ivf::IvfBuildParams;
     use lance_select::RowAddrMask;
     use lance_testing::datagen::{
@@ -992,6 +1075,486 @@ mod tests {
         assert!(err.to_string().contains("not representable"), "got {err}");
     }
 
+    /// A legacy IVF_PQ index with `num_bits=4` over 512 rows in four
+    /// fragments, written by pylance 0.24.1, which packs two codes per byte.
+    /// See `test_data/v0.24.1/datagen.py`.
+    const LEGACY_4BIT_PACKED: &str = "v0.24.1/legacy_ivf_pq_4bit";
+    const LEGACY_4BIT_PARTITIONS: usize = 2;
+
+    async fn open_legacy_4bit_fixture(fixture: &str) -> (TempDir, Dataset) {
+        let test_dir = copy_test_data_to_tmp(fixture).unwrap();
+        let dataset = Dataset::open(&test_dir.path_str()).await.unwrap();
+        let footer = index_file_footer(&dataset).await;
+        assert_eq!(
+            read_version(&footer).unwrap(),
+            (0, 1),
+            "the fixture must remain a legacy IVF_PQ index file"
+        );
+        (test_dir, dataset)
+    }
+
+    async fn index_file_footer(dataset: &Dataset) -> bytes::Bytes {
+        let indices = dataset.load_indices().await.unwrap();
+        let index = indices.iter().find(|i| i.name == "vector_idx").unwrap();
+        segment_file_footer(dataset, index).await
+    }
+
+    async fn segment_file_footer(dataset: &Dataset, segment: &IndexMetadata) -> bytes::Bytes {
+        let path = dataset
+            .indices_dir()
+            .join(segment.uuid.to_string())
+            .join(INDEX_FILE_NAME);
+        let reader = dataset.table_state.object_store.open(&path).await.unwrap();
+        read_last_block(reader.as_ref()).await.unwrap()
+    }
+
+    /// Maps the `id` of every row in the index to its PQ code, read back
+    /// through the index partitions.
+    async fn legacy_4bit_codes_by_id(dataset: &Dataset) -> HashMap<i64, Vec<u8>> {
+        let rows = dataset
+            .scan()
+            .project(&["id"])
+            .unwrap()
+            .with_row_id()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let ids_by_row_id: HashMap<u64, i64> = rows[ROW_ID]
+            .as_primitive::<UInt64Type>()
+            .values()
+            .iter()
+            .copied()
+            .zip(
+                rows["id"]
+                    .as_primitive::<Int64Type>()
+                    .values()
+                    .iter()
+                    .copied(),
+            )
+            .collect();
+
+        let mut codes = HashMap::new();
+        for partition in 0..LEGACY_4BIT_PARTITIONS {
+            let stream = dataset
+                .read_index_partition("vector_idx", partition, true)
+                .await
+                .unwrap();
+            for batch in stream.try_collect::<Vec<_>>().await.unwrap() {
+                let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>();
+                let partition_codes = batch[PQ_CODE_COLUMN].as_fixed_size_list();
+                assert_eq!(partition_codes.value_length(), 2, "4 sub-vectors x 4 bits");
+                for (i, row_id) in row_ids.values().iter().enumerate() {
+                    let id = *ids_by_row_id.get(row_id).unwrap_or_else(|| {
+                        panic!("partition {partition}: row id {row_id} is not a live row")
+                    });
+                    let code = partition_codes
+                        .value(i)
+                        .as_primitive::<UInt8Type>()
+                        .values()
+                        .to_vec();
+                    assert!(codes.insert(id, code).is_none(), "id {id} indexed twice");
+                }
+            }
+        }
+        assert_eq!(codes.len(), ids_by_row_id.len());
+        codes
+    }
+
+    /// Queries every 37th row with its own vector and expects the row in its
+    /// top 10.
+    async fn assert_legacy_4bit_rows_find_themselves(dataset: &Dataset) {
+        let rows = dataset
+            .scan()
+            .project(&["id", "vector"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let ids = rows["id"].as_primitive::<Int64Type>();
+        let vectors = rows["vector"].as_fixed_size_list();
+        for row in (0..rows.num_rows()).step_by(37) {
+            let results = dataset
+                .scan()
+                .project(&["id"])
+                .unwrap()
+                .nearest("vector", vectors.value(row).as_ref(), 10)
+                .unwrap()
+                .try_into_batch()
+                .await
+                .unwrap();
+            let found = results["id"].as_primitive::<Int64Type>().values();
+            assert!(
+                found.contains(&ids.value(row)),
+                "id {} not in its own top 10: {found:?}",
+                ids.value(row)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_legacy_4bit_ivf_pq_search() {
+        let (_test_dir, dataset) = open_legacy_4bit_fixture(LEGACY_4BIT_PACKED).await;
+
+        assert_eq!(legacy_4bit_codes_by_id(&dataset).await.len(), 512);
+        assert_legacy_4bit_rows_find_themselves(&dataset).await;
+    }
+
+    /// Immediate remap rewrites the index file in the packed layout; deferred
+    /// remap keeps the file and translates each page as it loads.
+    #[rstest::rstest]
+    #[case::immediate_remap(false)]
+    #[case::deferred_remap(true)]
+    #[tokio::test]
+    async fn test_legacy_4bit_ivf_pq_compaction_keeps_codes(#[case] defer_index_remap: bool) {
+        let (_test_dir, mut dataset) = open_legacy_4bit_fixture(LEGACY_4BIT_PACKED).await;
+        let mut expected = legacy_4bit_codes_by_id(&dataset).await;
+        let index_uuid = |indices: &[IndexMetadata]| {
+            indices
+                .iter()
+                .find(|index| index.name == "vector_idx")
+                .unwrap()
+                .uuid
+        };
+        let old_uuid = index_uuid(&dataset.load_indices().await.unwrap());
+
+        dataset.delete("id % 7 = 3").await.unwrap();
+        let options = CompactionOptions {
+            defer_index_remap,
+            ..Default::default()
+        };
+        let metrics = compact_files(&mut dataset, options, None).await.unwrap();
+        assert_eq!((metrics.fragments_removed, metrics.fragments_added), (4, 1));
+
+        let new_uuid = index_uuid(&dataset.load_indices().await.unwrap());
+        assert_eq!(new_uuid == old_uuid, defer_index_remap);
+        expected.retain(|id, _| id % 7 != 3);
+        assert_eq!(legacy_4bit_codes_by_id(&dataset).await, expected);
+        assert_legacy_4bit_rows_find_themselves(&dataset).await;
+        // Deferred remap keeps the file written for all 512 rows.
+        let file_rows = if defer_index_remap {
+            512
+        } else {
+            expected.len()
+        };
+        assert_eq!(
+            read_metadata_offset(&index_file_footer(&dataset).await).unwrap(),
+            file_rows * (2 + 8),
+            "the index file packs two 4-bit codes per byte"
+        );
+    }
+
+    async fn assert_search_asks_for_rebuild(dataset: &Dataset) {
+        let query = Float32Array::from(vec![0.5_f32; 16]);
+        let err = dataset
+            .scan()
+            .nearest("vector", &query, 10)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::NotSupported { .. }), "got {err:?}");
+        assert!(err.to_string().contains("Rebuild the index"), "got {err}");
+    }
+
+    /// Runs `options` and expects it to commit nothing: the dataset at `uri`,
+    /// reopened, has the same version, index segments and index directories.
+    async fn optimize_without_commit(
+        uri: &str,
+        dataset: &mut Dataset,
+        options: &OptimizeOptions,
+    ) -> Result<()> {
+        async fn segments(dataset: &Dataset) -> Vec<(Uuid, Option<RoaringBitmap>)> {
+            let indices = dataset.load_indices().await.unwrap();
+            indices
+                .iter()
+                .map(|index| (index.uuid, index.fragment_bitmap.clone()))
+                .collect()
+        }
+        let index_dirs = || {
+            std::fs::read_dir(format!("{uri}/_indices"))
+                .unwrap()
+                .count()
+        };
+        let version = dataset.version().version;
+        let before = segments(dataset).await;
+        let dirs = index_dirs();
+        let result = dataset.optimize_indices(options).await;
+        let reopened = Dataset::open(uri).await.unwrap();
+        assert_eq!(reopened.version().version, version);
+        assert_eq!(segments(&reopened).await, before);
+        assert_eq!(index_dirs(), dirs, "no index directory is left behind");
+        result
+    }
+
+    async fn assert_optimize_asks_for_rebuild(
+        uri: &str,
+        dataset: &mut Dataset,
+        options: &OptimizeOptions,
+    ) {
+        let err = optimize_without_commit(uri, dataset, options)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::NotSupported { .. }), "got {err:?}");
+        assert!(err.to_string().contains("Rebuild the index"), "got {err}");
+    }
+
+    /// Appends one fragment of rows with ids `ids` and random vectors seeded
+    /// by the first id.
+    async fn append_legacy_4bit_rows(dataset: &mut Dataset, ids: Range<i64>) {
+        let schema = Arc::new(Schema::from(dataset.schema()));
+        let num_rows = ids.end - ids.start;
+        let mut seed = [0u8; 32];
+        seed[..8].copy_from_slice(&ids.start.to_le_bytes());
+        let vectors = generate_random_array_with_seed::<Float32Type>(num_rows as usize * 16, seed);
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(arrow_array::Int64Array::from_iter_values(ids)),
+                Arc::new(FixedSizeListArray::try_new_from_values(vectors, 16).unwrap()),
+            ],
+        )
+        .unwrap();
+        dataset
+            .append(RecordBatchIterator::new(vec![Ok(batch)], schema), None)
+            .await
+            .unwrap();
+    }
+
+    /// Two legacy 4-bit files that store one byte per sub-vector. pylance
+    /// 0.19.2 wrote the first so. The second is the 0.24.1 fixture after a
+    /// compaction on 14.0.3, which read each packed page at one byte per
+    /// sub-vector and wrote the misread codes and row ids back. See
+    /// `datagen.py` next to each. Search, appending and merging ask for a
+    /// rebuild, compaction keeps the stored bytes as 14.0.3 did, and retrain
+    /// rebuilds.
+    #[rstest::rstest]
+    #[case::written_before_0_20("v0.19.2/legacy_ivf_pq_4bit_unpacked")]
+    #[case::misremapped("v14.0.3/legacy_ivf_pq_4bit_misremapped")]
+    #[tokio::test]
+    async fn test_legacy_4bit_ivf_pq_unpacked_index_asks_for_rebuild(#[case] fixture: &str) {
+        let (test_dir, mut dataset) = open_legacy_4bit_fixture(fixture).await;
+        assert_search_asks_for_rebuild(&dataset).await;
+
+        dataset.delete("id < 300").await.unwrap();
+        let metrics = compact_files(&mut dataset, CompactionOptions::default(), None)
+            .await
+            .unwrap();
+        assert_eq!(metrics.fragments_added, 1);
+        let mut index_rows = 0;
+        for partition in 0..LEGACY_4BIT_PARTITIONS {
+            let batches = dataset
+                .read_index_partition("vector_idx", partition, false)
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            index_rows += batches.iter().map(RecordBatch::num_rows).sum::<usize>();
+        }
+        assert_eq!(
+            read_metadata_offset(&index_file_footer(&dataset).await).unwrap(),
+            index_rows * (4 + 8),
+            "the remapped index keeps one stored byte per sub-vector"
+        );
+        assert_search_asks_for_rebuild(&dataset).await;
+
+        let uri = test_dir.path_str();
+        assert_optimize_asks_for_rebuild(&uri, &mut dataset, &OptimizeOptions::merge(1)).await;
+        append_legacy_4bit_rows(&mut dataset, 512..576).await;
+        for options in [OptimizeOptions::append(), OptimizeOptions::default()] {
+            assert_optimize_asks_for_rebuild(&uri, &mut dataset, &options).await;
+        }
+
+        dataset
+            .optimize_indices(&OptimizeOptions::retrain())
+            .await
+            .unwrap();
+        assert_legacy_4bit_rows_find_themselves(&dataset).await;
+    }
+
+    /// pylance 0.24.1 appended a packed delta segment to the 0.19.2 index, see
+    /// `test_data/v0.24.1/datagen.py`. Merging both segments asks for a
+    /// rebuild. A default optimize with new rows would merge only the delta,
+    /// but search still fails on the older segment, so it asks for a rebuild
+    /// too, as an append does.
+    #[tokio::test]
+    async fn test_legacy_4bit_ivf_pq_delta_on_unpacked_index_asks_for_rebuild() {
+        let (test_dir, mut dataset) =
+            open_legacy_4bit_fixture("v0.24.1/legacy_ivf_pq_4bit_unpacked_appended").await;
+        let segments = dataset.load_indices().await.unwrap();
+        let bitmaps = segments
+            .iter()
+            .map(|segment| segment.fragment_bitmap.clone().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            bitmaps,
+            vec![(0..4).collect::<RoaringBitmap>(), [4].into_iter().collect()]
+        );
+        assert_eq!(
+            read_metadata_offset(&segment_file_footer(&dataset, &segments[1]).await).unwrap(),
+            64 * (2 + 8),
+            "the delta packs two 4-bit codes per byte"
+        );
+        assert_search_asks_for_rebuild(&dataset).await;
+
+        let uri = test_dir.path_str();
+        assert_optimize_asks_for_rebuild(&uri, &mut dataset, &OptimizeOptions::merge(2)).await;
+        append_legacy_4bit_rows(&mut dataset, 576..640).await;
+        for options in [OptimizeOptions::default(), OptimizeOptions::append()] {
+            assert_optimize_asks_for_rebuild(&uri, &mut dataset, &options).await;
+        }
+
+        dataset
+            .optimize_indices(&OptimizeOptions::retrain())
+            .await
+            .unwrap();
+        assert_legacy_4bit_rows_find_themselves(&dataset).await;
+    }
+
+    /// Commits a current-format segment over fragment `fragment` that reuses
+    /// the legacy codebook. Its centroids put every row in one partition, far
+    /// above four times its target size of 4, so optimize wants to split it.
+    async fn commit_current_format_segment(dataset: &mut Dataset, fragment: u32) -> Uuid {
+        let legacy_uuid = dataset.load_indices().await.unwrap()[0].uuid;
+        let legacy = dataset
+            .open_vector_index("vector", &legacy_uuid, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let Quantizer::Product(pq) = legacy.quantizer() else {
+            panic!("a legacy IVF_PQ segment reports a product quantizer");
+        };
+        let centroids = FixedSizeListArray::try_new_from_values(
+            Float32Array::from_iter_values(
+                std::iter::repeat_n(0.5, 16).chain(std::iter::repeat_n(100.0, 16)),
+            ),
+            16,
+        )
+        .unwrap();
+        let mut ivf = IvfBuildParams::try_with_centroids(2, Arc::new(centroids)).unwrap();
+        ivf.target_partition_size = Some(4);
+        let params = crate::index::vector::VectorIndexParams::with_ivf_pq_params(
+            MetricType::L2,
+            ivf,
+            lance_index::vector::pq::PQBuildParams::with_codebook(
+                4,
+                4,
+                Arc::new(pq.codebook.values().clone()),
+            ),
+        );
+        let segment = crate::index::CreateIndexBuilder::new(
+            dataset,
+            &["vector"],
+            lance_index::IndexType::Vector,
+            &params,
+        )
+        .name("vector_idx".into())
+        .replace(true)
+        .fragments(vec![fragment])
+        .execute_uncommitted()
+        .await
+        .unwrap();
+        let uuid = segment.uuid;
+        dataset
+            .commit_existing_index_segments("vector_idx", "vector", vec![segment])
+            .await
+            .unwrap();
+        uuid
+    }
+
+    /// An unreadable legacy segment beside a current-format one. A rebalance
+    /// of the current-format segment still runs. New rows are refused by the
+    /// single-process and a named split optimize, an unnamed split optimize
+    /// skips the index, and retrain rebuilds.
+    #[tokio::test]
+    async fn test_legacy_4bit_unpacked_segment_beside_current_format_segment() {
+        let (test_dir, mut dataset) =
+            open_legacy_4bit_fixture("v0.19.2/legacy_ivf_pq_4bit_unpacked").await;
+        let uri = test_dir.path_str();
+        let legacy_uuid = dataset.load_indices().await.unwrap()[0].uuid;
+        append_legacy_4bit_rows(&mut dataset, 512..576).await;
+        let current_uuid = commit_current_format_segment(&mut dataset, 4).await;
+
+        dataset
+            .optimize_indices(&OptimizeOptions::default())
+            .await
+            .unwrap();
+        let uuids = dataset
+            .load_indices()
+            .await
+            .unwrap()
+            .iter()
+            .map(|index| index.uuid)
+            .collect::<Vec<_>>();
+        assert_eq!(uuids.len(), 2, "{uuids:?}");
+        assert!(uuids.contains(&legacy_uuid), "{uuids:?}");
+        assert!(!uuids.contains(&current_uuid), "rebalanced: {uuids:?}");
+
+        append_legacy_4bit_rows(&mut dataset, 576..640).await;
+        let split = OptimizeOptions::default().max_rows_per_task(Some(1000));
+        optimize_without_commit(&uri, &mut dataset, &split)
+            .await
+            .unwrap();
+        let named = split.index_names(vec!["vector_idx".into()]);
+        for options in [named, OptimizeOptions::default()] {
+            assert_optimize_asks_for_rebuild(&uri, &mut dataset, &options).await;
+        }
+
+        dataset
+            .optimize_indices(&OptimizeOptions::retrain())
+            .await
+            .unwrap();
+        assert_legacy_4bit_rows_find_themselves(&dataset).await;
+    }
+
+    /// Writers since 0.20 reject an odd sub-vector count at 4 bits, so such a
+    /// file can only come from an earlier release, which stored one byte per
+    /// code. The page reads at that width and refuses search.
+    #[tokio::test]
+    async fn test_legacy_4bit_odd_sub_vector_page_keeps_one_byte_per_code() {
+        let path = TempObjFile::default();
+        let object_store = ObjectStore::local();
+        let mut writer = object_store.create(&path).await.unwrap();
+        writer.write_all(&[1, 2, 3, 4, 5, 6]).await.unwrap();
+        writer.write_all(&11_u64.to_le_bytes()).await.unwrap();
+        writer.write_all(&12_u64.to_le_bytes()).await.unwrap();
+        Writer::shutdown(writer.as_mut()).await.unwrap();
+
+        let codebook = FixedSizeListArray::try_new_from_values(
+            Float32Array::from_iter_values((0..16 * 3).map(|value| value as f32)),
+            3,
+        )
+        .unwrap();
+        let index = PQIndex::new(
+            ProductQuantizer::new(3, 4, 3, codebook, DistanceType::L2),
+            MetricType::L2,
+            None,
+        );
+        let reader = object_store.open(&path).await.unwrap();
+        let page = index.load(reader.into(), 0, 2).await.unwrap();
+
+        assert_eq!(page.row_ids().copied().collect::<Vec<_>>(), vec![11, 12]);
+        let batches = page
+            .to_batch_stream(true)
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(
+            batches[0][PQ_CODE_COLUMN]
+                .as_fixed_size_list()
+                .value_length(),
+            3
+        );
+        let err = page
+            .as_any()
+            .downcast_ref::<PQIndex>()
+            .unwrap()
+            .check_codes_readable()
+            .unwrap_err();
+        assert!(matches!(err, Error::NotSupported { .. }), "got {err:?}");
+    }
+
     struct TestPreFilter {
         row_ids: Vec<u64>,
         is_empty_threads: Option<Arc<Mutex<Vec<String>>>>,
@@ -1064,6 +1627,7 @@ mod tests {
             row_ids: Some(Arc::new(UInt64Array::from(vec![10, 11, 12]))),
             metric_type: MetricType::L2,
             frag_reuse_index: None,
+            code_bytes_per_vector: 1,
         };
         let query = Query {
             column: "vector".to_string(),
