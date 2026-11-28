@@ -167,10 +167,10 @@ message Manifest {
    *   with their original semantics.
    * * 1 << 23: the schema contains, or a snapshot this one derives from
    *   contained, a "decimal:32" or "decimal:64" field, which requires data
-   *   storage version 2.3. Both feature words carry the bit, set in the commit
-   *   that adds the first such field and kept in derived snapshots, including
-   *   restore. Readers and writers that do not implement these logical types
-   *   must refuse the dataset.
+   *   storage version 2.3. Both feature words carry the bit, set in every
+   *   commit whose schema has such a field and kept in derived snapshots,
+   *   including clone and restore. Readers and writers that do not implement
+   *   these logical types must refuse the dataset.
    */
   uint64 reader_feature_flags = 9;
 

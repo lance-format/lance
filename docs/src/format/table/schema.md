@@ -74,9 +74,10 @@ Decimal types support arbitrary-precision numeric values. The format is: `decima
 - A table whose schema contains such a field must have data storage version 2.3 or later and must
   set `FLAG_DECIMAL32_AND_DECIMAL64` (`2^23`) in both `reader_feature_flags` and
   `writer_feature_flags`; see [Feature Flags](versioning.md#feature-flags). A writer sets both bits
-  in the commit that adds the first such field. Both bits then remain set in every snapshot derived
-  from it, including after the fields are dropped and after a restore, because retained data files
-  may still record these logical types in their own schemas.
+  in every commit whose schema contains such a field. Both bits then remain set in every snapshot
+  derived from it, including clones, restores, and snapshots whose schema no longer contains such a
+  field. Data files written while the field existed may still record these logical types in their
+  own schemas.
 
 Lance releases that predate these logical types cannot parse them. A data storage version of 2.3
 alone does not tell a client whether it can read the table, and older releases do not reject a
