@@ -22,7 +22,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow_array::{Array, BinaryArray, Int64Array, RecordBatch};
+use arrow_array::{Array, Int64Array, RecordBatch};
 use arrow_schema::{Schema, SchemaRef};
 use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::physical_expr::PhysicalExpr;
@@ -167,17 +167,7 @@ impl CountFromMaskExec {
         // Drain any remaining batches so the upstream sees a clean shutdown.
         while stream.try_next().await.map_err(Error::from)?.is_some() {}
 
-        let result_col = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<BinaryArray>()
-            .ok_or_else(|| {
-                Error::internal(format!(
-                    "CountFromMaskExec: prefilter result column has type {:?}, expected Binary",
-                    batch.column(0).data_type()
-                ))
-            })?;
-        RowAddrMask::from_arrow(result_col)
+        RowAddrMask::from_arrow(batch.column(0).as_ref())
     }
 
     /// Fold the prefilter, fragment allow list, and deletion mask into a

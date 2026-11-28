@@ -7,8 +7,11 @@ use std::io::Write;
 use std::ops::{Range, RangeBounds, RangeInclusive};
 use std::{collections::BTreeMap, io::Read};
 
-use arrow_array::{Array, BinaryArray, GenericBinaryArray};
+use arrow_array::{
+    Array, BinaryArray, GenericBinaryArray, LargeBinaryArray, OffsetSizeTrait, cast::AsArray,
+};
 use arrow_buffer::{Buffer, NullBuffer, OffsetBuffer};
+use arrow_schema::DataType;
 use byteorder::{ReadBytesExt, WriteBytesExt};
 use itertools::Itertools;
 use lance_core::deepsize::DeepSizeOf;
@@ -366,7 +369,20 @@ impl RowAddrMask {
     ///
     /// We serialize this as a variable length binary array with two items.  The first item
     /// is the block list and the second item is the allow list.
+    ///
+    /// Binary offsets are i32, so this returns an error when the serialized mask exceeds
+    /// 2 GiB. Use [`Self::into_large_arrow`] for masks that may be larger.
     pub fn into_arrow(&self) -> Result<BinaryArray> {
+        self.to_binary_array()
+    }
+
+    /// Like [`Self::into_arrow`], but as a `LargeBinary` array (i64 offsets), which has no
+    /// 2 GiB limit. A mask over tens of billions of rows can exceed that limit.
+    pub fn into_large_arrow(&self) -> Result<LargeBinaryArray> {
+        self.to_binary_array()
+    }
+
+    fn to_binary_array<O: OffsetSizeTrait>(&self) -> Result<GenericBinaryArray<O>> {
         // NOTE: This serialization format must be stable as it is used in IPC.
         let (block_list, allow_list) = match self {
             Self::AllowList(allow_list) => (None, Some(allow_list)),
@@ -381,6 +397,14 @@ impl RowAddrMask {
             .as_ref()
             .map(|al| al.serialized_size())
             .unwrap_or(0);
+        let total_length = block_list_length + allow_list_length;
+        if O::from_usize(total_length).is_none() {
+            return Err(Error::invalid_input(format!(
+                "RowAddrMask serializes to {total_length} bytes, which exceeds the {} offset limit; \
+                 use a LargeBinary layout (relational algebra version 2)",
+                GenericBinaryArray::<O>::DATA_TYPE
+            )));
+        }
         let lengths = vec![block_list_length, allow_list_length];
         let offsets = OffsetBuffer::from_lengths(lengths);
         let mut value_bytes = vec![0; block_list_length + allow_list_length];
@@ -395,24 +419,28 @@ impl RowAddrMask {
         }
         let values = Buffer::from(value_bytes);
         let nulls = NullBuffer::from(validity);
-        Ok(BinaryArray::try_new(offsets, values, Some(nulls))?)
+        Ok(GenericBinaryArray::try_new(offsets, values, Some(nulls))?)
     }
 
-    /// Deserialize a row address mask from Arrow
-    pub fn from_arrow(array: &GenericBinaryArray<i32>) -> Result<Self> {
-        let block_list = if array.is_null(0) {
-            None
-        } else {
-            Some(RowAddrTreeMap::deserialize_from(array.value(0)))
+    /// Deserialize a row address mask from Arrow (Binary or LargeBinary)
+    pub fn from_arrow(array: &dyn Array) -> Result<Self> {
+        let value = |i: usize| -> Option<&[u8]> {
+            if array.is_null(i) {
+                None
+            } else if let Some(a) = array.as_binary_opt::<i64>() {
+                Some(a.value(i))
+            } else {
+                Some(array.as_binary::<i32>().value(i))
+            }
+        };
+        if !matches!(array.data_type(), DataType::Binary | DataType::LargeBinary) {
+            return Err(Error::internal(format!(
+                "RowAddrMask::from_arrow: expected Binary or LargeBinary, got {:?}",
+                array.data_type()
+            )));
         }
-        .transpose()?;
-
-        let allow_list = if array.is_null(1) {
-            None
-        } else {
-            Some(RowAddrTreeMap::deserialize_from(array.value(1)))
-        }
-        .transpose()?;
+        let block_list = value(0).map(RowAddrTreeMap::deserialize_from).transpose()?;
+        let allow_list = value(1).map(RowAddrTreeMap::deserialize_from).transpose()?;
 
         let res = match (block_list, allow_list) {
             (Some(bl), None) => Self::BlockList(bl),
@@ -2306,6 +2334,22 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "allocates ~8 GiB; run manually: cargo test -p lance-select -- --ignored over_2gib"]
+    fn test_roundtrip_arrow_over_2gib() {
+        // 0x55 = every other bit -> 65535 dense containers of 8 KiB ≈ 512 MiB per fragment
+        let frag = RoaringBitmap::from_lsb0_bytes(0, &vec![0x55u8; (1 << 29) - 8192]);
+        let mut map = RowAddrTreeMap::default();
+        for f in 0..5 {
+            map.insert_bitmap(f, frag.clone());
+        }
+        assert!(map.serialized_size() > i32::MAX as usize);
+        let original = RowAddrMask::from_allowed(map);
+        assert!(original.into_arrow().is_err());
+        let array = original.into_large_arrow().unwrap();
+        assert_eq!(RowAddrMask::from_arrow(&array).unwrap(), original);
+    }
+
+    #[test]
     fn test_roundtrip_arrow() {
         let row_addrs = rows(&[1, 2, 3, 100, 2000]);
 
@@ -2313,11 +2357,19 @@ mod tests {
         let original = RowAddrMask::from_allowed(row_addrs.clone());
         let array = original.into_arrow().unwrap();
         assert_eq!(RowAddrMask::from_arrow(&array).unwrap(), original);
+        let array = original.into_large_arrow().unwrap();
+        assert_eq!(RowAddrMask::from_arrow(&array).unwrap(), original);
 
         // Block list
         let original = RowAddrMask::from_block(row_addrs);
         let array = original.into_arrow().unwrap();
         assert_eq!(RowAddrMask::from_arrow(&array).unwrap(), original);
+        let array = original.into_large_arrow().unwrap();
+        assert_eq!(RowAddrMask::from_arrow(&array).unwrap(), original);
+
+        // Wrong type must error even when every value is null
+        let wrong = arrow_array::StringArray::from(vec![None::<&str>, None]);
+        assert!(RowAddrMask::from_arrow(&wrong).is_err());
     }
 
     #[test]

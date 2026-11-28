@@ -44,8 +44,8 @@ use uuid::Uuid;
 use crate::dataset::Dataset;
 use crate::dataset::fragment_slice::FragmentSlice;
 use crate::index::vector::utils::{get_vector_dim, get_vector_type, validate_distance_type_for};
-use crate::io::exec::LANCE_RELATIONAL_ALGEBRA_VERSION;
 use crate::io::exec::knn::QUERY_INDEX_COL;
+use crate::io::exec::{LANCE_MAX_RELATIONAL_ALGEBRA_VERSION, LANCE_RELATIONAL_ALGEBRA_VERSION};
 use crate::{Error, Result};
 
 use super::aggregate::AggregateExpr;
@@ -700,6 +700,33 @@ impl Scanner {
     pub fn target_parallelism(&mut self, n: usize) -> &mut Self {
         self.target_parallelism = Some(n);
         self
+    }
+
+    /// Set the relational algebra version of the plan and of the plan-node outputs
+    /// this scanner produces.
+    ///
+    /// Defaults to [`LANCE_RELATIONAL_ALGEBRA_VERSION`], which released versions of
+    /// Lance can read. Version 2 serializes scalar-index results with `LargeBinary`
+    /// masks, which lifts the 2 GiB per-mask limit of version 1. Only select it when
+    /// every node that executes part of the plan supports version 2.
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result};
+    /// # async fn test(dataset: &Dataset) -> Result<()> {
+    /// let mut scanner = dataset.scan();
+    /// scanner.relational_algebra_version(2)?.filter("id = 25")?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn relational_algebra_version(&mut self, version: u32) -> Result<&mut Self> {
+        if !(1..=LANCE_MAX_RELATIONAL_ALGEBRA_VERSION).contains(&version) {
+            return Err(Error::invalid_input(format!(
+                "relational_algebra_version must be between 1 and \
+                 {LANCE_MAX_RELATIONAL_ALGEBRA_VERSION}, got {version}"
+            )));
+        }
+        self.relational_algebra_version = version;
+        Ok(self)
     }
 
     /// Set whether to read data in order (default: true)
@@ -1631,6 +1658,7 @@ mod tests {
     use lance_index::IndexType;
     use lance_index::vector::DIST_COL;
     use lance_linalg::distance::DistanceType;
+    use lance_select::result::IndexExprResultWireFormat;
     use rstest::rstest;
 
     use crate::dataset::scanner::test_dataset::{
@@ -1670,6 +1698,43 @@ mod tests {
         assert!(error.to_string().contains(message), "{error}");
         // Failed validation must not leave a partially applied selection.
         assert!(scan.physical_row_addr_prefilter.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_relational_algebra_version() -> Result<()> {
+        let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false).await?;
+        test_ds.make_scalar_index().await?;
+        let dataset = &test_ds.dataset;
+
+        let mut oracle = dataset.scan();
+        oracle
+            .filter("i > 50")?
+            .use_scalar_index(false)
+            .project(&["i"])?;
+        let expected = oracle.try_into_batch().await?;
+
+        for (version, format) in [
+            (1, IndexExprResultWireFormat::ThreeVariant),
+            (2, IndexExprResultWireFormat::TwoMask),
+        ] {
+            let mut scan = dataset.scan();
+            scan.relational_algebra_version(version)?
+                .filter("i > 50")?
+                .project(&["i"])?;
+            assert_eq!(scan.index_expr_result_format(), format);
+            assert_eq!(scan.count_rows().await?, expected.num_rows() as u64);
+            assert_eq!(scan.try_into_batch().await?, expected, "version {version}");
+        }
+
+        for version in [0, LANCE_MAX_RELATIONAL_ALGEBRA_VERSION + 1] {
+            let err = dataset
+                .scan()
+                .relational_algebra_version(version)
+                .err()
+                .unwrap();
+            assert!(matches!(err, Error::InvalidInput { .. }), "{err}");
+        }
+        Ok(())
     }
 
     #[tokio::test]
