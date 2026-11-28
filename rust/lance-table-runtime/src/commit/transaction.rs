@@ -36,7 +36,7 @@ use super::publish::{
     write_transaction_file,
 };
 use super::retry::{default_commit_retry_timeout, maybe_timeout, timeout_error};
-use super::transactions::{TransactionReadSource, load_and_sort_new_transactions};
+use super::transactions::{TransactionReadSource, load_and_sort_new_transactions_with_location};
 use super::{CommitHooks, CommitIndexHook, CommitLifecycleHook};
 
 /// The build config for one commit attempt against `dataset`'s current manifest.
@@ -307,7 +307,7 @@ pub async fn commit_transaction(
         build_config,
         commit_config,
         retry_timeout,
-        manifest_naming_scheme,
+        mut manifest_naming_scheme,
         affected_rows,
         inserted_row_count,
         append_idempotency_key,
@@ -327,6 +327,10 @@ pub async fn commit_transaction(
     let read_version = transaction.read_version;
     let mut target_version = read_version + 1;
     let original_dataset = dataset.clone();
+    // Read-side locations are authoritative for publication only when both
+    // bindings match; callers may override the write handler or store.
+    let reuse_read_location = std::ptr::eq(commit_handler, dataset.state.commit_handler.as_ref())
+        && std::ptr::eq(object_store, dataset.state.object_store.as_ref());
     let conditional_commit = expected_latest_version.is_some();
     if let Some(expected) = expected_latest_version
         && expected != read_version
@@ -403,6 +407,7 @@ pub async fn commit_transaction(
     .then(|| read_version_dataset.schema().clone());
 
     while backoff.attempt() < num_attempts {
+        let mut latest_location = None;
         // We are pessimistic here and assume there may be other transactions
         // we need to check for. We could be optimistic here and blindly
         // attempt to commit, giving faster performance for sequence writes and
@@ -411,7 +416,8 @@ pub async fn commit_transaction(
         // for users. So we always check for other transactions.
         if let Some(expected_version) = expected_latest_version {
             ensure_can_write_manifest(&dataset.manifest)?;
-            let (latest_manifest, _) = dataset.latest_manifest().await?;
+            let (latest_manifest, location) = dataset.latest_manifest().await?;
+            latest_location = Some(location);
             if latest_manifest.version != expected_version {
                 return Err(Error::retryable_commit_conflict_source(
                     expected_version,
@@ -430,9 +436,10 @@ pub async fn commit_transaction(
             } else {
                 TransactionReadSource::SessionCache
             };
-            let (loaded_dataset, other_transactions) =
-                load_and_sort_new_transactions(&dataset, source).await?;
+            let (loaded_dataset, other_transactions, location) =
+                load_and_sort_new_transactions_with_location(&dataset, source).await?;
             dataset = loaded_dataset;
+            latest_location = location;
 
             ensure_can_write_manifest(&dataset.manifest)?;
 
@@ -518,6 +525,23 @@ pub async fn commit_transaction(
             tagged_rewrite = assembly;
         } else {
             ensure_can_write_manifest(&dataset.manifest)?;
+        }
+
+        // Migration can rename manifests without advancing the version, leaving
+        // idle writers' cached V1 locations stale. Reuse catch-up's authoritative
+        // location when possible. Strict overwrites skip catch-up and must look
+        // up the latest location, since their historical manifest may be pruned.
+        // Keep an observed V2 scheme across retries: migration is one-way.
+        if manifest_naming_scheme == ManifestNamingScheme::V1 {
+            manifest_naming_scheme = match latest_location.filter(|_| reuse_read_location) {
+                Some(location) => location.naming_scheme,
+                None => {
+                    commit_handler
+                        .resolve_latest_location(&dataset.state.base, object_store)
+                        .await?
+                        .naming_scheme
+                }
+            };
         }
         let attempt_start = Instant::now();
         let retry_start = *retry_start.get_or_insert(attempt_start);

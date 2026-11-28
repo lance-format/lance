@@ -2,19 +2,22 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::collections::HashMap;
+use std::fmt::{Display, Formatter};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use arrow_array::{Int32Array, RecordBatch};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+use futures::stream::BoxStream;
+use futures::{StreamExt, TryStreamExt};
 use lance_core::utils::address::RowAddress;
 use lance_core::{Error, datatypes::Schema};
 use lance_file::version::ConcreteFileVersion;
 use lance_io::object_store::ObjectStore;
-use lance_table::format::{Fragment, IndexFile, IndexMetadata, Manifest};
+use lance_table::format::{Fragment, IndexFile, IndexMetadata, Manifest, ManifestBuildConfig};
 use lance_table::io::commit::{
-    CommitError, CommitHandler, ConditionalPutCommitHandler, ManifestLocation,
-    ManifestNamingScheme, ManifestWriter,
+    CommitConfig, CommitError, CommitHandler, ConditionalPutCommitHandler, ManifestLocation,
+    ManifestNamingScheme, ManifestWriter, migrate_scheme_to_v2,
 };
 use lance_table::io::manifest::read_manifest_indexes;
 use lance_table::system_index::frag_reuse::{
@@ -22,9 +25,14 @@ use lance_table::system_index::frag_reuse::{
 };
 use lance_table::transaction::{Operation, Transaction};
 use object_store::path::Path;
+use object_store::{
+    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStoreExt,
+    PutMultipartOptions, PutOptions, PutPayload, PutResult,
+};
 use roaring::{RoaringBitmap, RoaringTreemap};
 use uuid::Uuid;
 
+use super::{CommitHooks, CommitTransactionOptions, commit_transaction};
 use crate::test_util::{test_commit_table, write_file};
 use crate::{CommitBuilder, Table};
 
@@ -60,12 +68,24 @@ async fn append_transaction(table: &Table, name: &str, values: &[i32]) -> Transa
 #[derive(Debug, Default)]
 struct ConflictOnce {
     attempts: AtomicU32,
+    latest_resolutions: AtomicU32,
 }
 
 #[async_trait::async_trait]
 impl CommitHandler for ConflictOnce {
     fn is_version_not_found_definitive(&self) -> bool {
         true
+    }
+
+    async fn resolve_latest_location(
+        &self,
+        base_path: &Path,
+        object_store: &ObjectStore,
+    ) -> lance_core::Result<ManifestLocation> {
+        self.latest_resolutions.fetch_add(1, Ordering::Relaxed);
+        ConditionalPutCommitHandler
+            .resolve_latest_location(base_path, object_store)
+            .await
     }
 
     async fn commit(
@@ -93,6 +113,251 @@ impl CommitHandler for ConflictOnce {
             )
             .await
     }
+}
+
+/// Model a lazy backend with two keys per listing request.
+#[derive(Debug)]
+struct PagedManifestStore {
+    inner: Arc<dyn object_store::ObjectStore>,
+    pages: Arc<AtomicU32>,
+}
+
+impl Display for PagedManifestStore {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "PagedManifestStore")
+    }
+}
+
+#[async_trait::async_trait]
+impl object_store::ObjectStore for PagedManifestStore {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        options: PutOptions,
+    ) -> object_store::Result<PutResult> {
+        self.inner.put_opts(location, payload, options).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        options: PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn MultipartUpload>> {
+        self.inner.put_multipart_opts(location, options).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &Path,
+        options: GetOptions,
+    ) -> object_store::Result<GetResult> {
+        self.inner.get_opts(location, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, object_store::Result<Path>>,
+    ) -> BoxStream<'static, object_store::Result<Path>> {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        let pages = self.pages.clone();
+        let is_manifest_listing = prefix.is_some_and(|path| path.filename() == Some("_versions"));
+        self.inner
+            .list(prefix)
+            .chunks(2)
+            .flat_map(move |page| {
+                if is_manifest_listing {
+                    pages.fetch_add(1, Ordering::Relaxed);
+                }
+                futures::stream::iter(page)
+            })
+            .boxed()
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        options: CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+}
+
+async fn v1_manifest_history() -> Table {
+    let mut table = test_commit_table(4, 2).await;
+    let v1_path = ManifestNamingScheme::V1.manifest_path(&table.state.base, 1);
+    table
+        .state
+        .object_store
+        .inner
+        .rename_opts(
+            &table.state.manifest_location.path,
+            &v1_path,
+            Default::default(),
+        )
+        .await
+        .unwrap();
+    table.state.manifest_location = table
+        .state
+        .commit_handler
+        .resolve_latest_location(&table.state.base, &table.state.object_store)
+        .await
+        .unwrap();
+    for version in 2..=5 {
+        let transaction = append_transaction(&table, &format!("{version}.lance"), &[1]).await;
+        table = CommitBuilder::new(Arc::new(table))
+            .execute(transaction)
+            .await
+            .unwrap();
+    }
+    table
+}
+
+#[rstest::rstest]
+#[case::up_to_date(5, false)]
+#[case::catch_up(4, false)]
+#[case::conditional(5, true)]
+#[tokio::test]
+async fn standalone_v1_commit_lists_history_once(
+    #[case] read_version: u64,
+    #[case] is_conditional: bool,
+) {
+    let mut table = v1_manifest_history().await;
+    let pages = Arc::new(AtomicU32::new(0));
+    let store = Arc::make_mut(&mut table.state.object_store);
+    store.inner = Arc::new(PagedManifestStore {
+        inner: store.inner.clone(),
+        pages: pages.clone(),
+    });
+    let table = table.checkout_version(read_version).await.unwrap();
+    let transaction = append_transaction(&table, "staged.lance", &[9]).await;
+    let build_config = ManifestBuildConfig::default();
+    let commit_config = CommitConfig::default();
+    let mut options =
+        CommitTransactionOptions::new(&build_config, &commit_config, ManifestNamingScheme::V1);
+    if is_conditional {
+        options = options.with_expected_latest_version(read_version);
+    }
+    let (manifest, location) = commit_transaction(
+        &table,
+        &table.state.object_store,
+        table.state.commit_handler.as_ref(),
+        &transaction,
+        options,
+        CommitHooks::default(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(manifest.version, 6);
+    assert_eq!(manifest.fragments.len(), 7);
+    assert_eq!(location.naming_scheme, ManifestNamingScheme::V1);
+    assert_eq!(
+        pages.load(Ordering::Relaxed),
+        3,
+        "five V1 manifests need one scan of three pages"
+    );
+}
+
+#[rstest::rstest]
+#[case::same_bindings(true, true, 0)]
+#[case::different_handler(false, true, 1)]
+#[case::different_store(true, false, 1)]
+#[tokio::test]
+async fn standalone_migrated_commit_retains_v2_across_retries(
+    #[case] same_handler: bool,
+    #[case] same_store: bool,
+    #[case] expected_resolutions: u32,
+) {
+    let mut table = v1_manifest_history().await;
+    migrate_scheme_to_v2(&table.state.object_store, &table.state.base)
+        .await
+        .unwrap();
+    let handler = Arc::new(ConflictOnce::default());
+    if same_handler {
+        table.state.commit_handler = handler.clone();
+    }
+    let other_store = table.state.object_store.as_ref().clone();
+    let write_store = if same_store {
+        table.state.object_store.as_ref()
+    } else {
+        &other_store
+    };
+    let transaction = append_transaction(&table, "staged.lance", &[9]).await;
+    let build_config = ManifestBuildConfig::default();
+    let commit_config = CommitConfig {
+        num_retries: 2,
+        ..Default::default()
+    };
+    let (manifest, location) = commit_transaction(
+        &table,
+        write_store,
+        handler.as_ref(),
+        &transaction,
+        CommitTransactionOptions::new(&build_config, &commit_config, ManifestNamingScheme::V1),
+        CommitHooks::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(manifest.version, 6);
+    assert_eq!(location.naming_scheme, ManifestNamingScheme::V2);
+    assert_eq!(handler.attempts.load(Ordering::Relaxed), 2);
+    assert_eq!(
+        handler.latest_resolutions.load(Ordering::Relaxed),
+        expected_resolutions
+    );
+}
+
+#[tokio::test]
+async fn standalone_strict_overwrite_after_migration_with_pruned_history() {
+    let latest = v1_manifest_history().await;
+    let stale = latest.checkout_version(4).await.unwrap();
+    migrate_scheme_to_v2(&latest.state.object_store, &latest.state.base)
+        .await
+        .unwrap();
+    latest
+        .state
+        .object_store
+        .inner
+        .delete(&ManifestNamingScheme::V2.manifest_path(&latest.state.base, 4))
+        .await
+        .unwrap();
+    let transaction = Transaction::new(
+        4,
+        Operation::Overwrite {
+            schema: stale.schema().clone(),
+            fragments: stale.manifest.fragments.as_ref().clone(),
+            config_upsert_values: None,
+            initial_bases: None,
+        },
+        None,
+    );
+    let error = CommitBuilder::new(Arc::new(stale))
+        .with_max_retries(0)
+        .execute(transaction)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::CommitConflict { .. }), "{error}");
+    assert!(error.to_string().contains("Failed to commit"), "{error}");
+    assert!(
+        !latest
+            .state
+            .object_store
+            .inner
+            .list(Some(&latest.state.base.clone().join("_versions")))
+            .map_ok(|meta| ManifestLocation::try_from(meta).unwrap().naming_scheme)
+            .try_any(|scheme| futures::future::ready(scheme == ManifestNamingScheme::V1))
+            .await
+            .unwrap()
+    );
 }
 
 #[tokio::test]
