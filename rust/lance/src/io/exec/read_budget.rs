@@ -27,6 +27,7 @@ use lance_core::{
 use lance_datafusion::resources::{
     DataFusionMemoryReserver, flat_batch_allowance, flat_batch_retained_bytes, retain_batch_owner,
 };
+use lance_encoding::decoder::DecodeResources;
 use lance_file::reader::ReadEstimate;
 use lance_io::read_budget::{Admission, BudgetReader, Reservation};
 
@@ -348,10 +349,13 @@ impl ChunkAdmission {
                     .ok_or_else(|| {
                         Error::invalid_input("scan decoded backing allowance overflow")
                     })?;
-                resources
+                let lease = resources
                     .pool
-                    .reserve_lease("strict scan decoded backing", allowance)
-                    .map(|lease| Arc::new(Mutex::new(lease)))
+                    .reserve_lease("strict scan decoded backing", allowance)?;
+                Ok(DecodedBacking {
+                    pool: resources.pool,
+                    lease: Arc::new(Mutex::new(lease)),
+                })
             })
             .transpose()?;
         Ok(Arc::new(ChunkBudget {
@@ -365,11 +369,16 @@ impl ChunkAdmission {
     }
 }
 
+struct DecodedBacking {
+    pool: Arc<DataFusionMemoryReserver>,
+    lease: Arc<Mutex<Box<dyn MemoryLease>>>,
+}
+
 /// The memory reserved for decoding one chunk: its pages and decoded data,
 /// released once the chunk is decoded. Its output batches move their share
 /// out with [`ChunkBudget::charge_output`] and keep it until emitted.
 pub struct ChunkBudget {
-    hard_backing: Option<Arc<Mutex<Box<dyn MemoryLease>>>>,
+    hard_backing: Option<DecodedBacking>,
     reservation: Reservation,
     estimate: ReadEstimate,
     rows: u64,
@@ -380,8 +389,14 @@ pub struct ChunkBudget {
 }
 
 impl ChunkBudget {
+    pub(super) fn decode_resources(self: &Arc<Self>) -> Option<DecodeResources> {
+        self.hard_backing
+            .as_ref()
+            .map(|backing| DecodeResources::new(backing.pool.clone(), self.clone()))
+    }
+
     pub(super) fn retain_output(&self, batch: RecordBatch) -> Result<RecordBatch> {
-        let Some(owner) = &self.hard_backing else {
+        let Some(backing) = &self.hard_backing else {
             return Ok(batch);
         };
         if u64::try_from(batch.num_rows()).ok() != Some(self.rows) {
@@ -391,11 +406,12 @@ impl ChunkBudget {
                 batch.num_rows()
             )));
         }
-        owner
+        backing
+            .lease
             .lock()
             .map_err(|_| Error::internal("scan backing lease poisoned"))?
             .try_shrink(flat_batch_retained_bytes(&batch)?)?;
-        retain_batch_owner(batch, owner.clone())
+        retain_batch_owner(batch, backing.lease.clone())
     }
 
     /// Charges an output batch of the chunk until the batch is dropped, taken

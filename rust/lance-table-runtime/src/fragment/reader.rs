@@ -19,6 +19,7 @@ use lance_core::{
     Error, ROW_ADDR_FIELD, ROW_CREATED_AT_VERSION_FIELD, ROW_ID_FIELD,
     ROW_LAST_UPDATED_AT_VERSION_FIELD, Result,
 };
+use lance_encoding::decoder::DecodeResources;
 use lance_file::version::ConcreteFileVersion;
 use lance_io::ReadBatchParams;
 use lance_table::rowids::RowIdSequence;
@@ -687,6 +688,18 @@ impl FragmentReader {
         ranges: Arc<[Range<u64>]>,
         batch_size: u32,
     ) -> Result<ReadBatchFutStream> {
+        self.read_ranges_with_resources(ranges, batch_size, None)
+            .await
+    }
+
+    /// Read physical ranges, carrying an optional backing owner through file decoding.
+    #[doc(hidden)]
+    pub async fn read_ranges_with_resources(
+        &self,
+        ranges: Arc<[Range<u64>]>,
+        batch_size: u32,
+        resources: Option<DecodeResources>,
+    ) -> Result<ReadBatchFutStream> {
         let total_num_rows = self.num_physical_rows as u32;
         let mut num_requested_rows = 0;
         // Note that row ranges at this point are physical and not logical.
@@ -735,8 +748,18 @@ impl FragmentReader {
             //
             // Run all readers' scheduling concurrently so the per-file
             // `initialize` I/Os overlap.
-            let read_futs = self.readers.iter().map(|reader| {
-                reader.read_ranges_tasks(ranges.clone(), batch_size, reader.projection().clone())
+            let read_futs = self.readers.iter().map(|reader| match &resources {
+                Some(resources) => reader.read_ranges_tasks_with_resources(
+                    ranges.clone(),
+                    batch_size,
+                    reader.projection().clone(),
+                    resources.clone(),
+                ),
+                None => reader.read_ranges_tasks(
+                    ranges.clone(),
+                    batch_size,
+                    reader.projection().clone(),
+                ),
             });
             let read_streams = futures::future::try_join_all(read_futs).await?;
             // Merge the streams, this merges the generated batches

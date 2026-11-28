@@ -231,6 +231,7 @@ use lance_core::datatypes::{
     BLOB_DESC_LANCE_FIELD, Field, Schema, validate_fixed_size_list_dimensions,
 };
 use lance_core::utils::futures::{FinallyStreamExt, StreamOnDropExt};
+use lance_core::utils::memory::MemoryReserver;
 use lance_core::utils::parse::parse_env_as_bool;
 use log::{debug, trace, warn};
 use prost::Message;
@@ -2244,6 +2245,74 @@ const INITIAL_BYTE_ESTIMATE_ROWS: u64 = 128;
 // requests within the current batch without starting later batches eagerly.
 const PAGE_LOAD_CONCURRENCY: usize = 16;
 
+/// The operation pool and an existing backing reservation for a structural read.
+#[derive(Clone)]
+#[doc(hidden)]
+pub struct DecodeResources {
+    pool: Arc<dyn MemoryReserver>,
+    backing: Arc<dyn Send + Sync>,
+}
+
+impl DecodeResources {
+    /// Retain one pre-admitted backing owner through native decoding and
+    /// disposal of an unclaimed result. A consumer taking the batch must
+    /// retain its backing owner for as long as it uses the batch.
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use lance_core::{Result, utils::memory::MemoryReserver};
+    /// # use lance_encoding::decoder::DecodeResources;
+    /// # fn resources(pool: Arc<dyn MemoryReserver>) -> Result<DecodeResources> {
+    /// let backing = Arc::new(pool.reserve_lease("decoded backing", 1024)?);
+    /// Ok(DecodeResources::new(pool, backing))
+    /// # }
+    /// ```
+    pub fn new(pool: Arc<dyn MemoryReserver>, backing: Arc<dyn Send + Sync>) -> Self {
+        Self { pool, backing }
+    }
+
+    async fn spawn_decode(
+        &self,
+        task: NextDecodeTask,
+        emitted_batch_size_warning: Arc<Once>,
+    ) -> Result<(RecordBatch, u64)> {
+        // The backing is already admitted by the scan. Charge the native
+        // task and the result slot before allocating their control state.
+        let work = (task, emitted_batch_size_warning, self.backing.clone());
+        let control_bytes = size_of_val(&work)
+            + size_of::<(Result<(RecordBatch, u64)>, Arc<dyn Send + Sync>)>()
+            + 1024; // Tokio task and result-channel bookkeeping.
+        let control = self
+            .pool
+            .reserve("structural decode task control", control_bytes)?;
+        let running = self
+            .pool
+            .task_group()
+            .map(|group| group.start("structural batch decode"))
+            .transpose()?;
+        let (completed, outcome) = tokio::sync::oneshot::channel();
+
+        // One capture preserves field drop order even if Tokio cancels the
+        // queued task on runtime shutdown. Once running, the work and any
+        // unclaimed result are dropped before the completion token.
+        let job = (work, completed, (control, running));
+        lance_core::utils::tokio::spawn(async move {
+            let (work, completed, completion) = job;
+            let (task, warning, backing) = work;
+            let result = task.into_batch(warning);
+            drop(completed.send((result, backing)));
+            drop(completion);
+        })
+        .await
+        .map_err(|err| Error::wrapped(err.into()))?;
+
+        let (result, _backing) = outcome.await.map_err(|err| {
+            Error::internal(format!("structural decode task lost its result: {err}"))
+        })?;
+        result
+    }
+}
+
 /// A stream that takes scheduled jobs and generates decode tasks from them.
 pub struct StructuralBatchDecodeStream {
     context: DecoderContext,
@@ -2262,6 +2331,7 @@ pub struct StructuralBatchDecodeStream {
     // - false: run `into_batch` inline, which avoids Tokio scheduling overhead and is
     //   typically better for point lookups / small takes.
     spawn_batch_decode_tasks: bool,
+    resources: Option<DecodeResources>,
     /// If set, target this many bytes per batch while retaining `rows_per_batch`
     /// as an independent upper bound.
     batch_size_bytes: Option<u64>,
@@ -2310,6 +2380,7 @@ impl StructuralBatchDecodeStream {
             scheduler_exhausted: false,
             emitted_batch_size_warning: Arc::new(Once::new()),
             spawn_batch_decode_tasks,
+            resources: None,
             batch_size_bytes,
             schema_bytes_per_row,
             has_variable_width,
@@ -2446,16 +2517,22 @@ impl StructuralBatchDecodeStream {
             // same throughput-vs-overhead choice made by the scheduler.
             let spawn_batch_decode_tasks = slf.spawn_batch_decode_tasks;
             let has_variable_width = slf.has_variable_width;
+            let resources = slf.resources.clone();
             let task = async move {
-                let (batch, data_size) = if spawn_batch_decode_tasks {
-                    lance_core::utils::tokio::spawn(async move {
-                        next_task.into_batch(emitted_batch_size_warning)
-                    })
-                    .await
-                    .map_err(|err| Error::wrapped(err.into()))??
-                } else {
-                    next_task.into_batch(emitted_batch_size_warning)?
-                };
+                let (batch, data_size) =
+                    if let (true, Some(resources)) = (spawn_batch_decode_tasks, &resources) {
+                        resources
+                            .spawn_decode(next_task, emitted_batch_size_warning)
+                            .await?
+                    } else if spawn_batch_decode_tasks {
+                        lance_core::utils::tokio::spawn(async move {
+                            next_task.into_batch(emitted_batch_size_warning)
+                        })
+                        .await
+                        .map_err(|err| Error::wrapped(err.into()))??
+                    } else {
+                        next_task.into_batch(emitted_batch_size_warning)?
+                    };
                 // Dictionary blocks can expand when materialized as Arrow
                 // strings. Budget the buffers handed to the consumer instead
                 // of the smaller intermediate representation.
@@ -2692,6 +2769,7 @@ pub fn create_decode_stream(
         rx,
         batch_size_bytes,
         true,
+        None,
     )
 }
 
@@ -2717,6 +2795,7 @@ fn create_decode_stream_with_i32_offset_limit(
     rx: mpsc::UnboundedReceiver<Result<DecoderMessage>>,
     batch_size_bytes: Option<u64>,
     limit_i32_offset_batch_size: bool,
+    resources: Option<DecodeResources>,
 ) -> Result<BoxStream<'static, ReadBatchTask>> {
     if is_structural {
         let arrow_schema = ArrowSchema::from(schema);
@@ -2727,16 +2806,22 @@ fn create_decode_stream_with_i32_offset_limit(
             /*nullable=*/ false,
         )?
         .with_column_contexts(root_column_contexts(schema));
-        Ok(StructuralBatchDecodeStream::new(
+        let mut stream = StructuralBatchDecodeStream::new(
             rx,
             batch_size,
             num_rows,
             structural_decoder,
             spawn_structural_batch_decode_tasks,
             batch_size_bytes,
-        )
-        .into_stream())
+        );
+        stream.resources = resources;
+        Ok(stream.into_stream())
     } else {
+        if resources.is_some() {
+            return Err(Error::not_supported(
+                "accounted decoding requires a structural file",
+            ));
+        }
         if batch_size_bytes.is_some() {
             warn!("batch_size_bytes is not supported for v2.0 files and will be ignored");
         }
@@ -2804,6 +2889,7 @@ async fn create_scheduler_decoder(
     column_indices: Vec<u32>,
     target_schema: Arc<Schema>,
     config: SchedulerDecoderConfig,
+    resources: Option<DecodeResources>,
 ) -> Result<BoxStream<'static, ReadBatchTask>> {
     let num_rows = requested_rows.num_rows();
     let is_range_request = matches!(&requested_rows, RequestedRows::Ranges(_));
@@ -2818,7 +2904,7 @@ async fn create_scheduler_decoder(
 
     let (tx, rx) = mpsc::unbounded_channel();
 
-    let decode_stream = create_decode_stream(
+    let decode_stream = create_decode_stream_with_i32_offset_limit(
         &target_schema,
         num_rows,
         config.batch_size,
@@ -2827,6 +2913,8 @@ async fn create_scheduler_decoder(
         spawn_structural_batch_decode_tasks,
         rx,
         config.batch_size_bytes,
+        true,
+        resources,
     )?;
 
     // The scheduler's `initialize` may perform I/O to load column metadata
@@ -2897,6 +2985,29 @@ pub async fn schedule_and_decode(
     target_schema: Arc<Schema>,
     config: SchedulerDecoderConfig,
 ) -> Result<BoxStream<'static, ReadBatchTask>> {
+    schedule_and_decode_with_resources(
+        column_infos,
+        requested_rows,
+        filter,
+        column_indices,
+        target_schema,
+        config,
+        None,
+    )
+    .await
+}
+
+/// Schedule a read whose optional backing owner follows dispatched structure decodes.
+#[doc(hidden)]
+pub async fn schedule_and_decode_with_resources(
+    column_infos: Vec<Arc<ColumnInfo>>,
+    requested_rows: RequestedRows,
+    filter: FilterExpression,
+    column_indices: Vec<u32>,
+    target_schema: Arc<Schema>,
+    config: SchedulerDecoderConfig,
+    resources: Option<DecodeResources>,
+) -> Result<BoxStream<'static, ReadBatchTask>> {
     if requested_rows.num_rows() == 0 {
         return Ok(stream::empty().boxed());
     }
@@ -2914,6 +3025,7 @@ pub async fn schedule_and_decode(
         column_indices,
         target_schema,
         config,
+        resources,
     )
     .await?;
 
@@ -3934,6 +4046,7 @@ pub async fn decode_batch(
         rx,
         None,
         false,
+        None,
     )?;
     decode_stream.next().await.unwrap().task.await
 }
@@ -3945,7 +4058,15 @@ mod tests {
     use crate::repdef::DefinitionInterpretation;
     use arrow_array::{StringArray, UInt32Array, types::UInt32Type};
     use futures::TryStreamExt;
-    use std::{collections::VecDeque, sync::atomic::AtomicUsize, time::Duration};
+    use lance_core::utils::tasks::ResourceTaskGroup;
+    use std::{
+        collections::VecDeque,
+        sync::{
+            Weak,
+            atomic::{AtomicBool, AtomicUsize},
+        },
+        time::Duration,
+    };
     use tokio::sync::Barrier;
 
     #[derive(Debug)]
@@ -4764,6 +4885,154 @@ mod tests {
             batches.next().await.is_none(),
             "stream should stop after the page-load error"
         );
+    }
+
+    #[derive(Debug)]
+    struct DecodeTestPool {
+        tasks: Arc<ResourceTaskGroup>,
+        reserved: Arc<AtomicUsize>,
+    }
+
+    struct DecodeTestCharge {
+        reserved: Arc<AtomicUsize>,
+        bytes: usize,
+    }
+
+    impl Drop for DecodeTestCharge {
+        fn drop(&mut self) {
+            self.reserved.fetch_sub(self.bytes, Ordering::Release);
+        }
+    }
+
+    impl MemoryReserver for DecodeTestPool {
+        fn reserve(&self, _stage: &str, bytes: usize) -> Result<Box<dyn Send + Sync>> {
+            self.reserved.fetch_add(bytes, Ordering::Relaxed);
+            Ok(Box::new(DecodeTestCharge {
+                reserved: self.reserved.clone(),
+                bytes,
+            }))
+        }
+
+        fn task_group(&self) -> Option<Arc<ResourceTaskGroup>> {
+            Some(self.tasks.clone())
+        }
+    }
+
+    struct DecodeBackingProbe {
+        tasks: Arc<ResourceTaskGroup>,
+        _charge: Box<dyn Send + Sync>,
+    }
+
+    impl Drop for DecodeBackingProbe {
+        fn drop(&mut self) {
+            assert_eq!(
+                self.tasks.active(),
+                1,
+                "release backing before reporting completion"
+            );
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct ObservedDecodePage {
+        backing: Weak<DecodeBackingProbe>,
+        decoded: Arc<AtomicBool>,
+        should_fail: bool,
+    }
+
+    impl StructuralPageDecoder for ObservedDecodePage {
+        fn drain(&mut self, num_rows: u64) -> Result<Box<dyn DecodePageTask>> {
+            assert_eq!(num_rows, 1);
+            Ok(Box::new(self.clone()))
+        }
+
+        fn num_rows(&self) -> u64 {
+            1
+        }
+    }
+
+    impl DecodePageTask for ObservedDecodePage {
+        fn decode(self: Box<Self>) -> Result<DecodedPage> {
+            assert!(
+                self.backing.upgrade().is_some(),
+                "native decode lost its backing lease"
+            );
+            self.decoded.store(true, Ordering::Release);
+            if self.should_fail {
+                Err(Error::io("test structural decode failure"))
+            } else {
+                Box::new(LiteralPageTask(42)).decode()
+            }
+        }
+    }
+
+    #[rstest::rstest]
+    #[case::success(false)]
+    #[case::decode_error(true)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_cancelled_structural_decode_owns_backing_until_completion(
+        #[case] should_fail: bool,
+    ) {
+        let tasks = Arc::new(ResourceTaskGroup::default());
+        let reserved = Arc::new(AtomicUsize::new(0));
+        let pool = Arc::new(DecodeTestPool {
+            tasks: tasks.clone(),
+            reserved: reserved.clone(),
+        });
+        let backing_bytes = 16;
+        let backing = Arc::new(DecodeBackingProbe {
+            tasks: tasks.clone(),
+            _charge: pool.reserve("test decoded backing", backing_bytes).unwrap(),
+        });
+        let backing_ref = Arc::downgrade(&backing);
+        let decoded = Arc::new(AtomicBool::new(false));
+        let page = ObservedDecodePage {
+            backing: backing_ref.clone(),
+            decoded: decoded.clone(),
+            should_fail,
+        };
+        let fields = Fields::from(vec![ArrowField::new("value", DataType::UInt32, false)]);
+        let root = StructuralStructDecoder::new(fields, true, true, false).unwrap();
+        let (tx, rx) = unbounded_channel();
+        tx.send(Ok(DecoderMessage {
+            scheduled_so_far: 1,
+            decoders: vec![MessageType::UnloadedPage(UnloadedPageShard(
+                async move {
+                    Ok(LoadedPageShard {
+                        decoder: Box::new(page),
+                        path: VecDeque::from([0]),
+                    })
+                }
+                .boxed(),
+            ))],
+        }))
+        .unwrap();
+        drop(tx);
+        let mut stream = StructuralBatchDecodeStream::new(rx, 1, 1, root, true, None);
+        stream.resources = Some(DecodeResources::new(pool, backing));
+        let mut stream = stream.into_stream();
+        let mut task = stream.next().await.unwrap().task;
+        drop(stream);
+
+        // The current-thread runtime cannot run the queued native task until
+        // this test yields. Drop the caller before letting that work start.
+        assert!(futures::poll!(&mut task).is_pending());
+        let pending_bytes = reserved.load(Ordering::Acquire);
+        assert!(pending_bytes > backing_bytes);
+        drop(task);
+        assert_eq!(reserved.load(Ordering::Acquire), pending_bytes);
+        assert!(!decoded.load(Ordering::Acquire));
+        assert_eq!(tasks.active(), 1);
+        assert!(backing_ref.upgrade().is_some());
+        let mut completion = std::pin::pin!(tasks.wait());
+        assert!(futures::poll!(&mut completion).is_pending());
+        tokio::time::timeout(Duration::from_secs(1), completion)
+            .await
+            .unwrap();
+        assert!(decoded.load(Ordering::Acquire));
+        assert!(backing_ref.upgrade().is_none());
+        assert_eq!(tasks.active(), 0);
+        assert_eq!(reserved.load(Ordering::Acquire), 0);
     }
 
     #[tokio::test]

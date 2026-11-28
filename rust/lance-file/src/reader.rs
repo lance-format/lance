@@ -22,9 +22,9 @@ pub use lance_encoding::decoder::FilterExpression;
 use lance_encoding::{
     EncodingsIo,
     decoder::{
-        ColumnInfo, DecoderConfig, DecoderPlugins, ListReadMode, PageEncoding, PageInfo,
-        ReadBatchTask, RequestedRows, SchedulerDecoderConfig, schedule_and_decode,
-        schedule_and_decode_blocking,
+        ColumnInfo, DecodeResources, DecoderConfig, DecoderPlugins, ListReadMode, PageEncoding,
+        PageInfo, ReadBatchTask, RequestedRows, SchedulerDecoderConfig, schedule_and_decode,
+        schedule_and_decode_blocking, schedule_and_decode_with_resources,
     },
     encoder::EncodedBatch,
 };
@@ -687,7 +687,7 @@ impl FileReader {
         filter: FilterExpression,
     ) -> Result<Pin<Box<dyn Stream<Item = ReadBatchTask> + Send>>> {
         self.core
-            .read_prepared_tasks(params, batch_size, prepared, read_len, filter)
+            .read_prepared_tasks(params, batch_size, prepared, read_len, filter, None)
             .await
     }
 
@@ -1578,6 +1578,7 @@ impl FileReader {
         filter: FilterExpression,
         decoder_config: DecoderConfig,
         batch_size_bytes: Option<u64>,
+        resources: Option<DecodeResources>,
     ) -> Result<BoxStream<'static, ReadBatchTask>> {
         let num_rows = ranges.iter().map(|r| r.end - r.start).sum::<u64>();
         debug!(
@@ -1601,13 +1602,14 @@ impl FileReader {
 
         let requested_rows = RequestedRows::Ranges(ranges);
 
-        schedule_and_decode(
+        schedule_and_decode_with_resources(
             column_infos,
             requested_rows,
             filter,
             projection.column_indices,
             projection.schema,
             config,
+            resources,
         )
         .await
     }
@@ -2224,6 +2226,7 @@ impl DecodeEngine {
         batch_size: u32,
         prepared: PreparedProjection,
         filter: FilterExpression,
+        resources: Option<DecodeResources>,
     ) -> Result<BoxStream<'static, ReadBatchTask>> {
         FileReader::do_read_ranges(
             prepared.column_infos,
@@ -2236,6 +2239,7 @@ impl DecodeEngine {
             filter,
             self.options.decoder_config.clone(),
             self.options.batch_size_bytes,
+            resources,
         )
         .await
     }
@@ -2247,6 +2251,7 @@ impl DecodeEngine {
         prepared: PreparedProjection,
         read_len: u64,
         filter: FilterExpression,
+        resources: Option<DecodeResources>,
     ) -> Result<Pin<Box<dyn Stream<Item = ReadBatchTask> + Send>>> {
         let verify_bound = |params: &ReadBatchParams, bound: u64, inclusive: bool| {
             if bound > read_len || (bound == read_len && inclusive) {
@@ -2257,6 +2262,11 @@ impl DecodeEngine {
                 Ok(())
             }
         };
+        if resources.is_some() && !matches!(params, ReadBatchParams::Ranges(_)) {
+            return Err(Error::not_supported(
+                "accounted decoding requires a range list",
+            ));
+        }
         match &params {
             ReadBatchParams::Indices(indices) => {
                 for idx in indices {
@@ -2288,7 +2298,7 @@ impl DecodeEngine {
                     verify_bound(&params, range.end, false)?;
                     ranges_u64.push(range.start..range.end);
                 }
-                self.read_ranges(ranges_u64, batch_size, prepared, filter)
+                self.read_ranges(ranges_u64, batch_size, prepared, filter, resources)
                     .await
             }
             ReadBatchParams::RangeFrom(range) => {
@@ -2312,19 +2322,6 @@ impl DecodeEngine {
 impl ProjectedFileReader {
     pub(crate) fn base_projection(&self) -> &ReaderProjection {
         &self.core.base_projection
-    }
-
-    pub(crate) async fn read_prepared_tasks(
-        &self,
-        params: ReadBatchParams,
-        batch_size: u32,
-        prepared: PreparedProjection,
-        read_len: u64,
-        filter: FilterExpression,
-    ) -> Result<Pin<Box<dyn Stream<Item = ReadBatchTask> + Send>>> {
-        self.core
-            .read_prepared_tasks(params, batch_size, prepared, read_len, filter)
-            .await
     }
 
     /// Returns a clone of this reader using a different scheduler.
@@ -2727,6 +2724,20 @@ impl ProjectedFileReader {
         projection: Option<ReaderProjection>,
         filter: FilterExpression,
     ) -> Result<Pin<Box<dyn Stream<Item = ReadBatchTask> + Send>>> {
+        self.read_tasks_with_resources(params, batch_size, projection, filter, None)
+            .await
+    }
+
+    /// Read a structural range list with an optional pre-admitted backing owner.
+    #[doc(hidden)]
+    pub async fn read_tasks_with_resources(
+        &self,
+        params: ReadBatchParams,
+        batch_size: u32,
+        projection: Option<ReaderProjection>,
+        filter: FilterExpression,
+        resources: Option<DecodeResources>,
+    ) -> Result<Pin<Box<dyn Stream<Item = ReadBatchTask> + Send>>> {
         let projection = projection.unwrap_or_else(|| self.base_projection().clone());
         let (prepared, read_len) = self
             .core
@@ -2738,7 +2749,8 @@ impl ProjectedFileReader {
                 &self.core.cache,
             )
             .await?;
-        self.read_prepared_tasks(params, batch_size, prepared, read_len, filter)
+        self.core
+            .read_prepared_tasks(params, batch_size, prepared, read_len, filter, resources)
             .await
     }
 }

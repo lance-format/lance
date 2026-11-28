@@ -500,7 +500,11 @@ impl OpenedFragmentRead {
         let chunk_budget_for_output = chunk_budget.clone();
         let fragment_stream = self
             .reader
-            .read_ranges(ranges.into(), self.batch_size)
+            .read_ranges_with_resources(
+                ranges.into(),
+                self.batch_size,
+                chunk_budget.as_ref().and_then(ChunkBudget::decode_resources),
+            )
             .await?
             .map(move |batch_fut: ReadBatchFut| {
                 let global_metrics = global_metrics.clone();
