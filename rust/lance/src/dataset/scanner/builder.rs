@@ -12,9 +12,8 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use arrow::array::AsArray;
-use arrow_array::{Array, types::Float32Type};
+use arrow_array::{Array, ArrayRef, GenericListArray, OffsetSizeTrait, types::Float32Type};
 use arrow_schema::{DataType, Schema as ArrowSchema};
-use arrow_select::concat::concat;
 use chrono::Utc;
 use datafusion::common::DFSchema;
 use datafusion::logical_expr::{Expr, ScalarUDF, lit};
@@ -817,15 +816,38 @@ impl Scanner {
         matches!(vector_type, DataType::FixedSizeList(_, _))
             && matches!(
                 query_type,
-                DataType::List(_) | DataType::FixedSizeList(_, _)
+                DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(_, _)
             )
+    }
+
+    fn flatten_list_query<O: OffsetSizeTrait>(
+        query: &GenericListArray<O>,
+        column: &str,
+        dim: usize,
+    ) -> Result<ArrayRef> {
+        let offsets = query.value_offsets();
+        for (index, bounds) in offsets.windows(2).enumerate() {
+            let query_dim = bounds[1] - bounds[0];
+            if query_dim.to_usize() != Some(dim) {
+                return Err(Error::invalid_input(format!(
+                    "query dim({query_dim:?}) doesn't match the column {column} vector dim({dim}) at query index {index}"
+                )));
+            }
+        }
+        let (Some(start), Some(end)) = (offsets[0].to_usize(), offsets[query.len()].to_usize())
+        else {
+            return Err(Error::invalid_input(format!(
+                "query offsets for column {column} do not fit in usize"
+            )));
+        };
+        Ok(query.values().slice(start, end - start))
     }
 
     /// Find up to k nearest neighbors within the vector column.
     ///
     /// The query can be a Float16Array, Float32Array, Float64Array, UInt8Array,
-    /// or a ListArray/FixedSizeListArray of the above types. A suitable vector index
-    /// is used when available; otherwise the search uses flat KNN.
+    /// or a ListArray, LargeListArray, or FixedSizeListArray of the above types.
+    /// A suitable vector index is used when available; otherwise the search uses flat KNN.
     ///
     /// [`Self::with_fragments`] defines the search scope with either SQL filtering
     /// strategy. It and [`Self::with_index_segments`] can be configured before or after
@@ -841,57 +863,30 @@ impl Scanner {
                 "Query vector must have non-zero length".to_string(),
             ));
         }
-        // make sure the field exists
+        if q.null_count() != 0 {
+            return Err(Error::invalid_input(
+                "Query vectors must be non-null".to_string(),
+            ));
+        }
         let (vector_type, element_type) = get_vector_type(self.dataset.schema(), column)?;
         let dim = get_vector_dim(self.dataset.schema(), column)?;
-        let query_type = q.data_type().clone();
-
-        let (q, query_count) = match &query_type {
-            DataType::List(_) | DataType::FixedSizeList(_, _) => {
-                if let Some(list_array) = q.as_list_opt::<i32>() {
-                    for i in 0..list_array.len() {
-                        let vec = list_array.value(i);
-                        if vec.len() != dim {
-                            return Err(Error::invalid_input(format!(
-                                "query dim({}) doesn't match the column {} vector dim({})",
-                                vec.len(),
-                                column,
-                                dim,
-                            )));
-                        }
-                    }
-                    // A list-like query against a multivector column is one multivector query.
-                    // The same list-like query against a fixed-size vector column is a batch
-                    // of single-vector queries.
-                    let query_count = if matches!(vector_type, DataType::List(_)) {
-                        1
-                    } else {
-                        list_array.len()
-                    };
-                    let offsets = list_array.value_offsets();
-                    let start = offsets[0] as usize;
-                    let end = offsets[list_array.len()] as usize;
-                    (list_array.values().slice(start, end - start), query_count)
-                } else {
-                    let fsl = q.as_fixed_size_list();
-                    if fsl.value_length() as usize != dim {
-                        return Err(Error::invalid_input(format!(
-                            "query dim({}) doesn't match the column {} vector dim({})",
-                            fsl.value_length(),
-                            column,
-                            dim,
-                        )));
-                    }
-                    // A list-like query against a multivector column is one multivector query.
-                    // The same list-like query against a fixed-size vector column is a batch
-                    // of single-vector queries.
-                    let query_count = if matches!(vector_type, DataType::List(_)) {
-                        1
-                    } else {
-                        fsl.len()
-                    };
-                    (fsl.values().clone(), query_count)
+        let is_batch_nearest = Self::is_batch_nearest_query(&vector_type, q.data_type());
+        let query_count = if is_batch_nearest { q.len() } else { 1 };
+        let q = match q.data_type() {
+            DataType::List(_) => Self::flatten_list_query(q.as_list::<i32>(), column, dim)?,
+            DataType::LargeList(_) => Self::flatten_list_query(q.as_list::<i64>(), column, dim)?,
+            DataType::FixedSizeList(_, _) => {
+                let fsl = q.as_fixed_size_list();
+                if fsl.value_length() as usize != dim {
+                    return Err(Error::invalid_input(format!(
+                        "query dim({}) doesn't match the column {} vector dim({})",
+                        fsl.value_length(),
+                        column,
+                        dim,
+                    )));
                 }
+                // Fixed-size list slicing also slices the child values.
+                fsl.values().clone()
             }
             _ => {
                 if q.len() != dim {
@@ -902,11 +897,15 @@ impl Scanner {
                         dim,
                     )));
                 }
-                (q.slice(0, q.len()), 1)
+                q.slice(0, q.len())
             }
         };
+        if q.null_count() != 0 {
+            return Err(Error::invalid_input(
+                "Query vector values must be non-null".to_string(),
+            ));
+        }
 
-        let is_batch_nearest = Self::is_batch_nearest_query(&vector_type, &query_type);
         if is_batch_nearest && self.dataset.schema().field(QUERY_INDEX_COL).is_some() {
             return Err(Error::invalid_input(format!(
                 "batch nearest neighbor search cannot be used on datasets with column '{QUERY_INDEX_COL}'"
@@ -1186,7 +1185,9 @@ impl Scanner {
         }
         validate_distance_type_for(metric, &DataType::Float32)?;
         let query_element_type = match query.data_type() {
-            DataType::List(field) | DataType::FixedSizeList(field, _) => field.data_type(),
+            DataType::List(field)
+            | DataType::LargeList(field)
+            | DataType::FixedSizeList(field, _) => field.data_type(),
             data_type => data_type,
         };
         if query_element_type != &DataType::Float32 {
@@ -1215,22 +1216,12 @@ impl Scanner {
             )));
         }
 
-        // Respect offsets when a caller passes a slice of a batch query array.
-        let vectors = if let Some(list) = query.as_list_opt::<i32>() {
-            (0..list.len()).map(|i| list.value(i)).collect::<Vec<_>>()
-        } else if let Some(list) = query.as_fixed_size_list_opt() {
-            (0..list.len()).map(|i| list.value(i)).collect::<Vec<_>>()
-        } else {
-            vec![query.slice(0, query.len())]
-        };
-        let key = concat(
-            &vectors
-                .iter()
-                .map(|value| value.as_ref())
-                .collect::<Vec<_>>(),
-        )?;
+        let key = validation
+            .nearest
+            .ok_or_else(|| Error::internal("Validated refinement query is missing".to_string()))?
+            .key;
         let values = key.as_primitive::<Float32Type>();
-        if values.null_count() > 0 || values.values().iter().any(|value| !value.is_finite()) {
+        if values.values().iter().any(|value| !value.is_finite()) {
             return Err(Error::invalid_input(
                 "refine_q must contain only finite, non-null values".to_string(),
             ));
