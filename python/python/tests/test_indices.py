@@ -744,11 +744,27 @@ def test_load_shuffled_vectors(
     )
 
     sorted_filenames = filenames1 + filenames2
+    dataset_path = pathlib.Path(tmpdir) / "dataset"
+    original_version = small_rand_dataset.version
+    original_indices = small_rand_dataset.describe_indices()
+
+    hamming_ivf = IvfModel(small_rand_ivf.centroids, "hamming")
+    with pytest.raises(ValueError, match="IVF_PQ does not support the hamming metric"):
+        builder.load_shuffled_vectors(
+            sorted_filenames, str(tmpdir), hamming_ivf, small_rand_pq
+        )
+
+    reopened = lance.dataset(dataset_path)
+    assert reopened.version == original_version
+    assert reopened.describe_indices() == original_indices
+    assert not any(path.is_file() for path in (dataset_path / "_indices").rglob("*"))
+
     builder.load_shuffled_vectors(
         sorted_filenames, str(tmpdir), small_rand_ivf, small_rand_pq
     )
 
-    final_ds = lance.dataset(str(tmpdir / "dataset"))
+    final_ds = lance.dataset(dataset_path)
+    assert final_ds.version == original_version + 1
     stats = final_ds.stats.index_stats("vectors_idx")
     assert stats["name"] == "vectors_idx"
     assert stats["num_indexed_fragments"] == NUM_FRAGMENTS

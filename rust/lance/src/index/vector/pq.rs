@@ -49,7 +49,7 @@ use tracing::{Level, instrument, span};
 pub use lance_index::vector::pq::PQBuildParams;
 use lance_linalg::kernels::normalize_fsl_owned;
 
-use super::VectorIndex;
+use super::{VectorIndex, reject_hamming_metric};
 use crate::Dataset;
 use crate::index::prefilter::PreFilter;
 use crate::index::vector::utils::maybe_sample_training_data;
@@ -570,6 +570,8 @@ pub async fn build_pq_model_in_fragments(
     ivf: Option<&IvfModel>,
     fragment_ids: Option<&[u32]>,
 ) -> Result<ProductQuantizer> {
+    reject_hamming_metric("PQ", metric_type)?;
+
     if let Some(codebook) = &params.codebook {
         let (_, value_type) =
             crate::index::vector::utils::get_vector_type(dataset.schema(), column)?;
@@ -711,6 +713,7 @@ pub(crate) fn build_pq_storage(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
 
     use std::collections::HashMap;
     use std::{ops::Range, sync::Mutex};
@@ -801,6 +804,38 @@ mod tests {
 
         let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
         (Dataset::write(batches, test_uri, None).await.unwrap(), fsl)
+    }
+
+    #[rstest::rstest]
+    #[case::train_codebook(false)]
+    #[case::supplied_codebook(true)]
+    #[tokio::test]
+    async fn test_pq_model_rejects_hamming(#[case] supplied_codebook: bool) {
+        const DIM: usize = 8;
+        let dataset = lance_datagen::gen_batch()
+            .col(
+                "vector",
+                lance_datagen::array::rand_vec::<Float32Type>((DIM as u32).into()),
+            )
+            .into_ram_dataset(FragmentCount::from(1), FragmentRowCount::from(16))
+            .await
+            .unwrap();
+
+        let mut params = PQBuildParams::new(2, 4);
+        if supplied_codebook {
+            params.codebook = Some(Arc::new(Float32Array::from(vec![0.0; 16 * DIM])));
+        }
+        let error = build_pq_model(&dataset, "vector", DIM, MetricType::Hamming, &params, None)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error:?}");
+        assert!(
+            error
+                .to_string()
+                .contains("PQ does not support the hamming metric"),
+            "{error}"
+        );
     }
 
     #[tokio::test]
