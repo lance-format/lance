@@ -6,8 +6,11 @@
 // These helpers stay crate-visible so callers do not depend on private parameter types.
 #![allow(clippy::redundant_pub_crate)]
 
+use super::field_dependencies::input_field_ids;
+
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Instant;
 
 use arrow_schema::{DataType, Field as ArrowField, Fields};
 use async_trait::async_trait;
@@ -47,8 +50,7 @@ use lance_io::utils::{
     CachedFileSize, read_last_block, read_message, read_message_from_buf, read_metadata_offset,
     read_version,
 };
-use lance_table::format::{Fragment, IndexMetadata, SelfDescribingFileReader};
-use lance_table::io::manifest::read_manifest_indexes;
+use lance_table::format::{Fragment, IndexMetadata, Manifest, SelfDescribingFileReader};
 use roaring::RoaringBitmap;
 use tracing::{info, instrument};
 use uuid::Uuid;
@@ -60,18 +62,16 @@ use crate::index::frag_reuse_with_stable_row_ids::warn_about_indices_hidden_by_f
 use crate::index::mem_wal::open_mem_wal_index;
 use crate::index::scalar::{self, IndexDetails, fetch_index_details, list_element};
 use crate::index::segment::{
-    index_is_usable, index_type_is_known, segment_has_vector_details, unsupported_index_version,
+    index_has_supported_field_dependencies, index_is_usable, index_type_is_known,
+    segment_has_vector_details, unsupported_index_version,
 };
 use crate::index::vector;
 use crate::index::vector::{
     LogicalVectorIndex,
-    details::{infer_missing_vector_details, needs_vector_details_inference},
     ivf::v2::{IVFIndex, IvfOpenContext, IvfStateEntryBox, aux_file_key},
     utils::get_vector_type,
 };
-use crate::session::index_caches::{
-    DerivedIndexListingKey, FragReuseIndexKey, IndexMetadataKey, write_index_identity,
-};
+use crate::session::index_caches::{FragReuseIndexKey, write_index_identity};
 use crate::{Dataset, Error, Result};
 
 // Cache keys for different index types
@@ -310,7 +310,7 @@ pub(crate) async fn open_index_proto(reader: &dyn Reader) -> Result<pb::Index> {
 /// runs on every call, and `load_indices` sits on the query-planning path and on
 /// merge_insert's per-batch path. Warning there would cost an operator one line
 /// per hidden index per query for as long as the dataset carries one.
-pub(crate) fn warn_about_unsupported_indices(indices: &[IndexMetadata]) {
+pub(crate) fn warn_about_unsupported_indices(manifest: &Manifest, indices: &[IndexMetadata]) {
     for idx in indices {
         if !index_type_is_known(idx) {
             let type_url = idx
@@ -330,7 +330,7 @@ pub(crate) fn warn_about_unsupported_indices(indices: &[IndexMetadata]) {
                 idx.index_version,
                 max_supported_version,
             );
-        } else if !index_is_usable(idx) {
+        } else if !index_has_supported_field_dependencies(idx) {
             log::warn!(
                 "Index {} has unsupported field dependencies {:?}, ignoring it",
                 idx.name,
@@ -338,6 +338,7 @@ pub(crate) fn warn_about_unsupported_indices(indices: &[IndexMetadata]) {
             );
         }
     }
+    warn_about_indices_hidden_by_frag_reuse(manifest, indices);
 }
 
 /// Every index the manifest names, including any this build has no reader for.
@@ -352,113 +353,9 @@ pub(crate) fn warn_about_unsupported_indices(indices: &[IndexMetadata]) {
 /// reservation, replace and removal selection, explicit drop - answers that
 /// second question too: a name it cannot see is a name it will hand out twice.
 pub(crate) async fn load_all_indices(dataset: &Dataset) -> Result<Arc<Vec<IndexMetadata>>> {
-    let metadata_key = IndexMetadataKey {
-        version: dataset.manifest.version,
-        store_identity: &dataset.object_store.store_prefix,
-        e_tag: dataset.manifest_location.e_tag.as_deref(),
-    };
-    let mut indices = dataset
-        .index_cache
-        .get_or_insert_with_key(metadata_key, || async {
-            let loaded = read_manifest_indexes(
-                &dataset.object_store,
-                &dataset.manifest_location,
-                &dataset.manifest,
-            )
-            .await?;
-            warn_about_unsupported_indices(&loaded);
-            warn_about_indices_hidden_by_frag_reuse(&dataset.manifest, &loaded);
-            Ok(loaded)
-        })
-        .await?;
-
-    // Infer details for legacy vector indices (once per index name, concurrently).
-    // This may run on indices that were opportunistically cached during Dataset::open
-    // before the full Dataset was available for inference.
-    {
-        let schema = dataset.schema();
-        if indices
-            .iter()
-            .any(|idx| needs_vector_details_inference(idx, schema))
-        {
-            let mut updated = indices.as_ref().clone();
-            infer_missing_vector_details(dataset, &mut updated).await;
-            if updated != *indices {
-                indices = Arc::new(updated);
-                dataset
-                    .index_cache
-                    .insert_with_key(&metadata_key, indices.clone())
-                    .await;
-            }
-        }
-    }
-
-    // Legacy FRI index version 0 is handled below by directly remapping fragment coverage.
-    // For version 1 and above, load_indices handles version checks and filters index
-    // segments for query use; keep their metadata unchanged here.
-    if indices
-        .iter()
-        .any(lance_table::system_index::frag_reuse::metadata::is_tagged)
-    {
-        if indices
-            .iter()
-            .filter(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
-            .count()
-            != 1
-        {
-            return Err(Error::corrupt_file_named(
-                "FRI metadata",
-                "tagged history requires a single FRI entry",
-            ));
-        }
-        // Commit bookkeeping carries the original Any unchanged. Only query
-        // loading or an operation consuming FRI needs to interpret its encoding.
-        return Ok(indices);
-    }
-    if let Some(frag_reuse_index_meta) =
-        indices.iter().find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
-    {
-        // Query planning loads the listing several times per scan, and each
-        // remap walks the whole reuse history.
-        let remapped_key = DerivedIndexListingKey {
-            version: metadata_key.version,
-            store_identity: metadata_key.store_identity,
-            e_tag: metadata_key.e_tag,
-        };
-        if let Some(remapped) = dataset.index_cache.get_with_key(&remapped_key).await {
-            return Ok(remapped);
-        }
-        let identity = frag_reuse::v0_cache_identity(dataset, frag_reuse_index_meta);
-        let fri_key = FragReuseIndexKey { uuid: &identity };
-        let frag_reuse_index = dataset
-            .index_cache
-            .get_or_insert_with_key(fri_key, || async move {
-                let index_details =
-                    load_frag_reuse_index_details(dataset, frag_reuse_index_meta).await?;
-                open_frag_reuse_index(frag_reuse_index_meta.uuid, index_details.as_ref()).await
-            })
-            .await?;
-        let mut remapped = indices.as_ref().clone();
-        for idx in remapped.iter_mut() {
-            if let Some(bitmap) = idx.fragment_bitmap.as_mut() {
-                frag_reuse_index.remap_fragment_bitmap(bitmap)?;
-            }
-        }
-        let remapped = Arc::new(remapped);
-        // A later call may still infer the missing details; don't pin this list.
-        if !indices
-            .iter()
-            .any(|idx| needs_vector_details_inference(idx, dataset.schema()))
-        {
-            dataset
-                .index_cache
-                .insert_with_key(&remapped_key, remapped.clone())
-                .await;
-        }
-        Ok(remapped)
-    } else {
-        Ok(indices)
-    }
+    let hook = crate::io::commit::LanceCommitHook::new(dataset.session.clone());
+    lance_table_runtime::commit::load_all_indices(&dataset.table_view().to_table(), Some(&hook))
+        .await
 }
 
 /// The segments named `name`, including any this build has no reader for.
@@ -851,9 +748,8 @@ impl Dataset {
             .await
     }
 
-    // Production passes `IndexDetails::get_plugin`. Tests pass a lookup that
-    // adds plugins the process-wide registry lacks, so `plugin_for` stays until
-    // a registration API replaces `SCALAR_INDEX_PLUGIN_REGISTRY`.
+    // Production passes `IndexDetails::get_plugin`. Tests can inject a lookup
+    // while keeping the process-wide registry shared across tests.
     pub(crate) async fn scalar_index_info_with_plugins(
         &self,
         indices: &[IndexMetadata],
@@ -877,16 +773,23 @@ impl Dataset {
         // other segments registered under the same name, because a search opens
         // every segment of the name a parser reports and asks all of them.
         let mut pending_parsers = Vec::new();
-        for index in indices.iter().filter(|idx| {
-            if ignored_index_names.contains(&idx.name) {
-                return false;
+        for index in indices {
+            if ignored_index_names.contains(&index.name) {
+                continue;
             }
-            if idx.keyed_fields().len() > 1 && !registers_planners {
-                return false;
+            let input_fields = match input_field_ids(index) {
+                Ok(fields) => fields,
+                Err(error) => {
+                    log::warn!("Skipping index '{}': {error}", index.name);
+                    continue;
+                }
+            };
+            if input_fields.len() > 1 && !registers_planners {
+                continue;
             }
 
             // Check if this is an FTS index by looking at index details
-            let is_fts_index = if let Some(details) = &idx.index_details {
+            let is_fts_index = if let Some(details) = &index.index_details {
                 IndexDetails(details.clone()).supports_fts()
             } else {
                 false
@@ -894,17 +797,16 @@ impl Dataset {
 
             // Only include indices with non-empty fragment bitmaps, except for FTS indices
             // which need to be discoverable even when empty
-            let has_non_empty_bitmap = idx.fragment_bitmap.as_ref().is_some_and(|bitmap| {
-                !bitmap.is_empty() && !(bitmap & self.fragment_bitmap.as_ref()).is_empty()
+            let has_non_empty_bitmap = index.fragment_bitmap.as_ref().is_some_and(|bitmap| {
+                !bitmap.is_empty()
+                    && !(bitmap & self.table_state.fragment_bitmap.as_ref()).is_empty()
             });
 
-            // Same name-collision rationale as `CreateIndexBuilder`'s
-            // default-name loop in create.rs: only the keyed prefix decides
-            // which column this index answers for.
-            !idx.keyed_fields().is_empty() && (has_non_empty_bitmap || is_fts_index)
-        }) {
-            let keyed_columns = index
-                .keyed_fields()
+            // Dependencies and carried columns do not add query inputs.
+            if input_fields.is_empty() || !(has_non_empty_bitmap || is_fts_index) {
+                continue;
+            }
+            let keyed_columns = input_fields
                 .iter()
                 .map(|&field_id| {
                     schema.field_by_id(field_id).ok_or_else(|| {
@@ -1243,7 +1145,7 @@ impl Dataset {
                 .0
                 .reconstruct(
                     object_store,
-                    self.metadata_cache.as_ref(),
+                    self.table_state.metadata_cache.as_ref(),
                     partition_cache,
                     remapping,
                     open_context,
@@ -1257,6 +1159,7 @@ impl Dataset {
             return Ok(cached.0.clone());
         }
 
+        let prepare_start = Instant::now();
         // Only legacy vector file readers consume the V1 handle. A tagged
         // history is handled by the shared remapper above, including identity.
         let has_tagged_history = load_all_indices(self)
@@ -1313,7 +1216,7 @@ impl Dataset {
             minor_version,
         ) {
             (0, 1) | (0, 0) => {
-                info!(target: TRACE_IO_EVENTS, index_uuid=%uuid, r#type=IO_TYPE_OPEN_VECTOR, version="0.1", index_type="IVF_PQ");
+                info!(target: TRACE_IO_EVENTS, index_uuid=%uuid, r#type=IO_TYPE_OPEN_VECTOR, prepare_us=i64::try_from(prepare_start.elapsed().as_micros()).unwrap_or(i64::MAX), version="0.1", index_type="IVF_PQ");
                 let proto = open_index_proto(reader.as_ref()).await?;
                 match &proto.implementation {
                     Some(Implementation::VectorIndex(vector_index)) => {
@@ -1335,10 +1238,15 @@ impl Dataset {
             }
 
             (0, 2) => {
-                info!(target: TRACE_IO_EVENTS, index_uuid=%uuid, r#type=IO_TYPE_OPEN_VECTOR, version="0.2", index_type="IVF_PQ");
+                info!(target: TRACE_IO_EVENTS, index_uuid=%uuid, r#type=IO_TYPE_OPEN_VECTOR, prepare_us=i64::try_from(prepare_start.elapsed().as_micros()).unwrap_or(i64::MAX), version="0.2", index_type="IVF_PQ");
                 let reader = V1FileReader::try_new_self_described_from_reader(
                     lazy_reader,
-                    Some(&self.metadata_cache.file_metadata_cache(&index_file)),
+                    Some(
+                        &self
+                            .table_state
+                            .metadata_cache
+                            .file_metadata_cache(&index_file),
+                    ),
                 )
                 .await?;
                 let idx = vector::open_vector_index_v2(
@@ -1362,7 +1270,7 @@ impl Dataset {
 
                 let (_, element_type) = get_vector_type(self.schema(), &field_path)?;
 
-                info!(target: TRACE_IO_EVENTS, index_uuid=%uuid, r#type=IO_TYPE_OPEN_VECTOR, version="0.3", index_type=index_metadata.index_type);
+                info!(target: TRACE_IO_EVENTS, index_uuid=%uuid, r#type=IO_TYPE_OPEN_VECTOR, prepare_us=i64::try_from(prepare_start.elapsed().as_micros()).unwrap_or(i64::MAX), version="0.3", index_type=index_metadata.index_type);
 
                 match index_metadata.index_type.as_str() {
                     "IVF_FLAT" => match element_type {
@@ -1372,7 +1280,7 @@ impl Dataset {
                                 index_dir,
                                 uuid.to_owned(),
                                 remapping,
-                                self.metadata_cache.as_ref(),
+                                self.table_state.metadata_cache.as_ref(),
                                 index_cache,
                                 file_sizes,
                                 open_context,
@@ -1386,7 +1294,7 @@ impl Dataset {
                                 index_dir,
                                 uuid.to_owned(),
                                 remapping,
-                                self.metadata_cache.as_ref(),
+                                self.table_state.metadata_cache.as_ref(),
                                 index_cache,
                                 file_sizes,
                                 open_context,
@@ -1406,7 +1314,7 @@ impl Dataset {
                             index_dir,
                             uuid.to_owned(),
                             remapping,
-                            self.metadata_cache.as_ref(),
+                            self.table_state.metadata_cache.as_ref(),
                             index_cache,
                             file_sizes,
                             open_context,
@@ -1421,7 +1329,7 @@ impl Dataset {
                             index_dir,
                             uuid.to_owned(),
                             remapping,
-                            self.metadata_cache.as_ref(),
+                            self.table_state.metadata_cache.as_ref(),
                             index_cache,
                             file_sizes,
                             open_context,
@@ -1436,7 +1344,7 @@ impl Dataset {
                             index_dir,
                             uuid.to_owned(),
                             remapping,
-                            self.metadata_cache.as_ref(),
+                            self.table_state.metadata_cache.as_ref(),
                             index_cache,
                             file_sizes,
                             open_context,
@@ -1452,7 +1360,7 @@ impl Dataset {
                                 index_dir,
                                 uuid.to_owned(),
                                 remapping,
-                                self.metadata_cache.as_ref(),
+                                self.table_state.metadata_cache.as_ref(),
                                 index_cache,
                                 file_sizes,
                                 open_context,
@@ -1466,7 +1374,7 @@ impl Dataset {
                                 index_dir,
                                 uuid.to_owned(),
                                 remapping,
-                                self.metadata_cache.as_ref(),
+                                self.table_state.metadata_cache.as_ref(),
                                 index_cache,
                                 file_sizes,
                                 open_context,
@@ -1482,7 +1390,7 @@ impl Dataset {
                             index_dir,
                             uuid.to_owned(),
                             remapping,
-                            self.metadata_cache.as_ref(),
+                            self.table_state.metadata_cache.as_ref(),
                             index_cache,
                             file_sizes,
                             open_context,
@@ -1497,7 +1405,7 @@ impl Dataset {
                             index_dir,
                             uuid.to_owned(),
                             remapping,
-                            self.metadata_cache.as_ref(),
+                            self.table_state.metadata_cache.as_ref(),
                             index_cache,
                             file_sizes,
                             open_context,
@@ -1512,7 +1420,7 @@ impl Dataset {
                             index_dir,
                             uuid.to_owned(),
                             remapping,
-                            self.metadata_cache.as_ref(),
+                            self.table_state.metadata_cache.as_ref(),
                             index_cache,
                             file_sizes,
                             open_context,
@@ -1577,7 +1485,10 @@ impl Dataset {
             file,
             None,
             Default::default(),
-            &self.metadata_cache.file_metadata_cache(index_file),
+            &self
+                .table_state
+                .metadata_cache
+                .file_metadata_cache(index_file),
             FileReaderOptions::default(),
         )
         .await?;
@@ -1923,11 +1834,9 @@ impl DatasetIndexInternalExt for Dataset {
                 ))
             })?;
 
-        // Only the keyed prefix matters here. The rebuild below writes fresh,
-        // non-covered metadata and never reads the carried columns, so requiring
-        // them to exist and type-match would reject a target that can hold this
-        // index perfectly well.
-        let keyed_fields = source_index.keyed_fields();
+        // Rebuild from the query inputs. The target build records its own field
+        // IDs for additional dependencies and does not read carried columns.
+        let keyed_fields = input_field_ids(source_index)?;
         let mut field_paths = Vec::with_capacity(keyed_fields.len());
         for field_id in keyed_fields.iter() {
             let source_field = source_dataset

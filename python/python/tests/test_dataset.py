@@ -20,7 +20,7 @@ import uuid
 from datetime import date, datetime, timedelta, timezone, tzinfo
 from enum import Enum
 from pathlib import Path
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 from typing import List, Optional
 from unittest import mock
 
@@ -1939,6 +1939,26 @@ def test_count_rows(tmp_path: Path):
     assert count_rows == 100
 
     assert dataset.count_rows(filter="a < 50") == 50
+
+
+@pytest.mark.parametrize(
+    ("predicate", "expected"),
+    [(None, [3, 3]), ("a < 4", [3, 1]), (pc.field("a") < 4, [3, 1])],
+    ids=["unfiltered", "sql", "arrow"],
+)
+def test_count_rows_selected_fragments(tmp_path: Path, predicate, expected):
+    ds = lance.write_dataset(pa.table({"a": range(6)}), tmp_path, max_rows_per_file=3)
+    fragments = ds.get_fragments()
+    with pytest.raises(TypeError, match=r"LanceFragment\.count_rows"):
+        ds.count_rows(filter=predicate, fragments=fragments[:1])
+    assert [fragment.count_rows(filter=predicate) for fragment in fragments] == expected
+
+
+def test_count_rows_selected_fragments_empty(tmp_path: Path):
+    ds = lance.write_dataset(pa.table({"a": range(3)}), tmp_path)
+    with pytest.raises(TypeError, match=r"LanceFragment\.count_rows"):
+        ds.count_rows(fragments=[])
+    assert ds.count_rows(fragments=None, use_threads=False) == 3
 
 
 def test_count_rows_via_scanner(tmp_path: Path):
@@ -7374,6 +7394,160 @@ def test_default_scan_options(tmp_path: Path):
     assert dataset.schema.names == ["a", "b", "_rowaddr"]
 
 
+@pytest.mark.parametrize("selection_form", ["list", "iterator", "mapping"])
+def test_default_scan_options_fragments(tmp_path: Path, selection_form: str):
+    data = pa.table({"id": [0, 1, 2, 3]})
+    dataset = lance.write_dataset(data, tmp_path, max_rows_per_file=2)
+    first, second = dataset.get_fragments()
+    selected = [second]
+    if selection_form == "iterator":
+        selected = iter(selected)
+    elif selection_form == "mapping":
+        selected = {second: "selected"}
+    scoped = lance.dataset(tmp_path, default_scan_options={"fragments": selected})
+
+    expected = dataset.scanner(fragments=[second]).to_table()
+    assert expected == data.slice(2)
+    assert scoped.schema == expected.schema
+    assert scoped.to_table() == expected
+    assert scoped.to_table() == expected
+    assert scoped.scanner(fragments=[first]).to_table() == data.slice(0, 2)
+    assert scoped.scanner(fragments=[]).to_table() == data.slice(0, 0)
+
+
+@pytest.mark.parametrize("fragments", [None, [], {}], ids=["none", "empty", "mapping"])
+def test_default_scan_options_empty_fragments(tmp_path: Path, fragments):
+    data = pa.table({"id": [0, 1]})
+    dataset = lance.write_dataset(data, tmp_path, max_rows_per_file=1)
+    scoped = lance.dataset(tmp_path, default_scan_options={"fragments": fragments})
+    assert scoped.to_table() == dataset.scanner(fragments=fragments).to_table()
+
+
+@pytest.mark.parametrize(
+    ("selection_form", "clone_options"),
+    [
+        pytest.param("string", None, id="string"),
+        pytest.param("uuid", None, id="uuid"),
+        pytest.param("iterator", None, id="iterator"),
+        pytest.param("mapping", None, id="mapping"),
+        pytest.param("iterator", {}, id="native-clone"),
+        pytest.param("iterator", {"block_size": 4096}, id="reconfigured-clone"),
+    ],
+)
+def test_default_scan_options_index_segments(
+    tmp_path: Path, selection_form: str, clone_options
+):
+    data = pa.table(
+        {
+            "id": range(6),
+            "vector": pa.array(
+                [[float(i), 0.0] for i in range(6)], type=pa.list_(pa.float32(), 2)
+            ),
+        }
+    )
+    dataset = lance.write_dataset(data.slice(0, 4), tmp_path, max_rows_per_file=2)
+    dataset = dataset.create_index(
+        "vector",
+        "IVF_FLAT",
+        num_partitions=1,
+        ivf_centroids=np.zeros((1, 2), dtype=np.float32),
+    )
+    segment = dataset.describe_indices()[0].segments[0].uuid
+    dataset = lance.write_dataset(data.slice(4), dataset, mode="append")
+    nearest = {"column": "vector", "q": [5.0, 0.0], "k": 3}
+    assert dataset.scanner(nearest=nearest).to_table()["id"].to_pylist() == [5, 4, 3]
+    expected = dataset.scanner(nearest=nearest, index_segments=[segment]).to_table()
+    expected_ids = [3, 2, 1]
+    ids = expected["id"].to_pylist()
+    assert len(set(ids) & set(expected_ids)) / len(expected_ids) == 1.0
+    assert ids == expected_ids
+
+    selected = [str(segment)]
+    if selection_form == "uuid":
+        selected = [uuid.UUID(str(segment))]
+    elif selection_form == "iterator":
+        selected = iter(selected)
+    elif selection_form == "mapping":
+        selected = {str(segment): "selected"}
+    options = {"nearest": nearest, "index_segments": selected}
+    if clone_options is None:
+        scoped = lance.dataset(tmp_path, default_scan_options=options)
+    else:
+        scoped = dataset.shallow_clone(
+            tmp_path / "clone",
+            reference=(None, None),
+            default_scan_options=options,
+            **clone_options,
+        )
+    assert scoped.schema == expected.schema
+    assert scoped.to_table() == expected
+    assert scoped.to_table() == expected
+    assert scoped.scanner(index_segments=None).to_table() == expected
+
+
+@pytest.mark.parametrize(
+    "segments",
+    [str(uuid.UUID(int=0)), uuid.UUID(int=0), [123]],
+    ids=["bare-string", "bare-uuid", "invalid-element"],
+)
+def test_default_scan_options_invalid_index_segments(tmp_path: Path, segments):
+    lance.write_dataset(pa.table({"id": [0]}), tmp_path)
+    with pytest.raises(TypeError, match="index_segments must be an iterable"):
+        lance.dataset(tmp_path, default_scan_options={"index_segments": segments})
+
+
+def test_shallow_clone_with_failing_default_scope(tmp_path: Path):
+    dataset = lance.write_dataset(pa.table({"id": [0]}), tmp_path / "source")
+    target = tmp_path / "clone"
+
+    def failing_segments():
+        yield str(uuid.UUID(int=0))
+        raise RuntimeError("selection interrupted")
+
+    with pytest.raises(RuntimeError, match="selection interrupted"):
+        dataset.shallow_clone(
+            target,
+            reference=(None, None),
+            default_scan_options={"index_segments": failing_segments()},
+        )
+    assert not target.exists()
+
+
+@pytest.mark.parametrize("option", ["full_text_query", "full_text_search"])
+@pytest.mark.parametrize(
+    "query",
+    [
+        pytest.param("apple", id="string"),
+        pytest.param({"query": "apple", "columns": ["text"]}, id="dictionary"),
+        pytest.param(lance.query.MatchQuery("apple", column="text"), id="object"),
+    ],
+)
+def test_default_scan_options_full_text_query(tmp_path: Path, option: str, query):
+    data = pa.table({"id": [0, 1, 2, 3], "text": [None, "pear", "", "apple"]})
+    dataset = lance.write_dataset(data, tmp_path, max_rows_per_file=2)
+    dataset.create_scalar_index("text", "INVERTED")
+    expected = dataset.scanner(full_text_query=query).to_table()
+    assert expected["id"].to_pylist() == [3]
+
+    searched = lance.dataset(tmp_path, default_scan_options={option: query})
+    assert searched.to_table() == expected
+    assert searched.scanner(full_text_query="pear").to_table()["id"].to_pylist() == [1]
+
+
+def test_default_scan_options_full_text_query_none(tmp_path: Path):
+    data = pa.table({"text": ["apple", "pear"]})
+    lance.write_dataset(data, tmp_path, max_rows_per_file=1)
+    dataset = lance.dataset(tmp_path, default_scan_options={"full_text_query": None})
+    assert dataset.to_table() == data
+
+
+def test_default_scan_options_unknown(tmp_path: Path):
+    lance.write_dataset(pa.table({"id": [0]}), tmp_path)
+    dataset = lance.dataset(tmp_path, default_scan_options={"unknown_option": True})
+    with pytest.raises(ValueError, match="Unknown option unknown_option"):
+        dataset.scanner()
+
+
 def test_inline_deletions(tmp_path: Path):
     import json
 
@@ -8156,6 +8330,33 @@ def test_stats(tmp_path: Path):
     assert data_stats.fields[1].bytes_on_disk > 0
     assert data_stats.fields[2].id == 2
     assert data_stats.fields[2].bytes_on_disk > 0
+
+
+def test_column_value_range(tmp_path: Path):
+    table = pa.table({"x": list(range(100)), "y": ["a"] * 100})
+    dataset = lance.write_dataset(table, tmp_path)
+    dataset.create_scalar_index("x", index_type="ZONEMAP", name="x_zonemap")
+
+    value_range = dataset.stats.column_value_range("x")
+    assert value_range == (0, 99)
+    assert dataset.stats.column_value_range("y") is None
+
+    dataset.insert(pa.table({"x": [1000], "y": ["b"]}))
+    # The new fragment is not covered by the index built before the insert.
+    assert dataset.stats.column_value_range("x") is None
+
+    with pytest.raises(ValueError, match="not found"):
+        dataset.stats.column_value_range("missing")
+
+
+def test_column_value_range_time64_ns_keeps_live_values(tmp_path: Path):
+    values = pa.array([1, 2, 3], type=pa.time64("ns"))
+    dataset = lance.write_dataset(pa.table({"x": values}), tmp_path)
+    dataset.create_scalar_index("x", index_type="ZONEMAP")
+    value_range = dataset.stats.column_value_range("x")
+    assert value_range is not None
+    _, hi = value_range
+    assert not pc.any(pc.greater(values, pa.scalar(hi, type=values.type))).as_py()
 
 
 def test_column_layout_stats(tmp_path: Path):
@@ -9834,6 +10035,21 @@ def test_read_transaction_properties(tmp_path):
     assert props.get("custom_prop") == "custom_value"
 
 
+def test_disable_transaction_file(tmp_path: Path):
+    table = pa.table({"id": [1, 2, 3]})
+    transactions_dir = tmp_path / "_transactions"
+
+    dataset = lance.write_dataset(table, tmp_path, disable_transaction_file=True)
+    assert not transactions_dir.exists() or not any(transactions_dir.iterdir())
+    # The transaction is still readable from the manifest's inline section.
+    operation = dataset.read_transaction(1).operation
+    assert isinstance(operation, lance.LanceOperation.Overwrite)
+
+    dataset = lance.write_dataset(table, tmp_path, mode="append")
+    assert len(list(transactions_dir.iterdir())) == 1
+    assert dataset.count_rows() == 6
+
+
 def test_get_properties_with_no_properties(tmp_path):
     """Test retrieving properties when none were set."""
     # Create a test dataset without properties
@@ -10919,3 +11135,103 @@ class TestLanceScannerTake:
         ds = self._make_dataset(tmp_path)
         scanner = ds.scanner(filter="id >= 4")
         assert scanner.take(pa.array([0, 2]))["id"].to_pylist() == [4, 6]
+
+
+@pytest.mark.parametrize(
+    "method,keyword,error_type",
+    [
+        ("cleanup_old_versions", "older_than", OSError),
+        ("explain_cleanup_old_versions", "older_than", OSError),
+        ("expire_versions", "before", ValueError),
+        ("explain_expire_versions", "before", ValueError),
+    ],
+)
+def test_cleanup_rejects_negative_age(tmp_path: Path, method, keyword, error_type):
+    # A negative age puts the cutoff in the future, which would remove every old
+    # version without any error.
+    data = pa.table({"a": [1]})
+    lance.write_dataset(data, tmp_path)
+    ds = lance.write_dataset(data, tmp_path, mode="append")
+
+    with pytest.raises(error_type, match=f"{keyword} must be non-negative"):
+        getattr(ds, method)(**{keyword: timedelta(days=-1)})
+    assert len(lance.dataset(tmp_path).versions()) == 2
+
+
+@pytest.mark.parametrize(
+    "options,error_type,match",
+    [
+        (
+            {"interval": "5"},
+            TypeError,
+            r"auto_cleanup_options\['interval'\]: .*cannot be interpreted as an int",
+        ),
+        (
+            {"older_than_seconds": "2592000"},
+            TypeError,
+            r"auto_cleanup_options\['older_than_seconds'\]: ",
+        ),
+        (
+            {"interval": -1},
+            OverflowError,
+            r"auto_cleanup_options\['interval'\]: ",
+        ),
+        (
+            {"older_than_seconds": 2**62},
+            ValueError,
+            r"auto_cleanup_options\['older_than_seconds'\] is out of range",
+        ),
+        (True, TypeError, "Mapping"),
+    ],
+)
+def test_auto_cleanup_options_reject_invalid_values(
+    tmp_path, options, error_type, match
+):
+    # Falling back to the default would configure a retention the caller never asked
+    # for.
+    with pytest.raises(error_type, match=match):
+        lance.write_dataset(
+            pa.table({"a": [1]}), tmp_path, mode="create", auto_cleanup_options=options
+        )
+
+
+def test_auto_cleanup_options_partial_and_mapping(tmp_path):
+    table = pa.table({"a": [1]})
+    # A key whose value is None gets its default, like a key that is left out.
+    lance.write_dataset(
+        table,
+        tmp_path / "a",
+        auto_cleanup_options={"interval": None, "older_than_seconds": 3600},
+    )
+    config = lance.dataset(tmp_path / "a").config()
+    assert config["lance.auto_cleanup.interval"] == "20"
+    assert config["lance.auto_cleanup.older_than"] == "1h"
+
+    # Any mapping is accepted, not only a dict.
+    lance.write_dataset(
+        table,
+        tmp_path / "b",
+        auto_cleanup_options=MappingProxyType({"interval": 5}),
+    )
+    assert lance.dataset(tmp_path / "b").config()["lance.auto_cleanup.interval"] == "5"
+
+
+def test_auto_cleanup_options_keep_errors_from_index(tmp_path):
+    # Only pyo3's own conversion errors get the option name. A ValueError or a
+    # TypeError subclass raised by a user's __index__ reaches the caller unchanged.
+    class CustomTypeError(TypeError):
+        pass
+
+    for raised in [ValueError("bad interval"), CustomTypeError("bad interval")]:
+
+        class Interval:
+            def __index__(self):
+                raise raised
+
+        with pytest.raises(type(raised)) as exc_info:
+            lance.write_dataset(
+                pa.table({"a": [1]}),
+                tmp_path / type(raised).__name__,
+                auto_cleanup_options={"interval": Interval()},
+            )
+        assert exc_info.value is raised

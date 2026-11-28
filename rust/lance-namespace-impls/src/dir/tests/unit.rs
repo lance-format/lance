@@ -2,6 +2,79 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use super::*;
+use crate::context::{DynamicContextProvider, OperationInfo};
+
+/// The builder's three flags have supported combinations that must resolve to
+/// the same discovery behavior they had before the internal mode existed.
+/// Migration is intentionally ignored unless both sources are enabled.
+#[rstest]
+#[case::neither(false, false, false, TableDiscoveryMode::NoDiscovery)]
+#[case::neither_ignores_migration(false, false, true, TableDiscoveryMode::NoDiscovery)]
+#[case::directory(false, true, false, TableDiscoveryMode::DirectoryOnly)]
+#[case::directory_ignores_migration(false, true, true, TableDiscoveryMode::DirectoryOnly)]
+#[case::manifest(true, false, false, TableDiscoveryMode::ManifestOnly)]
+#[case::manifest_ignores_migration(true, false, true, TableDiscoveryMode::ManifestOnly)]
+#[case::directory_first(true, true, false, TableDiscoveryMode::DirectoryFirst)]
+#[case::manifest_first(true, true, true, TableDiscoveryMode::ManifestFirst)]
+fn test_table_discovery_mode_resolution(
+    #[case] manifest_enabled: bool,
+    #[case] dir_listing_enabled: bool,
+    #[case] migration_enabled: bool,
+    #[case] expected_mode: TableDiscoveryMode,
+) {
+    let mode =
+        TableDiscoveryMode::from_flags(manifest_enabled, dir_listing_enabled, migration_enabled);
+    assert_eq!(mode, expected_mode);
+
+    let (has_manifest, has_directory_listing, uses_manifest_for_root, merges_manifest_listing) =
+        match expected_mode {
+            TableDiscoveryMode::NoDiscovery => (false, false, false, false),
+            TableDiscoveryMode::DirectoryOnly => (false, true, false, false),
+            TableDiscoveryMode::ManifestOnly => (true, false, true, false),
+            TableDiscoveryMode::DirectoryFirst => (true, true, false, false),
+            TableDiscoveryMode::ManifestFirst => (true, true, true, true),
+        };
+    assert_eq!(mode.has_manifest(), has_manifest);
+    assert_eq!(mode.has_directory_listing(), has_directory_listing);
+    assert_eq!(mode.uses_manifest_for_root(), uses_manifest_for_root);
+    assert_eq!(mode.merges_manifest_listing(), merges_manifest_listing);
+}
+
+#[tokio::test]
+async fn test_context_provider_retained_for_namespace_lifetime() {
+    #[derive(Debug)]
+    struct Provider;
+
+    impl DynamicContextProvider for Provider {
+        fn provide_context(
+            &self,
+            _info: &OperationInfo,
+        ) -> std::collections::HashMap<String, String> {
+            std::collections::HashMap::new()
+        }
+    }
+
+    let temp_dir = TempStdDir::default();
+    let provider = Arc::new(Provider);
+    let provider_ref = Arc::downgrade(&provider);
+    let namespace = DirectoryNamespaceBuilder::new(temp_dir.to_str().unwrap())
+        .context_provider(provider.clone())
+        .build()
+        .await
+        .unwrap();
+
+    drop(provider);
+    assert!(
+        provider_ref.upgrade().is_some(),
+        "the namespace must keep the context provider alive after build"
+    );
+
+    drop(namespace);
+    assert!(
+        provider_ref.upgrade().is_none(),
+        "dropping the namespace must release the context provider"
+    );
+}
 
 fn build_rq_num_bits(index_type: &str, num_bits: Option<i32>) -> Result<u8> {
     let mut request = CreateTableIndexRequest::new("vector".to_string(), index_type.to_string());
@@ -442,37 +515,21 @@ fn test_map_open_error() {
     );
 }
 
-/// The shared parser must decode both naming schemes; this is the cheap
-/// V1 no-regression guard (creating a real V1 table is not exposed here).
-#[test]
-fn test_manifest_version_from_filename() {
-    // V1: the plain version number.
+#[rstest]
+#[case::v1("5.manifest", Some(5))]
+#[case::v1_zero("0.manifest", Some(0))]
+#[case::v2("18446744073709551610.manifest", Some(5))]
+#[case::v2_zero("18446744073709551615.manifest", Some(0))]
+#[case::data("data.lance", None)]
+#[case::detached("d9223372036854775809.manifest", None)]
+#[case::leading_zero("05.manifest", None)]
+#[case::backup("5.backup.manifest", None)]
+#[case::nested("staging/5.manifest", None)]
+fn test_committed_manifest(#[case] entry: &str, #[case] expected: Option<u64>) {
+    let table = Path::from("example.lance");
+    let path = Path::parse(format!("{table}/{VERSIONS_DIR}/{entry}")).unwrap();
     assert_eq!(
-        DirectoryNamespace::manifest_version_from_filename("5.manifest"),
-        Some(5)
-    );
-    assert_eq!(
-        DirectoryNamespace::manifest_version_from_filename("0.manifest"),
-        Some(0)
-    );
-    // V2: version stored as u64::MAX - version, zero-padded to 20 digits.
-    let v2_five = format!("{:020}.manifest", u64::MAX - 5);
-    assert_eq!(
-        DirectoryNamespace::manifest_version_from_filename(&v2_five),
-        Some(5)
-    );
-    let v2_zero = format!("{:020}.manifest", u64::MAX);
-    assert_eq!(
-        DirectoryNamespace::manifest_version_from_filename(&v2_zero),
-        Some(0)
-    );
-    // Non-manifest and detached (`d`-prefixed) entries are ignored.
-    assert_eq!(
-        DirectoryNamespace::manifest_version_from_filename("data.lance"),
-        None
-    );
-    assert_eq!(
-        DirectoryNamespace::manifest_version_from_filename("d5.manifest"),
-        None
+        DirectoryNamespace::committed_manifest(&table, &path).map(|(_, version)| version),
+        expected
     );
 }

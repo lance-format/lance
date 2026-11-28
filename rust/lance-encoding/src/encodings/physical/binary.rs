@@ -317,7 +317,7 @@ fn serialized_variable_cost(
 }
 
 // Compare complete layouts, including value-buffer alignment. Pricing offsets
-// alone can select Delta(Flat) just for omitting its first offset, then lose all
+// alone can select MonotonicDelta(Flat) just for omitting its first offset, then lose all
 // those bytes again to the second buffer's header and padding.
 fn offset_layout_costs<N: OffsetSizeTrait>(
     offsets: &[N],
@@ -1540,7 +1540,7 @@ mod tests {
     }
 
     #[test]
-    fn generic_offsets_use_delta_payload() {
+    fn generic_offsets_use_monotonic_delta_payload() {
         let lengths = (0..4_096)
             .map(|index| [1_usize, 7, 2, 5][index % 4])
             .collect::<Vec<_>>();
@@ -1562,7 +1562,7 @@ mod tests {
                 .offsets
                 .as_deref()
                 .and_then(|offsets| offsets.compression.as_ref()),
-            Some(Compression::Delta(_))
+            Some(Compression::MonotonicDelta(_))
         ));
         assert_eq!(compressed.data.len(), 2);
         assert!(
@@ -1697,7 +1697,7 @@ mod tests {
 
     #[rstest]
     #[case::range([16_usize; 4], "range")]
-    #[case::delta([4_usize, 10, 5, 8], "delta")]
+    #[case::monotonic_delta([4_usize, 10, 5, 8], "monotonic_delta")]
     #[test_log::test(tokio::test)]
     async fn generic_offsets_support_scan_range_take(
         #[case] lengths: [usize; 4],

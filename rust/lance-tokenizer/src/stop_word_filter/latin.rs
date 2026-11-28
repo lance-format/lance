@@ -523,12 +523,13 @@ pub(super) const TURKISH: &[&str] = &[
 // These valid monolingual stop words have content meanings in other languages.
 // Language-specific additions remain opt-in instead of widening the ICU union.
 pub(super) const UNION_EXCLUSIONS: &[&str] = &[
-    "ai", "az", "bin", "cam", "cat", "cite", "d", "dass", "dat", "den", "die", "din", "dog",
-    "door", "du", "ei", "en", "end", "et", "ett", "eu", "frå", "gij", "ham", "hat", "hay", "hem",
-    "hoe", "ill", "inn", "jij", "jou", "jouw", "jullie", "m", "ma", "man", "men", "min", "mint",
-    "mod", "ne", "ni", "no", "nu", "nun", "o", "once", "s", "sale", "sea", "seas", "sin", "sine",
-    "sit", "son", "soy", "t", "tale", "tot", "uno", "unsere", "unserem", "unseren", "unserer",
-    "unseres", "van", "var", "ve", "vi", "want", "war", "wij", "y", "își", "îți", "și", "ți",
+    "ad", "ai", "ale", "az", "bin", "c", "cam", "cat", "ci", "cite", "com", "d", "dass", "dat",
+    "den", "die", "dig", "din", "dog", "door", "du", "e", "ei", "en", "end", "era", "et", "ett",
+    "eu", "frå", "gij", "ham", "hat", "hay", "hem", "hoe", "ill", "inn", "io", "j", "jij", "jou",
+    "jouw", "jullie", "l", "m", "ma", "man", "men", "min", "mine", "mint", "mod", "ne", "ni", "no",
+    "nu", "nun", "o", "once", "os", "pic", "pot", "s", "sale", "sea", "seas", "sin", "sine", "sit",
+    "son", "soy", "t", "tale", "tot", "uno", "unsere", "unserem", "unseren", "unserer", "unseres",
+    "van", "var", "ve", "vi", "want", "war", "wij", "y", "își", "îți", "și", "ți",
 ];
 
 #[cfg(test)]
@@ -540,8 +541,8 @@ mod tests {
 
     #[test]
     fn preserves_latin_search_terms() {
-        let text =
-            "war son sin van want cat dog hay soy sea bin hat nun mint ill don haven won not no";
+        let text = "war son sin van want cat dog hay soy sea bin hat nun mint ill don haven won not no \
+            pot pic ale era mine mining dig ad ads com ci os io vitamin c vitamin e j l";
         for split in [false, true] {
             for stem in [false, true] {
                 let base = if split {

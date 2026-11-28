@@ -71,12 +71,21 @@ jobs:
         with:
           distribution: temurin
           java-version: 17
-          cache: "maven"
+      # Isolate the JNI build's Maven cache from downstream test/publish jobs
+      # and fall back across version bumps in java/pom.xml via restore-keys.
+      - name: Cache JNI Maven dependencies
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        env:
+          MAVEN_CACHE_PREFIX: maven-java-jni-${{ runner.os }}-${{ runner.arch }}-
+        with:
+          path: ~/.m2/repository
+          key: ${{ env.MAVEN_CACHE_PREFIX }}${{ hashFiles('java/**/pom.xml', 'java/.mvn/**') }}
+          restore-keys: ${{ env.MAVEN_CACHE_PREFIX }}
       # Runs the build-jni profile (cargo build + cargo test) but skips the Java
       # tests, which run in the per-JDK jobs against the uploaded library.
       - name: Build and test lance-jni
         working-directory: java
-        run: mvn test -Dmaven.test.skip=true -Dspotless.skip=true
+        run: mvn -B -Daether.connector.http.retryHandler.count=6 test -Dmaven.test.skip=true -Dspotless.skip=true
       - name: Upload native library
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -107,7 +116,15 @@ jobs:
         with:
           distribution: temurin
           java-version: ${{ matrix.java-version }}
-          cache: "maven"
+      # Jobs that skip Spotless can finish without downloading its formatter.
+      - name: Cache Java test dependencies
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        env:
+          MAVEN_CACHE_PREFIX: maven-java-tests-${{ runner.os }}-${{ runner.arch }}-${{ matrix.java-version == '25' && 'without-spotless' || 'with-spotless' }}-
+        with:
+          path: ~/.m2/repository
+          key: ${{ env.MAVEN_CACHE_PREFIX }}${{ hashFiles('java/**/pom.xml', 'java/.mvn/**') }}
+          restore-keys: ${{ env.MAVEN_CACHE_PREFIX }}
       # Skip the format gate on Java 25: google-java-format 1.22.0 (pinned via
       # spotless) reaches into com.sun.tools.javac internals and throws
       # NoSuchMethodError on JDK 25's javac. No google-java-format release runs
@@ -116,8 +133,29 @@ jobs:
       - name: Running code style check with Java ${{ matrix.java-version }}
         if: matrix.java-version != '25'
         working-directory: java
+        shell: bash
         run: |
-          mvn spotless:check
+          log="$RUNNER_TEMP/spotless-check.log"
+          dependency_error='^\[ERROR\] Failed to execute goal com\.diffplug\.spotless:spotless-maven-plugin:[^:]+:check .*Unable to resolve dependencies:'
+          central='https://repo\.maven\.apache\.org/maven2/?'
+          retryable="HTTP Status: 429|Could not find artifact .+ in [^[:space:]]+ \($central\)| was not found in $central during a previous attempt"
+          update_flags=()
+
+          for delay in 10 30 60; do
+            if mvn -B "${update_flags[@]}" spotless:check |& tee "$log"; then
+              exit 0
+            else
+              status=$?
+            fi
+            if ! grep -Eq "$dependency_error.*($retryable)" "$log"; then
+              exit "$status"
+            fi
+
+            printf 'Retrying Spotless dependency resolution in %s seconds.\n' "$delay"
+            sleep "$delay"
+            update_flags=(-U)
+          done
+          mvn -B -U spotless:check
       - name: Start localstack
         run: |
           docker compose -f docker-compose.yml up -d --wait
@@ -129,4 +167,5 @@ jobs:
           # spotless is also bound into the build lifecycle, so on Java 25 the
           # format gate must be skipped here too (-Dspotless.skip=true), not just
           # in the standalone step above.
-          mvn install -Dskip.build.jni=true ${{ matrix.java-version == '25' && '-Dspotless.skip=true' || '' }}
+          # Skip installing the built Lance artifact into the dependency cache.
+          mvn -B -Daether.connector.http.retryHandler.count=6 install -Dskip.build.jni=true -Dmaven.install.skip=true ${{ matrix.java-version == '25' && '-Dspotless.skip=true' || '' }}

@@ -41,7 +41,7 @@ use lance_io::{
 use object_store::{ObjectStoreExt, path::Path};
 use pyo3::{
     Bound, IntoPyObjectExt, Py, PyErr, PyResult, Python,
-    exceptions::{PyIOError, PyRuntimeError},
+    exceptions::{PyIOError, PyRuntimeError, PyValueError},
     pyclass, pyfunction, pymethods,
     types::PyAny,
 };
@@ -1105,10 +1105,20 @@ impl LanceFileReader {
         batch_size: u32,
         batch_readahead: u32,
     ) -> PyResult<PyArrowType<Box<dyn RecordBatchReader + Send>>> {
+        // The reader takes u32 indices; reject larger values instead of letting
+        // them wrap around to a different, valid row.
         let indices = row_indices
             .into_iter()
-            .map(|idx| idx as u32)
-            .collect::<Vec<_>>();
+            .map(|idx| {
+                u32::try_from(idx).map_err(|_| {
+                    PyValueError::new_err(format!(
+                        "take_rows supports row indices up to {}, got {idx}; use read_range \
+                         for rows beyond that",
+                        u32::MAX
+                    ))
+                })
+            })
+            .collect::<PyResult<Vec<_>>>()?;
         let indices_arr = UInt32Array::from(indices);
         self.read_stream(
             lance_io::ReadBatchParams::Indices(indices_arr),

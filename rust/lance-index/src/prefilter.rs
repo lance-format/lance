@@ -73,6 +73,13 @@ pub trait PreFilter: Send + Sync {
         false
     }
 
+    /// Whether the mask carries no query filter, only deleted rows and index
+    /// coverage. Such a mask passes nearly every row, so a search can check it
+    /// on its candidates instead of on every row of a partition.
+    fn deletions_only(&self) -> bool {
+        false
+    }
+
     /// Check whether a slice of row ids should be included in a query.
     ///
     /// Returns a vector of indices into the input slice that should be included,
@@ -80,6 +87,36 @@ pub trait PreFilter: Send + Sync {
     ///
     /// This method must be called after `wait_for_ready`
     fn filter_row_ids<'a>(&self, row_ids: Box<dyn Iterator<Item = &'a u64> + 'a>) -> Vec<u64>;
+
+    /// Fill `out` with selected offsets, clearing its previous contents.
+    ///
+    /// Call after [`Self::wait_for_ready`] with fewer than `u32::MAX` rows.
+    /// Implementations can reuse query-local lookup state across partitions.
+    fn filter_row_offsets_into(&self, row_ids: &[u64], out: &mut Vec<u32>) {
+        self.mask().selected_offsets_into(row_ids.iter(), out);
+    }
+}
+
+/// Estimates the share of a partition's `len` rows that `mask` blocks from
+/// `samples` of them. The offsets are hashed so that deletions in a regular
+/// pattern do not line up with the sample.
+pub fn sample_blocked_share(
+    mask: &RowAddrMask,
+    len: usize,
+    samples: usize,
+    row_id: impl Fn(u32) -> u64,
+) -> f64 {
+    let samples = samples.min(len);
+    if samples == 0 {
+        return 0.0;
+    }
+    let blocked = (0..samples as u64)
+        .filter(|sample| {
+            let offset = (sample.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32) % len as u64;
+            !mask.selected(row_id(offset as u32))
+        })
+        .count();
+    blocked as f64 / samples as f64
 }
 
 /// A prefilter that does nothing

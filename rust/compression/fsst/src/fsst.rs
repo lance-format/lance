@@ -415,12 +415,22 @@ impl SymbolTable {
         let mut input_in_1_word = [0; 8];
         input_in_1_word[..len].copy_from_slice(&input[..len]);
         let input_in_u64 = fsst_unaligned_load_unchecked(input_in_1_word.as_ptr());
-        let hash_idx = fsst_hash(input_in_u64) as usize & (FSST_HASH_TAB_SIZE - 1);
+        // Symbols are inserted under the hash of their first three bytes; hashing
+        // the whole padded word probes a different bucket whenever the fourth byte
+        // is odd, and the symbol is missed. A symbol longer than the input must not
+        // match the zero padding. When no longer symbol starts here, a declared
+        // two-byte symbol is the match, as in `match_next_symbol_in_sample`.
+        let hash_idx = fsst_hash(input_in_u64 & 0xFFFFFF) as usize & (FSST_HASH_TAB_SIZE - 1);
         let s_in_hash_tab = self.hash_tab[hash_idx];
         if s_in_hash_tab.icl < FSST_ICL_FREE
+            && s_in_hash_tab.symbol_len() as usize <= len
             && s_in_hash_tab.val == (input_in_u64 & (u64::MAX >> s_in_hash_tab.ignored_bits()))
         {
             return s_in_hash_tab.code();
+        }
+        let short_code = self.short_codes[(input_in_u64 & 0xFFFF) as usize] & FSST_CODE_MASK;
+        if short_code >= FSST_CODE_BASE {
+            return short_code;
         }
         self.byte_codes[input[0] as usize] & FSST_CODE_MASK
     }
@@ -2352,6 +2362,64 @@ But exactly how the acquaintance and friendship came about, we cannot say.";
         decompress(&table, &bytes, &offsets, &mut out, &mut out_offsets).unwrap();
         assert_eq!(&out[..], b"A");
         assert_eq!(out_offsets, [0, 1]);
+    }
+
+    #[test]
+    fn test_training_slow_path_matches_the_fast_path() {
+        // The slow path of training must find what the fast path finds: a
+        // symbol by the hash of its first three bytes whatever the fourth is,
+        // and otherwise a declared two-byte symbol.
+        let byte = |b: u8| Symbol::from_char(b, 0);
+        let pair = |a: u8, b: u8| Symbol::concat(byte(a), byte(b));
+        let first_code = |st: &SymbolTable| st.symbols[FSST_CODE_BASE as usize].code();
+
+        for word in [b"abcd", b"comm"] {
+            let mut st = SymbolTable::new();
+            let symbol = Symbol::concat(pair(word[0], word[1]), pair(word[2], word[3]));
+            assert!(st.add(symbol));
+            assert_eq!(
+                st.find_longest_symbol_from_char_slice(word),
+                first_code(&st),
+                "{word:?} (fourth byte {})",
+                word[3]
+            );
+        }
+
+        let mut st = SymbolTable::new();
+        assert!(st.add(pair(b'c', b'o')));
+        assert_eq!(
+            st.find_longest_symbol_from_char_slice(b"cox"),
+            first_code(&st)
+        );
+
+        // A symbol longer than the input does not match its zero padding.
+        let mut st = SymbolTable::new();
+        assert!(st.add(Symbol::concat(pair(b'a', b'b'), pair(b'c', 0))));
+        assert_eq!(st.find_longest_symbol_from_char_slice(b"abc"), b'a' as u16);
+    }
+
+    #[test]
+    fn test_training_slow_path_agrees_with_the_fast_path_on_trained_tables() {
+        // Wherever at least 8 bytes remain, both lookups see the same 8-byte load, so
+        // a table trained on real text must give the same code from either of them.
+        for paragraph in [TEST_PARAGRAPH, TEST_PARAGRAPH2, TEST_PARAGRAPH3] {
+            let offsets = [0i32, paragraph.len() as i32];
+            let trained = build_symbol_table(paragraph.as_bytes(), &offsets).unwrap();
+            // Training looks symbols up before `finalize()`. Finalizing moves every code
+            // below FSST_CODE_BASE, so neither lookup would take its two-byte fallback.
+            let mut st = SymbolTable::new();
+            for symbol in &trained.symbols[..trained.n_symbols as usize] {
+                assert!(st.add(*symbol));
+            }
+            let text = paragraph.as_bytes();
+            for curr in 0..text.len() - 7 {
+                assert_eq!(
+                    st.find_longest_symbol_from_char_slice(&text[curr..]),
+                    match_next_symbol_in_sample(&st, text, curr).0,
+                    "position {curr}"
+                );
+            }
+        }
     }
 
     #[test]

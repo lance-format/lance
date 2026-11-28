@@ -40,16 +40,19 @@
 mod cgroup;
 mod components;
 mod events;
+mod ivf;
 mod observer;
 mod proc;
 mod report;
 mod telemetry;
 
 pub use components::{Component, register_component};
+#[doc(hidden)]
+pub use ivf::IvfPartitionCopies;
 pub use observer::{MemoryObserver, OBSERVE_ENV_VAR, StageWindow, set_observation};
 pub use report::OperationReport;
 pub use telemetry::{
-    METRIC_CGROUP, METRIC_CGROUP_LIMIT, METRIC_COMPONENT, METRIC_OPERATION_PEAK, METRIC_RSS,
-    METRIC_RSS_PEAK, METRIC_STAGE_PEAK, PEAK_BOUNDS, describe_metrics, histogram_bounds,
-    refresh_metrics,
+    METRIC_CGROUP, METRIC_CGROUP_LIMIT, METRIC_COMPONENT, METRIC_IVF_PARTITION_BACKING,
+    METRIC_OPERATION_PEAK, METRIC_RSS, METRIC_RSS_PEAK, METRIC_STAGE_PEAK, PEAK_BOUNDS,
+    describe_metrics, histogram_bounds, refresh_metrics,
 };

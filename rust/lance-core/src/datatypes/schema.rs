@@ -810,19 +810,30 @@ impl Schema {
 
     /// Get the sequence of fields from the root to the field with the given id.
     pub fn field_ancestry_by_id(&self, id: i32) -> Option<Vec<&Field>> {
-        let mut to_visit = self.fields.iter().map(|f| vec![f]).collect::<Vec<_>>();
-        while let Some(path) = to_visit.pop() {
-            let field = path.last().unwrap();
-            if field.id == id {
-                return Some(path);
-            }
-            for child in field.children.iter() {
-                let mut new_path = path.clone();
-                new_path.push(child);
-                to_visit.push(new_path);
+        // Keep only ancestors and their remaining siblings, rather than copying
+        // the whole path for every candidate. Preserve the reverse sibling order.
+        let mut ancestors: Vec<(&Field, &[Field])> = Vec::new();
+        let mut remaining = self.fields.as_slice();
+        loop {
+            if let Some((field, siblings)) = remaining.split_last() {
+                if field.id == id {
+                    let mut path = Vec::with_capacity(ancestors.len() + 1);
+                    path.extend(ancestors.iter().map(|(parent, _)| *parent));
+                    path.push(field);
+                    return Some(path);
+                }
+                if field.children.is_empty() {
+                    remaining = siblings;
+                } else {
+                    ancestors.push((field, siblings));
+                    remaining = &field.children;
+                }
+            } else if let Some((_, siblings)) = ancestors.pop() {
+                remaining = siblings;
+            } else {
+                return None;
             }
         }
-        None
     }
 
     pub fn mut_field_by_id(&mut self, id: impl Into<i32>) -> Option<&mut Field> {
@@ -1466,6 +1477,57 @@ impl Projection {
             with_row_created_at_version: false,
             blob_handling: BlobHandling::default(),
         }
+    }
+
+    /// Resolve a requested schema against the base schema by name and type.
+    ///
+    /// Fields can select a subset of the children of a nested column. System
+    /// columns are represented by projection flags. In particular, a request
+    /// for `_rowoffset` selects the row address needed to compute it.
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use lance_core::{ROW_ADDR, datatypes::{Projection, Schema}};
+    ///
+    /// let base = Arc::new(Schema::default());
+    /// let requested = base.project_preserve_system_columns(&[ROW_ADDR])?;
+    /// let projection = Projection::from_schema(base, &requested)?;
+    /// assert!(projection.with_row_addr);
+    /// # Ok::<(), lance_core::Error>(())
+    /// ```
+    pub fn from_schema(base: Arc<dyn Projectable>, requested: &Schema) -> Result<Self> {
+        let mut projection = Self::empty(base);
+        let mut data_fields = Vec::with_capacity(requested.fields.len());
+        for field in &requested.fields {
+            match field.name.as_str() {
+                ROW_ID => projection.with_row_id = true,
+                ROW_ADDR | ROW_OFFSET => projection.with_row_addr = true,
+                ROW_LAST_UPDATED_AT_VERSION => {
+                    projection.with_row_last_updated_at_version = true;
+                }
+                ROW_CREATED_AT_VERSION => projection.with_row_created_at_version = true,
+                name => {
+                    if projection.base_schema().field(name).is_none() {
+                        return Err(Error::invalid_input(format!(
+                            "Column '{name}' not found in schema"
+                        )));
+                    }
+                    data_fields.push(field.clone());
+                }
+            }
+        }
+        // Resolve names and types first. A schema assembled independently can
+        // contain field IDs that designate different columns in this table.
+        let data_schema = Schema {
+            fields: data_fields,
+            metadata: requested.metadata.clone(),
+        };
+        let data_schema = projection.base_schema().project_by_schema(
+            &data_schema,
+            OnMissing::Error,
+            OnTypeMismatch::Error,
+        )?;
+        Ok(projection.union_schema(&data_schema))
     }
 
     pub fn full(base: Arc<dyn Projectable>) -> Self {
@@ -3193,6 +3255,75 @@ mod tests {
 
         let field = schema.field_by_id(3).unwrap();
         assert_eq!(field.name, "f2");
+
+        for (id, names) in [
+            (0, vec!["a"]),
+            (1, vec!["b"]),
+            (2, vec!["b", "f1"]),
+            (3, vec!["b", "f2"]),
+            (4, vec!["b", "f3"]),
+            (5, vec!["c"]),
+        ] {
+            let path = schema.field_ancestry_by_id(id).unwrap();
+            assert_eq!(
+                path.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(),
+                names
+            );
+            assert!(std::ptr::eq(
+                *path.last().unwrap(),
+                schema.field_by_id(id).unwrap()
+            ));
+        }
+        assert!(schema.field_ancestry_by_id(-1).is_none());
+        assert!(Schema::default().field_ancestry_by_id(0).is_none());
+    }
+
+    #[test]
+    fn test_field_ancestry_backtracking_and_duplicate_ids() {
+        let mut root =
+            Field::new_arrow("root", DataType::Struct(Default::default()), true).unwrap();
+        root.id = 0;
+        let mut left = Field::new_arrow("left", DataType::Int32, true).unwrap();
+        left.id = 1;
+        let mut right =
+            Field::new_arrow("right", DataType::Struct(Default::default()), true).unwrap();
+        right.id = 2;
+        let mut leaf = Field::new_arrow("leaf", DataType::Int32, true).unwrap();
+        leaf.id = 3;
+        right.children.push(leaf);
+        root.children = vec![left, right];
+        let mut schema = Schema {
+            fields: vec![root],
+            ..Default::default()
+        };
+        let path = schema.field_ancestry_by_id(3).unwrap();
+        assert_eq!(
+            path.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(),
+            ["root", "right", "leaf"]
+        );
+        let path = schema.field_ancestry_by_id(1).unwrap();
+        assert_eq!(
+            path.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(),
+            ["root", "left"]
+        );
+        assert!(schema.field_ancestry_by_id(4).is_none());
+
+        // Preserve the original traversal's first match, even on unvalidated schemas.
+        schema.fields[0].children[1].children[0].id = 1;
+        assert_eq!(
+            schema.field_ancestry_by_id(1).unwrap().last().unwrap().name,
+            "leaf"
+        );
+        schema.fields[0].children[1].id = 1;
+        assert_eq!(
+            schema.field_ancestry_by_id(1).unwrap().last().unwrap().name,
+            "right"
+        );
+        schema.fields[0].id = 1;
+        assert_eq!(
+            schema.field_ancestry_by_id(1).unwrap().last().unwrap().name,
+            "root"
+        );
     }
 
     #[test]

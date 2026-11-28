@@ -268,8 +268,8 @@ async fn test_remap_index_rejects_malformed_covering_fields() {
     dataset.index_cache.clear().await;
     let metadata_key = crate::session::index_caches::IndexMetadataKey {
         version: dataset.version().version,
-        store_identity: &dataset.object_store.store_prefix,
-        e_tag: dataset.manifest_location.e_tag.as_deref(),
+        store_identity: &dataset.table_state.object_store.store_prefix,
+        e_tag: dataset.table_state.manifest_location.e_tag.as_deref(),
     };
     dataset
         .index_cache
