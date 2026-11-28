@@ -147,12 +147,12 @@ async fn test_scalar_cache_uses_current_object_store(#[case] request_wrappers: b
     let dataset_a = &requests[0];
     let dataset_b = &requests[1];
     assert!(!Arc::ptr_eq(
-        &dataset_a.object_store,
-        &dataset_b.object_store
+        &dataset_a.table_state.object_store,
+        &dataset_b.table_state.object_store
     ));
     assert!(!Arc::ptr_eq(
-        &dataset_a.object_store.inner,
-        &dataset_b.object_store.inner
+        &dataset_a.table_state.object_store.inner,
+        &dataset_b.table_state.object_store.inner
     ));
 
     let initial_metrics = LocalMetricsCollector::default();

@@ -232,13 +232,14 @@ mod tests {
                 data_change: true,
             }),
             Action::SetDeletionFile(SetDeletionFile {
-                fragment: 6,
+                fragment: Ref::Committed(6),
                 deletion_file: DeletionFile {
                     read_version: 3,
                     id: 9,
                     file_type: DeletionFileType::Bitmap,
                     num_deleted_rows: Some(4),
                     base_id: None,
+                    path: Some("_deletions/9.bin".into()),
                     inline: None,
                 },
                 data_change: true,

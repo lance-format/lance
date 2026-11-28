@@ -897,7 +897,6 @@ pub(crate) async fn build_distributed_vector_index(
         }
 
         let dim = crate::index::vector::utils::get_vector_dim(filtered_dataset.schema(), column)?;
-        let metric_type = params.metric_type;
 
         let pre_codebook = pq_params
             .codebook
@@ -918,16 +917,14 @@ pub(crate) async fn build_distributed_vector_index(
         let codebook_fsl =
             arrow_array::FixedSizeListArray::try_new_from_values(pre_codebook, dim as i32)?;
 
+        // Codes go to the nearest codeword by L2 for every metric, as in the
+        // single-node build; search takes the metric from the index metadata.
         Ok(ProductQuantizer::new(
             pq_params.num_sub_vectors,
             pq_params.num_bits as u32,
             dim,
             codebook_fsl,
-            if metric_type == MetricType::Cosine {
-                MetricType::L2
-            } else {
-                metric_type
-            },
+            MetricType::L2,
         ))
     };
 
@@ -2417,7 +2414,7 @@ pub async fn initialize_vector_index(
         ))
     })?;
 
-    let fragment_bitmap = Some(target_dataset.fragment_bitmap.as_ref().clone());
+    let fragment_bitmap = Some(target_dataset.table_state.fragment_bitmap.as_ref().clone());
 
     let new_idx = IndexMetadata {
         uuid: new_uuid,
@@ -2710,11 +2707,11 @@ mod tests {
         .unwrap();
         assert_eq!(dataset.get_fragments().len(), 16);
 
-        dataset.object_store.io_stats_incremental();
+        dataset.table_state.object_store.io_stats_incremental();
         let counted = count_trainable_vectors(&dataset, "vec", ROWS, 256)
             .await
             .unwrap();
-        let bounded_reads = dataset.object_store.io_stats_incremental();
+        let bounded_reads = dataset.table_state.object_store.io_stats_incremental();
         assert!((256..ROWS).contains(&counted), "counted {counted}");
 
         assert_eq!(
@@ -2723,7 +2720,7 @@ mod tests {
                 .unwrap(),
             ROWS
         );
-        let full_reads = dataset.object_store.io_stats_incremental();
+        let full_reads = dataset.table_state.object_store.io_stats_incremental();
         assert!(
             bounded_reads.read_bytes < full_reads.read_bytes / 2,
             "threshold check read {} bytes; full count read {} bytes",
@@ -3879,6 +3876,7 @@ mod tests {
         let training_path = out_base.clone().join("global_training.idx");
 
         let writer = dataset
+            .table_state
             .object_store
             .as_ref()
             .create(&training_path)

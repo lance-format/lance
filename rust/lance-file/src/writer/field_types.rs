@@ -10,6 +10,7 @@
 //! example Arrow JSON text to Lance JSONB); this check only rejects arrays that
 //! skipped it, before any page is encoded.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
@@ -93,18 +94,15 @@ impl ExpectedTypes {
         if self.accepted.as_ref() == Some(&batch_schema) {
             return Ok(());
         }
-        for (index, expected) in self.fields.iter().enumerate() {
-            // Batches usually list columns in schema order; only fall back to
-            // a name search when they do not, so wide schemas stay linear.
-            let actual = batch_schema
-                .fields()
-                .get(index)
-                .filter(|actual| actual.name() == expected.name())
-                .or_else(|| {
-                    let (index, _) = batch_schema.column_with_name(expected.name())?;
-                    batch_schema.fields().get(index)
-                });
-            if let Some(actual) = actual {
+        // Match column_by_name's first occurrence even when a later duplicate
+        // happens to occupy the expected position. Build once per schema so
+        // reordered wide batches do not need a name scan for every field.
+        let mut fields_by_name = HashMap::with_capacity(batch_schema.fields().len());
+        for field in batch_schema.fields() {
+            fields_by_name.entry(field.name()).or_insert(field);
+        }
+        for expected in &self.fields {
+            if let Some(actual) = fields_by_name.get(expected.name()) {
                 check_field(expected, actual, true).map_err(into_error)?;
             }
         }

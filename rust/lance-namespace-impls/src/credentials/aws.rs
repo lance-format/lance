@@ -336,29 +336,21 @@ impl AwsCredentialVendor {
             .and_then(|v| v.as_str())
             .unwrap_or("unknown");
 
-        // Sanitize for role session name (alphanumeric, =, @, -, .)
+        // Sanitize for role session name (ASCII alphanumeric, =, @, -, .): STS
+        // rejects non-ASCII characters.
         let sanitized: String = subject
             .chars()
-            .filter(|c| c.is_alphanumeric() || *c == '=' || *c == '@' || *c == '-' || *c == '.')
+            .filter(|c| {
+                c.is_ascii_alphanumeric() || *c == '=' || *c == '@' || *c == '-' || *c == '.'
+            })
             .collect();
 
-        let session_name = format!("lance-{}", sanitized);
-
-        // Cap to 64 chars (AWS limit)
-        if session_name.len() > 64 {
-            session_name[..64].to_string()
-        } else {
-            session_name
-        }
+        Self::cap_session_name(&format!("lance-{}", sanitized))
     }
 
-    /// Cap a session name to 64 characters (AWS limit).
+    /// Cap a session name to 64 bytes (AWS limit) without splitting a character.
     fn cap_session_name(name: &str) -> String {
-        if name.len() > 64 {
-            name[..64].to_string()
-        } else {
-            name.to_string()
-        }
+        name[..name.floor_char_boundary(64)].to_string()
     }
 
     /// Extract credentials from an STS Credentials response.
@@ -848,6 +840,41 @@ mod tests {
             err.to_string()
                 .contains("failed to read pod web identity token"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::cjk_sub(r#"{"sub":"用戶名稱測試資料用戶名稱測試資料再加四字"}"#, "lance-")]
+    #[case::mixed_sub(r#"{"sub":"張三.zhang@example.com"}"#, "lance-.zhang@example.com")]
+    #[case::long_email(
+        r#"{"email":"a.very.long.mailbox.name.for.testing@example-subdomain.example.com"}"#,
+        "lance-a.very.long.mailbox.name.for.testing@example-subdomain.exa"
+    )]
+    fn test_session_name_from_token_is_valid_for_sts(
+        #[case] payload: &str,
+        #[case] expected: &str,
+    ) {
+        // The header and signature segments are never parsed.
+        let jwt = format!("header.{}.signature", URL_SAFE_NO_PAD.encode(payload));
+        let session_name = AwsCredentialVendor::derive_session_name_from_token(&jwt);
+        assert_eq!(session_name, expected);
+        assert!(
+            session_name.len() <= 64
+                && session_name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "=.@-".contains(c)),
+            "STS rejects session name {session_name:?}"
+        );
+    }
+
+    #[test]
+    fn test_cap_session_name_keeps_whole_characters() {
+        // Operator-configured names are not sanitized; byte 64 falls inside a
+        // three-byte character here.
+        let name = format!("{}a", "中".repeat(23));
+        assert_eq!(
+            AwsCredentialVendor::cap_session_name(&name),
+            "中".repeat(21)
         );
     }
 

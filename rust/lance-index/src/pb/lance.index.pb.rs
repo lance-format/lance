@@ -123,7 +123,7 @@ pub struct Ivf {
     /// Number of records in the partition.
     #[prost(uint32, repeated, tag = "3")]
     pub lengths: ::prost::alloc::vec::Vec<u32>,
-    /// Tensor of centroids. `num_partitions * dimension` of float32s.
+    /// Centroid tensor of shape `\[num_partitions, dimension\]` with type `Tensor.data_type`.
     #[prost(message, optional, tag = "4")]
     pub centroids_tensor: ::core::option::Option<Tensor>,
     /// KMeans loss.
@@ -447,8 +447,7 @@ impl ::prost::Name for VectorIndexDetails {
 /// Hierarchical Navigable Small World (HNSW) parameters, used as an optional configuration for IVF indexes.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct HnswParameters {
-    /// The maximum number of outgoing edges per node in the HNSW graph. Higher values
-    /// means more connections, better recall, but more memory and slower builds.
+    /// The maximum number of neighbors selected for a new node at each level.
     /// Referred to as "M" in the HNSW literature.
     #[prost(uint32, tag = "1")]
     pub max_connections: u32,

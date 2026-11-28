@@ -21,8 +21,10 @@ use prost::Message;
 use crate::EncodingsIo;
 use crate::buffer::LanceBuffer;
 use crate::compression::DefaultDecompressionStrategy;
+#[cfg(feature = "bitpacking")]
+use crate::compression::{BlockCompressor, CompressionStrategy, try_bitpacking_block};
 use crate::constants::{
-    COMPRESSION_LEVEL_META_KEY, COMPRESSION_META_KEY, DICT_DIVISOR_META_KEY,
+    AXIS_DELTA_META_KEY, COMPRESSION_LEVEL_META_KEY, COMPRESSION_META_KEY, DICT_DIVISOR_META_KEY,
     DICT_SIZE_RATIO_META_KEY, DICT_VALUES_COMPRESSION_LEVEL_META_KEY,
     DICT_VALUES_COMPRESSION_META_KEY, STRUCTURAL_ENCODING_META_KEY, STRUCTURAL_ENCODING_MINIBLOCK,
 };
@@ -38,6 +40,16 @@ use crate::testing::{
     TestCases, TestEncoding, check_round_trip_encoding_of_data,
     check_round_trip_encoding_of_data_with_expected,
 };
+#[cfg(feature = "bitpacking")]
+use crate::{
+    encodings::{
+        logical::primitive::{fullzip::PerValueCompressor, miniblock::MiniBlockCompressor},
+        physical::value::ValueEncoder,
+    },
+    repdef::{DefinitionInterpretation, SerializedRepDefs},
+};
+#[cfg(feature = "bitpacking")]
+use lance_core::{Result, datatypes::Field};
 
 use super::{DictionaryEncodingPolicy, MiniblockChunkSize, PrimitiveStructuralEncoder};
 
@@ -870,7 +882,7 @@ async fn test_tensor_per_value_compression(
         (COMPRESSION_META_KEY.to_string(), compression.to_string()),
         (COMPRESSION_LEVEL_META_KEY.to_string(), "3".to_string()),
         // Exercise the configured codec independently of automatic selection.
-        ("lance-encoding:axis-delta".to_string(), "off".to_string()),
+        (AXIS_DELTA_META_KEY.to_string(), "off".to_string()),
     ]);
     let field = arrow_schema::Field::new("tensor", array.data_type().clone(), true)
         .with_metadata(metadata.clone());
@@ -1286,6 +1298,103 @@ fn test_v2_1_miniblock_serializes_log_num_values_15() {
     );
 }
 
+#[cfg(feature = "bitpacking")]
+#[rstest::rstest]
+#[case::level_count(true, 49_150)]
+#[case::level_buffer_bytes(false, 16_384)]
+fn test_explicit_minichunk_size_reduces_to_fit_dense_levels(
+    #[case] compressed_levels: bool,
+    #[case] first_chunk_levels: u16,
+) {
+    // The raw case overflows only the level buffer length. The bitpacked case
+    // has small buffers but more levels than the count field can hold.
+    #[derive(Debug)]
+    struct Strategy(bool);
+    impl CompressionStrategy for Strategy {
+        fn minichunk_size(&self, _field: &Field) -> Result<Option<u64>> {
+            Ok(Some(256 * 1024))
+        }
+
+        fn create_block_compressor(
+            &self,
+            _field: &Field,
+            data: &DataBlock,
+        ) -> Result<Box<dyn BlockCompressor>> {
+            Ok(if self.0 {
+                try_bitpacking_block(data).unwrap()
+            } else {
+                Box::new(ValueEncoder::default())
+            })
+        }
+
+        fn create_per_value(
+            &self,
+            _field: &Field,
+            _data: &DataBlock,
+        ) -> Result<Box<dyn PerValueCompressor>> {
+            Ok(Box::new(ValueEncoder::default()))
+        }
+
+        fn create_miniblock_compressor(
+            &self,
+            _field: &Field,
+            _data: &DataBlock,
+        ) -> Result<Box<dyn MiniBlockCompressor>> {
+            Ok(Box::new(ValueEncoder::default()))
+        }
+    }
+
+    let num_values = 32_769;
+    let data = DataBlock::FixedWidth(FixedWidthDataBlock {
+        data: LanceBuffer::reinterpret_vec((0..num_values).collect::<Vec<u64>>()),
+        bits_per_value: 64,
+        num_values,
+        block_info: BlockInfo::new(),
+    });
+    let (rep, def, layers) = if compressed_levels {
+        // One visible list item followed by two empty lists. A count of
+        // 32,768 values needs 98,302 levels in the first chunk.
+        (
+            Some(vec![1; 3 * num_values as usize]),
+            [0, 1, 1].repeat(num_values as usize),
+            vec![
+                DefinitionInterpretation::AllValidItem,
+                DefinitionInterpretation::EmptyableList,
+            ],
+        )
+    } else {
+        (
+            None,
+            (0..num_values).map(|i| (i % 2) as u16).collect::<Vec<_>>(),
+            vec![DefinitionInterpretation::NullableItem],
+        )
+    };
+    let num_rows = def.len() as u64;
+    let repdef = SerializedRepDefs::new(rep, Some(def), layers);
+    let field = Field::new_arrow("value", DataType::UInt64, true).unwrap();
+    let encoded = PrimitiveStructuralEncoder::encode_miniblock(
+        0,
+        &field,
+        &Strategy(compressed_levels),
+        data,
+        repdef,
+        0,
+        None,
+        num_rows,
+        MiniblockChunkSize::U32,
+    )
+    .unwrap();
+    let words = encoded.data[0].borrow_to_typed_slice::<u32>();
+    assert_eq!(
+        words.iter().map(|word| word & 15).collect::<Vec<_>>(),
+        [14, 14, 0]
+    );
+    assert_eq!(
+        u16::from_le_bytes(encoded.data[1][..2].try_into().unwrap()),
+        first_chunk_levels
+    );
+}
+
 async fn encode_first_page(
     field: arrow_schema::Field,
     array: ArrayRef,
@@ -1518,7 +1627,7 @@ async fn test_v2_3_generic_offsets_preserve_legacy_and_take_io() {
     ));
     assert!(matches!(
         variable_offset_compression(&v2_3),
-        Compression::Delta(_)
+        Compression::MonotonicDelta(_)
     ));
     assert!(variable_value_wire_bytes(&v2_3) < variable_value_wire_bytes(&v2_2));
     assert_eq!(miniblock_layout(&v2_2).num_buffers, 1);
@@ -2167,11 +2276,11 @@ async fn test_axis_delta_per_value_compression(
             "lance-encoding:structural-encoding".to_string(),
             structure.to_string(),
         ),
-        ("lance-encoding:axis-delta".to_string(), mode.to_string()),
+        (AXIS_DELTA_META_KEY.to_string(), mode.to_string()),
         (COMPRESSION_META_KEY.to_string(), compression.to_string()),
     ]);
     if mode == "default" {
-        metadata.remove("lance-encoding:axis-delta");
+        metadata.remove(AXIS_DELTA_META_KEY);
     }
     metadata.insert(
         "ARROW:extension:name".into(),
@@ -2303,7 +2412,7 @@ async fn test_default_axis_delta_preserves_other_encodings(
         // or the tensor is unsupported. Stable writers already use raw storage.
         metadata.remove(COMPRESSION_META_KEY);
     }
-    metadata.insert("lance-encoding:axis-delta".into(), "off".into());
+    metadata.insert(AXIS_DELTA_META_KEY.into(), "off".into());
     let field =
         arrow_schema::Field::new("value", array.data_type().clone(), false).with_metadata(metadata);
     let disabled = encode_first_page(field, array, version).await;
