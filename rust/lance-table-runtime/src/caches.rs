@@ -156,7 +156,7 @@ impl CacheKey for DeletionFileKey<'_> {
     }
 
     fn schema() -> CacheKeySchema {
-        CacheKeySchema::new("lance.dataset.deletion-file-key", 2)
+        CacheKeySchema::new("lance.dataset.deletion-file-key", 3)
     }
 
     fn write_key(&self, builder: &mut KeyBuilder) {
@@ -179,6 +179,9 @@ impl CacheKey for DeletionFileKey<'_> {
             builder.write_str(path);
         } else {
             builder.write_none();
+        }
+        if let Some(inline) = &self.deletion_file.inline {
+            builder.write_bytes(inline);
         }
     }
 }

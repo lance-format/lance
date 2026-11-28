@@ -39,6 +39,7 @@ pub(super) struct Staged {
     /// Carried separately because `CommitBuilder` takes it separately; the
     /// second phase of delete/update conflict detection needs it.
     pub affected_rows: Option<RowAddrTreeMap>,
+    inserted_row_count: Option<u64>,
 }
 
 impl Staged {
@@ -46,6 +47,7 @@ impl Staged {
         Self {
             transaction,
             affected_rows: None,
+            inserted_row_count: None,
         }
     }
 
@@ -53,6 +55,7 @@ impl Staged {
         Self {
             transaction,
             affected_rows,
+            inserted_row_count: None,
         }
     }
 
@@ -60,6 +63,9 @@ impl Staged {
     /// the latest version is what forces the rebase under test.
     pub async fn commit(self, base: &Arc<Dataset>) -> Result<Dataset> {
         let mut builder = CommitBuilder::new(base.clone()).with_max_retries(1);
+        if let Some(count) = self.inserted_row_count {
+            builder = builder.with_inserted_row_count(count);
+        }
         if let Some(rows) = self.affected_rows {
             builder = builder.with_affected_rows(rows);
         }
@@ -433,10 +439,11 @@ async fn stage_update_rewrite_rows(dataset: &Arc<Dataset>, fragment: usize) -> R
         .try_build()?
         .execute_uncommitted(reader)
         .await?;
-    Ok(Staged::with_affected_rows(
-        staged.transaction,
-        staged.affected_rows,
-    ))
+    Ok(Staged {
+        transaction: staged.transaction,
+        affected_rows: staged.affected_rows,
+        inserted_row_count: Some(staged.stats.num_inserted_rows),
+    })
 }
 
 /// `RewriteColumns` has no uncommitted builder, so it is assembled from the

@@ -78,6 +78,8 @@ pub struct TransactionRebase<'a> {
     /// Fragments that have been deleted or modified
     modified_fragment_ids: HashSet<u64>,
     affected_rows: Option<&'a RowAddrTreeMap>,
+    /// The original read snapshot and masks checked before finishing a row rebase.
+    row_history: Option<Box<staged_update::RowHistory>>,
     /// Boxed: the commit loop holds the rebase across awaits.
     frag_reuse_base: Option<Box<FragReuseBase>>,
     /// Compacted SSTables from conflicting UpdateMemWalState transactions.
@@ -296,6 +298,7 @@ fn updates_schema_or_field_metadata(operation: &Operation) -> bool {
 mod check;
 mod finish;
 mod init;
+mod staged_update;
 
 impl<'a> TransactionRebase<'a> {
     #[track_caller]

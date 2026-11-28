@@ -459,6 +459,7 @@ fn test_conflicts() {
     for (operation, expected_conflicts) in &cases {
         let transaction = Transaction::new(0, operation.clone(), None);
         let mut rebase = TransactionRebase {
+            row_history: None,
             transaction,
             initial_fragments: HashMap::new(),
             modified_fragment_ids: modified_fragment_ids(operation).collect::<HashSet<_>>(),
@@ -706,6 +707,7 @@ fn test_data_overlay_conflicts() {
 
     for (other, expected) in cases {
         let mut rebase = TransactionRebase {
+            row_history: None,
             transaction: Transaction::new(0, overlay_op(1), None),
             initial_fragments: HashMap::new(),
             modified_fragment_ids: modified_fragment_ids(&overlay_op(1)).collect::<HashSet<_>>(),
@@ -773,6 +775,7 @@ fn test_rewrite_conflicts_with_data_overlay() {
 
     for (other, expect_conflict) in [(overlay_on(1), true), (overlay_on(0), false)] {
         let mut rebase = TransactionRebase {
+            row_history: None,
             transaction: Transaction::new(0, rewrite_op.clone(), None),
             initial_fragments: HashMap::new(),
             modified_fragment_ids: modified_fragment_ids(&rewrite_op).collect::<HashSet<_>>(),
@@ -923,6 +926,7 @@ fn test_update_conflicts_with_data_overlay() {
 
     for (update_op, other, affected_rows, expect_conflict) in cases {
         let mut rebase = TransactionRebase {
+            row_history: None,
             transaction: Transaction::new(0, update_op.clone(), None),
             initial_fragments: HashMap::new(),
             modified_fragment_ids: modified_fragment_ids(&update_op).collect::<HashSet<_>>(),
@@ -1000,6 +1004,7 @@ fn test_schema_change_blocks_stale_append(
         };
 
         let mut append_rebase = TransactionRebase {
+            row_history: None,
             transaction: Transaction::new(0, append.clone(), None),
             initial_fragments: HashMap::new(),
             modified_fragment_ids: HashSet::new(),
@@ -1023,6 +1028,7 @@ fn test_schema_change_blocks_stale_append(
         );
 
         let mut schema_rebase = TransactionRebase {
+            row_history: None,
             transaction: Transaction::new(0, schema_change.clone(), None),
             initial_fragments: HashMap::new(),
             modified_fragment_ids: HashSet::from_iter([0]),
@@ -1114,6 +1120,7 @@ fn test_non_null_claim_barrier() {
                 ("writer-rebasing", writer.clone(), project.clone()),
             ] {
                 let mut rebase = TransactionRebase {
+                    row_history: None,
                     transaction: Transaction::new(0, ours.clone(), None),
                     initial_fragments: HashMap::new(),
                     modified_fragment_ids: modified_fragment_ids(&ours).collect::<HashSet<_>>(),
@@ -1173,6 +1180,7 @@ fn test_column_rewrite_conflicts_with_a_projection_that_dropped_its_field(
         preserves_nullability: true,
     };
     let mut rebase = TransactionRebase {
+        row_history: None,
         transaction: Transaction::new(0, rewrite.clone(), None),
         initial_fragments: HashMap::new(),
         modified_fragment_ids: modified_fragment_ids(&rewrite).collect::<HashSet<_>>(),
@@ -1308,6 +1316,7 @@ fn test_create_index_rebase_prunes_updated_field_coverage(
         metadata: Default::default(),
     };
     let mut rebase = TransactionRebase {
+        row_history: None,
         transaction: Transaction::new(
             1,
             Operation::CreateIndex {
@@ -1415,6 +1424,7 @@ impl CoveringConflictSite {
         ))
         .unwrap();
         let rebase_of = |ours: Operation| TransactionRebase {
+            row_history: None,
             transaction: Transaction::new(1, ours, None),
             initial_fragments: HashMap::new(),
             modified_fragment_ids: HashSet::new(),
@@ -1597,6 +1607,7 @@ fn test_update_config_conflicts_with_restore(
         (restore.operation, update),
     ] {
         let mut rebase = TransactionRebase {
+            row_history: None,
             transaction: Transaction::new(0, ours, None),
             initial_fragments: HashMap::new(),
             modified_fragment_ids: HashSet::new(),
@@ -2083,6 +2094,7 @@ async fn test_conflicts_data_replacement() {
         let txn2 = Transaction::new(0, op2.clone(), None);
 
         let mut rebase = TransactionRebase {
+            row_history: None,
             transaction: txn1,
             initial_fragments: HashMap::new(),
             modified_fragment_ids: modified_fragment_ids(&op1).collect::<HashSet<_>>(),

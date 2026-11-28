@@ -112,6 +112,7 @@ pub struct CommitBuilder<'a> {
     commit_config: CommitConfig,
     retry_timeout: Duration,
     affected_rows: Option<RowAddrTreeMap>,
+    inserted_row_count: Option<u64>,
     transaction_properties: Option<Arc<HashMap<String, String>>>,
     append_idempotency_property: Option<String>,
     timeout: Option<Duration>,
@@ -143,6 +144,7 @@ impl<'a> CommitBuilder<'a> {
             commit_config: Default::default(),
             retry_timeout: default_commit_retry_timeout(),
             affected_rows: None,
+            inserted_row_count: None,
             transaction_properties: None,
             append_idempotency_property: None,
             timeout: Some(DEFAULT_COMMIT_TIMEOUT),
@@ -366,6 +368,20 @@ impl<'a> CommitBuilder<'a> {
     /// used to perform fast conflict resolution.
     pub fn with_affected_rows(mut self, affected_rows: RowAddrTreeMap) -> Self {
         self.affected_rows = Some(affected_rows);
+        self
+    }
+
+    /// Supply the number of rows newly inserted by the staged write. A pure
+    /// UPDATE relocates rows but inserts zero new logical rows.
+    ///
+    /// ```
+    /// use lance_table_runtime::CommitBuilder;
+    /// # fn stage(count: u64) {
+    /// let builder = CommitBuilder::new("memory://dataset").with_inserted_row_count(count);
+    /// # }
+    /// ```
+    pub fn with_inserted_row_count(mut self, count: u64) -> Self {
+        self.inserted_row_count = Some(count);
         self
     }
 
@@ -762,6 +778,7 @@ impl<'a> CommitBuilder<'a> {
                     )
                     .with_retry_timeout(self.retry_timeout)
                     .with_affected_rows(self.affected_rows.as_ref())
+                    .with_inserted_row_count(self.inserted_row_count)
                     .with_append_idempotency_key(append_idempotency_key),
                     hooks,
                 )
