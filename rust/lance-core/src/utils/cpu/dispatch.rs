@@ -136,9 +136,17 @@ impl_call!(
 );
 impl_call!(
     <A: ?Sized, B: ?Sized, C: ?Sized, D: ?Sized, E: ?Sized>
+    fn(a: &A, b: &B, c: &C, d: &D, e: &mut E)
+);
+impl_call!(
+    <A: ?Sized, B: ?Sized, C: ?Sized, D: ?Sized, E: ?Sized>
     fn(a: &A, b: &B, c: &C, d: &D, e: &E, f: f32, g: Option<f32>)
 );
 impl_call!(<B: ?Sized, C: ?Sized> fn(a: u64, b: &B, c: &mut C));
+impl_call!(
+    <A: ?Sized, C: ?Sized, D: ?Sized, E: ?Sized, G: ?Sized>
+    fn(a: &A, b: u64, c: &C, d: &D, e: &E, f: f32, g: &mut G)
+);
 
 /// One operation's kernels, best first, with the host's choice made once.
 ///
@@ -205,6 +213,12 @@ impl<F: Copy> Dispatch<F> {
             return Kernel(self.candidates[0].kernel);
         }
         Kernel(*self.selected.0.get_or_init(|| self.selected().kernel))
+    }
+
+    /// The last candidate, which every host supports.
+    pub fn fallback(&self) -> Kernel<F> {
+        // `new` rejects a last candidate that needs any feature.
+        Kernel(self.candidates[self.candidates.len() - 1].kernel)
     }
 
     /// The candidate [`Self::get`] returns.
@@ -435,6 +449,22 @@ mod tests {
         // The first call selects and caches; the second reads the cache.
         assert_eq!(UNSUPPORTED_FIRST.get().call(&[1.0, 2.0], &[3.0]), 6.0);
         assert_eq!(UNSUPPORTED_FIRST.get().call(&[1.0, 2.0], &[3.0]), 6.0);
+    }
+
+    // SAFETY: the kernel is a plain Rust function without target features.
+    const DOUBLED_SUM: Candidate<SumFn> =
+        unsafe { Candidate::new("doubled", CpuFeatures::empty(), doubled_sum) };
+
+    crate::dispatch! {
+        static DOUBLED_FIRST: Dispatch<SumFn> = &[DOUBLED_SUM, PORTABLE_SUM];
+    }
+
+    #[test]
+    fn fallback_is_the_last_candidate() {
+        assert_eq!(DOUBLED_FIRST.get().call(&[1.0, 2.0], &[3.0]), 12.0);
+        assert_eq!(DOUBLED_FIRST.fallback().call(&[1.0, 2.0], &[3.0]), 6.0);
+        assert_eq!(UNSUPPORTED_FIRST.fallback().call(&[1.0, 2.0], &[3.0]), 6.0);
+        assert_eq!(PORTABLE_ONLY.fallback().call(&[1.0, 2.0], &[3.0]), 6.0);
     }
 
     #[test]
