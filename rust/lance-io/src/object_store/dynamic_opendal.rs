@@ -251,11 +251,13 @@ impl OSObjectStore for DynamicOpenDalStore {
 
 #[cfg(test)]
 mod tests {
+    use mock_instant::thread_local::MockClock;
     use std::collections::HashMap;
     use std::sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     };
+    use std::time::Duration;
 
     use async_trait::async_trait;
     use object_store::ObjectStoreExt as _;
@@ -400,5 +402,86 @@ mod tests {
         assert_eq!(merged.get("bucket").unwrap(), "url-bucket");
         assert_eq!(merged.get("root").unwrap(), "/");
         assert_eq!(merged.get("token").unwrap(), "provider-token");
+    }
+
+    #[derive(Debug, Default)]
+    struct InitiallyAbsentProvider {
+        calls: AtomicUsize,
+        available: AtomicBool,
+    }
+
+    #[async_trait]
+    impl StorageOptionsProvider for InitiallyAbsentProvider {
+        async fn fetch_storage_options(&self) -> Result<Option<HashMap<String, String>>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self.available.load(Ordering::SeqCst).then(|| {
+                HashMap::from([
+                    ("token".into(), "shared".into()),
+                    ("base_7.token".into(), "seven".into()),
+                ])
+            }))
+        }
+
+        fn provider_id(&self) -> String {
+            "initially-absent".into()
+        }
+    }
+
+    #[rstest::rstest]
+    #[case::default_scope(None, "shared")]
+    #[case::numbered_scope(Some(7), "seven")]
+    #[tokio::test]
+    async fn operations_refresh_scoped_absence_without_repeated_provider_calls(
+        #[case] base_id: Option<u32>,
+        #[case] expected_token: &str,
+    ) {
+        MockClock::set_system_time(Duration::from_secs(100_000));
+        let provider = Arc::new(InitiallyAbsentProvider::default());
+        let parent = Arc::new(StorageOptionsAccessor::with_provider(provider.clone()));
+        assert!(parent.get_storage_options().await.unwrap().0.is_empty());
+        provider.available.store(true, Ordering::SeqCst);
+        MockClock::advance(Duration::from_secs(1));
+        MockClock::advance_system_time(Duration::from_secs(1));
+        let store = DynamicOpenDalStore::new(
+            "memory",
+            HashMap::new(),
+            parent.scoped_to_base(base_id),
+            |options| Ok(options.clone()),
+            build_memory_store,
+        );
+        let path = Path::from("file");
+        store
+            .put(&path, Bytes::from_static(b"before").into())
+            .await
+            .unwrap();
+        let before = store.current_store().await.unwrap();
+        for _ in 0..8 {
+            store.head(&path).await.unwrap();
+            assert_eq!(
+                store.get(&path).await.unwrap().bytes().await.unwrap(),
+                Bytes::from_static(b"before")
+            );
+        }
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        MockClock::advance(Duration::from_secs(59));
+        MockClock::advance_system_time(Duration::from_secs(59));
+        store
+            .put(&path, Bytes::from_static(b"after").into())
+            .await
+            .unwrap();
+        let after = store.current_store().await.unwrap();
+        assert!(!Arc::ptr_eq(&before, &after));
+        assert_eq!(
+            store.cache.read().await.as_ref().unwrap().config["token"],
+            expected_token
+        );
+        for _ in 0..8 {
+            store.head(&path).await.unwrap();
+            assert_eq!(
+                store.get(&path).await.unwrap().bytes().await.unwrap(),
+                Bytes::from_static(b"after")
+            );
+        }
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
     }
 }

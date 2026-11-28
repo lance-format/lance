@@ -9,21 +9,22 @@
 //! - [`StorageOptionsAccessor`] for unified access to storage options with automatic
 //!   caching and refresh
 
-use std::collections::HashMap;
+use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
 #[cfg(test)]
-use mock_instant::thread_local::{SystemTime, UNIX_EPOCH};
+use mock_instant::thread_local::{Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(not(test))]
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use lance_namespace::LanceNamespace;
 use lance_namespace::models::DescribeTableRequest;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 use crate::{Error, Result};
 
@@ -228,10 +229,8 @@ pub fn resolve_base_scoped_options(
 /// A [`StorageOptionsProvider`] that resolves another accessor's options for a
 /// single base path scope.
 ///
-/// Fetching through this provider first refreshes the parent accessor when its
-/// options have expired, then resolves the refreshed options for the scope. As
-/// a result, dynamically vended per-base credentials (e.g. a namespace server
-/// returning `base_<id>.<key>` entries in one flat map) stay fresh per base.
+/// Fetching through this provider checks expiration for the requested scope.
+/// The parent accessor shares refreshed options across all scopes.
 #[derive(Debug)]
 pub struct BaseScopedStorageOptionsProvider {
     inner: Arc<StorageOptionsAccessor>,
@@ -247,13 +246,19 @@ impl BaseScopedStorageOptionsProvider {
 #[async_trait]
 impl StorageOptionsProvider for BaseScopedStorageOptionsProvider {
     async fn fetch_storage_options(&self) -> Result<Option<HashMap<String, String>>> {
-        let options = self.inner.get_storage_options().await?;
-        Ok(Some(resolve_base_scoped_options(&options.0, self.base_id)))
+        let options = self
+            .inner
+            .read_storage_options(StorageOptionsScope::Base(self.base_id), false)
+            .await?;
+        Ok(Some(options.0))
     }
 
     async fn force_fetch_storage_options(&self) -> Result<Option<HashMap<String, String>>> {
-        let options = self.inner.refresh_storage_options().await?;
-        Ok(Some(resolve_base_scoped_options(&options.0, self.base_id)))
+        let options = self
+            .inner
+            .read_storage_options(StorageOptionsScope::Base(self.base_id), true)
+            .await?;
+        Ok(Some(options.0))
     }
 
     fn provider_id(&self) -> String {
@@ -280,16 +285,19 @@ impl StorageOptionsProvider for BaseScopedStorageOptionsProvider {
 /// # Thread Safety
 ///
 /// The accessor is thread-safe and can be shared across multiple tasks.
-/// Concurrent refresh attempts are deduplicated using a try-lock mechanism.
+/// Concurrent reads share a refresh when it makes their options fresh.
 pub struct StorageOptionsAccessor {
     /// Initial/fallback static storage options
-    initial_options: Option<HashMap<String, String>>,
+    initial_options: Option<StorageOptionsSnapshot>,
 
     /// Optional dynamic provider for refreshing options
     provider: Option<Arc<dyn StorageOptionsProvider>>,
 
     /// Cached storage options with expiration tracking
-    cache: Arc<RwLock<Option<CachedStorageOptions>>>,
+    cache: RwLock<Arc<CachedStorageOptions>>,
+
+    /// Serializes provider fetches while allowing fresh scopes to read the cache.
+    refresh_gate: Mutex<()>,
 
     /// Duration before expiry to trigger refresh
     refresh_offset: Duration,
@@ -298,6 +306,9 @@ pub struct StorageOptionsAccessor {
     /// options are already resolved for one base path scope, so scoping again
     /// is a no-op.
     scope_resolved: bool,
+
+    /// Dynamic scopes use their parent's cache and freshness, never a resolved snapshot.
+    scoped_provider: Option<Arc<BaseScopedStorageOptionsProvider>>,
 }
 
 impl fmt::Debug for StorageOptionsAccessor {
@@ -310,10 +321,72 @@ impl fmt::Debug for StorageOptionsAccessor {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum StorageOptionsScope {
+    Raw,
+    Base(Option<u32>),
+}
+
+impl StorageOptionsScope {
+    fn resolve(self, options: &HashMap<String, String>) -> Cow<'_, HashMap<String, String>> {
+        match self {
+            Self::Raw => Cow::Borrowed(options),
+            Self::Base(base_id) => Cow::Owned(resolve_base_scoped_options(options, base_id)),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
 struct CachedStorageOptions {
+    vended: Option<Arc<StorageOptionsSnapshot>>,
+    absence: Option<CachedAbsence>,
+}
+
+#[derive(Debug)]
+struct CachedAbsence {
+    retry_after: Instant,
+    /// Scopes already expired at this point can use fallback under the same deadline.
+    recorded_at_millis: u64,
+    /// Scopes that selected fallback during an early or forced refresh.
+    fallback_scopes: HashSet<StorageOptionsScope>,
+}
+
+#[derive(Debug)]
+struct StorageOptionsSnapshot {
     options: HashMap<String, String>,
-    expires_at_millis: Option<u64>,
+    /// Earliest expiration across the raw map, including every base.
+    raw_expires_at_millis: Option<u64>,
+}
+
+impl StorageOptionsSnapshot {
+    fn new(options: HashMap<String, String>) -> Self {
+        let raw_expires_at_millis = options
+            .iter()
+            .filter(|(key, _)| {
+                key.as_str() == EXPIRES_AT_MILLIS_KEY
+                    || matches!(
+                        parse_base_scoped_key(key),
+                        Some((_, scoped_key)) if scoped_key == EXPIRES_AT_MILLIS_KEY
+                    )
+            })
+            .filter_map(|(_, value)| value.parse::<u64>().ok())
+            .min();
+        Self {
+            options,
+            raw_expires_at_millis,
+        }
+    }
+
+    fn view(&self, scope: StorageOptionsScope) -> (Cow<'_, HashMap<String, String>>, Option<u64>) {
+        let options = scope.resolve(&self.options);
+        let expiry = match scope {
+            StorageOptionsScope::Raw => self.raw_expires_at_millis,
+            StorageOptionsScope::Base(_) => options
+                .get(EXPIRES_AT_MILLIS_KEY)
+                .and_then(|value| value.parse().ok()),
+        };
+        (options, expiry)
+    }
 }
 
 impl StorageOptionsAccessor {
@@ -326,44 +399,21 @@ impl StorageOptionsAccessor {
             .unwrap_or(Duration::from_millis(DEFAULT_REFRESH_OFFSET_MILLIS))
     }
 
-    /// Effective expiration of a raw options map: the minimum of the unscoped
-    /// `expires_at_millis` and every `base_<id>.expires_at_millis` entry.
-    ///
-    /// A flat map may vend per-base credentials that expire before the shared
-    /// ones. Refreshing when the earliest credential is due keeps base-scoped
-    /// accessors (which refresh through this accessor) from re-resolving stale
-    /// per-base credentials out of a still-"valid" cache.
-    fn effective_expires_at_millis(options: &HashMap<String, String>) -> Option<u64> {
-        options
-            .iter()
-            .filter(|(key, _)| {
-                key.as_str() == EXPIRES_AT_MILLIS_KEY
-                    || matches!(
-                        parse_base_scoped_key(key),
-                        Some((_, scoped_key)) if scoped_key == EXPIRES_AT_MILLIS_KEY
-                    )
-            })
-            .filter_map(|(_, value)| value.parse::<u64>().ok())
-            .min()
-    }
-
     /// Create an accessor with only static options (no refresh capability)
     ///
     /// The returned accessor will always return the provided options.
     /// This is useful when credentials don't expire or are managed externally.
     pub fn with_static_options(options: HashMap<String, String>) -> Self {
-        let expires_at_millis = Self::effective_expires_at_millis(&options);
         let refresh_offset = Self::extract_refresh_offset(&options);
 
         Self {
-            initial_options: Some(options.clone()),
+            initial_options: Some(StorageOptionsSnapshot::new(options)),
             provider: None,
-            cache: Arc::new(RwLock::new(Some(CachedStorageOptions {
-                options,
-                expires_at_millis,
-            }))),
+            cache: RwLock::new(Arc::default()),
+            refresh_gate: Mutex::new(()),
             refresh_offset,
             scope_resolved: false,
+            scoped_provider: None,
         }
     }
 
@@ -379,9 +429,11 @@ impl StorageOptionsAccessor {
         Self {
             initial_options: None,
             provider: Some(provider),
-            cache: Arc::new(RwLock::new(None)),
+            cache: RwLock::new(Arc::default()),
+            refresh_gate: Mutex::new(()),
             refresh_offset: Duration::from_millis(DEFAULT_REFRESH_OFFSET_MILLIS),
             scope_resolved: false,
+            scoped_provider: None,
         }
     }
 
@@ -398,43 +450,31 @@ impl StorageOptionsAccessor {
         initial_options: HashMap<String, String>,
         provider: Arc<dyn StorageOptionsProvider>,
     ) -> Self {
-        let expires_at_millis = Self::effective_expires_at_millis(&initial_options);
         let refresh_offset = Self::extract_refresh_offset(&initial_options);
 
         Self {
-            initial_options: Some(initial_options.clone()),
+            initial_options: Some(StorageOptionsSnapshot::new(initial_options)),
             provider: Some(provider),
-            cache: Arc::new(RwLock::new(Some(CachedStorageOptions {
-                options: initial_options,
-                expires_at_millis,
-            }))),
+            cache: RwLock::new(Arc::default()),
+            refresh_gate: Mutex::new(()),
             refresh_offset,
             scope_resolved: false,
+            scoped_provider: None,
         }
     }
 
     /// Get current valid storage options
     ///
-    /// - Returns cached options if not expired
-    /// - Fetches from provider if expired or not cached
-    /// - Falls back to initial_options if provider returns None
+    /// A scoped accessor checks the effective expiry for its base. A raw accessor
+    /// checks the earliest expiry across the map. Refresh uses the configured offset.
+    /// If the provider returns `None`, the accessor uses the initial options or defaults.
     ///
     /// # Errors
     ///
-    /// Returns an error if:
-    /// - The provider fails to fetch options
-    /// - No options are available (no cache, no provider, no initial options)
+    /// Returns an error if the provider fetch fails or the requested fallback has expired.
     pub async fn get_storage_options(&self) -> Result<super::StorageOptions> {
-        loop {
-            match self.do_get_storage_options().await? {
-                Some(options) => return Ok(options),
-                None => {
-                    // Lock was busy, wait 10ms before retrying
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                    continue;
-                }
-            }
-        }
+        self.read_storage_options(StorageOptionsScope::Raw, false)
+            .await
     }
 
     /// Fetch fresh options from the provider and update the cache.
@@ -444,151 +484,167 @@ impl StorageOptionsAccessor {
     /// propagates through provider chains (e.g. base-scoped wrappers), so the
     /// origin provider is re-queried even when intermediate caches are valid.
     pub(crate) async fn refresh_storage_options(&self) -> Result<super::StorageOptions> {
+        self.read_storage_options(StorageOptionsScope::Raw, true)
+            .await
+    }
+
+    async fn read_storage_options(
+        &self,
+        scope: StorageOptionsScope,
+        force: bool,
+    ) -> Result<super::StorageOptions> {
+        if let Some(scoped) = &self.scoped_provider {
+            let options = scoped
+                .inner
+                .read_cached_options(StorageOptionsScope::Base(scoped.base_id), force)
+                .await?;
+            return Ok(match scope {
+                StorageOptionsScope::Raw => options,
+                StorageOptionsScope::Base(base_id) => {
+                    super::StorageOptions(resolve_base_scoped_options(&options.0, base_id))
+                }
+            });
+        }
+
+        self.read_cached_options(scope, force).await
+    }
+
+    async fn read_cached_options(
+        &self,
+        scope: StorageOptionsScope,
+        force: bool,
+    ) -> Result<super::StorageOptions> {
         let Some(provider) = &self.provider else {
-            return self.get_storage_options().await;
+            return Ok(super::StorageOptions(
+                self.fallback_view(scope).0.into_owned(),
+            ));
         };
+
+        if !force && let Some(options) = self.fresh_options(scope).await {
+            return Ok(options);
+        }
+
+        let _refresh = self.refresh_gate.lock().await;
+        // A different scope may have refreshed the shared map while we waited.
+        if !force && let Some(options) = self.fresh_options(scope).await {
+            return Ok(options);
+        }
 
         log::debug!(
             "Refreshing storage options from provider: {}",
             provider.provider_id()
         );
-
-        let storage_options_map = provider.force_fetch_storage_options().await.map_err(|e| {
+        let fetched = if force {
+            provider.force_fetch_storage_options().await
+        } else {
+            provider.fetch_storage_options().await
+        }
+        .map_err(|e| {
             Error::io_source(Box::new(std::io::Error::other(format!(
                 "Failed to fetch storage options: {}",
                 e
             ))))
         })?;
 
-        let Some(options) = storage_options_map else {
-            if let Some(initial) = &self.initial_options {
-                return Ok(super::StorageOptions(initial.clone()));
+        let (options, cache) = match fetched {
+            Some(options) => {
+                let snapshot = Arc::new(StorageOptionsSnapshot::new(options));
+                let resolved = snapshot.view(scope).0.into_owned();
+                let cache = CachedStorageOptions {
+                    vended: Some(snapshot),
+                    absence: None,
+                };
+                (resolved, cache)
             }
-            log::debug!(
-                "Provider {} returned no storage options, using default credentials",
-                provider.provider_id()
-            );
-            return Ok(super::StorageOptions(HashMap::new()));
+            None => {
+                let (options, expiry) = self.fallback_view(scope);
+                let now_millis = Self::now_millis();
+                if let Some(expiration) = expiry
+                    && expiration <= now_millis
+                {
+                    return Err(Error::invalid_input(format!(
+                        "Provider returned no options and initial credentials expired at {expiration}"
+                    )));
+                }
+
+                // Preserve the vended map for siblings and share the retry deadline.
+                let previous = self.cache.read().await.clone();
+                let mut fallback_scopes = previous
+                    .absence
+                    .as_ref()
+                    .map(|absence| absence.fallback_scopes.clone())
+                    .unwrap_or_default();
+                if let Some(vended) = &previous.vended
+                    && vended
+                        .view(scope)
+                        .1
+                        .is_none_or(|expiry| expiry > now_millis)
+                {
+                    fallback_scopes.insert(scope);
+                }
+                let cache = CachedStorageOptions {
+                    vended: previous.vended.clone(),
+                    absence: Some(CachedAbsence {
+                        retry_after: Instant::now() + Duration::from_secs(60),
+                        recorded_at_millis: now_millis,
+                        fallback_scopes,
+                    }),
+                };
+                (options.into_owned(), cache)
+            }
         };
-
-        let expires_at_millis = Self::effective_expires_at_millis(&options);
-
-        let mut cache = self.cache.write().await;
-        *cache = Some(CachedStorageOptions {
-            options: options.clone(),
-            expires_at_millis,
-        });
-
+        *self.cache.write().await = Arc::new(cache);
         Ok(super::StorageOptions(options))
     }
 
-    async fn do_get_storage_options(&self) -> Result<Option<super::StorageOptions>> {
-        // Check if we have valid cached options with read lock
-        {
-            let cached = self.cache.read().await;
-            if !self.needs_refresh(&cached)
-                && let Some(cached_opts) = &*cached
-            {
-                return Ok(Some(super::StorageOptions(cached_opts.options.clone())));
-            }
-        }
-
-        // If no provider, return initial options or use defaults
-        let Some(provider) = &self.provider else {
-            return if let Some(initial) = &self.initial_options {
-                Ok(Some(super::StorageOptions(initial.clone())))
-            } else {
-                // No provider and no initial options - use default credentials
-                Ok(Some(super::StorageOptions(HashMap::new())))
-            };
-        };
-
-        // Try to acquire write lock - if it fails, return None and let caller retry
-        let Ok(mut cache) = self.cache.try_write() else {
-            return Ok(None);
-        };
-
-        // Double-check if options are still stale after acquiring write lock
-        // (another thread might have refreshed them)
-        if !self.needs_refresh(&cache)
-            && let Some(cached_opts) = &*cache
-        {
-            return Ok(Some(super::StorageOptions(cached_opts.options.clone())));
-        }
-        log::debug!(
-            "Refreshing storage options from provider: {}",
-            provider.provider_id()
-        );
-
-        let storage_options_map = provider.fetch_storage_options().await.map_err(|e| {
-            Error::io_source(Box::new(std::io::Error::other(format!(
-                "Failed to fetch storage options: {}",
-                e
-            ))))
-        })?;
-
-        let Some(options) = storage_options_map else {
-            // Provider returned None, fall back to initial options or use defaults
-            if let Some(initial) = &self.initial_options {
-                return Ok(Some(super::StorageOptions(initial.clone())));
-            }
-            // Provider returned None and no initial options - use default credentials
-            // This is valid when namespace doesn't vend credentials (e.g., directory namespace
-            // where environment credentials are used)
-            log::debug!(
-                "Provider {} returned no storage options, using default credentials",
-                provider.provider_id()
-            );
-            return Ok(Some(super::StorageOptions(HashMap::new())));
-        };
-
-        let expires_at_millis = Self::effective_expires_at_millis(&options);
-
-        if let Some(expires_at) = expires_at_millis {
-            let now_ms = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or(Duration::from_secs(0))
-                .as_millis() as u64;
-            let expires_in_secs = (expires_at.saturating_sub(now_ms)) / 1000;
-            log::debug!(
-                "Successfully refreshed storage options from provider: {}, options expire in {} seconds",
-                provider.provider_id(),
-                expires_in_secs
-            );
-        } else {
-            log::debug!(
-                "Successfully refreshed storage options from provider: {} (no expiration)",
-                provider.provider_id()
-            );
-        }
-
-        *cache = Some(CachedStorageOptions {
-            options: options.clone(),
-            expires_at_millis,
-        });
-
-        Ok(Some(super::StorageOptions(options)))
+    fn fallback_view(
+        &self,
+        scope: StorageOptionsScope,
+    ) -> (Cow<'_, HashMap<String, String>>, Option<u64>) {
+        self.initial_options.as_ref().map_or_else(
+            || (Cow::Owned(HashMap::new()), None),
+            |snapshot| snapshot.view(scope),
+        )
     }
 
-    fn needs_refresh(&self, cached: &Option<CachedStorageOptions>) -> bool {
-        match cached {
-            None => true,
-            Some(cached_opts) => {
-                if let Some(expires_at_millis) = cached_opts.expires_at_millis {
-                    let now_ms = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or(Duration::from_secs(0))
-                        .as_millis() as u64;
+    async fn fresh_options(&self, scope: StorageOptionsScope) -> Option<super::StorageOptions> {
+        let cache = self.cache.read().await.clone();
+        let vended = cache
+            .vended
+            .as_ref()
+            .map(|snapshot| snapshot.view(scope))
+            .filter(|(_, expiry)| {
+                !cache.absence.as_ref().is_some_and(|absence| {
+                    absence.fallback_scopes.contains(&scope)
+                        || expiry.is_some_and(|expiry| expiry <= absence.recorded_at_millis)
+                })
+            });
 
-                    // Refresh if we're within the refresh offset of expiration
-                    let refresh_offset_millis = self.refresh_offset.as_millis() as u64;
-                    now_ms + refresh_offset_millis >= expires_at_millis
-                } else {
-                    // No expiration means options never expire
-                    false
-                }
-            }
+        let ((options, expiry), refresh_offset) = if let Some(view) = vended {
+            (view, self.refresh_offset)
+        } else {
+            let refresh_offset = match &cache.absence {
+                // A fallback retries at the shared deadline or its actual expiry.
+                Some(absence) if Instant::now() < absence.retry_after => Duration::ZERO,
+                None if self.initial_options.is_some() => self.refresh_offset,
+                _ => return None,
+            };
+            (self.fallback_view(scope), refresh_offset)
+        };
+
+        if expiry.is_some_and(|expiry| {
+            Self::now_millis().saturating_add(refresh_offset.as_millis() as u64) >= expiry
+        }) {
+            return None;
         }
+        Some(super::StorageOptions(options.into_owned()))
+    }
+
+    fn now_millis() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64
     }
 
     /// Get the initial storage options without refresh
@@ -596,7 +652,9 @@ impl StorageOptionsAccessor {
     /// Returns the initial options that were provided when creating the accessor.
     /// This does not trigger any refresh, even if the options have expired.
     pub fn initial_storage_options(&self) -> Option<&HashMap<String, String>> {
-        self.initial_options.as_ref()
+        self.initial_options
+            .as_ref()
+            .map(|snapshot| &snapshot.options)
     }
 
     /// Get the accessor ID for equality/hashing
@@ -606,7 +664,7 @@ impl StorageOptionsAccessor {
     pub fn accessor_id(&self) -> String {
         if let Some(provider) = &self.provider {
             provider.provider_id()
-        } else if let Some(initial) = &self.initial_options {
+        } else if let Some(initial) = self.initial_storage_options() {
             // Generate a stable ID from initial options
             use std::collections::hash_map::DefaultHasher;
             use std::hash::{Hash, Hasher};
@@ -638,7 +696,9 @@ impl StorageOptionsAccessor {
     /// through [`BaseScopedStorageOptionsProvider`] — fetched options may vend
     /// base-scoped entries at any refresh, even when the initial options carry
     /// none — so refreshed options are re-resolved for the scope on every
-    /// fetch. Accessors already produced by this method are returned unchanged.
+    /// fetch. Dynamic scopes read through the parent's cache so bounded absence
+    /// responses retain their original retry deadline. Accessors already
+    /// produced by this method are returned unchanged.
     pub fn scoped_to_base(self: &Arc<Self>, base_id: Option<u32>) -> Arc<Self> {
         if self.scope_resolved {
             return self.clone();
@@ -648,11 +708,12 @@ impl StorageOptionsAccessor {
             let mut scoped = match self.initial_storage_options() {
                 Some(initial) => Self::with_initial_and_provider(
                     resolve_base_scoped_options(initial, base_id),
-                    provider,
+                    provider.clone(),
                 ),
-                None => Self::with_provider(provider),
+                None => Self::with_provider(provider.clone()),
             };
             scoped.scope_resolved = true;
+            scoped.scoped_provider = Some(provider);
             Arc::new(scoped)
         } else {
             match self.initial_storage_options() {
@@ -688,7 +749,76 @@ impl StorageOptionsAccessor {
 mod tests {
     use super::*;
     use mock_instant::thread_local::MockClock;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use tokio::sync::{Notify, Semaphore};
+    #[derive(Debug)]
+    struct AbsentProvider(std::sync::atomic::AtomicUsize);
 
+    #[async_trait]
+    impl StorageOptionsProvider for AbsentProvider {
+        async fn fetch_storage_options(&self) -> Result<Option<HashMap<String, String>>> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(None)
+        }
+        fn provider_id(&self) -> String {
+            "absent".into()
+        }
+    }
+
+    #[tokio::test]
+    async fn absence_is_cached_until_deadline_or_force_refresh() {
+        let provider = Arc::new(AbsentProvider(std::sync::atomic::AtomicUsize::new(0)));
+        let accessor = StorageOptionsAccessor::with_provider(provider.clone());
+        futures::future::join_all((0..20).map(|_| accessor.get_storage_options()))
+            .await
+            .into_iter()
+            .for_each(|result| assert!(result.unwrap().0.is_empty()));
+        assert_eq!(provider.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+        accessor.refresh_storage_options().await.unwrap();
+        assert_eq!(provider.0.load(std::sync::atomic::Ordering::SeqCst), 2);
+        MockClock::advance(Duration::from_secs(60));
+        accessor.get_storage_options().await.unwrap();
+        assert_eq!(provider.0.load(std::sync::atomic::Ordering::SeqCst), 3);
+        let expired = StorageOptionsAccessor::with_initial_and_provider(
+            HashMap::from([(EXPIRES_AT_MILLIS_KEY.into(), "1".into())]),
+            provider,
+        );
+        MockClock::set_system_time(Duration::from_millis(2));
+        assert!(
+            expired
+                .get_storage_options()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("expired")
+        );
+    }
+
+    #[tokio::test]
+    async fn absent_refresh_preserves_fallback_expiration() {
+        MockClock::set_system_time(Duration::from_secs(100));
+        let provider = Arc::new(AbsentProvider(std::sync::atomic::AtomicUsize::new(0)));
+        let accessor = StorageOptionsAccessor::with_initial_and_provider(
+            HashMap::from([(EXPIRES_AT_MILLIS_KEY.into(), "101000".into())]),
+            provider.clone(),
+        );
+        for _ in 0..20 {
+            assert_eq!(
+                accessor.get_storage_options().await.unwrap().0[EXPIRES_AT_MILLIS_KEY],
+                "101000"
+            );
+        }
+        assert_eq!(provider.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+        MockClock::set_system_time(Duration::from_secs(101));
+        assert!(
+            accessor
+                .get_storage_options()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("expired")
+        );
+    }
     #[derive(Debug)]
     struct MockStorageOptionsProvider {
         call_count: Arc<RwLock<usize>>,
@@ -1055,48 +1185,121 @@ mod tests {
         assert_eq!(*provider.call_count.read().await, 1);
     }
 
+    #[rstest::rstest]
+    #[case::absence(Ok(None))]
+    #[case::provider_error(Err(Error::io("injected provider failure")))]
+    #[case::renewal(Ok(Some(scoped_block_sizes("16384", "32768", "65536", 700_000))))]
     #[tokio::test]
-    async fn test_scoped_earlier_base_expiry_refreshes_parent() {
-        MockClock::set_system_time(Duration::from_secs(100_000));
-        let now_ms = MockClock::system_time().as_millis() as u64;
+    async fn scoped_refresh_isolates_expired_base(
+        #[case] response: Result<Option<HashMap<String, String>>>,
+        #[values(false, true)] direct_provider: bool,
+    ) {
+        MockClock::set_system_time(Duration::from_secs(100_121));
+        let provider = Arc::new(TransitionProvider::default());
+        let is_error = response.is_err();
+        provider.fail.store(is_error, Ordering::SeqCst);
+        *provider.options.write().await = response.unwrap_or_default();
+        let is_renewal = provider.options.read().await.is_some();
+        let parent = Arc::new(StorageOptionsAccessor::with_initial_and_provider(
+            scoped_block_sizes("2048", "4096", "8192", 120_000),
+            provider.clone(),
+        ));
+        let primary = parent.scoped_to_base(None);
+        let base8 = BaseScopedStorageOptionsProvider::new(parent.clone(), Some(8));
+        assert_eq!(
+            primary.get_storage_options().await.unwrap().0["block_size"],
+            "2048"
+        );
+        assert_eq!(
+            base8.fetch_storage_options().await.unwrap().unwrap()["block_size"],
+            "8192"
+        );
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
 
-        // Base 1 credentials expire before the shared ones; the parent must
-        // refresh when the earliest credential is due, or the scoped accessor
-        // would keep re-resolving stale base-1 credentials from a still-
-        // "valid" parent cache.
-        let provider = Arc::new(MockBaseScopedVendingProvider {
-            call_count: Arc::new(RwLock::new(0)),
-            expires_in_millis: 600_000,
-        });
-        let initial = HashMap::from([
-            ("account_key".to_string(), "SHARED_0".to_string()),
-            ("base_1.account_key".to_string(), "BASE1_0".to_string()),
-            (
-                EXPIRES_AT_MILLIS_KEY.to_string(),
-                (now_ms + 600_000).to_string(),
-            ),
-            (
-                format!("base_1.{}", EXPIRES_AT_MILLIS_KEY),
-                (now_ms + 120_000).to_string(),
-            ),
-        ]);
+        let result = if direct_provider {
+            BaseScopedStorageOptionsProvider::new(parent.clone(), Some(7))
+                .fetch_storage_options()
+                .await
+                .map(|options| options.unwrap())
+        } else {
+            parent
+                .scoped_to_base(Some(7))
+                .get_storage_options()
+                .await
+                .map(|options| options.0)
+        };
+        if is_renewal {
+            assert_eq!(result.unwrap()["block_size"], "32768");
+        } else {
+            let error = result.unwrap_err();
+            if is_error {
+                assert!(matches!(error, Error::IO { .. }));
+                assert!(error.to_string().contains("injected provider failure"));
+            } else {
+                assert!(matches!(error, Error::InvalidInput { .. }));
+                assert!(error.to_string().contains("expired"));
+            }
+        }
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            primary.get_storage_options().await.unwrap().0["block_size"],
+            if is_renewal { "16384" } else { "2048" }
+        );
+        assert_eq!(
+            base8.fetch_storage_options().await.unwrap().unwrap()["block_size"],
+            if is_renewal { "65536" } else { "8192" }
+        );
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn raw_map_and_base_use_parent_refresh_offset() {
+        MockClock::set_system_time(Duration::from_secs(100_100));
+        let provider = Arc::new(TransitionProvider::default());
+        provider.fail.store(true, Ordering::SeqCst);
+        let mut initial = scoped_block_sizes("2048", "4096", "8192", 120_000);
+        initial.insert(REFRESH_OFFSET_MILLIS_KEY.into(), "10000".into());
+        initial.insert("base_7.refresh_offset_millis".into(), "1".into());
         let parent = Arc::new(StorageOptionsAccessor::with_initial_and_provider(
             initial,
             provider.clone(),
         ));
+        let base7 = parent.scoped_to_base(Some(7));
+        assert_eq!(
+            parent.get_storage_options().await.unwrap().0["base_7.block_size"],
+            "4096"
+        );
+        assert_eq!(
+            base7.get_storage_options().await.unwrap().0["block_size"],
+            "4096"
+        );
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
 
-        let base1 = parent.scoped_to_base(Some(1));
-        let result = base1.get_storage_options().await.unwrap();
-        assert_eq!(result.0.get("account_key").unwrap(), "BASE1_0");
-        assert_eq!(*provider.call_count.read().await, 0);
+        MockClock::advance_system_time(Duration::from_secs(10));
+        for accessor in [&parent, &base7] {
+            let error = accessor.get_storage_options().await.unwrap_err();
+            assert!(matches!(error, Error::IO { .. }));
+            assert!(error.to_string().contains("injected provider failure"));
+        }
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+    }
 
-        // Past the base-1 expiry but before the shared expiry: the parent's
-        // effective expiry is the earlier one, so the refresh chain fetches
-        // fresh credentials instead of re-serving BASE1_0.
-        MockClock::set_system_time(Duration::from_secs(100_000 + 121));
-        let result = base1.get_storage_options().await.unwrap();
-        assert_eq!(result.0.get("account_key").unwrap(), "BASE1_1");
-        assert_eq!(*provider.call_count.read().await, 1);
+    fn scoped_block_sizes(
+        primary: &str,
+        base7: &str,
+        base8: &str,
+        base7_expiry_offset: u64,
+    ) -> HashMap<String, String> {
+        HashMap::from([
+            ("block_size".into(), primary.into()),
+            ("base_7.block_size".into(), base7.into()),
+            ("base_8.block_size".into(), base8.into()),
+            (EXPIRES_AT_MILLIS_KEY.into(), "101000000".into()),
+            (
+                format!("base_7.{EXPIRES_AT_MILLIS_KEY}"),
+                (100_000_000 + base7_expiry_offset).to_string(),
+            ),
+        ])
     }
 
     #[tokio::test]
@@ -1240,5 +1443,433 @@ mod tests {
         let result = base1.refresh_storage_options().await.unwrap();
         assert_eq!(result.0.get("account_key").unwrap(), "BASE1_1");
         assert_eq!(*provider.call_count.read().await, 1);
+    }
+
+    #[derive(Debug, Default)]
+    struct TransitionProvider {
+        calls: AtomicUsize,
+        options: RwLock<Option<HashMap<String, String>>>,
+        fail: AtomicBool,
+    }
+
+    #[async_trait]
+    impl StorageOptionsProvider for TransitionProvider {
+        async fn fetch_storage_options(&self) -> Result<Option<HashMap<String, String>>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail.load(Ordering::SeqCst) {
+                return Err(Error::io("injected provider failure"));
+            }
+            Ok(self.options.read().await.clone())
+        }
+
+        fn provider_id(&self) -> String {
+            "transition-provider".into()
+        }
+    }
+
+    fn vended_options() -> HashMap<String, String> {
+        HashMap::from([
+            ("token".into(), "shared".into()),
+            ("base_7.token".into(), "seven".into()),
+            (EXPIRES_AT_MILLIS_KEY.into(), "200000000".into()),
+        ])
+    }
+
+    #[rstest::rstest]
+    #[case::default_scope(None, "shared")]
+    #[case::numbered_scope(Some(7), "seven")]
+    #[tokio::test]
+    async fn new_scope_preserves_parent_absence_deadline(
+        #[case] base_id: Option<u32>,
+        #[case] expected_token: &str,
+        #[values(false, true)] refresh_parent_first: bool,
+        #[values(false, true)] force_initial_fetch: bool,
+    ) {
+        MockClock::set_system_time(Duration::from_secs(100_000));
+        let provider = Arc::new(TransitionProvider::default());
+        let parent = Arc::new(StorageOptionsAccessor::with_provider(provider.clone()));
+        let initial_scope = parent.scoped_to_base(None);
+        let initial = if force_initial_fetch {
+            initial_scope.refresh_storage_options().await.unwrap()
+        } else {
+            initial_scope.get_storage_options().await.unwrap()
+        };
+        assert!(initial.0.is_empty());
+        *provider.options.write().await = Some(vended_options());
+        MockClock::advance(Duration::from_secs(1));
+        MockClock::advance_system_time(Duration::from_secs(1));
+        let scope = parent.scoped_to_base(base_id);
+        assert!(scope.get_storage_options().await.unwrap().0.is_empty());
+        MockClock::advance(Duration::from_millis(58_999));
+        MockClock::advance_system_time(Duration::from_millis(58_999));
+        assert!(scope.get_storage_options().await.unwrap().0.is_empty());
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        MockClock::advance(Duration::from_millis(1));
+        MockClock::advance_system_time(Duration::from_millis(1));
+        if refresh_parent_first {
+            assert_eq!(
+                parent.get_storage_options().await.unwrap().0["token"],
+                "shared"
+            );
+        }
+        assert_eq!(
+            scope
+                .get_storage_options()
+                .await
+                .unwrap()
+                .0
+                .get("token")
+                .map(String::as_str),
+            Some(expected_token),
+            "new scopes must discover credentials at the parent's original deadline"
+        );
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[rstest::rstest]
+    #[case::default_scope(None, "shared")]
+    #[case::numbered_scope(Some(7), "seven")]
+    #[tokio::test]
+    async fn scope_distinguishes_empty_options_and_forces_parent_refresh(
+        #[case] base_id: Option<u32>,
+        #[case] expected_token: &str,
+        #[values(false, true)] absent: bool,
+    ) {
+        let provider = Arc::new(TransitionProvider::default());
+        if !absent {
+            *provider.options.write().await = Some(HashMap::new());
+        }
+        let parent = Arc::new(StorageOptionsAccessor::with_provider(provider.clone()));
+        assert!(parent.get_storage_options().await.unwrap().0.is_empty());
+        let scope = parent.scoped_to_base(base_id);
+        assert!(scope.get_storage_options().await.unwrap().0.is_empty());
+        *provider.options.write().await = Some(vended_options());
+        if !absent {
+            MockClock::advance(Duration::from_secs(60));
+            MockClock::advance_system_time(Duration::from_secs(60));
+        }
+        assert!(scope.get_storage_options().await.unwrap().0.is_empty());
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            scope.refresh_storage_options().await.unwrap().0["token"],
+            expected_token
+        );
+        assert_eq!(
+            scope.get_storage_options().await.unwrap().0["token"],
+            expected_token
+        );
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[rstest::rstest]
+    #[case::expired_base(false, 120_000)]
+    #[case::early_refresh(false, 170_000)]
+    #[case::forced_refresh(true, 300_000)]
+    #[tokio::test]
+    async fn scoped_absence_preserves_vended_siblings(
+        #[case] force: bool,
+        #[case] vended_base_expiry: u64,
+        #[values(false, true)] provider_fails_at_deadline: bool,
+    ) {
+        MockClock::set_system_time(Duration::from_secs(100_055));
+        let mut initial = scoped_block_sizes("2048", "4096", "8192", 300_000);
+        initial.insert(EXPIRES_AT_MILLIS_KEY.into(), "100110000".into());
+        let provider = Arc::new(TransitionProvider::default());
+        let mut vended = scoped_block_sizes("16384", "32768", "65536", vended_base_expiry);
+        vended.insert(
+            format!("base_8.{EXPIRES_AT_MILLIS_KEY}"),
+            "100250000".into(),
+        );
+        *provider.options.write().await = Some(vended);
+        let parent = Arc::new(StorageOptionsAccessor::with_initial_and_provider(
+            initial,
+            provider.clone(),
+        ));
+        let primary = parent.scoped_to_base(None);
+        let base7 = parent.scoped_to_base(Some(7));
+        assert_eq!(
+            primary.get_storage_options().await.unwrap().0["block_size"],
+            "16384"
+        );
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+
+        MockClock::set_system_time(Duration::from_secs(100_121));
+        *provider.options.write().await = None;
+        let fallback = if force {
+            BaseScopedStorageOptionsProvider::new(parent.clone(), Some(7))
+                .force_fetch_storage_options()
+                .await
+                .unwrap()
+                .unwrap()
+        } else {
+            base7.get_storage_options().await.unwrap().0
+        };
+        assert_eq!(fallback["block_size"], "4096");
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+
+        let base8 = parent.scoped_to_base(Some(8));
+        let primary_read = primary.get_storage_options().await;
+        let base8_read = base8.get_storage_options().await;
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(primary_read.unwrap().0["block_size"], "16384");
+        assert_eq!(base8_read.unwrap().0["block_size"], "65536");
+        assert_eq!(
+            base7.get_storage_options().await.unwrap().0["block_size"],
+            "4096"
+        );
+
+        MockClock::advance(Duration::from_millis(59_999));
+        MockClock::advance_system_time(Duration::from_millis(59_999));
+        assert_eq!(
+            base7.get_storage_options().await.unwrap().0["block_size"],
+            "4096"
+        );
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+
+        MockClock::advance(Duration::from_millis(1));
+        MockClock::advance_system_time(Duration::from_millis(1));
+        provider
+            .fail
+            .store(provider_fails_at_deadline, Ordering::SeqCst);
+        let primary_read = primary.get_storage_options().await;
+        let base8_read = base8.get_storage_options().await;
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(primary_read.unwrap().0["block_size"], "16384");
+        assert_eq!(base8_read.unwrap().0["block_size"], "65536");
+
+        let base7_read = base7.get_storage_options().await;
+        if provider_fails_at_deadline {
+            let error = base7_read.unwrap_err();
+            assert!(matches!(error, Error::IO { .. }));
+            assert!(error.to_string().contains("injected provider failure"));
+        } else {
+            assert_eq!(base7_read.unwrap().0["block_size"], "4096");
+        }
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 3);
+
+        // Base 8 refreshes at its own offset, even during a renewed absence window.
+        MockClock::advance(Duration::from_secs(9));
+        MockClock::advance_system_time(Duration::from_secs(9));
+        provider.fail.store(true, Ordering::SeqCst);
+        let error = base8.get_storage_options().await.unwrap_err();
+        assert!(matches!(error, Error::IO { .. }));
+        assert!(error.to_string().contains("injected provider failure"));
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 4);
+
+        provider.fail.store(false, Ordering::SeqCst);
+        *provider.options.write().await =
+            Some(scoped_block_sizes("2048", "8192", "32768", 600_000));
+        MockClock::advance(Duration::from_secs(60));
+        MockClock::advance_system_time(Duration::from_secs(60));
+        assert_eq!(
+            base7.get_storage_options().await.unwrap().0["block_size"],
+            "8192"
+        );
+        assert_eq!(
+            base8.get_storage_options().await.unwrap().0["block_size"],
+            "32768"
+        );
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 5);
+    }
+
+    #[rstest::rstest]
+    #[case::primary_unscoped(None, Some(500), None, Some(500))]
+    #[case::primary_ignores_base_expiry(None, None, Some(500), None)]
+    #[case::base_inherits_unscoped(Some(7), Some(500), None, Some(500))]
+    #[case::base_with_own_expiry(Some(7), None, Some(500), Some(500))]
+    #[case::base_overrides_earlier_unscoped(Some(7), Some(500), Some(1000), Some(1000))]
+    #[tokio::test]
+    async fn scoped_fallback_expiration_and_provider_errors(
+        #[case] base_id: Option<u32>,
+        #[case] unscoped_expiry: Option<u64>,
+        #[case] base_expiry: Option<u64>,
+        #[case] scope_expiry: Option<u64>,
+    ) {
+        MockClock::set_system_time(Duration::from_secs(100_000));
+        let provider = Arc::new(TransitionProvider::default());
+        let mut initial = HashMap::from([("token".into(), "fallback".into())]);
+        if let Some(expiry) = unscoped_expiry {
+            initial.insert(
+                EXPIRES_AT_MILLIS_KEY.into(),
+                (100_000_000 + expiry).to_string(),
+            );
+        }
+        if let Some(expiry) = base_expiry {
+            initial.insert(
+                format!("base_7.{EXPIRES_AT_MILLIS_KEY}"),
+                (100_000_000 + expiry).to_string(),
+            );
+        }
+        let parent = Arc::new(StorageOptionsAccessor::with_initial_and_provider(
+            initial,
+            provider.clone(),
+        ));
+        let scope = parent.scoped_to_base(base_id);
+        assert_eq!(
+            scope.refresh_storage_options().await.unwrap().0["token"],
+            "fallback"
+        );
+
+        let mut expected_calls = 1;
+        if scope_expiry != Some(500) {
+            MockClock::advance(Duration::from_millis(500));
+            MockClock::advance_system_time(Duration::from_millis(500));
+            assert_eq!(
+                scope.get_storage_options().await.unwrap().0["token"],
+                "fallback"
+            );
+            assert_eq!(provider.calls.load(Ordering::SeqCst), expected_calls);
+        }
+
+        MockClock::set_system_time(Duration::from_millis(
+            100_000_000 + scope_expiry.unwrap_or(500),
+        ));
+        if let Some(expiry) = scope_expiry {
+            // The fallback's actual expiry allows an early retry before the shared deadline.
+            for result in [
+                scope.get_storage_options().await,
+                scope.refresh_storage_options().await,
+            ] {
+                let error = result.unwrap_err();
+                assert!(matches!(error, Error::InvalidInput { .. }));
+                assert!(
+                    error
+                        .to_string()
+                        .contains(&format!("expired at {}", 100_000_000 + expiry))
+                );
+            }
+            expected_calls += 2;
+        } else {
+            // The primary fallback has no expiry and retries at the monotonic deadline.
+            MockClock::advance(Duration::from_millis(59_500));
+        }
+        assert_eq!(provider.calls.load(Ordering::SeqCst), expected_calls);
+        provider.fail.store(true, Ordering::SeqCst);
+        for _ in 0..2 {
+            let error = scope.get_storage_options().await.unwrap_err();
+            assert!(matches!(error, Error::IO { .. }));
+            assert!(error.to_string().contains("injected provider failure"));
+        }
+        expected_calls += 2;
+        assert_eq!(provider.calls.load(Ordering::SeqCst), expected_calls);
+        provider.fail.store(false, Ordering::SeqCst);
+        *provider.options.write().await = Some(vended_options());
+        let expected_token = if base_id.is_some() { "seven" } else { "shared" };
+        assert_eq!(
+            scope.get_storage_options().await.unwrap().0["token"],
+            expected_token
+        );
+        expected_calls += 1;
+        assert_eq!(provider.calls.load(Ordering::SeqCst), expected_calls);
+        provider.fail.store(true, Ordering::SeqCst);
+        let error = scope.refresh_storage_options().await.unwrap_err();
+        assert!(matches!(error, Error::IO { .. }));
+        assert!(error.to_string().contains("injected provider failure"));
+        assert_eq!(
+            scope.get_storage_options().await.unwrap().0["token"],
+            expected_token
+        );
+        assert_eq!(provider.calls.load(Ordering::SeqCst), expected_calls + 1);
+    }
+
+    #[derive(Debug)]
+    struct GatedProvider {
+        inner: TransitionProvider,
+        entered: Notify,
+        resume: Semaphore,
+    }
+
+    #[async_trait]
+    impl StorageOptionsProvider for GatedProvider {
+        async fn fetch_storage_options(&self) -> Result<Option<HashMap<String, String>>> {
+            self.entered.notify_one();
+            self.resume.acquire().await.unwrap().forget();
+            self.inner.fetch_storage_options().await
+        }
+        fn provider_id(&self) -> String {
+            "gated-provider".into()
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_scopes_share_cold_and_expired_parent_refresh() {
+        let provider = Arc::new(GatedProvider {
+            inner: TransitionProvider::default(),
+            entered: Notify::new(),
+            resume: Semaphore::new(0),
+        });
+        let parent = Arc::new(StorageOptionsAccessor::with_provider(provider.clone()));
+        let scopes = (0..8)
+            .map(|i| parent.scoped_to_base((i % 2 == 0).then_some(7)))
+            .collect::<Vec<_>>();
+        for refresh in [false, true] {
+            if refresh {
+                *provider.inner.options.write().await = Some(vended_options());
+                MockClock::advance(Duration::from_secs(60));
+            }
+            let reads =
+                futures::future::join_all(scopes.iter().map(|scope| scope.get_storage_options()));
+            tokio::pin!(reads);
+            tokio::select! {
+                _ = provider.entered.notified() => {},
+                _ = &mut reads => panic!("reads must wait for the gated provider"),
+            }
+            provider.resume.add_permits(1);
+            for result in reads.await {
+                let options = result.unwrap().0;
+                if refresh {
+                    assert!(options.contains_key("token"));
+                } else {
+                    assert!(options.is_empty());
+                }
+            }
+            assert_eq!(
+                provider.inner.calls.load(Ordering::SeqCst),
+                if refresh { 2 } else { 1 }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn fresh_scopes_can_read_while_stale_base_refreshes() {
+        MockClock::set_system_time(Duration::from_secs(100_121));
+        let provider = Arc::new(GatedProvider {
+            inner: TransitionProvider::default(),
+            entered: Notify::new(),
+            resume: Semaphore::new(0),
+        });
+        *provider.inner.options.write().await =
+            Some(scoped_block_sizes("16384", "32768", "65536", 700_000));
+        let parent = Arc::new(StorageOptionsAccessor::with_initial_and_provider(
+            scoped_block_sizes("2048", "4096", "8192", 120_000),
+            provider.clone(),
+        ));
+        let base7 = parent.scoped_to_base(Some(7));
+        let primary = parent.scoped_to_base(None);
+        let base8 = parent.scoped_to_base(Some(8));
+
+        let stale_reads = futures::future::join_all((0..8).map(|_| base7.get_storage_options()));
+        tokio::pin!(stale_reads);
+        tokio::select! {
+            _ = provider.entered.notified() => {},
+            _ = &mut stale_reads => panic!("base 7 must wait for the gated provider"),
+        }
+        for (scope, expected) in [(&primary, "2048"), (&base8, "8192")] {
+            let options = futures::FutureExt::now_or_never(scope.get_storage_options())
+                .expect("fresh scope must complete while the provider is pending");
+            assert_eq!(options.unwrap().0["block_size"], expected);
+        }
+        provider.resume.add_permits(1);
+        let renewed = tokio::time::timeout(Duration::from_secs(1), stale_reads)
+            .await
+            .expect("stale readers must share one refresh");
+        for result in renewed {
+            assert_eq!(result.unwrap().0["block_size"], "32768");
+        }
+        assert_eq!(
+            primary.get_storage_options().await.unwrap().0["block_size"],
+            "16384"
+        );
+        assert_eq!(provider.inner.calls.load(Ordering::SeqCst), 1);
     }
 }
