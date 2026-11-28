@@ -1,0 +1,52 @@
+name: Kotoba v1 header
+
+on:
+  push:
+    branches:
+      - main
+      - release/**
+    paths:
+      - kotoba/**
+      - .github/workflows/kotoba*.yml
+  pull_request:
+    branches:
+      - main
+      - release/**
+    paths:
+      - kotoba/**
+      - .github/workflows/kotoba*.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  header-v1:
+    name: Compile and assert fixture header
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install Kotoba CLI 0.7.2
+        env:
+          KOTOBA_VERSION: "0.7.2"
+          ARCHIVE_SHA256: "95e225461e1b8a21849b251e8c8b654693d2c8a516b258532771651e978e1977"
+          BINARY_SHA256: "51f696d7d08b92d3d0f34ac5a32dc846ce63aeab3295b1baf74f8fc78a85601c"
+        run: |
+          set -euo pipefail
+          base="https://github.com/kotoba-lang/kotoba/releases/download/v${KOTOBA_VERSION}"
+          mkdir -p "${HOME}/.local/bin"
+          curl -fsSL "${base}/kotoba-linux-amd64.tar.gz" -o /tmp/kotoba-linux-amd64.tar.gz
+          echo "${ARCHIVE_SHA256}  /tmp/kotoba-linux-amd64.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/kotoba-linux-amd64.tar.gz -C /tmp kotoba
+          echo "${BINARY_SHA256}  /tmp/kotoba" | sha256sum -c -
+          install -m 0755 /tmp/kotoba "${HOME}/.local/bin/kotoba"
+          echo "${HOME}/.local/bin" >> "${GITHUB_PATH}"
+
+      - name: Run kotoba/checks.sh
+        run: bash kotoba/checks.sh
