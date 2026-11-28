@@ -30,15 +30,17 @@ use crate::{
     buffer::LanceBuffer,
     compression::{
         BlockCompressor, CompressionStrategy, field_metadata_params, finalize_miniblock_compressor,
-        reject_packed_struct_per_value, try_bitpacking_block, try_bitpacking_miniblock,
-        try_byte_stream_split_miniblock, try_child_rle_miniblock,
+        reject_packed_struct_per_value, try_alp_miniblock, try_bitpacking_block,
+        try_bitpacking_miniblock, try_byte_stream_split_miniblock, try_child_rle_miniblock,
         try_fixed_packed_struct_miniblock, try_fixed_u8_rle_block, try_fixed_u8_rle_miniblock,
-        try_general_block, try_raw_block, try_raw_fixed_size_list_miniblock,
+        try_general_block, try_pcodec_miniblock, try_raw_block, try_raw_fixed_size_list_miniblock,
         try_raw_fixed_width_miniblock, try_raw_per_value, try_uncompressed_fixed_width_miniblock,
         try_variable_rle_block, try_variable_width_miniblock,
         try_variable_width_miniblock_with_generic_offsets, try_variable_width_per_value,
+        try_wide_bitpacking_block, try_wide_bitpacking_miniblock,
     },
     compression_config::{CompressionFieldParams, CompressionParams},
+    constants::PCODEC_COMPRESSION,
     data::DataBlock,
     decoder::{
         ColumnInfo, DecodeBatchScheduler, DecoderMessage, DecoderPlugins, FilterExpression,
@@ -117,11 +119,41 @@ impl TestCompressionStrategy {
         params.merge(&metadata);
         params
     }
+
+    fn auxiliary_params(&self, field: &LanceField) -> CompressionFieldParams {
+        let mut params = self.field_params(field);
+        // In 2.3, Pcodec applies only to value mini-blocks.
+        if self.encoding == TestEncoding::StructuralSparse
+            && params.compression.as_deref() == Some(PCODEC_COMPRESSION)
+        {
+            params.compression = None;
+            params.compression_level = None;
+        }
+        params
+    }
 }
 
 impl CompressionStrategy for TestCompressionStrategy {
     fn allows_byte_wide_fsl_booleans(&self) -> bool {
         self.encoding == TestEncoding::StructuralSparse
+    }
+
+    fn create_dictionary_index_compressor(
+        &self,
+        field: &LanceField,
+        data: &DataBlock,
+    ) -> Result<Box<dyn MiniBlockCompressor>> {
+        if self.encoding != TestEncoding::StructuralSparse {
+            return self.create_miniblock_compressor(field, data);
+        }
+        let params = self.auxiliary_params(field);
+        let compressor = try_uncompressed_fixed_width_miniblock(data, &params)
+            .or_else(|| try_byte_stream_split_miniblock(data, &params))
+            .or_else(|| try_fixed_u8_rle_miniblock(data, &params))
+            .or_else(|| try_bitpacking_miniblock(data))
+            .or_else(|| try_raw_fixed_width_miniblock(data))
+            .ok_or_else(|| Error::internal("Dictionary indices must be fixed-width values"))?;
+        finalize_miniblock_compressor(data, compressor, &params)
     }
 
     fn create_miniblock_compressor(
@@ -130,8 +162,16 @@ impl CompressionStrategy for TestCompressionStrategy {
         data: &DataBlock,
     ) -> Result<Box<dyn MiniBlockCompressor>> {
         let params = self.field_params(field);
+        let is_v2_3 = self.encoding == TestEncoding::StructuralSparse;
+        // Match the v2.3 writer: Pcodec is a complete compressor, and ALP
+        // participates in the ordinary fixed-width compression chain.
+        if is_v2_3 && let Some(compressor) = try_pcodec_miniblock(field, data, &params)? {
+            return Ok(compressor);
+        }
         let compressor =
             if let Some(compressor) = try_uncompressed_fixed_width_miniblock(data, &params) {
+                compressor
+            } else if is_v2_3 && let Some(compressor) = try_alp_miniblock(field, data, &params) {
                 compressor
             } else if let Some(compressor) = try_byte_stream_split_miniblock(data, &params) {
                 compressor
@@ -142,7 +182,14 @@ impl CompressionStrategy for TestCompressionStrategy {
                 }
             } {
                 compressor
-            } else if let Some(compressor) = try_bitpacking_miniblock(data) {
+            } else if let Some(compressor) = match self.encoding {
+                // Only the 2.3 strategy composes the wide selector, so only the 2.3 shape
+                // may pick 128-bit inline bitpacking.
+                TestEncoding::StructuralSparse => try_wide_bitpacking_miniblock(data),
+                TestEncoding::Array | TestEncoding::StructuralU16 | TestEncoding::StructuralU32 => {
+                    try_bitpacking_miniblock(data)
+                }
+            } {
                 compressor
             } else if let Some(compressor) = try_raw_fixed_width_miniblock(data) {
                 compressor
@@ -218,7 +265,7 @@ impl CompressionStrategy for TestCompressionStrategy {
         field: &LanceField,
         data: &DataBlock,
     ) -> Result<Box<dyn BlockCompressor>> {
-        let params = self.field_params(field);
+        let params = self.auxiliary_params(field);
         if self.encoding == TestEncoding::StructuralSparse
             && let Some(compressor) = crate::compression::try_fixed_size_list_block(data, &params)?
         {
@@ -232,7 +279,15 @@ impl CompressionStrategy for TestCompressionStrategy {
         if let Some(compressor) = rle {
             return Ok(compressor);
         }
-        if let Some(compressor) = try_bitpacking_block(data) {
+        let bitpacking = match self.encoding {
+            // Same gate as the miniblock chain above: 128-bit values are only offered to
+            // the 2.3 shape.
+            TestEncoding::StructuralSparse => try_wide_bitpacking_block(data),
+            TestEncoding::Array | TestEncoding::StructuralU16 | TestEncoding::StructuralU32 => {
+                try_bitpacking_block(data)
+            }
+        };
+        if let Some(compressor) = bitpacking {
             return Ok(compressor);
         }
         if matches!(
@@ -521,7 +576,7 @@ fn column_indices_from_schema(schema: &Schema, is_structural_encoding: bool) -> 
 #[allow(clippy::too_many_arguments)]
 async fn test_decode(
     num_rows: u64,
-    batch_size: u32,
+    test_cases: &TestCases,
     schema: &Schema,
     column_infos: &[Arc<ColumnInfo>],
     expected: Option<Arc<dyn Array>>,
@@ -562,6 +617,7 @@ async fn test_decode(
 
     scheduler_fut.await;
 
+    let batch_size = test_cases.batch_size;
     let mut decode_stream = create_decode_stream(
         &lance_schema,
         num_rows,
@@ -590,7 +646,14 @@ async fn test_decode(
                     actual.len()
                 );
             }
-            if &expected != actual {
+            if test_cases.exact_array_equality {
+                // Arrow compares the bytes of every valid floating-point value.
+                assert_eq!(
+                    expected.to_data(),
+                    actual.to_data(),
+                    "Mismatch in batch at row offset {offset}"
+                );
+            } else if &expected != actual {
                 if let Ok(comparator) = make_comparator(&expected, &actual, SortOptions::default())
                 {
                     // We can't just assert_eq! because the error message is not very helpful.  This gives us a bit
@@ -761,6 +824,7 @@ fn supports_nulls(data_type: &DataType, encoding: TestEncoding) -> bool {
 }
 
 type EncodingVerificationFn = dyn Fn(&[EncodedColumn], &TestEncoding);
+type ColumnPageVerificationFn = dyn Fn(&[Arc<ColumnInfo>]);
 
 // The default will just test the full read
 #[derive(Clone)]
@@ -769,12 +833,14 @@ pub struct TestCases {
     indices: Vec<Vec<u64>>,
     batch_size: u32,
     skip_validation: bool,
+    exact_array_equality: bool,
     max_page_size: Option<u64>,
     page_sizes: Vec<u64>,
     slicing_modes: Vec<bool>,
     ingest_batch_counts: Vec<u32>,
     encodings: Vec<TestEncoding>,
     verify_encoding: Option<Arc<EncodingVerificationFn>>,
+    verify_column_pages: Option<Arc<ColumnPageVerificationFn>>,
     expected_encoding: Option<Vec<String>>,
 }
 
@@ -785,12 +851,14 @@ impl Default for TestCases {
             ranges: Vec::new(),
             indices: Vec::new(),
             skip_validation: false,
+            exact_array_equality: false,
             max_page_size: None,
             page_sizes: vec![4096, 1024 * 1024],
             slicing_modes: vec![false, true],
             ingest_batch_counts: vec![1, 5, 10],
             encodings: TestEncoding::all().collect(),
             verify_encoding: None,
+            verify_column_pages: None,
             expected_encoding: None,
         }
     }
@@ -829,6 +897,12 @@ impl TestCases {
 
     pub fn without_validation(mut self) -> Self {
         self.skip_validation = true;
+        self
+    }
+
+    /// Require Arrow array equality for every read, including the bits of valid floats.
+    pub fn with_exact_array_equality(mut self) -> Self {
+        self.exact_array_equality = true;
         self
     }
 
@@ -906,6 +980,12 @@ impl TestCases {
         if let Some(verify_encoding) = self.verify_encoding.as_ref() {
             verify_encoding(columns, encoding);
         }
+    }
+
+    /// Inspect the page metadata that will be passed to the decoder.
+    pub fn with_verify_column_pages(mut self, verify: Arc<ColumnPageVerificationFn>) -> Self {
+        self.verify_column_pages = Some(verify);
+        self
     }
 
     pub fn with_expected_encoding(mut self, encoding: impl Into<String>) -> Self {
@@ -1374,6 +1454,9 @@ async fn check_round_trip_encoding_inner(
         column_infos.push(Arc::new(column_info));
     }
 
+    if let Some(verify) = &test_cases.verify_column_pages {
+        verify(&column_infos);
+    }
     let encoded_data = writer.encoded_data.freeze();
 
     let scheduler = Arc::new(SimulatedScheduler::new(encoded_data)) as Arc<dyn EncodingsIo>;
@@ -1414,7 +1497,7 @@ async fn check_round_trip_encoding_inner(
     let scheduler_copy = scheduler.clone();
     test_decode(
         num_rows,
-        test_cases.batch_size,
+        test_cases,
         &schema,
         &column_infos,
         expected_data.clone(),
@@ -1450,7 +1533,7 @@ async fn check_round_trip_encoding_inner(
         let requested_ranges = Some(Arc::<[Range<u64>]>::from(vec![range.clone()]));
         test_decode(
             num_rows,
-            test_cases.batch_size,
+            test_cases,
             &schema,
             &column_infos,
             expected,
@@ -1512,7 +1595,7 @@ async fn check_round_trip_encoding_inner(
         ));
         test_decode(
             num_rows,
-            test_cases.batch_size,
+            test_cases,
             &schema,
             &column_infos,
             expected,

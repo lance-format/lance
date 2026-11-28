@@ -399,16 +399,12 @@ pub struct AlpMiniBlockEncoder {
 }
 
 impl AlpMiniBlockEncoder {
+    // The out-of-line bitpack layout pads chunks to 1024-value blocks.
+    pub(crate) const VALUES_PER_CHUNK: u64 = 1024;
+
     pub fn new(bits_per_value: u64) -> Self {
         assert!(bits_per_value == 32 || bits_per_value == 64);
         Self { bits_per_value }
-    }
-
-    fn max_chunk_size(&self) -> usize {
-        // The out-of-line bitpack layout pads chunks to 1024-value blocks, so
-        // smaller chunks would waste half of every block. 64-bit ALP offsets
-        // up to the 63-bit fallback threshold still fit the 8 KiB chunk budget.
-        1024
     }
 }
 
@@ -482,9 +478,10 @@ impl MiniBlockCompressor for AlpMiniBlockEncoder {
         }
 
         let raw_size = data.num_values as usize * (self.bits_per_value as usize / 8);
+        let chunk_size = Self::VALUES_PER_CHUNK as usize;
         let encoded = match self.bits_per_value {
-            32 => encode_page_f32(&data, self.max_chunk_size(), raw_size)?,
-            64 => encode_page_f64(&data, self.max_chunk_size(), raw_size)?,
+            32 => encode_page_f32(&data, chunk_size, raw_size)?,
+            64 => encode_page_f64(&data, chunk_size, raw_size)?,
             _ => unreachable!(),
         };
 
