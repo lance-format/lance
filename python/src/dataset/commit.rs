@@ -30,8 +30,10 @@ static PY_CONFLICT_ERROR: LazyLock<PyResult<Py<PyAny>>> = LazyLock::new(|| {
 });
 
 fn handle_error(py_err: PyErr, py: Python) -> CommitError {
+    // The cached object is the class itself. `get_type()` would return its metaclass,
+    // which no exception instance passes, and the conflict arm would never be taken.
     let conflict_err_type = match &*PY_CONFLICT_ERROR {
-        Ok(err) => err.bind(py).get_type(),
+        Ok(err) => err.bind(py).clone(),
         Err(import_error) => {
             return CommitError::OtherError(Error::internal(format!(
                 "Error importing from pylance {}",
@@ -41,13 +43,32 @@ fn handle_error(py_err: PyErr, py: Python) -> CommitError {
     };
 
     if py_err.is_instance(py, &conflict_err_type) {
-        CommitError::CommitConflict
+        // `retryable=False` means retrying cannot help, so it must not be retried.
+        let retryable = py_err
+            .value(py)
+            .getattr("retryable")
+            .and_then(|flag| flag.is_truthy())
+            .unwrap_or(true);
+        if retryable {
+            CommitError::CommitConflict
+        } else {
+            CommitError::OtherError(Error::incompatible_transaction_source(
+                py_err.to_string().into(),
+            ))
+        }
     } else {
-        CommitError::OtherError(Error::internal(format!(
-            "Error from commit handler: {}",
-            py_err
-        )))
+        handler_error(py_err)
     }
+}
+
+/// Maps a lock error to an internal error. Release maps every error this way:
+/// `release(true)` runs after the manifest is written, so treating a conflict there
+/// as one would retry or reject a commit that landed.
+fn handler_error(py_err: PyErr) -> CommitError {
+    CommitError::OtherError(Error::internal(format!(
+        "Error from commit handler: {}",
+        py_err
+    )))
 }
 
 pub struct PyCommitLock {
@@ -104,7 +125,7 @@ impl CommitLease for PyCommitLease {
             if success {
                 self.inner
                     .call_method1(py, "__exit__", (py.None(), py.None(), py.None()))
-                    .map_err(|err| handle_error(err, py))
+                    .map_err(handler_error)
             } else {
                 // Setting Python's pending error indicator would interfere
                 // with calling __exit__; pass the exception directly instead.
@@ -115,7 +136,7 @@ impl CommitLease for PyCommitLease {
                         "__exit__",
                         (err.get_type(py), err.value(py), err.traceback(py)),
                     )
-                    .map_err(|err| handle_error(err, py))
+                    .map_err(handler_error)
             }
         })?;
         Ok(())

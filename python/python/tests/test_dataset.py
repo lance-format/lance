@@ -8007,17 +8007,31 @@ def test_custom_commit_lock(tmp_path: Path):
     commit_module = importlib.import_module("lance.commit")
 
     @contextlib.contextmanager
-    def commit_lock(_version: int):
+    def conflicting_lock(_version: int):
         raise commit_module.CommitConflictError()
 
-    with pytest.raises(Exception, match="CommitConflictError"):
+    # Creating a dataset treats a conflict as another writer having created it first.
+    with pytest.raises(OSError, match="Dataset already exists"):
         lance.write_dataset(
-            pa.table({"a": range(100)}), tmp_path / "test3", commit_lock=commit_lock
+            pa.table({"a": range(100)}),
+            tmp_path / "test3",
+            commit_lock=conflicting_lock,
         )
 
-    dataset = lance.dataset(tmp_path / "test1", commit_lock=commit_lock)
-    with pytest.raises(Exception, match="CommitConflictError"):
-        dataset.delete("a < 10")
+    # On an existing dataset a conflict is retried, and the lock is called again.
+    lock_calls = []
+
+    @contextlib.contextmanager
+    def contended_lock(version: int):
+        lock_calls.append(version)
+        if len(lock_calls) == 1:
+            raise commit_module.CommitConflictError()
+        yield
+
+    dataset = lance.dataset(tmp_path / "test1", commit_lock=contended_lock)
+    dataset.delete("a < 10")
+    assert len(lock_calls) == 2
+    assert dataset.count_rows() == 90
 
 
 @pytest.mark.parametrize("manager_type", ["class", "generator"])
@@ -12203,3 +12217,60 @@ def test_merge_insert_while_the_handle_is_borrowed(tmp_path: Path):
     ds.checkout_latest()
     assert ds.version == 2
     assert ds.to_table()["value"].to_pylist() == [1] * 10
+
+
+@pytest.mark.parametrize("retryable", [True, False])
+def test_commit_lock_conflict_error_keeps_type(tmp_path: Path, retryable):
+    # A CommitConflictError raised by a custom lock is a commit conflict, not a generic
+    # internal OSError. A retryable one is retried; one that is not fails at once.
+    commit_module = importlib.import_module("lance.commit")
+    lock_calls = []
+
+    @contextlib.contextmanager
+    def conflicting_lock(version: int):
+        lock_calls.append(version)
+        raise commit_module.CommitConflictError("taken", retryable=retryable)
+
+    dataset = lance.write_dataset(pa.table({"a": range(10)}), tmp_path / "data")
+    fragment = dataset.get_fragments()[0]
+
+    with pytest.raises(commit_module.CommitConflictError) as exc_info:
+        lance.LanceDataset.commit(
+            str(tmp_path / "data"),
+            lance.LanceOperation.Append([fragment.metadata]),
+            read_version=dataset.version,
+            commit_lock=conflicting_lock,
+            max_retries=3,
+        )
+    assert exc_info.value.retryable is retryable
+    assert len(lock_calls) == (3 if retryable else 1)
+    assert lance.dataset(tmp_path / "data").version == 1
+
+
+def test_commit_lock_release_conflict_is_not_a_commit_conflict(tmp_path: Path):
+    # A lock that raises CommitConflictError on release does so after the manifest
+    # was written. That must not be treated as a rejected commit.
+    commit_module = importlib.import_module("lance.commit")
+    lock_calls = []
+
+    @contextlib.contextmanager
+    def releasing_lock(version: int):
+        lock_calls.append(version)
+        yield
+        raise commit_module.CommitConflictError("release failed", retryable=False)
+
+    dataset = lance.write_dataset(pa.table({"a": range(10)}), tmp_path / "data")
+    fragment = dataset.get_fragments()[0]
+
+    with pytest.raises(OSError, match="Error from commit handler") as exc_info:
+        lance.LanceDataset.commit(
+            str(tmp_path / "data"),
+            lance.LanceOperation.Append([fragment.metadata]),
+            read_version=dataset.version,
+            commit_lock=releasing_lock,
+            max_retries=3,
+        )
+    assert not isinstance(exc_info.value, commit_module.CommitConflictError)
+    assert len(lock_calls) == 1
+    # The manifest was written before the release failed.
+    assert lance.dataset(tmp_path / "data").version == 2
