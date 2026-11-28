@@ -897,6 +897,7 @@ class LanceDataset(pa.dataset.Dataset):
             if val is not None:
                 opt(val)
 
+        setopt(builder.columns, columns)
         setopt(builder.filter, filter)
         setopt(builder.prefilter, prefilter)
         if row_addr_allowlist is not None or row_addr_blocklist is not None:
@@ -924,23 +925,6 @@ class LanceDataset(pa.dataset.Dataset):
         setopt(builder.strict_batch_size, strict_batch_size)
         setopt(builder.order_by, order_by)
         setopt(builder.disable_scoring_autoprojection, disable_scoring_autoprojection)
-        # columns=None has a special meaning. we can't treat it as "user didn't specify"
-        if self._default_scan_options is None:
-            # No defaults, use user-provided, if any
-            builder = builder.columns(columns)
-        else:
-            default_columns = self._default_scan_options.get("columns", None)
-            if default_columns is None:
-                # No default_columns, use user-provided, if any
-                builder = builder.columns(columns)
-            else:
-                if columns is not None:
-                    # User supplied None, fallback to default (no way to override
-                    # default to None)
-                    builder = builder.columns(columns)
-                else:
-                    # User supplied non-None, use that
-                    builder = builder.columns(default_columns)
 
         if full_text_query is not None:
             if isinstance(full_text_query, (str, FullTextQuery)):

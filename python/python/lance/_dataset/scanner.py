@@ -769,7 +769,13 @@ class ScannerBuilder:
             setter = getattr(self, key, None)
             if setter is None:
                 raise ValueError(f"Unknown option {key}")
-            if isinstance(value, dict):
+            # Projection and compound filter dictionaries are option values.
+            if isinstance(value, dict) and not (
+                key == "columns"
+                or (
+                    key == "filter" and value.keys() <= {"expr_filter", "search_filter"}
+                )
+            ):
                 setter(**value)
             else:
                 setter(value)
@@ -867,12 +873,12 @@ class ScannerBuilder:
     def columns(
         self, cols: Optional[Union[List[str], Dict[str, str]]] = None
     ) -> ScannerBuilder:
-        if cols is None:
-            self._columns = None
-        elif isinstance(cols, dict):
-            self._columns_with_transform = list(cols.items())
-        elif isinstance(cols, list):
+        if cols is None or isinstance(cols, list):
             self._columns = cols
+            self._columns_with_transform = None
+        elif isinstance(cols, dict):
+            self._columns = None
+            self._columns_with_transform = list(cols.items())
         else:
             raise TypeError(
                 f"columns must be a list or dict[name, expression], got {type(cols)}"
@@ -901,8 +907,10 @@ class ScannerBuilder:
             )
         elif isinstance(filter, str):
             self._filter = filter
+            self._substrait_filter = None
         elif isinstance(filter, pa.compute.Expression):
             self._substrait_filter = _serialize_expression(filter, self.ds._ds.schema)
+            self._filter = None
         else:
             expr_filter = filter.get("expr_filter")
             if expr_filter is not None:
