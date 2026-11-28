@@ -1097,6 +1097,9 @@ impl PostingListBuilder {
     }
 
     pub fn remap(&mut self, removed: &[u32]) {
+        if removed.is_empty() {
+            return;
+        }
         let mut cursor = 0;
         let mut new_builder = Self::new_with_posting_tail_codec_and_block_size(
             self.has_positions(),
@@ -1104,9 +1107,7 @@ impl PostingListBuilder {
             self.block_size(),
         );
         for (doc_id, freq, positions) in self.iter() {
-            while cursor < removed.len() && removed[cursor] < doc_id {
-                cursor += 1;
-            }
+            cursor += removed_before(&removed[cursor..], doc_id);
             if cursor < removed.len() && removed[cursor] == doc_id {
                 continue;
             }
@@ -1119,6 +1120,23 @@ impl PostingListBuilder {
 
         *self = new_builder;
     }
+}
+
+// Every token starts at the beginning of the removal list. A linear walk costs
+// O(tokens * removed documents) for rare tokens near the end of a partition.
+// Gallop over large gaps, then bisect only that window; dense postings retain
+// constant work for small gaps. Both input lists are in ascending doc-id order.
+fn removed_before(removed: &[u32], doc_id: u32) -> usize {
+    if removed.first().is_none_or(|&removed| removed >= doc_id) {
+        return 0;
+    }
+    let mut start = 1;
+    let mut end = 1;
+    while end < removed.len() && removed[end] < doc_id {
+        start = end + 1;
+        end = end.saturating_mul(2);
+    }
+    start + removed[start..end.min(removed.len())].partition_point(|&removed| removed < doc_id)
 }
 
 pub(super) fn compute_block_score_and_impact_block(

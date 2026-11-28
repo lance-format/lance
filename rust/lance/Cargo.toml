@@ -401,3 +401,7 @@ harness = false
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "fts_update"
+harness = false

@@ -1434,6 +1434,51 @@ async fn test_posting_builder_remap() {
     );
 }
 
+// Sparse gaps must shift document IDs without changing frequencies or positions.
+#[rstest::rstest]
+#[case::empty(Vec::new(), vec![1, 2])]
+#[case::no_deletions(vec![0, 17, 100_000], Vec::new())]
+#[case::all_deleted(vec![0, 17, 100_000], vec![0, 17, 100_000])]
+#[case::deletions_after(vec![0, 1, 2], vec![3, 4, 5])]
+#[case::long_prefix(vec![90_001, 99_999, 100_000], (0..90_000).collect())]
+#[case::large_gaps(vec![0, 100, 1000, 10_000, 99_999], (0..100_000).step_by(3).collect())]
+#[case::block_boundaries((0..800).collect(), (0..800).step_by(3).collect())]
+#[case::max_id(vec![0, 1, u32::MAX - 1, u32::MAX], vec![0, 9, u32::MAX])]
+fn test_posting_builder_remap_preserves_entries(
+    #[case] docs: Vec<u32>,
+    #[case] removed: Vec<u32>,
+    #[values(false, true)] with_positions: bool,
+    #[values(PostingTailCodec::Fixed32, PostingTailCodec::VarintDelta)] codec: PostingTailCodec,
+) {
+    let mut builder =
+        PostingListBuilder::new_with_posting_tail_codec_and_block_size(with_positions, codec, 256);
+    for (index, &doc) in docs.iter().enumerate() {
+        let count = (index % 4 + 1) as u32;
+        let positions = if with_positions {
+            PositionRecorder::Position((0..count).map(|i| i * 3 + 1).collect())
+        } else {
+            PositionRecorder::Count(count)
+        };
+        builder.add(doc, positions);
+    }
+    // Independent oracle: filter and count over the complete removal list.
+    let expected = builder
+        .iter()
+        .filter_map(|(doc, freq, positions)| {
+            if removed.contains(&doc) {
+                return None;
+            }
+            let shift = removed.iter().filter(|&&removed| removed < doc).count() as u32;
+            Some((doc - shift, freq, positions))
+        })
+        .collect::<Vec<_>>();
+    builder.remap(&removed);
+    assert_eq!(builder.iter().collect::<Vec<_>>(), expected);
+    assert_eq!(builder.posting_tail_codec, codec);
+    assert_eq!(builder.block_size_log2, 8);
+    assert_eq!(builder.has_positions(), with_positions);
+}
+
 /// Doc id gaps and frequencies that exercise one- to five-byte varints in the
 /// builder's tail encoding.
 fn varied_postings(len: usize) -> (Vec<u32>, Vec<u32>) {
