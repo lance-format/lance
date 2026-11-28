@@ -265,6 +265,24 @@ impl<'a> CommitBuilder<'a> {
         self
     }
 
+    /// Supply the number of newly inserted logical rows observed by this writer.
+    /// A zero count lets the resolver distinguish updates from unencoded insert keys.
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result, dataset::{CommitBuilder, write::merge_insert::UncommittedMergeInsert}};
+    /// # async fn commit(uri: &str, staged: UncommittedMergeInsert) -> Result<Dataset> {
+    /// let mut builder = CommitBuilder::new(uri).with_inserted_row_count(staged.stats.num_inserted_rows);
+    /// if let Some(rows) = staged.affected_rows {
+    ///     builder = builder.with_affected_rows(rows);
+    /// }
+    /// builder.execute(staged.transaction).await
+    /// # }
+    /// ```
+    pub fn with_inserted_row_count(mut self, count: u64) -> Self {
+        self.inner = self.inner.with_inserted_row_count(count);
+        self
+    }
+
     /// Set a timeout for the commit operation.
     ///
     /// The timeout bounds the *entire* [`Self::execute`] / [`Self::execute_batch`]

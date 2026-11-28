@@ -2,6 +2,105 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use super::*;
+use lance::dataset::ColumnAlteration;
+use lance_namespace::models::RegisterTableRequest;
+
+#[tokio::test]
+async fn test_describe_table_registered_snapshot() {
+    let temp = TempStdDir::default();
+    let root = temp.to_str().unwrap();
+    let listing = DirectoryNamespaceBuilder::new(root)
+        .manifest_enabled(false)
+        .build()
+        .await
+        .unwrap();
+    create_scalar_table(&listing, "source").await;
+    let mut main = open_dataset(&listing, "source").await;
+    let mut dev = main.create_branch("dev", 1, None).await.unwrap();
+    dev.tags().create("release", 1).await.unwrap();
+    main.tags().create("main-tag", 1).await.unwrap();
+    dev.alter_columns(&[ColumnAlteration::new("id".into()).rename("new_id".into())])
+        .await
+        .unwrap();
+
+    let catalog = DirectoryNamespaceBuilder::new(root)
+        .dir_listing_enabled(false)
+        .table_version_tracking_enabled(true)
+        .storage_options(HashMap::from([("application".into(), "reader".into())]))
+        .build()
+        .await
+        .unwrap();
+    let branch_path = uri_to_url(dev.uri()).unwrap().to_file_path().unwrap();
+    let id = Some(vec!["registered".into()]);
+    catalog
+        .register_table(RegisterTableRequest {
+            id: id.clone(),
+            ..RegisterTableRequest::new("source.lance/tree/dev".into())
+        })
+        .await
+        .unwrap();
+    let selected = DescribeTableRequest {
+        id,
+        tag: Some("release".into()),
+        load_detailed_metadata: Some(true),
+        ..Default::default()
+    };
+    let response = catalog.describe_table(selected.clone()).await.unwrap();
+    assert_eq!(
+        (
+            response.schema.unwrap().fields[0].name.as_str(),
+            response.version
+        ),
+        ("id", Some(1)),
+        "selected schema differs from the direct dataset snapshot"
+    );
+    assert_eq!(response.managed_versioning, Some(true));
+    assert!(response.storage_options.is_none());
+    assert_eq!(response.table_uri, response.location);
+    assert_eq!(
+        uri_to_url(&response.location.unwrap())
+            .unwrap()
+            .to_file_path()
+            .unwrap(),
+        branch_path
+    );
+    let manifest = catalog.manifest_ns_for_read().unwrap();
+    let direct = manifest.describe_table(selected.clone()).await.unwrap();
+    assert_eq!(direct.schema.unwrap().fields[0].name, "id");
+    assert_eq!(direct.storage_options.unwrap()["application"], "reader");
+    let private = manifest
+        .describe_table(DescribeTableRequest {
+            vend_credentials: Some(false),
+            ..selected.clone()
+        })
+        .await
+        .unwrap();
+    assert!(private.storage_options.is_none());
+    let error = catalog
+        .describe_table(DescribeTableRequest {
+            tag: Some("main-tag".into()),
+            ..selected.clone()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(mutation_error_code(error), ErrorCode::Unsupported);
+
+    append_unreadable_manifest(&catalog, &dev).await;
+    // A direct registration needs a readable local manifest to locate the owner of a tag.
+    let error = catalog.describe_table(selected.clone()).await.unwrap_err();
+    assert_eq!(mutation_error_code(error), ErrorCode::Unsupported);
+    let pinned = catalog
+        .describe_table(DescribeTableRequest {
+            tag: None,
+            branch: Some("dev".into()),
+            version: Some(1),
+            ..selected
+        })
+        .await
+        .unwrap();
+    assert_eq!(pinned.schema.unwrap().fields[0].name, "id");
+    assert_eq!(pinned.version, Some(1));
+}
 
 #[tokio::test]
 async fn test_register_table() {

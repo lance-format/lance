@@ -678,23 +678,6 @@ fn extract_inserted_rows_filter(ob: &Bound<'_, PyAny>) -> PyResult<KeyExistenceF
     )
 }
 
-pub struct PyUpdateMode(pub UpdateMode);
-
-impl FromPyObject<'_, '_> for PyUpdateMode {
-    type Error = PyErr;
-    fn extract(ob: Borrowed<'_, '_, PyAny>) -> PyResult<Self> {
-        let mode_str: String = ob.extract()?;
-        match mode_str.as_str() {
-            "rewrite_rows" => Ok(Self(UpdateMode::RewriteRows)),
-            "rewrite_columns" => Ok(Self(UpdateMode::RewriteColumns)),
-            _ => Err(PyValueError::new_err(format!(
-                "Invalid UpdateMode: {}. Valid options are: rewrite_rows, rewrite_columns",
-                mode_str
-            ))),
-        }
-    }
-}
-
 fn import_compacted_sstables(values: &Bound<'_, PyAny>) -> PyResult<Vec<CompactedSsTable>> {
     if values.is_none() {
         return Ok(Vec::new());
@@ -781,16 +764,19 @@ impl FromPyObject<'_, '_> for PyLance<Operation> {
 
                 let fields_modified = ob.getattr("fields_modified")?.extract()?;
 
-                let fields_for_preserving_frag_bitmap = ob
-                    .getattr("fields_for_preserving_frag_bitmap")?
-                    .extract()
-                    .unwrap_or_default();
-
-                let update_mode = ob
-                    .getattr("update_mode")?
-                    .extract::<PyUpdateMode>()
-                    .ok()
-                    .map(|py_mode| py_mode.0);
+                let fields_for_preserving_frag_bitmap =
+                    ob.getattr("fields_for_preserving_frag_bitmap")?.extract()?;
+                let mode: String = ob.getattr("update_mode")?.extract()?;
+                let update_mode = match mode.as_str() {
+                    "" => None,
+                    "rewrite_rows" => Some(UpdateMode::RewriteRows),
+                    "rewrite_columns" => Some(UpdateMode::RewriteColumns),
+                    _ => {
+                        return Err(PyValueError::new_err(format!(
+                            "Invalid update_mode {mode:?}, expected \"\", \"rewrite_rows\" or \"rewrite_columns\""
+                        )));
+                    }
+                };
 
                 // Absent on objects predating the field.
                 let updated_fragment_offsets = ob

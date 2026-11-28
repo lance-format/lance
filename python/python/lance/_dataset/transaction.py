@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 import dataclasses
+import hashlib
+import pickle
 import uuid
 import warnings
 from abc import ABC
@@ -46,6 +48,49 @@ class Transaction:
         default_factory=dict
     )
     tag: Optional[str] = None
+
+    def _row_rewrite(self):
+        op = self.operation
+        if not (
+            isinstance(op, LanceOperation.Update)
+            and op.update_mode == "rewrite_rows"
+            and not op.fields_modified
+            and op.updated_fragment_offsets is None
+        ):
+            return None
+        # File descriptors identify the output keys without copying potentially
+        # large inline row-ID and version arrays into the worker handoff.
+        digest = hashlib.sha256()
+        for fragment in op.new_fragments:
+            if fragment.overlays or fragment.deletion_file is not None:
+                return None
+            digest.update(
+                pickle.dumps((fragment.physical_rows, fragment.files), protocol=5)
+            )
+        return (
+            self.read_version,
+            tuple(op.removed_fragment_ids),
+            op.inserted_rows_filter,
+            tuple(
+                (fragment.id, fragment.deletion_file)
+                for fragment in op.updated_fragments
+            ),
+            digest.digest(),
+        )
+
+    def _set_staged_merge_write(
+        self, rows: Optional[bytes], num_inserted_rows: int
+    ) -> None:
+        rewrite = self._row_rewrite()
+        if rewrite is not None:
+            self._staged_rows = (rewrite, rows, num_inserted_rows)
+
+    @property
+    def _staged_merge_write(self) -> Optional[tuple[Optional[bytes], int]]:
+        staged = getattr(self, "_staged_rows", None)
+        if staged is not None and len(staged) == 3 and staged[0] == self._row_rewrite():
+            return staged[1], staged[2]
+        return None
 
 
 class UpdateResult(TypedDict):
@@ -294,6 +339,9 @@ class LanceOperation:
         fields_for_preserving_frag_bitmap: list[int]
             The fields that used to judge whether to preserve the new frag's id into
             the frag bitmap of the specified indices.
+        update_mode: str
+            Use ``"rewrite_rows"`` or ``"rewrite_columns"`` for a row or column
+            rewrite. The default empty string leaves the mode unspecified.
         updated_fragment_offsets: dict[int, bytes], optional
             Physical row offsets that matched the update, keyed by fragment id,
             each serialized in the portable RoaringBitmap format. Set on
@@ -310,6 +358,11 @@ class LanceOperation:
             Keys inserted by a merge-insert, used for concurrent conflict
             detection. ``might_contain`` compares stored key hashes for an
             exact set and may have false positives for a bloom filter.
+            Two staged merges must retry if only one supplies a key filter.
+            A raw Update with only ``new_fragments`` is a blind append: it
+            can publish after a keyed writer even when their keys overlap.
+            A stale keyed writer must retry after that append because the
+            appended keys are unknown.
         """
 
         removed_fragment_ids: List[int] = dataclasses.field(default_factory=list)
