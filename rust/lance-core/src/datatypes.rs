@@ -9,6 +9,9 @@ use std::sync::{Arc, LazyLock};
 
 use crate::deepsize::DeepSizeOf;
 use arrow_array::ArrayRef;
+use arrow_array::types::{
+    Decimal32Type, Decimal64Type, DecimalType, validate_decimal_precision_and_scale,
+};
 use arrow_schema::{DataType, Field as ArrowField, Fields, TimeUnit};
 use lance_arrow::bfloat16::{BFLOAT16_EXT_NAME, is_bfloat16_field};
 use lance_arrow::{ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY};
@@ -325,6 +328,20 @@ fn parse_timeunit(unit: &str) -> Result<TimeUnit> {
     }
 }
 
+/// Rejects a `Decimal32` or `Decimal64` type outside the schema spec's
+/// `1 <= P <= max` and `0 <= S <= P`. Arrow's own check accepts a negative
+/// scale, on which DataFusion's cast unwrapping overflows.
+fn validate_narrow_decimal<T: DecimalType>(dt: &DataType, precision: u8, scale: i8) -> Result<()> {
+    validate_decimal_precision_and_scale::<T>(precision, scale)
+        .map_err(|err| Error::schema(format!("Unsupported data type {dt}: {err}")))?;
+    if scale < 0 {
+        return Err(Error::schema(format!(
+            "Unsupported data type {dt}: scale {scale} is negative"
+        )));
+    }
+    Ok(())
+}
+
 impl TryFrom<&DataType> for LogicalType {
     type Error = Error;
 
@@ -343,8 +360,14 @@ impl TryFrom<&DataType> for LogicalType {
             DataType::Float16 => "halffloat".to_string(),
             DataType::Float32 => "float".to_string(),
             DataType::Float64 => "double".to_string(),
-            DataType::Decimal32(precision, scale) => format!("decimal:32:{precision}:{scale}"),
-            DataType::Decimal64(precision, scale) => format!("decimal:64:{precision}:{scale}"),
+            DataType::Decimal32(precision, scale) => {
+                validate_narrow_decimal::<Decimal32Type>(dt, *precision, *scale)?;
+                format!("decimal:32:{precision}:{scale}")
+            }
+            DataType::Decimal64(precision, scale) => {
+                validate_narrow_decimal::<Decimal64Type>(dt, *precision, *scale)?;
+                format!("decimal:64:{precision}:{scale}")
+            }
             DataType::Decimal128(precision, scale) => format!("decimal:128:{precision}:{scale}"),
             DataType::Decimal256(precision, scale) => format!("decimal:256:{precision}:{scale}"),
             DataType::Utf8 | DataType::Utf8View => "string".to_string(),
@@ -945,6 +968,41 @@ mod tests {
         let logical_type = LogicalType::try_from(&data_type).unwrap();
         assert_eq!(logical_type.to_string(), expected);
         assert_eq!(DataType::try_from(&logical_type).unwrap(), data_type);
+    }
+
+    /// Types outside the spec's precision and scale ranges must not reach storage:
+    /// later filters index DataFusion's tables by precision, and a negative scale
+    /// overflows its cast unwrapping.
+    #[rstest]
+    #[case::decimal32_precision_too_large(
+        DataType::Decimal32(10, 2),
+        "precision 10 is greater than max 9"
+    )]
+    #[case::decimal32_zero_precision(DataType::Decimal32(0, 0), "precision cannot be 0")]
+    #[case::decimal32_scale_above_precision(
+        DataType::Decimal32(4, 5),
+        "scale 5 is greater than precision 4"
+    )]
+    #[case::decimal64_precision_too_large(
+        DataType::Decimal64(19, 2),
+        "precision 19 is greater than max 18"
+    )]
+    #[case::decimal32_negative_scale(DataType::Decimal32(5, -2), "scale -2 is negative")]
+    #[case::decimal64_negative_scale(DataType::Decimal64(18, -5), "scale -5 is negative")]
+    fn test_decimal_logical_type_rejects_invalid_precision(
+        #[case] data_type: DataType,
+        #[case] expected: &str,
+    ) {
+        let err = LogicalType::try_from(&data_type).unwrap_err();
+        assert!(
+            matches!(err, Error::Schema { .. }),
+            "unexpected error: {err}"
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains(&data_type.to_string()) && message.contains(expected),
+            "unexpected error: {message}"
+        );
     }
 
     #[rstest]

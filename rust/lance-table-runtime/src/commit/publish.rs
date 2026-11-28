@@ -378,12 +378,6 @@ pub async fn write_manifest_file(
             .verify_primary_key()
             .map_err(CommitError::OtherError)?;
         validate_blob_threshold_metadata(&manifest.schema).map_err(CommitError::OtherError)?;
-        // Adding an all-null column writes no data file, so no file writer checks it.
-        validate_decimal32_and_decimal64(
-            &manifest.schema,
-            manifest.data_storage_format.lance_file_format(),
-        )
-        .map_err(CommitError::OtherError)?;
     }
     if config.auto_set_feature_flags() {
         // build_manifest may have already set FLAG_STABLE_ROW_IDS on the manifest.
@@ -426,6 +420,16 @@ pub async fn write_manifest_file(
 
     validate_non_reusable_field_id_flags(manifest).map_err(CommitError::OtherError)?;
     finalize_manifest_storage_version(manifest)?;
+    // Adding an all-null column writes no data file, so no file writer checks it.
+    // This runs after finalizing, which can raise a legacy default to the files'
+    // version, so it checks the version being published.
+    if may_change_schema {
+        validate_decimal32_and_decimal64(
+            &manifest.schema,
+            manifest.data_storage_format.lance_file_format(),
+        )
+        .map_err(CommitError::OtherError)?;
+    }
 
     manifest.set_timestamp(
         config

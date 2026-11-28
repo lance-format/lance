@@ -4760,6 +4760,78 @@ async fn decimal32_and_decimal64_round_trip_on_2_3() {
     assert_eq!(filtered.num_rows(), expected_rows);
 }
 
+/// Committing 2.3 files over a legacy dataset publishes the files' version, so
+/// the commit-time check must accept their Decimal32 and Decimal64 columns.
+#[tokio::test]
+async fn overwrite_legacy_dataset_with_decimal32_and_decimal64_files() {
+    let test_uri = TempStrDir::default();
+    let ids =
+        RecordBatch::try_from_iter([("id", Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef)])
+            .unwrap();
+    let dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(ids.clone())], ids.schema()),
+        &test_uri,
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::Legacy),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        dataset.manifest.data_storage_format.lance_file_format(),
+        ConcreteFileVersion::V1
+    );
+
+    let batch = decimal32_and_decimal64_batch(1..5);
+    let params = WriteParams {
+        mode: WriteMode::Overwrite,
+        data_storage_version: Some(LanceFileVersion::V2_3),
+        ..Default::default()
+    };
+    let dataset = Arc::new(dataset);
+    let transaction = InsertBuilder::new(dataset.clone())
+        .with_params(&params)
+        .execute_uncommitted(vec![batch.clone()])
+        .await
+        .unwrap();
+    CommitBuilder::new(dataset)
+        .execute(transaction)
+        .await
+        .unwrap();
+
+    let dataset = Dataset::open(&test_uri).await.unwrap();
+    assert_eq!(
+        dataset.manifest.data_storage_format.lance_file_format(),
+        ConcreteFileVersion::V2_3
+    );
+    assert_eq!(dataset.scan().try_into_batch().await.unwrap(), batch);
+}
+
+/// `with_data_type` does not check the precision, and Arrow allows a negative
+/// scale, so the write must reject both rather than store a type later filters
+/// cannot plan.
+#[rstest]
+#[case::precision_beyond_width(DataType::Decimal32(10, 2), "precision 10 is greater than max 9")]
+#[case::negative_scale(DataType::Decimal32(5, -2), "scale -2 is negative")]
+#[tokio::test]
+async fn write_rejects_invalid_decimal32_type(#[case] data_type: DataType, #[case] expected: &str) {
+    let values = Decimal32Array::from(vec![Some(1), None]).with_data_type(data_type);
+    let batch = RecordBatch::try_from_iter([("d", Arc::new(values) as ArrayRef)]).unwrap();
+    let error = Dataset::write(
+        RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+        "memory://",
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_3),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(error, Error::Schema { .. }), "{error}");
+    assert!(error.to_string().contains(expected), "{error}");
+}
+
 /// Released readers of these versions reject the `decimal:32` and `decimal:64`
 /// logical types, so the write must fail before it records them.
 #[rstest]

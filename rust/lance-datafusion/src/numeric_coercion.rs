@@ -970,6 +970,24 @@ mod tests {
     )]
     #[case::decimal64_above_precision(PRICE64, "d = 10000000000000000.5", 0, Some(false))]
     #[case::decimal64_between(PRICE64, "d BETWEEN 0.051 AND 0.07", 5, Some(false))]
+    #[case::cast_arithmetic(
+        PRICE,
+        "d = CAST(1 AS DECIMAL(9, 2)) + CAST(2 AS DECIMAL(9, 2))",
+        300,
+        Some(true)
+    )]
+    #[case::decimal32_cast_arithmetic(
+        PRICE32,
+        "d = CAST(1 AS DECIMAL(9, 2)) + CAST(2 AS DECIMAL(9, 2))",
+        300,
+        Some(true)
+    )]
+    #[case::decimal32_cast_arithmetic_miss(
+        PRICE32,
+        "d = CAST(1 AS DECIMAL(9, 2)) + CAST(2 AS DECIMAL(9, 2))",
+        299,
+        Some(false)
+    )]
     fn decimal_predicates(
         #[case] data_type: DataType,
         #[case] sql: &str,
