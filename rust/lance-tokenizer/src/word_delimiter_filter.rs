@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::collections::VecDeque;
+use std::mem;
 
 use crate::{Token, TokenFilter, TokenStream, Tokenizer};
 
@@ -70,6 +71,8 @@ impl<T: Tokenizer> Tokenizer for WordDelimiterFilterWrapper<T> {
             preserve_original: self.preserve_original,
             split_on_numerics: self.split_on_numerics,
             position_offset: 0,
+            parts: Vec::new(),
+            spare_texts: Vec::new(),
         }
     }
 }
@@ -82,34 +85,29 @@ pub struct WordDelimiterTokenStream<T> {
     preserve_original: bool,
     split_on_numerics: bool,
     position_offset: usize,
-}
-
-#[derive(Clone, Copy)]
-struct CharInfo {
-    offset: usize,
-    ch: char,
+    parts: Vec<(usize, usize)>,
+    spare_texts: Vec<String>,
 }
 
 fn is_identifier_text(text: &str) -> bool {
     text.chars().any(|ch| ch == '_' || ch.is_alphanumeric())
 }
 
-fn split_identifier(text: &str, split_on_numerics: bool) -> Vec<(usize, usize)> {
-    let mut pieces = Vec::new();
+fn split_identifier(text: &str, split_on_numerics: bool, pieces: &mut Vec<(usize, usize)>) {
+    pieces.clear();
     let mut segment_start = None;
     for (offset, ch) in text.char_indices() {
         if ch == '_' {
             if let Some(start) = segment_start.take() {
-                split_segment(text, start, offset, split_on_numerics, &mut pieces);
+                split_segment(text, start, offset, split_on_numerics, pieces);
             }
         } else if segment_start.is_none() {
             segment_start = Some(offset);
         }
     }
     if let Some(start) = segment_start {
-        split_segment(text, start, text.len(), split_on_numerics, &mut pieces);
+        split_segment(text, start, text.len(), split_on_numerics, pieces);
     }
-    pieces
 }
 
 fn split_segment(
@@ -119,106 +117,109 @@ fn split_segment(
     split_on_numerics: bool,
     pieces: &mut Vec<(usize, usize)>,
 ) {
-    if start == end {
+    let mut chars = text[start..end].char_indices().peekable();
+    let Some((_, mut prev)) = chars.next() else {
         return;
-    }
-    let chars = text[start..end]
-        .char_indices()
-        .map(|(offset, ch)| CharInfo {
-            offset: start + offset,
-            ch,
-        })
-        .collect::<Vec<_>>();
+    };
     let mut piece_start = start;
-    for idx in 1..chars.len() {
-        if is_boundary(&chars, idx, split_on_numerics) {
-            pieces.push((piece_start, chars[idx].offset));
-            piece_start = chars[idx].offset;
+    while let Some((offset, cur)) = chars.next() {
+        let next = chars.peek().map(|&(_, next)| next);
+        if is_boundary(prev, cur, next, split_on_numerics) {
+            pieces.push((piece_start, start + offset));
+            piece_start = start + offset;
         }
+        prev = cur;
     }
     pieces.push((piece_start, end));
 }
 
-fn is_boundary(chars: &[CharInfo], idx: usize, split_on_numerics: bool) -> bool {
-    let prev = chars[idx - 1].ch;
-    let cur = chars[idx].ch;
+fn is_boundary(prev: char, cur: char, next: Option<char>, split_on_numerics: bool) -> bool {
     if split_on_numerics && prev.is_ascii_digit() != cur.is_ascii_digit() {
         return true;
     }
     if prev.is_lowercase() && cur.is_uppercase() {
         return true;
     }
-    if prev.is_uppercase()
-        && cur.is_uppercase()
-        && chars
-            .get(idx + 1)
-            .is_some_and(|next| next.ch.is_lowercase())
-    {
+    if prev.is_uppercase() && cur.is_uppercase() && next.is_some_and(char::is_lowercase) {
         return true;
     }
     false
 }
 
-impl<T: TokenStream> WordDelimiterTokenStream<T> {
-    fn refill(&mut self) -> bool {
-        while self.pending.is_empty() {
-            if !self.tail.advance() {
-                return false;
-            }
-            self.enqueue_current_tail_token();
-        }
-        true
-    }
+fn load_token(target: &mut Token, source: &Token, position: usize, position_length: usize) {
+    target.offset_from = source.offset_from;
+    target.offset_to = source.offset_to;
+    target.position = position;
+    target.text.clone_from(&source.text);
+    target.position_length = position_length;
+}
 
-    fn enqueue_current_tail_token(&mut self) {
+impl<T: TokenStream> WordDelimiterTokenStream<T> {
+    fn load_current_tail_token(&mut self) {
         let token = self.tail.token();
         let adjusted_position = token.position.saturating_add(self.position_offset);
         if !is_identifier_text(&token.text) {
-            let mut token = token.clone();
-            token.position = adjusted_position;
-            self.pending.push_back(token);
+            load_token(
+                &mut self.current,
+                token,
+                adjusted_position,
+                token.position_length,
+            );
             return;
         }
 
-        let parts = split_identifier(&token.text, self.split_on_numerics);
+        split_identifier(&token.text, self.split_on_numerics, &mut self.parts);
+        let parts = &self.parts;
         if parts.len() <= 1 {
-            let mut token = token.clone();
-            token.position = adjusted_position;
-            self.pending.push_back(token);
+            load_token(
+                &mut self.current,
+                token,
+                adjusted_position,
+                token.position_length,
+            );
             return;
         }
 
         if self.preserve_original {
-            let mut original = token.clone();
-            original.position = adjusted_position;
-            original.position_length = parts.len();
-            self.pending.push_back(original);
+            load_token(&mut self.current, token, adjusted_position, parts.len());
         }
 
         for (part_idx, (start, end)) in parts.iter().copied().enumerate() {
-            let mut part = token.clone();
-            part.offset_from = token.offset_from + start;
-            part.offset_to = token.offset_from + end;
-            part.position = adjusted_position + part_idx;
-            part.position_length = 1;
-            part.text.clear();
-            part.text.push_str(&token.text[start..end]);
-            self.pending.push_back(part);
+            let mut text = self.spare_texts.pop().unwrap_or_default();
+            text.clear();
+            text.push_str(&token.text[start..end]);
+            self.pending.push_back(Token {
+                offset_from: token.offset_from + start,
+                offset_to: token.offset_from + end,
+                position: adjusted_position + part_idx,
+                text,
+                position_length: 1,
+            });
         }
         self.position_offset += parts.len() - 1;
+        if !self.preserve_original
+            && let Some(first) = self.pending.pop_front()
+        {
+            self.set_current(first);
+        }
+    }
+
+    fn set_current(&mut self, token: Token) {
+        let previous = mem::replace(&mut self.current, token);
+        self.spare_texts.push(previous.text);
     }
 }
 
 impl<T: TokenStream> TokenStream for WordDelimiterTokenStream<T> {
     fn advance(&mut self) -> bool {
-        if !self.refill() {
+        if let Some(token) = self.pending.pop_front() {
+            self.set_current(token);
+            return true;
+        }
+        if !self.tail.advance() {
             return false;
         }
-        let Some(token) = self.pending.pop_front() else {
-            debug_assert!(false, "pending token should be available after refill");
-            return false;
-        };
-        self.current = token;
+        self.load_current_tail_token();
         true
     }
 
