@@ -161,7 +161,7 @@ pub(crate) async fn remap_index(
         .await
     {
         Ok(g) => g,
-        Err(e) => {
+        Err(e @ Error::NotSupported { .. }) => {
             log::warn!(
                 "Cannot open index '{}' on '{}': {}, so it is not remapped. Rebuild the index.",
                 index_id,
@@ -170,6 +170,7 @@ pub(crate) async fn remap_index(
             );
             return Ok(RemapResult::Drop);
         }
+        Err(e) => return Err(e),
     };
 
     let created_index = match generic.index_type() {
