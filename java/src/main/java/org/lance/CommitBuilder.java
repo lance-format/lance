@@ -281,6 +281,10 @@ public class CommitBuilder {
    * @return a new Dataset at the committed version
    */
   public Dataset execute(Transaction transaction) {
+    return execute(transaction, false);
+  }
+
+  Dataset execute(Transaction transaction, boolean useDerivedAllocator) {
     Preconditions.checkNotNull(transaction, "Transaction must not be null");
     if (dataset != null) {
       try (LockManager.ReadLock readLock = dataset.acquireReadLock()) {
@@ -299,7 +303,11 @@ public class CommitBuilder {
                 tableId,
                 namespaceClientManagedVersioning,
                 commitTimeoutNanos);
-        result.setAllocator(dataset.allocator());
+        if (useDerivedAllocator) {
+          result.initializeDerivedAllocator(dataset);
+        } else {
+          result.shareAllocator(dataset);
+        }
         return result;
       }
     }
