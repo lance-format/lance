@@ -3,7 +3,7 @@ name: Area Labeler
 on:
   # pull_request_target is required so labels can be applied to PRs from forks.
   pull_request_target:
-    types: [opened, synchronize, reopened]
+    types: [opened, synchronize, reopened, edited]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -12,6 +12,7 @@ concurrency:
 jobs:
   label:
     name: Apply area labels
+    if: github.event.action != 'edited' || github.event.changes.base != null
     permissions:
       contents: read
       pull-requests: write
@@ -22,3 +23,4 @@ jobs:
           configuration-path: .github/labeler-area.yml
           # Match dotfiles/dot-folders (e.g. .github/**) for A-ci.
           dot: true
+          sync-labels: true
