@@ -58,6 +58,8 @@ categories = [
 rust-version = "1.98.0"
 
 [workspace.dependencies]
+percent-encoding = "2.3"
+thiserror = "2"
 arc-swap = "1.7"
 libc = "0.2.176"
 lance = { version = "=16.0.0-beta.5", path = "./rust/lance", default-features = false }

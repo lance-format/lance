@@ -12,6 +12,7 @@ categories.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+thiserror.workspace = true
 
 object_store = { workspace = true }
 opendal = { workspace = true, optional = true }

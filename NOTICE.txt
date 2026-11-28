@@ -1,0 +1,7 @@
+The storage path and value types include code adapted from Apache Arrow Object Store 0.14.2.
+
+Apache Arrow Object Store
+Copyright 2020-2026 The Apache Software Foundation
+
+This product includes software developed at
+The Apache Software Foundation (http://www.apache.org/).
