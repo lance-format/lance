@@ -114,9 +114,12 @@ fn simplify_constant(expr: Expr) -> Option<ScalarValue> {
     }
 }
 
-/// The exact value of `+`, `-`, `*` and `<<` on integer literals, or `None`
-/// for any other operator or operand, or a value beyond `i128`.
+/// The exact value of `+`, `-`, `*`, `/`, `%`, `<<` and `>>` on integer
+/// literals, or `None` for any other operator or operand, a division by zero,
+/// a shift by 64 or more, or a value beyond `i128`.
 fn exact_integer(expr: &Expr) -> Option<i128> {
+    // Beyond 63 the operand types mask the shift, so the exact value would differ.
+    let shift = |by: i128| u32::try_from(by).ok().filter(|by| *by < 64);
     match expr {
         Expr::Literal(value, _) => match value {
             ScalarValue::Int8(Some(v)) => Some((*v).into()),
@@ -135,9 +138,10 @@ fn exact_integer(expr: &Expr) -> Option<i128> {
                 Operator::Plus => left.checked_add(right),
                 Operator::Minus => left.checked_sub(right),
                 Operator::Multiply => left.checked_mul(right),
-                Operator::BitwiseShiftLeft => {
-                    left.checked_mul(2_i128.checked_pow(u32::try_from(right).ok()?)?)
-                }
+                Operator::Divide => left.checked_div(right),
+                Operator::Modulo => left.checked_rem(right),
+                Operator::BitwiseShiftLeft => left.checked_mul(1 << shift(right)?),
+                Operator::BitwiseShiftRight => Some(left >> shift(right)?),
                 _ => None,
             }
         }
@@ -847,6 +851,8 @@ mod tests {
     #[rstest::rstest]
     #[case::constant_first("7 / 0 = f")]
     #[case::column_first("f = 7 / 0")]
+    #[case::integer_column("i = 7 / 0")]
+    #[case::remainder("i = 7 % 0")]
     fn constant_expressions_keep_their_errors(#[case] sql: &str) {
         let error = evaluate_filter(sql).expect_err(sql);
         assert!(error.contains("Divide by zero"), "{sql}: {error}");
@@ -873,6 +879,51 @@ mod tests {
         let batch = arrow_array::record_batch!(("w", UInt64, [1_u64 << 63, 3])).unwrap();
         let planner = crate::planner::Planner::new(batch.schema());
         assert_eq!(planner.parse_filter(sql).unwrap(), expected, "{sql}");
+    }
+
+    /// Every integer operator a constant expression may hold keeps its exact
+    /// value before the result is narrowed, so `(1 << 63) / 2` compares with
+    /// 2^62 on a `UInt64` column rather than with a negative `Int64`.
+    #[rstest::rstest]
+    #[case::divide("w >= (1 << 63) / 2", [Some(false), Some(false), Some(true), Some(true), None])]
+    #[case::divide_reversed("(1 << 63) / 2 <= w", [Some(false), Some(false), Some(true), Some(true), None])]
+    #[case::right_shift("w >= (1 << 63) >> 1", [Some(false), Some(false), Some(true), Some(true), None])]
+    #[case::remainder(
+        "w = (1 << 63) % 9223372036854775807",
+        [Some(false), Some(true), Some(false), Some(false), None]
+    )]
+    #[case::between(
+        "w BETWEEN (1 << 63) >> 1 AND (1 << 63) / 1",
+        [Some(false), Some(false), Some(true), Some(true), None]
+    )]
+    fn exact_integer_arithmetic_on_unsigned_column(
+        #[case] sql: &str,
+        #[case] expected: [Option<bool>; 5],
+    ) {
+        use arrow_array::{BooleanArray, cast::AsArray};
+
+        let batch = arrow_array::record_batch!((
+            "w",
+            UInt64,
+            [Some(0), Some(1), Some(1_u64 << 62), Some(1_u64 << 63), None]
+        ))
+        .unwrap();
+        let planner = crate::planner::Planner::new(batch.schema());
+        let expr = planner
+            .optimize_expr(planner.parse_filter(sql).unwrap())
+            .unwrap();
+        let result = planner
+            .create_physical_expr(&expr)
+            .unwrap()
+            .evaluate(&batch)
+            .unwrap()
+            .into_array(batch.num_rows())
+            .unwrap();
+        assert_eq!(
+            result.as_boolean(),
+            &BooleanArray::from(expected.to_vec()),
+            "{sql}"
+        );
     }
 
     /// Arithmetic with a constant operand is not narrowed to the column type,
