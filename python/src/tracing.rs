@@ -39,11 +39,11 @@ use std::sync::mpsc;
 use std::sync::mpsc::TryRecvError;
 use std::sync::mpsc::TrySendError;
 use std::thread::JoinHandle;
-use tracing::Event;
 use tracing::field::Field;
 use tracing::field::Visit;
 use tracing::span;
 use tracing::subscriber;
+use tracing::{Event, Level};
 use tracing_chrome::ChromeLayer;
 use tracing_chrome::{ChromeLayerBuilder, TraceStyle};
 use tracing_subscriber::Registry;
@@ -100,17 +100,15 @@ impl From<TraceEvent> for PyTraceEvent {
 
 struct LoggingPassthroughState {
     inner: Option<ChromeLayer<Registry>>,
-    level: log::Level,
     callback_sender: Option<mpsc::SyncSender<TraceEvent>>,
     callback_handle: Option<JoinHandle<()>>,
     warned_about_overflow: AtomicBool,
 }
 
 impl LoggingPassthroughState {
-    fn new(level: log::Level) -> Self {
+    fn new() -> Self {
         Self {
             inner: None,
-            level,
             callback_sender: None,
             callback_handle: None,
             warned_about_overflow: AtomicBool::new(false),
@@ -263,9 +261,16 @@ impl tracing_subscriber::Layer<Registry> for LoggingPassthroughRef {
         let mut fields = EventToStr::default();
         event.record(&mut fields);
         let log_target = trace_event_log_target(event.metadata().target());
+        let log_level = match *event.metadata().level() {
+            Level::TRACE => log::Level::Trace,
+            Level::DEBUG => log::Level::Debug,
+            Level::INFO => log::Level::Info,
+            Level::WARN => log::Level::Warn,
+            Level::ERROR => log::Level::Error,
+        };
         log::log!(
             target: &log_target,
-            state.level,
+            log_level,
             "target=\"{}\" {}",
             event.metadata().target(),
             fields.str
@@ -375,7 +380,7 @@ pub fn initialize_tracing(level: log::Level) {
     SUBSCRIBER
         .write()
         .unwrap()
-        .replace(LoggingPassthroughState::new(level));
+        .replace(LoggingPassthroughState::new());
 
     let subscriber =
         Registry::default().with(LoggingPassthroughRef(SUBSCRIBER.clone()).with_filter(filter));
