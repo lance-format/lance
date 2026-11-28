@@ -2438,12 +2438,12 @@ pub(crate) fn remap_row_addrs(
 /// exactly, because the merge drains each source's keys and advances every one
 /// of them once. Counting entries rather than emitted keys is what makes it
 /// exact -- a key held by three sources costs three loads and yields one output
-/// row, and a key whose rows are all retired by `old_data_filter` yields none.
+/// row, and a key with no rows left after filtering yields none.
 ///
 /// Nulls are excluded, matching how the merge treats them everywhere else: they
 /// live in `null_map`, outside `index_map`, and are unioned in one step.
-pub(crate) fn merge_source_entry_count(sources: &[Arc<BitmapIndex>]) -> u64 {
-    sources.iter().map(|s| s.index_map.len() as u64).sum()
+pub(crate) fn merge_source_entry_count<'a>(sources: impl Iterator<Item = &'a BitmapIndex>) -> u64 {
+    sources.map(|s| s.index_map.len() as u64).sum()
 }
 
 /// Rows per batch when a merge streams a source's bitmaps column. A bitmap can
@@ -2539,7 +2539,7 @@ impl<'a> SequentialBitmapReader<'a> {
 }
 
 /// Merge loaded bitmap indexes into `writer` without materializing all source
-/// bitmap payloads at once, applying the same `old_data_filter` to every source.
+/// bitmap payloads at once, applying each source's old-data filter.
 /// See [`OldSegments`] for the merge itself.
 ///
 /// Null keys live outside `index_map`, in each source's `null_map`, so they are
@@ -2553,11 +2553,10 @@ impl<'a> SequentialBitmapReader<'a> {
 /// actually in, since it loads one bitmap per entry.
 ///
 /// A key whose merged bitmap comes out empty (every one of its rows retired by
-/// `old_data_filter`) is not written, the rule [`BitmapBatchWriter::emit`]
+/// its source filters) is not written, the rule [`BitmapBatchWriter::emit`]
 /// applies to every path.
 pub(crate) async fn merge_index_maps(
-    sources: &[Arc<BitmapIndex>],
-    old_data_filter: Option<&super::OldIndexDataFilter>,
+    sources: Vec<OldSegment<'_>>,
     writer: &mut BitmapBatchWriter,
     progress: Option<(&dyn IndexBuildProgress, &str)>,
 ) -> Result<()> {
@@ -2566,18 +2565,9 @@ pub(crate) async fn merge_index_maps(
             "Bitmap index merge requires at least one source index".to_string(),
         ));
     };
-    let value_type = first.value_type().clone();
-
-    let mut old = OldSegments::new(
-        sources
-            .iter()
-            .map(|source| OldSegment {
-                index: source.as_ref(),
-                filter: old_data_filter,
-            })
-            .collect(),
-    )
-    .await?;
+    let value_type = first.index.value_type().clone();
+    let entry_count = merge_source_entry_count(sources.iter().map(|source| source.index));
+    let mut old = OldSegments::new(sources).await?;
 
     if let Some(merged_nulls) = old.take_null_bitmap() {
         let null_key = new_null_array(&value_type, 1);
@@ -2591,7 +2581,7 @@ pub(crate) async fn merge_index_maps(
     // One per key is millions of those on a high-cardinality column. Scaling the
     // interval to the total rather than fixing it means a merge of fewer than a
     // hundred keys still reports every key, which costs nothing at that size.
-    let report_every = (merge_source_entry_count(sources) / 100).max(1);
+    let report_every = (entry_count / 100).max(1);
     let mut last_reported = 0u64;
 
     while let Some((key, merged)) = old.take_smallest_if(|_| true).await? {
@@ -2636,7 +2626,7 @@ pub async fn merge_bitmap_indices(
             "Bitmap segment merge requires at least one source segment".to_string(),
         ));
     };
-    let entry_count = merge_source_entry_count(source_indices);
+    let entry_count = merge_source_entry_count(source_indices.iter().map(Arc::as_ref));
     progress
         .stage_start("merge_bitmap_segments", Some(entry_count), "entries")
         .await?;

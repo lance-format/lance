@@ -5304,11 +5304,11 @@ mod tests {
     #[tokio::test]
     async fn test_label_list_merge_rejects_nullable_segment_missing_null_metadata() {
         use crate::dataset::index::LanceIndexStoreExt;
-        use lance_index::scalar::IndexStore;
         use lance_index::scalar::label_list::{
             BITMAP_LOOKUP_NAME, LABEL_LIST_NULLS_METADATA_KEY, LABEL_LIST_NULLS_MIN_VERSION,
         };
         use lance_index::scalar::lance_format::LanceIndexStore;
+        use lance_index::scalar::{IndexStore, SearchResult};
 
         let tmpdir = TempStrDir::default();
         let dataset_uri = format!("file://{}", tmpdir.as_str());
@@ -5365,13 +5365,51 @@ mod tests {
         legacy_segment.files = Some(index_files_to_table(vec![legacy_file]));
 
         let err = dataset
-            .merge_existing_index_segments(vec![legacy_segment])
+            .merge_existing_index_segments(vec![legacy_segment.clone()])
             .await
             .unwrap_err();
         assert!(
             err.to_string().contains(LABEL_LIST_NULLS_METADATA_KEY),
             "unexpected error: {err}"
         );
+
+        // The old format legitimately omitted the buffer. Optimize must
+        // recover the list nulls by scanning those rows.
+        legacy_segment.index_version = LABEL_LIST_NULLS_MIN_VERSION - 1;
+        dataset
+            .commit_existing_index_segments("labels_legacy_idx", "labels", vec![legacy_segment])
+            .await
+            .unwrap();
+        let (schema, batch) = label_list_batch(vec![Some(vec![Some(1)])]);
+        dataset
+            .append(RecordBatchIterator::new(vec![Ok(batch)], schema), None)
+            .await
+            .unwrap();
+        dataset
+            .optimize_indices(&OptimizeOptions::merge(1))
+            .await
+            .unwrap();
+        let segments = dataset
+            .load_indices_by_name("labels_legacy_idx")
+            .await
+            .unwrap();
+        assert_eq!(segments.len(), 1);
+        let index = crate::index::scalar::open_scalar_index(
+            &dataset,
+            "labels",
+            &segments[0],
+            &NoOpMetricsCollector,
+        )
+        .await
+        .unwrap();
+        let query = LabelListQuery::HasAnyLabel(vec![ScalarValue::Int64(Some(1))]);
+        let SearchResult::Exact(matches) =
+            index.search(&query, &NoOpMetricsCollector).await.unwrap()
+        else {
+            panic!("expected exact LabelList results");
+        };
+        assert_eq!(matches.true_rows().row_addrs().unwrap().count(), 2);
+        assert_eq!(matches.null_rows().row_addrs().unwrap().count(), 1);
     }
 
     #[tokio::test]

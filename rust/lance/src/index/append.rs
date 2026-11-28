@@ -47,7 +47,7 @@ use crate::dataset::index::LanceIndexStoreExt;
 use crate::dataset::overlay::{collect_overlay_stale_rows_for_segment, overlaid_fragments};
 use crate::dataset::rowids::{load_row_id_sequences, translate_addr_treemap_to_row_ids};
 use crate::index::scalar::{
-    IndexDetails, TrainingRows, TrainingScanOptions, fetch_index_details, list_element,
+    IndexDetails, TrainingRows, TrainingScanOptions, fetch_index_details, label_list, list_element,
     load_fts_training_data, load_training_data, scan_training_data,
 };
 use crate::index::vector::details::vector_index_details_default;
@@ -915,7 +915,11 @@ pub fn select_segments_to_merge<'a>(
 /// Whether a scalar index can merge multiple segments without rescanning their data.
 fn has_segment_merge_primitive(index_type: IndexType) -> bool {
     match index_type {
-        IndexType::BTree | IndexType::Bitmap | IndexType::NGram | IndexType::MinHashLsh => true,
+        IndexType::BTree
+        | IndexType::Bitmap
+        | IndexType::LabelList
+        | IndexType::NGram
+        | IndexType::MinHashLsh => true,
         #[cfg(feature = "geo")]
         IndexType::RTree => true,
         _ => false,
@@ -1111,6 +1115,13 @@ async fn merge_scalar_indices<'a>(
             .iter()
             .any(|segment| segment.index_version < ZoneMapIndexVersion::CURRENT as i32);
 
+    // LabelList must rebuild if a nullable source predates list-null support
+    // or the sources disagree on their row identifier domain.
+    let label_list_requires_rebuild = index_type == IndexType::LabelList
+        && !legacy_domain_mismatch
+        && !effective_old_frags.is_empty()
+        && !label_list::segments_support_merge(dataset.as_ref(), &selected_old_indices)?;
+
     // Two or more bloom filter segments merge by their zones unless only a
     // rebuild catches the index up (a pending compaction remap, since the
     // merge keeps the oldest source version, or a segment without null rows)
@@ -1161,6 +1172,7 @@ async fn merge_scalar_indices<'a>(
         && !ngram_requires_rebuild
         && !legacy_domain_mismatch
         && !zonemap_requires_rebuild
+        && !label_list_requires_rebuild
         && (has_segment_merge_primitive(index_type)
             || is_bloomfilter_mergeable
             || selected_old_indices.len() == 1);
@@ -1256,12 +1268,13 @@ async fn merge_scalar_indices<'a>(
             .await?;
             // The scalar merge primitives below read old rows by address. Only
             // those types need per-segment filters, so skip the deletion-vector
-            // reads for a BloomFilter zone merge. `old_data_address_domain`
-            // returns true for every type in this group.
+            // reads for a BloomFilter zone merge. Legacy LabelList row IDs
+            // already use address numbering on tables without stable row IDs.
             let merge_filters = if matches!(
                 index_type,
                 IndexType::BTree
                     | IndexType::Bitmap
+                    | IndexType::LabelList
                     | IndexType::NGram
                     | IndexType::RTree
                     | IndexType::MinHashLsh
@@ -1320,6 +1333,17 @@ async fn merge_scalar_indices<'a>(
                     )
                     .await?
                 }
+                IndexType::LabelList => {
+                    label_list::open_and_merge_segments(
+                        dataset.as_ref(),
+                        field_path,
+                        &selected_old_indices,
+                        new_data_stream,
+                        &new_store,
+                        merge_filters.as_deref().unwrap_or_default(),
+                    )
+                    .await?
+                }
                 IndexType::NGram => {
                     crate::index::scalar::ngram::open_and_merge_segments(
                         dataset.as_ref(),
@@ -1360,10 +1384,9 @@ async fn merge_scalar_indices<'a>(
                     // Without an N:1 merge primitive (unlike BTree/Bitmap/NGram
                     // above), `can_merge_segments` only allows this arm with
                     // exactly one selected segment, which `update` updates in
-                    // place. Its domain can be either: a LabelList segment
-                    // reports its own, while a BloomFilter, a JSON index over an
-                    // address-domain target and a list-element index store row
-                    // addresses, which a row-id filter would wrongly prune.
+                    // place. A BloomFilter, a JSON index over an address-domain
+                    // target and a list-element index store row addresses, which
+                    // a row-id filter would wrongly prune.
                     // That is harmless without stable row ids (the two domains
                     // coincide), and `legacy_domain_mismatch` above already
                     // forces a full rebuild instead of reaching here for a

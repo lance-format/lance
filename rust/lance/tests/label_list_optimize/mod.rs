@@ -225,7 +225,7 @@ async fn test_label_list_split_round_trip_and_queries(#[values(false, true)] sta
 }
 
 #[tokio::test]
-async fn test_label_list_single_task_keeps_old_segments_in_merge() {
+async fn test_label_list_single_task_merges_old_segments() {
     let test_dir = TempStrDir::default();
     let mut dataset = write_label_list_dataset(&test_dir, 16, true).await;
     let batch = label_list_optimize_batch(16, 8);
@@ -247,25 +247,44 @@ async fn test_label_list_single_task_keeps_old_segments_in_merge() {
     let options = OptimizeOptions::merge(2).max_rows_per_task(Some(8));
     let plan = plan_optimize_indices(&dataset, &options).await.unwrap();
     assert_eq!(task_groups(&plan), vec![(0, vec![3])]);
-    assert!(plan.tasks[0].old_segments.is_empty());
-    assert_eq!(plan.tasks[0].num_indices_to_merge, Some(0));
+    assert_eq!(plan.tasks[0].old_segments.len(), 2);
+    assert_eq!(plan.tasks[0].num_indices_to_merge, Some(2));
     assert_eq!(plan.merges.len(), 1);
-    assert_eq!(plan.merges[0].old_segments.len(), 2);
+    assert!(plan.merges[0].old_segments.is_empty());
+
+    let store = dataset.object_store(None).await.unwrap();
+    store.io_stats_incremental();
     let built = plan.tasks[0].execute(&dataset).await.unwrap().unwrap();
+    let stats = store.io_stats_incremental();
+    let read_data_file = |fragment_id| {
+        let fragment = dataset.get_fragment(fragment_id).unwrap();
+        fragment.metadata().files.iter().any(|file| {
+            stats
+                .requests
+                .iter()
+                .any(|request| request.path.as_ref().ends_with(&file.path))
+        })
+    };
+    assert!(read_data_file(3), "the task must read the new fragment");
+    for fragment_id in [1, 2] {
+        assert!(
+            !read_data_file(fragment_id),
+            "the task must reuse the index for old fragment {fragment_id}",
+        );
+    }
+
     assert_eq!(
         built.segment.fragment_bitmap,
-        Some([3u32].into_iter().collect())
+        Some([1u32, 2, 3].into_iter().collect()),
     );
-    assert!(built.replaces.is_empty());
+    assert_eq!(built.replaces.len(), 2);
+    let built_uuid = built.segment.uuid;
     let merged = plan.merges[0]
         .execute(&dataset, &[built])
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(
-        merged.segment.fragment_bitmap,
-        Some([1u32, 2, 3].into_iter().collect()),
-    );
+    assert_eq!(merged.segment.uuid, built_uuid);
 
     let index =
         scalar::open_scalar_index(&dataset, "labels", &merged.segment, &NoOpMetricsCollector)
@@ -276,15 +295,28 @@ async fn test_label_list_single_task_keeps_old_segments_in_merge() {
     let SearchResult::Exact(matches) = result else {
         panic!("expected exact LabelList result");
     };
-    for row_set in [matches.true_rows(), matches.null_rows().clone()] {
-        assert!(
-            row_set
-                .row_addrs()
-                .unwrap()
-                .all(|addr| addr.fragment_id() != 0),
-            "retired fragment must disappear from value and list-null postings",
-        );
-    }
+    let addresses = |rows: &[(u32, u32)]| {
+        rows.iter()
+            .map(|&(fragment, offset)| RowAddress::new_from_parts(fragment, offset))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        matches.true_rows().row_addrs().unwrap().collect::<Vec<_>>(),
+        addresses(&[
+            (1, 0),
+            (1, 3),
+            (1, 6),
+            (2, 0),
+            (2, 6),
+            (3, 0),
+            (3, 3),
+            (3, 6)
+        ]),
+    );
+    assert_eq!(
+        matches.null_rows().row_addrs().unwrap().collect::<Vec<_>>(),
+        addresses(&[(1, 1), (3, 1)]),
+    );
     drop(index);
     commit_optimize_indices(&mut dataset, vec![merged], &options)
         .await
@@ -292,28 +324,15 @@ async fn test_label_list_single_task_keeps_old_segments_in_merge() {
     let actual = segments(&dataset, "labels_idx").await;
     assert_eq!(actual.len(), 1);
     assert_eq!(coverage(&actual), [1u32, 2, 3].into_iter().collect());
-    for predicate in [
-        "array_has_any(labels, [1])",
-        "array_contains(labels, 1)",
-        "NOT array_has_any(labels, [1])",
-        "array_has_all(labels, [])",
-        "labels IS NULL",
-    ] {
-        assert_eq!(
-            label_list_optimize_ids(&dataset, predicate, true).await,
-            label_list_optimize_ids(&dataset, predicate, false).await,
-            "{predicate}",
-        );
-    }
-    let ids = label_list_optimize_ids(&dataset, "array_contains(labels, 1)", true).await;
-    assert!(!ids.contains(&19));
-    assert!(ids.contains(&24));
 }
 
+#[rstest::rstest]
 #[tokio::test]
-async fn test_label_list_split_merge_cleans_partial_deletions() {
+async fn test_label_list_split_merge_cleans_partial_deletions(
+    #[values(false, true)] stable_row_ids: bool,
+) {
     let test_dir = TempStrDir::default();
-    let mut dataset = write_label_list_dataset(&test_dir, 8, true).await;
+    let mut dataset = write_label_list_dataset(&test_dir, 8, stable_row_ids).await;
     dataset.delete("id = 1 OR id = 3").await.unwrap();
     let batch = label_list_optimize_batch(8, 8);
     let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
@@ -323,9 +342,9 @@ async fn test_label_list_split_merge_cleans_partial_deletions() {
     let options = OptimizeOptions::merge(1).max_rows_per_task(Some(8));
     let plan = plan_optimize_indices(&dataset, &options).await.unwrap();
     assert_eq!(task_groups(&plan), vec![(0, vec![1])]);
-    assert!(plan.tasks[0].old_segments.is_empty());
+    assert_eq!(plan.tasks[0].old_segments.len(), 1);
     assert_eq!(plan.merges.len(), 1);
-    assert_eq!(plan.merges[0].old_segments.len(), 1);
+    assert!(plan.merges[0].old_segments.is_empty());
     let built = plan.tasks[0].execute(&dataset).await.unwrap().unwrap();
     let merged = plan.merges[0]
         .execute(&dataset, &[built])
