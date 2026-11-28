@@ -306,6 +306,17 @@ pub async fn commit_transaction(
         expected_latest_version,
         tagged_frag_reuse_trim,
     } = options;
+    // The next attached version follows the one the transaction read. A
+    // detached version has no place in the history to follow, so this is the
+    // caller's mistake rather than an exhausted version space.
+    if is_detached_version(transaction.read_version) {
+        return Err(Error::invalid_input(format!(
+            "cannot commit on top of detached version {}: detached versions are not part of \
+             the dataset's history. Commit the change as detached to build on it, or restore \
+             the detached version to make it the latest version first",
+            transaction.read_version
+        )));
+    }
     if append_idempotency_key.is_some()
         && (expected_latest_version.is_some() || build_config.disable_transaction_file())
     {
@@ -545,7 +556,7 @@ pub async fn commit_transaction(
         target_version = dataset.manifest.version + 1;
         if is_detached_version(target_version) {
             return Err(Error::internal(
-                "more than 2^65 versions have been created and so regular version numbers are appearing as 'detached' versions.",
+                "more than 2^63 versions have been created and so regular version numbers are appearing as 'detached' versions.",
             ));
         }
         // Build an up-to-date manifest from the transaction and current

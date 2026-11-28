@@ -442,6 +442,8 @@ class LanceDataset(pa.dataset.Dataset):
             a version number in a specified branch. (None, None) means the latest
             version_number on the default branch. ``("main", version)`` is an
             explicit alias for the default branch in this reference context.
+            The reference cannot resolve to a detached version, which is not
+            part of the dataset's history; restore it first.
         storage_options: Optional[Dict[str, str]]
             Storage options for the underlying object store. If not provided,
             the storage options from the current dataset will be used.
@@ -5069,6 +5071,8 @@ class LanceDataset(pa.dataset.Dataset):
             a version number in a specified branch. (None, None) means the latest
             version_number on the default branch. ``("main", version)`` is an
             explicit alias for the default branch in this reference context.
+            The reference cannot resolve to a detached version, which is not
+            part of the dataset's history; restore it first.
         storage_options : dict, optional
             Object store configuration for the new dataset (e.g., credentials,
             endpoints). This replaces the store the target metadata is written
@@ -5251,6 +5255,8 @@ class LanceDataset(pa.dataset.Dataset):
             An integer specifies a version number in the current branch; a string
             specifies a tag name; a Tuple[Optional[str], Optional[int]] specifies
             a version number in a specified branch.
+            The reference cannot resolve to a detached version, which is not
+            part of the dataset's history; restore it first.
         storage_options : dict, optional
             Object store configuration for the destination dataset. If omitted,
             the source dataset's storage options are used.

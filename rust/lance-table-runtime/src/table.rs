@@ -441,6 +441,8 @@ impl<'a> TableView<'a> {
         refs::check_new_branch(branch)?;
 
         let (source_branch, version_number) = self.resolve_reference(version.into()).await?;
+        // Before the reservation is written, so a rejected source leaves no ref behind.
+        refs::ensure_clone_source_attached(version_number)?;
         let branch_location = self.branch_location().find_branch(Some(branch))?;
         let branch_file = refs::branch_contents_path(&self.refs.root()?.path, branch);
         if self.state.object_store.exists(&branch_file).await? {

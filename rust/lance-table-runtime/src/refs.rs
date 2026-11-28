@@ -7,6 +7,7 @@ use chrono::{DateTime, Utc};
 use futures::stream::{StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lance_io::object_store::ObjectStore;
+use lance_table::format::is_detached_version;
 use lance_table::io::commit::{CommitHandler, VERSIONS_DIR};
 use lance_table::io::deletion::DELETIONS_DIR;
 use lance_table::system_index::mem_wal::is_mem_wal_dir_name;
@@ -1660,6 +1661,26 @@ pub fn check_valid_tag(s: &str) -> Result<()> {
         });
     }
 
+    Ok(())
+}
+
+/// Refuse to start a clone or branch from a detached version.
+///
+/// A copy keeps its source's version number. A copy of a detached version
+/// would therefore only have a detached manifest, which no reader resolves as
+/// the copy's latest version: the copy could only be opened by naming that
+/// detached version, and a later write to its URI would create an unrelated
+/// dataset in its place.
+#[doc(hidden)]
+pub fn ensure_clone_source_attached(version: u64) -> Result<()> {
+    if is_detached_version(version) {
+        return Err(Error::invalid_input(format!(
+            "cannot clone or branch from detached version {version}: detached versions are \
+             not part of the dataset's history, so the copy would have no latest version. \
+             Restore the detached version to make it the latest version, then clone or \
+             branch from the restored version"
+        )));
+    }
     Ok(())
 }
 
