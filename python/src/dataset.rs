@@ -317,6 +317,22 @@ pub struct Dataset {
     pub(crate) ds: Arc<LanceDataset>,
 }
 
+/// Point the handle at `new_ds` after a commit that has already landed.
+///
+/// Another thread may be inside a method of the same handle. Then the handle stays
+/// at its previous version, as it would after a commit by another writer, instead of
+/// failing after the commit went through.
+pub(crate) fn set_committed_dataset(dataset: &Bound<'_, Dataset>, new_ds: Arc<LanceDataset>) {
+    match dataset.try_borrow_mut() {
+        Ok(mut handle) => handle.ds = new_ds,
+        Err(_) => log::warn!(
+            "Committed version {}, but another thread is using this dataset handle, so it \
+             stays at its previous version",
+            new_ds.version().version
+        ),
+    }
+}
+
 impl Dataset {
     #[allow(clippy::too_many_arguments)]
     async fn cleanup_operation(

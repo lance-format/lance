@@ -12178,3 +12178,28 @@ def test_auto_cleanup_options_keep_errors_from_index(tmp_path):
                 auto_cleanup_options={"interval": Interval()},
             )
         assert exc_info.value is raised
+
+
+def test_merge_insert_while_the_handle_is_borrowed(tmp_path: Path):
+    # A merge that committed while another call was using the same handle used to
+    # raise PanicException ("Already borrowed") after the commit had landed.
+    # `take_scan` holds the handle while it calls `__iter__` on its argument, so the
+    # merge below always commits inside that borrow.
+    uri = tmp_path / "data"
+    ds = lance.write_dataset(pa.table({"id": range(10), "value": [0] * 10}), uri)
+    stats = []
+
+    class MergeOnIter:
+        def __iter__(self):
+            new_rows = pa.table({"id": range(10), "value": [1] * 10})
+            merge = ds.merge_insert("id").when_matched_update_all()
+            stats.append(merge.execute(new_rows))
+            return iter([])
+
+    ds._ds.take_scan(MergeOnIter())
+
+    assert stats[0]["num_updated_rows"] == 10
+    assert ds.version == 1
+    ds.checkout_latest()
+    assert ds.version == 2
+    assert ds.to_table()["value"].to_pylist() == [1] * 10

@@ -155,7 +155,8 @@ class MergeInsertBuilder(_MergeInsertBuilder):
 
         This function updates the original dataset and returns a dictionary with
         information about merge statistics - i.e. the number of inserted, updated,
-        and deleted rows.
+        and deleted rows. If another thread is using the dataset when the commit
+        finishes, the dataset stays at its previous version and a warning is logged.
 
         Parameters
         ----------
