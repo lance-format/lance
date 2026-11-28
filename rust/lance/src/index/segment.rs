@@ -181,6 +181,8 @@ pub(crate) fn index_details_have_reader(type_url: &str) -> bool {
         return false;
     };
     if details_type_name.eq_ignore_ascii_case(&VectorIndexDetails::full_name())
+        // Older released vector writers used the table package for empty details.
+        || details_type_name.eq_ignore_ascii_case("lance.table.VectorIndexDetails")
         // MemWAL flush used this exact pre-`pb` package name.
         || details_type_name.eq_ignore_ascii_case("lance.index.VectorIndexDetails")
     {
@@ -322,7 +324,8 @@ pub(crate) fn index_has_supported_field_dependencies(index: &IndexMetadata) -> b
 /// format version. Their field dependencies must belong to the user schema:
 /// reserved negative IDs require dedicated support, not schema lookups.
 pub(crate) fn index_is_usable(index: &IndexMetadata) -> bool {
-    index_type_is_known(index)
+    index.index_version >= 0
+        && index_type_is_known(index)
         && unsupported_index_version(index).is_none()
         && index_has_supported_field_dependencies(index)
 }
@@ -337,6 +340,7 @@ mod tests {
     fn test_index_details_reader_matches_complete_type_name_case_insensitively() {
         for type_url in [
             "/lance.index.pb.VectorIndexDetails",
+            "/lance.table.VectorIndexDetails",
             "type.googleapis.com/LANCE.INDEX.PB.VECTORINDEXDETAILS",
             "type.googleapis.com/lance.index.VectorIndexDetails",
             "type.googleapis.com/LANCE.TABLE.BTREEINDEXDETAILS",

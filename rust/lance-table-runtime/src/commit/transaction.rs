@@ -51,7 +51,8 @@ pub(super) async fn build_config_for_attempt(
 ) -> Result<ManifestBuildConfig> {
     let mut config = build_config
         .clone()
-        .with_timestamp_nanos(hooks.timestamp_nanos());
+        .with_timestamp_nanos(hooks.timestamp_nanos())
+        .with_index_is_supported(super::index::index_usability(hooks.index));
     let reads_existing_lineage = match &transaction.operation {
         // An update resolves its new fragments' created-at versions from the
         // existing fragments unless their writer placed them, and refreshes

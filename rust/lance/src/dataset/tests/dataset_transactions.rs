@@ -4913,16 +4913,33 @@ mod composite {
         );
     }
 
+    #[rstest::rstest]
+    #[case::supported(Some("lance.table.BTreeIndexDetails"), 1, true)]
+    #[case::legacy(None, 0, true)]
+    #[case::missing_details(None, 1, false)]
+    #[case::future_version(Some("lance.table.BTreeIndexDetails"), 2, false)]
+    #[case::unknown_type(Some("example.BTreeIndexDetails"), 1, false)]
     #[tokio::test]
-    async fn test_a_commit_extends_an_index_segments_coverage() {
+    async fn test_a_commit_extends_only_supported_index_coverage(
+        #[case] details_type: Option<&str>,
+        #[case] index_version: i32,
+        #[case] is_supported: bool,
+    ) {
         let dataset = test_dataset(false).await;
-        let segment = index_segment("by_a", vec![Ref::Committed(0)]);
+        let mut segment = index_segment("by_a", vec![Ref::Committed(0)]);
+        segment.index_details = details_type.map(|details_type| {
+            Arc::new(prost_types::Any {
+                type_url: format!("type.googleapis.com/{details_type}"),
+                value: Vec::new(),
+            })
+        });
+        segment.index_version = index_version;
         let uuid = segment.uuid;
         let dataset = commit(dataset, vec![Action::AddIndexSegment(segment)]).await;
         assert_eq!(index_coverage(&dataset, "by_a").await, vec![0]);
 
-        let dataset = commit(
-            dataset,
+        let result = try_commit(
+            dataset.clone(),
             vec![Action::AdjustIndexCoverage(AdjustIndexCoverage {
                 uuid,
                 name: "by_a".into(),
@@ -4934,7 +4951,23 @@ mod composite {
         )
         .await;
 
-        assert_eq!(index_coverage(&dataset, "by_a").await, vec![1]);
+        if is_supported {
+            assert_eq!(index_coverage(&result.unwrap(), "by_a").await, vec![1]);
+        } else {
+            let error = result.expect_err("unsupported coverage must not expand");
+            assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+            assert!(
+                error
+                    .to_string()
+                    .contains("Cannot extend coverage of index 'by_a'"),
+                "{error}"
+            );
+            let version = dataset.version().version;
+            let mut dataset = dataset;
+            dataset.checkout_latest().await.unwrap();
+            assert_eq!(dataset.version().version, version);
+            assert_eq!(index_coverage(&dataset, "by_a").await, vec![0]);
+        }
     }
 
     /// Commit a segment a builder staged, as the action set a writer would

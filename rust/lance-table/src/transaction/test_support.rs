@@ -17,13 +17,15 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use uuid::Uuid;
 
-/// Default build config for `lance-table` unit tests, stamped with the current system time.
+/// Test build config using the table layer's conservative built-in support bounds.
 pub fn default_build_config() -> ManifestBuildConfig {
     let now_nanos = std::time::SystemTime::now()
         .duration_since(std::time::SystemTime::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    ManifestBuildConfig::default().with_timestamp_nanos(now_nanos)
+    ManifestBuildConfig::default()
+        .with_timestamp_nanos(now_nanos)
+        .with_index_is_supported(IndexMetadata::supports_fragment_bitmap_rewrite)
 }
 
 pub fn sample_manifest() -> Manifest {

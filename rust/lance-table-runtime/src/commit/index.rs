@@ -71,7 +71,7 @@ impl CacheKey for InferredIndexListingKey<'_> {
     }
 
     fn schema() -> CacheKeySchema {
-        CacheKeySchema::new("lance.index.inferred-listing", 1)
+        CacheKeySchema::new("lance.index.inferred-listing", 2)
     }
 
     fn write_key(&self, builder: &mut KeyBuilder) {
@@ -81,7 +81,8 @@ impl CacheKey for InferredIndexListingKey<'_> {
 }
 
 /// The complete index listing for commit bookkeeping. Version-zero FRI
-/// coverage is translated, and tagged histories retain their stored provenance.
+/// translates only supported coverage; other segments and tagged histories
+/// retain their stored provenance.
 /// Query-time filters and coverage projections must never seed a commit.
 pub async fn load_all_indices(
     table: &Table,
@@ -94,18 +95,21 @@ pub async fn load_all_indices(
         store_identity: metadata_key.store_identity,
         e_tag: metadata_key.e_tag,
     };
-    let mut indices = listing_with_v0_coverage(table, raw, key).await?;
+    let index_is_supported = index_usability(hook);
+    let all_indices_supported = raw.iter().all(index_is_supported);
+    let mut indices = listing_with_v0_coverage(table, raw, key, index_is_supported).await?;
     if let Some(hook) = hook
         && indices
             .iter()
             .any(|index| hook.needs_legacy_details(table, index))
     {
-        let inferred_key =
-            hook.legacy_details_cache_namespace()
-                .map(|namespace| InferredIndexListingKey {
-                    snapshot: key,
-                    namespace,
-                });
+        let inferred_key = hook
+            .legacy_details_cache_namespace()
+            .filter(|_| all_indices_supported)
+            .map(|namespace| InferredIndexListingKey {
+                snapshot: key,
+                namespace,
+            });
         if let Some(key) = &inferred_key
             && let Some(cached) = table.index_cache().get_with_key(key).await
         {
@@ -152,6 +156,7 @@ async fn listing_with_v0_coverage(
     table: &Table,
     raw: Arc<Vec<IndexMetadata>>,
     key: DerivedIndexListingKey<'_>,
+    index_is_supported: fn(&IndexMetadata) -> bool,
 ) -> Result<Arc<Vec<IndexMetadata>>> {
     let mut entries = raw
         .iter()
@@ -168,27 +173,37 @@ async fn listing_with_v0_coverage(
         }
         return Ok(raw);
     }
-    if let Some(cached) = table.index_cache().get_with_key(&key).await {
+    // A shared cache may hold a projection made by a writer with different
+    // plugins or optional features. Unsupported segments must retain raw coverage.
+    let all_indices_supported = raw.iter().all(index_is_supported);
+    if all_indices_supported && let Some(cached) = table.index_cache().get_with_key(&key).await {
         return Ok(cached);
     }
     let history = open_v0_frag_reuse_index(table, fri).await?;
     let mut remapped = raw.as_ref().clone();
     for index in &mut remapped {
+        // This listing seeds commits as well as reads. Never publish inferred
+        // coverage for a segment the active writer cannot interpret.
+        if !index_is_supported(index) {
+            continue;
+        }
         if let Some(bitmap) = &mut index.fragment_bitmap {
             history.remap_fragment_bitmap(bitmap)?;
         }
     }
     let remapped = Arc::new(remapped);
-    table
-        .index_cache()
-        .insert_with_key(&key, remapped.clone())
-        .await;
+    if all_indices_supported {
+        table
+            .index_cache()
+            .insert_with_key(&key, remapped.clone())
+            .await;
+    }
     Ok(remapped)
 }
 
 /// Metadata-only operations can publish the original entries when no user
-/// index implementation is present. Coverage-sensitive operations still use
-/// the version-zero FRI projection.
+/// index implementation is present. Coverage-sensitive operations translate
+/// only the segments supported by the active index hook.
 pub(super) async fn load_attempt_indices(
     table: &Table,
     operation: &Operation,

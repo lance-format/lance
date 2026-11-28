@@ -365,9 +365,8 @@ pub(super) async fn migrate_indices(
         // Migration is skipped for an index this build has no reader for: every
         // branch below would have to open it to recalculate anything, which is
         // exactly what this build cannot do, and failing here would fail an
-        // unrelated commit. Skipped, not untouched - `load_all_indices` still
-        // remaps its `fragment_bitmap` through the fragment-reuse index, which
-        // is what keeps its coverage pointing at the fragments its rows live in.
+        // unrelated commit. Its stored coverage must remain unchanged rather
+        // than persisting a fragment-reuse projection this writer cannot verify.
         if !index_is_usable(index) {
             continue;
         }

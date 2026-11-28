@@ -19,7 +19,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use super::encoded_fragments::{EncodedFragmentCache, carry_encoded_fragments};
-use super::{ClusteringDefinition, Fragment, InlineRowIds, RowIdMeta};
+use super::{ClusteringDefinition, Fragment, IndexMetadata, InlineRowIds, RowIdMeta};
 use crate::feature_flags::{COVERING_FLAGS, STICKY_READER_FLAGS, STICKY_WRITER_FLAGS};
 use crate::feature_flags::{FLAG_STABLE_ROW_IDS, has_deprecated_v2_feature_flag};
 use crate::format::fragment::DataFileFieldInterner;
@@ -925,6 +925,7 @@ pub struct ManifestBuildConfig {
     /// last-updated-at versions; the build cannot read a data file itself. Only
     /// consulted for fragments whose sequences are spilled.
     spilled_row_lineage: Arc<crate::rowids::version::SpilledRowLineage>,
+    index_is_supported: fn(&IndexMetadata) -> bool,
 }
 
 impl Default for ManifestBuildConfig {
@@ -938,6 +939,7 @@ impl Default for ManifestBuildConfig {
             activate_non_reusable_field_ids: false,
             clustering_definitions: None,
             spilled_row_lineage: Default::default(),
+            index_is_supported: crate::system_index::is_system_index,
         }
     }
 }
@@ -946,6 +948,33 @@ impl ManifestBuildConfig {
     /// Create a new [`ManifestBuildConfig`] with default settings.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Declare whether the active writer supports each segment's exact type
+    /// and version. Automatic coverage inference and coverage-only expansion
+    /// consult this before trusting identifier-domain metadata. A completed
+    /// physical remap supplies its own replacement metadata instead.
+    ///
+    /// Defaults to system indices only. Writers with user index readers must
+    /// provide their capabilities, including installed plugins and optional features.
+    ///
+    /// ```
+    /// use lance_table::format::ManifestBuildConfig;
+    /// // A metadata-only writer can keep every segment opaque.
+    /// let config = ManifestBuildConfig::new().with_index_is_supported(|_| false);
+    /// let predicate = config.index_is_supported();
+    /// ```
+    pub fn with_index_is_supported(
+        mut self,
+        index_is_supported: fn(&IndexMetadata) -> bool,
+    ) -> Self {
+        self.index_is_supported = index_is_supported;
+        self
+    }
+
+    /// The active writer's type and version capability predicate.
+    pub fn index_is_supported(&self) -> fn(&IndexMetadata) -> bool {
+        self.index_is_supported
     }
 
     /// Recompute the manifest's feature flags from the fragments and settings.

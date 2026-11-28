@@ -280,10 +280,7 @@ async fn standalone_append_preserves_unknown_index_entries(#[case] has_v0_fri: b
         .iter()
         .find(|index| index.uuid == unknown.uuid)
         .unwrap();
-    assert_eq!(
-        computed.fragment_bitmap,
-        Some(RoaringBitmap::from_iter([0, 1]))
-    );
+    assert_eq!(computed, &unknown);
     assert_eq!(
         indexed.load_index_metadata().await.unwrap().as_ref(),
         &stored

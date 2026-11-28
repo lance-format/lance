@@ -14,6 +14,7 @@ use crate::index::frag_reuse::{
     open_frag_reuse_index,
 };
 use crate::index::frag_reuse_reader::{CachedMapping, open_mapping};
+use crate::index::segment::index_is_usable;
 use crate::{Dataset, index};
 use async_trait::async_trait;
 use lance_core::Error;
@@ -1066,6 +1067,15 @@ pub async fn remap_column_index(
     }
 
     for index in &segments {
+        if !index_is_usable(index) {
+            log::warn!(
+                "Skipping remap of index '{}' (segment {}): unsupported index type or version {}",
+                index.name,
+                index.uuid,
+                index.index_version
+            );
+            continue;
+        }
         if tagged {
             remap_index_tagged(dataset, &index.uuid).await?;
         } else {
@@ -2590,6 +2600,48 @@ mod tests {
             assert_eq!(segment_fragments_for(&dataset, 3).await, Vec::<u32>::new());
             assert_eq!(segment_fragments_for(&dataset, 0).await, Vec::<u32>::new());
             assert_eq!(segment_fragments_for(&dataset, 9).await, vec![12]);
+        }
+
+        #[rstest::rstest]
+        #[case::future_version(false)]
+        #[case::unknown_type(true)]
+        #[tokio::test]
+        #[serial_test::serial(frag_reuse_maintenance)]
+        async fn unsupported_segments_are_skipped_without_a_commit(#[case] unknown_type: bool) {
+            let mut dataset = keyed_dataset(2).await;
+            reserve_fragments(&mut dataset, 40).await;
+            let mut dataset = commit_stable_partition(dataset, &[0, 1], 10).await;
+            let before = stored_index(&dataset, "i_idx").await;
+            let mut unsupported = before.clone();
+            if unknown_type {
+                unsupported.index_details = Some(Arc::new(prost_types::Any {
+                    type_url: "type.googleapis.com/example.BTreeIndexDetails".into(),
+                    value: vec![],
+                }));
+            } else {
+                unsupported.index_version = 100;
+            }
+            dataset
+                .apply_commit(
+                    Transaction::new(
+                        dataset.manifest.version,
+                        Operation::CreateIndex {
+                            new_indices: vec![unsupported.clone()],
+                            removed_indices: vec![before],
+                        },
+                        None,
+                    ),
+                    &Default::default(),
+                    &Default::default(),
+                )
+                .await
+                .unwrap();
+            let version = dataset.manifest.version;
+            remap_column_index(&mut dataset, &["i"], Some("i_idx".into()))
+                .await
+                .unwrap();
+            assert_eq!(dataset.manifest.version, version);
+            assert_eq!(stored_index(&dataset, "i_idx").await, unsupported);
         }
 
         /// Segments the reader derives no coverage for are not remapped: the

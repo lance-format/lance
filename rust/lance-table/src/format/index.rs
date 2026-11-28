@@ -88,6 +88,14 @@ pub struct IndexMetadata {
     /// This may contain fragment ids that no longer exist in the dataset.
     ///
     /// If this is None, then this is unknown.
+    ///
+    /// Writers must not extend or remap coverage of an index whose type or
+    /// version they do not support. They may leave it unchanged, shrink its
+    /// coverage, drop it, or refuse the operation. The active writer declares
+    /// its capabilities in [`super::ManifestBuildConfig::with_index_is_supported`].
+    /// If indexed values change, coverage must also be withdrawn from retired
+    /// sources that resolve to the changed fragments. Without that mapping,
+    /// clear the affected segment's coverage rather than retaining stale claims.
     pub fragment_bitmap: Option<RoaringBitmap>,
 
     /// Metadata specific to the index type
@@ -242,12 +250,65 @@ impl IndexMetadata {
             .is_some_and(|details| index_details_are_row_addrs(details, self.index_version))
     }
 
+    /// Conservative support bounds for the built-in metadata hints in this
+    /// crate. This does not reflect installed scalar plugins or optional
+    /// features. Manifest builders must supply the active writer's capabilities
+    /// through [`super::ManifestBuildConfig::with_index_is_supported`] before inferring
+    /// coverage; a completed physical remap does not use this hint.
+    ///
+    /// Unknown types and versions may only retain or lose coverage. Legacy
+    /// segments without details use version 0; newer versions require details.
+    ///
+    /// ```
+    /// # use lance_table::format::IndexMetadata;
+    /// # fn can_rewrite(index: &IndexMetadata) -> bool {
+    /// index.supports_fragment_bitmap_rewrite()
+    /// # }
+    /// ```
+    pub fn supports_fragment_bitmap_rewrite(&self) -> bool {
+        let Some(details) = &self.index_details else {
+            return self.index_version == 0;
+        };
+        let type_url = details.type_url.to_ascii_lowercase();
+        let Some((package, name)) = type_url
+            .rsplit_once('/')
+            .and_then(|(_, name)| name.rsplit_once('.'))
+        else {
+            return false;
+        };
+        // Keep these bounds in sync with the index plugins. The lance crate's
+        // test_fragment_bitmap_rewrite_versions_match_readers checks that a
+        // reader version bump cannot silently leave this writer gate behind.
+        let max_version = match (package, name) {
+            (
+                "lance.table" | "lance.index.pb",
+                "btreeindexdetails"
+                | "bitmapindexdetails"
+                | "ngramindexdetails"
+                | "zonemapindexdetails",
+            ) => 1,
+            ("lance.table" | "lance.index.pb", "labellistindexdetails") => 2,
+            ("lance.table" | "lance.index.pb", "invertedindexdetails") => 3,
+            (
+                "lance.index.pb",
+                "rtreeindexdetails" | "minhashlshindexdetails" | "jsonindexdetails",
+            ) => 1,
+            ("lance.index.pb", "bloomfilterindexdetails" | "listelementindexdetails") => 0,
+            ("lance.index.pb", "fmindexdetails") => 10,
+            // Vector subtypes share one compatibility version. Include the
+            // historical table identity and the one emitted by MemWAL flush.
+            ("lance.index.pb" | "lance.table" | "lance.index", "vectorindexdetails") => 3,
+            _ => return false,
+        };
+        (0..=max_version).contains(&self.index_version)
+    }
+
     /// Whether the metadata proves that stored identifiers survive a physical
     /// row rewrite without remapping. Unknown plugin types must lose coverage
     /// of rewritten rows instead of being assumed to store stable row IDs.
-    /// Missing details retain the historical native-index behavior.
+    /// Missing details retain the historical native-index behavior at version 0.
     pub(crate) fn can_follow_stable_row_ids(&self) -> bool {
-        if self.results_are_row_addrs() {
+        if !self.supports_fragment_bitmap_rewrite() || self.results_are_row_addrs() {
             return false;
         }
         let Some(details) = &self.index_details else {
@@ -332,14 +393,15 @@ impl IndexMetadata {
     /// ZoneMap, BloomFilter, FM and RTree cannot remap. This gate recognizes the
     /// supported built-in address-domain formats without opening index files.
     pub fn supports_eager_remap(&self) -> bool {
-        self.index_details.as_ref().is_some_and(|details| {
-            Self::is_btree_addr_domain(details, self.index_version)
-                || Self::is_bitmap_addr_domain(details, self.index_version)
-                || Self::is_label_list_addr_domain(details, self.index_version)
-                || Self::is_list_element(details)
-                || Self::is_ngram_addr_domain(details, self.index_version)
-                || Self::is_minhash_addr_domain(details, self.index_version)
-        })
+        self.supports_fragment_bitmap_rewrite()
+            && self.index_details.as_ref().is_some_and(|details| {
+                Self::is_btree_addr_domain(details, self.index_version)
+                    || Self::is_bitmap_addr_domain(details, self.index_version)
+                    || Self::is_label_list_addr_domain(details, self.index_version)
+                    || Self::is_list_element(details)
+                    || Self::is_ngram_addr_domain(details, self.index_version)
+                    || Self::is_minhash_addr_domain(details, self.index_version)
+            })
     }
 
     /// The prefix of [`Self::fields`] this index is keyed on, with the carried
@@ -1465,9 +1527,8 @@ mod tests {
         assert_eq!(metadata.supports_eager_remap(), supports_eager_remap);
     }
 
-    /// A list-element index stores row addresses at every version, and remaps
-    /// its B-tree during compaction, so it keeps covering rewritten fragments on
-    /// a stable-row-ID table.
+    /// List-element indices store row addresses, but only a supported version
+    /// may authorize remapping its B-tree during compaction.
     #[rstest]
     fn test_list_element_is_remappable_addr_domain(#[values(0, 1)] index_version: i32) {
         let mut metadata = index_metadata_with(vec![0], vec![]);
@@ -1478,7 +1539,7 @@ mod tests {
         metadata.index_version = index_version;
         assert!(metadata.results_are_row_addrs());
         assert!(!metadata.can_follow_stable_row_ids());
-        assert!(metadata.supports_eager_remap());
+        assert_eq!(metadata.supports_eager_remap(), index_version == 0);
     }
 
     #[test]
@@ -1500,6 +1561,43 @@ mod tests {
             metadata.results_are_row_addrs(),
             "a version 1 JSON segment wraps a target that stores row addresses"
         );
+    }
+
+    #[rstest]
+    #[case::inverted("lance.table.InvertedIndexDetails", 4)]
+    #[case::vector("lance.index.pb.VectorIndexDetails", 4)]
+    #[case::legacy_table_vector("lance.table.VectorIndexDetails", 4)]
+    #[case::legacy_vector("lance.index.VectorIndexDetails", 4)]
+    #[case::json("lance.index.pb.JsonIndexDetails", 2)]
+    #[case::btree("lance.table.BTreeIndexDetails", 2)]
+    #[case::bitmap("lance.table.BitmapIndexDetails", 2)]
+    #[case::label_list("lance.table.LabelListIndexDetails", 3)]
+    #[case::ngram("lance.table.NGramIndexDetails", 2)]
+    #[case::minhash("lance.index.pb.MinHashLshIndexDetails", 2)]
+    #[case::rtree("lance.index.pb.RTreeIndexDetails", 2)]
+    #[case::list_element("lance.index.pb.ListElementIndexDetails", 1)]
+    #[case::negative("lance.table.InvertedIndexDetails", -1)]
+    #[case::foreign("example.BTreeIndexDetails", 1)]
+    fn test_unsupported_versions_cannot_follow_or_remap(
+        #[case] details_type: &str,
+        #[case] index_version: i32,
+    ) {
+        let mut metadata = index_metadata_with(vec![0], vec![]);
+        metadata.index_details = Some(Arc::new(prost_types::Any {
+            type_url: format!("type.googleapis.com/{details_type}"),
+            value: vec![],
+        }));
+        metadata.index_version = index_version;
+        assert!(!metadata.can_follow_stable_row_ids());
+        assert!(!metadata.supports_eager_remap());
+    }
+
+    #[rstest]
+    fn test_missing_details_only_support_legacy_version(#[values(-1, 0, 1)] version: i32) {
+        let mut metadata = index_metadata_with(vec![0], vec![]);
+        metadata.index_version = version;
+        assert_eq!(metadata.supports_fragment_bitmap_rewrite(), version == 0);
+        assert_eq!(metadata.can_follow_stable_row_ids(), version == 0);
     }
 
     /// `validate_covering_fields` holds the rules of both layouts, which is

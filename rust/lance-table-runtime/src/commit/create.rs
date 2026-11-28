@@ -52,7 +52,8 @@ pub async fn commit_new_dataset(
 ) -> Result<(Manifest, ManifestLocation)> {
     let build_config = build_config
         .clone()
-        .with_timestamp_nanos(hooks.timestamp_nanos());
+        .with_timestamp_nanos(hooks.timestamp_nanos())
+        .with_index_is_supported(super::index::index_usability(hooks.index));
     let mut transaction = transaction.clone();
     if let Operation::Overwrite { schema, .. } = &mut transaction.operation {
         assign_new_table_field_ids(schema, inherited_field_ids)?;

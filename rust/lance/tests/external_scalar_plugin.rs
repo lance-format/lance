@@ -27,6 +27,7 @@ use lance_index::{
     registry::IndexPluginRegistry,
     scalar::{
         CreatedIndex, IndexStore, RowIdRemapper, ScalarIndex, ScalarIndexParams,
+        btree::BTreeIndexPlugin,
         expression::{SargableQueryParser, ScalarQueryParser},
         registry::{BasicTrainer, ScalarIndexPlugin, TrainingRequest},
         seed::{IndexSeedWriter, SEED_META_KEY_PREFIX},
@@ -59,6 +60,7 @@ const ROWS_PER_ZONE: u64 = 2;
 // Every test registers before its first dataset operation, even when tests run concurrently.
 static REGISTRATION: LazyLock<()> = LazyLock::new(|| {
     register_scalar_index_plugin::<ExampleIndexDetails, ExampleIndexPlugin>().unwrap();
+    register_scalar_index_plugin::<RemappableIndexDetails, RemappableIndexPlugin>().unwrap();
 });
 
 #[async_trait]
@@ -160,6 +162,163 @@ impl ScalarIndexPlugin for ExampleIndexPlugin {
                 .with_version(ZoneMapSeedVersion::V0),
         )))
     }
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct RemappableIndexDetails {}
+
+impl Name for RemappableIndexDetails {
+    const NAME: &'static str = "RemappableIndexDetails";
+    const PACKAGE: &'static str = "example.index";
+}
+
+#[derive(Debug, Default)]
+struct RemappableIndexPlugin;
+
+#[async_trait]
+impl BasicTrainer for RemappableIndexPlugin {
+    fn new_training_request(
+        &self,
+        params: &str,
+        field: &Field,
+    ) -> Result<Box<dyn TrainingRequest>> {
+        BTreeIndexPlugin.new_training_request(params, field)
+    }
+
+    async fn train_index(
+        &self,
+        data: SendableRecordBatchStream,
+        index_store: &dyn IndexStore,
+        request: Box<dyn TrainingRequest>,
+        fragment_ids: Option<Vec<u32>>,
+        progress: Arc<dyn IndexBuildProgress>,
+    ) -> Result<CreatedIndex> {
+        let mut created = BTreeIndexPlugin
+            .train_index(data, index_store, request, fragment_ids, progress)
+            .await?;
+        created.index_details = prost_types::Any::from_msg(&RemappableIndexDetails {})?;
+        Ok(created)
+    }
+}
+
+#[async_trait]
+impl ScalarIndexPlugin for RemappableIndexPlugin {
+    fn basic_trainer(&self) -> Option<&dyn BasicTrainer> {
+        Some(self)
+    }
+
+    fn name(&self) -> &str {
+        "Remappable"
+    }
+
+    fn provides_exact_answer(&self) -> bool {
+        true
+    }
+
+    fn version(&self) -> u32 {
+        BTreeIndexPlugin.version()
+    }
+
+    fn new_query_parser(
+        &self,
+        index_name: String,
+        _index_details: &prost_types::Any,
+    ) -> Option<Box<dyn ScalarQueryParser>> {
+        Some(Box::new(SargableQueryParser::new(
+            index_name,
+            self.name().to_string(),
+            false,
+        )))
+    }
+
+    async fn load_index(
+        &self,
+        index_store: Arc<dyn IndexStore>,
+        index_details: &prost_types::Any,
+        index_version: u32,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        cache: &LanceCache,
+    ) -> Result<Arc<dyn ScalarIndex>> {
+        BTreeIndexPlugin
+            .load_index(
+                index_store,
+                index_details,
+                index_version,
+                frag_reuse_index,
+                cache,
+            )
+            .await
+    }
+}
+
+#[tokio::test]
+async fn external_plugin_completed_remap_can_be_committed() {
+    LazyLock::force(&REGISTRATION);
+    let directory = tempdir().unwrap();
+    let batch = record_batch!(("value", Int64, [1, 2, 3, 4])).unwrap();
+    let schema = batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch)], schema),
+        directory.path().to_str().unwrap(),
+        Some(WriteParams {
+            max_rows_per_file: 2,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    dataset
+        .create_index(
+            &["value"],
+            IndexType::Scalar,
+            Some("plugin_index".to_string()),
+            &ScalarIndexParams::new("remappable".to_string()),
+            false,
+        )
+        .await
+        .unwrap();
+    let before = dataset.load_indices().await.unwrap()[0].clone();
+    assert_eq!(before.fragment_bitmap.as_ref().unwrap().len(), 2);
+    compact_files(
+        &mut dataset,
+        CompactionOptions {
+            target_rows_per_fragment: 4,
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    let reopened = Dataset::open(dataset.uri()).await.unwrap();
+    assert_eq!(reopened.fragments().len(), 1);
+    let after = &reopened.load_indices().await.unwrap()[0];
+    assert_ne!(after.uuid, before.uuid, "the plugin must physically remap");
+    assert_eq!(after.index_details, before.index_details);
+    assert_eq!(after.fragment_bitmap.as_ref().unwrap().len(), 1);
+    assert!(
+        after
+            .fragment_bitmap
+            .as_ref()
+            .unwrap()
+            .contains(reopened.fragments()[0].id as u32)
+    );
+    let mut scan = reopened.scan();
+    scan.filter("value = 3").unwrap();
+    assert!(
+        scan.explain_plan(false)
+            .await
+            .unwrap()
+            .contains("ScalarIndex")
+    );
+    let actual = scan.try_into_batch().await.unwrap();
+    let mut full_scan = reopened.scan();
+    full_scan
+        .filter("value = 3")
+        .unwrap()
+        .use_scalar_index(false);
+    let expected = full_scan.try_into_batch().await.unwrap();
+    assert_eq!(expected.num_rows(), 1);
+    assert_eq!(actual, expected);
 }
 
 #[rstest]

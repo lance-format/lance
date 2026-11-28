@@ -3,6 +3,11 @@
 
 use super::support::*;
 use super::*;
+use crate::dataset::CommitBuilder;
+use lance_table::format::DataFile;
+use lance_table::transaction::action::{
+    Action, AddDataFile, CompositeOperation, FieldRef, Ref, TombstoneFieldData, UserStep,
+};
 
 #[tokio::test]
 async fn test_drop_index() {
@@ -2893,13 +2898,21 @@ async fn test_a_detached_commit_does_not_erase_an_unsupported_index() {
     assert_eq!(detached.count_rows(None).await.unwrap(), 20);
 }
 
-/// Compaction bins fragments so that no rewrite group splits an index's
-/// coverage, and `recalculate_fragment_bitmap` rejects the plan if one does.
-/// Both sides therefore have to count the same indices: planning from the
-/// filtered view while the commit carries the complete one makes compaction
-/// fail outright on a dataset holding an index from a newer build.
+/// Compaction must succeed while retaining an unreadable index segment.
+/// Supported segments follow stable row ids into rewritten fragments, while
+/// unsupported segments lose rewritten coverage and fall back to scans.
+#[rstest]
+#[case::supported(None)]
+#[case::future_version(Some(UnreadableIndexKind::NewerVersion))]
+#[case::unknown_type(Some(UnreadableIndexKind::UnknownType))]
+#[cfg_attr(
+    not(feature = "geo"),
+    case::disabled_feature(Some(UnreadableIndexKind::DisabledFeature))
+)]
 #[tokio::test]
-async fn test_compaction_survives_an_unsupported_index() {
+async fn test_compaction_only_expands_supported_index_coverage(
+    #[case] unreadable_kind: Option<UnreadableIndexKind>,
+) {
     let test_dir = tempfile::tempdir().unwrap();
     let test_uri = test_dir.path().to_str().unwrap();
 
@@ -2911,7 +2924,7 @@ async fn test_compaction_survives_an_unsupported_index() {
         lance_datagen::gen_batch()
             .col("id", array::step::<Int32Type>())
             .col("payload", array::step::<Int32Type>())
-            .col("text", array::rand_utf8(ByteCount::from(8), false))
+            .col("text", array::fill_utf8("shared".to_string()))
             .into_reader_rows(RowCount::from(10), BatchCount::from(1))
     }
 
@@ -2925,18 +2938,22 @@ async fn test_compaction_survives_an_unsupported_index() {
         .unwrap();
     assert_eq!(dataset.get_fragments().len(), 2);
 
-    // Row-id-domain: its coverage is recalculated (not dropped) across a
-    // rewrite under stable row ids, which is exactly the property this test
-    // checks. The other scalar index types moved to row-address domain and
-    // no longer exercise it.
+    // A supported row-id-domain index can follow stable row ids into rewritten
+    // fragments. Neither a future version nor an unknown type may do so.
     let inverted_params = ScalarIndexParams::for_builtin(BuiltinIndexType::Inverted);
     dataset
         .create_index_builder(&["text"], IndexType::Inverted, &inverted_params)
         .name("id_idx".to_string())
-        .train(false)
         .await
         .unwrap();
-    hide_index_from_this_build(&mut dataset, "id_idx").await;
+    let readable = manifest_index(&dataset, "id_idx").await;
+    assert_eq!(
+        readable.fragment_bitmap,
+        Some([0_u32, 1].into_iter().collect())
+    );
+    if let Some(kind) = unreadable_kind {
+        hide_index_as(&mut dataset, "id_idx", kind).await;
+    }
 
     // A fragment the index does not cover, so a bin holding it together with
     // the covered ones would split the index's coverage.
@@ -2969,9 +2986,384 @@ async fn test_compaction_survives_an_unsupported_index() {
         .iter()
         .map(|f| f.id() as u32)
         .collect::<RoaringBitmap>();
+    if unreadable_kind.is_some() {
+        assert_eq!(
+            after,
+            IndexMetadata {
+                fragment_bitmap: Some(RoaringBitmap::new()),
+                ..before
+            },
+            "unsupported metadata must survive with rewritten coverage removed"
+        );
+
+        // Model a reader that understands the preserved segment by restoring
+        // the real file format's identity. Empty coverage must trigger scanning
+        // the rewritten rows instead of trusting stale entries in the segment.
+        dataset
+            .apply_commit(
+                Transaction::new(
+                    dataset.manifest.version,
+                    Operation::CreateIndex {
+                        new_indices: vec![IndexMetadata {
+                            index_details: readable.index_details,
+                            index_version: readable.index_version,
+                            ..after.clone()
+                        }],
+                        removed_indices: vec![after],
+                    },
+                    None,
+                ),
+                &Default::default(),
+                &Default::default(),
+            )
+            .await
+            .unwrap();
+    } else {
+        let coverage = after.fragment_bitmap.unwrap();
+        assert_eq!(coverage.len(), 1);
+        assert!(coverage.is_subset(&live));
+        assert!(coverage.is_disjoint(&before.fragment_bitmap.unwrap()));
+    }
+    assert_eq!(
+        dataset
+            .scan()
+            .full_text_search(FullTextSearchQuery::new("shared".to_owned()))
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap()
+            .num_rows(),
+        20
+    );
+}
+
+/// Dataset append carries the index hook, unlike a standalone write. It must
+/// not publish version-zero history's inferred coverage for an unreadable segment.
+#[rstest]
+#[case::future_version(UnreadableIndexKind::NewerVersion)]
+#[case::unknown_type(UnreadableIndexKind::UnknownType)]
+#[cfg_attr(
+    not(feature = "geo"),
+    case::disabled_feature(UnreadableIndexKind::DisabledFeature)
+)]
+#[tokio::test]
+async fn test_dataset_append_preserves_unsupported_coverage_after_deferred_compaction(
+    #[case] kind: UnreadableIndexKind,
+) {
+    let directory = tempfile::tempdir().unwrap();
+    let uri = directory.path().to_str().unwrap();
+    let mut dataset = Dataset::write(
+        two_column_reader(),
+        uri,
+        Some(WriteParams {
+            max_rows_per_file: 5,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    dataset
+        .create_index_builder(
+            &["id"],
+            IndexType::BTree,
+            &ScalarIndexParams::for_builtin(BuiltinIndexType::BTree),
+        )
+        .name("id_idx".to_string())
+        .await
+        .unwrap();
+    let readable = manifest_index(&dataset, "id_idx").await;
+    hide_index_as(&mut dataset, "id_idx", kind).await;
+    let before = manifest_index(&dataset, "id_idx").await;
+    assert_eq!(before.fragment_bitmap, Some(RoaringBitmap::from([0, 1])));
+
+    let metrics = compact_files(
+        &mut dataset,
+        CompactionOptions {
+            defer_index_remap: true,
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(metrics.fragments_removed, 2);
+    assert_eq!(dataset.fragments().len(), 1);
+    assert_eq!(
+        manifest_index(&dataset, FRAG_REUSE_INDEX_NAME)
+            .await
+            .index_version,
+        0
+    );
+    assert_eq!(manifest_index(&dataset, "id_idx").await, before);
+
+    // A shared cache may contain a projection made by a build that could
+    // read this type. This writer must not persist that projection either.
+    let mut projected = raw_manifest_indices(&dataset).await;
+    projected
+        .iter_mut()
+        .find(|index| index.name == "id_idx")
+        .unwrap()
+        .fragment_bitmap = Some(dataset.table_state.fragment_bitmap.as_ref().clone());
+    dataset
+        .index_cache
+        .insert_with_key(
+            &crate::session::index_caches::DerivedIndexListingKey {
+                version: dataset.manifest.version,
+                store_identity: &dataset.table_state.object_store.store_prefix,
+                e_tag: dataset.manifest_location().e_tag.as_deref(),
+            },
+            Arc::new(projected),
+        )
+        .await;
+
+    dataset.append(two_column_reader(), None).await.unwrap();
+    let mut reopened = Dataset::open(uri).await.unwrap();
+    let after = manifest_index(&reopened, "id_idx").await;
+    assert_eq!(
+        after, before,
+        "append must preserve the stored segment coverage"
+    );
+
+    // Restore the real identity to model a reader that understands the segment.
+    // Its deferred coverage excludes the appended fragment, which must be scanned.
+    reopened
+        .apply_commit(
+            Transaction::new(
+                reopened.manifest.version,
+                Operation::CreateIndex {
+                    new_indices: vec![IndexMetadata {
+                        index_details: readable.index_details,
+                        index_version: readable.index_version,
+                        ..after.clone()
+                    }],
+                    removed_indices: vec![after],
+                },
+                None,
+            ),
+            &Default::default(),
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+    let reopened = Dataset::open(uri).await.unwrap();
+    let coverage = reopened.load_indices_by_name("id_idx").await.unwrap()[0]
+        .fragment_bitmap
+        .clone()
+        .unwrap();
+    assert_eq!(coverage.len(), 1);
+    assert!(!coverage.contains(reopened.fragments().last().unwrap().id as u32));
+    let mut full_scan = reopened.scan();
+    full_scan
+        .project(&["id"])
+        .unwrap()
+        .filter("id = 3")
+        .unwrap()
+        .use_scalar_index(false);
+    let expected = full_scan.try_into_batch().await.unwrap();
+    assert_eq!(expected.num_rows(), 2);
+    let mut indexed_scan = reopened.scan();
+    indexed_scan
+        .project(&["id"])
+        .unwrap()
+        .filter("id = 3")
+        .unwrap();
     assert!(
-        !after.fragment_bitmap.unwrap().is_disjoint(&live),
-        "the surviving index covers only fragments the rewrite deleted"
+        indexed_scan
+            .explain_plan(false)
+            .await
+            .unwrap()
+            .contains("ScalarIndex")
+    );
+    assert_eq!(indexed_scan.try_into_batch().await.unwrap(), expected);
+}
+
+#[rstest]
+#[case::future_version(UnreadableIndexKind::NewerVersion)]
+#[case::unknown_type(UnreadableIndexKind::UnknownType)]
+#[cfg_attr(
+    not(feature = "geo"),
+    case::disabled_feature(UnreadableIndexKind::DisabledFeature)
+)]
+#[tokio::test]
+async fn test_in_place_replacement_withdraws_unsupported_source_coverage(
+    #[case] kind: UnreadableIndexKind,
+    #[values(false, true)] composite: bool,
+    #[values(false, true)] covering_field: bool,
+) {
+    let directory = tempfile::tempdir().unwrap();
+    let uri = directory.path().to_str().unwrap();
+    let mut dataset = Dataset::write(
+        lance_datagen::gen_batch()
+            .col("id", array::step::<Int32Type>())
+            .col("payload", array::step::<Int32Type>())
+            .col("covered", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(10), BatchCount::from(1)),
+        uri,
+        Some(WriteParams {
+            max_rows_per_file: 5,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let params = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree);
+    for (column, name) in [("id", "id_idx"), ("payload", READABLE_INDEX)] {
+        dataset
+            .create_index_builder(&[column], IndexType::BTree, &params)
+            .name(name.to_string())
+            .await
+            .unwrap();
+    }
+    let readable = manifest_index(&dataset, "id_idx").await;
+    if covering_field {
+        dataset
+            .apply_commit(
+                Transaction::new(
+                    dataset.manifest.version,
+                    Operation::CreateIndex {
+                        new_indices: vec![IndexMetadata {
+                            covering_fields: vec![2],
+                            ..readable.clone()
+                        }],
+                        removed_indices: vec![readable.clone()],
+                    },
+                    None,
+                ),
+                &Default::default(),
+                &Default::default(),
+            )
+            .await
+            .unwrap();
+    }
+    hide_index_as(&mut dataset, "id_idx", kind).await;
+    hide_index_as(&mut dataset, READABLE_INDEX, kind).await;
+    let before = manifest_index(&dataset, "id_idx").await;
+    let unrelated = manifest_index(&dataset, READABLE_INDEX).await;
+
+    let metrics = compact_files(
+        &mut dataset,
+        CompactionOptions {
+            defer_index_remap: true,
+            ..Default::default()
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(metrics.fragments_removed, 2);
+    assert_eq!(dataset.fragments().len(), 1);
+    assert_eq!(
+        manifest_index(&dataset, FRAG_REUSE_INDEX_NAME)
+            .await
+            .index_version,
+        0
+    );
+    assert_eq!(before.fragment_bitmap, Some(RoaringBitmap::from([0, 1])));
+    assert_eq!(manifest_index(&dataset, "id_idx").await, before);
+
+    let (column, field_id) = if covering_field {
+        ("covered", 2)
+    } else {
+        ("id", 0)
+    };
+    let replacement = arrow_array::record_batch!((column, Int32, vec![42; 10])).unwrap();
+    let replacements = dataset
+        .get_fragments()
+        .remove(0)
+        .write_columns(
+            futures::stream::iter([Ok(replacement)]),
+            &dataset.schema().project(&[column]).unwrap(),
+        )
+        .await
+        .unwrap();
+    let operation = if composite {
+        Operation::CompositeOperation(CompositeOperation::new(vec![UserStep::new(
+            "replace indexed values",
+            vec![
+                Action::TombstoneFieldData(TombstoneFieldData {
+                    fragment: Ref::Committed(replacements.0),
+                    field_ids: vec![FieldRef::Committed(field_id)],
+                    data_change: true,
+                }),
+                Action::AddDataFile(AddDataFile {
+                    fragment: Ref::Committed(replacements.0),
+                    file: DataFile {
+                        fields: Arc::from([]),
+                        ..replacements.1
+                    },
+                    field_ids: vec![FieldRef::Committed(field_id)],
+                    data_change: true,
+                    base: None,
+                }),
+            ],
+        )]))
+    } else {
+        Operation::DataReplacement {
+            replacements: vec![replacements],
+            data_change: true,
+        }
+    };
+    let transaction = Transaction::new(dataset.manifest.version, operation, None);
+    if composite {
+        CommitBuilder::new(Arc::new(dataset))
+            .with_experimental_composite_operations(true)
+            .execute(transaction)
+            .await
+            .unwrap();
+    } else {
+        dataset
+            .apply_commit(transaction, &Default::default(), &Default::default())
+            .await
+            .unwrap();
+    }
+    let mut reopened = Dataset::open(uri).await.unwrap();
+    let after = manifest_index(&reopened, "id_idx").await;
+    assert_eq!(
+        after,
+        IndexMetadata {
+            fragment_bitmap: Some(RoaringBitmap::new()),
+            ..before
+        },
+        "a value replacement must withdraw its retired source coverage"
+    );
+    assert_eq!(manifest_index(&reopened, READABLE_INDEX).await, unrelated);
+
+    // Model a later reader that understands the original BTree files. Their
+    // stale values must not hide the replacement values from its queries.
+    reopened
+        .apply_commit(
+            Transaction::new(
+                reopened.manifest.version,
+                Operation::CreateIndex {
+                    new_indices: vec![IndexMetadata {
+                        index_details: readable.index_details,
+                        index_version: readable.index_version,
+                        ..after.clone()
+                    }],
+                    removed_indices: vec![after],
+                },
+                None,
+            ),
+            &Default::default(),
+            &Default::default(),
+        )
+        .await
+        .unwrap();
+    let reopened = Dataset::open(uri).await.unwrap();
+    let filter = format!("{column} = 42");
+    let mut full_scan = reopened.scan();
+    full_scan.filter(&filter).unwrap().use_scalar_index(false);
+    let expected = full_scan.try_into_batch().await.unwrap();
+    assert_eq!(expected.num_rows(), 10);
+    assert_eq!(
+        reopened
+            .scan()
+            .filter(&filter)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap(),
+        expected
     );
 }
 
@@ -2982,8 +3374,8 @@ async fn test_compaction_survives_an_unsupported_index() {
 /// longer exist. Those fragments are held back from the plan instead; the
 /// rest of the table still compacts.
 ///
-/// The stable-row-id case is the test above: there the fragment-reuse index
-/// repairs the coverage afterwards, so nothing has to be held back.
+/// In the stable-row-id case above, unsupported coverage can shrink instead,
+/// so nothing has to be held back.
 #[rstest]
 #[case::newer_version(UnreadableIndexKind::NewerVersion)]
 #[case::unknown_type(UnreadableIndexKind::UnknownType)]
