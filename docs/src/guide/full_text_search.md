@@ -567,6 +567,8 @@ Appended rows remain searchable: Lance combines indexed search with unindexed sc
 
 After changing tokenizer or analyzer settings, rebuild the index with `create_scalar_index(..., replace=True)` so the entire dataset uses the new configuration. `optimize_indices()` adds new data to existing indexes; it does not change their analyzer settings.
 
+Upgrading Lance can also change the built-in stop words, such as the list that `icu` and `icu/split` use. If an index removes stop words with a built-in list (`remove_stop_words` is on and `custom_stop_words` is unset), rebuild it after such an upgrade even though its settings have not changed: call `create_scalar_index(column, "INVERTED", name=index_name, replace=True, ...)` with the same options the index was created with. `optimize_indices()` keeps the existing postings, and `retrain=True` applies only to vector indices. Until the index is rebuilt, rows indexed before the upgrade cannot be found through a word the new list no longer removes, while rows indexed after the upgrade and rows not yet indexed can. An AND or phrase query that contains such a word matches none of the older rows.
+
 For large builds, `num_workers` and `memory_limit` control build parallelism and memory. See [Performance Guide](performance.md#indexes) and the [FTS format specification](../format/index/scalar/fts.md) for resource and compatibility details.
 
 ## Full-Text and Vector Search
