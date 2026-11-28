@@ -6,4 +6,5 @@ nav:
   - Voting: voting.md
   - Contributing: contributing.md
   - Release: release.md
+  - Mixed Version Support: mixed_versions.md
   - Project Specific Guidelines: project-specific

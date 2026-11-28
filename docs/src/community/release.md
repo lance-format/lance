@@ -43,6 +43,10 @@ It is strongly discouraged to continue adding patch releases to old versions.
 For major version releases, it is recommended to include a migration guide for users to understand how to
 handle any breaking changes introduced in the major version.
 
+Breaking changes to the file or index formats carry an additional constraint: they ship opt-in for a period
+before they can become the default, so that readers and writers on different releases keep interoperating.
+See [Guidelines for Mixed Version Support](./mixed_versions.md).
+
 ## Project Specific Release Process
 
 Each project maintains its own detailed release process in a file named `release_process.md`.

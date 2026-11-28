@@ -9,6 +9,7 @@ Also see directory-specific guidelines: [rust/](rust/AGENTS.md) | [python/](pyth
 - Treat every file format marked stable as a durable compatibility contract. All changes to a stable format must preserve both backward and forward compatibility.
 - Treat every file format marked unstable as disposable. It may change freely; do not add compatibility code, migrations, fallbacks, or tests for files written by earlier unstable revisions.
 - Evaluate compatibility against the latest released stable version while continuing to honor all stable format contracts. Changes that exist only on the current branch or `main` are not compatibility constraints; do not compromise a cleaner or more complete design to preserve those intermediate states.
+- Ship a breaking file or index format change opt-in and default off. It may become the default only after a stable release has been able to read it for three months, so that readers and writers within that window keep interoperating. Maintenance operations (compaction, optimize, incremental indexing, clone, restore) must preserve the existing form instead of upgrading it. See [Guidelines for Mixed Version Support](docs/src/community/mixed_versions.md).
 
 ### Legacy Compatibility Boundaries
 
