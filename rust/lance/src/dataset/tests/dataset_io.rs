@@ -38,8 +38,9 @@ use arrow_array::RecordBatch;
 use arrow_array::RecordBatchReader;
 use arrow_array::{Array, FixedSizeListArray, Int16Array, Int16DictionaryArray, StructArray};
 use arrow_array::{
-    ArrayRef, BooleanArray, Decimal128Array, Int8Array, Int8DictionaryArray, Int32Array,
-    Int64Array, RecordBatchIterator, StringArray, UInt8Array, UInt8DictionaryArray,
+    ArrayRef, BooleanArray, Decimal32Array, Decimal64Array, Decimal128Array, Int8Array,
+    Int8DictionaryArray, Int32Array, Int64Array, RecordBatchIterator, StringArray, UInt8Array,
+    UInt8DictionaryArray, UInt32Array,
     cast::as_string_array,
     types::{Float32Type, Int32Type},
 };
@@ -4683,6 +4684,197 @@ async fn write_rejects_dictionary_value_type_that_has_no_logical_type() {
 
     assert!(matches!(error, Error::Schema { .. }));
     assert!(error.to_string().contains("does not parse back"));
+}
+
+/// Unscaled values covering nulls, both signs and the largest magnitude each
+/// precision allows.
+fn decimal32_and_decimal64_batch(rows: Range<i64>) -> RecordBatch {
+    let value = |i: i64, max: i64| match i % 5 {
+        0 => None,
+        1 => Some(max),
+        2 => Some(-max),
+        _ => Some(i * 37 - 500),
+    };
+    let d32 = Decimal32Array::from_iter(
+        rows.clone()
+            .map(|i| value(i, 999_999_999).map(|v| v as i32)),
+    )
+    .with_precision_and_scale(9, 2)
+    .unwrap();
+    let d64 = Decimal64Array::from_iter(rows.map(|i| value(i, 999_999_999_999_999_999)))
+        .with_precision_and_scale(18, 3)
+        .unwrap();
+    RecordBatch::try_from_iter([
+        ("d32", Arc::new(d32) as ArrayRef),
+        ("d64", Arc::new(d64) as ArrayRef),
+    ])
+    .unwrap()
+}
+
+#[tokio::test]
+async fn decimal32_and_decimal64_round_trip_on_2_3() {
+    let test_uri = TempStrDir::default();
+    let batch = decimal32_and_decimal64_batch(0..1000);
+    let params = WriteParams {
+        data_storage_version: Some(LanceFileVersion::V2_3),
+        max_rows_per_file: 300,
+        ..Default::default()
+    };
+    Dataset::write(
+        RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+        &test_uri,
+        Some(params),
+    )
+    .await
+    .unwrap();
+
+    // Reopening parses the stored `decimal:32` and `decimal:64` logical types.
+    let dataset = Dataset::open(&test_uri).await.unwrap();
+    assert_eq!(dataset.get_fragments().len(), 4);
+    assert_eq!(dataset.scan().try_into_batch().await.unwrap(), batch);
+
+    let indices = [0, 1, 2, 299, 300, 999];
+    let taken = dataset
+        .take(&indices, Arc::new(dataset.schema().clone()))
+        .await
+        .unwrap();
+    let expected = arrow_select::take::take_record_batch(
+        &batch,
+        &UInt32Array::from_iter_values(indices.iter().map(|&i| i as u32)),
+    )
+    .unwrap();
+    assert_eq!(taken, expected);
+
+    // Every non-null `d64` exceeds the integer, which is outside its precision.
+    let mut scan = dataset.scan();
+    scan.filter("d32 < 0 AND d64 > -999999999999999999")
+        .unwrap();
+    let filtered = scan.try_into_batch().await.unwrap();
+    let expected_rows = (0..1000_i64)
+        .filter(|i| match i % 5 {
+            0 | 1 => false,
+            2 => true,
+            _ => i * 37 - 500 < 0,
+        })
+        .count();
+    assert_eq!(filtered.num_rows(), expected_rows);
+}
+
+/// Committing 2.3 files over a legacy dataset publishes the files' version, so
+/// the commit-time check must accept their Decimal32 and Decimal64 columns.
+#[tokio::test]
+async fn overwrite_legacy_dataset_with_decimal32_and_decimal64_files() {
+    let test_uri = TempStrDir::default();
+    let ids =
+        RecordBatch::try_from_iter([("id", Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef)])
+            .unwrap();
+    let dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(ids.clone())], ids.schema()),
+        &test_uri,
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::Legacy),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        dataset.manifest.data_storage_format.lance_file_format(),
+        ConcreteFileVersion::V1
+    );
+
+    let batch = decimal32_and_decimal64_batch(1..5);
+    let params = WriteParams {
+        mode: WriteMode::Overwrite,
+        data_storage_version: Some(LanceFileVersion::V2_3),
+        ..Default::default()
+    };
+    let dataset = Arc::new(dataset);
+    let transaction = InsertBuilder::new(dataset.clone())
+        .with_params(&params)
+        .execute_uncommitted(vec![batch.clone()])
+        .await
+        .unwrap();
+    CommitBuilder::new(dataset)
+        .execute(transaction)
+        .await
+        .unwrap();
+
+    let dataset = Dataset::open(&test_uri).await.unwrap();
+    assert_eq!(
+        dataset.manifest.data_storage_format.lance_file_format(),
+        ConcreteFileVersion::V2_3
+    );
+    assert_eq!(dataset.scan().try_into_batch().await.unwrap(), batch);
+}
+
+/// `with_data_type` does not check the precision, and Arrow allows a negative
+/// scale, so the write must reject both rather than store a type later filters
+/// cannot plan.
+#[rstest]
+#[case::precision_beyond_width(DataType::Decimal32(10, 2), "precision 10 is greater than max 9")]
+#[case::negative_scale(DataType::Decimal32(5, -2), "scale -2 is negative")]
+#[tokio::test]
+async fn write_rejects_invalid_decimal32_type(#[case] data_type: DataType, #[case] expected: &str) {
+    let values = Decimal32Array::from(vec![Some(1), None]).with_data_type(data_type);
+    let batch = RecordBatch::try_from_iter([("d", Arc::new(values) as ArrayRef)]).unwrap();
+    let error = Dataset::write(
+        RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+        "memory://",
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_3),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(error, Error::Schema { .. }), "{error}");
+    assert!(error.to_string().contains(expected), "{error}");
+}
+
+/// Released readers of these versions reject the `decimal:32` and `decimal:64`
+/// logical types, so the write must fail before it records them.
+#[rstest]
+#[tokio::test]
+async fn write_rejects_decimal32_and_decimal64_before_2_3(
+    #[values(
+        LanceFileVersion::Legacy,
+        LanceFileVersion::V2_0,
+        LanceFileVersion::V2_1,
+        LanceFileVersion::V2_2
+    )]
+    version: LanceFileVersion,
+    #[values("d32", "d64")] column: &str,
+) {
+    // No nulls: the legacy format rejects null decimals on its own.
+    let batch = decimal32_and_decimal64_batch(1..5);
+    let batch = batch
+        .project(&[batch.schema().index_of(column).unwrap()])
+        .unwrap();
+    let params = WriteParams {
+        data_storage_version: Some(version),
+        ..Default::default()
+    };
+    let error = Dataset::write(
+        RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+        "memory://",
+        Some(params),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(
+        matches!(error, Error::InvalidInput { .. }),
+        "{version:?}: {error}"
+    );
+    let message = error.to_string();
+    let data_type = batch.schema().field(0).data_type().to_string();
+    assert!(
+        message.contains(&format!("'{column}'"))
+            && message.contains(&data_type)
+            && message.contains("require data storage version 2.3"),
+        "{version:?}: {message}"
+    );
 }
 
 #[rstest]

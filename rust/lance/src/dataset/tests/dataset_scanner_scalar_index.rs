@@ -8,7 +8,8 @@ use arrow::datatypes::Int32Type;
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Float32Type, UInt32Type, UInt64Type};
 use arrow_array::{
-    Array, Int32Array, PrimitiveArray, RecordBatch, RecordBatchIterator, StringArray,
+    Array, Decimal32Array, Decimal64Array, Int32Array, PrimitiveArray, RecordBatch,
+    RecordBatchIterator, StringArray,
 };
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use futures::TryStreamExt;
@@ -2848,5 +2849,113 @@ async fn test_fast_search_ignored_scalar_indices(
     if restrict_rows {
         let values = batch["a"].as_primitive::<Int32Type>();
         assert_eq!(values.values().as_ref(), &[97, 99]);
+    }
+}
+
+/// Index files follow the dataset's data storage version, so a 2.3 dataset can
+/// index its Decimal32 and Decimal64 columns. Each index must return the rows an
+/// unindexed scan returns.
+#[rstest]
+#[tokio::test]
+async fn test_decimal32_and_decimal64_scalar_indices_match_unindexed_scan(
+    #[values(DataType::Decimal32(9, 2), DataType::Decimal64(18, 2))] data_type: DataType,
+    #[values(
+        BuiltinIndexType::BTree,
+        BuiltinIndexType::Bitmap,
+        BuiltinIndexType::ZoneMap
+    )]
+    index_type: BuiltinIndexType,
+) {
+    let units = (0..60_i64)
+        .map(|i| (i % 10 != 0).then_some(i * 7 - 200))
+        .collect::<Vec<_>>();
+    let values: Arc<dyn Array> = match data_type {
+        DataType::Decimal32(precision, scale) => Arc::new(
+            Decimal32Array::from_iter(units.iter().map(|v| v.map(|v| v as i32)))
+                .with_precision_and_scale(precision, scale)
+                .unwrap(),
+        ),
+        DataType::Decimal64(precision, scale) => Arc::new(
+            Decimal64Array::from_iter(units.iter().copied())
+                .with_precision_and_scale(precision, scale)
+                .unwrap(),
+        ),
+        _ => unreachable!(),
+    };
+    let batch = RecordBatch::try_from_iter([
+        (
+            "id",
+            Arc::new(Int32Array::from_iter_values(0..60)) as Arc<dyn Array>,
+        ),
+        ("d", values),
+    ])
+    .unwrap();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
+        "memory://",
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_3),
+            max_rows_per_file: 20,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    dataset
+        .create_index(
+            &["d"],
+            IndexType::Scalar,
+            None,
+            &ScalarIndexParams::for_builtin(index_type.clone()),
+            true,
+        )
+        .await
+        .unwrap();
+
+    let mut scan = dataset.scan();
+    scan.filter("d < 0").unwrap();
+    let plan = scan.explain_plan(false).await.unwrap();
+    assert!(plan.contains("ScalarIndexQuery"), "{index_type:?}: {plan}");
+
+    let matched = async |filter: &str, use_index: bool| -> Vec<i32> {
+        let batch = dataset
+            .scan()
+            .use_scalar_index(use_index)
+            .filter(filter)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let mut ids = batch["id"].as_primitive::<Int32Type>().values().to_vec();
+        ids.sort_unstable();
+        ids
+    };
+    let in_range = |low: i64, high: i64| -> Vec<i32> {
+        (0..60)
+            .filter(|&i| units[i as usize].is_some_and(|v| (low..=high).contains(&v)))
+            .collect()
+    };
+    for (filter, expected) in [
+        ("d = -0.53", in_range(-53, -53)),
+        ("d = 0.05", vec![]),
+        ("d < 0", in_range(i64::MIN, -1)),
+        ("d >= 1.5", in_range(150, i64::MAX)),
+        ("d BETWEEN -1 AND 0.5", in_range(-100, 50)),
+        (
+            "d IN (-0.53, 1.71)",
+            [in_range(-53, -53), in_range(171, 171)].concat(),
+        ),
+        ("d IS NULL", (0..60).step_by(10).collect()),
+    ] {
+        assert_eq!(
+            matched(filter, false).await,
+            expected,
+            "{filter} without index"
+        );
+        assert_eq!(
+            matched(filter, true).await,
+            expected,
+            "{filter} with {index_type:?}"
+        );
     }
 }

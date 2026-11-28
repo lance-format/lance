@@ -3317,8 +3317,7 @@ class LanceDataset(pa.dataset.Dataset):
                     and not pa.types.is_binary(field_type)
                     and not pa.types.is_large_binary(field_type)
                     and not pa.types.is_temporal(field_type)
-                    and not pa.types.is_decimal128(field_type)
-                    and not pa.types.is_decimal256(field_type)
+                    and not pa.types.is_decimal(field_type)
                     and not pa.types.is_fixed_size_binary(field_type)
                 ):
                     raise TypeError(

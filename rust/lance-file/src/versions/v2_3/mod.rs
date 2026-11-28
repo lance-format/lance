@@ -134,7 +134,8 @@ impl FieldEncodingStrategy for FieldStrategy {
 pub fn encoding_strategy(params: CompressionParams) -> Arc<dyn FieldEncodingStrategy> {
     let compression = Arc::new(compression::Strategy::new(params));
     Arc::new(FieldStrategy {
-        primitive: PrimitiveFieldEncoding::new([PrimitivePageEncoding::planar(compression)]),
+        primitive: PrimitiveFieldEncoding::new([PrimitivePageEncoding::planar(compression)])
+            .with_decimal32_and_decimal64(),
     })
 }
 

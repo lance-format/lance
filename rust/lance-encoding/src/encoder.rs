@@ -620,4 +620,71 @@ mod tests {
                 .contains("FixedSizeList<Struct> is not enabled by the selected file format")
         );
     }
+
+    /// Released 2.1 and 2.2 readers cannot parse the `decimal:32` and `decimal:64`
+    /// logical types, so only the 2.3 grammar builds encoders for them, at any depth.
+    #[rstest]
+    #[case::decimal32(ArrowDataType::Decimal32(9, 2), false)]
+    #[case::decimal64(ArrowDataType::Decimal64(18, 2), false)]
+    #[case::fixed_size_list(
+        ArrowDataType::FixedSizeList(
+            Arc::new(ArrowField::new("item", ArrowDataType::Decimal32(9, 2), true)),
+            2
+        ),
+        false
+    )]
+    #[case::struct_child(ArrowDataType::Struct(ArrowFields::from(vec![ArrowField::new(
+        "price",
+        ArrowDataType::Decimal64(18, 2),
+        true
+    )])), false)]
+    #[case::packed_struct_child(ArrowDataType::Struct(ArrowFields::from(vec![ArrowField::new(
+        "amount",
+        ArrowDataType::Decimal32(9, 2),
+        true
+    )])), true)]
+    fn test_decimal32_and_decimal64_require_v2_3(
+        #[case] data_type: ArrowDataType,
+        #[case] is_packed: bool,
+        #[values(TestEncoding::StructuralU16, TestEncoding::StructuralU32)] encoding: TestEncoding,
+    ) {
+        let arrow_field = ArrowField::new("price", data_type.clone(), true);
+        let arrow_field = if is_packed {
+            arrow_field.with_metadata(HashMap::from([(
+                crate::constants::PACKED_STRUCT_META_KEY.to_string(),
+                "true".to_string(),
+            )]))
+        } else {
+            arrow_field
+        };
+        let field = Field::try_from(&arrow_field).unwrap();
+        let strategy = test_encoding_strategy(encoding);
+        let err = create_test_field_encoder(
+            strategy.as_ref(),
+            &field,
+            &mut ColumnIndexSequence::default(),
+            &EncodingOptions::default(),
+        )
+        .err()
+        .unwrap();
+        assert!(
+            matches!(err, Error::InvalidInput { .. }),
+            "{encoding} {data_type}: {err}"
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains("field 'price'")
+                && message.contains("write Decimal32 and Decimal64 columns with file version 2.3"),
+            "{encoding} {data_type}: {message}"
+        );
+
+        let strategy = test_encoding_strategy(TestEncoding::StructuralSparse);
+        create_test_field_encoder(
+            strategy.as_ref(),
+            &field,
+            &mut ColumnIndexSequence::default(),
+            &EncodingOptions::default(),
+        )
+        .unwrap();
+    }
 }

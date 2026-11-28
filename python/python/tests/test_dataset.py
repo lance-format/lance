@@ -318,6 +318,47 @@ def test_roundtrip_types(tmp_path: Path):
     assert dataset.to_table() == table
 
 
+@pytest.mark.skipif(
+    not hasattr(pa, "decimal32"), reason="pyarrow before 19 has no decimal32"
+)
+def test_decimal32_and_decimal64_round_trip(tmp_path: Path):
+    from decimal import Decimal
+
+    table = pa.table(
+        {
+            "d32": pa.array(
+                [Decimal("-9999999.99"), None, Decimal("0.05")], pa.decimal32(9, 2)
+            ),
+            "d64": pa.array(
+                [Decimal("9999999999999999.99"), Decimal("-1.00"), None],
+                pa.decimal64(18, 2),
+            ),
+        }
+    )
+    dataset = lance.write_dataset(table, tmp_path, data_storage_version="2.3")
+    dataset = lance.dataset(tmp_path)
+    assert dataset.schema == table.schema
+    assert dataset.to_table() == table
+    assert dataset.to_table(filter="d32 < 0.055")["d32"].to_pylist() == [
+        Decimal("-9999999.99"),
+        Decimal("0.05"),
+    ]
+
+
+@pytest.mark.skipif(
+    not hasattr(pa, "decimal32"), reason="pyarrow before 19 has no decimal32"
+)
+@pytest.mark.parametrize("data_storage_version", ["2.1", "2.2"])
+def test_decimal32_and_decimal64_require_2_3(tmp_path: Path, data_storage_version):
+    from decimal import Decimal
+
+    table = pa.table({"d32": pa.array([Decimal("1.00")], pa.decimal32(9, 2))})
+    with pytest.raises(
+        OSError, match="'d32' has data type Decimal32.*require data storage version 2.3"
+    ):
+        lance.write_dataset(table, tmp_path, data_storage_version=data_storage_version)
+
+
 @pytest.mark.parametrize("data_storage_version", ["legacy", "stable", "2.1"])
 def test_write_zero_dimension_fixed_size_list(
     tmp_path: Path, data_storage_version: str

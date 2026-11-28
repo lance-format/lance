@@ -2238,6 +2238,100 @@ mod test {
         check_round_trip_encoding_of_data(arrays, &test_cases, metadata).await;
     }
 
+    /// Builds a `Decimal32` or `Decimal64` array of `data_type` from unscaled values.
+    fn decimal_array(data_type: &DataType, values: Vec<Option<i64>>) -> Arc<dyn Array> {
+        use arrow_array::{Decimal32Array, Decimal64Array};
+
+        match data_type {
+            DataType::Decimal32(precision, scale) => Arc::new(
+                Decimal32Array::from_iter(values.into_iter().map(|v| v.map(|v| v as i32)))
+                    .with_precision_and_scale(*precision, *scale)
+                    .unwrap(),
+            ),
+            DataType::Decimal64(precision, scale) => Arc::new(
+                Decimal64Array::from_iter(values)
+                    .with_precision_and_scale(*precision, *scale)
+                    .unwrap(),
+            ),
+            other => panic!("not a Decimal32 or Decimal64 type: {other}"),
+        }
+    }
+
+    /// Decimal32 and Decimal64 are fixed-width 32 and 64-bit values, which only 2.3 accepts.
+    /// The values mix signs, nulls and the largest magnitude the precision allows.
+    #[rstest]
+    #[case::decimal32(DataType::Decimal32(9, 2), 999_999_999)]
+    #[case::decimal64(DataType::Decimal64(18, 3), 999_999_999_999_999_999)]
+    #[test_log::test(tokio::test)]
+    async fn test_decimal32_and_decimal64_round_trip_on_2_3(
+        #[case] data_type: DataType,
+        #[case] max_unscaled: i64,
+    ) {
+        use crate::testing::TestEncoding;
+
+        // The ranges and indices start, end, or cross the 1024-value chunk boundary.
+        let test_cases = TestCases::default()
+            .with_range(0..500)
+            .with_range(1000..1100)
+            .with_range(1500..2048)
+            .with_indices(vec![0])
+            .with_indices(vec![1023, 1024])
+            .with_indices(vec![5, 1500, 2047])
+            .with_encodings([TestEncoding::StructuralSparse]);
+        let values = (0..2048_i64)
+            .map(|i| match i % 7 {
+                0 => None,
+                1 => Some(max_unscaled),
+                2 => Some(-max_unscaled),
+                _ if i % 2 == 0 => Some(i),
+                _ => Some(-i),
+            })
+            .collect();
+
+        check_round_trip_encoding_of_data(
+            vec![decimal_array(&data_type, values)],
+            &test_cases,
+            HashMap::new(),
+        )
+        .await;
+    }
+
+    /// Small non-negative values reach the existing 32 and 64-bit inline bitpacking.
+    #[rstest]
+    #[case::decimal32(DataType::Decimal32(9, 2))]
+    #[case::decimal64(DataType::Decimal64(18, 2))]
+    #[test_log::test(tokio::test)]
+    async fn test_small_decimal32_and_decimal64_values_are_bitpacked_on_2_3(
+        #[case] data_type: DataType,
+        #[values(false, true)] with_nulls: bool,
+    ) {
+        use crate::testing::TestEncoding;
+
+        let test_cases = TestCases::default()
+            .with_range(1000..1100)
+            .with_indices(vec![1023, 1024])
+            .with_expected_encoding("inline_bitpacking")
+            .with_encodings([TestEncoding::StructuralSparse]);
+        // Every value is distinct so the page is not dictionary encoded.
+        let values = (0..2048_i64)
+            .map(|i| (!with_nulls || i % 7 != 0).then_some((1 << 20) | i))
+            .collect();
+        let metadata = HashMap::from([
+            ("lance-encoding:bss".to_string(), "off".to_string()),
+            (
+                "lance-encoding:dict-divisor".to_string(),
+                "100000".to_string(),
+            ),
+        ]);
+
+        check_round_trip_encoding_of_data(
+            vec![decimal_array(&data_type, values)],
+            &test_cases,
+            metadata,
+        )
+        .await;
+    }
+
     /// `FixedSizeBinary(16)` reaches the same 128-bit selector as `Decimal128`.
     #[test_log::test(tokio::test)]
     async fn test_fixed_size_binary_16_bitpacking_round_trips_on_2_3() {

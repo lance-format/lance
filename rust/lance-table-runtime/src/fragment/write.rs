@@ -16,7 +16,7 @@ use std::borrow::Cow;
 use uuid::Uuid;
 
 use crate::paths::DATA_DIR;
-use crate::write::schema::promote_legacy_blob_schema;
+use crate::write::schema::{promote_legacy_blob_schema, validate_decimal32_and_decimal64};
 use crate::write::{
     SeedCollector, WriteMode, WriteParams, WriterOptions, blob_v2_external_base_resolver,
     open_writer, validate_and_resolve_target_bases_with_primary, validate_row_limits,
@@ -127,6 +127,8 @@ impl<'a> FragmentCreateBuilder<'a> {
             validate_row_limits(version, params)?;
         }
         let id = id.unwrap_or_default();
+        // The legacy writer below is opened directly, not through `open_writer`.
+        validate_decimal32_and_decimal64(&schema, version)?;
         if version == ConcreteFileVersion::V1 {
             self.write_v1_impl(stream, schema, id).await
         } else {

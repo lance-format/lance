@@ -125,6 +125,8 @@ impl DataTypeExt for DataType {
                 | Float16
                 | Float32
                 | Float64
+                | Decimal32(_, _)
+                | Decimal64(_, _)
                 | Decimal128(_, _)
                 | Decimal256(_, _)
                 | FixedSizeList(_, _)
@@ -161,6 +163,8 @@ impl DataTypeExt for DataType {
             Self::Time64(_) => Some(8),
             Self::Timestamp(_, _) => Some(8),
             Self::Duration(_) => Some(8),
+            Self::Decimal32(_, _) => Some(4),
+            Self::Decimal64(_, _) => Some(8),
             Self::Decimal128(_, _) => Some(16),
             Self::Decimal256(_, _) => Some(32),
             Self::Interval(unit) => match unit {
@@ -2818,6 +2822,16 @@ mod tests {
                 .byte_width_opt(),
             None
         );
+    }
+
+    #[rstest::rstest]
+    #[case::decimal32(DataType::Decimal32(9, 2), 4)]
+    #[case::decimal64(DataType::Decimal64(18, 2), 8)]
+    #[case::decimal128(DataType::Decimal128(38, 2), 16)]
+    #[case::decimal256(DataType::Decimal256(76, 2), 32)]
+    fn test_decimal_is_fixed_stride(#[case] data_type: DataType, #[case] byte_width: usize) {
+        assert!(data_type.is_fixed_stride(), "{data_type}");
+        assert_eq!(data_type.byte_width_opt(), Some(byte_width), "{data_type}");
     }
 
     #[test]

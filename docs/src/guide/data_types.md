@@ -14,7 +14,7 @@ Lance supports the full Apache Arrow type system. When writing data through Pyth
 | `Int8`, `Int16`, `Int32`, `Int64` | Signed integers | IDs, counts |
 | `UInt8`, `UInt16`, `UInt32`, `UInt64` | Unsigned integers | IDs, indices |
 | `Float16`, `Float32`, `Float64` | Floating point numbers | Measurements, scores |
-| `Decimal128`, `Decimal256` | Fixed-precision decimals | Financial data |
+| `Decimal32`, `Decimal64`, `Decimal128`, `Decimal256` | Fixed-precision decimals (`Decimal32` and `Decimal64` require data storage version 2.3 or later) | Financial data |
 | `Date32`, `Date64` | Date values | Birth dates, event dates |
 | `Time32`, `Time64` | Time values | Time of day |
 | `Timestamp` | Date and time with timezone | Event timestamps |

@@ -4,7 +4,10 @@
 //! Feature flags
 
 use crate::format::{IndexMetadata, Manifest};
-use lance_core::{Error, Result, datatypes::Schema};
+use lance_core::{
+    Error, Result,
+    datatypes::{Schema, first_decimal32_or_decimal64_field},
+};
 
 /// Fragments may contain deletion files, which record the tombstones of
 /// soft-deleted rows.
@@ -169,8 +172,13 @@ pub const FLAG_DELETION_FILE_PATHS: u64 = 1 << 21;
 /// Reserved ahead of its implementation. This build masks the bit out in
 /// `supported_flags_when`, so it refuses to write a table that sets it.
 pub const FLAG_BTREE_KEY_LAYOUT: u64 = 1 << 22;
+/// The schema contains, or a snapshot this one derives from contained, a
+/// `decimal:32` or `decimal:64` field. Released builds cannot parse these logical
+/// types, and this bit makes them refuse the table instead of failing on the
+/// schema or appending rows that leave the fields null. Paired and sticky.
+pub const FLAG_DECIMAL32_AND_DECIMAL64: u64 = 1 << 23;
 /// The first bit that is unknown as a feature flag
-pub const FLAG_UNKNOWN: u64 = 1 << 23;
+pub const FLAG_UNKNOWN: u64 = 1 << 24;
 
 const _: () = assert!(FLAG_COVERED_INDEX_METADATA < FLAG_UNKNOWN);
 // The fence needs a bit the current released build already refuses, which means
@@ -198,11 +206,15 @@ const _: () = assert!(FLAG_DELETION_FILE_PATHS < FLAG_UNKNOWN);
 // Same fence for this bit: v15.0.0-beta.7 refuses bit 19 and up.
 const _: () = assert!(FLAG_BTREE_KEY_LAYOUT >= 1 << 19);
 const _: () = assert!(FLAG_BTREE_KEY_LAYOUT < FLAG_UNKNOWN);
+// Same fence for this bit: v16.0.0-beta.5 refuses bit 23 and up.
+const _: () = assert!(FLAG_DECIMAL32_AND_DECIMAL64 >= 1 << 23);
+const _: () = assert!(FLAG_DECIMAL32_AND_DECIMAL64 < FLAG_UNKNOWN);
 
 pub(crate) const STICKY_PAIRED_FLAGS: u64 = FLAG_MIXED_DATA_FILE_VERSIONS
     | FLAG_FRAGMENT_REUSE_INDEX
     | FLAG_MANAGED_BLOBS
-    | FLAG_ZONE_WRITE_SEEDS;
+    | FLAG_ZONE_WRITE_SEEDS
+    | FLAG_DECIMAL32_AND_DECIMAL64;
 pub(crate) const STICKY_READER_FLAGS: u64 = STICKY_PAIRED_FLAGS;
 pub(crate) const STICKY_WRITER_FLAGS: u64 =
     STICKY_PAIRED_FLAGS | FLAG_NON_REUSABLE_FIELD_IDS | FLAG_DELETION_FILE_PATHS;
@@ -451,6 +463,11 @@ pub fn apply_feature_flags(
         manifest.writer_feature_flags |= FLAG_DELETION_FILE_PATHS;
     }
     manifest.writer_feature_flags |= deletion_file_paths_writer;
+
+    if first_decimal32_or_decimal64_field(&manifest.schema).is_some() {
+        manifest.reader_feature_flags |= FLAG_DECIMAL32_AND_DECIMAL64;
+        manifest.writer_feature_flags |= FLAG_DECIMAL32_AND_DECIMAL64;
+    }
 
     // If any fragment has row ids, they must all have row ids.
     let has_row_ids = manifest
@@ -791,6 +808,7 @@ pub fn validate_paired_feature_flags(manifest: &Manifest) -> Result<()> {
         (FLAG_MANAGED_BLOBS, "Managed Blob"),
         (FLAG_ZONE_WRITE_SEEDS, "zone write seed"),
         (FLAG_LOCAL_FRAGMENT_ALIASES, "local fragment aliases"),
+        (FLAG_DECIMAL32_AND_DECIMAL64, "Decimal32/Decimal64"),
     ] {
         let reader = manifest.reader_feature_flags & flag != 0;
         let writer = manifest.writer_feature_flags & flag != 0;
@@ -1020,7 +1038,7 @@ mod tests {
         assert_eq!(FLAG_INLINE_DELETIONS, 1 << 19);
         assert!(can_read_dataset(FLAG_INLINE_DELETIONS));
         assert!(can_write_dataset(FLAG_INLINE_DELETIONS));
-        assert_eq!(FLAG_UNKNOWN, 1 << 23);
+        assert_eq!(FLAG_UNKNOWN, 1 << 24);
         assert!(!can_read_dataset(FLAG_UNKNOWN));
         assert!(!can_write_dataset(FLAG_UNKNOWN));
 
@@ -1104,6 +1122,48 @@ mod tests {
         inherit_sticky_feature_flags(&mut destination, &manifest).unwrap();
         assert_eq!(destination.reader_feature_flags, FLAG_ZONE_WRITE_SEEDS);
         assert_eq!(destination.writer_feature_flags, FLAG_ZONE_WRITE_SEEDS);
+    }
+
+    #[test]
+    fn test_decimal32_and_decimal64_flag_is_supported_paired_and_sticky() {
+        assert_eq!(FLAG_DECIMAL32_AND_DECIMAL64, 1 << 23);
+        assert_eq!(FLAG_UNKNOWN, 1 << 24);
+        assert!(can_read_dataset(FLAG_DECIMAL32_AND_DECIMAL64));
+        assert!(can_write_dataset(FLAG_DECIMAL32_AND_DECIMAL64));
+
+        let mut manifest = empty_manifest();
+        manifest.reader_feature_flags = FLAG_DECIMAL32_AND_DECIMAL64;
+        manifest.writer_feature_flags = FLAG_DECIMAL32_AND_DECIMAL64;
+        apply_feature_flags(&mut manifest, false, false).unwrap();
+        assert_eq!(manifest.reader_feature_flags, FLAG_DECIMAL32_AND_DECIMAL64);
+        assert_eq!(manifest.writer_feature_flags, FLAG_DECIMAL32_AND_DECIMAL64);
+        let mut destination = empty_manifest();
+        inherit_sticky_feature_flags(&mut destination, &manifest).unwrap();
+        assert_eq!(
+            destination.reader_feature_flags,
+            FLAG_DECIMAL32_AND_DECIMAL64
+        );
+        assert_eq!(
+            destination.writer_feature_flags,
+            FLAG_DECIMAL32_AND_DECIMAL64
+        );
+
+        for (reader, writer) in [(true, false), (false, true)] {
+            let mut manifest = empty_manifest();
+            manifest.reader_feature_flags = if reader {
+                FLAG_DECIMAL32_AND_DECIMAL64
+            } else {
+                0
+            };
+            manifest.writer_feature_flags = if writer {
+                FLAG_DECIMAL32_AND_DECIMAL64
+            } else {
+                0
+            };
+            let error = validate_paired_feature_flags(&manifest).unwrap_err();
+            assert!(matches!(error, Error::CorruptFile { .. }));
+            assert!(error.to_string().contains("Decimal32/Decimal64"), "{error}");
+        }
     }
 
     #[test]
@@ -1827,7 +1887,7 @@ mod tests {
         assert_eq!(FLAG_DELETION_FILE_PATHS, 1 << 21);
         assert!(can_read_dataset(FLAG_DELETION_FILE_PATHS));
         assert!(can_write_dataset(FLAG_DELETION_FILE_PATHS));
-        assert_eq!(FLAG_UNKNOWN, 1 << 23);
+        assert_eq!(FLAG_UNKNOWN, 1 << 24);
         assert!(!can_read_dataset(FLAG_UNKNOWN));
         assert!(!can_write_dataset(FLAG_UNKNOWN));
     }

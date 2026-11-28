@@ -13,6 +13,7 @@ use lance_core::{
     Error, Result,
     datatypes::{
         Field, NullabilityComparison, OnMissing, OnTypeMismatch, Schema, SchemaCompareOptions,
+        first_decimal32_or_decimal64_field,
     },
 };
 use lance_file::version::ConcreteFileVersion;
@@ -232,6 +233,33 @@ fn legacy_blob_field_path(schema: &Schema) -> Option<String> {
                 .field_path(field.id)
                 .unwrap_or_else(|_| field.name.clone())
         })
+}
+
+/// Reject `Decimal32` and `Decimal64` fields below data storage version 2.3, whose
+/// readers cannot parse the `decimal:32` and `decimal:64` logical types.
+pub fn validate_decimal32_and_decimal64(
+    schema: &Schema,
+    version: ConcreteFileVersion,
+) -> Result<()> {
+    match version {
+        ConcreteFileVersion::V2_3 => Ok(()),
+        ConcreteFileVersion::V1
+        | ConcreteFileVersion::V2_0
+        | ConcreteFileVersion::V2_1
+        | ConcreteFileVersion::V2_2 => {
+            let Some(field) = first_decimal32_or_decimal64_field(schema) else {
+                return Ok(());
+            };
+            let path = schema
+                .field_path_minimal(field.id)
+                .unwrap_or_else(|_| field.name.clone());
+            Err(Error::invalid_input(format!(
+                "Column '{path}' has data type {}; Decimal32 and Decimal64 columns require \
+                 data storage version 2.3 or later, got {version}",
+                field.data_type()
+            )))
+        }
+    }
 }
 
 pub fn schema_compare_options(version: ConcreteFileVersion) -> SchemaCompareOptions {

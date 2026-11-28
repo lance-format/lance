@@ -9,6 +9,9 @@ use std::sync::{Arc, LazyLock};
 
 use crate::deepsize::DeepSizeOf;
 use arrow_array::ArrayRef;
+use arrow_array::types::{
+    Decimal32Type, Decimal64Type, DecimalType, validate_decimal_precision_and_scale,
+};
 use arrow_schema::{DataType, Field as ArrowField, Fields, TimeUnit};
 use lance_arrow::bfloat16::{BFLOAT16_EXT_NAME, is_bfloat16_field};
 use lance_arrow::{ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY};
@@ -325,6 +328,35 @@ fn parse_timeunit(unit: &str) -> Result<TimeUnit> {
     }
 }
 
+/// The first field, in pre-order, whose type is `Decimal32` or `Decimal64`, or a
+/// fixed-size list of them. These logical types need format version 2.3 or later.
+pub fn first_decimal32_or_decimal64_field(schema: &Schema) -> Option<&Field> {
+    fn holds(data_type: &DataType) -> bool {
+        match data_type {
+            DataType::Decimal32(..) | DataType::Decimal64(..) => true,
+            DataType::FixedSizeList(item, _) => holds(item.data_type()),
+            _ => false,
+        }
+    }
+    schema
+        .fields_pre_order()
+        .find(|field| holds(&field.data_type()))
+}
+
+/// Rejects a `Decimal32` or `Decimal64` type outside the schema spec's
+/// `1 <= P <= max` and `0 <= S <= P`. Arrow's own check accepts a negative
+/// scale, on which DataFusion's cast unwrapping overflows.
+fn validate_narrow_decimal<T: DecimalType>(dt: &DataType, precision: u8, scale: i8) -> Result<()> {
+    validate_decimal_precision_and_scale::<T>(precision, scale)
+        .map_err(|err| Error::schema(format!("Unsupported data type {dt}: {err}")))?;
+    if scale < 0 {
+        return Err(Error::schema(format!(
+            "Unsupported data type {dt}: scale {scale} is negative"
+        )));
+    }
+    Ok(())
+}
+
 impl TryFrom<&DataType> for LogicalType {
     type Error = Error;
 
@@ -343,6 +375,14 @@ impl TryFrom<&DataType> for LogicalType {
             DataType::Float16 => "halffloat".to_string(),
             DataType::Float32 => "float".to_string(),
             DataType::Float64 => "double".to_string(),
+            DataType::Decimal32(precision, scale) => {
+                validate_narrow_decimal::<Decimal32Type>(dt, *precision, *scale)?;
+                format!("decimal:32:{precision}:{scale}")
+            }
+            DataType::Decimal64(precision, scale) => {
+                validate_narrow_decimal::<Decimal64Type>(dt, *precision, *scale)?;
+                format!("decimal:64:{precision}:{scale}")
+            }
             DataType::Decimal128(precision, scale) => format!("decimal:128:{precision}:{scale}"),
             DataType::Decimal256(precision, scale) => format!("decimal:256:{precision}:{scale}"),
             DataType::Utf8 | DataType::Utf8View => "string".to_string(),
@@ -536,14 +576,14 @@ impl TryFrom<&LogicalType> for DataType {
                             .parse::<i8>()
                             .map_err(|err| Error::schema(err.to_string()))?;
 
-                        if bits == 128 {
-                            Ok(Decimal128(precision, scale))
-                        } else if bits == 256 {
-                            Ok(Decimal256(precision, scale))
-                        } else {
-                            Err(Error::schema(format!(
-                                "Only Decimal128 and Decimal256 is supported. Found {bits}"
-                            )))
+                        match bits {
+                            32 => Ok(Decimal32(precision, scale)),
+                            64 => Ok(Decimal64(precision, scale)),
+                            128 => Ok(Decimal128(precision, scale)),
+                            256 => Ok(Decimal256(precision, scale)),
+                            _ => Err(Error::schema(format!(
+                                "Only Decimal32, Decimal64, Decimal128 and Decimal256 are supported. Found {bits}"
+                            ))),
                         }
                     }
                 }
@@ -922,6 +962,80 @@ mod tests {
         );
         assert!(
             err.to_string().contains("does not parse back"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Pins the on-disk spelling of each decimal width and parses it back.
+    #[rstest]
+    #[case::decimal32(DataType::Decimal32(9, 2), "decimal:32:9:2")]
+    #[case::decimal64(DataType::Decimal64(18, 3), "decimal:64:18:3")]
+    #[case::decimal128(DataType::Decimal128(38, 10), "decimal:128:38:10")]
+    #[case::decimal256(DataType::Decimal256(76, 0), "decimal:256:76:0")]
+    #[case::fixed_size_list_decimal32(
+        DataType::FixedSizeList(
+            Arc::new(ArrowField::new("item", DataType::Decimal32(9, 2), true)),
+            4
+        ),
+        "fixed_size_list:decimal:32:9:2:4"
+    )]
+    fn test_decimal_logical_type_encoding(#[case] data_type: DataType, #[case] expected: &str) {
+        let logical_type = LogicalType::try_from(&data_type).unwrap();
+        assert_eq!(logical_type.to_string(), expected);
+        assert_eq!(DataType::try_from(&logical_type).unwrap(), data_type);
+    }
+
+    /// Types outside the spec's precision and scale ranges must not reach storage:
+    /// later filters index DataFusion's tables by precision, and a negative scale
+    /// overflows its cast unwrapping.
+    #[rstest]
+    #[case::decimal32_precision_too_large(
+        DataType::Decimal32(10, 2),
+        "precision 10 is greater than max 9"
+    )]
+    #[case::decimal32_zero_precision(DataType::Decimal32(0, 0), "precision cannot be 0")]
+    #[case::decimal32_scale_above_precision(
+        DataType::Decimal32(4, 5),
+        "scale 5 is greater than precision 4"
+    )]
+    #[case::decimal64_precision_too_large(
+        DataType::Decimal64(19, 2),
+        "precision 19 is greater than max 18"
+    )]
+    #[case::decimal32_negative_scale(DataType::Decimal32(5, -2), "scale -2 is negative")]
+    #[case::decimal64_negative_scale(DataType::Decimal64(18, -5), "scale -5 is negative")]
+    fn test_decimal_logical_type_rejects_invalid_precision(
+        #[case] data_type: DataType,
+        #[case] expected: &str,
+    ) {
+        let err = LogicalType::try_from(&data_type).unwrap_err();
+        assert!(
+            matches!(err, Error::Schema { .. }),
+            "unexpected error: {err}"
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains(&data_type.to_string()) && message.contains(expected),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[rstest]
+    #[case::bits_16("decimal:16:4:2", 16)]
+    #[case::bits_512("decimal:512:10:2", 512)]
+    fn test_decimal_logical_type_rejects_unknown_bit_width(
+        #[case] encoded: &str,
+        #[case] bits: i16,
+    ) {
+        let err = DataType::try_from(&LogicalType::from(encoded)).unwrap_err();
+        assert!(
+            matches!(err, Error::Schema { .. }),
+            "unexpected error: {err}"
+        );
+        assert!(
+            err.to_string().contains(&format!(
+                "Only Decimal32, Decimal64, Decimal128 and Decimal256 are supported. Found {bits}"
+            )),
             "unexpected error: {err}"
         );
     }
