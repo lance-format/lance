@@ -901,6 +901,12 @@ pub struct Manifest {
     ///    derived snapshots, including clone and restore, because data files may
     ///    retain version 1 seeds. Legacy seeds may coexist and must be decoded
     ///    with their original semantics.
+    /// * 1 << 23: the schema contains, or a snapshot this one derives from
+    ///    contained, a "decimal:32" or "decimal:64" field, which requires data
+    ///    storage version 2.3. Both feature words carry the bit, set in every
+    ///    commit whose schema has such a field and kept in derived snapshots,
+    ///    including clone and restore. Readers and writers that do not implement
+    ///    these logical types must refuse the dataset.
     #[prost(uint64, tag = "9")]
     pub reader_feature_flags: u64,
     /// Feature flags for writers.
@@ -917,6 +923,8 @@ pub struct Manifest {
     /// * 1 << 16: paired with the reader bit for version 1 zone-level statistics
     ///    seeds. Writers must preserve the seed contract and the required bits
     ///    during data writes, index maintenance, cleanup, clone, and restore.
+    /// * 1 << 23: paired with the reader bit for "decimal:32" and "decimal:64"
+    ///    fields.
     #[prost(uint64, tag = "10")]
     pub writer_feature_flags: u64,
     /// Highest fragment id ever allocated or reserved in this lineage.
