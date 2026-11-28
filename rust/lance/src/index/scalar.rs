@@ -9,6 +9,7 @@ pub(crate) mod bloomfilter;
 pub(crate) mod btree;
 pub(crate) mod fmindex;
 pub(crate) mod inverted;
+pub(crate) mod json;
 pub(crate) mod label_list;
 pub(crate) mod list_element;
 pub(crate) mod minhash_lsh;

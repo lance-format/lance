@@ -1085,8 +1085,13 @@ async fn merge_scalar_indices<'a>(
     rebuild_frags |= &effective_old_frags;
     let new_uuid = Uuid::new_v4();
 
+    let json_merge_target = reference_idx
+        .index_details
+        .as_deref()
+        .and_then(super::scalar::json::merge_target_type);
     let frag_reuse_index = dataset.open_frag_reuse_index(&NoOpMetricsCollector).await?;
-    let ngram_requires_rebuild = index_type == IndexType::NGram
+    let ngram_requires_rebuild = (index_type == IndexType::NGram
+        || json_merge_target == Some(IndexType::NGram))
         && frag_reuse_index.as_ref().is_some_and(|frag_reuse_index| {
             fragment_reuse_affects_segments(frag_reuse_index, selected_old_indices.iter().copied())
         });
@@ -1163,6 +1168,7 @@ async fn merge_scalar_indices<'a>(
         && !zonemap_requires_rebuild
         && (has_segment_merge_primitive(index_type)
             || is_bloomfilter_mergeable
+            || json_merge_target.is_some()
             || selected_old_indices.len() == 1);
 
     // The bitmap the merged segment commits, decided by how its content is
@@ -1254,10 +1260,8 @@ async fn merge_scalar_indices<'a>(
                 scan_selection,
             )
             .await?;
-            // The scalar merge primitives below read old rows by address. Only
-            // those types need per-segment filters, so skip the deletion-vector
-            // reads for a BloomFilter zone merge. `old_data_address_domain`
-            // returns true for every type in this group.
+            // These scalar merge primitives consume per-row filters in their
+            // target's domain. BloomFilter merges by zones instead.
             let merge_filters = if matches!(
                 index_type,
                 IndexType::BTree
@@ -1265,10 +1269,15 @@ async fn merge_scalar_indices<'a>(
                     | IndexType::NGram
                     | IndexType::RTree
                     | IndexType::MinHashLsh
-            ) {
-                let (_, filters) =
-                    build_per_segment_filters(dataset.as_ref(), &selected_old_indices, None, true)
-                        .await?;
+            ) || json_merge_target.is_some()
+            {
+                let (_, filters) = build_per_segment_filters(
+                    dataset.as_ref(),
+                    &selected_old_indices,
+                    None,
+                    address_domain,
+                )
+                .await?;
                 Some(
                     filters
                         .into_iter()
@@ -1280,6 +1289,18 @@ async fn merge_scalar_indices<'a>(
             };
 
             match index_type {
+                IndexType::Scalar if json_merge_target.is_some() => {
+                    super::scalar::json::open_and_merge_segments(
+                        dataset.as_ref(),
+                        field_path,
+                        &selected_old_indices,
+                        Some(new_data_stream),
+                        &new_store,
+                        merge_filters.as_deref().unwrap_or_default(),
+                        None,
+                    )
+                    .await?
+                }
                 IndexType::BloomFilter if is_bloomfilter_mergeable => {
                     let fragment_filters = crate::index::scalar::bloomfilter::effective_coverage(
                         dataset.as_ref(),
@@ -5248,12 +5269,6 @@ mod tests {
 
     /// A JSON-wrapped BITMAP must keep working without stable row ids, where a
     /// row id and a row address are the same value.
-    ///
-    /// Creation only: unlike BTree (see the matching test below), Bitmap does
-    /// not report a `training_data_type`, so `JsonIndex::update` -- and so
-    /// `optimize_indices` -- is not supported for a JSON-wrapped Bitmap target
-    /// at all, regardless of stable row ids. Pre-existing and unrelated to the
-    /// row-address-domain migration.
     #[tokio::test]
     async fn test_json_wrapped_bitmap_create_without_stable_row_ids() {
         let test_dir = TempStrDir::default();
