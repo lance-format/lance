@@ -603,10 +603,11 @@ mod tests {
     use std::{collections::HashMap, sync::Arc};
 
     use arrow_array::{
-        Array, ArrayRef, FixedSizeListArray,
+        Array, ArrayRef, BooleanArray, FixedSizeListArray,
         builder::{Int32Builder, ListBuilder},
         cast::AsArray,
     };
+    use arrow_buffer::NullBuffer;
     use arrow_schema::{DataType, Field, Fields};
     use rstest::rstest;
 
@@ -926,6 +927,123 @@ mod tests {
                 STRUCTURAL_ENCODING_META_KEY.to_string(),
                 STRUCTURAL_ENCODING_FULLZIP.to_string(),
             )]),
+        )
+        .await;
+    }
+
+    fn boolean_fsl(num_rows: i32, dimension: i32, has_null_items: bool) -> ArrayRef {
+        let items = BooleanArray::from_iter(
+            (0..num_rows * dimension)
+                .map(|i| (!has_null_items || i % 5 != 0).then_some(i % 3 == 0)),
+        );
+        Arc::new(FixedSizeListArray::new(
+            Arc::new(Field::new("item", DataType::Boolean, true)),
+            dimension,
+            Arc::new(items),
+            Some(NullBuffer::from(
+                (0..num_rows).map(|i| i % 7 != 0).collect::<Vec<_>>(),
+            )),
+        ))
+    }
+
+    fn structural_encoding_metadata(structural_encoding: Option<&str>) -> HashMap<String, String> {
+        structural_encoding
+            .map(|encoding| {
+                HashMap::from([(
+                    STRUCTURAL_ENCODING_META_KEY.to_string(),
+                    encoding.to_string(),
+                )])
+            })
+            .unwrap_or_default()
+    }
+
+    /// Fixed-size lists of booleans that keep their items bit-packed, which every
+    /// 2.1 and 2.2 reader can read. Lists too wide for mini-block chunks take the
+    /// full-zip layout without being asked to.
+    #[rstest]
+    #[case::mini_block_partial_byte_rows(3, false, None)]
+    #[case::mini_block_null_items(3, true, None)]
+    #[case::mini_block_whole_byte_rows_null_items(16, true, None)]
+    #[case::full_zip_whole_byte_rows(16, false, Some(STRUCTURAL_ENCODING_FULLZIP))]
+    #[case::wide_whole_byte_rows(32768, false, None)]
+    #[tokio::test]
+    async fn test_boolean_fsl_bit_packed_round_trip(
+        #[case] dimension: i32,
+        #[case] has_null_items: bool,
+        #[case] structural_encoding: Option<&str>,
+    ) {
+        let num_rows = 20;
+        check_round_trip_encoding_of_data(
+            vec![boolean_fsl(num_rows, dimension, has_null_items)],
+            &TestCases::default()
+                .with_structural_encodings()
+                .with_range(0..num_rows as u64)
+                .with_range(10..13)
+                .with_indices(vec![0, 9, 19]),
+            structural_encoding_metadata(structural_encoding),
+        )
+        .await;
+    }
+
+    /// Full-zip copies whole bytes per row, so a fixed-size list of booleans whose
+    /// rows do not fill whole bytes, or whose items can be null, needs one byte per
+    /// item there. Released 2.1 and 2.2 readers misread that layout, so only 2.3
+    /// writes it and earlier versions return an error.
+    #[rstest]
+    #[case::full_zip_null_items_one(1, true, Some(STRUCTURAL_ENCODING_FULLZIP))]
+    #[case::full_zip_null_items_three(3, true, Some(STRUCTURAL_ENCODING_FULLZIP))]
+    #[case::full_zip_null_items_eight(8, true, Some(STRUCTURAL_ENCODING_FULLZIP))]
+    #[case::full_zip_null_items_sixteen(16, true, Some(STRUCTURAL_ENCODING_FULLZIP))]
+    #[case::full_zip_partial_byte_rows(3, false, Some(STRUCTURAL_ENCODING_FULLZIP))]
+    #[case::wide_partial_byte_rows(4095, false, None)]
+    #[case::wide_null_items(4095, true, None)]
+    #[tokio::test]
+    async fn test_boolean_fsl_byte_wide_items(
+        #[case] dimension: i32,
+        #[case] has_null_items: bool,
+        #[case] structural_encoding: Option<&str>,
+    ) {
+        use crate::encoder::{EncodingOptions, encode_batch};
+        use crate::testing::test_encoding_strategy;
+        use arrow_array::RecordBatch;
+
+        let num_rows = 20;
+        let lists = boolean_fsl(num_rows, dimension, has_null_items);
+        let metadata = structural_encoding_metadata(structural_encoding);
+
+        let field =
+            Field::new("lists", lists.data_type().clone(), true).with_metadata(metadata.clone());
+        let batch = RecordBatch::try_new(
+            Arc::new(arrow_schema::Schema::new(vec![field])),
+            vec![lists.clone()],
+        )
+        .unwrap();
+        let schema =
+            Arc::new(lance_core::datatypes::Schema::try_from(batch.schema().as_ref()).unwrap());
+        for encoding in [TestEncoding::StructuralU16, TestEncoding::StructuralU32] {
+            let strategy = test_encoding_strategy(encoding);
+            let err = encode_batch(
+                &batch,
+                schema.clone(),
+                strategy.as_ref(),
+                &EncodingOptions::default(),
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                err.to_string().contains("write it with file version 2.3"),
+                "{encoding}: {err}"
+            );
+        }
+
+        check_round_trip_encoding_of_data(
+            vec![lists],
+            &TestCases::default()
+                .with_encoding(TestEncoding::StructuralSparse)
+                .with_range(0..num_rows as u64)
+                .with_range(10..13)
+                .with_indices(vec![0, 9, 19]),
+            metadata,
         )
         .await;
     }

@@ -12,7 +12,9 @@
 //! both layouts, and of native and layered indexes alike, weigh their
 //! values.
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock};
+use std::time::Instant;
 
 use arrow::array::ArrayData;
 use arrow::buffer::{Buffer, MutableBuffer};
@@ -22,6 +24,7 @@ use arrow_schema::{DataType, SchemaRef};
 use arrow_select::concat::concat;
 use lance_arrow::deepcopy::deep_copy_array_sliced;
 use lance_core::Result;
+use lance_core::memory::IvfPartitionCopies;
 
 /// Whether `data` holds exactly its values: a fixed-width column, or a
 /// fixed-size list of one, without nulls, whose buffer allocates its values'
@@ -47,7 +50,10 @@ fn is_exact(data: &ArrayData) -> bool {
 /// `pieces`, consecutive parts of one column, as one array in buffers of
 /// exactly its values' size; `None` for a layout [`is_exact`] does not size
 /// or for pieces with nulls.
-fn exact_concat(pieces: &[ArrayData]) -> Option<ArrayData> {
+fn exact_concat(
+    pieces: &[ArrayData],
+    finish: &mut impl FnMut(MutableBuffer) -> Buffer,
+) -> Option<ArrayData> {
     let data_type = pieces.first()?.data_type();
     if pieces.iter().any(|piece| piece.nulls().is_some()) {
         return None;
@@ -63,7 +69,7 @@ fn exact_concat(pieces: &[ArrayData]) -> Option<ArrayData> {
                     _ => None,
                 })
                 .collect::<Option<Vec<_>>>()?;
-            let child = exact_concat(&children)?;
+            let child = exact_concat(&children, finish)?;
             ArrayData::builder(data_type.clone())
                 .len(len)
                 .child_data(vec![child])
@@ -85,7 +91,7 @@ fn exact_concat(pieces: &[ArrayData]) -> Option<ArrayData> {
             }
             ArrayData::builder(data_type.clone())
                 .len(len)
-                .add_buffer(Buffer::from(values))
+                .add_buffer(finish(values))
                 .build()
                 .ok()
         }
@@ -98,6 +104,14 @@ fn exact_concat(pieces: &[ArrayData]) -> Option<ArrayData> {
 /// that the array never shares the buffer of a larger read. A layout
 /// [`exact_concat`] does not size is concatenated, or copied, as is.
 pub fn exact_array(pieces: &[&ArrayRef], copy: bool) -> Result<ArrayRef> {
+    exact_array_with(pieces, copy, &mut Buffer::from)
+}
+
+fn exact_array_with(
+    pieces: &[&ArrayRef],
+    copy: bool,
+    finish: &mut impl FnMut(MutableBuffer) -> Buffer,
+) -> Result<ArrayRef> {
     let data: Vec<ArrayData> = pieces.iter().map(|piece| piece.to_data()).collect();
     if let [single] = data.as_slice()
         && !copy
@@ -105,7 +119,7 @@ pub fn exact_array(pieces: &[&ArrayRef], copy: bool) -> Result<ArrayRef> {
     {
         return Ok(pieces[0].clone());
     }
-    if let Some(exact) = exact_concat(&data) {
+    if let Some(exact) = exact_concat(&data, finish) {
         return Ok(make_array(exact));
     }
     Ok(match pieces {
@@ -121,6 +135,47 @@ pub fn exact_array(pieces: &[&ArrayRef], copy: bool) -> Result<ArrayRef> {
 /// `batches`, consecutive reads of `schema`'s columns, as one batch whose
 /// columns are [`exact_array`]s.
 pub fn exact_batch(schema: &SchemaRef, batches: &[RecordBatch], copy: bool) -> Result<RecordBatch> {
+    exact_batch_with(schema, batches, copy, Buffer::from)
+}
+
+/// Materialize whole IVF partition columns. Only a freshly allocated buffer
+/// from the fixed-width copier has a known, exclusive allocation owner here.
+pub fn exact_partition_batch(schema: &SchemaRef, batches: &[RecordBatch]) -> Result<RecordBatch> {
+    let Some(mut observation) = IvfPartitionCopies::start() else {
+        return exact_batch(schema, batches, false);
+    };
+    let batch = exact_batch_with(schema, batches, false, |values| observation.finish(values))?;
+    let copied_bytes = observation.copied_bytes();
+    if copied_bytes >= 8 * 1024 * 1024
+        && tracing::enabled!(target: lance_core::utils::tracing::TRACE_MEMORY, tracing::Level::DEBUG)
+    {
+        // A wide query can fan out to thousands of partitions. Keep at most
+        // one large-copy example per process per minute on its caller's span.
+        static START: LazyLock<Instant> = LazyLock::new(Instant::now);
+        static NEXT_SECOND: AtomicU64 = AtomicU64::new(0);
+        let now = START.elapsed().as_secs();
+        if NEXT_SECOND
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+                (now >= next).then_some(now + 60)
+            })
+            .is_ok()
+        {
+            tracing::debug!(
+                target: lance_core::utils::tracing::TRACE_MEMORY,
+                ivf_partition_copied_bytes = copied_bytes,
+                "IVF partition materialization"
+            );
+        }
+    }
+    Ok(batch)
+}
+
+fn exact_batch_with(
+    schema: &SchemaRef,
+    batches: &[RecordBatch],
+    copy: bool,
+    mut finish: impl FnMut(MutableBuffer) -> Buffer,
+) -> Result<RecordBatch> {
     if batches.is_empty() {
         return Ok(concat_batches(schema, batches)?);
     }
@@ -128,7 +183,7 @@ pub fn exact_batch(schema: &SchemaRef, batches: &[RecordBatch], copy: bool) -> R
     let columns = (0..schema.fields().len())
         .map(|column| {
             let pieces: Vec<&ArrayRef> = batches.iter().map(|batch| batch.column(column)).collect();
-            exact_array(&pieces, copy)
+            exact_array_with(&pieces, copy, &mut finish)
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(RecordBatch::try_new_with_options(
@@ -276,8 +331,25 @@ mod tests {
             ],
         )
         .unwrap();
-        let joined = exact_batch(&schema, &[batch.slice(0, 4), batch.slice(4, 6)], false).unwrap();
+        let mut copied = 0;
+        let mut finish = |values: MutableBuffer| {
+            copied += values.capacity();
+            Buffer::from(values)
+        };
+        let joined = exact_batch_with(
+            &schema,
+            &[batch.slice(0, 4), batch.slice(4, 6)],
+            false,
+            &mut finish,
+        )
+        .unwrap();
         assert_eq!(joined, batch);
+        // Reusing an exact batch keeps every backing: only the original
+        // join created 10 u64 ids and 10 four-byte codes.
+        let reused =
+            exact_batch_with(&schema, std::slice::from_ref(&joined), false, &mut finish).unwrap();
+        assert_eq!(reused, batch);
+        assert_eq!(copied, 120);
         for column in joined.columns() {
             assert!(is_exact(&column.to_data()));
         }

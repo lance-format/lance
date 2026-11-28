@@ -114,9 +114,9 @@ impl ManifestScan {
 /// this makes the result an incomplete view of what the dataset references, so
 /// a caller building a deletion predicate must leave it unset.
 pub fn scan_manifests(dataset: &Dataset, min_version: Option<u64>) -> ManifestScan {
-    let base = dataset.base.clone();
-    let object_store = dataset.object_store.clone();
-    let commit_handler = dataset.commit_handler.clone();
+    let base = dataset.table_state.base.clone();
+    let object_store = dataset.table_state.object_store.clone();
+    let commit_handler = dataset.table_state.commit_handler.clone();
 
     let (tx_manifest, rx_manifest) = tokio::sync::mpsc::channel::<Result<ScannedManifest>>(2);
     let (tx_locations, rx_locations) =

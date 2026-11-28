@@ -54,7 +54,6 @@ use crate::dataset::mem_wal::wal::{
     BatchDurableWatcher, TriggerIndexApply, TriggerWalFlush, WalAppender, WalFlushFailure,
     WalFlushResult, WalFlushSource, WalFlusher, WalOnlyState, WalRetryConfig, WriterCursors,
 };
-use crate::dataset::write::ExternalBlobMode;
 
 /// Result of a write operation.
 #[derive(Debug)]
@@ -412,19 +411,15 @@ impl SharedWriterState {
             .unwrap_or_default();
         let source_store_params = self.config.store_params.clone().unwrap_or_default();
         let new_preprocessor = || {
-            BlobPreprocessor::new(
+            BlobPreprocessor::for_mem_wal(
                 self.object_store.as_ref().clone(),
                 data_dir.clone(),
                 target.data_file_key().to_string(),
                 &logical_schema,
-                None,
-                true,
-                ExternalBlobMode::Reference,
                 source_store_registry,
                 source_store_params,
-                None,
+                memtable.blob_id_allocator(),
             )
-            .map(|preprocessor| preprocessor.for_mem_wal(memtable.blob_id_allocator()))
         };
 
         // A non-durable put becomes visible when its in-memory index apply
