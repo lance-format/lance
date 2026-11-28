@@ -577,6 +577,17 @@ impl RowAddrSelection {
         std::mem::replace(self, Self::Partial(RoaringBitmap::new()))
     }
 
+    /// Whether this selection is covered by the corresponding fragment in another map.
+    fn is_subset_of(&self, other: Option<&Self>) -> bool {
+        match (self, other) {
+            (_, Some(Self::Full)) => true,
+            (Self::Partial(lhs), Some(Self::Partial(rhs))) => lhs.is_subset(rhs),
+            (Self::Partial(lhs), None) => lhs.is_empty(),
+            (Self::Full, Some(Self::Partial(rhs))) => rhs.is_full(),
+            (Self::Full, None) => false,
+        }
+    }
+
     /// The rows of one fragment held by both sides, or `None` if there are
     /// none. An owned `lhs` is narrowed in place, a borrowed one is not copied
     /// first. The one definition behind `&=` and
@@ -627,21 +638,37 @@ impl RowAddrTreeMap {
     /// A full fragment in `self` is only covered by a full fragment (or a
     /// full bitmap) in `other`.
     pub fn is_subset(&self, other: &Self) -> bool {
-        self.inner
-            .iter()
-            .all(|(fragment, lhs)| match (lhs, other.inner.get(fragment)) {
-                (_, Some(RowAddrSelection::Full)) => true,
-                (RowAddrSelection::Partial(lhs), Some(RowAddrSelection::Partial(rhs))) => {
-                    lhs.is_subset(rhs)
-                }
-                (RowAddrSelection::Partial(lhs), None) => lhs.is_empty(),
-                (RowAddrSelection::Full, Some(RowAddrSelection::Partial(rhs))) => rhs.is_full(),
-                (RowAddrSelection::Full, None) => false,
-            })
+        // A dense probe can walk the sorted keys with at most two mask
+        // entries per probe fragment on average. Sparse probes use lookups.
+        if self.inner.len() < other.inner.len().div_ceil(2) {
+            return self
+                .inner
+                .iter()
+                .all(|(fragment, lhs)| lhs.is_subset_of(other.inner.get(fragment)));
+        }
+
+        let Some((&first_fragment, _)) = self.inner.first_key_value() else {
+            return true;
+        };
+        // Stop at the first rejected row even when the probe begins far into the mask.
+        let mut allowed = other.inner.range(first_fragment..);
+        let mut next_allowed = allowed.next();
+        self.inner.iter().all(|(fragment, lhs)| {
+            while next_allowed.is_some_and(|(id, _)| id < fragment) {
+                next_allowed = allowed.next();
+            }
+            let rhs = next_allowed
+                .filter(|(id, _)| *id == fragment)
+                .map(|(_, selection)| selection);
+            lhs.is_subset_of(rhs)
+        })
     }
 
     /// Whether `self` and `other` hold no row in common, without allocating.
     pub fn is_disjoint(&self, other: &Self) -> bool {
+        if other.inner.is_empty() {
+            return true;
+        }
         self.inner
             .iter()
             .all(|(fragment, lhs)| match (lhs, other.inner.get(fragment)) {
@@ -1928,6 +1955,25 @@ mod tests {
         assert!(!RowAddrMask::from_block(full_fragment.clone()).selects_all(&partition_rows));
         assert!(RowAddrMask::from_block(rows(&[10])).selects_all(&full_fragment));
         assert!(!RowAddrMask::from_block(rows(&[2_u64 << 32 | 9])).selects_all(&full_fragment));
+
+        // Restricted deletion masks bound even undeleted fragments by their
+        // current physical row count. An address outside that prefix is stale.
+        let mut allowed = RowAddrTreeMap::new();
+        allowed.insert_bitmap(9, (0..20).collect());
+        allowed.insert_fragment(12);
+        let allow = RowAddrMask::from_allowed(allowed);
+        let valid = [9_u64 << 32 | 19, 12_u64 << 32 | 53];
+        assert!(allow.selects_all(&rows(&valid)));
+        assert!(!allow.selects_all(&rows(&[valid[0], 9_u64 << 32 | 20])));
+        assert!(!allow.selects_all(&rows(&[valid[0], 13_u64 << 32])));
+
+        let mut sparse_allow = RowAddrTreeMap::new();
+        for fragment in [2, 4, 6, 8, 10] {
+            sparse_allow.insert_bitmap(fragment, (0..20).collect());
+        }
+        let allow = RowAddrMask::from_allowed(sparse_allow);
+        assert!(allow.selects_all(&rows(&[10_u64 << 32 | 19])));
+        assert!(!allow.selects_all(&rows(&[10_u64 << 32 | 20])));
     }
 
     /// The in-place predicates agree with the allocating set operations.
@@ -1937,6 +1983,15 @@ mod tests {
         full_two.insert_fragment(2);
         let mut mixed = rows(&[1, 5, 1_u64 << 32 | 7]);
         mixed.insert_fragment(2);
+        let mut empty_then_last = rows(&[u64::from(u32::MAX) << 32 | 7]);
+        let last_fragment = empty_then_last.clone();
+        empty_then_last.insert_bitmap(2, RoaringBitmap::new());
+        let mut empty_two = RowAddrTreeMap::new();
+        empty_two.insert_bitmap(2, RoaringBitmap::new());
+        let mut another_two = RowAddrTreeMap::new();
+        another_two.insert_bitmap(2, (2..7).collect());
+        let mut mixed_last = rows(&[2_u64 << 32 | 8]);
+        mixed_last.insert_fragment(u32::MAX);
         let maps = [
             RowAddrTreeMap::new(),
             rows(&[1, 5]),
@@ -1945,12 +2000,19 @@ mod tests {
             rows(&[2_u64 << 32 | 3]),
             full_two,
             mixed,
+            empty_then_last,
+            last_fragment,
+            empty_two,
+            another_two,
+            mixed_last,
         ];
         for lhs in &maps {
             for rhs in &maps {
+                // An empty fragment can remain in the map after subtraction.
+                let residual = lhs.difference(rhs);
                 assert_eq!(
                     lhs.is_subset(rhs),
-                    lhs.difference(rhs).is_empty(),
+                    residual.len() == Some(0),
                     "is_subset({lhs:?}, {rhs:?})"
                 );
                 assert_eq!(
