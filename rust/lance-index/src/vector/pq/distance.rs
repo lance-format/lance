@@ -4,7 +4,6 @@
 use core::panic;
 
 use super::utils::get_sub_vector_centroids;
-use lance_core::assume_eq;
 use lance_linalg::distance::{
     Dot, L2, dot::DotPrepared, dot_distance_batch_into, l2::L2Prepared, l2_distance_batch_into,
 };
@@ -207,12 +206,13 @@ pub(super) fn compute_pq_distance_into(
     code: &[u8],
     distances: &mut Vec<f32>,
 ) {
-    distances.clear();
     if code.is_empty() {
+        distances.clear();
         return;
     }
     if num_bits == 4 {
         let code_len = num_sub_vectors / 2;
+        distances.clear();
         distances.resize(code.len() / code_len, 0.0);
         sum_4bit_dist_table_f32_transposed(
             distances.len(),
@@ -223,26 +223,7 @@ pub(super) fn compute_pq_distance_into(
         );
         return;
     }
-    // here `code` has been transposed,
-    // so code[i][j] is the code of i-th sub-vector of the j-th vector,
-    // and `code` is a flatten array of [num_sub_vectors, num_vectors] u8,
-    // so code[i * num_vectors + j] is the code of i-th sub-vector of the j-th vector.
-    let num_vectors = code.len() / num_sub_vectors;
-    distances.resize(num_vectors, 0.0);
-    // it must be 8
-    const NUM_CENTROIDS: usize = 2_usize.pow(8);
-    for (sub_vec_idx, vec_indices) in code.chunks_exact(num_vectors).enumerate() {
-        let dist_table =
-            &distance_table[sub_vec_idx * NUM_CENTROIDS..(sub_vec_idx + 1) * NUM_CENTROIDS];
-        assume_eq!(dist_table.len(), NUM_CENTROIDS);
-        assume_eq!(vec_indices.len(), distances.len());
-        vec_indices
-            .iter()
-            .zip(distances.iter_mut())
-            .for_each(|(&centroid_idx, sum)| {
-                *sum += dist_table[centroid_idx as usize];
-            });
-    }
+    super::scan::compute_pq8_distance_into(distance_table, num_sub_vectors, code, distances);
 }
 
 /// Exact 8-bit PQ distances of `ids` over column-major codes, into
