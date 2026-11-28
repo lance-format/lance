@@ -663,20 +663,47 @@ impl Branches<'_> {
             return Ok(());
         }
 
-        let has_local_paths =
-            self.object_store().is_local() || self.object_store().scheme() == "file-object-store";
+        let is_file_object_store = self.object_store().scheme() == "file-object-store";
+        let has_local_paths = self.object_store().is_local() || is_file_object_store;
+        let root = self.refs.root()?.path;
+        let canonical_root = if has_local_paths {
+            self.object_store().canonicalize_local_path(&root).await?
+        } else {
+            None
+        };
+        let mut has_pending_directory = false;
         let mut remaining_paths = Vec::with_capacity(remaining_branches.len() + 1);
         for remaining in &remaining_branches {
             let path = self.refs.base_location.find_branch(Some(remaining))?.path;
-            let canonical_path = self.object_store().canonicalize_local_path(&path).await?;
+            let mut canonical_path = self.object_store().canonicalize_local_path(&path).await?;
             let canonical_retained_dirs = if has_local_paths {
                 let retained_dirs = if canonical_path.is_some() {
                     self.collect_canonical_retained_dirs(&path, branch).await?
+                } else if let Some(local_root) = &canonical_root {
+                    let directory =
+                        Self::locate_reserved_directory(local_root, remaining, branch).await;
+                    if !self
+                        .object_store()
+                        .exists(&branch_contents_path(&root, remaining))
+                        .await?
+                    {
+                        continue;
+                    }
+                    match directory? {
+                        ReservedDirectory::Pending(directory) => {
+                            has_pending_directory = true;
+                            Some(vec![directory])
+                        }
+                        ReservedDirectory::Exists(directory) => {
+                            canonical_path = Some(directory);
+                            self.collect_canonical_retained_dirs(&path, branch).await?
+                        }
+                    }
                 } else {
                     None
                 };
                 let Some(retained_dirs) = retained_dirs else {
-                    let remaining_ref = branch_contents_path(&self.refs.root()?.path, remaining);
+                    let remaining_ref = branch_contents_path(&root, remaining);
                     if !self.object_store().exists(&remaining_ref).await? {
                         // Another delete finished after cleanup listed the refs.
                         continue;
@@ -699,8 +726,8 @@ impl Branches<'_> {
         }
 
         if has_local_paths {
-            let path = self.refs.root()?.path;
-            let canonical_path = self.object_store().canonicalize_local_path(&path).await?;
+            let path = root;
+            let canonical_path = canonical_root;
             if canonical_path.is_none() {
                 log::warn!(
                     "Keeping branch directories after deleting {branch}: cannot resolve main dataset at {path}"
@@ -738,7 +765,7 @@ impl Branches<'_> {
             };
         }
 
-        if self.object_store().scheme() == "file-object-store" {
+        if is_file_object_store {
             cleanup = match cleanup {
                 BranchCleanup::Recursive(path) => BranchCleanup::Selective(path),
                 cleanup => cleanup,
@@ -767,15 +794,14 @@ impl Branches<'_> {
                     if matches!(classification, SharedBranchPath::Remaining) {
                         continue;
                     }
-                    let traverse_unrelated =
-                        if matches!(classification, SharedBranchPath::Unrelated)
-                            && self.object_store().scheme() == "file-object-store"
-                        {
-                            self.recursive_delete_would_touch_retained_data(&path, &remaining_paths)
-                                .await?
-                        } else {
-                            false
-                        };
+                    // A dangling alias can acquire a target when a reservation completes
+                    // between the recursive listing and the recursive delete.
+                    let traverse_unrelated = matches!(classification, SharedBranchPath::Unrelated)
+                        && is_file_object_store
+                        && (has_pending_directory
+                            || self
+                                .recursive_delete_would_touch_retained_data(&path, &remaining_paths)
+                                .await?);
                     if matches!(classification, SharedBranchPath::Unrelated) && !traverse_unrelated
                     {
                         if let Err(e) = self.object_store().remove_dir_all(path).await {
@@ -788,7 +814,7 @@ impl Branches<'_> {
                         }
                         continue;
                     }
-                    if traverse_unrelated {
+                    if traverse_unrelated && !has_pending_directory {
                         log::warn!(
                             "Inspecting branch subtree {path}: recursive deletion would reach retained dataset data"
                         );
@@ -817,7 +843,15 @@ impl Branches<'_> {
                             let canonical_child =
                                 self.object_store().canonicalize_local_path(&child).await?;
                             match (&canonical_path, canonical_child) {
-                                (Some(parent), Some(child)) if child.starts_with(parent) => {}
+                                (Some(parent), Some(child))
+                                    if child != *parent && child.starts_with(parent) => {}
+                                _ if has_pending_directory && is_file_object_store => {
+                                    return Err(Error::RefConflict {
+                                        message: format!(
+                                            "Cannot safely clean up branch {branch}: local subtree {child} could not be resolved below {path} while another branch is reserved. Check the alias before retrying with force_delete_branch"
+                                        ),
+                                    });
+                                }
                                 _ => {
                                     log::warn!(
                                         "Keeping aliased branch subtree {child}: canonical path leaves parent {path}"
@@ -832,6 +866,42 @@ impl Branches<'_> {
                 Ok(())
             }
         }
+    }
+
+    // A reservation can precede its directory. Retain the future path as well
+    // as its ancestors, since the creator can start writing during cleanup.
+    async fn locate_reserved_directory(
+        root: &std::path::Path,
+        remaining: &str,
+        deleted: &str,
+    ) -> Result<ReservedDirectory> {
+        check_valid_branch(remaining)?;
+        let mut directory = root.to_path_buf();
+        let mut components = std::iter::once(BRANCH_DIR).chain(remaining.split('/'));
+        while let Some(component) = components.next() {
+            let next = directory.join(component);
+            match tokio::fs::symlink_metadata(&next).await {
+                Ok(metadata) if metadata.is_dir() => directory = next,
+                Err(error) if error.kind() == ErrorKind::NotFound => {
+                    let mut projected = tokio::fs::canonicalize(directory).await?.join(component);
+                    projected.extend(components);
+                    return Ok(ReservedDirectory::Pending(projected));
+                }
+                Ok(_) => {
+                    return Err(Error::RefConflict {
+                        message: format!(
+                            "Cannot safely clean up branch {deleted}: reserved branch {remaining} uses an alias or non-directory at {}. Move or remove the conflicting route before retrying with force_delete_branch",
+                            next.display()
+                        ),
+                    });
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        // The creator materialized its directory while cleanup was inspecting it.
+        Ok(ReservedDirectory::Exists(
+            tokio::fs::canonicalize(directory).await?,
+        ))
     }
 
     async fn collect_canonical_retained_dirs(
@@ -1089,6 +1159,11 @@ struct RemainingBranchPath {
     canonical_path: Option<PathBuf>,
     canonical_retained_dirs: Vec<PathBuf>,
     is_named_branch: bool,
+}
+
+enum ReservedDirectory {
+    Pending(PathBuf),
+    Exists(PathBuf),
 }
 
 enum SharedBranchPath {
