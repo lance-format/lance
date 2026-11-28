@@ -26,6 +26,7 @@ import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.arrow.vector.types.pojo.Schema;
 
 import java.nio.ByteBuffer;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
@@ -41,7 +42,7 @@ import java.util.concurrent.atomic.AtomicLong;
  */
 public class AsyncScanner implements AutoCloseable {
   private static final AtomicLong TASK_ID_GENERATOR = new AtomicLong(1);
-  private final ConcurrentHashMap<Long, CompletableFuture<Long>> pendingTasks =
+  private final ConcurrentHashMap<Long, CompletableFuture<ArrowReader>> pendingTasks =
       new ConcurrentHashMap<>();
 
   private BufferAllocator allocator;
@@ -146,46 +147,57 @@ public class AsyncScanner implements AutoCloseable {
       }
 
       long taskId = TASK_ID_GENERATOR.getAndIncrement();
-      CompletableFuture<Long> streamPtrFuture = new CompletableFuture<>();
-      pendingTasks.put(taskId, streamPtrFuture);
-
-      // Start async scan in Rust
-      nativeStartScan(taskId);
-
-      // Transform stream pointer to ArrowReader
-      return streamPtrFuture.handle(
-          (streamPtr, error) -> {
-            pendingTasks.remove(taskId);
-
-            if (error != null) {
-              throw new LanceException("Scan failed", error);
-            }
-
-            if (streamPtr < 0) {
-              throw new LanceException("Native scan returned an invalid stream pointer");
-            }
-
-            try {
-              ArrowArrayStream stream = ArrowArrayStream.wrap(streamPtr);
-              return Data.importArrayStream(allocator, stream);
-            } catch (Exception e) {
-              throw new LanceException("Failed to import scan stream", e);
+      CompletableFuture<ArrowReader> future = new CompletableFuture<>();
+      pendingTasks.put(taskId, future);
+      future.whenComplete(
+          (reader, error) -> {
+            if (future.isCancelled()) {
+              try (LockManager.ReadLock ignored = lockManager.acquireReadLock()) {
+                if (pendingTasks.remove(taskId, future) && nativeAsyncScannerHandle != 0) {
+                  nativeCancelTask(taskId);
+                }
+              }
             }
           });
+      try {
+        nativeStartScan(taskId);
+      } catch (Throwable error) {
+        pendingTasks.remove(taskId);
+        future.completeExceptionally(error);
+      }
+      return future;
     }
   }
 
   /** Called by Rust dispatcher thread via JNI to complete a task successfully. */
-  private void completeTask(long taskId, long resultPtr) {
-    CompletableFuture<Long> future = pendingTasks.get(taskId);
-    if (future != null) {
-      future.complete(resultPtr);
+  private boolean completeTask(long taskId, long resultPtr) {
+    CompletableFuture<ArrowReader> future = pendingTasks.get(taskId);
+    if (future == null) {
+      return false;
     }
+    if (future.isDone()) {
+      pendingTasks.remove(taskId, future);
+      return false;
+    }
+    try (ArrowArrayStream stream = ArrowArrayStream.wrap(resultPtr)) {
+      ArrowReader reader = Data.importArrayStream(allocator, stream);
+      if (!future.complete(reader)) {
+        reader.close();
+      }
+    } catch (Throwable error) {
+      future.completeExceptionally(
+          error instanceof Error
+              ? error
+              : new LanceException("Failed to import scan stream", error));
+    } finally {
+      pendingTasks.remove(taskId, future);
+    }
+    return true;
   }
 
   /** Called by Rust dispatcher thread via JNI to fail a task with an error. */
   private void failTask(long taskId, String errorMessage) {
-    CompletableFuture<Long> future = pendingTasks.get(taskId);
+    CompletableFuture<ArrowReader> future = pendingTasks.remove(taskId);
     if (future != null) {
       future.completeExceptionally(new LanceException(errorMessage));
     }
@@ -216,18 +228,20 @@ public class AsyncScanner implements AutoCloseable {
    */
   @Override
   public void close() throws Exception {
+    List<CompletableFuture<ArrowReader>> cancelled = new ArrayList<>();
     try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
       if (nativeAsyncScannerHandle != 0) {
         // Cancel all pending tasks
         for (Long taskId : pendingTasks.keySet()) {
           nativeCancelTask(taskId);
         }
-        pendingTasks.clear();
-
         releaseNativeScanner();
         nativeAsyncScannerHandle = 0;
       }
+      cancelled.addAll(pendingTasks.values());
+      pendingTasks.clear();
     }
+    cancelled.forEach(future -> future.cancel(false));
   }
 
   private native void nativeCancelTask(long taskId);

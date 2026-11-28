@@ -48,7 +48,7 @@ impl Dispatcher {
                 // Use the pre-resolved GlobalRef instead of find_class to
                 // avoid classloader issues on this native thread.
                 let complete_method = env
-                    .get_method_id(&async_scanner_class, "completeTask", "(JJ)V")
+                    .get_method_id(&async_scanner_class, "completeTask", "(JJ)Z")
                     .expect("completeTask method not found");
                 let fail_method = env
                     .get_method_id(&async_scanner_class, "failTask", "(JLjava/lang/String;)V")
@@ -137,7 +137,7 @@ fn handle_success(
         env.call_method_unchecked(
             scanner_obj,
             complete_method,
-            jni::signature::ReturnType::Primitive(jni::signature::Primitive::Void),
+            jni::signature::ReturnType::Primitive(jni::signature::Primitive::Boolean),
             &[
                 jni::sys::jvalue { j: task_id as i64 },
                 jni::sys::jvalue { j: result_ptr },
@@ -145,19 +145,17 @@ fn handle_success(
         )
     };
 
-    if let Err(e) = result {
-        log::error!("Failed to call completeTask: {:?}", e);
+    if !matches!(result, Ok(jni::objects::JValueOwned::Bool(1))) {
+        log::debug!("completeTask rejected result: {:?}", result);
         // Clear any pending JNI exception to protect the dispatcher loop
         let _ = env.exception_clear();
-        // Clean up the FFI stream since Java won't receive it
-        unsafe {
-            drop(Box::from_raw(
-                result_ptr as *mut arrow::ffi_stream::FFI_ArrowArrayStream,
-            ));
-        }
-        log::debug!(
-            "Cleaned up FFI stream pointer for task {} after completeTask failure",
-            task_id
-        );
+    }
+    // Arrow Java moves accepted streams into its own allocation and marks this
+    // allocation released. Dropping it frees the shell; rejected streams also
+    // release their producer here.
+    unsafe {
+        drop(Box::from_raw(
+            result_ptr as *mut arrow::ffi_stream::FFI_ArrowArrayStream,
+        ));
     }
 }
