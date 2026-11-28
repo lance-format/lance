@@ -119,6 +119,10 @@ impl VectorIndex for PreTransformIndex {
         self.inner.total_partitions()
     }
 
+    async fn prewarm_partitions(&self, partition_ids: &[usize]) -> Result<()> {
+        self.inner.prewarm_partitions(partition_ids).await
+    }
+
     async fn search_in_partition(
         &self,
         partition_id: usize,

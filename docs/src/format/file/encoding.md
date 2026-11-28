@@ -659,6 +659,7 @@ on a per-value basis. We use ☑️ to mark a technique that is applied on a per
 | ByteStreamSplit | ❓                    | ❌                       | ✅ (2.1)                   |
 | ALP             | ❓                    | ❌                       | ✅ (2.3)                   |
 | Pcodec          | ❓                    | ❌                       | ✅ (2.3)                   |
+| AxisDelta       | ❌                    | ☑️ (2.3)                 | ❌                         |
 | General         | ✅ (2.2)              | ☑️ (2.1)                 | ✅ (2.1)                   |
 
 In the following sections we will describe each technique in a bit more detail and explain how it is utilized
@@ -672,10 +673,17 @@ with a fixed number of bits per value.
 When applied in a mini-block context we find the largest power of 2 number of values that will be less than
 8,186 bytes and use that as the block size.
 
+In Lance 2.3 mini-block and generic unsigned block positions, `Flat.data` must be absent: leaf
+`BufferCompression` is not supported. General compression uses a `General` wrapper at a permitted position.
+
 ### Variable
 
 Variable compression is the uncompressed representation of variable-width data. There is a buffer of values and
 a buffer of offsets.
+
+In Lance 2.3 buffer-backed block positions and variable-width `Zipped` value positions, `Variable.offsets` must
+be `Flat` with `bits_per_value` equal to 32 or 64 and `Flat.data` absent. `Variable.values` must also be absent.
+The generic offset encodings described below are supported only in mini-block positions.
 
 When applied in a mini-block context each block may have a different number of values. We walk through the values
 until we find the point that would exceed 4,096 bytes and then use the most recent power of 2 number of values that
@@ -693,8 +701,9 @@ chunk buffer
 The first legacy offset points past the offset table to the first value byte. The chunk is padded to an 8-byte
 boundary.
 
-Starting with Lance 2.3, a writer may instead encode the offsets as an independently decodable generic block when
-that produces fewer complete serialized bytes, including the descriptor, chunk header, buffer entries and padding.
+Starting with Lance 2.3, a mini-block writer may instead encode the offsets as an independently decodable generic
+block when that produces fewer complete serialized bytes, including the descriptor, chunk header, buffer entries
+and padding.
 Every chunk in the page uses the same offset codec. Its offset sequence contains `num_values + 1` unsigned values,
 starts at zero, is non-decreasing, and ends at the length of that chunk's value buffer.
 
@@ -715,6 +724,9 @@ A non-`Flat` `Variable.offsets` descriptor identifies this generic form and foll
 do not emit a separate generic `Flat` container.
 Readers fetch and decode only the selected mini-block, so the additional logical buffer does not change random-read
 granularity.
+
+In Lance 2.3 mini-block positions, `Variable.values` must be absent in both the interleaved and generic forms.
+Value bytes are stored without leaf `BufferCompression`; the offsets must follow the layout-specific contract above.
 
 ### Generic Unsigned Blocks
 
@@ -738,11 +750,26 @@ generic unsigned block root
 └── Dictionary(indices=u32 leaf, items=sequence-width leaf)
 ```
 
-`MonotonicDelta` decodes `num_values - 1` child values. RLE children have the same run cardinality, all run lengths are
-positive, and their checked sum equals `num_values`. Dictionary indices have `num_values` entries and every index
-is less than the declared dictionary item count. General compression must decode exactly the byte length implied by
-the containing cardinality and sequence width. Readers reject missing children, incompatible widths, unsupported
-nesting, wrong payload arity, malformed framing and arithmetic overflow.
+`Range` and `MonotonicDelta` require `num_values >= 2`; `MonotonicDelta` decodes `num_values - 1` child values.
+
+When either RLE child has a payload, the frame starts with the `values` payload length as an 8-byte
+little-endian integer, followed by that many `values` payload bytes, then the `run_lengths` payload through
+the end of the frame. A metadata-only child contributes zero payload bytes. If both children are metadata-only,
+the entire frame, including its length prefix, is omitted.
+
+RLE children have the same run cardinality, all run lengths are positive, and their checked sum equals `num_values`.
+To recover that run cardinality, block RLE
+requires either `run_lengths` encoded as `Constant` or `Range`, or at least one plain `Flat` child (`values` or
+`run_lengths`, with no `BufferCompression`). Constant run lengths must divide `num_values` exactly; Range run lengths
+must have a positive start and step and an integer run count whose arithmetic-series sum is `num_values`.
+Otherwise, the run count is the plain child's payload byte length divided by its declared byte width. Two bitpacked
+children are invalid because neither supplies the run count. A `Range` child in either position requires at least
+two recovered runs.
+
+Dictionary indices have `num_values` entries and every index is less than the declared dictionary item count.
+General compression must decode exactly the byte length implied by the containing cardinality and sequence width.
+Readers reject missing children, incompatible widths, unsupported nesting, wrong payload arity, malformed framing
+and arithmetic overflow.
 
 ### Constant
 
@@ -752,9 +779,9 @@ Other containers, such as all-null encodings, define their own Constant semantic
 
 ### Range
 
-Range is a metadata-only block encoding for unsigned `u32` and `u64` arithmetic sequences. It stores the first
-value and a positive step; the containing block supplies the number of values. Readers compute value `i` as
-`start + step * i` and reject invalid widths or arithmetic overflow.
+Range is a metadata-only block encoding for unsigned `u32` and `u64` arithmetic sequences of at least two values.
+It stores the first value and a positive step; the containing block supplies the number of values. Readers compute
+value `i` as `start + step * i` and reject invalid widths or arithmetic overflow.
 
 ```protobuf
 --8<-- "protos/encodings_v2_3.proto:encoding-range"
@@ -763,8 +790,8 @@ value and a positive step; the containing block supplies the number of values. R
 ### MonotonicDelta
 
 MonotonicDelta encodes a non-decreasing unsigned `u32` or `u64` sequence as its first value and the `n - 1`
-adjacent differences. A child block codec represents those differences. MonotonicDelta has a payload exactly
-when its child has one. Readers reconstruct values with checked prefix sums.
+adjacent differences, requiring at least two input values. A child block codec represents those differences.
+MonotonicDelta has a payload exactly when its child has one. Readers reconstruct values with checked prefix sums.
 
 ```protobuf
 %%% proto.message.MonotonicDelta %%%
@@ -792,6 +819,50 @@ a u32 array and the maximum value is 5000 then we only need 13 bits to store eac
 
 When used in a mini-block context we always use 1024 values per block. In addition, we store the compressed bit
 width inline in the block itself.
+
+Lance 2.1 and later bitpack values whose `uncompressed_bits_per_value` is 8, 16, 32 or 64. Starting in 2.3,
+`InlineBitpacking` and `OutOfLineBitpacking` also allow `uncompressed_bits_per_value = 128`, which writers use for
+16-byte fixed-width values such as `Decimal128`. Readers of 2.1 and 2.2 files reject a bitpacking encoding whose
+`uncompressed_bits_per_value` is greater than 64.
+
+In Lance 2.3 mini-block positions, `InlineBitpacking.uncompressed_bits_per_value` must be 8, 16, 32, 64, or 128.
+`InlineBitpacking.values` must be absent in mini-block and generic unsigned block positions.
+
+Values are packed in blocks of 1024. Every value in a block is below `2^w`, where `w` is the packed width. Values of
+8, 16, 32 and 64 bits use the transposed layout below with `k` equal to the value width. A 128-bit value is treated
+as an unsigned 128-bit integer, so a block that contains a negative `Decimal128` value has `w = 128`. A 128-bit
+block is `128 * w` bytes, laid out by `w`:
+
+| `w`       | Layout of a 128-bit packed block                                                                     |
+| --------- | ---------------------------------------------------------------------------------------------------- |
+| 0         | Empty. Every value is zero.                                                                          |
+| 1 to 64   | The low `k` bits of each value in the transposed layout, with `k = 32` when `w` is at most 32 and `k = 64` otherwise. |
+| 65 to 127 | The low 64 bits of the 1024 values as little-endian 64-bit words in value order, not transposed, followed by the high `w - 64` bits of each value in the transposed layout with `k = 64` at width `w - 64`. |
+| 128       | The 1024 values as little-endian 16-byte integers.                                                   |
+
+The transposed layout packs 1024 `k`-bit values at width `w` (`0 < w <= k`) into `w * 1024 / k` little-endian `k`-bit
+words. Let `L = 1024 / k` be the number of lanes. Lane `l` (from 0 to `L - 1`) owns words `j * L + l` for `j` from 0
+to `w - 1`. Taken in that order, least significant bit first, those words form a bit stream in which row `r` (from 0
+to `k - 1`) occupies bits `r * w` to `(r + 1) * w - 1`. Row `r` of lane `l` holds value
+`O[r / 8] * 16 + (r % 8) * 128 + l`, where `O = [0, 4, 2, 6, 1, 5, 3, 7]`. When `w = k` the block is still this
+permutation of the values, not a plain copy. A block with `w = 0` is empty.
+
+An `InlineBitpacking` buffer is a mini-block chunk, or a block of at most 1024 values. It is one word of the
+uncompressed width holding `w`, little-endian, followed by one packed block; for 128-bit values the header is 16 bytes
+and `w` is from 0 to 128. Each chunk has its own `w`. A buffer of fewer than 1024 values is zero-padded to 1024 before
+packing, and readers keep the leading values. A buffer that holds no values (`num_values = 0`) is 0 bytes, with no
+header, and readers return no values without reading it. `InlineBitpacking.values` must be absent. Readers reject a
+header above the uncompressed width and a packed block of any other length. Lance writers set `w` to the uncompressed
+width minus the leading zero bits of the bitwise OR of the chunk's values.
+
+An `OutOfLineBitpacking` payload of `n` values packs every block at one width: `w` is the `bits_per_value` of its
+`values` encoding, which must be `Flat` with no buffer compression. `w` is from 0 to the uncompressed width, which is
+0 to 128 for 128-bit values. Inside a [generic unsigned block](#generic-unsigned-blocks), which only holds `u32` or
+`u64` values, `w` is from 1 to the uncompressed width minus 1. The payload is `n / 1024` (rounded down) packed blocks
+back to back with no headers, followed by the remaining `t` values, if any. The tail is either zero-padded to 1024
+values and packed, or stored as `t` raw little-endian values. Lance writers pack the tail only when the packed block
+is smaller than the raw values; for 128-bit values that is `128 * w < 16 * t`. Readers pick the tail layout from the
+payload length, treat the tail as raw when both lengths are equal, and reject any other length.
 
 Bitpacking is, in theory, usable in a full zip context. However, values in this context are so large that shaving
 off a few bits is unlikely to have any meaningful impact. Also, the full-zip context keeps things byte-aligned and
@@ -994,14 +1065,46 @@ is rejected. Pages of fixed-size lists with null items are stored without pcodec
 %%% proto.message.Pcodec %%%
 ```
 
+### Axis delta (unstable 2.3)
+
+`AxisDelta` wraps a fixed-size-list encoding, optionally nested, whose leaf is
+plain 8-, 16-, 32-, or 64-bit data. Child validity and other transforms are not
+allowed. The writer restricts input to signed and unsigned integer tensors.
+Outer tensor validity remains in the structural plane.
+
+The descriptor stores positive `axis_length` and `inner_stride`. Their product
+must divide the positive number of elements per tensor. Partition each tensor
+into spans of that product. Preserve the first `inner_stride` elements of each
+span. For every later element, subtract the original element `inner_stride`
+positions earlier, modulo two to the element bit width. Decode by adding the
+reconstructed predecessor with the same modulus. Elements remain little endian
+and retain their order and width. No state crosses tensor boundaries.
+
+This descriptor is valid only in per-value positions, including inside General
+compression. General compression retains one frame per tensor. Selecting and
+reading a tensor does not require other tensors; selecting an individual element
+still requires decoding that tensor's frame.
+
+```protobuf
+%%% proto.message.AxisDelta %%%
+```
+
 ### General
 
 General compression is a catch-all term for classical opaque compression techniques such as LZ4, ZStandard, Snappy,
 etc. These techniques are typically back-referencing compressors which replace values with a "back reference" to
 a spot where we already saw the value.
 
-When applied in a mini-block context we run general compression after all other compression and compress the entire
-mini-block.
+In Lance 2.3, when `General` wraps the whole mini-block codec, `General.values` must describe a valid mini-block
+codec. After that inner codec encodes a chunk, `General` compresses only its first buffer, independently for each
+chunk. The buffer count and order are preserved; remaining buffers are unchanged. Decoding decompresses the first
+buffer before passing all buffers to the inner codec. For a single-buffer codec this compresses the entire chunk;
+for a multi-buffer codec it does not. Within mini-block `Rle`, `values` and `run_lengths` can each independently
+use `General(Flat)` to compress their respective child buffers.
+The wrapper does not permit leaf `BufferCompression` on `Flat.data`, `InlineBitpacking.values`, or `Variable.values`.
+
+In generic unsigned block positions, `General` is permitted only as the root wrapping plain `Flat` of the sequence
+width, as specified in the [generic unsigned block contract](#generic-unsigned-blocks).
 
 When applied in a full zip context we run general compression on each value.
 
@@ -1019,6 +1122,7 @@ options. However, they can also be set in the field metadata in the schema.
 | ------------------------------------ | ------------------------------------ | ---------------- | --------------------------------------------------------------------------------------- |
 | `lance-encoding:compression`         | `lz4`, `zstd`, `none`, ...           | `none`           | Opt-in to general compression. The value indicates the scheme.                          |
 | `lance-encoding:compression-level`   | Integers (range is scheme dependent) | Varies by scheme | Higher indicates more work should be done to compress the data.                         |
+| `lance-encoding:minichunk-size`      | Positive integer byte count          | Codec default    | Target uncompressed value bytes per MiniBlock chunk. See below.                         |
 | `lance-encoding:rle-threshold`       | `0.0-1.0`                            | `0.5`            | See below                                                                               |
 | `lance-encoding:bss`                 | `off`, `on`, `auto`                  | `auto`           | See below                                                                               |
 | `lance-encoding:dict-divisor`        | Integers greater than 1              | `2`              | See below                                                                               |
@@ -1027,6 +1131,7 @@ options. However, they can also be set in the field metadata in the schema.
 | `lance-encoding:dict-values-compression-level` | Integers (scheme dependent) | Varies by scheme | Compression level for dictionary values general compression                             |
 | `lance-encoding:general`             | `off`, `on`                          | `off`            | Whether to apply general compression.                                                   |
 | `lance-encoding:alp`                 | `off`, `on`, `auto`                  | `auto`           | Whether to apply ALP for floating point data (unstable 2.3 format only).                |
+| `lance-encoding:axis-delta`          | `off`, `auto`, `auto:<axis>`, `on:<axis>` | `auto`      | Configures [AxisDelta](#axis-delta-unstable-23) for integer tensors. See [AxisDelta mode](#axisdelta-mode). |
 | `lance-encoding:packed`              | Any string                           | Not set          | Whether to apply packed struct encoding (see above).                                    |
 | `lance-encoding:structural-encoding` | `miniblock`, `fullzip`, `sparse`     | Not set          | Select a structural policy; `sparse` requires Lance 2.3 and retains canonical dense all-valid pages.                                |
 
@@ -1044,8 +1149,8 @@ The `lance-encoding:compression` setting enables general-purpose compression alg
   the Pcodec section above. It accepts `lance-encoding:compression-level` from 0 to 12 (default 8).
 
 General compression is applied on top of other encoding techniques (RLE, BSS, bitpacking, etc.) to further reduce
-data size. For mini-block layouts, compression is applied to entire mini-blocks. For full-zip layouts with large values
-(≥32KiB), compression is automatically applied per-value.
+data size. For Lance 2.3 mini-block layouts, `General` compresses each chunk's first buffer as described above.
+For full-zip layouts with large values (≥32KiB), compression is automatically applied per-value.
 
 #### Compression Level
 
@@ -1058,6 +1163,38 @@ The compression level is scheme dependent. Currently the following schemes suppo
 
 Higher compression levels generally provide better compression at the cost of slower encoding speed. Decoding speed
 is typically less affected by the compression level.
+
+#### MiniBlock Chunk Size
+
+Lance 2.2 and later apply `lance-encoding:minichunk-size` to flat fixed-width,
+plain fixed-size-list, and byte-stream-split MiniBlock values. Set it on the
+field that owns the value buffers. For a variable-length list, this is the
+leaf item field, such as the `int64` item of `struct<value: list<int64>>`.
+A fixed-size list stored as one value takes the option on the fixed-size-list
+field.
+
+Non-final chunks contain the largest power-of-two count that fits the target,
+up to 32,768 values. `LANCE_MINIBLOCK_MAX_VALUES` can set a lower count limit.
+Targets that cannot fit a full chunk for the input are rejected.
+A fixed-size-list value counts as one complete list, including its item
+validity buffers in the byte budget. Dense nested chunks may use fewer values
+to fit repetition and definition levels. The 32,768-value cap limits flat
+`int64` and `float64` chunks to 256 KiB of uncompressed values, `int32` and
+`float32` to 128 KiB, and `int16` to 64 KiB.
+
+For an explicit `zstd` or `lz4` request, the writer gives an incompatible
+automatic inline bitpacking or ALP chunk size lower priority. Explicit ALP
+and Pcodec requests retain their codec-specific chunk sizing. Automatic RLE
+with only singleton runs also yields when its chunk size conflicts with the
+target. RLE with repeated values, dictionaries, and FullZip keep their own
+sizing policies. An unset target uses the selected codec's default.
+
+Lance 2.1 uses its default fixed-width chunking for targets up to 8,186 bytes.
+Reusing a schema with a larger fixed-width target, such as 32 KiB on an
+`int64` list item, now returns an error in 2.1 where earlier writers used
+default chunking. For binary and string values, Lance 2.1 continues to ignore
+field metadata hints of 32 KiB or more. An effective programmatic target for
+those values must be smaller than 32 KiB in 2.1.
 
 #### Run Length Encoding (RLE) Threshold
 
@@ -1089,7 +1226,7 @@ BSS is a data transformation that makes floating-point data more compressible; i
 
 **Key points:**
 - Supported types: Only 32-bit and 64-bit data (f32, f64, timestamps)
-- Maximum chunk sizes: 1024 values (f32), 512 values (f64)
+- Default chunk sizes: 1024 values (f32), 512 values (f64). Lance 2.2 and later support an explicit MiniBlock byte target.
 - `auto` mode: Uses entropy analysis with 0.5 sensitivity threshold
 - `on` mode: Always applies BSS for supported types
 - `off` mode: Never applies BSS
@@ -1123,6 +1260,19 @@ ALP is particularly effective for:
 - Columns where the raw floating point bytes are high-entropy but the values have few significant digits
 - Time-series data with consistent precision
 - Scientific data with correlated mantissa patterns
+
+#### AxisDelta Mode
+
+The unstable Lance 2.3 per-value writer checks `lance-encoding:axis-delta` field metadata first, then the
+per-column `axis_delta` setting, then the per-type setting.
+
+- `auto` (default) samples eligible tensors when LZ4 or Zstandard is configured. It tries the longest physical
+  dimension (innermost on ties) and chooses between raw storage, direct compression, and compression with prediction.
+- `auto:<axis>` makes the same selection using the specified axis.
+- `on:<axis>` requires prediction along the specified axis, with or without general compression.
+- `off` disables prediction and sampling while keeping the configured codec.
+
+Axis numbers are zero-based logical axes within the tensor. The writer rejects invalid metadata values.
 
 #### Dictionary Encoding Controls
 
@@ -1192,27 +1342,3 @@ The maximum number of values per mini-block can be tuned via an environment vari
 Reducing this value produces smaller mini-blocks, which reduces the amount of data fetched per read at the
 cost of more mini-blocks and slightly more metadata overhead. Increasing it can reduce metadata overhead and
 improve throughput for highly compressible data, but it may increase random-read amplification.
-
-#### Axis delta (unstable 2.3)
-
-`AxisDelta` wraps a fixed-size-list encoding, optionally nested, whose leaf is
-plain 8-, 16-, 32-, or 64-bit data. Child validity and other transforms are not
-allowed. The writer restricts input to signed and unsigned integer tensors.
-Outer tensor validity remains in the structural plane.
-
-The descriptor stores positive `axis_length` and `inner_stride`. Their product
-must divide the positive number of elements per tensor. Partition each tensor
-into spans of that product. Preserve the first `inner_stride` elements of each
-span. For every later element, subtract the original element `inner_stride`
-positions earlier, modulo two to the element bit width. Decode by adding the
-reconstructed predecessor with the same modulus. Elements remain little endian
-and retain their order and width. No state crosses tensor boundaries.
-
-This descriptor is valid only in per-value positions, including inside General
-compression. General compression retains one frame per tensor. Selecting and
-reading a tensor does not require other tensors; selecting an individual element
-still requires decoding that tensor's frame.
-
-```protobuf
-%%% proto.message.AxisDelta %%%
-```
