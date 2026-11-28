@@ -16,5 +16,14 @@ jobs:
     - name: Checkout Actions Repository
       uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
+    - name: Download typos with retries
+      run: |
+        curl --fail --location \
+          --retry 5 --retry-all-errors --retry-delay 10 \
+          --output typos.tar.gz \
+          https://github.com/crate-ci/typos/releases/download/v1.26.0/typos-v1.26.0-x86_64-unknown-linux-musl.tar.gz
+        tar -xzf typos.tar.gz ./typos
+        rm typos.tar.gz
+
     - name: Check spelling of the entire repository
       uses: crate-ci/typos@6802cc60d4e7f78b9d5454f6cf3935c042d5e1e3 # v1.26.0
