@@ -1094,7 +1094,8 @@ impl From<&CompositeOperation> for Footprint {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::format::{BasePath, DataFile};
+    use crate::format::{BasePath, DataFile, RowIdMeta};
+    use crate::rowids::write_row_ids;
     use crate::transaction::action::test_support::{any_deletion_file, footprint};
     use crate::transaction::action::{
         Action, AddBase, AddDataFile, AddField, AddFragment, AlterField, ConfigUpdate, DropField,
@@ -1145,6 +1146,32 @@ mod tests {
             id,
             physical_rows: 10,
             row_id_meta: None,
+            last_updated_at_version_meta: None,
+            created_at_version_meta: None,
+            data_change: true,
+        })
+    }
+
+    /// An `AddFragment` whose stable row ids live in a hidden column of a data
+    /// file, which conflict detection cannot read.
+    fn add_fragment_with_spilled_row_ids(id: Ref) -> Action {
+        Action::AddFragment(AddFragment {
+            id,
+            physical_rows: 10,
+            row_id_meta: Some(RowIdMeta::Column),
+            last_updated_at_version_meta: None,
+            created_at_version_meta: None,
+            data_change: true,
+        })
+    }
+
+    fn add_fragment_with_inline_row_ids(id: Ref, start: u64) -> Action {
+        Action::AddFragment(AddFragment {
+            id,
+            physical_rows: 10,
+            row_id_meta: Some(RowIdMeta::Inline(
+                write_row_ids(&(start..start + 10).into()).into(),
+            )),
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
             data_change: true,
@@ -1467,6 +1494,32 @@ mod tests {
     #[case::claiming_a_reserved_id_a_concurrent_set_removes(
         vec![add_fragment(Ref::Committed(1))],
         vec![remove_fragment(1)],
+        true,
+    )]
+    // Spilled row ids live in a data file conflict detection cannot read, so
+    // their set is unknown. Claiming nothing would let two operations that
+    // spend one reservation both land with the same ids
+    // (https://github.com/lance-format/lance/issues/11276), so the footprint
+    // takes the table exclusively instead.
+    #[case::spilled_row_ids_conflict_with_anything(
+        vec![add_fragment_with_spilled_row_ids(Ref::Committed(1))],
+        vec![add_fragment(Ref::Committed(2))],
+        true,
+    )]
+    #[case::spilled_row_ids_conflict_with_an_unrelated_append(
+        vec![add_fragment_with_spilled_row_ids(Ref::Committed(1))],
+        vec![add_fragment(Ref::Local(0))],
+        true,
+    )]
+    // Inline ids stay an exact claim, so disjoint ranges still do not collide.
+    #[case::disjoint_inline_row_ids(
+        vec![add_fragment_with_inline_row_ids(Ref::Committed(1), 0)],
+        vec![add_fragment_with_inline_row_ids(Ref::Committed(2), 10)],
+        false,
+    )]
+    #[case::overlapping_inline_row_ids(
+        vec![add_fragment_with_inline_row_ids(Ref::Committed(1), 0)],
+        vec![add_fragment_with_inline_row_ids(Ref::Committed(2), 5)],
         true,
     )]
     fn test_conflicts(

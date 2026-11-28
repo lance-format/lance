@@ -132,7 +132,11 @@ impl AddFragment {
     /// two operations spending one reservation collide. A sequence that does
     /// not decode takes the table exclusively: apply rejects it anyway, and a
     /// footprint must not under-report. A spilled sequence lives in a file
-    /// this cannot read, and goes unclaimed.
+    /// this cannot read, so its ids are unknown and it takes the table
+    /// exclusively too: claiming nothing would let two operations that spend
+    /// one reservation both land with the same ids. That over-reports the
+    /// conflict, which a footprint must do rather than under-report; see
+    /// <https://github.com/lance-format/lance/issues/11276>.
     ///
     /// Either form records that rows arrive, which is the one thing about an
     /// added fragment a concurrent
@@ -144,11 +148,16 @@ impl AddFragment {
         if let Some(id) = self.id.committed() {
             footprint.write(Coordinate::FragmentExistence(id));
         }
-        if let Some(RowIdMeta::Inline(data)) = &self.row_id_meta {
-            match read_row_ids(data) {
+        match &self.row_id_meta {
+            Some(RowIdMeta::Inline(data)) => match read_row_ids(data) {
                 Ok(sequence) => footprint.supply_row_ids(&sequence.to_treemap()),
                 Err(_) => footprint.take_exclusive(),
-            }
+            },
+            // The ids are a hidden column of a data file, which a footprint
+            // cannot read. Their set is unknown, so no exact claim can be
+            // made and none must be silently skipped.
+            Some(RowIdMeta::Column) => footprint.take_exclusive(),
+            None => {}
         }
         if self.data_change {
             footprint.insert_rows();
