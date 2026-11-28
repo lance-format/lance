@@ -5400,8 +5400,11 @@ class LanceDataset(pa.dataset.Dataset):
         Compare changes between two versions of this dataset.
 
         You must specify either ``compared_against`` (shorthand for comparing the
-        current version against a specific older version) or both ``begin_version``
+        current version against a specific version) or both ``begin_version``
         and ``end_version`` for an explicit range.
+
+        Delta accessors raise ``ValueError`` if ``begin_version`` is greater than
+        ``end_version``.
 
         Reading row changes requires stable row IDs at both nonzero endpoints.
         Enable them when creating the dataset with ``enable_stable_row_ids=True``.
@@ -5411,8 +5414,7 @@ class LanceDataset(pa.dataset.Dataset):
         ----------
         compared_against : int, optional
             The version to compare the current dataset version against.
-            This is a shorthand for setting ``begin_version=compared_against``
-            and ``end_version=self.version``.
+            The smaller version is the start and the larger version is the end.
         begin_version : int, optional
             The start version (exclusive) for the comparison range.
             Must be used together with ``end_version``.
