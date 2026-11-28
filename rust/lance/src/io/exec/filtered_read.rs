@@ -82,6 +82,7 @@ use crate::dataset::scanner::{
 };
 use crate::dataset::versions;
 
+use super::FragmentIdColumn;
 use super::column_width::{self, MeasuredWidths};
 use super::utils::{IoMetrics, estimated_bytes_per_row, estimated_total_byte_size};
 
@@ -182,6 +183,7 @@ struct ScopedFragmentRead {
     // `projection` plus the columns the filter needs
     read_projection: Arc<Projection>,
     with_deleted_rows: bool,
+    fragment_id_column: Option<FragmentIdColumn>,
     batch_size: u32,
     file_reader_options: Option<FileReaderOptions>,
     // An in-memory filter to apply after reading the fragment (whatever couldn't be
@@ -640,6 +642,7 @@ impl FilteredReadStream {
                 &crate::dataset::blob::blob_v2_descriptor_schema(&options.projection.to_schema()),
             ))
         };
+        let output_schema = options.with_fragment_id_schema(output_schema);
         // Get scan_range_after_filter from the plan
         let scan_range_after_filter = plan.scan_range_after_filter.clone();
 
@@ -1097,6 +1100,7 @@ impl FilteredReadStream {
                     projection: projection.clone(),
                     read_projection,
                     with_deleted_rows: options.with_deleted_rows,
+                    fragment_id_column: options.fragment_id_column.clone(),
                     batch_size: default_batch_size,
                     file_reader_options: options.file_reader_options.clone(),
                     physical_filter,
@@ -1665,6 +1669,8 @@ impl FilteredReadStream {
         fragment_read_task.ranges.sort_by_key(|r| r.start);
 
         let physical_filter = fragment_read_task.physical_filter;
+        let fragment_id = fragment_read_task.fragment.id();
+        let fragment_id_column = fragment_read_task.fragment_id_column;
 
         // We are going to count the fragment as scanned on the first batch we
         // read. This might miss empty fragments, but we assume that wouldn't be
@@ -1728,13 +1734,18 @@ impl FilteredReadStream {
             .map(|(batch_fut, args)| Self::wrap_with_filter(batch_fut, args.0, args.1))
             .map(move |batch_fut_result| {
                 let batch_fut = batch_fut_result?;
+                let fragment_id_column = fragment_id_column.clone();
                 Ok(batch_fut
-                    .and_then(move |batch| {
-                        futures::future::ready(if let Some(budget) = batch_size_bytes {
+                    .and_then(move |mut batch| async move {
+                        if let Some(column) = fragment_id_column {
+                            let tagged = column.add_to_batch(batch.batch(), fragment_id)?;
+                            batch = batch.with_batch(tagged);
+                        }
+                        if let Some(budget) = batch_size_bytes {
                             batch.split_by_bytes((budget * 2) as usize)
                         } else {
                             Ok(vec![batch])
-                        })
+                        }
                     })
                     .boxed())
             });
@@ -1950,6 +1961,7 @@ pub struct FilteredReadOptions {
     pub scan_range_after_filter: Option<Range<u64>>,
     /// Include deleted rows in the scan; they are returned with a null row id
     pub with_deleted_rows: bool,
+    pub(crate) fragment_id_column: Option<FragmentIdColumn>,
     /// The maximum number of rows per batch
     pub batch_size: Option<u32>,
     /// File reader options to use when reading data files.
@@ -2006,6 +2018,7 @@ impl FilteredReadOptions {
             scan_range_before_filter: None,
             scan_range_after_filter: None,
             with_deleted_rows: false,
+            fragment_id_column: None,
             batch_size: None,
             file_reader_options: None,
             fragment_readahead: None,
@@ -2022,6 +2035,13 @@ impl FilteredReadOptions {
             threading_mode: FilteredReadThreadingMode::OnePartitionMultipleThreads(
                 get_num_compute_intensive_cpus(),
             ),
+        }
+    }
+
+    fn with_fragment_id_schema(&self, schema: SchemaRef) -> SchemaRef {
+        match &self.fragment_id_column {
+            Some(column) => Arc::new(column.add_to_schema(&schema)),
+            None => schema,
         }
     }
 
@@ -2801,7 +2821,8 @@ impl FilteredReadExec {
                 ));
             }
         }
-        let output_schema = public_blob_v2_binary_projection_schema(&options.projection);
+        let output_schema = options
+            .with_fragment_id_schema(public_blob_v2_binary_projection_schema(&options.projection));
         let bytes_per_row = estimated_bytes_per_row(
             output_schema.as_ref(),
             dataset.schema(),
@@ -4073,7 +4094,9 @@ impl ExecutionPlan for FilteredReadExec {
 
         // Need to add in filter columns even though they aren't part of the projection
         let (read_projection, physical_filter) = self.options.plan_filter(filter)?;
-        let read_schema = public_blob_v2_binary_projection_schema(&read_projection);
+        let read_schema = self
+            .options
+            .with_fragment_id_schema(public_blob_v2_binary_projection_schema(&read_projection));
 
         let mock_input = Arc::new(Self::try_new(
             self.dataset.clone(),

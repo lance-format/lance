@@ -46,10 +46,18 @@ pub fn create_scan_stream(
     config: LanceScanConfig,
     metrics: &ExecutionPlanMetricsSet,
     partition: usize,
+    fragment_id_column: Option<crate::io::exec::FragmentIdColumn>,
 ) -> datafusion::error::Result<LanceStream> {
     match version {
         ConcreteFileVersion::V1 => LanceStream::try_new_v1(
-            dataset, fragments, offsets, projection, config, metrics, partition,
+            dataset,
+            fragments,
+            offsets,
+            projection,
+            config,
+            metrics,
+            partition,
+            fragment_id_column,
         ),
         ConcreteFileVersion::V2_0
         | ConcreteFileVersion::V2_1

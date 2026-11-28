@@ -39,6 +39,7 @@ use lance_index::vector::{
 use lance_linalg::distance::MetricType;
 use lance_select::{RowAddrMask, RowAddrTreeMap};
 use lance_table::format::{Fragment, IndexMetadata};
+use roaring::RoaringBitmap;
 use uuid::Uuid;
 
 use crate::dataset::Dataset;
@@ -95,6 +96,7 @@ impl Scanner {
             use_scalar_index: true,
             ignored_scalar_index_names: HashSet::new(),
             include_deleted_rows: false,
+            fragment_id_column: None,
             scan_stats_callback: None,
             strict_batch_size: false,
             file_reader_options,
@@ -1462,6 +1464,50 @@ impl Scanner {
         self.legacy_with_row_addr = true;
         self.projection_plan.include_row_addr();
         self
+    }
+
+    /// Add a source fragment ID column and return its distinct output name.
+    /// The default fragment scope requires unique IDs for unambiguous tags.
+    #[doc(hidden)]
+    pub fn with_fragment_id(&mut self) -> Result<String> {
+        if self.aggregate.is_some() {
+            return Err(Error::not_supported_source(
+                "scan_batches cannot tag aggregate results with source fragments".into(),
+            ));
+        }
+
+        if self.fragments.is_none()
+            && self.dataset.fragment_bitmap().len() < self.dataset.count_fragments() as u64
+        {
+            // Older manifests can reuse an ID, which makes ID-based tags ambiguous.
+            // The cached bitmap lets valid manifests skip the duplicate search.
+            let mut seen = RoaringBitmap::new();
+            if let Some(fragment) = self
+                .dataset
+                .iter_fragments()
+                .find(|fragment| !seen.insert(fragment.id as u32))
+            {
+                return Err(Error::invalid_input(format!(
+                    "scan_batches cannot tag the default fragment scope with duplicate fragment ID {} in dataset version {}",
+                    fragment.id,
+                    self.dataset.version_id(),
+                )));
+            }
+        }
+
+        let projection = &mut self.projection_plan;
+        let mut name = "_lance_fragment_id".to_string();
+        while self.dataset.schema().field(&name).is_some()
+            || projection
+                .requested_output_expr
+                .iter()
+                .any(|column| column.name == name)
+        {
+            name.push('_');
+        }
+        projection.physical_projection.with_row_addr = true;
+        self.fragment_id_column = Some(name.clone());
+        Ok(name)
     }
 
     /// Instruct the scanner to disable automatic projection of scoring columns

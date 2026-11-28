@@ -65,6 +65,16 @@ def test_fix_data_storage_version(tmp_path: Path):
         ds.delete("false")
 
 
+def test_scan_batches_rejects_duplicate_manifest_fragment_ids(tmp_path: Path):
+    ds = prep_dataset(tmp_path, "v0.16.0", "wrong_data_version_no_fix.lance")
+    ds = lance.dataset(ds.uri, version=2)
+    scanner = ds.scanner(columns=["foo"], batch_size=1)
+    assert scanner.to_table()["foo"].to_pylist() == [1, 2, 1, 3]
+
+    with pytest.raises(ValueError, match=r"duplicate fragment ID 1\b.*version 2\b"):
+        next(scanner.scan_batches())
+
+
 def test_old_btree_bitmap_indices(tmp_path: Path):
     """
     In versions below 0.21.0 we used the legacy file format for btree and bitmap

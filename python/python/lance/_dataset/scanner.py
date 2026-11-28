@@ -13,6 +13,7 @@ from typing import (
     Any,
     Callable,
     Dict,
+    Generator,
     Iterable,
     Iterator,
     List,
@@ -23,6 +24,7 @@ from typing import (
 )
 
 import pyarrow as pa
+import pyarrow.compute as pc
 from pyarrow import RecordBatch, Schema
 
 from ..dependencies import _check_for_numpy
@@ -161,7 +163,9 @@ def _snapshot_scanner_builder(builder: "ScannerBuilder") -> Dict[str, Any]:
             return value
 
     return {
-        key: snapshot_value(value)
+        key: tuple(value)
+        if key == "_fragments" and value is not None
+        else snapshot_value(value)
         for key, value in vars(builder).items()
         if key != "ds"
     }
@@ -734,7 +738,7 @@ class ScannerBuilder:
         self._batch_readahead: Optional[int] = None
         self._fragment_readahead: Optional[int] = None
         self._scan_in_order = True
-        self._fragments = None
+        self._fragments: Optional[list[LanceFragment]] = None
         self._index_segments = None
         self._with_row_id = False
         self._with_row_address = False
@@ -1039,19 +1043,14 @@ class ScannerBuilder:
         :meth:`nearest` and :meth:`with_index_segments`.
         See :meth:`LanceDataset.scanner` for a mixed-search example.
         """
-        if fragments is not None:
-            inner_fragments = []
-            for f in fragments:
-                if isinstance(f, LanceFragment):
-                    inner_fragments.append(f._fragment)
-                else:
-                    raise TypeError(
-                        f"fragments must be an iterable of LanceFragment. "
-                        f"Got {type(f)} instead."
-                    )
-            fragments = inner_fragments
-
-        self._fragments = fragments
+        scope = None if fragments is None else list(fragments)
+        for fragment in scope or ():
+            if not isinstance(fragment, LanceFragment):
+                raise TypeError(
+                    f"fragments must be an iterable of LanceFragment. "
+                    f"Got {type(fragment)} instead."
+                )
+        self._fragments = scope
         return self
 
     def with_index_segments(
@@ -1392,7 +1391,14 @@ class ScannerBuilder:
         return self
 
     def to_scanner(self) -> LanceScanner:
-        scanner = self.ds._ds.scanner(
+        # Fragment tags and blob exports must use the same snapshot as the scan.
+        dataset = copy.copy(self.ds)
+        fragments = (
+            None
+            if self._fragments is None
+            else [fragment._fragment for fragment in self._fragments]
+        )
+        scanner = dataset._ds.scanner(
             self._columns,
             self._columns_with_transform,
             self._filter,
@@ -1407,7 +1413,7 @@ class ScannerBuilder:
             self._batch_readahead,
             self._fragment_readahead,
             self._scan_in_order,
-            self._fragments,
+            fragments,
             self._index_segments,
             self._with_row_id,
             self._with_row_address,
@@ -1429,7 +1435,7 @@ class ScannerBuilder:
             self._row_addr_blocklist,
             self._minhash_query,
         )
-        return LanceScanner(scanner, self.ds, _snapshot_scanner_builder(self))
+        return LanceScanner(scanner, dataset, _snapshot_scanner_builder(self))
 
 
 class LanceScanner(pa.dataset.Scanner):
@@ -1545,23 +1551,82 @@ class LanceScanner(pa.dataset.Scanner):
         """The schema with which batches will be read from fragments."""
         return self._ds.schema
 
-    def scan_batches(self):
-        """
-        Consume a Scanner in record batches with corresponding fragments.
+    def scan_batches(self) -> Generator[pa.dataset.TaggedRecordBatch, None, None]:
+        """Stream batches tagged with the fragments that supplied their rows.
+
+        A batch spanning several fragments is split into contiguous runs in
+        scan order. Close the iterator to release the reader if stopping early.
 
         Returns
         -------
         record_batches : iterator of TaggedRecordBatch
+
+        Raises
+        ------
+        ValueError
+            If an explicit fragment scope contains conflicting descriptors for
+            the same fragment ID or the dataset's default scope contains
+            duplicate fragment IDs.
+        NotImplementedError
+            If the scan produces aggregate rows without a source fragment.
+
+        Examples
+        --------
+        >>> import lance
+        >>> import pyarrow as pa
+        >>> ds = lance.write_dataset(
+        ...     pa.table({"id": [1, 2]}), "memory://", max_rows_per_file=1
+        ... )
+        >>> [tagged.fragment.fragment_id for tagged in ds.scanner().scan_batches()]
+        [0, 1]
         """
-        lst = []
-        reader = self.to_reader()
-        while True:
-            batch = reader.read_next_batch()
-            if batch is None:
-                reader.close()
-                break
-            lst.append(batch)
-        return lst
+        fragments: dict[int, LanceFragment] = {}
+        for fragment in (self._snapshot or {}).get("_fragments") or ():
+            fragment_id = fragment.fragment_id
+            previous = fragments.setdefault(fragment_id, fragment)
+            if previous is not fragment and (
+                previous._ds.uri != fragment._ds.uri
+                or previous._ds.version != fragment._ds.version
+                or previous.metadata.to_json() != fragment.metadata.to_json()
+            ):
+                raise ValueError(
+                    f"scan_batches received conflicting fragment descriptors for ID "
+                    f"{fragment_id}"
+                )
+
+        scanner, fragment_id_column = self._scanner._with_fragment_id()
+        reader = scanner.to_pyarrow()
+        try:
+            fragment_id_index = reader.schema.get_field_index(fragment_id_column)
+            if fragment_id_index < 0:
+                raise RuntimeError("scan_batches expected a source fragment column")
+
+            for batch in reader:
+                runs = pc.run_end_encode(
+                    batch.column(fragment_id_index), run_end_type=pa.int64()
+                )
+                projected = batch.remove_column(fragment_id_index)
+                start = 0
+                for end, fragment_id in zip(
+                    runs.run_ends.to_pylist(), runs.values.to_pylist()
+                ):
+                    if fragment_id is None:
+                        raise RuntimeError(
+                            "scan_batches encountered a null fragment ID"
+                        )
+                    if fragment_id not in fragments:
+                        fragment = self._ds.get_fragment(fragment_id)
+                        if fragment is None:
+                            raise RuntimeError(
+                                f"scan_batches could not find fragment {fragment_id}"
+                            )
+                        fragments[fragment_id] = fragment
+                    yield pa.dataset.TaggedRecordBatch(
+                        projected.slice(start, end - start), fragments[fragment_id]
+                    )
+                    start = end
+        finally:
+            reader.close()
 
     def take(self, indices):
         """Select rows of data by their position in the scan results.
