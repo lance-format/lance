@@ -1710,7 +1710,11 @@ async fn test_deleted_branch_cleanup_failure_keeps_ref_authoritative(
         root.commit_handler(),
         root.branch_location(),
     );
-    root.force_delete_branch("a").await.unwrap();
+    if local {
+        root.delete_branch("a").await.unwrap();
+    } else {
+        root.force_delete_branch("a").await.unwrap();
+    }
     let recreated = root.create_branch("a", 1, None).await.unwrap();
     assert_eq!(recreated.count_rows(None).await.unwrap(), 2);
     let reopened = root.checkout_branch("a").await.unwrap();
@@ -2092,22 +2096,25 @@ async fn test_delete_with_pending_reservation_through_symlink() {
     std::os::unix::fs::symlink("a/gateway", tree.join("route")).unwrap();
     let reservation = root.reserve_branch("route/b", 1).await.unwrap();
 
-    let deletion = root.delete_branch("a").await;
+    let error = root.delete_branch("a").await.unwrap_err();
+    assert!(matches!(error, Error::RefConflict { .. }), "{error}");
+    assert!(error.to_string().contains("route/b"), "{error}");
     assert_eq!(
         std::fs::canonicalize(tree.join("route")).unwrap(),
         std::fs::canonicalize(&destination).unwrap()
     );
     let completed = root.complete_branch(reservation, None).await.unwrap();
     assert_eq!(completed.scan().try_into_batch().await.unwrap(), expected);
-    match deletion {
-        Ok(()) => {
-            root.create_branch("a", 1, None).await.unwrap();
-        }
-        Err(error) => {
-            assert!(matches!(error, Error::RefConflict { .. }), "{error}");
-            assert!(error.to_string().contains("route/b"), "{error}");
-        }
-    }
+    assert_eq!(
+        root.checkout_branch("a")
+            .await
+            .unwrap()
+            .scan()
+            .try_into_batch()
+            .await
+            .unwrap(),
+        expected
+    );
 }
 
 #[cfg(unix)]
@@ -2124,18 +2131,25 @@ async fn test_delete_with_pending_reservation_and_relocated_versions() {
     std::os::unix::fs::symlink(&relocated, &versions).unwrap();
     let reservation = root.reserve_branch("b", 1).await.unwrap();
 
-    let deletion = root.delete_branch("a").await;
+    let error = root.delete_branch("a").await.unwrap_err();
+    assert!(matches!(error, Error::RefConflict { .. }), "{error}");
+    assert!(error.to_string().contains("_versions"), "{error}");
+    assert_eq!(
+        root.checkout_branch("a")
+            .await
+            .unwrap()
+            .scan()
+            .try_into_batch()
+            .await
+            .unwrap(),
+        expected
+    );
+    std::fs::remove_file(&versions).unwrap();
+    std::fs::rename(relocated, versions).unwrap();
+    root.delete_branch("a").await.unwrap();
+    root.create_branch("a", 1, None).await.unwrap();
     let completed = root.complete_branch(reservation, None).await.unwrap();
     assert_eq!(completed.scan().try_into_batch().await.unwrap(), expected);
-    match deletion {
-        Ok(()) => {
-            root.create_branch("a", 1, None).await.unwrap();
-        }
-        Err(error) => {
-            assert!(matches!(error, Error::RefConflict { .. }), "{error}");
-            assert!(error.to_string().contains("_versions"), "{error}");
-        }
-    }
 }
 
 #[tokio::test]

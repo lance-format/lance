@@ -453,7 +453,7 @@ impl<'a> TableView<'a> {
             return Err(Error::RefConflict {
                 message: format!(
                     "Cannot create branch {branch}: {versions_path} contains leftover version data. \
-                     Use force_delete_branch to clean up the unused branch before retrying"
+                     Retry an interrupted branch deletion or use force_delete_branch to clean up orphaned version data"
                 ),
             });
         }

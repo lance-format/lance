@@ -2306,6 +2306,66 @@ async fn test_delete_unknown_branch() {
     );
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn test_delete_branch_retry_after_alias_conflict() {
+    let (namespace, _temp) = create_test_namespace().await;
+    create_scalar_table(&namespace, "users").await;
+    create_branch_with_commits(&namespace, "users", "dev", 1).await;
+    let main = open_dataset(&namespace, "users").await;
+    let tree = uri_to_url(main.uri())
+        .unwrap()
+        .to_file_path()
+        .unwrap()
+        .join("tree");
+    std::os::unix::fs::symlink("dev", tree.join("route")).unwrap();
+    let reservation = main.reserve_branch("route/child", 1).await.unwrap();
+    let id = Some(vec!["users".into()]);
+    let request = DeleteTableBranchRequest {
+        id: id.clone(),
+        name: "dev".into(),
+        ..Default::default()
+    };
+
+    let error = namespace
+        .delete_table_branch(request.clone())
+        .await
+        .unwrap_err();
+    assert_eq!(namespace_code(&error), Some(ErrorCode::InvalidInput));
+    assert!(error.to_string().contains("route/child"), "{error}");
+    let branch = DescribeTableRequest {
+        id: id.clone(),
+        branch: Some("dev".into()),
+        load_detailed_metadata: Some(true),
+        ..Default::default()
+    };
+    assert_eq!(
+        namespace
+            .describe_table(branch.clone())
+            .await
+            .unwrap()
+            .version,
+        Some(2)
+    );
+
+    std::fs::remove_file(tree.join("route")).unwrap();
+    namespace.delete_table_branch(request).await.unwrap();
+    namespace
+        .create_table_branch(CreateTableBranchRequest {
+            id,
+            name: "dev".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        namespace.describe_table(branch).await.unwrap().version,
+        Some(1)
+    );
+    let child = main.complete_branch(reservation, None).await.unwrap();
+    assert_eq!(scan_id_column(&child).await, vec![1, 2, 3]);
+}
+
 #[tokio::test]
 async fn test_delete_referenced_branch_conflict() {
     let (namespace, _temp_dir, table_id) = create_tagged_test_table(2).await;

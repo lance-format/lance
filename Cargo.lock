@@ -5380,6 +5380,7 @@ dependencies = [
  "rand 0.9.5",
  "roaring",
  "rstest",
+ "same-file",
  "semver",
  "serde",
  "serde_json",

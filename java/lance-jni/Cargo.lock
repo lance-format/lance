@@ -4566,6 +4566,7 @@ dependencies = [
  "prost-types",
  "rand 0.9.5",
  "roaring",
+ "same-file",
  "semver",
  "serde",
  "serde_json",
