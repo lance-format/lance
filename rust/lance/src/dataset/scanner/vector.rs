@@ -403,6 +403,19 @@ impl Scanner {
             let stale_rows = self.overlay_stale_vector_rows(&index_segments)?;
             // Build a prefilter block mask for stale rows (empty = no-op fast path).
             let overlay_block = stale_rows.block_mask().await?;
+            let fallback_fragments = if self.fast_search {
+                Vec::new()
+            } else {
+                self.fragments_missing_from_index_segments(&index_name, &index_segments)
+                    .await?
+            };
+            // Refine, or merging unindexed and stale rows into the result,
+            // re-scores the index's candidates exactly and applies the range
+            // to those distances. Retained quantized scores are not re-scored.
+            let rescored_exactly = q.refine_factor.is_some()
+                || (!self.fast_search
+                    && self.quantized_refine_factor.is_none()
+                    && (!fallback_fragments.is_empty() || !stale_rows.is_empty()));
 
             let ann_query = if self.quantized_refine_factor.is_some() {
                 let exact_factor = q.refine_factor.unwrap_or(1) as usize;
@@ -421,20 +434,20 @@ impl Scanner {
 
             let ann_node = match vector_type {
                 DataType::FixedSizeList(_, _) => {
-                    // Refine applies the distance range to exact distances, but
-                    // the search still has to, or a lower bound leaves it only
-                    // candidates refine then drops. It ranks on the index's own
-                    // scale, so it gets the range on that scale.
-                    let ann_query = match q.refine_factor {
-                        Some(_) => {
-                            let scale = index_distance_scale(index_metric, &index_segments);
-                            Query {
-                                lower_bound: q.lower_bound.map(|lower| lower * scale),
-                                upper_bound: q.upper_bound.map(|upper| upper * scale),
-                                ..ann_query
-                            }
+                    // An exact re-score applies the distance range to exact
+                    // distances, but the search still has to, or a lower bound
+                    // leaves it only candidates the re-score then drops. It
+                    // ranks on the index's own scale, so it gets the range on
+                    // that scale.
+                    let ann_query = if rescored_exactly {
+                        let scale = index_distance_scale(index_metric, &index_segments);
+                        Query {
+                            lower_bound: q.lower_bound.map(|lower| lower * scale),
+                            upper_bound: q.upper_bound.map(|upper| upper * scale),
+                            ..ann_query
                         }
-                        None => ann_query,
+                    } else {
+                        ann_query
                     };
                     self.ann(
                         &ann_query,
@@ -483,7 +496,7 @@ impl Scanner {
                 knn_node = self
                     .knn_combined(
                         &q,
-                        &index_name,
+                        fallback_fragments,
                         &index_segments,
                         &stale_rows,
                         knn_node,
@@ -892,16 +905,12 @@ impl Scanner {
     async fn knn_combined(
         &self,
         q: &Query,
-        index_name: &str,
+        fallback_fragments: Vec<Fragment>,
         indexed_segments: &[IndexMetadata],
         stale_rows: &IndexVisibility,
         mut knn_node: Arc<dyn ExecutionPlan>,
         filter_plan: &ExprFilterPlan,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let fallback_fragments = self
-            .fragments_missing_from_index_segments(index_name, indexed_segments)
-            .await?;
-
         let has_fallback = !fallback_fragments.is_empty();
         let has_stale = !stale_rows.is_empty();
 

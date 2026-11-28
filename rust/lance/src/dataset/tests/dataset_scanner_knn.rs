@@ -2704,6 +2704,124 @@ async fn test_refined_knn_applies_distance_range_to_exact_distances() {
     }
 }
 
+/// With unindexed rows, an unrefined search re-scores the index's candidates
+/// exactly and applies the range to those exact distances, so the index has
+/// to apply it on its own (doubled, for cosine SQ/PQ/RQ) scale.
+#[rstest]
+#[case::ivf_sq(VectorIndexParams::with_ivf_sq_params(
+    DistanceType::Cosine,
+    IvfBuildParams::new(1),
+    SQBuildParams::default(),
+))]
+#[case::ivf_pq(VectorIndexParams::ivf_pq(1, 8, 8, DistanceType::Cosine, 50))]
+#[case::ivf_rq(VectorIndexParams::ivf_rq(1, 4, DistanceType::Cosine))]
+#[tokio::test]
+async fn test_knn_with_unindexed_rows_applies_distance_range_to_exact_distances(
+    #[case] index_params: VectorIndexParams,
+) {
+    const DIM: usize = 32;
+    const ROWS_PER_GROUP: usize = 128;
+    // Exact cosine distances of the three row groups. With the range below,
+    // only the middle group is in range, and no group is in range on both
+    // the exact and the doubled scale.
+    const GROUP_DISTANCES: [f32; 3] = [0.1, 0.5, 1.5];
+    let (lower, upper) = (0.4, 0.7);
+
+    let mut seed: u64 = 42;
+    let mut next_uniform = move || {
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((seed >> 33) as f32 / (1u64 << 31) as f32) * 2.0 - 1.0
+    };
+    // The query is the first basis vector, so a unit row at cosine distance
+    // `d` is `(1 - d) * e0` plus an orthogonal part of norm `sqrt(1 - (1 - d)^2)`.
+    let mut values = Vec::with_capacity(GROUP_DISTANCES.len() * ROWS_PER_GROUP * DIM);
+    for distance in GROUP_DISTANCES {
+        for _ in 0..ROWS_PER_GROUP {
+            let cos = 1.0 - (distance + 0.02 * next_uniform());
+            let orthogonal: Vec<f32> = (1..DIM).map(|_| next_uniform()).collect();
+            let norm = orthogonal.iter().map(|v| v * v).sum::<f32>().sqrt();
+            let sin = (1.0 - cos * cos).sqrt();
+            values.push(cos);
+            values.extend(orthogonal.iter().map(|v| v / norm * sin));
+        }
+    }
+    let mut query = vec![0.0; DIM];
+    query[0] = 1.0;
+    let far_row: Vec<f32> = query.iter().map(|v| -v).collect();
+
+    let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+        "vec",
+        DataType::FixedSizeList(
+            Arc::new(ArrowField::new("item", DataType::Float32, true)),
+            DIM as i32,
+        ),
+        true,
+    )]));
+    let to_batch = |values: Vec<f32>| {
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(
+                FixedSizeListArray::try_new_from_values(Float32Array::from(values), DIM as i32)
+                    .unwrap(),
+            )],
+        )
+        .unwrap()
+    };
+    let tmp = TempStrDir::default();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(to_batch(values))], schema.clone()),
+        &tmp,
+        None,
+    )
+    .await
+    .unwrap();
+    dataset
+        .create_index(&["vec"], IndexType::Vector, None, &index_params, true)
+        .await
+        .unwrap();
+    dataset
+        .append(
+            RecordBatchIterator::new(vec![Ok(to_batch(far_row))], schema.clone()),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 2);
+
+    let search = |use_index: bool| {
+        let mut scan = dataset.scan();
+        scan.nearest(
+            "vec",
+            &Float32Array::from(query.clone()),
+            2 * ROWS_PER_GROUP,
+        )
+        .unwrap()
+        .distance_metric(DistanceType::Cosine)
+        .distance_range(Some(lower), Some(upper))
+        .use_index(use_index)
+        .with_row_id();
+        async move { scan.try_into_batch().await.unwrap() }
+    };
+    let indexed = search(true).await;
+    let flat = search(false).await;
+
+    let distances = indexed[DIST_COL].as_primitive::<Float32Type>().values();
+    assert!(!distances.is_empty(), "no rows within the exact range");
+    for distance in distances {
+        assert!(
+            (lower..upper).contains(distance),
+            "{distance} is outside [{lower}, {upper})"
+        );
+    }
+    assert_eq!(batch_row_ids(&indexed), batch_row_ids(&flat));
+    assert_eq!(
+        distances,
+        flat[DIST_COL].as_primitive::<Float32Type>().values()
+    );
+}
+
 #[tokio::test]
 async fn test_batch_knn_quantized_refinement_uses_rerank_path() {
     let mut test_ds = TestVectorDataset::new(LanceFileVersion::Stable, true)
