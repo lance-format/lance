@@ -47,7 +47,6 @@ use lance_index::vector::DIST_COL;
 use lance_io::stream::RecordBatchStream;
 use tracing::instrument;
 
-use crate::datatypes::Schema;
 use crate::io::exec::filtered_read::{FilteredReadExec, filter_read_columns};
 use crate::io::exec::knn::{QUERY_INDEX_COL, query_index_field};
 use crate::io::exec::{
@@ -77,21 +76,19 @@ impl Scanner {
     /// after setting all other options.
     pub fn get_expr_filter(&self) -> Result<Option<Expr>> {
         if let Some(filter) = &self.filter.expr_filter {
-            let filter_schema = self.filterable_schema()?;
-            Ok(Some(filter.to_datafusion(
+            Ok(Some(filter.to_datafusion_with_arrow(
                 self.dataset.schema(),
-                filter_schema.as_ref(),
+                self.filterable_schema()?,
             )?))
         } else {
             Ok(None)
         }
     }
 
-    fn add_extra_columns(
+    fn extra_columns(
         &self,
-        schema: Schema,
         fts_document_granularity: Option<DocumentGranularity>,
-    ) -> Result<Schema> {
+    ) -> Vec<ArrowField> {
         let mut extra_columns = vec![ArrowField::new(ROW_OFFSET, DataType::UInt64, true)];
 
         if self.nearest.is_some() || self.minhash_query.is_some() {
@@ -114,14 +111,14 @@ impl Scanner {
             }
         }
 
-        schema.merge(&ArrowSchema::new(extra_columns))
+        extra_columns
     }
 
     /// The full schema available to filters
     ///
     /// This is the schema of the dataset, any metadata columns like _rowid or _rowaddr
     /// and any extra columns like _distance or _score
-    fn filterable_schema(&self) -> Result<Arc<Schema>> {
+    fn filterable_schema(&self) -> Result<SchemaRef> {
         let fts_document_granularity = self
             .full_text_query
             .as_ref()
@@ -132,18 +129,9 @@ impl Scanner {
     fn filterable_schema_with_fts_granularity(
         &self,
         fts_document_granularity: Option<DocumentGranularity>,
-    ) -> Result<Arc<Schema>> {
-        let base_schema = Projection::full(self.dataset.clone())
-            .with_row_id()
-            .with_row_addr()
-            .with_row_last_updated_at_version()
-            .with_row_created_at_version()
-            .to_schema();
-
-        Ok(Arc::new(self.add_extra_columns(
-            base_schema,
-            fts_document_granularity,
-        )?))
+    ) -> Result<SchemaRef> {
+        self.dataset
+            .filterable_schema(&self.extra_columns(fts_document_granularity))
     }
 
     /// This takes the current output, and the user's requested projection, and calculates the
@@ -563,14 +551,13 @@ impl Scanner {
         query_filter: Option<QueryFilter>,
         fts_document_granularity: Option<DocumentGranularity>,
     ) -> Result<FilterPlan> {
-        let filter_schema =
-            self.filterable_schema_with_fts_granularity(fts_document_granularity)?;
-        let planner = Planner::new(Arc::new(filter_schema.as_ref().into()));
-
         // Check expr filter
         let filter_plan = if let Some(filter) = self.filter.expr_filter.as_ref() {
+            let filter_schema =
+                self.filterable_schema_with_fts_granularity(fts_document_granularity)?;
+            let planner = Planner::new(filter_schema.clone());
             let expr = planner.optimize_expr(
-                filter.to_datafusion(self.dataset.schema(), filter_schema.as_ref())?,
+                filter.to_datafusion_with_arrow(self.dataset.schema(), filter_schema)?,
             )?;
             let index_info = match self.scalar_index_selection.as_ref() {
                 Some(selection) => {
@@ -1227,13 +1214,16 @@ mod tests {
     use rstest::rstest;
 
     use crate::dataset::Dataset;
+    use crate::dataset::NewColumnTransform;
     use crate::dataset::WriteParams;
     use crate::dataset::builder::DatasetBuilder;
     use crate::dataset::scanner::test_dataset::{
         TestVectorDataset, assert_scan_slice_matches, batch_knn_two_queries, find_filtered_read,
     };
+
     use crate::index::DatasetIndexExt;
     use crate::io::exec::PreFilterSource;
+    use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
 
     #[tokio::test]
     async fn test_stable_row_id_limit_pushdown_with_deletions() -> Result<()> {
@@ -2021,5 +2011,200 @@ mod tests {
                 .collect();
             assert_eq!(actual, expected);
         }
+    }
+
+    fn uncached_filterable_schema(scan: &Scanner) -> ArrowSchema {
+        let schema = Projection::full(scan.dataset.clone())
+            .with_row_id()
+            .with_row_addr()
+            .with_row_last_updated_at_version()
+            .with_row_created_at_version()
+            .to_schema()
+            .merge(&ArrowSchema::new(scan.extra_columns(None)))
+            .unwrap();
+        ArrowSchema::from(&schema)
+    }
+
+    #[tokio::test]
+    async fn test_filterable_schema_shares_the_table_fields() {
+        let test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false)
+            .await
+            .unwrap();
+        let dataset = Arc::new(test_ds.dataset);
+
+        let plain = dataset.scan();
+        let schema = plain.filterable_schema_with_fts_granularity(None).unwrap();
+        assert_eq!(*schema, uncached_filterable_schema(&plain));
+
+        let mut knn = dataset.scan();
+        knn.nearest("vec", &batch_knn_two_queries().0.value(0), 2)
+            .unwrap();
+        let knn_schema = knn.filterable_schema_with_fts_granularity(None).unwrap();
+        assert_eq!(*knn_schema, uncached_filterable_schema(&knn));
+        assert!(knn_schema.field_with_name(DIST_COL).is_ok());
+        assert!(schema.field_with_name(DIST_COL).is_err());
+
+        // Every scan of the version shares the table's fields.
+        let again = dataset
+            .scan()
+            .filterable_schema_with_fts_granularity(None)
+            .unwrap();
+        for other in [&again, &knn_schema] {
+            assert!(Arc::ptr_eq(&schema.fields()[0], &other.fields()[0]));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_filterable_schema_follows_new_versions() {
+        let mut dataset = gen_batch()
+            .col("a", array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(1), FragmentRowCount::from(4))
+            .await
+            .unwrap();
+        let before = Arc::new(dataset.clone())
+            .scan()
+            .filterable_schema_with_fts_granularity(None)
+            .unwrap();
+
+        dataset
+            .add_columns(
+                NewColumnTransform::SqlExpressions(vec![("b".into(), "a * 2".into())]),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let mut scan = Arc::new(dataset).scan();
+        assert!(before.field_with_name("b").is_err());
+        let after = scan.filterable_schema_with_fts_granularity(None).unwrap();
+        assert!(after.field_with_name("b").is_ok());
+        scan.filter("b = 4").unwrap();
+        assert_eq!(scan.try_into_batch().await.unwrap().num_rows(), 1);
+    }
+
+    /// A table recreated at the same URI and version in one session gets its
+    /// own filter schema.
+    #[tokio::test]
+    async fn test_filterable_schema_is_not_shared_with_a_recreated_table() {
+        let tmp = TempStrDir::default();
+        let uri = tmp.as_str().to_string();
+        let first = gen_batch()
+            .col("a", array::step::<Int32Type>())
+            .into_dataset(&uri, FragmentCount::from(1), FragmentRowCount::from(4))
+            .await
+            .unwrap();
+        let session = first.session();
+        let mut warm = Arc::new(first).scan();
+        warm.filter("a > 0").unwrap();
+        assert_eq!(warm.try_into_batch().await.unwrap().num_rows(), 3);
+
+        std::fs::remove_dir_all(tmp.as_str()).unwrap();
+        let batch = gen_batch()
+            .col("a", array::step::<Int32Type>())
+            .col("b", array::step::<Int32Type>())
+            .into_batch_rows(RowCount::from(4))
+            .unwrap();
+        let schema = batch.schema();
+        let params = WriteParams {
+            session: Some(session.clone()),
+            ..Default::default()
+        };
+        let recreated = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            &uri,
+            Some(params),
+        )
+        .await
+        .unwrap();
+        assert_eq!(recreated.version_id(), 1);
+        let reopened = DatasetBuilder::from_uri(&uri)
+            .with_session(session)
+            .load()
+            .await
+            .unwrap();
+        assert!(reopened.schema().field("b").is_some());
+
+        let mut scan = Arc::new(reopened).scan();
+        scan.filter("b > 0").unwrap();
+        assert_eq!(scan.try_into_batch().await.unwrap().num_rows(), 3);
+    }
+
+    /// A manifest assigned directly, without `set_manifest`, gets its own schema.
+    #[tokio::test]
+    async fn test_filterable_schema_follows_an_assigned_manifest() {
+        let old = Arc::new(
+            gen_batch()
+                .col("a", array::step::<Int32Type>())
+                .into_ram_dataset(FragmentCount::from(1), FragmentRowCount::from(4))
+                .await
+                .unwrap(),
+        );
+        let new = gen_batch()
+            .col("a", array::step::<Int32Type>())
+            .col("b", array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(1), FragmentRowCount::from(4))
+            .await
+            .unwrap();
+        let warm = old
+            .scan()
+            .filterable_schema_with_fts_granularity(None)
+            .unwrap();
+        assert!(warm.field_with_name("b").is_err());
+
+        // The clone shares the slot `old` filled.
+        let mut assigned = (*old).clone();
+        assigned.manifest = new.manifest.clone();
+        let schema = Arc::new(assigned)
+            .scan()
+            .filterable_schema_with_fts_granularity(None)
+            .unwrap();
+        assert!(schema.field_with_name("b").is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_filterable_schema_merges_a_colliding_extra_column() {
+        let dataset = Arc::new(
+            gen_batch()
+                .col("a", array::step::<Int32Type>())
+                .into_ram_dataset(FragmentCount::from(1), FragmentRowCount::from(4))
+                .await
+                .unwrap(),
+        );
+        let extra = [ArrowField::new("a", DataType::Int32, true)];
+        let expected = Projection::full(dataset.clone())
+            .with_row_id()
+            .with_row_addr()
+            .with_row_last_updated_at_version()
+            .with_row_created_at_version()
+            .to_schema()
+            .merge(&ArrowSchema::new(extra.to_vec()))
+            .unwrap();
+        assert_eq!(
+            *dataset.filterable_schema(&extra).unwrap(),
+            ArrowSchema::from(&expected)
+        );
+
+        // An incompatible type fails to merge, as before.
+        let incompatible = [ArrowField::new("a", DataType::Utf8, true)];
+        assert!(dataset.filterable_schema(&incompatible).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_unfiltered_scan_does_not_build_filterable_schema() {
+        let dataset = Arc::new(
+            gen_batch()
+                .col("a", array::step::<Int32Type>())
+                .into_ram_dataset(FragmentCount::from(1), FragmentRowCount::from(4))
+                .await
+                .unwrap(),
+        );
+        let scan = dataset.scan();
+        assert_eq!(scan.try_into_batch().await.unwrap().num_rows(), 4);
+        assert!(!dataset.filter_schema.is_built());
+
+        let mut filtered = dataset.scan();
+        filtered.filter("a > 0").unwrap();
+        filtered.try_into_batch().await.unwrap();
+        assert!(dataset.filter_schema.is_built());
     }
 }

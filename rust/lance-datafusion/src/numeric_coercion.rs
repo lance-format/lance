@@ -20,10 +20,9 @@ use datafusion::logical_expr::{Between, BinaryExpr, ExprSchemable, Operator};
 use datafusion::prelude::{Expr, lit};
 use datafusion::scalar::ScalarValue;
 use lance_core::Result;
-use lance_core::datatypes::Schema;
 
 use crate::expr::safe_coerce_scalar;
-use crate::logical_expr::{coerce_expr, resolve_column_type};
+use crate::logical_expr::{ColumnTypes, coerce_expr, resolve_column_type};
 use crate::planner::Planner;
 
 /// Inclusive lower and exclusive upper bounds, exactly representable as f64.
@@ -88,7 +87,7 @@ fn is_decimal(data_type: &DataType) -> bool {
     )
 }
 
-fn lower(column: &Expr, op: Operator, operand: &Expr, schema: &Schema) -> Option<Lowered> {
+fn lower(column: &Expr, op: Operator, operand: &Expr, schema: &dyn ColumnTypes) -> Option<Lowered> {
     use Operator::*;
     let data_type = resolve_column_type(column, schema)?;
     if is_decimal(&data_type) {
@@ -296,7 +295,7 @@ fn lower_decimal(
 /// integers and decimals whose exact value differs from what the coercion
 /// produces for decimal columns. Returns `None` for any other filter, so it
 /// keeps its current shape.
-pub fn rewrite(expr: &Expr, schema: &Schema) -> Option<Expr> {
+pub fn rewrite(expr: &Expr, schema: &dyn ColumnTypes) -> Option<Expr> {
     let negate = |expr: Expr, negated: bool| if negated { !expr } else { expr };
     match expr {
         Expr::BinaryExpr(BinaryExpr { left, op, right }) => {

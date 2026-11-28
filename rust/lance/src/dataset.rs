@@ -253,6 +253,8 @@ pub struct Dataset {
     pub refs: Refs,
     pub(crate) session: Arc<Session>,
     pub(crate) index_cache: Arc<DSIndexCache>,
+    /// The table and system columns filters resolve against, for `manifest`.
+    pub(crate) filter_schema: Arc<scanner::TableFilterSchema>,
 }
 
 impl std::fmt::Debug for Dataset {
@@ -532,6 +534,7 @@ impl Dataset {
             refs,
             session,
             index_cache,
+            filter_schema: Default::default(),
         }
     }
 
@@ -584,6 +587,7 @@ impl Dataset {
     fn set_manifest(&mut self, manifest: Arc<Manifest>, manifest_location: ManifestLocation) {
         self.table_state
             .set_manifest(&mut self.manifest, manifest, manifest_location);
+        self.filter_schema = Default::default();
     }
 
     /// Check out the latest version of the branch.

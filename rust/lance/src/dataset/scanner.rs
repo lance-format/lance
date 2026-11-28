@@ -12,6 +12,7 @@
 
 mod aggregate;
 mod builder;
+mod filter_schema;
 pub(crate) mod fts;
 mod list_structure;
 mod minhash;
@@ -20,6 +21,8 @@ mod source;
 #[cfg(test)]
 pub mod test_dataset;
 mod vector;
+
+pub(crate) use filter_schema::TableFilterSchema;
 
 pub use aggregate::{AggregateExpr, AggregateExprBuilder};
 pub use source::TakeOperation;
@@ -349,11 +352,21 @@ impl ExprFilter {
     #[allow(unused)]
     #[instrument(level = "trace", name = "filter_to_df", skip_all)]
     pub fn to_datafusion(&self, dataset_schema: &Schema, full_schema: &Schema) -> Result<Expr> {
+        self.to_datafusion_with_arrow(dataset_schema, Arc::new(ArrowSchema::from(full_schema)))
+    }
+
+    /// Like [`Self::to_datafusion`], with the full schema in Arrow form.
+    #[allow(unused)]
+    pub(crate) fn to_datafusion_with_arrow(
+        &self,
+        dataset_schema: &Schema,
+        full_arrow_schema: SchemaRef,
+    ) -> Result<Expr> {
         match self {
             Self::Sql(sql) => {
-                let schema = Arc::new(ArrowSchema::from(full_schema));
+                let schema = full_arrow_schema;
                 let planner = Planner::new(schema.clone());
-                let filter = planner.parse_filter_with_schema(sql, full_schema)?;
+                let filter = planner.parse_filter_with_schema(sql, schema.as_ref())?;
 
                 let df_schema = DFSchema::try_from(schema)?;
                 let ret_field = filter.to_field(&df_schema)?.1;
