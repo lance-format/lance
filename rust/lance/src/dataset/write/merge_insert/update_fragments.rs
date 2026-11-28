@@ -573,11 +573,30 @@ impl MergeInsertJob {
                 let reader = RecordBatchIterator::new(batches, write_schema.clone());
                 let stream = reader_to_stream(Box::new(reader));
 
-                let write_schema = dataset.schema().project_by_schema(
-                    write_schema.as_ref(),
-                    OnMissing::Error,
-                    OnTypeMismatch::Error,
-                )?;
+                let write_schema = dataset
+                    .schema()
+                    .project_by_schema(
+                        write_schema.as_ref(),
+                        OnMissing::Error,
+                        OnTypeMismatch::Error,
+                    )
+                    .or_else(|error| {
+                        if !versions::writes_blob_v2(write_version) {
+                            return Err(error);
+                        }
+                        // Match legacy Blob list items to the target's logical v2
+                        // shape while retaining its field IDs. The original byte
+                        // arrays are converted by the Blob v2 writer.
+                        let source =
+                            lance_core::datatypes::Schema::try_from(write_schema.as_ref())?;
+                        let (source, target) =
+                            lance_table_runtime::write::blob_write_comparison_schemas(
+                                &source,
+                                dataset.schema(),
+                                write_version,
+                            )?;
+                        target.project_by_schema(&source, OnMissing::Error, OnTypeMismatch::Error)
+                    })?;
 
                 let (fragments, _) = if let Some(scope) = diagnostics {
                     write_fragments_internal_impl(
