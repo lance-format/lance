@@ -13,6 +13,8 @@ use futures::TryStreamExt;
 use object_store::path::Path;
 
 use lance_core::error::{Error, Result};
+
+use crate::vector::kmeans::HierarchicalNodeAlgorithm;
 use lance_io::stream::RecordBatchStream;
 
 /// Parameters to build IVF partitions
@@ -67,6 +69,14 @@ pub struct IvfBuildParams {
     /// experimental and defaults to 0 to preserve existing behavior.
     pub streaming_refine_passes: usize,
 
+    /// The clustering each node of hierarchical k-means runs when IVF trains
+    /// more than 256 partitions from a sample. `None` picks e-means for L2 and
+    /// cosine and Lloyd for dot; set
+    /// [`HierarchicalNodeAlgorithm::Lloyd`] to train with Lloyd, bounded by
+    /// [`Self::max_iters`], under every distance. e-means supports only L2 and
+    /// cosine. Streaming training and incremental retraining always run Lloyd.
+    pub kmeans_algorithm: Option<HierarchicalNodeAlgorithm>,
+
     /// Precomputed partitions file (row_id -> partition_id)
     /// mutually exclusive with `precomputed_shuffle_buffers`
     /// requires `centroids` to be set and `retrain` to be false
@@ -99,6 +109,7 @@ impl Default for IvfBuildParams {
             streaming_sample_rate: None,
             streaming_coreset_rate: None,
             streaming_refine_passes: 0,
+            kmeans_algorithm: None,
             precomputed_partitions_file: None,
             precomputed_shuffle_buffers: None,
             shuffle_partition_batches: 1024 * 10,

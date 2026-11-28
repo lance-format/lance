@@ -1,0 +1,148 @@
+loaded 33554432 x 1024 rows and 1000 queries in 10.4s
+found the exact neighbours in 74.5s
+wrote 33554432 rows in 32 fragments in 198.4s
+21:31:52 d1024n16m-main-k16384-m128-c96-r1
+d1024n16m-main-k16384-m128-c96-r1: built IVF16384,PQ128 on 16777216 x 1024 in 116.5s
+d1024n16m-main-k16384-m128-c96-r1: recall@10 0.6437 at nprobes 64, refine 0
+d1024n16m-main-k16384-m128-c96-r1: recall@10 0.6452 at nprobes 256, refine 0
+21:34:36 d1024n16m-before-k16384-m128-c96-r1
+d1024n16m-before-k16384-m128-c96-r1: built IVF16384,PQ128 on 16777216 x 1024 in 112.7s
+d1024n16m-before-k16384-m128-c96-r1: recall@10 0.6277 at nprobes 64, refine 0
+d1024n16m-before-k16384-m128-c96-r1: recall@10 0.6312 at nprobes 256, refine 0
+21:36:57 d1024n16m-after-k16384-m128-c96-r1
+d1024n16m-after-k16384-m128-c96-r1: built IVF16384,PQ128 on 16777216 x 1024 in 62.9s
+d1024n16m-after-k16384-m128-c96-r1: recall@10 0.6415 at nprobes 64, refine 0
+d1024n16m-after-k16384-m128-c96-r1: recall@10 0.6442 at nprobes 256, refine 0
+21:38:29 d128n67m-main-k65536-m16-c96-r1
+d128n67m-main-k65536-m16-c96-r1: built IVF65536,PQ16 on 67108864 x 128 in 132.9s
+d128n67m-main-k65536-m16-c96-r1: recall@10 0.4643 at nprobes 256, refine 0
+d128n67m-main-k65536-m16-c96-r1: recall@10 0.4644 at nprobes 1024, refine 0
+21:41:48 d128n67m-before-k65536-m16-c96-r1
+d128n67m-before-k65536-m16-c96-r1: built IVF65536,PQ16 on 67108864 x 128 in 94.4s
+d128n67m-before-k65536-m16-c96-r1: recall@10 0.4585 at nprobes 256, refine 0
+d128n67m-before-k65536-m16-c96-r1: recall@10 0.4585 at nprobes 1024, refine 0
+21:44:30 d128n67m-after-k65536-m16-c96-r1
+d128n67m-after-k65536-m16-c96-r1: built IVF65536,PQ16 on 67108864 x 128 in 58.6s
+d128n67m-after-k65536-m16-c96-r1: recall@10 0.4639 at nprobes 256, refine 0
+d128n67m-after-k65536-m16-c96-r1: recall@10 0.4640 at nprobes 1024, refine 0
+21:46:37 d1024n33m-main-k32768-m128-c96-r1
+d1024n33m-main-k32768-m128-c96-r1: built IVF32768,PQ128 on 33554432 x 1024 in 250.7s
+d1024n33m-main-k32768-m128-c96-r1: recall@10 0.6376 at nprobes 128, refine 0
+d1024n33m-main-k32768-m128-c96-r1: recall@10 0.6381 at nprobes 512, refine 0
+21:51:54 d1024n33m-before-k32768-m128-c96-r1
+d1024n33m-before-k32768-m128-c96-r1: built IVF32768,PQ128 on 33554432 x 1024 in 229.4s
+d1024n33m-before-k32768-m128-c96-r1: recall@10 0.6408 at nprobes 128, refine 0
+d1024n33m-before-k32768-m128-c96-r1: recall@10 0.6418 at nprobes 512, refine 0
+21:56:51 d1024n33m-after-k32768-m128-c96-r1
+d1024n33m-after-k32768-m128-c96-r1: built IVF32768,PQ128 on 33554432 x 1024 in 134.0s
+d1024n33m-after-k32768-m128-c96-r1: recall@10 0.6383 at nprobes 128, refine 0
+d1024n33m-after-k32768-m128-c96-r1: recall@10 0.6389 at nprobes 512, refine 0
+22:00:11 d128n67m-main-k16384-m16-c96-r1
+d128n67m-main-k16384-m16-c96-r1: built IVF16384,PQ16 on 67108864 x 128 in 84.0s
+d128n67m-main-k16384-m16-c96-r1: recall@10 0.4383 at nprobes 64, refine 0
+d128n67m-main-k16384-m16-c96-r1: recall@10 0.4391 at nprobes 256, refine 0
+22:01:40 d128n67m-before-k16384-m16-c96-r1
+d128n67m-before-k16384-m16-c96-r1: built IVF16384,PQ16 on 67108864 x 128 in 75.7s
+d128n67m-before-k16384-m16-c96-r1: recall@10 0.4380 at nprobes 64, refine 0
+d128n67m-before-k16384-m16-c96-r1: recall@10 0.4385 at nprobes 256, refine 0
+22:03:01 d128n67m-after-k16384-m16-c96-r1
+d128n67m-after-k16384-m16-c96-r1: built IVF16384,PQ16 on 67108864 x 128 in 45.8s
+d128n67m-after-k16384-m16-c96-r1: recall@10 0.4361 at nprobes 64, refine 0
+d128n67m-after-k16384-m16-c96-r1: recall@10 0.4368 at nprobes 256, refine 0
+22:03:52 d1024n16m-main-k4096-m128-c96-r1
+d1024n16m-main-k4096-m128-c96-r1: built IVF4096,PQ128 on 16777216 x 1024 in 69.0s
+d1024n16m-main-k4096-m128-c96-r1: recall@10 0.6440 at nprobes 16, refine 0
+d1024n16m-main-k4096-m128-c96-r1: recall@10 0.6568 at nprobes 64, refine 0
+22:05:09 d1024n16m-before-k4096-m128-c96-r1
+d1024n16m-before-k4096-m128-c96-r1: built IVF4096,PQ128 on 16777216 x 1024 in 62.9s
+d1024n16m-before-k4096-m128-c96-r1: recall@10 0.6454 at nprobes 16, refine 0
+d1024n16m-before-k4096-m128-c96-r1: recall@10 0.6561 at nprobes 64, refine 0
+22:06:20 d1024n16m-after-k4096-m128-c96-r1
+d1024n16m-after-k4096-m128-c96-r1: built IVF4096,PQ128 on 16777216 x 1024 in 50.2s
+d1024n16m-after-k4096-m128-c96-r1: recall@10 0.6430 at nprobes 16, refine 0
+d1024n16m-after-k4096-m128-c96-r1: recall@10 0.6552 at nprobes 64, refine 0
+22:07:18 d1024n16m-main-k16384-m128-c24-r1
+d1024n16m-main-k16384-m128-c24-r1: built IVF16384,PQ128 on 16777216 x 1024 in 189.0s
+d1024n16m-main-k16384-m128-c24-r1: recall@10 0.6383 at nprobes 64, refine 0
+d1024n16m-main-k16384-m128-c24-r1: recall@10 0.6421 at nprobes 256, refine 0
+22:10:56 d1024n16m-before-k16384-m128-c24-r1
+d1024n16m-before-k16384-m128-c24-r1: built IVF16384,PQ128 on 16777216 x 1024 in 173.7s
+d1024n16m-before-k16384-m128-c24-r1: recall@10 0.6351 at nprobes 64, refine 0
+d1024n16m-before-k16384-m128-c24-r1: recall@10 0.6394 at nprobes 256, refine 0
+22:14:18 d1024n16m-after-k16384-m128-c24-r1
+d1024n16m-after-k16384-m128-c24-r1: built IVF16384,PQ128 on 16777216 x 1024 in 126.6s
+d1024n16m-after-k16384-m128-c24-r1: recall@10 0.6396 at nprobes 64, refine 0
+d1024n16m-after-k16384-m128-c24-r1: recall@10 0.6427 at nprobes 256, refine 0
+22:16:53 d1024n16m-main-k16384-m128-c96-r2
+d1024n16m-main-k16384-m128-c96-r2: built IVF16384,PQ128 on 16777216 x 1024 in 118.6s
+d1024n16m-main-k16384-m128-c96-r2: recall@10 0.6427 at nprobes 64, refine 0
+d1024n16m-main-k16384-m128-c96-r2: recall@10 0.6456 at nprobes 256, refine 0
+22:19:21 d1024n16m-before-k16384-m128-c96-r2
+d1024n16m-before-k16384-m128-c96-r2: built IVF16384,PQ128 on 16777216 x 1024 in 112.2s
+d1024n16m-before-k16384-m128-c96-r2: recall@10 0.6396 at nprobes 64, refine 0
+d1024n16m-before-k16384-m128-c96-r2: recall@10 0.6435 at nprobes 256, refine 0
+22:21:43 d1024n16m-after-k16384-m128-c96-r2
+d1024n16m-after-k16384-m128-c96-r2: built IVF16384,PQ128 on 16777216 x 1024 in 63.1s
+d1024n16m-after-k16384-m128-c96-r2: recall@10 0.6439 at nprobes 64, refine 0
+d1024n16m-after-k16384-m128-c96-r2: recall@10 0.6455 at nprobes 256, refine 0
+22:23:15 d128n67m-main-k65536-m16-c96-r2
+d128n67m-main-k65536-m16-c96-r2: built IVF65536,PQ16 on 67108864 x 128 in 133.6s
+d128n67m-main-k65536-m16-c96-r2: recall@10 0.4626 at nprobes 256, refine 0
+d128n67m-main-k65536-m16-c96-r2: recall@10 0.4625 at nprobes 1024, refine 0
+22:26:35 d128n67m-before-k65536-m16-c96-r2
+d128n67m-before-k65536-m16-c96-r2: built IVF65536,PQ16 on 67108864 x 128 in 91.7s
+d128n67m-before-k65536-m16-c96-r2: recall@10 0.4717 at nprobes 256, refine 0
+d128n67m-before-k65536-m16-c96-r2: recall@10 0.4718 at nprobes 1024, refine 0
+22:29:12 d128n67m-after-k65536-m16-c96-r2
+d128n67m-after-k65536-m16-c96-r2: built IVF65536,PQ16 on 67108864 x 128 in 57.6s
+d128n67m-after-k65536-m16-c96-r2: recall@10 0.4593 at nprobes 256, refine 0
+d128n67m-after-k65536-m16-c96-r2: recall@10 0.4593 at nprobes 1024, refine 0
+22:31:16 d1024n33m-main-k32768-m128-c96-r2
+d1024n33m-main-k32768-m128-c96-r2: built IVF32768,PQ128 on 33554432 x 1024 in 248.3s
+d1024n33m-main-k32768-m128-c96-r2: recall@10 0.6401 at nprobes 128, refine 0
+d1024n33m-main-k32768-m128-c96-r2: recall@10 0.6415 at nprobes 512, refine 0
+22:36:30 d1024n33m-before-k32768-m128-c96-r2
+d1024n33m-before-k32768-m128-c96-r2: built IVF32768,PQ128 on 33554432 x 1024 in 231.7s
+d1024n33m-before-k32768-m128-c96-r2: recall@10 0.6378 at nprobes 128, refine 0
+d1024n33m-before-k32768-m128-c96-r2: recall@10 0.6387 at nprobes 512, refine 0
+22:41:28 d1024n33m-after-k32768-m128-c96-r2
+d1024n33m-after-k32768-m128-c96-r2: built IVF32768,PQ128 on 33554432 x 1024 in 133.7s
+d1024n33m-after-k32768-m128-c96-r2: recall@10 0.6383 at nprobes 128, refine 0
+d1024n33m-after-k32768-m128-c96-r2: recall@10 0.6390 at nprobes 512, refine 0
+22:44:48 d128n67m-main-k16384-m16-c96-r2
+d128n67m-main-k16384-m16-c96-r2: built IVF16384,PQ16 on 67108864 x 128 in 85.8s
+d128n67m-main-k16384-m16-c96-r2: recall@10 0.4307 at nprobes 64, refine 0
+d128n67m-main-k16384-m16-c96-r2: recall@10 0.4308 at nprobes 256, refine 0
+22:46:19 d128n67m-before-k16384-m16-c96-r2
+d128n67m-before-k16384-m16-c96-r2: built IVF16384,PQ16 on 67108864 x 128 in 76.6s
+d128n67m-before-k16384-m16-c96-r2: recall@10 0.4389 at nprobes 64, refine 0
+d128n67m-before-k16384-m16-c96-r2: recall@10 0.4391 at nprobes 256, refine 0
+22:47:41 d128n67m-after-k16384-m16-c96-r2
+d128n67m-after-k16384-m16-c96-r2: built IVF16384,PQ16 on 67108864 x 128 in 46.3s
+d128n67m-after-k16384-m16-c96-r2: recall@10 0.4374 at nprobes 64, refine 0
+d128n67m-after-k16384-m16-c96-r2: recall@10 0.4374 at nprobes 256, refine 0
+22:48:33 d1024n16m-main-k4096-m128-c96-r2
+d1024n16m-main-k4096-m128-c96-r2: built IVF4096,PQ128 on 16777216 x 1024 in 68.6s
+d1024n16m-main-k4096-m128-c96-r2: recall@10 0.6438 at nprobes 16, refine 0
+d1024n16m-main-k4096-m128-c96-r2: recall@10 0.6565 at nprobes 64, refine 0
+22:49:50 d1024n16m-before-k4096-m128-c96-r2
+d1024n16m-before-k4096-m128-c96-r2: built IVF4096,PQ128 on 16777216 x 1024 in 62.4s
+d1024n16m-before-k4096-m128-c96-r2: recall@10 0.6401 at nprobes 16, refine 0
+d1024n16m-before-k4096-m128-c96-r2: recall@10 0.6516 at nprobes 64, refine 0
+22:51:00 d1024n16m-after-k4096-m128-c96-r2
+d1024n16m-after-k4096-m128-c96-r2: built IVF4096,PQ128 on 16777216 x 1024 in 49.3s
+d1024n16m-after-k4096-m128-c96-r2: recall@10 0.6370 at nprobes 16, refine 0
+d1024n16m-after-k4096-m128-c96-r2: recall@10 0.6487 at nprobes 64, refine 0
+22:51:58 d1024n16m-main-k16384-m128-c24-r2
+d1024n16m-main-k16384-m128-c24-r2: built IVF16384,PQ128 on 16777216 x 1024 in 188.3s
+d1024n16m-main-k16384-m128-c24-r2: recall@10 0.6333 at nprobes 64, refine 0
+d1024n16m-main-k16384-m128-c24-r2: recall@10 0.6366 at nprobes 256, refine 0
+22:55:35 d1024n16m-before-k16384-m128-c24-r2
+d1024n16m-before-k16384-m128-c24-r2: built IVF16384,PQ128 on 16777216 x 1024 in 174.5s
+d1024n16m-before-k16384-m128-c24-r2: recall@10 0.6428 at nprobes 64, refine 0
+d1024n16m-before-k16384-m128-c24-r2: recall@10 0.6455 at nprobes 256, refine 0
+22:58:58 d1024n16m-after-k16384-m128-c24-r2
+d1024n16m-after-k16384-m128-c24-r2: built IVF16384,PQ128 on 16777216 x 1024 in 124.3s
+d1024n16m-after-k16384-m128-c24-r2: recall@10 0.6359 at nprobes 64, refine 0
+d1024n16m-after-k16384-m128-c24-r2: recall@10 0.6397 at nprobes 256, refine 0
+AB DONE

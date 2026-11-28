@@ -1,0 +1,11 @@
+# started on Wed Nov 18 23:37:45 2026
+
+
+ Performance counter stats for process id '25239':
+
+              6861      page-faults                                                           
+            110121      context-switches                                                      
+               108      cpu-migrations                                                        
+
+       5.005954606 seconds time elapsed
+

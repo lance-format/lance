@@ -1,0 +1,177 @@
+loaded 67108864 x 64 base and 100000 queries in 18.9s
+lloyd-d64-n67108864-k262144-b1-e3-t96-s1-timing: trained 262144 centroids in 137.7s (13071.8s CPU)
+lloyd-d64-n67108864-k262144-b1-e3-t96-s1-timing: validation MSE 35611.51, training MSE 33922.65
+loaded 67108864 x 64 base and 100000 queries in 18.9s
+emeans-d64-n67108864-k262144-b1-e3-t96-s1-timing: trained 262144 centroids in 10.4s (895.2s CPU)
+emeans-d64-n67108864-k262144-b1-e3-t96-s1-timing: validation MSE 35546.35, training MSE 33920.71
+loaded 67108864 x 64 base and 100000 queries in 19.0s
+lloyd-d64-n67108864-k262144-b1-e3-t96-s2-timing: trained 262144 centroids in 135.7s (12888.4s CPU)
+lloyd-d64-n67108864-k262144-b1-e3-t96-s2-timing: validation MSE 35636.86, training MSE 33941.07
+loaded 67108864 x 64 base and 100000 queries in 19.0s
+emeans-d64-n67108864-k262144-b1-e3-t96-s2-timing: trained 262144 centroids in 10.4s (888.2s CPU)
+emeans-d64-n67108864-k262144-b1-e3-t96-s2-timing: validation MSE 35568.99, training MSE 33897.69
+loaded 67108864 x 64 base and 10000 queries in 18.4s
+lloyd-d64-n67108864-k262144-b1-e3-t96-s1-profile: trained 262144 centroids in 179.0s (17043.0s CPU)
+lloyd-d64-n67108864-k262144-b1-e3-t96-s1-profile: validation MSE 35306.57, training MSE 34037.02
+loaded 67108864 x 64 base and 10000 queries in 18.4s
+emeans-d64-n67108864-k262144-b1-e3-t96-s1-profile: trained 262144 centroids in 20.4s (1852.7s CPU)
+emeans-d64-n67108864-k262144-b1-e3-t96-s1-profile: validation MSE 35262.16, training MSE 34110.11
+loaded 67108864 x 128 base and 100000 queries in 21.4s
+lloyd-d128-n67108864-k262144-b1-e3-t96-s1-timing: trained 262144 centroids in 130.4s (12339.3s CPU)
+lloyd-d128-n67108864-k262144-b1-e3-t96-s1-timing: validation MSE 60441.43, training MSE 57408.27
+loaded 67108864 x 128 base and 100000 queries in 21.4s
+emeans-d128-n67108864-k262144-b1-e3-t96-s1-timing: trained 262144 centroids in 16.2s (1437.7s CPU)
+emeans-d128-n67108864-k262144-b1-e3-t96-s1-timing: validation MSE 60344.28, training MSE 57259.78
+loaded 67108864 x 128 base and 100000 queries in 21.4s
+lloyd-d128-n67108864-k262144-b1-e3-t96-s2-timing: trained 262144 centroids in 134.7s (12751.4s CPU)
+lloyd-d128-n67108864-k262144-b1-e3-t96-s2-timing: validation MSE 60452.27, training MSE 57376.19
+loaded 67108864 x 128 base and 100000 queries in 21.5s
+emeans-d128-n67108864-k262144-b1-e3-t96-s2-timing: trained 262144 centroids in 15.4s (1359.9s CPU)
+emeans-d128-n67108864-k262144-b1-e3-t96-s2-timing: validation MSE 60356.41, training MSE 57274.24
+loaded 67108864 x 128 base and 10000 queries in 21.4s
+lloyd-d128-n67108864-k262144-b1-e3-t96-s1-profile: trained 262144 centroids in 178.5s (16948.6s CPU)
+lloyd-d128-n67108864-k262144-b1-e3-t96-s1-profile: validation MSE 60109.69, training MSE 57677.49
+loaded 67108864 x 128 base and 10000 queries in 21.3s
+emeans-d128-n67108864-k262144-b1-e3-t96-s1-profile: trained 262144 centroids in 23.4s (2125.4s CPU)
+emeans-d128-n67108864-k262144-b1-e3-t96-s1-profile: validation MSE 59900.59, training MSE 57454.55
+loaded 67108864 x 128 base and 10000 queries in 241.5s
+lloyd-d128-n67108864-k262144-b1-e3-t1-s1-profile: trained 262144 centroids in 631.6s (637.1s CPU)
+lloyd-d128-n67108864-k262144-b1-e3-t1-s1-profile: validation MSE 60109.69, training MSE 57677.49
+loaded 67108864 x 128 base and 10000 queries in 242.6s
+emeans-d128-n67108864-k262144-b1-e3-t1-s1-profile: trained 262144 centroids in 177.9s (179.3s CPU)
+emeans-d128-n67108864-k262144-b1-e3-t1-s1-profile: validation MSE 59900.59, training MSE 57454.55
+loaded 67108864 x 256 base and 100000 queries in 27.4s
+lloyd-d256-n67108864-k262144-b1-e3-t96-s1-timing: trained 262144 centroids in 139.7s (13177.0s CPU)
+lloyd-d256-n67108864-k262144-b1-e3-t96-s1-timing: validation MSE 93701.91, training MSE 88492.96
+loaded 67108864 x 256 base and 100000 queries in 27.5s
+emeans-d256-n67108864-k262144-b1-e3-t96-s1-timing: trained 262144 centroids in 22.8s (2054.6s CPU)
+emeans-d256-n67108864-k262144-b1-e3-t96-s1-timing: validation MSE 93640.48, training MSE 88202.59
+loaded 67108864 x 256 base and 100000 queries in 27.5s
+lloyd-d256-n67108864-k262144-b1-e3-t96-s2-timing: trained 262144 centroids in 139.7s (13166.9s CPU)
+lloyd-d256-n67108864-k262144-b1-e3-t96-s2-timing: validation MSE 93710.30, training MSE 88505.57
+loaded 67108864 x 256 base and 100000 queries in 27.5s
+emeans-d256-n67108864-k262144-b1-e3-t96-s2-timing: trained 262144 centroids in 25.3s (2294.9s CPU)
+emeans-d256-n67108864-k262144-b1-e3-t96-s2-timing: validation MSE 93570.80, training MSE 88231.58
+loaded 67108864 x 256 base and 10000 queries in 27.4s
+lloyd-d256-n67108864-k262144-b1-e3-t96-s1-profile: trained 262144 centroids in 176.2s (16665.5s CPU)
+lloyd-d256-n67108864-k262144-b1-e3-t96-s1-profile: validation MSE 93243.50, training MSE 88544.69
+loaded 67108864 x 256 base and 10000 queries in 27.4s
+emeans-d256-n67108864-k262144-b1-e3-t96-s1-profile: trained 262144 centroids in 29.6s (2701.7s CPU)
+emeans-d256-n67108864-k262144-b1-e3-t96-s1-profile: validation MSE 93060.20, training MSE 88443.29
+loaded 67108864 x 512 base and 100000 queries in 39.9s
+lloyd-d512-n67108864-k262144-b1-e3-t96-s1-timing: trained 262144 centroids in 154.6s (14508.2s CPU)
+lloyd-d512-n67108864-k262144-b1-e3-t96-s1-timing: validation MSE 133920.76, training MSE 126223.12
+loaded 67108864 x 512 base and 100000 queries in 39.9s
+emeans-d512-n67108864-k262144-b1-e3-t96-s1-timing: trained 262144 centroids in 42.0s (3857.7s CPU)
+emeans-d512-n67108864-k262144-b1-e3-t96-s1-timing: validation MSE 133776.34, training MSE 125665.51
+loaded 67108864 x 512 base and 100000 queries in 39.9s
+lloyd-d512-n67108864-k262144-b1-e3-t96-s2-timing: trained 262144 centroids in 157.2s (14756.8s CPU)
+lloyd-d512-n67108864-k262144-b1-e3-t96-s2-timing: validation MSE 133969.98, training MSE 126217.05
+loaded 67108864 x 512 base and 100000 queries in 40.0s
+emeans-d512-n67108864-k262144-b1-e3-t96-s2-timing: trained 262144 centroids in 42.5s (3901.7s CPU)
+emeans-d512-n67108864-k262144-b1-e3-t96-s2-timing: validation MSE 133746.61, training MSE 125810.97
+loaded 67108864 x 512 base and 10000 queries in 39.8s
+lloyd-d512-n67108864-k262144-b1-e3-t96-s1-profile: trained 262144 centroids in 183.9s (17306.0s CPU)
+lloyd-d512-n67108864-k262144-b1-e3-t96-s1-profile: validation MSE 133369.90, training MSE 126482.44
+loaded 67108864 x 512 base and 10000 queries in 39.8s
+emeans-d512-n67108864-k262144-b1-e3-t96-s1-profile: trained 262144 centroids in 44.4s (4097.2s CPU)
+emeans-d512-n67108864-k262144-b1-e3-t96-s1-profile: validation MSE 133212.99, training MSE 125676.54
+loaded 67108864 x 1024 base and 100000 queries in 22.4s
+lloyd-d1024-n67108864-k262144-b1-e3-t96-s1-timing: trained 262144 centroids in 205.7s (19077.9s CPU)
+lloyd-d1024-n67108864-k262144-b1-e3-t96-s1-timing: validation MSE 171975.67, training MSE 162282.69
+loaded 67108864 x 1024 base and 100000 queries in 22.3s
+emeans-d1024-n67108864-k262144-b1-e3-t96-s1-timing: trained 262144 centroids in 54.1s (4979.0s CPU)
+emeans-d1024-n67108864-k262144-b1-e3-t96-s1-timing: validation MSE 171742.57, training MSE 161735.66
+loaded 67108864 x 1024 base and 100000 queries in 22.4s
+lloyd-d1024-n67108864-k262144-b1-e3-t96-s2-timing: trained 262144 centroids in 204.5s (18970.6s CPU)
+lloyd-d1024-n67108864-k262144-b1-e3-t96-s2-timing: validation MSE 172041.84, training MSE 162342.73
+loaded 67108864 x 1024 base and 100000 queries in 22.7s
+emeans-d1024-n67108864-k262144-b1-e3-t96-s2-timing: trained 262144 centroids in 81.8s (7567.5s CPU)
+emeans-d1024-n67108864-k262144-b1-e3-t96-s2-timing: validation MSE 171695.26, training MSE 161830.43
+loaded 67108864 x 1024 base and 10000 queries in 22.1s
+lloyd-d1024-n67108864-k262144-b1-e3-t96-s1-profile: trained 262144 centroids in 215.8s (20051.5s CPU)
+lloyd-d1024-n67108864-k262144-b1-e3-t96-s1-profile: validation MSE 171344.33, training MSE 162475.91
+loaded 67108864 x 1024 base and 10000 queries in 22.6s
+emeans-d1024-n67108864-k262144-b1-e3-t96-s1-profile: trained 262144 centroids in 82.2s (7609.4s CPU)
+emeans-d1024-n67108864-k262144-b1-e3-t96-s1-profile: validation MSE 170985.46, training MSE 161950.07
+loaded 67108864 x 64 base and 100000 queries in 18.4s
+emeans-d64-n67108864-k262144-b1-e3-t96-s1-baseline: trained 262144 centroids in 10.8s (927.6s CPU)
+emeans-d64-n67108864-k262144-b1-e3-t96-s1-baseline: validation MSE 35546.35, training MSE 33920.71
+loaded 67108864 x 128 base and 100000 queries in 21.4s
+emeans-d128-n67108864-k262144-b1-e3-t96-s1-baseline: trained 262144 centroids in 15.1s (1340.0s CPU)
+emeans-d128-n67108864-k262144-b1-e3-t96-s1-baseline: validation MSE 60344.28, training MSE 57259.78
+loaded 67108864 x 256 base and 100000 queries in 27.4s
+emeans-d256-n67108864-k262144-b1-e3-t96-s1-baseline: trained 262144 centroids in 22.9s (2067.7s CPU)
+emeans-d256-n67108864-k262144-b1-e3-t96-s1-baseline: validation MSE 93640.48, training MSE 88202.59
+loaded 67108864 x 512 base and 100000 queries in 39.9s
+emeans-d512-n67108864-k262144-b1-e3-t96-s1-baseline: trained 262144 centroids in 44.9s (4098.5s CPU)
+emeans-d512-n67108864-k262144-b1-e3-t96-s1-baseline: validation MSE 133776.34, training MSE 125665.51
+loaded 67108864 x 1024 base and 100000 queries in 22.4s
+emeans-d1024-n67108864-k262144-b1-e3-t96-s1-baseline: trained 262144 centroids in 96.6s (8774.9s CPU)
+emeans-d1024-n67108864-k262144-b1-e3-t96-s1-baseline: validation MSE 171742.57, training MSE 161735.66
+loaded 67108864 x 128 base and 100000 queries in 243.9s
+lloyd-d128-n67108864-k262144-b1-e3-t1-s1-timing: trained 262144 centroids in 433.6s (437.3s CPU)
+lloyd-d128-n67108864-k262144-b1-e3-t1-s1-timing: validation MSE 60441.43, training MSE 57408.27
+loaded 67108864 x 128 base and 100000 queries in 242.8s
+emeans-d128-n67108864-k262144-b1-e3-t1-s1-timing: trained 262144 centroids in 147.5s (148.7s CPU)
+emeans-d128-n67108864-k262144-b1-e3-t1-s1-timing: validation MSE 60344.28, training MSE 57259.78
+loaded 67108864 x 128 base and 10000 queries in 20.3s
+lloyd-d128-n67108864-k262144-b1-e3-t48-s1-profile: trained 262144 centroids in 180.6s (8572.0s CPU)
+lloyd-d128-n67108864-k262144-b1-e3-t48-s1-profile: validation MSE 60109.69, training MSE 57677.49
+loaded 67108864 x 128 base and 10000 queries in 20.2s
+emeans-d128-n67108864-k262144-b1-e3-t48-s1-profile: trained 262144 centroids in 24.8s (1137.6s CPU)
+emeans-d128-n67108864-k262144-b1-e3-t48-s1-profile: validation MSE 59900.59, training MSE 57454.55
+loaded 67108864 x 128 base and 10000 queries in 23.2s
+lloyd-d128-n67108864-k262144-b1-e3-t24-s1-profile: trained 262144 centroids in 152.7s (3625.3s CPU)
+lloyd-d128-n67108864-k262144-b1-e3-t24-s1-profile: validation MSE 60109.69, training MSE 57677.49
+loaded 67108864 x 128 base and 10000 queries in 23.1s
+emeans-d128-n67108864-k262144-b1-e3-t24-s1-profile: trained 262144 centroids in 22.6s (516.5s CPU)
+emeans-d128-n67108864-k262144-b1-e3-t24-s1-profile: validation MSE 59900.59, training MSE 57454.55
+loaded 67108864 x 128 base and 10000 queries in 32.6s
+lloyd-d128-n67108864-k262144-b1-e3-t12-s1-profile: trained 262144 centroids in 121.2s (1443.0s CPU)
+lloyd-d128-n67108864-k262144-b1-e3-t12-s1-profile: validation MSE 60109.69, training MSE 57677.49
+loaded 67108864 x 128 base and 10000 queries in 32.5s
+emeans-d128-n67108864-k262144-b1-e3-t12-s1-profile: trained 262144 centroids in 20.4s (232.7s CPU)
+emeans-d128-n67108864-k262144-b1-e3-t12-s1-profile: validation MSE 59900.59, training MSE 57454.55
+loaded 67108864 x 128 base and 100000 queries in 21.5s
+emeans-d128-n67108864-k262144-b0.5-e3-t96-s1-timing: trained 262144 centroids in 12.8s (1113.2s CPU)
+emeans-d128-n67108864-k262144-b0.5-e3-t96-s1-timing: validation MSE 60325.17, training MSE 57265.88
+loaded 67108864 x 128 base and 100000 queries in 21.5s
+emeans-d128-n67108864-k262144-b0.5-e3-t96-s2-timing: trained 262144 centroids in 14.9s (1320.4s CPU)
+emeans-d128-n67108864-k262144-b0.5-e3-t96-s2-timing: validation MSE 60335.45, training MSE 57255.43
+loaded 67108864 x 128 base and 100000 queries in 21.5s
+emeans-d128-n67108864-k262144-b0.5-e3-t96-s3-timing: trained 262144 centroids in 14.6s (1286.1s CPU)
+emeans-d128-n67108864-k262144-b0.5-e3-t96-s3-timing: validation MSE 60367.02, training MSE 57261.32
+loaded 67108864 x 128 base and 10000 queries in 21.4s
+emeans-d128-n67108864-k262144-b0.5-e3-t96-s1-profile: trained 262144 centroids in 23.2s (2105.0s CPU)
+emeans-d128-n67108864-k262144-b0.5-e3-t96-s1-profile: validation MSE 59870.34, training MSE 57374.78
+loaded 67108864 x 128 base and 100000 queries in 21.5s
+emeans-d128-n67108864-k262144-b2-e3-t96-s1-timing: trained 262144 centroids in 15.5s (1377.4s CPU)
+emeans-d128-n67108864-k262144-b2-e3-t96-s1-timing: validation MSE 60379.59, training MSE 57340.82
+loaded 67108864 x 128 base and 100000 queries in 21.5s
+emeans-d128-n67108864-k262144-b2-e3-t96-s2-timing: trained 262144 centroids in 16.7s (1486.0s CPU)
+emeans-d128-n67108864-k262144-b2-e3-t96-s2-timing: validation MSE 60365.23, training MSE 57325.36
+loaded 67108864 x 128 base and 100000 queries in 21.5s
+emeans-d128-n67108864-k262144-b2-e3-t96-s3-timing: trained 262144 centroids in 16.1s (1437.9s CPU)
+emeans-d128-n67108864-k262144-b2-e3-t96-s3-timing: validation MSE 60408.41, training MSE 57296.33
+loaded 67108864 x 128 base and 10000 queries in 21.4s
+emeans-d128-n67108864-k262144-b2-e3-t96-s1-profile: trained 262144 centroids in 23.1s (2110.6s CPU)
+emeans-d128-n67108864-k262144-b2-e3-t96-s1-profile: validation MSE 59941.27, training MSE 57574.27
+loaded 67108864 x 128 base and 100000 queries in 21.5s
+emeans-d128-n67108864-k262144-b1-e2-t96-s1-timing: trained 262144 centroids in 14.4s (1266.4s CPU)
+emeans-d128-n67108864-k262144-b1-e2-t96-s1-timing: validation MSE 60436.97, training MSE 57374.62
+loaded 67108864 x 128 base and 100000 queries in 21.5s
+emeans-d128-n67108864-k262144-b1-e2-t96-s2-timing: trained 262144 centroids in 14.5s (1276.4s CPU)
+emeans-d128-n67108864-k262144-b1-e2-t96-s2-timing: validation MSE 60432.40, training MSE 57386.08
+loaded 67108864 x 128 base and 100000 queries in 21.5s
+emeans-d128-n67108864-k262144-b1-e2-t96-s3-timing: trained 262144 centroids in 14.3s (1253.6s CPU)
+emeans-d128-n67108864-k262144-b1-e2-t96-s3-timing: validation MSE 60459.56, training MSE 57383.56
+loaded 67108864 x 128 base and 100000 queries in 21.5s
+emeans-d128-n67108864-k262144-b1-e5-t96-s1-timing: trained 262144 centroids in 19.0s (1708.4s CPU)
+emeans-d128-n67108864-k262144-b1-e5-t96-s1-timing: validation MSE 60308.63, training MSE 57201.40
+loaded 67108864 x 128 base and 100000 queries in 21.5s
+emeans-d128-n67108864-k262144-b1-e5-t96-s2-timing: trained 262144 centroids in 18.9s (1702.3s CPU)
+emeans-d128-n67108864-k262144-b1-e5-t96-s2-timing: validation MSE 60288.71, training MSE 57213.36
+loaded 67108864 x 128 base and 100000 queries in 21.5s
+emeans-d128-n67108864-k262144-b1-e5-t96-s3-timing: trained 262144 centroids in 19.2s (1720.0s CPU)
+emeans-d128-n67108864-k262144-b1-e5-t96-s3-timing: validation MSE 60297.57, training MSE 57189.21

@@ -11,6 +11,7 @@
 //!
 
 use core::f32;
+use std::cell::Cell;
 use std::cmp::Reverse;
 use std::ops::{AddAssign, DivAssign};
 use std::sync::Arc;
@@ -53,6 +54,29 @@ use {
 use crate::vector::utils::SimpleIndex;
 use lance_core::{Error, Result};
 
+pub mod emeans;
+pub mod profile;
+
+use emeans::assign::NearestCentroid;
+use emeans::{EMeansParams, train_emeans};
+use profile::{Phase, Work};
+
+/// The clustering each node of hierarchical k-means runs to split its vectors
+/// into [`KMeansParams::hierarchical_k`] sub-clusters. The tree around the
+/// nodes (size-proportional quotas, sibling sub-trees trained in parallel,
+/// leaves as member means, optional global refinement) is the same for both.
+#[derive(Debug, Clone, Default)]
+pub enum HierarchicalNodeAlgorithm {
+    /// Lloyd iterations bounded by [`KMeansParams::max_iters`] and
+    /// [`KMeansParams::tolerance`], with [`KMeansParams::redos`] restarts.
+    #[default]
+    Lloyd,
+    /// Mini-batch e-means, see [`emeans::train_emeans`]. Supports only the
+    /// L2 distance. Each node's seed is derived from [`KMeansParams::seed`],
+    /// so [`EMeansParams::seed`] is ignored.
+    EMeans(EMeansParams),
+}
+
 /// KMean initialization method.
 #[derive(Debug, Clone, PartialEq)]
 pub enum KMeanInit {
@@ -91,8 +115,13 @@ pub struct KMeansParams {
     /// Default is 16. A larger fan-out makes a shallower tree with fewer
     /// sub-tree boundaries, which improves the clustering a little at a higher
     /// training cost; a smaller one is faster but loses recall.
-    /// Hierarchical k-means is enabled only if hierarchical_k > 1 and k > 256.
+    /// Hierarchical k-means is enabled only if hierarchical_k > 1, k > 256 and
+    /// no initial centroids are supplied.
     pub hierarchical_k: usize,
+
+    /// The clustering each node of the hierarchy runs. Default is Lloyd.
+    /// Non-hierarchical training always runs Lloyd and ignores it.
+    pub hierarchical_node_algorithm: HierarchicalNodeAlgorithm,
 
     /// Number of global Lloyd iterations run over the whole training sample after
     /// the hierarchical tree is built, with every centroid competing for every
@@ -122,6 +151,10 @@ impl std::fmt::Debug for KMeansParams {
             .field("distance_type", &self.distance_type)
             .field("balance_factor", &self.balance_factor)
             .field("hierarchical_k", &self.hierarchical_k)
+            .field(
+                "hierarchical_node_algorithm",
+                &self.hierarchical_node_algorithm,
+            )
             .field("refine_iters", &self.refine_iters)
             .field("seed", &self.seed)
             .field("on_progress", &self.on_progress.as_ref().map(|_| "..."))
@@ -139,6 +172,7 @@ impl Default for KMeansParams {
             distance_type: DistanceType::L2,
             balance_factor: 0.0,
             hierarchical_k: 16,
+            hierarchical_node_algorithm: HierarchicalNodeAlgorithm::default(),
             refine_iters: 0,
             seed: None,
             on_progress: None,
@@ -185,6 +219,16 @@ impl KMeansParams {
     /// See [`KMeansParams::hierarchical_k`].
     pub fn with_hierarchical_k(mut self, hierarchical_k: usize) -> Self {
         self.hierarchical_k = hierarchical_k;
+        self
+    }
+
+    /// Set the clustering each node of the hierarchy runs.
+    /// See [`KMeansParams::hierarchical_node_algorithm`].
+    pub fn with_hierarchical_node_algorithm(
+        mut self,
+        algorithm: HierarchicalNodeAlgorithm,
+    ) -> Self {
+        self.hierarchical_node_algorithm = algorithm;
         self
     }
 
@@ -370,6 +414,7 @@ pub trait KMeansAlgo<T: Num> {
             index,
         );
 
+        let _busy = profile::work(Work::Assign);
         let k = centroids.len() / dimension;
         let mut cluster_radius = vec![f32::NEG_INFINITY; k];
         let mut losses = vec![0.0; k];
@@ -399,6 +444,23 @@ pub trait KMeansAlgo<T: Num> {
         index: Option<&SimpleIndex>,
     ) -> (Vec<Option<u32>>, Vec<Option<f32>>);
 
+    /// Nearest centroid of every row of `data` named by `indices`, without
+    /// balancing: how hierarchical training hands a node's vectors to its
+    /// sub-clusters. `None` for a row whose distances are all NaN.
+    fn membership_of_rows(
+        centroids: &[T],
+        data: &[T],
+        dimension: usize,
+        indices: &[usize],
+        distance_type: DistanceType,
+    ) -> Vec<Option<u32>>
+    where
+        T: Clone + Send + Sync,
+        Self: Sized,
+    {
+        gathered_membership_of_rows::<T, Self>(centroids, data, dimension, indices, distance_type)
+    }
+
     /// Construct a new KMeans model.
     fn to_kmeans(
         data: &[T],
@@ -409,6 +471,112 @@ pub trait KMeansAlgo<T: Num> {
         distance_type: DistanceType,
         loss: f64,
     ) -> KMeans;
+}
+
+/// [`KMeansAlgo::membership_of_rows`] by gathering the rows in chunks and
+/// running [`KMeansAlgo::compute_membership_and_dist`] on each, so that no copy
+/// of the whole node is ever held.
+fn gathered_membership_of_rows<T: Num + Clone + Send + Sync, Algo: KMeansAlgo<T>>(
+    centroids: &[T],
+    data: &[T],
+    dimension: usize,
+    indices: &[usize],
+    distance_type: DistanceType,
+) -> Vec<Option<u32>> {
+    let chunk_rows = (MEMBERSHIP_CHUNK_BYTES / (dimension * size_of::<T>())).max(1);
+    indices
+        .par_chunks(chunk_rows)
+        .flat_map_iter(|chunk| {
+            let gather_busy = profile::work(Work::Gather);
+            let mut rows = Vec::with_capacity(chunk.len() * dimension);
+            for &idx in chunk {
+                rows.extend_from_slice(&data[idx * dimension..(idx + 1) * dimension]);
+            }
+            drop(gather_busy);
+            let (membership, _) = Algo::compute_membership_and_dist(
+                centroids,
+                &rows,
+                dimension,
+                distance_type,
+                0.0,
+                None,
+                None,
+            );
+            membership
+        })
+        .collect()
+}
+
+/// Whether an `f32` centroid table of `num_values` values is small enough for
+/// the transposed [`L2Prepared`] kernel, as PQ sub-vector codebooks are.
+fn fits_l2_prepared(num_values: usize, dimension: usize) -> bool {
+    dimension <= L2_PREPARED_MAX_DIMENSION && num_values * size_of::<f32>() <= L2_PREPARED_MAX_BYTES
+}
+
+/// The nearest centroid of every `f32` vector of `data` under L2 and the
+/// squared distance to it, with the tiled GEMM of e-means assignment.
+fn gemm_membership_and_dist(
+    centroids: &[f32],
+    data: &[f32],
+    dimension: usize,
+) -> (Vec<Option<u32>>, Vec<Option<f32>>) {
+    let prepared = f32::prepare_centroids(centroids, dimension);
+    let num_rows = data.len() / dimension;
+    let chunk_rows = (MEMBERSHIP_CHUNK_BYTES / (dimension * size_of::<f32>()))
+        .min(num_rows.div_ceil(MEMBERSHIP_MIN_TASKS))
+        .max(MEMBERSHIP_MIN_TASK_ROWS);
+    data[..num_rows * dimension]
+        .par_chunks(chunk_rows * dimension)
+        .flat_map_iter(|vectors| {
+            let _busy = profile::work(Work::Assign);
+            let rows: Vec<usize> = (0..vectors.len() / dimension).collect();
+            let mut assignments = Vec::with_capacity(rows.len());
+            f32::assign_rows(
+                vectors,
+                dimension,
+                centroids,
+                &prepared,
+                &rows,
+                &mut assignments,
+            );
+            assignments.into_iter().map(Option::unzip)
+        })
+        .unzip()
+}
+
+/// [`KMeansAlgo::membership_of_rows`] for `f32` vectors under L2: every task
+/// scores its rows against all centroids with the tiled GEMM of e-means
+/// assignment, reading the rows in place. Tasks are sequential inside, so the
+/// parallelism comes from the many chunks of a large node and from sibling
+/// nodes, never from rayon jobs per vector.
+fn gemm_membership_of_rows(
+    centroids: &[f32],
+    data: &[f32],
+    dimension: usize,
+    indices: &[usize],
+) -> Vec<Option<u32>> {
+    let prepared = f32::prepare_centroids(centroids, dimension);
+    let chunk_rows = (MEMBERSHIP_CHUNK_BYTES / (dimension * size_of::<f32>()))
+        .min(indices.len().div_ceil(MEMBERSHIP_MIN_TASKS))
+        .max(MEMBERSHIP_MIN_TASK_ROWS);
+    indices
+        .par_chunks(chunk_rows)
+        .flat_map_iter(|rows| {
+            let _busy = profile::work(Work::Assign);
+            let mut assignments = Vec::with_capacity(rows.len());
+            f32::assign_rows(
+                data,
+                dimension,
+                centroids,
+                &prepared,
+                rows,
+                &mut assignments,
+            );
+            assignments
+                .into_iter()
+                .map(|assignment| assignment.map(|(centroid, _)| centroid))
+        })
+        .collect()
 }
 
 /// Reads a `T::Native` slice as `f16` when — and only when — that is what it is.
@@ -454,6 +622,45 @@ impl MaybeF32 for Float64Type {}
 const L2_PREPARED_MAX_DIMENSION: usize = 16;
 const L2_PREPARED_MAX_BYTES: usize = 32 * 1024;
 
+thread_local! {
+    /// Set while this thread trains one node of the hierarchy by itself; see
+    /// [`train_on_this_thread`].
+    static TRAINS_ON_THIS_THREAD: Cell<bool> = const { Cell::new(false) };
+}
+
+/// The `with_min_len` of a k-means rayon loop that would otherwise use `min`:
+/// `usize::MAX` while [`train_on_this_thread`] runs, so the loop is a single
+/// job that runs inline.
+fn job_min_len(min: usize) -> usize {
+    if TRAINS_ON_THIS_THREAD.get() {
+        usize::MAX
+    } else {
+        min
+    }
+}
+
+/// Runs `train` with every k-means rayon loop on this thread as one inline
+/// job: no fork, no join, no work stealing. Hierarchical training uses it once
+/// sibling nodes alone outnumber the threads, where splitting a node's small
+/// loops across threads only spends time in rayon's scheduler. Results are the
+/// same either way: chunk boundaries, and with them summation order, do not
+/// depend on how chunks are grouped into jobs.
+fn train_on_this_thread<R>(train: impl FnOnce() -> R) -> R {
+    // Restore rather than clear: a loop outside this module may still split
+    // and join, and the job this thread steals meanwhile sets its own state.
+    let previous = TRAINS_ON_THIS_THREAD.replace(true);
+    let result = train();
+    TRAINS_ON_THIS_THREAD.set(previous);
+    result
+}
+
+/// Vector-centroid coordinate pairs one rayon job of a membership pass scores
+/// at least, about 50 µs of work. One job per vector would drown small
+/// centroid tables, such as the 16-centroid nodes of hierarchical training, in
+/// work-stealing overhead: on 96 threads most CPU time went to rayon's
+/// scheduler, and training slowed down as threads were added.
+const MIN_JOB_DISTANCE_TERMS: usize = 1 << 17;
+
 /// Centroid tables up to this size are summed with one partial table per data
 /// chunk ([`sum_members_single_pass`]); larger tables keep the centroid-split
 /// update, whose redundant passes over the data cost less than replicating the
@@ -477,7 +684,9 @@ fn sum_members_single_pass<N: Float + AddAssign + Send + Sync>(
     let partial_sums = data
         .par_chunks(rows_per_chunk * dimension)
         .zip(membership.par_chunks(rows_per_chunk))
+        .with_min_len(job_min_len(1))
         .map(|(vectors, members)| {
+            let _busy = profile::work(Work::Update);
             let mut sums = vec![N::zero(); k * dimension];
             for (vector, cluster_id) in vectors.chunks(dimension).zip(members) {
                 if let Some(cluster_id) = cluster_id.filter(|&id| (id as usize) < k) {
@@ -488,6 +697,7 @@ fn sum_members_single_pass<N: Float + AddAssign + Send + Sync>(
             sums
         })
         .collect::<Vec<_>>();
+    let _busy = profile::work(Work::Update);
     partial_sums
         .into_iter()
         .reduce(|mut total, sums| {
@@ -518,6 +728,7 @@ fn sum_members_centroid_split<N: Float + AddAssign + Send + Sync>(
         .enumerate()
         .with_max_len(1)
         .for_each(|(i, centroids)| {
+            let _busy = profile::work(Work::Update);
             let start = i * chunk_size;
             let end = ((i + 1) * chunk_size).min(k);
             data.chunks(dimension)
@@ -597,6 +808,7 @@ fn dot_membership_amx_f16(
 
     Some(
         data.par_chunks(block_rows * dimension)
+            .with_min_len(job_min_len(1))
             .map_init(
                 || (vec![0f32; block_rows * n_padded], vec![0f32; k]),
                 |(scores, distances), block| {
@@ -655,6 +867,21 @@ where
     ) -> (Vec<Option<u32>>, Vec<Option<f32>>) {
         let biases =
             || cluster_sizes.map(|size| size.iter().map(|size| balance_factor * *size as f32));
+        // Large centroid tables keep one vector per job: a vector already
+        // carries enough work there.
+        let min_rows = MIN_JOB_DISTANCE_TERMS.div_ceil(centroids.len().max(1));
+        // Unbiased L2 assignment against a table too large for `L2Prepared`,
+        // as in the IVF shuffle: one GEMM per tile instead of one kernel call
+        // per vector-centroid pair.
+        if index.is_none()
+            && distance_type == DistanceType::L2
+            && cluster_sizes.is_none()
+            && let (Some(centroids), Some(data)) =
+                (T::as_f32_slice(centroids), T::as_f32_slice(data))
+            && !fits_l2_prepared(centroids.len(), dimension)
+        {
+            return gemm_membership_and_dist(centroids, data, dimension);
+        }
         let cluster_and_dists = match index {
             Some(index) => data
                 .par_chunks(dimension)
@@ -673,19 +900,19 @@ where
             None => match distance_type {
                 DistanceType::L2 => match T::as_f32_slice(centroids)
                     .zip(T::as_f32_slice(data))
-                    .filter(|_| {
-                        dimension <= L2_PREPARED_MAX_DIMENSION
-                            && centroids.len() * size_of::<f32>() <= L2_PREPARED_MAX_BYTES
-                    }) {
+                    .filter(|(centroids, _)| fits_l2_prepared(centroids.len(), dimension))
+                {
                     // PQ sub-vector codebooks: one SoA pass per vector instead of one
                     // kernel call per centroid, whose call and dispatch overhead
                     // dominates at these dimensions.
                     Some((centroids, data)) => {
                         let prepared = L2Prepared::new(centroids, dimension);
                         data.par_chunks(dimension)
+                            .with_min_len(job_min_len(min_rows))
                             .map_init(
                                 || vec![0f32; prepared.num_targets()],
                                 |dists, vec| {
+                                    let _busy = profile::work(Work::Assign);
                                     prepared.distances_into(vec, dists);
                                     argmin_value_float_with_bias(dists.iter().copied(), biases())
                                 },
@@ -694,9 +921,11 @@ where
                     }
                     None => data
                         .par_chunks(dimension)
+                        .with_min_len(job_min_len(min_rows))
                         .map_init(
                             || vec![0.0; centroids.len() / dimension],
                             |distances, vec| {
+                                let _busy = profile::work(Work::Assign);
                                 l2_distance_batch_into(vec, centroids, dimension, distances);
                                 argmin_value_float_with_bias(distances.iter().copied(), biases())
                             },
@@ -721,6 +950,7 @@ where
                     })
                     .unwrap_or_else(|| {
                         data.par_chunks(dimension)
+                            .with_min_len(job_min_len(min_rows))
                             .map_init(
                                 || vec![0.0; centroids.len() / dimension],
                                 |distances, vec| {
@@ -744,7 +974,29 @@ where
             },
         };
 
+        let _busy = profile::work(Work::Assign);
         cluster_and_dists.into_iter().map(Option::unzip).unzip()
+    }
+
+    fn membership_of_rows(
+        centroids: &[T::Native],
+        data: &[T::Native],
+        dimension: usize,
+        indices: &[usize],
+        distance_type: DistanceType,
+    ) -> Vec<Option<u32>> {
+        match (T::as_f32_slice(centroids), T::as_f32_slice(data)) {
+            (Some(centroids), Some(data)) if distance_type == DistanceType::L2 => {
+                gemm_membership_of_rows(centroids, data, dimension, indices)
+            }
+            _ => gathered_membership_of_rows::<T::Native, Self>(
+                centroids,
+                data,
+                dimension,
+                indices,
+                distance_type,
+            ),
+        }
     }
 
     fn to_kmeans(
@@ -767,13 +1019,16 @@ where
         centroids
             .par_chunks_mut(dimension)
             .zip(cluster_sizes.par_iter())
+            .with_min_len(job_min_len(1))
             .for_each(|(centroid, &cnt)| {
+                let _busy = profile::work(Work::Update);
                 if cnt > 0 {
                     let norm = T::Native::one() / T::Native::from_usize(cnt).unwrap();
                     centroid.iter_mut().for_each(|v| *v *= norm);
                 }
             });
 
+        let _busy = profile::work(Work::Update);
         let empty_clusters = cluster_sizes.iter().filter(|&cnt| *cnt == 0).count();
         if empty_clusters as f32 / k as f32 > 0.1 {
             if data.len() / dimension < k * 256 {
@@ -835,6 +1090,7 @@ impl KMeansAlgo<u8> for KModeAlgo {
                 )
             })
             .collect::<Vec<_>>();
+        let _busy = profile::work(Work::Assign);
         cluster_and_dists.into_iter().map(Option::unzip).unzip()
     }
 
@@ -919,6 +1175,13 @@ const TRAINING_ROWS_PER_CENTROID: usize = 512;
 /// bytes rather than rows: a row-count budget would hold a multiple of it on
 /// high-dimensional data.
 const MEMBERSHIP_CHUNK_BYTES: usize = 4 * 1024 * 1024;
+/// A node's rows are split into at least this many GEMM membership tasks,
+/// unless that would leave fewer than [`MEMBERSHIP_MIN_TASK_ROWS`] per task, so
+/// nodes with few siblings still spread across the pool.
+const MEMBERSHIP_MIN_TASKS: usize = 64;
+/// Rows below which a GEMM membership task would spend more on scheduling than
+/// on scoring.
+const MEMBERSHIP_MIN_TASK_ROWS: usize = 256;
 
 /// One leaf of the proportional hierarchy: a centroid and the training vectors
 /// it was fitted on.
@@ -1228,6 +1491,7 @@ impl KMeans {
 
         let mut rng = params.rng();
         for redo in 1..=params.redos {
+            let init_busy = profile::work(Work::Other);
             let mut kmeans: Self = match &params.init {
                 KMeanInit::Random => Self::init_random::<T>(
                     data.values(),
@@ -1247,6 +1511,7 @@ impl KMeans {
             // Random samples and caller-provided training seeds may have
             // different norms; constrain them before the first assignment.
             kmeans.normalize_dot_centroids();
+            drop(init_busy);
             let mut loss = f64::MAX;
             for i in 1..=params.max_iters {
                 if let Some(cb) = &params.on_progress {
@@ -1265,6 +1530,7 @@ impl KMeans {
                     kmeans.distance_type,
                 )?;
 
+                let assign_phase = profile::phase(Phase::LloydAssign);
                 let balance_factor = adjusted_balance_factor.min(params.balance_factor);
                 let (membership, radius, losses) = Algo::compute_membership_and_loss(
                     kmeans.centroids.as_primitive::<T>().values(),
@@ -1276,10 +1542,15 @@ impl KMeans {
                     index.as_ref(),
                 );
 
+                drop(assign_phase);
+
+                let update_phase = profile::phase(Phase::LloydUpdate);
+                let sizes_busy = profile::work(Work::Update);
                 adjusted_balance_factor =
                     compute_cluster_sizes(&membership, &radius, &losses, &mut cluster_sizes);
                 let balance_loss = compute_balance_loss(&cluster_sizes, n, balance_factor);
                 let last_loss = losses.iter().sum::<f64>() + balance_loss as f64;
+                drop(sizes_busy);
 
                 kmeans = Algo::to_kmeans(
                     data.values(),
@@ -1290,6 +1561,7 @@ impl KMeans {
                     params.distance_type,
                     last_loss,
                 );
+                drop(update_phase);
                 // Keep `last_loss` as the scale reference to preserve the legacy
                 // convergence threshold.
                 if kmeans_has_converged(loss, last_loss, params.tolerance) {
@@ -1315,40 +1587,6 @@ impl KMeans {
     }
 
     /// Helper function to create a FixedSizeListArray from indices
-    /// Nearest centroid of every row in `indices`, computed over gathered chunks
-    /// so that no copy of the whole node is ever held.
-    fn membership_of_rows<T: ArrowNumericType, Algo: KMeansAlgo<T::Native>>(
-        centroids: &[T::Native],
-        data_values: &[T::Native],
-        dimension: usize,
-        indices: &[usize],
-        distance_type: DistanceType,
-    ) -> Vec<Option<u32>>
-    where
-        T::Native: Num,
-    {
-        let chunk_rows = (MEMBERSHIP_CHUNK_BYTES / (dimension * size_of::<T::Native>())).max(1);
-        indices
-            .par_chunks(chunk_rows)
-            .flat_map_iter(|chunk| {
-                let mut rows = Vec::with_capacity(chunk.len() * dimension);
-                for &idx in chunk {
-                    rows.extend_from_slice(&data_values[idx * dimension..(idx + 1) * dimension]);
-                }
-                let (membership, _) = Algo::compute_membership_and_dist(
-                    centroids,
-                    &rows,
-                    dimension,
-                    distance_type,
-                    0.0,
-                    None,
-                    None,
-                );
-                membership
-            })
-            .collect()
-    }
-
     fn create_array_from_indices<T: ArrowNumericType>(
         indices: &[usize],
         data_values: &[T::Native],
@@ -1358,6 +1596,7 @@ impl KMeans {
         T::Native: Clone,
         PrimitiveArray<T>: From<Vec<T::Native>>,
     {
+        let _busy = profile::work(Work::Gather);
         let mut subset_data = Vec::with_capacity(indices.len() * dimension);
         for &idx in indices {
             let start = idx * dimension;
@@ -1498,6 +1737,8 @@ impl KMeans {
         // or allocating another full index array. All rows still get assigned.
         let node_params = params.derive(salt);
         let training_rows = n.min(k * TRAINING_ROWS_PER_CENTROID);
+        let sample_phase = profile::phase(Phase::NodeSample);
+        let shuffle_busy = profile::work(Work::Gather);
         let training_indices = if training_rows < n {
             indices
                 .partial_shuffle(&mut node_params.rng(), training_rows)
@@ -1505,17 +1746,45 @@ impl KMeans {
         } else {
             indices.as_mut_slice()
         };
+        drop(shuffle_busy);
         let training =
             Self::create_array_from_indices::<T>(training_indices, data_values, dimension)?;
-        let kmeans = Self::train_kmeans::<T, Algo>(&training, k, &node_params)?;
+        drop(sample_phase);
+        let train_phase = profile::phase(Phase::NodeTrain);
+        let train = || match &params.hierarchical_node_algorithm {
+            HierarchicalNodeAlgorithm::Lloyd => {
+                Self::train_kmeans::<T, Algo>(&training, k, &node_params)
+            }
+            HierarchicalNodeAlgorithm::EMeans(emeans_params) => {
+                let emeans_params = EMeansParams {
+                    seed: node_params.seed,
+                    ..emeans_params.clone()
+                };
+                train_emeans(&training, k, &emeans_params)
+                    .map_err(|e| ArrowError::ExternalError(Box::new(e)))
+            }
+        };
+        // Once this node holds at most 1/threads of the vectors, its siblings
+        // alone can keep every thread busy, so it trains on one thread. Nodes
+        // nearer the root split their training across the pool.
+        let total_rows = data_values.len() / dimension;
+        let kmeans = if n.saturating_mul(rayon::current_num_threads()) <= total_rows {
+            train_on_this_thread(train)?
+        } else {
+            train()?
+        };
+        drop(train_phase);
         drop(training);
-        let membership = Self::membership_of_rows::<T, Algo>(
+        let membership_phase = profile::phase(Phase::Membership);
+        let membership = Algo::membership_of_rows(
             kmeans.centroids.as_primitive::<T>().values(),
             data_values,
             dimension,
             &indices,
             params.distance_type,
         );
+        drop(membership_phase);
+        let children_busy = profile::work(Work::Other);
         let mut children: Vec<(usize, Vec<usize>)> =
             (0..k).map(|centroid| (centroid, Vec::new())).collect();
         for (local, cluster) in membership.iter().enumerate() {
@@ -1524,6 +1793,7 @@ impl KMeans {
             }
         }
         children.retain(|(_, child)| !child.is_empty());
+        drop(children_busy);
 
         if children.len() <= 1 {
             // Every vector landed in the same sub-cluster (duplicates): the node
@@ -1665,6 +1935,7 @@ impl KMeans {
         T::Native: Num,
         PrimitiveArray<T>: From<Vec<T::Native>>,
     {
+        let _phase = profile::phase(Phase::Leaves);
         let sub_data = Self::create_array_from_indices::<T>(&indices, data_values, dimension)?;
         let membership = vec![Some(0); indices.len()];
         let mut sizes = vec![indices.len()];
@@ -1760,8 +2031,21 @@ impl KMeans {
         // we set 256 as the threshold because:
         // 1. PQ would run kmeans with k=256, in that case we don't want to use hierarchical clustering for accuracy
         // 2. kmeans with k=256 is small enough that we don't need to use hierarchical clustering for efficiency
-        if k > 256 && params.hierarchical_k > 1 {
+        // Supplied initial centroids train flat: the hierarchy seeds each node
+        // from its own vectors and would discard them.
+        if k > 256 && params.hierarchical_k > 1 && !matches!(params.init, KMeanInit::Incremental(_))
+        {
             log::debug!("Using hierarchical clustering for k={}", k);
+            if matches!(
+                params.hierarchical_node_algorithm,
+                HierarchicalNodeAlgorithm::EMeans(_)
+            ) && params.distance_type != DistanceType::L2
+            {
+                return Err(ArrowError::InvalidArgumentError(format!(
+                    "KMeans: hierarchical e-means supports only the l2 distance, got {}",
+                    params.distance_type
+                )));
+            }
             return match (data.value_type(), params.distance_type) {
                 (DataType::Float16, DistanceType::L2 | DistanceType::Dot) => {
                     Self::train_hierarchical_kmeans::<Float16Type, KMeansAlgoFloat<Float16Type>>(
@@ -2512,6 +2796,293 @@ mod tests {
         let err =
             kmeans_find_partitions_binary(&centroids, &[], 1, DistanceType::Hamming).unwrap_err();
         assert!(err.to_string().contains("empty query"), "{err}");
+    }
+
+    /// Unbiased flat L2 assignment against a large centroid table, as the IVF
+    /// shuffle runs it, picks the centroid pairwise L2 picks up to rounding on
+    /// exact ties, reports the same distance, and leaves NaN rows unassigned.
+    #[rstest]
+    #[case::ivf_partitions(2_000, 366, 128)]
+    #[case::high_dimension(300, 40, 1024)]
+    #[case::large_low_dimension_table(1_000, 4_096, 16)]
+    fn test_flat_l2_gemm_assignment_matches_pairwise(
+        #[case] num_rows: usize,
+        #[case] k: usize,
+        #[case] dimension: usize,
+    ) {
+        let mut rng = SmallRng::seed_from_u64(5);
+        let mut data: Vec<f32> = (0..num_rows * dimension)
+            .map(|_| rng.random_range(-1.0..1.0))
+            .collect();
+        data[dimension..2 * dimension].fill(f32::NAN);
+        let centroids: Vec<f32> = (0..k * dimension)
+            .map(|_| rng.random_range(-1.0..1.0))
+            .collect();
+
+        let (membership, distances) = KMeansAlgoFloat::<Float32Type>::compute_membership_and_dist(
+            &centroids,
+            &data,
+            dimension,
+            DistanceType::L2,
+            0.0,
+            None,
+            None,
+        );
+
+        assert_eq!(membership.len(), num_rows);
+        assert_eq!((membership[1], distances[1]), (None, None));
+        for (row, vector) in data
+            .chunks_exact(dimension)
+            .enumerate()
+            .filter(|(row, _)| *row != 1)
+        {
+            let pairwise: Vec<f32> = centroids
+                .chunks_exact(dimension)
+                .map(|centroid| l2::l2(vector, centroid))
+                .collect();
+            let expected = argmin(pairwise.iter().copied()).unwrap();
+            let best = pairwise[expected as usize];
+            let chosen = membership[row].unwrap();
+            let tolerance = 1e-4 * best.max(1.0);
+            assert!(
+                (pairwise[chosen as usize] - best).abs() <= tolerance,
+                "row {row}: centroid {chosen} at {} is not tied with {expected} at {best}",
+                pairwise[chosen as usize]
+            );
+            let distance = distances[row].unwrap();
+            assert!(
+                (distance - best).abs() <= tolerance,
+                "row {row}: distance {distance} vs {best}"
+            );
+        }
+    }
+
+    /// Rows and centroids clustered tightly far from the origin, as a partition
+    /// split trains on, are assigned as pairwise L2 assigns them: at an offset
+    /// of 50 the GEMM expansion would otherwise round away gaps this small.
+    #[test]
+    fn test_flat_l2_gemm_assignment_far_from_origin() {
+        let (num_rows, k, dimension) = (1_000, 5, 32);
+        let mut rng = SmallRng::seed_from_u64(9);
+        let mut clustered = |len: usize| -> Vec<f32> {
+            (0..len)
+                .map(|i| {
+                    (if i % dimension == 0 { 50.0 } else { 0.0 }) + rng.random_range(-0.01..0.01)
+                })
+                .collect()
+        };
+        let data = clustered(num_rows * dimension);
+        let centroids = clustered(k * dimension);
+
+        let (membership, distances) = KMeansAlgoFloat::<Float32Type>::compute_membership_and_dist(
+            &centroids,
+            &data,
+            dimension,
+            DistanceType::L2,
+            0.0,
+            None,
+            None,
+        );
+
+        for (row, vector) in data.chunks_exact(dimension).enumerate() {
+            let pairwise: Vec<f32> = centroids
+                .chunks_exact(dimension)
+                .map(|centroid| l2::l2(vector, centroid))
+                .collect();
+            let best = pairwise[argmin(pairwise.iter().copied()).unwrap() as usize];
+            let chosen = membership[row].unwrap() as usize;
+            let tolerance = 1e-3 * best;
+            assert!(
+                pairwise[chosen] - best <= tolerance,
+                "row {row}: centroid {chosen} at {} is not the nearest at {best}",
+                pairwise[chosen]
+            );
+            assert!((distances[row].unwrap() - best).abs() <= tolerance);
+        }
+    }
+
+    /// Pairs of centroids close to each other but far from their common
+    /// mean, which centering alone leaves under the expansion's rounding,
+    /// each keep their own vectors.
+    #[test]
+    fn test_flat_l2_gemm_assignment_close_pairs_spread_around_mean() {
+        let dimension = 32;
+        let centroids: Vec<f32> = [1000.0, 1000.01, -1000.0, -1000.01]
+            .into_iter()
+            .flat_map(|x| (0..dimension).map(move |j| if j == 0 { x } else { 0.0 }))
+            .collect();
+        let (membership, distances) = KMeansAlgoFloat::<Float32Type>::compute_membership_and_dist(
+            &centroids,
+            &centroids,
+            dimension,
+            DistanceType::L2,
+            0.0,
+            None,
+            None,
+        );
+        assert_eq!(membership, vec![Some(0), Some(1), Some(2), Some(3)]);
+        assert_eq!(distances, vec![Some(0.0); 4]);
+    }
+
+    /// Hierarchical e-means separates groups of identical vectors that are far
+    /// from the origin and closer to each other than the GEMM expansion can
+    /// resolve there.
+    #[test]
+    fn test_hierarchical_emeans_separates_close_groups_far_from_origin() {
+        const DIM: usize = 8;
+        const NUM_GROUPS: usize = 257;
+        let values: Vec<f32> = (0..4)
+            .flat_map(|_| 0..NUM_GROUPS)
+            .flat_map(|group| [1000.0 + group as f32 * 0.001; DIM])
+            .collect();
+        let data = FixedSizeListArray::try_new_from_values(Float32Array::from(values), DIM as i32)
+            .unwrap();
+        let params = KMeansParams {
+            seed: Some(42),
+            hierarchical_k: 2,
+            ..Default::default()
+        }
+        .with_hierarchical_node_algorithm(HierarchicalNodeAlgorithm::EMeans(
+            EMeansParams::default(),
+        ));
+
+        let kmeans = KMeans::new_with_params(&data, NUM_GROUPS, &params).unwrap();
+        let mut first_components: Vec<f32> = kmeans
+            .centroids
+            .as_primitive::<Float32Type>()
+            .values()
+            .as_chunks::<DIM>()
+            .0
+            .iter()
+            .map(|centroid| centroid[0])
+            .collect();
+        first_components.sort_by(f32::total_cmp);
+        first_components.dedup();
+        assert_eq!(first_components.len(), NUM_GROUPS);
+    }
+
+    /// With no centroids, flat L2 assignment of vectors too wide for
+    /// `L2Prepared`, as a partition split can request, leaves every row
+    /// unassigned instead of panicking in the GEMM path.
+    #[test]
+    fn test_flat_l2_assignment_without_centroids() {
+        let dimension = 32;
+        let data = vec![1.0f32; 3 * dimension];
+        let (membership, distances) = KMeansAlgoFloat::<Float32Type>::compute_membership_and_dist(
+            &[],
+            &data,
+            dimension,
+            DistanceType::L2,
+            0.0,
+            None,
+            None,
+        );
+        assert_eq!(membership, vec![None; 3]);
+        assert_eq!(distances, vec![None; 3]);
+    }
+
+    /// The GEMM membership of hierarchical nodes picks the child that the
+    /// gathered per-vector path and direct L2 pick for every row, and leaves
+    /// NaN rows unassigned.
+    #[rstest]
+    #[case::small_node(100, 16, 64, 0.0, 1.0)]
+    #[case::many_tasks(20_000, 16, 128, 0.0, 1.0)]
+    #[case::high_dimension(600, 16, 1024, 0.0, 1.0)]
+    #[case::many_centroids(3_000, 300, 32, 0.0, 1.0)]
+    // A deep node: rows within 0.001 of each other at 1000 from the origin,
+    // where an uncentered expansion rounds by more than their gaps.
+    #[case::far_from_origin(3_000, 16, 128, 1000.0, 0.001)]
+    fn test_gemm_membership_matches_gathered_path(
+        #[case] num_rows: usize,
+        #[case] k: usize,
+        #[case] dimension: usize,
+        #[case] offset: f32,
+        #[case] spread: f32,
+    ) {
+        let mut rng = SmallRng::seed_from_u64(11);
+        let mut data: Vec<f32> = (0..2 * num_rows * dimension)
+            .map(|_| offset + rng.random_range(-spread..spread))
+            .collect();
+        data[dimension..2 * dimension].fill(f32::NAN);
+        let centroids: Vec<f32> = data[..k * dimension]
+            .iter()
+            .map(|value| value + 0.1 * spread)
+            .collect();
+        // A shuffled subset of the rows, as a node of the hierarchy holds.
+        let mut indices: Vec<usize> = (0..2 * num_rows).collect();
+        indices.shuffle(&mut rng);
+        indices.truncate(num_rows - 1);
+        indices.push(1);
+
+        let gemm = KMeansAlgoFloat::<Float32Type>::membership_of_rows(
+            &centroids,
+            &data,
+            dimension,
+            &indices,
+            DistanceType::L2,
+        );
+        let gathered = gathered_membership_of_rows::<f32, KMeansAlgoFloat<Float32Type>>(
+            &centroids,
+            &data,
+            dimension,
+            &indices,
+            DistanceType::L2,
+        );
+
+        assert_eq!(gemm.len(), indices.len());
+        assert_eq!(gemm[num_rows - 1], None);
+        assert_eq!(gemm, gathered);
+        // The gathered path shares the GEMM for wide vectors, so check against
+        // direct L2 as well.
+        let direct: Vec<Option<u32>> = indices
+            .iter()
+            .map(|&row| {
+                let vector = &data[row * dimension..(row + 1) * dimension];
+                argmin(
+                    centroids
+                        .chunks_exact(dimension)
+                        .map(|centroid| l2::l2(vector, centroid)),
+                )
+            })
+            .collect();
+        assert_eq!(gemm, direct);
+    }
+
+    /// Training a node on this thread only regroups chunks into jobs, so it
+    /// yields the very centroids that training across the pool does.
+    #[rstest]
+    #[case::lloyd(HierarchicalNodeAlgorithm::Lloyd)]
+    #[case::emeans(HierarchicalNodeAlgorithm::EMeans(EMeansParams::default()))]
+    fn test_training_on_this_thread_matches_pool(#[case] algorithm: HierarchicalNodeAlgorithm) {
+        let data = generate_random_array_with_seed::<Float32Type>(64 * 4096, [3; 32]);
+        let data = FixedSizeListArray::try_new_from_values(data, 64).unwrap();
+        let train = || match &algorithm {
+            HierarchicalNodeAlgorithm::Lloyd => {
+                let params = KMeansParams {
+                    seed: Some(5),
+                    ..Default::default()
+                };
+                KMeans::new_with_params(&data, 16, &params).unwrap()
+            }
+            HierarchicalNodeAlgorithm::EMeans(params) => {
+                let params = EMeansParams {
+                    seed: Some(5),
+                    ..params.clone()
+                };
+                train_emeans(&data, 16, &params).unwrap()
+            }
+        };
+
+        let pooled = train();
+        let alone = train_on_this_thread(|| {
+            assert_eq!(job_min_len(4), usize::MAX);
+            train()
+        });
+        assert_eq!(job_min_len(4), 4, "the scope must not outlive the call");
+        assert_eq!(
+            pooled.centroids.as_primitive::<Float32Type>().values(),
+            alone.centroids.as_primitive::<Float32Type>().values()
+        );
     }
 
     /// The SoA path and the per-centroid fallback must pick the centroids the
@@ -3439,8 +4010,10 @@ mod tests {
         assert_eq!(indices, expected);
     }
 
-    #[test]
-    fn test_hierarchical_kmeans_sorted_groups() {
+    #[rstest]
+    #[case::lloyd(HierarchicalNodeAlgorithm::Lloyd)]
+    #[case::emeans(HierarchicalNodeAlgorithm::EMeans(EMeansParams::default()))]
+    fn test_hierarchical_kmeans_sorted_groups(#[case] node_algorithm: HierarchicalNodeAlgorithm) {
         const K: usize = 257; // Greater than 256 to trigger hierarchical clustering
         // Ordered groups include exactly K distinct vectors, so successful
         // hierarchical training must recover every group.
@@ -3452,6 +4025,7 @@ mod tests {
         let params = KMeansParams {
             max_iters: 5,
             hierarchical_k: 2,
+            hierarchical_node_algorithm: node_algorithm,
             seed: Some(42),
             ..Default::default()
         };
@@ -3472,14 +4046,23 @@ mod tests {
         assert!(assigned_sizes(&kmeans, &data).iter().all(|&size| size > 0));
     }
 
-    #[test]
-    fn test_hierarchical_kmeans_is_seeded_and_balanced() {
+    #[rstest]
+    #[case::lloyd(HierarchicalNodeAlgorithm::Lloyd)]
+    #[case::emeans(HierarchicalNodeAlgorithm::EMeans(EMeansParams::default()))]
+    #[case::emeans_fractional(HierarchicalNodeAlgorithm::EMeans(EMeansParams {
+        epochs: 2.5,
+        ..Default::default()
+    }))]
+    fn test_hierarchical_kmeans_is_seeded_and_balanced(
+        #[case] node_algorithm: HierarchicalNodeAlgorithm,
+    ) {
         const DIM: usize = 16;
         const K: usize = 300;
         let data = skewed_training_data(K * 32, DIM);
         let params = KMeansParams {
             max_iters: 10,
             hierarchical_k: 16,
+            hierarchical_node_algorithm: node_algorithm,
             seed: Some(42),
             ..Default::default()
         };
@@ -3514,8 +4097,10 @@ mod tests {
         assert!(max <= 4.0 * mean, "largest partition {max} vs mean {mean}");
     }
 
-    #[test]
-    fn test_hierarchical_refinement_lowers_loss() {
+    #[rstest]
+    #[case::lloyd(HierarchicalNodeAlgorithm::Lloyd)]
+    #[case::emeans(HierarchicalNodeAlgorithm::EMeans(EMeansParams::default()))]
+    fn test_hierarchical_refinement_lowers_loss(#[case] node_algorithm: HierarchicalNodeAlgorithm) {
         const DIM: usize = 16;
         const K: usize = 300;
         let data = skewed_training_data(K * 16, DIM);
@@ -3523,6 +4108,7 @@ mod tests {
             let params = KMeansParams {
                 max_iters: 5,
                 hierarchical_k: 8,
+                hierarchical_node_algorithm: node_algorithm.clone(),
                 refine_iters,
                 seed: Some(7),
                 ..Default::default()
@@ -3537,6 +4123,45 @@ mod tests {
         assert!(
             refined <= unrefined * 1.001,
             "refinement raised the loss from {unrefined} to {refined}"
+        );
+    }
+
+    #[test]
+    fn test_hierarchical_emeans_matches_lloyd_loss() {
+        const DIM: usize = 16;
+        const K: usize = 300;
+        let data = skewed_training_data(K * 32, DIM);
+        let loss_of = |node_algorithm: HierarchicalNodeAlgorithm| {
+            let params = KMeansParams {
+                hierarchical_node_algorithm: node_algorithm,
+                seed: Some(42),
+                ..Default::default()
+            };
+            KMeans::new_with_params(&data, K, &params)
+                .unwrap()
+                .compute_loss(&data)
+                .unwrap()
+        };
+        let lloyd = loss_of(HierarchicalNodeAlgorithm::Lloyd);
+        let emeans = loss_of(HierarchicalNodeAlgorithm::EMeans(EMeansParams::default()));
+        assert!(
+            emeans <= lloyd * 1.02,
+            "hierarchical e-means loss {emeans} exceeds Lloyd loss {lloyd}"
+        );
+    }
+
+    #[test]
+    fn test_hierarchical_emeans_rejects_dot() {
+        let data = skewed_training_data(300 * 4, 4);
+        let params = KMeansParams {
+            distance_type: DistanceType::Dot,
+            hierarchical_node_algorithm: HierarchicalNodeAlgorithm::EMeans(EMeansParams::default()),
+            ..Default::default()
+        };
+        let err = KMeans::new_with_params(&data, 300, &params).unwrap_err();
+        assert!(
+            matches!(&err, ArrowError::InvalidArgumentError(message) if message.contains("e-means")),
+            "{err}"
         );
     }
 

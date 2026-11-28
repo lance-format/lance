@@ -1,0 +1,100 @@
+loaded 67108864 x 128 base and 10000 queries in 22.0s
+before-lloyd-d128-k262144-t96-s1: trained 262144 centroids in 37.9s (3521.7s CPU)
+before-lloyd-d128-k262144-t96-s1: validation MSE 60076.29, training MSE 57703.30
+loaded 67108864 x 128 base and 10000 queries in 22.0s
+full-lloyd-d128-k262144-t96-s1: trained 262144 centroids in 14.6s (1236.4s CPU)
+full-lloyd-d128-k262144-t96-s1: validation MSE 60048.73, training MSE 57585.78
+loaded 67108864 x 128 base and 10000 queries in 22.0s
+before-lloyd-d128-k262144-t96-s2: trained 262144 centroids in 38.5s (3579.9s CPU)
+before-lloyd-d128-k262144-t96-s2: validation MSE 59998.47, training MSE 57601.20
+loaded 67108864 x 128 base and 10000 queries in 22.0s
+full-lloyd-d128-k262144-t96-s2: trained 262144 centroids in 13.8s (1165.9s CPU)
+full-lloyd-d128-k262144-t96-s2: validation MSE 60013.96, training MSE 57516.40
+loaded 67108864 x 128 base and 10000 queries in 22.0s
+gemm-lloyd-d128-k262144-t96-s1: trained 262144 centroids in 37.9s (3524.4s CPU)
+gemm-lloyd-d128-k262144-t96-s1: validation MSE 60048.73, training MSE 57585.78
+loaded 67108864 x 128 base and 10000 queries in 21.6s
+before-emeans-d128-k262144-t96-s1: trained 262144 centroids in 8.9s (756.8s CPU)
+before-emeans-d128-k262144-t96-s1: validation MSE 59914.92, training MSE 57784.74
+loaded 67108864 x 128 base and 10000 queries in 21.5s
+full-emeans-d128-k262144-t96-s1: trained 262144 centroids in 5.9s (455.7s CPU)
+full-emeans-d128-k262144-t96-s1: validation MSE 59914.92, training MSE 57784.74
+loaded 67108864 x 128 base and 10000 queries in 21.6s
+before-emeans-d128-k262144-t96-s2: trained 262144 centroids in 9.5s (805.1s CPU)
+before-emeans-d128-k262144-t96-s2: validation MSE 59972.71, training MSE 57643.70
+loaded 67108864 x 128 base and 10000 queries in 21.6s
+full-emeans-d128-k262144-t96-s2: trained 262144 centroids in 5.9s (456.8s CPU)
+full-emeans-d128-k262144-t96-s2: validation MSE 59972.71, training MSE 57643.70
+loaded 67108864 x 128 base and 10000 queries in 21.6s
+gemm-emeans-d128-k262144-t96-s1: trained 262144 centroids in 9.4s (799.1s CPU)
+gemm-emeans-d128-k262144-t96-s1: validation MSE 59914.92, training MSE 57784.74
+loaded 67108864 x 1024 base and 10000 queries in 22.2s
+before-lloyd-d1024-k262144-t96-s1: trained 262144 centroids in 138.7s (12758.6s CPU)
+before-lloyd-d1024-k262144-t96-s1: validation MSE 171242.32, training MSE 162476.88
+loaded 67108864 x 1024 base and 10000 queries in 21.8s
+full-lloyd-d1024-k262144-t96-s1: trained 262144 centroids in 138.4s (10411.8s CPU)
+full-lloyd-d1024-k262144-t96-s1: validation MSE 171538.37, training MSE 163097.09
+loaded 67108864 x 1024 base and 10000 queries in 22.8s
+before-lloyd-d1024-k262144-t96-s2: trained 262144 centroids in 136.2s (12527.8s CPU)
+before-lloyd-d1024-k262144-t96-s2: validation MSE 171500.11, training MSE 162823.35
+loaded 67108864 x 1024 base and 10000 queries in 22.3s
+full-lloyd-d1024-k262144-t96-s2: trained 262144 centroids in 130.7s (10444.6s CPU)
+full-lloyd-d1024-k262144-t96-s2: validation MSE 171381.36, training MSE 162866.48
+loaded 67108864 x 1024 base and 10000 queries in 22.1s
+gemm-lloyd-d1024-k262144-t96-s1: trained 262144 centroids in 151.9s (14115.4s CPU)
+gemm-lloyd-d1024-k262144-t96-s1: validation MSE 171538.37, training MSE 163097.09
+loaded 67108864 x 1024 base and 10000 queries in 22.3s
+before-emeans-d1024-k262144-t96-s1: trained 262144 centroids in 67.6s (6242.6s CPU)
+before-emeans-d1024-k262144-t96-s1: validation MSE 171002.25, training MSE 162196.44
+loaded 67108864 x 1024 base and 10000 queries in 22.4s
+full-emeans-d1024-k262144-t96-s1: trained 262144 centroids in 47.0s (4009.3s CPU)
+full-emeans-d1024-k262144-t96-s1: validation MSE 171002.25, training MSE 162196.56
+loaded 67108864 x 1024 base and 10000 queries in 22.2s
+before-emeans-d1024-k262144-t96-s2: trained 262144 centroids in 58.3s (5361.0s CPU)
+before-emeans-d1024-k262144-t96-s2: validation MSE 171099.00, training MSE 162110.78
+loaded 67108864 x 1024 base and 10000 queries in 22.5s
+full-emeans-d1024-k262144-t96-s2: trained 262144 centroids in 52.6s (4270.9s CPU)
+full-emeans-d1024-k262144-t96-s2: validation MSE 171099.93, training MSE 162110.78
+loaded 67108864 x 1024 base and 10000 queries in 22.7s
+gemm-emeans-d1024-k262144-t96-s1: trained 262144 centroids in 67.2s (6203.4s CPU)
+gemm-emeans-d1024-k262144-t96-s1: validation MSE 171002.25, training MSE 162196.56
+loaded 67108864 x 128 base and 10000 queries in 32.6s
+full-lloyd-d128-k262144-t12-s1: trained 262144 centroids in 33.5s (390.8s CPU)
+full-lloyd-d128-k262144-t12-s1: validation MSE 60048.73, training MSE 57585.78
+loaded 67108864 x 128 base and 10000 queries in 23.3s
+full-lloyd-d128-k262144-t24-s1: trained 262144 centroids in 18.2s (410.1s CPU)
+full-lloyd-d128-k262144-t24-s1: validation MSE 60048.73, training MSE 57585.78
+loaded 67108864 x 128 base and 10000 queries in 20.4s
+full-lloyd-d128-k262144-t48-s1: trained 262144 centroids in 12.4s (535.9s CPU)
+full-lloyd-d128-k262144-t48-s1: validation MSE 60048.73, training MSE 57585.78
+loaded 67108864 x 128 base and 10000 queries in 20.4s
+before-lloyd-d128-k262144-t48-s1: trained 262144 centroids in 33.2s (1525.9s CPU)
+before-lloyd-d128-k262144-t48-s1: validation MSE 60076.29, training MSE 57703.30
+loaded 67108864 x 128 base and 10000 queries in 32.6s
+full-emeans-d128-k262144-t12-s1: trained 262144 centroids in 12.3s (135.9s CPU)
+full-emeans-d128-k262144-t12-s1: validation MSE 59914.92, training MSE 57784.74
+loaded 67108864 x 128 base and 10000 queries in 23.2s
+full-emeans-d128-k262144-t24-s1: trained 262144 centroids in 7.1s (144.5s CPU)
+full-emeans-d128-k262144-t24-s1: validation MSE 59914.92, training MSE 57784.74
+loaded 67108864 x 128 base and 10000 queries in 20.2s
+full-emeans-d128-k262144-t48-s1: trained 262144 centroids in 5.2s (199.9s CPU)
+full-emeans-d128-k262144-t48-s1: validation MSE 59914.92, training MSE 57784.74
+loaded 67108864 x 128 base and 10000 queries in 20.3s
+before-emeans-d128-k262144-t48-s1: trained 262144 centroids in 7.1s (288.5s CPU)
+before-emeans-d128-k262144-t48-s1: validation MSE 59914.92, training MSE 57784.74
+loaded 2097152 x 128 base and 10000 queries in 0.9s
+before-lloyd-d128-k256-t96-s1: trained 256 centroids in 0.2s (19.1s CPU)
+before-lloyd-d128-k256-t96-s1: validation MSE 115398.63, training MSE 112219.15
+loaded 2097152 x 128 base and 10000 queries in 0.9s
+full-lloyd-d128-k256-t96-s1: trained 256 centroids in 0.1s (8.8s CPU)
+full-lloyd-d128-k256-t96-s1: validation MSE 115409.83, training MSE 112202.49
+loaded 2097152 x 1024 base and 10000 queries in 1.0s
+before-lloyd-d1024-k256-t96-s1: trained 256 centroids in 1.0s (76.3s CPU)
+before-lloyd-d1024-k256-t96-s1: validation MSE 272717.41, training MSE 264381.43
+loaded 2097152 x 1024 base and 10000 queries in 1.0s
+full-lloyd-d1024-k256-t96-s1: trained 256 centroids in 0.9s (67.4s CPU)
+full-lloyd-d1024-k256-t96-s1: validation MSE 272696.56, training MSE 264371.49
+[ perf record: Woken up 4604 times to write data ]
+[ perf record: Captured and wrote 5.710 MB /home/ubuntu/r3/perf-lloyd.data (45421 samples) ]
+Terminated
+RUN3 DONE

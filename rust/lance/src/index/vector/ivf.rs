@@ -79,7 +79,8 @@ use lance_index::vector::hnsw::HnswMetadata;
 use lance_index::vector::hnsw::builder::HNSW_METADATA_KEY;
 use lance_index::vector::ivf::storage::IVF_METADATA_KEY;
 use lance_index::vector::ivf::storage::IvfModel;
-use lance_index::vector::kmeans::{KMeans, KMeansParams};
+use lance_index::vector::kmeans::emeans::EMeansParams;
+use lance_index::vector::kmeans::{HierarchicalNodeAlgorithm, KMeans, KMeansParams};
 use lance_index::vector::pq::storage::{
     PQ_METADATA_KEY, ProductQuantizationMetadata, ProductQuantizationStorage, transpose,
 };
@@ -3487,8 +3488,15 @@ where
             let _ = progress_tx.send(total);
         })
     };
+    // e-means supports only L2, which cosine training reaches by normalizing.
+    let node_algorithm = match (&params.kmeans_algorithm, metric_type) {
+        (Some(algorithm), _) => algorithm.clone(),
+        (None, MetricType::L2) => HierarchicalNodeAlgorithm::EMeans(EMeansParams::default()),
+        (None, _) => HierarchicalNodeAlgorithm::Lloyd,
+    };
     let kmeans_params = KMeansParams::new(centroids, params.max_iters as u32, REDOS, metric_type)
         .with_balance_factor(1.0)
+        .with_hierarchical_node_algorithm(node_algorithm)
         .with_on_progress(on_progress);
     let kmeans = lance_index::vector::kmeans::train_kmeans::<T>(
         data,
@@ -7294,6 +7302,61 @@ mod tests {
                 .values()
                 .as_ref(),
             &[4.0, 5.0]
+        );
+    }
+
+    #[rstest]
+    #[case::lloyd(Some(HierarchicalNodeAlgorithm::Lloyd))]
+    #[case::default(None)]
+    #[tokio::test]
+    async fn train_ivf_from_sample_retrains_many_initial_centroids(
+        #[case] kmeans_algorithm: Option<HierarchicalNodeAlgorithm>,
+    ) {
+        // Above 256 partitions, training without seeds would build a hierarchy;
+        // supplied seeds must still get exactly one Lloyd update.
+        const NUM_PARTITIONS: usize = 257;
+        let seeds = FixedSizeListArray::try_new_from_values(
+            Float32Array::from(
+                (0..NUM_PARTITIONS)
+                    .flat_map(|i| [10.0 * i as f32, 0.0])
+                    .collect::<Vec<_>>(),
+            ),
+            2,
+        )
+        .unwrap();
+        let sample = FixedSizeListArray::try_new_from_values(
+            Float32Array::from(
+                (0..NUM_PARTITIONS)
+                    .flat_map(|i| {
+                        let x = 10.0 * i as f32;
+                        [x - 1.0, 2.0, x + 3.0, 2.0]
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+            2,
+        )
+        .unwrap();
+        let mut params =
+            IvfBuildParams::try_with_centroids(NUM_PARTITIONS, Arc::new(seeds)).unwrap();
+        params.retrain = true;
+        params.max_iters = 1;
+        params.kmeans_algorithm = kmeans_algorithm;
+        let model = train_ivf_model_from_sample(sample, MetricType::L2, &params, noop_progress())
+            .await
+            .unwrap();
+        let expected = (0..NUM_PARTITIONS)
+            .flat_map(|i| [10.0 * i as f32 + 1.0, 2.0])
+            .collect::<Vec<_>>();
+        assert_eq!(
+            model
+                .centroids
+                .as_ref()
+                .unwrap()
+                .values()
+                .as_primitive::<Float32Type>()
+                .values()
+                .as_ref(),
+            expected.as_slice()
         );
     }
 
