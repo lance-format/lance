@@ -129,7 +129,7 @@ impl TakeOperation {
     /// If a take expression is combined with some other filter via an AND then the remainder will be
     /// returned as well.  For example, `_rowid = 10` will return (take_op, None) and
     /// `_rowid = 10 AND x > 70` will return (take_op, Some(x > 70)).
-    pub(super) fn try_from_expr(expr: &Expr) -> Option<(Self, Option<Expr>)> {
+    pub(in crate::dataset) fn try_from_expr(expr: &Expr) -> Option<(Self, Option<Expr>)> {
         if let Expr::BinaryExpr(binary) = expr {
             match binary.op {
                 datafusion_expr::Operator::And => {

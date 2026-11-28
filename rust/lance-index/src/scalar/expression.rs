@@ -2347,11 +2347,13 @@ fn maybe_indexed_column<'b>(
             let (parser, data_type) = multi.select(expr, data_type)?;
             Some((col.to_string(), data_type, parser))
         }
+        // A child field can be null even when its parent is valid.
+        Expr::ScalarFunction(udf) if udf.name() == "get_field" => None,
         Expr::ScalarFunction(udf) => {
             if udf.args.is_empty() {
                 return None;
             }
-            // For non-get_field functions, fall back to old behavior
+            // Function-specific parsers, such as JSON parsers, bind to the base column.
             let col = maybe_column(&udf.args[0])?;
             let (data_type, multi) = index_info.get_index(col)?;
             let (parser, data_type) = multi.select(expr, data_type)?;

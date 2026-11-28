@@ -50,7 +50,8 @@ use lance_core::deepsize::DeepSizeOf;
 use roaring::RoaringBitmap;
 
 use super::zoned::{
-    ParallelZoneTrainer, ZoneBound, ZoneProcessor, rebuild_zones_parallel, search_zones,
+    ParallelZoneTrainer, ZoneBound, ZoneProcessor, matching_zone_fragments, rebuild_zones_parallel,
+    search_zones,
 };
 
 pub const BLOOMFILTER_FILENAME: &str = "bloomfilter.lance";
@@ -635,6 +636,30 @@ impl ScalarIndex for BloomFilterIndex {
             SearchResult::AtMost(_) => SearchResult::at_most(selected).with_nulls(nulls),
             SearchResult::AtLeast(_) => SearchResult::at_least(selected).with_nulls(nulls),
         })
+    }
+
+    async fn candidate_fragment_ids(
+        &self,
+        query: &dyn AnyQuery,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Option<RoaringBitmap>> {
+        let Some(typed_query) = query.as_any().downcast_ref::<BloomFilterQuery>() else {
+            return Ok(None);
+        };
+        // Translating a matching zone through a row remapper can enumerate every
+        // row in the zone. Keep the segment's coverage for the worker to filter.
+        if self.frag_reuse_index.is_some() || self.batch_remapper.is_some() {
+            return Ok(None);
+        }
+        if matches!(typed_query, BloomFilterQuery::IsNull())
+            && let Some(null_rows) = &self.null_rows
+        {
+            return Ok(Some(null_rows.iter().map(|(&id, _)| id).collect()));
+        }
+        matching_zone_fragments(&self.zones, metrics, |zone| {
+            self.evaluate_block_against_query(zone, typed_query)
+        })
+        .map(Some)
     }
 
     fn results_are_row_addresses(&self) -> bool {
@@ -1790,6 +1815,10 @@ impl ScalarIndexPlugin for BloomFilterIndexPlugin {
 
     fn name(&self) -> &str {
         "BloomFilter"
+    }
+
+    fn supports_fragment_pruning(&self) -> bool {
+        true
     }
 
     fn new_query_parser(

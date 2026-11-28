@@ -856,6 +856,19 @@ pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
         self.search(query, metrics).await
     }
 
+    /// Return a superset of matching fragment IDs in this segment's current
+    /// physical address domain. An empty bitmap proves no match within the
+    /// segment's coverage. Return `None` when the query cannot be answered.
+    ///
+    /// The caller accounts for index coverage and changes since index creation.
+    async fn candidate_fragment_ids(
+        &self,
+        _query: &dyn AnyQuery,
+        _metrics: &dyn MetricsCollector,
+    ) -> Result<Option<RoaringBitmap>> {
+        Ok(None)
+    }
+
     /// This index as an [`OrderedScalarIndex`], or `None` when it cannot
     /// stream rows in key order.
     fn as_ordered(&self) -> Option<&dyn OrderedScalarIndex> {

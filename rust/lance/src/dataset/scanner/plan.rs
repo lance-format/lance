@@ -121,7 +121,7 @@ impl Scanner {
     ///
     /// This is the schema of the dataset, any metadata columns like _rowid or _rowaddr
     /// and any extra columns like _distance or _score
-    fn filterable_schema(&self) -> Result<Arc<Schema>> {
+    pub(in crate::dataset) fn filterable_schema(&self) -> Result<Arc<Schema>> {
         let fts_document_granularity = self
             .full_text_query
             .as_ref()

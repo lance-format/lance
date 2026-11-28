@@ -2748,6 +2748,49 @@ async fn dropped_unknown_transition_forces_scalar_query_to_scan(#[case] external
     }
 }
 
+#[rstest::rstest]
+#[case::zonemap(IndexType::ZoneMap)]
+#[case::bloomfilter(IndexType::BloomFilter)]
+#[tokio::test]
+async fn test_fragment_pruning_retains_tagged_remapped_coverage(#[case] index_type: IndexType) {
+    let mut dataset = fixture_with_index(index_type).await;
+    let (transition, destinations) = prepare(&dataset).await;
+    let content = InlineContent {
+        legacy_versions: vec![],
+        transitions: vec![transition],
+    }
+    .encode_to_vec();
+    install(&mut dataset, content, destinations, false).await;
+
+    let metadata = dataset.load_indices_by_name("i_idx").await.unwrap();
+    assert_eq!(metadata.len(), 1);
+    let index = dataset
+        .open_scalar_index("i", &metadata[0].uuid, &NoOpMetricsCollector)
+        .await
+        .unwrap();
+    let value = datafusion::scalar::ScalarValue::Int32(Some(100));
+    let query: Box<dyn lance_index::scalar::AnyQuery> = match index_type {
+        IndexType::ZoneMap => Box::new(lance_index::scalar::SargableQuery::Equals(value)),
+        _ => Box::new(lance_index::scalar::BloomFilterQuery::Equals(value)),
+    };
+    // Opening a tagged index requires its remapping plan. Detect row-level
+    // translation specifically by guarding the query after the open.
+    let result = lance_index::scalar::LEGACY_TRAFFIC_ONLY
+        .scope(
+            (),
+            index.candidate_fragment_ids(query.as_ref(), &NoOpMetricsCollector),
+        )
+        .await
+        .unwrap();
+    assert!(result.is_none());
+
+    let candidates = dataset
+        .candidate_fragment_ids(crate::dataset::scanner::ExprFilter::Sql("i = 100".into()))
+        .await
+        .unwrap();
+    assert_eq!(candidates, RoaringBitmap::from_iter([10, 11]));
+}
+
 // Combination: FRI effective coverage x #9449 fragment-scope pruning.
 //
 // Two BTree segments each cover one source fragment (S1 -> F0, S2 -> F1). An FRI

@@ -61,7 +61,9 @@ use lance_core::Result;
 use lance_core::deepsize::DeepSizeOf;
 use roaring::RoaringBitmap;
 
-use super::zoned::{ParallelZoneTrainer, ZoneBound, ZoneProcessor, search_zones};
+use super::zoned::{
+    ParallelZoneTrainer, ZoneBound, ZoneProcessor, matching_zone_fragments, search_zones,
+};
 use std::collections::HashSet;
 
 /// `rows` without the positions of `fragments`.
@@ -1191,6 +1193,30 @@ impl ScalarIndex for ZoneMapIndex {
         })
     }
 
+    async fn candidate_fragment_ids(
+        &self,
+        query: &dyn AnyQuery,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Option<RoaringBitmap>> {
+        let Some(typed_query) = query.as_any().downcast_ref::<SargableQuery>() else {
+            return Ok(None);
+        };
+        // Translating a matching zone through a row remapper can enumerate every
+        // row in the zone. Keep the segment's coverage for the worker to filter.
+        if self.fri.is_some() || self.batch_remapper.is_some() {
+            return Ok(None);
+        }
+        if matches!(typed_query, SargableQuery::IsNull())
+            && let Some(null_rows) = &self.null_rows
+        {
+            return Ok(Some(null_rows.iter().map(|(&id, _)| id).collect()));
+        }
+        matching_zone_fragments(&self.zones, metrics, |zone| {
+            self.evaluate_zone_against_query(zone, typed_query)
+        })
+        .map(Some)
+    }
+
     fn results_are_row_addresses(&self) -> bool {
         true
     }
@@ -2221,6 +2247,10 @@ impl ScalarIndexPlugin for ZoneMapIndexPlugin {
 
     fn version(&self) -> u32 {
         ZONEMAP_INDEX_VERSION
+    }
+
+    fn supports_fragment_pruning(&self) -> bool {
+        true
     }
 
     fn new_query_parser(

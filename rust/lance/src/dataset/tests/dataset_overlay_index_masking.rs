@@ -431,6 +431,52 @@ fn fsl(rows: Vec<Vec<f32>>, dim: i32) -> ArrayRef {
     )
 }
 
+#[rstest]
+#[tokio::test]
+async fn test_fragment_pruning_retains_overlay_matches(
+    #[values(false, true)] stable_row_ids: bool,
+) {
+    let mut dataset = create_base_dataset_with(stable_row_ids).await;
+    dataset
+        .create_index(
+            &["age"],
+            IndexType::ZoneMap,
+            None,
+            &scalar_params(IndexType::ZoneMap),
+            true,
+        )
+        .await
+        .unwrap();
+
+    let snapshot = dataset.clone();
+    let dataset = overlay_age(dataset, "pruning_age_overlay", 0, &[(1, Some(999))]).await;
+    let filter = crate::dataset::scanner::ExprFilter::Sql("age = 999".into());
+    let candidates = dataset
+        .candidate_fragment_ids(filter.clone())
+        .await
+        .unwrap();
+    assert_eq!(candidates, RoaringBitmap::from_iter([0]));
+    assert!(
+        snapshot
+            .candidate_fragment_ids(filter)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    let mut scan = dataset.scan();
+    let matching = scan
+        .with_fragments(vec![dataset.fragments()[0].clone()])
+        .use_scalar_index(false)
+        .filter("age = 999")
+        .unwrap()
+        .try_into_batch()
+        .await
+        .unwrap();
+    assert_eq!(matching.num_rows(), 1);
+    assert_eq!(ids_matching(&dataset, "age = 999").await, vec![1]);
+}
+
 /// A newer overlay on the indexed field drops stale index hits (the old value no longer
 /// matches) and surfaces new matches (the new value is found even though the index never
 /// saw it). Mirrors the spec's Bob 25 -> 26 worked example.
