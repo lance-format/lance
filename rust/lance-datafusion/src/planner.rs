@@ -14,6 +14,7 @@ use crate::membership::simplify_membership_regions;
 use crate::numeric_coercion::unwrap_widening_casts;
 use crate::signed_zero::{normalize_float_comparisons, rewrite_float_comparisons};
 use crate::sql::{parse_sql_expr, parse_sql_filter};
+use crate::timestamp_coercion::unwrap_timestamp_widening_casts;
 use arrow::compute::CastOptions;
 use arrow_array::ListArray;
 use arrow_buffer::{OffsetBuffer, i256};
@@ -1377,6 +1378,15 @@ impl Planner {
         // `Float64` literal, and before the float comparison rewrite, which would
         // otherwise turn a comparison on the cast into ranges on the cast.
         let expr = unwrap_widening_casts(expr, &df_schema)?;
+
+        // Also after coercion, which casts a timestamp column compared with an
+        // operand in a finer unit to that unit, and before `simplify`, which would
+        // move the cast back onto the operand by truncating it to the column's unit.
+        let expr = unwrap_timestamp_widening_casts(
+            expr,
+            &|operand| simplifier.simplify(operand),
+            &df_schema,
+        )?;
 
         // Fold each comparison's own operands and rewrite it before anything above
         // it folds. `simplify` folds an operand and everything above it in one
