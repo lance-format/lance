@@ -1637,22 +1637,28 @@ impl<'a> CleanupTask<'a> {
                 .table_state
                 .object_store
                 .read_dir_all(&dir, unmodified_since)
-                .map_ok(|obj| stream::once(future::ready(Ok(obj))).boxed())
-                .or_else(|e| {
-                    // If the directory doesn't exist then we can just return an empty stream.
-                    if e.is_not_found() {
-                        future::ready(Ok(stream::empty::<Result<ObjectMeta>>().boxed()))
-                    } else {
-                        future::ready(Err(e))
-                    }
+                // A directory that does not exist contributes no candidates.
+                // Collapse that into a `None` item instead of rebuilding the
+                // stream type, so the common path stays a plain `map` over the
+                // listing.
+                .map(|result| match result {
+                    Ok(obj_meta) => Ok(Some(obj_meta)),
+                    Err(error) if error.is_not_found() => Ok(None),
+                    Err(error) => Err(error),
                 })
-                .try_flatten()
-                .try_filter_map(move |obj_meta| {
+                // No per-object `stream::once(..).boxed()`: that boxes and
+                // heap-allocates once per listed object, which on a table with
+                // millions of files dominates the listing phase.
+                .try_filter_map(move |obj_meta| async move {
+                    let Some(obj_meta) = obj_meta else {
+                        return Ok(None);
+                    };
                     // If a file is new-ish then it might be part of an ongoing operation and so we only
                     // delete it if we can verify it is part of an old version.
                     let maybe_in_progress = !self.policy.delete_unverified
                         && obj_meta.last_modified >= verification_threshold;
                     self.cleanup_file_if_not_referenced(obj_meta, maybe_in_progress, inspection_ref)
+                        .await
                 })
                 .boxed()
         };
@@ -1701,7 +1707,7 @@ impl<'a> CleanupTask<'a> {
                 None,
             ));
         }
-        let unreferenced_files = stream::iter(streams).flatten().boxed();
+        let unreferenced_files = stream::select_all(streams).boxed();
 
         // LocalFileSystem hides its staging files from object listings. They can
         // never be referenced, even inside a retained index or blob directory.

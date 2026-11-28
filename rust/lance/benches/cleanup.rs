@@ -9,6 +9,10 @@
 //!   with `delete_unverified` removes them.
 //! - `versions`: a dataset with `V` versions, each with one data file.
 //!   Cleanup removes every version but the latest.
+//! - `cleanup_listing_latency`: the `versions` shape against a store that
+//!   charges a fixed delay per listing. Local filesystems have no listing
+//!   latency, so this is the only scenario that can show whether cleanup
+//!   lists its managed subtrees concurrently.
 //!
 //! The benchmark also counts calls made through the wrapped object store. This
 //! lets a one-request-per-file implementation be compared with a bulk-delete
@@ -27,6 +31,11 @@
 //! - `CLEANUP_BENCH_SAMPLE_SIZE`: criterion sample size (default: 10, minimum: 10).
 //! - `CLEANUP_BENCH_SKIP_ORPHANS`: set to 1/true/yes to skip the orphan scenario.
 //! - `CLEANUP_BENCH_SKIP_VERSIONS`: set to 1/true/yes to skip the version scenario.
+//! - `CLEANUP_BENCH_LIST_DELAY_MS`: injected listing latency for the
+//!   `cleanup_listing_latency` scenario, in milliseconds. Accepts one value;
+//!   when unset the scenario runs 10, 50 and 100 ms.
+//! - `CLEANUP_BENCH_LATENCY_VERSIONS`: dataset versions for that scenario
+//!   (default: 20, minimum: 2).
 //!
 //! Malformed or out-of-range values are rejected instead of silently falling
 //! back to a default or resizing the requested workload. Skip flags also accept
@@ -195,6 +204,123 @@ impl WrappingObjectStore for CountingStoreWrapper {
     }
 
     // The wrapper only observes deletes, so listings can keep their pushdown.
+    fn wrap_paginated(
+        &self,
+        _store_prefix: &str,
+        original: Arc<dyn object_store::list::PaginatedListStore>,
+    ) -> Option<Arc<dyn object_store::list::PaginatedListStore>> {
+        Some(original)
+    }
+}
+
+/// Pass-through store that sleeps on every listing to stand in for a round trip.
+///
+/// A local filesystem has no listing latency, so serial and concurrent listing
+/// cost about the same and the difference is invisible. The delay is paid once
+/// per listing stream, before the first item, which models one request rather
+/// than per-object cost.
+#[derive(Debug)]
+struct SlowListStore {
+    inner: Arc<dyn OSObjectStore>,
+    delay: std::time::Duration,
+}
+
+impl std::fmt::Display for SlowListStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SlowListStore({})", self.inner)
+    }
+}
+
+#[async_trait]
+impl OSObjectStore for SlowListStore {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        bytes: PutPayload,
+        opts: PutOptions,
+    ) -> OSResult<PutResult> {
+        self.inner.put_opts(location, bytes, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOptions,
+    ) -> OSResult<Box<dyn MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(&self, location: &Path, options: GetOptions) -> OSResult<GetResult> {
+        self.inner.get_opts(location, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, OSResult<Path>>,
+    ) -> BoxStream<'static, OSResult<Path>> {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, OSResult<ObjectMeta>> {
+        let inner = Arc::clone(&self.inner);
+        let delay = self.delay;
+        let prefix = prefix.cloned();
+        futures::stream::once(async move {
+            tokio::time::sleep(delay).await;
+            inner.list(prefix.as_ref())
+        })
+        .flatten()
+        .boxed()
+    }
+
+    fn list_with_offset(
+        &self,
+        prefix: Option<&Path>,
+        offset: &Path,
+    ) -> BoxStream<'static, OSResult<ObjectMeta>> {
+        let inner = Arc::clone(&self.inner);
+        let delay = self.delay;
+        let prefix = prefix.cloned();
+        let offset = offset.clone();
+        futures::stream::once(async move {
+            tokio::time::sleep(delay).await;
+            inner.list_with_offset(prefix.as_ref(), &offset)
+        })
+        .flatten()
+        .boxed()
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OSResult<ListResult> {
+        tokio::time::sleep(self.delay).await;
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> OSResult<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+
+    async fn rename_opts(&self, from: &Path, to: &Path, options: RenameOptions) -> OSResult<()> {
+        self.inner.rename_opts(from, to, options).await
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SlowListWrapper {
+    delay: std::time::Duration,
+}
+
+impl WrappingObjectStore for SlowListWrapper {
+    fn wrap(
+        &self,
+        _store_prefix: &str,
+        original: Arc<dyn OSObjectStore>,
+    ) -> Arc<dyn OSObjectStore> {
+        Arc::new(SlowListStore {
+            inner: original,
+            delay: self.delay,
+        })
+    }
+
     fn wrap_paginated(
         &self,
         _store_prefix: &str,
@@ -442,9 +568,87 @@ fn bench_cleanup(c: &mut Criterion) {
     group.finish();
 }
 
+/// Cleanup against a store that charges a round trip per listing.
+///
+/// Cleanup lists seven managed subtrees. On a local filesystem those listings
+/// have no latency, so a serial and a concurrent pipeline finish in the same
+/// time and the difference never shows up. This scenario injects a fixed delay
+/// into every `list` call through [`SlowListWrapper`], which makes the number of
+/// listings cleanup serializes visible in the total.
+///
+/// With `N` subtrees listed serially the extra cost grows by roughly `N` times
+/// the delay; listed concurrently it stays near one delay. Comparing this case
+/// across a change to the listing pipeline is the point, not the absolute
+/// number.
+fn bench_listing_latency(c: &mut Criterion) {
+    let runtime = Runtime::new().unwrap();
+    let versions = env_usize("CLEANUP_BENCH_LATENCY_VERSIONS", 20, 2);
+    let delays = std::env::var("CLEANUP_BENCH_LIST_DELAY_MS")
+        .map(|value| {
+            let delay = value
+                .parse::<u64>()
+                .unwrap_or_else(|_| panic!("CLEANUP_BENCH_LIST_DELAY_MS must be an integer"));
+            vec![delay]
+        })
+        .unwrap_or_else(|_| vec![10, 50, 100]);
+
+    let mut group = c.benchmark_group("cleanup_listing_latency");
+    group.sample_size(env_usize("CLEANUP_BENCH_SAMPLE_SIZE", 10, 10));
+    for delay_ms in delays {
+        let delay = std::time::Duration::from_millis(delay_ms);
+        let reported = AtomicBool::new(false);
+        group.bench_function(BenchmarkId::new("versions", delay_ms), |b| {
+            b.iter_batched(
+                || runtime.block_on(setup_with_list_delay(versions, delay)),
+                |(dir, dataset)| {
+                    let stats = runtime
+                        .block_on(dataset.cleanup(versions_policy(&dataset)).execute())
+                        .unwrap();
+                    if !reported.swap(true, Ordering::Relaxed) {
+                        eprintln!(
+                            "cleanup listing latency (delay={delay_ms}ms, versions={versions}): \
+                             old_versions={} data_files_removed={} transaction_files_removed={}",
+                            stats.old_versions,
+                            stats.data_files_removed,
+                            stats.transaction_files_removed,
+                        );
+                    }
+                    (dir, stats)
+                },
+                BatchSize::PerIteration,
+            );
+        });
+    }
+    group.finish();
+}
+
+/// Builds `versions` overwrite versions with every listing delayed by `delay`.
+async fn setup_with_list_delay(versions: usize, delay: std::time::Duration) -> (TempDir, Dataset) {
+    let dir = TempDir::new().unwrap();
+    let uri = file_object_store_uri(&dir.path().join("db"));
+    let params = || WriteParams {
+        mode: WriteMode::Overwrite,
+        store_params: Some(ObjectStoreParams {
+            object_store_wrapper: Some(Arc::new(SlowListWrapper { delay })),
+            ..Default::default()
+        }),
+        skip_auto_cleanup: true,
+        ..Default::default()
+    };
+    let mut dataset = Dataset::write(batch_reader(), &uri, Some(params()))
+        .await
+        .unwrap();
+    for _ in 1..versions {
+        dataset = Dataset::write(batch_reader(), &uri, Some(params()))
+            .await
+            .unwrap();
+    }
+    (dir, dataset)
+}
+
 criterion_group! {
     name = benches;
     config = Criterion::default();
-    targets = bench_cleanup
+    targets = bench_cleanup, bench_listing_latency
 }
 criterion_main!(benches);
