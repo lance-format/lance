@@ -30,6 +30,10 @@ pub fn register_functions(ctx: &SessionContext) {
     // JSON functions
     ctx.register_udf(json::json_extract_udf());
     ctx.register_udf(json::json_extract_with_type_udf());
+    ctx.register_udf(json::json_extract_string_udf());
+    ctx.register_udf(json::json_extract_int_udf());
+    ctx.register_udf(json::json_extract_float_udf());
+    ctx.register_udf(json::json_extract_bool_udf());
     ctx.register_udf(json::json_exists_udf());
     ctx.register_udf(json::json_get_udf());
     ctx.register_udf(json::json_get_string_udf());

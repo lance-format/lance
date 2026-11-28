@@ -9329,6 +9329,37 @@ async fn test_optimize_append_json_btree_preserves_float_type() {
     assert_eq!(indexed.num_rows(), baseline.num_rows());
 }
 
+/// The typed JSONPath functions are evaluated, not routed to a JSON index, and agree
+/// with the unindexed scan.
+#[tokio::test]
+async fn test_json_extract_typed_filters_ignore_json_index() {
+    let dataset = json_btree_dataset(
+        vec![
+            r#"{"val": 1, "user": {"name": "a", "score": 1.5, "ok": true}}"#,
+            r#"{"val": 2, "user": {"name": "b", "score": 2.5, "ok": false}}"#,
+            r#"{"val": 3, "user": {"name": "c"}}"#,
+            r#"{"val": 4}"#,
+        ],
+        "val",
+    )
+    .await;
+
+    for (predicate, expected) in [
+        ("json_extract_int(json, '$.val') >= 3", 2),
+        ("json_extract_string(json, '$.user.name') = 'b'", 1),
+        ("json_extract_float(json, '$.user.score') > 2", 1),
+        ("json_extract_bool(json, '$.user.ok')", 1),
+        ("json_extract_string(json, '$.user.missing') IS NULL", 4),
+    ] {
+        let mut scan = dataset.scan();
+        scan.filter(predicate).unwrap();
+        let plan = scan.explain_plan(false).await.unwrap();
+        assert!(!plan.contains("ScalarIndexQuery"), "{predicate}: {plan}");
+        let batch = scan.try_into_batch().await.unwrap();
+        assert_eq!(batch.num_rows(), expected, "{predicate}");
+    }
+}
+
 /// A JSON-wrapped zonemap answers in row addresses, which differ from stable
 /// row ids past fragment 0, so the wrapper must report its target's domain.
 #[tokio::test]
