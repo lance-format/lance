@@ -534,6 +534,17 @@ async fn test_group_by_with_count() {
     let batch = arrow::compute::concat_batches(&results[0].schema(), &results).unwrap();
     assert_eq!(batch.num_rows(), 3); // 3 categories
 
+    let prefix: Vec<RecordBatch> = scanner
+        .try_into_stream_with_output_limit(Some(1))
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    let prefix = arrow::compute::concat_batches(&batch.schema(), &prefix).unwrap();
+    assert_eq!(prefix.num_rows(), 1);
+    assert_eq!(prefix.column(1).as_primitive::<Int64Type>().value(0), 40);
+
     // Each category should have 40 rows (120 total / 3 categories)
     let counts: Vec<i64> = batch
         .column(1) // count column

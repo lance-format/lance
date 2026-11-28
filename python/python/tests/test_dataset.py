@@ -1703,6 +1703,81 @@ def test_limit_offset(tmp_path: Path, data_storage_version: str):
     assert dataset.to_table(offset=3, limit=1) == filt_table
 
 
+def test_scanner_head_read_budget(tmp_path):
+    data = pa.table({"id": range(8192)})
+    dataset = lance.write_dataset(data, tmp_path, max_rows_per_file=2048)
+    stats = []
+    scanner = dataset.scanner(
+        filter="id >= 64",
+        batch_size=128,
+        batch_readahead=2,
+        fragment_readahead=1,
+        scan_stats_callback=stats.append,
+    )
+    assert scanner.head(1) == data.slice(64, 1)
+    assert len(stats) == 1
+    rows_read = stats[0].all_counts["rows_scanned"]
+    assert 0 < rows_read < len(data), f"head scanned {rows_read} rows"
+    assert scanner.to_table() == data.slice(64)
+
+
+@pytest.mark.parametrize(
+    "options", [{"limit": 5}, {"offset": 1}, {"offset": 1, "limit": 5}]
+)
+def test_scanner_head_with_existing_read_range(tmp_path, options):
+    data = pa.table({"id": range(12)})
+    dataset = lance.write_dataset(data, tmp_path, max_rows_per_file=4)
+    scanner = dataset.scanner(**options)
+    expected = data.slice(options.get("offset", 0), options.get("limit"))
+    assert scanner.head(1) == expected.slice(0, 1)
+    assert scanner.to_table() == expected
+
+
+@pytest.mark.parametrize("stop", [0, 1, np.int64(2), 10**30, -1, None])
+def test_scanner_head_preserves_scan(tmp_path, stop):
+    data = pa.table({"id": [4, 2, 3, 1], "label": ["d", "b", "c", "a"]})
+    dataset = lance.write_dataset(data, tmp_path, max_rows_per_file=2)
+    stats = []
+    scanner = dataset.scanner(
+        columns=["label"],
+        order_by=["id"],
+        filter="id > 1",
+        offset=1,
+        limit=2,
+        scan_stats_callback=stats.append,
+    )
+    dataset.delete("id = 3")
+    expected = pa.table({"label": ["c", "d"]})
+    assert scanner.head(stop) == expected[:stop]
+    assert len(stats) == 1
+    assert scanner.to_table() == expected
+
+
+def test_scanner_head_uses_subclass_reader(tmp_path):
+    data = pa.table({"id": [0, 1, 2]})
+    ds = lance.write_dataset(data, tmp_path)
+
+    class SkipFirst(lance.LanceScanner):
+        def to_reader(self):
+            return super().to_reader().read_all().slice(1).to_reader()
+
+    scanner = SkipFirst(ds.scanner()._scanner, ds)
+    assert scanner.head(1) == data.slice(1, 1)
+
+
+def test_scanner_head_uses_subclass_table():
+    data = pa.table({"id": [1, 2]})
+
+    class TableScanner(lance.LanceScanner):
+        def __init__(self):
+            self.table = data
+
+        def to_table(self):
+            return self.table
+
+    assert TableScanner().head(1) == data.slice(0, 1)
+
+
 def test_relative_paths(tmp_path: Path):
     # relative paths get coerced to the full absolute path
     current_dir = os.getcwd()

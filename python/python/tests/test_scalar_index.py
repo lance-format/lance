@@ -3620,6 +3620,9 @@ def test_minhash_lsh_index():
     filtered = ds.to_table(nearest=query, limit=3, filter="id > 0", prefilter=True)
     assert filtered["id"].to_pylist() == [3, 1]
 
+    postfiltered = ds.scanner(nearest=query, limit=3, filter="id > 0", prefilter=False)
+    assert postfiltered.head(1)["id"].to_pylist() == [3]
+
     with pytest.raises(Exception, match="No MinHash LSH index found for column id"):
         ds.to_table(nearest=MinHashQuery(base, "id"), limit=3)
 

@@ -181,13 +181,18 @@ impl Scanner {
             .map_err(|err| PyValueError::new_err(err.to_string()))
     }
 
+    #[pyo3(signature = (output_limit=None))]
     fn to_pyarrow(
         self_: PyRef<'_, Self>,
+        output_limit: Option<usize>,
     ) -> PyResult<PyArrowType<Box<dyn RecordBatchReader + Send>>> {
         let scanner = self_.scanner.clone();
         let reader = rt()
             .spawn(Some(self_.py()), async move {
-                LanceReader::try_new(scanner).await
+                scanner
+                    .try_into_stream_with_output_limit(output_limit)
+                    .await
+                    .map(LanceReader::from_stream)
             })?
             .map_err(|err| PyValueError::new_err(err.to_string()))?;
 

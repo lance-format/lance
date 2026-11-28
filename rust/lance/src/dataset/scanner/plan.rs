@@ -24,6 +24,8 @@ use datafusion::logical_expr::Expr;
 use datafusion::physical_expr::PhysicalSortExpr;
 use datafusion::physical_optimizer::output_requirements::OutputRequirementExec;
 use datafusion::physical_plan::display::DisplayableExecutionPlan;
+use datafusion::physical_plan::empty::EmptyExec;
+use datafusion::physical_plan::limit::GlobalLimitExec;
 use datafusion::physical_plan::projection::ProjectionExec as DFProjectionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::{ExecutionPlan, SendableRecordBatchStream, expressions};
@@ -37,7 +39,7 @@ use lance_core::datatypes::{Field, OnMissing, Projection};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{ROW_ADDR, ROW_ID, ROW_OFFSET};
 use lance_datafusion::exec::{
-    LanceExecutionOptions, StrictBatchSizeExec, analyze_plan, execute_plan,
+    LanceExecutionOptions, StrictBatchSizeExec, analyze_plan, execute_plan, into_single_partition,
 };
 use lance_index::scalar::expression::create_filter_plan;
 use lance_index::scalar::inverted::{
@@ -269,19 +271,43 @@ impl Scanner {
     }
 
     /// Create a stream from the Scanner.
-    #[instrument(skip_all)]
     pub fn try_into_stream(&self) -> BoxFuture<'_, Result<DatasetRecordBatchStream>> {
+        self.try_into_stream_with_output_limit(None)
+    }
+
+    /// Stream at most `output_limit` rows of the configured scan result.
+    ///
+    /// The cap applies after search, aggregation and the scan's own offset and limit.
+    ///
+    /// ```
+    /// # use lance::{Dataset, Result};
+    /// # async fn example(dataset: &Dataset) -> Result<()> {
+    /// let first_ten = dataset.scan().try_into_stream_with_output_limit(Some(10)).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[instrument(name = "try_into_stream", skip_all)]
+    pub fn try_into_stream_with_output_limit(
+        &self,
+        output_limit: Option<usize>,
+    ) -> BoxFuture<'_, Result<DatasetRecordBatchStream>> {
         // Future intentionally boxed here to avoid large futures on the stack
         async move {
             let plan = self.create_plan().await?;
-
+            // The scanner's optimized plan already owns its offsets and search limits.
+            // Cap the merged output so a limit pushed into a source cannot replace them.
+            let plan: Arc<dyn ExecutionPlan> = match output_limit {
+                None => plan,
+                Some(0) => Arc::new(EmptyExec::new(plan.schema())),
+                Some(cap) => Arc::new(GlobalLimitExec::new(
+                    into_single_partition(plan),
+                    0,
+                    Some(cap),
+                )),
+            };
             Ok(DatasetRecordBatchStream::new(execute_plan(
                 plan,
-                LanceExecutionOptions {
-                    batch_size: self.batch_size,
-                    execution_stats_callback: self.scan_stats_callback.clone(),
-                    ..Default::default()
-                },
+                self.execution_options(),
             )?))
         }
         .boxed()
@@ -1234,6 +1260,24 @@ mod tests {
     };
     use crate::index::DatasetIndexExt;
     use crate::io::exec::PreFilterSource;
+
+    #[tokio::test]
+    async fn test_output_limit_with_offset() -> Result<()> {
+        let test_ds = TestVectorDataset::new(LanceFileVersion::Stable, false).await?;
+        let mut scan = test_ds.dataset.scan();
+        scan.filter("i >= 0")?;
+        for inner in [None, Some(1)] {
+            scan.limit(inner, Some(1))?;
+            let expected = scan.try_into_batch().await?;
+            let batches: Vec<_> = scan
+                .try_into_stream_with_output_limit(Some(usize::MAX))
+                .await?
+                .try_collect()
+                .await?;
+            assert_eq!(concat_batches(&expected.schema(), &batches)?, expected);
+        }
+        Ok(())
+    }
 
     #[tokio::test]
     async fn test_stable_row_id_limit_pushdown_with_deletions() -> Result<()> {
