@@ -69,7 +69,7 @@ use crate::{
     },
 };
 
-use super::exact_buffers::exact_batch;
+use super::exact_buffers::{exact_batch, exact_partition_batch};
 use super::graph::OrderedFloat;
 use super::graph::OrderedNode;
 use super::pairwise::{
@@ -1956,7 +1956,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
                 .await?;
             if self.supports_rabit_planes() {
                 // Keep cache charges independent of excess decoder buffer capacity.
-                exact_batch(&schema, &batches, false)?
+                exact_partition_batch(&schema, &batches)?
             } else {
                 concat_batches(&schema, batches.iter())?
             }
@@ -2826,7 +2826,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
             .try_collect::<Vec<_>>()
             .await?;
         if whole {
-            exact_batch(schema, &batches, false)
+            exact_partition_batch(schema, &batches)
         } else {
             concat_batches(schema, batches.iter()).map_err(Into::into)
         }
@@ -2922,7 +2922,7 @@ impl<Q: Quantization> IvfQuantizationStorage<Q> {
                 .await?;
             Some(if rows.is_none() {
                 // A whole read, which entries hold: see `read_projected`.
-                exact_batch(&file_schema, &batches, false)?
+                exact_partition_batch(&file_schema, &batches)?
             } else {
                 concat_batches(&file_schema, batches.iter())?
             })

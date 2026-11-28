@@ -43,7 +43,7 @@ use tracing::instrument;
 
 use super::{
     AnyQuery, IndexFile, IndexStore, LabelListQuery, OldIndexDataFilter, ScalarIndex,
-    bitmap::BitmapIndex,
+    SearchOptions, bitmap::BitmapIndex,
 };
 use super::{BuiltinIndexType, SargableQuery, ScalarIndexParams};
 use super::{MetricsCollector, SearchResult};
@@ -96,7 +96,13 @@ trait LabelListSubIndex: ScalarIndex + DeepSizeOf {
         query: &dyn AnyQuery,
         metrics: &dyn MetricsCollector,
     ) -> Result<NullableRowAddrSet> {
-        let result = self.search(query, metrics).await?;
+        let result = self
+            .search_with_options(
+                query,
+                SearchOptions::default().with_track_nulls(false),
+                metrics,
+            )
+            .await?;
         match result {
             SearchResult::Exact(row_ids) => {
                 // Label list semantics treat NULL elements as non-matches, so only TRUE/FALSE
@@ -305,6 +311,16 @@ impl ScalarIndex for LabelListIndex {
         query: &dyn AnyQuery,
         metrics: &dyn MetricsCollector,
     ) -> Result<SearchResult> {
+        self.search_with_options(query, SearchOptions::default(), metrics)
+            .await
+    }
+
+    async fn search_with_options(
+        &self,
+        query: &dyn AnyQuery,
+        options: SearchOptions,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<SearchResult> {
         let query = query.as_any().downcast_ref::<LabelListQuery>().unwrap();
 
         let row_ids = match query {
@@ -318,7 +334,7 @@ impl ScalarIndex for LabelListIndex {
                 self.set_union(values_results, labels.len() == 1).await
             }
         }?;
-        let row_ids = if self.list_nulls.as_ref().is_empty() {
+        let row_ids = if !options.track_nulls() || self.list_nulls.as_ref().is_empty() {
             row_ids
         } else {
             let mut nulls = row_ids.null_rows().clone();
@@ -1183,7 +1199,7 @@ mod tests {
     use super::super::bitmap::BitmapIndexState;
     use super::super::btree::OrderableScalarValue;
     use super::*;
-    use crate::metrics::LocalMetricsCollector;
+    use crate::metrics::{LocalMetricsCollector, NoOpMetricsCollector};
     use crate::progress::NoopIndexBuildProgress;
     use crate::scalar::bitmap::test_util::{self, row_addrs};
     use lance_core::utils::tempfile::TempObjDir;
@@ -1644,6 +1660,45 @@ mod tests {
             .await
             .unwrap();
         (tmpdir, index)
+    }
+
+    #[rstest]
+    #[case::any(LabelListQuery::HasAnyLabel(vec![ScalarValue::Utf8(Some("a".into()))]))]
+    #[case::all(LabelListQuery::HasAllLabels(vec![ScalarValue::Utf8(Some("a".into()))]))]
+    #[tokio::test]
+    #[serial_test::serial(LANCE_DF_SPILL_POOL)]
+    async fn test_search_options_preserve_true_rows_without_tracking_list_nulls(
+        #[case] query: LabelListQuery,
+    ) {
+        let other_fragment = 1u64 << 32;
+        let rows: Vec<SampleRow> = vec![
+            (0, Some(vec![Some("a".into())])),
+            (1, None),
+            (other_fragment, Some(vec![Some("a".into()), None])),
+            (other_fragment + 1, Some(vec![])),
+            (other_fragment + 2, Some(vec![None])),
+        ];
+        let (_dir, index) = build_label_list_segment(&rows).await;
+        let SearchResult::Exact(tracked) =
+            index.search(&query, &NoOpMetricsCollector).await.unwrap()
+        else {
+            panic!("label-list search must be exact");
+        };
+        let SearchResult::Exact(untracked) = index
+            .search_with_options(
+                &query,
+                SearchOptions::default().with_track_nulls(false),
+                &NoOpMetricsCollector,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("label-list search must be exact");
+        };
+        assert_eq!(row_addrs(tracked.null_rows()), vec![1]);
+        assert!(untracked.null_rows().is_empty());
+        assert_eq!(row_addrs(&tracked.true_rows()), vec![0, other_fragment]);
+        assert_eq!(untracked.true_rows(), tracked.true_rows());
     }
 
     /// `calculate_included_frags` reports that coverage cannot be rebuilt from

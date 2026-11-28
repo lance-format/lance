@@ -867,7 +867,7 @@ async fn test_native_strategy_scoring_through_fragment_reuse(
 }
 
 #[derive(Debug, Clone, Copy)]
-enum NativeScanFactory {
+pub(super) enum NativeScanFactory {
     Whole(RabitCacheLayout),
     Survivors(ExIndex, RabitScanScope),
 }
