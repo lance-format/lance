@@ -1460,7 +1460,7 @@ async fn create_fragmented_fts_index_with_order(
     create_fragmented_fts_index_with_groups(dataset, column, with_position, fragment_groups).await;
 }
 
-async fn create_fragmented_fts_index_with_groups(
+pub(super) async fn create_fragmented_fts_index_with_groups(
     dataset: &mut Dataset,
     column: &str,
     with_position: bool,
