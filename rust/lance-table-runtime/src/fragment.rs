@@ -3,10 +3,16 @@
 
 //! Read the files and row metadata that make up a table fragment.
 
+mod columns;
+mod deletions;
 mod file_reader;
 mod read_config;
+#[doc(hidden)]
+pub mod read_defaults;
 mod reader;
 pub mod session;
+mod updater;
+pub(crate) mod write;
 
 use std::borrow::Cow;
 use std::collections::HashSet;
@@ -17,6 +23,7 @@ use futures::future::try_join_all;
 use futures::{future, join};
 use lance_core::datatypes::Schema;
 use lance_core::utils::deletion::DeletionVector;
+use lance_core::utils::io_stats::IoStatsRecorder;
 use lance_core::{Error, ROW_ADDR, ROW_ID, Result};
 use lance_file::version::ConcreteFileVersion;
 use lance_table::format::{DataFile, DeletionFile, Fragment};
@@ -25,12 +32,20 @@ use lance_table::io::deletion::deletion_file_path;
 use crate::Table;
 use crate::io::deletion::read_table_deletion_file;
 
+pub(crate) use columns::discard_staged_file;
+#[doc(hidden)]
+pub use columns::{duplicate_field_path, relax_nullability, validate_write_version};
 pub use file_reader::GenericFileReader;
 #[doc(hidden)]
 pub use file_reader::V1FragmentReader;
 pub use read_config::{BaseSchedulers, FragReadConfig};
 pub use reader::FragmentReader;
 pub use session::FragmentSession;
+#[doc(hidden)]
+pub use updater::Updater;
+pub use write::FragmentCreateBuilder;
+#[doc(hidden)]
+pub use write::generate_random_filename;
 
 /// A fragment bound to the table snapshot that supplies its schema and storage.
 #[derive(Debug, Clone)]
@@ -217,7 +232,7 @@ impl FileFragment {
         // Just open any file. All of them should have same size.
         let some_file = &self.metadata.files[0];
         let reader = self
-            .open_reader(some_file, None, &FragReadConfig::default())
+            .open_reader(some_file, None, &FragReadConfig::default(), None)
             .await?
             .ok_or_else(|| {
                 Error::internal(format!(
@@ -352,7 +367,7 @@ impl FileFragment {
         let get_lengths = user_data_files.clone().map(|data_file| async move {
             let data_file_dir = self.table.data_file_dir(data_file)?;
             let reader = self
-                .open_reader(data_file, None, &FragReadConfig::default())
+                .open_reader(data_file, None, &FragReadConfig::default(), None)
                 .await?
                 .ok_or_else(|| {
                     Error::corrupt_file(
@@ -590,7 +605,20 @@ impl FileFragment {
         projection: &Schema,
         read_config: FragReadConfig,
     ) -> Result<RecordBatch> {
-        let reader = self.open(projection, read_config).await?;
+        self.take_rows_with_io_stats(row_offsets, projection, read_config, None)
+            .await
+    }
+
+    pub(crate) async fn take_rows_with_io_stats(
+        &self,
+        row_offsets: &[u32],
+        projection: &Schema,
+        read_config: FragReadConfig,
+        io_stats: Option<Arc<dyn IoStatsRecorder>>,
+    ) -> Result<RecordBatch> {
+        let reader = self
+            .open_with_io_stats(projection, read_config, io_stats)
+            .await?;
 
         reader.take_rows(row_offsets).await
     }

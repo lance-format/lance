@@ -292,6 +292,20 @@ async fn test_list_versions_under_early_stop_bounded_consumption() {
                 .boxed()
         }
 
+        fn list_with_offset(
+            &self,
+            prefix: Option<&Path>,
+            offset: &Path,
+        ) -> BoxStream<'static, OSResult<ObjectMeta>> {
+            let entries_listed = self.entries_listed.clone();
+            self.target
+                .list_with_offset(prefix, offset)
+                .inspect(move |_| {
+                    entries_listed.fetch_add(1, Ordering::SeqCst);
+                })
+                .boxed()
+        }
+
         async fn list_with_delimiter(&self, prefix: Option<&Path>) -> OSResult<ListResult> {
             self.target.list_with_delimiter(prefix).await
         }
@@ -313,12 +327,16 @@ async fn test_list_versions_under_early_stop_bounded_consumption() {
             base_path: Url,
             params: &ObjectStoreParams,
         ) -> Result<ObjectStore> {
-            let mut store = MemoryStoreProvider.new_store(base_path, params).await?;
-            store.inner = Arc::new(EntryCountingStore {
-                target: store.inner.clone(),
+            let store = MemoryStoreProvider
+                .new_store(base_path.clone(), params)
+                .await?;
+            let inner = Arc::new(EntryCountingStore {
+                target: store.inner,
                 entries_listed: self.entries_listed.clone(),
             });
-            Ok(store)
+            Ok(ObjectStore::new(
+                inner, base_path, None, None, false, true, 1, 0, None,
+            ))
         }
 
         fn extract_path(&self, url: &Url) -> Result<Path> {
@@ -337,13 +355,14 @@ async fn test_list_versions_under_early_stop_bounded_consumption() {
     let entries_listed = Arc::new(AtomicUsize::new(0));
     let registry = Arc::new(ObjectStoreRegistry::default());
     registry.insert(
-        "memory-object-store",
+        "s3",
         Arc::new(EntryCountingMemoryProvider {
             entries_listed: entries_listed.clone(),
         }),
     );
     let session = Arc::new(Session::new(0, 0, registry));
-    let ns = DirectoryNamespaceBuilder::new("memory-object-store://lv-count")
+    let ns = DirectoryNamespaceBuilder::new("s3://lv-count")
+        .manifest_enabled(false)
         .session(session)
         .build()
         .await
@@ -382,6 +401,79 @@ async fn test_list_versions_under_early_stop_bounded_consumption() {
              101 entries)",
         consumed
     );
+
+    // A large V1 version can sort inside the physical V2 run.
+    let interleaved = 1_844_674_407_370_955_161;
+    ns.object_store
+        .put(
+            &ManifestNamingScheme::V1.manifest_path(&table_path, interleaved),
+            b"m",
+        )
+        .await
+        .unwrap();
+    let request = ListTableVersionsRequest {
+        id: Some(vec!["lv_count".into()]),
+        limit: Some(3),
+        page_token: Some("35".into()),
+        ..Default::default()
+    };
+    let before = entries_listed.load(Ordering::SeqCst);
+    let page = ns.list_table_versions(request.clone()).await.unwrap();
+    assert_eq!(
+        page.versions.iter().map(|v| v.version).collect::<Vec<_>>(),
+        [36, 37, 38]
+    );
+    assert_eq!(page.page_token.as_deref(), Some("38"));
+    let consumed = entries_listed.load(Ordering::SeqCst) - before;
+    assert!(
+        consumed <= 5,
+        "dense continuation consumed {consumed} entries"
+    );
+
+    let history = ns
+        .list_table_versions(ListTableVersionsRequest {
+            id: request.id.clone(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .versions;
+    assert_eq!(history.last().unwrap().version, interleaved as i64);
+    let mut token = None;
+    for expected in history.chunks(3) {
+        let page = ns
+            .list_table_versions(ListTableVersionsRequest {
+                page_token: token,
+                ..request.clone()
+            })
+            .await
+            .unwrap();
+        assert_eq!(page.versions, expected);
+        token = page.page_token;
+    }
+    assert!(token.is_none());
+
+    // An apparently complete V2 window still has to account for V1 aliases.
+    let alias = ManifestNamingScheme::V1.manifest_path(&table_path, 37);
+    ns.object_store.put(&alias, b"m").await.unwrap();
+    let err = ns.list_table_versions(request.clone()).await.unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("Multiple manifests for version 37")
+    );
+    assert_eq!(mutation_error_code(err), ErrorCode::Internal);
+
+    ns.object_store.inner.delete(&alias).await.unwrap();
+    for v in [35, 36] {
+        let key = ManifestNamingScheme::V2.manifest_path(&table_path, v);
+        ns.object_store.inner.delete(&key).await.unwrap();
+    }
+    let page = ns.list_table_versions(request).await.unwrap();
+    assert_eq!(
+        page.versions.iter().map(|v| v.version).collect::<Vec<_>>(),
+        [37, 38, 39]
+    );
+    assert_eq!(page.page_token.as_deref(), Some("39"));
 }
 
 #[derive(Debug)]

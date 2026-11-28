@@ -149,6 +149,23 @@ impl TableSession {
     }
 }
 
+impl std::fmt::Debug for TableSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TableSession")
+            .field(
+                "unregistered_external_blob_policy",
+                &self.unregistered_external_blob_policy,
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl AsRef<Self> for TableSession {
+    fn as_ref(&self) -> &Self {
+        self
+    }
+}
+
 impl Default for TableSession {
     fn default() -> Self {
         Self::with_caches(

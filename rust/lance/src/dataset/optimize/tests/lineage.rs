@@ -6,12 +6,12 @@
 use lance_io::stream::{RecordBatchStreamAdapter, SendableRecordBatchStream};
 
 use super::*;
-use crate::dataset::optimize::execution::{
-    PlannedRowLineage, append_row_lineage_columns, can_use_binary_copy, place_planned_row_lineage,
+use crate::dataset::rowids::{RowLineage, RowLineagePlan, RowLineageSpill, plan_row_lineage_spill};
+use lance_table_runtime::optimize::execution::{
+    PlannedRowLineage, append_row_lineage_columns, place_planned_row_lineage,
     place_row_lineage_in_files,
 };
-use crate::dataset::optimize::planning::pins_dead_user_columns_for_lineage;
-use crate::dataset::rowids::{RowLineage, RowLineagePlan, RowLineageSpill, plan_row_lineage_spill};
+use lance_table_runtime::optimize::planning::pins_dead_user_columns_for_lineage;
 
 #[tokio::test]
 async fn test_compaction_balances_non_divisible_stable_task() {
@@ -125,7 +125,7 @@ async fn per_fragment_plan_spills_only_the_fragments_over_budget() {
         .collect::<Vec<_>>();
 
     place_planned_row_lineage(
-        &dataset,
+        &dataset.table_view().to_table(),
         &mut fragments,
         PlannedRowLineage {
             lineages,

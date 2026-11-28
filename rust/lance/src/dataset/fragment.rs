@@ -7,20 +7,16 @@ mod aligned_update;
 pub mod session;
 pub mod write;
 
-use std::borrow::Cow;
-use std::collections::HashSet;
 use std::ops::Range;
 use std::sync::Arc;
 
 use arrow_array::cast::as_primitive_array;
 use arrow_array::{RecordBatch, RecordBatchReader, UInt64Array};
-use arrow_schema::{DataType, Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema};
 use datafusion::logical_expr::Expr;
 use datafusion::scalar::ScalarValue;
 use futures::future::try_join_all;
-use futures::{FutureExt, Stream, StreamExt, TryStreamExt, join};
-use lance_arrow::RecordBatchExt;
-use lance_core::datatypes::{BlobHandling, NullabilityComparison, Schema, SchemaCompareOptions};
+use futures::{FutureExt, Stream, StreamExt, TryStreamExt};
+use lance_core::datatypes::{BlobHandling, Schema, SchemaCompareOptions};
 use lance_core::utils::deletion::DeletionVector;
 use lance_core::{Error, ROW_ADDR, ROW_ID, Result};
 use lance_datafusion::utils::StreamingWriteSource;
@@ -33,10 +29,8 @@ use lance_io::scheduler::{FileScheduler, ScanScheduler, SchedulerConfig};
 use lance_io::stream::RecordBatchStream;
 use lance_io::utils::CachedFileSize;
 use lance_table::format::{DataFile, Fragment};
-use lance_table::io::deletion::write_deletion_file;
 use lance_table::utils::stream::ReadBatchFutStream;
 use lance_table_runtime::Table;
-use object_store::path::Path;
 use roaring::RoaringBitmap;
 
 use self::write::FragmentCreateBuilder;
@@ -44,9 +38,9 @@ use self::write::FragmentCreateBuilder;
 use super::hash_joiner::HashJoiner;
 use super::scanner::Scanner;
 use super::updater::Updater;
-use super::write::seeds::SeedCollector;
+use super::write::seeds::LanceWriteSeedHook;
 use super::{NewColumnTransform, WriteParams, schema_evolution, versions};
-use crate::blob::{BlobWriteSources, logical_to_prepared_blob_schema};
+use crate::blob::BlobWriteSources;
 use crate::dataset::fragment::session::FragmentSession;
 use crate::dataset::overlay::writer::{OverlayWriter, WriteOverlayError};
 use crate::dataset::{Dataset, UpdateJoinOptions};
@@ -120,92 +114,7 @@ pub use lance_table_runtime::fragment::{
     BaseSchedulers, FragReadConfig, FragmentReader, GenericFileReader,
 };
 
-/// The first path in `fields` that names a sibling twice. Projection picks
-/// children by name, so a duplicate makes that choice arbitrary, and the
-/// name-set comparison the schema check uses cannot see one at all.
-pub(crate) fn duplicate_field_path(fields: &ArrowFields, path: &str) -> Option<String> {
-    let mut seen = HashSet::new();
-    for field in fields {
-        let qualified = if path.is_empty() {
-            field.name().clone()
-        } else {
-            format!("{path}.{}", field.name())
-        };
-        if !seen.insert(field.name()) {
-            return Some(qualified);
-        }
-        if let Some(nested) = duplicate_nested_path(field.data_type(), &qualified) {
-            return Some(nested);
-        }
-    }
-    None
-}
-
-fn duplicate_nested_path(data_type: &DataType, path: &str) -> Option<String> {
-    match data_type {
-        DataType::Struct(children) => duplicate_field_path(children, path),
-        DataType::List(item)
-        | DataType::LargeList(item)
-        | DataType::FixedSizeList(item, _)
-        | DataType::Map(item, _) => {
-            duplicate_nested_path(item.data_type(), &format!("{path}.item"))
-        }
-        _ => None,
-    }
-}
-
-/// Remove a staged file that will not be committed. Best effort: it is
-/// unreachable either way, and must not mask the error that caused it.
-pub(crate) async fn discard_staged_file(dataset: &Dataset, path: &Path) {
-    // Blob v2 spills sidecars into data/<file-stem>/ beside the file, and
-    // those are the large ones; leaving them is what makes a routine
-    // rejection expensive.
-    if let Some(stem) = path
-        .filename()
-        .and_then(|name| name.strip_suffix(".lance"))
-        .map(|stem| dataset.data_dir().join(stem))
-        && let Err(delete_error) = dataset
-            .table_state
-            .object_store
-            .remove_dir_all(stem.clone())
-            .await
-    {
-        log::warn!("failed to delete staged blob sidecars '{stem}': {delete_error}");
-    }
-    if let Err(delete_error) = dataset.table_state.object_store.delete(path).await {
-        log::warn!("failed to delete staged column file '{path}': {delete_error}");
-    }
-}
-
-/// `field` with nullability dropped at every level: the projector rebuilds
-/// arrays against its target and panics rather than reports on a constraint,
-/// so it gets a shape that cannot fail and the writer objects instead.
-pub(crate) fn relax_nullability(field: &ArrowField) -> ArrowField {
-    let relax = |field: &Arc<ArrowField>| Arc::new(relax_nullability(field));
-    let data_type = match field.data_type() {
-        DataType::Struct(children) => DataType::Struct(children.iter().map(relax).collect()),
-        DataType::List(item) => DataType::List(relax(item)),
-        DataType::LargeList(item) => DataType::LargeList(relax(item)),
-        DataType::FixedSizeList(item, width) => DataType::FixedSizeList(relax(item), *width),
-        // A Map's entries struct and its key stay required -- Arrow rejects a
-        // map whose entries or keys are nullable -- so only the value relaxes.
-        DataType::Map(entries, sorted) => match entries.data_type() {
-            DataType::Struct(kv) if kv.len() == 2 => {
-                let value = Arc::new(relax_nullability(&kv[1]));
-                let entries = ArrowField::new(
-                    entries.name(),
-                    DataType::Struct(vec![kv[0].clone(), value].into()),
-                    false,
-                )
-                .with_metadata(entries.metadata().clone());
-                DataType::Map(Arc::new(entries), *sorted)
-            }
-            _ => field.data_type().clone(),
-        },
-        other => other.clone(),
-    };
-    ArrowField::new(field.name(), data_type, true).with_metadata(field.metadata().clone())
-}
+pub(crate) use lance_table_runtime::fragment::{duplicate_field_path, relax_nullability};
 
 impl FileFragment {
     /// Creates a new FileFragment.
@@ -758,55 +667,21 @@ impl FileFragment {
         blob_handling: Option<BlobHandling>,
         write_version: ConcreteFileVersion,
     ) -> Result<Updater> {
-        let mut schema = self.dataset.schema().clone();
-
-        let mut with_row_addr = false;
-        let mut with_row_id = false;
-        if let Some(columns) = columns {
-            let mut projection = Vec::new();
-            for column in columns {
-                if column.as_ref() == ROW_ADDR {
-                    with_row_addr = true;
-                } else if column.as_ref() == ROW_ID {
-                    with_row_id = true;
-                } else {
-                    projection.push(column.as_ref());
-                }
-            }
-            schema = schema.project(&projection)?;
-        }
-
-        if let Some(blob_handling) = blob_handling {
-            schema.fields = schema
-                .fields
-                .into_iter()
-                .map(|field| blob_handling.unload_if_needed(field))
-                .collect();
-        }
-
-        // If there is no projection, we at least need to read the row addresses
-        with_row_addr |= !with_row_id && schema.fields.is_empty();
-
-        let reader = self.open(
-            &schema,
-            FragReadConfig::default()
-                .with_row_address(with_row_addr)
-                .with_row_id(with_row_id),
-        );
-        let deletion_vector = self.get_deletion_vector();
-        let (reader, deletion_vector) = join!(reader, deletion_vector);
-        let reader = reader?;
-        let deletion_vector = deletion_vector?.unwrap_or_default().as_ref().clone();
-
-        Updater::try_new(
-            self.clone(),
-            reader,
-            deletion_vector,
+        let updater = Box::pin(self.core.updater_with_version(
+            columns,
             schemas,
             batch_size,
+            blob_handling,
             write_version,
-        )
-        .await
+            || super::scanner::get_default_batch_size().unwrap_or(1024),
+            FragReadConfig::default(),
+        ))
+        .await?;
+        let hook = Arc::new(LanceWriteSeedHook::new(self.dataset.session.clone()));
+        Ok(Updater::from_runtime(
+            self.clone(),
+            updater.with_seed_hook(hook),
+        ))
     }
 
     pub async fn merge_columns(
@@ -1018,13 +893,6 @@ impl FileFragment {
         })
     }
 
-    fn schema_mismatch(&self, detail: impl std::fmt::Display) -> Error {
-        Error::invalid_input(format!(
-            "column data for fragment {} does not match the requested schema: {detail}",
-            self.id()
-        ))
-    }
-
     /// Write new data for columns of this fragment as a standalone data file,
     /// without committing it, and return the
     /// [`DataReplacementGroup`](super::transaction::DataReplacementGroup)
@@ -1182,222 +1050,16 @@ impl FileFragment {
         file_writer_options: FileWriterOptions,
         has_blob_sources: bool,
     ) -> Result<super::transaction::DataReplacementGroup> {
-        versions::validate_write_version(
-            self.dataset
-                .manifest
-                .data_storage_format
-                .lance_file_format(),
+        let hook = LanceWriteSeedHook::new(self.dataset.session.clone());
+        Box::pin(self.core.write_column_with_version_and_options(
+            data,
+            schema,
             write_version,
-        )?;
-        let expected_rows = self.physical_rows().await? as u64;
-
-        let mut writer_schema = self.resolve_writer_schema(schema)?;
-        if has_blob_sources {
-            writer_schema
-                .metadata
-                .clone_from(&self.dataset.schema().metadata);
-        }
-        let batch_schema = ArrowSchema::from(&writer_schema);
-        let (batch_schema, expected_schema) = if has_blob_sources {
-            let prepared = logical_to_prepared_blob_schema(&batch_schema)?;
-            let expected_schema = Cow::Owned(Schema::try_from(&prepared)?);
-            (prepared, expected_schema)
-        } else {
-            (batch_schema, Cow::Borrowed(&writer_schema))
-        };
-        let projection_schema = ArrowSchema::new(
-            batch_schema
-                .fields()
-                .iter()
-                .map(|field| relax_nullability(field))
-                .collect::<Vec<_>>(),
-        );
-
-        if write_version == ConcreteFileVersion::V1 {
-            // The legacy reader pairs a fragment's files by batch boundary, so a
-            // staged file chunked to the caller's batches leaves the fragment
-            // unreadable. Rechunking is the legacy update path's job, not this
-            // one's.
-            return Err(Error::not_supported(format!(
-                "write_columns is not supported for fragment {} in the legacy file format",
-                self.id()
-            )));
-        }
-
-        // The update writer, not a raw file writer: that boundary carries the
-        // version's write policies (blob v2 columns arrive logical and must be
-        // prepared for the encoders) and returns a populated `DataFile`.
-        // Blob v2 descriptors land under the dataset root, outside any
-        // registered external base, as on the other update paths.
-        let has_blob_v2 = writer_schema
-            .fields_pre_order()
-            .any(|field| field.is_blob_v2());
-        // Resolve the seed writers before the staged file exists, so a failure
-        // here leaves nothing to discard.
-        let mut seeds = SeedCollector::for_write(
-            write_version,
-            Some(self.dataset.as_ref()),
-            &writer_schema,
-            true,
-        )
-        .await?;
-        let mut writer = versions::open_update_writer_with_options(
-            write_version,
-            self.dataset.as_ref(),
-            &writer_schema,
-            has_blob_v2 && !has_blob_sources,
             file_writer_options,
-        )
-        .await?;
-        let staged_path = {
-            let (file_name, _) = writer.data_file_path();
-            self.dataset.data_dir().join(file_name)
-        };
-
-        // From here every failure -- a stream error, a rejected batch, a write
-        // or finish error, a row-count mismatch -- owns the same staged
-        // artifacts: the data file and any Blob sidecars already finalized
-        // beside it. One exit cleans them all.
-        let mut data = std::pin::pin!(data);
-        let staged: Result<_> = async {
-            while let Some(batch_result) = data.next().await {
-                let (batch, sources) = batch_result?;
-                // Struct encoders consume children positionally, so a batch
-                // ordered differently from the manifest lands under the wrong
-                // field ids. Projection fixes that by name, but it downcasts by
-                // shape, so the whole tree is compared first. Nullability is the
-                // writer's to enforce, against the data rather than the
-                // declared schema.
-                if let Some(duplicate) = duplicate_field_path(batch.schema_ref().fields(), "") {
-                    return Err(self.schema_mismatch(format!("column '{duplicate}' appears twice")));
-                }
-                Schema::try_from(batch.schema_ref().as_ref())
-                    .and_then(|staged| {
-                        staged.check_compatible(
-                            expected_schema.as_ref(),
-                            &SchemaCompareOptions {
-                                compare_nullability: NullabilityComparison::Ignore,
-                                ignore_field_order: true,
-                                ..Default::default()
-                            },
-                        )
-                    })
-                    .map_err(|mismatch| self.schema_mismatch(mismatch))?;
-                let batch = batch
-                    .project_by_schema(&projection_schema)
-                    .map_err(|err| self.schema_mismatch(err))?;
-                if let Some(sources) = sources.as_ref() {
-                    writer
-                        .write_with_blob_sources(&batch, &self.dataset.table_state.base, sources)
-                        .await?;
-                } else {
-                    writer.write(std::slice::from_ref(&batch)).await?;
-                }
-                seeds.observe(&batch)?;
-            }
-            seeds.flush(writer.as_mut()).await?;
-            let (num_rows, data_file) = writer.finish().await?;
-            if num_rows as u64 != expected_rows {
-                return Err(Error::invalid_input(format!(
-                    "column data for fragment {} has {} rows but the fragment has {} physical rows",
-                    self.id(),
-                    num_rows,
-                    expected_rows
-                )));
-            }
-            Ok(data_file)
-        }
-        .await;
-
-        match staged {
-            Ok(data_file) => Ok(super::transaction::DataReplacementGroup(
-                self.id() as u64,
-                data_file,
-            )),
-            Err(err) => {
-                // The writer may still hold the file open (a buffered upload,
-                // an unflushed local handle); release it before deleting.
-                drop(writer);
-                discard_staged_file(self.dataset.as_ref(), &staged_path).await;
-                Err(err)
-            }
-        }
-    }
-
-    /// Resolve the fields a staged file will carry against the manifest.
-    ///
-    /// Shared by [`Self::write_columns`] and [`Self::write_overlay`]: both stage
-    /// a data file that the commit path publishes without publishing schema, so
-    /// both need the same guarantee that every field is one the dataset already
-    /// defines, exactly as it defines it. Returns the manifest's own fields, so
-    /// physical layout comes from the manifest rather than from the request.
-    pub(crate) fn resolve_writer_schema(&self, schema: &Schema) -> Result<Schema> {
-        // Readers take everything but the field id from the manifest, so a
-        // staged field reusing an id is decoded as the manifest's version rather
-        // than rejected. Compare full identity, not just the storage type.
-        let compare_options = SchemaCompareOptions {
-            compare_field_ids: true,
-            ..Default::default()
-        };
-        // Top-level requests match top-level manifest fields only: resolving an
-        // id from anywhere lets a caller reuse a field at a path the dataset
-        // never gave it, staging a file covering the borrowed field. Layout then
-        // comes from the manifest, since the metadata the identity check ignores
-        // -- packed structs, blob encoding -- decides physical field coverage.
-        let dataset_schema = self.dataset.schema();
-        let mut writer_fields = Vec::with_capacity(schema.fields.len());
-        let mut requested = HashSet::with_capacity(schema.fields.len());
-        for field in &schema.fields {
-            // The per-field identity check cannot see the request naming an
-            // id twice, and the set-based batch comparison downstream would
-            // match one batch column against both copies.
-            if !requested.insert(field.id) {
-                return Err(Error::invalid_input(format!(
-                    "column data for fragment {} names field id {} ('{}') more than once",
-                    self.id(),
-                    field.id,
-                    field.name
-                )));
-            }
-            if lance_core::is_system_column(&field.name) {
-                return Err(Error::invalid_input(format!(
-                    "column data for fragment {} names reserved column '{}'",
-                    self.id(),
-                    field.name
-                )));
-            }
-            let Some(existing) = dataset_schema
-                .fields
-                .iter()
-                .find(|existing| existing.id == field.id)
-            else {
-                // The commit path publishes data files, never schema, so a
-                // field the manifest does not define would commit as a file no
-                // live field answers for -- and a concurrent schema change
-                // could never be checked against it.
-                return Err(Error::invalid_input(format!(
-                    "column data for fragment {} names field id {} ('{}') that the dataset schema \
-                     does not define; declare the column with add_columns before staging its data",
-                    self.id(),
-                    field.id,
-                    field.name
-                )));
-            };
-            // `explain_difference` recurses, covering the whole subtree.
-            if let Some(difference) = field.explain_difference(existing, &compare_options) {
-                return Err(Error::invalid_input(format!(
-                    "column data for fragment {} does not match dataset field id {}: {}",
-                    self.id(),
-                    field.id,
-                    difference
-                )));
-            }
-            writer_fields.push(existing.clone());
-        }
-        Ok(Schema {
-            fields: writer_fields,
-            metadata: schema.metadata.clone(),
-        })
+            has_blob_sources,
+            Some(&hook),
+        ))
+        .await
     }
 
     /// Stage a data overlay supplying new values for a subset of this fragment's
@@ -1458,7 +1120,7 @@ impl FileFragment {
         &self,
         schema: &Schema,
     ) -> std::result::Result<OverlayWriter, WriteOverlayError> {
-        OverlayWriter::open(self.dataset.clone(), self, schema).await
+        Box::pin(self.core.write_overlay(schema)).await
     }
 
     /// Delete rows from the fragment.
@@ -1541,51 +1203,17 @@ impl FileFragment {
         self,
         new_deletions: impl IntoIterator<Item = u32>,
     ) -> Result<Option<Self>> {
-        let mut deletion_vector = self
-            .get_deletion_vector()
+        let Self { dataset, core } = self;
+        Ok(Box::pin(core.extend_deletions(new_deletions))
             .await?
-            .unwrap_or_default()
-            .as_ref()
-            .clone();
-
-        deletion_vector.extend(new_deletions);
-
-        self.write_deletions(deletion_vector).await
+            .map(|core| Self { dataset, core }))
     }
 
-    async fn write_deletions(mut self, deletion_vector: DeletionVector) -> Result<Option<Self>> {
-        let physical_rows = self.physical_rows().await?;
-        if deletion_vector.len() == physical_rows
-            && deletion_vector.contains_range(0..physical_rows as u32)
-        {
-            return Ok(None);
-        } else if deletion_vector.len() >= physical_rows {
-            let dv_len = deletion_vector.len();
-            let examples: Vec<u32> = deletion_vector
-                .into_iter()
-                .filter(|x| *x >= physical_rows as u32)
-                .take(5)
-                .collect();
-            return Err(Error::internal(format!(
-                "Deletion vector includes rows that aren't in the fragment. \
-            Num physical rows {}; Deletion vector length: {}; \
-            Examples: {:?}",
-                physical_rows, dv_len, examples
-            )));
-        }
-
-        let deletion_file = write_deletion_file(
-            &self.dataset.table_state.base,
-            self.metadata().id,
-            self.dataset.version_id(),
-            &deletion_vector,
-            self.dataset.table_state.object_store.as_ref(),
-            self.dataset.inline_deletions_max_bytes()?,
-        )
-        .await?;
-        self.metadata_mut().deletion_file = deletion_file;
-
-        Ok(Some(self))
+    async fn write_deletions(self, deletion_vector: DeletionVector) -> Result<Option<Self>> {
+        let Self { dataset, core } = self;
+        Ok(Box::pin(core.write_deletions(deletion_vector))
+            .await?
+            .map(|core| Self { dataset, core }))
     }
 }
 
@@ -1607,6 +1235,7 @@ pub(crate) mod tests {
         StringArray, UInt32Array,
     };
     use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
+    use lance_arrow::RecordBatchExt;
     use lance_core::utils::address::RowAddress;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_core::{ROW_ID, ROW_ID_FIELD};
@@ -1619,6 +1248,7 @@ pub(crate) mod tests {
     use pretty_assertions::assert_eq;
     use rstest::rstest;
     use std::collections::HashMap;
+    use std::collections::HashSet;
 
     use super::*;
     use crate::{
@@ -5056,7 +4686,7 @@ pub(crate) mod tests {
         let dataset = Arc::new(create_dataset(&test_dir, LanceFileVersion::Stable).await);
 
         let deletion_vector = DeletionVector::from_iter([2, 9]);
-        let deletion_file = write_deletion_file(
+        let deletion_file = lance_table::io::deletion::write_deletion_file(
             &dataset.table_state.base,
             99,
             dataset.version().version,
@@ -5097,7 +4727,7 @@ pub(crate) mod tests {
         let dataset = Arc::new(create_dataset(&test_dir, LanceFileVersion::Stable).await);
 
         let deletion_vector = DeletionVector::from_iter([2, 10]);
-        let deletion_file = write_deletion_file(
+        let deletion_file = lance_table::io::deletion::write_deletion_file(
             &dataset.table_state.base,
             99,
             dataset.version().version,
@@ -5264,7 +4894,7 @@ pub(crate) mod tests {
         let fragment_index = 1;
         let fragment_id = dataset.manifest.fragments[fragment_index].id;
         assert_ne!(fragment_id, 0, "need a non-zero fragment id");
-        let deletion_file = write_deletion_file(
+        let deletion_file = lance_table::io::deletion::write_deletion_file(
             &dataset.table_state.base,
             fragment_id,
             dataset.version().version,

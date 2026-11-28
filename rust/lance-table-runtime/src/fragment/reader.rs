@@ -13,6 +13,7 @@ use futures::{FutureExt, StreamExt, TryFutureExt, TryStreamExt, join, stream};
 use lance_arrow::{RecordBatchExt, SchemaExt};
 use lance_core::datatypes::Schema;
 use lance_core::utils::deletion::DeletionVector;
+use lance_core::utils::io_stats::IoStatsRecorder;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{
     Error, ROW_ADDR_FIELD, ROW_CREATED_AT_VERSION_FIELD, ROW_ID_FIELD,
@@ -46,6 +47,15 @@ impl FileFragment {
         projection: &Schema,
         read_config: FragReadConfig,
     ) -> Result<FragmentReader> {
+        self.open_with_io_stats(projection, read_config, None).await
+    }
+
+    pub(crate) async fn open_with_io_stats(
+        &self,
+        projection: &Schema,
+        read_config: FragReadConfig,
+        io_stats: Option<Arc<dyn IoStatsRecorder>>,
+    ) -> Result<FragmentReader> {
         if read_config.make_deletions_null
             && !read_config.with_row_id
             && !read_config.with_row_address
@@ -54,7 +64,7 @@ impl FileFragment {
                 "make_deletions_null requires with_row_id or with_row_address".to_string(),
             ));
         }
-        let open_files = self.open_readers(projection, &read_config);
+        let open_files = self.open_readers(projection, &read_config, io_stats.clone());
         let deletion_vec_load = if read_config.ignore_deletions {
             futures::future::Either::Left(futures::future::ready(Ok(None)))
         } else {
@@ -142,6 +152,7 @@ impl FileFragment {
                 reader.overlay = Some(OverlayReadState {
                     planner: Arc::new(planner),
                     read_config: Arc::new(read_config.clone()),
+                    io_stats,
                 });
             }
         }
@@ -232,6 +243,7 @@ pub struct FragmentReader {
 struct OverlayReadState {
     planner: Arc<OverlayReadPlanner>,
     read_config: Arc<FragReadConfig>,
+    io_stats: Option<Arc<dyn IoStatsRecorder>>,
 }
 
 // Custom clone impl needed because it is not easy to clone Box<dyn GenericFileReader>
@@ -411,6 +423,7 @@ impl FragmentReader {
             &selection,
             &self.fragment,
             &overlay.read_config,
+            overlay.io_stats.clone(),
         )
         .await?;
         if plans.is_empty() {

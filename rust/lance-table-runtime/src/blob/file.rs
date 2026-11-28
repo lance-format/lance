@@ -273,6 +273,7 @@ pub struct BlobFile {
     pub(super) size: u64,
     kind: BlobKind,
     uri: Option<String>,
+    base_id: Option<u32>,
 }
 
 impl BlobFile {
@@ -292,8 +293,14 @@ impl BlobFile {
             size,
             kind,
             uri,
+            base_id: None,
             state: Arc::new(Mutex::new(BlobFileState::new())),
         }
+    }
+
+    pub(super) fn with_base_id(mut self, base_id: Option<u32>) -> Self {
+        self.base_id = base_id;
+        self
     }
 
     /// Create an inline blob reader backed by a data file.
@@ -408,6 +415,7 @@ impl BlobFile {
             size: self.size,
             kind: self.kind,
             uri: self.uri.clone(),
+            base_id: self.base_id,
         }
     }
 
@@ -700,6 +708,24 @@ impl BlobFile {
 
     pub fn kind(&self) -> BlobKind {
         self.kind
+    }
+
+    /// The registered storage base used to locate this blob within its dataset.
+    ///
+    /// Inline and sidecar blobs inherit the data file's base. Managed blobs use
+    /// their explicit base when present and otherwise inherit the data file's base.
+    /// External blobs with a relative URI use the base named by their descriptor.
+    /// Returns `None` for the default dataset location, an absolute External URI,
+    /// or a handle constructed directly from an object store and path.
+    ///
+    /// ```
+    /// # use lance_table_runtime::{Table, blob::BlobFile};
+    /// # fn example(table: &Table, file: &BlobFile) {
+    /// let base = file.base_id().and_then(|id| table.base_paths().get(&id));
+    /// # }
+    /// ```
+    pub fn base_id(&self) -> Option<u32> {
+        self.base_id
     }
 
     pub fn uri(&self) -> Option<&str> {

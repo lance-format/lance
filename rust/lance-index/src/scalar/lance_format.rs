@@ -735,6 +735,17 @@ impl IndexStore for LanceIndexStore {
         new_name: &str,
         dest_store: &dyn IndexStore,
     ) -> Result<IndexFile> {
+        self.copy_index_file_to_with_observer(name, new_name, dest_store, None)
+            .await
+    }
+
+    async fn copy_index_file_to_with_observer(
+        &self,
+        name: &str,
+        new_name: &str,
+        dest_store: &dyn IndexStore,
+        observer: Option<&dyn lance_io::object_store::CopyObserver>,
+    ) -> Result<IndexFile> {
         let path = self.index_file_path(name)?;
 
         match dest_store.as_any().downcast_ref::<Self>() {
@@ -742,7 +753,7 @@ impl IndexStore for LanceIndexStore {
                 let dest_path = dest_store.index_file_path(new_name)?;
                 let result = self
                     .object_store
-                    .copy_bulk(&path, &dest_store.object_store, &dest_path)
+                    .copy_bulk_with_observer(&path, &dest_store.object_store, &dest_path, observer)
                     .await?;
                 Ok(IndexFile {
                     path: new_name.to_string(),

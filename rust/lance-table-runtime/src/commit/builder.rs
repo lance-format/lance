@@ -57,6 +57,18 @@ impl CommitDestination<'_> {
     }
 }
 
+impl From<Table> for CommitDestination<'_> {
+    fn from(table: Table) -> Self {
+        Self::Table(Arc::new(table))
+    }
+}
+
+impl From<&Table> for CommitDestination<'_> {
+    fn from(table: &Table) -> Self {
+        Self::from(table.clone())
+    }
+}
+
 impl From<Arc<Table>> for CommitDestination<'_> {
     fn from(dataset: Arc<Table>) -> Self {
         CommitDestination::Table(dataset)
@@ -320,6 +332,33 @@ impl<'a> CommitBuilder<'a> {
 
     pub fn with_skip_auto_cleanup(mut self, skip_auto_cleanup: bool) -> Self {
         self.commit_config.skip_auto_cleanup = skip_auto_cleanup;
+        self
+    }
+
+    /// Whether to store the transaction only inline in the manifest, skipping the
+    /// separate file under `_transactions/` and saving one object write. The
+    /// transaction is inlined regardless of its size, up to `u32::MAX` bytes.
+    ///
+    /// The new manifest gets a writer feature flag, so Lance releases older than
+    /// v1.0.0 refuse to write to that version. Later commits that do not set this
+    /// write the transaction file again and drop the flag.
+    ///
+    /// Readers older than Lance 14.0 return no transaction for such a version
+    /// and cannot rebase a concurrent commit across it. Keep the transaction
+    /// file when clients older than 14.0 read transaction history or commit
+    /// concurrently.
+    ///
+    /// **Default is false.**
+    ///
+    /// ```
+    /// use lance_table_runtime::CommitBuilder;
+    ///
+    /// let _builder = CommitBuilder::new("memory://dataset").with_disable_transaction_file(true);
+    /// ```
+    pub fn with_disable_transaction_file(mut self, disable_transaction_file: bool) -> Self {
+        self.manifest_config = self
+            .manifest_config
+            .with_disable_transaction_file(disable_transaction_file);
         self
     }
 

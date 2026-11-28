@@ -296,7 +296,7 @@ async fn storage_statistics_require_full_file_metadata() {
     let projection = table.schema().project(&["a"]).unwrap();
     let config = FragReadConfig::default();
     let reader = fragment
-        .open_reader(file, Some(&projection), &config)
+        .open_reader(file, Some(&projection), &config, None)
         .await
         .unwrap()
         .unwrap();

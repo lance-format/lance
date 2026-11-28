@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -106,8 +107,9 @@ pub struct Session {
     /// Optional runtime strategy, rebound for each opened index.
     pub(crate) rabit_scan_factory: Option<Arc<dyn RabitScanFactory>>,
 
-    /// See [`Self::with_datafusion_session`].
-    datafusion_session: Option<SessionContext>,
+    /// See [`Self::with_datafusion_session`]. Held type-erased so that proving
+    /// `Session: Send + Sync` does not walk DataFusion's plan types.
+    datafusion_session: Option<Arc<dyn Any + Send + Sync>>,
 }
 
 impl DeepSizeOf for Session {
@@ -346,13 +348,15 @@ impl Session {
     /// session's datasets, e.g. with
     /// [`lance_datafusion::planner::Planner::new_with_session`].
     pub fn with_datafusion_session(mut self, session: SessionContext) -> Self {
-        self.datafusion_session = Some(session);
+        self.datafusion_session = Some(Arc::new(session));
         self
     }
 
     /// The session set by [`Self::with_datafusion_session`], if any.
     pub fn datafusion_session(&self) -> Option<&SessionContext> {
-        self.datafusion_session.as_ref()
+        self.datafusion_session
+            .as_ref()
+            .and_then(|session| session.downcast_ref())
     }
 
     /// Return a reference to the session's spill store.
@@ -641,6 +645,12 @@ impl Session {
     /// weighted capacity; see [`Self::set_index_cache_capacity`].
     pub fn set_metadata_cache_capacity(&self, capacity: usize) -> Result<()> {
         self.file_metadata_cache().set_capacity(capacity)
+    }
+}
+
+impl AsRef<TableSession> for Session {
+    fn as_ref(&self) -> &TableSession {
+        &self.table_session
     }
 }
 

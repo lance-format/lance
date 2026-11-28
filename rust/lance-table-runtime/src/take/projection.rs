@@ -8,6 +8,7 @@ use arrow_schema::{DataType, Field};
 use lance_arrow::RecordBatchExt;
 use lance_arrow::json::convert_lance_json_to_arrow;
 use lance_core::datatypes::{OnMissing, OnTypeMismatch, Projectable, Projection, Schema};
+use lance_core::utils::io_stats::IoStatsRecorder;
 use lance_core::{ROW_ADDR, ROW_OFFSET, ROW_OFFSET_FIELD, Result, is_system_column};
 
 use super::{TakeOptions, TakeSelection};
@@ -76,9 +77,16 @@ impl TakeProjection {
         table: &Table,
         selection: TakeSelection<'_>,
         options: TakeOptions,
+        io_stats: Option<Arc<dyn IoStatsRecorder>>,
     ) -> Result<RecordBatch> {
         let physical_batch = table
-            .take_physical(selection, &self.physical, self.with_row_offset, options)
+            .take_physical_with_io_stats(
+                selection,
+                &self.physical,
+                self.with_row_offset,
+                options,
+                io_stats,
+            )
             .await?;
 
         let batch = match physical_batch {

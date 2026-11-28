@@ -15,8 +15,8 @@ use object_store::path::Path;
 
 use super::locate::{BlobLocator, StoredBlob, data_file_key_from_path};
 use super::test_util::create_multi_base_blob_v2_fixture;
-use super::write::INLINE_MAX;
 use crate::Dataset;
+use lance_table_runtime::blob::thresholds::INLINE_MAX;
 
 mod policies;
 
@@ -54,7 +54,7 @@ async fn test_blob_locator_locates_each_kind() {
     let field_id = dataset.schema().field("blob").unwrap().id as u32;
     let data_file = dataset.get_fragment(0).unwrap().metadata().files[0].clone();
     let data_dir = dataset.data_file_dir(&data_file).unwrap();
-    let base_root = dataset.blob_base_path(Some(1)).unwrap();
+    let base_root = dataset.table_view().blob_base_path(Some(1)).unwrap();
     let sidecar = blob_path(&data_dir, data_file_key_from_path(&data_file.path), 7);
     let external_dir = TempStdDir::default();
     let external_file = external_dir.join("payload.bin");
@@ -219,6 +219,7 @@ async fn test_take_blob_v2_from_non_default_base_packed() {
     assert_eq!(blobs.len(), 1);
     let blob = blobs[0].as_ref().unwrap();
     assert_eq!(blob.kind(), BlobKind::Packed);
+    assert_eq!(blob.base_id(), Some(1));
     assert_eq!(
         blob.read().await.unwrap().as_ref(),
         fixture.expected.as_slice()

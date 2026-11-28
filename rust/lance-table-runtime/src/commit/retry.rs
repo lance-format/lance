@@ -140,15 +140,16 @@ pub async fn execute_with_retry<S: RetrySnapshot, E: RetryExecutor<S>>(
             maybe_timeout(backoff.attempt(), start, config.retry_timeout, execute_fut);
         let data = execute_fut.await??;
 
-        let commit_future = executor.commit(dataset_ref.clone(), data);
-        let commit_future = maybe_timeout(
-            backoff.attempt(),
-            start,
-            config.retry_timeout,
-            commit_future,
-        );
+        // The deadline is checked before the commit starts, never around it.
+        // Cancelling a commit after its manifest is written would report a
+        // committed write as failed, and callers retrying a non-idempotent
+        // operation would apply it twice. The commit is still bounded by its
+        // own retry limits.
+        if backoff.attempt() > 0 && start.elapsed() > config.retry_timeout {
+            return Err(timeout_error(config.retry_timeout, backoff.attempt() + 1));
+        }
 
-        match commit_future.await? {
+        match executor.commit(dataset_ref.clone(), data).await {
             Ok(result) => return Ok(result),
             Err(Error::RetryableCommitConflict { .. }) => {
                 // Check whether we have exhausted our retries *before* we sleep.

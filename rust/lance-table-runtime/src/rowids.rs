@@ -3,6 +3,7 @@
 
 //! Read and validate stable row IDs and per-row dataset versions.
 
+mod capture;
 mod spill;
 mod take;
 mod validate;
@@ -26,7 +27,16 @@ use crate::caches::{RowIdIndexKey, RowIdSequenceKey, RowVersionSequenceKey};
 use crate::io::deletion::read_table_deletion_file;
 
 #[doc(hidden)]
+pub use capture::{CapturedRowIds, make_rowid_capture_stream};
+#[doc(hidden)]
 pub use spill::lineage_field;
+#[doc(hidden)]
+pub use spill::write::{
+    CarriedRowLineage, DEFAULT_INLINE_ROW_LINEAGE_MAX_BYTES,
+    INLINE_ROW_LINEAGE_MAX_BYTES_CONFIG_KEY, PlacedRowLineage, RowLineage, RowLineagePlan,
+    RowLineageSpill, SPILL_ROW_LINEAGE_CONFIG_KEY, inline_row_lineage_max_bytes,
+    place_carried_row_lineage, place_row_lineage, plan_row_lineage_spill,
+};
 pub use spill::{read_spilled_row_ids, read_spilled_versions};
 pub(crate) use take::resolve_take_row_ids;
 pub use validate::validate_stable_row_ids;

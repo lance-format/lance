@@ -21,6 +21,7 @@ use super::pb;
 use crate::pb::Tensor;
 use crate::vector::flat::storage::FlatBinStorage;
 use crate::vector::flat::storage::FlatFloatStorage;
+use crate::vector::graph::VisitedGenerator;
 use crate::vector::hnsw::HNSW;
 use crate::vector::hnsw::builder::{HnswBuildParams, HnswQueryParams};
 use crate::vector::v3::subindex::IvfSubIndex;
@@ -159,7 +160,19 @@ impl SimpleIndex {
         Self::try_new(store).map(Some)
     }
 
-    pub(crate) fn search(&self, query: ArrayRef) -> Result<(u32, f32)> {
+    /// A visited set for [`Self::search`] to reuse across the searches of
+    /// one thread.
+    pub(crate) fn visited_generator(&self) -> VisitedGenerator {
+        VisitedGenerator::new(self.index.len())
+    }
+
+    /// The nearest centroid to `query` and the distance to it, searched with
+    /// `visited`, which one thread can reuse for all its queries.
+    pub(crate) fn search(
+        &self,
+        query: ArrayRef,
+        visited: &mut VisitedGenerator,
+    ) -> Result<(u32, f32)> {
         let params = HnswQueryParams {
             ef: 15,
             lower_bound: None,
@@ -169,14 +182,17 @@ impl SimpleIndex {
             rq_graph_scoring: Default::default(),
         };
         let (res, _) = match &self.store {
-            SimpleStore::Float(store) => self.index.search_basic(query, 1, &params, None, store)?,
+            SimpleStore::Float(store) => self
+                .index
+                .search_basic_with(query, 1, &params, None, visited, store)?,
             SimpleStore::Binary(store) => {
                 let query = if query.data_type() == &DataType::UInt8 {
                     query
                 } else {
                     cast(&query, &DataType::UInt8).map_err(|e| Error::index(e.to_string()))?
                 };
-                self.index.search_basic(query, 1, &params, None, store)?
+                self.index
+                    .search_basic_with(query, 1, &params, None, visited, store)?
             }
         };
         Ok((res[0].id, res[0].dist.0))
@@ -387,6 +403,7 @@ mod tests {
     use rayon::ThreadPoolBuilder;
 
     use arrow::compute::cast;
+    use rand::{Rng, SeedableRng, rngs::SmallRng};
     use rstest::rstest;
 
     fn build_index(centroids: ArrayRef, dim: usize) -> SimpleIndex {
@@ -418,9 +435,31 @@ mod tests {
         let thread_pool = ThreadPoolBuilder::new().num_threads(1).build().unwrap();
         let index = thread_pool.install(|| build_index(centroids, 16));
         let query: ArrayRef = Arc::new(Float32Array::from(vec![query_val; 16]));
-        let (id, dist) = index.search(query).unwrap();
+        let (id, dist) = index.search(query, &mut index.visited_generator()).unwrap();
         assert_eq!(id, 42);
         assert_eq!(dist, 0.0);
+    }
+
+    /// A visited set reused across a thread's searches, as IVF assignment
+    /// reuses one per batch, finds what a fresh set per search finds.
+    #[test]
+    fn test_simple_index_reused_visited_set_matches_fresh() {
+        let dim = 16;
+        let mut rng = SmallRng::seed_from_u64(7);
+        let centroids: ArrayRef = Arc::new(Float32Array::from_iter_values(
+            (0..2_000 * dim).map(|_| rng.random_range(-1.0f32..1.0)),
+        ));
+        let index = build_index(centroids, dim);
+        let mut reused = index.visited_generator();
+        for _ in 0..300 {
+            let query: ArrayRef = Arc::new(Float32Array::from_iter_values(
+                (0..dim).map(|_| rng.random_range(-1.0f32..1.0)),
+            ));
+            let fresh = index
+                .search(query.clone(), &mut index.visited_generator())
+                .unwrap();
+            assert_eq!(index.search(query, &mut reused).unwrap(), fresh);
+        }
     }
 
     #[test]
@@ -432,7 +471,7 @@ mod tests {
         ));
         let index = build_binary_index(centroids, 16);
         let query: ArrayRef = Arc::new(UInt8Array::from(vec![42u8; 16]));
-        let (id, dist) = index.search(query).unwrap();
+        let (id, dist) = index.search(query, &mut index.visited_generator()).unwrap();
         assert_eq!(id, 42);
         assert_eq!(dist, 0.0);
     }

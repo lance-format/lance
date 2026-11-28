@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, TypedDict
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, TypedDict
 
 import pyarrow as pa
 
@@ -89,6 +89,36 @@ class LanceStats:
         Statistics about the data in the dataset.
         """
         return self._ds.data_stats()
+
+    def column_value_range(self, column: str) -> Optional[Tuple[Any, Any]]:
+        """
+        Global ``[min, max]`` for ``column`` from its ZoneMap index.
+
+        The range is read from index metadata and does not scan data. It is a
+        superset of live values: deletion vectors can only make it wider.
+        Bounds Python can represent exactly are returned as Python scalars.
+        A bound that would lose precision, such as ``time64[ns]``, stays a
+        PyArrow scalar so callers cannot prune a matching row.
+
+        Parameters
+        ----------
+        column : str
+            Column to bound. The column must exist in the dataset schema.
+
+        Returns
+        -------
+        tuple or None
+            ``(min, max)``, or ``None`` when no sound bound exists: the column
+            has no ZoneMap index, some live fragment is not covered, a data
+            overlay committed after a segment was built, or the column
+            contains NaN.
+
+        Raises
+        ------
+        ValueError
+            If ``column`` is not in the dataset schema.
+        """
+        return self._ds.column_value_range(column)
 
     def zone_statistics(self, index_name: str) -> pa.Table:
         """

@@ -260,3 +260,99 @@ pub fn gated_range_store(
     ));
     (store, inner, gate)
 }
+
+#[derive(Debug)]
+pub struct RejectEmptyRangeObjectStore;
+
+impl std::fmt::Display for RejectEmptyRangeObjectStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "RejectEmptyRangeObjectStore")
+    }
+}
+
+#[async_trait]
+impl object_store::ObjectStore for RejectEmptyRangeObjectStore {
+    async fn put_opts(
+        &self,
+        _location: &Path,
+        _bytes: PutPayload,
+        _opts: PutOptions,
+    ) -> object_store::Result<PutResult> {
+        unimplemented!("put_opts is not used by these tests")
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        _location: &Path,
+        _opts: PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn MultipartUpload>> {
+        unimplemented!("put_multipart_opts is not used by these tests")
+    }
+
+    async fn get_opts(
+        &self,
+        location: &Path,
+        options: GetOptions,
+    ) -> object_store::Result<GetResult> {
+        let Some(GetRange::Bounded(range)) = options.range else {
+            unreachable!("blob reads should always request a bounded range")
+        };
+        if range.start == range.end {
+            return Err(object_store::Error::Generic {
+                store: "RejectEmptyRangeObjectStore",
+                source: format!(
+                    "Range started at {} and ended at {}",
+                    range.start, range.end
+                )
+                .into(),
+            });
+        }
+        Err(object_store::Error::NotSupported {
+            source: format!("unexpected non-empty range {range:?} for {location}").into(),
+        })
+    }
+
+    fn delete_stream(
+        &self,
+        _locations: futures::stream::BoxStream<'static, object_store::Result<Path>>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<Path>> {
+        unimplemented!("delete_stream is not used by these tests")
+    }
+
+    fn list(
+        &self,
+        _prefix: Option<&Path>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<ObjectMeta>> {
+        unimplemented!("list is not used by these tests")
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        _prefix: Option<&Path>,
+    ) -> object_store::Result<ListResult> {
+        unimplemented!("list_with_delimiter is not used by these tests")
+    }
+
+    async fn copy_opts(
+        &self,
+        _from: &Path,
+        _to: &Path,
+        _options: CopyOptions,
+    ) -> object_store::Result<()> {
+        unimplemented!("copy_opts is not used by these tests")
+    }
+}
+
+pub fn reject_empty_range_store() -> Arc<ObjectStore> {
+    Arc::new(ObjectStore::new(
+        Arc::new(RejectEmptyRangeObjectStore) as Arc<dyn object_store::ObjectStore>,
+        Url::parse("mock:///blob-tests").unwrap(),
+        None,
+        None,
+        false,
+        true,
+        lance_io::object_store::DEFAULT_LOCAL_IO_PARALLELISM,
+        lance_io::object_store::DEFAULT_DOWNLOAD_RETRY_COUNT,
+        None,
+    ))
+}

@@ -44,7 +44,7 @@ use lance_table::io::commit::{
 use crate::io::commit::namespace_manifest::LanceNamespaceExternalManifestStore;
 use lance_table::io::manifest::{read_manifest, read_manifest_indexes};
 use lance_table_runtime::base::has_any_entry;
-pub(crate) use lance_table_runtime::paths::{BLOBS_DIR, DATA_DIR, INDICES_DIR, TRANSACTIONS_DIR};
+pub(crate) use lance_table_runtime::paths::{DATA_DIR, INDICES_DIR, TRANSACTIONS_DIR};
 use lance_table_runtime::{Table, TableState, TableView};
 pub use lance_table_runtime::{Version, VersionRef, VersionTransaction};
 use object_store::path::Path;
@@ -58,7 +58,7 @@ use std::num::NonZero;
 use std::ops::Range;
 use std::pin::Pin;
 use std::sync::Arc;
-use tracing::{info, instrument, warn};
+use tracing::{Instrument, debug_span, field::Empty, info, instrument, warn};
 
 pub(crate) mod blob;
 pub(crate) use lance_table_runtime::branch_location;
@@ -66,7 +66,6 @@ pub mod builder;
 pub mod cleanup;
 pub mod compaction_stats;
 mod data_file;
-mod data_file_part;
 pub mod deletions;
 pub mod delta;
 pub mod expire;
@@ -122,7 +121,7 @@ pub(crate) mod versions;
 pub mod write;
 
 pub use data_file::DataFileTarget;
-pub use data_file_part::DataFilePart;
+pub use lance_table_runtime::write::DataFilePart;
 
 pub(crate) use take::row_offsets_to_row_addresses;
 
@@ -133,7 +132,6 @@ use self::refs::Refs;
 use self::scanner::{DatasetRecordBatchStream, Scanner};
 use self::statistics::DatasetStatistics;
 use self::transaction::{Operation, Transaction, TransactionBuilder, UpdateMapEntry};
-use self::write::cleanup_data_fragments;
 use crate::dataset::branch_location::BranchLocation;
 use crate::dataset::cleanup::{CleanupOperation, CleanupPolicy, CleanupPolicyBuilder};
 use crate::dataset::refs::{BranchContents, BranchIdentifier, BranchReservation, Branches, Tags};
@@ -1556,7 +1554,29 @@ impl Dataset {
         row_indices: &[u64],
         projection: impl Into<ProjectionRequest>,
     ) -> Result<RecordBatch> {
-        take::take(self, row_indices, projection.into()).await
+        let span = debug_span!(
+            "take_io",
+            num_rows = row_indices.len(),
+            fragments_selected = Empty,
+            logical_ranges = Empty,
+            logical_requested_bytes = Empty,
+            logical_union_bytes = Empty,
+            physical_iops = Empty,
+            scheduler_requests = Empty,
+            physical_bytes = Empty,
+            cloud_reader_attempts = Empty,
+            cloud_reader_failed_attempts = Empty,
+            cloud_reader_body_bytes = Empty,
+            peak_active_reads = Empty,
+            max_scheduler_queue_time_ns = Empty,
+            max_child_read_time_ns = Empty,
+            elapsed_ns = Empty,
+            outcome = Empty,
+        );
+        let summary_span = (!span.is_disabled()).then(|| span.clone());
+        take::take(self, row_indices, projection.into(), summary_span)
+            .instrument(span)
+            .await
     }
 
     /// Take rows with a maximum number of active fragment-reader data reads in the primary base.
@@ -1580,15 +1600,43 @@ impl Dataset {
     /// # Ok(())
     /// # }
     /// ```
-    #[instrument(skip_all, fields(num_rows=row_indices.len(), io_parallelism))]
+    #[instrument(skip_all, fields(num_rows=row_indices.len(), io_parallelism = io_parallelism))]
     pub async fn take_with_io_parallelism(
         &self,
         row_indices: &[u64],
         projection: impl Into<ProjectionRequest>,
         io_parallelism: u32,
     ) -> Result<RecordBatch> {
-        take::take_with_io_parallelism(self, row_indices, projection.into(), Some(io_parallelism))
-            .await
+        let span = debug_span!(
+            "take_io",
+            num_rows = row_indices.len(),
+            io_parallelism,
+            fragments_selected = Empty,
+            logical_ranges = Empty,
+            logical_requested_bytes = Empty,
+            logical_union_bytes = Empty,
+            physical_iops = Empty,
+            scheduler_requests = Empty,
+            physical_bytes = Empty,
+            cloud_reader_attempts = Empty,
+            cloud_reader_failed_attempts = Empty,
+            cloud_reader_body_bytes = Empty,
+            peak_active_reads = Empty,
+            max_scheduler_queue_time_ns = Empty,
+            max_child_read_time_ns = Empty,
+            elapsed_ns = Empty,
+            outcome = Empty,
+        );
+        let summary_span = (!span.is_disabled()).then(|| span.clone());
+        take::take_with_io_parallelism(
+            self,
+            row_indices,
+            projection.into(),
+            Some(io_parallelism),
+            summary_span,
+        )
+        .instrument(span)
+        .await
     }
 
     /// Take Rows by the internal ROW ids.
@@ -2432,10 +2480,6 @@ impl Dataset {
     /// If `base_id` is `None`, returns the default data directory.
     pub(crate) fn data_file_dir_for_base(&self, base_id: Option<u32>) -> Result<Path> {
         self.table_view().data_file_dir_for_base(base_id)
-    }
-
-    pub(crate) fn blob_base_path(&self, base_id: Option<u32>) -> Result<Path> {
-        self.table_view().blob_base_path(base_id)
     }
 
     /// Resolve the object store for the primary dataset or an additional base.

@@ -25,6 +25,7 @@ pub use spill::{
     PlacedRowLineage, RowLineage, SPILL_ROW_LINEAGE_CONFIG_KEY, inline_row_lineage_max_bytes,
     place_row_lineage,
 };
+#[cfg(test)]
 pub(crate) use spill::{RowLineagePlan, RowLineageSpill, plan_row_lineage_spill};
 
 /// Load a row id sequence from the given dataset and fragment.

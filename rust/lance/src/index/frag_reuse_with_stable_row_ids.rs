@@ -8,10 +8,8 @@
 use lance_core::{Error, Result};
 use lance_index::mem_wal::MEM_WAL_INDEX_NAME;
 use lance_index::registry::display_type_from_url;
-use lance_table::feature_flags::frag_reuse_with_stable_row_ids_enabled;
 use lance_table::format::{IndexMetadata, Manifest, pb as table_pb};
-use lance_table::system_index::frag_reuse::metadata::uses_tagged_fri;
-use lance_table::system_index::frag_reuse::{FRAG_REUSE_INDEX_NAME, is_frag_reuse_index_entry};
+use lance_table::system_index::frag_reuse::is_frag_reuse_index_entry;
 use prost::Name;
 use prost_types::Any;
 
@@ -138,41 +136,21 @@ pub fn validate_stable_row_id_user_indices(
     )))
 }
 
-pub fn ensure_frag_reuse_recording_allowed(
-    manifest: &Manifest,
-    indices: &[IndexMetadata],
-) -> Result<()> {
-    ensure_frag_reuse_recording_allowed_when(
-        manifest,
-        indices,
-        frag_reuse_with_stable_row_ids_enabled(),
-    )
-}
-
+#[cfg(test)]
 fn ensure_frag_reuse_recording_allowed_when(
     manifest: &Manifest,
     indices: &[IndexMetadata],
     is_supported: bool,
 ) -> Result<()> {
-    if !is_supported {
-        return Err(Error::not_supported(
-            "Cannot compact with defer_index_remap: the dataset uses stable row IDs, and \
-             recording their row-address moves in a fragment reuse index is not supported by \
-             this build of Lance",
-        ));
-    }
-    // The tagged-history flag is sticky, so it can outlive a trim and a
-    // migration to stable row ids.
-    let frag_reuse_entry = indices
-        .iter()
-        .find(|index| index.name == FRAG_REUSE_INDEX_NAME);
-    if uses_tagged_fri(manifest, frag_reuse_entry) {
-        return Err(Error::not_supported(
-            "Cannot compact with defer_index_remap: the dataset uses stable row IDs, and its \
-             manifest requires a tagged fragment reuse history, which stable row IDs do not \
-             support",
-        ));
-    }
+    lance_table_runtime::frag_reuse::validate_stable_row_id_recording_format(
+        manifest,
+        indices,
+        is_supported,
+    )?;
+    validate_compaction_index_recording(indices)
+}
+
+pub fn validate_compaction_index_recording(indices: &[IndexMetadata]) -> Result<()> {
     let incompatible = incompatible_indices(indices);
     if incompatible.is_empty() {
         return Ok(());
@@ -277,6 +255,7 @@ mod tests {
     use lance_datagen::{Dimension, array, gen_batch};
     use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
     use lance_index::metrics::NoOpMetricsCollector;
+    use lance_index::scalar::btree::BTREE_INDEX_VERSION;
     use lance_index::scalar::{BuiltinIndexType, InvertedIndexParams, ScalarIndexParams};
     use lance_index::{IndexType, pb, pbold};
     use lance_linalg::distance::MetricType;
@@ -325,6 +304,19 @@ mod tests {
         Some(Any::from_msg(message).unwrap())
     }
 
+    /// What a list-element index records today: a B-tree target at its
+    /// current version, with Arrow row key encoding.
+    fn list_element_details() -> Option<Any> {
+        details(&pb::ListElementIndexDetails {
+            key_field_ids: vec![2, 3],
+            keys: vec!["label".to_string(), "confidence".to_string()],
+            key_types: vec!["string".to_string(), "float".to_string()],
+            key_encoding: pb::ListElementKeyEncoding::ArrowRowV1.into(),
+            target_details: details(&pbold::BTreeIndexDetails::default()),
+            target_index_version: BTREE_INDEX_VERSION,
+        })
+    }
+
     fn foreign(type_name: &str) -> Option<Any> {
         Some(Any {
             type_url: format!("type.googleapis.com/{type_name}"),
@@ -358,6 +350,7 @@ mod tests {
     #[case::bloom_filter(details(&pb::BloomFilterIndexDetails::default()), 0, true)]
     #[case::btree(details(&pbold::BTreeIndexDetails::default()), 1, true)]
     #[case::legacy_btree(details(&pbold::BTreeIndexDetails::default()), 0, false)]
+    #[case::list_element(list_element_details(), 0, true)]
     #[case::bitmap(details(&pbold::BitmapIndexDetails::default()), 0, false)]
     #[case::label_list(details(&pbold::LabelListIndexDetails::default()), 0, false)]
     #[case::ngram(details(&pbold::NGramIndexDetails::default()), 0, false)]
@@ -556,6 +549,18 @@ mod tests {
                 .contains("`zone_map`")
         );
         assert_rejected(result, "`bitmap`");
+
+        // Field dependencies are maintained by ordinary schema commits. The
+        // recording gate only needs to establish row-address compatibility.
+        let mut list_index = index_with("detections_idx", list_element_details(), 0);
+        list_index.fields.extend([2, 3]);
+        assert!(address_index_incompatibility(&list_index).is_none());
+        ensure_frag_reuse_recording_allowed_when(
+            &manifest,
+            std::slice::from_ref(&list_index),
+            true,
+        )
+        .unwrap();
     }
 
     async fn stable_row_id_dataset(uri: &str) -> Dataset {

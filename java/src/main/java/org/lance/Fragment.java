@@ -16,6 +16,7 @@ package org.lance;
 import org.lance.file.FileWriteOptions;
 import org.lance.fragment.FragmentMergeResult;
 import org.lance.fragment.FragmentUpdateResult;
+import org.lance.fragment.OverlayWriter;
 import org.lance.ipc.LanceScanner;
 import org.lance.ipc.ScanOptions;
 import org.lance.namespace.LanceNamespace;
@@ -29,6 +30,7 @@ import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.util.Preconditions;
 import org.apache.arrow.vector.VectorSchemaRoot;
 
+import java.io.IOException;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
@@ -236,6 +238,71 @@ public class Fragment {
 
   private native FragmentMergeResult nativeAddColumnsByReader(
       Dataset dataset, long fragmentId, long arrowStreamMemoryAddress, Optional<Long> batchSize);
+
+  /**
+   * Open a writer that stages new values for selected cells of this fragment.
+   *
+   * <p>Read {@code _rowaddr}, open the writer, and set the transaction's {@code readVersion} from
+   * the same dataset snapshot. If the {@link Dataset} instance is shared, keep it on that snapshot
+   * while capturing the read version and opening the scanner and writer.
+   *
+   * <p>Release builds require the {@code LANCE_ENABLE_UNSTABLE_DATA_OVERLAY_FILES} environment
+   * variable to be set to commit or read overlays.
+   *
+   * <p>This example sets up to ten values of an Int32 column named {@code value} to zero.
+   *
+   * <pre>{@code
+   * var columns = List.of("value");
+   * var scanOptions = new ScanOptions.Builder()
+   *     .columns(columns)
+   *     .withRowAddress(true)
+   *     .limit(10)
+   *     .build();
+   * var transaction = dataset.newTransactionBuilder(); // Captures the snapshot's read version.
+   * try (var scanner = fragment.newScan(scanOptions);
+   *     var writer = fragment.writeOverlay(columns);
+   *     var reader = scanner.scanBatches()) {
+   *   while (reader.loadNextBatch()) {
+   *     var batch = reader.getVectorSchemaRoot();
+   *     var source = (UInt8Vector) batch.getVector(MetadataColumns.ROWADDR);
+   *     try (var updates = VectorSchemaRoot.of(
+   *         new UInt8Vector(MetadataColumns.ROWADDR, dataset.allocator()),
+   *         new IntVector("value", dataset.allocator()))) {
+   *       updates.allocateNew();
+   *       var addresses = (UInt8Vector) updates.getVector(0);
+   *       var values = (IntVector) updates.getVector(1);
+   *       for (int row = 0; row < batch.getRowCount(); row++) {
+   *         addresses.setSafe(row, source.get(row));
+   *         values.setSafe(row, 0);
+   *       }
+   *       updates.setRowCount(batch.getRowCount());
+   *       writer.writeBatch(updates);
+   *     }
+   *   }
+   *   var group = writer.finish();
+   *   if (group.isPresent()) {
+   *     var operation = DataOverlay.builder().groups(List.of(group.get())).build();
+   *     try (var staged = transaction.operation(operation).build();
+   *         var committed = staged.commit()) {
+   *       // Read the committed overlay.
+   *     }
+   *   }
+   * }
+   * }</pre>
+   *
+   * @param columns existing top-level dataset columns the writer may update
+   * @return a writer for one overlay file
+   * @throws IOException if the staged file cannot be opened
+   */
+  public OverlayWriter writeOverlay(List<String> columns) throws IOException {
+    List<String> selectedColumns = List.copyOf(columns);
+    try (LockManager.ReadLock readLock = dataset.acquireReadLock()) {
+      return nativeWriteOverlay(dataset, fragmentMetadata.getId(), selectedColumns);
+    }
+  }
+
+  private static native OverlayWriter nativeWriteOverlay(
+      Dataset dataset, int fragmentId, List<String> columns) throws IOException;
 
   /**
    * Create a new fragment writer builder.

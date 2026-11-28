@@ -517,7 +517,10 @@ pub async fn commit_transaction(
         // Recomputed every attempt: the rebase above may have rewritten the
         // transaction.
         let pb_transaction = pb::Transaction::try_from(attempt_transaction.as_ref())?;
-        let inline_transaction = pb_transaction.encoded_len() <= hooks.inline_transaction_limit();
+        let inline_transaction = hooks.inlines_transaction(
+            pb_transaction.encoded_len(),
+            build_config.disable_transaction_file(),
+        )?;
         // Classified from the operation itself. Reading it back off the inline
         // copy would tie the verdict to the payload size instead.
         let may_change_schema = operation_may_change_schema(&pb_transaction);

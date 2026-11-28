@@ -205,7 +205,7 @@ async fn v0_compaction(dataset: &Dataset, source_ids: &[u64], dest_id: u64) -> T
     let mut serialized = Vec::new();
     changed_row_addrs.serialize_into(&mut serialized).unwrap();
     let entry = build_new_frag_reuse_index(
-        &mut dataset.clone(),
+        dataset,
         vec![FragReuseGroup {
             changed_row_addrs: serialized,
             old_frags: old_fragments.iter().map(FragDigest::from).collect(),

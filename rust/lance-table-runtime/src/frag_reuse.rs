@@ -23,10 +23,10 @@ pub use rewrite::{
 };
 pub use stable_row_ids::{
     apply_frag_reuse_with_stable_row_ids_flag, has_frag_reuse_with_stable_row_ids,
-    validate_stable_row_id_fri_shape,
+    validate_stable_row_id_fri_shape, validate_stable_row_id_recording_format,
 };
 pub use storage::{
-    FRAG_REUSE_INLINE_DETAILS_LIMIT, build_frag_reuse_index_metadata,
+    FRAG_REUSE_INLINE_DETAILS_LIMIT, build_frag_reuse_index_metadata, build_new_frag_reuse_index,
     build_tagged_frag_reuse_entry, decode_frag_reuse_ledger, decode_frag_reuse_ledger_from_content,
     encode_length_delimited_field, extract_raw_frag_reuse_content, frag_reuse_entry_appending,
     load_frag_reuse_index_details, load_frag_reuse_records, load_raw_frag_reuse_content,
