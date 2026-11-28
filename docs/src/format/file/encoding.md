@@ -434,6 +434,38 @@ packed structs can compose with sparse structure. Codec selection is a writer po
 %%% proto.message.NoValues %%%
 ```
 
+#### Dense Chunk Levels and Repetition Index
+
+The repetition index is buffer 2 without a dictionary and buffer 3 with a dictionary. Padding outside
+the buffer does not contribute to its recorded size. At zero depth the index descriptor and buffer
+are absent. For dense chunked pages with a repetition stream, the writer uses depth one.
+
+Let `n` be the number of 4-byte chunk metadata words in buffer 0 and `stride` be `repetition_index_depth + 1`.
+Each chunk has `stride` unsigned entries. When `repetition_index` is absent at positive depth, the
+buffer contains `n * stride` contiguous little-endian `u64` values in chunk order.
+A packed index requires a repetition stream and a depth between 1 and the number of list layers,
+inclusive, with a maximum depth of 65,535. Each entry fits in 16 bits. Each chunk packs consecutive
+pairs of entries into `u32` values, with the first entry in the low 16 bits and the second in the high
+16 bits. If `stride` is odd, the final high half of each chunk is zero. The `n * ceil(stride / 2)` values
+follow the [generic unsigned block contract](#generic-unsigned-blocks) with width `u32`. A metadata-only
+codec has a zero-length index buffer at the same ordinal. A payload-bearing codec stores its single
+payload in that buffer. Decoding a page's index requires no other page.
+
+For top-level row lookup, entry 0 (`ends`) counts rows ending in the chunk. A nonzero entry 1
+(`partial`) indicates a trailer, where a row continues into the next chunk. At depth one, `partial`
+counts the suffix of the chunk's repetition levels starting at the last top-level repetition marker,
+including that marker. If the row continues and the chunk contains no such marker, `partial` counts
+all its repetition levels. When the last row in the chunk ends at the chunk boundary or at the end of
+the page, `partial` is zero. Entries at index 2 and above are opaque to top-level lookup and packing
+preserves their values.
+
+A chunk has a preamble if the preceding chunk has a trailer. The first chunk has no preamble.
+The number of rows starting in a chunk is `ends` plus the trailer indicator minus the preamble
+indicator. The prefix sum gives each chunk's first row. In a packed index, `ends + partial` must be
+at most 65,535, and a chunk with no row starts must continue a preceding row. Readers verify that
+the prefix sum ends at the page row count and the last chunk has no trailer. Readers reject mismatched
+counts or payload arity, nonzero unused halves, and overflow in lengths, cardinalities, or row calculations.
+
 #### Sparse Structural Domains
 
 A domain is a layer-local coordinate space `[0, size)`. Layers are ordered from outer-most to inner-most:

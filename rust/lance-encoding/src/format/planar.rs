@@ -169,6 +169,7 @@ pub(crate) fn from_dense_execution(layout: metadata::PageLayout) -> Result<pb23:
                     repetition: m.rep_compression,
                     definition: m.def_compression,
                     repetition_index_depth: m.repetition_index_depth,
+                    repetition_index: None,
                 }),
                 dictionary: m.dictionary,
                 num_dictionary_items: m.num_dictionary_items,
