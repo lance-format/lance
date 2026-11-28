@@ -137,7 +137,6 @@ use crate::dataset::cleanup::{CleanupOperation, CleanupPolicy, CleanupPolicyBuil
 use crate::dataset::refs::{BranchContents, BranchIdentifier, BranchReservation, Branches, Tags};
 use crate::dataset::sql::SqlQueryBuilder;
 use crate::datatypes::Schema;
-use crate::index::memory_progress::{ObservedBuild, ObservedOperation};
 use crate::io::commit::{
     CommitTransactionOptions, commit_transaction, detect_overlapping_fragments, fix_schema,
 };
@@ -151,8 +150,6 @@ pub use blob::{
 };
 use hash_joiner::HashJoiner;
 pub use lance_core::ROW_ID;
-use lance_index::scalar::BuiltinIndexType;
-use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_namespace::models::{DeclareTableRequest, DescribeTableRequest};
 use lance_table::feature_flags::ensure_can_write_manifest;
 use lance_table::io::deletion::relative_deletion_file_path;
@@ -171,7 +168,6 @@ pub use write::merge_insert::{
     WhenNotMatched, WhenNotMatchedBySource,
 };
 
-use crate::dataset::index::LanceIndexStoreExt;
 pub use write::update::{UpdateBuilder, UpdateJob};
 #[allow(deprecated)]
 pub use write::{
@@ -3822,34 +3818,25 @@ impl Dataset {
         self.merge_impl(stream, left_on, right_on).await
     }
 
-    /// Merge a distributed scalar index into a single root artifact and report
-    /// progress via the supplied callback.
+    /// Merge distributed index metadata into a single root artifact.
+    ///
+    /// FTS builds use independent segments. Build them with
+    /// [`crate::index::CreateIndexBuilder::execute_uncommitted`] and publish them
+    /// with [`crate::index::DatasetIndexExt::commit_existing_index_segments`].
     pub async fn merge_index_metadata(
         &self,
-        index_uuid: &Uuid,
+        _index_uuid: &Uuid,
         index_type: IndexType,
         _batch_readhead: Option<usize>,
-        progress: Arc<dyn IndexBuildProgress>,
+        _progress: Arc<dyn IndexBuildProgress>,
     ) -> Result<()> {
-        let store = LanceIndexStore::from_dataset_for_new(self, index_uuid)?;
-        let index_dir = self.indices_dir().join(index_uuid.to_string());
         match index_type {
-            IndexType::Inverted => {
-                let observed = ObservedBuild::start(
-                    progress,
-                    ObservedOperation::MergeIndexMetadata,
-                    || BuiltinIndexType::Inverted.as_str().to_string(),
-                )?;
-                lance_index::scalar::inverted::builder::merge_index_files(
-                    self.table_state.object_store.as_ref(),
-                    &index_dir,
-                    Arc::new(store),
-                    observed.progress(),
-                )
-                .await?;
-                observed.finish();
-                Ok(())
-            }
+            IndexType::Inverted => Err(Error::invalid_input(
+                "FTS distributed indexing no longer supports merge_index_metadata; build independent \
+                 segments, optionally merge groups with merge_existing_index_segments(...), and \
+                 commit with commit_existing_index_segments(...)"
+                    .to_string(),
+            )),
             IndexType::BTree => {
                 Err(Error::invalid_input(
                     "BTree distributed indexing no longer supports merge_index_metadata; \

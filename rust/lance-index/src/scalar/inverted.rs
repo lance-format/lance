@@ -491,6 +491,8 @@ use super::IndexStore;
 pub struct InvertedIndexPlugin;
 
 impl InvertedIndexPlugin {
+    /// Build a complete index segment from a prefiltered training stream.
+    /// Pass `None` for `fragment_ids`, which formerly selected shared UUID output.
     pub async fn train_inverted_index(
         data: SendableRecordBatchStream,
         index_store: &dyn IndexStore,
@@ -498,24 +500,18 @@ impl InvertedIndexPlugin {
         fragment_ids: Option<Vec<u32>>,
         progress: Arc<dyn IndexBuildProgress>,
     ) -> Result<CreatedIndex> {
-        let fragment_mask = fragment_ids.as_ref().and_then(|frag_ids| {
-            if !frag_ids.is_empty() {
-                // Create a mask with fragment_id in high 32 bits for distributed indexing
-                // This mask is used to filter partitions belonging to specific fragments
-                // If multiple fragments processed, use first fragment_id <<32 as mask
-                Some((frag_ids[0] as u64) << 32)
-            } else {
-                None
-            }
-        });
+        if fragment_ids.is_some_and(|ids| !ids.is_empty()) {
+            return Err(Error::invalid_input(
+                "The FTS trainer no longer accepts a shared UUID fragment list. Pass a filtered stream and build an independent segment."
+                    .to_string(),
+            ));
+        }
 
         params.validate_format_version()?;
         let format_version = params.resolved_format_version();
         let is_element_document = params.get_document_granularity().is_list_element();
         let details = pbold::InvertedIndexDetails::try_from(&params)?;
-        let mut inverted_index =
-            InvertedIndexBuilder::new_with_fragment_mask(params, fragment_mask)
-                .with_progress(progress);
+        let mut inverted_index = InvertedIndexBuilder::new(params).with_progress(progress);
         let files = inverted_index.update(data, index_store, None).await?;
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&details).unwrap(),

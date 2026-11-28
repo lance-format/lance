@@ -108,7 +108,6 @@ pub(super) async fn build(
     let worker_config = IndexWorkerConfig {
         with_position: builder.params.with_position,
         format_version: builder.format_version,
-        fragment_mask: builder.fragment_mask,
         token_set_format: builder.token_set_format,
         worker_memory_limit_bytes: config.run_memory_limit_bytes,
         block_size: builder.params.block_size,

@@ -3327,7 +3327,7 @@ async fn vector_prefilter_scopes_to_subset_with_fri_translation() {
 async fn fts_prefilter_scopes_to_subset_with_fri_translation() {
     let dataset = scoped_prefilter_dataset(|dataset| {
         Box::pin(async move {
-            let direct = CreateIndexBuilder::new(
+            CreateIndexBuilder::new(
                 dataset,
                 &["text"],
                 IndexType::Inverted,
@@ -3337,28 +3337,7 @@ async fn fts_prefilter_scopes_to_subset_with_fri_translation() {
             .fragments(vec![10])
             .execute_uncommitted()
             .await
-            .unwrap();
-            // An uncommitted inverted index only has staged partition files; the
-            // CreateIndex commit normally merges them into the root layout the
-            // reader probes (`metadata.lance`). A CreateIndex commit is refused
-            // on a tagged history at this layer and the fixture persists the
-            // manifest directly, so run that finalize step here.
-            use crate::dataset::index::LanceIndexStoreExt;
-            let store = lance_index::scalar::lance_format::LanceIndexStore::from_dataset_for_new(
-                dataset,
-                &direct.uuid,
-            )
-            .unwrap();
-            let index_dir = dataset.indices_dir().join(direct.uuid.to_string());
-            lance_index::scalar::inverted::builder::merge_index_files(
-                dataset.table_state.object_store.as_ref(),
-                &index_dir,
-                Arc::new(store),
-                Arc::new(crate::index::NoopIndexBuildProgress),
-            )
-            .await
-            .unwrap();
-            direct
+            .unwrap()
         })
     })
     .await;

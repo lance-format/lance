@@ -9,9 +9,9 @@ use crate::index::frag_reuse::{
     MissingCoverageReason, frag_reuse_entry_appending, segment_coverage_reason,
 };
 use crate::index::frag_reuse_reader::tests::{persist_fixture, prepare_partition};
+use lance_index::scalar::IndexStore;
 use lance_index::scalar::inverted::METADATA_FILE;
 use lance_index::scalar::lance_format::LanceIndexStore;
-use lance_index::scalar::{IndexStore, index_files_to_table};
 
 #[tokio::test]
 async fn test_segmented_optimize_rebalances_only_one_segment() {
@@ -1440,7 +1440,7 @@ async fn test_optimize_skips_an_index_with_an_unavailable_tokenizer(
         .unwrap();
     let mut segments = Vec::with_capacity(2);
     for fragment in [0, 1] {
-        let mut segment = dataset
+        let segment = dataset
             .create_index_builder(
                 &["text"],
                 IndexType::Inverted,
@@ -1451,13 +1451,6 @@ async fn test_optimize_skips_an_index_with_an_unavailable_tokenizer(
             .execute_uncommitted()
             .await
             .unwrap();
-        if let Some(files) =
-            crate::index::scalar::inverted::finalize_segment_files_if_needed(&dataset, &segment)
-                .await
-                .unwrap()
-        {
-            segment.files = Some(index_files_to_table(files));
-        }
         segments.push(segment);
     }
     // Model an index written by a process with a tokenizer model installed.

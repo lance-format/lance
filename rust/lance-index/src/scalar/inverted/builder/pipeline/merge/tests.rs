@@ -68,7 +68,6 @@ fn merger(store: Arc<dyn IndexStore>, positions: bool) -> FinalMerge {
         budget: 4 << 20,
         target_bytes: None,
         ids: Arc::new(AtomicU64::new(100)),
-        fragment_mask: 0,
         token_format: TokenSetFormat::Fst,
         with_position: positions,
         block_size: 256,

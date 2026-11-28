@@ -146,8 +146,9 @@ public class IndexOptions {
     }
 
     /**
-     * A UUID to use for fragment-level distributed indexing multiple fragment-level indices need to
-     * share UUID for later merging. If not provided, a new UUID will be generated.
+     * A caller-supplied UUID for builds that allow it. Lance generates a UUID when omitted.
+     *
+     * <p>For FTS builds over a non-empty fragment subset, Lance generates the segment UUID.
      *
      * @param indexUUID indexUUID option
      */

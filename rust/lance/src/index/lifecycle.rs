@@ -202,29 +202,18 @@ pub(super) async fn build_index_metadata_from_segments(
             dataset_version,
         ) = segment.into_parts();
         let is_inverted_index = index_details.type_url.ends_with("InvertedIndexDetails");
-        if is_inverted_index {
-            let metadata = IndexMetadata {
-                uuid,
-                name: index_name.to_string(),
-                fields: fields.clone(),
-                covering_fields: covering_fields.clone(),
-                dataset_version,
-                fragment_bitmap: Some(fragment_bitmap.clone()),
-                index_details: Some(index_details.clone()),
-                index_version,
-                created_at: Some(chrono::Utc::now()),
-                base_id: None,
-                files: None,
-                clustering_id,
-                metadata: metadata.clone(),
-            };
-            crate::index::scalar::inverted::finalize_segment_files_if_needed(dataset, &metadata)
-                .await?;
-        }
         let index_dir = dataset.indices_dir().join(uuid.to_string());
         let mut files =
             list_index_files_with_sizes(&dataset.table_state.object_store, &index_dir).await?;
         if is_inverted_index {
+            if !files
+                .iter()
+                .any(|file| file.path == lance_index::scalar::inverted::METADATA_FILE)
+            {
+                return Err(Error::invalid_input(format!(
+                    "FTS segment {uuid} has no root metadata. Rebuild it as an independent segment."
+                )));
+            }
             retain_committed_inverted_files(&mut files);
         }
         Ok::<_, Error>(IndexMetadata {

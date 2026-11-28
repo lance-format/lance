@@ -3404,6 +3404,8 @@ class LanceDataset(pa.dataset.Dataset):
         return cls._normalized_index_type(index_type) in {
             "BTREE",
             "BITMAP",
+            "INVERTED",
+            "FTS",
             "NGRAM",
             "RTREE",
             "ZONEMAP",
@@ -3545,17 +3547,11 @@ class LanceDataset(pa.dataset.Dataset):
             structure. If False, an empty index will be created that can be
             populated later.
         fragment_ids : List[int], optional
-            If provided, the index will be created only on the specified fragments.
-            This enables distributed/fragment-level indexing. When provided, the
-            method returns metadata for one segment but does not commit
-            the index to the dataset. The segment can be optionally merged with
-            other segments and committed later with
-            ``commit_existing_index_segments(...)``.
-            This parameter is passed via kwargs internally.
+            Use :meth:`create_index_uncommitted` to build an index over a
+            fragment subset.
         index_uuid : str, optional
-            A UUID to use for the segment written by this call.
-            If not provided, a new UUID will be generated. This parameter is
-            passed via kwargs internally.
+            A UUID to use for the index written by this call. If omitted,
+            Lance generates one.
         progress_callback : callable, optional
             A callback that receives :class:`lance.progress.IndexProgress` events while
             the index is being built.
@@ -4493,6 +4489,8 @@ class LanceDataset(pa.dataset.Dataset):
         requirement:
 
         - ``fragment_ids`` must be provided
+        - For ``INVERTED`` / ``FTS`` builds with non-empty fragment IDs, Lance
+          generates the segment UUID. Omit ``index_uuid``.
         - Vector segments support both shared and independent model scopes. Pass
           the same IVF centroids, and for IVF_PQ the same PQ codebook, to each
           worker when segments need shared model semantics or physical merge
@@ -4630,16 +4628,15 @@ class LanceDataset(pa.dataset.Dataset):
         """
         Merge distributed scalar index metadata.
 
-        Vector and Bitmap distributed indexing no longer use this API. For
-        those index families, build segments with
+        Vector, Bitmap, and FTS distributed indexing use independent segments.
+        For those index families, build segments with
         :meth:`create_index_uncommitted`, optionally merge caller-defined
         groups with :meth:`merge_existing_index_segments`, and publish them with
         :meth:`commit_existing_index_segments`.
 
         This method does NOT commit changes.
 
-        This API merges temporary scalar index files (for example per-fragment
-        BTree or inverted index outputs).
+        This API merges temporary scalar index files.
         After this method returns, callers MUST explicitly commit
         the index manifest using lance.LanceDataset.commit(...)
         with a LanceOperation.CreateIndex.

@@ -1185,6 +1185,12 @@ fn ensure_index_uuid_allowed(
         || scalar_index_type.is_some_and(|index_type| index_type.eq_ignore_ascii_case("btree"))
     {
         Some("BTree")
+    } else if index_type == IndexType::Inverted
+        || scalar_index_type.is_some_and(|index_type| {
+            index_type.eq_ignore_ascii_case("inverted") || index_type.eq_ignore_ascii_case("fts")
+        })
+    {
+        Some("FTS")
     } else if index_type == IndexType::RTree
         || scalar_index_type.is_some_and(|index_type| index_type.eq_ignore_ascii_case("rtree"))
     {
@@ -1260,8 +1266,6 @@ mod tests {
     use std::{collections::BTreeSet, ops::Bound, sync::Arc};
     use tracing_subscriber::{Layer, layer::SubscriberExt};
     use uuid::Uuid;
-
-    lance_testing::define_stage_event_progress!(RecordingProgress, IndexBuildProgress, Result<()>);
 
     #[test]
     fn test_inverted_training_params_include_build_only_fields() {
@@ -2110,147 +2114,56 @@ mod tests {
         assert!(index_metadata.created_at.is_some());
     }
 
+    #[rstest]
+    #[case::inverted(IndexType::Inverted, None)]
+    #[case::scalar_inverted(IndexType::Scalar, Some("inverted"))]
+    #[case::scalar_fts(IndexType::Scalar, Some("fts"))]
     #[tokio::test]
-    async fn test_merge_index_metadata_inverted_reports_progress() {
-        // This exercises the public distributed inverted-index workflow end to end:
-        // 1. build one uncommitted shard per fragment with CreateIndexBuilder.progress(...)
-        // 2. merge those shards with Dataset::merge_index_metadata(...)
-        //
-        // Expected outcomes:
-        // - the build callback should surface public build stages such as load_data,
-        //   tokenize_docs, copy_partitions, and write_metadata
-        // - the merge callback should surface public merge stages such as
-        //   read_partition_metadata, remap_partition_files, and write_merged_metadata
-        // - merge stages should be reported in execution order
-        let tmpdir = TempStrDir::default();
-        let dataset_uri = format!("file://{}", tmpdir.as_str());
-
-        let batch1 = create_text_batch(0, 15);
-        let batch2 = create_text_batch(15, 30);
-        let batch3 = create_text_batch(30, 45);
-
-        let write_params = WriteParams {
-            max_rows_per_file: 15,
-            max_rows_per_group: 5,
-            ..Default::default()
-        };
-
-        // Write dataset with multiple batches to create multiple fragments
-        let batches = RecordBatchIterator::new(
-            vec![Ok(batch1), Ok(batch2), Ok(batch3)],
-            create_text_batch(0, 1).schema(),
-        );
-        let mut dataset = Dataset::write(batches, &dataset_uri, Some(write_params))
-            .await
-            .unwrap();
-
-        let params = InvertedIndexParams::default();
-        let fragments = dataset.get_fragments();
-        let fragment_ids: Vec<u32> = fragments.iter().map(|f| f.id() as u32).collect();
-        let shared_uuid = Uuid::new_v4();
-        let build_progress = Arc::new(RecordingProgress::default());
-
-        for &fragment_id in &fragment_ids {
-            let mut builder =
-                CreateIndexBuilder::new(&mut dataset, &["text"], IndexType::Inverted, &params)
-                    .name("distributed_index".to_string())
-                    .fragments(vec![fragment_id])
-                    .index_uuid(shared_uuid)
-                    .progress(build_progress.clone());
-
-            let index_metadata = builder.execute_uncommitted().await.unwrap();
-            assert_eq!(index_metadata.uuid, shared_uuid);
-            assert_eq!(index_metadata.name, "distributed_index");
-
-            let fragment_bitmap = index_metadata.fragment_bitmap.as_ref().unwrap();
-            let indexed_fragments: Vec<u32> = fragment_bitmap.iter().collect();
-            assert_eq!(indexed_fragments, vec![fragment_id]);
-        }
-
-        let merge_progress = Arc::new(RecordingProgress::default());
-        dataset
-            .merge_index_metadata(
-                &shared_uuid,
-                IndexType::Inverted,
-                None,
-                merge_progress.clone(),
+    async fn test_fts_fragment_build_rejects_explicit_uuid(
+        #[case] index_type: IndexType,
+        #[case] scalar_type: Option<&str>,
+    ) {
+        let data = gen_batch()
+            .col(
+                "text",
+                lance_datagen::array::fill_utf8("searchable".to_string()),
             )
+            .into_reader_rows(
+                lance_datagen::RowCount::from(2),
+                lance_datagen::BatchCount::from(1),
+            );
+        let mut dataset = Dataset::write(data, "memory://", None).await.unwrap();
+        let fragment = dataset.get_fragments()[0].id() as u32;
+        let uuid = Uuid::new_v4();
+        let inverted_params = InvertedIndexParams::default();
+        let scalar_params = ScalarIndexParams::new(scalar_type.unwrap_or("inverted").to_string());
+        let params: &dyn IndexParams = if scalar_type.is_some() {
+            &scalar_params
+        } else {
+            &inverted_params
+        };
+        let error = CreateIndexBuilder::new(&mut dataset, &["text"], index_type, params)
+            .fragments(vec![fragment])
+            .index_uuid(uuid)
+            .execute_uncommitted()
             .await
-            .unwrap();
-
-        let build_tags = build_progress
-            .recorded_events()
-            .iter()
-            .map(|(kind, stage, _)| format!("{kind}:{stage}"))
-            .collect::<Vec<_>>();
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
         assert!(
-            build_tags.iter().any(|e| e == "start:load_data"),
-            "expected load_data progress during public distributed build"
+            error
+                .to_string()
+                .contains("index_uuid is no longer accepted for FTS"),
+            "{error}"
         );
+        let index_dir = dataset.indices_dir().join(uuid.to_string());
         assert!(
-            build_tags.iter().any(|e| e == "start:tokenize_docs"),
-            "expected tokenize_docs progress during public distributed build"
-        );
-        assert!(
-            build_tags.iter().any(|e| e == "start:copy_partitions"),
-            "expected copy_partitions progress during public distributed build"
-        );
-        assert!(
-            build_tags.iter().any(|e| e == "start:write_metadata"),
-            "expected write_metadata progress during public distributed build"
-        );
-
-        let merge_events = merge_progress.recorded_events();
-        let merge_tags = merge_events
-            .iter()
-            .map(|(kind, stage, _)| format!("{kind}:{stage}"))
-            .collect::<Vec<_>>();
-        let read_start = merge_tags
-            .iter()
-            .position(|e| e == "start:read_partition_metadata")
-            .expect("missing read_partition_metadata start");
-        let read_complete = merge_tags
-            .iter()
-            .position(|e| e == "complete:read_partition_metadata")
-            .expect("missing read_partition_metadata complete");
-        let remap_start = merge_tags
-            .iter()
-            .position(|e| e == "start:remap_partition_files")
-            .expect("missing remap_partition_files start");
-        let remap_complete = merge_tags
-            .iter()
-            .position(|e| e == "complete:remap_partition_files")
-            .expect("missing remap_partition_files complete");
-        let metadata_start = merge_tags
-            .iter()
-            .position(|e| e == "start:write_merged_metadata")
-            .expect("missing write_merged_metadata start");
-        let metadata_complete = merge_tags
-            .iter()
-            .position(|e| e == "complete:write_merged_metadata")
-            .expect("missing write_merged_metadata complete");
-        assert!(read_start < read_complete);
-        assert!(read_complete < remap_start);
-        assert!(remap_start < remap_complete);
-        assert!(remap_complete < metadata_start);
-        assert!(metadata_start < metadata_complete);
-        assert!(
-            merge_tags
-                .iter()
-                .any(|e| e == "progress:read_partition_metadata"),
-            "expected read_partition_metadata progress during public merge"
-        );
-        assert!(
-            merge_tags
-                .iter()
-                .any(|e| e == "progress:remap_partition_files"),
-            "expected remap_partition_files progress during public merge"
-        );
-        assert!(
-            merge_tags
-                .iter()
-                .any(|e| e == "progress:write_merged_metadata"),
-            "expected write_merged_metadata progress during public merge"
+            dataset
+                .table_state
+                .object_store
+                .read_dir(index_dir)
+                .await
+                .unwrap()
+                .is_empty()
         );
     }
 
@@ -2582,8 +2495,11 @@ mod tests {
         .await;
     }
 
+    #[rstest]
+    #[case::btree(IndexType::BTree)]
+    #[case::fts(IndexType::Inverted)]
     #[tokio::test]
-    async fn test_merge_index_metadata_btree_soft_break() {
+    async fn test_merge_index_metadata_soft_break(#[case] index_type: IndexType) {
         let tmpdir = TempStrDir::default();
         let dataset_uri = format!("file://{}", tmpdir.as_str());
         let reader = gen_batch()
@@ -2597,7 +2513,7 @@ mod tests {
         let err = dataset
             .merge_index_metadata(
                 &Uuid::new_v4(),
-                IndexType::BTree,
+                index_type,
                 None,
                 Arc::new(NoopIndexBuildProgress),
             )
@@ -2606,7 +2522,7 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("no longer supports merge_index_metadata"),
-            "expected BTree merge_index_metadata soft-break error, got: {err}"
+            "expected merge_index_metadata soft-break error, got: {err}"
         );
     }
 
@@ -4050,7 +3966,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_commit_existing_index_segments_finalizes_fts_segments() {
+    async fn test_commit_existing_index_segments_fts() {
         let tmpdir = TempStrDir::default();
         let dataset_uri = format!("file://{}", tmpdir.as_str());
 
@@ -4076,7 +3992,9 @@ mod tests {
         .unwrap();
 
         let params = InvertedIndexParams::default();
+        let original_version = dataset.manifest.version;
         let mut input_segments = Vec::new();
+        let mut uuids = BTreeSet::new();
         for fragment in dataset.get_fragments() {
             let segment =
                 CreateIndexBuilder::new(&mut dataset, &["text"], IndexType::Inverted, &params)
@@ -4085,18 +4003,50 @@ mod tests {
                     .execute_uncommitted()
                     .await
                     .unwrap();
+            assert!(uuids.insert(segment.uuid));
+            let files = segment.files.as_ref().unwrap();
+            assert!(
+                files
+                    .iter()
+                    .any(|file| file.path == lance_index::scalar::inverted::METADATA_FILE)
+            );
+            assert!(files.iter().all(|file| !file.path.starts_with("staging/")));
+            let metadata_path = dataset
+                .indices_dir()
+                .join(segment.uuid.to_string())
+                .join(lance_index::scalar::inverted::METADATA_FILE);
+            assert!(
+                dataset
+                    .table_state
+                    .object_store
+                    .exists(&metadata_path)
+                    .await
+                    .unwrap()
+            );
             input_segments.push(segment);
         }
 
-        let segments = input_segments.clone();
-        assert_eq!(segments.len(), input_segments.len());
+        assert_eq!(dataset.manifest.version, original_version);
+        let metadata_path = dataset
+            .indices_dir()
+            .join(input_segments[0].uuid.to_string())
+            .join(lance_index::scalar::inverted::METADATA_FILE);
+        let store = dataset.table_state.object_store.clone();
+        let reader = store.open(&metadata_path).await.unwrap();
+        let metadata_bytes = reader.get_all().await.unwrap();
+        store.delete(&metadata_path).await.unwrap();
+        let error = dataset
+            .commit_existing_index_segments("text_idx", "text", input_segments.clone())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(
+            error.to_string().contains("has no root metadata"),
+            "{error}"
+        );
+        assert_eq!(dataset.manifest.version, original_version);
+        store.put(&metadata_path, &metadata_bytes).await.unwrap();
 
-        crate::index::scalar::inverted::finalize_segment_files_if_needed(
-            &dataset,
-            &input_segments[0],
-        )
-        .await
-        .unwrap();
         let stale_staging_path = dataset
             .indices_dir()
             .join(input_segments[0].uuid.to_string())
@@ -4110,7 +4060,7 @@ mod tests {
             .unwrap();
 
         dataset
-            .commit_existing_index_segments("text_idx", "text", segments)
+            .commit_existing_index_segments("text_idx", "text", input_segments.clone())
             .await
             .unwrap();
 
@@ -4133,12 +4083,12 @@ mod tests {
 
         let indices = dataset.load_indices_by_name("text_idx").await.unwrap();
         assert_eq!(indices.len(), input_segments.len());
-        let finalized_segment = indices
+        let committed_segment = indices
             .iter()
             .find(|index| index.uuid == input_segments[0].uuid)
-            .expect("finalized segment should be committed");
+            .expect("built segment should be committed");
         assert!(
-            finalized_segment
+            committed_segment
                 .files
                 .as_ref()
                 .expect("committed segment should track files")
