@@ -113,10 +113,16 @@ impl Eq for HilbertUDF {}
 impl std::hash::Hash for HilbertUDF {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.signature.hash(state);
-        self.bbox.minx().to_bits().hash(state);
-        self.bbox.miny().to_bits().hash(state);
-        self.bbox.maxx().to_bits().hash(state);
-        self.bbox.maxy().to_bits().hash(state);
+        for coordinate in [
+            self.bbox.minx(),
+            self.bbox.miny(),
+            self.bbox.maxx(),
+            self.bbox.maxy(),
+        ] {
+            // Numeric equality treats both signs of zero as equal.
+            let coordinate = if coordinate == 0.0 { 0.0 } else { coordinate };
+            coordinate.to_bits().hash(state);
+        }
         self.bbox_field.hash(state);
     }
 }
@@ -269,7 +275,44 @@ mod tests {
     use geoarrow_schema::{Dimension, PointType};
     use lance_core::ROW_ADDR;
     use rand::Rng;
+    use rstest::rstest;
+    use std::collections::{HashSet, hash_map::RandomState};
+    use std::hash::BuildHasher;
     use std::sync::Arc;
+
+    #[rstest]
+    #[case::minx([(0.0, 1.0), (2.0, 3.0)])]
+    #[case::miny([(1.0, 0.0), (2.0, 3.0)])]
+    #[case::maxx([(-2.0, 1.0), (0.0, 3.0)])]
+    #[case::maxy([(1.0, -2.0), (3.0, 0.0)])]
+    #[case::all_zero([(0.0, 0.0), (0.0, 0.0)])]
+    fn test_hilbert_udf_eq_hash_signed_zero(#[case] corners: [(f64, f64); 2]) {
+        let mut positive_bbox = BoundingBox::new();
+        let mut negative_bbox = BoundingBox::new();
+        for (x, y) in corners {
+            positive_bbox.add_point(&Point::new(x, y));
+            negative_bbox.add_point(&Point::new(
+                if x == 0.0 { -0.0 } else { x },
+                if y == 0.0 { -0.0 } else { y },
+            ));
+        }
+
+        let field = PointType::new(Dimension::XY, Default::default()).to_field("bbox", false);
+        let positive_udf = HilbertUDF::new(positive_bbox, field.clone());
+        let negative_udf = HilbertUDF::new(negative_bbox, field);
+        assert_eq!(positive_udf, negative_udf);
+
+        let hash_state = RandomState::new();
+        assert_eq!(
+            hash_state.hash_one(&positive_udf),
+            hash_state.hash_one(&negative_udf)
+        );
+
+        let mut set = HashSet::new();
+        set.insert(positive_udf);
+        assert!(set.contains(&negative_udf));
+        assert!(!set.insert(negative_udf));
+    }
 
     #[tokio::test]
     async fn test_hilbert_sort_same_x() {
