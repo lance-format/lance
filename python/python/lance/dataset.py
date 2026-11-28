@@ -1532,9 +1532,10 @@ class LanceDataset(pa.dataset.Dataset):
         """
         if filter is not None:
             raise ValueError("get_fragments() does not support filter yet")
+        snapshot = copy.copy(self)
         return [
-            LanceFragment(self, fragment_id=None, fragment=f)
-            for f in self._ds.get_fragments()
+            LanceFragment(snapshot, None, fragment=fragment, _dataset_is_snapshot=True)
+            for fragment in snapshot._ds.get_fragments()
         ]
 
     def fragment_ids(self) -> Bitmap:
@@ -1558,10 +1559,13 @@ class LanceDataset(pa.dataset.Dataset):
 
     def get_fragment(self, fragment_id: int) -> Optional[LanceFragment]:
         """Get the fragment with fragment id."""
-        raw_fragment = self._ds.get_fragment(fragment_id)
+        snapshot = copy.copy(self)
+        raw_fragment = snapshot._ds.get_fragment(fragment_id)
         if raw_fragment is None:
             return None
-        return LanceFragment(self, fragment_id=None, fragment=raw_fragment)
+        return LanceFragment(
+            snapshot, None, fragment=raw_fragment, _dataset_is_snapshot=True
+        )
 
     def io_stats_snapshot(self) -> IOStats:
         """

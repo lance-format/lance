@@ -14,6 +14,7 @@ import textwrap
 import threading
 import uuid
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import lance
@@ -22,8 +23,9 @@ import pyarrow as pa
 import pytest
 from lance import Blob, BlobColumn, BlobFile, DatasetBasePath
 from lance.blob import BlobType
+from lance.dataset import ColumnOrdering
 from lance.file import LanceFileSession
-from lance.fragment import write_fragments
+from lance.fragment import LanceFragment, write_fragments
 
 lance_dataset_module = importlib.import_module("lance.dataset")
 
@@ -3282,6 +3284,134 @@ def test_scanner_to_pandas_blob_alias(dataset_for_pandas_blob_tests):
     assert isinstance(df.iloc[0]["video"], BlobFile)
     assert df.iloc[1]["video"] is None
     assert df.iloc[2]["video"].readall() == b"world"
+
+
+@pytest.mark.parametrize("mutation", ["append", "delete"])
+@pytest.mark.parametrize("scope", ["dataset", "fragments", "fragment", "fragment_id"])
+def test_scanner_to_pandas_blob_pins_snapshot(tmp_path, mutation, scope):
+    payloads = {i: f"payload-{i}".encode() for i in range(1, 9)}
+    schema = pa.schema([pa.field("id", pa.int64()), lance.blob_field("blob")])
+
+    def make_table(ids):
+        return pa.Table.from_arrays(
+            [pa.array(ids), lance.blob_array([payloads[i] for i in ids])],
+            schema=schema,
+        )
+
+    ds = lance.write_dataset(
+        make_table([1, 2, 3, 4, 5, 6]),
+        tmp_path / "blob_pandas_snapshot",
+        data_storage_version="2.2",
+        max_rows_per_file=2,
+    )
+    fragments = ds.get_fragments()
+    assert len(fragments) == 3
+
+    scan_options = {
+        "columns": {"id": "id", "video": "blob"},
+        "with_row_address": scope != "dataset",
+        "order_by": [ColumnOrdering("id")],
+    }
+    if scope == "fragment":
+        scanner = fragments[1].scanner(**scan_options)
+        expected_ids = [3, 4]
+    elif scope == "fragment_id":
+        scanner = LanceFragment(ds, fragments[1].fragment_id).scanner(**scan_options)
+        expected_ids = [3, 4]
+    elif scope == "fragments":
+        scanner = ds.scanner(fragments=fragments[1:], **scan_options)
+        expected_ids = [3, 4, 5, 6]
+    else:
+        scanner = ds.scanner(**scan_options)
+        expected_ids = [1, 2, 3, 4, 5, 6]
+    original = scanner.to_table()
+    assert original["id"].to_pylist() == expected_ids
+
+    if mutation == "append":
+        ds.insert(make_table([7, 8]))
+        updated_ids = [1, 2, 3, 4, 5, 6, 7, 8]
+    else:
+        ds.delete("id IN (3, 5)")
+        updated_ids = [1, 2, 4, 6]
+
+    assert scanner.projected_schema.equals(original.schema, check_metadata=True)
+    pd.testing.assert_frame_equal(
+        scanner.to_pandas(blob_mode="descriptions"), original.to_pandas()
+    )
+    expected = original.to_pandas()
+    expected["video"] = [payloads[i] for i in expected_ids]
+    pd.testing.assert_frame_equal(scanner.to_pandas(blob_mode="bytes"), expected)
+
+    lazy = scanner.to_pandas(blob_mode="lazy")
+    assert all(isinstance(blob, BlobFile) for blob in lazy["video"])
+    lazy["video"] = [blob.readall() for blob in lazy["video"]]
+    pd.testing.assert_frame_equal(lazy, expected)
+
+    updated = ds.scanner(**scan_options).to_pandas(blob_mode="bytes")
+    assert updated["id"].tolist() == updated_ids
+    assert updated["video"].tolist() == [payloads[i] for i in updated_ids]
+
+
+@pytest.mark.parametrize("lookup", ["get_fragment", "get_fragments"])
+@pytest.mark.parametrize("blob_mode", ["bytes", "lazy"])
+def test_fragment_lookup_pins_blob_snapshot(tmp_path, monkeypatch, lookup, blob_mode):
+    ids = [1, 2, 3, 4]
+    payloads = [b"original-1", b"original-2", b"original-3", b"original-4"]
+    alternatives = [b"alternate-1", b"alternate-2", b"alternate-3", b"alternate-4"]
+    table = pa.Table.from_arrays(
+        [pa.array(ids), lance.blob_array(payloads), lance.blob_array(alternatives)],
+        schema=pa.schema(
+            [
+                pa.field("id", pa.int64()),
+                lance.blob_field("blob"),
+                lance.blob_field("other_blob"),
+            ]
+        ),
+    )
+    ds = lance.write_dataset(
+        table, tmp_path / "blob_lookup", data_storage_version="2.2", max_rows_per_file=2
+    )
+    updated = lance.dataset(ds.uri)
+    updated.alter_columns({"path": "blob", "name": "original_blob"})
+    updated.alter_columns({"path": "other_blob", "name": "blob"})
+
+    wrapping = threading.Event()
+    resume = threading.Event()
+    original_init = LanceFragment.__init__
+
+    def pause_wrapping(self, *args, **kwargs):
+        wrapping.set()
+        assert resume.wait(timeout=10), "fragment wrapping did not resume"
+        original_init(self, *args, **kwargs)
+
+    with monkeypatch.context() as patch, ThreadPoolExecutor(max_workers=1) as pool:
+        patch.setattr(LanceFragment, "__init__", pause_wrapping)
+        if lookup == "get_fragment":
+            pending = pool.submit(ds.get_fragment, 0)
+        else:
+            pending = pool.submit(ds.get_fragments)
+        try:
+            assert wrapping.wait(timeout=10), "fragment lookup did not reach wrapping"
+            ds.checkout_latest()
+            assert ds.version == updated.version
+        finally:
+            resume.set()
+        result = pending.result(timeout=10)
+
+    fragments = [result] if lookup == "get_fragment" else result
+    assert all(fragment._ds is fragments[0]._ds for fragment in fragments)
+    expected_ids = ids[:2] if lookup == "get_fragment" else ids
+    actual = []
+    for fragment in fragments:
+        frame = fragment.to_pandas(columns=["id", "blob"], blob_mode=blob_mode)
+        blobs = frame["blob"].tolist()
+        if blob_mode == "lazy":
+            blobs = [blob.readall() for blob in blobs]
+        actual.extend(zip(frame["id"].tolist(), blobs))
+    assert actual == [(i, payloads[i - 1]) for i in expected_ids]
+    assert ds.to_pandas(columns=["blob"], blob_mode="bytes")["blob"].tolist() == (
+        alternatives
+    )
 
 
 def test_scanner_to_pandas_blob_filter_limit_order(dataset_for_pandas_blob_tests):

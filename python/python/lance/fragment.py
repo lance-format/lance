@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import warnings
 from dataclasses import asdict, dataclass, field
@@ -368,15 +369,18 @@ class LanceFragment(pa.dataset.Fragment):
         fragment_id: Optional[int],
         *,
         fragment: Optional[_Fragment] = None,
+        _dataset_is_snapshot: bool = False,
     ):
-        self._ds = dataset
+        # Scanner replay and blob lookups need the same snapshot as the native
+        # fragment. Dataset lookups can share a snapshot captured before lookup.
+        self._ds = dataset if _dataset_is_snapshot else copy.copy(dataset)
         if fragment is None:
             if fragment_id is None:
                 raise ValueError("Either fragment or fragment_id must be specified")
-            fragment = dataset.get_fragment(fragment_id)._fragment
+            fragment = self._ds._ds.get_fragment(fragment_id)
+            if fragment is None:
+                raise ValueError(f"Fragment id does not exist: {fragment_id}")
         self._fragment: _Fragment = fragment
-        if self._fragment is None:
-            raise ValueError(f"Fragment id does not exist: {fragment_id}")
 
     def __repr__(self):
         return self._fragment.__repr__()
