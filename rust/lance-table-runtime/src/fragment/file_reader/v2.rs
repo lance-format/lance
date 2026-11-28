@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -187,6 +187,12 @@ pub(super) struct Reader {
     reader: Arc<ProjectedFileReader>,
     projection: Arc<Schema>,
     field_id_to_column_idx: Arc<BTreeMap<u32, u32>>,
+    /// Manifest `(field_id, column_index)` slots for byte attribution.
+    ///
+    /// `None` on an ordinary projected open. Repeated tombstones share a field
+    /// id, so the read map cannot reconstruct those column boundaries, and
+    /// only storage statistics need them.
+    stats_field_slots: Option<Arc<[(i32, i32)]>>,
     /// The blob fields this file stores in the legacy layout.
     legacy_blobs: Arc<HashSet<i32>>,
     default_priority: u32,
@@ -198,6 +204,7 @@ impl Reader {
         reader: Arc<ProjectedFileReader>,
         projection: Arc<Schema>,
         mut field_id_to_column_idx: Arc<BTreeMap<u32, u32>>,
+        stats_field_slots: Option<Arc<[(i32, i32)]>>,
         legacy_blobs: Arc<HashSet<i32>>,
         default_priority: u32,
         file_scheduler: FileScheduler,
@@ -232,6 +239,7 @@ impl Reader {
             reader,
             projection,
             field_id_to_column_idx,
+            stats_field_slots,
             legacy_blobs,
             default_priority,
             file_scheduler,
@@ -284,6 +292,53 @@ impl Reader {
             })
             .boxed())
     }
+}
+
+/// Column boundaries for byte attribution.
+///
+/// `slots` is `data_file.fields` zipped with `column_indices`. Every
+/// non-negative column index is a boundary, including each repeated tombstone
+/// (`-2`). Keying the read map by field id would keep only the last tombstone
+/// and treat the earlier column as a continuation of the previous field.
+///
+/// `field_id_to_column_idx` may also name a v2.0 structural header whose slot
+/// was tombstoned. That header is still the field's bytes, so it replaces the
+/// tombstone on its column. A replaced value column is not put back, and its
+/// tombstone stays a boundary.
+fn column_byte_owners(
+    slots: &[(i32, i32)],
+    field_id_to_column_idx: &BTreeMap<u32, u32>,
+) -> BTreeMap<u32, u32> {
+    let mut owners = BTreeMap::new();
+    let mut slotted_field_ids = HashSet::new();
+    for &(field_id, column_index) in slots {
+        if column_index < 0 {
+            continue;
+        }
+        owners.insert(column_index as u32, field_id as u32);
+        slotted_field_ids.insert(field_id as u32);
+    }
+    for (&field_id, &column_idx) in field_id_to_column_idx {
+        if !slotted_field_ids.contains(&field_id) {
+            owners.insert(column_idx, field_id);
+        }
+    }
+    owners
+}
+
+/// Bytes of a column with no boundary extend the field that owns the previous
+/// column. Columns before the first boundary stay on field 0, matching the
+/// historical default.
+fn attribute_column_bytes(owners: &BTreeMap<u32, u32>, column_sizes: &[u64]) -> Vec<(u32, u64)> {
+    let mut stats = Vec::with_capacity(column_sizes.len());
+    let mut current_field_id = 0;
+    for (column_idx, size_bytes) in column_sizes.iter().copied().enumerate() {
+        if let Some(field_id) = owners.get(&(column_idx as u32)) {
+            current_field_id = *field_id;
+        }
+        stats.push((current_field_id, size_bytes));
+    }
+    stats
 }
 
 impl GenericFileReader for Reader {
@@ -365,23 +420,19 @@ impl GenericFileReader for Reader {
         let file_statistics = self.reader.file_statistics().ok_or_else(|| {
             Error::internal("storage_stats requires full file metadata".to_string())
         })?;
-        let column_idx_to_field_id = self
-            .field_id_to_column_idx
+        // The owner map is built here and not stored on the reader, so cloning
+        // a reader does not copy it. Ordinary projected opens never allocate
+        // the slots this uses.
+        let slots = self.stats_field_slots.as_deref().ok_or_else(|| {
+            Error::internal("storage_stats requires full file metadata".to_string())
+        })?;
+        let owners = column_byte_owners(slots, self.field_id_to_column_idx.as_ref());
+        let column_sizes = file_statistics
+            .columns
             .iter()
-            .map(|(field_id, column_idx)| (*column_idx, *field_id))
-            .collect::<HashMap<_, _>>();
-
-        let mut stats = Vec::new();
-        // Some fields span more than one column.  We assume a column that doesn't have an
-        // entry in the field_id_to_column_idx map is a continuation of the previous field.
-        let mut current_field_id = 0;
-        for (column_idx, col_stats) in file_statistics.columns.iter().enumerate() {
-            if let Some(field_id) = column_idx_to_field_id.get(&(column_idx as u32)) {
-                current_field_id = *field_id;
-            }
-            stats.push((current_field_id, col_stats.size_bytes));
-        }
-        Ok(stats)
+            .map(|col| col.size_bytes)
+            .collect::<Vec<_>>();
+        Ok(attribute_column_bytes(&owners, &column_sizes))
     }
 
     fn projection(&self) -> &Arc<Schema> {
@@ -395,5 +446,49 @@ impl GenericFileReader for Reader {
 
     fn clone_box(&self) -> Box<dyn GenericFileReader> {
         Box::new(self.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TOMBSTONE: u32 = -2i32 as u32;
+
+    #[test]
+    fn repeated_tombstone_slots_do_not_extend_the_previous_field() {
+        // Aligned replacement of two columns leaves field ids [0, -2, -2].
+        // A field-id map keeps only the last -2, so sizes [10, 20, 30] would
+        // bill field 0 for 30 bytes. Each tombstone is its own column.
+        let slots = [(0, 0), (-2, 1), (-2, 2)];
+        let owners = column_byte_owners(&slots, &BTreeMap::from([(0, 0), (TOMBSTONE, 2)]));
+        assert_eq!(
+            attribute_column_bytes(&owners, &[10, 20, 30]),
+            vec![(0, 10), (TOMBSTONE, 20), (TOMBSTONE, 30)]
+        );
+    }
+
+    #[test]
+    fn column_without_a_slot_extends_the_previous_field() {
+        // A list can occupy two columns while only the first has a field slot.
+        // Children stored with column index -1 are not boundaries.
+        let slots = [(0, 0), (1, -1), (2, -1), (3, 1), (4, 3)];
+        let owners = column_byte_owners(&slots, &BTreeMap::from([(0, 0), (3, 1), (4, 3)]));
+        assert_eq!(
+            attribute_column_bytes(&owners, &[10, 20, 30, 40]),
+            vec![(0, 10), (3, 20), (3, 30), (4, 40)]
+        );
+    }
+
+    #[test]
+    fn recovered_structural_header_keeps_its_column() {
+        // V2.0 puts a tombstoned struct header back on its column. The other
+        // tombstone is a replaced value column and must not join field 0.
+        let slots = [(0, 0), (-2, 1), (-2, 2)];
+        let owners = column_byte_owners(&slots, &BTreeMap::from([(0, 0), (7, 1), (TOMBSTONE, 2)]));
+        assert_eq!(
+            attribute_column_bytes(&owners, &[10, 20, 30]),
+            vec![(0, 10), (7, 20), (TOMBSTONE, 30)]
+        );
     }
 }

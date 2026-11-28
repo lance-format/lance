@@ -544,6 +544,19 @@ class LanceFragment(pa.dataset.Fragment):
             ).count_rows()
         return self._fragment.count_rows(filter)
 
+    def storage_stats(self) -> List[Tuple[int, int]]:
+        """Return ``(field_id, bytes_on_disk)`` for every field in the current schema.
+
+        Ids match :meth:`LanceStats.data_stats`, including fields with no bytes
+        in this fragment (those are ``0``). Field ids removed from the schema,
+        and tombstoned slots still stored in a data file, are omitted. A field
+        stored in more than one data file is returned once, with the sizes
+        added together. Pairs are sorted by field id. Summing these across
+        :meth:`LanceDataset.get_fragments` matches :meth:`LanceStats.data_stats`.
+        V1 datasets return those zeros without reading data files.
+        """
+        return self._fragment.storage_stats()
+
     @property
     def num_deletions(self) -> int:
         """Return the number of deleted rows in this fragment."""

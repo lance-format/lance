@@ -5,6 +5,9 @@ import inspect
 import json
 import multiprocessing
 import pickle
+import subprocess
+import sys
+import textwrap
 import uuid
 from pathlib import Path
 from unittest import mock
@@ -27,6 +30,254 @@ from lance.file import LanceFileReader, LanceFileWriter
 from lance.fragment import DeletionFile, RowIdMeta, RowIdSequence, write_fragments
 from lance.progress import FileSystemFragmentWriteProgress
 from pyarrow.fs import FileInfo, FileType
+
+
+def test_fragment_storage_stats(tmp_path: Path):
+    table = pa.table({"x": list(range(20)), "y": ["a"] * 20})
+    dataset = write_dataset(
+        table,
+        tmp_path / "stats",
+        max_rows_per_file=10,
+        data_storage_version="2.1",
+    )
+    fragments = dataset.get_fragments()
+    assert len(fragments) == 2
+
+    totals: dict[int, int] = {}
+    for fragment in fragments:
+        pairs = fragment.storage_stats()
+        assert pairs == sorted(pairs)
+        assert pairs
+        for field_id, nbytes in pairs:
+            assert nbytes > 0
+            totals[field_id] = totals.get(field_id, 0) + nbytes
+
+    data_stats = dataset.stats.data_stats()
+    assert {field.id: field.bytes_on_disk for field in data_stats.fields} == totals
+
+
+def _schema_field_ids(dataset: LanceDataset) -> list[int]:
+    ids: list[int] = []
+
+    def walk(fields) -> None:
+        for field in fields:
+            ids.append(field.id())
+            walk(field.children())
+
+    walk(dataset.lance_schema.fields())
+    return ids
+
+
+def test_fragment_storage_stats_after_drop_and_aligned_rewrite(tmp_path: Path):
+    """Dropped ids stay out, and a rewritten neighbor does not absorb tombstones.
+
+    The untouched column's byte count is the value measured before the rewrite.
+    Comparing the two statistics APIs is not enough: they share one reader.
+    """
+    nrows = 32
+    table = pa.table(
+        {
+            "kept": list(range(nrows)),
+            "replaced_a": list(range(100, 100 + nrows)),
+            "replaced_b": list(range(200, 200 + nrows)),
+            "dropped": [f"row-{i}" for i in range(nrows)],
+        }
+    )
+    dataset_uri = tmp_path / "stats-rewrite"
+    dataset = write_dataset(
+        table,
+        dataset_uri,
+        data_storage_version="2.1",
+    )
+    fragment = dataset.get_fragments()[0]
+    assert len(fragment.data_files()) == 1
+    kept_id = dataset.lance_schema.field("kept").id()
+    replaced_a_id = dataset.lance_schema.field("replaced_a").id()
+    replaced_b_id = dataset.lance_schema.field("replaced_b").id()
+    dropped_id = dataset.lance_schema.field("dropped").id()
+    assert list(fragment.data_files()[0].fields) == [
+        kept_id,
+        replaced_a_id,
+        replaced_b_id,
+        dropped_id,
+    ]
+    kept_bytes = dict(fragment.storage_stats())[kept_id]
+    assert kept_bytes > 0
+
+    dataset.drop_columns(["dropped"])
+    fragment = dataset.get_fragments()[0]
+    # The shared file still stores the dropped id.
+    assert dropped_id in fragment.data_files()[0].fields
+
+    rows = fragment.to_table(
+        columns=["replaced_a", "replaced_b"], with_row_address=True
+    )
+    new_values = pa.table(
+        {
+            "_rowaddr": rows["_rowaddr"],
+            "replaced_a": pa.array([7] * rows.num_rows, pa.int64()),
+            "replaced_b": pa.array([8] * rows.num_rows, pa.int64()),
+        }
+    )
+    updated_fragment, fields_modified = fragment.update_columns_from_stream(new_values)
+    dataset = lance.LanceDataset.commit(
+        str(dataset_uri),
+        LanceOperation.Update(
+            updated_fragments=[updated_fragment],
+            fields_modified=fields_modified,
+            update_mode="rewrite_columns",
+        ),
+        read_version=dataset.version,
+    )
+    fragment = dataset.get_fragments()[0]
+    shared = next(
+        data_file
+        for data_file in fragment.data_files()
+        if dropped_id in data_file.fields
+    )
+    assert list(shared.fields) == [kept_id, -2, -2, dropped_id]
+
+    dataset.add_columns(pa.schema([pa.field("empty", pa.int64())]))
+    fragment = dataset.get_fragments()[0]
+    empty_id = dataset.lance_schema.field("empty").id()
+    stats = fragment.storage_stats()
+    stats_map = dict(stats)
+    schema_ids = _schema_field_ids(dataset)
+
+    assert stats == sorted(stats)
+    assert [field_id for field_id, _ in stats] == sorted(schema_ids)
+    assert dropped_id not in stats_map
+    assert (2**32 - 2) not in stats_map
+    assert stats_map[kept_id] == kept_bytes
+    assert stats_map[empty_id] == 0
+    assert stats_map[replaced_a_id] > 0
+    assert stats_map[replaced_b_id] > 0
+
+    data_stats = dataset.stats.data_stats()
+    assert {field.id: field.bytes_on_disk for field in data_stats.fields} == stats_map
+
+
+def test_fragment_storage_stats_v1_skips_data_files(tmp_path: Path):
+    """V1 has no per-field sizes, so fragment stats stay at the initialized zeros.
+
+    Dataset statistics already return those zeros without opening data files.
+    Removing the data file makes an accidental open fail.
+    """
+    dataset = write_dataset(
+        pa.table({"x": [1, 2], "y": ["a", "b"]}),
+        tmp_path / "v1",
+        data_storage_version="legacy",
+    )
+    data_dir = tmp_path / "v1" / "data"
+    removed = 0
+    for path in data_dir.glob("*.lance"):
+        path.unlink()
+        removed += 1
+    assert removed > 0
+
+    fragment = dataset.get_fragments()[0]
+    stats = fragment.storage_stats()
+    schema_ids = _schema_field_ids(dataset)
+    assert stats == sorted(stats)
+    assert [field_id for field_id, _ in stats] == sorted(schema_ids)
+    assert all(nbytes == 0 for _, nbytes in stats)
+
+    data_stats = dataset.stats.data_stats()
+    assert {field.id: field.bytes_on_disk for field in data_stats.fields} == dict(stats)
+
+
+def test_fragment_storage_stats_refreshes_expired_namespace_credentials(tmp_path: Path):
+    """Expired Python namespace credentials must not deadlock fragment stats.
+
+    Dataset statistics already release the GIL around this metadata read.
+    Fragment stats have to do the same: credential refresh calls back into
+    Python, and waiting while the GIL is held stops both sides.
+    """
+    script = textwrap.dedent(
+        """
+        import sys
+        import threading
+        import time
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+        from pathlib import Path
+
+        import lance
+        import pyarrow as pa
+        from lance.namespace import LanceNamespace
+
+
+        class Namespace(LanceNamespace):
+            def namespace_id(self):
+                return "fragment-stats-gil"
+
+            def describe_table(self, request):
+                print("REFRESH_REACHED", flush=True)
+                raise RuntimeError("REFRESH_REACHED")
+
+
+        class MissingManifest(BaseHTTPRequestHandler):
+            def do_HEAD(self):
+                self.send_error(404)
+
+            def log_message(self, *args):
+                pass
+
+
+        tmp_path = Path(sys.argv[1])
+        local = lance.write_dataset(
+            pa.table({"x": [1, 2]}),
+            tmp_path / "local",
+            data_storage_version="2.1",
+        )
+        server = HTTPServer(("127.0.0.1", 0), MissingManifest)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            options = {
+                "aws_access_key_id": "test",
+                "aws_secret_access_key": "test",
+                "aws_region": "us-east-1",
+                "aws_endpoint": f"http://127.0.0.1:{server.server_port}",
+                "allow_http": "true",
+                # Valid for the open. refresh_offset 0 keeps that open from
+                # refreshing; the sleep below is what makes the stats read the
+                # one that has to call describe_table.
+                "expires_at_millis": str(int(time.time() * 1000) + 1000),
+                "refresh_offset_millis": "0",
+                "client_max_retries": "0",
+            }
+            dataset = lance.LanceDataset(
+                "s3://bucket/ds",
+                version=local.version,
+                serialized_manifest=local._ds.serialized_manifest(),
+                storage_options=options,
+                namespace_client=Namespace(),
+                table_id=["ds"],
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+
+        time.sleep(1.2)
+        try:
+            dataset.get_fragments()[0].storage_stats()
+        except Exception as error:
+            if "REFRESH_REACHED" not in str(error):
+                raise SystemExit(f"unexpected error: {error}") from error
+        else:
+            raise SystemExit("expected refresh error")
+        """
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path)],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert "REFRESH_REACHED" in completed.stdout
 
 
 def test_write_fragment(tmp_path: Path):
