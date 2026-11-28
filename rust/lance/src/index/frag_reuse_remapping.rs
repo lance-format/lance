@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 //! Bridge common FRI address translation to scalar and vector index loading.
-use super::frag_reuse_reader::FragmentReuseIndex;
+use super::frag_reuse_reader::{FragmentReuseIndex, SegmentOwnership};
 use crate::Dataset;
 use async_trait::async_trait;
 use lance_core::Result;
@@ -179,6 +179,7 @@ pub(super) struct QueryRowIdRemapper {
     mapping: Arc<FragmentReuseIndex>,
     coverage: RoaringBitmap,
     excluded_fragments: RoaringBitmap,
+    ownership: Option<SegmentOwnership>,
 }
 
 impl std::fmt::Debug for QueryRowIdRemapper {
@@ -186,6 +187,7 @@ impl std::fmt::Debug for QueryRowIdRemapper {
         f.debug_struct("QueryRowIdRemapper")
             .field("coverage", &self.coverage)
             .field("excluded_fragments", &self.excluded_fragments)
+            .field("ownership", &self.ownership)
             .finish_non_exhaustive()
     }
 }
@@ -195,11 +197,13 @@ impl QueryRowIdRemapper {
         mapping: Arc<FragmentReuseIndex>,
         coverage: RoaringBitmap,
         excluded_fragments: RoaringBitmap,
+        ownership: Option<SegmentOwnership>,
     ) -> Self {
         Self {
             mapping,
             coverage,
             excluded_fragments,
+            ownership,
         }
     }
 }
@@ -210,7 +214,7 @@ impl lance_index::scalar::BatchRowIdRemapper for QueryRowIdRemapper {
         lance_index::scalar::check_batch_remapping_entry()?;
         Ok(self
             .mapping
-            .remap_row_ids_excluding(row_ids, &self.excluded_fragments)
+            .remap_row_ids_excluding(row_ids, &self.excluded_fragments, self.ownership.as_ref())
             .await?
             .into_iter()
             .map(|address| {

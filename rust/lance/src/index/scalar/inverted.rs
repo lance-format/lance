@@ -1657,6 +1657,7 @@ mod tests {
             SegmentRemappingPlan::Translate {
                 coverage: RoaringBitmap::new(),
                 excluded_fragments: RoaringBitmap::new(),
+                ownership: None,
                 fingerprint: [0; 32],
             },
         );
