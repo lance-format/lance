@@ -11,12 +11,12 @@ use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::ngram::NGramIndex;
 use lance_index::scalar::{
     BuiltinIndexType, CreatedIndex, IndexStore, OldIndexDataFilter, RowIdRemapper,
-    ScalarIndexParams, index_files_to_table,
+    ScalarIndexParams,
 };
 use lance_table::format::IndexMetadata;
-use roaring::RoaringBitmap;
 use uuid::Uuid;
 
+use super::segment_merge::SegmentMerge;
 use crate::{
     Dataset, Error, Result, dataset::index::LanceIndexStoreExt,
     index::loading::DatasetIndexInternalExt,
@@ -40,45 +40,19 @@ pub(in crate::index) async fn merge_segments(
     segments: Vec<IndexMetadata>,
     staged: Option<&crate::index::frag_reuse::StagedRemappingPlans>,
 ) -> Result<IndexMetadata> {
-    if segments.is_empty() {
-        return Err(Error::index("No segment metadata was provided".to_string()));
-    }
+    let merge = SegmentMerge::new(dataset, "NGram", &segments)?;
+    let field_path = merge.field_path();
 
-    // All source segments must belong to the same column.
-    let reference_fields = segments[0].fields.as_slice();
-    for segment in segments.iter().skip(1) {
-        if !segment.declares_same_fields(&segments[0]) {
-            return Err(Error::invalid_input(format!(
-                "NGram merge_segments: segment {} has fields {:?}, expected {:?}",
-                segment.uuid, segment.fields, reference_fields,
-            )));
-        }
-    }
-
-    let field_id = *segments[0].fields.first().ok_or_else(|| {
-        Error::invalid_input(format!(
-            "CreateIndex: segment {} is missing field ids",
-            segments[0].uuid
-        ))
-    })?;
-    let source_dataset_version = segments
-        .iter()
-        .map(|segment| segment.dataset_version)
-        .min()
-        .unwrap_or(dataset.manifest.version);
-    let segment_refs = segments.iter().collect::<Vec<_>>();
-
-    let new_uuid = Uuid::new_v4();
     let frag_reuse_index = dataset.open_frag_reuse_index(&NoOpMetricsCollector).await?;
-    let has_retired_coverage = segments.iter().any(|segment| {
+    let has_retired_coverage = merge.segments().iter().any(|segment| {
         segment
-            .deleted_fragment_bitmap(&dataset.fragment_bitmap)
+            .deleted_fragment_bitmap(&dataset.table_state.fragment_bitmap)
             .is_some_and(|retired| !retired.is_empty())
     });
     let requires_rebuild = frag_reuse_index.as_ref().is_some_and(|frag_reuse_index| {
         crate::index::append::fragment_reuse_affects_segments(
             frag_reuse_index,
-            segment_refs.iter().copied(),
+            merge.segments().iter().copied(),
         )
     });
     if has_retired_coverage && !requires_rebuild {
@@ -89,30 +63,19 @@ pub(in crate::index) async fn merge_segments(
                 .to_string(),
         ));
     }
-    let (created_index, dataset_version, fragment_bitmap) = if requires_rebuild {
-        let mut fragment_bitmap = segments
-            .iter()
-            .map(|segment| {
-                segment.fragment_bitmap.as_ref().cloned().ok_or_else(|| {
-                    Error::invalid_input(format!(
-                        "CreateIndex: segment {} is missing fragment coverage",
-                        segment.uuid
-                    ))
-                })
-            })
-            .collect::<Result<Vec<_>>>()?
-            .into_iter()
-            .fold(RoaringBitmap::new(), |coverage, segment| coverage | segment);
+    let (new_uuid, created_index, dataset_version, fragment_bitmap) = if requires_rebuild {
+        let mut fragment_bitmap = merge.stored_coverage_union()?;
         frag_reuse_index
             .as_ref()
             .expect("requires_rebuild implies a fragment-reuse index")
             .remap_fragment_bitmap(&mut fragment_bitmap)?;
-        fragment_bitmap &= dataset.fragment_bitmap.as_ref();
-        let field_path = dataset.schema().field_path(field_id)?;
+        fragment_bitmap &= dataset.table_state.fragment_bitmap.as_ref();
+        let new_uuid = Uuid::new_v4();
         (
+            new_uuid,
             super::build_scalar_index(
                 dataset,
-                &field_path,
+                field_path,
                 new_uuid,
                 &ScalarIndexParams::for_builtin(BuiltinIndexType::NGram),
                 true,
@@ -129,39 +92,25 @@ pub(in crate::index) async fn merge_segments(
         // stable-row-id dataset, and without stable row ids the two domains
         // coincide, so the filters can always be address-domain.
         let (fragment_bitmap, old_data_filters) =
-            crate::index::append::build_per_segment_filters(dataset, &segment_refs, staged, true)
-                .await?;
-        let new_store = LanceIndexStore::from_dataset_for_new(dataset, &new_uuid)?;
+            merge.per_segment_filters(dataset, staged, true).await?;
+        let (new_uuid, new_store) = merge.new_store(dataset)?;
         (
+            new_uuid,
             open_and_merge_segments(
                 dataset,
-                &segment_refs,
+                merge.segments(),
                 None,
                 &new_store,
                 &old_data_filters,
                 staged,
             )
             .await?,
-            source_dataset_version,
+            merge.dataset_version(),
             fragment_bitmap,
         )
     };
 
-    Ok(IndexMetadata {
-        uuid: new_uuid,
-        name: segments[0].name.clone(),
-        fields: segments[0].fields.clone(),
-        covering_fields: segments[0].covering_fields.clone(),
-        dataset_version,
-        fragment_bitmap: Some(fragment_bitmap),
-        index_details: Some(Arc::new(created_index.index_details)),
-        index_version: created_index.index_version as i32,
-        created_at: Some(chrono::Utc::now()),
-        base_id: None,
-        files: Some(index_files_to_table(created_index.files)),
-        clustering_id: None,
-        metadata: Default::default(),
-    })
+    Ok(merge.build_metadata(new_uuid, dataset_version, fragment_bitmap, created_index))
 }
 
 /// Merge the given NGram segments with optional newly appended data into a single
@@ -190,10 +139,9 @@ pub(in crate::index) async fn open_and_merge_segments(
                 // coverage; the plan says whether its rows translate.
                 Some(SegmentRemappingPlan::Translate { .. }) => true,
                 Some(_) => false,
-                None => segment
-                    .fragment_bitmap
-                    .as_ref()
-                    .is_none_or(|bitmap| !bitmap.is_subset(dataset.fragment_bitmap.as_ref())),
+                None => segment.fragment_bitmap.as_ref().is_none_or(|bitmap| {
+                    !bitmap.is_subset(dataset.table_state.fragment_bitmap.as_ref())
+                }),
             }
         })
     {

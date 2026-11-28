@@ -16,6 +16,7 @@ use arrow_schema::{DataType, Schema as ArrowSchema};
 use async_trait::async_trait;
 use blob::LanceBlobFile;
 use chrono::{Duration, Utc};
+use datafusion_common::ScalarValue;
 use futures::{StreamExt, TryFutureExt};
 use lance_index::scalar::minhash_lsh::MinHashQuery;
 use lance_index::vector::bq::RQBuildParams;
@@ -330,6 +331,12 @@ impl Dataset {
     ) -> lance_core::Result<lance::dataset::cleanup::CleanupOperation<'_>> {
         let mut builder = CleanupPolicyBuilder::default();
         if let Some(v) = older_than_micros {
+            if v < 0 {
+                // A negative age moves the cutoff into the future.
+                return Err(lance::Error::invalid_input(format!(
+                    "older_than must be non-negative, got {v} microseconds"
+                )));
+            }
             let older_than = Duration::microseconds(v);
             builder = builder.before_timestamp(Utc::now() - older_than);
         }
@@ -397,6 +404,12 @@ fn expire_versions_policy(
 ) -> PyResult<lance::dataset::expire::ExpireVersionsPolicy> {
     let mut builder = lance::dataset::expire::ExpireVersionsPolicyBuilder::default();
     if let Some(micros) = before_micros {
+        if micros < 0 {
+            // A negative age moves the cutoff into the future.
+            return Err(PyValueError::new_err(format!(
+                "before must be non-negative, got {micros} microseconds"
+            )));
+        }
         // A duration, not an absolute time, matching `cleanup_policy`: the caller says
         // "older than this" and the cutoff is computed here against one clock.
         builder = builder.before_timestamp(Utc::now() - Duration::microseconds(micros));
@@ -527,6 +540,46 @@ fn file_reader_options_from_read_params(
         decoder_config,
         ..Default::default()
     })
+}
+
+/// Convert a DataFusion scalar to a Python value.
+///
+/// Exact values become Python scalars. ``as_py()`` truncates ``time64[ns]`` to
+/// microseconds, and a truncated maximum can sit below every live value. Keep
+/// the PyArrow scalar when the conversion does not round-trip.
+fn scalar_value_to_py(py: Python<'_>, value: ScalarValue) -> PyResult<Py<PyAny>> {
+    if value.is_null() {
+        return Ok(py.None());
+    }
+    let array = value
+        .to_array()
+        .map_err(|err| PyValueError::new_err(err.to_string()))?;
+    let py_array = array.to_data().to_pyarrow(py)?;
+    let scalar = py_array.get_item(0)?;
+    let Ok(py_value) = scalar.call_method0("as_py") else {
+        return Ok(scalar.unbind());
+    };
+    if python_value_round_trips(py, &py_array, &py_value)? {
+        Ok(py_value.unbind())
+    } else {
+        Ok(scalar.unbind())
+    }
+}
+
+fn python_value_round_trips(
+    py: Python<'_>,
+    original: &Bound<'_, PyAny>,
+    py_value: &Bound<'_, PyAny>,
+) -> PyResult<bool> {
+    let pyarrow = py.import("pyarrow")?;
+    let dtype = original.getattr("type")?;
+    let values = PyList::new(py, [py_value.clone()])?;
+    let kwargs = PyDict::new(py);
+    kwargs.set_item("type", dtype)?;
+    let Ok(roundtrip) = pyarrow.call_method("array", (values,), Some(&kwargs)) else {
+        return Ok(false);
+    };
+    roundtrip.call_method1("equals", (original,))?.extract()
 }
 
 #[pymethods]
@@ -1412,12 +1465,13 @@ impl Dataset {
             .map_err(|err| PyIOError::new_err(err.to_string()))
     }
 
-    #[pyo3(signature=(row_indices, columns = None, columns_with_transform = None))]
+    #[pyo3(signature=(row_indices, columns = None, columns_with_transform = None, io_parallelism = None))]
     fn take<'py>(
         self_: PyRef<'py, Self>,
         row_indices: Vec<u64>,
         columns: Option<Vec<String>>,
         columns_with_transform: Option<Vec<(String, String)>>,
+        io_parallelism: Option<u32>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let projection = match (columns, columns_with_transform) {
             (Some(_), Some(_)) => {
@@ -1432,8 +1486,18 @@ impl Dataset {
             (None, Some(sql_exprs)) => Ok(ProjectionRequest::from_sql(sql_exprs)),
             (None, None) => Ok(ProjectionRequest::from_schema(self_.ds.schema().clone())),
         }?;
+        let ds = self_.ds.clone();
+        let read = async move {
+            match io_parallelism {
+                Some(io_parallelism) => {
+                    ds.take_with_io_parallelism(&row_indices, projection, io_parallelism)
+                        .await
+                }
+                None => ds.take(&row_indices, projection).await,
+            }
+        };
         let batch = rt()
-            .block_on(Some(self_.py()), self_.ds.take(&row_indices, projection))?
+            .block_on(Some(self_.py()), read)?
             .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
 
         batch.to_pyarrow(self_.py())
@@ -2845,6 +2909,25 @@ impl Dataset {
         rt().block_on(None, self.ds.calculate_data_stats())?
             .infer_error()
             .map(PyLance)
+    }
+
+    /// Global `[min, max]` for `column` from its ZoneMap index, without a scan.
+    ///
+    /// `None` when the column has no ZoneMap, the index does not cover every
+    /// live fragment, a newer data overlay can move values outside the
+    /// summaries, or the column contains NaN.
+    #[pyo3(signature = (column))]
+    fn column_value_range(
+        &self,
+        py: Python<'_>,
+        column: String,
+    ) -> PyResult<Option<(Py<PyAny>, Py<PyAny>)>> {
+        let range = rt()
+            .block_on(None, self.ds.statistics().column_value_range(&column))?
+            .infer_error()?;
+        range
+            .map(|(lo, hi)| Ok((scalar_value_to_py(py, lo)?, scalar_value_to_py(py, hi)?)))
+            .transpose()
     }
 
     /// Per-zone statistics for a ZoneMap index, as one Arrow record batch.

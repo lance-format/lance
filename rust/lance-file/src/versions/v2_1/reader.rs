@@ -23,13 +23,27 @@ fn required<'a, T>(value: Option<&'a T>, label: &str) -> Result<&'a T> {
     })
 }
 
+/// The shared decoders read 128-bit bitpacking, but only Lance v2.3 writes it.
+fn reject_wide_bitpacking(uncompressed_bits_per_value: u64) -> Result<()> {
+    if uncompressed_bits_per_value > 64 {
+        return Err(Error::invalid_input_source(
+            format!(
+                "Lance v2.1 bitpacks at most 64-bit values, got {uncompressed_bits_per_value}-bit bitpacking"
+            )
+            .into(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_compressive_encoding(encoding: &pb21::CompressiveEncoding) -> Result<()> {
     use pb21::compressive_encoding::Compression;
 
     match encoding.compression.as_ref() {
-        Some(Compression::Flat(_))
-        | Some(Compression::InlineBitpacking(_))
-        | Some(Compression::Constant(_)) => Ok(()),
+        Some(Compression::Flat(_)) | Some(Compression::Constant(_)) => Ok(()),
+        Some(Compression::InlineBitpacking(bitpacking)) => {
+            reject_wide_bitpacking(bitpacking.uncompressed_bits_per_value)
+        }
         Some(Compression::Variable(variable)) => {
             let offsets = required(variable.offsets.as_deref(), "variable offsets")?;
             validate_compressive_encoding(offsets)?;
@@ -41,6 +55,7 @@ fn validate_compressive_encoding(encoding: &pb21::CompressiveEncoding) -> Result
             Ok(())
         }
         Some(Compression::OutOfLineBitpacking(bitpacking)) => {
+            reject_wide_bitpacking(bitpacking.uncompressed_bits_per_value)?;
             validate_compressive_encoding(required(
                 bitpacking.values.as_deref(),
                 "out-of-line bitpacking values",
@@ -303,6 +318,55 @@ mod grammar_tests {
                 .to_string()
                 .contains("Variable packed struct compression is not part")
         );
+    }
+
+    #[rstest::rstest]
+    #[case::inline(Compression::InlineBitpacking(pb21::InlineBitpacking {
+        uncompressed_bits_per_value: 128,
+        values: None,
+    }))]
+    #[case::out_of_line(Compression::OutOfLineBitpacking(Box::new(pb21::OutOfLineBitpacking {
+        uncompressed_bits_per_value: 128,
+        values: Some(Box::new(CompressiveEncoding {
+            compression: Some(Compression::Flat(pb21::Flat {
+                bits_per_value: 24,
+                data: None,
+            })),
+        })),
+    })))]
+    fn rejects_128_bit_bitpacking(#[case] compression: Compression) {
+        let encoding = CompressiveEncoding {
+            compression: Some(compression),
+        };
+        let error = validate_compressive_encoding(&encoding).unwrap_err();
+        assert!(matches!(&error, Error::InvalidInput { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("Lance v2.1 bitpacks at most 64-bit values, got 128-bit"),
+            "{error}"
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::inline(Compression::InlineBitpacking(pb21::InlineBitpacking {
+        uncompressed_bits_per_value: 64,
+        values: None,
+    }))]
+    #[case::out_of_line(Compression::OutOfLineBitpacking(Box::new(pb21::OutOfLineBitpacking {
+        uncompressed_bits_per_value: 64,
+        values: Some(Box::new(CompressiveEncoding {
+            compression: Some(Compression::Flat(pb21::Flat {
+                bits_per_value: 24,
+                data: None,
+            })),
+        })),
+    })))]
+    fn accepts_64_bit_bitpacking(#[case] compression: Compression) {
+        let encoding = CompressiveEncoding {
+            compression: Some(compression),
+        };
+        validate_compressive_encoding(&encoding).unwrap();
     }
 
     #[rstest::rstest]

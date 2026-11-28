@@ -13,6 +13,9 @@ pub const COMPRESSION_META_KEY: &str = "lance-encoding:compression";
 pub const PCODEC_COMPRESSION: &str = "pcodec";
 /// Metadata key for specifying compression level (applies to schemes that support levels)
 pub const COMPRESSION_LEVEL_META_KEY: &str = "lance-encoding:compression-level";
+/// Metadata key for per-value AxisDelta prediction in integer tensors (unstable Lance 2.3).
+/// Accepts `off`, `auto`, `auto:<axis>`, or `on:<axis>` for a zero-based tensor axis.
+pub const AXIS_DELTA_META_KEY: &str = "lance-encoding:axis-delta";
 /// Metadata key for specifying RLE (Run-Length Encoding) threshold
 pub const RLE_THRESHOLD_META_KEY: &str = "lance-encoding:rle-threshold";
 /// Metadata key for specifying minichunk size

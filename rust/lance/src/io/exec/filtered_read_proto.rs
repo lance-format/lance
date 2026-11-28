@@ -439,17 +439,12 @@ async fn fr_options_from_proto(
     if proto.batch_size_bytes.is_some()
         || !proto.list_structure.is_empty()
         || dataset
-            .file_reader_options
-            .as_ref()
+            .file_reader_options()
             .is_some_and(|options| !options.decoder_config.list_structure.is_empty())
     {
         // Preserve executor-side validation and I/O settings, but replace the
         // structural demand: placeholder values are safe only for this plan.
-        let mut file_reader_options = dataset
-            .file_reader_options
-            .as_deref()
-            .cloned()
-            .unwrap_or_default();
+        let mut file_reader_options = dataset.file_reader_options().cloned().unwrap_or_default();
         if let Some(batch_size_bytes) = proto.batch_size_bytes {
             file_reader_options.batch_size_bytes = Some(batch_size_bytes);
         }
@@ -738,7 +733,7 @@ fn range_from_proto(proto: &pb::U64Range) -> Range<u64> {
 fn fragments_from_proto(fragment_ids: &[u64], dataset: &Dataset) -> Result<Vec<Fragment>> {
     let fragments = dataset.manifest.fragments.as_slice();
     // Duplicate IDs in legacy manifests must resolve to their first stored fragment.
-    let ids_are_unique = dataset.fragment_bitmap.len() == fragments.len() as u64;
+    let ids_are_unique = dataset.fragment_bitmap().len() == fragments.len() as u64;
     fragment_ids
         .iter()
         .map(|id| {
@@ -869,7 +864,12 @@ mod tests {
                     .data_file_dir(file)
                     .unwrap()
                     .join(file.path.as_str());
-                let bytes = written.object_store.read_one_all(&path).await.unwrap();
+                let bytes = written
+                    .table_state
+                    .object_store
+                    .read_one_all(&path)
+                    .await
+                    .unwrap();
                 let spans: Vec<_> = payloads
                     .iter()
                     .filter_map(|payload| {
@@ -887,7 +887,7 @@ mod tests {
         }
         assert_eq!(found, payloads.len());
         let dataset = Arc::new(Dataset::open(&dir).await.unwrap());
-        dataset.object_store.io_stats_incremental();
+        dataset.table_state.object_store.io_stats_incremental();
         let mut scanner = dataset.scan();
         if nonempty {
             scanner
@@ -951,7 +951,7 @@ mod tests {
                 vec![None, Some(0), Some(2), Some(2)]
             );
         }
-        let stats = dataset.object_store.io_stats_incremental();
+        let stats = dataset.table_state.object_store.io_stats_incremental();
         assert!(stats.read_iops > 0);
         for request in &stats.requests {
             if let Some(payloads) = forbidden.get(&request.path) {
@@ -1208,7 +1208,7 @@ mod tests {
     async fn make_test_dataset_with_file_reader_options() -> Arc<Dataset> {
         let mut dataset = make_test_dataset().await;
         if let Some(ds) = Arc::get_mut(&mut dataset) {
-            ds.file_reader_options = Some(Arc::new(FileReaderOptions {
+            ds.table_state.file_reader_options = Some(Arc::new(FileReaderOptions {
                 read_chunk_size: 1234,
                 decoder_config: DecoderConfig {
                     validate_on_decode: true,
@@ -1403,6 +1403,7 @@ mod tests {
         let defaults = Arc::make_mut(
             Arc::get_mut(&mut dataset)
                 .unwrap()
+                .table_state
                 .file_reader_options
                 .as_mut()
                 .unwrap(),
@@ -1439,8 +1440,7 @@ mod tests {
         assert!(effective.decoder_config.validate_on_decode);
         assert_eq!(
             dataset
-                .file_reader_options
-                .as_ref()
+                .file_reader_options()
                 .unwrap()
                 .decoder_config
                 .list_structure
@@ -1583,7 +1583,7 @@ mod tests {
             })
             .collect();
         let mut dataset = (*make_test_dataset().await).clone();
-        dataset.fragment_bitmap = Arc::new(
+        dataset.table_state.fragment_bitmap = Arc::new(
             fragments
                 .iter()
                 .map(|fragment| fragment.id as u32)
@@ -1737,7 +1737,7 @@ mod tests {
         let table = pb::TableIdentifier {
             uri: dataset.uri().to_string(),
             version: dataset.manifest.version,
-            manifest_etag: dataset.manifest_location.e_tag.clone(),
+            manifest_etag: dataset.manifest_location().e_tag.clone(),
             serialized_manifest: None,
             storage_options: [("region".to_string(), "test".to_string())].into(),
         };

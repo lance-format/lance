@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
 import random
+import subprocess
+import sys
 from collections import Counter
 from itertools import permutations, product
 from pathlib import Path
@@ -332,6 +334,19 @@ def test_set_epoch_reshuffles(tmp_path: Path, sampler_cls):
     epoch2 = first_ids()
 
     assert epoch1 != epoch2, "Different epochs should produce different orders"
+
+
+def test_set_epoch_does_not_import_torch():
+    # Only LanceDataset moves the epoch into torch shared memory; a sampler used
+    # on its own must not pull torch in.
+    code = (
+        "import sys; "
+        "from lance.sampler import ShardedBatchSampler, ShardedFragmentSampler; "
+        "[cls(0, 1, randomize=True).set_epoch(1) "
+        "for cls in (ShardedBatchSampler, ShardedFragmentSampler)]; "
+        "assert 'torch' not in sys.modules"
+    )
+    subprocess.run([sys.executable, "-c", code], check=True)
 
 
 @pytest.mark.parametrize("world_size", [3, 4])

@@ -135,7 +135,9 @@ impl DeletionVector {
                 let mut base = 0;
                 for range in ranges {
                     for deleted in bitmap.range(range.clone()) {
-                        mask.delete(base + deleted - range.start);
+                        // Subtract first so high fragment offsets cannot overflow
+                        // before being translated to positions in this batch.
+                        mask.delete(base + (deleted - range.start));
                     }
                     base += range.end - range.start;
                 }
@@ -147,7 +149,7 @@ impl DeletionVector {
                 let mut base = 0;
                 for range in ranges {
                     for deleted in set.iter().copied().filter(|offset| range.contains(offset)) {
-                        mask.delete(base + deleted - range.start);
+                        mask.delete(base + (deleted - range.start));
                     }
                     base += range.end - range.start;
                 }
@@ -585,6 +587,21 @@ mod test {
     // More deleted rows than the batch holds, so the per-row probe is used instead.
     #[case::set_probed(set_dv([0, 1, 2, 3, 4, 5, 6, 7]), vec![2..5], 3)]
     #[case::bitmap(bitmap_dv([2, 5, 11]), vec![0..8, 10..14], 12)]
+    #[case::set_walked_high_offsets(
+        set_dv([u32::MAX - 1]),
+        vec![0..2, u32::MAX - 2..u32::MAX],
+        4
+    )]
+    #[case::set_probed_high_offsets(
+        set_dv([0, 1, u32::MAX - 1]),
+        vec![0..2, u32::MAX - 2..u32::MAX],
+        4
+    )]
+    #[case::bitmap_high_offsets(
+        bitmap_dv([u32::MAX - 1]),
+        vec![0..2, u32::MAX - 2..u32::MAX],
+        4
+    )]
     fn test_build_keep_mask_matches_build_predicate(
         #[case] dv: DeletionVector,
         #[case] ranges: Vec<Range<u32>>,
