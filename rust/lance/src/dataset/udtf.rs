@@ -21,6 +21,9 @@ use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
 
+mod hybrid;
+pub use hybrid::{HybridQueryUDTF, HybridQueryUDTFBuilder};
+
 /// Provide a table based on full text search query.
 ///
 /// The table has the dataset's columns, then `_score`, then `_rowid` and
